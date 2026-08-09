@@ -151,7 +151,7 @@ impl ProviderAdapterActivation {
         lease: ProviderActivationLease,
         consolidated_stream: TradierSourceConfig,
         consolidated_snapshots: TradierSourceConfig,
-        derived_indexes: TradierSourceConfig,
+        derived_indexes: Option<TradierSourceConfig>,
         limits: TradierTransportLimits,
         initial_stream_symbols: Vec<SourceIdentifier>,
         cancellation: CancellationToken,
@@ -168,7 +168,7 @@ impl ProviderAdapterActivation {
             &binding,
             &consolidated_stream,
             &consolidated_snapshots,
-            &derived_indexes,
+            derived_indexes.as_ref(),
             limits,
         )?;
         let secret = self
@@ -196,7 +196,7 @@ impl ProviderAdapterActivation {
             consolidated_stream: Some(consolidated_stream),
             subscriptions,
             consolidated_snapshots: Some(consolidated_snapshots),
-            derived_indexes: Some(derived_indexes),
+            derived_indexes,
         })
     }
 }
@@ -206,7 +206,7 @@ fn validate_configurations(
     binding: &ProviderAccountBinding,
     consolidated_stream: &TradierSourceConfig,
     consolidated_snapshots: &TradierSourceConfig,
-    derived_indexes: &TradierSourceConfig,
+    derived_indexes: Option<&TradierSourceConfig>,
     limits: TradierTransportLimits,
 ) -> Result<(), TradierMarketDataActivationError> {
     let expected_budget = ProviderRateDeclaration::try_for_authorization_subject(
@@ -219,7 +219,7 @@ fn validate_configurations(
     .map_err(|_error| TradierMarketDataActivationError::SourceBinding)?
     .policy()
     .clone();
-    let expected = [
+    let required = [
         (
             consolidated_stream,
             TradierLogicalProfile::ConsolidatedSecurities,
@@ -232,14 +232,8 @@ fn validate_configurations(
             TradierAccessSurface::RestSnapshots,
             DataQuality::Aggregated,
         ),
-        (
-            derived_indexes,
-            TradierLogicalProfile::DerivedIndexes,
-            TradierAccessSurface::RestSnapshots,
-            DataQuality::Modeled,
-        ),
     ];
-    for (config, profile, access, quality) in expected {
+    for (config, profile, access, quality) in required {
         if !binding.validates_metadata(config.metadata())
             || config.profile() != profile
             || config.access_surface() != access
@@ -249,6 +243,16 @@ fn validate_configurations(
         {
             return Err(TradierMarketDataActivationError::SourceBinding);
         }
+    }
+    if let Some(config) = derived_indexes
+        && (!binding.validates_metadata(config.metadata())
+            || config.profile() != TradierLogicalProfile::DerivedIndexes
+            || config.access_surface() != TradierAccessSurface::RestSnapshots
+            || config.metadata().quality_ceiling() != DataQuality::Modeled
+            || config.metadata().budget_policy() != Some(&expected_budget)
+            || config.transport_limits() != limits)
+    {
+        return Err(TradierMarketDataActivationError::SourceBinding);
     }
     Ok(())
 }

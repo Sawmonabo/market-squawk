@@ -123,6 +123,7 @@ pub struct KrakenL3BookBatch {
     timestamp: Timestamp,
     checksum: u32,
     events: Vec<KrakenL3OrderEvent>,
+    price_projection: KrakenL3PriceProjection,
 }
 
 impl KrakenL3BookBatch {
@@ -174,6 +175,14 @@ impl KrakenL3BookBatch {
         &self.events
     }
 
+    /// Returns the bounded price-level view derived from the same checksum-admitted book image.
+    ///
+    /// This is a display/read projection only. Its source remains the authenticated order-level
+    /// batch and it cannot grant execution authority or replace the individual-order state.
+    pub(super) const fn price_projection(&self) -> &KrakenL3PriceProjection {
+        &self.price_projection
+    }
+
     /// Returns the explicit provider depth class.
     pub const fn market_depth(&self) -> MarketDepth {
         MarketDepth::OrderLevel
@@ -182,6 +191,44 @@ impl KrakenL3BookBatch {
     /// Returns the maximum data-quality class this adapter may claim.
     pub const fn quality_ceiling(&self) -> DataQuality {
         DataQuality::DirectUnverified
+    }
+}
+
+/// One exact aggregate inside a checksum-admitted Kraken order-level image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct KrakenL3PriceLevel {
+    price: ProviderPrice,
+    quantity: Decimal,
+}
+
+impl KrakenL3PriceLevel {
+    /// Returns the exact provider price retained from the first order at this price.
+    pub(super) const fn price(&self) -> &ProviderPrice {
+        &self.price
+    }
+
+    /// Returns the checked sum of visible provider order quantities.
+    pub(super) const fn quantity(&self) -> Decimal {
+        self.quantity
+    }
+}
+
+/// Bounded price-level projection derived from one checksum-admitted L3 state transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct KrakenL3PriceProjection {
+    bids: Vec<KrakenL3PriceLevel>,
+    asks: Vec<KrakenL3PriceLevel>,
+}
+
+impl KrakenL3PriceProjection {
+    /// Returns bids ordered best to worst.
+    pub(super) fn bids(&self) -> &[KrakenL3PriceLevel] {
+        &self.bids
+    }
+
+    /// Returns asks ordered best to worst.
+    pub(super) fn asks(&self) -> &[KrakenL3PriceLevel] {
+        &self.asks
     }
 }
 
@@ -492,6 +539,7 @@ impl KrakenL3Decoder {
         if expected != computed {
             return Err(KrakenL3DecodeError::ChecksumMismatch { expected, computed });
         }
+        let price_projection = project_price_levels(&candidate, self.depth.get())?;
         candidate.truncate(self.depth.get());
         let next_ordinal = self.products[product_index]
             .local_ordinal
@@ -530,6 +578,7 @@ impl KrakenL3Decoder {
             timestamp: message_timestamp,
             checksum: computed,
             events,
+            price_projection,
         }))
     }
 
@@ -629,6 +678,15 @@ impl KrakenL3Decoder {
                 return Err(error);
             }
         };
+        let price_projection = match project_price_levels(&product.book, self.depth.get()) {
+            Ok(projection) => projection,
+            Err(error) => {
+                if !rollback(&mut product.book, undo) {
+                    product.book = OrderBook::default();
+                }
+                return Err(error);
+            }
+        };
         product.book.truncate(self.depth.get());
         product.local_ordinal = next_ordinal;
         product.last_timestamp = Some(message_timestamp);
@@ -643,6 +701,7 @@ impl KrakenL3Decoder {
             timestamp: message_timestamp,
             checksum: computed,
             events,
+            price_projection,
         }))
     }
 
@@ -905,6 +964,49 @@ fn validate_uncrossed(book: &OrderBook) -> Result<(), KrakenL3DecodeError> {
         return Err(KrakenL3DecodeError::CrossedBook);
     }
     Ok(())
+}
+
+fn project_price_levels(
+    book: &OrderBook,
+    depth: usize,
+) -> Result<KrakenL3PriceProjection, KrakenL3DecodeError> {
+    Ok(KrakenL3PriceProjection {
+        bids: project_side(&book.bids, ProviderBookSide::Bid, depth)?,
+        asks: project_side(&book.asks, ProviderBookSide::Ask, depth)?,
+    })
+}
+
+fn project_side(
+    orders: &[KrakenL3Order],
+    side: ProviderBookSide,
+    depth: usize,
+) -> Result<Vec<KrakenL3PriceLevel>, KrakenL3DecodeError> {
+    let mut levels: Vec<KrakenL3PriceLevel> = Vec::new();
+    levels
+        .try_reserve_exact(depth.min(orders.len()))
+        .map_err(|_| KrakenL3DecodeError::Allocation)?;
+    for order in orders {
+        if order.side != side {
+            return Err(KrakenL3DecodeError::InvalidBook);
+        }
+        if let Some(level) = levels.last_mut()
+            && level.price.value().decimal() == order.price.value().decimal()
+        {
+            level.quantity = level
+                .quantity
+                .checked_add(order.quantity.value().decimal())
+                .ok_or(KrakenL3DecodeError::ProjectionOverflow)?;
+            continue;
+        }
+        if levels.len() == depth {
+            break;
+        }
+        levels.push(KrakenL3PriceLevel {
+            price: order.price.clone(),
+            quantity: order.quantity.value().decimal(),
+        });
+    }
+    Ok(levels)
 }
 
 #[derive(Debug)]
@@ -1254,6 +1356,9 @@ pub enum KrakenL3DecodeError {
     /// The local diagnostic ordinal cannot advance.
     #[error("Kraken level-3 local generation ordinal overflow")]
     OrdinalOverflow,
+    /// A checksum-admitted price-level projection overflowed exact arithmetic.
+    #[error("Kraken level-3 price projection overflowed")]
+    ProjectionOverflow,
     /// A bounded allocation could not be reserved.
     #[error("Kraken level-3 bounded allocation failed")]
     Allocation,

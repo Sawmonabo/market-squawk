@@ -9,6 +9,7 @@ mod cli_transport;
 mod executable;
 mod fair_value_producer;
 mod governance;
+mod market_provider_configuration;
 pub(crate) mod operations;
 mod provider_activation_state;
 mod source_lifecycle;
@@ -66,6 +67,7 @@ use self::executable::{
 use self::executable::{admit_installed_onnx_worker, installed_release_programs};
 use self::fair_value_producer::ProductionFairValueProducerSelectionAuthority;
 use self::governance::{DecisionGovernanceAdapter, ProductionFairValueGovernanceActionFactory};
+use self::market_provider_configuration::ProductionMarketProviderConfigurationResolver;
 use self::provider_activation_state::{
     DurableProviderActivationState, ProviderMetadataBackupAuthority,
 };
@@ -397,23 +399,34 @@ impl LocalProduct {
         let live_fair_value = Arc::new(LiveFairValueObservationBuffer::try_new(
             maximum_live_route_count(&config)?,
         )?);
-        let market_runtime = MarketRuntimeRegistry::try_new(
-            config.clone(),
-            provider_rate.clone(),
-            Arc::clone(&provider_activation),
-            Arc::clone(&live_fair_value),
-        )?;
-        let reference_search: Arc<dyn MarketReferenceSearchAuthority> = Arc::new(
+        let nasdaq_reference = Arc::new(
             NasdaqReferenceUniverseService::try_new(provider_rate.clone()).map_err(|error| {
                 tracing::error!(%error, "Nasdaq reference-universe startup failed");
                 LocalProductError::NasdaqReference
             })?,
         );
+        let prepared_market_configuration = ProductionMarketProviderConfigurationResolver::try_new(
+            config.clone(),
+            Arc::clone(&onboarding),
+            Arc::clone(&provider_activation),
+            Arc::clone(&nasdaq_reference),
+            research.as_ref(),
+            provider_rate.clone(),
+        )?;
+        let market_runtime = MarketRuntimeRegistry::try_new(
+            config.clone(),
+            provider_rate.clone(),
+            Arc::clone(&provider_activation),
+            prepared_market_configuration,
+            Arc::clone(&live_fair_value),
+        )?;
+        let reference_search: Arc<dyn MarketReferenceSearchAuthority> = nasdaq_reference;
         let paper = PaperApplicationServices::new(
             config.clone(),
             Arc::clone(&decisions),
             Arc::clone(&market_runtime),
             research.instrument_definitions(),
+            research.market_data_instruments(),
             reference_search,
         );
         let source_lifecycle = Arc::new(ProductionSourceLifecycleAuthority::new(

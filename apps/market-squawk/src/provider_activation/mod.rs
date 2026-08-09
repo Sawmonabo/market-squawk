@@ -7,6 +7,7 @@ mod direct;
 mod kraken_l3;
 mod market_config;
 pub(crate) mod nasdaq_reference;
+pub(crate) mod openfigi_identity;
 mod specs;
 mod tradier;
 
@@ -55,8 +56,9 @@ pub use kraken_l3::{
     KrakenL3AccountActivation, KrakenL3ActivationError, KrakenL3WebSocketTokenMaterial,
 };
 pub use market_config::{
-    AlpacaBasicMarketConfigurationInput, BoundedMarketInstrumentSet,
-    KrakenL3MarketConfigurationInput, MarketConfigAuthorityRequirement, MarketInstrumentBinding,
+    AlpacaBasicMarketConfigurationInput, BoundedMarketDataInstrumentSet,
+    BoundedMarketInstrumentSet, KrakenL3MarketConfigurationInput, MarketConfigAuthorityRequirement,
+    MarketDataInstrumentBinding, MarketDataSubscriptionSymbolEvidence, MarketInstrumentBinding,
     MarketInstrumentReferenceBinding, MarketProviderConfigurationError, MarketSourceEvidence,
     MarketSubscriptionPriority, PreparedAlpacaBasicMarketConfiguration,
     PreparedKrakenL3MarketConfiguration, PreparedMarketProviderConfiguration,

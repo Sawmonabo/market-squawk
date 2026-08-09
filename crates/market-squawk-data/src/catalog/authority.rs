@@ -149,7 +149,11 @@ impl Catalog {
                  + (SELECT COUNT(*) FROM listing_reference_generations)
                  + (SELECT COUNT(*) FROM listing_reference_files)
                  + (SELECT COUNT(*) FROM listing_reference_values)
-                 + (SELECT COUNT(*) FROM listing_reference_memberships)",
+                 + (SELECT COUNT(*) FROM listing_reference_memberships)
+                 + (SELECT COUNT(*) FROM market_data_instrument_identities)
+                 + (SELECT COUNT(*) FROM market_data_instrument_revisions)
+                 + (SELECT COUNT(*) FROM market_data_instrument_current)
+                 + (SELECT COUNT(*) FROM market_data_instrument_search_terms)",
             [],
             |row| row.get(0),
         )?;

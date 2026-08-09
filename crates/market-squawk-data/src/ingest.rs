@@ -823,6 +823,18 @@ impl AnalyticalDataService {
         crate::InstrumentDefinitionReadCapability::new(Arc::clone(&self.authority))
     }
 
+    /// Returns bounded current reads over FIGI-backed, non-execution market-data definitions.
+    pub fn market_data_instruments(&self) -> crate::MarketDataInstrumentReadCapability {
+        crate::MarketDataInstrumentReadCapability::new(Arc::clone(&self.authority))
+    }
+
+    /// Returns the sole atomic publication authority for FIGI-backed market-data definitions.
+    pub fn market_data_instrument_synchronization(
+        &self,
+    ) -> crate::MarketDataInstrumentSynchronizationCapability {
+        crate::MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&self.authority))
+    }
+
     /// Returns bounded company-identity reads over this service's sole catalog session.
     pub fn company_identities(&self) -> crate::CompanyIdentityReadCapability {
         crate::CompanyIdentityReadCapability::new(Arc::clone(&self.authority))

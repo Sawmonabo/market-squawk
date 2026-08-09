@@ -20,8 +20,8 @@ use market_squawk_adapter_nasdaq_symbols::{
 use market_squawk_domain::{
     AssetClass, AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality,
     DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    MetadataRevision, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
-    SourceIdentifier, Timestamp, VenueId,
+    MetadataRevision, ProviderInstrumentId, RevisionBoundPayloadEvidence, SchemaVersion,
+    SequenceCapability, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
@@ -45,11 +45,75 @@ use crate::application::{
 
 const DIRECTORY_OBJECT_COUNT: u16 = 2;
 const MAXIMUM_SEARCH_ROWS: usize = 100;
+pub(crate) const MAXIMUM_SELECTED_LISTING_IDENTITIES: usize = 250;
 const DIRECTORY_DELAY_NANOS: u64 = 60 * 1_000_000_000;
 const DAY_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * 1_000_000_000;
 const DEFAULT_OVERVIEW_SYMBOLS: [&str; 8] =
     ["SPY", "QQQ", "DIA", "IWM", "VTI", "AAPL", "MSFT", "NVDA"];
+
+/// Exact current-directory key accepted by bounded identity enrichment.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct NasdaqListingKey {
+    symbol: ProviderInstrumentId,
+    mic: VenueId,
+}
+
+impl NasdaqListingKey {
+    pub(crate) const fn new(symbol: ProviderInstrumentId, mic: VenueId) -> Self {
+        Self { symbol, mic }
+    }
+
+    pub(crate) const fn symbol(&self) -> &ProviderInstrumentId {
+        &self.symbol
+    }
+
+    pub(crate) const fn mic(&self) -> &VenueId {
+        &self.mic
+    }
+}
+
+/// Session-only current listing identity with the exact directory evidence that established it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NasdaqCurrentListing {
+    key: NasdaqListingKey,
+    asset_class: AssetClass,
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    source_payload_evidence: ExactPayloadEvidence,
+    source_timestamp: Timestamp,
+    observed_at: Timestamp,
+}
+
+impl NasdaqCurrentListing {
+    pub(crate) const fn key(&self) -> &NasdaqListingKey {
+        &self.key
+    }
+
+    pub(crate) const fn asset_class(&self) -> AssetClass {
+        self.asset_class
+    }
+
+    pub(crate) const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    pub(crate) const fn metadata_revision(&self) -> &MetadataRevision {
+        &self.metadata_revision
+    }
+
+    pub(crate) const fn source_payload_evidence(&self) -> &ExactPayloadEvidence {
+        &self.source_payload_evidence
+    }
+
+    pub(crate) const fn source_timestamp(&self) -> Timestamp {
+        self.source_timestamp
+    }
+
+    pub(crate) const fn observed_at(&self) -> Timestamp {
+        self.observed_at
+    }
+}
 
 /// One process-local source registry and normalized official-directory snapshot.
 pub(crate) struct NasdaqReferenceUniverseService {
@@ -143,6 +207,73 @@ impl NasdaqReferenceUniverseService {
         *self.snapshot.write().await = Some(Arc::clone(&loaded));
         drop(refresh);
         Ok(loaded)
+    }
+
+    /// Resolves a sorted, deduplicated, caller-selected subset against one current snapshot.
+    ///
+    /// Missing keys are deliberately omitted so the coordinator can retain an explicit
+    /// per-listing `not current` result. This method never enumerates the full snapshot to a
+    /// downstream provider.
+    pub(crate) async fn selected_current_listings(
+        &self,
+        keys: &[NasdaqListingKey],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<NasdaqCurrentListing>, NasdaqReferenceUniverseError> {
+        if keys.is_empty()
+            || keys.len() > MAXIMUM_SELECTED_LISTING_IDENTITIES
+            || keys.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(NasdaqReferenceUniverseError::InvalidSelection);
+        }
+        let snapshot = self.snapshot(deadline, cancellation).await?;
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(keys.len())
+            .map_err(|_| NasdaqReferenceUniverseError::Capacity)?;
+        for key in keys {
+            ensure_open(deadline, cancellation, &self.lifecycle)?;
+            if let Ok(index) = snapshot.records.binary_search_by(|record| {
+                record
+                    .listing
+                    .key
+                    .symbol
+                    .cmp(&key.symbol)
+                    .then_with(|| record.listing.key.mic.cmp(&key.mic))
+            }) {
+                selected.push(snapshot.records[index].listing.clone());
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Returns the code-owned default overview in its declared display order.
+    ///
+    /// Missing current-directory rows are deliberately omitted. Each retained value carries the
+    /// exact symbol, MIC, asset class, and source evidence from the current snapshot; this method
+    /// does not infer an identity. Callers that require key ordering must sort and deduplicate the
+    /// returned [`NasdaqListingKey`] values before passing them to a sorted-key API.
+    pub(crate) async fn default_overview_current_listings(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<NasdaqCurrentListing>, NasdaqReferenceUniverseError> {
+        let snapshot = self.snapshot(deadline, cancellation).await?;
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(DEFAULT_OVERVIEW_SYMBOLS.len())
+            .map_err(|_| NasdaqReferenceUniverseError::Capacity)?;
+        for wanted in DEFAULT_OVERVIEW_SYMBOLS {
+            ensure_open(deadline, cancellation, &self.lifecycle)?;
+            if let Some(record) = snapshot
+                .records
+                .iter()
+                .find(|record| record.symbol.eq_ignore_ascii_case(wanted))
+            {
+                selected.push(record.listing.clone());
+            }
+        }
+        Ok(selected)
     }
 
     async fn load_snapshot(
@@ -357,6 +488,7 @@ struct ReferenceUniverseSnapshot {
 
 #[derive(Debug)]
 struct ReferenceUniverseRecord {
+    listing: NasdaqCurrentListing,
     presentation: MarketReferenceRecord,
     symbol: String,
     security_name: String,
@@ -401,7 +533,21 @@ impl ReferenceUniverseRecord {
             MarketReferenceMatchKind::DefaultOverview,
         )
         .map_err(|_| NasdaqReferenceUniverseError::SourceBinding)?;
+        let listing = NasdaqCurrentListing {
+            key: NasdaqListingKey::new(
+                ProviderInstrumentId::try_from(symbol.as_str())
+                    .map_err(|_| NasdaqReferenceUniverseError::SourceBinding)?,
+                venue_id.clone(),
+            ),
+            asset_class,
+            source_id: metadata.source_id().clone(),
+            metadata_revision: metadata.revision().clone(),
+            source_payload_evidence: record.source_payload_evidence().clone(),
+            source_timestamp: record.source_last_modified_at(),
+            observed_at: record.first_observed_at(),
+        };
         Ok(Self {
+            listing,
             presentation,
             symbol,
             security_name,
@@ -682,6 +828,8 @@ fn map_service_error(error: &NasdaqReferenceUniverseError) -> ServiceError {
 pub(crate) enum NasdaqReferenceUniverseError {
     #[error("Nasdaq reference configuration is invalid")]
     InvalidConfiguration,
+    #[error("Nasdaq selected listing keys are empty, unbounded, duplicated, or unordered")]
+    InvalidSelection,
     #[error("Nasdaq reference source binding is invalid")]
     SourceBinding,
     #[error("Nasdaq reference files did not form one complete directory")]

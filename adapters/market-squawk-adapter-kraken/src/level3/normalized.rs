@@ -4,12 +4,12 @@ use market_squawk_domain::{
     InstrumentExecutionTerms, PriceTicks, QuantityLots, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    NormalizationError, ProviderBookSide, normalize_delta_quantity, normalize_positive_quantity,
-    normalize_price,
+    NormalizationError, ProviderBookSide, ProviderDecimalLexeme, ProviderQuantity,
+    normalize_delta_quantity, normalize_positive_quantity, normalize_price,
 };
 use thiserror::Error;
 
-use super::{KrakenL3BookBatch, KrakenL3OrderEventKind};
+use super::{KrakenL3BookBatch, KrakenL3OrderEventKind, decoder::KrakenL3PriceLevel};
 
 /// One Kraken order after exact instrument tick/lot normalization.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,6 +119,38 @@ impl KrakenL3BookBatch {
         }
         Ok(scaled)
     }
+
+    /// Validates that the checksum-admitted aggregate is exactly representable in instrument
+    /// ticks and lots.
+    ///
+    /// # Errors
+    ///
+    /// Rejects mismatched terms or an inexact aggregate.
+    pub fn validate_price_projection(
+        &self,
+        terms: InstrumentExecutionTerms,
+    ) -> Result<(), KrakenL3ScaleError> {
+        if terms.instrument_id() != self.instrument() {
+            return Err(KrakenL3ScaleError::InstrumentMismatch);
+        }
+        validate_price_levels(self.price_projection().bids(), terms)?;
+        validate_price_levels(self.price_projection().asks(), terms)
+    }
+}
+
+fn validate_price_levels(
+    levels: &[KrakenL3PriceLevel],
+    terms: InstrumentExecutionTerms,
+) -> Result<(), KrakenL3ScaleError> {
+    for level in levels {
+        let quantity = level.quantity().normalize().to_string();
+        let quantity = ProviderDecimalLexeme::try_new(&quantity)
+            .map(ProviderQuantity::new)
+            .map_err(|_| KrakenL3ScaleError::ProjectionQuantity)?;
+        let _price = normalize_price(level.price(), terms.price_tick())?;
+        let _quantity = normalize_positive_quantity(&quantity, terms.lot_size())?;
+    }
+    Ok(())
 }
 
 fn clone_identifier(value: &SourceIdentifier) -> Result<SourceIdentifier, KrakenL3ScaleError> {
@@ -148,4 +180,7 @@ pub enum KrakenL3ScaleError {
     /// A previously validated provider identity could not be reconstructed.
     #[error("Kraken level-3 order identity invariant failed")]
     IdentifierInvariant,
+    /// A checked aggregate could not be represented as an exact provider decimal lexeme.
+    #[error("Kraken level-3 price projection quantity is invalid")]
+    ProjectionQuantity,
 }

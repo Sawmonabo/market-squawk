@@ -22,7 +22,9 @@ use market_squawk_sources::{
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 
-use super::super::{order_level::OrderLevelIngress, sink::ProductionRawMarketSink};
+use super::super::{
+    composition::system_timestamp, order_level::OrderLevelIngress, sink::ProductionRawMarketSink,
+};
 
 #[derive(Debug)]
 struct CapturedFrame {
@@ -198,11 +200,18 @@ impl CoinbaseDirectOutput for CoinbaseDirectProductOutput<'_, '_> {
         let Some(publish_timeout) = self.order_level_publish_timeout else {
             return Err(self.fail(CoinbaseDirectOutputFailure::OrderLevelPublication));
         };
+        let available_at = match system_timestamp() {
+            Ok(available_at) => available_at,
+            Err(_error) => {
+                return Err(self.fail(CoinbaseDirectOutputFailure::OrderLevelPublication));
+            }
+        };
         let built = match build_order_level_batch(
             update,
             ingress,
             self.order_level_snapshot_sequence,
             self.order_level_last_sequence,
+            available_at,
         ) {
             Ok(built) => built,
             Err(()) => {
@@ -253,6 +262,7 @@ fn build_order_level_batch(
     ingress: &OrderLevelIngress,
     retained_snapshot: Option<SequenceNumber>,
     retained_previous: Option<SequenceNumber>,
+    available_at: market_squawk_domain::Timestamp,
 ) -> Result<BuiltOrderLevelBatch, ()> {
     let SourceProtocolProfile::Live(protocol) = update.metadata().protocol_profile() else {
         return Err(());
@@ -370,6 +380,7 @@ fn build_order_level_batch(
         batch_identifier,
         source_timestamp,
         received_at,
+        available_at,
         DataQuality::DirectUnverified,
         MarketFreshness::Fresh {
             last_market_at: received_at,

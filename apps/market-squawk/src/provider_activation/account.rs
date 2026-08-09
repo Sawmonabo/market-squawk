@@ -22,12 +22,27 @@ pub enum ProviderMarketAccount {
 }
 
 impl ProviderMarketAccount {
-    const fn surface(self) -> &'static str {
+    /// Every closed account-market group admitted by the installed product.
+    pub(crate) const ALL: [Self; 3] = [
+        Self::AlpacaBasic,
+        Self::TradierBrokerage,
+        Self::KrakenLevel3,
+    ];
+
+    /// Returns the canonical lifecycle surface owned by this account group.
+    pub(crate) const fn surface_id(self) -> &'static str {
         match self {
             Self::AlpacaBasic => "alpaca.basic-market-data",
             Self::TradierBrokerage => "tradier.brokerage-market-data",
             Self::KrakenLevel3 => "kraken.spot-authenticated-level3-market-data",
         }
+    }
+
+    /// Resolves only one of the closed account-market lifecycle surfaces.
+    pub(crate) fn from_surface_id(surface_id: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|account| account.surface_id() == surface_id)
     }
 
     const fn provider(self) -> &'static str {
@@ -83,7 +98,7 @@ impl ProviderAccountBinding {
         let verification_evidence = lease
             .verification_evidence_digest()
             .ok_or(ProviderAccountActivationError::SourceBinding)?;
-        if lease.surface_id().as_str() != account.surface() {
+        if lease.surface_id().as_str() != account.surface_id() {
             return Err(ProviderAccountActivationError::SurfaceMismatch);
         }
         if digest.algorithm() != DigestAlgorithm::Sha256

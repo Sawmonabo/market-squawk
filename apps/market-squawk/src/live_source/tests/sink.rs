@@ -151,16 +151,20 @@ async fn pre_acknowledgement_snapshot_is_bounded_and_published_only_after_exact_
         registry.validate_current_authority(&session),
         Err(RegistryError::HealthNotQualified)
     ));
-    let mut sink = ProductionRawMarketSink::try_new(ProductionRawMarketSinkInput {
-        capture: publisher,
-        registry: &mut registry,
-        session: &session,
-        health_reporter,
-        decoder: ProductionMarketDecoder::Coinbase(profile.decoder().clone()),
-        subscription,
-        live_ingress,
-        routes: vec![route_activation],
-    })?;
+    let (startup_readiness, mut startup_ready) = tokio::sync::oneshot::channel();
+    let mut sink = ProductionRawMarketSink::try_new_with_startup_readiness(
+        ProductionRawMarketSinkInput {
+            capture: publisher,
+            registry: &mut registry,
+            session: &session,
+            health_reporter,
+            decoder: ProductionMarketDecoder::Coinbase(profile.decoder().clone()),
+            subscription,
+            live_ingress,
+            routes: vec![route_activation],
+        },
+        startup_readiness,
+    )?;
 
     let snapshot = fixture_frame(&mut frame_factory, "snapshot.json")?;
     if let Err(error) = sink.try_publish(snapshot) {
@@ -171,6 +175,10 @@ async fn pre_acknowledgement_snapshot_is_bounded_and_published_only_after_exact_
         .into());
     }
     assert_eq!(current_book(&snapshots, &route)?, None);
+    assert_eq!(
+        startup_ready.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    );
     let acknowledgement = fixture_frame(&mut frame_factory, "subscriptions.json")?;
     if let Err(error) = sink.try_publish(acknowledgement) {
         return Err(format!(
@@ -179,6 +187,7 @@ async fn pre_acknowledgement_snapshot_is_bounded_and_published_only_after_exact_
         )
         .into());
     }
+    tokio::time::timeout(Duration::from_secs(1), &mut startup_ready).await??;
     let _revision = wait_for_book(&snapshots, &route, 10010, 10020).await?;
     assert_eq!(sink.terminal_failure(), None);
     drop(sink);

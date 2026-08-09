@@ -8,6 +8,7 @@ use market_squawk_data::{
     DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuildRequest, DatasetBuilder,
     DatasetId, FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
     IngestPrecommitAuthority, InstrumentDefinitionReadCapability, ManifestCatalogError,
+    MarketDataInstrumentReadCapability, MarketDataInstrumentSynchronizationCapability,
     ObjectStoreConfig, OnboardingCatalogCapability, ResearchIngestService, RightsDecisionInput,
     RightsError, SourceOperation, extraction_provider_payload_digest,
 };
@@ -400,6 +401,18 @@ impl ResearchService {
     /// Returns bounded point-in-time definition reads over this service's sole catalog session.
     pub fn instrument_definitions(&self) -> InstrumentDefinitionReadCapability {
         self.analytical.instrument_definitions()
+    }
+
+    /// Returns bounded reads over FIGI-backed, explicitly non-executable market identities.
+    pub fn market_data_instruments(&self) -> MarketDataInstrumentReadCapability {
+        self.analytical.market_data_instruments()
+    }
+
+    /// Returns the sole atomic publisher for FIGI-backed market-data identities.
+    pub fn market_data_instrument_synchronization(
+        &self,
+    ) -> MarketDataInstrumentSynchronizationCapability {
+        self.analytical.market_data_instrument_synchronization()
     }
 
     /// Returns bounded company-identity reads over the canonical research catalog.

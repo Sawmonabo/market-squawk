@@ -5,20 +5,27 @@ use std::time::{Duration, Instant};
 use market_squawk_data::{
     ArtifactRecord, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig, CatalogError,
     CatalogLimit, CatalogResultLimits, ContractCompletion, DatasetManifestRecord, IngestIdentity,
-    IngestRunState, ListingReferenceExchangeCode, ListingReferenceFileKind,
+    IngestRunState, ListingReferenceError, ListingReferenceExchangeCode, ListingReferenceFileKind,
     ListingReferenceFinancialStatus, ListingReferenceGenerationInput,
     ListingReferenceMarketCategory, ListingReferencePublicationCapability,
     ListingReferencePublicationDisposition, ListingReferenceReadCapability,
-    ListingReferenceRecordInput, ListingReferenceSourceFileInput, OnboardingAppendOutcome,
-    OnboardingReservationRequest, RightsBasis, RightsDecisionInput, RightsError, SourceCursor,
-    SourceOperation,
+    ListingReferenceRecordInput, ListingReferenceSourceFileInput, MarketDataInstrumentCatalogError,
+    MarketDataInstrumentMatchKind, MarketDataInstrumentReadCapability,
+    MarketDataInstrumentSynchronization, MarketDataInstrumentSynchronizationCapability,
+    OnboardingAppendOutcome, OnboardingReservationRequest, RightsBasis, RightsDecisionInput,
+    RightsError, SourceCursor, SourceOperation, market_data_instrument_id,
 };
 use market_squawk_domain::{
-    AssetClass, AuthorizationBasis, ChecksumCapability, ContractRollMapping, CoverageDelay,
-    DataQuality, DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, InstrumentDefinition, LifecycleTransition, LifecycleTransitionKind,
-    MetadataRevision, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
-    SourceIdentifier, SymbolIdentityRecord, Timestamp, VenueId, VenueSymbol,
+    AssetClass, AssignmentVerification, AuthorizationBasis, ChecksumCapability,
+    ContractRollMapping, CoverageDelay, Currency, DataQuality, DeliveryEvidence, DigestAlgorithm,
+    EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, ExternalIdentifier,
+    ExternalIdentifierRecord, ExternalIdentifierRecordInput, Figi, IdentifierEntitlement,
+    IdentifierRightsPolicyReference, InstrumentDefinition, InstrumentId, LifecycleTransition,
+    LifecycleTransitionKind, MarketDataDisplayName, MarketDataInstrumentDefinition,
+    MarketDataInstrumentDefinitionInput, MetadataRevision, ProviderIdentityEvidence,
+    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId,
+    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
+    SymbolIdentityRecord, Timestamp, VenueId, VenueMapping, VenueSymbol,
 };
 use market_squawk_platform::LocalPaths;
 use market_squawk_platform::{SecretGeneration, SecretRef};
@@ -74,7 +81,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
     assert!(!health.trusted_schema());
     assert_eq!(health.synchronous(), 2);
     assert_eq!(health.busy_timeout(), Duration::from_millis(750));
-    assert_eq!(health.applied_migrations(), 20);
+    assert_eq!(health.applied_migrations(), 21);
     assert!(matches!(
         CatalogAuthority::open(config.clone()),
         Err(CatalogError::WriterAlreadyOpen)
@@ -93,7 +100,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         CatalogAuthority::open(alias_config),
         Err(CatalogError::UnsafePath)
     ));
-    assert_eq!(catalog.health()?.applied_migrations(), 20);
+    assert_eq!(catalog.health()?.applied_migrations(), 21);
     drop(catalog);
     std::fs::remove_file(alias_location.path())?;
     let catalog = CatalogAuthority::open(config.clone())?;
@@ -727,6 +734,189 @@ fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> Te
     );
     assert_eq!(replay.generation().generation_sequence(), 1);
     Ok(())
+}
+
+#[test]
+fn figi_market_data_definitions_publish_atomically_and_reopen_current_search() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("market-data-instruments"))?;
+    let config = CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        Duration::from_millis(750),
+        CatalogLimit::new(32)?,
+        CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?;
+    let figi = Figi::try_from("BBG000B9XVV8")?;
+    let derived_id = market_data_instrument_id(&figi)?;
+    assert_eq!(derived_id, market_data_instrument_id(&figi)?);
+
+    let initial = market_data_definition(
+        figi.clone(),
+        derived_id,
+        10,
+        "Apple Incorporated",
+        "AAPL.US",
+        31,
+    )?;
+    let wrong_id = market_data_instrument_id(&Figi::try_from("BBG000BLNNH6")?)?;
+    let mismatched =
+        market_data_definition(figi.clone(), wrong_id, 11, "Wrong Identity", "WRONG.US", 32)?;
+    assert!(matches!(
+        MarketDataInstrumentSynchronization::try_new(vec![initial.clone()], 2),
+        Err(MarketDataInstrumentCatalogError::PartialBatch {
+            expected: 2,
+            actual: 1
+        })
+    ));
+
+    let authority = Arc::new(Mutex::new(CatalogAuthority::open(config.clone())?));
+    let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
+    let reader = MarketDataInstrumentReadCapability::new(Arc::clone(&authority));
+    let cancellation = CancellationToken::new();
+    let deadline = || Instant::now() + Duration::from_secs(2);
+    let invalid_batch =
+        MarketDataInstrumentSynchronization::try_new(vec![initial.clone(), mismatched], 2)?;
+    assert!(matches!(
+        publisher.synchronize(invalid_batch, deadline(), &cancellation),
+        Err(MarketDataInstrumentCatalogError::MismatchedInstrumentId)
+    ));
+    assert!(
+        reader
+            .latest(derived_id, deadline(), &cancellation)?
+            .is_none()
+    );
+
+    let inserted = publisher.synchronize(
+        MarketDataInstrumentSynchronization::try_new(vec![initial.clone()], 1)?,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!((inserted.inserted(), inserted.replayed()), (1, 0));
+    let retained = reader
+        .latest_by_figi(&figi, deadline(), &cancellation)?
+        .ok_or(CatalogError::InvalidRecord)?;
+    assert_eq!(retained.revision_sequence(), 1);
+    let replay = publisher.synchronize(
+        MarketDataInstrumentSynchronization::try_new(vec![initial], 1)?,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!((replay.inserted(), replay.replayed()), (0, 1));
+    assert_eq!(
+        reader
+            .latest(derived_id, deadline(), &cancellation)?
+            .ok_or(CatalogError::InvalidRecord)?,
+        retained
+    );
+
+    let successor =
+        market_data_definition(figi.clone(), derived_id, 20, "Apple Inc.", "AAPL.US", 33)?;
+    let advanced = publisher.synchronize(
+        MarketDataInstrumentSynchronization::try_new(vec![successor], 1)?,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!((advanced.inserted(), advanced.replayed()), (1, 0));
+    let provider_match = reader.search("AAPL.US", 4, deadline(), &cancellation)?;
+    assert_eq!(provider_match.matches().len(), 1);
+    assert_eq!(
+        provider_match.matches()[0].match_kind(),
+        MarketDataInstrumentMatchKind::ProviderSymbol
+    );
+    assert!(
+        !serde_json::to_string(provider_match.matches()[0].record().definition())?
+            .contains("execution")
+    );
+    drop(reader);
+    drop(publisher);
+    drop(authority);
+
+    let authority = Arc::new(Mutex::new(CatalogAuthority::open(config)?));
+    let reader = MarketDataInstrumentReadCapability::new(authority);
+    let reopened = reader
+        .latest_by_figi(&figi, deadline(), &cancellation)?
+        .ok_or(CatalogError::InvalidRecord)?;
+    assert_eq!(reopened.revision_sequence(), 2);
+    assert_eq!(
+        reopened
+            .definition()
+            .display_name()
+            .ok_or(CatalogError::InvalidRecord)?
+            .as_str(),
+        "Apple Inc."
+    );
+    Ok(())
+}
+
+fn market_data_definition(
+    figi: Figi,
+    instrument_id: InstrumentId,
+    effective_start: i64,
+    display_name: &str,
+    provider_symbol: &str,
+    evidence_byte: u8,
+) -> TestResult<MarketDataInstrumentDefinition> {
+    let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(effective_start), None)?;
+    let exact = |byte| ExactPayloadEvidence::from_content_digest(digest(byte));
+    let rights = || -> TestResult<IdentifierRightsPolicyReference> {
+        Ok(IdentifierRightsPolicyReference::new(
+            SourceIdentifier::try_from("figi-public-domain-v1")?,
+            IdentifierEntitlement::PublicDomain,
+            SourceIdentifier::try_from("https://www.openfigi.com/about/figi")?,
+        ))
+    };
+    Ok(MarketDataInstrumentDefinition::try_new(
+        MarketDataInstrumentDefinitionInput {
+            instrument_id,
+            reference_evidence: RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from(format!(
+                    "market-data-definition-{evidence_byte}"
+                ))?),
+                exact(evidence_byte),
+            ),
+            effective_interval: effective,
+            asset_class: AssetClass::Equity,
+            display_name: Some(MarketDataDisplayName::try_new(
+                display_name,
+                SourceId::try_from("admitted-listing-reference")?,
+                exact(evidence_byte.saturating_add(1)),
+                rights()?,
+            )?),
+            quote_currency: Currency::try_from("USD")?,
+            quote_currency_evidence: exact(evidence_byte.saturating_add(2)),
+            venue_mappings: vec![VenueMapping::new(
+                VenueId::try_from("XNAS")?,
+                VenueSymbol::try_from("AAPL")?,
+            )],
+            provider_identities: vec![ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                instrument_id,
+                source_id: SourceId::try_from("nasdaq-symbol-directory")?,
+                provider_instrument_id: ProviderInstrumentId::try_from(provider_symbol)?,
+                evidence: ProviderIdentityEvidence::from_content_digest(digest(
+                    evidence_byte.saturating_add(3),
+                )),
+                source_timestamp: Some(Timestamp::from_unix_nanos(effective_start)),
+                observed_at: Timestamp::from_unix_nanos(effective_start + 1),
+                metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(format!(
+                    "provider-{evidence_byte}"
+                ))?),
+                validity: effective,
+                supersedes: None,
+            })],
+            identifiers: vec![ExternalIdentifierRecord::new(
+                ExternalIdentifierRecordInput {
+                    identifier: ExternalIdentifier::Figi(figi),
+                    assignment_verification: AssignmentVerification::VerifiedAssigned,
+                    source_id: SourceId::try_from("openfigi-v3")?,
+                    source_evidence: exact(evidence_byte.saturating_add(4)),
+                    source_timestamp: Some(Timestamp::from_unix_nanos(effective_start)),
+                    observed_at: Timestamp::from_unix_nanos(effective_start + 1),
+                    validity: effective,
+                    rights_policy: rights()?,
+                },
+            )],
+        },
+    )?)
 }
 
 fn listing_reference_generation(

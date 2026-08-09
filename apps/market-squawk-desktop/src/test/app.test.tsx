@@ -7,7 +7,7 @@ import { App } from "@/app/app"
 import marketSquawkMarkSvg from "@/assets/market-squawk-mark.svg?raw"
 import { CredentialField } from "@/components/setup/credential-field"
 import { lookupRoute } from "@/features/lookup/lookup-surface"
-import type { DesktopBootstrap } from "@/lib/schemas"
+import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 const blockedBootstrap: DesktopBootstrap = {
@@ -235,6 +235,135 @@ function datasetRead(
   }
 }
 
+const unifiedKrakenMarket: ApplicationResult = {
+  data: [
+    {
+      instrumentId: "7e8299e7-9757-4441-926f-d0b22c767a65",
+      symbol: "BTC/USD",
+      symbolKind: "provider_subscription",
+      symbolVenueId: "kraken",
+      assetClass: "crypto",
+      quoteCurrency: "USD",
+      definitionKind: "execution_capable",
+      definitionRevision: 3,
+      referenceRevision: null,
+      permanentFigi: null,
+      displayName: "Bitcoin",
+      tickSize: "0.1",
+      lotSize: "0.00000001",
+      executionTermsAvailable: true,
+      referenceEvidence: null,
+      availability: "Live",
+      confidence: "Direct unverified",
+      quote: {
+        bidPrice: "68000.1",
+        bidPriceProviderLexeme: "68000.1",
+        bidSize: "0.25",
+        bidSizeProviderLexeme: "0.25000000",
+        askPrice: "68000.2",
+        askPriceProviderLexeme: "68000.2",
+        askSize: "0.3",
+        askSizeProviderLexeme: "0.30000000",
+        midPrice: "68000.15",
+        midPriceBasis: "best_bid_ask",
+        lastPrice: "68000.2",
+        lastPriceProviderLexeme: "68000.2",
+        lastSize: "0.02",
+        lastSizeProviderLexeme: "0.02000000",
+        lastSourceTimestamp: "2026-08-09T14:30:00Z",
+        lastReceivedAt: "2026-08-09T14:30:00.010Z",
+        lastAvailableAt: "2026-08-09T14:30:00.011Z",
+        lastQuality: "direct_unverified",
+        lastFreshAtSelection: true,
+        quoteEvidence: { surfaceId: "kraken-l3" },
+        tradeEvidence: null,
+      },
+      orderBook: {
+        depth: "order_level",
+        revision: "17",
+        phase: "healthy",
+        quarantineReason: null,
+        quality: "direct_unverified",
+        freshness: "fresh",
+        lastMarketAt: "2026-08-09T14:30:00Z",
+        usableForSelection: true,
+        totalOrderCount: 2,
+        returnedOrderCount: 2,
+        sampleTruncated: false,
+        samplePolicy: "stable_provider_order_id_prefix",
+        orders: [
+          {
+            orderId: "kraken-bid-1",
+            side: "bid",
+            price: "68000.1",
+            priceTicks: "680001",
+            quantity: "0.25",
+            quantityLots: "25000000",
+            providerOrderTimestamp: "2026-08-09T14:30:00Z",
+            providerPriority: null,
+            firstSeenIn: "snapshot",
+            lastUpdatedIn: "snapshot",
+            lastSourceTimestamp: "2026-08-09T14:30:00Z",
+            lastReceivedAt: "2026-08-09T14:30:00.010Z",
+            arrivalOrdinal: "1",
+          },
+          {
+            orderId: "kraken-ask-1",
+            side: "ask",
+            price: "68000.2",
+            priceTicks: "680002",
+            quantity: "0.3",
+            quantityLots: "30000000",
+            providerOrderTimestamp: "2026-08-09T14:30:00Z",
+            providerPriority: null,
+            firstSeenIn: "snapshot",
+            lastUpdatedIn: "snapshot",
+            lastSourceTimestamp: "2026-08-09T14:30:00Z",
+            lastReceivedAt: "2026-08-09T14:30:00.010Z",
+            arrivalOrdinal: "2",
+          },
+        ],
+      },
+      selectedSource: {
+        surfaceId: "kraken-l3",
+        providerId: "kraken",
+        providerSymbol: "BTC/USD",
+        sourceId: "kraken-l3-account",
+        venueId: "kraken",
+        providerProduct: "websocket-v2",
+        providerChannel: "level3",
+        timing: "live",
+        depth: "order_level",
+        depthLabel: "Order-level book",
+        quality: "direct_unverified",
+        coverage: "single_venue",
+        health: "healthy",
+        freshness: {
+          receivedAt: "2026-08-09T14:30:00.010Z",
+          availableAt: "2026-08-09T14:30:00.011Z",
+          sourceValidUntil: "2026-08-09T14:30:05Z",
+          freshAtSelection: true,
+        },
+        integrity: {
+          state: "checksum_valid",
+          phase: "healthy",
+          generationCurrent: true,
+          snapshotInitialized: true,
+        },
+      },
+      alternatives: [],
+      selectionReceipt: { policyRevision: 1 },
+    },
+  ],
+  metadata: {
+    completeness: "complete",
+    returnedItems: 1,
+    availableItems: 1,
+    sourceCoverage: { status: "complete", providers: ["kraken"] },
+    dataQuality: { status: "direct_unverified" },
+  },
+}
+
 describe("Market Squawk desktop boundary", () => {
   it("keeps an instrument lookup bound to its exact Markets context", () => {
     const instrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
@@ -247,6 +376,52 @@ describe("Market Squawk desktop boundary", () => {
         destination: { kind: "market_instrument", instrumentId },
       }),
     ).toBe(`/markets?instrumentId=${instrumentId}`)
+  })
+
+  it("renders one unified market with automatic source confidence and order-level detail", async () => {
+    const user = userEvent.setup()
+    const readyBootstrap: DesktopBootstrap = {
+      ...blockedBootstrap,
+      operations: [
+        datasetRead(
+          "Market.GetUnifiedFeed",
+          "market",
+          "Return the bounded unified market view.",
+        ),
+      ],
+    }
+    render(
+      <MemoryRouter initialEntries={["/markets"]}>
+        <App
+          transport={transport(readyBootstrap, undefined, async (request) => {
+            if (request.query === "marketUnifiedFeed") return unifiedKrakenMarket
+            throw new Error(`Unexpected market query: ${request.query}`)
+          })}
+        />
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByRole("heading", { name: "Markets" })).toBeTruthy()
+    const marketHeading = await screen.findByRole("heading", { name: "BTC/USD" })
+    const marketCard = marketHeading.closest("button")
+    expect(marketCard).toBeInstanceOf(HTMLButtonElement)
+    if (!(marketCard instanceof HTMLButtonElement)) {
+      throw new Error("Unified market card is absent")
+    }
+    expect(within(marketCard).getByText("Bitcoin")).toBeTruthy()
+    expect(within(marketCard).getByText("Live")).toBeTruthy()
+    expect(within(marketCard).getByText("Order-level book")).toBeTruthy()
+    expect(within(marketCard).getByText("2 of 2")).toBeTruthy()
+    expect(screen.queryByRole("combobox", { name: /provider/i })).toBeNull()
+
+    await user.click(
+      screen.getByText("Show detailed trades, quotes, order book, and source comparison"),
+    )
+    expect(await screen.findByText("Chosen automatically")).toBeTruthy()
+    expect(screen.getByText("Orders behind the visible market")).toBeTruthy()
+    await user.click(screen.getByText("Data confidence"))
+    expect(screen.getAllByText("kraken").length).toBeGreaterThan(0)
+    expect(screen.getByText("Checksum valid")).toBeTruthy()
   })
 
   it("keeps fallback bootstrap native and enters the ready workspace only after reconnect", async () => {

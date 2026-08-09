@@ -116,8 +116,16 @@ impl ProductionSourceProfile {
                 .iter()
                 .map(|mapping| mapping.symbol().to_owned()),
         );
+        let transport = config.transport_limits();
+        let subscription_ack_timeout = checked_duration_sum([
+            transport.connect_timeout(),
+            transport.io_timeout(), // subscription write
+            transport.io_timeout(), // connected control frame
+            transport.io_timeout(), // authenticated control frame
+            transport.io_timeout(), // exact subscription acknowledgement
+        ])?;
         Ok(Self {
-            subscription_ack_timeout: config.transport_limits().io_timeout(),
+            subscription_ack_timeout,
             connector: ProductionConnectorProfile::AlpacaIex {
                 config: Box::new(config),
                 credentials,
@@ -146,8 +154,16 @@ impl ProductionSourceProfile {
                 .iter()
                 .map(|mapping| mapping.symbol().to_owned()),
         );
+        let transport = config.transport_limits();
+        let subscription_ack_timeout = checked_duration_sum([
+            transport.connect_timeout(),
+            transport.io_timeout(), // subscription write
+            transport.io_timeout(), // connected control frame
+            transport.io_timeout(), // authenticated control frame
+            transport.io_timeout(), // exact subscription acknowledgement
+        ])?;
         Ok(Self {
-            subscription_ack_timeout: config.transport_limits().io_timeout(),
+            subscription_ack_timeout,
             connector: ProductionConnectorProfile::AlpacaOptions {
                 config: Box::new(config),
                 credentials,
@@ -182,8 +198,15 @@ impl ProductionSourceProfile {
             return Err(ProductionProviderError::TradierProfileMismatch);
         }
         let products = owned_product_names(selected)?;
+        let transport = config.transport_limits();
+        let subscription_ack_timeout = checked_duration_sum([
+            Duration::from_nanos(transport.http().total_timeout_nanos()),
+            Duration::from_nanos(transport.http().connect_timeout_nanos()),
+            transport.io_timeout(), // subscription write
+            transport.io_timeout(), // first validated market-data frame
+        ])?;
         Ok(Self {
-            subscription_ack_timeout: config.transport_limits().io_timeout(),
+            subscription_ack_timeout,
             connector: ProductionConnectorProfile::TradierStreaming {
                 config: Box::new(config),
                 account,
@@ -269,8 +292,13 @@ impl ProductionSourceProfile {
         self.connector.try_source(generation)
     }
 
-    pub(super) fn tradier_subscription_authority(&self) -> Option<TradierSubscriptionAuthority> {
-        self.connector.tradier_subscription_authority()
+    pub(super) const fn supports_display_output(&self) -> bool {
+        matches!(
+            &self.connector,
+            ProductionConnectorProfile::AlpacaIex { .. }
+                | ProductionConnectorProfile::AlpacaOptions { .. }
+                | ProductionConnectorProfile::TradierStreaming { .. }
+        )
     }
 
     #[cfg(all(test, debug_assertions))]
@@ -322,6 +350,16 @@ fn owned_product_names(
         products.push(product);
     }
     Ok(products)
+}
+
+fn checked_duration_sum<const N: usize>(
+    stages: [Duration; N],
+) -> Result<Duration, ProductionProviderError> {
+    stages.into_iter().try_fold(Duration::ZERO, |total, stage| {
+        total
+            .checked_add(stage)
+            .ok_or(ProductionProviderError::StartupAcknowledgementTimeoutOverflow)
+    })
 }
 
 #[derive(Debug)]
@@ -525,6 +563,8 @@ pub enum ProductionProviderError {
     TradierSubscription(#[from] TradierSubscriptionError),
     #[error("Tradier production profile is not the consolidated streaming surface")]
     TradierProfileMismatch,
+    #[error("production provider startup acknowledgement deadline overflowed")]
+    StartupAcknowledgementTimeoutOverflow,
     #[error(transparent)]
     Source(#[from] SourceError),
     #[error("production Kraken decoder could not be constructed")]

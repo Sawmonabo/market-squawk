@@ -8,10 +8,11 @@ use std::{cmp::Ordering, fmt, num::NonZeroUsize, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use market_squawk_data::InstrumentDefinitionReadCapability;
+use market_squawk_data::{InstrumentDefinitionReadCapability, MarketDataInstrumentReadCapability};
 use market_squawk_domain::{
     AssetClass, CoverageDelay, DataQuality, EvidenceDigest, InstrumentDefinition, InstrumentId,
-    LiveEventClass, MarketDepth, SourceId, SourceIdentifier, Timestamp, VenueId,
+    LiveEventClass, MarketDataInstrumentDefinition, MarketDepth, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
 };
 use market_squawk_live::{
     RouteSnapshot, ShardSnapshot, SnapshotCompleteness, SnapshotDimension, StreamSnapshot,
@@ -24,6 +25,7 @@ use serde_json::Value;
 
 use super::ensure_live;
 use crate::application::market_runtime::{
+    MarketDisplaySnapshotBatch, MarketDisplaySnapshotLease, MarketKrakenPriceProjectionLease,
     MarketOrderLevelSnapshot, MarketRuntimeRegistry, MarketRuntimeSnapshotBatch,
 };
 use crate::application::{ApplicationDomainService, effective_service_limits};
@@ -45,6 +47,7 @@ const MARKET_GET_COMPARISONS: &str = "Market.GetComparisons";
 const MARKET_GET_UNIFIED_FEED: &str = "Market.GetUnifiedFeed";
 const MARKET_SEARCH_UNIVERSE: &str = "Market.SearchUniverse";
 const MAXIMUM_UNIFIED_MARKET_INSTRUMENTS: usize = 4_096;
+const MAXIMUM_UNIFIED_DISPLAY_SOURCES_PER_INSTRUMENT: usize = 256;
 const MAXIMUM_UNIFIED_ORDER_SAMPLE: usize = 64;
 const MAXIMUM_REFERENCE_SEARCH_ROWS: usize = 100;
 
@@ -191,6 +194,7 @@ pub(crate) trait MarketReferenceSearchAuthority: fmt::Debug + Send + Sync + 'sta
 pub(super) struct MarketDomainService {
     registry: Arc<MarketRuntimeRegistry>,
     instrument_definitions: InstrumentDefinitionReadCapability,
+    market_data_instruments: MarketDataInstrumentReadCapability,
     reference_search: Arc<dyn MarketReferenceSearchAuthority>,
 }
 
@@ -198,11 +202,13 @@ impl MarketDomainService {
     pub(super) fn new(
         registry: Arc<MarketRuntimeRegistry>,
         instrument_definitions: InstrumentDefinitionReadCapability,
+        market_data_instruments: MarketDataInstrumentReadCapability,
         reference_search: Arc<dyn MarketReferenceSearchAuthority>,
     ) -> Self {
         Self {
             registry,
             instrument_definitions,
+            market_data_instruments,
             reference_search,
         }
     }
@@ -261,7 +267,8 @@ impl ApplicationDomainService for MarketDomainService {
             .await?;
         let streams = collect_streams(&snapshots, &filters, &context)?;
 
-        let source_coverage = source_coverage_value(&streams, snapshots.failures(), &filters);
+        let source_coverage =
+            source_coverage_value(&streams, snapshots.failures(), &filters, &[], &[]);
         let output = match request.name() {
             MARKET_GET_SNAPSHOT => build_snapshot_result(
                 &streams,
@@ -312,15 +319,64 @@ impl ApplicationDomainService for MarketDomainService {
                 &context,
             ),
             MARKET_GET_UNIFIED_FEED => {
-                let definitions =
-                    load_instrument_definitions(&self.instrument_definitions, &streams, &context)?;
-                let order_level =
-                    load_order_level_snapshots(self.registry.as_ref(), &streams, &context).await?;
-                let surface_policies = build_surface_policies(&snapshots, reference_at)?;
+                let display_instrument_ids =
+                    load_display_instrument_ids(self.registry.as_ref(), &filters, &context).await?;
+                let market_instrument_ids =
+                    load_market_instrument_ids(self.registry.as_ref(), &filters, &context).await?;
+                let display_batches = load_display_snapshots(
+                    self.registry.as_ref(),
+                    &display_instrument_ids,
+                    reference_at,
+                    &context,
+                )
+                .await?;
+                let display_snapshots = display_snapshot_refs(&display_batches, &filters)?;
+                let kraken_price_projections = load_kraken_price_projections(
+                    self.registry.as_ref(),
+                    &market_instrument_ids,
+                    &filters,
+                    &context,
+                )
+                .await?;
+                let kraken_projection_refs = kraken_projection_refs(&kraken_price_projections)?;
+                let definitions = load_instrument_definitions(
+                    &self.instrument_definitions,
+                    &streams,
+                    &kraken_price_projections,
+                    &context,
+                )?;
+                let market_data_definitions = load_market_data_instrument_definitions(
+                    &self.market_data_instruments,
+                    &display_instrument_ids,
+                    &context,
+                )?;
+                let order_level = load_order_level_snapshots(
+                    self.registry.as_ref(),
+                    &streams,
+                    &kraken_price_projections,
+                    &context,
+                )
+                .await?;
+                let surface_policies = build_surface_policies(
+                    &snapshots,
+                    &display_snapshots,
+                    &kraken_projection_refs,
+                    reference_at,
+                )?;
+                let source_coverage = source_coverage_value(
+                    &streams,
+                    snapshots.failures(),
+                    &filters,
+                    &display_snapshots,
+                    &kraken_projection_refs,
+                );
                 build_unified_market_result(
                     &streams,
                     &filters,
                     &definitions,
+                    &market_data_definitions,
+                    &display_snapshots,
+                    &kraken_projection_refs,
                     &surface_policies,
                     &order_level,
                     reference_at,
@@ -413,13 +469,20 @@ fn build_reference_search_result(
 fn load_instrument_definitions(
     reader: &InstrumentDefinitionReadCapability,
     streams: &[StreamView<'_>],
+    kraken: &[MarketKrakenPriceProjectionLease],
     context: &RequestContext,
 ) -> Result<Vec<InstrumentDefinition>, ServiceError> {
     let mut instrument_ids = Vec::new();
     instrument_ids
-        .try_reserve_exact(streams.len())
+        .try_reserve_exact(
+            streams
+                .len()
+                .checked_add(kraken.len())
+                .ok_or(ServiceError::ResourceExhausted)?,
+        )
         .map_err(|_error| ServiceError::ResourceExhausted)?;
     instrument_ids.extend(streams.iter().map(|view| view.route.route().instrument()));
+    instrument_ids.extend(kraken.iter().map(|snapshot| snapshot.key().instrument_id()));
     instrument_ids.sort_unstable();
     instrument_ids.dedup();
     if instrument_ids.len() > MAXIMUM_UNIFIED_MARKET_INSTRUMENTS {
@@ -445,16 +508,164 @@ fn load_instrument_definitions(
     Ok(definitions)
 }
 
+async fn load_market_instrument_ids(
+    registry: &MarketRuntimeRegistry,
+    filters: &MarketFilters<'_>,
+    context: &RequestContext,
+) -> Result<Vec<InstrumentId>, ServiceError> {
+    let maximum =
+        NonZeroUsize::new(MAXIMUM_UNIFIED_MARKET_INSTRUMENTS).ok_or(ServiceError::Internal)?;
+    let mut instrument_ids = registry
+        .market_instrument_ids(maximum, context.deadline(), context.cancellation())
+        .await?;
+    instrument_ids.retain(|instrument_id| matches_instrument_filter(filters, *instrument_id));
+    Ok(instrument_ids)
+}
+
+async fn load_display_instrument_ids(
+    registry: &MarketRuntimeRegistry,
+    filters: &MarketFilters<'_>,
+    context: &RequestContext,
+) -> Result<Vec<InstrumentId>, ServiceError> {
+    let maximum =
+        NonZeroUsize::new(MAXIMUM_UNIFIED_MARKET_INSTRUMENTS).ok_or(ServiceError::Internal)?;
+    let mut instrument_ids = registry
+        .display_instrument_ids(maximum, context.deadline(), context.cancellation())
+        .await?;
+    instrument_ids.retain(|instrument_id| matches_instrument_filter(filters, *instrument_id));
+    Ok(instrument_ids)
+}
+
+async fn load_display_snapshots(
+    registry: &MarketRuntimeRegistry,
+    instrument_ids: &[InstrumentId],
+    reference_at: Timestamp,
+    context: &RequestContext,
+) -> Result<Vec<MarketDisplaySnapshotBatch>, ServiceError> {
+    let maximum_sources = NonZeroUsize::new(MAXIMUM_UNIFIED_DISPLAY_SOURCES_PER_INSTRUMENT)
+        .ok_or(ServiceError::Internal)?;
+    let mut batches = Vec::new();
+    batches
+        .try_reserve_exact(instrument_ids.len())
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for instrument_id in instrument_ids {
+        ensure_live(context)?;
+        batches.push(
+            registry
+                .display_snapshots_for_instrument(
+                    *instrument_id,
+                    maximum_sources,
+                    reference_at,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .await?,
+        );
+    }
+    Ok(batches)
+}
+
+fn display_snapshot_refs<'batch>(
+    batches: &'batch [MarketDisplaySnapshotBatch],
+    filters: &MarketFilters<'_>,
+) -> Result<Vec<&'batch MarketDisplaySnapshotLease>, ServiceError> {
+    let count = batches.iter().try_fold(0_usize, |count, batch| {
+        count.checked_add(batch.snapshots().len())
+    });
+    let mut snapshots = Vec::new();
+    snapshots
+        .try_reserve_exact(count.ok_or(ServiceError::ResourceExhausted)?)
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for snapshot in batches
+        .iter()
+        .flat_map(MarketDisplaySnapshotBatch::snapshots)
+    {
+        if filters.matches_display_identity(snapshot) {
+            snapshots.push(snapshot);
+        }
+    }
+    Ok(snapshots)
+}
+
+fn kraken_projection_refs(
+    projections: &[MarketKrakenPriceProjectionLease],
+) -> Result<Vec<&MarketKrakenPriceProjectionLease>, ServiceError> {
+    let mut references = Vec::new();
+    references
+        .try_reserve_exact(projections.len())
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    references.extend(projections.iter());
+    Ok(references)
+}
+
+fn load_market_data_instrument_definitions(
+    reader: &MarketDataInstrumentReadCapability,
+    instrument_ids: &[InstrumentId],
+    context: &RequestContext,
+) -> Result<Vec<MarketDataInstrumentDefinition>, ServiceError> {
+    let mut definitions = Vec::new();
+    definitions
+        .try_reserve_exact(instrument_ids.len())
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for instrument_id in instrument_ids {
+        ensure_live(context)?;
+        let record = reader
+            .latest(*instrument_id, context.deadline(), context.cancellation())
+            .map_err(|error| {
+                tracing::error!(%error, "unified Markets market-data definition read failed");
+                ServiceError::Unavailable
+            })?
+            .ok_or(ServiceError::Unavailable)?;
+        definitions.push(record.definition().clone());
+    }
+    if definitions
+        .windows(2)
+        .any(|pair| pair[0].instrument_id() >= pair[1].instrument_id())
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(definitions)
+}
+
+async fn load_kraken_price_projections(
+    registry: &MarketRuntimeRegistry,
+    instrument_ids: &[InstrumentId],
+    filters: &MarketFilters<'_>,
+    context: &RequestContext,
+) -> Result<Vec<MarketKrakenPriceProjectionLease>, ServiceError> {
+    let mut snapshots = Vec::new();
+    snapshots
+        .try_reserve_exact(instrument_ids.len())
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for instrument_id in instrument_ids {
+        ensure_live(context)?;
+        if let Some(snapshot) = registry
+            .kraken_price_projection(*instrument_id, context.deadline(), context.cancellation())
+            .await?
+            && filters.matches_kraken_identity(&snapshot)
+        {
+            snapshots.push(snapshot);
+        }
+    }
+    Ok(snapshots)
+}
+
 async fn load_order_level_snapshots(
     registry: &MarketRuntimeRegistry,
     streams: &[StreamView<'_>],
+    kraken: &[MarketKrakenPriceProjectionLease],
     context: &RequestContext,
 ) -> Result<Vec<MarketOrderLevelSnapshot>, ServiceError> {
     let maximum_orders =
         NonZeroUsize::new(MAXIMUM_UNIFIED_ORDER_SAMPLE).ok_or(ServiceError::Internal)?;
     let mut snapshots = Vec::new();
     snapshots
-        .try_reserve_exact(streams.len())
+        .try_reserve_exact(
+            streams
+                .len()
+                .checked_add(kraken.len())
+                .ok_or(ServiceError::ResourceExhausted)?,
+        )
         .map_err(|_error| ServiceError::ResourceExhausted)?;
     for view in streams {
         ensure_live(context)?;
@@ -473,6 +684,32 @@ async fn load_order_level_snapshots(
                 view.route.route().venue(),
                 view.route.route().instrument(),
                 view.stream.connection_generation(),
+                maximum_orders,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await?
+        {
+            snapshots.push(snapshot);
+        }
+    }
+    for projection in kraken {
+        ensure_live(context)?;
+        let key = projection.key();
+        if snapshots.iter().any(|existing| {
+            existing.source_id() == key.source_id()
+                && existing.venue_id() == key.venue_id()
+                && existing.instrument_id() == key.instrument_id()
+                && existing.generation() == key.generation()
+        }) {
+            continue;
+        }
+        if let Some(snapshot) = registry
+            .order_level_snapshot(
+                key.source_id(),
+                key.venue_id(),
+                key.instrument_id(),
+                key.generation(),
                 maximum_orders,
                 context.deadline(),
                 context.cancellation(),
@@ -503,6 +740,8 @@ fn supports_order_level(metadata: &SourceMetadata) -> bool {
 
 fn build_surface_policies(
     snapshots: &MarketRuntimeSnapshotBatch,
+    display_snapshots: &[&MarketDisplaySnapshotLease],
+    kraken_projections: &[&MarketKrakenPriceProjectionLease],
     reference_at: Timestamp,
 ) -> Result<Vec<MarketSurfaceSelectionPolicy>, ServiceError> {
     let policy_count = snapshots
@@ -513,6 +752,14 @@ fn build_surface_policies(
                 count.checked_add(metadata.coverage().asset_classes().len())
             })
         });
+    let policy_count = display_snapshots.iter().try_fold(
+        policy_count.ok_or(ServiceError::ResourceExhausted)?,
+        |count, snapshot| count.checked_add(snapshot.metadata().coverage().asset_classes().len()),
+    );
+    let policy_count = kraken_projections.iter().try_fold(
+        policy_count.ok_or(ServiceError::ResourceExhausted)?,
+        |count, snapshot| count.checked_add(snapshot.metadata().coverage().asset_classes().len()),
+    );
     let policy_count = policy_count.ok_or(ServiceError::ResourceExhausted)?;
     let operations = crate::application::market_selection::MarketOperationSet::try_new(&[
         crate::application::market_selection::MarketOperation::SnapshotDisplay,
@@ -527,21 +774,74 @@ fn build_surface_policies(
         for metadata in source.metadata().iter() {
             for asset_class in metadata.coverage().asset_classes() {
                 let rights = surface_rights(metadata, operations, reference_at)?;
-                policies.push(MarketSurfaceSelectionPolicy::try_new(
-                    source.surface_id().clone(),
-                    metadata.source_id().clone(),
-                    metadata.provider().clone(),
+                push_surface_policy(
+                    &mut policies,
+                    source.surface_id(),
+                    metadata,
                     *asset_class,
                     operations,
-                    observation_timing(metadata),
-                    presentation_depth(metadata, *asset_class),
-                    market_coverage(metadata, *asset_class),
                     rights,
-                )?);
+                )?;
             }
         }
     }
+    for snapshot in display_snapshots {
+        let metadata = snapshot.metadata();
+        for asset_class in metadata.coverage().asset_classes() {
+            let rights = surface_rights(metadata, operations, reference_at)?;
+            push_surface_policy(
+                &mut policies,
+                snapshot.surface_id(),
+                metadata,
+                *asset_class,
+                operations,
+                rights,
+            )?;
+        }
+    }
+    for snapshot in kraken_projections {
+        let metadata = snapshot.metadata();
+        for asset_class in metadata.coverage().asset_classes() {
+            let rights = surface_rights(metadata, operations, reference_at)?;
+            push_surface_policy(
+                &mut policies,
+                snapshot.surface_id(),
+                metadata,
+                *asset_class,
+                operations,
+                rights,
+            )?;
+        }
+    }
     Ok(policies)
+}
+
+fn push_surface_policy(
+    policies: &mut Vec<MarketSurfaceSelectionPolicy>,
+    surface_id: &SourceIdentifier,
+    metadata: &SourceMetadata,
+    asset_class: AssetClass,
+    operations: crate::application::market_selection::MarketOperationSet,
+    rights: MarketSurfaceRightsPolicy,
+) -> Result<(), ServiceError> {
+    if policies
+        .iter()
+        .any(|policy| policy.matches_identity(surface_id, metadata.source_id(), asset_class))
+    {
+        return Ok(());
+    }
+    policies.push(MarketSurfaceSelectionPolicy::try_new(
+        surface_id.clone(),
+        metadata.source_id().clone(),
+        metadata.provider().clone(),
+        asset_class,
+        operations,
+        observation_timing(metadata),
+        presentation_depth(metadata, asset_class),
+        market_coverage(metadata, asset_class),
+        rights,
+    )?);
+    Ok(())
 }
 
 fn surface_rights(
@@ -717,10 +1017,40 @@ impl<'request> MarketFilters<'request> {
                     .is_ok())
     }
 
+    fn matches_display_identity(&self, snapshot: &MarketDisplaySnapshotLease) -> bool {
+        matches_instrument_filter(self, snapshot.lease().key().instrument_id())
+            && (self.sources.is_empty()
+                || self
+                    .sources
+                    .binary_search(&snapshot.metadata().source_id().as_str())
+                    .is_ok()
+                || self
+                    .sources
+                    .binary_search(&snapshot.surface_id().as_str())
+                    .is_ok())
+    }
+
+    fn matches_kraken_identity(&self, snapshot: &MarketKrakenPriceProjectionLease) -> bool {
+        matches_instrument_filter(self, snapshot.key().instrument_id())
+            && (self.sources.is_empty()
+                || self
+                    .sources
+                    .binary_search(&snapshot.metadata().source_id().as_str())
+                    .is_ok()
+                || self
+                    .sources
+                    .binary_search(&snapshot.surface_id().as_str())
+                    .is_ok())
+    }
+
     fn matches_time(&self, timestamp: Timestamp) -> bool {
         self.time_range
             .is_none_or(|(start, end)| timestamp >= start && timestamp <= end)
     }
+}
+
+fn matches_instrument_filter(filters: &MarketFilters<'_>, instrument_id: InstrumentId) -> bool {
+    filters.instruments.is_empty() || filters.instruments.binary_search(&instrument_id).is_ok()
 }
 
 fn parse_time_range(value: &Value) -> Result<(Timestamp, Timestamp), ServiceError> {

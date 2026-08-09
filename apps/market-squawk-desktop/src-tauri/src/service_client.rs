@@ -1141,6 +1141,11 @@ pub(crate) async fn source_control(
     );
     insert_optional(
         &mut arguments,
+        "expectedRuntimeGenerationSha256",
+        request.expected_runtime_generation_sha256,
+    );
+    insert_optional(
+        &mut arguments,
         "onboardingSessionId",
         request.onboarding_session_id,
     );

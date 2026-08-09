@@ -83,6 +83,7 @@ pub struct OrderLevelBatchInput {
     batch_identifier: SourceIdentifier,
     source_timestamp: Timestamp,
     received_at: Timestamp,
+    available_at: Timestamp,
     quality: DataQuality,
     freshness: MarketFreshness,
     sequence_rule: Option<SequenceValidationRule>,
@@ -103,6 +104,7 @@ impl OrderLevelBatchInput {
         batch_identifier: SourceIdentifier,
         source_timestamp: Timestamp,
         received_at: Timestamp,
+        available_at: Timestamp,
         quality: DataQuality,
         freshness: MarketFreshness,
         sequence_rule: Option<SequenceValidationRule>,
@@ -116,6 +118,7 @@ impl OrderLevelBatchInput {
             batch_identifier,
             source_timestamp,
             received_at,
+            available_at,
             quality,
             freshness,
             sequence_rule,
@@ -134,6 +137,7 @@ pub struct OrderLevelBatch {
     pub(super) batch_identifier: SourceIdentifier,
     pub(super) source_timestamp: Timestamp,
     pub(super) received_at: Timestamp,
+    pub(super) available_at: Timestamp,
     pub(super) quality: DataQuality,
     pub(super) freshness: MarketFreshness,
     pub(super) sequence_rule: Option<SequenceValidationRule>,
@@ -157,6 +161,7 @@ impl OrderLevelBatch {
     pub fn try_new(input: OrderLevelBatchInput) -> Result<Self, OrderLevelBatchError> {
         validate_quality(input.quality)?;
         validate_freshness(input.freshness, input.received_at)?;
+        validate_availability(input.received_at, input.available_at)?;
         validate_payload(&input.payload, input.source_timestamp, input.received_at)?;
         validate_sequence(
             &input.route,
@@ -171,6 +176,7 @@ impl OrderLevelBatch {
             batch_identifier: input.batch_identifier,
             source_timestamp: input.source_timestamp,
             received_at: input.received_at,
+            available_at: input.available_at,
             quality: input.quality,
             freshness: input.freshness,
             sequence_rule: input.sequence_rule,
@@ -204,6 +210,11 @@ impl OrderLevelBatch {
     /// Returns the latest receive time in this transaction.
     pub const fn received_at(&self) -> Timestamp {
         self.received_at
+    }
+
+    /// Returns when the complete transaction became available to local readers.
+    pub const fn available_at(&self) -> Timestamp {
+        self.available_at
     }
 
     /// Returns the archival quality ceiling, never current execution authority.
@@ -307,6 +318,17 @@ fn validate_freshness(
         MarketFreshness::Uninitialized
         | MarketFreshness::Fresh { .. }
         | MarketFreshness::Stale { .. } => Err(OrderLevelBatchError::FreshnessMismatch),
+    }
+}
+
+fn validate_availability(
+    received_at: Timestamp,
+    available_at: Timestamp,
+) -> Result<(), OrderLevelBatchError> {
+    if received_at <= available_at {
+        Ok(())
+    } else {
+        Err(OrderLevelBatchError::AvailabilityBeforeReceipt)
     }
 }
 
@@ -515,6 +537,9 @@ pub enum OrderLevelBatchError {
     /// Market freshness did not identify this exact market-bearing receive time.
     #[error("order-level freshness does not match the terminal market receive time")]
     FreshnessMismatch,
+    /// Local availability preceded receipt of the complete provider transaction.
+    #[error("order-level availability precedes local receipt")]
+    AvailabilityBeforeReceipt,
     /// Snapshot order count exceeded the shared hard limit.
     #[error("order-level snapshot contains {observed} orders; maximum is {maximum}")]
     TooManyOrders { observed: usize, maximum: usize },

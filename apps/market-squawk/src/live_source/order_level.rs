@@ -680,46 +680,10 @@ impl ReadClient {
 /// Supervisor-facing monitor for one exact generation's terminal status.
 #[derive(Debug)]
 pub(crate) struct OrderLevelSupervisorMonitor {
-    key: Arc<OrderLevelBookKey>,
     status: watch::Receiver<Option<OrderLevelTerminalFailure>>,
 }
 
 impl OrderLevelSupervisorMonitor {
-    pub(crate) fn key(&self) -> &OrderLevelBookKey {
-        &self.key
-    }
-
-    /// Returns a terminal cause already published by the actor, if any.
-    pub(crate) fn current_failure(&self) -> Option<OrderLevelTerminalFailure> {
-        *self.status.borrow()
-    }
-
-    /// Waits for terminal quarantine, unexpected worker closure, cancellation, or deadline.
-    pub(crate) async fn wait(
-        &mut self,
-        cancellation: &CancellationToken,
-        deadline: Instant,
-    ) -> Result<OrderLevelTerminalFailure, OrderLevelMonitorError> {
-        if let Some(failure) = *self.status.borrow_and_update() {
-            return Ok(failure);
-        }
-        if Instant::now() >= deadline {
-            return Err(OrderLevelMonitorError::Deadline);
-        }
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => Err(OrderLevelMonitorError::Cancelled),
-            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                Err(OrderLevelMonitorError::Deadline)
-            }
-            result = self.status.changed() => match result {
-                Ok(()) => (*self.status.borrow_and_update())
-                    .ok_or(OrderLevelMonitorError::WorkerClosed),
-                Err(_closed) => Err(OrderLevelMonitorError::WorkerClosed),
-            }
-        }
-    }
-
     /// Waits for terminal quarantine for the lifetime of one source generation.
     ///
     /// Source generation supervision is intentionally long-running. Cancellation is the bounded
@@ -748,8 +712,6 @@ impl OrderLevelSupervisorMonitor {
 pub(crate) enum OrderLevelMonitorError {
     #[error("order-level supervisor wait was cancelled")]
     Cancelled,
-    #[error("order-level supervisor wait deadline elapsed")]
-    Deadline,
     #[error("order-level actor exited without a terminal failure signal")]
     WorkerClosed,
 }
@@ -927,7 +889,7 @@ impl OrderLevelDirectory {
                 actor_status: status.clone(),
                 actor_cancellation,
             },
-            monitor: OrderLevelSupervisorMonitor { key, status },
+            monitor: OrderLevelSupervisorMonitor { status },
         })
     }
 

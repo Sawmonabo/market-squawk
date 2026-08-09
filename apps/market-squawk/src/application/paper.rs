@@ -19,7 +19,7 @@ use market_squawk_adapter_paper::{
     PaperAccountRiskSnapshot, PaperCashBalance, PaperExecutionSnapshot, PaperFillSnapshot,
     PaperOrderSnapshot, PaperPosition,
 };
-use market_squawk_data::InstrumentDefinitionReadCapability;
+use market_squawk_data::{InstrumentDefinitionReadCapability, MarketDataInstrumentReadCapability};
 use market_squawk_decisions::{InvestmentTargetSetId, TargetState, TargetStatus};
 use market_squawk_domain::{
     BasisPoints, DigestAlgorithm, Money, OrderId, OrderSide, OrderType, PriceTicks, QuantityLots,
@@ -77,6 +77,7 @@ pub struct PaperApplicationServices {
     controller: Arc<PaperController>,
     market_runtime: Arc<MarketRuntimeRegistry>,
     instrument_definitions: InstrumentDefinitionReadCapability,
+    market_data_instruments: MarketDataInstrumentReadCapability,
     reference_search: Arc<dyn market::MarketReferenceSearchAuthority>,
 }
 
@@ -148,6 +149,7 @@ impl PaperApplicationServices {
         decisions: Arc<DecisionApplication>,
         market_runtime: Arc<MarketRuntimeRegistry>,
         instrument_definitions: InstrumentDefinitionReadCapability,
+        market_data_instruments: MarketDataInstrumentReadCapability,
         reference_search: Arc<dyn MarketReferenceSearchAuthority>,
     ) -> Self {
         Self {
@@ -158,6 +160,7 @@ impl PaperApplicationServices {
             )),
             market_runtime,
             instrument_definitions,
+            market_data_instruments,
             reference_search,
         }
     }
@@ -181,6 +184,7 @@ impl PaperApplicationServices {
         Arc::new(market::MarketDomainService::new(
             Arc::clone(&self.market_runtime),
             self.instrument_definitions.clone(),
+            self.market_data_instruments.clone(),
             Arc::clone(&self.reference_search),
         ))
     }
@@ -209,6 +213,10 @@ impl fmt::Debug for PaperApplicationServices {
             .field(
                 "instrument_definitions",
                 &"[SEALED INSTRUMENT-DEFINITION READ AUTHORITY]",
+            )
+            .field(
+                "market_data_instruments",
+                &"[SEALED MARKET-DATA INSTRUMENT READ AUTHORITY]",
             )
             .field("reference_search", &self.reference_search)
             .finish()

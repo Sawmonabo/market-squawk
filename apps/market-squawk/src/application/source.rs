@@ -449,6 +449,16 @@ impl SourceController {
                     .map_err(|_error| ServiceError::InvalidRequest)
             })
             .transpose()?;
+        let expected_runtime_generation_digest = request
+            .arguments()
+            .get("expectedRuntimeGenerationSha256")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or(ServiceError::InvalidRequest)
+                    .and_then(parse_sha256)
+            })
+            .transpose()?;
         let onboarding_session_id = optional_uuid(request, "onboardingSessionId")?;
         let public_configuration_digest = request
             .arguments()
@@ -478,6 +488,7 @@ impl SourceController {
             action,
             expected_state_revision,
             expected_generation,
+            expected_runtime_generation_digest,
             onboarding_session_id,
             public_configuration_digest,
             reason,

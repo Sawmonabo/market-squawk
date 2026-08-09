@@ -3,10 +3,13 @@
 use std::{
     collections::{HashMap, VecDeque},
     mem::size_of,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use super::{
+    display_market::{
+        DisplayMarketIngress, DisplayMarketRouteIdentity, DisplayMarketTerminalFailure,
+    },
     provider::ProductionMarketDecoder,
     route_actor::{RouteActivationBinding, RouteActivationPublisher},
     subscription_state::{
@@ -18,13 +21,15 @@ use market_squawk_live::{LiveIngressBindError, LiveIngressError, LiveRuntimeIngr
 use market_squawk_platform::{CapturePublishError, RawCapturePublisher};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationHealth, BudgetHealth, BudgetPermitLease,
-    CaptureGenerationCapabilities, ConnectionLiveness, ControlFrameKind, CurrentHealthReporter,
+    CaptureGenerationCapabilities, ConnectionLiveness, ControlFrameKind,
+    CurrentDecodedProviderBatch, CurrentDecodedProviderBatches, CurrentHealthReporter,
     CurrentSourceSession, DecodeInternalError, DecodeOutcome, FreshnessPolicy, MarketDecoder,
     ProviderTimestampEvidence, QuarantineReason, RawMarketFrame, RawMarketSink, RegistryError,
     ResynchronizationReason, SinkError, SourceHealthError, SourceHealthSnapshot, SourceMetadata,
     SourceMetadataProvider, ValidatedSessionDecodeOutcome,
 };
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 /// Input capabilities consumed by one exact-generation production sink.
 #[derive(Debug)]
@@ -52,6 +57,19 @@ pub(super) struct ProductionPredecodedMarketSinkInput<'a> {
     pub(super) routes: Vec<RouteActivationPublisher>,
 }
 
+/// Input capabilities for one exact-generation display-only source sink.
+#[derive(Debug)]
+pub(super) struct ProductionDisplayMarketSinkInput<'a> {
+    pub(super) capture: RawCapturePublisher<CaptureGenerationCapabilities>,
+    pub(super) registry: &'a mut AuthoritativeSourceRegistry,
+    pub(super) session: &'a CurrentSourceSession,
+    pub(super) health_reporter: CurrentHealthReporter,
+    pub(super) decoder: ProductionMarketDecoder,
+    pub(super) subscription: SubscriptionStateMachine,
+    pub(super) display_ingresses: Vec<DisplayMarketIngress>,
+    pub(super) ingress_timeout: Duration,
+}
+
 /// Exact capture/session/health/live-route bridge used directly by the Coinbase reader.
 #[derive(Debug)]
 pub(super) struct ProductionRawMarketSink<'a> {
@@ -64,8 +82,9 @@ pub(super) struct ProductionRawMarketSink<'a> {
     generation: GenerationIdentity,
     subscription: SubscriptionStateMachine,
     pending_data: PendingDataBuffer,
-    live_ingress: LiveRuntimeIngress,
-    routes: HashMap<ShardKey, RouteActivationPublisher>,
+    output: QualifiedSourceOutput,
+    startup_readiness: Option<oneshot::Sender<()>>,
+    startup_ready: bool,
     last_transport_at: Option<Timestamp>,
     last_market_at: Option<Timestamp>,
     last_source_at: Option<Timestamp>,
@@ -81,6 +100,10 @@ impl<'a> ProductionRawMarketSink<'a> {
         input: ProductionRawMarketSinkInput<'a>,
     ) -> Result<Self, ProductionSinkConstructionError> {
         let metadata = input.decoder.metadata().clone();
+        let output = QualifiedSourceOutput::Live(QualifiedLiveOutput::try_new(
+            input.live_ingress,
+            input.routes,
+        )?);
         Self::try_new_inner(
             input.capture,
             input.registry,
@@ -89,14 +112,26 @@ impl<'a> ProductionRawMarketSink<'a> {
             Some(input.decoder),
             metadata,
             input.subscription,
-            input.live_ingress,
-            input.routes,
+            output,
         )
+    }
+
+    pub(super) fn try_new_with_startup_readiness(
+        input: ProductionRawMarketSinkInput<'a>,
+        startup_readiness: oneshot::Sender<()>,
+    ) -> Result<Self, ProductionSinkConstructionError> {
+        let mut sink = Self::try_new(input)?;
+        sink.startup_readiness = Some(startup_readiness);
+        Ok(sink)
     }
 
     pub(super) fn try_new_predecoded(
         input: ProductionPredecodedMarketSinkInput<'a>,
     ) -> Result<Self, ProductionSinkConstructionError> {
+        let output = QualifiedSourceOutput::Live(QualifiedLiveOutput::try_new(
+            input.live_ingress,
+            input.routes,
+        )?);
         Self::try_new_inner(
             input.capture,
             input.registry,
@@ -105,9 +140,38 @@ impl<'a> ProductionRawMarketSink<'a> {
             None,
             input.metadata,
             input.subscription,
-            input.live_ingress,
-            input.routes,
+            output,
         )
+    }
+
+    pub(super) fn try_new_display(
+        input: ProductionDisplayMarketSinkInput<'a>,
+    ) -> Result<Self, ProductionSinkConstructionError> {
+        let metadata = input.decoder.metadata().clone();
+        validate_display_generation(&metadata, input.session, &input.display_ingresses)?;
+        let output = QualifiedSourceOutput::Display(QualifiedDisplayOutput::try_new(
+            input.display_ingresses,
+            input.ingress_timeout,
+        )?);
+        Self::try_new_inner(
+            input.capture,
+            input.registry,
+            input.session,
+            input.health_reporter,
+            Some(input.decoder),
+            metadata,
+            input.subscription,
+            output,
+        )
+    }
+
+    pub(super) fn try_new_display_with_startup_readiness(
+        input: ProductionDisplayMarketSinkInput<'a>,
+        startup_readiness: oneshot::Sender<()>,
+    ) -> Result<Self, ProductionSinkConstructionError> {
+        let mut sink = Self::try_new_display(input)?;
+        sink.startup_readiness = Some(startup_readiness);
+        Ok(sink)
     }
 
     #[allow(
@@ -122,21 +186,8 @@ impl<'a> ProductionRawMarketSink<'a> {
         decoder: Option<ProductionMarketDecoder>,
         metadata: SourceMetadata,
         subscription: SubscriptionStateMachine,
-        live_ingress: LiveRuntimeIngress,
-        route_publishers: Vec<RouteActivationPublisher>,
+        output: QualifiedSourceOutput,
     ) -> Result<Self, ProductionSinkConstructionError> {
-        if route_publishers.is_empty() {
-            return Err(ProductionSinkConstructionError::MissingRoutes);
-        }
-        let mut routes = HashMap::new();
-        routes
-            .try_reserve(route_publishers.len())
-            .map_err(|_error| ProductionSinkConstructionError::AllocationFailed)?;
-        for route in route_publishers {
-            if routes.insert(route.route().clone(), route).is_some() {
-                return Err(ProductionSinkConstructionError::DuplicateRoute);
-            }
-        }
         let pending_data =
             PendingDataBuffer::try_new(subscription.pre_acknowledgement_data_limits())?;
         Ok(Self {
@@ -149,8 +200,9 @@ impl<'a> ProductionRawMarketSink<'a> {
             generation: GenerationIdentity::from_session(session),
             subscription,
             pending_data,
-            live_ingress,
-            routes,
+            output,
+            startup_readiness: None,
+            startup_ready: false,
             last_transport_at: None,
             last_market_at: None,
             last_source_at: None,
@@ -164,6 +216,18 @@ impl<'a> ProductionRawMarketSink<'a> {
 
     pub(super) const fn terminal_failure(&self) -> Option<ProductionSinkFailure> {
         self.terminal
+    }
+
+    pub(super) const fn startup_ready(&self) -> bool {
+        self.startup_ready
+    }
+
+    pub(super) fn record_display_terminal_failure(
+        &mut self,
+        failure: DisplayMarketTerminalFailure,
+    ) {
+        tracing::error!(%failure, "display-market generation failed terminally");
+        let _sink_error = self.fail(ProductionSinkFailure::DisplayTerminal);
     }
 
     fn process_frame(&mut self, frame: RawMarketFrame) -> Result<(), ProductionSinkFailure> {
@@ -222,7 +286,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             .capture
             .try_publish(frame)
             .map_err(ProductionSinkFailure::Capture)?;
-        self.poll_route_failures()?;
+        self.output.poll_failures()?;
         Ok(receipt)
     }
 
@@ -231,9 +295,8 @@ impl<'a> ProductionRawMarketSink<'a> {
         outcome: DecodeOutcome,
         receipt: market_squawk_sources::CaptureAdmissionReceipt,
     ) -> Result<(), ProductionSinkFailure> {
-        self.poll_route_failures()?;
+        self.output.poll_failures()?;
         let latest_source_at = latest_source_timestamp(&outcome);
-        let decoded_route = decoded_route(&outcome)?;
         let received_at = outcome.evidence().received_at();
         let validated_session = self
             .registry
@@ -249,12 +312,9 @@ impl<'a> ProductionRawMarketSink<'a> {
                 control.evidence().payload_digest(),
                 received_at,
             ),
-            ValidatedSessionDecodeOutcome::Data(data) => self.process_data(
-                data,
-                decoded_route.ok_or(ProductionSinkFailure::RouteUnavailableBeforeUpgrade)?,
-                latest_source_at,
-                received_at,
-            ),
+            ValidatedSessionDecodeOutcome::Data(data) => {
+                self.process_data(data, latest_source_at, received_at)
+            }
             ValidatedSessionDecodeOutcome::Ignored(ignored) => self
                 .subscription
                 .observe_ignored(&self.generation, Instant::now(), ignored.reason())
@@ -313,7 +373,6 @@ impl<'a> ProductionRawMarketSink<'a> {
     fn process_data(
         &mut self,
         data: market_squawk_sources::CapturedDecodedProviderBatch,
-        route: ShardKey,
         latest_source_at: Option<Timestamp>,
         received_at: Timestamp,
     ) -> Result<(), ProductionSinkFailure> {
@@ -332,23 +391,28 @@ impl<'a> ProductionRawMarketSink<'a> {
         {
             return self
                 .pending_data
-                .try_push(data, route, latest_source_at, received_at);
+                .try_push(data, latest_source_at, received_at);
         }
-        self.process_active_data(data, route, latest_source_at, received_at, received_at)
+        self.process_active_data(data, latest_source_at, received_at, received_at)?;
+        self.publish_startup_readiness()
     }
 
     fn flush_pending_data(
         &mut self,
         acknowledgement_received_at: Timestamp,
     ) -> Result<(), ProductionSinkFailure> {
+        let mut published = false;
         while let Some(pending) = self.pending_data.try_pop_front()? {
             self.process_active_data(
                 pending.data,
-                pending.route,
                 pending.latest_source_at,
                 pending.received_at,
                 acknowledgement_received_at.max(pending.received_at),
             )?;
+            published = true;
+        }
+        if published {
+            self.publish_startup_readiness()?;
         }
         Ok(())
     }
@@ -356,7 +420,6 @@ impl<'a> ProductionRawMarketSink<'a> {
     fn process_active_data(
         &mut self,
         data: market_squawk_sources::CapturedDecodedProviderBatch,
-        route: ShardKey,
         latest_source_at: Option<Timestamp>,
         received_at: Timestamp,
         health_observed_at: Timestamp,
@@ -374,11 +437,6 @@ impl<'a> ProductionRawMarketSink<'a> {
         let requires_rebind = self
             .health_rebind_at
             .is_none_or(|deadline| received_at >= deadline);
-        let dormant = if requires_rebind {
-            Some(self.prepare_route(&route)?)
-        } else {
-            None
-        };
         if requires_rebind {
             self.record_health(health_observed_at)?;
         }
@@ -389,50 +447,25 @@ impl<'a> ProductionRawMarketSink<'a> {
         let batches = current
             .validate_data_outcome_owned(data)
             .map_err(ProductionSinkFailure::Registry)?;
-        if batches.len() != 1 {
-            return Err(ProductionSinkFailure::UnexpectedRouteCount);
-        }
-        let batch = batches
-            .into_iter()
-            .next()
-            .ok_or(ProductionSinkFailure::UnexpectedRouteCount)?;
-        let valid_until = batch.current_lease().valid_until();
-        let current_route = ShardKey::new(batch.key().venue().clone(), batch.key().instrument());
-        if current_route != route {
-            return Err(ProductionSinkFailure::RouteMismatch);
-        }
-        let manager = self
-            .routes
-            .get_mut(&route)
-            .ok_or(ProductionSinkFailure::UnknownRoute)?;
-        if let Some(dormant) = dormant {
-            manager.start_activation(dormant, batch)?;
+        let valid_until = self.output.try_publish(batches, received_at)?;
+        if requires_rebind {
             self.health_rebind_at = Some(rebind_at(
                 health_observed_at,
                 self.metadata.freshness_policy(),
             )?);
             self.health_valid_until = Some(valid_until);
-        } else {
-            manager.try_publish(batch)?;
         }
         Ok(())
     }
 
-    fn prepare_route(
-        &mut self,
-        route: &ShardKey,
-    ) -> Result<RouteActivationBinding, ProductionSinkFailure> {
-        let manager = self
-            .routes
-            .get_mut(route)
-            .ok_or(ProductionSinkFailure::UnknownRoute)?;
-        manager.prepare(&self.live_ingress)
-    }
-
-    fn poll_route_failures(&mut self) -> Result<(), ProductionSinkFailure> {
-        for route in self.routes.values_mut() {
-            route.check_failure()?;
-        }
+    fn publish_startup_readiness(&mut self) -> Result<(), ProductionSinkFailure> {
+        let Some(readiness) = self.startup_readiness.take() else {
+            return Ok(());
+        };
+        readiness
+            .send(())
+            .map_err(|_value| ProductionSinkFailure::StartupObserverDropped)?;
+        self.startup_ready = true;
         Ok(())
     }
 
@@ -490,7 +523,8 @@ impl<'a> ProductionRawMarketSink<'a> {
         .map_err(ProductionSinkFailure::Registry)?;
         self.registry
             .record_health(self.session, update)
-            .map_err(ProductionSinkFailure::Registry)
+            .map_err(ProductionSinkFailure::Registry)?;
+        self.output.advance_health_revision()
     }
 
     fn fail(&mut self, failure: ProductionSinkFailure) -> SinkError {
@@ -504,7 +538,6 @@ impl<'a> ProductionRawMarketSink<'a> {
 #[derive(Debug)]
 struct PendingDecodedData {
     data: market_squawk_sources::CapturedDecodedProviderBatch,
-    route: ShardKey,
     latest_source_at: Option<Timestamp>,
     received_at: Timestamp,
     retained_bytes: usize,
@@ -541,7 +574,6 @@ impl PendingDataBuffer {
     fn try_push(
         &mut self,
         data: market_squawk_sources::CapturedDecodedProviderBatch,
-        route: ShardKey,
         latest_source_at: Option<Timestamp>,
         received_at: Timestamp,
     ) -> Result<(), ProductionSinkFailure> {
@@ -552,7 +584,6 @@ impl PendingDataBuffer {
             .retained_bytes()
             .map_err(|_error| ProductionSinkFailure::PreAcknowledgementRetainedSizeOverflow)?
             .checked_add(size_of::<PendingDecodedData>())
-            .and_then(|bytes| bytes.checked_add(route.venue().retained_bytes()))
             .ok_or(ProductionSinkFailure::PreAcknowledgementRetainedSizeOverflow)?;
         let next_total = self
             .retained_bytes
@@ -563,7 +594,6 @@ impl PendingDataBuffer {
         }
         self.entries.push_back(PendingDecodedData {
             data,
-            route,
             latest_source_at,
             received_at,
             retained_bytes,
@@ -585,6 +615,309 @@ impl PendingDataBuffer {
             .ok_or(ProductionSinkFailure::PreAcknowledgementBufferAccounting)?;
         Ok(Some(entry))
     }
+}
+
+fn validate_display_generation(
+    metadata: &SourceMetadata,
+    session: &CurrentSourceSession,
+    ingresses: &[DisplayMarketIngress],
+) -> Result<(), ProductionSinkConstructionError> {
+    if ingresses.is_empty() {
+        return Err(ProductionSinkConstructionError::MissingRoutes);
+    }
+    if ingresses.iter().any(|ingress| {
+        ingress.key().source_id() != metadata.source_id()
+            || ingress.key().generation() != session.generation()
+    }) {
+        return Err(ProductionSinkConstructionError::DisplayGenerationMismatch);
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum QualifiedSourceOutput {
+    Live(QualifiedLiveOutput),
+    Display(QualifiedDisplayOutput),
+}
+
+impl QualifiedSourceOutput {
+    fn advance_health_revision(&mut self) -> Result<(), ProductionSinkFailure> {
+        match self {
+            Self::Live(output) => output.advance_health_revision(),
+            Self::Display(_output) => Ok(()),
+        }
+    }
+
+    fn try_publish(
+        &mut self,
+        batches: CurrentDecodedProviderBatches,
+        validated_at: Timestamp,
+    ) -> Result<Timestamp, ProductionSinkFailure> {
+        match self {
+            Self::Live(output) => output.try_publish(batches),
+            Self::Display(output) => output.try_publish(batches, validated_at),
+        }
+    }
+
+    fn poll_failures(&mut self) -> Result<(), ProductionSinkFailure> {
+        match self {
+            Self::Live(output) => output.poll_failures(),
+            Self::Display(output) => output.poll_failures(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QualifiedDisplayOutput {
+    routes: HashMap<DisplayMarketRouteIdentity, DisplayMarketIngress>,
+    ingress_timeout: Duration,
+}
+
+impl QualifiedDisplayOutput {
+    fn try_new(
+        ingresses: Vec<DisplayMarketIngress>,
+        ingress_timeout: Duration,
+    ) -> Result<Self, ProductionSinkConstructionError> {
+        if ingresses.is_empty() {
+            return Err(ProductionSinkConstructionError::MissingRoutes);
+        }
+        if ingress_timeout.is_zero() {
+            return Err(ProductionSinkConstructionError::InvalidDisplayIngressTimeout);
+        }
+        let mut routes = HashMap::new();
+        routes
+            .try_reserve(ingresses.len())
+            .map_err(|_error| ProductionSinkConstructionError::AllocationFailed)?;
+        for ingress in ingresses {
+            let route = DisplayMarketRouteIdentity::try_new(
+                ingress.key().venue_id(),
+                ingress.key().instrument_id(),
+            )
+            .map_err(|_error| ProductionSinkConstructionError::AllocationFailed)?;
+            if routes.insert(route, ingress).is_some() {
+                return Err(ProductionSinkConstructionError::DuplicateRoute);
+            }
+        }
+        Ok(Self {
+            routes,
+            ingress_timeout,
+        })
+    }
+
+    fn try_publish(
+        &mut self,
+        batches: CurrentDecodedProviderBatches,
+        validated_at: Timestamp,
+    ) -> Result<Timestamp, ProductionSinkFailure> {
+        let batch_count = batches.len();
+        if batch_count == 0 {
+            return Err(ProductionSinkFailure::UnexpectedRouteCount);
+        }
+        self.poll_failures()?;
+        let deadline = Instant::now()
+            .checked_add(self.ingress_timeout)
+            .ok_or(ProductionSinkFailure::OutputDeadlineRange)?;
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(batch_count)
+            .map_err(|_error| ProductionSinkFailure::OutputAllocationFailed)?;
+        let mut valid_until: Option<Timestamp> = None;
+        for batch in batches {
+            let route =
+                DisplayMarketRouteIdentity::try_new(batch.key().venue(), batch.key().instrument())
+                    .map_err(|_error| ProductionSinkFailure::OutputAllocationFailed)?;
+            if prepared
+                .iter()
+                .any(|candidate: &PreparedDisplayRoute| candidate.route == route)
+            {
+                return Err(ProductionSinkFailure::UnexpectedRouteCount);
+            }
+            let ingress = self
+                .routes
+                .get(&route)
+                .ok_or(ProductionSinkFailure::UnknownRoute)?;
+            ingress
+                .preflight(&batch, validated_at, deadline)
+                .map_err(|error| {
+                    tracing::error!(%error, "display-market ingress preflight failed");
+                    ProductionSinkFailure::DisplayIngress
+                })?;
+            valid_until = Some(
+                valid_until.map_or(batch.current_lease().valid_until(), |current| {
+                    current.min(batch.current_lease().valid_until())
+                }),
+            );
+            prepared.push(PreparedDisplayRoute { route, batch });
+        }
+        for publication in prepared {
+            let ingress = self
+                .routes
+                .get(&publication.route)
+                .ok_or(ProductionSinkFailure::UnknownRoute)?;
+            ingress
+                .try_publish(publication.batch, validated_at, deadline)
+                .map_err(|error| {
+                    tracing::error!(%error, "display-market ingress publication failed");
+                    ProductionSinkFailure::DisplayIngress
+                })?;
+        }
+        valid_until.ok_or(ProductionSinkFailure::UnexpectedRouteCount)
+    }
+
+    fn poll_failures(&self) -> Result<(), ProductionSinkFailure> {
+        for ingress in self.routes.values() {
+            if let Some(failure) = ingress.current_failure() {
+                tracing::error!(%failure, "display-market ingress observed terminal actor state");
+                return Err(ProductionSinkFailure::DisplayTerminal);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PreparedDisplayRoute {
+    route: DisplayMarketRouteIdentity,
+    batch: CurrentDecodedProviderBatch,
+}
+
+/// Sealed current-batch output boundary shared by raw and adapter-predecoded source paths.
+///
+/// Capture, session, subscription, and source-health authority remain in the parent sink. This
+/// component owns only registry-qualified live-ingress routing, so another bounded display output
+/// can be added without duplicating those authorities.
+#[derive(Debug)]
+struct QualifiedLiveOutput {
+    live_ingress: LiveRuntimeIngress,
+    routes: HashMap<ShardKey, QualifiedRoutePublisher>,
+    health_revision: u64,
+}
+
+impl QualifiedLiveOutput {
+    fn try_new(
+        live_ingress: LiveRuntimeIngress,
+        route_publishers: Vec<RouteActivationPublisher>,
+    ) -> Result<Self, ProductionSinkConstructionError> {
+        if route_publishers.is_empty() {
+            return Err(ProductionSinkConstructionError::MissingRoutes);
+        }
+        let mut routes = HashMap::new();
+        routes
+            .try_reserve(route_publishers.len())
+            .map_err(|_error| ProductionSinkConstructionError::AllocationFailed)?;
+        for publisher in route_publishers {
+            let route = publisher.route().clone();
+            if routes
+                .insert(
+                    route,
+                    QualifiedRoutePublisher {
+                        publisher,
+                        bound_health_revision: None,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ProductionSinkConstructionError::DuplicateRoute);
+            }
+        }
+        Ok(Self {
+            live_ingress,
+            routes,
+            health_revision: 0,
+        })
+    }
+
+    fn advance_health_revision(&mut self) -> Result<(), ProductionSinkFailure> {
+        self.health_revision = self
+            .health_revision
+            .checked_add(1)
+            .ok_or(ProductionSinkFailure::HealthRevisionExhausted)?;
+        Ok(())
+    }
+
+    /// Preflights the complete frame partition before admitting any member route.
+    ///
+    /// Once command admission begins, any failure tears down the exact source generation. The
+    /// registry has already validated every observation and retained their shared capture evidence.
+    fn try_publish(
+        &mut self,
+        batches: CurrentDecodedProviderBatches,
+    ) -> Result<Timestamp, ProductionSinkFailure> {
+        let batch_count = batches.len();
+        if self.health_revision == 0 || batch_count == 0 {
+            return Err(ProductionSinkFailure::UnexpectedRouteCount);
+        }
+        self.poll_failures()?;
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(batch_count)
+            .map_err(|_error| ProductionSinkFailure::OutputAllocationFailed)?;
+        let mut valid_until: Option<Timestamp> = None;
+        for batch in batches {
+            let route = ShardKey::new(batch.key().venue().clone(), batch.key().instrument());
+            if prepared
+                .iter()
+                .any(|candidate: &PreparedQualifiedRoute| candidate.route == route)
+            {
+                return Err(ProductionSinkFailure::UnexpectedRouteCount);
+            }
+            let publisher = self
+                .routes
+                .get_mut(&route)
+                .ok_or(ProductionSinkFailure::UnknownRoute)?;
+            let activation = if publisher.bound_health_revision == Some(self.health_revision) {
+                None
+            } else {
+                Some(publisher.publisher.prepare(&self.live_ingress)?)
+            };
+            valid_until = Some(
+                valid_until.map_or(batch.current_lease().valid_until(), |current| {
+                    current.min(batch.current_lease().valid_until())
+                }),
+            );
+            prepared.push(PreparedQualifiedRoute {
+                route,
+                activation,
+                batch,
+            });
+        }
+        for publication in prepared {
+            let publisher = self
+                .routes
+                .get_mut(&publication.route)
+                .ok_or(ProductionSinkFailure::UnknownRoute)?;
+            match publication.activation {
+                Some(activation) => {
+                    publisher
+                        .publisher
+                        .start_activation(activation, publication.batch)?;
+                    publisher.bound_health_revision = Some(self.health_revision);
+                }
+                None => publisher.publisher.try_publish(publication.batch)?,
+            }
+        }
+        valid_until.ok_or(ProductionSinkFailure::UnexpectedRouteCount)
+    }
+
+    fn poll_failures(&mut self) -> Result<(), ProductionSinkFailure> {
+        for route in self.routes.values_mut() {
+            route.publisher.check_failure()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct QualifiedRoutePublisher {
+    publisher: RouteActivationPublisher,
+    bound_health_revision: Option<u64>,
+}
+
+#[derive(Debug)]
+struct PreparedQualifiedRoute {
+    route: ShardKey,
+    activation: Option<RouteActivationBinding>,
+    batch: CurrentDecodedProviderBatch,
 }
 
 impl RawMarketSink for ProductionRawMarketSink<'_> {
@@ -618,23 +951,6 @@ impl RawMarketSink for ProductionRawMarketSink<'_> {
             .map_err(ProductionSinkFailure::Subscription)
             .map_err(|failure| self.fail(failure))
     }
-}
-
-fn decoded_route(outcome: &DecodeOutcome) -> Result<Option<ShardKey>, ProductionSinkFailure> {
-    let DecodeOutcome::Data(batch) = outcome else {
-        return Ok(None);
-    };
-    let mut observations = batch.observations().iter();
-    let first = observations
-        .next()
-        .ok_or(ProductionSinkFailure::UnexpectedRouteCount)?;
-    let route = ShardKey::new(first.venue().clone(), first.instrument());
-    if observations.any(|observation| {
-        observation.venue() != route.venue() || observation.instrument() != route.instrument()
-    }) {
-        return Err(ProductionSinkFailure::UnexpectedRouteCount);
-    }
-    Ok(Some(route))
 }
 
 fn latest_source_timestamp(outcome: &DecodeOutcome) -> Option<Timestamp> {
@@ -709,22 +1025,30 @@ pub enum ProductionSinkFailure {
     PreAcknowledgementRetainedSizeOverflow,
     #[error("pre-acknowledgement retained-size accounting is inconsistent")]
     PreAcknowledgementBufferAccounting,
+    #[error("qualified live-output staging allocation failed")]
+    OutputAllocationFailed,
+    #[error("qualified output deadline cannot be represented")]
+    OutputDeadlineRange,
+    #[error("display-market ingress failed")]
+    DisplayIngress,
+    #[error("display-market generation failed terminally")]
+    DisplayTerminal,
     #[error("route activation worker is closed")]
     ActivationWorkerClosed,
     #[error("decoded data route is not configured")]
     UnknownRoute,
-    #[error("decoded data route changed during authority upgrade")]
-    RouteMismatch,
-    #[error("Coinbase decoder produced an unexpected routed batch count")]
+    #[error("registry-qualified data produced an invalid routed batch set")]
     UnexpectedRouteCount,
-    #[error("Coinbase authorization or coverage is not finitely bounded")]
+    #[error("source authorization or coverage is not finitely bounded")]
     UnboundedAuthorization,
-    #[error("Coinbase metadata does not declare live coverage")]
+    #[error("source metadata does not declare live coverage")]
     MissingLiveCoverage,
+    #[error("source health revision counter exhausted")]
+    HealthRevisionExhausted,
     #[error("health rebind deadline cannot be represented")]
     HealthDeadlineRange,
-    #[error("decoded route is unavailable before current-data upgrade")]
-    RouteUnavailableBeforeUpgrade,
+    #[error("production source startup observer was dropped")]
+    StartupObserverDropped,
     #[error("active provider request budget was bound more than once")]
     DuplicateActiveRequestBudget,
 }
@@ -761,15 +1085,18 @@ impl ProductionSinkFailure {
             | Self::RouteActivation(_)
             | Self::ActivationBufferCountSaturated
             | Self::ActivationBufferBytesSaturated
+            | Self::OutputAllocationFailed
+            | Self::OutputDeadlineRange
             | Self::ActivationWorkerClosed
             | Self::UnknownRoute
-            | Self::RouteMismatch
             | Self::UnexpectedRouteCount
             | Self::UnboundedAuthorization
             | Self::MissingLiveCoverage
+            | Self::HealthRevisionExhausted
             | Self::HealthDeadlineRange
-            | Self::DuplicateActiveRequestBudget
-            | Self::RouteUnavailableBeforeUpgrade => false,
+            | Self::StartupObserverDropped
+            | Self::DuplicateActiveRequestBudget => false,
+            Self::DisplayIngress | Self::DisplayTerminal => true,
         }
     }
 
@@ -803,14 +1130,18 @@ impl ProductionSinkFailure {
             | Self::RouteActivation(_)
             | Self::PreAcknowledgementRetainedSizeOverflow
             | Self::PreAcknowledgementBufferAccounting
+            | Self::OutputAllocationFailed
+            | Self::OutputDeadlineRange
+            | Self::DisplayIngress
+            | Self::DisplayTerminal
             | Self::UnknownRoute
-            | Self::RouteMismatch
             | Self::UnexpectedRouteCount
             | Self::UnboundedAuthorization
             | Self::MissingLiveCoverage
+            | Self::HealthRevisionExhausted
             | Self::HealthDeadlineRange
-            | Self::DuplicateActiveRequestBudget
-            | Self::RouteUnavailableBeforeUpgrade => SinkError::CaptureIncomplete,
+            | Self::StartupObserverDropped
+            | Self::DuplicateActiveRequestBudget => SinkError::CaptureIncomplete,
         }
     }
 }
@@ -823,4 +1154,8 @@ pub enum ProductionSinkConstructionError {
     DuplicateRoute,
     #[error("production sink route allocation failed")]
     AllocationFailed,
+    #[error("display-market ingress generation does not match source authority")]
+    DisplayGenerationMismatch,
+    #[error("display-market ingress timeout must be non-zero")]
+    InvalidDisplayIngressTimeout,
 }

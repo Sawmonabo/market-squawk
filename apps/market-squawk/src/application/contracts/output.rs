@@ -167,23 +167,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             "comparable",
             "observations",
         ]),
-        "Market.GetUnifiedFeed" => market_rows(&[
-            "instrumentId",
-            "symbol",
-            "symbolVenueId",
-            "assetClass",
-            "quoteCurrency",
-            "definitionRevision",
-            "tickSize",
-            "lotSize",
-            "availability",
-            "confidence",
-            "quote",
-            "orderBook",
-            "selectedSource",
-            "alternatives",
-            "selectionReceipt",
-        ]),
+        "Market.GetUnifiedFeed" => unified_market_rows(),
         "Market.SearchUniverse" => market_rows(&[
             "referenceId",
             "symbol",
@@ -1178,6 +1162,59 @@ fn market_rows(required: &[&str]) -> Value {
         .map(|name| (*name, market_field(name)))
         .collect();
     nullable_rows(signature(fields))
+}
+
+fn unified_market_rows() -> Value {
+    nullable_rows(closed(
+        vec![
+            ("instrumentId", uuid()),
+            ("symbol", bounded_text(256)),
+            ("symbolKind", bounded_text(64)),
+            ("symbolVenueId", nullable(bounded_text(128))),
+            ("assetClass", bounded_text(64)),
+            ("quoteCurrency", bounded_text(32)),
+            ("definitionKind", bounded_text(64)),
+            ("definitionRevision", nullable(unsigned())),
+            ("referenceRevision", nullable(bounded_text(256))),
+            ("permanentFigi", nullable(bounded_text(64))),
+            ("displayName", nullable(bounded_text(512))),
+            ("tickSize", nullable(bounded_text(128))),
+            ("lotSize", nullable(bounded_text(128))),
+            ("executionTermsAvailable", boolean()),
+            ("referenceEvidence", nullable(record())),
+            ("availability", bounded_text(128)),
+            ("confidence", bounded_text(256)),
+            ("quote", record()),
+            ("orderBook", nullable(record())),
+            ("selectedSource", nullable(record())),
+            ("alternatives", bounded_array(record(), 8)),
+            ("selectionReceipt", record()),
+        ],
+        &[
+            "instrumentId",
+            "symbol",
+            "symbolKind",
+            "symbolVenueId",
+            "assetClass",
+            "quoteCurrency",
+            "definitionKind",
+            "definitionRevision",
+            "referenceRevision",
+            "permanentFigi",
+            "displayName",
+            "tickSize",
+            "lotSize",
+            "executionTermsAvailable",
+            "referenceEvidence",
+            "availability",
+            "confidence",
+            "quote",
+            "orderBook",
+            "selectedSource",
+            "alternatives",
+            "selectionReceipt",
+        ],
+    ))
 }
 
 fn market_field(name: &str) -> Value {

@@ -14,6 +14,9 @@ const LIVE_SOURCES = new Set([
   "coinbase.public-market-data",
   "coinbase.exchange-direct-market-data",
   "kraken.spot-public-market-data",
+  "alpaca.basic-market-data",
+  "tradier.brokerage-market-data",
+  "kraken.spot-authenticated-level3-market-data",
 ])
 const PUBLIC_LIVE_SOURCES = new Set([
   "coinbase.public-market-data",
@@ -137,6 +140,7 @@ export function lifecycleControls(source: SourceEvidence): LifecycleControl[] {
     expectedStateRevision: lifecycle.stateRevision,
   }
   const current = lifecycle.currentGeneration
+  const runtimeGeneration = lifecycle.runtimeGenerationSha256
   const hasConfiguration =
     lifecycle.configurationSessionId !== null &&
     lifecycle.publicConfigurationSha256 !== undefined
@@ -185,11 +189,13 @@ export function lifecycleControls(source: SourceEvidence): LifecycleControl[] {
         ...(LIVE_SOURCES.has(source.id)
           ? [control("verify", "Verify", base)]
           : []),
-        ...(current
+        ...(current || runtimeGeneration
           ? [
               control("resynchronize", "Resynchronize", {
                 ...base,
-                expectedGeneration: current,
+                ...(current
+                  ? { expectedGeneration: current }
+                  : { expectedRuntimeGenerationSha256: runtimeGeneration }),
                 reason: "desktop-user-request",
               }),
             ]

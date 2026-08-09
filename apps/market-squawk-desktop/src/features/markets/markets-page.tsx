@@ -115,7 +115,15 @@ function ReadyMarketsPage({
   const normalizedSearch = searchText.trim().toLocaleLowerCase()
   const visibleRows = normalizedSearch
     ? rows.filter((row) =>
-        [row.symbol, row.assetClass, row.quoteCurrency, row.selectedSource?.providerId]
+        [
+          row.symbol,
+          row.displayName,
+          row.permanentFigi,
+          row.assetClass,
+          row.quoteCurrency,
+          row.selectedSource?.providerId,
+          row.selectedSource?.providerSymbol,
+        ]
           .filter((value): value is string => Boolean(value))
           .some((value) => value.toLocaleLowerCase().includes(normalizedSearch)),
       )
@@ -340,7 +348,7 @@ function ReadyMarketsPage({
               </summary>
               <InstrumentWorkspace
                 instrumentId={selectedInstrument}
-                orderBook={selectedRow?.orderBook ?? null}
+                market={selectedRow}
                 trades={{ available: tradesAvailable, query: trades }}
                 quotes={{ available: quotesAvailable, query: quotes }}
                 books={{ available: booksAvailable, query: books }}
@@ -489,7 +497,7 @@ function MarketCard({ row, selected, onSelect }: {
           </p>
           <h2 className="mt-2 truncate text-xl font-semibold">{row.symbol}</h2>
           <p className="mt-1 truncate text-[11px] text-muted-foreground">
-            {source?.providerId ?? "No source available"}
+            {row.displayName ?? source?.providerId ?? "No source available"}
           </p>
         </div>
         <EvidenceBadge
@@ -525,7 +533,8 @@ function MarketCard({ row, selected, onSelect }: {
         />
         <Fact label="Updated" value={dateTime(source?.freshness.availableAt ?? null)} />
       </dl>
-      {source && (!source.integrity.generationCurrent || !source.integrity.snapshotInitialized) ? (
+      {source &&
+      (source.integrity.generationCurrent === false || !source.integrity.snapshotInitialized) ? (
         <div className="mt-4 flex gap-2 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-xs text-amber-200">
           <CircleAlert className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
           <span>Source synchronization is incomplete. This observation is not treated as current.</span>
@@ -545,14 +554,14 @@ type InstrumentQuery = {
 
 function InstrumentWorkspace({
   instrumentId,
-  orderBook,
+  market,
   trades,
   quotes,
   books,
   comparisons,
 }: {
   instrumentId: string
-  orderBook: UnifiedMarketRow["orderBook"]
+  market: UnifiedMarketRow | null
   trades: InstrumentQuery
   quotes: InstrumentQuery
   books: InstrumentQuery
@@ -579,7 +588,8 @@ function InstrumentWorkspace({
           Trades, quotes, book, and cross-source comparison
         </h2>
       </div>
-      {orderBook ? <IndividualOrderBook book={orderBook} /> : null}
+      {market?.selectedSource ? <SelectedSourceSummary row={market} /> : null}
+      {market?.orderBook ? <IndividualOrderBook book={market.orderBook} /> : null}
       <div className="grid gap-4 xl:grid-cols-2">
         <InstrumentPanel
           title="Last trades"
@@ -695,6 +705,53 @@ function InstrumentWorkspace({
           ) : null}
         </InstrumentPanel>
       </div>
+    </section>
+  )
+}
+
+function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
+  const source = row.selectedSource
+  if (!source) return null
+
+  return (
+    <section className="mb-4 rounded-xl border border-border bg-card/35 p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+            Chosen automatically
+          </p>
+          <h3 className="mt-1 text-sm font-semibold">
+            {humanize(source.providerId)} · {source.providerSymbol ?? row.symbol}
+          </h3>
+          <p className="mt-1 max-w-2xl text-[11px] leading-5 text-muted-foreground">
+            Market Squawk selected the best eligible current source for this instrument. Any delay,
+            coverage limit, or confidence downgrade remains attached below.
+          </p>
+        </div>
+        <EvidenceBadge
+          label={source.freshness.freshAtSelection ? "Current" : "Not current"}
+          tone={source.freshness.freshAtSelection ? "good" : "bad"}
+        />
+      </div>
+      <dl className="mt-4 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Fact label="Confidence" value={row.confidence} />
+        <Fact label="Coverage" value={humanize(source.coverage)} />
+        <Fact label="Market depth" value={source.depthLabel} />
+        <Fact label="Updated" value={dateTime(source.freshness.availableAt)} />
+      </dl>
+      <details className="mt-4 rounded-lg border border-border bg-background/30 p-3">
+        <summary className="cursor-pointer text-xs font-semibold">Data confidence</summary>
+        <dl className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Fact label="Provider" value={source.providerId} />
+          <Fact label="Source" value={source.sourceId} />
+          <Fact label="Venue" value={source.venueId ?? "Not reported"} />
+          <Fact label="Provider channel" value={source.providerChannel} />
+          <Fact label="Timing" value={humanize(source.timing)} />
+          <Fact label="Quality" value={humanize(source.quality)} />
+          <Fact label="Source health" value={humanize(source.health)} />
+          <Fact label="Integrity" value={humanize(source.integrity.state)} />
+        </dl>
+      </details>
     </section>
   )
 }

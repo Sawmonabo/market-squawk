@@ -85,6 +85,7 @@ market-squawk-adapter-files = { workspace = true }
 market-squawk-adapter-fred = { workspace = true }
 market-squawk-adapter-kraken = { workspace = true }
 market-squawk-adapter-nasdaq-symbols = { workspace = true }
+market-squawk-adapter-openfigi = { workspace = true }
 market-squawk-adapter-paper = { workspace = true }
 market-squawk-adapter-portfolio = { workspace = true }
 market-squawk-adapter-sec = { workspace = true }

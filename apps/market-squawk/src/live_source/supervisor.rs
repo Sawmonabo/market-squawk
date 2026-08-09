@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use market_squawk_domain::{ConnectionGeneration, IdentityError, SourceIdentifier};
 use market_squawk_live::{LiveIngressBindError, LiveRuntimeIngress, ShardKey};
 use market_squawk_platform::{
@@ -27,11 +28,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     composition::{ProductionCoinbaseProfileError, system_timestamp},
-    provider::{ProductionProviderError, ProductionSourceProfile},
+    display_market::{
+        DisplayMarketActorLimits, DisplayMarketActorShutdown, DisplayMarketDirectory,
+        DisplayMarketIngress, DisplayMarketKey, DisplayMarketMonitorError,
+        DisplayMarketRouteIdentity, DisplayMarketSupervisorMonitor, DisplayMarketTerminalFailure,
+    },
+    provider::{ProductionLiveSource, ProductionProviderError, ProductionSourceProfile},
     route_actor::{RouteActorWorker, RouteBufferLimits, spawn_route_activation},
     sink::{
-        ProductionRawMarketSink, ProductionRawMarketSinkInput, ProductionSinkConstructionError,
-        ProductionSinkFailure,
+        ProductionDisplayMarketSinkInput, ProductionRawMarketSink, ProductionRawMarketSinkInput,
+        ProductionSinkConstructionError, ProductionSinkFailure,
     },
     subscription_state::{
         GenerationIdentity, SubscriptionConstructionError, SubscriptionLimits,
@@ -52,6 +58,8 @@ const BACKOFF_JITTER_SAMPLE_BASIS_POINTS: u16 = 1_000;
 pub(super) struct ProductionGenerationOutcome {
     generation: ConnectionGeneration,
     source_error: Option<SourceError>,
+    startup_required: bool,
+    startup_ready: bool,
 }
 
 impl ProductionGenerationOutcome {
@@ -62,6 +70,10 @@ impl ProductionGenerationOutcome {
 
     pub(super) const fn source_error(self) -> Option<SourceError> {
         self.source_error
+    }
+
+    const fn failed_before_startup_readiness(self) -> bool {
+        self.startup_required && !self.startup_ready
     }
 }
 
@@ -75,9 +87,32 @@ pub(super) struct ProductionSourceSupervisor {
     backoff: ProviderBackoffAuthority,
     paths: LocalPaths,
     capture_process: CaptureProcessInfrastructure,
-    live_ingress: LiveRuntimeIngress,
-    routes: Vec<ShardKey>,
-    route_buffer_limits: RouteBufferLimits,
+    output: ProductionSupervisorOutput,
+}
+
+#[derive(Debug)]
+enum ProductionSupervisorOutput {
+    Live {
+        ingress: LiveRuntimeIngress,
+        routes: Vec<ShardKey>,
+        buffer_limits: RouteBufferLimits,
+    },
+    Display {
+        directory: DisplayMarketDirectory,
+        routes: Vec<DisplayMarketRouteIdentity>,
+        actor_limits: DisplayMarketActorLimits,
+    },
+}
+
+#[derive(Debug)]
+enum PreparedGenerationOutput {
+    Live {
+        ingress: LiveRuntimeIngress,
+        route_publishers: Vec<super::route_actor::RouteActivationPublisher>,
+    },
+    Display {
+        display_ingresses: Vec<DisplayMarketIngress>,
+    },
 }
 
 impl ProductionSourceSupervisor {
@@ -119,6 +154,69 @@ impl ProductionSourceSupervisor {
         route_buffer_limits: RouteBufferLimits,
         provider_rate: ProviderRateAuthority,
     ) -> Result<Self, ProductionSupervisorError> {
+        let output = ProductionSupervisorOutput::Live {
+            ingress: live_ingress,
+            routes,
+            buffer_limits: route_buffer_limits,
+        };
+        Self::try_new_with_output(
+            config,
+            profile,
+            paths,
+            capture_process,
+            output,
+            provider_rate,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "display source composition keeps directory, bounds, and durable authority explicit"
+    )]
+    pub(super) fn try_new_display_with_provider_rate(
+        config: &AppConfig,
+        profile: ProductionSourceProfile,
+        paths: LocalPaths,
+        capture_process: CaptureProcessInfrastructure,
+        directory: DisplayMarketDirectory,
+        routes: Vec<DisplayMarketRouteIdentity>,
+        actor_limits: DisplayMarketActorLimits,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<Self, ProductionSupervisorError> {
+        if !profile.supports_display_output() {
+            return Err(ProductionSupervisorError::UnsupportedDisplayProvider);
+        }
+        if routes.is_empty() {
+            return Err(ProductionSupervisorError::MissingDisplayRoutes);
+        }
+        for (index, route) in routes.iter().enumerate() {
+            if routes[index.saturating_add(1)..].contains(route) {
+                return Err(ProductionSupervisorError::DuplicateDisplayRoute);
+            }
+        }
+        let output = ProductionSupervisorOutput::Display {
+            directory,
+            routes,
+            actor_limits,
+        };
+        Self::try_new_with_output(
+            config,
+            profile,
+            paths,
+            capture_process,
+            output,
+            provider_rate,
+        )
+    }
+
+    fn try_new_with_output(
+        config: &AppConfig,
+        profile: ProductionSourceProfile,
+        paths: LocalPaths,
+        capture_process: CaptureProcessInfrastructure,
+        output: ProductionSupervisorOutput,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<Self, ProductionSupervisorError> {
         let registered_at = system_timestamp()?;
         let authority_store = LocalAuthorityStateStore::try_open(
             paths.root().join("authority").join(profile.source_key()),
@@ -149,9 +247,7 @@ impl ProductionSourceSupervisor {
             backoff,
             paths,
             capture_process,
-            live_ingress,
-            routes,
-            route_buffer_limits,
+            output,
         })
     }
 
@@ -166,9 +262,17 @@ impl ProductionSourceSupervisor {
             self.profile.source_key(),
             uuid::Uuid::new_v4()
         ))?);
+        let output_route_count = match &self.output {
+            ProductionSupervisorOutput::Live { routes, .. } => routes.len(),
+            ProductionSupervisorOutput::Display { routes, .. } => routes.len(),
+        };
         let mut route_workers = Vec::new();
+        let mut display_monitors = Vec::new();
         route_workers
-            .try_reserve_exact(self.routes.len())
+            .try_reserve_exact(output_route_count)
+            .map_err(|_error| ProductionSupervisorError::AllocationFailed)?;
+        display_monitors
+            .try_reserve_exact(output_route_count)
             .map_err(|_error| ProductionSupervisorError::AllocationFailed)?;
         let registry = self
             .registry
@@ -176,11 +280,12 @@ impl ProductionSourceSupervisor {
             .ok_or(ProductionSupervisorError::AlreadyShutdown)?;
         let session = registry.begin_next_session(&self.registered, session_id, at)?;
         let generation = session.generation();
+        let startup_required = startup.is_some();
         let route_cancellation = cancellation.child_token();
         let mut capture_control = None;
         let mut writer_handle = None;
 
-        let source_result = async {
+        let source_result: Result<(Option<SourceError>, bool), ProductionSupervisorError> = async {
             let capabilities = registry.take_capture_generation_capabilities(&session)?;
             let health_reporter = registry.take_current_health_reporter(&session)?;
             let (publisher, control, writer) = raw_capture_channel(
@@ -206,20 +311,68 @@ impl ProductionSourceSupervisor {
             activate_owned_capture(&mut capture_control, &writer_handle)?;
             let source_generation = registry.take_live_source_generation(&session)?;
 
-            let mut route_publishers = Vec::new();
-            route_publishers
-                .try_reserve_exact(self.routes.len())
-                .map_err(|_error| ProductionSupervisorError::AllocationFailed)?;
-            for route in &self.routes {
-                let dormant = self.live_ingress.reserve_route(route.clone())?;
-                let (publisher, worker) = spawn_route_activation(
-                    dormant,
-                    self.route_buffer_limits,
-                    route_cancellation.clone(),
-                );
-                route_publishers.push(publisher);
-                route_workers.push(worker);
-            }
+            let prepared_output = match &self.output {
+                ProductionSupervisorOutput::Live {
+                    ingress,
+                    routes,
+                    buffer_limits,
+                } => {
+                    let mut route_publishers = Vec::new();
+                    route_publishers
+                        .try_reserve_exact(routes.len())
+                        .map_err(|_error| ProductionSupervisorError::AllocationFailed)?;
+                    for route in routes {
+                        let dormant = ingress.reserve_route(route.clone())?;
+                        let (publisher, worker) = spawn_route_activation(
+                            dormant,
+                            *buffer_limits,
+                            route_cancellation.clone(),
+                        );
+                        route_publishers.push(publisher);
+                        route_workers.push(worker);
+                    }
+                    PreparedGenerationOutput::Live {
+                        ingress: ingress.clone(),
+                        route_publishers,
+                    }
+                }
+                ProductionSupervisorOutput::Display {
+                    directory,
+                    routes,
+                    actor_limits,
+                } => {
+                    let registration_deadline = Instant::now()
+                        .checked_add(self.config.source_shutdown())
+                        .ok_or(ProductionSupervisorError::DisplayDeadlineRange)?;
+                    let mut display_ingresses = Vec::new();
+                    display_ingresses
+                        .try_reserve_exact(routes.len())
+                        .map_err(|_error| ProductionSupervisorError::AllocationFailed)?;
+                    for route in routes {
+                        let key = DisplayMarketKey::try_new(
+                            self.profile.metadata().source_id(),
+                            route.venue_id(),
+                            route.instrument_id(),
+                            generation,
+                        )
+                        .map_err(|error| {
+                            tracing::error!(%error, "display-market route key is invalid");
+                            ProductionSupervisorError::DisplayDirectory
+                        })?;
+                        let registration = directory
+                            .register(key, *actor_limits, &cancellation, registration_deadline)
+                            .await
+                            .map_err(|error| {
+                                tracing::error!(%error, "display-market registration failed");
+                                ProductionSupervisorError::DisplayDirectory
+                            })?;
+                        let (ingress, monitor) = registration.into_parts();
+                        display_ingresses.push(ingress);
+                        display_monitors.push(monitor);
+                    }
+                    PreparedGenerationOutput::Display { display_ingresses }
+                }
+            };
 
             let subscription_products = self.profile.subscription_product_snapshot()?;
             let subscription = SubscriptionStateMachine::try_new_with_policy(
@@ -243,23 +396,63 @@ impl ProductionSourceSupervisor {
             );
             let mut source = self.profile.try_source(source_generation)?;
             let decoder = self.profile.decoder()?;
-            let mut sink = ProductionRawMarketSink::try_new(ProductionRawMarketSinkInput {
-                capture: publisher,
-                registry,
-                session: &session,
-                health_reporter,
-                decoder,
-                subscription,
-                live_ingress: self.live_ingress.clone(),
-                routes: route_publishers,
-            })?;
-            if let Some(sender) = startup.take() {
-                sender
-                    .send(())
-                    .map_err(|_value| ProductionSupervisorError::StartupObserverDropped)?;
-            }
-            let result = source.run(&mut sink, cancellation).await;
+            let mut sink = match prepared_output {
+                PreparedGenerationOutput::Live {
+                    ingress,
+                    route_publishers,
+                } => {
+                    let input = ProductionRawMarketSinkInput {
+                        capture: publisher,
+                        registry,
+                        session: &session,
+                        health_reporter,
+                        decoder,
+                        subscription,
+                        live_ingress: ingress,
+                        routes: route_publishers,
+                    };
+                    match startup.take() {
+                        Some(readiness) => ProductionRawMarketSink::try_new_with_startup_readiness(
+                            input, readiness,
+                        )?,
+                        None => ProductionRawMarketSink::try_new(input)?,
+                    }
+                }
+                PreparedGenerationOutput::Display { display_ingresses } => {
+                    let input = ProductionDisplayMarketSinkInput {
+                        capture: publisher,
+                        registry,
+                        session: &session,
+                        health_reporter,
+                        decoder,
+                        subscription,
+                        display_ingresses,
+                        ingress_timeout: self.config.source_shutdown(),
+                    };
+                    match startup.take() {
+                        Some(readiness) => {
+                            ProductionRawMarketSink::try_new_display_with_startup_readiness(
+                                input, readiness,
+                            )?
+                        }
+                        None => ProductionRawMarketSink::try_new_display(input)?,
+                    }
+                }
+            };
+            let result = if display_monitors.is_empty() {
+                source.run(&mut sink, cancellation.clone()).await
+            } else {
+                run_display_source(
+                    &mut source,
+                    &mut sink,
+                    cancellation.clone(),
+                    &mut display_monitors,
+                    self.config.source_shutdown(),
+                )
+                .await?
+            };
             let terminal = sink.terminal_failure();
+            let startup_ready = sink.startup_ready();
             if let Some(failure) = terminal {
                 tracing::warn!(
                     source = self.profile.source_key(),
@@ -269,7 +462,7 @@ impl ProductionSourceSupervisor {
                 );
             }
             drop(sink);
-            match (result, terminal) {
+            let source_error = match (result, terminal) {
                 (Err(_error), Some(failure)) if failure.requires_generation_resynchronization() => {
                     Ok(Some(SourceError::GenerationResynchronizationRequired))
                 }
@@ -280,7 +473,8 @@ impl ProductionSourceSupervisor {
                 }
                 (Ok(()), Some(failure)) => Err(ProductionSupervisorError::Sink(failure)),
                 (Ok(()), None) => Ok(None),
-            }
+            }?;
+            Ok((source_error, startup_ready))
         }
         .await;
 
@@ -290,6 +484,17 @@ impl ProductionSourceSupervisor {
             let route_result = route_worker_cleanup_error(worker).await;
             if cleanup_error.is_none() {
                 cleanup_error = route_result;
+            }
+        }
+        if let ProductionSupervisorOutput::Display { directory, .. } = &self.output {
+            let display_result = unregister_display_generation(
+                directory,
+                &display_monitors,
+                self.config.source_shutdown(),
+            )
+            .await;
+            if cleanup_error.is_none() {
+                cleanup_error = display_result;
             }
         }
         if let Err(error) = registry.end_session(&session, at)
@@ -322,9 +527,12 @@ impl ProductionSourceSupervisor {
         if let Some(error) = cleanup_error {
             return Err(error);
         }
+        let (source_error, startup_ready) = source_result?;
         Ok(ProductionGenerationOutcome {
             generation,
-            source_error: source_result?,
+            source_error,
+            startup_required,
+            startup_ready,
         })
     }
 
@@ -359,6 +567,15 @@ impl ProductionSourceSupervisor {
             let outcome = self
                 .run_one_generation(cancellation.child_token(), startup)
                 .await?;
+            if outcome.failed_before_startup_readiness() {
+                return match outcome.source_error() {
+                    Some(SourceError::Cancelled) if cancellation.is_cancelled() => Ok(()),
+                    Some(source) => Err(ProductionSupervisorError::SourceFailedBeforeReadiness(
+                        source,
+                    )),
+                    None => Err(ProductionSupervisorError::SourceCompletedBeforeReadiness),
+                };
+            }
             let Some(error) = outcome.source_error() else {
                 self.wait_after_refusal(cancellation).await?;
                 continue;
@@ -442,6 +659,101 @@ impl ProductionSourceSupervisor {
     }
 }
 
+async fn run_display_source(
+    source: &mut ProductionLiveSource,
+    sink: &mut ProductionRawMarketSink<'_>,
+    cancellation: CancellationToken,
+    monitors: &mut [DisplayMarketSupervisorMonitor],
+    shutdown_timeout: Duration,
+) -> Result<Result<(), SourceError>, ProductionSupervisorError> {
+    enum Outcome {
+        Source(Result<(), SourceError>),
+        Terminal(DisplayMarketTerminalFailure),
+        Cancelled(Result<(), SourceError>),
+        MonitorClosed(DisplayMarketMonitorError),
+    }
+
+    let outcome = {
+        let source_run = source.run(sink, cancellation.clone());
+        tokio::pin!(source_run);
+        tokio::select! {
+            biased;
+            result = &mut source_run => Outcome::Source(result),
+            monitor = wait_for_display_terminal(monitors, &cancellation) => {
+                cancellation.cancel();
+                let stopped = tokio::time::timeout(shutdown_timeout, &mut source_run)
+                    .await
+                    .map_err(|_elapsed| {
+                        ProductionSupervisorError::DisplaySourceShutdownDeadline
+                    })?;
+                match monitor {
+                    Ok(failure) => Outcome::Terminal(failure),
+                    Err(DisplayMarketMonitorError::Cancelled) => Outcome::Cancelled(stopped),
+                    Err(error) => Outcome::MonitorClosed(error),
+                }
+            }
+        }
+    };
+    match outcome {
+        Outcome::Source(result) | Outcome::Cancelled(result) => Ok(result),
+        Outcome::Terminal(failure) => {
+            sink.record_display_terminal_failure(failure);
+            Ok(Ok(()))
+        }
+        Outcome::MonitorClosed(error) => {
+            tracing::error!(%error, "display-market terminal monitor failed");
+            Err(ProductionSupervisorError::DisplayMonitor)
+        }
+    }
+}
+
+async fn wait_for_display_terminal(
+    monitors: &mut [DisplayMarketSupervisorMonitor],
+    cancellation: &CancellationToken,
+) -> Result<DisplayMarketTerminalFailure, DisplayMarketMonitorError> {
+    let waits = FuturesUnordered::new();
+    for monitor in monitors {
+        waits.push(monitor.wait_until_terminal(cancellation));
+    }
+    let mut waits = waits;
+    waits
+        .next()
+        .await
+        .ok_or(DisplayMarketMonitorError::WorkerClosed)?
+}
+
+async fn unregister_display_generation(
+    directory: &DisplayMarketDirectory,
+    monitors: &[DisplayMarketSupervisorMonitor],
+    shutdown_timeout: Duration,
+) -> Option<ProductionSupervisorError> {
+    let Some(deadline) = Instant::now().checked_add(shutdown_timeout) else {
+        return Some(ProductionSupervisorError::DisplayDeadlineRange);
+    };
+    let cleanup_cancellation = CancellationToken::new();
+    let mut first_error = None;
+    for monitor in monitors.iter().rev() {
+        let result = directory
+            .unregister(monitor.key(), &cleanup_cancellation, deadline)
+            .await;
+        let error = match result {
+            Ok(DisplayMarketActorShutdown::Graceful) => None,
+            Ok(disposition) => {
+                tracing::error!(?disposition, "display-market actor shutdown was incomplete");
+                Some(ProductionSupervisorError::IncompleteDisplayShutdown)
+            }
+            Err(error) => {
+                tracing::error!(%error, "display-market actor unregister failed");
+                Some(ProductionSupervisorError::DisplayDirectory)
+            }
+        };
+        if first_error.is_none() {
+            first_error = error;
+        }
+    }
+    first_error
+}
+
 pub(super) async fn route_worker_cleanup_error(
     worker: RouteActorWorker,
 ) -> Option<ProductionSupervisorError> {
@@ -477,14 +789,32 @@ pub enum ProductionSupervisorError {
     AllocationFailed,
     #[error("production source supervisor static policy is invalid")]
     InvalidStaticPolicy,
+    #[error("production display mode is unavailable for this provider")]
+    UnsupportedDisplayProvider,
+    #[error("production display mode requires at least one mapped instrument")]
+    MissingDisplayRoutes,
+    #[error("production display mode contains a duplicate mapped instrument route")]
+    DuplicateDisplayRoute,
+    #[error("production display lifecycle deadline cannot be represented")]
+    DisplayDeadlineRange,
+    #[error("production display source did not stop within its bounded cancellation deadline")]
+    DisplaySourceShutdownDeadline,
+    #[error("display-market terminal monitor failed")]
+    DisplayMonitor,
+    #[error("display-market directory operation failed")]
+    DisplayDirectory,
+    #[error("display-market exact-generation actor did not stop cleanly")]
+    IncompleteDisplayShutdown,
     #[error("capture activation began without cleanup-owned control")]
     MissingCaptureControlOwnership,
     #[error("capture activation began without cleanup-owned writer")]
     MissingCaptureWriterOwnership,
     #[error("capture writer did not complete bounded shutdown: {0:?}")]
     IncompleteCaptureShutdown(market_squawk_platform::ProcessCaptureShutdownOutcome),
-    #[error("production source startup observer was dropped")]
-    StartupObserverDropped,
+    #[error("production source failed before subscription and first-data readiness: {0}")]
+    SourceFailedBeforeReadiness(SourceError),
+    #[error("production source completed before subscription and first-data readiness")]
+    SourceCompletedBeforeReadiness,
     #[error("production source generation failed terminally: {0}")]
     TerminalSource(SourceError),
     #[error("production provider budget is unavailable: {0:?}")]

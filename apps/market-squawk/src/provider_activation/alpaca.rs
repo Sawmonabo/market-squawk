@@ -86,7 +86,7 @@ impl ProviderAdapterActivation {
         &self,
         lease: ProviderActivationLease,
         iex: AlpacaIexLiveConfig,
-        options: AlpacaOptionsLiveConfig,
+        options: Option<AlpacaOptionsLiveConfig>,
         cancellation: CancellationToken,
     ) -> Result<AlpacaBasicAccountActivation, AlpacaBasicActivationError> {
         if cancellation.is_cancelled() {
@@ -94,7 +94,7 @@ impl ProviderAdapterActivation {
         }
         let binding =
             ProviderAccountBinding::try_from_lease(ProviderMarketAccount::AlpacaBasic, &lease)?;
-        validate_configurations(&lease, &binding, &iex, &options)?;
+        validate_configurations(&lease, &binding, &iex, options.as_ref())?;
         let secret = self
             .onboarding
             .read_secret_for_activation_request(&lease, cancellation)
@@ -119,7 +119,7 @@ impl ProviderAdapterActivation {
             authority,
             credentials,
             iex: Some(iex),
-            options: Some(options),
+            options,
         })
     }
 }
@@ -128,7 +128,7 @@ fn validate_configurations(
     lease: &ProviderActivationLease,
     binding: &ProviderAccountBinding,
     iex: &AlpacaIexLiveConfig,
-    options: &AlpacaOptionsLiveConfig,
+    options: Option<&AlpacaOptionsLiveConfig>,
 ) -> Result<(), AlpacaBasicActivationError> {
     let expected_budget = ProviderRateDeclaration::try_for_authorization_subject(
         lease
@@ -141,17 +141,22 @@ fn validate_configurations(
     .policy()
     .clone();
     let iex_metadata = iex.metadata();
-    let options_metadata = options.metadata();
     if !binding.validates_metadata(iex_metadata)
-        || !binding.validates_metadata(options_metadata)
         || iex_metadata.quality_ceiling() != DataQuality::DirectUnverified
-        || options_metadata.quality_ceiling() != DataQuality::Indicative
         || iex_metadata.budget_policy() != Some(&expected_budget)
-        || options_metadata.budget_policy() != Some(&expected_budget)
         || iex.endpoint() != "wss://stream.data.alpaca.markets/v2/iex"
-        || options.endpoint() != "wss://stream.data.alpaca.markets/v1beta1/indicative"
     {
         return Err(AlpacaBasicActivationError::SourceBinding);
+    }
+    if let Some(options) = options {
+        let metadata = options.metadata();
+        if !binding.validates_metadata(metadata)
+            || metadata.quality_ceiling() != DataQuality::Indicative
+            || metadata.budget_policy() != Some(&expected_budget)
+            || options.endpoint() != "wss://stream.data.alpaca.markets/v1beta1/indicative"
+        {
+            return Err(AlpacaBasicActivationError::SourceBinding);
+        }
     }
     Ok(())
 }

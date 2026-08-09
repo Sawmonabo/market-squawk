@@ -7,6 +7,7 @@ mod diagnostics;
 mod evidence;
 mod fair_value;
 mod listing_reference;
+mod market_data_instruments;
 mod migration_preflight;
 mod observed_revisions;
 mod onboarding;
@@ -49,6 +50,14 @@ pub use self::listing_reference::{
     ListingReferenceRecordInput, ListingReferenceRightsState, ListingReferenceSearchMatch,
     ListingReferenceSearchPage, ListingReferenceSourceFileInput, MAX_LISTING_REFERENCE_RECORDS,
     MAX_LISTING_REFERENCE_SEARCH_ROWS,
+};
+pub use self::market_data_instruments::{
+    MARKET_DATA_INSTRUMENT_ID_NAMESPACE, MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS,
+    MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS, MarketDataInstrumentCatalogError,
+    MarketDataInstrumentMatchKind, MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
+    MarketDataInstrumentSearchMatch, MarketDataInstrumentSearchPage,
+    MarketDataInstrumentSynchronization, MarketDataInstrumentSynchronizationCapability,
+    MarketDataInstrumentSynchronizationReceipt, market_data_instrument_id,
 };
 pub use self::onboarding::{
     OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,

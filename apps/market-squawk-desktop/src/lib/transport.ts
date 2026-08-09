@@ -620,6 +620,7 @@ export interface SourceLifecycleRequest {
   provider: string
   expectedStateRevision: number
   expectedGeneration?: number
+  expectedRuntimeGenerationSha256?: string
   onboardingSessionId?: string
   publicConfigurationSha256?: string
   reason?: string

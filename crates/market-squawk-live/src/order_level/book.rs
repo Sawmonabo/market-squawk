@@ -181,6 +181,7 @@ pub struct OrderLevelPriceProjection {
     freshness: MarketFreshness,
     source_timestamp: Timestamp,
     received_at: Timestamp,
+    available_at: Timestamp,
     provider_sequence: Option<SequenceNumber>,
     diagnostic_ordinal: Option<u64>,
     sequence: SequenceEvidence,
@@ -230,6 +231,11 @@ impl OrderLevelPriceProjection {
         self.received_at
     }
 
+    /// Returns when this committed order-level state became available to local readers.
+    pub const fn available_at(&self) -> Timestamp {
+        self.available_at
+    }
+
     /// Returns the last provider sequence, never a local ordinal.
     pub const fn provider_sequence(&self) -> Option<SequenceNumber> {
         self.provider_sequence
@@ -275,6 +281,7 @@ pub struct OrderLevelCommit {
     provider_sequence: Option<SequenceNumber>,
     diagnostic_ordinal: Option<u64>,
     quality: DataQuality,
+    available_at: Timestamp,
 }
 
 impl OrderLevelCommit {
@@ -307,6 +314,11 @@ impl OrderLevelCommit {
     pub const fn quality(self) -> DataQuality {
         self.quality
     }
+
+    /// Returns when the committed state became available to local readers.
+    pub const fn available_at(self) -> Timestamp {
+        self.available_at
+    }
 }
 
 /// Bounded generation-owned order-level source of truth.
@@ -331,6 +343,7 @@ pub struct OrderLevelBook {
     freshness: MarketFreshness,
     source_timestamp: Option<Timestamp>,
     received_at: Option<Timestamp>,
+    available_at: Option<Timestamp>,
     last_batch_identifier: Option<SourceIdentifier>,
 }
 
@@ -364,6 +377,7 @@ impl OrderLevelBook {
             freshness: MarketFreshness::Uninitialized,
             source_timestamp: None,
             received_at: None,
+            available_at: None,
             last_batch_identifier: None,
         })
     }
@@ -418,6 +432,7 @@ impl OrderLevelBook {
         self.freshness = MarketFreshness::Uninitialized;
         self.source_timestamp = None;
         self.received_at = None;
+        self.available_at = None;
         self.last_batch_identifier = None;
         Ok(revision)
     }
@@ -518,6 +533,11 @@ impl OrderLevelBook {
         self.freshness
     }
 
+    /// Returns when the latest atomically committed state became available to local readers.
+    pub const fn available_at(&self) -> Option<Timestamp> {
+        self.available_at
+    }
+
     /// Derives a deterministic checked price-level view without changing order-level state.
     ///
     /// Duplicate-price provider orders remain distinct in [`Self::orders`]. This method sums them
@@ -534,6 +554,9 @@ impl OrderLevelBook {
             .ok_or(OrderLevelProjectionError::Unavailable)?;
         let received_at = self
             .received_at
+            .ok_or(OrderLevelProjectionError::Unavailable)?;
+        let available_at = self
+            .available_at
             .ok_or(OrderLevelProjectionError::Unavailable)?;
         let batch_identifier = self
             .last_batch_identifier
@@ -560,6 +583,7 @@ impl OrderLevelBook {
             freshness: self.freshness,
             source_timestamp,
             received_at,
+            available_at,
             provider_sequence: self.provider_sequence,
             diagnostic_ordinal: self.diagnostic_ordinal,
             sequence,
@@ -643,6 +667,7 @@ impl OrderLevelBook {
         self.freshness = batch.freshness;
         self.source_timestamp = Some(batch.source_timestamp);
         self.received_at = Some(batch.received_at);
+        self.available_at = Some(batch.available_at);
         self.last_batch_identifier = Some(batch.batch_identifier);
         Ok(OrderLevelCommit {
             revision: next_revision,
@@ -651,6 +676,7 @@ impl OrderLevelBook {
             provider_sequence,
             diagnostic_ordinal: self.diagnostic_ordinal,
             quality: self.quality(),
+            available_at: batch.available_at,
         })
     }
 
@@ -664,6 +690,9 @@ impl OrderLevelBook {
             || self
                 .received_at
                 .is_some_and(|previous| batch.received_at < previous)
+            || self
+                .available_at
+                .is_some_and(|previous| batch.available_at < previous)
         {
             return Err((
                 OrderLevelQuarantineReason::Mutation,

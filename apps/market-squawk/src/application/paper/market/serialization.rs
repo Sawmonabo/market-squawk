@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 use super::{MarketFilters, StreamView};
 use crate::application::domain_support::encode_hex;
 use crate::application::market_runtime::{
-    MarketSourceSnapshotFailure, MarketSourceSnapshotFailureKind,
+    MarketDisplaySnapshotLease, MarketKrakenPriceProjectionLease, MarketSourceSnapshotFailure,
+    MarketSourceSnapshotFailureKind,
 };
 
 const MAXIMUM_LISTED_EVIDENCE_IDENTITIES: usize = 8;
@@ -278,11 +279,23 @@ pub(super) fn source_coverage_value(
     streams: &[StreamView<'_>],
     failures: &[MarketSourceSnapshotFailure],
     filters: &MarketFilters<'_>,
+    display: &[&MarketDisplaySnapshotLease],
+    kraken: &[&MarketKrakenPriceProjectionLease],
 ) -> Value {
     let mut sources = streams
         .iter()
-        .map(|view| view.stream.source().as_str())
+        .map(|view| view.stream.source().as_str().to_owned())
         .collect::<Vec<_>>();
+    sources.extend(
+        display
+            .iter()
+            .map(|snapshot| snapshot.metadata().source_id().as_str().to_owned()),
+    );
+    sources.extend(
+        kraken
+            .iter()
+            .map(|snapshot| snapshot.metadata().source_id().as_str().to_owned()),
+    );
     sources.sort_unstable();
     sources.dedup();
     let source_count = sources.len();
@@ -290,8 +303,18 @@ pub(super) fn source_coverage_value(
 
     let mut venues = streams
         .iter()
-        .map(|view| view.route.route().venue().as_str())
+        .map(|view| view.route.route().venue().as_str().to_owned())
         .collect::<Vec<_>>();
+    venues.extend(
+        display
+            .iter()
+            .map(|snapshot| snapshot.lease().key().venue_id().as_str().to_owned()),
+    );
+    venues.extend(
+        kraken
+            .iter()
+            .map(|snapshot| snapshot.key().venue_id().as_str().to_owned()),
+    );
     venues.sort_unstable();
     venues.dedup();
     let venue_count = venues.len();
@@ -313,7 +336,11 @@ pub(super) fn source_coverage_value(
         .collect::<Vec<_>>();
 
     json!({
-        "mode": "current_live_runtime",
+        "mode": if display.is_empty() && kraken.is_empty() {
+            "current_live_runtime"
+        } else {
+            "unified_current_market_runtime"
+        },
         "consistency": if failed_source_count == 0 {
             "per_shard_current_non_atomic"
         } else {
@@ -340,7 +367,9 @@ pub(super) fn source_coverage_value(
         "listedFailedSourcesComplete":
             failed_source_count <= MAXIMUM_LISTED_EVIDENCE_IDENTITIES,
         "streamIdentityScope": "complete",
-        "bookDepthScope": "per_record_explicit"
+        "bookDepthScope": "per_record_explicit",
+        "displayObservationCount": display.len(),
+        "krakenOrderLevelProjectionCount": kraken.len()
     })
 }
 

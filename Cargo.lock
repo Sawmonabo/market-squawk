@@ -4325,6 +4325,7 @@ dependencies = [
  "market-squawk-adapter-fred",
  "market-squawk-adapter-kraken",
  "market-squawk-adapter-nasdaq-symbols",
+ "market-squawk-adapter-openfigi",
  "market-squawk-adapter-paper",
  "market-squawk-adapter-portfolio",
  "market-squawk-adapter-sec",
@@ -4528,6 +4529,24 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "market-squawk-adapter-openfigi"
+version = "1.0.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "market-squawk-domain",
+ "market-squawk-sources",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "zeroize",
 ]
 
 [[package]]

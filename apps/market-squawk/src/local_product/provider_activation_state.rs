@@ -1,4 +1,4 @@
-//! Crash-safe, secret-free persistence for reconstructible research-provider activation.
+//! Crash-safe, secret-free persistence for provider activation and source lifecycle authority.
 
 mod evidence;
 
@@ -17,6 +17,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::application::{ProductionResearchIngestCoordinator, ResearchIngestCompositionError};
+use crate::provider_activation::ProviderMarketAccount;
 use crate::provider_onboarding::{
     ProviderOnboardingError, ProviderOnboardingService, ProviderRuntimeStartupAdmissions,
 };
@@ -31,7 +32,9 @@ const QUARANTINE_RECORD_KIND: &str = "provider_activation_quarantine";
 const MAXIMUM_RECIPE_EVIDENCE_OBJECTS: usize = 1_024;
 const ACTIVATION_STATE_DIRECTORY: &str = "sources/provider-activation-v1";
 const SOURCE_LIFECYCLE_SCHEMA_VERSION: u16 = 1;
-const PROVIDER_METADATA_BACKUP_SCHEMA_VERSION: u16 = 1;
+const LEGACY_PROVIDER_METADATA_BACKUP_SCHEMA_VERSION: u16 = 1;
+const PROVIDER_METADATA_BACKUP_SCHEMA_VERSION: u16 = 2;
+const LEGACY_PROVIDER_METADATA_LIFECYCLE_SURFACE_COUNT: usize = 11;
 pub(super) const PROVIDER_METADATA_BACKUP_SCHEMA: &str = "market-squawk-provider-metadata-v1";
 pub(super) const PROVIDER_METADATA_BACKUP_PRODUCER: &str =
     "market-squawk.provider-metadata-authority";
@@ -59,9 +62,19 @@ pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 8] = [
     "local.portfolio-imports",
 ];
 
-const SERIALIZED_LIFECYCLE_SURFACES: [&str; 11] = [
+const COINBASE_DIRECT_LIVE_SURFACE: &str = "coinbase.exchange-direct-market-data";
+
+const SESSION_BACKED_LIVE_SURFACES: [&str; 4] = [
+    COINBASE_DIRECT_LIVE_SURFACE,
+    ProviderMarketAccount::AlpacaBasic.surface_id(),
+    ProviderMarketAccount::TradierBrokerage.surface_id(),
+    ProviderMarketAccount::KrakenLevel3.surface_id(),
+];
+
+// New lifecycle surfaces are appended so schema-v1 backups remain an exact prefix.
+const SERIALIZED_LIFECYCLE_SURFACES: [&str; 14] = [
     "coinbase.public-market-data",
-    "coinbase.exchange-direct-market-data",
+    COINBASE_DIRECT_LIVE_SURFACE,
     "kraken.spot-public-market-data",
     "sec.edgar-public",
     "bls.v1-unregistered",
@@ -71,6 +84,9 @@ const SERIALIZED_LIFECYCLE_SURFACES: [&str; 11] = [
     "fred-alfred.api-v1-v2",
     "local.files",
     "local.portfolio-imports",
+    ProviderMarketAccount::AlpacaBasic.surface_id(),
+    ProviderMarketAccount::TradierBrokerage.surface_id(),
+    ProviderMarketAccount::KrakenLevel3.surface_id(),
 ];
 
 /// Least-authority owner seam for the protected provider-metadata component.
@@ -418,7 +434,11 @@ impl DurableProviderActivationState {
         }
     }
 
-    /// Returns the one exact desired runtime session for every durable research surface.
+    /// Returns every exact session still retained by durable runtime lifecycle authority.
+    ///
+    /// Research recipes and session-backed market groups share onboarding startup reconciliation.
+    /// Stopped and indeterminate live records retain restart/reconciliation authority; removed
+    /// records do not retain credential authority.
     pub(super) fn startup_runtime_admissions(
         &self,
     ) -> Result<ProviderRuntimeStartupAdmissions, ProviderOnboardingError> {
@@ -454,6 +474,21 @@ impl DurableProviderActivationState {
                     .into_iter()
                     .map(|session_id| (surface_id.clone(), session_id)),
             );
+        }
+        for surface_id in SESSION_BACKED_LIVE_SURFACES {
+            let record = self
+                .source_lifecycle_record(surface_id)
+                .map_err(|_error| ProviderOnboardingError::InvalidSessionState)?;
+            let retained_session = match record.phase() {
+                DurableSourceLifecyclePhase::Active
+                | DurableSourceLifecyclePhase::Stopped
+                | DurableSourceLifecyclePhase::Applying
+                | DurableSourceLifecyclePhase::ReconciliationRequired => record.session_id(),
+                DurableSourceLifecyclePhase::Removed => None,
+            };
+            if let Some(session_id) = retained_session {
+                entries.push((SourceIdentifier::try_from(surface_id)?, session_id));
+            }
         }
         ProviderRuntimeStartupAdmissions::try_new(entries)
     }
@@ -1312,21 +1347,30 @@ fn validate_provider_metadata_backup(
     let wire: ProviderMetadataBackupWire =
         serde_json::from_slice(bytes).map_err(|_| ProviderMetadataBackupError::Invalid)?;
     if wire.schema != PROVIDER_METADATA_BACKUP_SCHEMA
-        || wire.schema_version != PROVIDER_METADATA_BACKUP_SCHEMA_VERSION
         || serde_json::to_vec(&wire).map_err(|_| ProviderMetadataBackupError::Invalid)? != bytes
-        || wire.lifecycle_records.len() != SERIALIZED_LIFECYCLE_SURFACES.len()
     {
+        return Err(ProviderMetadataBackupError::Invalid);
+    }
+    let backup_schema_version = wire.schema_version;
+    let expected_lifecycle_surfaces: &[&str] = match backup_schema_version {
+        PROVIDER_METADATA_BACKUP_SCHEMA_VERSION => &SERIALIZED_LIFECYCLE_SURFACES,
+        LEGACY_PROVIDER_METADATA_BACKUP_SCHEMA_VERSION => {
+            &SERIALIZED_LIFECYCLE_SURFACES[..LEGACY_PROVIDER_METADATA_LIFECYCLE_SURFACE_COUNT]
+        }
+        _ => return Err(ProviderMetadataBackupError::Invalid),
+    };
+    if wire.lifecycle_records.len() != expected_lifecycle_surfaces.len() {
         return Err(ProviderMetadataBackupError::Invalid);
     }
 
     let mut lifecycle_records = Vec::new();
     lifecycle_records
-        .try_reserve_exact(wire.lifecycle_records.len())
+        .try_reserve_exact(SERIALIZED_LIFECYCLE_SURFACES.len())
         .map_err(|_| ProviderMetadataBackupError::ResourceExhausted)?;
     for (encoded, expected_surface) in wire
         .lifecycle_records
         .into_iter()
-        .zip(SERIALIZED_LIFECYCLE_SURFACES)
+        .zip(expected_lifecycle_surfaces.iter().copied())
     {
         if encoded.surface_id != expected_surface {
             return Err(ProviderMetadataBackupError::Invalid);
@@ -1337,6 +1381,25 @@ fn validate_provider_metadata_backup(
             return Err(ProviderMetadataBackupError::Invalid);
         }
         lifecycle_records.push((encoded.surface_id, bytes));
+    }
+    if backup_schema_version == LEGACY_PROVIDER_METADATA_BACKUP_SCHEMA_VERSION {
+        for surface_id in
+            &SERIALIZED_LIFECYCLE_SURFACES[LEGACY_PROVIDER_METADATA_LIFECYCLE_SURFACE_COUNT..]
+        {
+            let record = DurableSourceLifecycleRecord {
+                revision: NonZeroU64::MIN,
+                phase: DurableSourceLifecyclePhase::Stopped,
+                operation_id: None,
+                command_digest: None,
+                transition_digest: None,
+                session_id: None,
+                public_configuration_digest: None,
+            };
+            lifecycle_records.push((
+                (*surface_id).to_owned(),
+                encode_source_lifecycle(surface_id, &record)?,
+            ));
+        }
     }
 
     let mut activation_recipes = Vec::new();
@@ -1654,9 +1717,16 @@ fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivati
 fn lifecycle_surface_key(
     surface_id: &str,
 ) -> Result<&'static str, DurableProviderActivationStateError> {
+    if let Some(account) = ProviderMarketAccount::from_surface_id(surface_id) {
+        return Ok(match account {
+            ProviderMarketAccount::AlpacaBasic => "alpaca-basic-market-data",
+            ProviderMarketAccount::TradierBrokerage => "tradier-brokerage-market-data",
+            ProviderMarketAccount::KrakenLevel3 => "kraken-authenticated-level3-market-data",
+        });
+    }
     match surface_id {
         "coinbase.public-market-data" => Ok("coinbase-public"),
-        "coinbase.exchange-direct-market-data" => Ok("coinbase-direct"),
+        COINBASE_DIRECT_LIVE_SURFACE => Ok("coinbase-direct"),
         "kraken.spot-public-market-data" => Ok("kraken-public"),
         "local.files" => Ok("local-files"),
         "local.portfolio-imports" => Ok("local-portfolio-imports"),
@@ -2416,8 +2486,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_provider_metadata_restores_the_fenced_revision_without_runtime_authority()
-    -> TestResult {
+    async fn legacy_provider_metadata_restores_with_stopped_account_lifecycles() -> TestResult {
         let source = tempfile::tempdir()?;
         let environment = BTreeMap::<OsString, OsString>::new();
         let config = AppConfig::load(ConfigSources::new(
@@ -2450,6 +2519,12 @@ mod tests {
         let retained = authority
             .retain(&tokio_util::sync::CancellationToken::new())
             .await?;
+        let mut legacy_wire: ProviderMetadataBackupWire = serde_json::from_slice(retained.bytes())?;
+        legacy_wire.schema_version = LEGACY_PROVIDER_METADATA_BACKUP_SCHEMA_VERSION;
+        legacy_wire
+            .lifecycle_records
+            .truncate(LEGACY_PROVIDER_METADATA_LIFECYCLE_SURFACE_COUNT);
+        let legacy_backup = serde_json::to_vec(&legacy_wire)?;
 
         state.publish_recipe(
             surface_id,
@@ -2470,7 +2545,7 @@ mod tests {
         let requirements = ProviderMetadataBackupAuthority::restore_fresh(
             &restored_state,
             registry_store,
-            retained.bytes(),
+            &legacy_backup,
         )?;
         assert!(requirements.iter().any(|requirement| {
             requirement.surface_id == surface_id
@@ -2487,6 +2562,19 @@ mod tests {
                     && recipe.request_bytes.as_ref() == retained_request
                     && recipe.state_digest == retained_digest
         ));
+        for account in ProviderMarketAccount::ALL {
+            let account_surface = account.surface_id();
+            let lifecycle_key = lifecycle_surface_key(account_surface)?;
+            assert!(
+                LocalAuthorityStateStore::try_open(restored_state.lifecycle_root(lifecycle_key))?
+                    .load()?
+                    .is_some()
+            );
+            let record = restored_state.source_lifecycle_record(account_surface)?;
+            assert_eq!(record.revision(), NonZeroU64::MIN);
+            assert_eq!(record.phase(), DurableSourceLifecyclePhase::Stopped);
+            assert_eq!(record.session_id(), None);
+        }
         market_squawk_sources::AuthoritativeSourceRegistry::try_new_durable(
             LocalAuthorityStateStore::try_open(
                 destination.path().join("control/sources/research-runtime"),

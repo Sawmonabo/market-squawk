@@ -5,17 +5,26 @@ import type { ApplicationResult } from "@/lib/schemas"
 const quoteSchema = z
   .object({
     bidPrice: z.string().nullable(),
+    bidPriceProviderLexeme: z.string().nullable(),
     bidSize: z.string().nullable(),
+    bidSizeProviderLexeme: z.string().nullable(),
     askPrice: z.string().nullable(),
+    askPriceProviderLexeme: z.string().nullable(),
     askSize: z.string().nullable(),
+    askSizeProviderLexeme: z.string().nullable(),
     midPrice: z.string().nullable(),
+    midPriceBasis: z.string().nullable(),
     lastPrice: z.string().nullable(),
+    lastPriceProviderLexeme: z.string().nullable(),
     lastSize: z.string().nullable(),
+    lastSizeProviderLexeme: z.string().nullable(),
     lastSourceTimestamp: z.string().nullable(),
     lastReceivedAt: z.string().nullable(),
     lastAvailableAt: z.string().nullable(),
     lastQuality: z.string().nullable(),
     lastFreshAtSelection: z.boolean().nullable(),
+    quoteEvidence: z.record(z.string(), z.unknown()).nullable(),
+    tradeEvidence: z.record(z.string(), z.unknown()).nullable(),
   })
   .strict()
 
@@ -23,6 +32,7 @@ const selectedSourceSchema = z
   .object({
     surfaceId: z.string().min(1),
     providerId: z.string().min(1),
+    providerSymbol: z.string().min(1).optional(),
     sourceId: z.string().min(1),
     venueId: z.string().nullable(),
     providerProduct: z.string().min(1),
@@ -37,7 +47,7 @@ const selectedSourceSchema = z
       .object({
         receivedAt: z.string(),
         availableAt: z.string(),
-        sourceValidUntil: z.string(),
+        sourceValidUntil: z.string().nullable(),
         freshAtSelection: z.boolean(),
       })
       .passthrough(),
@@ -45,7 +55,7 @@ const selectedSourceSchema = z
       .object({
         state: z.string().min(1),
         phase: z.string().min(1),
-        generationCurrent: z.boolean(),
+        generationCurrent: z.boolean().nullable(),
         snapshotInitialized: z.boolean(),
       })
       .passthrough(),
@@ -98,12 +108,19 @@ export const unifiedMarketRowSchema = z
   .object({
     instrumentId: z.string().uuid(),
     symbol: z.string().min(1),
-    symbolVenueId: z.string().min(1),
+    symbolKind: z.string().min(1),
+    symbolVenueId: z.string().min(1).nullable(),
     assetClass: z.string().min(1),
     quoteCurrency: z.string().min(1),
-    definitionRevision: z.number().int().positive(),
-    tickSize: z.string().min(1),
-    lotSize: z.string().min(1),
+    definitionKind: z.string().min(1),
+    definitionRevision: z.number().int().positive().nullable(),
+    referenceRevision: z.string().min(1).nullable(),
+    permanentFigi: z.string().min(1).nullable(),
+    displayName: z.string().min(1).nullable(),
+    tickSize: z.string().min(1).nullable(),
+    lotSize: z.string().min(1).nullable(),
+    executionTermsAvailable: z.boolean(),
+    referenceEvidence: z.record(z.string(), z.unknown()).nullable(),
     availability: z.string().min(1),
     confidence: z.string().min(1),
     quote: quoteSchema,

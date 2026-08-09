@@ -139,6 +139,7 @@ const SOURCE_LIFECYCLE_ARGUMENTS: &[ArgumentSpec] = &[
             maximum: u64::MAX,
         },
     ),
+    ArgumentSpec::optional("expectedRuntimeGenerationSha256", ArgumentKind::Sha256),
     ArgumentSpec::optional("onboardingSessionId", ArgumentKind::Uuid),
     ArgumentSpec::optional("publicConfigurationSha256", ArgumentKind::Sha256),
     ArgumentSpec::optional("reason", ArgumentKind::Identifier),

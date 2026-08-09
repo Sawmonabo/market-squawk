@@ -31,11 +31,13 @@ fn duplicate_price_orders_survive_and_failed_checksum_cannot_publish() -> TestRe
     let limits = OrderLevelLimits::new(16, DepthLimit::new(8)?)?;
     let mut book = OrderLevelBook::try_new(route.clone(), limits)?;
     let snapshot_time = Timestamp::from_unix_nanos(1_000);
+    let snapshot_available_at = Timestamp::from_unix_nanos(1_100);
     let snapshot = OrderLevelBatch::try_new(OrderLevelBatchInput::new(
         route.clone(),
         SourceIdentifier::try_from("kraken-level3-snapshot-1")?,
         snapshot_time,
         snapshot_time,
+        snapshot_available_at,
         DataQuality::DirectUnverified,
         MarketFreshness::Fresh {
             last_market_at: snapshot_time,
@@ -60,10 +62,12 @@ fn duplicate_price_orders_survive_and_failed_checksum_cannot_publish() -> TestRe
     assert_eq!(first.bids()[0].quantity(), QuantityLots::new(7)?);
     assert_eq!(first.bids()[0].order_count(), 2);
     assert_eq!(first.asks()[0].price(), PriceTicks::new(101));
+    assert_eq!(first.available_at(), snapshot_available_at);
     assert_eq!(first, book.project_price_levels()?);
 
     let committed_orders = book.orders().to_vec();
     let update_time = Timestamp::from_unix_nanos(2_000);
+    let update_available_at = Timestamp::from_unix_nanos(2_100);
     let delete = OrderLevelOperation::Done {
         order_id: SourceIdentifier::try_from("bid-a")?,
         side: Some(BookSide::Bid),
@@ -77,6 +81,7 @@ fn duplicate_price_orders_survive_and_failed_checksum_cannot_publish() -> TestRe
         SourceIdentifier::try_from("kraken-level3-update-2")?,
         update_time,
         update_time,
+        update_available_at,
         DataQuality::DirectUnverified,
         MarketFreshness::Fresh {
             last_market_at: update_time,
@@ -106,6 +111,7 @@ fn duplicate_price_orders_survive_and_failed_checksum_cannot_publish() -> TestRe
     );
     let isolated = book.project_price_levels()?;
     assert_eq!(isolated.quality(), DataQuality::Quarantined);
+    assert_eq!(isolated.available_at(), snapshot_available_at);
     assert_eq!(isolated.bids()[0].quantity(), QuantityLots::new(7)?);
     assert_eq!(isolated.bids()[0].order_count(), 2);
     Ok(())

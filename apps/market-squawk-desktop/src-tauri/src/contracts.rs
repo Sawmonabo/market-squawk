@@ -914,6 +914,7 @@ pub(crate) struct SourceLifecycleInput {
     pub(crate) provider: String,
     pub(crate) expected_state_revision: u64,
     pub(crate) expected_generation: Option<u64>,
+    pub(crate) expected_runtime_generation_sha256: Option<String>,
     pub(crate) onboarding_session_id: Option<Uuid>,
     pub(crate) public_configuration_sha256: Option<String>,
     pub(crate) reason: Option<String>,

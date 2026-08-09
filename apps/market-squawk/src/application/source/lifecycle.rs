@@ -40,6 +40,8 @@ pub struct SourceLifecycleCommandInput {
     pub expected_state_revision: NonZeroU64,
     /// Exact current live generation required by retry or resynchronization.
     pub expected_generation: Option<ConnectionGeneration>,
+    /// Exact current non-scalar runtime identity required for account-group resynchronization.
+    pub expected_runtime_generation_digest: Option<EvidenceDigest>,
     /// Existing onboarding session resolved privately by the authority.
     pub onboarding_session_id: Option<Uuid>,
     /// Digest of an already prepared public configuration; never raw configuration or credentials.
@@ -60,6 +62,10 @@ impl fmt::Debug for SourceLifecycleCommandInput {
             .field("action", &self.action)
             .field("expected_state_revision", &self.expected_state_revision)
             .field("expected_generation", &self.expected_generation)
+            .field(
+                "has_expected_runtime_generation_digest",
+                &self.expected_runtime_generation_digest.is_some(),
+            )
             .field("onboarding_session_id", &self.onboarding_session_id)
             .field(
                 "has_public_configuration_digest",
@@ -77,6 +83,7 @@ pub struct SourceLifecycleCommand {
     action: SourceLifecycleAction,
     expected_state_revision: NonZeroU64,
     expected_generation: Option<ConnectionGeneration>,
+    expected_runtime_generation_digest: Option<EvidenceDigest>,
     onboarding_session_id: Option<Uuid>,
     public_configuration_digest: Option<EvidenceDigest>,
     reason: Option<SourceIdentifier>,
@@ -93,27 +100,35 @@ impl SourceLifecycleCommand {
         let valid = match input.action {
             SourceLifecycleAction::Start | SourceLifecycleAction::Verify => {
                 input.expected_generation.is_none()
+                    && input.expected_runtime_generation_digest.is_none()
                     && input.public_configuration_digest.is_none()
                     && input.reason.is_none()
             }
             SourceLifecycleAction::Reconfigure => {
-                input.onboarding_session_id.is_some()
+                input.expected_generation.is_none()
+                    && input.expected_runtime_generation_digest.is_none()
+                    && input.onboarding_session_id.is_some()
                     && input.public_configuration_digest.is_some()
                     && input.reason.is_none()
             }
             SourceLifecycleAction::Retry => {
-                input.onboarding_session_id.is_none()
+                input.expected_generation.is_none()
+                    && input.expected_runtime_generation_digest.is_none()
+                    && input.onboarding_session_id.is_none()
                     && input.public_configuration_digest.is_none()
                     && input.reason.is_some()
             }
             SourceLifecycleAction::Resynchronize => {
-                input.expected_generation.is_some()
+                (input.expected_generation.is_some()
+                    ^ input.expected_runtime_generation_digest.is_some())
                     && input.onboarding_session_id.is_none()
                     && input.public_configuration_digest.is_none()
                     && input.reason.is_some()
             }
             SourceLifecycleAction::Stop | SourceLifecycleAction::Remove => {
-                input.onboarding_session_id.is_none()
+                !(input.expected_generation.is_some()
+                    && input.expected_runtime_generation_digest.is_some())
+                    && input.onboarding_session_id.is_none()
                     && input.public_configuration_digest.is_none()
                     && input.reason.is_some()
             }
@@ -121,9 +136,14 @@ impl SourceLifecycleCommand {
         if !valid {
             return Err(SourceLifecycleError::InvalidRequest);
         }
-        if input.public_configuration_digest.is_some_and(|digest| {
-            digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32]
-        }) {
+        if [
+            input.expected_runtime_generation_digest,
+            input.public_configuration_digest,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|digest| digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32])
+        {
             return Err(SourceLifecycleError::InvalidRequest);
         }
         Ok(Self {
@@ -131,6 +151,7 @@ impl SourceLifecycleCommand {
             action: input.action,
             expected_state_revision: input.expected_state_revision,
             expected_generation: input.expected_generation,
+            expected_runtime_generation_digest: input.expected_runtime_generation_digest,
             onboarding_session_id: input.onboarding_session_id,
             public_configuration_digest: input.public_configuration_digest,
             reason: input.reason,
@@ -157,6 +178,11 @@ impl SourceLifecycleCommand {
     /// Returns the exact expected live generation when required.
     pub const fn expected_generation(&self) -> Option<ConnectionGeneration> {
         self.expected_generation
+    }
+
+    /// Returns the exact expected non-scalar runtime identity when required.
+    pub const fn expected_runtime_generation_digest(&self) -> Option<EvidenceDigest> {
+        self.expected_runtime_generation_digest
     }
 
     /// Returns the onboarding session identity when the action resolves prepared authority.
@@ -193,6 +219,10 @@ impl fmt::Debug for SourceLifecycleCommand {
             .field("action", &self.action)
             .field("expected_state_revision", &self.expected_state_revision)
             .field("expected_generation", &self.expected_generation)
+            .field(
+                "has_expected_runtime_generation_digest",
+                &self.expected_runtime_generation_digest.is_some(),
+            )
             .field("onboarding_session_id", &self.onboarding_session_id)
             .field(
                 "has_public_configuration_digest",
@@ -360,7 +390,7 @@ pub struct SourceLifecycleReceiptInput {
     pub previous_generation: Option<ConnectionGeneration>,
     /// Current generation after the operation when one exists.
     pub current_generation: Option<ConnectionGeneration>,
-    /// Exact callable research-runtime generation identity when this is not a live stream.
+    /// Exact callable non-scalar runtime identity for research or an account-provider group.
     pub runtime_generation_digest: Option<EvidenceDigest>,
     /// Current coverage conclusion.
     pub coverage: Option<CoverageStatus>,
@@ -393,12 +423,17 @@ impl SourceLifecycleReceipt {
     pub fn try_new(input: SourceLifecycleReceiptInput) -> Result<Self, SourceLifecycleError> {
         if input.action == SourceLifecycleAction::Resynchronize
             && input.disposition == SourceLifecycleDisposition::Applied
-            && !matches!(
+        {
+            let scalar_advanced = matches!(
                 (input.previous_generation, input.current_generation),
                 (Some(previous), Some(current)) if current.get() > previous.get()
-            )
-        {
-            return Err(SourceLifecycleError::InvalidResult);
+            );
+            let non_scalar_replaced = input.previous_generation.is_none()
+                && input.current_generation.is_none()
+                && input.runtime_generation_digest.is_some();
+            if !scalar_advanced && !non_scalar_replaced {
+                return Err(SourceLifecycleError::InvalidResult);
+            }
         }
         if matches!(
             input.disposition,
@@ -460,7 +495,7 @@ pub struct SourceLifecycleStatusInput {
     pub configuration_session_id: Option<Uuid>,
     /// Exact current live generation when this is a live stream.
     pub current_generation: Option<ConnectionGeneration>,
-    /// Exact callable research-runtime generation when this is a research source.
+    /// Exact callable non-scalar runtime identity for research or an account-provider group.
     pub runtime_generation_digest: Option<EvidenceDigest>,
     /// Current public configuration identity when retained.
     pub public_configuration_digest: Option<EvidenceDigest>,
@@ -631,4 +666,65 @@ pub trait SourceLifecycleAuthority: Send + Sync {
 
 fn valid_sha256(digest: EvidenceDigest) -> bool {
     digest.algorithm() == DigestAlgorithm::Sha256 && digest.bytes() != [0; 32]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroU64, time::Duration};
+
+    use super::*;
+
+    #[test]
+    fn resynchronization_requires_exactly_one_runtime_generation_kind()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [7; 32]);
+        let command =
+            SourceLifecycleCommand::try_new(resynchronize_input(None, Some(runtime_digest)))?;
+        assert_eq!(command.expected_generation(), None);
+        assert_eq!(
+            command.expected_runtime_generation_digest(),
+            Some(runtime_digest)
+        );
+
+        let scalar = ConnectionGeneration::new(1)?;
+        assert_eq!(
+            SourceLifecycleCommand::try_new(resynchronize_input(Some(scalar), None))?
+                .expected_generation(),
+            Some(scalar)
+        );
+        assert_eq!(
+            SourceLifecycleCommand::try_new(resynchronize_input(None, None)).unwrap_err(),
+            SourceLifecycleError::InvalidRequest
+        );
+        assert_eq!(
+            SourceLifecycleCommand::try_new(resynchronize_input(
+                Some(scalar),
+                Some(runtime_digest),
+            ))
+            .unwrap_err(),
+            SourceLifecycleError::InvalidRequest
+        );
+        Ok(())
+    }
+
+    fn resynchronize_input(
+        expected_generation: Option<ConnectionGeneration>,
+        expected_runtime_generation_digest: Option<EvidenceDigest>,
+    ) -> SourceLifecycleCommandInput {
+        SourceLifecycleCommandInput {
+            provider: SourceIdentifier::try_from("test.market-source")
+                .expect("test provider is valid"),
+            action: SourceLifecycleAction::Resynchronize,
+            expected_state_revision: NonZeroU64::MIN,
+            expected_generation,
+            expected_runtime_generation_digest,
+            onboarding_session_id: None,
+            public_configuration_digest: None,
+            reason: Some(
+                SourceIdentifier::try_from("test-resynchronize").expect("test reason is valid"),
+            ),
+            cancellation: CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(1),
+        }
+    }
 }

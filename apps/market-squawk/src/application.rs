@@ -51,7 +51,11 @@ pub use fair_value::{
     ResearchFairValueInputPublisher,
 };
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
-pub(crate) use market_runtime::MarketRuntimeRegistry;
+pub(crate) use market_runtime::{
+    AccountMarketSurface, MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration,
+    MarketRuntimeRegistry, PreparedMarketProviderConfigurationRequest,
+    PreparedMarketProviderConfigurationResolver,
+};
 pub use paper::PaperApplicationServices;
 pub(crate) use paper::{
     MarketReferenceMatchKind, MarketReferenceRecord, MarketReferenceSearchAuthority,

@@ -224,16 +224,6 @@ pub(crate) struct CoinbaseDirectLiveMarketComposition {
 }
 
 impl CoinbaseDirectLiveMarketComposition {
-    /// Starts one credential-bound Coinbase Direct market runtime without action hooks.
-    pub(crate) async fn start(
-        self,
-        cancellation: CancellationToken,
-    ) -> Result<crate::CoinbaseDirectLiveRuntime, crate::CoinbaseDirectSupervisorError> {
-        self.activation
-            .start_live(self.runtime_config, cancellation)
-            .await
-    }
-
     /// Starts the source-only Direct runtime and retains individual provider orders centrally.
     pub(crate) async fn start_with_order_level(
         self,

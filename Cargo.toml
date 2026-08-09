@@ -84,6 +84,7 @@ market-squawk-adapter-files = { path = "adapters/market-squawk-adapter-files", v
 market-squawk-adapter-fred = { path = "adapters/market-squawk-adapter-fred", version = "=1.0.0" }
 market-squawk-adapter-kraken = { path = "adapters/market-squawk-adapter-kraken", version = "=1.0.0" }
 market-squawk-adapter-nasdaq-symbols = { path = "adapters/market-squawk-adapter-nasdaq-symbols", version = "=1.0.0" }
+market-squawk-adapter-openfigi = { path = "adapters/market-squawk-adapter-openfigi", version = "=1.0.0" }
 market-squawk-adapter-paper = { path = "adapters/market-squawk-adapter-paper", version = "=1.0.0" }
 market-squawk-adapter-portfolio = { path = "adapters/market-squawk-adapter-portfolio", version = "=1.0.0" }
 market-squawk-adapter-sec = { path = "adapters/market-squawk-adapter-sec", version = "=1.0.0" }
