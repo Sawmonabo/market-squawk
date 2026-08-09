@@ -47,8 +47,12 @@ evidence; it does not replace the README capability truth or the canonical relea
   action-hook proof, the existing application hook-composition proof, the consolidated Coinbase
   and Kraken order-level protocol proofs, and the existing Alpaca, Tradier, and Nasdaq adapter
   tests. The refreshed 1,200-path Python source closure also verifies. Generated Cargo output is
-  18,559,008 KiB, below the 20 GiB ceiling; no extra worktree exists. Broad CI remains deferred
-  until the feature candidate is frozen for release-branch integration.
+  18,559,008 KiB, below the 20 GiB ceiling; no extra worktree exists. Automatic broad run
+  `31322655877` was cancelled before completion. Workflow checkpoint
+  `9baac4f4f24af67befb5ffca406ce2348084f45e` now reserves compiler/test matrices for explicit
+  frozen-candidate dispatches and pushes to integration branches; intermediate pull-request pushes
+  retain only lightweight classification, generated-input, credential, and documentation policy
+  checks.
 - Remaining barriers before the requested owner-test handoff are outcome-based:
 
   1. Compose Tradier, Alpaca, Nasdaq reference data, and authenticated crypto depth into the shared
