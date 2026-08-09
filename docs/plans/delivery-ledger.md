@@ -12,12 +12,15 @@ evidence; it does not replace the README capability truth or the canonical relea
   `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
   release-branch integration is authorized in this execution scope.
 - The latest product-code checkpoint is
-  `f9e2bf6df5bf25b236bfd723e330bb777d7f50d7`. It adds the bounded concurrent market-runtime
-  registry, automatic account-free Coinbase/Kraken startup and recovery, paper-action attachment
-  to the existing live runtime, authenticated Coinbase and Kraken order-level adapters, and the
-  Alpaca Basic, Tradier, and Nasdaq Symbol Directory adapters. It also refreshes the signed Python
-  source inventory to 1,200 exact paths. The preceding integrated workflow checkpoint remains
-  `6f0b4426cb029492f53ee32496848829498b2919`. Neither checkpoint is a frozen release candidate.
+  `3381669b1609526c6e15e9c06d8140bf45cc8abb`. It keeps the bounded concurrent market-runtime
+  registry and adds the production Coinbase order-level path, the canonical order-preserving book
+  and bounded shared read authority, deterministic source selection, Nasdaq Symbol Directory
+  search, the source-preserving unified Markets response, and the corresponding non-technical
+  Desktop feed and instrument workspace. It also adds compiled account/configuration authorities
+  for Alpaca Basic, Tradier, and authenticated Kraken depth plus a durable Nasdaq listing-reference
+  catalog boundary. Those latter authorities are not represented as live product coverage until
+  their producer/runtime composition is complete. The preceding market-runtime checkpoint remains
+  `f9e2bf6df5bf25b236bfd723e330bb777d7f50d7`. Neither checkpoint is a frozen release candidate.
 - The main checkout owns the feature branch. `.worktrees` is empty and no temporary lane branch
   exists. The previously uncommitted integration state is now captured atomically at the code
   checkpoint above, including every newly registered Tauri permission, migration, native identity
@@ -42,12 +45,12 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Issue [#25](https://github.com/Sawmonabo/market-squawk/issues/25), issue
   [#45](https://github.com/Sawmonabo/market-squawk/issues/45), draft PR
   [#43](https://github.com/Sawmonabo/market-squawk/pull/43), and the Project items remain open and
-  `In Progress`. The market-runtime checkpoint passed formatting, diff integrity, strict
-  all-feature Clippy for the application/live/provider packages, the existing two-route dynamic
-  action-hook proof, the existing application hook-composition proof, the consolidated Coinbase
-  and Kraken order-level protocol proofs, and the existing Alpaca, Tradier, and Nasdaq adapter
-  tests. The refreshed 1,200-path Python source closure also verifies. Generated Cargo output is
-  18,559,008 KiB, below the 20 GiB ceiling; no extra worktree exists. Automatic broad run
+  `In Progress`. Exact integrated head `3381669b` passes the focused locked application-library
+  check, Desktop TypeScript check, repository formatting check, and diff integrity check. Earlier
+  disjoint lane proofs cover the Nasdaq catalog replay, deterministic resolver, and provider
+  decoder invariants, but they are not substituted for the future unchanged-head release gate.
+  Generated Cargo output is 15,586,704 KiB, below the 20 GiB ceiling; no extra worktree exists.
+  Automatic broad run
   `31322655877` was cancelled before completion. Workflow checkpoint
   `9baac4f4f24af67befb5ffca406ce2348084f45e` now reserves compiler/test matrices for explicit
   frozen-candidate dispatches and pushes to integration branches; intermediate pull-request pushes
@@ -55,10 +58,12 @@ evidence; it does not replace the README capability truth or the canonical relea
   checks.
 - Remaining barriers before the requested owner-test handoff are outcome-based:
 
-  1. Compose Tradier, Alpaca, Nasdaq reference data, and authenticated crypto depth into the shared
-     service; persist the searchable multi-asset universe; then implement the deterministic
-     resolver, source-preserving unified read model, and fully wired non-technical Markets desktop
-     journey. The adapters now exist, but these producer-to-consumer paths are not complete yet.
+  1. Finish the security-level identity/definition producer, then compose Alpaca, Tradier, and
+     authenticated Kraken depth into the shared runtime. Persist Nasdaq reference generations when
+     the admitted rights evidence permits it, and connect those retained definitions to the unified
+     Markets feed. Coinbase order-level depth, Nasdaq reference search, deterministic selection,
+     and the unified Desktop presentation are now wired; the remaining account-backed providers
+     must not be advertised until their exact runtime paths are active.
   2. Complete the resumable guided setup execution and every remaining shared-service/MCP,
      onboarding, research, Python/model, portfolio, decision, source, and restart workflow.
   3. Run one focused installed integration/e2e pass, including every desktop route and every flow
