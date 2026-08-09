@@ -11,12 +11,13 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Active branch: `feature/v1-installed-product-experience`, based on
   `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
   release-branch integration is authorized in this execution scope.
-- The integrated product-code checkpoint is
-  `6f0b4426cb029492f53ee32496848829498b2919`. It includes the instrument and SEC identity
-  publication/search, recoverable screening and dossier workflow, shared service/MCP authority,
-  desktop bootstrap recovery, guided research-file import, live/paper lifecycle reconciliation,
-  development runtime, source parsing, and source-closure corrections. The checkpoint and this
-  ledger update are pushed together; neither is a frozen release candidate.
+- The latest product-code checkpoint is
+  `f9e2bf6df5bf25b236bfd723e330bb777d7f50d7`. It adds the bounded concurrent market-runtime
+  registry, automatic account-free Coinbase/Kraken startup and recovery, paper-action attachment
+  to the existing live runtime, authenticated Coinbase and Kraken order-level adapters, and the
+  Alpaca Basic, Tradier, and Nasdaq Symbol Directory adapters. It also refreshes the signed Python
+  source inventory to 1,200 exact paths. The preceding integrated workflow checkpoint remains
+  `6f0b4426cb029492f53ee32496848829498b2919`. Neither checkpoint is a frozen release candidate.
 - The main checkout owns the feature branch. `.worktrees` is empty and no temporary lane branch
   exists. The previously uncommitted integration state is now captured atomically at the code
   checkpoint above, including every newly registered Tauri permission, migration, native identity
@@ -34,22 +35,26 @@ evidence; it does not replace the README capability truth or the canonical relea
   attribution, preview-retention, and development-runtime defects. The code checkpoint closes
   those bounded defects with serialized live ownership, owner-scoped durable import recovery, one
   explicit bootstrap action, delayed window reveal, source-bound stored evidence, bounded preview
-  retention, and a reusable two-program model runtime. This is remediation, not a new review
-  checkpoint or release approval.
+  retention, and a reusable two-program model runtime. The market-runtime checkpoint then removes
+  the one-live-provider restriction and prevents paper execution from opening a duplicate market
+  connection. This is remediation and implementation evidence, not a new review checkpoint or
+  release approval.
 - Issue [#25](https://github.com/Sawmonabo/market-squawk/issues/25), issue
   [#45](https://github.com/Sawmonabo/market-squawk/issues/45), draft PR
   [#43](https://github.com/Sawmonabo/market-squawk/pull/43), and the Project items remain open and
-  `In Progress`. Focused integration evidence passed Rust formatting, application library and
-  binary checks, desktop-native check, frontend typecheck and production bundle, `just` syntax,
-  Python builder syntax, JSON admission, diff hygiene, and the 1,169-path Python source closure.
-  Generated Cargo output is 16 GiB after reclaiming idle cross-target release output, below the
-  20 GiB ceiling. Automatically triggered broad run `31317133401` was canceled; broad CI remains
-  deferred until the feature candidate is frozen for release-branch integration.
+  `In Progress`. The market-runtime checkpoint passed formatting, diff integrity, strict
+  all-feature Clippy for the application/live/provider packages, the existing two-route dynamic
+  action-hook proof, the existing application hook-composition proof, the consolidated Coinbase
+  and Kraken order-level protocol proofs, and the existing Alpaca, Tradier, and Nasdaq adapter
+  tests. The refreshed 1,200-path Python source closure also verifies. Generated Cargo output is
+  18,559,008 KiB, below the 20 GiB ceiling; no extra worktree exists. Broad CI remains deferred
+  until the feature candidate is frozen for release-branch integration.
 - Remaining barriers before the requested owner-test handoff are outcome-based:
 
-  1. Implement and prove the bounded multi-provider registry, admitted provider surfaces,
-     searchable multi-asset universe, deterministic resolver, unified presentation read model, and
-     fully wired non-technical Markets desktop journey.
+  1. Compose Tradier, Alpaca, Nasdaq reference data, and authenticated crypto depth into the shared
+     service; persist the searchable multi-asset universe; then implement the deterministic
+     resolver, source-preserving unified read model, and fully wired non-technical Markets desktop
+     journey. The adapters now exist, but these producer-to-consumer paths are not complete yet.
   2. Complete the resumable guided setup execution and every remaining shared-service/MCP,
      onboarding, research, Python/model, portfolio, decision, source, and restart workflow.
   3. Run one focused installed integration/e2e pass, including every desktop route and every flow
