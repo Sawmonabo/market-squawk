@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -41,6 +41,7 @@ jobs:
       package: ${{ steps.changes.outputs.package }}
       linux_matrix: ${{ steps.changes.outputs.linux_matrix }}
       platform: ${{ steps.release_scope.outputs.platform }}
+      verification: ${{ steps.release_scope.outputs.verification }}
       tree_sha: ${{ steps.freeze.outputs.tree_sha }}
     steps:
       - id: release_scope
@@ -55,6 +56,7 @@ jobs:
           set -euo pipefail
 
           platform=false
+          verification=false
           if [[ "$PLATFORM_VERIFICATION" == "true" ]]; then
             if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
               echo "Complete platform verification requires an explicit dispatch." >&2
@@ -73,8 +75,14 @@ jobs:
                 ;;
             esac
             platform=true
+            verification=true
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            case "$WORKFLOW_REF" in
+              refs/heads/main|refs/heads/release/*) verification=true ;;
+            esac
           fi
           echo "platform=$platform" >> "$GITHUB_OUTPUT"
+          echo "verification=$verification" >> "$GITHUB_OUTPUT"
       # actions/checkout v7.0.1, verified release commit (2026-07-22).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -252,12 +260,16 @@ jobs:
           fi
       # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        if: needs.classify.outputs.rust == 'true'
+        if: >-
+          needs.classify.outputs.verification == 'true' &&
+          needs.classify.outputs.rust == 'true'
         with:
           toolchain: 1.97.1
       # taiki-e/install-action v2.85.3, verified release commit (2026-07-24).
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68
-        if: needs.classify.outputs.rust == 'true'
+        if: >-
+          needs.classify.outputs.verification == 'true' &&
+          needs.classify.outputs.rust == 'true'
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
       - name: Install pinned Gitleaks CLI
@@ -279,7 +291,9 @@ jobs:
           gitleaks dir --redact --no-banner .
           gitleaks git --redact --no-banner
       - name: Check Rust workspace and dependency policy
-        if: needs.classify.outputs.rust == 'true'
+        if: >-
+          needs.classify.outputs.verification == 'true' &&
+          needs.classify.outputs.rust == 'true'
         run: |
           python3 scripts/check_workspace_boundaries.py
           cargo fetch --locked --quiet
@@ -401,7 +415,9 @@ jobs:
   python:
     name: Python source contracts
     needs: classify
-    if: needs.classify.outputs.python == 'true'
+    if: >-
+      needs.classify.outputs.verification == 'true' &&
+      needs.classify.outputs.python == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -422,7 +438,9 @@ jobs:
   linux:
     name: Linux ${{ matrix.name }}
     needs: classify
-    if: needs.classify.outputs.code == 'true'
+    if: >-
+      needs.classify.outputs.verification == 'true' &&
+      needs.classify.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.classify.outputs.linux_matrix) }}
@@ -484,7 +502,9 @@ jobs:
   macos:
     name: macOS workspace
     needs: classify
-    if: needs.classify.outputs.rust == 'true'
+    if: >-
+      needs.classify.outputs.verification == 'true' &&
+      needs.classify.outputs.rust == 'true'
     runs-on: macos-15-intel
     timeout-minutes: 60
     steps:
@@ -525,7 +545,9 @@ jobs:
   windows:
     name: Windows workspace
     needs: classify
-    if: needs.classify.outputs.rust == 'true'
+    if: >-
+      needs.classify.outputs.verification == 'true' &&
+      needs.classify.outputs.rust == 'true'
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
@@ -1607,6 +1629,7 @@ jobs:
           RUST: ${{ needs.classify.outputs.rust }}
           PYTHON: ${{ needs.classify.outputs.python }}
           PLATFORM: ${{ needs.classify.outputs.platform }}
+          VERIFICATION: ${{ needs.classify.outputs.verification }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           POLICY_RESULT: ${{ needs.policy.result }}
           DOCUMENTATION_LINKS_RESULT: ${{ needs.documentation-links.result }}
@@ -1628,19 +1651,19 @@ jobs:
             [[ "$DOCUMENTATION_LINKS_RESULT" == "skipped" ]]
           fi
 
-          if [[ "$PYTHON" == "true" ]]; then
+          if [[ "$VERIFICATION" == "true" && "$PYTHON" == "true" ]]; then
             [[ "$PYTHON_RESULT" == "success" ]]
           else
             [[ "$PYTHON_RESULT" == "skipped" ]]
           fi
 
-          if [[ "$CODE" == "true" ]]; then
+          if [[ "$VERIFICATION" == "true" && "$CODE" == "true" ]]; then
             [[ "$LINUX_RESULT" == "success" ]]
           else
             [[ "$LINUX_RESULT" == "skipped" ]]
           fi
 
-          if [[ "$RUST" == "true" ]]; then
+          if [[ "$VERIFICATION" == "true" && "$RUST" == "true" ]]; then
             [[ "$MACOS_RESULT" == "success" ]]
             [[ "$WINDOWS_RESULT" == "success" ]]
           else
