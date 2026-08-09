@@ -12,19 +12,23 @@ evidence; it does not replace the README capability truth or the canonical relea
   `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
   release-branch integration is authorized in this execution scope.
 - The latest product-code checkpoint is
-  `3381669b1609526c6e15e9c06d8140bf45cc8abb`. It keeps the bounded concurrent market-runtime
-  registry and adds the production Coinbase order-level path, the canonical order-preserving book
-  and bounded shared read authority, deterministic source selection, Nasdaq Symbol Directory
-  search, the source-preserving unified Markets response, and the corresponding non-technical
-  Desktop feed and instrument workspace. It also adds compiled account/configuration authorities
-  for Alpaca Basic, Tradier, and authenticated Kraken depth plus a durable Nasdaq listing-reference
-  catalog boundary. Those latter authorities are not represented as live product coverage until
-  their producer/runtime composition is complete. The preceding market-runtime checkpoint remains
-  `f9e2bf6df5bf25b236bfd723e330bb777d7f50d7`. Neither checkpoint is a frozen release candidate.
+  `854e8c15ffdbed29c5f0d976b1216ab9396c52e1`. It completes the bounded account-group runtime for
+  Alpaca Basic, Tradier, and authenticated Kraken order-level depth; FIGI-backed non-execution
+  market identity and catalog persistence; source-preserving display and order-level actors;
+  exact-session lifecycle recovery; deterministic source selection; and the unified Desktop
+  feed, instrument workspace, individual-order view, and expandable Data confidence evidence.
+  Runtime composition is present, but real credentials, authorized network responses, reconnect,
+  rate-limit, restart, and fallback behavior remain acceptance evidence rather than inferred
+  coverage. Release-evidence correction
+  `9b007b71ec634aa3aca43bb97f64d16bbb9e05d2` separately replaces ordinary build-time Git-HEAD
+  binding with a deterministic measured-source closure while retaining exact candidate commit,
+  tree, and verification-script identity in the external authoritative evidence envelope. Neither
+  commit is a frozen release candidate.
 - The main checkout owns the feature branch. `.worktrees` is empty and no temporary lane branch
-  exists. The previously uncommitted integration state is now captured atomically at the code
-  checkpoint above, including every newly registered Tauri permission, migration, native identity
-  file, file-import module, and Python source identity required by the compiled product.
+  exists. Local and origin feature heads both point to `9b007b71`; the root worktree was clean and
+  unchanged immediately after the two scoped pushes. The Python source-closure lock is intentionally
+  not refreshed at this checkpoint because the binding goal requires that refresh only after the
+  remaining product source changes are final.
 - The approved Markets expansion is now a V1 release blocker in issue
   [#45](https://github.com/Sawmonabo/market-squawk/issues/45), the maintained installed-product
   design/plan, and the
@@ -45,11 +49,13 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Issue [#25](https://github.com/Sawmonabo/market-squawk/issues/25), issue
   [#45](https://github.com/Sawmonabo/market-squawk/issues/45), draft PR
   [#43](https://github.com/Sawmonabo/market-squawk/pull/43), and the Project items remain open and
-  `In Progress`. Exact integrated head `3381669b` passes the focused locked application-library
-  check, Desktop TypeScript check, repository formatting check, and diff integrity check. Earlier
-  disjoint lane proofs cover the Nasdaq catalog replay, deterministic resolver, and provider
-  decoder invariants, but they are not substituted for the future unchanged-head release gate.
-  Generated Cargo output is 15,586,704 KiB, below the 20 GiB ceiling; no extra worktree exists.
+  `In Progress`. The pushed Markets slice passed a locked application-library check with zero
+  warnings, a locked Tauri Desktop check, Desktop TypeScript compilation, the one critical unified
+  Markets journey, the account-group resynchronization authority case, repository formatting, and
+  diff integrity. The release-evidence slice passed 21 host-boundary cases, the exact
+  source-closure-drift case, and Python syntax validation. These are focused checkpoint results,
+  not the future unchanged-head release gate. Generated Cargo output is 17,482,952 KiB, below the
+  20 GiB ceiling; no extra worktree exists.
   Automatic broad run
   `31322655877` was cancelled before completion. Workflow checkpoint
   `9baac4f4f24af67befb5ffca406ce2348084f45e` now reserves compiler/test matrices for explicit
@@ -58,18 +64,21 @@ evidence; it does not replace the README capability truth or the canonical relea
   checks.
 - Remaining barriers before the requested owner-test handoff are outcome-based:
 
-  1. Finish the security-level identity/definition producer, then compose Alpaca, Tradier, and
-     authenticated Kraken depth into the shared runtime. Persist Nasdaq reference generations when
-     the admitted rights evidence permits it, and connect those retained definitions to the unified
-     Markets feed. Coinbase order-level depth, Nasdaq reference search, deterministic selection,
-     and the unified Desktop presentation are now wired; the remaining account-backed providers
-     must not be advertised until their exact runtime paths are active.
-  2. Complete the resumable guided setup execution and every remaining shared-service/MCP,
+  1. Run the isolated no-account and credential-authorized live Market paths against exact current
+     provider responses. Prove startup, search, subscriptions, source selection, order-level
+     resynchronization, rate budgeting, fallback disclosure, restart, stale-credential rejection,
+     and shared Desktop/CLI/MCP reads before advertising that coverage as accepted.
+  2. Complete the unified non-technical investment workspace above the feed: bars, features,
+     forecasts, buy/add/trim/sell targets, backtests, fundamentals/filings, portfolio impact, risk,
+     and personalized opportunities. Optional options and derived-index children remain absent
+     unless their exact configured identity and source evidence exist.
+  3. Complete the resumable guided setup execution and every remaining shared-service/MCP,
      onboarding, research, Python/model, portfolio, decision, source, and restart workflow.
-  3. Run one focused installed integration/e2e pass, including every desktop route and every flow
+  4. Run one focused installed integration/e2e pass, including every desktop route and every flow
      not blocked by an unavailable user account or key, plus fresh shared Claude Code and Codex MCP
      clients and restart/stale-credential recovery.
-  4. Freeze one unchanged feature head, run the complete local release gate once, obtain all four
+  5. Refresh the Python source closure only after the product source is final, freeze one unchanged
+     feature head, run the complete local release gate once, obtain all four
      platform installed-product proofs, close every grouped Quarter 4 finding, update PR #43 and
      the ledger with exact-head evidence, and prepare the owner-test package.
 - Completion stops at the feature-branch packaged V1 handoff. Publishing assets, creating a public
