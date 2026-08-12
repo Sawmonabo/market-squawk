@@ -264,6 +264,11 @@ impl PreparedInstalledOperations {
             )
             .map_err(|_error| InstalledServiceError::CompositionStage("recommendation setup"))?,
         );
+        product
+            .register_portfolio_candidate_resolution(Arc::clone(&recommendation_setup))
+            .map_err(|_error| {
+                InstalledServiceError::CompositionStage("portfolio candidate resolution")
+            })?;
         let activity = Arc::new(RuntimeActivityCoordinator::new(
             RuntimeActivityLimits::try_new(
                 4_096,

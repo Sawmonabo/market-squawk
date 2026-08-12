@@ -193,7 +193,7 @@ impl MarketSurfaceSelectionPolicy {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct UnifiedInstrumentDefinition<'definition> {
+pub(super) struct UnifiedInstrumentDefinition<'definition> {
     instrument_id: InstrumentId,
     asset_class: AssetClass,
     quote_currency: Currency,
@@ -202,7 +202,7 @@ struct UnifiedInstrumentDefinition<'definition> {
 }
 
 impl<'definition> UnifiedInstrumentDefinition<'definition> {
-    fn try_new(
+    pub(super) fn try_new(
         instrument_id: InstrumentId,
         executable: Option<&'definition InstrumentDefinition>,
         market_data: Option<&'definition MarketDataInstrumentDefinition>,
@@ -232,16 +232,22 @@ impl<'definition> UnifiedInstrumentDefinition<'definition> {
         })
     }
 
-    const fn instrument_id(self) -> InstrumentId {
+    pub(super) const fn instrument_id(self) -> InstrumentId {
         self.instrument_id
     }
 
-    const fn asset_class(self) -> AssetClass {
+    pub(super) const fn asset_class(self) -> AssetClass {
         self.asset_class
     }
 
     const fn quote_currency(self) -> Currency {
         self.quote_currency
+    }
+
+    pub(super) fn execution_terms(self) -> Result<InstrumentExecutionTerms, ServiceError> {
+        self.executable
+            .map(InstrumentDefinition::execution_terms)
+            .ok_or(ServiceError::Unavailable)
     }
 }
 
@@ -385,7 +391,7 @@ pub(super) fn build_unified_market_result(
     )
 }
 
-fn validate_inputs(
+pub(super) fn validate_inputs(
     streams: &[StreamView<'_>],
     definitions: &[InstrumentDefinition],
     market_data_definitions: &[MarketDataInstrumentDefinition],
@@ -528,7 +534,7 @@ fn unified_definition<'definition>(
     UnifiedInstrumentDefinition::try_new(instrument_id, executable, market_data)
 }
 
-fn build_candidates(
+pub(super) fn build_candidates(
     streams: &[StreamView<'_>],
     definition: UnifiedInstrumentDefinition<'_>,
     display_snapshots: &[&MarketDisplaySnapshotLease],
@@ -826,7 +832,8 @@ fn source_candidate(
             .map_err(selection_error)?,
         policy.rights.admission().map_err(selection_error)?,
         integrity,
-        // A presentation read owns no execution capability. It must not infer one from quality.
+        // Market observation reads own no execution capability. They must not infer one from
+        // quality, including when the selected mark is used for portfolio analysis.
         ExecutionEligibility::Ineligible,
     );
     SourceCandidate::try_new(
@@ -1233,36 +1240,13 @@ fn instrument_row(
             exact_selected_view(streams, display_snapshots, kraken_projections, selected)
         })
         .transpose()?;
-    let investment_source = match selected_view {
-        Some(UnifiedSelectedView::Live(view)) => {
-            let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
-            Some(SelectedMarketInvestmentSource::Live(
-                LiveMarketInvestmentSource::new(
-                    view.surface_id,
-                    view.metadata.provider(),
-                    view.stream,
-                    view.route.features(),
-                    executable,
-                    view.shard.published_at(),
-                ),
-            ))
-        }
-        Some(UnifiedSelectedView::Display(snapshot)) => {
-            let market_data = definition.market_data.ok_or(ServiceError::InvalidResult)?;
-            Some(SelectedMarketInvestmentSource::Display {
-                snapshot,
-                definition: market_data,
-            })
-        }
-        Some(UnifiedSelectedView::Kraken(snapshot)) => {
-            Some(SelectedMarketInvestmentSource::Kraken(snapshot))
-        }
-        None => None,
-    };
-    let market_observation = market_investment_value(
-        read_market_investment_observation(receipt, investment_source)
-            .map_err(market_investment_error)?,
-    );
+    let market_observation = market_investment_value(read_selected_market_investment(
+        definition,
+        streams,
+        display_snapshots,
+        kraken_projections,
+        receipt,
+    )?);
     let symbol = unified_symbol(
         definition,
         selected_view,
@@ -1363,6 +1347,52 @@ fn instrument_row(
             "downgradeDimensions": selected_downgrades.iter().map(downgrade_value).collect::<Vec<_>>()
         }
     }))
+}
+
+/// Reads the typed source-preserving investment observation used by non-executable compositors.
+///
+/// The returned evidence borrows the exact selected runtime lease and definition. Callers must
+/// convert it to their owned evidence while those authorities remain alive.
+pub(super) fn read_selected_market_investment<'receipt, 'source>(
+    definition: UnifiedInstrumentDefinition<'source>,
+    streams: &[StreamView<'source>],
+    display_snapshots: &[&'source MarketDisplaySnapshotLease],
+    kraken_projections: &[&'source MarketKrakenPriceProjectionLease],
+    receipt: &'receipt MarketSelectionReceipt,
+) -> Result<MarketInvestmentRead<'receipt, 'source>, ServiceError> {
+    let selected_view = receipt
+        .selected()
+        .map(|selected| {
+            exact_selected_view(streams, display_snapshots, kraken_projections, selected)
+        })
+        .transpose()?;
+    let source = match selected_view {
+        Some(UnifiedSelectedView::Live(view)) => {
+            let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
+            Some(SelectedMarketInvestmentSource::Live(
+                LiveMarketInvestmentSource::new(
+                    view.surface_id,
+                    view.metadata.provider(),
+                    view.stream,
+                    view.route.features(),
+                    executable,
+                    view.shard.published_at(),
+                ),
+            ))
+        }
+        Some(UnifiedSelectedView::Display(snapshot)) => {
+            let market_data = definition.market_data.ok_or(ServiceError::InvalidResult)?;
+            Some(SelectedMarketInvestmentSource::Display {
+                snapshot,
+                definition: market_data,
+            })
+        }
+        Some(UnifiedSelectedView::Kraken(snapshot)) => {
+            Some(SelectedMarketInvestmentSource::Kraken(snapshot))
+        }
+        None => None,
+    };
+    read_market_investment_observation(receipt, source).map_err(market_investment_error)
 }
 
 fn market_investment_value(read: MarketInvestmentRead<'_, '_>) -> Value {

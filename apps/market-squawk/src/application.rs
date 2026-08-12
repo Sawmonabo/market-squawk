@@ -62,7 +62,7 @@ pub(crate) use market_runtime::{
 pub use paper::PaperApplicationServices;
 pub(crate) use paper::{
     MarketReferenceMatchKind, MarketReferenceRecord, MarketReferenceSearchAuthority,
-    MarketReferenceSearchPage, PaperRuntimeActivityAuthority,
+    MarketReferenceSearchPage, PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
 };
 pub(crate) use research::{
     AnalyticalForecastEvidenceReader, DatasetPreparationAuthority, DatasetPreparationError,

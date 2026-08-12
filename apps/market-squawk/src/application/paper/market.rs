@@ -1,5 +1,6 @@
 //! Bounded current-state Market domain over the paper runtime's live owner.
 
+mod candidate;
 mod results;
 mod serialization;
 mod unified;
@@ -28,7 +29,9 @@ use crate::application::market_runtime::{
     MarketDisplaySnapshotBatch, MarketDisplaySnapshotLease, MarketKrakenPriceProjectionLease,
     MarketOrderLevelSnapshot, MarketRuntimeRegistry, MarketRuntimeSnapshotBatch,
 };
+use crate::application::market_selection::{MarketOperation, MarketOperationSet};
 use crate::application::{ApplicationDomainService, effective_service_limits};
+pub(super) use candidate::ProductionPortfolioCandidateResolutionFactory;
 use results::{
     build_book_result, build_comparison_result, build_quality_result, build_quote_result,
     build_snapshot_result, build_trade_result,
@@ -362,6 +365,7 @@ impl ApplicationDomainService for MarketDomainService {
                     &display_snapshots,
                     &kraken_projection_refs,
                     reference_at,
+                    presentation_surface_operations()?,
                 )?;
                 let source_coverage = source_coverage_value(
                     &streams,
@@ -743,6 +747,7 @@ fn build_surface_policies(
     display_snapshots: &[&MarketDisplaySnapshotLease],
     kraken_projections: &[&MarketKrakenPriceProjectionLease],
     reference_at: Timestamp,
+    operations: MarketOperationSet,
 ) -> Result<Vec<MarketSurfaceSelectionPolicy>, ServiceError> {
     let policy_count = snapshots
         .sources()
@@ -761,11 +766,6 @@ fn build_surface_policies(
         |count, snapshot| count.checked_add(snapshot.metadata().coverage().asset_classes().len()),
     );
     let policy_count = policy_count.ok_or(ServiceError::ResourceExhausted)?;
-    let operations = crate::application::market_selection::MarketOperationSet::try_new(&[
-        crate::application::market_selection::MarketOperation::SnapshotDisplay,
-        crate::application::market_selection::MarketOperation::StreamDisplay,
-    ])
-    .map_err(|_error| ServiceError::Internal)?;
     let mut policies = Vec::new();
     policies
         .try_reserve_exact(policy_count)
@@ -814,6 +814,14 @@ fn build_surface_policies(
         }
     }
     Ok(policies)
+}
+
+fn presentation_surface_operations() -> Result<MarketOperationSet, ServiceError> {
+    MarketOperationSet::try_new(&[
+        MarketOperation::SnapshotDisplay,
+        MarketOperation::StreamDisplay,
+    ])
+    .map_err(|_error| ServiceError::Internal)
 }
 
 fn push_surface_policy(
@@ -1122,6 +1130,58 @@ fn collect_streams<'snapshot>(
                 }
             }
         }
+    }
+    streams.sort_unstable_by(compare_streams);
+    Ok(streams)
+}
+
+/// Collects only one exact instrument's complete scalar stream set for a non-presentation read.
+fn collect_candidate_streams<'snapshot>(
+    snapshots: &'snapshot MarketRuntimeSnapshotBatch,
+    instrument_id: InstrumentId,
+    deadline: Instant,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<StreamView<'snapshot>>, ServiceError> {
+    let mut count = 0_usize;
+    for source in snapshots.sources() {
+        for shard in source.lease().snapshots() {
+            require_complete(shard.route_dimension())?;
+            for route in shard.routes() {
+                require_complete(route.stream_dimension())?;
+                if route.route().instrument() == instrument_id {
+                    count = count
+                        .checked_add(route.streams().len())
+                        .ok_or(ServiceError::ResourceExhausted)?;
+                }
+            }
+        }
+    }
+    let mut streams = Vec::new();
+    streams
+        .try_reserve_exact(count)
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for source in snapshots.sources() {
+        for shard in source.lease().snapshots() {
+            super::ensure_before(deadline, cancellation)?;
+            for route in shard.routes() {
+                if route.route().instrument() != instrument_id {
+                    continue;
+                }
+                for stream in route.streams() {
+                    let metadata = exact_stream_metadata(source.metadata(), stream.source())?;
+                    streams.push(StreamView {
+                        surface_id: source.surface_id(),
+                        metadata,
+                        shard,
+                        route,
+                        stream,
+                    });
+                }
+            }
+        }
+    }
+    if streams.len() != count {
+        return Err(ServiceError::InvalidResult);
     }
     streams.sort_unstable_by(compare_streams);
     Ok(streams)

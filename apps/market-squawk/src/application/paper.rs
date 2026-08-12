@@ -45,6 +45,7 @@ use super::market_runtime::{
     COINBASE_DIRECT_SURFACE_ID, COINBASE_PUBLIC_SURFACE_ID, KRAKEN_PUBLIC_SURFACE_ID,
     MarketRuntimeRegistry,
 };
+use super::recommendation::RecommendationSetupAuthority;
 use super::source::SourceRuntimeView;
 use super::{ApplicationDomainService, effective_service_limits};
 use crate::{
@@ -55,6 +56,9 @@ use crate::{
         local_coinbase_direct_paper_bot_on_existing_market_with_strategy_mode,
         local_paper_bot_on_existing_public_market_with_strategy_mode, manual_paper_account_id,
         manual_paper_reason_code, manual_paper_strategy_id,
+    },
+    portfolio_application::{
+        PortfolioAccountCatalogReadCapability, PortfolioCandidateResolutionAuthority,
     },
 };
 
@@ -79,6 +83,32 @@ pub struct PaperApplicationServices {
     instrument_definitions: InstrumentDefinitionReadCapability,
     market_data_instruments: MarketDataInstrumentReadCapability,
     reference_search: Arc<dyn market::MarketReferenceSearchAuthority>,
+}
+
+/// Market-only candidate factory retained until durable workspace setup is available.
+#[derive(Clone)]
+pub(crate) struct PortfolioCandidateResolutionFactory {
+    inner: market::ProductionPortfolioCandidateResolutionFactory,
+}
+
+impl PortfolioCandidateResolutionFactory {
+    /// Binds the exact workspace setup and immutable imported-portfolio catalog reader.
+    pub(crate) fn bind(
+        &self,
+        setup: Arc<RecommendationSetupAuthority>,
+        catalog: PortfolioAccountCatalogReadCapability,
+    ) -> Arc<dyn PortfolioCandidateResolutionAuthority> {
+        self.inner.bind(setup, catalog)
+    }
+}
+
+impl fmt::Debug for PortfolioCandidateResolutionFactory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PortfolioCandidateResolutionFactory")
+            .field("authority", &"[CURRENT MARKET READS ONLY]")
+            .finish()
+    }
 }
 
 pub(crate) use market::{
@@ -201,6 +231,21 @@ impl PaperApplicationServices {
         Arc::new(PaperRuntimeActivityControl {
             controller: Arc::clone(&self.controller),
         })
+    }
+
+    /// Returns a read-only factory without paper state, action hooks, risk, or order authority.
+    pub(crate) fn candidate_resolution_factory(
+        &self,
+    ) -> Result<PortfolioCandidateResolutionFactory, ServiceError> {
+        let maximum_mark_age_nanos = u64::try_from(self.controller.config.stale_after().as_nanos())
+            .map_err(|_error| ServiceError::Internal)?;
+        market::ProductionPortfolioCandidateResolutionFactory::try_new(
+            Arc::clone(&self.market_runtime),
+            self.instrument_definitions.clone(),
+            self.market_data_instruments.clone(),
+            maximum_mark_age_nanos,
+        )
+        .map(|inner| PortfolioCandidateResolutionFactory { inner })
     }
 }
 

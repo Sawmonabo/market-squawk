@@ -18,14 +18,17 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::application::market_selection::{
-    CandidateTimestamps, FreshnessBasis, MarketInvestmentMarkBasis, MarketInvestmentObservation,
-    MarketSelectionReceipt,
+use crate::application::{
+    market_selection::{
+        CandidateTimestamps, FreshnessBasis, MarketInvestmentMarkBasis,
+        MarketInvestmentObservation, MarketSelectionReceipt,
+    },
+    recommendation::ResolvedRecommendationSetup,
 };
 
 use super::import::hex;
 use super::model::PublishedRevision;
-use super::{PortfolioApplicationServiceError, Runtime};
+use super::{PortfolioAccountCatalogSnapshot, PortfolioApplicationServiceError, Runtime};
 
 const CANDIDATE_IMPACT_POLICY: &str = "selected_market_candidate_impact_v3";
 const CANDIDATE_IMPACT_EVIDENCE_SCHEMA_VERSION: u16 = 1;
@@ -461,34 +464,58 @@ pub(crate) struct PortfolioCandidateMarketEvidence {
 /// Server-resolved setup, selected-market observation, and exact financial terms.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PortfolioCandidateResolution {
-    setup: PortfolioCandidateSetupBinding,
+    setup: ResolvedRecommendationSetup,
+    catalog: PortfolioAccountCatalogSnapshot,
     market: PortfolioCandidateMarketEvidence,
 }
 
 impl PortfolioCandidateResolution {
     /// Builds the only production candidate input from already-resolved typed authorities.
     pub(crate) fn try_from_authorities(
-        setup: &crate::application::recommendation::ResolvedRecommendationSetup,
+        setup: ResolvedRecommendationSetup,
+        catalog: PortfolioAccountCatalogSnapshot,
         receipt: &MarketSelectionReceipt,
         observation: MarketInvestmentObservation<'_, '_>,
         execution_terms: InstrumentExecutionTerms,
         fees: PortfolioCandidateAvailability<PortfolioCandidateCost>,
         slippage: PortfolioCandidateAvailability<PortfolioCandidateCost>,
     ) -> Result<Self, PortfolioApplicationServiceError> {
-        let setup = PortfolioCandidateSetupBinding::try_from_resolved_setup(setup)?;
+        let setup_binding = PortfolioCandidateSetupBinding::try_from_resolved_setup(&setup)?;
+        let current_head = catalog
+            .head(setup_binding.account_id())
+            .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+        if setup.as_of().unix_nanos() <= 0
+            || setup.catalog_digest() != catalog.digest()
+            || setup.available_accounts() != catalog.account_count()
+            || setup.current_head() != current_head
+            || current_head.revision() != setup_binding.portfolio_revision()
+            || current_head.reporting_currency() != setup_binding.reporting_currency()
+        {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
         let market = PortfolioCandidateMarketEvidence::try_from_market_selection(
             receipt,
             observation,
             execution_terms,
             fees,
             slippage,
-            setup.portfolio_revision.clone(),
+            setup_binding.portfolio_revision.clone(),
         )?;
-        Ok(Self { setup, market })
+        Ok(Self {
+            setup,
+            catalog,
+            market,
+        })
     }
 
-    pub(crate) const fn setup(&self) -> &PortfolioCandidateSetupBinding {
+    /// Returns the complete durable setup joined at the exact evaluation instant.
+    pub(crate) const fn setup(&self) -> &ResolvedRecommendationSetup {
         &self.setup
+    }
+
+    /// Returns every ordered account head used to resolve the selected setup.
+    pub(crate) const fn catalog(&self) -> &PortfolioAccountCatalogSnapshot {
+        &self.catalog
     }
 
     pub(crate) const fn market(&self) -> &PortfolioCandidateMarketEvidence {
@@ -675,9 +702,10 @@ impl PortfolioCandidateImpactRequest {
         scenario_shock: Decimal,
         evaluated_at: Timestamp,
     ) -> Result<Self, PortfolioApplicationServiceError> {
+        let setup = PortfolioCandidateSetupBinding::try_from_resolved_setup(&resolution.setup)?;
         let instrument_id = resolution.market.observation.instrument_id;
         Self::try_new(
-            resolution.setup,
+            setup,
             instrument_id,
             proposed_quantity,
             scenario_shock,
@@ -1900,6 +1928,20 @@ mod tests {
         assert_eq!(content["authority"]["portfolioMutation"], false);
         assert_eq!(content["authority"]["executionAuthority"], false);
         assert_eq!(content["authority"]["reservation"], false);
+        assert_eq!(
+            content["costEvidence"]["fees"],
+            serde_json::json!({
+                "status": "unavailable",
+                "reason": "exact_fees",
+            })
+        );
+        assert_eq!(
+            content["costEvidence"]["slippage"],
+            serde_json::json!({
+                "status": "unavailable",
+                "reason": "exact_slippage",
+            })
+        );
         assert_eq!(
             content["riskAdvisory"]["outcome"],
             "indeterminate_at_evaluation"

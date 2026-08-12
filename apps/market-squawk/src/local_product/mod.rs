@@ -102,7 +102,7 @@ use crate::application::{
     FairValueInputAuthorityError, FairValueInputAuthorityLimits,
     FairValueProducerSelectionAuthority, LiveFairValueObservationBuffer,
     LiveFairValueObservationBufferError, MarketReferenceSearchAuthority, MarketRuntimeRegistry,
-    PaperApplicationServices, PaperRuntimeActivityAuthority,
+    PaperApplicationServices, PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
     PrepublishedResearchSourceRegistration, ProductionFairValueInputAuthority,
     ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
     ResearchIngestCompositionError, ResearchSourceDiscoveryCoordinator, SourceDomainService,
@@ -201,6 +201,7 @@ pub struct LocalProduct {
     research_ingest: Arc<ProductionResearchIngestCoordinator>,
     source_lifecycle: Arc<ProductionSourceLifecycleAuthority>,
     paper_activity: Arc<dyn PaperRuntimeActivityAuthority>,
+    portfolio_candidate_resolution: PortfolioCandidateResolutionFactory,
     provider_onboarding: Arc<ProviderOnboardingService>,
     provider_activation: Arc<ProviderAdapterActivation>,
     provider_research_activation: Arc<cli_provider::ProviderResearchActivationService>,
@@ -502,6 +503,7 @@ impl LocalProduct {
             research.market_data_instruments(),
             reference_search,
         );
+        let portfolio_candidate_resolution = paper.candidate_resolution_factory()?;
         let source_lifecycle = Arc::new(ProductionSourceLifecycleAuthority::new(
             paths.clone(),
             Arc::clone(&onboarding),
@@ -631,6 +633,7 @@ impl LocalProduct {
             research_ingest,
             source_lifecycle,
             paper_activity,
+            portfolio_candidate_resolution,
             provider_onboarding: onboarding,
             provider_activation,
             provider_research_activation: portal_activation,
@@ -770,6 +773,18 @@ impl LocalProduct {
     /// Returns the durable portfolio service used by direct CLI publication boundaries.
     pub fn portfolio(&self) -> Arc<PortfolioApplicationService> {
         Arc::clone(&self.portfolio)
+    }
+
+    /// Installs the sole workspace-bound resolver before the installed service becomes ready.
+    pub(crate) fn register_portfolio_candidate_resolution(
+        &self,
+        setup: Arc<crate::application::recommendation::RecommendationSetupAuthority>,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let authority = self
+            .portfolio_candidate_resolution
+            .bind(setup, self.portfolio.account_catalog_reader());
+        self.portfolio
+            .register_candidate_resolution_authority(authority)
     }
 
     /// Returns the sole durable decision workflow authority.
