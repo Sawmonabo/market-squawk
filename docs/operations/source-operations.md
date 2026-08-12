@@ -10,7 +10,7 @@ authority-free source status views.
 | Audience | Source operators, data-rights reviewers, incident responders, and maintainers |
 | Status | Current |
 | Last substantive review | 2026-08-12 |
-| Review basis | `7fb52c19dc273fe44d3846f1986c61c1321032fd` plus the Wave 6 candidate; not provider-workflow or release acceptance |
+| Review basis | `8fd91dad768affda2126ed91a5b97f1bd1e32209` plus the Wave 8B profile/documentation candidate; not provider-workflow or release acceptance |
 
 ## Contents
 
@@ -216,16 +216,19 @@ The selected mappings above are current code facts, not claims that their data r
 The existing application already has substantive Alpaca, Nasdaq reference, SEC, BLS,
 FRED/ALFRED, and Treasury foundations. Provider-native core and transport code is also present for
 Schwab, Yahoo, IEX HIST, OCC/Cboe reference, BEA, Census, EIA, Tiingo, and the Federal Reserve
-Board. Board revision 4 adds an exact bounded no-key H.15 onboarding GET whose response must pass
-the adapter's exact 11-series/ten-row parser under the shared one-request-per-minute,
-single-flight application budget.
+Board. Board revision 4 retains an exact bounded no-key H.15 onboarding GET whose response must
+pass the adapter's exact 11-series/ten-date parser under the shared one-request-per-minute,
+single-flight application budget. Production is a distinct rolling 100-date/1,100-observation
+contract; the full-history package is unavailable to the one-batch source until partitioned
+resumable extraction exists.
 
 Most of these selected surfaces remain `refresh_required`; Board revision 4 is `available` at the
 profile/onboarding-doctor boundary and now has code-owned activation/source construction, shared
 rich-capture binding, analytical-dataset registration, and lifecycle serialization/restore.
-Focused Board activation/restart proof remains upstream-blocked. Executed durable live
-publication, manifests, point-in-time selectors, typed reads, macro/Desktop composition, restart
-acceptance, and frozen-head acceptance remain separate gates. Read `source status`, `source
+The scripted installed Board journey proves rolling capture/sealing, durable catalog/Parquet
+publication, typed history and macro-dashboard reads, stable same-root restart evidence, and zero
+post-restart provider HTTP. Real-network installed retrieval/publication/restart acceptance,
+Desktop composition, and frozen-head acceptance remain separate gates. Read `source status`, `source
 coverage`, and the [delivery ledger](../plans/delivery-ledger.md) rather than inferring product
 availability from a profile release state or code-path presence.
 
@@ -467,7 +470,7 @@ The closed provider kinds are:
 | `treasury_fiscal` | Inclusive first/last dates and page size for the exact Fiscal Data query |
 | `treasury_daily_rates` | Inclusive first/last years; every official family available in that range is activated |
 | `fred_alfred` | Exact current terms artifact; exact official-HTTPS Bank response bytes verified by fresh reacquisition; explicit hash-bound review with reviewer, issuer, grantee, service, exact series, operations, conditions, and revalidation; independent per-series public-domain or owner evidence |
-| `federal_reserve_board_h15` | No additional input; must match an active revision-4 Board lease and always constructs the code-owned exact full-history H.15 contract |
+| `federal_reserve_board_h15` | No additional input; must match an active revision-4 Board lease and construct only the exact rolling 100-date H.15 dashboard contract; the full-history contract is rejected until partitioned resumable extraction exists |
 
 Credential bytes are never part of this request. FRED's request shape does not create rights:
 without an admitted active lease and both exact authority gates, the command fails closed. A
@@ -642,6 +645,7 @@ the data root, and never remove files or catalog rows by hand.
 | Registered BLS v2 cannot activate | The distinct keyed profile remains `refresh_required`, or its foreground credential is unavailable | Use public v1 within its limits or wait for an admitted registered-v2 revision; never treat v1 authority as v2 authority |
 | FRED key/import or use is rejected | API-key format, current terms, exact written Bank permission, hash-bound local review, exact-series authority, requested operations, or validity intersection is missing or mismatched | Correct the exact rejected authority or key generation; a successful key probe or contact receipt cannot replace either rights gate |
 | Treasury XML cannot publish durably | Family/query authority, CC0 evidence, official response, or publication integrity is incomplete | Preserve the exact error and rerun only after correcting the named family or authority input; never inherit rights across surfaces |
+| Board full-history source construction is rejected | The full-history response cannot satisfy the indivisible one-batch capture/publication contract | Use the code-owned rolling 100-date dashboard source; do not raise bounds or relabel it as full history. Implement reviewed partitioned, checkpointed, resumable ingestion before admitting the full-history research contract |
 | Discovery or ingestion rejects an object | Provider activation, rights, exact dataset/object identity, metadata, or the fresh process-local receipt no longer matches | Read current source status, rerun the bounded listing, and retry the exact confirmed ingestion; never fabricate or reuse a receipt |
 | Status shows `currentSession: active` and `runtime: not_active` | Research extraction adapter is active but no live market runtime exists in this process | Treat session/activation evidence as extraction status; do not fabricate live health |
 | Activation request rejects as invalid | Wrong schema version, unknown field/kind, oversized or symlinked input, surface/session mismatch, missing evidence, or bad hash | Use the exact controlled request and evidence root; do not weaken validation |

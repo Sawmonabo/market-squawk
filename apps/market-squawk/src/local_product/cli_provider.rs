@@ -18,7 +18,8 @@ use cap_fs_ext::DirExt as _;
 use cap_std::fs::Dir;
 use market_squawk_adapter_bls::{BlsAccessTier, BlsRequestPlan, BlsSeriesMetadata};
 use market_squawk_adapter_federal_reserve::{
-    BOARD_DDP_SOURCE_ID, BoardDatasetContract, BoardDatasetProfile, BoardParseLimits,
+    BOARD_DDP_SOURCE_ID, BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
+    BoardDatasetProfile,
 };
 use market_squawk_adapter_files::{ExtractionLimits, ExtractionLimitsInput};
 use market_squawk_adapter_fred::{
@@ -47,10 +48,10 @@ use market_squawk_platform::{
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
     BudgetWindowSemantics, CoverageDomain, EndpointPolicy, FRED_ALFRED_API_SURFACE_ID,
-    FreshnessPolicy, HistoricalCapability, HttpRequestBounds, MAX_PROVIDER_CAPTURE_PAGE_BYTES,
-    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
-    ProviderRateDeclaration, QueryParameterRule, QuerySensitivity, SourceCapabilities, SourceClass,
-    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    FreshnessPolicy, HistoricalCapability, HttpRequestBounds, NetworkAccessPolicy, PathScope,
+    ProviderBudgetPolicy, ProviderBudgetWindow, ProviderRateDeclaration, QueryParameterRule,
+    QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SourceMetadataInput, SourceProtocolProfile,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2307,17 +2308,14 @@ fn build_research_activation(
             ProviderAdapterActivationRequest::Fred(FredAdapterActivation::new(metadata, policy))
         }
         ProviderRequest::FederalReserveBoardH15 => {
-            let contract = BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
+            let profile = BoardDatasetProfile::h15_treasury_constant_maturities_rolling_dashboard()
                 .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
             let metadata = federal_reserve_board_metadata(
                 lease,
                 activation_evidence,
                 metadata_effective,
-                &contract,
+                &profile,
             )?;
-            let profile =
-                BoardDatasetProfile::try_new(contract, BoardParseLimits::default(), Vec::new())
-                    .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
             ProviderAdapterActivationRequest::Board(BoardAdapterActivation::new(metadata, profile))
         }
         ProviderRequest::ControlledLocalFiles { configuration } => {
@@ -4313,8 +4311,11 @@ fn federal_reserve_board_metadata(
     lease: &ProviderActivationLease,
     evidence: EvidenceDigest,
     effective: EffectiveInterval,
-    contract: &BoardDatasetContract,
+    profile: &BoardDatasetProfile,
 ) -> Result<SourceMetadata, CliProviderActivationError> {
+    let contract = profile.contract();
+    let rolling_date_count =
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT.to_string();
     let exact_query =
         |key: &str, value: &str| -> Result<QueryParameterRule, CliProviderActivationError> {
             QueryParameterRule::try_new_exact_public(
@@ -4331,11 +4332,7 @@ fn federal_reserve_board_metadata(
         vec![
             exact_query("filetype", "csv")?,
             exact_query("label", "include")?,
-            QueryParameterRule::try_new_exact_empty_public(
-                SourceIdentifier::try_from("lastObs")
-                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-            )
-            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+            exact_query("lastobs", &rolling_date_count)?,
             exact_query("layout", "seriescolumn")?,
             exact_query("rel", "H15")?,
             exact_query("series", "bf17364827e38702b42a58cf8eaa3f78")?,
@@ -4345,13 +4342,9 @@ fn federal_reserve_board_metadata(
         256,
     )
     .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
-    // The full-history artifact grows each business day. Align its transport bound with the
-    // existing single-page raw-capture admission instead of pinning near today's response size.
-    let network = EndpointPolicy::try_from_api_rules(
-        vec![rule],
-        request_bounds(MAX_PROVIDER_CAPTURE_PAGE_BYTES)?,
-    )
-    .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    // Match the closed one-megabyte parser ceiling owned by the rolling dashboard profile.
+    let network = EndpointPolicy::try_from_api_rules(vec![rule], request_bounds(1024 * 1024)?)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
     let source_id = SourceId::try_from(BOARD_DDP_SOURCE_ID)
         .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
     metadata_with_source_id(
@@ -5385,15 +5378,20 @@ mod tests {
             .and_then(Value::as_str)
             .ok_or("Board activation did not return its provider dataset identifier")?;
         let board_dataset = SourceIdentifier::try_from(board_dataset)?;
-        let board_profile = BoardDatasetProfile::try_new(
-            BoardDatasetContract::h15_treasury_constant_maturities_production_csv()?,
-            BoardParseLimits::default(),
-            Vec::new(),
-        )?;
+        let board_profile =
+            BoardDatasetProfile::h15_treasury_constant_maturities_rolling_dashboard()?;
         assert_eq!(&board_dataset, board_profile.dataset());
+        assert!(
+            board_profile
+                .contract()
+                .is_h15_treasury_constant_maturities_rolling_dashboard()
+        );
         assert_eq!(
-            board_profile.analytical_dataset().as_str(),
-            "federal-reserve-board.h15.h15-treasury-constant-maturities.fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e"
+            board_profile
+                .analytical_dataset()
+                .as_str()
+                .replace('.', ":"),
+            board_profile.dataset().as_str()
         );
         assert!(
             product

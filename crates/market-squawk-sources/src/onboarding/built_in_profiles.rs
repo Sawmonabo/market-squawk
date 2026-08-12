@@ -2173,7 +2173,7 @@ fn federal_reserve_board() -> Result<BuiltInSpec, ProviderProfileError> {
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: None,
         permissions: &[],
-        coverage: "No-key Federal Reserve Board Data Download Program current-definition statistical-release surface, admitted initially only for the exact 11-series H.15 Treasury constant-maturity CSV contract; the bounded doctor requests exactly ten recent observations per series, while the distinct production contract retains full history; DDP is not a vintage-history authority, has no established numeric request ceiling, and is limited by application policy to one shared request per minute with one request in flight; provider-native authority-governed HTTPS, strict parsing, canonical mapping, application activation/source construction, rich raw-capture handoff, analytical-dataset registration, and lifecycle restore code are present; focused activation/restart proof is upstream-blocked, and executed durable live publication, PIT typed reads, macro product composition, restart acceptance, and release proof remain incomplete",
+        coverage: "No-key Federal Reserve Board Data Download Program current-definition statistical-release surface, admitted initially only for the exact 11-series H.15 Treasury constant-maturity family; the unchanged bounded doctor requests exactly ten recent dates per series, while the active production contract is the distinct live-verified rolling 100-date dashboard response with exactly 1,100 observations; the full-history Download contract remains a distinct research identity but is unavailable through the indivisible one-batch source/publication path until partitioned resumable extraction exists; DDP is not a vintage-history authority, has no established numeric request ceiling, and is limited by application policy to one shared request per minute with one request in flight; provider-native authority-governed HTTPS, strict parsing, canonical mapping, application activation/source construction, rich raw-capture handoff, analytical-dataset registration, and lifecycle restore code are present; the scripted installed journey proves rolling capture, durable publication, typed history/dashboard reads, stable same-root restart evidence, and zero post-restart HTTP, while real-network installed retrieval, raw sealing, durable publication, and restart/release acceptance remain incomplete",
         quality: DataQuality::OfficialDelayed,
         probe: VerificationProbe::network_exact_public_query(
             ProbeTransport::HttpGet,
@@ -2192,6 +2192,7 @@ fn federal_reserve_board() -> Result<BuiltInSpec, ProviderProfileError> {
         rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
         duties: &[
             "freeze release, series, frequency, bounds, format, exact generated automation URL, and matching structure/schema digests for every admitted package",
+            "activate the exact rolling 100-date H.15 dashboard contract only; reject the full-history package from the one-batch source until a bounded partitioned resumable extraction contract exists",
             "enforce one shared release-driven application queue at no more than one request per minute without presenting it as a provider limit",
             "retain scheduled release, publication, route availability, correction or repost, local receipt, schema, and local revision as separate evidence",
             "never claim DDP supplies pre-revision or complete real-time vintage history",
@@ -2203,7 +2204,7 @@ fn federal_reserve_board() -> Result<BuiltInSpec, ProviderProfileError> {
         evidence: FEDERAL_RESERVE_BOARD_EVIDENCE,
         rate_policy: "federal-reserve-board.data-download-program.pending-rate-policy.v1",
         refresh_trigger: "FEDERAL-RESERVE-BOARD-DDP",
-        handoff_instruction: "No key is required. Continue with the exact bounded ten-observation H.15 doctor. A successful probe may advance the code-owned activation and registered research path; focused activation/restart proof is still required, followed by executed durable live publication, PIT reads, macro product composition, restart acceptance, and release proof.",
+        handoff_instruction: "No key is required. Continue with the unchanged exact ten-date H.15 doctor. After a successful probe, activate only the code-owned rolling 100-date dashboard profile; the distinct full-history package remains unavailable until partitioned resumable extraction is implemented. The scripted installed rolling publication, typed history/dashboard read, and same-root restart proof passes; real-network installed retrieval, raw sealing, durable publication, and restart/release acceptance remain required.",
     })
 }
 

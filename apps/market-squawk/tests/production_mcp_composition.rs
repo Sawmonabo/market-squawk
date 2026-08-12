@@ -10,6 +10,8 @@ use std::{
 };
 
 use anyhow::Context as _;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use chrono::{Datelike as _, NaiveDate};
 use futures_util::FutureExt as _;
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use market_squawk::BoardInstalledFixtureBundle;
@@ -22,7 +24,9 @@ use market_squawk::{
 };
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use market_squawk_adapter_federal_reserve::{
-    BoardDatasetContract, BoardScriptedCsvResponse, BoardScriptedTransportCounters,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT,
+    BoardDatasetProfile, BoardScriptedCsvResponse, BoardScriptedTransportCounters,
     BoardScriptedTransportFactory,
 };
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -53,9 +57,7 @@ const OWNER_RESEARCH_CSV: &[u8] = b"row_id,Close Price\nrow-1,12.34\nrow-2,13.05
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 const BOARD_SURFACE: &str = "federal-reserve-board.data-download-program";
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
-const BOARD_PROVIDER_DATASET: &str = "federal-reserve-board:h15:h15-treasury-constant-maturities:fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e";
-#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
-const BOARD_ANALYTICAL_DATASET: &str = "federal-reserve-board.h15.h15-treasury-constant-maturities.fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e";
+const INSTALLED_BOARD_HISTORY_MAXIMUM_BYTES: usize = 8 * 1024 * 1024;
 
 #[test]
 fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() -> TestResult {
@@ -453,7 +455,7 @@ fn installed_board_fixture() -> TestResult<BoardInstalledFixtureBundle> {
         "2026-08-06",
         "2026-08-07",
     ];
-    let production_dates = ["2026-08-07", "2026-08-10"];
+    let production_dates = installed_board_rolling_dates()?;
     let doctor = BoardScriptedCsvResponse::try_new(
         installed_board_csv(&doctor_dates, false)?,
         Duration::from_millis(1),
@@ -463,7 +465,7 @@ fn installed_board_fixture() -> TestResult<BoardInstalledFixtureBundle> {
         installed_board_csv(&production_dates, true)?,
         Duration::from_millis(1),
     )
-    .context("construct exact full-history Board production response")?;
+    .context("construct exact 11-series by 100-date rolling Board production response")?;
     let transport = BoardScriptedTransportFactory::try_new(doctor, production)
         .context("validate separate Board doctor and production responses")?;
     let elapsed = std::time::SystemTime::now()
@@ -481,10 +483,39 @@ fn installed_board_fixture() -> TestResult<BoardInstalledFixtureBundle> {
 }
 
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
-fn installed_board_csv(dates: &[&str], latest_twenty_year_missing: bool) -> TestResult<String> {
-    let contract = BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
-        .context("construct production Board H.15 contract")?;
-    let series = contract
+fn installed_board_rolling_dates() -> TestResult<Vec<String>> {
+    let mut date = NaiveDate::from_ymd_opt(2026, 8, 10)
+        .context("construct final rolling Board fixture date")?;
+    let mut dates = Vec::new();
+    dates
+        .try_reserve_exact(BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT)
+        .context("reserve rolling Board fixture dates")?;
+    while dates.len() < BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT {
+        if date.weekday().number_from_monday() <= 5 {
+            dates.push(date.to_string());
+        }
+        date = date
+            .pred_opt()
+            .context("walk backward through rolling Board fixture dates")?;
+    }
+    dates.reverse();
+    Ok(dates)
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn installed_board_profile() -> TestResult<BoardDatasetProfile> {
+    BoardDatasetProfile::h15_treasury_constant_maturities_rolling_dashboard()
+        .context("construct rolling Board H.15 dashboard profile")
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn installed_board_csv<S: AsRef<str>>(
+    dates: &[S],
+    latest_twenty_year_missing: bool,
+) -> TestResult<String> {
+    let profile = installed_board_profile()?;
+    let series = profile
+        .contract()
         .series_scope()
         .exact_series()
         .context("Board H.15 contract did not retain its exact series")?;
@@ -524,7 +555,7 @@ fn installed_board_csv(dates: &[&str], latest_twenty_year_missing: bool) -> Test
     for (date_index, date) in dates.iter().enumerate() {
         let latest = date_index + 1 == dates.len();
         let mut row = Vec::with_capacity(series.len() + 1);
-        row.push((*date).to_owned());
+        row.push(date.as_ref().to_owned());
         for series_index in 0..series.len() {
             let value = if latest_twenty_year_missing && latest && series_index == 9 {
                 "ND".to_owned()
@@ -557,6 +588,9 @@ async fn exercise_installed_board_vertical(
     installation_root: &Path,
     fixture: &BoardInstalledFixtureBundle,
 ) -> TestResult<InstalledBoardEvidence> {
+    let board_profile = installed_board_profile()?;
+    let board_provider_dataset = board_profile.dataset().as_str();
+    let board_analytical_dataset = board_profile.analytical_dataset().as_str();
     let before_msj = installed_file_evidence(installation_root, "msj")?;
     let before_parquet = installed_file_evidence(installation_root, "parquet")?;
     let registered = invoke_installed_board(
@@ -667,7 +701,7 @@ async fn exercise_installed_board_vertical(
     assert_eq!(activated["profile"], BOARD_SURFACE);
     assert_eq!(
         activated["provider_dataset_identifier"],
-        BOARD_PROVIDER_DATASET
+        board_provider_dataset
     );
     assert_eq!(activated["capability_revision"], 4);
     assert!(activated["credential_generation"].is_null());
@@ -679,7 +713,7 @@ async fn exercise_installed_board_vertical(
             "Source.Discover",
             json!({
                 "provider": BOARD_SURFACE,
-                "dataset": BOARD_PROVIDER_DATASET,
+                "dataset": board_provider_dataset,
                 "sourceCoverage": [BOARD_SURFACE],
                 "confirm": true,
                 "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
@@ -702,7 +736,7 @@ async fn exercise_installed_board_vertical(
             "Source.Discover",
             json!({
                 "provider": BOARD_SURFACE,
-                "dataset": BOARD_PROVIDER_DATASET,
+                "dataset": board_provider_dataset,
                 "sourceCoverage": [BOARD_SURFACE],
                 "confirm": true,
                 "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
@@ -727,7 +761,7 @@ async fn exercise_installed_board_vertical(
         .context("Board discovery did not return an object array")?;
     assert_eq!(objects.len(), 1);
     let object = &objects[0];
-    assert_eq!(object["dataset"], BOARD_PROVIDER_DATASET);
+    assert_eq!(object["dataset"], board_provider_dataset);
     assert_installed_board_transport_counts(fixture.transport_counters(), 1, 1, 1, 1);
 
     let ingest = invoke_installed_board(
@@ -737,7 +771,7 @@ async fn exercise_installed_board_vertical(
         json!({
             "provider": BOARD_SURFACE,
             "object": object["object_id"],
-            "dataset": BOARD_PROVIDER_DATASET,
+            "dataset": board_provider_dataset,
             "discoveryReceipt": object["discovery_receipt"],
             "sourceCoverage": [BOARD_SURFACE],
             "confirm": true,
@@ -745,8 +779,11 @@ async fn exercise_installed_board_vertical(
         }),
     )
     .await?;
-    assert_eq!(ingest["manifest"]["datasetId"], BOARD_ANALYTICAL_DATASET);
-    assert_eq!(ingest["rowCount"], 22);
+    assert_eq!(ingest["manifest"]["datasetId"], board_analytical_dataset);
+    assert_eq!(
+        ingest["rowCount"],
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT
+    );
     assert_eq!(ingest["objectCount"], 1);
     assert!(ingest["totalBytes"].as_u64().is_some_and(|bytes| bytes > 0));
     assert!(
@@ -761,13 +798,16 @@ async fn exercise_installed_board_vertical(
         "manifest",
         "Research.GetManifest",
         json!({
-            "dataset": BOARD_ANALYTICAL_DATASET,
+            "dataset": board_analytical_dataset,
             "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
         }),
     )
     .await?;
-    assert_eq!(manifest["manifest"]["datasetId"], BOARD_ANALYTICAL_DATASET);
-    assert_eq!(manifest["rowCount"], 22);
+    assert_eq!(manifest["manifest"]["datasetId"], board_analytical_dataset);
+    assert_eq!(
+        manifest["rowCount"],
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT
+    );
     assert_eq!(manifest["objectCount"], 1);
 
     let history = invoke_installed_board(
@@ -775,8 +815,11 @@ async fn exercise_installed_board_vertical(
         "history",
         "Research.GetHistory",
         json!({
-            "dataset": BOARD_ANALYTICAL_DATASET,
-            "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+            "dataset": board_analytical_dataset,
+            "resultLimits": {
+                "maximumItems": BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT,
+                "maximumBytes": INSTALLED_BOARD_HISTORY_MAXIMUM_BYTES
+            },
         }),
     )
     .await?;
@@ -822,6 +865,9 @@ async fn assert_installed_board_restored(
     counters_before_restart: BoardScriptedTransportCounters,
     evidence: &InstalledBoardEvidence,
 ) -> TestResult {
+    let board_profile = installed_board_profile()?;
+    let board_provider_dataset = board_profile.dataset().as_str();
+    let board_analytical_dataset = board_profile.analytical_dataset().as_str();
     assert_eq!(fixture.transport_counters(), counters_before_restart);
     let status = invoke_installed_board(
         client,
@@ -845,7 +891,7 @@ async fn assert_installed_board_restored(
     assert!(row["currentSession"]["active_generation"].is_null());
     assert!(row["currentSession"]["candidate_generation"].is_null());
     assert_eq!(row["currentSession"]["generations"], json!([]));
-    assert_eq!(row["providerDatasetIdentifier"], BOARD_PROVIDER_DATASET);
+    assert_eq!(row["providerDatasetIdentifier"], board_provider_dataset);
     assert_eq!(row["lifecycleSupport"], "managed");
     assert_eq!(row["runtime"]["state"], "not_active");
 
@@ -854,7 +900,7 @@ async fn assert_installed_board_restored(
         "manifest-after-restart",
         "Research.GetManifest",
         json!({
-            "dataset": BOARD_ANALYTICAL_DATASET,
+            "dataset": board_analytical_dataset,
             "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
         }),
     )
@@ -865,8 +911,11 @@ async fn assert_installed_board_restored(
         "history-after-restart",
         "Research.GetHistory",
         json!({
-            "dataset": BOARD_ANALYTICAL_DATASET,
-            "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+            "dataset": board_analytical_dataset,
+            "resultLimits": {
+                "maximumItems": BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT,
+                "maximumBytes": INSTALLED_BOARD_HISTORY_MAXIMUM_BYTES
+            },
         }),
     )
     .await?;
@@ -933,6 +982,7 @@ async fn installed_board_dashboard(
 
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 fn assert_installed_board_dashboard(dashboard: &Value) -> TestResult {
+    let board_profile = installed_board_profile()?;
     assert_eq!(
         dashboard["schemaIdentity"],
         "market-squawk-macro-dashboard/v1"
@@ -940,11 +990,11 @@ fn assert_installed_board_dashboard(dashboard: &Value) -> TestResult {
     assert_eq!(dashboard["binding"]["surfaceId"], BOARD_SURFACE);
     assert_eq!(
         dashboard["binding"]["providerDatasetId"],
-        BOARD_PROVIDER_DATASET
+        board_profile.dataset().as_str()
     );
     assert_eq!(
         dashboard["binding"]["analyticalDatasetId"],
-        BOARD_ANALYTICAL_DATASET
+        board_profile.analytical_dataset().as_str()
     );
     assert_eq!(dashboard["release"]["code"], "H15");
     assert_eq!(dashboard["selection"]["returnedSeries"], 11);
@@ -1025,7 +1075,12 @@ fn stable_installed_board_history(history: &Value) -> TestResult<Value> {
         artifact.get("mediaType"),
         Some(&json!("application/vnd.apache.parquet"))
     );
-    assert_eq!(artifact.get("rowCount"), Some(&json!(22)));
+    assert_eq!(
+        artifact.get("rowCount"),
+        Some(&json!(
+            BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT
+        ))
+    );
     assert!(
         artifact
             .get("byteCount")

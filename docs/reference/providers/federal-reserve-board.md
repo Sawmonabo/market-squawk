@@ -4,9 +4,9 @@
 | --- | --- |
 | Document type | Selected-provider target and evidence contract |
 | Audience | Operators, financial-data engineers, quantitative researchers, application integrators, and reviewers |
-| Status | H.15 profile, bounded doctor, activation binding, and registered research-source path implemented; focused proof and product availability remain open |
+| Status | H.15 profile, bounded doctor, rolling-dashboard source contract, activation binding, and registered research path implemented; scripted installed publication/read/restart proof passes, while real-network installed and release acceptance remain open |
 | Evidence cutoff | 2026-08-12, America/New_York |
-| Audit basis | `7fb52c19dc273fe44d3846f1986c61c1321032fd` plus the preserved Wave 6 overlay |
+| Audit basis | `8fd91dad768affda2126ed91a5b97f1bd1e32209` plus the Wave 8B profile/documentation candidate |
 
 ## Role and product workflows
 
@@ -37,8 +37,9 @@ revision, and the product must expose that limitation at historical cutoffs.
 | DDP gateway | `https://www.federalreserve.gov/datadownload/` |
 | DDP help | `https://www.federalreserve.gov/datadownload/help/` |
 | Initial H.15 descriptor | `https://www.federalreserve.gov/datadownload/Download.aspx?rel=H15` |
-| H.15 full-history production CSV | `https://www.federalreserve.gov/datadownload/Download.aspx?filetype=csv&label=include&lastObs=&layout=seriescolumn&rel=H15&series=bf17364827e38702b42a58cf8eaa3f78&type=package` |
+| H.15 rolling dashboard CSV | `https://www.federalreserve.gov/datadownload/Output.aspx?filetype=csv&label=include&lastobs=100&layout=seriescolumn&rel=H15&series=bf17364827e38702b42a58cf8eaa3f78&type=package` |
 | H.15 bounded doctor CSV | `https://www.federalreserve.gov/datadownload/Output.aspx?filetype=csv&label=include&lastobs=10&layout=seriescolumn&rel=H15&series=bf17364827e38702b42a58cf8eaa3f78&type=package` |
+| H.15 full-history research contract | `https://www.federalreserve.gov/datadownload/Download.aspx?filetype=csv&label=include&lastObs=&layout=seriescolumn&rel=H15&series=bf17364827e38702b42a58cf8eaa3f78&type=package`; unavailable through the one-batch source until partitioned resumable extraction exists |
 | Change/correction channel | `https://www.federalreserve.gov/feeds/DataDownload.html` |
 
 - **VERIFIED PROVIDER FACT:** DDP supports custom or preformatted packages in CSV, Excel, and
@@ -55,8 +56,16 @@ revision, and the product must expose that limitation at historical cutoffs.
   constant-maturity series: `1m`, `3m`, `6m`, `1y`, `2y`, `3y`, `5y`, `7y`, `10y`, `20y`, and
   `30y`. Values retain the Board's exact decimal representation and
   `percent_per_year` presentation unit.
-- **APPLICATION POLICY:** the doctor and production contracts have distinct URL, request, and
-  contract digests. A ten-row doctor response cannot be published as a complete history.
+- **IMPLEMENTED CODE FACT:** the active dashboard contract accepts exactly **100 dates × 11
+  series = 1,100 observations**. It has a closed parser budget and rejects any response that does
+  not preserve those exact counts.
+- **APPLICATION POLICY:** doctor, rolling dashboard, and full-history contracts have distinct URL,
+  request, contract, provider-dataset, and analytical-dataset identities. The ten-date doctor is
+  readiness evidence only. Each rolling response is a complete replacement generation of the
+  rolling dataset, not complete Board history.
+- **IMPLEMENTED CODE FACT:** constructing the full-history contract remains possible for explicit
+  research identity, but `BoardSource` rejects it with `PartitionedExtractionRequired`; it cannot
+  enter the indivisible one-batch raw-capture/publication path.
 
 ## Feed provenance, clocks, and revisions
 
@@ -88,6 +97,19 @@ capacity. Release retrieval outranks historical refresh; there is no periodic hi
 
 - **RUNTIME-MEASURED VALUE (2026-08-12):** the exact bounded doctor URL returned HTTP 200 and
   2,663 bytes containing the exact 11 admitted H.15 series and ten observation rows per series.
+- **RUNTIME-MEASURED VALUE (2026-08-12):** the exact rolling dashboard URL returned the latest 100
+  dates for all 11 admitted series. Wave 8A froze that exact selector and validates the resulting
+  1,100-observation shape before source construction/publication.
+- **RUNTIME-MEASURED VALUE (2026-08-12):** the exact scripted installed journey passed with the
+  revision-4 no-key profile, 11-series/ten-date doctor, durable shared-rate refusal before a
+  governed 60-second advance, rolling 100-date × 11-series acquisition, 1,100-row rich capture and
+  `MSJ1` seal, catalog/Parquet publication, typed history artifact, ordered 11-slot macro dashboard,
+  stable same-root restart evidence, and zero provider HTTP after restart. This is deterministic
+  fixture evidence, not a real-network installed run.
+- **IMPLEMENTED CODE FACT:** the rolling provider dataset identity is
+  `federal-reserve-board:h15:h15-treasury-constant-maturities:339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f`;
+  its analytical identity is
+  `federal-reserve-board.h15.h15-treasury-constant-maturities.339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f`.
 - **IMPLEMENTED CODE FACT:** onboarding accepts the response only after the adapter's strict H.15
   CSV parser validates all six metadata rows, all exact series identities, units, multipliers,
   currencies, periods, decimals/missing values, 11-series count, and 110 total observations.
@@ -97,7 +119,7 @@ capacity. Release retrieval outranks historical refresh; there is no periodic hi
 ## Canonical storage and point-in-time selection
 
 ```text
-bounded release file + exact SDMX structure/schema artifacts
+bounded rolling release file + exact request/schema identity
   -> release/frequency-specific structural validation
   -> market_squawk.research_observations::MacroObservation
   -> immutable Parquet generation + manifest
@@ -135,14 +157,16 @@ cutoff. It may not claim that DDP itself supplies a complete vintage history.
   contract. The adapter also contains authority-governed HTTPS retrieval, typed H.15 parsing,
   exact raw-capture handoff, canonical macro mapping, correction/repost modeling, and publication
   primitives.
-- The application now owns the exact no-key activation request/spec, constructs the production
-  profile and source under the active onboarding lease, binds rich extraction output into the
-  shared capture protocol, registers the exact analytical dataset identity, and serializes/restores
-  the Board lifecycle surface.
-- Focused activation/restart proof is still upstream-blocked. No completed live production
-  retrieval has yet proved raw sealing, durable canonical generation/manifests, or restart recovery.
-  PIT typed reads, macro/rate application operations, Desktop consumption, restart acceptance, and
-  release acceptance remain open.
+- The application owns the exact no-key activation request/spec. The production activation seam is
+  required to construct only the closed rolling 100-date profile, bind rich extraction output into
+  the shared capture protocol, register its exact analytical dataset identity, and
+  serialize/restore the Board lifecycle surface. The full-history contract cannot substitute for
+  that rolling dataset.
+- The scripted installed journey proves activation, rolling acquisition, rich raw capture and
+  sealing, durable catalog/Parquet publication, typed history and macro-dashboard reads, stable
+  evidence across a clean same-root restart, and zero post-restart provider HTTP. A real-network
+  installed retrieval has not yet proved those same boundaries; Desktop consumption plus
+  real-network restart and release acceptance remain open.
 - Reuse the existing research data plane for those seams. Do not create a parallel macro store,
   scheduler, or dashboard-only fetch path.
 
@@ -161,22 +185,27 @@ The implemented onboarding doctor proves:
 5. one shared request-per-minute, single-flight application budget; and
 6. response-body evidence digest without inventing a vintage or durable dataset.
 
-End-to-end product availability still requires the distinct full-history contract to complete a
-live governed retrieval, retain and seal raw evidence before durable canonical publication,
-survive a proven restart, answer a bounded exact-cutoff typed read, and appear in its macro/rate
-workflow with `current-definition` and freshness limitations visible.
+End-to-end dashboard availability requires the rolling 100-date contract to complete a governed
+retrieval, retain and seal raw evidence before durable canonical publication, survive a proven
+restart, answer a bounded exact-cutoff typed read, and appear in its macro/rate workflow with
+`current-definition`, rolling-window, and freshness limitations visible. Full-history research is
+a separate future partitioned/resumable ingestion path and is not a prerequisite for the bounded
+dashboard.
 
 ## Hard gaps
 
-- Only the exact initial H.15 Treasury constant-maturity package is frozen. Other Board releases,
-  series, formats, and schemas require separate contracts and bounded qualification.
+- Only the exact H.15 Treasury constant-maturity rolling dashboard and doctor contracts are
+  admitted to the active path. Other Board releases, series, formats, and schemas require separate
+  contracts and bounded qualification.
+- Full H.15 history cannot use the current indivisible one-batch source/publication handoff; a
+  partitioned, checkpointed, resumable extraction/publication contract remains required.
 - Numeric request/concurrency/payload limits, quota headers, and retry semantics are unpublished.
 - DDP does not supply pre-revision, real-time, or complete historical-as-known data.
 - Release-page, DDP-route, correction, and local availability can differ; no universal finality
   event is documented.
-- Focused activation/restart proof is blocked upstream; executed durable live publication,
-  manifests, PIT typed reads, workflow/Desktop consumption, and restart/release acceptance remain
-  incomplete.
+- Scripted installed activation, durable rolling publication, typed reads, dashboard composition,
+  and same-root restart now pass. Real-network installed retrieval, raw sealing, publication,
+  workflow/Desktop consumption, and restart/release acceptance remain incomplete.
 
 ## First-party sources
 

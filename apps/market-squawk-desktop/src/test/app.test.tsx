@@ -379,12 +379,12 @@ const h15DashboardData = {
     surfaceId: "federal-reserve-board.data-download-program",
     sourceId: "federal-reserve-board-ddp",
     providerDatasetId:
-      "federal-reserve-board:h15:h15-treasury-constant-maturities:fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e",
+      "federal-reserve-board:h15:h15-treasury-constant-maturities:339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f",
     analyticalDatasetId:
-      "federal-reserve-board.h15.h15-treasury-constant-maturities.fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e",
+      "federal-reserve-board.h15.h15-treasury-constant-maturities.339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f",
     manifest: {
       datasetId:
-        "federal-reserve-board.h15.h15-treasury-constant-maturities.fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e",
+        "federal-reserve-board.h15.h15-treasury-constant-maturities.339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f",
       manifestVersion: "3",
       schema: {
         name: "market-squawk-research-v3",
@@ -503,7 +503,8 @@ const inactiveH15SourceStatus: ApplicationResult = {
         display_name: "Federal Reserve Board Data Download Program",
       },
       currentSession: null,
-      providerDatasetIdentifier: "H15",
+      providerDatasetIdentifier:
+        "federal-reserve-board:h15:h15-treasury-constant-maturities:339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f",
       lifecycleSupport: "managed",
       lifecycle: {
         provider: "federal-reserve-board.data-download-program",

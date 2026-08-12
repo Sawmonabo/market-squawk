@@ -10,7 +10,7 @@ adapters.
 | Audience | Operators, source-adapter authors, research engineers, risk engineers, and auditors |
 | Status | Current |
 | Last substantive review | 2026-08-12 |
-| Reviewed commit | `7fb52c19dc273fe44d3846f1986c61c1321032fd` plus the Wave 6 candidate |
+| Reviewed commit | `8fd91dad768affda2126ed91a5b97f1bd1e32209` plus the Wave 8B profile/documentation candidate |
 
 ## Contents
 
@@ -374,22 +374,30 @@ does not become `DirectVerified`.
 
 ### Federal Reserve Board H.15 profile boundary
 
-`federal-reserve-board.data-download-program` revision 4 is `available` for one exact no-key
-onboarding doctor: the 11-series H.15 Treasury constant-maturity CSV package bounded to ten recent
-observations per series. The application performs one exact allowlisted GET, enforces a shared
+`federal-reserve-board.data-download-program` revision 4 is `available` under its unchanged exact
+no-key doctor: the 11-series H.15 Treasury constant-maturity CSV package bounded to ten recent
+dates per series. The application performs one exact allowlisted GET, enforces a shared
 one-request-per-minute/single-flight application policy, and accepts the response only when the
 provider-native parser proves the exact metadata, identities, units, periods, 11 series, and 110
-observations. The full-history production URL has a separate request and contract identity.
+observations.
+
+The active production dataset is a separate live-verified `Output.aspx` contract bounded to the
+latest 100 dates: exactly 1,100 H.15 observations. Doctor, rolling dashboard, and full-history
+packages have distinct request, contract, provider-dataset, and analytical-dataset identities.
+The full-history `Download.aspx` contract is retained as an explicit research identity, but the
+one-batch `BoardSource` rejects it until a partitioned, checkpointed, resumable extraction path
+exists.
 
 The provider-native adapter has authority-governed HTTPS retrieval, exact response/capture
 evidence, strict parsing, canonical macro mapping, correction/repost modeling, and publication
 primitives. The application now constructs that source under an active onboarding lease, binds its
 rich output to the shared capture protocol, registers the exact analytical dataset identity, and
-serializes/restores the lifecycle surface. Focused activation/restart proof is upstream-blocked,
-and no completed live production run yet proves sealed raw evidence, durable canonical publication,
-manifests, or restart recovery. PIT reads, source operations, and a Desktop macro workflow remain
-open. Therefore Board is intentionally absent from the implemented product-path matrix above. Its
-`available` profile state must not be rendered as a queryable dataset or dashboard status.
+serializes/restores the lifecycle surface. The scripted installed journey proves 1,100-row rich
+capture and sealing, catalog/Parquet publication, typed history and macro-dashboard reads, stable
+evidence across a clean same-root restart, and zero provider HTTP after restart. Real-network
+installed retrieval/publication/restart acceptance and the Desktop macro workflow remain open.
+Therefore Board is intentionally absent from the implemented product-path matrix above. Its
+`available` profile state must not be rendered as generally available from scripted evidence alone.
 
 ### Lease-gated research adapters
 
@@ -412,7 +420,7 @@ and request.
 | FRED/ALFRED | Exact series metadata, observations, vintage dates, and revision history | API key for ephemeral retrieval; durable use additionally requires exact Bank service permission, explicit local review, and exact per-series rights |
 | Treasury Fiscal Data | Average Interest Rates v2 for an exact date interval and page size | Exact endpoint/query allowlist; dataset/version provenance |
 | Treasury daily XML | All five official families over an inclusive year range | Exact family schemas and start years; strict year/month/all-history requests; cross-page integrity; exact payload/revision lineage |
-| Federal Reserve Board H.15 | Exact 11-series Treasury constant-maturity full-history package | No-key active lease; exact endpoint/query allowlist; shared one-request-per-minute/single-flight application budget; distinct provider and analytical dataset identities; rich capture binding |
+| Federal Reserve Board H.15 | Exact rolling 100-date × 11-series Treasury constant-maturity dashboard generation | No-key active lease; exact endpoint/query allowlist; shared one-request-per-minute/single-flight application budget; strict 1,100-observation parser bound; distinct doctor/rolling/full-history identities; rich capture binding; full history requires partitioned resumable extraction |
 
 The research metadata for these adapters uses a positive one-nanosecond `delayed` declaration and
 `unknown` delivery rather than claiming real-time or direct delivery.
@@ -420,8 +428,9 @@ The research metadata for these adapters uses a positive one-nanosecond `delayed
 Durable activation recipes now cover seven profile surfaces: SEC; BLS v1 and v2; Treasury Fiscal
 and daily XML; FRED/ALFRED; and Federal Reserve Board H.15. Recipes are secret-free and bind exact
 request and evidence digests. Restore code can reconstruct SEC, BLS v1, both Treasury surfaces,
-and Board without a credential when their authority remains valid; the focused Board
-activation/restart proof is still upstream-blocked. BLS v2 and FRED return
+and Board without a credential when their authority remains valid; the scripted Board
+activation/publication/read/restart journey passes, while real-network installed acceptance remains
+open. BLS v2 and FRED return
 `provider activation requires explicit foreground credential resume` and remain disabled until
 that explicit resume. Invalid evidence, authority, or adapter state quarantines the recipe.
 
@@ -439,8 +448,11 @@ At the reviewed commit, release and rights gates have concrete consequences:
   each exact series.
 - Treasury Fiscal Data and daily-rate XML are available built-in official profiles with all six
   rights operations admitted by their separate dataset-level evidence.
-- Federal Reserve Board revision 4 admits the exact H.15 activation and restore code path, but its
-  focused restart proof and executed durable production publication remain incomplete.
+- Federal Reserve Board revision 4 admits the exact H.15 activation and restore code path; current
+  activation must select the rolling 100-date dataset. Scripted installed rolling capture,
+  publication, typed reads, dashboard composition, and same-root restart pass; real-network
+  installed and release acceptance remain incomplete, while full-history publication is unavailable
+  pending a partitioned resumable path.
 
 ### FRED durable-rights boundary
 

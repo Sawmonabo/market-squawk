@@ -9,7 +9,7 @@ then fill the local credential template. It does not enable providers by itself.
 | Audience | Local Market Squawk owner/operator |
 | Status | Account preparation and one-time installed credential import are implemented; provider activation/publication/workflow integration remains in flight |
 | Last substantive review | 2026-08-12 |
-| Implementation review basis | Provider documentation and capacity review current through 2026-08-12; repository audit base `7fb52c19` plus preserved Wave 6 overlay; not frozen-head acceptance |
+| Implementation review basis | Provider documentation and capacity review current through 2026-08-12; repository audit base `8fd91dad` plus the Wave 8B profile/documentation candidate; not frozen-head acceptance |
 
 ## Important current boundary
 
@@ -115,7 +115,7 @@ makes explicitly selected feed/date jobs eligible; it never starts a full archiv
 | Tiingo Starter | Optional free Starter account and token | `TIINGO_API_TOKEN` | In-flight credential/request/NAV/EOD and serializable quota-ledger core exists; application-owned durable ledger binding, activation, publication, and fund read remain open |
 | SEC | No key; truthful organization/name and monitored email | `SEC_USER_AGENT_ORGANIZATION`, `SEC_USER_AGENT_EMAIL` | Company filing/fact foundations exist; N-PORT/N-CEN absent |
 | Treasury Fiscal Data/daily rates | No account or key | Enable flags only | Existing foundations |
-| Federal Reserve Board | No account or key | Enable flag only | Revision-4 profile, exact bounded H.15 doctor, provider-native core, application activation/source construction, rich-capture binding, analytical-dataset registration, and lifecycle restore exist; focused proof, durable live publication, PIT read, and product composition remain open |
+| Federal Reserve Board | No account or key | Enable flag only | Revision-4 profile and ten-date doctor remain current; the active production source is the distinct rolling 100-date H.15 dashboard contract with exact 1,100-observation validation. Scripted installed capture/publication/read/restart proof passes. Full history is unavailable pending partitioned resumable extraction; real-network installed and product acceptance remain open |
 
 ## 1. Alpaca Paper Only / Basic core
 
@@ -289,10 +289,13 @@ and prefers official bulk archives for large bootstrap work.
 - **Treasury daily-rate XML:** no account or key; the existing mandatory source owns all five
   admitted rate families.
 - **Federal Reserve Board direct releases:** no account or key. The code-owned revision-4 profile
-  first runs the exact ten-observation H.15 doctor; production retrieval uses a separate exact
-  full-history H.15 contract. Neither URL is operator-configurable. The application can construct
-  and restore the registered Board research source after successful onboarding, but focused proof
-  is still blocked and no durable macro dataset or Desktop workflow is yet accepted.
+  first runs the exact ten-date H.15 doctor; production retrieval uses a separate exact rolling
+  100-date H.15 dashboard contract. Neither URL is operator-configurable. The full-history contract
+  cannot use the one-batch source and remains unavailable until partitioned resumable extraction is
+  implemented. The application can construct and restore the registered rolling Board research
+  source after successful onboarding. Its scripted installed capture, durable publication, typed
+  history/dashboard read, and same-root restart journey passes; real-network installed and Desktop
+  workflow acceptance remain open.
 
 ## Completion checklist
 

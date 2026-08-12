@@ -13,8 +13,8 @@ use arrow::json::ArrayWriter;
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
 use market_squawk_adapter_federal_reserve::{
-    BOARD_DDP_SOURCE_ID, BoardDatasetContract, BoardDatasetFamily, BoardDatasetProfile,
-    BoardFrequency, BoardH15DashboardSeriesDescriptor, BoardParseLimits, BoardRelease,
+    BOARD_DDP_SOURCE_ID, BoardDatasetFamily, BoardDatasetProfile, BoardFrequency,
+    BoardH15DashboardSeriesDescriptor, BoardRelease,
     h15_treasury_constant_maturities_canonical_unit_identifier,
     h15_treasury_constant_maturities_dashboard_series,
 };
@@ -585,11 +585,8 @@ impl ResearchController {
             return Err(ServiceError::ResourceExhausted);
         }
 
-        let contract = BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
+        let profile = BoardDatasetProfile::h15_treasury_constant_maturities_rolling_dashboard()
             .map_err(|_error| ServiceError::Unavailable)?;
-        let profile =
-            BoardDatasetProfile::try_new(contract, BoardParseLimits::default(), Vec::new())
-                .map_err(|_error| ServiceError::Unavailable)?;
         validate_macro_dashboard_profile(&profile)?;
 
         let dataset = DatasetId::try_from(profile.analytical_dataset().as_str())
@@ -866,7 +863,8 @@ fn validate_macro_dashboard_request(request: &TypedToolRequest) -> Result<(), Se
 
 fn validate_macro_dashboard_profile(profile: &BoardDatasetProfile) -> Result<(), ServiceError> {
     let contract = profile.contract();
-    if contract.release() != BoardRelease::H15SelectedInterestRates
+    if !contract.is_h15_treasury_constant_maturities_rolling_dashboard()
+        || contract.release() != BoardRelease::H15SelectedInterestRates
         || contract.family() != BoardDatasetFamily::H15TreasuryConstantMaturities
         || contract.frequency() != BoardFrequency::BusinessDaily
         || h15_treasury_constant_maturities_dashboard_series().len() != MACRO_DASHBOARD_SERIES_COUNT
