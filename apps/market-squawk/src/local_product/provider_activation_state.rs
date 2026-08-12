@@ -42,7 +42,7 @@ const MAXIMUM_PROVIDER_METADATA_BACKUP_BYTES: usize = 160 * 1024 * 1024;
 const MAXIMUM_BACKUP_EVIDENCE_OBJECT_BYTES: u64 = 1024 * 1024;
 const RESTORED_REQUIREMENT_SCHEMA_VERSION: u16 = 1;
 
-pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 7] = [
+pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 8] = [
     "sec.edgar-public",
     "bls.v1-unregistered",
     "bls.v2-registered",
@@ -50,8 +50,9 @@ pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 7] = [
     "treasury.fiscal-data",
     "fred-alfred.api-v1-v2",
     "local.files",
+    "federal-reserve-board.data-download-program",
 ];
-pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 8] = [
+pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 9] = [
     "sec.edgar-public",
     "bls.v1-unregistered",
     "bls.v2-registered",
@@ -60,6 +61,7 @@ pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 8] = [
     "fred-alfred.api-v1-v2",
     "local.files",
     "local.portfolio-imports",
+    "federal-reserve-board.data-download-program",
 ];
 
 const COINBASE_DIRECT_LIVE_SURFACE: &str = "coinbase.exchange-direct-market-data";
@@ -72,7 +74,7 @@ const SESSION_BACKED_LIVE_SURFACES: [&str; 4] = [
 ];
 
 // New lifecycle surfaces are appended so schema-v1 backups remain an exact prefix.
-const SERIALIZED_LIFECYCLE_SURFACES: [&str; 14] = [
+const SERIALIZED_LIFECYCLE_SURFACES: [&str; 15] = [
     "coinbase.public-market-data",
     COINBASE_DIRECT_LIVE_SURFACE,
     "kraken.spot-public-market-data",
@@ -87,6 +89,7 @@ const SERIALIZED_LIFECYCLE_SURFACES: [&str; 14] = [
     ProviderMarketAccount::AlpacaBasic.surface_id(),
     ProviderMarketAccount::TradierBrokerage.surface_id(),
     ProviderMarketAccount::KrakenLevel3.surface_id(),
+    "federal-reserve-board.data-download-program",
 ];
 
 /// Least-authority owner seam for the protected provider-metadata component.
@@ -1710,6 +1713,7 @@ fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivati
         "treasury.fiscal-data" => Ok("treasury-fiscal"),
         "fred-alfred.api-v1-v2" => Ok("fred-alfred"),
         "local.files" => Ok("local-files"),
+        "federal-reserve-board.data-download-program" => Ok("federal-reserve-board-h15"),
         _ => Err(DurableProviderActivationStateError::UnknownSurface),
     }
 }

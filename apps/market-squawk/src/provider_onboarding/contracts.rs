@@ -317,6 +317,8 @@ pub enum ProviderPortalActivationRequest {
         /// Exact rights grants; the guided starter uses reviewed `UNRATE` evidence.
         grants: Vec<FredPortalGrantInput>,
     },
+    /// Federal Reserve Board H.15 current-definition Treasury constant-maturity rates.
+    FederalReserveBoardH15,
 }
 
 /// Exact written St. Louis Fed permission for Market Squawk's durable FRED API operations.

@@ -385,6 +385,7 @@ fn research_schema_definition() -> Result<Schema, DatasetSchemaError> {
         Field::new("instrument_id", DataType::Utf8, true),
         Field::new("venue_id", DataType::Utf8, true),
         Field::new("source_identifier", DataType::Utf8, false),
+        Field::new("macro_series", DataType::Utf8, true),
         Field::new("source_timestamp", timestamp.clone(), true),
         Field::new("received_at", timestamp.clone(), false),
         Field::new("available_at", timestamp.clone(), true),

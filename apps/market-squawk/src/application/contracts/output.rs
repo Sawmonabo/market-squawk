@@ -2,6 +2,9 @@
 
 use serde_json::{Map, Value, json};
 
+use market_squawk_adapter_federal_reserve::{
+    BOARD_DDP_SOURCE_ID, h15_treasury_constant_maturities_dashboard_series,
+};
 use market_squawk_decisions::{
     RECOMMENDATION_TRACK_RECORD_MINIMUM_COMPLETED, RECOMMENDATION_TRACK_RECORD_MINIMUM_COVERAGE_PPM,
 };
@@ -207,8 +210,9 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         | "Fundamental.GetFilings"
         | "Fundamental.GetFacts"
         | "Fundamental.GetStatements"
-        | "Fundamental.GetRatios"
-        | "Macro.ListSeries"
+        | "Fundamental.GetRatios" => observation_result(),
+        "Macro.GetDashboard" => macro_dashboard(),
+        "Macro.ListSeries"
         | "Macro.GetObservations"
         | "Macro.GetVintages"
         | "Macro.GetRevisions" => observation_result(),
@@ -3155,6 +3159,192 @@ fn canonical_decimal_text() -> Value {
     })
 }
 
+fn macro_dashboard() -> Value {
+    closed(
+        vec![
+            (
+                "schemaIdentity",
+                constant("market-squawk-macro-dashboard/v1"),
+            ),
+            ("binding", macro_dashboard_binding()),
+            ("release", macro_dashboard_release()),
+            ("selection", macro_dashboard_selection()),
+            (
+                "observations",
+                fixed_array(macro_dashboard_observation(), 11),
+            ),
+        ],
+        &[
+            "schemaIdentity",
+            "binding",
+            "release",
+            "selection",
+            "observations",
+        ],
+    )
+}
+
+fn macro_dashboard_binding() -> Value {
+    closed(
+        vec![
+            (
+                "surfaceId",
+                constant("federal-reserve-board.data-download-program"),
+            ),
+            ("sourceId", constant(BOARD_DDP_SOURCE_ID)),
+            ("providerDatasetId", bounded_text(512)),
+            ("analyticalDatasetId", analytical_dataset_identifier()),
+            ("manifest", macro_dashboard_manifest()),
+            ("objectGraphDigest", lowercase_sha256()),
+            ("queryIdentity", lowercase_sha256()),
+            ("resultDigest", lowercase_sha256()),
+        ],
+        &[
+            "surfaceId",
+            "sourceId",
+            "providerDatasetId",
+            "analyticalDatasetId",
+            "manifest",
+            "objectGraphDigest",
+            "queryIdentity",
+            "resultDigest",
+        ],
+    )
+}
+
+fn macro_dashboard_manifest() -> Value {
+    closed(
+        vec![
+            ("datasetId", analytical_dataset_identifier()),
+            (
+                "manifestVersion",
+                one_of(vec![
+                    json!({"type": "string", "pattern": "^[1-9][0-9]*$"}),
+                    json!({"type": "integer", "minimum": 1}),
+                ]),
+            ),
+            (
+                "schema",
+                closed(
+                    vec![
+                        ("name", bounded_text(256)),
+                        ("version", bounded_unsigned_range(1, u16::MAX.into())),
+                        ("fingerprint", lowercase_sha256()),
+                    ],
+                    &["name", "version", "fingerprint"],
+                ),
+            ),
+            ("contentHash", lowercase_sha256()),
+        ],
+        &["datasetId", "manifestVersion", "schema", "contentHash"],
+    )
+}
+
+fn macro_dashboard_release() -> Value {
+    closed(
+        vec![
+            ("code", constant("H15")),
+            ("title", constant("H.15 Selected Interest Rates")),
+            ("family", constant("h15-treasury-constant-maturities")),
+            ("frequency", constant("business_daily")),
+            ("quality", constant("official_delayed")),
+        ],
+        &["code", "title", "family", "frequency", "quality"],
+    )
+}
+
+fn macro_dashboard_selection() -> Value {
+    closed(
+        vec![
+            ("policy", constant("latest_known_by_series_as_of_cutoff_v1")),
+            ("evaluatedAt", timestamp()),
+            ("selectionDigest", lowercase_sha256()),
+            ("returnedSeries", constant_unsigned(11)),
+            ("availableSeries", bounded_unsigned(11)),
+            ("missingSeries", bounded_unsigned(11)),
+            ("complete", constant_bool(true)),
+        ],
+        &[
+            "policy",
+            "evaluatedAt",
+            "selectionDigest",
+            "returnedSeries",
+            "availableSeries",
+            "missingSeries",
+            "complete",
+        ],
+    )
+}
+
+fn macro_dashboard_observation() -> Value {
+    closed(
+        vec![
+            ("slot", macro_dashboard_slot()),
+            ("label", bounded_text(256)),
+            ("maturityOrder", bounded_unsigned_range(1, 11)),
+            ("seriesId", bounded_text(512)),
+            ("unitId", bounded_text(512)),
+            ("unitPresentation", constant("percent_per_year")),
+            ("effectiveDate", exact_length_text(10)),
+            ("availableAt", timestamp()),
+            ("revision", bounded_unsigned_range(1, u64::from(u32::MAX))),
+            ("observation", macro_dashboard_value()),
+            ("sourceIdentifier", bounded_text(512)),
+            ("sourcePayloadDigest", lowercase_sha256()),
+        ],
+        &[
+            "slot",
+            "label",
+            "maturityOrder",
+            "seriesId",
+            "unitId",
+            "unitPresentation",
+            "effectiveDate",
+            "availableAt",
+            "revision",
+            "observation",
+            "sourceIdentifier",
+            "sourcePayloadDigest",
+        ],
+    )
+}
+
+fn macro_dashboard_slot() -> Value {
+    let slots = h15_treasury_constant_maturities_dashboard_series()
+        .iter()
+        .map(|descriptor| descriptor.slot())
+        .collect::<Vec<_>>();
+    json!({"type": "string", "enum": slots})
+}
+
+fn macro_dashboard_value() -> Value {
+    one_of(vec![
+        closed(
+            vec![
+                ("state", constant("observed")),
+                ("decimal", canonical_decimal_text()),
+            ],
+            &["state", "decimal"],
+        ),
+        closed(
+            vec![
+                ("state", constant("missing")),
+                ("marker", bounded_text(128)),
+                ("reason", nullable(bounded_text(512))),
+            ],
+            &["state", "marker", "reason"],
+        ),
+    ])
+}
+
+fn analytical_dataset_identifier() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+    })
+}
+
 fn positive_integer_text() -> Value {
     json!({"type": "string", "pattern": "^[1-9][0-9]*$"})
 }
@@ -5503,6 +5693,10 @@ fn text() -> Value {
 
 fn bounded_text(maximum: usize) -> Value {
     json!({"type": "string", "minLength": 1, "maxLength": maximum})
+}
+
+fn exact_length_text(length: usize) -> Value {
+    json!({"type": "string", "minLength": length, "maxLength": length})
 }
 
 fn sha256() -> Value {

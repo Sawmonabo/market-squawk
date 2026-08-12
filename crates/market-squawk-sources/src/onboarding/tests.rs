@@ -197,6 +197,77 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         Some("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt")
     );
 
+    let board = profiles
+        .get("federal-reserve-board.data-download-program")
+        .ok_or("missing Federal Reserve Board profile")?;
+    assert_eq!(board.release_state(), ProfileReleaseState::Available);
+    assert_eq!(board.capability().revision().get(), 4);
+    assert_eq!(
+        board
+            .capability_history()
+            .map(|capability| capability.revision().get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert_eq!(board.probe().transport(), ProbeTransport::HttpGet);
+    assert_eq!(
+        board.probe().endpoint(),
+        Some(super::built_in_profiles::FEDERAL_RESERVE_BOARD_H15_PROBE_URL)
+    );
+    let board_policy = board
+        .probe()
+        .endpoint_policy()
+        .ok_or("Board doctor omitted its exact endpoint policy")?;
+    assert!(
+        board_policy
+            .authorize_request(super::built_in_profiles::FEDERAL_RESERVE_BOARD_H15_PROBE_URL)
+            .is_ok()
+    );
+    assert!(
+        board_policy
+            .authorize_request(
+                "https://www.federalreserve.gov/datadownload/Output.aspx?filetype=csv&label=include&lastobs=11&layout=seriescolumn&rel=H15&series=bf17364827e38702b42a58cf8eaa3f78&type=package"
+            )
+            .is_err()
+    );
+    assert_eq!(
+        board.capability().verifier_revision().as_str(),
+        "federal-reserve-board.data-download-program.probe.v2"
+    );
+    let board_revision_three = board
+        .capability_history()
+        .find(|capability| capability.revision().get() == 3)
+        .ok_or("Board profile omitted immutable revision 3")?;
+    assert_eq!(
+        board_revision_three.verifier_revision().as_str(),
+        "federal-reserve-board.data-download-program.probe.v1"
+    );
+    assert_eq!(
+        board_revision_three.rate_policy().policy_id().as_str(),
+        "federal-reserve-board.data-download-program.pending-rate-policy.v1"
+    );
+    assert_eq!(
+        board.capability().rate_policy().policy_id().as_str(),
+        "federal-reserve-board.data-download-program.rate-policy.v1"
+    );
+    assert!(board.coverage().0.contains("exact 11-series H.15"));
+    assert_eq!(
+        board.persistence_evidence().map(ProfileEvidence::source_id),
+        Some("MSQ-SELECTED-MARKET-DATA-ARCHITECTURE-2026-08-11")
+    );
+    let board_budget = board
+        .capability()
+        .rate_policy()
+        .enforcement_policy()
+        .ok_or("Board profile omitted its application budget")?;
+    assert_eq!(board_budget.max_concurrent(), 1);
+    assert_eq!(
+        board_budget
+            .window(0)
+            .map(|window| (window.requests_per_window(), window.window_nanos())),
+        Some((1, 60_000_000_000))
+    );
+
     for (profile_id, activation, setup, credential, coverage_marker, windows) in [
         (
             "schwab.trader-api-market-data",
@@ -261,14 +332,6 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
             CredentialKind::ApiKey,
             "5,000-row maximum",
             &[(1, 1_000_000_000)][..],
-        ),
-        (
-            "federal-reserve-board.data-download-program",
-            ProfileActivationMode::NoCredential,
-            SetupMode::NoCredential,
-            CredentialKind::None,
-            "one request per minute",
-            &[(1, 60_000_000_000)][..],
         ),
         (
             "tiingo.starter-eod-nav",

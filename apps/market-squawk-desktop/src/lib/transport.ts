@@ -41,6 +41,11 @@ export type SetupPlanSelection = {
 
 export type DashboardQuery =
   | { query: "overview" }
+  | {
+      query: "macroDashboard"
+      provider: "federal-reserve-board.data-download-program"
+      release: "h15"
+    }
   | { query: "lookup"; text: string; categories?: string[] }
   | { query: "marketSnapshot" | "marketQuality" | "marketUnifiedFeed" }
   | { query: "marketUniverse"; text?: string }

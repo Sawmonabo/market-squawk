@@ -10,6 +10,7 @@ use market_squawk_adapter_bls::{
 use market_squawk_adapter_coinbase::{
     CoinbaseConfigError, CoinbaseDirectLimits, CoinbaseProductMapping,
 };
+use market_squawk_adapter_federal_reserve::BoardDatasetProfile;
 use market_squawk_adapter_files::ExtractionLimits;
 use market_squawk_adapter_fred::FredRightsPolicy;
 use market_squawk_adapter_portfolio::PortfolioImportLimits;
@@ -312,6 +313,26 @@ impl FredAdapterActivation {
     }
 }
 
+/// Federal Reserve Board construction inputs for one exact code-owned H.15 package.
+#[derive(Debug)]
+pub struct BoardAdapterActivation {
+    pub(super) metadata: SourceMetadata,
+    pub(super) profile: BoardDatasetProfile,
+}
+
+impl BoardAdapterActivation {
+    /// Retains exact no-key metadata and the selected provider request/schema profile.
+    #[must_use]
+    pub fn new(metadata: SourceMetadata, profile: BoardDatasetProfile) -> Self {
+        Self { metadata, profile }
+    }
+
+    /// Returns the exact provider discovery identity carried by the selected Board profile.
+    pub(crate) const fn provider_dataset_identifier(&self) -> &SourceIdentifier {
+        self.profile.dataset()
+    }
+}
+
 /// Explicit user-root and manifest authority for one local-file research source.
 pub struct LocalFileAdapterActivation {
     pub(super) metadata: SourceMetadata,
@@ -478,6 +499,8 @@ pub enum ProviderAdapterActivationRequest {
     Treasury(TreasuryAdapterActivation),
     /// FRED/ALFRED extraction under exact scope-specific rights.
     Fred(FredAdapterActivation),
+    /// Federal Reserve Board H.15 extraction from one exact no-key DDP package.
+    Board(BoardAdapterActivation),
     /// User-owned local file extraction.
     LocalFiles(LocalFileAdapterActivation),
     /// Workspace-controlled exact bytes admitted by the guided local-file workflow.
@@ -491,6 +514,7 @@ impl ProviderAdapterActivationRequest {
     pub(crate) fn provider_dataset_identifier(&self) -> Option<&SourceIdentifier> {
         match self {
             Self::Bls(specification) => specification.provider_dataset_identifier(),
+            Self::Board(specification) => Some(specification.provider_dataset_identifier()),
             Self::Live(_)
             | Self::CoinbaseDirect(_)
             | Self::Sec(_)
@@ -539,6 +563,9 @@ pub enum ProviderAdapterActivationError {
     /// FRED construction rejected exact key, rights, or metadata authority.
     #[error(transparent)]
     Fred(#[from] market_squawk_adapter_fred::FredSourceError),
+    /// Federal Reserve Board construction rejected exact metadata or the H.15 profile.
+    #[error(transparent)]
+    Board(#[from] market_squawk_adapter_federal_reserve::BoardSourceError),
     /// Local-file construction rejected root, manifest, metadata, or storage authority.
     #[error(transparent)]
     Files(#[from] market_squawk_adapter_files::FileAdapterError),

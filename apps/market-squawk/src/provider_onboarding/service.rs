@@ -15,6 +15,10 @@ use market_squawk_adapter_bea::BeaUserId;
 use market_squawk_adapter_census::CensusApiKey;
 use market_squawk_adapter_coinbase::CoinbaseDirectHmacSigner;
 use market_squawk_adapter_eia::EiaApiKey;
+use market_squawk_adapter_federal_reserve::{
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL, BoardDatasetContract,
+    BoardParseLimits, parse_csv as parse_board_csv,
+};
 use market_squawk_adapter_fred::{
     FredParseLimits, FredSeriesMetadata, FredTermsDocumentRole, MAX_FRED_SERVICE_PERMISSION_BYTES,
     MAX_FRED_TERMS_DOCUMENT_BYTES,
@@ -2484,6 +2488,33 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
             .map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
         return Ok(());
     }
+    if profile_id == "federal-reserve-board.data-download-program" {
+        let contract = BoardDatasetContract::h15_treasury_constant_maturities_doctor_probe_csv()
+            .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        let limits = BoardParseLimits::try_new(
+            MAX_PROBE_BODY_BYTES,
+            1,
+            MAX_PROBE_BODY_BYTES as u64,
+            MAX_PROBE_BODY_BYTES as u64,
+            1,
+            11,
+            110,
+            16,
+            1,
+            8 * 1024,
+        )
+        .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        let parsed = parse_board_csv(&contract, body, limits)
+            .map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
+        return (parsed.series().len() == 11
+            && parsed.observation_count() == 110
+            && parsed
+                .series()
+                .iter()
+                .all(|series| series.observations().len() == 10))
+        .then_some(())
+        .ok_or(ProviderOnboardingError::ProbeUnavailable);
+    }
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
     let valid = match profile_id {
@@ -2843,6 +2874,38 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
+    fn federal_reserve_board_doctor_requires_exact_h15_ten_observation_contract() -> TestResult {
+        let profiles = built_in_provider_profiles()?;
+        let profile = profiles
+            .get("federal-reserve-board.data-download-program")
+            .ok_or("Federal Reserve Board onboarding profile is missing")?;
+        assert_eq!(
+            profile.probe().endpoint(),
+            Some(BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL)
+        );
+        let exact = board_h15_probe_fixture(10);
+        validate_probe_semantics(
+            "federal-reserve-board.data-download-program",
+            exact.as_bytes(),
+        )?;
+        assert!(
+            validate_probe_semantics(
+                "federal-reserve-board.data-download-program",
+                board_h15_probe_fixture(9).as_bytes(),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_probe_semantics(
+                "federal-reserve-board.data-download-program",
+                exact.replacen("Time Period", "Date", 1).as_bytes(),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn credentialed_market_profiles_fail_closed_at_secret_and_probe_boundaries() -> TestResult {
         let profiles = built_in_provider_profiles()?;
         let profile = profiles
@@ -3157,5 +3220,68 @@ mod tests {
         ));
         tokio::time::timeout(Duration::from_millis(250), second).await???;
         Ok(())
+    }
+
+    fn board_h15_probe_fixture(observation_rows: usize) -> String {
+        let descriptors = market_squawk_adapter_federal_reserve::
+            h15_treasury_constant_maturities_dashboard_series();
+        let mut rows = Vec::with_capacity(6 + observation_rows);
+        for (label, values) in [
+            (
+                "Series Description",
+                descriptors
+                    .iter()
+                    .map(|descriptor| format!("{} Treasury constant maturity", descriptor.label()))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "Unit:",
+                descriptors
+                    .iter()
+                    .map(|_descriptor| "Percent:_Per_Year".to_owned())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "Multiplier:",
+                descriptors
+                    .iter()
+                    .map(|_descriptor| "1".to_owned())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "Currency:",
+                descriptors
+                    .iter()
+                    .map(|_descriptor| "NA".to_owned())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "Unique Identifier: ",
+                descriptors
+                    .iter()
+                    .map(|descriptor| format!("H15/H15/{}", descriptor.provider_series_name()))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "Time Period",
+                descriptors
+                    .iter()
+                    .map(|descriptor| descriptor.provider_series_name().to_owned())
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            rows.push(format!("{label},{}", values.join(",")));
+        }
+        for day in 1..=observation_rows {
+            rows.push(format!(
+                "2026-08-{day:02},{}",
+                descriptors
+                    .iter()
+                    .map(|_descriptor| "4.000")
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        rows.join("\n") + "\n"
     }
 }

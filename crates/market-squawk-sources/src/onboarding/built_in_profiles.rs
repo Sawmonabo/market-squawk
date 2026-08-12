@@ -120,6 +120,13 @@ const BEA_PROFILE: &str = "bea.api-data";
 const CENSUS_PROFILE: &str = "census.data-api";
 const EIA_PROFILE: &str = "eia.api-v2";
 const FEDERAL_RESERVE_BOARD_PROFILE: &str = "federal-reserve-board.data-download-program";
+const FEDERAL_RESERVE_BOARD_H15_PROBE_BASE_URL: &str =
+    "https://www.federalreserve.gov/datadownload/Output.aspx";
+pub(super) const FEDERAL_RESERVE_BOARD_H15_PROBE_URL: &str = concat!(
+    "https://www.federalreserve.gov/datadownload/Output.aspx?filetype=csv&label=include&",
+    "lastobs=10&layout=seriescolumn&rel=H15&series=bf17364827e38702b42a58cf8eaa3f78&",
+    "type=package"
+);
 const TIINGO_PROFILE: &str = "tiingo.starter-eod-nav";
 const TRADIER_MARKET_DATA_PROFILE: &str = "tradier.brokerage-market-data";
 const KRAKEN_L3_PROFILE: &str = "kraken.spot-authenticated-level3-market-data";
@@ -1001,7 +1008,8 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
             LEGACY_REPORT_DIGEST,
             built_in_budget(&spec, false)?,
-            spec.probe.transport() != ProbeTransport::Local,
+            spec.probe.transport() != ProbeTransport::Local
+                && spec.id != FEDERAL_RESERVE_BOARD_PROFILE,
         )?,
         historical_rights_state,
     )?;
@@ -1119,6 +1127,41 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
                 revision_three,
                 revision_four,
             ],
+            current,
+        )
+    } else if spec.id == FEDERAL_RESERVE_BOARD_PROFILE {
+        let revision_three = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(3)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(spec.rate_policy)?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(2)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, true)?,
+                false,
+            )?,
+        )?;
+        let current = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(4)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(2)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, true)?,
+                true,
+            )?,
+        )?;
+        (
+            vec![legacy_capability, revision_two, revision_three],
             current,
         )
     } else if matches!(spec.id, SEC_PROFILE | BLS_PUBLIC_V1_PROFILE) {
@@ -1247,6 +1290,7 @@ fn build_capability_with_rights_state(
             spec.id,
             if (spec.id == TREASURY_DAILY_RATES_PROFILE && revision.get() >= 3)
                 || (spec.id == TREASURY_FISCAL_PROFILE && revision.get() >= 4)
+                || (spec.id == FEDERAL_RESERVE_BOARD_PROFILE && revision.get() >= 4)
             {
                 2
             } else {
@@ -1395,6 +1439,8 @@ fn is_selected_architecture_profile(profile_id: &str) -> bool {
 fn current_rate_policy(spec: &BuiltInSpec) -> &'static str {
     if spec.id == "fred-alfred.api-v1-v2" {
         "fred-alfred.api-v1-v2.rate-policy.v2"
+    } else if spec.id == FEDERAL_RESERVE_BOARD_PROFILE {
+        "federal-reserve-board.data-download-program.rate-policy.v1"
     } else {
         spec.rate_policy
     }
@@ -1498,6 +1544,8 @@ fn built_in_budget(
             1,
             backoff,
         ),
+        // No numeric Board ceiling is published. This single-flight one-per-minute bound is a
+        // Market Squawk application policy shared by the doctor and later H.15 retrieval.
         FEDERAL_RESERVE_BOARD_PROFILE => {
             simple_budget("federal-reserve-board", None, 1, MINUTE_NANOS, 1, backoff)
         }
@@ -2121,15 +2169,26 @@ fn federal_reserve_board() -> Result<BuiltInSpec, ProviderProfileError> {
         zero_fee: ZeroFeeStatus::NoCredentialFeeNotEstablished,
         account: Requirement::NotRequired,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RefreshRequired,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: None,
         permissions: &[],
-        coverage: "No-key release-driven target for Federal Reserve Board Data Download Program current-definition statistical releases, initially H.15 rates, with exact generated package URLs and matching CSV, Excel, or XML/SDMX structures; DDP is not a vintage-history authority, publishes one frequency per output file, has no established numeric request ceiling, and is limited by application policy to one request per minute; a transport-free provider-native request/schema/parser/source/publication core plus bounded response-receipt contracts is present, while application-owned HTTPS retrieval and budget binding, doctor, activation, durable canonical publication, PIT typed read, product composition, and restart/release proof remain absent",
+        coverage: "No-key Federal Reserve Board Data Download Program current-definition statistical-release surface, admitted initially only for the exact 11-series H.15 Treasury constant-maturity CSV contract; the bounded doctor requests exactly ten recent observations per series, while the distinct production contract retains full history; DDP is not a vintage-history authority, has no established numeric request ceiling, and is limited by application policy to one shared request per minute with one request in flight; provider-native authority-governed HTTPS, strict parsing, canonical mapping, application activation/source construction, rich raw-capture handoff, analytical-dataset registration, and lifecycle restore code are present; focused activation/restart proof is upstream-blocked, and executed durable live publication, PIT typed reads, macro product composition, restart acceptance, and release proof remain incomplete",
         quality: DataQuality::OfficialDelayed,
-        probe: VerificationProbe::local(
-            "the Board DDP request/schema/parser/source/publication core and response-receipt contracts are installed, but application HTTPS retrieval/budget binding, doctor, activation, durable canonical publisher, PIT read, and product proof are not; activation remains refresh_required",
-        ),
+        probe: VerificationProbe::network_exact_public_query(
+            ProbeTransport::HttpGet,
+            FEDERAL_RESERVE_BOARD_H15_PROBE_BASE_URL,
+            FEDERAL_RESERVE_BOARD_H15_PROBE_URL,
+            &[
+                ("filetype", "csv"),
+                ("label", "include"),
+                ("lastobs", "10"),
+                ("layout", "seriescolumn"),
+                ("rel", "H15"),
+                ("series", "bf17364827e38702b42a58cf8eaa3f78"),
+                ("type", "package"),
+            ],
+        )?,
         rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
         duties: &[
             "freeze release, series, frequency, bounds, format, exact generated automation URL, and matching structure/schema digests for every admitted package",
@@ -2140,11 +2199,11 @@ fn federal_reserve_board() -> Result<BuiltInSpec, ProviderProfileError> {
         persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
         rotation: "not applicable: this selected surface has no credential",
         revocation: "disable future Board DDP jobs locally",
-        recovery: REFRESH_RECOVERY,
+        recovery: COMMON_RECOVERY,
         evidence: FEDERAL_RESERVE_BOARD_EVIDENCE,
         rate_policy: "federal-reserve-board.data-download-program.pending-rate-policy.v1",
         refresh_trigger: "FEDERAL-RESERVE-BOARD-DDP",
-        handoff_instruction: "No key is required. The transport-free Board request, schema, parser, source, publication, and response-receipt core is present; the profile remains unavailable until application HTTPS acquisition, doctor/activation, durable canonical publication, PIT selection, product composition, and restart/release proof are implemented.",
+        handoff_instruction: "No key is required. Continue with the exact bounded ten-observation H.15 doctor. A successful probe may advance the code-owned activation and registered research path; focused activation/restart proof is still required, followed by executed durable live publication, PIT reads, macro product composition, restart acceptance, and release proof.",
     })
 }
 

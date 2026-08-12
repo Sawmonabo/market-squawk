@@ -195,6 +195,10 @@ pub(crate) struct ApplicationInvocation {
 )]
 pub(crate) enum DashboardQueryCommand {
     Overview,
+    MacroDashboard {
+        provider: String,
+        release: String,
+    },
     Lookup {
         text: String,
         categories: Option<Vec<String>>,

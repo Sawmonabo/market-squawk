@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use market_squawk_domain::CalendarDate;
+use market_squawk_domain::{CalendarDate, SourceIdentifier};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -15,6 +15,158 @@ use crate::digest::{finish, update_bool, update_bytes, update_tag, update_u64};
 pub const BOARD_DDP_SOURCE_ID: &str = "federal-reserve-board-ddp";
 /// Native adapter contract version bound into requests, parsed batches, and receipts.
 pub const BOARD_NATIVE_CONTRACT_VERSION: u16 = 1;
+/// Official full-history H.15 Treasury constant-maturity preformatted CSV package.
+pub const BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL: &str = concat!(
+    "https://www.federalreserve.gov/datadownload/Download.aspx?filetype=csv&label=include&",
+    "lastObs=&layout=seriescolumn&rel=H15&series=bf17364827e38702b42a58cf8eaa3f78&",
+    "type=package"
+);
+/// Live-verified bounded H.15 doctor route returning at most ten recent observations per series.
+pub const BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL: &str = concat!(
+    "https://www.federalreserve.gov/datadownload/Output.aspx?filetype=csv&label=include&",
+    "lastobs=10&layout=seriescolumn&rel=H15&series=bf17364827e38702b42a58cf8eaa3f78&",
+    "type=package"
+);
+
+/// User-facing identity for one series in the selected H.15 Treasury-maturity dashboard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardH15DashboardSeriesDescriptor {
+    slot: &'static str,
+    label: &'static str,
+    maturity_order: u8,
+    provider_series_name: &'static str,
+    unit_presentation: &'static str,
+}
+
+impl BoardH15DashboardSeriesDescriptor {
+    /// Returns the stable application/DTO slot; consumers must not derive it from provider text.
+    pub const fn slot(self) -> &'static str {
+        self.slot
+    }
+
+    /// Returns the concise user-facing maturity label.
+    pub const fn label(self) -> &'static str {
+        self.label
+    }
+
+    /// Returns the ascending maturity position in this exact dashboard package.
+    pub const fn maturity_order(self) -> u8 {
+        self.maturity_order
+    }
+
+    /// Returns the exact source-authored DDP series name.
+    pub const fn provider_series_name(self) -> &'static str {
+        self.provider_series_name
+    }
+
+    /// Returns the presentation unit. Values are percentage points per year, not fractions.
+    pub const fn unit_presentation(self) -> &'static str {
+        self.unit_presentation
+    }
+
+    /// Returns the exact canonical [`market_squawk_domain::MacroObservation`] series identity.
+    pub fn canonical_macro_series_identifier(self) -> Result<SourceIdentifier, BoardAdapterError> {
+        SourceIdentifier::try_from(format!(
+            "federal-reserve-board:h15:H15%2FH15%2F{}",
+            self.provider_series_name
+        ))
+        .map_err(|_| BoardAdapterError::InvalidContract)
+    }
+}
+
+const BOARD_H15_DASHBOARD_SERIES: [BoardH15DashboardSeriesDescriptor; 11] = [
+    BoardH15DashboardSeriesDescriptor {
+        slot: "1m",
+        label: "1 Month",
+        maturity_order: 1,
+        provider_series_name: "RIFLGFCM01_N.B",
+        unit_presentation: "percent_per_year",
+    },
+    BoardH15DashboardSeriesDescriptor {
+        slot: "3m",
+        label: "3 Month",
+        maturity_order: 2,
+        provider_series_name: "RIFLGFCM03_N.B",
+        unit_presentation: "percent_per_year",
+    },
+    BoardH15DashboardSeriesDescriptor {
+        slot: "6m",
+        label: "6 Month",
+        maturity_order: 3,
+        provider_series_name: "RIFLGFCM06_N.B",
+        unit_presentation: "percent_per_year",
+    },
+    BoardH15DashboardSeriesDescriptor {
+        slot: "1y",
+        label: "1 Year",
+        maturity_order: 4,
+        provider_series_name: "RIFLGFCY01_N.B",
+        unit_presentation: "percent_per_year",
+    },
+    BoardH15DashboardSeriesDescriptor {
+        slot: "2y",
+        label: "2 Year",
+        maturity_order: 5,
+        provider_series_name: "RIFLGFCY02_N.B",
+        unit_presentation: "percent_per_year",
+    },
+    BoardH15DashboardSeriesDescriptor {
+        slot: "3y",
+        label: "3 Year",
+        maturity_order: 6,
+        provider_series_name: "RIFLGFCY03_N.B",
+        unit_presentation: "percent_per_year",
+    },
+    BoardH15DashboardSeriesDescriptor {
+        slot: "5y",
+        label: "5 Year",
+        maturity_order: 7,
+        provider_series_name: "RIFLGFCY05_N.B",
+        unit_presentation: "percent_per_year",
+    },
+    BoardH15DashboardSeriesDescriptor {
+        slot: "7y",
+        label: "7 Year",
+        maturity_order: 8,
+        provider_series_name: "RIFLGFCY07_N.B",
+        unit_presentation: "percent_per_year",
+    },
+    BoardH15DashboardSeriesDescriptor {
+        slot: "10y",
+        label: "10 Year",
+        maturity_order: 9,
+        provider_series_name: "RIFLGFCY10_N.B",
+        unit_presentation: "percent_per_year",
+    },
+    BoardH15DashboardSeriesDescriptor {
+        slot: "20y",
+        label: "20 Year",
+        maturity_order: 10,
+        provider_series_name: "RIFLGFCY20_N.B",
+        unit_presentation: "percent_per_year",
+    },
+    BoardH15DashboardSeriesDescriptor {
+        slot: "30y",
+        label: "30 Year",
+        maturity_order: 11,
+        provider_series_name: "RIFLGFCY30_N.B",
+        unit_presentation: "percent_per_year",
+    },
+];
+
+/// Returns the complete, maturity-ordered H.15 dashboard series catalog.
+pub const fn h15_treasury_constant_maturities_dashboard_series()
+-> &'static [BoardH15DashboardSeriesDescriptor; 11] {
+    &BOARD_H15_DASHBOARD_SERIES
+}
+
+/// Returns the exact unit identity emitted by canonical H.15 Treasury-maturity observations.
+pub fn h15_treasury_constant_maturities_canonical_unit_identifier()
+-> Result<SourceIdentifier, BoardAdapterError> {
+    SourceIdentifier::try_from("federal-reserve-board-unit:Percent%3A_Per_Year:multiplier:1")
+        .map_err(|_| BoardAdapterError::InvalidContract)
+}
 
 const MAX_URL_BYTES: usize = 4 * 1024;
 const MAX_SERIES_PER_CONTRACT: usize = 20_000;
@@ -698,38 +850,44 @@ pub struct BoardDatasetContract {
 }
 
 impl BoardDatasetContract {
+    /// Builds the code-owned full-history H.15 Treasury constant-maturity CSV contract.
+    pub fn h15_treasury_constant_maturities_production_csv() -> Result<Self, BoardAdapterError> {
+        Self::h15_treasury_constant_maturities_csv(
+            BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL,
+        )
+    }
+
+    /// Builds the bounded H.15 route/schema contract used only by provider doctor probes.
+    ///
+    /// Its URL and contract digest remain distinct from the full-history production dataset, so a
+    /// bounded readiness response cannot be mistaken for a complete analytical generation.
+    pub fn h15_treasury_constant_maturities_doctor_probe_csv() -> Result<Self, BoardAdapterError> {
+        Self::h15_treasury_constant_maturities_csv(
+            BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL,
+        )
+    }
+
     /// Builds the selected H.15 daily Treasury constant-maturity CSV contract over the exact
     /// generated automated-download URL supplied by the application registry.
     pub fn h15_treasury_constant_maturities_csv(
         generated_url: impl Into<Box<str>>,
     ) -> Result<Self, BoardAdapterError> {
-        let series = [
-            ("RIFLGFCM01_N.B", "1-month"),
-            ("RIFLGFCM03_N.B", "3-month"),
-            ("RIFLGFCM06_N.B", "6-month"),
-            ("RIFLGFCY01_N.B", "1-year"),
-            ("RIFLGFCY02_N.B", "2-year"),
-            ("RIFLGFCY03_N.B", "3-year"),
-            ("RIFLGFCY05_N.B", "5-year"),
-            ("RIFLGFCY07_N.B", "7-year"),
-            ("RIFLGFCY10_N.B", "10-year"),
-            ("RIFLGFCY20_N.B", "20-year"),
-            ("RIFLGFCY30_N.B", "30-year"),
-        ]
-        .into_iter()
-        .map(|(series_name, _maturity)| {
-            BoardSeriesContract::try_new(
-                format!("H15/H15/{series_name}"),
-                series_name,
-                None,
-                "Percent:_Per_Year",
-                Decimal::ONE,
-                "NA",
-                BoardFrequency::BusinessDaily,
-                BoardSeriesLifecycle::Active,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        let series = h15_treasury_constant_maturities_dashboard_series()
+            .iter()
+            .map(|descriptor| {
+                let series_name = descriptor.provider_series_name();
+                BoardSeriesContract::try_new(
+                    format!("H15/H15/{series_name}"),
+                    series_name,
+                    None,
+                    "Percent:_Per_Year",
+                    Decimal::ONE,
+                    "NA",
+                    BoardFrequency::BusinessDaily,
+                    BoardSeriesLifecycle::Active,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Self::try_csv_series_column(
             BoardDatasetFamily::H15TreasuryConstantMaturities,
             generated_url,
@@ -1017,7 +1175,10 @@ fn validate_official_url(
         return Err(BoardAdapterError::RequestUrlRejected);
     }
     let path = parsed.path().to_ascii_lowercase();
-    if path == "/datadownload/output.aspx" {
+    if matches!(
+        path.as_str(),
+        "/datadownload/output.aspx" | "/datadownload/download.aspx"
+    ) {
         validate_ddp_query(&parsed, release, format)
     } else {
         let release_prefix = format!("/releases/{}/", release.code().to_ascii_lowercase());

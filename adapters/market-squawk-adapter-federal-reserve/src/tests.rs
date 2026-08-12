@@ -112,6 +112,108 @@ struct BoardSourceHarness {
 #[test]
 fn exact_h15_publication_retains_correction_and_replacement_evidence() -> Result<(), Box<dyn Error>>
 {
+    let production = BoardDatasetContract::h15_treasury_constant_maturities_production_csv()?;
+    let doctor = BoardDatasetContract::h15_treasury_constant_maturities_doctor_probe_csv()?;
+    assert_eq!(
+        production.url(),
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL
+    );
+    assert_eq!(
+        doctor.url(),
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL
+    );
+    assert_ne!(production.contract_digest(), doctor.contract_digest());
+    assert_ne!(
+        production.request().request_digest(),
+        doctor.request().request_digest()
+    );
+    let lower_hex = |digest: [u8; 32]| {
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    assert_eq!(
+        lower_hex(production.contract_digest()),
+        "fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e"
+    );
+    assert_eq!(
+        lower_hex(production.request().request_digest()),
+        "fce4b15d52a8431d7112d5fd0eed3334c5f5dce476ab419396f21d3355683167"
+    );
+    assert_eq!(
+        lower_hex(doctor.contract_digest()),
+        "eb8005e0ccc273f8a5f88e941352700d24265439ae16c5f2675329043b3fcfeb"
+    );
+    assert_eq!(
+        lower_hex(doctor.request().request_digest()),
+        "ac99775935dcb97df1d865519888de9da9d3f372c8ed67e21ecf23894bd99977"
+    );
+    assert_eq!(
+        production
+            .series_scope()
+            .exact_series()
+            .ok_or("production series scope")?
+            .len(),
+        11
+    );
+    let descriptors = h15_treasury_constant_maturities_dashboard_series();
+    assert_eq!(descriptors.len(), 11);
+    for (index, descriptor) in descriptors.iter().copied().enumerate() {
+        assert_eq!(usize::from(descriptor.maturity_order()), index + 1);
+        assert_eq!(descriptor.unit_presentation(), "percent_per_year");
+        let contract_series = &production
+            .series_scope()
+            .exact_series()
+            .ok_or("production series scope")?[index];
+        assert_eq!(
+            descriptor.provider_series_name(),
+            contract_series.series_name()
+        );
+        assert_eq!(
+            descriptor.canonical_macro_series_identifier()?.as_str(),
+            format!(
+                "federal-reserve-board:h15:H15%2FH15%2F{}",
+                descriptor.provider_series_name()
+            )
+        );
+    }
+    assert_eq!(descriptors[0].slot(), "1m");
+    assert_eq!(descriptors[0].label(), "1 Month");
+    assert_eq!(descriptors[10].slot(), "30y");
+    assert_eq!(descriptors[10].label(), "30 Year");
+    assert_eq!(
+        h15_treasury_constant_maturities_canonical_unit_identifier()?.as_str(),
+        "federal-reserve-board-unit:Percent%3A_Per_Year:multiplier:1"
+    );
+    let descriptor_wire = serde_json::to_value(descriptors[0])?;
+    assert_eq!(descriptor_wire["maturityOrder"], 1);
+    assert_eq!(descriptor_wire["unitPresentation"], "percent_per_year");
+    assert!(descriptor_wire.get("maturity_order").is_none());
+
+    let production_profile =
+        BoardDatasetProfile::try_new(production, BoardParseLimits::default(), Vec::new())?;
+    let doctor_profile =
+        BoardDatasetProfile::try_new(doctor, BoardParseLimits::default(), Vec::new())?;
+    assert_ne!(production_profile.dataset(), doctor_profile.dataset());
+    assert_ne!(
+        production_profile.analytical_dataset(),
+        doctor_profile.analytical_dataset()
+    );
+    assert!(
+        !production_profile
+            .analytical_dataset()
+            .as_str()
+            .contains(':')
+    );
+    assert_eq!(
+        production_profile
+            .analytical_dataset()
+            .as_str()
+            .replace('.', ":"),
+        production_profile.dataset().as_str()
+    );
+
     let contract = test_h15_one_series_contract(H15_URL)?;
     let first = parse_csv(
         &contract,

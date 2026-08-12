@@ -17,6 +17,9 @@ use bytes::Bytes;
 use cap_fs_ext::DirExt as _;
 use cap_std::fs::Dir;
 use market_squawk_adapter_bls::{BlsAccessTier, BlsRequestPlan, BlsSeriesMetadata};
+use market_squawk_adapter_federal_reserve::{
+    BoardDatasetContract, BoardDatasetProfile, BoardParseLimits,
+};
 use market_squawk_adapter_files::{ExtractionLimits, ExtractionLimitsInput};
 use market_squawk_adapter_fred::{
     CURRENT_FRED_RIGHTS_ARTIFACT_SHA256, CURRENT_UNRATE_RIGHTS_ARTIFACT_SHA256, FredOperation,
@@ -44,10 +47,10 @@ use market_squawk_platform::{
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
     BudgetWindowSemantics, CoverageDomain, EndpointPolicy, FRED_ALFRED_API_SURFACE_ID,
-    FreshnessPolicy, HistoricalCapability, HttpRequestBounds, NetworkAccessPolicy, PathScope,
-    ProviderBudgetPolicy, ProviderBudgetWindow, ProviderRateDeclaration, QueryParameterRule,
-    QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
-    SourceMetadataInput, SourceProtocolProfile,
+    FreshnessPolicy, HistoricalCapability, HttpRequestBounds, MAX_PROVIDER_CAPTURE_PAGE_BYTES,
+    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
+    ProviderRateDeclaration, QueryParameterRule, QuerySensitivity, SourceCapabilities, SourceClass,
+    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -61,8 +64,8 @@ use uuid::Uuid;
 
 use crate::application::ResearchProviderRuntimeGeneration;
 use crate::provider_activation::{
-    CommittedProviderAdapterReplacement, ControlledLocalFileAdapterActivation,
-    PreparedProviderAdapterReplacement,
+    BoardAdapterActivation, CommittedProviderAdapterReplacement,
+    ControlledLocalFileAdapterActivation, PreparedProviderAdapterReplacement,
 };
 use crate::provider_onboarding::{
     AcquiredFredTermsDocument, FredPortalEvidenceInput, FredPortalGrantInput,
@@ -109,6 +112,7 @@ const KRAKEN_PUBLIC_SURFACE: &str = "kraken.spot-public-market-data";
 const TREASURY_XML_SURFACE: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL_SURFACE: &str = "treasury.fiscal-data";
 const FRED_SURFACE: &str = FRED_ALFRED_API_SURFACE_ID;
+const FEDERAL_RESERVE_BOARD_SURFACE: &str = "federal-reserve-board.data-download-program";
 const LOCAL_FILES_SURFACE: &str = "local.files";
 const FRED_RIGHTS_MANIFEST_BYTES: &[u8] =
     include_bytes!("../../../../docs/verification/fred-rights-decision.json");
@@ -2302,6 +2306,20 @@ fn build_research_activation(
             )?;
             ProviderAdapterActivationRequest::Fred(FredAdapterActivation::new(metadata, policy))
         }
+        ProviderRequest::FederalReserveBoardH15 => {
+            let contract = BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let metadata = federal_reserve_board_metadata(
+                lease,
+                activation_evidence,
+                metadata_effective,
+                &contract,
+            )?;
+            let profile =
+                BoardDatasetProfile::try_new(contract, BoardParseLimits::default(), Vec::new())
+                    .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            ProviderAdapterActivationRequest::Board(BoardAdapterActivation::new(metadata, profile))
+        }
         ProviderRequest::ControlledLocalFiles { configuration } => {
             let manifest_digest = sha256_evidence(&configuration.manifest_sha256)?;
             let admitted_input_set = sha256_evidence(&configuration.admitted_input_set_sha256)?;
@@ -2422,6 +2440,7 @@ enum ProviderRequest {
     FredAlfred {
         configuration: Box<FredProviderRequest>,
     },
+    FederalReserveBoardH15,
     ControlledLocalFiles {
         configuration: ControlledLocalFileRequest,
     },
@@ -2455,6 +2474,7 @@ impl ProviderRequest {
             Self::TreasuryFiscal { .. } => ProviderSurface::Exact(TREASURY_FISCAL_SURFACE),
             Self::TreasuryDailyRates { .. } => ProviderSurface::Exact(TREASURY_XML_SURFACE),
             Self::FredAlfred { .. } => ProviderSurface::Exact(FRED_SURFACE),
+            Self::FederalReserveBoardH15 => ProviderSurface::Exact(FEDERAL_RESERVE_BOARD_SURFACE),
             Self::ControlledLocalFiles { .. } => ProviderSurface::Exact(LOCAL_FILES_SURFACE),
         }
     }
@@ -2543,6 +2563,15 @@ fn portal_provider_request(
 ) -> Result<(ProviderRequest, LoadedActivationEvidence), CliProviderActivationError> {
     match request {
         ProviderPortalActivationRequest::Source => Err(CliProviderActivationError::SurfaceMismatch),
+        ProviderPortalActivationRequest::FederalReserveBoardH15 => {
+            require_surface(lease, ProviderSurface::Exact(FEDERAL_RESERVE_BOARD_SURFACE))?;
+            Ok((
+                ProviderRequest::FederalReserveBoardH15,
+                LoadedActivationEvidence {
+                    objects: BTreeMap::new(),
+                },
+            ))
+        }
         ProviderPortalActivationRequest::Sec { cik } => {
             require_surface(lease, ProviderSurface::Exact(SEC_SURFACE))?;
             Ok((
@@ -3502,6 +3531,7 @@ fn evidence_references(
         }
         ProviderRequest::TreasuryFiscal { .. }
         | ProviderRequest::TreasuryDailyRates { .. }
+        | ProviderRequest::FederalReserveBoardH15
         | ProviderRequest::ControlledLocalFiles { .. } => {}
         ProviderRequest::Bls {
             series_metadata, ..
@@ -3653,7 +3683,8 @@ fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivati
             if request.schema_version != PREVIOUS_REQUEST_SCHEMA_VERSION
                 || matches!(
                     &request.provider,
-                    ProviderRequest::ControlledLocalFiles { .. }
+                    ProviderRequest::FederalReserveBoardH15
+                        | ProviderRequest::ControlledLocalFiles { .. }
                 )
             {
                 return Err(CliProviderActivationError::InvalidRequest);
@@ -3668,6 +3699,7 @@ fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivati
                 || matches!(
                     &request.provider,
                     ProviderRequest::FredAlfred { .. }
+                        | ProviderRequest::FederalReserveBoardH15
                         | ProviderRequest::ControlledLocalFiles { .. }
                 )
             {
@@ -4242,6 +4274,64 @@ fn treasury_metadata(
         effective,
         network,
         simple_budget("us-treasury", 100, MINUTE_NANOS, 2, None)?,
+    )
+}
+
+fn federal_reserve_board_metadata(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    effective: EffectiveInterval,
+    contract: &BoardDatasetContract,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    let exact_query =
+        |key: &str, value: &str| -> Result<QueryParameterRule, CliProviderActivationError> {
+            QueryParameterRule::try_new_exact_public(
+                SourceIdentifier::try_from(key)
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                SourceIdentifier::try_from(value)
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)
+        };
+    let rule = ApiEndpointRule::try_new(
+        without_query(contract.url())?,
+        PathScope::Exact,
+        vec![
+            exact_query("filetype", "csv")?,
+            exact_query("label", "include")?,
+            QueryParameterRule::try_new_exact_empty_public(
+                SourceIdentifier::try_from("lastObs")
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+            exact_query("layout", "seriescolumn")?,
+            exact_query("rel", "H15")?,
+            exact_query("series", "bf17364827e38702b42a58cf8eaa3f78")?,
+            exact_query("type", "package")?,
+        ],
+        7,
+        256,
+    )
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    // The full-history artifact grows each business day. Align its transport bound with the
+    // existing single-page raw-capture admission instead of pinning near today's response size.
+    let network = EndpointPolicy::try_from_api_rules(
+        vec![rule],
+        request_bounds(MAX_PROVIDER_CAPTURE_PAGE_BYTES)?,
+    )
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    metadata(
+        lease,
+        evidence,
+        "federal-reserve-board",
+        "federal-reserve-board",
+        SourceClass::OfficialAgency,
+        CoverageDomain::Macroeconomic,
+        AuthorizationMode::PublicInterface,
+        HistoricalCapability::Historical,
+        effective,
+        network,
+        simple_budget("federal-reserve-board", 1, MINUTE_NANOS, 1, None)?,
     )
 }
 
@@ -5181,7 +5271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_bls_activation_returns_its_exact_discovery_dataset() -> TestResult {
+    async fn public_research_activations_return_exact_datasets_and_restore() -> TestResult {
         let temporary = tempfile::tempdir()?;
         let config = AppConfig::load(ConfigSources::new(
             None,
@@ -5240,6 +5330,42 @@ mod tests {
                 .research_ingest()
                 .is_profile_registered(lease.surface_id())?
         );
+        let board_lease = prepared_anonymous_lease(
+            &product,
+            FEDERAL_RESERVE_BOARD_SURFACE,
+            "federal-reserve-board-h15-dataset",
+        )
+        .await?;
+        assert!(board_lease.generation().is_none());
+        assert!(board_lease.secret_reference().is_none());
+        let board_activated = activation
+            .activate_from_portal(
+                board_lease.session_id(),
+                ProviderPortalActivationRequest::FederalReserveBoardH15,
+                CancellationToken::new(),
+            )
+            .await?;
+        let board_value = serde_json::to_value(board_activated)?;
+        let board_dataset = board_value
+            .get("provider_dataset_identifier")
+            .and_then(Value::as_str)
+            .ok_or("Board activation did not return its provider dataset identifier")?;
+        let board_dataset = SourceIdentifier::try_from(board_dataset)?;
+        let board_profile = BoardDatasetProfile::try_new(
+            BoardDatasetContract::h15_treasury_constant_maturities_production_csv()?,
+            BoardParseLimits::default(),
+            Vec::new(),
+        )?;
+        assert_eq!(&board_dataset, board_profile.dataset());
+        assert_eq!(
+            board_profile.analytical_dataset().as_str(),
+            "federal-reserve-board.h15.h15-treasury-constant-maturities.fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e"
+        );
+        assert!(
+            product
+                .research_ingest()
+                .is_profile_registered(board_lease.surface_id())?
+        );
         drop(activation);
         assert!(
             product
@@ -5260,6 +5386,10 @@ mod tests {
         assert_eq!(
             recovered_activation.provider_dataset_identifier(lease.surface_id())?,
             Some(dataset.clone())
+        );
+        assert_eq!(
+            recovered_activation.provider_dataset_identifier(board_lease.surface_id())?,
+            Some(board_dataset.clone())
         );
         let status = crate::local_product::execute_cli_command(
             &recovered,

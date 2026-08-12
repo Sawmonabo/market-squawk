@@ -580,7 +580,10 @@ impl ProcessBudgetCoordinator {
             if working.len() == self.capacity {
                 return Err(BudgetPoolError::CoordinatorCapacity);
             }
-            let clock: Arc<dyn BudgetClock> = Arc::new(SystemBudgetClock::new());
+            let clock = provider_rate_binding
+                .as_ref()
+                .map(ProviderRateBinding::clock)
+                .unwrap_or_else(|| Arc::new(SystemBudgetClock::new()));
             let observation = clock
                 .observation()
                 .map_err(|_| BudgetPoolError::ClockUnavailable)?;
@@ -606,7 +609,6 @@ impl ProcessBudgetCoordinator {
                     Some(provider_rate) => SharedProviderBudget::new_durable_with_provider_rate(
                         resolved.policy().clone(),
                         observation.monotonic,
-                        clock,
                         durability,
                         provider_rate,
                     ),
@@ -683,7 +685,6 @@ impl ProcessBudgetCoordinator {
             }) {
                 return Err(BudgetPoolError::ConflictingDurability);
             }
-            let clock: Arc<dyn BudgetClock> = Arc::new(SystemBudgetClock::new());
             let durability = BudgetDurabilityBinding {
                 session: Arc::clone(session),
                 slot,
@@ -698,16 +699,18 @@ impl ProcessBudgetCoordinator {
                 Some(provider_rate) => SharedProviderBudget::from_checkpoint_with_provider_rate(
                     resolved.policy().clone(),
                     checkpoint,
-                    clock,
                     durability,
                     provider_rate,
                 ),
-                None => SharedProviderBudget::from_checkpoint(
-                    resolved.policy().clone(),
-                    checkpoint,
-                    clock,
-                    durability,
-                ),
+                None => {
+                    let clock: Arc<dyn BudgetClock> = Arc::new(SystemBudgetClock::new());
+                    SharedProviderBudget::from_checkpoint(
+                        resolved.policy().clone(),
+                        checkpoint,
+                        clock,
+                        durability,
+                    )
+                }
             }
             .map_err(|_| BudgetPoolError::Persistence)?;
             working.push(CoordinatedBudgetAllocation {
@@ -847,7 +850,12 @@ impl BudgetPermitLease {
     }
 
     pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
-        let state_dynamic = self.allocation.state.lock().ok()?.dynamic_retained_bytes()?;
+        let state_dynamic = self
+            .allocation
+            .state
+            .lock()
+            .ok()?
+            .dynamic_retained_bytes()?;
         std::mem::size_of::<BudgetAllocation>()
             .checked_add(crate::conservative_arc_control_block_charge::<
                 BudgetAllocation,

@@ -1,7 +1,10 @@
 //! Product-wide durable provider request and connection admission.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(debug_assertions)]
+use std::sync::Mutex;
+#[cfg(debug_assertions)]
+use std::time::Duration;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use serde::Serialize;
@@ -10,9 +13,12 @@ use thiserror::Error;
 
 use crate::{AuthorizationMode, AuthorizationSubjectResolutionError, AuthorizationSubjectResolver};
 
+#[cfg(debug_assertions)]
+use super::ClockObservation;
 use super::{
-    BudgetCollisionKey, BudgetPoolError, BudgetUnavailableReason, EndpointPolicy, MonotonicInstant,
-    ProviderBudgetPolicy, ResolvedProviderBudgetPolicy, RetryAfter, SharedProviderBudget,
+    BudgetClock, BudgetCollisionKey, BudgetPoolError, BudgetUnavailableReason, EndpointPolicy,
+    MonotonicInstant, ProviderBudgetPolicy, ResolvedProviderBudgetPolicy, RetryAfter,
+    SharedProviderBudget, SystemBudgetClock,
 };
 
 const MAX_RATE_COLLISION_IDENTITIES: usize = 64;
@@ -461,6 +467,64 @@ pub struct ProviderRateAuthority {
 struct ProviderRateAuthorityInner {
     store: Arc<dyn ProviderRateStore>,
     run_id: ProviderRateRunId,
+    clock: Arc<dyn BudgetClock>,
+    #[cfg(debug_assertions)]
+    manual_clock: Option<Arc<ManualProviderRateClock>>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+struct ManualProviderRateClock {
+    observation: Mutex<ClockObservation>,
+}
+
+#[cfg(debug_assertions)]
+impl ManualProviderRateClock {
+    fn new(wall_clock: Timestamp) -> Self {
+        Self {
+            observation: Mutex::new(ClockObservation::new(
+                wall_clock,
+                MonotonicInstant::from_nanos(0),
+            )),
+        }
+    }
+
+    fn advance(&self, duration: Duration) -> Result<(), ProviderRateStoreError> {
+        let wall_delta =
+            i64::try_from(duration.as_nanos()).map_err(|_| ProviderRateStoreError::Clock)?;
+        let monotonic_delta =
+            u64::try_from(duration.as_nanos()).map_err(|_| ProviderRateStoreError::Clock)?;
+        let mut observation = self
+            .observation
+            .lock()
+            .map_err(|_| ProviderRateStoreError::Clock)?;
+        let wall_clock = observation
+            .wall_clock
+            .unix_nanos()
+            .checked_add(wall_delta)
+            .map(Timestamp::from_unix_nanos)
+            .ok_or(ProviderRateStoreError::Clock)?;
+        let monotonic = observation
+            .monotonic
+            .checked_add(monotonic_delta)
+            .ok_or(ProviderRateStoreError::Clock)?;
+        *observation = ClockObservation::new(wall_clock, monotonic);
+        Ok(())
+    }
+}
+
+#[cfg(debug_assertions)]
+impl BudgetClock for ManualProviderRateClock {
+    fn observation(&self) -> Result<ClockObservation, BudgetUnavailableReason> {
+        self.observation
+            .lock()
+            .map(|observation| *observation)
+            .map_err(|_| BudgetUnavailableReason::ClockUnavailable)
+    }
+
+    fn shared_allocation_charge(&self) -> usize {
+        std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
+    }
 }
 
 impl std::fmt::Debug for ProviderRateAuthority {
@@ -479,10 +543,76 @@ impl ProviderRateAuthority {
     ///
     /// Fails closed when durable state cannot be opened or reconciled.
     pub fn try_new(store: Arc<dyn ProviderRateStore>) -> Result<Self, ProviderRateStoreError> {
-        let now = system_timestamp()?;
+        let clock: Arc<dyn BudgetClock> = Arc::new(SystemBudgetClock::new());
+        #[cfg(debug_assertions)]
+        {
+            Self::try_new_with_clock(store, clock, None)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            Self::try_new_with_clock(store, clock)
+        }
+    }
+
+    /// Opens the real durable authority over a manually advanced paired clock for debug fixtures.
+    ///
+    /// The returned authority still performs normal store ownership, declaration registration,
+    /// request-window charging, and local shared-budget admission. Only its wall and monotonic
+    /// observation source is controlled. This API is absent from release builds.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the initial clock observation or durable run admission fails.
+    #[cfg(debug_assertions)]
+    pub fn try_new_with_debug_manual_clock(
+        store: Arc<dyn ProviderRateStore>,
+        wall_clock: Timestamp,
+    ) -> Result<Self, ProviderRateStoreError> {
+        let manual_clock = Arc::new(ManualProviderRateClock::new(wall_clock));
+        let clock: Arc<dyn BudgetClock> = manual_clock.clone();
+        Self::try_new_with_clock(store, clock, Some(manual_clock))
+    }
+
+    /// Advances both paired clock coordinates by exactly the supplied duration.
+    ///
+    /// No budget or durable state is cleared or rewritten. The next ordinary authority operation
+    /// observes the advanced time and must still pass its real admission policy. This API is absent
+    /// from release builds.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an authority not created by [`Self::try_new_with_debug_manual_clock`], a poisoned
+    /// clock, or checked wall/monotonic overflow.
+    #[cfg(debug_assertions)]
+    pub fn advance_debug_manual_clock(
+        &self,
+        duration: Duration,
+    ) -> Result<(), ProviderRateStoreError> {
+        self.inner
+            .manual_clock
+            .as_ref()
+            .ok_or(ProviderRateStoreError::Clock)?
+            .advance(duration)
+    }
+
+    fn try_new_with_clock(
+        store: Arc<dyn ProviderRateStore>,
+        clock: Arc<dyn BudgetClock>,
+        #[cfg(debug_assertions)] manual_clock: Option<Arc<ManualProviderRateClock>>,
+    ) -> Result<Self, ProviderRateStoreError> {
+        let now = clock
+            .observation()
+            .map_err(|_| ProviderRateStoreError::Clock)?
+            .wall_clock;
         let run_id = store.start_run(now)?;
         Ok(Self {
-            inner: Arc::new(ProviderRateAuthorityInner { store, run_id }),
+            inner: Arc::new(ProviderRateAuthorityInner {
+                store,
+                run_id,
+                clock,
+                #[cfg(debug_assertions)]
+                manual_clock,
+            }),
         })
     }
 
@@ -517,7 +647,7 @@ impl ProviderRateAuthority {
         ) {
             return Err(ProviderRateStoreError::Conflict);
         }
-        let now = system_timestamp()?;
+        let now = self.wall_clock()?;
         self.inner
             .store
             .bind_authorization_subject(self.inner.run_id, mode, evidence, subject, now)
@@ -527,7 +657,7 @@ impl ProviderRateAuthority {
         &self,
         declaration: &ProviderRateDeclaration,
     ) -> Result<ProviderRateBinding, BudgetPoolError> {
-        let now = system_timestamp().map_err(map_store_registration_error)?;
+        let now = self.wall_clock().map_err(map_store_registration_error)?;
         let registration = self
             .inner
             .store
@@ -542,6 +672,14 @@ impl ProviderRateAuthority {
             authority: self.clone(),
             registration,
         })
+    }
+
+    fn wall_clock(&self) -> Result<Timestamp, ProviderRateStoreError> {
+        self.inner
+            .clock
+            .observation()
+            .map(|observation| observation.wall_clock)
+            .map_err(|_| ProviderRateStoreError::Clock)
     }
 }
 
@@ -585,6 +723,11 @@ impl ProviderRateBinding {
     pub(in crate::policy) fn same_group(&self, other: &Self) -> bool {
         self.registration.group_id() == other.registration.group_id()
             && self.registration.policy_digest() == other.registration.policy_digest()
+            && Arc::ptr_eq(&self.authority.inner.clock, &other.authority.inner.clock)
+    }
+
+    pub(in crate::policy) fn clock(&self) -> Arc<dyn BudgetClock> {
+        Arc::clone(&self.authority.inner.clock)
     }
 
     pub(in crate::policy) fn try_acquire_decision(
@@ -733,14 +876,6 @@ fn digest_serialized<T: Serialize>(
         DigestAlgorithm::Sha256,
         digest.finalize().into(),
     ))
-}
-
-fn system_timestamp() -> Result<Timestamp, ProviderRateStoreError> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ProviderRateStoreError::Clock)?;
-    let nanos = i64::try_from(duration.as_nanos()).map_err(|_| ProviderRateStoreError::Clock)?;
-    Ok(Timestamp::from_unix_nanos(nanos))
 }
 
 fn map_store_registration_error(error: ProviderRateStoreError) -> BudgetPoolError {

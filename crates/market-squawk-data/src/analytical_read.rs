@@ -1,15 +1,16 @@
 //! Least-authority immutable analytical catalog and fixed-template observation reads.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array as _, BinaryArray};
+use arrow::array::{Array as _, BinaryArray, Date32Array, Int64Array, StringArray, UInt32Array};
 use market_squawk_domain::{
     BarTimestampBasis, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
-    FundNavObservation, InstrumentId, MarketBarAdjustment, MarketBarObservation,
+    FundNavObservation, InstrumentId, MacroObservation, MarketBarAdjustment, MarketBarObservation,
     MarketBarSessionEvidence, ProviderInstrumentId, ResearchObservation,
     ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
@@ -48,6 +49,8 @@ const MAX_MARKET_BAR_ROWS: u32 = 50_000;
 const MAX_MARKET_BAR_REVISION_CANDIDATES: usize = 100_000;
 const MAX_FUND_NAV_ROWS: u32 = 10_000;
 const MAX_FUND_NAV_REVISION_CANDIDATES: usize = 100_000;
+const MAX_MACRO_SNAPSHOT_SERIES: usize = 32;
+const MAX_MACRO_SNAPSHOT_TIED_CANDIDATES_PER_SERIES: usize = 8;
 const MAX_OUTCOME_MARKET_BAR_CANDIDATES: usize = 4_096;
 const OUTCOME_MARKET_BAR_QUERY_BYTES: u64 = 64 * 1024 * 1024;
 const OUTCOME_MARKET_BAR_QUERY_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
@@ -355,6 +358,212 @@ impl AnalyticalObservationTemplate {
             Self::FundNav => Some("fund_nav"),
             Self::AlternativeData => Some("alternative_data"),
         }
+    }
+}
+
+/// Canonically ordered, nonempty Macro series set compiled into the application.
+///
+/// Construction accepts only a `'static` slice so request input cannot widen the series authority
+/// at runtime. Duplicate identities are rejected rather than silently changing the declared set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyticalMacroSeriesAllowlist {
+    series: Box<[SourceIdentifier]>,
+}
+
+impl AnalyticalMacroSeriesAllowlist {
+    /// Parses at most 32 code-owned series identifiers into canonical order.
+    pub fn try_from_code_owned(
+        values: &'static [&'static str],
+    ) -> Result<Self, AnalyticalReadError> {
+        if values.is_empty() || values.len() > MAX_MACRO_SNAPSHOT_SERIES {
+            return Err(AnalyticalReadError::InvalidMacroSeriesAllowlist);
+        }
+        let mut series = Vec::new();
+        series
+            .try_reserve_exact(values.len())
+            .map_err(|_| AnalyticalReadError::InvalidMacroSeriesAllowlist)?;
+        for value in values {
+            series.push(
+                SourceIdentifier::try_from(*value)
+                    .map_err(|_| AnalyticalReadError::InvalidMacroSeriesAllowlist)?,
+            );
+        }
+        series.sort_unstable();
+        if series.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(AnalyticalReadError::InvalidMacroSeriesAllowlist);
+        }
+        Ok(Self {
+            series: series.into_boxed_slice(),
+        })
+    }
+
+    /// Canonicalizes adapter-produced identities selected by code-owned application policy.
+    pub fn try_from_code_owned_identifiers(
+        mut values: Vec<SourceIdentifier>,
+    ) -> Result<Self, AnalyticalReadError> {
+        if values.is_empty() || values.len() > MAX_MACRO_SNAPSHOT_SERIES {
+            return Err(AnalyticalReadError::InvalidMacroSeriesAllowlist);
+        }
+        values.sort_unstable();
+        if values.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(AnalyticalReadError::InvalidMacroSeriesAllowlist);
+        }
+        Ok(Self {
+            series: values.into_boxed_slice(),
+        })
+    }
+
+    /// Returns the exact canonical series set used by filtering and selection identity.
+    pub fn series(&self) -> &[SourceIdentifier] {
+        &self.series
+    }
+
+    fn contains(&self, series: &SourceIdentifier) -> bool {
+        self.series.binary_search(series).is_ok()
+    }
+}
+
+/// Exact immutable request for a bounded latest-known Macro snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyticalMacroLatestKnownRequest {
+    manifest: DatasetManifestRef,
+    source_id: SourceId,
+    knowledge_cutoff: Timestamp,
+    effective_date_cutoff: CalendarDate,
+    series_allowlist: AnalyticalMacroSeriesAllowlist,
+}
+
+impl AnalyticalMacroLatestKnownRequest {
+    /// Validates the canonical schema and retains the exact source, cutoff, and code-owned set.
+    pub fn try_new(
+        manifest: DatasetManifestRef,
+        source_id: SourceId,
+        knowledge_cutoff: Timestamp,
+        effective_date_cutoff: CalendarDate,
+        series_allowlist: AnalyticalMacroSeriesAllowlist,
+    ) -> Result<Self, AnalyticalReadError> {
+        let canonical = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(|_| AnalyticalReadError::InvalidObservationSchema)?;
+        if manifest.schema() != &canonical {
+            return Err(AnalyticalReadError::InvalidObservationSchema);
+        }
+        Ok(Self {
+            manifest,
+            source_id,
+            knowledge_cutoff,
+            effective_date_cutoff,
+            series_allowlist,
+        })
+    }
+
+    /// Returns the exact immutable input generation.
+    pub const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    /// Returns the sole source-rights namespace admitted by this request.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the inclusive conservative local-knowledge cutoff.
+    pub const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    /// Returns the inclusive calendar-precision effective-date cutoff.
+    pub const fn effective_date_cutoff(&self) -> CalendarDate {
+        self.effective_date_cutoff
+    }
+
+    /// Returns the canonical nonempty code-owned series set.
+    pub const fn series_allowlist(&self) -> &AnalyticalMacroSeriesAllowlist {
+        &self.series_allowlist
+    }
+
+    /// Returns the minimum query row envelope needed to retain ties plus a saturation sentinel.
+    pub fn required_query_rows(&self) -> u64 {
+        u64::try_from(self.candidate_limit_with_sentinel()).unwrap_or(u64::MAX)
+    }
+
+    fn sql(&self) -> String {
+        let source_id = sql_string_literal(self.source_id.as_str());
+        let cutoff = self.knowledge_cutoff.unix_nanos();
+        let effective_cutoff = self.effective_date_cutoff;
+        let series = self
+            .series_allowlist
+            .series()
+            .iter()
+            .map(|series| sql_string_literal(series.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "WITH eligible AS ( \
+                 SELECT macro_series, effective_date, revision, payload_sha256, payload_json, \
+                        source_identifier \
+                 FROM {OBSERVATION_TABLE} \
+                 WHERE observation_kind = 'macro' \
+                   AND source_id = {source_id} \
+                   AND macro_series IN ({series}) \
+                   AND available_at IS NOT NULL \
+                   AND CAST(available_at AS BIGINT) <= {cutoff} \
+                   AND CAST(received_at AS BIGINT) <= {cutoff} \
+                   AND CAST(ingested_at AS BIGINT) <= {cutoff} \
+                   AND (published_precision IS NULL \
+                        OR published_precision <> 'exact_timestamp' \
+                        OR (published_at IS NOT NULL \
+                            AND CAST(published_at AS BIGINT) <= {cutoff})) \
+                   AND effective_precision = 'calendar_date' \
+                   AND effective_date IS NOT NULL \
+                   AND effective_date <= DATE '{effective_cutoff}' \
+             ), latest_date AS ( \
+                 SELECT macro_series, MAX(effective_date) AS effective_date \
+                 FROM eligible GROUP BY macro_series \
+            ), latest_revision AS ( \
+                 SELECT eligible.macro_series, eligible.effective_date, \
+                        MAX(eligible.revision) AS revision \
+                 FROM eligible \
+                 JOIN latest_date \
+                   ON eligible.macro_series = latest_date.macro_series \
+                  AND eligible.effective_date = latest_date.effective_date \
+                 GROUP BY eligible.macro_series, eligible.effective_date \
+             ), selected AS ( \
+                 SELECT eligible.macro_series, eligible.effective_date, eligible.revision, \
+                        eligible.payload_sha256, eligible.payload_json, \
+                        eligible.source_identifier \
+                 FROM eligible \
+                 JOIN latest_revision \
+                   ON eligible.macro_series = latest_revision.macro_series \
+                  AND eligible.effective_date = latest_revision.effective_date \
+                  AND eligible.revision = latest_revision.revision \
+             ), tie_counts AS ( \
+                 SELECT macro_series, effective_date, revision, COUNT(*) AS tie_count \
+                 FROM selected GROUP BY macro_series, effective_date, revision \
+             ) \
+             SELECT selected.macro_series, selected.effective_date, selected.revision, \
+                    selected.payload_sha256, selected.payload_json, tie_counts.tie_count \
+             FROM selected \
+             JOIN tie_counts \
+               ON selected.macro_series = tie_counts.macro_series \
+              AND selected.effective_date = tie_counts.effective_date \
+              AND selected.revision = tie_counts.revision \
+             ORDER BY selected.macro_series, selected.payload_sha256, \
+                      selected.source_identifier \
+             LIMIT {}",
+            self.candidate_limit_with_sentinel()
+        )
+    }
+
+    fn candidate_limit(&self) -> usize {
+        self.series_allowlist
+            .series()
+            .len()
+            .saturating_mul(MAX_MACRO_SNAPSHOT_TIED_CANDIDATES_PER_SERIES)
+    }
+
+    fn candidate_limit_with_sentinel(&self) -> usize {
+        self.candidate_limit().saturating_add(1)
     }
 }
 
@@ -1014,6 +1223,37 @@ pub struct AnalyticalObservationOutput {
     output: PinnedQueryOutput,
 }
 
+/// Typed latest-known Macro observations plus exact query and final-selection evidence.
+#[derive(Debug)]
+pub struct AnalyticalMacroLatestKnownOutput {
+    source_id: SourceId,
+    output: PinnedQueryOutput,
+    observations: Box<[MacroObservation]>,
+    selection_digest: EvidenceDigest,
+}
+
+impl AnalyticalMacroLatestKnownOutput {
+    /// Returns the exact source-rights namespace requested and verified for the generation.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns exact manifest, object graph, candidate query, and candidate result evidence.
+    pub const fn output(&self) -> &PinnedQueryOutput {
+        &self.output
+    }
+
+    /// Returns latest-known observations in exact canonical Macro-family order.
+    pub fn observations(&self) -> &[MacroObservation] {
+        &self.observations
+    }
+
+    /// Returns the code-owned SHA-256 identity of the final typed selection.
+    pub const fn selection_digest(&self) -> EvidenceDigest {
+        self.selection_digest
+    }
+}
+
 /// Typed bars plus the non-forgeable evidence for their exact manifest-pinned query.
 #[derive(Debug)]
 pub struct AnalyticalMarketBarOutput {
@@ -1285,6 +1525,70 @@ impl AnalyticalReadCapability {
             result = execution.as_mut() => result?,
         };
         Ok(AnalyticalObservationOutput { source_id, output })
+    }
+
+    /// Reads a bounded latest-known PIT snapshot for an exact source and code-owned Macro set.
+    ///
+    /// The fixed query admits only conservative availability, receipt, and ingestion clocks at or
+    /// before the knowledge cutoff. Typed decoding then revalidates every returned row, filters the
+    /// canonical `MacroObservation::series` identity, and uses the shared PIT selector per
+    /// comparable temporal-coordinate class. Same-family/same-revision semantic divergence fails
+    /// closed before any observation crosses this boundary.
+    pub async fn read_macro_latest_known_snapshot(
+        &self,
+        request: AnalyticalMacroLatestKnownRequest,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<AnalyticalMacroLatestKnownOutput, AnalyticalReadError> {
+        let (pinned, source_id, _) =
+            self.manifests
+                .read_exact(request.manifest(), deadline, &cancellation)?;
+        if source_id != request.source_id {
+            return Err(AnalyticalReadError::MacroSnapshotSourceOwnerMismatch);
+        }
+        let query = QueryRequest::try_new(pinned.manifest().clone(), request.sql())?;
+        let engine = ResearchQueryEngine::from_pinned_dataset(
+            pinned,
+            OBSERVATION_TABLE,
+            Arc::clone(&self.objects),
+            cancellation.clone(),
+        )
+        .await?;
+        let operation_cancellation = cancellation.child_token();
+        let execution_cancellation = operation_cancellation.clone();
+        let execution = engine.query_pinned(query, limits, execution_cancellation);
+        tokio::pin!(execution);
+        let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(deadline_wait);
+        let output = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                return Err(AnalyticalReadError::Query(QueryError::Cancelled));
+            }
+            _ = deadline_wait.as_mut() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                return Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded));
+            }
+            result = execution.as_mut() => result?,
+        };
+        let selected =
+            decode_macro_latest_known_snapshot(&output, &request, deadline, &cancellation).await?;
+        let selection_digest = macro_latest_known_selection_digest(&request, &output, &selected);
+        let observations = selected
+            .into_iter()
+            .map(|selected| selected.observation)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(AnalyticalMacroLatestKnownOutput {
+            source_id,
+            output,
+            observations,
+            selection_digest,
+        })
     }
 
     /// Reads a bounded point-in-time bar series for exactly one stable instrument.
@@ -1564,6 +1868,27 @@ pub enum AnalyticalReadError {
     /// A typed Fund NAV calendar-date range was reversed.
     #[error("analytical Fund NAV date range is invalid")]
     InvalidFundNavDateRange,
+    /// A Macro snapshot series set was empty, duplicated, invalid, or above its fixed ceiling.
+    #[error("analytical Macro series allowlist is invalid")]
+    InvalidMacroSeriesAllowlist,
+    /// The exact generation owner did not match the request's sole source namespace.
+    #[error("analytical Macro snapshot source owner does not match the request")]
+    MacroSnapshotSourceOwnerMismatch,
+    /// Typed Macro snapshot decoding requires a bounded inline query result.
+    #[error("analytical Macro snapshot result must be inline")]
+    MacroSnapshotResultRequiresInline,
+    /// The fixed Macro candidate ceiling was saturated, so a complete selection is unknowable.
+    #[error("analytical Macro snapshot candidate set is saturated")]
+    MacroSnapshotCandidateSetSaturated,
+    /// A same-family/same-revision Macro group carried divergent semantic payloads.
+    #[error("analytical Macro snapshot contains a revision conflict")]
+    MacroSnapshotRevisionConflict,
+    /// One or more requested Macro series had no unique latest-known observation.
+    #[error("analytical Macro snapshot is incomplete")]
+    MacroSnapshotIncomplete,
+    /// A returned row violated the typed Macro request or canonical PIT contract.
+    #[error("analytical Macro snapshot result is invalid")]
+    InvalidMacroSnapshotResult,
     /// An outcome request reversed its inclusive horizon/completion window.
     #[error("analytical outcome market-bar completion window is invalid")]
     InvalidOutcomeMarketBarWindow,
@@ -1597,6 +1922,304 @@ pub enum AnalyticalReadError {
     /// Canonical feature-row verification failed.
     #[error("analytical forecast row verification failed: {0}")]
     PythonDataset(#[from] crate::PythonDatasetCatalogError),
+}
+
+struct SelectedMacroObservation {
+    observation: MacroObservation,
+    effective_date: CalendarDate,
+    revision: u32,
+    stored_payload_sha256: EvidenceDigest,
+    payload_identity: EvidenceDigest,
+    provenance_identity: EvidenceDigest,
+    evidence_identity: EvidenceDigest,
+}
+
+async fn decode_macro_latest_known_snapshot(
+    output: &PinnedQueryOutput,
+    request: &AnalyticalMacroLatestKnownRequest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Vec<SelectedMacroObservation>, AnalyticalReadError> {
+    if output.manifest() != request.manifest() {
+        return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+    }
+    let crate::QueryResult::Inline { batches, .. } = output.result() else {
+        return Err(AnalyticalReadError::MacroSnapshotResultRequiresInline);
+    };
+    let row_count = batches.iter().try_fold(0_usize, |count, batch| {
+        count
+            .checked_add(batch.num_rows())
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)
+    })?;
+    if row_count > request.candidate_limit() {
+        return Err(AnalyticalReadError::MacroSnapshotCandidateSetSaturated);
+    }
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(row_count)
+        .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let mut stored_payload_sha256 = Vec::new();
+    stored_payload_sha256
+        .try_reserve_exact(row_count)
+        .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let mut observed_ties = BTreeMap::<(String, i32, u32), (usize, usize)>::new();
+    for batch in batches {
+        let series = batch
+            .column_by_name("macro_series")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        let effective_dates = batch
+            .column_by_name("effective_date")
+            .and_then(|column| column.as_any().downcast_ref::<Date32Array>())
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        let revisions = batch
+            .column_by_name("revision")
+            .and_then(|column| column.as_any().downcast_ref::<UInt32Array>())
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        let payload_digests = batch
+            .column_by_name("payload_sha256")
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        let payloads = batch
+            .column_by_name("payload_json")
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        let tie_counts = batch
+            .column_by_name("tie_count")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        if [
+            series.len(),
+            effective_dates.len(),
+            revisions.len(),
+            payload_digests.len(),
+            payloads.len(),
+            tie_counts.len(),
+        ]
+        .into_iter()
+        .any(|len| len != batch.num_rows())
+        {
+            return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+        }
+        for row in 0..batch.num_rows() {
+            if series.is_null(row)
+                || effective_dates.is_null(row)
+                || revisions.is_null(row)
+                || payload_digests.is_null(row)
+                || payloads.is_null(row)
+                || tie_counts.is_null(row)
+                || revisions.value(row) == 0
+            {
+                return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+            }
+            let tie_count = usize::try_from(tie_counts.value(row))
+                .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            if tie_count == 0 || tie_count > MAX_MACRO_SNAPSHOT_TIED_CANDIDATES_PER_SERIES {
+                return Err(AnalyticalReadError::MacroSnapshotCandidateSetSaturated);
+            }
+            let payload = payloads.value(row);
+            let payload_digest: [u8; 32] = payload_digests
+                .value(row)
+                .try_into()
+                .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            let computed_payload_digest: [u8; 32] = Sha256::digest(payload).into();
+            if payload_digest != computed_payload_digest {
+                return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+            }
+            let tie_key = (
+                series.value(row).to_owned(),
+                effective_dates.value(row),
+                revisions.value(row),
+            );
+            let entry = observed_ties.entry(tie_key).or_insert((tie_count, 0));
+            if entry.0 != tie_count {
+                return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+            }
+            entry.1 = entry
+                .1
+                .checked_add(1)
+                .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            let observation = serde_json::from_slice::<ResearchObservation>(payload)
+                .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            let ResearchObservation::Macro(macro_observation) = &observation else {
+                return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+            };
+            let context = macro_observation.context();
+            let provenance = context.provenance();
+            let effective_date = context
+                .time()
+                .effective()
+                .calendar_date_value()
+                .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            let available_at = provenance
+                .availability()
+                .conservative_available_at()
+                .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            if provenance.source_id() != &request.source_id
+                || series.value(row) != macro_observation.series().as_str()
+                || !request
+                    .series_allowlist
+                    .contains(macro_observation.series())
+                || effective_dates.value(row) != effective_date.days_since_unix_epoch()
+                || effective_date > request.effective_date_cutoff
+                || revisions.value(row) != context.time().revision().get()
+                || available_at > request.knowledge_cutoff
+                || provenance.received_at() > request.knowledge_cutoff
+                || provenance.ingested_at() > request.knowledge_cutoff
+                || context.time().published().is_some_and(|published| {
+                    published
+                        .exact_timestamp()
+                        .is_some_and(|published| published > request.knowledge_cutoff)
+                })
+            {
+                return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+            }
+            candidates.push(PointInTimeCandidate::new(
+                observation,
+                request.manifest.clone(),
+            ));
+            stored_payload_sha256
+                .push(EvidenceDigest::new(DigestAlgorithm::Sha256, payload_digest));
+        }
+    }
+    if observed_ties
+        .iter()
+        .any(|(_, (declared, observed))| declared != observed)
+    {
+        return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+    }
+
+    let policy = PointInTimePolicy::try_new(NonZeroU32::MIN, PointInTimeRevisionMode::LatestKnown)
+        .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let pit_limits = PointInTimeLimits::try_new(
+        request.candidate_limit(),
+        request.series_allowlist.series().len(),
+        request.candidate_limit(),
+        request.series_allowlist.series().len(),
+        32 * 1024 * 1024,
+    )
+    .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let pit_request = PointInTimeRequest::try_new(
+        policy,
+        request.knowledge_cutoff,
+        None,
+        ResearchTemporalCoordinate::calendar_date(request.effective_date_cutoff),
+        None,
+        pit_limits,
+    )
+    .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let selection = match PointInTimeService::new()
+        .select(&pit_request, &candidates, cancellation, deadline)
+        .await
+    {
+        Ok(selection) => selection,
+        Err(crate::PointInTimeError::RevisionConflicts { .. }) => {
+            return Err(AnalyticalReadError::MacroSnapshotRevisionConflict);
+        }
+        Err(crate::PointInTimeError::Cancelled) => {
+            return Err(AnalyticalReadError::Query(QueryError::Cancelled));
+        }
+        Err(crate::PointInTimeError::DeadlineExceeded) => {
+            return Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded));
+        }
+        Err(_) => return Err(AnalyticalReadError::InvalidMacroSnapshotResult),
+    };
+    if selection.records().len() != request.series_allowlist.series().len() {
+        return Err(AnalyticalReadError::MacroSnapshotIncomplete);
+    }
+    let mut selected = Vec::new();
+    selected
+        .try_reserve_exact(selection.records().len())
+        .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    for record in selection.records() {
+        let candidate_index = candidates
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, record.candidate()))
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        let ResearchObservation::Macro(macro_observation) = record.candidate().observation() else {
+            return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+        };
+        let effective_date = macro_observation
+            .context()
+            .time()
+            .effective()
+            .calendar_date_value()
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        selected.push(SelectedMacroObservation {
+            observation: macro_observation.clone(),
+            effective_date,
+            revision: macro_observation.context().time().revision().get(),
+            stored_payload_sha256: *stored_payload_sha256
+                .get(candidate_index)
+                .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?,
+            payload_identity: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                record.payload_identity().bytes(),
+            ),
+            provenance_identity: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                record.provenance_identity().bytes(),
+            ),
+            evidence_identity: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                record.evidence_identity().bytes(),
+            ),
+        });
+    }
+    selected
+        .sort_unstable_by(|left, right| left.observation.series().cmp(right.observation.series()));
+    if !selected
+        .iter()
+        .map(|selected| selected.observation.series())
+        .eq(request.series_allowlist.series().iter())
+    {
+        return Err(AnalyticalReadError::MacroSnapshotIncomplete);
+    }
+    Ok(selected)
+}
+
+fn macro_latest_known_selection_digest(
+    request: &AnalyticalMacroLatestKnownRequest,
+    output: &PinnedQueryOutput,
+    selected: &[SelectedMacroObservation],
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/analytical-macro-latest-known-selection/v1");
+    hash_manifest(&mut hash, request.manifest());
+    hash_evidence(&mut hash, output.object_graph_digest());
+    hash_evidence(&mut hash, output.query_identity());
+    hash_evidence(&mut hash, output.result_digest());
+    hash_str(&mut hash, request.source_id.as_str());
+    hash_timestamp(&mut hash, request.knowledge_cutoff);
+    hash.update(request.effective_date_cutoff.year().to_be_bytes());
+    hash.update([request.effective_date_cutoff.month()]);
+    hash.update([request.effective_date_cutoff.day()]);
+    hash.update(b"point-in-time-policy/v1:latest-known;calendar-latest-effective/v1");
+    hash.update(
+        u64::try_from(request.series_allowlist.series().len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for series in request.series_allowlist.series() {
+        hash_str(&mut hash, series.as_str());
+    }
+    hash.update(
+        u64::try_from(selected.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for selected in selected {
+        hash_str(&mut hash, selected.observation.series().as_str());
+        hash.update(selected.effective_date.year().to_be_bytes());
+        hash.update([selected.effective_date.month()]);
+        hash.update([selected.effective_date.day()]);
+        hash.update(selected.revision.to_be_bytes());
+        hash_evidence(&mut hash, selected.stored_payload_sha256);
+        hash_evidence(&mut hash, selected.payload_identity);
+        hash_evidence(&mut hash, selected.provenance_identity);
+        hash_evidence(&mut hash, selected.evidence_identity);
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
 }
 
 async fn decode_fund_nav_history(

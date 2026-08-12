@@ -38,7 +38,8 @@ pub use analytical_backup::{
 pub use analytical_read::{
     AnalyticalFeatureDataset, AnalyticalFeatureDatasetPage, AnalyticalFeatureDatasetSelection,
     AnalyticalFundNavOutput, AnalyticalFundNavReadLimit, AnalyticalFundNavReadRequest,
-    AnalyticalGeneration, AnalyticalGenerationPage, AnalyticalMarketBarOutput,
+    AnalyticalGeneration, AnalyticalGenerationPage, AnalyticalMacroLatestKnownOutput,
+    AnalyticalMacroLatestKnownRequest, AnalyticalMacroSeriesAllowlist, AnalyticalMarketBarOutput,
     AnalyticalMarketBarReadLimit, AnalyticalMarketBarReadRequest, AnalyticalObservationOutput,
     AnalyticalObservationReadRequest, AnalyticalObservationTemplate, AnalyticalReadCapability,
     AnalyticalReadError, AnalyticalReadLimit, ForecastDatasetEvidence,

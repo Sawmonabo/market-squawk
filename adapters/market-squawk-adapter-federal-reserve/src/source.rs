@@ -28,12 +28,14 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-#[cfg(test)]
+#[cfg(any(test, all(feature = "scripted-transport-fixture", debug_assertions)))]
 use crate::transport::BoardTransport;
 use crate::transport::{
     BoardAttemptTelemetry, BoardConditionalRequest, BoardFetchFailure, BoardHttpClient,
     BoardHttpReceipt, BoardRetrievalOutcome, BoardRetrievedFile, system_timestamp,
 };
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+use crate::transport::{BoardScriptedProductionTransport, BoardScriptedTransportFactory};
 use crate::{
     BoardAdapterError, BoardArtifactKind, BoardDatasetContract, BoardFileFormat, BoardParseLimits,
     BoardPeriod, BoardPeriodValue, BoardSeries, BoardValue, ParsedBoardDataset, parse_csv,
@@ -100,6 +102,7 @@ pub struct BoardDatasetProfile {
     parse_limits: BoardParseLimits,
     structural_artifacts: Vec<BoardStructuralArtifact>,
     dataset: SourceIdentifier,
+    analytical_dataset: SourceIdentifier,
 }
 
 impl BoardDatasetProfile {
@@ -118,11 +121,19 @@ impl BoardDatasetProfile {
             lower_hex(contract.contract_digest()),
         ))
         .map_err(|_| BoardSourceError::InvalidProfile)?;
+        let analytical_dataset = SourceIdentifier::try_from(format!(
+            "federal-reserve-board.{}.{}.{}",
+            contract.release().code().to_ascii_lowercase(),
+            contract.family().as_str(),
+            lower_hex(contract.contract_digest()),
+        ))
+        .map_err(|_| BoardSourceError::InvalidProfile)?;
         Ok(Self {
             contract,
             parse_limits,
             structural_artifacts,
             dataset,
+            analytical_dataset,
         })
     }
 
@@ -137,6 +148,10 @@ impl BoardDatasetProfile {
     /// Returns the stable provider-dataset identity used by discovery.
     pub const fn dataset(&self) -> &SourceIdentifier {
         &self.dataset
+    }
+    /// Returns the storage-safe analytical identity for this exact contract.
+    pub const fn analytical_dataset(&self) -> &SourceIdentifier {
+        &self.analytical_dataset
     }
     /// Returns external schema/structure artifacts for XML profiles.
     pub fn structural_artifacts(&self) -> &[BoardStructuralArtifact] {
@@ -323,7 +338,18 @@ impl BoardSource {
         })
     }
 
-    #[cfg(test)]
+    /// Returns the storage-safe analytical identity for this configured provider dataset.
+    pub fn analytical_dataset_identifier(
+        &self,
+        provider_dataset: &SourceIdentifier,
+    ) -> Result<SourceIdentifier, BoardSourceError> {
+        if provider_dataset != self.profile.dataset() {
+            return Err(BoardSourceError::InvalidProfile);
+        }
+        Ok(self.profile.analytical_dataset().clone())
+    }
+
+    #[cfg(any(test, all(feature = "scripted-transport-fixture", debug_assertions)))]
     pub(crate) fn try_new_with_transport(
         metadata: SourceMetadata,
         profile: BoardDatasetProfile,
@@ -598,6 +624,44 @@ impl BoardSource {
         }
         apply_telemetry(&mut health, failure.telemetry);
         Ok(())
+    }
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BoardScriptedTransportFactory {
+    /// Constructs the real production source with only its exact HTTP execution scripted.
+    ///
+    /// The profile must be the frozen full-history H.15 contract and its metadata must still admit
+    /// the exact official URL. Discovery, cached extraction, raw-capture material, normalization,
+    /// health, and revision behavior remain [`BoardSource`] production behavior.
+    pub fn production_source(
+        &self,
+        metadata: SourceMetadata,
+        profile: BoardDatasetProfile,
+    ) -> Result<BoardSource, BoardSourceError> {
+        let expected = BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
+            .map_err(BoardSourceError::Protocol)?;
+        if profile.contract().contract_digest() != expected.contract_digest()
+            || profile.contract().url() != expected.url()
+        {
+            return Err(BoardSourceError::InvalidProfile);
+        }
+        let market_squawk_sources::NetworkAccessPolicy::Allowlisted(policy) =
+            metadata.network_policy()
+        else {
+            return Err(BoardSourceError::InvalidMetadata);
+        };
+        let bounds = policy.request_bounds();
+        let maximum_response_bytes = profile.parse_limits().max_source_bytes().min(
+            usize::try_from(bounds.max_response_bytes())
+                .map_err(|_| BoardSourceError::InvalidMetadata)?,
+        );
+        let transport = Arc::new(BoardScriptedProductionTransport::new(
+            self.production_queue(),
+            maximum_response_bytes,
+            std::time::Duration::from_nanos(bounds.total_timeout_nanos()),
+        ));
+        BoardSource::try_new_with_transport(metadata, profile, transport)
     }
 }
 

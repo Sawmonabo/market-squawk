@@ -9,8 +9,8 @@ authority-free source status views.
 | Document type | Operations runbook |
 | Audience | Source operators, data-rights reviewers, incident responders, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-08-11 |
-| Review basis | Current credential-import and selected-profile candidate; not provider-workflow or release acceptance |
+| Last substantive review | 2026-08-12 |
+| Review basis | `7fb52c19dc273fe44d3846f1986c61c1321032fd` plus the Wave 6 candidate; not provider-workflow or release acceptance |
 
 ## Contents
 
@@ -193,7 +193,7 @@ The result always contains the 17 selected mappings in this fixed order:
 | `sec` | `sec.edgar-public` rev 4 | No secret; organization and contact email become public onboarding configuration |
 | `treasury_fiscal_data` | `treasury.fiscal-data` rev 4 | No secret |
 | `treasury_daily_rates` | `treasury.daily-rates-xml` rev 4 | No secret |
-| `federal_reserve_board_direct` | `federal-reserve-board.data-download-program` rev 3 | No secret |
+| `federal_reserve_board_direct` | `federal-reserve-board.data-download-program` rev 4 | No secret; exact H.15 doctor intent only |
 
 Each provider row has exactly one secret-free `disposition`:
 
@@ -215,16 +215,19 @@ proof.
 The selected mappings above are current code facts, not claims that their data reaches a product.
 The existing application already has substantive Alpaca, Nasdaq reference, SEC, BLS,
 FRED/ALFRED, and Treasury foundations. Provider-native core and transport code is also present for
-Schwab, Yahoo, IEX HIST, OCC/Cboe reference, BEA, Census, EIA, and Tiingo. The Federal Reserve
-Board surface has a deliberately transport-free request, parser, source, publication, and response-
-receipt core; application-owned HTTPS acquisition remains separate.
+Schwab, Yahoo, IEX HIST, OCC/Cboe reference, BEA, Census, EIA, Tiingo, and the Federal Reserve
+Board. Board revision 4 adds an exact bounded no-key H.15 onboarding GET whose response must pass
+the adapter's exact 11-series/ten-row parser under the shared one-request-per-minute,
+single-flight application budget.
 
-These surfaces remain `refresh_required` and unavailable to product workflows. Provider-specific
-doctor or entitlement probes, activation binding, scheduling and capacity evidence, raw/canonical
-publication, manifests, point-in-time selectors, typed reads, Desktop/CLI/MCP composition, restart
-journeys, and frozen-head acceptance remain provider-specific gates. Read `source status`,
-`source coverage`, and the [delivery ledger](../plans/delivery-ledger.md) rather than inferring
-availability from registry or crate presence.
+Most of these selected surfaces remain `refresh_required`; Board revision 4 is `available` at the
+profile/onboarding-doctor boundary and now has code-owned activation/source construction, shared
+rich-capture binding, analytical-dataset registration, and lifecycle serialization/restore.
+Focused Board activation/restart proof remains upstream-blocked. Executed durable live
+publication, manifests, point-in-time selectors, typed reads, macro/Desktop composition, restart
+acceptance, and frozen-head acceptance remain separate gates. Read `source status`, `source
+coverage`, and the [delivery ledger](../plans/delivery-ledger.md) rather than inferring product
+availability from a profile release state or code-path presence.
 
 ## Read source status, coverage, and health
 
@@ -447,7 +450,7 @@ Its parent directory becomes the authorized input root. The top-level closed JSO
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 5,
   "session_id": "<uuid>",
   "provider": {
     "kind": "<closed-provider-kind>"
@@ -464,10 +467,12 @@ The closed provider kinds are:
 | `treasury_fiscal` | Inclusive first/last dates and page size for the exact Fiscal Data query |
 | `treasury_daily_rates` | Inclusive first/last years; every official family available in that range is activated |
 | `fred_alfred` | Exact current terms artifact; exact official-HTTPS Bank response bytes verified by fresh reacquisition; explicit hash-bound review with reviewer, issuer, grantee, service, exact series, operations, conditions, and revalidation; independent per-series public-domain or owner evidence |
+| `federal_reserve_board_h15` | No additional input; must match an active revision-4 Board lease and always constructs the code-owned exact full-history H.15 contract |
 
 Credential bytes are never part of this request. FRED's request shape does not create rights:
 without an admitted active lease and both exact authority gates, the command fails closed. A
-contact-form submission or receipt is request-route provenance, not permission.
+contact-form submission or receipt is request-route provenance, not permission. Board is admitted
+only in schema version 5; older request versions cannot acquire this new surface implicitly.
 
 Request bytes and referenced evidence digests are part of durable recipe identity. Do not
 reconstruct or reformat a portal request from status output, and do not use `source activate` after
@@ -708,6 +713,8 @@ for what the product currently admits.
 | [Treasury Fiscal Data API documentation](https://fiscaldata.treasury.gov/api-documentation/) | Official Fiscal Service API query and pagination contract | 2026-07-23 |
 | [Treasury daily interest-rate XML feed](https://home.treasury.gov/treasury-daily-interest-rate-xml-feed) | Five XML families, year/month selectors, and zero-based 300-row all-history pagination | 2026-07-26 |
 | [Treasury daily-rates release authority](../research/providers/2026-07-26-treasury-daily-rates-release-authority.md) | Dataset-level public-access and CC0 evidence for durable local use | 2026-07-26 |
+| [Federal Reserve Board Data Download Program](https://www.federalreserve.gov/datadownload/) | No-key DDP entry point and current-definition release boundary | 2026-08-12 |
+| [Federal Reserve Board DDP help](https://www.federalreserve.gov/datadownload/help/) | Automated download formats, one-frequency-per-file behavior, labels, units, and multipliers | 2026-08-12 |
 | [FRED API terms of use](https://fred.stlouisfed.org/docs/api/terms_of_use.html) | Required API key, mutable terms, usage restrictions, and obligations that prevent implied durable rights | 2026-07-23 |
 | [FRED API key documentation](https://fred.stlouisfed.org/docs/api/api_key.html) | Provider-controlled account/key boundary; application users require their own keys | 2026-07-26 |
 | [Current FRED legal terms](https://fred.stlouisfed.org/legal/) | Current service and API-specific storage, caching, archival, database, software-development, and model-training prohibitions | 2026-07-26 |

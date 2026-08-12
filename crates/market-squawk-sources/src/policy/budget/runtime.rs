@@ -375,7 +375,7 @@ impl SharedProviderBudget {
         policy: ProviderBudgetPolicy,
         binding: ProviderRateBinding,
     ) -> Result<Self, BudgetPoolError> {
-        let clock: Arc<dyn BudgetClock> = Arc::new(SystemBudgetClock::new());
+        let clock = binding.clock();
         let starts_at = clock
             .observation()
             .map_err(|_| BudgetPoolError::ClockUnavailable)?
@@ -417,10 +417,10 @@ impl SharedProviderBudget {
     pub(in crate::policy) fn new_durable_with_provider_rate(
         policy: ProviderBudgetPolicy,
         starts_at: MonotonicInstant,
-        clock: Arc<dyn BudgetClock>,
         durability: BudgetDurabilityBinding,
         provider_rate: ProviderRateBinding,
     ) -> Self {
+        let clock = provider_rate.clock();
         let state = BudgetState::new(&policy, starts_at);
         Self {
             allocation: Arc::new(BudgetAllocation {
@@ -461,10 +461,10 @@ impl SharedProviderBudget {
     pub(in crate::policy) fn from_checkpoint_with_provider_rate(
         policy: ProviderBudgetPolicy,
         checkpoint: &BudgetCheckpointState,
-        clock: Arc<dyn BudgetClock>,
         durability: BudgetDurabilityBinding,
         provider_rate: ProviderRateBinding,
     ) -> Result<Self, AuthorityPersistenceError> {
+        let clock = provider_rate.clock();
         let observation = clock
             .observation()
             .map_err(|_| AuthorityPersistenceError::InvalidState)?;

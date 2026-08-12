@@ -8,8 +8,8 @@ then fill the local credential template. It does not enable providers by itself.
 | Document type | Operator setup runbook |
 | Audience | Local Market Squawk owner/operator |
 | Status | Account preparation and one-time installed credential import are implemented; provider activation/publication/workflow integration remains in flight |
-| Last substantive review | 2026-08-11 |
-| Implementation review basis | Provider documentation and capacity review current on 2026-08-11; repository audit base `1b723108` plus preserved in-flight overlay; not frozen-head acceptance |
+| Last substantive review | 2026-08-12 |
+| Implementation review basis | Provider documentation and capacity review current through 2026-08-12; repository audit base `7fb52c19` plus preserved Wave 6 overlay; not frozen-head acceptance |
 
 ## Important current boundary
 
@@ -72,7 +72,7 @@ The 17 receipt-provider mappings are:
 | `sec` | `sec.edgar-public` rev 4 | Public organization/contact values; no secret |
 | `treasury_fiscal_data` | `treasury.fiscal-data` rev 4 | No secret |
 | `treasury_daily_rates` | `treasury.daily-rates-xml` rev 4 | No secret |
-| `federal_reserve_board_direct` | `federal-reserve-board.data-download-program` rev 3 | No secret |
+| `federal_reserve_board_direct` | `federal-reserve-board.data-download-program` rev 4 | No secret; exact H.15 doctor intent |
 
 Every row returns exactly one disposition: `disabled`, `credential_stored_unverified`,
 `probe_required`, or `profile_unavailable`. These are secret-free import outcomes, not provider
@@ -115,7 +115,7 @@ makes explicitly selected feed/date jobs eligible; it never starts a full archiv
 | Tiingo Starter | Optional free Starter account and token | `TIINGO_API_TOKEN` | In-flight credential/request/NAV/EOD and serializable quota-ledger core exists; application-owned durable ledger binding, activation, publication, and fund read remain open |
 | SEC | No key; truthful organization/name and monitored email | `SEC_USER_AGENT_ORGANIZATION`, `SEC_USER_AGENT_EMAIL` | Company filing/fact foundations exist; N-PORT/N-CEN absent |
 | Treasury Fiscal Data/daily rates | No account or key | Enable flags only | Existing foundations |
-| Federal Reserve Board | No account or key | Enable flag only | In-flight direct-release model/parser/publication core exists; installed transport, activation, PIT read, and product composition remain open |
+| Federal Reserve Board | No account or key | Enable flag only | Revision-4 profile, exact bounded H.15 doctor, provider-native core, application activation/source construction, rich-capture binding, analytical-dataset registration, and lifecycle restore exist; focused proof, durable live publication, PIT read, and product composition remain open |
 
 ## 1. Alpaca Paper Only / Basic core
 
@@ -288,8 +288,11 @@ and prefers official bulk archives for large bootstrap work.
   [official API](https://fiscaldata.treasury.gov/api-documentation/).
 - **Treasury daily-rate XML:** no account or key; the existing mandatory source owns all five
   admitted rate families.
-- **Federal Reserve Board direct releases:** no account or key; use code-owned release descriptors,
-  beginning with [H.15](https://www.federalreserve.gov/datadownload/Download.aspx?rel=H15).
+- **Federal Reserve Board direct releases:** no account or key. The code-owned revision-4 profile
+  first runs the exact ten-observation H.15 doctor; production retrieval uses a separate exact
+  full-history H.15 contract. Neither URL is operator-configurable. The application can construct
+  and restore the registered Board research source after successful onboarding, but focused proof
+  is still blocked and no durable macro dataset or Desktop workflow is yet accepted.
 
 ## Completion checklist
 
@@ -318,9 +321,11 @@ and prefers official bulk archives for large bootstrap work.
 
 Completing the checklist and running the installed import closes credential collection and local
 delegation only. The current candidate contains the selected profiles and in-flight adapter cores,
-but it does not close provider entitlements, doctors/authenticated probes, activation bindings,
+but it does not by itself close provider entitlements, doctors/authenticated probes, activation,
 schedulers, durable raw/canonical publication, PIT reads, product workflow composition, restart
 proof, or the external data gaps documented in the
 [provider architecture](../architecture/market-data-provider-architecture.md).
+Board's activation and restore code paths are present separately from import, with their focused
+proof and durable product path still incomplete.
 The shared canonical destinations and point-in-time evidence rules are in the
 [canonical schema contract](../reference/market-data-canonical-schemas.md).

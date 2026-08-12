@@ -16,6 +16,8 @@ use crate::{
 
 // Canonical string conversion happens after the shared bridge's size check, so retain its cap.
 const MAXIMUM_CANONICAL_JOB_RESULT_BYTES: usize = 1024 * 1024;
+const FEDERAL_RESERVE_BOARD_DDP_PROVIDER: &str = "federal-reserve-board.data-download-program";
+const H15_RELEASE: &str = "h15";
 
 #[tauri::command]
 pub(crate) async fn dashboard_query(
@@ -24,6 +26,17 @@ pub(crate) async fn dashboard_query(
 ) -> Result<Value, DesktopCommandError> {
     let (operation, arguments) = match request {
         DashboardQueryCommand::Overview => ("Analysis.GetDecisionOverview", Map::new()),
+        DashboardQueryCommand::MacroDashboard { provider, release } => {
+            if provider != FEDERAL_RESERVE_BOARD_DDP_PROVIDER || release != H15_RELEASE {
+                return Err(DesktopCommandError::invalid_request(
+                    "The selected macro dashboard is unsupported.",
+                ));
+            }
+            let mut arguments = Map::new();
+            arguments.insert("provider".to_owned(), json!(provider));
+            arguments.insert("release".to_owned(), json!(release));
+            ("Macro.GetDashboard", arguments)
+        }
         DashboardQueryCommand::Lookup { text, categories } => {
             let mut arguments = Map::new();
             arguments.insert("query".to_owned(), json!(text));

@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react"
+import { act, render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
 import { describe, expect, it } from "vitest"
@@ -8,7 +8,11 @@ import marketSquawkMarkSvg from "@/assets/market-squawk-mark.svg?raw"
 import { CredentialField } from "@/components/setup/credential-field"
 import type { AnalyticalControllerStatus } from "@/features/advanced/analytical-profile-contracts"
 import { lookupRoute } from "@/features/lookup/lookup-surface"
-import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
+import type {
+  ApplicationResult,
+  DesktopBootstrap,
+  DesktopEvent,
+} from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 const blockedBootstrap: DesktopBootstrap = {
@@ -303,6 +307,221 @@ function datasetRead(
   }
 }
 
+const resultLimitsInputSchema = {
+  type: "object",
+  properties: {
+    maximumItems: { type: "integer", minimum: 1, maximum: 100_000 },
+    maximumBytes: { type: "integer", minimum: 1, maximum: 268_435_456 },
+  },
+  required: ["maximumItems", "maximumBytes"],
+  additionalProperties: false,
+}
+
+function macroDashboardRead(): DesktopBootstrap["operations"][number] {
+  return {
+    name: "Macro.GetDashboard",
+    description: "Return the exact stored H.15 dashboard publication.",
+    domain: "macro",
+    authorization: "read_only",
+    readOnly: true,
+    destructive: false,
+    inputSchema: {
+      type: "object",
+      properties: {
+        resultLimits: resultLimitsInputSchema,
+        provider: {
+          type: "string",
+          enum: ["federal-reserve-board.data-download-program"],
+        },
+        release: { type: "string", enum: ["h15"] },
+      },
+      required: ["resultLimits", "provider", "release"],
+      additionalProperties: false,
+    },
+  }
+}
+
+function sourceStatusRead(): DesktopBootstrap["operations"][number] {
+  return {
+    name: "Source.GetStatus",
+    description: "Return bounded configured provider status.",
+    domain: "source",
+    authorization: "read_only",
+    readOnly: true,
+    destructive: false,
+    inputSchema: {
+      type: "object",
+      properties: {
+        resultLimits: resultLimitsInputSchema,
+        sourceCoverage: {
+          type: "array",
+          minItems: 1,
+          maxItems: 32,
+          uniqueItems: true,
+          items: { type: "string", minLength: 1, maxLength: 256 },
+        },
+      },
+      required: ["resultLimits"],
+      additionalProperties: false,
+    },
+  }
+}
+
+const h15DashboardData = {
+  schemaIdentity: "market-squawk-macro-dashboard/v1",
+  binding: {
+    surfaceId: "federal-reserve-board.data-download-program",
+    sourceId: "federal-reserve-board-ddp",
+    providerDatasetId:
+      "federal-reserve-board:h15:h15-treasury-constant-maturities:fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e",
+    analyticalDatasetId:
+      "federal-reserve-board.h15.h15-treasury-constant-maturities.fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e",
+    manifest: {
+      datasetId:
+        "federal-reserve-board.h15.h15-treasury-constant-maturities.fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e",
+      manifestVersion: "3",
+      schema: {
+        name: "market-squawk-research-v3",
+        version: 3,
+        fingerprint: "1".repeat(64),
+      },
+      contentHash: "2".repeat(64),
+    },
+    objectGraphDigest: "3".repeat(64),
+    queryIdentity: "4".repeat(64),
+    resultDigest: "5".repeat(64),
+  },
+  release: {
+    code: "H15",
+    title: "H.15 Selected Interest Rates",
+    family: "h15-treasury-constant-maturities",
+    frequency: "business_daily",
+    quality: "official_delayed",
+  },
+  selection: {
+    policy: "latest_known_by_series_as_of_cutoff_v1",
+    evaluatedAt: "2026-08-11T20:30:00Z",
+    selectionDigest: "7".repeat(64),
+    returnedSeries: 11,
+    availableSeries: 10,
+    missingSeries: 1,
+    complete: true,
+  },
+  observations: [
+    ["1m", "1 Month", "RIFLGFCM01_N.B"],
+    ["3m", "3 Month", "RIFLGFCM03_N.B"],
+    ["6m", "6 Month", "RIFLGFCM06_N.B"],
+    ["1y", "1 Year", "RIFLGFCY01_N.B"],
+    ["2y", "2 Year", "RIFLGFCY02_N.B"],
+    ["3y", "3 Year", "RIFLGFCY03_N.B"],
+    ["5y", "5 Year", "RIFLGFCY05_N.B"],
+    ["7y", "7 Year", "RIFLGFCY07_N.B"],
+    ["10y", "10 Year", "RIFLGFCY10_N.B"],
+    ["20y", "20 Year", "RIFLGFCY20_N.B"],
+    ["30y", "30 Year", "RIFLGFCY30_N.B"],
+  ].map(([slot, label, providerSeriesName], index) => ({
+    slot,
+    label,
+    maturityOrder: index + 1,
+    seriesId: `federal-reserve-board:h15:H15%2FH15%2F${providerSeriesName}`,
+    unitId: "federal-reserve-board-unit:Percent%3A_Per_Year:multiplier:1",
+    unitPresentation: "percent_per_year",
+    effectiveDate: "2026-08-11",
+    availableAt: "2026-08-11T20:25:00Z",
+    revision: 1,
+    observation:
+      slot === "20y"
+        ? {
+            state: "missing",
+            marker: "ND",
+            reason: "Provider reported no observation for this date.",
+          }
+        : { state: "observed", decimal: index === 0 ? "4.25" : "4.5" },
+    sourceIdentifier: `frb-ddp:h15:${providerSeriesName}:2026-08-11`,
+    sourcePayloadDigest: "6".repeat(64),
+  })),
+}
+
+const h15DashboardResult: ApplicationResult = {
+  data: h15DashboardData,
+  metadata: {
+    completeness: "complete",
+    returnedItems: 11,
+    availableItems: 11,
+    sourceCoverage: {
+      status: "complete",
+      providers: ["federal-reserve-board.data-download-program"],
+    },
+    dataQuality: { status: "official_delayed" },
+  },
+}
+
+const refreshedH15DashboardResult: ApplicationResult = {
+  data: {
+    ...h15DashboardData,
+    binding: {
+      ...h15DashboardData.binding,
+      manifest: {
+        ...h15DashboardData.binding.manifest,
+        manifestVersion: "4",
+        contentHash: "8".repeat(64),
+      },
+      resultDigest: "9".repeat(64),
+    },
+    selection: {
+      ...h15DashboardData.selection,
+      evaluatedAt: "2026-08-12T20:30:00Z",
+      selectionDigest: "a".repeat(64),
+    },
+    observations: h15DashboardData.observations.map((observation, index) =>
+      index === 0
+        ? {
+            ...observation,
+            effectiveDate: "2026-08-12",
+            availableAt: "2026-08-12T20:25:00Z",
+            observation: { state: "observed", decimal: "4.35" },
+            sourceIdentifier: "frb-ddp:h15:RIFLGFCM01_N.B:2026-08-12",
+            sourcePayloadDigest: "b".repeat(64),
+          }
+        : observation,
+    ),
+  },
+  metadata: h15DashboardResult.metadata,
+}
+
+const inactiveH15SourceStatus: ApplicationResult = {
+  data: [
+    {
+      profile: {
+        id: "federal-reserve-board.data-download-program",
+        display_name: "Federal Reserve Board Data Download Program",
+      },
+      currentSession: null,
+      providerDatasetIdentifier: "H15",
+      lifecycleSupport: "managed",
+      lifecycle: {
+        provider: "federal-reserve-board.data-download-program",
+        state: "stopped",
+        stateRevision: 7,
+        configurationSessionId: null,
+        blocker: null,
+        observedAt: "2026-08-11T20:31:00Z",
+      },
+      runtime: {},
+    },
+  ],
+  metadata: {
+    completeness: "complete",
+    returnedItems: 1,
+    availableItems: 1,
+    sourceCoverage: {
+      status: "complete",
+      providers: ["federal-reserve-board.data-download-program"],
+    },
+    dataQuality: { status: "not_applicable" },
+  },
+}
+
 const unifiedKrakenMarket: ApplicationResult = {
   data: [
     {
@@ -580,6 +799,7 @@ describe("Market Squawk desktop boundary", () => {
   })
 
   it("uses grouped product navigation to explore real research and AI connection state", async () => {
+    const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
     const readyBootstrap: DesktopBootstrap = {
       ...blockedBootstrap,
       operations: [
@@ -603,11 +823,51 @@ describe("Market Squawk desktop boundary", () => {
           "macro",
           "Return bounded macroeconomic revision history.",
         ),
+        macroDashboardRead(),
+        sourceStatusRead(),
       ],
+    }
+    let currentBootstrap = readyBootstrap
+    let admittedServiceGeneration = readyBootstrap.runtime.serviceGeneration
+    const issuedBootstrapGenerations: number[] = []
+    const desktopEvents: {
+      listener: ((event: DesktopEvent) => void) | null
+    } = { listener: null }
+    const dashboardTransport: ProductTransport = {
+      ...transport(readyBootstrap, undefined, async (request) => {
+        issuedQueries.push(request)
+        if (request.query === "macroDashboard") {
+          return admittedServiceGeneration === 2
+            ? refreshedH15DashboardResult
+            : h15DashboardResult
+        }
+        if (request.query === "sourceStatus") return inactiveH15SourceStatus
+        return {
+          data: null,
+          metadata: {
+            completeness: "complete",
+            returnedItems: 0,
+            availableItems: 0,
+            sourceCoverage: { status: "not_applicable" },
+            dataQuality: { status: "not_applicable" },
+          },
+        }
+      }),
+      bootstrap: async () => {
+        admittedServiceGeneration = currentBootstrap.runtime.serviceGeneration
+        issuedBootstrapGenerations.push(admittedServiceGeneration)
+        return currentBootstrap
+      },
+      subscribe: async (listener) => {
+        desktopEvents.listener = listener
+        return () => {
+          if (desktopEvents.listener === listener) desktopEvents.listener = null
+        }
+      },
     }
     const rendered = render(
       <MemoryRouter initialEntries={["/advanced/research-data"]}>
-        <App transport={transport(readyBootstrap)} />
+        <App transport={dashboardTransport} />
       </MemoryRouter>,
     )
 
@@ -668,7 +928,128 @@ describe("Market Squawk desktop boundary", () => {
       }),
     ).toBeTruthy()
     expect(await screen.findByText("No analytical datasets yet")).toBeTruthy()
+    const h15Heading = await screen.findByRole("heading", {
+      name: "H.15 Selected Interest Rates",
+    })
+    const h15Section = h15Heading.closest("section")
+    expect(h15Section).toBeInstanceOf(HTMLElement)
+    if (!(h15Section instanceof HTMLElement)) {
+      throw new Error("The H.15 research section is absent")
+    }
+    expect(within(h15Section).getByText("Stored publication")).toBeTruthy()
+    expect(within(h15Section).getByText("Queryable")).toBeTruthy()
+    expect(within(h15Section).getByText("Source readiness")).toBeTruthy()
+    expect(within(h15Section).getByText("Inactive")).toBeTruthy()
+    expect(
+      within(h15Section).getByText("Source lifecycle observed"),
+    ).toBeTruthy()
+    expect(
+      within(h15Section).getByText("2026-08-11T20:31:00Z"),
+    ).toBeTruthy()
+    expect(
+      within(h15Section).getByText("Source runtime observed"),
+    ).toBeTruthy()
+    expect(within(h15Section).getByText("Not reported")).toBeTruthy()
+    expect(within(h15Section).getByText("4.25%")).toBeTruthy()
+    expect(
+      within(h15Section).getByText("Pinned query result digest"),
+    ).toBeTruthy()
+    expect(
+      within(h15Section).getByText("Final typed selection digest"),
+    ).toBeTruthy()
+    expect(within(h15Section).getByText("5".repeat(64))).toBeTruthy()
+    expect(within(h15Section).getByText("7".repeat(64))).toBeTruthy()
+    const missingHeading = within(h15Section).getByRole("heading", {
+      name: "20 Year",
+    })
+    const missingObservation = missingHeading.closest("article")
+    expect(missingObservation).toBeInstanceOf(HTMLElement)
+    if (!(missingObservation instanceof HTMLElement)) {
+      throw new Error("The explicit H.15 missing observation is absent")
+    }
+    expect(within(missingObservation).getByText("Missing")).toBeTruthy()
+    expect(within(missingObservation).getByText("ND")).toBeTruthy()
+    expect(
+      within(missingObservation).getByText(
+        "Provider reported no observation for this date.",
+      ),
+    ).toBeTruthy()
+    expect(
+      within(missingObservation).getByText(
+        "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY20_N.B",
+      ),
+    ).toBeTruthy()
+    expect(
+      issuedQueries.filter((request) => request.query === "macroDashboard"),
+    ).toEqual([
+      {
+        query: "macroDashboard",
+        provider: "federal-reserve-board.data-download-program",
+        release: "h15",
+      },
+    ])
+    expect(
+      issuedQueries.filter((request) => request.query === "sourceStatus"),
+    ).toEqual([
+      {
+        query: "sourceStatus",
+        sourceIds: ["federal-reserve-board.data-download-program"],
+      },
+    ])
     expect(screen.queryByText("Operation arguments")).toBeNull()
+
+    const initialMacroReads = issuedQueries.filter(
+      (request) => request.query === "macroDashboard",
+    ).length
+    const initialSourceReads = issuedQueries.filter(
+      (request) => request.query === "sourceStatus",
+    ).length
+    const notifyDesktopEvent = desktopEvents.listener
+    if (!notifyDesktopEvent) {
+      throw new Error("The Desktop event subscription was not installed")
+    }
+    currentBootstrap = {
+      ...readyBootstrap,
+      runtime: {
+        ...readyBootstrap.runtime,
+        serviceGeneration: 2,
+      },
+    }
+    await act(async () => {
+      notifyDesktopEvent({
+        runtime: readyBootstrap.runtime,
+        sequence: "1",
+        body: {
+          type: "resync_required",
+          reason: "service_event_stream_changed",
+        },
+      })
+    })
+
+    expect(await screen.findByText("4.35%")).toBeTruthy()
+    const refreshedH15Heading = screen.getByRole("heading", {
+      name: "H.15 Selected Interest Rates",
+    })
+    const refreshedH15Section = refreshedH15Heading.closest("section")
+    expect(refreshedH15Section).toBeInstanceOf(HTMLElement)
+    if (!(refreshedH15Section instanceof HTMLElement)) {
+      throw new Error("The refreshed H.15 research section is absent")
+    }
+    expect(within(refreshedH15Section).queryByText("4.25%")).toBeNull()
+    expect(
+      within(refreshedH15Section).queryByText("5".repeat(64)),
+    ).toBeNull()
+    expect(
+      within(refreshedH15Section).getByText("9".repeat(64)),
+    ).toBeTruthy()
+    expect(
+      issuedQueries.filter((request) => request.query === "macroDashboard")
+        .length,
+    ).toBeGreaterThan(initialMacroReads)
+    expect(
+      issuedQueries.filter((request) => request.query === "sourceStatus").length,
+    ).toBeGreaterThan(initialSourceReads)
+    expect(issuedBootstrapGenerations).toContain(2)
 
     rendered.unmount()
     const mcpRendered = render(

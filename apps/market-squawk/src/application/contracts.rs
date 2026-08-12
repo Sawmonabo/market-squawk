@@ -106,6 +106,13 @@ const MARKET_UNIVERSE_SEARCH_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::optional("query", ArgumentKind::Text)];
 const PROVIDER_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("provider", ArgumentKind::Identifier)];
+const MACRO_DASHBOARD_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required(
+        "provider",
+        ArgumentKind::Enumeration(&["federal-reserve-board.data-download-program"]),
+    ),
+    ArgumentSpec::required("release", ArgumentKind::Enumeration(&["h15"])),
+];
 const PROVIDER_CREDENTIAL_BUNDLE_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("inputTicketId", ArgumentKind::Uuid)];
 const SOURCE_DISCOVERY_ARGUMENTS: &[ArgumentSpec] = &[
@@ -1091,6 +1098,19 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Return bounded point-in-time fundamental ratios.",
         ServiceDomain::Fundamental,
     ),
+    OperationSpec {
+        name: "Macro.GetDashboard",
+        description: "Return the exact latest-known Federal Reserve Board H.15 Treasury constant-maturity dashboard.",
+        domain: ServiceDomain::Macro,
+        scope: LOCAL_SCOPE,
+        arguments: MACRO_DASHBOARD_ARGUMENTS,
+        authorization: ToolAuthorization::ReadOnly,
+        source_evidence: SourceEvidencePolicy::Required,
+        artifact: ToolArtifactPolicy::InlineOnly,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+    },
     read_observations(
         "Macro.ListSeries",
         "List bounded macroeconomic series represented by a dataset.",

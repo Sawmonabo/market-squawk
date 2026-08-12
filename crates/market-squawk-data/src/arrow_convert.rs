@@ -370,6 +370,7 @@ impl ResearchArrowBatch {
         let mut instrument_ids = Vec::with_capacity(observations.len());
         let mut venue_ids = Vec::with_capacity(observations.len());
         let mut source_identifiers = Vec::with_capacity(observations.len());
+        let mut macro_series = Vec::with_capacity(observations.len());
         let mut source_timestamps = Vec::with_capacity(observations.len());
         let mut received_at = Vec::with_capacity(observations.len());
         let mut available_at = Vec::with_capacity(observations.len());
@@ -421,6 +422,12 @@ impl ResearchArrowBatch {
             instrument_ids.push(provenance.instrument_id().map(|id| id.to_string()));
             venue_ids.push(provenance.venue_id().map(|id| id.as_str().to_owned()));
             source_identifiers.push(provenance.source_identifier().as_str().to_owned());
+            macro_series.push(match observation {
+                ResearchObservation::Macro(macro_observation) => {
+                    Some(macro_observation.series().as_str().to_owned())
+                }
+                _ => None,
+            });
             source_timestamps.push(
                 provenance
                     .source_timestamp()
@@ -506,6 +513,7 @@ impl ResearchArrowBatch {
             Arc::new(StringArray::from(instrument_ids)),
             Arc::new(StringArray::from(venue_ids)),
             Arc::new(StringArray::from(source_identifiers)),
+            Arc::new(StringArray::from(macro_series)),
             Arc::new(utc(source_timestamps)),
             Arc::new(TimestampNanosecondArray::from(received_at).with_timezone_utc()),
             Arc::new(utc(available_at)),
@@ -927,7 +935,7 @@ fn projection_vector_slot_bytes(row_count: usize) -> Result<usize, ArrowConversi
     let slots_per_row = (3 * bytes) // serialized lineage, payload digest, and payload JSON
         .checked_add(7 * borrowed_string) // kind, availability/precision, quality, value state
         .and_then(|value| value.checked_add(2 * string)) // source and source identifier
-        .and_then(|value| value.checked_add(14 * optional_string))
+        .and_then(|value| value.checked_add(15 * optional_string))
         .and_then(|value| value.checked_add(8 * optional_i64))
         .and_then(|value| value.checked_add(2 * size_of::<i64>()))
         .and_then(|value| value.checked_add(3 * optional_i32))

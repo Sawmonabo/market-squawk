@@ -22,6 +22,16 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
+import {
+  H15Dashboard,
+  H15_SURFACE_ID,
+  parseMacroDashboard,
+  type MacroDashboardSourceReadiness,
+} from "@/features/macro"
+import {
+  sourceEvidence,
+  type SourceEvidence,
+} from "@/features/sources/source-evidence"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { JobControlRequest, ProductTransport } from "@/lib/transport"
 
@@ -95,6 +105,26 @@ function ResearchWorkspace({
     ...productKeys.domain(bootstrap.runtime, "job"),
     "research-activity",
   ] as const
+  const operations = new Set(
+    bootstrap.operations.map((operation) => operation.name),
+  )
+  const macroDashboardAvailable = operations.has("Macro.GetDashboard")
+  const sourceStatusAvailable = operations.has("Source.GetStatus")
+  const h15Key = productKeys.operation(
+    bootstrap.runtime,
+    "research",
+    "Macro.GetDashboard",
+    {
+      provider: H15_SURFACE_ID,
+      release: "h15",
+    },
+  )
+  const h15SourceKey = productKeys.operation(
+    bootstrap.runtime,
+    "source",
+    "Source.GetStatus",
+    { sourceIds: [H15_SURFACE_ID] },
+  )
   const datasets = useInfiniteQuery({
     queryKey: datasetKey,
     initialPageParam: undefined as string | undefined,
@@ -113,6 +143,27 @@ function ResearchWorkspace({
     queryFn: async () =>
       parseResearchJobs(await transport.query({ query: "jobs", limit: 25 })),
     refetchInterval: 5_000,
+  })
+  const h15 = useQuery({
+    queryKey: h15Key,
+    enabled: macroDashboardAvailable,
+    queryFn: async () =>
+      parseMacroDashboard(
+        await transport.query({
+          query: "macroDashboard",
+          provider: H15_SURFACE_ID,
+          release: "h15",
+        }),
+      ),
+  })
+  const h15Source = useQuery({
+    queryKey: h15SourceKey,
+    enabled: macroDashboardAvailable && sourceStatusAvailable,
+    queryFn: () =>
+      transport.query({
+        query: "sourceStatus",
+        sourceIds: [H15_SURFACE_ID],
+      }),
   })
   const jobMutation = useMutation({
     mutationFn: ({ request }: { request: ResearchJobMutationRequest }) =>
@@ -151,6 +202,25 @@ function ResearchWorkspace({
       job.state,
     ),
   ).length
+  const h15SourceReadiness = macroSourceReadiness(
+    sourceStatusAvailable,
+    h15Source.isPending,
+    h15Source.isError,
+    h15Source.data
+      ? sourceEvidence(
+          bootstrap.providerProfiles,
+          bootstrap.providerSessions,
+          [h15Source.data],
+          undefined,
+          undefined,
+        ).find((source) => source.id === H15_SURFACE_ID)
+      : undefined,
+  )
+  const refreshing =
+    datasets.isFetching ||
+    jobs.isFetching ||
+    (macroDashboardAvailable && h15.isFetching) ||
+    (macroDashboardAvailable && sourceStatusAvailable && h15Source.isFetching)
 
   return (
     <ResearchFrame>
@@ -172,16 +242,42 @@ function ResearchWorkspace({
           onClick={() => {
             void datasets.refetch()
             void jobs.refetch()
+            if (macroDashboardAvailable) void h15.refetch()
+            if (macroDashboardAvailable && sourceStatusAvailable) {
+              void h15Source.refetch()
+            }
           }}
-          disabled={datasets.isFetching || jobs.isFetching}
+          disabled={refreshing}
         >
           <RefreshCw
-            className={datasets.isFetching || jobs.isFetching ? "animate-spin" : ""}
+            className={refreshing ? "animate-spin" : ""}
             aria-hidden="true"
           />
           Refresh
         </Button>
       </header>
+
+      {macroDashboardAvailable ? (
+        <div className="mt-6">
+          <H15Dashboard
+            state={
+              h15.isPending
+                ? { status: "loading" }
+                : h15.isError
+                  ? {
+                      status: "error",
+                      message: messageFrom(h15.error),
+                      onRetry: () => void h15.refetch(),
+                    }
+                  : {
+                      status: "ready",
+                      dashboard: h15.data,
+                      sourceReadiness: h15SourceReadiness,
+                    }
+            }
+          />
+        </div>
+      ) : null}
 
       <ResearchIngestion
         bootstrap={bootstrap}
@@ -642,4 +738,93 @@ function messageFrom(error: unknown) {
   return error instanceof Error
     ? error.message
     : "Market Squawk could not complete this local research request."
+}
+
+function macroSourceReadiness(
+  available: boolean,
+  pending: boolean,
+  failed: boolean,
+  source: SourceEvidence | undefined,
+): MacroDashboardSourceReadiness | null {
+  if (!available) return null
+  if (pending) {
+    return {
+      state: "unknown",
+      label: "Checking",
+      detail:
+        "Current provider acquisition readiness is being checked separately from stored data.",
+      lifecycleObservedAt: null,
+      runtimeObservedAt: null,
+    }
+  }
+  if (failed) {
+    return {
+      state: "unavailable",
+      label: "Readiness unavailable",
+      detail:
+        "Current provider acquisition readiness could not be read; the stored publication remains queryable.",
+      lifecycleObservedAt: null,
+      runtimeObservedAt: null,
+    }
+  }
+  if (!source?.operationalState) {
+    return {
+      state: "unknown",
+      label: "Not reported",
+      detail:
+        "The source status response did not contain a safely recognized acquisition state.",
+      lifecycleObservedAt: source?.lifecycle?.observedAt ?? null,
+      runtimeObservedAt: source?.observedAt ?? null,
+    }
+  }
+
+  switch (source.operationalState) {
+    case "active":
+      return {
+        state: "active",
+        label: "Active",
+        detail:
+          "Provider acquisition is active; stored publication readiness remains independently evidenced.",
+        lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
+        runtimeObservedAt: source.observedAt,
+      }
+    case "stopped":
+    case "removed":
+      return {
+        state: "inactive",
+        label: "Inactive",
+        detail:
+          "Provider acquisition is inactive; the retained publication is still stored and queryable.",
+        lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
+        runtimeObservedAt: source.observedAt,
+      }
+    case "blocked":
+      return {
+        state: "blocked",
+        label: "Blocked",
+        detail:
+          "Provider acquisition requires attention; the retained publication is still stored and queryable.",
+        lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
+        runtimeObservedAt: source.observedAt,
+      }
+    case "unavailable":
+    case "failed":
+      return {
+        state: "unavailable",
+        label: "Unavailable",
+        detail:
+          "Provider acquisition is unavailable; the retained publication is still stored and queryable.",
+        lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
+        runtimeObservedAt: source.observedAt,
+      }
+    default:
+      return {
+        state: "unknown",
+        label: humanize(source.operationalState),
+        detail:
+          "Provider acquisition is changing or unrecognized; stored publication readiness remains independent.",
+        lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
+        runtimeObservedAt: source.observedAt,
+      }
+  }
 }

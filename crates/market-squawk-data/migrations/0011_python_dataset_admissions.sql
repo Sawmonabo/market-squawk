@@ -7,7 +7,7 @@ WHEN NOT (
         NEW.schema_name = 'market_squawk.research_observations'
         AND NEW.schema_version = 3
         AND NEW.schema_fingerprint =
-            X'4c11d3d99dd0128d236783b2891f92dd54a38182eebe8432ccf7a582fb3d5f68'
+            X'adbb26ab67e0389eb0a4422f1eb29b54be518fbb01a6b0624da41cb862e61c0a'
     ) OR (
         NEW.schema_name = 'market_squawk.feature_label_components'
         AND NEW.schema_version = 3

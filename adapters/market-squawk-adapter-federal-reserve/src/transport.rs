@@ -3,6 +3,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+use std::collections::VecDeque;
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+use std::sync::Mutex;
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::{Bytes, BytesMut};
 use futures_util::future::BoxFuture;
 use futures_util::{Stream, StreamExt as _};
@@ -21,10 +28,478 @@ use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::source::{BoardDatasetProfile, BoardSourceError};
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+use crate::{
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL, BoardDatasetContract, BoardParseLimits,
+    parse_csv,
+};
 use crate::{BoardAdapterError, BoardFileFormat, ParsedBoardDataset};
 
 const USER_AGENT_VALUE: &str = "market-squawk/1.0 federal-reserve-board-adapter";
 const MAX_VALIDATOR_BYTES: usize = 8 * 1024;
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+const SCRIPTED_DOCTOR_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+const SCRIPTED_DOCTOR_MAX_DEADLINE: Duration = Duration::from_secs(10);
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+const SCRIPTED_MAX_LATENCY: Duration = Duration::from_secs(10);
+
+/// One exact deterministic CSV response retained by the debug-only scripted transport.
+///
+/// Status, media type, and content encoding are closed to `200`, `text/csv`, and `identity`.
+/// The trusted receipt time is derived from the exact request start plus this response's latency.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoardScriptedCsvResponse {
+    body: Bytes,
+    latency: Duration,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BoardScriptedCsvResponse {
+    /// Retains one bounded nonempty CSV body and deterministic positive latency.
+    pub fn try_new(
+        body: impl Into<Bytes>,
+        latency: Duration,
+    ) -> Result<Self, BoardScriptedTransportError> {
+        let body = body.into();
+        if body.is_empty()
+            || u64::try_from(body.len()).map_or(true, |length| {
+                length > market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGE_BYTES
+            })
+            || latency.is_zero()
+            || latency > SCRIPTED_MAX_LATENCY
+        {
+            return Err(BoardScriptedTransportError::InvalidResponse);
+        }
+        Ok(Self { body, latency })
+    }
+
+    /// Returns HTTP `200`.
+    pub const fn status(&self) -> u16 {
+        200
+    }
+
+    /// Returns the exact response media type.
+    pub const fn content_type(&self) -> &'static str {
+        "text/csv"
+    }
+
+    /// Returns the exact response content encoding.
+    pub const fn content_encoding(&self) -> &'static str {
+        "identity"
+    }
+
+    /// Returns the exact declared and observed body length.
+    pub fn body_bytes(&self) -> usize {
+        self.body.len()
+    }
+
+    /// Returns the exact response body.
+    pub const fn body(&self) -> &Bytes {
+        &self.body
+    }
+
+    /// Returns the deterministic response latency.
+    pub const fn latency(&self) -> Duration {
+        self.latency
+    }
+}
+
+/// Complete bounded request presented to a debug-only Board scripted executor.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoardScriptedHttpRequest {
+    url: Box<str>,
+    accept: Box<str>,
+    accept_encoding: Box<str>,
+    maximum_response_bytes: usize,
+    started_at: Timestamp,
+    deadline: Timestamp,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BoardScriptedHttpRequest {
+    /// Binds the exact official URL and request headers to byte and absolute-deadline bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        url: impl Into<Box<str>>,
+        accept: impl Into<Box<str>>,
+        accept_encoding: impl Into<Box<str>>,
+        maximum_response_bytes: usize,
+        started_at: Timestamp,
+        deadline: Timestamp,
+    ) -> Result<Self, BoardScriptedTransportError> {
+        let request = Self {
+            url: url.into(),
+            accept: accept.into(),
+            accept_encoding: accept_encoding.into(),
+            maximum_response_bytes,
+            started_at,
+            deadline,
+        };
+        if request.url.is_empty()
+            || request.url.len() > 4 * 1024
+            || request.accept.is_empty()
+            || request.accept.len() > 128
+            || request.accept_encoding.is_empty()
+            || request.accept_encoding.len() > 128
+            || request.maximum_response_bytes == 0
+            || u64::try_from(request.maximum_response_bytes).map_or(true, |maximum| {
+                maximum > market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGE_BYTES
+            })
+            || request.deadline <= request.started_at
+        {
+            return Err(BoardScriptedTransportError::InvalidRequest);
+        }
+        Ok(request)
+    }
+
+    /// Returns `GET`; scripted callers cannot substitute another method.
+    pub const fn method(&self) -> &'static str {
+        "GET"
+    }
+
+    /// Returns the exact requested official URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Returns the exact `Accept` header value.
+    pub fn accept(&self) -> &str {
+        &self.accept
+    }
+
+    /// Returns the exact `Accept-Encoding` header value.
+    pub fn accept_encoding(&self) -> &str {
+        &self.accept_encoding
+    }
+
+    /// Returns the response byte ceiling supplied by the owning policy.
+    pub const fn maximum_response_bytes(&self) -> usize {
+        self.maximum_response_bytes
+    }
+
+    /// Returns the trusted request-start time.
+    pub const fn started_at(&self) -> Timestamp {
+        self.started_at
+    }
+
+    /// Returns the exact absolute request deadline.
+    pub const fn deadline(&self) -> Timestamp {
+        self.deadline
+    }
+
+    fn deadline_duration(&self) -> Result<Duration, BoardScriptedTransportError> {
+        let nanos = self
+            .deadline
+            .unix_nanos()
+            .checked_sub(self.started_at.unix_nanos())
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or(BoardScriptedTransportError::InvalidRequest)?;
+        Ok(Duration::from_nanos(nanos))
+    }
+}
+
+/// Deterministic executed response returned by the debug-only doctor executor.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoardScriptedHttpResponse {
+    response: BoardScriptedCsvResponse,
+    received_at: Timestamp,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BoardScriptedHttpResponse {
+    /// Returns HTTP `200`.
+    pub const fn status(&self) -> u16 {
+        self.response.status()
+    }
+
+    /// Returns `text/csv`.
+    pub const fn content_type(&self) -> &'static str {
+        self.response.content_type()
+    }
+
+    /// Returns `identity`.
+    pub const fn content_encoding(&self) -> &'static str {
+        self.response.content_encoding()
+    }
+
+    /// Returns exact response bytes.
+    pub const fn body(&self) -> &Bytes {
+        self.response.body()
+    }
+
+    /// Returns the exact declared and observed body length.
+    pub fn body_bytes(&self) -> usize {
+        self.response.body_bytes()
+    }
+
+    /// Returns request start plus deterministic scripted latency.
+    pub const fn received_at(&self) -> Timestamp {
+        self.received_at
+    }
+
+    /// Returns deterministic scripted latency.
+    pub const fn latency(&self) -> Duration {
+        self.response.latency()
+    }
+
+    /// Consumes the response and returns exact provider bytes.
+    pub fn into_body(self) -> Bytes {
+        self.response.body
+    }
+}
+
+/// Separate doctor and production execution totals for one scripted transport bundle.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoardScriptedTransportCounters {
+    doctor_attempts: u64,
+    doctor_responses: u64,
+    production_attempts: u64,
+    production_responses: u64,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BoardScriptedTransportCounters {
+    /// Returns doctor executor calls, including rejected or repeated calls.
+    pub const fn doctor_attempts(self) -> u64 {
+        self.doctor_attempts
+    }
+
+    /// Returns successfully consumed doctor responses.
+    pub const fn doctor_responses(self) -> u64 {
+        self.doctor_responses
+    }
+
+    /// Returns production executor calls, including rejected or repeated calls.
+    pub const fn production_attempts(self) -> u64 {
+        self.production_attempts
+    }
+
+    /// Returns successfully consumed production responses.
+    pub const fn production_responses(self) -> u64 {
+        self.production_responses
+    }
+}
+
+/// Closed scripted-transport failure available only to debug fixture composition.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BoardScriptedTransportError {
+    /// A supplied response is empty, oversized, malformed, or outside fixture latency bounds.
+    #[error("invalid Federal Reserve Board scripted response")]
+    InvalidResponse,
+    /// A call differs from its exact official URL, headers, or policy-owned request bounds.
+    #[error("invalid Federal Reserve Board scripted request")]
+    InvalidRequest,
+    /// The operation was cancelled before a response could be consumed.
+    #[error("Federal Reserve Board scripted request was cancelled")]
+    Cancelled,
+    /// The scripted latency crosses the exact request deadline.
+    #[error("Federal Reserve Board scripted request exceeded its deadline")]
+    DeadlineExceeded,
+    /// Exact response bytes cross the request's policy-owned ceiling.
+    #[error("Federal Reserve Board scripted response exceeded its byte bound")]
+    ResponseTooLarge,
+    /// The one-shot response was already consumed.
+    #[error("Federal Reserve Board scripted response was already consumed")]
+    ResponseConsumed,
+    /// Fixture synchronization failed closed.
+    #[error("Federal Reserve Board scripted transport synchronization failed")]
+    Synchronization,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Debug)]
+pub(crate) struct BoardScriptedQueue {
+    responses: Mutex<VecDeque<BoardScriptedCsvResponse>>,
+    attempts: AtomicU64,
+    completed: AtomicU64,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BoardScriptedQueue {
+    fn one(response: BoardScriptedCsvResponse) -> Self {
+        Self {
+            responses: Mutex::new(VecDeque::from([response])),
+            attempts: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+        }
+    }
+
+    fn execute(
+        &self,
+        request: &BoardScriptedHttpRequest,
+        expected_url: &str,
+        expected_maximum_response_bytes: usize,
+        maximum_deadline_duration: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<BoardScriptedHttpResponse, BoardScriptedTransportError> {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        if cancellation.is_cancelled() {
+            return Err(BoardScriptedTransportError::Cancelled);
+        }
+        if request.method() != "GET"
+            || request.url() != expected_url
+            || request.accept() != BoardFileFormat::DdpCsvSeriesColumnV1.accept()
+            || request.accept_encoding() != "identity"
+            || request.maximum_response_bytes() != expected_maximum_response_bytes
+        {
+            return Err(BoardScriptedTransportError::InvalidRequest);
+        }
+        let deadline_duration = request.deadline_duration()?;
+        if deadline_duration > maximum_deadline_duration {
+            return Err(BoardScriptedTransportError::InvalidRequest);
+        }
+        let mut responses = self
+            .responses
+            .lock()
+            .map_err(|_| BoardScriptedTransportError::Synchronization)?;
+        let response = responses
+            .front()
+            .ok_or(BoardScriptedTransportError::ResponseConsumed)?;
+        let latency_nanos = u64::try_from(response.latency().as_nanos())
+            .map_err(|_| BoardScriptedTransportError::InvalidResponse)?;
+        let received_at = request
+            .started_at()
+            .checked_add_nanos(
+                i64::try_from(latency_nanos)
+                    .map_err(|_| BoardScriptedTransportError::InvalidResponse)?,
+            )
+            .map_err(|_| BoardScriptedTransportError::InvalidResponse)?;
+        if response.body_bytes() > request.maximum_response_bytes() {
+            return Err(BoardScriptedTransportError::ResponseTooLarge);
+        }
+        if received_at > request.deadline() {
+            return Err(BoardScriptedTransportError::DeadlineExceeded);
+        }
+        if cancellation.is_cancelled() {
+            return Err(BoardScriptedTransportError::Cancelled);
+        }
+        let response = responses
+            .pop_front()
+            .ok_or(BoardScriptedTransportError::ResponseConsumed)?;
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        Ok(BoardScriptedHttpResponse {
+            response,
+            received_at,
+        })
+    }
+}
+
+/// Cloneable one-shot executor for the exact bounded H.15 doctor route.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Debug)]
+pub struct BoardScriptedDoctorExecutor {
+    queue: Arc<BoardScriptedQueue>,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BoardScriptedDoctorExecutor {
+    /// Executes only the frozen official doctor request under its exact policy bounds.
+    pub async fn execute(
+        &self,
+        request: BoardScriptedHttpRequest,
+        cancellation: CancellationToken,
+    ) -> Result<BoardScriptedHttpResponse, BoardScriptedTransportError> {
+        self.queue.execute(
+            &request,
+            BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL,
+            SCRIPTED_DOCTOR_MAX_RESPONSE_BYTES,
+            SCRIPTED_DOCTOR_MAX_DEADLINE,
+            &cancellation,
+        )
+    }
+}
+
+/// Debug-only closed bundle of disjoint one-shot doctor and production responses.
+///
+/// This fixture never changes an endpoint or network policy. The production arm constructs the
+/// real [`crate::BoardSource`], so discovery caching, rich extraction, exact raw capture material,
+/// canonical mapping, and provider authority remain the production path.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Debug)]
+pub struct BoardScriptedTransportFactory {
+    doctor: Arc<BoardScriptedQueue>,
+    production: Arc<BoardScriptedQueue>,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BoardScriptedTransportFactory {
+    /// Validates and retains one exact doctor and one exact production H.15 CSV response.
+    pub fn try_new(
+        doctor: BoardScriptedCsvResponse,
+        production: BoardScriptedCsvResponse,
+    ) -> Result<Self, BoardScriptedTransportError> {
+        validate_scripted_h15_response(&doctor, true)?;
+        validate_scripted_h15_response(&production, false)?;
+        Ok(Self {
+            doctor: Arc::new(BoardScriptedQueue::one(doctor)),
+            production: Arc::new(BoardScriptedQueue::one(production)),
+        })
+    }
+
+    /// Returns a cloneable executor over only the doctor response queue.
+    pub fn doctor_executor(&self) -> BoardScriptedDoctorExecutor {
+        BoardScriptedDoctorExecutor {
+            queue: Arc::clone(&self.doctor),
+        }
+    }
+
+    /// Returns separate observed attempt and completed-response counters.
+    pub fn counters(&self) -> BoardScriptedTransportCounters {
+        BoardScriptedTransportCounters {
+            doctor_attempts: self.doctor.attempts.load(Ordering::Relaxed),
+            doctor_responses: self.doctor.completed.load(Ordering::Relaxed),
+            production_attempts: self.production.attempts.load(Ordering::Relaxed),
+            production_responses: self.production.completed.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn production_queue(&self) -> Arc<BoardScriptedQueue> {
+        Arc::clone(&self.production)
+    }
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+fn validate_scripted_h15_response(
+    response: &BoardScriptedCsvResponse,
+    doctor: bool,
+) -> Result<(), BoardScriptedTransportError> {
+    if doctor && response.body_bytes() > SCRIPTED_DOCTOR_MAX_RESPONSE_BYTES {
+        return Err(BoardScriptedTransportError::InvalidResponse);
+    }
+    let contract = if doctor {
+        BoardDatasetContract::h15_treasury_constant_maturities_doctor_probe_csv()
+    } else {
+        BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
+    }
+    .map_err(|_| BoardScriptedTransportError::InvalidResponse)?;
+    let parsed = parse_csv(&contract, response.body(), BoardParseLimits::default())
+        .map_err(|_| BoardScriptedTransportError::InvalidResponse)?;
+    let exact_series = parsed.series().len() == 11
+        && parsed
+            .series()
+            .iter()
+            .all(|series| !series.observations().is_empty());
+    let exact_doctor = !doctor
+        || (parsed.observation_count() == 110
+            && parsed
+                .series()
+                .iter()
+                .all(|series| series.observations().len() == 10));
+    if exact_series && exact_doctor {
+        Ok(())
+    } else {
+        Err(BoardScriptedTransportError::InvalidResponse)
+    }
+}
 
 /// Opaque HTTP validators retained exactly and admitted only after bounded syntax checks.
 #[derive(Clone, Eq, PartialEq, Serialize)]
@@ -310,6 +785,10 @@ pub(crate) struct BoardHttpRequest {
     pub(crate) url: String,
     pub(crate) accept: &'static str,
     pub(crate) conditional: Option<BoardConditionalRequest>,
+    #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+    pub(crate) started_at: Timestamp,
+    #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+    pub(crate) deadline: Timestamp,
 }
 
 #[derive(Clone, Debug)]
@@ -334,6 +813,86 @@ pub(crate) trait BoardTransport: std::fmt::Debug + Send + Sync {
         timeout: Duration,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<BoardHttpResponse, BoardSourceError>>;
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Debug)]
+pub(crate) struct BoardScriptedProductionTransport {
+    queue: Arc<BoardScriptedQueue>,
+    maximum_response_bytes: usize,
+    maximum_deadline_duration: Duration,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BoardScriptedProductionTransport {
+    pub(crate) fn new(
+        queue: Arc<BoardScriptedQueue>,
+        maximum_response_bytes: usize,
+        maximum_deadline_duration: Duration,
+    ) -> Self {
+        Self {
+            queue,
+            maximum_response_bytes,
+            maximum_deadline_duration,
+        }
+    }
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BoardTransport for BoardScriptedProductionTransport {
+    fn execute(
+        &self,
+        request: BoardHttpRequest,
+        max_bytes: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<BoardHttpResponse, BoardSourceError>> {
+        Box::pin(async move {
+            if request.conditional.is_some()
+                || max_bytes != self.maximum_response_bytes
+                || timeout.is_zero()
+                || timeout > self.maximum_deadline_duration
+            {
+                return Err(BoardSourceError::InvalidProfile);
+            }
+            let scripted = BoardScriptedHttpRequest::try_new(
+                request.url,
+                request.accept,
+                "identity",
+                max_bytes,
+                request.started_at,
+                request.deadline,
+            )
+            .map_err(map_scripted_error)?;
+            let response = self
+                .queue
+                .execute(
+                    &scripted,
+                    BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL,
+                    self.maximum_response_bytes,
+                    self.maximum_deadline_duration,
+                    &cancellation,
+                )
+                .map_err(map_scripted_error)?;
+            let body_bytes =
+                u64::try_from(response.body_bytes()).map_err(|_| BoardSourceError::BodyTooLarge)?;
+            let received_at = response.received_at();
+            let latency = response.latency();
+            let body = response.into_body();
+            Ok(BoardHttpResponse {
+                status: 200,
+                retry_after: None,
+                content_encoding: Some(b"identity".to_vec()),
+                content_type: Some(b"text/csv".to_vec()),
+                etag: None,
+                last_modified: None,
+                declared_body_bytes: Some(body_bytes),
+                body,
+                received_at,
+                latency,
+            })
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -374,7 +933,7 @@ impl BoardHttpClient {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, all(feature = "scripted-transport-fixture", debug_assertions)))]
     pub(crate) fn try_new_with_transport(
         metadata: &SourceMetadata,
         transport: Arc<dyn BoardTransport>,
@@ -424,6 +983,13 @@ impl BoardHttpClient {
             .parse_limits()
             .max_source_bytes()
             .min(self.max_response_bytes);
+        #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+        let effective_deadline =
+            started_at
+                .checked_add_nanos(i64::try_from(duration_nanos(timeout)).map_err(|_| {
+                    failure_without_response(ExtractionSourceError::DeadlineExceeded)
+                })?)
+                .map_err(|_| failure_without_response(ExtractionSourceError::DeadlineExceeded))?;
         let transport_started = Instant::now();
         let response = match self
             .transport
@@ -432,6 +998,10 @@ impl BoardHttpClient {
                     url: request.url().to_owned(),
                     accept: request.accept(),
                     conditional: conditional.cloned(),
+                    #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+                    started_at,
+                    #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+                    deadline: effective_deadline,
                 },
                 maximum,
                 timeout,
@@ -841,6 +1411,19 @@ fn map_source_error(error: BoardSourceError) -> ExtractionSourceError {
         | BoardSourceError::Protocol(_)
         | BoardSourceError::HealthUnavailable
         | BoardSourceError::CanonicalMapping => SourceError::InvalidProtocolState.into(),
+    }
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+fn map_scripted_error(error: BoardScriptedTransportError) -> BoardSourceError {
+    match error {
+        BoardScriptedTransportError::Cancelled => BoardSourceError::Cancelled,
+        BoardScriptedTransportError::DeadlineExceeded => BoardSourceError::DeadlineExceeded,
+        BoardScriptedTransportError::ResponseTooLarge => BoardSourceError::BodyTooLarge,
+        BoardScriptedTransportError::InvalidResponse
+        | BoardScriptedTransportError::InvalidRequest
+        | BoardScriptedTransportError::ResponseConsumed
+        | BoardScriptedTransportError::Synchronization => BoardSourceError::InvalidProfile,
     }
 }
 

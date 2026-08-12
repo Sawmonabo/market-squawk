@@ -11,14 +11,14 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{BinaryArray, StringArray, TimestampNanosecondArray, UInt32Array};
+use arrow::array::{BinaryArray, StringArray};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalFeatureDatasetSelection, AnalyticalFundNavReadLimit,
-    AnalyticalFundNavReadRequest, AnalyticalManifestCatalog, AnalyticalMarketBarReadLimit,
-    AnalyticalMarketBarReadRequest, AnalyticalObservationReadRequest,
-    AnalyticalObservationTemplate, AnalyticalReadError, AnalyticalReadLimit, CatalogAuthority,
+    AnalyticalFundNavReadRequest, AnalyticalMacroLatestKnownRequest,
+    AnalyticalMacroSeriesAllowlist, AnalyticalManifestCatalog, AnalyticalMarketBarReadLimit,
+    AnalyticalMarketBarReadRequest, AnalyticalReadError, AnalyticalReadLimit, CatalogAuthority,
     CatalogConfig, CatalogError, CatalogLimit, CatalogResultLimits, ChronologicalSplitPolicy,
     CommittedDataset, CompactionRequest, ComponentAdjustmentEvidence, ComponentKind,
     ComponentScope, ComponentSelector, ComponentValue, CorporateActionAdjustment,
@@ -28,14 +28,13 @@ use market_squawk_data::{
     DatasetSchemaRegistry, FeatureLabelComponentInput, FeatureLabelComponentSpec, FundNavDateRange,
     IngestError, IngestIdentity, MAX_RETAINED_PYTHON_DATASET_ADMISSIONS,
     MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES, ManifestCatalogError, MissingValuePolicy,
-    ObjectStoreConfig, ObservationFamilyKey, ObservationKnowledgeRange, OutcomeMarketBarRequest,
-    OutcomeMarketBarSelection, OutcomeMarketBarSeries, OutcomeMarketBarUnavailableReason,
-    ParquetStoreError, PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode,
-    QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, QueryResult,
-    ResearchArrowBatch, ResearchIngestService, ResearchQueryEngine, ResearchUse,
-    ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet, RightsBasis, RightsDecisionInput,
-    Sha256Digest, SourceOperation, UniverseId, UniverseLimits, UniverseMembership,
-    extraction_provider_payload_digest,
+    ObjectStoreConfig, ObservationFamilyKey, OutcomeMarketBarRequest, OutcomeMarketBarSelection,
+    OutcomeMarketBarSeries, OutcomeMarketBarUnavailableReason, ParquetStoreError,
+    PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode, QueryArtifactReservationInput,
+    QueryError, QueryLimits, QueryRequest, QueryResult, ResearchArrowBatch, ResearchIngestService,
+    ResearchQueryEngine, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet,
+    RightsBasis, RightsDecisionInput, Sha256Digest, SourceOperation, UniverseId, UniverseLimits,
+    UniverseMembership, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     AssetClass, AuthorizationBasis, AvailabilityEvidence as DomainAvailabilityEvidence,
@@ -79,6 +78,20 @@ const ARTIFACT_QUERY: &str = "SELECT a.value FROM observations
      CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS c(value)
      CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS d(value)
      CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS e(value)";
+
+const MACRO_SNAPSHOT_SERIES: [&str; 11] = [
+    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCM01_N.B",
+    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCM03_N.B",
+    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCM06_N.B",
+    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY01_N.B",
+    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY02_N.B",
+    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY03_N.B",
+    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY05_N.B",
+    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY07_N.B",
+    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY10_N.B",
+    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY20_N.B",
+    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY30_N.B",
+];
 
 #[derive(Debug, Default)]
 struct RejectDatasetPublication {
@@ -1449,12 +1462,75 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
 {
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("reader"))?;
-    let (service, committed) = initialized_service_with_dataset(
-        &paths,
-        test_catalog_config(paths.catalog()?.clone())?,
-        ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
-    )
-    .await?;
+    let location = paths.catalog()?.clone();
+    let catalog_config = test_catalog_config(location.clone())?;
+    let store_config = ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?;
+    let authority = CatalogAuthority::open(catalog_config.clone())?;
+    let source = local_source()?;
+    authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
+    let batch = macro_snapshot_extraction_batch()?;
+    let revisions = macro_snapshot_revision_plan(&batch)?;
+    let payload_digest = extraction_provider_payload_digest(&batch);
+    let rights = authority.admit_source_rights(RightsDecisionInput {
+        source_id: source.source_id().clone(),
+        payload_digest,
+        retrieved_at: Timestamp::from_unix_nanos(15),
+        basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
+        authorization_evidence: digest(32),
+        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+        permitted_operations: vec![SourceOperation::Persist],
+    })?;
+    authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+        rights.rights_id(),
+        ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+        digest(33),
+        Some(Timestamp::from_unix_nanos(i64::MAX)),
+    )?)?;
+    let reservation = authority.reserve_ingest(
+        &IngestIdentity::try_new(
+            source.source_id().clone(),
+            payload_digest,
+            SourceOperation::Persist,
+            "fred:h15:macro-snapshot-fixture:v1",
+        )?,
+        &rights,
+    )?;
+    let service = AnalyticalDataService::initialize(
+        authority,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        store_config,
+    )?;
+    let committed = service
+        .ingest_with_revision_plan(
+            reservation,
+            DatasetId::try_from(batch.request().object().dataset().as_str())?,
+            batch,
+            revisions,
+            CancellationToken::new(),
+        )
+        .await?;
+    for persisted in service
+        .object_store()
+        .read_pinned(committed.pinned(), &CancellationToken::new())?
+    {
+        let projected_series = persisted
+            .column_by_name("macro_series")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or("missing Macro series projection")?;
+        let payloads = persisted
+            .column_by_name("payload_json")
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or("missing Macro payload projection")?;
+        for row in 0..persisted.num_rows() {
+            let ResearchObservation::Macro(payload) =
+                serde_json::from_slice::<ResearchObservation>(payloads.value(row))?
+            else {
+                return Err("Macro fixture payload changed variant".into());
+            };
+            assert_eq!(projected_series.value(row), payload.series().as_str());
+        }
+    }
     let reader = service.analytical_reader();
     let limit = AnalyticalReadLimit::try_new(1)?;
     let cancellation = CancellationToken::new();
@@ -1492,25 +1568,31 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
         *listed.source_id()
     );
 
-    let request = AnalyticalObservationReadRequest::try_new(
-        committed.manifest().clone(),
-        AnalyticalObservationTemplate::Macro,
-        Vec::new(),
-        Some(ObservationKnowledgeRange::try_new(
-            Timestamp::from_unix_nanos(90),
-            Timestamp::from_unix_nanos(110),
-        )?),
+    let allowlist = AnalyticalMacroSeriesAllowlist::try_from_code_owned_identifiers(
+        MACRO_SNAPSHOT_SERIES
+            .iter()
+            .map(|series| SourceIdentifier::try_from(*series))
+            .collect::<Result<Vec<_>, _>>()?,
     )?;
+    let effective_date_cutoff = market_squawk_domain::CalendarDate::new(2026, 8, 11)?;
+    let request = AnalyticalMacroLatestKnownRequest::try_new(
+        committed.manifest().clone(),
+        source.source_id().clone(),
+        Timestamp::from_unix_nanos(250),
+        effective_date_cutoff,
+        allowlist,
+    )?;
+    assert_eq!(request.required_query_rows(), 89);
     let observed = reader
-        .read_observations(
-            request,
+        .read_macro_latest_known_snapshot(
+            request.clone(),
             QueryLimits::try_new(
+                request.required_query_rows(),
+                256 * 1024,
+                64 * 1024 * 1024,
                 1,
-                64 * 1024,
-                8 * 1024 * 1024,
-                1,
-                128,
-                128,
+                2_048,
+                2_048,
                 Duration::from_secs(10),
             )?,
             deadline,
@@ -1518,41 +1600,84 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
         )
         .await?;
     assert_eq!(observed.source_id().as_str(), "fred-local-fixture");
+    assert_eq!(observed.output().manifest(), committed.manifest());
+    assert_eq!(observed.observations().len(), MACRO_SNAPSHOT_SERIES.len());
+    assert_eq!(
+        observed
+            .observations()
+            .iter()
+            .map(|observation| observation.series().as_str())
+            .collect::<Vec<_>>(),
+        request
+            .series_allowlist()
+            .series()
+            .iter()
+            .map(SourceIdentifier::as_str)
+            .collect::<Vec<_>>()
+    );
+    let corrected = observed
+        .observations()
+        .iter()
+        .find(|observation| observation.series().as_str() == MACRO_SNAPSHOT_SERIES[0])
+        .ok_or("missing corrected Macro snapshot series")?;
+    assert_eq!(corrected.context().time().revision().get(), 2);
+    assert_eq!(
+        corrected.context().time().effective().calendar_date_value(),
+        Some(market_squawk_domain::CalendarDate::new(2026, 8, 10)?)
+    );
+    assert_eq!(
+        corrected.value().observed_value(),
+        Some(Decimal::new(425, 2))
+    );
     let QueryResult::Inline { batches, .. } = observed.output().result() else {
-        return Err("expected one inline fixed-template result".into());
+        return Err("expected one inline Macro snapshot result".into());
     };
-    let batch = batches.first().ok_or("missing fixed-template batch")?;
-    assert_eq!(batch.num_rows(), 1);
-    let schema = batch.schema();
-    let string = |name| -> Result<&StringArray, Box<dyn Error>> {
-        Ok(batch
-            .column(schema.index_of(name)?)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("fixed-template string column changed")?)
-    };
-    assert_eq!(string("observation_kind")?.value(0), "macro");
-    assert_eq!(string("source_id")?.value(0), "fred-local-fixture");
-    assert_eq!(string("quality")?.value(0), "official_delayed");
-    let revisions = batch
-        .column(schema.index_of("revision")?)
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .ok_or("fixed-template revision column changed")?;
-    assert_eq!(revisions.value(0), 1);
-    for (name, expected) in [
-        ("available_at", 100),
-        ("effective_at", 90),
-        ("published_at", 100),
-        ("superseded_at", 200),
-    ] {
-        let values = batch
-            .column(schema.index_of(name)?)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .ok_or("fixed-template time column changed")?;
-        assert_eq!(values.value(0), expected);
-    }
+    assert_eq!(
+        batches
+            .iter()
+            .map(arrow::record_batch::RecordBatch::num_rows)
+            .sum::<usize>(),
+        MACRO_SNAPSHOT_SERIES.len(),
+        "engine-owned latest-date/latest-revision selection must cross the typed boundary bounded"
+    );
+    assert_ne!(observed.output().result_digest().bytes(), [0; 32]);
+    assert_ne!(observed.selection_digest().bytes(), [0; 32]);
+    let selection_digest = observed.selection_digest();
+    let candidate_result_digest = observed.output().result_digest();
+    let expected_observations = observed.observations().to_vec();
+    let manifest = committed.manifest().clone();
+    drop(observed);
+    drop(committed);
+    drop(reader);
+    drop(service);
+
+    let restarted = AnalyticalDataService::open(
+        CatalogAuthority::open(catalog_config)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        store_config,
+    )?;
+    let replayed = restarted
+        .analytical_reader()
+        .read_macro_latest_known_snapshot(
+            request.clone(),
+            QueryLimits::try_new(
+                request.required_query_rows(),
+                256 * 1024,
+                64 * 1024 * 1024,
+                1,
+                2_048,
+                2_048,
+                Duration::from_secs(10),
+            )?,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(replayed.output().manifest(), &manifest);
+    assert_eq!(replayed.output().result_digest(), candidate_result_digest);
+    assert_eq!(replayed.selection_digest(), selection_digest);
+    assert_eq!(replayed.observations(), expected_observations);
     Ok(())
 }
 
@@ -2622,6 +2747,179 @@ fn provider_revision_plan(
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     Ok(ExtractionRevisionPlan::try_new(evidence)?)
+}
+
+fn macro_snapshot_extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
+    let discovery = DiscoveryRequest::try_new(
+        SourceIdentifier::try_from("h15-treasury-constant-maturities")?,
+        None,
+        NonZeroU16::MIN,
+        Timestamp::from_unix_nanos(1_000),
+    )?;
+    let object = SourceObject::try_new(
+        SourceId::try_from("fred-local-fixture")?,
+        MetadataRevision::new(SourceIdentifier::try_from("revision-1")?),
+        &discovery,
+        SourceIdentifier::try_from("h15-treasury-full-history-fixture")?,
+        SourceIdentifier::try_from("text-csv")?,
+        ExactPayloadEvidence::from_content_digest(digest(93)),
+        EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        None,
+        Some(64 * 1024),
+    )?;
+    let request = ExtractionRequest::try_new(
+        object,
+        NonZeroU32::new(14).ok_or("nonzero Macro snapshot record limit")?,
+        NonZeroU64::new(1024 * 1024).ok_or("nonzero Macro snapshot byte limit")?,
+        Timestamp::from_unix_nanos(1_000),
+    )?;
+    let older = market_squawk_domain::CalendarDate::new(2026, 8, 9)?;
+    let current = market_squawk_domain::CalendarDate::new(2026, 8, 10)?;
+    let future_knowledge = market_squawk_domain::CalendarDate::new(2026, 8, 11)?;
+    let mut specifications = vec![
+        (
+            MACRO_SNAPSHOT_SERIES[0],
+            older,
+            90_i64,
+            95_i64,
+            Decimal::new(400, 2),
+            "macro-s0-older-v1".to_owned(),
+        ),
+        (
+            MACRO_SNAPSHOT_SERIES[0],
+            current,
+            100_i64,
+            105_i64,
+            Decimal::new(410, 2),
+            "macro-s0-current-v1".to_owned(),
+        ),
+        (
+            MACRO_SNAPSHOT_SERIES[0],
+            current,
+            150_i64,
+            155_i64,
+            Decimal::new(425, 2),
+            "macro-s0-current-v2".to_owned(),
+        ),
+        (
+            MACRO_SNAPSHOT_SERIES[0],
+            future_knowledge,
+            300_i64,
+            305_i64,
+            Decimal::new(450, 2),
+            "macro-s0-future-knowledge-v1".to_owned(),
+        ),
+    ];
+    for (index, series) in MACRO_SNAPSHOT_SERIES.iter().enumerate().skip(1) {
+        let index = i64::try_from(index)?;
+        specifications.push((
+            *series,
+            current,
+            100_i64
+                .checked_add(index)
+                .ok_or("Macro fixture time overflow")?,
+            110_i64
+                .checked_add(index)
+                .ok_or("Macro fixture time overflow")?,
+            Decimal::new(
+                300_i64
+                    .checked_add(index)
+                    .ok_or("Macro fixture value overflow")?,
+                2,
+            ),
+            format!("macro-s{index}-current-v1"),
+        ));
+    }
+    let mut records = Vec::new();
+    records.try_reserve_exact(specifications.len())?;
+    for (series, effective_date, received, ingested, value, revision) in specifications {
+        let observation = macro_snapshot_observation(
+            series,
+            effective_date,
+            received,
+            ingested,
+            value,
+            &revision,
+        )?;
+        let payload = serde_json::to_vec(&observation)?;
+        records.push(ExtractionRecord::try_new_with_time(
+            &request,
+            SourceIdentifier::try_from("market-squawk-research-v3")?,
+            ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(&payload).into(),
+            )),
+            ResearchTemporalCoordinate::calendar_date(effective_date),
+            None,
+            SourceAvailabilityEvidence::LocalFirstObserved {
+                observed_at: Timestamp::from_unix_nanos(received),
+            },
+            SourceIdentifier::try_from(revision)?,
+            None,
+            payload.into(),
+        )?);
+    }
+    Ok(ExtractionBatch::try_new(&request, records)?)
+}
+
+fn macro_snapshot_revision_plan(
+    batch: &ExtractionBatch,
+) -> Result<ExtractionRevisionPlan, Box<dyn Error>> {
+    let evidence = batch
+        .records()
+        .iter()
+        .map(|record| {
+            let version = record.revision().as_str().as_bytes();
+            let observed_at = record
+                .available_at()
+                .ok_or("Macro fixture must carry conservative availability")?;
+            let order = ObservedProviderOrder::try_new(
+                ResearchTemporalCoordinate::exact(observed_at),
+                version,
+            )?;
+            ExtractionRevisionEvidence::provider_supplied(version, order).map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok(ExtractionRevisionPlan::try_new(evidence)?)
+}
+
+fn macro_snapshot_observation(
+    series: &str,
+    effective_date: market_squawk_domain::CalendarDate,
+    received: i64,
+    ingested: i64,
+    value: Decimal,
+    occurrence: &str,
+) -> Result<ResearchObservation, Box<dyn Error>> {
+    let received_at = Timestamp::from_unix_nanos(received);
+    let context = ResearchContext::new(
+        ResearchProvenance::try_new(ResearchProvenanceInput {
+            source_id: SourceId::try_from("fred-local-fixture")?,
+            instrument_id: None,
+            venue_id: None,
+            source_identifier: SourceIdentifier::try_from(format!("frb-ddp:h15:{occurrence}"))?,
+            source_timestamp: None,
+            received_at,
+            ingested_at: Timestamp::from_unix_nanos(ingested),
+            quality: DataQuality::OfficialDelayed,
+            payload_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+                "federal-reserve-board:h15:fixture",
+            )?),
+            availability: DomainAvailabilityEvidence::local_first_observed(received_at),
+        })?,
+        ResearchTime::try_new_with_coordinates(
+            ResearchTemporalCoordinate::calendar_date(effective_date),
+            None,
+            RevisionNumber::new(1)?,
+            None,
+        )?,
+    )?;
+    Ok(ResearchObservation::Macro(MacroObservation::new(
+        context,
+        SourceIdentifier::try_from(series)?,
+        value,
+        SourceIdentifier::try_from("percent-per-year")?,
+    )))
 }
 
 fn macro_observation() -> Result<ResearchObservation, Box<dyn Error>> {

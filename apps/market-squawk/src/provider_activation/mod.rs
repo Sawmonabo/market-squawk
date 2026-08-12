@@ -19,6 +19,7 @@ use std::{
 
 use bytes::Bytes;
 use market_squawk_adapter_bls::{BlsAuthorization, BlsRegistrationKey, BlsSource, BlsSourceConfig};
+use market_squawk_adapter_federal_reserve::BoardSource;
 use market_squawk_adapter_files::FileExtractionSource;
 use market_squawk_adapter_fred::{FredApiKey, FredOperation, FredRightsPolicy, FredSource};
 use market_squawk_adapter_portfolio::PortfolioManifestExtractionSource;
@@ -66,11 +67,11 @@ pub use market_config::{
     TradierMarketConfigurationInput,
 };
 pub use specs::{
-    BlsAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS, CoinbaseDirectActivationSpecError,
-    CoinbaseDirectAdapterActivation, CoinbaseDirectProductActivation,
-    ControlledLocalFileAdapterActivation, FredAdapterActivation, LocalFileAdapterActivation,
-    PortfolioAdapterActivation, ProviderAdapterActivationError, ProviderAdapterActivationRequest,
-    SecAdapterActivation, TreasuryAdapterActivation,
+    BlsAdapterActivation, BoardAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS,
+    CoinbaseDirectActivationSpecError, CoinbaseDirectAdapterActivation,
+    CoinbaseDirectProductActivation, ControlledLocalFileAdapterActivation, FredAdapterActivation,
+    LocalFileAdapterActivation, PortfolioAdapterActivation, ProviderAdapterActivationError,
+    ProviderAdapterActivationRequest, SecAdapterActivation, TreasuryAdapterActivation,
 };
 pub use tradier::{
     TradierMarketDataAccountActivation, TradierMarketDataActivationError,
@@ -85,6 +86,7 @@ const BLS_REGISTERED_SURFACE: &str = "bls.v2-registered";
 const TREASURY_XML_SURFACE: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL_SURFACE: &str = "treasury.fiscal-data";
 const FRED_SURFACE: &str = FRED_ALFRED_API_SURFACE_ID;
+const FEDERAL_RESERVE_BOARD_SURFACE: &str = "federal-reserve-board.data-download-program";
 const LOCAL_FILES_SURFACE: &str = "local.files";
 const PORTFOLIO_SURFACE: &str = "local.portfolio-imports";
 const MAXIMUM_EPHEMERAL_DISCOVERY_PAGES: u16 = 64;
@@ -579,6 +581,10 @@ impl ProviderAdapterActivation {
                 &spec.metadata,
                 fred_research_rights(lease, spec.metadata.source_id(), &spec.policy)?,
             ),
+            ProviderAdapterActivationRequest::Board(spec) => (
+                &spec.metadata,
+                provider_research_rights(lease, spec.metadata.source_id())?,
+            ),
             ProviderAdapterActivationRequest::ControlledLocalFiles(spec) => (
                 &spec.metadata,
                 controlled_local_file_rights(lease, spec.metadata.source_id(), &spec.evidence)?,
@@ -706,6 +712,7 @@ impl ProviderAdapterActivation {
             ProviderAdapterActivationRequest::Live(_)
             | ProviderAdapterActivationRequest::CoinbaseDirect(_)
             | ProviderAdapterActivationRequest::Sec(_)
+            | ProviderAdapterActivationRequest::Board(_)
             | ProviderAdapterActivationRequest::LocalFiles(_)
             | ProviderAdapterActivationRequest::Portfolio(_) => {
                 return Err(ProviderAdapterActivationError::SourceBinding);
@@ -780,6 +787,9 @@ impl ProviderAdapterActivation {
                 .activate_fred(lease, spec, cancellation)
                 .await
                 .map(Into::into),
+            ProviderAdapterActivationRequest::Board(spec) => {
+                self.activate_board(lease, spec).map(Into::into)
+            }
             ProviderAdapterActivationRequest::LocalFiles(spec) => {
                 self.activate_local_files(lease, spec).map(Into::into)
             }
@@ -817,6 +827,9 @@ impl ProviderAdapterActivation {
             ProviderAdapterActivationRequest::Fred(_spec) => {
                 require_surface(&lease, FRED_SURFACE)?;
                 Err(ProviderAdapterActivationError::ExplicitResumeRequired)
+            }
+            ProviderAdapterActivationRequest::Board(spec) => {
+                self.activate_board(lease, spec).map(Into::into)
             }
             ProviderAdapterActivationRequest::LocalFiles(spec) => {
                 self.activate_local_files(lease, spec).map(Into::into)
@@ -972,6 +985,17 @@ impl ProviderAdapterActivation {
         let key = FredApiKey::try_new(secret.expose_secret().to_owned())?;
         let rights = fred_research_rights(&lease, spec.metadata.source_id(), &spec.policy)?;
         let source = FredSource::try_new(spec.metadata, key, spec.policy)?;
+        self.register(lease, source, rights)
+    }
+
+    fn activate_board(
+        &self,
+        lease: ProviderActivationLease,
+        spec: BoardAdapterActivation,
+    ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
+        require_surface(&lease, FEDERAL_RESERVE_BOARD_SURFACE)?;
+        let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+        let source = BoardSource::try_new(spec.metadata, spec.profile)?;
         self.register(lease, source, rights)
     }
 

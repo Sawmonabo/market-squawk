@@ -288,6 +288,8 @@ fn map_analytical_error(error: AnalyticalReadError) -> FairValueProducerSelectio
         | AnalyticalReadError::InvalidMarketBarEffectiveRange
         | AnalyticalReadError::InvalidFundNavLimit
         | AnalyticalReadError::InvalidFundNavDateRange
+        | AnalyticalReadError::InvalidMacroSeriesAllowlist
+        | AnalyticalReadError::MacroSnapshotSourceOwnerMismatch
         | AnalyticalReadError::InvalidOutcomeMarketBarWindow
         | AnalyticalReadError::InvalidObservationSchema => {
             FairValueProducerSelectionError::InvalidSelection
@@ -303,6 +305,11 @@ fn map_analytical_error(error: AnalyticalReadError) -> FairValueProducerSelectio
         | AnalyticalReadError::InvalidMarketBarResult
         | AnalyticalReadError::FundNavResultRequiresInline
         | AnalyticalReadError::InvalidFundNavResult
+        | AnalyticalReadError::MacroSnapshotResultRequiresInline
+        | AnalyticalReadError::MacroSnapshotCandidateSetSaturated
+        | AnalyticalReadError::MacroSnapshotRevisionConflict
+        | AnalyticalReadError::MacroSnapshotIncomplete
+        | AnalyticalReadError::InvalidMacroSnapshotResult
         | AnalyticalReadError::Query(_) => FairValueProducerSelectionError::Internal,
     }
 }

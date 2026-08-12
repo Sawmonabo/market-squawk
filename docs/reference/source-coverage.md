@@ -9,8 +9,8 @@ adapters.
 | Document type | Reference |
 | Audience | Operators, source-adapter authors, research engineers, risk engineers, and auditors |
 | Status | Current |
-| Last substantive review | 2026-07-26 |
-| Reviewed commit | `50912c18271a0389fb5ac8817555230930dd0506` |
+| Last substantive review | 2026-08-12 |
+| Reviewed commit | `7fb52c19dc273fe44d3846f1986c61c1321032fd` plus the Wave 6 candidate |
 
 ## Contents
 
@@ -53,11 +53,13 @@ the approved target providers, current official contracts, account-specific prob
 canonical destinations, and implementation gaps—including owner-enabled Schwab—without falsely
 adding those sources to the implemented product-path matrix below. The current selected-provider
 candidate contains provider-native core and transport code for Schwab, Yahoo, IEX HIST, OCC/Cboe
-reference, BEA, Census, EIA, and Tiingo; the Federal Reserve Board core is deliberately transport-
-free. Those crates do not become product paths until their application-owned doctor or entitlement
-probe, activation binding, durable canonical publication, point-in-time typed read, workflow
-composition, restart journey, and frozen-head acceptance are complete. The matrix below reports
-that end-to-end composition, not crate presence.
+reference, BEA, Census, EIA, Tiingo, and the Federal Reserve Board. Board profile revision 4 also
+has an exact bounded H.15 onboarding doctor plus application activation/source construction,
+shared rich-capture binding, analytical-dataset registration, and lifecycle restore code. Those
+surfaces do not become product paths until focused proof, durable canonical publication,
+point-in-time typed reads, workflow composition, restart acceptance, and frozen-head acceptance
+are complete. The matrix below reports that end-to-end composition, not crate, profile, or
+unaccepted code-path presence.
 
 ## Source identity and immutable metadata
 
@@ -370,17 +372,38 @@ does not become `DirectVerified`.
 
 ## Research and local adapters
 
+### Federal Reserve Board H.15 profile boundary
+
+`federal-reserve-board.data-download-program` revision 4 is `available` for one exact no-key
+onboarding doctor: the 11-series H.15 Treasury constant-maturity CSV package bounded to ten recent
+observations per series. The application performs one exact allowlisted GET, enforces a shared
+one-request-per-minute/single-flight application policy, and accepts the response only when the
+provider-native parser proves the exact metadata, identities, units, periods, 11 series, and 110
+observations. The full-history production URL has a separate request and contract identity.
+
+The provider-native adapter has authority-governed HTTPS retrieval, exact response/capture
+evidence, strict parsing, canonical macro mapping, correction/repost modeling, and publication
+primitives. The application now constructs that source under an active onboarding lease, binds its
+rich output to the shared capture protocol, registers the exact analytical dataset identity, and
+serializes/restores the lifecycle surface. Focused activation/restart proof is upstream-blocked,
+and no completed live production run yet proves sealed raw evidence, durable canonical publication,
+manifests, or restart recovery. PIT reads, source operations, and a Desktop macro workflow remain
+open. Therefore Board is intentionally absent from the implemented product-path matrix above. Its
+`available` profile state must not be rendered as a queryable dataset or dashboard status.
+
 ### Lease-gated research adapters
 
 Research activation requires an active immutable onboarding lease for the exact surface, exact
 source/revision binding, and admitted `persist` rights with non-refresh exact evidence. The CLI
-activation request is a closed schema-version-3 object with schema-version-2 recovery, capped at
-1 MiB. Its provider kinds are
-`sec`, `bls`, `treasury_fiscal`, `treasury_daily_rates`, and `fred_alfred`; each kind has a closed,
-provider-specific scope. The loopback portal exposes these typed research activations plus
-source-session activation for public Coinbase, Coinbase Direct, and Kraken. Source-session
-activation verifies onboarding authority but does not manufacture a research adapter or expand
-durable-use rights beyond the exact evidence admitted by its profile and request.
+activation request is a closed schema-version-5 object with bounded schema-version-2 through
+schema-version-4 recovery, capped at 1 MiB. Its provider kinds are `sec`, `bls`,
+`treasury_fiscal`, `treasury_daily_rates`, `fred_alfred`, and
+`federal_reserve_board_h15`; each kind has a closed, provider-specific scope, and Board is admitted
+only in schema version 5. The activation authority also accepts these typed research requests from
+the loopback portal boundary plus source-session activation for public Coinbase, Coinbase Direct,
+and Kraken. Source-session activation verifies onboarding authority but does not manufacture a
+research adapter or expand durable-use rights beyond the exact evidence admitted by its profile
+and request.
 
 | Adapter | Extracted scope | Important bounded/authority behavior |
 | --- | --- | --- |
@@ -389,14 +412,16 @@ durable-use rights beyond the exact evidence admitted by its profile and request
 | FRED/ALFRED | Exact series metadata, observations, vintage dates, and revision history | API key for ephemeral retrieval; durable use additionally requires exact Bank service permission, explicit local review, and exact per-series rights |
 | Treasury Fiscal Data | Average Interest Rates v2 for an exact date interval and page size | Exact endpoint/query allowlist; dataset/version provenance |
 | Treasury daily XML | All five official families over an inclusive year range | Exact family schemas and start years; strict year/month/all-history requests; cross-page integrity; exact payload/revision lineage |
+| Federal Reserve Board H.15 | Exact 11-series Treasury constant-maturity full-history package | No-key active lease; exact endpoint/query allowlist; shared one-request-per-minute/single-flight application budget; distinct provider and analytical dataset identities; rich capture binding |
 
 The research metadata for these adapters uses a positive one-nanosecond `delayed` declaration and
 `unknown` delivery rather than claiming real-time or direct delivery.
 
-Durable activation recipes exist for exactly six profile surfaces: SEC; BLS v1 and v2; Treasury
-Fiscal and daily XML; and FRED/ALFRED. Recipes are secret-free and bind exact request and evidence
-digests. On restart, SEC, BLS v1, and both Treasury surfaces can be reconstructed without a
-credential when their authority remains valid. BLS v2 and FRED return
+Durable activation recipes now cover seven profile surfaces: SEC; BLS v1 and v2; Treasury Fiscal
+and daily XML; FRED/ALFRED; and Federal Reserve Board H.15. Recipes are secret-free and bind exact
+request and evidence digests. Restore code can reconstruct SEC, BLS v1, both Treasury surfaces,
+and Board without a credential when their authority remains valid; the focused Board
+activation/restart proof is still upstream-blocked. BLS v2 and FRED return
 `provider activation requires explicit foreground credential resume` and remain disabled until
 that explicit resume. Invalid evidence, authority, or adapter state quarantines the recipe.
 
@@ -414,6 +439,8 @@ At the reviewed commit, release and rights gates have concrete consequences:
   each exact series.
 - Treasury Fiscal Data and daily-rate XML are available built-in official profiles with all six
   rights operations admitted by their separate dataset-level evidence.
+- Federal Reserve Board revision 4 admits the exact H.15 activation and restore code path, but its
+  focused restart proof and executed durable production publication remain incomplete.
 
 ### FRED durable-rights boundary
 
@@ -500,6 +527,7 @@ redistribute.
 | BLS v2 registered | Admitted | Admitted | Admitted | Admitted | Pending | Pending |
 | Treasury daily-rates XML | Admitted | Admitted | Admitted | Admitted | Admitted | Admitted |
 | Treasury Fiscal Data | Admitted | Admitted | Admitted | Admitted | Admitted | Admitted |
+| Federal Reserve Board H.15 | Admitted | Admitted | Admitted | Admitted | Blocked | Blocked |
 | Local files | Admitted | Admitted | Admitted | Admitted | Admitted | Pending |
 | Local portfolio imports | Admitted | Admitted | Admitted | Admitted | Admitted | Pending |
 | Local paper execution | Admitted | Admitted | Admitted | Admitted | Admitted | Admitted |

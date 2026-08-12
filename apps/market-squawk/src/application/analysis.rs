@@ -1036,12 +1036,19 @@ fn map_feature_read_error(error: AnalyticalReadError) -> ServiceError {
         | AnalyticalReadError::InvalidMarketBarEffectiveRange
         | AnalyticalReadError::InvalidFundNavLimit
         | AnalyticalReadError::InvalidFundNavDateRange
+        | AnalyticalReadError::InvalidMacroSeriesAllowlist
+        | AnalyticalReadError::MacroSnapshotSourceOwnerMismatch
         | AnalyticalReadError::InvalidOutcomeMarketBarWindow
         | AnalyticalReadError::InvalidObservationSchema => ServiceError::InvalidRequest,
         AnalyticalReadError::MarketBarResultRequiresInline
         | AnalyticalReadError::InvalidMarketBarResult
         | AnalyticalReadError::FundNavResultRequiresInline
-        | AnalyticalReadError::InvalidFundNavResult => ServiceError::InvalidResult,
+        | AnalyticalReadError::InvalidFundNavResult
+        | AnalyticalReadError::MacroSnapshotResultRequiresInline
+        | AnalyticalReadError::MacroSnapshotCandidateSetSaturated
+        | AnalyticalReadError::MacroSnapshotRevisionConflict
+        | AnalyticalReadError::MacroSnapshotIncomplete
+        | AnalyticalReadError::InvalidMacroSnapshotResult => ServiceError::InvalidResult,
         AnalyticalReadError::Manifest(ManifestCatalogError::Cancelled)
         | AnalyticalReadError::Query(QueryError::Cancelled) => ServiceError::Cancelled,
         AnalyticalReadError::Manifest(ManifestCatalogError::DeadlineExceeded)

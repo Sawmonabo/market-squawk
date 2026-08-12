@@ -820,6 +820,58 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_treasury::Treasur
     }
 }
 
+impl ManagedResearchExtractionSource for market_squawk_adapter_federal_reserve::BoardSource {
+    fn extract_managed(
+        &self,
+        authority: market_squawk_sources::ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
+        let extracted = self.extract_with_evidence(authority, request, cancellation);
+        Box::pin(async move {
+            let output = extracted.await.map_err(|error| {
+                match error {
+                market_squawk_adapter_federal_reserve::BoardExtractionError::Source(error) => {
+                    error
+                }
+                market_squawk_adapter_federal_reserve::BoardExtractionError::Capture(_)
+                | market_squawk_adapter_federal_reserve::BoardExtractionError::CaptureBodyTooLarge {
+                    ..
+                }
+                | market_squawk_adapter_federal_reserve::BoardExtractionError::RawCapture(_) => {
+                    invalid_capture_protocol()
+                }
+            }
+            })?;
+            let (batch, _parsed, _receipt, capture_material) = output.into_parts();
+            bind_single_provider_capture(batch, capture_material)
+        })
+    }
+
+    fn discovery_dataset_identifier(&self) -> Option<&SourceIdentifier> {
+        Some(self.profile().dataset())
+    }
+
+    fn analytical_dataset(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<DatasetId, ResearchRevisionPlanError> {
+        let identifier = self
+            .analytical_dataset_identifier(batch.request().object().dataset())
+            .map_err(|_error| ResearchRevisionPlanError)?;
+        DatasetId::try_from(identifier.as_str()).map_err(|_error| ResearchRevisionPlanError)
+    }
+
+    fn revision_plan(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<Option<ExtractionRevisionPlan>, ResearchRevisionPlanError> {
+        market_squawk_adapter_federal_reserve::BoardSource::revision_plan(self, batch)
+            .map(Some)
+            .map_err(|_error| ResearchRevisionPlanError)
+    }
+}
+
 impl ManagedResearchExtractionSource for market_squawk_adapter_files::FileExtractionSource {
     fn revision_plan(
         &self,

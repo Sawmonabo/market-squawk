@@ -11,15 +11,26 @@ use std::{
 
 use arrow::json::ArrayWriter;
 use async_trait::async_trait;
-use chrono::DateTime;
+use chrono::{DateTime, Datelike, SecondsFormat, Utc};
+use market_squawk_adapter_federal_reserve::{
+    BOARD_DDP_SOURCE_ID, BoardDatasetContract, BoardDatasetFamily, BoardDatasetProfile,
+    BoardFrequency, BoardH15DashboardSeriesDescriptor, BoardParseLimits, BoardRelease,
+    h15_treasury_constant_maturities_canonical_unit_identifier,
+    h15_treasury_constant_maturities_dashboard_series,
+};
 use market_squawk_data::{
     AnalyticalFundNavOutput, AnalyticalFundNavReadRequest, AnalyticalGeneration,
-    AnalyticalObservationReadRequest, AnalyticalObservationTemplate, AnalyticalReadCapability,
-    AnalyticalReadError, AnalyticalReadLimit, DatasetId, DatasetManifestRef, GenerationKind,
-    GenerationParentRelation, IngestPrecommitAuthority, ManifestCatalogError,
-    PinnedArtifactQueryRequest, PinnedQueryOutput, QueryError, QueryLimits, QueryResult,
+    AnalyticalMacroLatestKnownOutput, AnalyticalMacroLatestKnownRequest,
+    AnalyticalMacroSeriesAllowlist, AnalyticalObservationReadRequest,
+    AnalyticalObservationTemplate, AnalyticalReadCapability, AnalyticalReadError,
+    AnalyticalReadLimit, DatasetId, DatasetManifestRef, GenerationKind, GenerationParentRelation,
+    IngestPrecommitAuthority, ManifestCatalogError, PinnedArtifactQueryRequest, PinnedQueryOutput,
+    QueryError, QueryLimits, QueryResult,
 };
-use market_squawk_domain::{InstrumentId, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, MacroObservation,
+    PayloadReference, SourceId, SourceIdentifier, Timestamp,
+};
 use market_squawk_services::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRepository,
     RequestContext, ServiceDomain, ServiceError, ServiceLimits, ToolResultMetadata,
@@ -63,9 +74,18 @@ const FUNDAMENTAL_GET_STATEMENTS: &str = "Fundamental.GetStatements";
 const FUNDAMENTAL_GET_RATIOS: &str = "Fundamental.GetRatios";
 
 const MACRO_LIST_SERIES: &str = "Macro.ListSeries";
+const MACRO_GET_DASHBOARD: &str = "Macro.GetDashboard";
 const MACRO_GET_OBSERVATIONS: &str = "Macro.GetObservations";
 const MACRO_GET_VINTAGES: &str = "Macro.GetVintages";
 const MACRO_GET_REVISIONS: &str = "Macro.GetRevisions";
+
+const BOARD_DDP_SURFACE_ID: &str = "federal-reserve-board.data-download-program";
+const H15_REQUEST_RELEASE: &str = "h15";
+const MACRO_DASHBOARD_SCHEMA_IDENTITY: &str = "market-squawk-macro-dashboard/v1";
+const MACRO_DASHBOARD_SELECTION_POLICY: &str = "latest_known_by_series_as_of_cutoff_v1";
+const MACRO_DASHBOARD_SERIES_COUNT: usize = 11;
+const MACRO_DASHBOARD_QUERY_BYTES: u64 = 256 * 1024;
+const MACRO_DASHBOARD_QUERY_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
 const MAX_ANALYTICAL_PAGE: usize = 64;
 const QUERY_ARTIFACT_TTL: Duration = Duration::from_secs(60 * 60);
@@ -382,6 +402,12 @@ impl ApplicationDomainService for MacroDomainService {
     ) -> Result<TypedToolResult, ServiceError> {
         let _call = DomainLifecycle::enter(&self.controller.lifecycle, &context)?;
         match request.name() {
+            MACRO_GET_DASHBOARD => {
+                let limits = effective_service_limits(&request, &context)?;
+                self.controller
+                    .macro_dashboard(&request, &context, limits)
+                    .await
+            }
             MACRO_LIST_SERIES
             | MACRO_GET_OBSERVATIONS
             | MACRO_GET_VINTAGES
@@ -545,6 +571,86 @@ impl ResearchController {
             context,
         )
         .await
+    }
+
+    async fn macro_dashboard(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        limits: ServiceLimits,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let (knowledge_cutoff, effective_date_cutoff, evaluated_at) = macro_dashboard_cutoff()?;
+        validate_macro_dashboard_request(request)?;
+        if limits.maximum_result_items() < MACRO_DASHBOARD_SERIES_COUNT {
+            return Err(ServiceError::ResourceExhausted);
+        }
+
+        let contract = BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
+            .map_err(|_error| ServiceError::Unavailable)?;
+        let profile =
+            BoardDatasetProfile::try_new(contract, BoardParseLimits::default(), Vec::new())
+                .map_err(|_error| ServiceError::Unavailable)?;
+        validate_macro_dashboard_profile(&profile)?;
+
+        let dataset = DatasetId::try_from(profile.analytical_dataset().as_str())
+            .map_err(|_error| ServiceError::Unavailable)?;
+        let generation = self
+            .reader
+            .latest(&dataset, context.deadline(), context.cancellation())
+            .map_err(map_read_error)?
+            .ok_or(ServiceError::NotFound)?;
+        let descriptors = h15_treasury_constant_maturities_dashboard_series();
+        let mut series = Vec::new();
+        series
+            .try_reserve_exact(MACRO_DASHBOARD_SERIES_COUNT)
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        for descriptor in descriptors {
+            series.push(
+                descriptor
+                    .canonical_macro_series_identifier()
+                    .map_err(|_error| ServiceError::Unavailable)?,
+            );
+        }
+        let allowlist = AnalyticalMacroSeriesAllowlist::try_from_code_owned_identifiers(series)
+            .map_err(map_read_error)?;
+        let source_id =
+            SourceId::try_from(BOARD_DDP_SOURCE_ID).map_err(|_error| ServiceError::Unavailable)?;
+        let read = AnalyticalMacroLatestKnownRequest::try_new(
+            generation.manifest().clone(),
+            source_id.clone(),
+            knowledge_cutoff,
+            effective_date_cutoff,
+            allowlist,
+        )
+        .map_err(map_read_error)?;
+        let query_limits = macro_dashboard_query_limits(&read, context)?;
+        let output = self
+            .reader
+            .read_macro_latest_known_snapshot(
+                read,
+                query_limits,
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await
+            .map_err(map_read_error)?;
+        if output.source_id() != &source_id
+            || output.output().manifest() != generation.manifest()
+            || output.output().manifest().dataset_id().as_str()
+                != profile.analytical_dataset().as_str()
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+
+        macro_dashboard_result(
+            &profile,
+            &source_id,
+            knowledge_cutoff,
+            effective_date_cutoff,
+            &evaluated_at,
+            &output,
+            limits,
+        )
     }
 
     fn begin_shutdown(&self) {
@@ -735,6 +841,325 @@ impl Write for BoundedJsonBuffer {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+fn validate_macro_dashboard_request(request: &TypedToolRequest) -> Result<(), ServiceError> {
+    let arguments = request.arguments();
+    let provider = arguments
+        .get("provider")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::InvalidRequest)?;
+    let release = arguments
+        .get("release")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::InvalidRequest)?;
+    if provider != BOARD_DDP_SURFACE_ID
+        || release != H15_REQUEST_RELEASE
+        || !arguments
+            .keys()
+            .all(|field| matches!(field.as_str(), "provider" | "release" | "resultLimits"))
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn validate_macro_dashboard_profile(profile: &BoardDatasetProfile) -> Result<(), ServiceError> {
+    let contract = profile.contract();
+    if contract.release() != BoardRelease::H15SelectedInterestRates
+        || contract.family() != BoardDatasetFamily::H15TreasuryConstantMaturities
+        || contract.frequency() != BoardFrequency::BusinessDaily
+        || h15_treasury_constant_maturities_dashboard_series().len() != MACRO_DASHBOARD_SERIES_COUNT
+    {
+        return Err(ServiceError::Unavailable);
+    }
+    Ok(())
+}
+
+fn macro_dashboard_cutoff() -> Result<(Timestamp, CalendarDate, String), ServiceError> {
+    let evaluated_at = Utc::now();
+    let unix_nanos = evaluated_at
+        .timestamp_nanos_opt()
+        .ok_or(ServiceError::Unavailable)?;
+    let year = u16::try_from(evaluated_at.year()).map_err(|_error| ServiceError::Unavailable)?;
+    let month = u8::try_from(evaluated_at.month()).map_err(|_error| ServiceError::Unavailable)?;
+    let day = u8::try_from(evaluated_at.day()).map_err(|_error| ServiceError::Unavailable)?;
+    let effective_date =
+        CalendarDate::new(year, month, day).map_err(|_error| ServiceError::Unavailable)?;
+    Ok((
+        Timestamp::from_unix_nanos(unix_nanos),
+        effective_date,
+        evaluated_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+    ))
+}
+
+fn macro_dashboard_query_limits(
+    request: &AnalyticalMacroLatestKnownRequest,
+    context: &RequestContext,
+) -> Result<QueryLimits, ServiceError> {
+    let now = Instant::now();
+    if now >= context.deadline() {
+        return Err(ServiceError::DeadlineExceeded);
+    }
+    let deadline = context
+        .deadline()
+        .saturating_duration_since(now)
+        .min(Duration::from_secs(60));
+    QueryLimits::try_new_with_inline_bytes(
+        request.required_query_rows(),
+        MACRO_DASHBOARD_QUERY_BYTES,
+        MACRO_DASHBOARD_QUERY_BYTES,
+        MACRO_DASHBOARD_QUERY_MEMORY_BYTES,
+        4,
+        2_048,
+        4_096,
+        deadline,
+    )
+    .map_err(map_query_error)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the immutable dashboard result binds every independent selection authority"
+)]
+fn macro_dashboard_result(
+    profile: &BoardDatasetProfile,
+    source_id: &SourceId,
+    knowledge_cutoff: Timestamp,
+    effective_date_cutoff: CalendarDate,
+    evaluated_at: &str,
+    output: &AnalyticalMacroLatestKnownOutput,
+    limits: ServiceLimits,
+) -> Result<TypedToolResult, ServiceError> {
+    let expected_unit = h15_treasury_constant_maturities_canonical_unit_identifier()
+        .map_err(|_error| ServiceError::Unavailable)?;
+    let actual = output.observations();
+    if actual.len() != MACRO_DASHBOARD_SERIES_COUNT {
+        return Err(ServiceError::InvalidResult);
+    }
+
+    let mut selected = [false; MACRO_DASHBOARD_SERIES_COUNT];
+    let mut observations = Vec::new();
+    observations
+        .try_reserve_exact(MACRO_DASHBOARD_SERIES_COUNT)
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    let mut available_series = 0_usize;
+    let mut missing_series = 0_usize;
+    for descriptor in h15_treasury_constant_maturities_dashboard_series() {
+        let expected_series = descriptor
+            .canonical_macro_series_identifier()
+            .map_err(|_error| ServiceError::Unavailable)?;
+        let mut matching = actual
+            .iter()
+            .enumerate()
+            .filter(|(_, observation)| observation.series() == &expected_series);
+        let (index, observation) = matching.next().ok_or(ServiceError::InvalidResult)?;
+        if matching.next().is_some() || selected[index] {
+            return Err(ServiceError::InvalidResult);
+        }
+        selected[index] = true;
+        let (value, observed) = macro_dashboard_observation_value(
+            *descriptor,
+            observation,
+            source_id,
+            &expected_series,
+            &expected_unit,
+            knowledge_cutoff,
+            effective_date_cutoff,
+        )?;
+        if observed {
+            available_series = available_series
+                .checked_add(1)
+                .ok_or(ServiceError::ResourceExhausted)?;
+        } else {
+            missing_series = missing_series
+                .checked_add(1)
+                .ok_or(ServiceError::ResourceExhausted)?;
+        }
+        observations.push(value);
+    }
+    if selected.iter().any(|matched| !matched)
+        || available_series
+            .checked_add(missing_series)
+            .filter(|total| *total == MACRO_DASHBOARD_SERIES_COUNT)
+            .is_none()
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+
+    let pinned = output.output();
+    let object_graph_digest = sha256_digest_hex(pinned.object_graph_digest())?;
+    let query_identity = sha256_digest_hex(pinned.query_identity())?;
+    let result_digest = sha256_digest_hex(pinned.result_digest())?;
+    let selection_digest = sha256_digest_hex(output.selection_digest())?;
+    let manifest = macro_dashboard_manifest_value(pinned.manifest());
+    let content = json!({
+        "schemaIdentity": MACRO_DASHBOARD_SCHEMA_IDENTITY,
+        "binding": {
+            "surfaceId": BOARD_DDP_SURFACE_ID,
+            "sourceId": source_id.as_str(),
+            "providerDatasetId": profile.dataset().as_str(),
+            "analyticalDatasetId": profile.analytical_dataset().as_str(),
+            "manifest": manifest.clone(),
+            "objectGraphDigest": object_graph_digest,
+            "queryIdentity": query_identity,
+            "resultDigest": result_digest,
+        },
+        "release": {
+            "code": profile.contract().release().code(),
+            "title": profile.contract().release().title(),
+            "family": profile.contract().family().as_str(),
+            "frequency": "business_daily",
+            "quality": "official_delayed",
+        },
+        "selection": {
+            "policy": MACRO_DASHBOARD_SELECTION_POLICY,
+            "evaluatedAt": evaluated_at,
+            "selectionDigest": selection_digest,
+            "returnedSeries": MACRO_DASHBOARD_SERIES_COUNT,
+            "availableSeries": available_series,
+            "missingSeries": missing_series,
+            "complete": true,
+        },
+        "observations": observations,
+    });
+    let source_coverage = json!({
+        "sourceId": source_id.as_str(),
+        "manifest": manifest,
+        "objectGraphDigest": content["binding"]["objectGraphDigest"].clone(),
+        "queryIdentity": content["binding"]["queryIdentity"].clone(),
+        "resultDigest": content["binding"]["resultDigest"].clone(),
+        "selectionDigest": content["selection"]["selectionDigest"].clone(),
+    });
+    let data_quality = json!({
+        "classification": "official_delayed",
+        "recordLevelProvenance": true,
+        "observedSeries": available_series,
+        "missingSeries": missing_series,
+        "executionEligible": false,
+        "executionEligibility": "research_only_execution_ineligible",
+    });
+    let metadata = ToolResultMetadata::try_complete(source_coverage, data_quality)
+        .map_err(|_error| ServiceError::InvalidResult)?;
+    TypedToolResult::try_new(content, MACRO_DASHBOARD_SERIES_COUNT, metadata, limits)
+        .map_err(Into::into)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every independent observation invariant must remain explicit"
+)]
+fn macro_dashboard_observation_value(
+    descriptor: BoardH15DashboardSeriesDescriptor,
+    observation: &MacroObservation,
+    source_id: &SourceId,
+    expected_series: &SourceIdentifier,
+    expected_unit: &SourceIdentifier,
+    knowledge_cutoff: Timestamp,
+    effective_date_cutoff: CalendarDate,
+) -> Result<(Value, bool), ServiceError> {
+    let context = observation.context();
+    let provenance = context.provenance();
+    let time = context.time();
+    let effective_date = time
+        .effective()
+        .calendar_date_value()
+        .filter(|date| *date <= effective_date_cutoff)
+        .ok_or(ServiceError::InvalidResult)?;
+    let available_at = provenance
+        .availability()
+        .conservative_available_at()
+        .filter(|available_at| *available_at <= knowledge_cutoff)
+        .ok_or(ServiceError::InvalidResult)?;
+    if observation.series() != expected_series
+        || observation.unit() != expected_unit
+        || provenance.source_id() != source_id
+        || provenance.instrument_id().is_some()
+        || provenance.venue_id().is_some()
+        || provenance.quality() != DataQuality::OfficialDelayed
+        || provenance.received_at() > knowledge_cutoff
+        || provenance.ingested_at() > knowledge_cutoff
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    let payload_digest = match provenance.payload_reference() {
+        PayloadReference::ContentHash(payload)
+            if payload.algorithm() == DigestAlgorithm::Sha256 =>
+        {
+            encode_hex(payload.digest())
+        }
+        PayloadReference::ContentHash(_) | PayloadReference::SourceReference(_) => {
+            return Err(ServiceError::InvalidResult);
+        }
+    };
+    let (value, observed) = match (
+        observation.value().observed_value(),
+        observation.value().missing_value(),
+    ) {
+        (Some(value), None) => (
+            json!({
+                "state": "observed",
+                "decimal": value.normalize().to_string(),
+            }),
+            true,
+        ),
+        (None, Some(missing)) => (
+            json!({
+                "state": "missing",
+                "marker": missing.marker().as_str(),
+                "reason": missing.reason().map(SourceIdentifier::as_str),
+            }),
+            false,
+        ),
+        (Some(_), Some(_)) | (None, None) => return Err(ServiceError::InvalidResult),
+    };
+    Ok((
+        json!({
+            "slot": descriptor.slot(),
+            "label": descriptor.label(),
+            "maturityOrder": descriptor.maturity_order(),
+            "seriesId": observation.series().as_str(),
+            "unitId": observation.unit().as_str(),
+            "unitPresentation": descriptor.unit_presentation(),
+            "effectiveDate": effective_date.to_string(),
+            "availableAt": timestamp_rfc3339(available_at)?,
+            "revision": time.revision().get(),
+            "observation": value,
+            "sourceIdentifier": provenance.source_identifier().as_str(),
+            "sourcePayloadDigest": payload_digest,
+        }),
+        observed,
+    ))
+}
+
+fn timestamp_rfc3339(timestamp: Timestamp) -> Result<String, ServiceError> {
+    let unix_nanos = timestamp.unix_nanos();
+    let seconds = unix_nanos.div_euclid(1_000_000_000);
+    let nanoseconds = u32::try_from(unix_nanos.rem_euclid(1_000_000_000))
+        .map_err(|_error| ServiceError::InvalidResult)?;
+    DateTime::<Utc>::from_timestamp(seconds, nanoseconds)
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::Nanos, true))
+        .ok_or(ServiceError::InvalidResult)
+}
+
+fn sha256_digest_hex(digest: EvidenceDigest) -> Result<String, ServiceError> {
+    if digest.algorithm() != DigestAlgorithm::Sha256 {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(encode_hex(digest.bytes()))
+}
+
+fn macro_dashboard_manifest_value(manifest: &DatasetManifestRef) -> Value {
+    json!({
+        "datasetId": manifest.dataset_id().as_str(),
+        "manifestVersion": manifest.manifest_version().to_string(),
+        "schema": {
+            "name": manifest.schema().name(),
+            "version": manifest.schema_version().get(),
+            "fingerprint": encode_hex(manifest.schema().fingerprint()),
+        },
+        "contentHash": encode_hex(manifest.content_hash().bytes()),
+    })
 }
 
 fn query_limits(
@@ -937,12 +1362,19 @@ fn map_read_error(error: AnalyticalReadError) -> ServiceError {
         | AnalyticalReadError::InvalidMarketBarEffectiveRange
         | AnalyticalReadError::InvalidFundNavLimit
         | AnalyticalReadError::InvalidFundNavDateRange
+        | AnalyticalReadError::InvalidMacroSeriesAllowlist
+        | AnalyticalReadError::MacroSnapshotSourceOwnerMismatch
         | AnalyticalReadError::InvalidOutcomeMarketBarWindow
         | AnalyticalReadError::InvalidObservationSchema => ServiceError::InvalidRequest,
         AnalyticalReadError::MarketBarResultRequiresInline
         | AnalyticalReadError::InvalidMarketBarResult
         | AnalyticalReadError::FundNavResultRequiresInline
-        | AnalyticalReadError::InvalidFundNavResult => ServiceError::InvalidResult,
+        | AnalyticalReadError::InvalidFundNavResult
+        | AnalyticalReadError::MacroSnapshotResultRequiresInline
+        | AnalyticalReadError::MacroSnapshotCandidateSetSaturated
+        | AnalyticalReadError::MacroSnapshotRevisionConflict
+        | AnalyticalReadError::MacroSnapshotIncomplete
+        | AnalyticalReadError::InvalidMacroSnapshotResult => ServiceError::InvalidResult,
         AnalyticalReadError::ForecastDatasetUnavailable => ServiceError::NotFound,
         AnalyticalReadError::Parquet(_) | AnalyticalReadError::PythonDataset(_) => {
             ServiceError::Unavailable

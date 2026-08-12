@@ -100,8 +100,8 @@ const TREASURY_DAILY_RATES_PROFILE: RegisteredProfileSpec = RegisteredProfileSpe
 };
 const FEDERAL_RESERVE_BOARD_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "federal-reserve-board.data-download-program",
-    capability_revision: 3,
-    release_state: ProfileReleaseState::RefreshRequired,
+    capability_revision: 4,
+    release_state: ProfileReleaseState::Available,
 };
 
 const PROVIDER_SPECS: [ProviderDelegationSpec; PROVIDER_COUNT] = [

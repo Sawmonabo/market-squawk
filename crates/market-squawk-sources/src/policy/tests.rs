@@ -45,6 +45,116 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
+    #[derive(Debug, Default)]
+    struct OnePerMinuteRateStore {
+        last_admitted_at: Mutex<Option<Timestamp>>,
+    }
+
+    #[cfg(debug_assertions)]
+    impl ProviderRateStore for OnePerMinuteRateStore {
+        fn start_run(&self, _now: Timestamp) -> Result<ProviderRateRunId, ProviderRateStoreError> {
+            Ok(ProviderRateRunId::from_bytes([1; 16]))
+        }
+
+        fn register(
+            &self,
+            _run_id: ProviderRateRunId,
+            declaration: &ProviderRateDeclaration,
+            _now: Timestamp,
+        ) -> Result<ProviderRateRegistration, ProviderRateStoreError> {
+            Ok(ProviderRateRegistration::new(
+                ProviderRateGroupId::from_bytes([2; 16]),
+                declaration.policy_digest(),
+                declaration.declaration_digest(),
+            ))
+        }
+
+        fn try_acquire(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            now: Timestamp,
+        ) -> Result<ProviderRateDecision, ProviderRateStoreError> {
+            const MINUTE_NANOS: i64 = 60_000_000_000;
+            let mut last_admitted_at = self
+                .last_admitted_at
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Corrupt)?;
+            if let Some(last) = *last_admitted_at {
+                let deadline = last
+                    .unix_nanos()
+                    .checked_add(MINUTE_NANOS)
+                    .map(Timestamp::from_unix_nanos)
+                    .ok_or(ProviderRateStoreError::Clock)?;
+                if now < deadline {
+                    return Ok(ProviderRateDecision::WaitUntil(deadline));
+                }
+            }
+            *last_admitted_at = Some(now);
+            Ok(ProviderRateDecision::Ready(
+                ProviderRatePermitId::from_bytes([3; 16]),
+            ))
+        }
+
+        fn release(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _permit_id: ProviderRatePermitId,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn apply_retry_after(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+            _retry_after: RetryAfter,
+        ) -> Result<ProviderRateDecision, ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn apply_refusal(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+            _jitter_sample_basis_points: u16,
+        ) -> Result<ProviderRateDecision, ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn record_success(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn bind_authorization_subject(
+            &self,
+            _run_id: ProviderRateRunId,
+            _mode: crate::AuthorizationMode,
+            _evidence: market_squawk_domain::EvidenceDigest,
+            _subject: &SourceIdentifier,
+            _now: Timestamp,
+        ) -> Result<(), ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn resolve_authorization_subject(
+            &self,
+            _mode: crate::AuthorizationMode,
+            _evidence: market_squawk_domain::EvidenceDigest,
+        ) -> Result<Option<SourceIdentifier>, ProviderRateStoreError> {
+            Ok(None)
+        }
+    }
+
     #[derive(Debug)]
     struct SwitchableClock {
         observation: Mutex<ClockObservation>,
@@ -403,6 +513,55 @@ mod tests {
         );
         assert!(clock.set(0, 100));
         assert!(matches!(budget.try_acquire(), BudgetDecision::Ready(_)));
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_clock_advances_provider_and_local_windows_together()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MINUTE_NANOS: u64 = 60_000_000_000;
+        let provider = SourceIdentifier::try_from("manual-clock-provider")?;
+        let subject = SourceIdentifier::try_from("manual-clock-subject")?;
+        let policy = ProviderBudgetPolicy::try_new(
+            BudgetScope::with_authorization_account(provider, subject.clone()),
+            NonZeroU32::MIN,
+            NonZeroU64::new(MINUTE_NANOS).ok_or("minute window must be nonzero")?,
+            NonZeroU16::MIN,
+            BackoffPolicy::try_new(
+                NonZeroU64::MIN,
+                NonZeroU64::new(MINUTE_NANOS).ok_or("maximum backoff must be nonzero")?,
+                0,
+            )?,
+        )?;
+        let declaration = ProviderRateDeclaration::try_for_authorization_subject(policy, &subject)?;
+        let authority = ProviderRateAuthority::try_new_with_debug_manual_clock(
+            Arc::new(OnePerMinuteRateStore::default()),
+            Timestamp::from_unix_nanos(1_000_000_000),
+        )?;
+        let doctor = authority.register_budget(declaration.clone())?;
+        let production = authority.register_budget(declaration)?;
+
+        let BudgetDecision::Ready(doctor_permit) = doctor.try_acquire() else {
+            return Err("doctor request was not admitted".into());
+        };
+        doctor_permit.release();
+        let deadline = match production.try_acquire() {
+            BudgetDecision::WaitUntil(deadline) => deadline,
+            _ => return Err("production request bypassed the shared minute window".into()),
+        };
+        assert_eq!(deadline.as_nanos(), MINUTE_NANOS);
+        assert_eq!(
+            production.remaining_wait(deadline),
+            Ok(Duration::from_secs(60))
+        );
+
+        authority.advance_debug_manual_clock(Duration::from_secs(60))?;
+        assert_eq!(production.remaining_wait(deadline), Ok(Duration::ZERO));
+        let BudgetDecision::Ready(production_permit) = production.try_acquire() else {
+            return Err("production request was not admitted at the exact minute boundary".into());
+        };
+        production_permit.release();
         Ok(())
     }
 
