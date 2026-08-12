@@ -37,6 +37,7 @@ const DEVELOPMENT_SERVICE_PROGRAM: &str = "MARKET_SQUAWK_DEVELOPMENT_SERVICE_PRO
 pub(crate) struct DesktopServiceConnection {
     pub(crate) application: LoopbackApplicationClient,
     pub(crate) bootstrap: Value,
+    pub(crate) authority: Arc<DesktopServiceAuthority>,
 }
 
 pub(crate) enum DesktopServiceStartup {
@@ -45,8 +46,7 @@ pub(crate) enum DesktopServiceStartup {
 }
 
 pub(crate) struct DesktopServiceBootstrap {
-    connector: Arc<InstalledServiceConnector>,
-    installation_data_root: PathBuf,
+    authority: Arc<DesktopServiceAuthority>,
     requirement: BootstrapRequirement,
 }
 
@@ -54,6 +54,23 @@ impl DesktopServiceBootstrap {
     pub(crate) const fn requirement(&self) -> BootstrapRequirement {
         self.requirement
     }
+}
+
+/// Native-only authority for reconnecting to or restarting the exact installed service.
+///
+/// The retained launch specification contains only already validated paths. It contains no
+/// credential value and is never constructed from WebView input.
+pub(crate) struct DesktopServiceAuthority {
+    connector: Arc<InstalledServiceConnector>,
+    launch: DesktopServiceLaunch,
+}
+
+struct DesktopServiceLaunch {
+    program: PathBuf,
+    data_dir: PathBuf,
+    config_path: Option<PathBuf>,
+    training_release_root: Option<PathBuf>,
+    installation_data_root: PathBuf,
 }
 
 pub(crate) enum DesktopBootstrapAction {
@@ -94,38 +111,57 @@ pub(crate) async fn connect_or_start(
         InstalledServiceConnector::try_new_at_installation_root(config, &installation_data_root)
             .map_err(|_error| DesktopServiceError::Discovery)?,
     );
-    match connect(&connector).await {
+    let authority = Arc::new(DesktopServiceAuthority {
+        connector,
+        launch: DesktopServiceLaunch {
+            program: selected_service_program()?,
+            data_dir: config.data_dir().to_path_buf(),
+            config_path: config_path.map(Path::to_path_buf),
+            training_release_root: config.training_release_root().map(Path::to_path_buf),
+            installation_data_root,
+        },
+    });
+    reconnect_or_start(&authority).await
+}
+
+pub(crate) async fn reconnect_or_start(
+    authority: &Arc<DesktopServiceAuthority>,
+) -> Result<DesktopServiceStartup, DesktopServiceError> {
+    match connect(authority).await {
         Ok(connection) => return Ok(DesktopServiceStartup::Ready(Box::new(connection))),
         Err(ConnectionAttempt::NotRunning) => {}
         Err(ConnectionAttempt::InvalidBootstrap) => {
             return Err(DesktopServiceError::InvalidBootstrap);
         }
     }
-    if let Some(bootstrap) = bootstrap_required(&connector, &installation_data_root).await? {
+    if let Some(bootstrap) = bootstrap_required(authority).await? {
         return Ok(DesktopServiceStartup::BootstrapRequired(bootstrap));
     }
 
     let program = selected_service_program()?;
+    if program != authority.launch.program {
+        return Err(DesktopServiceError::InvalidBootstrap);
+    }
     let mut command = Command::new(program);
     command
         .env_remove("MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM")
         .env_remove("MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY_PROGRAM")
         .arg("--data-dir")
-        .arg(config.data_dir())
+        .arg(&authority.launch.data_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(path) = config_path {
+    if let Some(path) = &authority.launch.config_path {
         command.arg("--config").arg(path);
     }
-    if let Some(path) = config.training_release_root() {
+    if let Some(path) = &authority.launch.training_release_root {
         command.arg("--training-release-root").arg(path);
     }
     command
         .arg("--installation-data-root")
-        .arg(&installation_data_root);
+        .arg(&authority.launch.installation_data_root);
     let mut child = command.spawn().map_err(DesktopServiceError::Launch)?;
-    wait_for_started_service(&connector, &installation_data_root, &mut child).await
+    wait_for_started_service(authority, &mut child).await
 }
 
 fn selected_service_program() -> Result<PathBuf, DesktopServiceError> {
@@ -138,8 +174,7 @@ fn selected_service_program() -> Result<PathBuf, DesktopServiceError> {
 }
 
 async fn wait_for_started_service(
-    connector: &Arc<InstalledServiceConnector>,
-    installation_data_root: &Path,
+    authority: &Arc<DesktopServiceAuthority>,
     child: &mut Child,
 ) -> Result<DesktopServiceStartup, DesktopServiceError> {
     let deadline = Instant::now()
@@ -152,20 +187,18 @@ async fn wait_for_started_service(
             .map_err(DesktopServiceError::ProcessState)?
             .is_some()
         {
-            return connect_after_competing_start(connector, installation_data_root).await;
+            return connect_after_competing_start(authority).await;
         }
-        let startup = read_service_startup_evidence(installation_data_root)
+        let startup = read_service_startup_evidence(&authority.launch.installation_data_root)
             .map(|evidence| evidence.map(|evidence| evidence.state()));
         match startup {
             Ok(Some(ServiceStartupState::Starting { .. })) => {
                 observed_fresh_start = true;
-                if let Some(bootstrap) =
-                    bootstrap_required(connector, installation_data_root).await?
-                {
+                if let Some(bootstrap) = bootstrap_required(authority).await? {
                     return Ok(DesktopServiceStartup::BootstrapRequired(bootstrap));
                 }
             }
-            Ok(Some(ServiceStartupState::Ready)) => match connect(connector).await {
+            Ok(Some(ServiceStartupState::Ready)) => match connect(authority).await {
                 Ok(connection) => {
                     return Ok(DesktopServiceStartup::Ready(Box::new(connection)));
                 }
@@ -196,13 +229,12 @@ async fn wait_for_started_service(
 }
 
 async fn connect_after_competing_start(
-    connector: &Arc<InstalledServiceConnector>,
-    installation_data_root: &Path,
+    authority: &Arc<DesktopServiceAuthority>,
 ) -> Result<DesktopServiceStartup, DesktopServiceError> {
-    if let Ok(connection) = connect(connector).await {
+    if let Ok(connection) = connect(authority).await {
         return Ok(DesktopServiceStartup::Ready(Box::new(connection)));
     }
-    if let Some(bootstrap) = bootstrap_required(connector, installation_data_root).await? {
+    if let Some(bootstrap) = bootstrap_required(authority).await? {
         return Ok(DesktopServiceStartup::BootstrapRequired(bootstrap));
     }
     Err(DesktopServiceError::StartupExited)
@@ -215,10 +247,11 @@ pub(crate) async fn complete_bootstrap(
     let action = admit_bootstrap_action(bootstrap.requirement, action)?;
     let status = match action {
         DesktopBootstrapAction::Unlock(unlock) => {
-            bootstrap.connector.bootstrap_unlock(unlock).await
+            bootstrap.authority.connector.bootstrap_unlock(unlock).await
         }
         DesktopBootstrapAction::RetryAfterForegroundKeyring => {
             bootstrap
+                .authority
                 .connector
                 .bootstrap_retry_after_foreground_keyring()
                 .await
@@ -229,12 +262,7 @@ pub(crate) async fn complete_bootstrap(
     {
         return Err(DesktopServiceError::InvalidBootstrap);
     }
-    connect_until_ready(
-        &bootstrap.connector,
-        &bootstrap.installation_data_root,
-        FOREGROUND_BOOTSTRAP_TIMEOUT,
-    )
-    .await
+    connect_until_ready(&bootstrap.authority, FOREGROUND_BOOTSTRAP_TIMEOUT).await
 }
 
 fn admit_bootstrap_action(
@@ -258,17 +286,15 @@ fn admit_bootstrap_action(
 }
 
 async fn bootstrap_required(
-    connector: &Arc<InstalledServiceConnector>,
-    installation_data_root: &Path,
+    authority: &Arc<DesktopServiceAuthority>,
 ) -> Result<Option<DesktopServiceBootstrap>, DesktopServiceError> {
-    match connector.bootstrap_status().await {
+    match authority.connector.bootstrap_status().await {
         Ok(status)
             if status.state() == InstalledServiceBootstrapState::Required
                 && status.requirement().is_some() =>
         {
             Ok(Some(DesktopServiceBootstrap {
-                connector: Arc::clone(connector),
-                installation_data_root: installation_data_root.to_path_buf(),
+                authority: Arc::clone(authority),
                 requirement: status
                     .requirement()
                     .ok_or(DesktopServiceError::InvalidBootstrap)?,
@@ -290,16 +316,15 @@ async fn bootstrap_required(
 }
 
 async fn connect_until_ready(
-    connector: &InstalledServiceConnector,
-    installation_data_root: &Path,
+    authority: &Arc<DesktopServiceAuthority>,
     timeout: Duration,
 ) -> Result<DesktopServiceConnection, DesktopServiceError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(DesktopServiceError::StartupDeadline)?;
     loop {
-        let startup =
-            read_service_startup_evidence(installation_data_root)?.map(|evidence| evidence.state());
+        let startup = read_service_startup_evidence(&authority.launch.installation_data_root)?
+            .map(|evidence| evidence.state());
         match startup {
             Some(ServiceStartupState::Starting { .. }) => {}
             Some(ServiceStartupState::Failed { phase }) => {
@@ -308,7 +333,7 @@ async fn connect_until_ready(
             Some(ServiceStartupState::Stopped) => {
                 return Err(DesktopServiceError::StartupExited);
             }
-            Some(ServiceStartupState::Ready) | None => match connect(connector).await {
+            Some(ServiceStartupState::Ready) | None => match connect(authority).await {
                 Ok(connection) => return Ok(connection),
                 Err(ConnectionAttempt::InvalidBootstrap) => {
                     return Err(DesktopServiceError::InvalidBootstrap);
@@ -324,9 +349,10 @@ async fn connect_until_ready(
 }
 
 async fn connect(
-    connector: &InstalledServiceConnector,
+    authority: &Arc<DesktopServiceAuthority>,
 ) -> Result<DesktopServiceConnection, ConnectionAttempt> {
-    let application = connector
+    let application = authority
+        .connector
         .connect_with_timeout(
             NamedClient::Desktop,
             Some(DESKTOP_ORIGIN.to_owned()),
@@ -340,6 +366,7 @@ async fn connect(
     Ok(DesktopServiceConnection {
         application,
         bootstrap,
+        authority: Arc::clone(authority),
     })
 }
 

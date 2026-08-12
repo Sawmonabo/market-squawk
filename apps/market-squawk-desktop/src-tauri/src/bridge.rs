@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::{Duration, Instant},
 };
 
@@ -27,14 +27,15 @@ use uuid::Uuid;
 use crate::analytical_controller::DesktopAnalyticalController;
 use crate::contracts::{
     ApplicationInvocation, DesktopBootstrap, DesktopCommandError, DesktopServiceBootstrapCommand,
-    DesktopServiceBootstrapRequirement, DesktopServiceBootstrapStatus, DesktopStartup,
-    InstallationControlCommand, OperationSummary, ProviderOnboardingCommand, Readiness,
-    ReadinessState,
+    DesktopServiceBootstrapRequirement, DesktopServiceBootstrapStatus, DesktopServiceReconnect,
+    DesktopStartup, InstallationControlCommand, OperationSummary, ProviderOnboardingCommand,
+    Readiness, ReadinessState,
 };
-use crate::mcp_clients::DesktopMcpClientState;
+use crate::events::DesktopEventSubscriptions;
+use crate::mcp_clients::{DesktopMcpClientState, DesktopMcpRuntimeBinding};
 use crate::service::{
-    self, DesktopBootstrapAction, DesktopServiceBootstrap, DesktopServiceConnection,
-    DesktopServiceStartup,
+    self, DesktopBootstrapAction, DesktopServiceAuthority, DesktopServiceBootstrap,
+    DesktopServiceConnection, DesktopServiceStartup,
 };
 
 const MAXIMUM_APPLICATION_ARGUMENT_BYTES: usize = 256 * 1024;
@@ -48,6 +49,7 @@ const MAXIMUM_GOVERNANCE_AUTHORIZATIONS: usize = 256;
 const SOURCE_SETUP_OPERATION: &str = "Source.Setup";
 const SOURCE_STATUS_OPERATION: &str = "Source.GetStatus";
 
+#[derive(Clone)]
 pub(crate) struct DesktopCompositionContext {
     configured_data_root: PathBuf,
     service_data_root: PathBuf,
@@ -74,13 +76,20 @@ impl DesktopCompositionContext {
     }
 }
 
-struct PendingDesktopBootstrap {
-    service: DesktopServiceBootstrap,
-    context: DesktopCompositionContext,
+enum PendingDesktopBootstrap {
+    Initial {
+        service: DesktopServiceBootstrap,
+        context: DesktopCompositionContext,
+    },
+    Reconnect {
+        service: DesktopServiceBootstrap,
+        expected_runtime: RuntimeIdentity,
+    },
 }
 
 pub(crate) struct DesktopBootstrapState {
     pending: tokio::sync::Mutex<Option<PendingDesktopBootstrap>>,
+    reconnect_gate: tokio::sync::Mutex<()>,
 }
 
 impl DesktopBootstrapState {
@@ -95,28 +104,43 @@ impl DesktopBootstrapState {
                 None
             }
             DesktopServiceStartup::BootstrapRequired(service) => {
-                Some(PendingDesktopBootstrap { service, context })
+                Some(PendingDesktopBootstrap::Initial { service, context })
             }
         };
         Ok(Self {
             pending: tokio::sync::Mutex::new(pending),
+            reconnect_gate: tokio::sync::Mutex::new(()),
         })
     }
 
     async fn status(&self) -> Result<DesktopServiceBootstrapStatus, DesktopCommandError> {
         let pending = self.pending.lock().await;
         let pending = pending.as_ref().ok_or_else(DesktopCommandError::internal)?;
-        Ok(DesktopServiceBootstrapStatus::required(
-            match pending.service.requirement() {
-                BootstrapRequirement::EncryptedFallbackLocked => {
-                    DesktopServiceBootstrapRequirement::EncryptedFallbackLocked
-                }
-                BootstrapRequirement::ForegroundKeyringRetry => {
-                    DesktopServiceBootstrapRequirement::ForegroundKeyringRetry
-                }
-            },
-        ))
+        Ok(pending_bootstrap_status(pending))
     }
+
+    async fn pending_status(&self) -> Option<DesktopServiceBootstrapStatus> {
+        self.pending
+            .lock()
+            .await
+            .as_ref()
+            .map(pending_bootstrap_status)
+    }
+}
+
+fn pending_bootstrap_status(pending: &PendingDesktopBootstrap) -> DesktopServiceBootstrapStatus {
+    let service = match pending {
+        PendingDesktopBootstrap::Initial { service, .. }
+        | PendingDesktopBootstrap::Reconnect { service, .. } => service,
+    };
+    DesktopServiceBootstrapStatus::required(match service.requirement() {
+        BootstrapRequirement::EncryptedFallbackLocked => {
+            DesktopServiceBootstrapRequirement::EncryptedFallbackLocked
+        }
+        BootstrapRequirement::ForegroundKeyringRetry => {
+            DesktopServiceBootstrapRequirement::ForegroundKeyringRetry
+        }
+    })
 }
 
 fn manage_ready_desktop(
@@ -124,39 +148,11 @@ fn manage_ready_desktop(
     connection: DesktopServiceConnection,
     context: &DesktopCompositionContext,
 ) -> Result<(), DesktopCommandError> {
-    if app.try_state::<DesktopState>().is_some()
-        || app.try_state::<DesktopMcpClientState>().is_some()
-        || app.try_state::<DesktopAnalyticalController>().is_some()
-    {
+    if app.try_state::<DesktopState>().is_some() {
         return Err(DesktopCommandError::internal());
     }
-    let state = DesktopState::try_new(
-        connection.application,
-        connection.bootstrap,
-        &context.configured_data_root,
-        &context.service_data_root,
-        context.installation_root.clone(),
-        context.installation_status.clone(),
-    )?;
-    let local_paths = LocalPaths::open_existing(state.data_root())
-        .map_err(|_error| DesktopCommandError::internal())?;
-    let analytical_controller = DesktopAnalyticalController::try_open(
-        &local_paths,
-        state.runtime().workspace_id().as_uuid(),
-    )?;
-    let (endpoint_identity, claude_credential_identity, codex_credential_identity) =
-        state.mcp_authority_identities();
-    let mcp_clients = DesktopMcpClientState::try_new(
-        &local_paths,
-        context.relay_program.clone(),
-        &context.service_data_root,
-        state.runtime(),
-        endpoint_identity,
-        claude_credential_identity,
-        codex_credential_identity,
-    )
-    .map_err(|_error| DesktopCommandError::internal())?;
-    if !app.manage(state) || !app.manage(mcp_clients) || !app.manage(analytical_controller) {
+    let state = DesktopState::try_new(connection, context.clone())?;
+    if !app.manage(state) {
         return Err(DesktopCommandError::internal());
     }
     Ok(())
@@ -345,14 +341,28 @@ fn required_string<'a>(value: &'a Value, pointer: &str) -> Result<&'a str, Deskt
 }
 
 pub(crate) struct DesktopState {
+    current: RwLock<Arc<DesktopGeneration>>,
+    webview_admitted_runtime: RwLock<RuntimeIdentity>,
+    service: Arc<DesktopServiceAuthority>,
+    context: DesktopCompositionContext,
+    restart_program: OnceLock<PathBuf>,
+}
+
+pub(crate) struct DesktopGeneration {
     application: Arc<LoopbackApplicationClient>,
     service_bootstrap: ServiceBootstrapSnapshot,
     data_root: PathBuf,
-    installation_root: PathBuf,
-    installation_status: InstallStatus,
     cancellation: CancellationToken,
-    restart_program: OnceLock<PathBuf>,
     governance_authorizations: Mutex<HashMap<Uuid, NativeGovernanceAuthorization>>,
+    mcp_clients: Arc<DesktopMcpClientState>,
+    analytical_controller: Arc<DesktopAnalyticalController>,
+    analytical_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct PreparedDesktopReplacement {
+    generation: Arc<DesktopGeneration>,
+    mcp_binding: DesktopMcpRuntimeBinding,
+    bootstrap: DesktopBootstrap,
 }
 
 struct NativeGovernanceAuthorization {
@@ -364,37 +374,132 @@ struct NativeGovernanceAuthorization {
 
 impl DesktopState {
     pub(crate) fn try_new(
-        application: LoopbackApplicationClient,
-        service_bootstrap: Value,
-        configured_data_root: &Path,
-        service_data_root: &Path,
-        installation_root: PathBuf,
-        installation_status: InstallStatus,
+        connection: DesktopServiceConnection,
+        context: DesktopCompositionContext,
     ) -> Result<Self, DesktopCommandError> {
-        let service_bootstrap = ServiceBootstrapSnapshot::try_from(service_bootstrap)?;
-        let data_root = resolve_workspace_data_root(
-            &service_bootstrap,
-            configured_data_root,
-            service_data_root,
-        )?;
+        let service = Arc::clone(&connection.authority);
+        let generation = DesktopGeneration::try_new(connection, &context)?;
+        let runtime = generation.runtime();
         Ok(Self {
-            application: Arc::new(application),
-            service_bootstrap,
-            data_root,
-            installation_root,
-            installation_status,
-            cancellation: CancellationToken::new(),
+            current: RwLock::new(Arc::new(generation)),
+            webview_admitted_runtime: RwLock::new(runtime),
+            service,
+            context,
             restart_program: OnceLock::new(),
-            governance_authorizations: Mutex::new(HashMap::new()),
         })
     }
 
-    fn data_root(&self) -> &Path {
-        &self.data_root
+    pub(crate) fn generation(&self) -> Result<Arc<DesktopGeneration>, DesktopCommandError> {
+        let generation = self.current_generation()?;
+        let admitted = self
+            .webview_admitted_runtime
+            .read()
+            .map_err(|_error| DesktopCommandError::internal())?;
+        admit_webview_runtime(*admitted, generation.runtime())?;
+        Ok(generation)
+    }
+
+    pub(crate) fn current_generation(&self) -> Result<Arc<DesktopGeneration>, DesktopCommandError> {
+        self.current
+            .read()
+            .map(|generation| Arc::clone(&generation))
+            .map_err(|_error| DesktopCommandError::internal())
+    }
+
+    pub(crate) fn admit_current(
+        &self,
+        generation: &Arc<DesktopGeneration>,
+    ) -> Result<(), DesktopCommandError> {
+        let current = self
+            .current
+            .read()
+            .map_err(|_error| DesktopCommandError::internal())?;
+        if Arc::ptr_eq(&current, generation) {
+            Ok(())
+        } else {
+            Err(service_generation_changed())
+        }
+    }
+
+    async fn prepare_replacement(
+        &self,
+        current: &Arc<DesktopGeneration>,
+        expected: RuntimeIdentity,
+        connection: DesktopServiceConnection,
+    ) -> Result<PreparedDesktopReplacement, DesktopCommandError> {
+        if !Arc::ptr_eq(&self.service, &connection.authority) {
+            return Err(DesktopCommandError::internal());
+        }
+        let replacement =
+            DesktopGeneration::try_replacement(connection, &self.context, current, expected)?;
+        let mcp_binding = DesktopMcpClientState::prepare_runtime_binding(
+            replacement.runtime(),
+            replacement.service_bootstrap.mcp_endpoint_identity.clone(),
+            replacement
+                .service_bootstrap
+                .claude_code_credential_identity
+                .clone(),
+            replacement
+                .service_bootstrap
+                .codex_credential_identity
+                .clone(),
+        )
+        .map_err(|_error| DesktopCommandError::internal())?;
+        let generation = Arc::new(replacement);
+        let bootstrap = generation
+            .prepare_bootstrap(&self.context.installation_status)
+            .await?;
+        self.admit_current(current)?;
+        Ok(PreparedDesktopReplacement {
+            generation,
+            mcp_binding,
+            bootstrap,
+        })
+    }
+
+    fn replace_generation(
+        &self,
+        expected: RuntimeIdentity,
+        replacement: Arc<DesktopGeneration>,
+    ) -> Result<Arc<DesktopGeneration>, DesktopCommandError> {
+        let mut current = self
+            .current
+            .write()
+            .map_err(|_error| DesktopCommandError::internal())?;
+        admit_replacement(
+            current.runtime(),
+            &current.data_root,
+            expected,
+            replacement.runtime(),
+            &replacement.data_root,
+        )?;
+        Ok(std::mem::replace(&mut current, replacement))
+    }
+
+    pub(crate) fn acknowledge_webview_runtime(
+        &self,
+        generation: &Arc<DesktopGeneration>,
+        runtime: RuntimeIdentity,
+    ) -> Result<(), DesktopCommandError> {
+        self.admit_current(generation)?;
+        if generation.runtime() != runtime {
+            return Err(service_generation_changed());
+        }
+        let mut admitted = self
+            .webview_admitted_runtime
+            .write()
+            .map_err(|_error| DesktopCommandError::internal())?;
+        self.admit_current(generation)?;
+        *admitted = runtime;
+        Ok(())
+    }
+
+    pub(crate) fn service_authority(&self) -> Arc<DesktopServiceAuthority> {
+        Arc::clone(&self.service)
     }
 
     fn schedule_restart(&self, program: PathBuf) -> Result<(), DesktopCommandError> {
-        self.restart_program.set(program).map_err(|_| {
+        self.restart_program.set(program).map_err(|_error| {
             DesktopCommandError::new(
                 "installation_restart_pending",
                 "Market Squawk is already restarting into the selected release.",
@@ -404,6 +509,132 @@ impl DesktopState {
 
     pub(crate) fn scheduled_restart_program(&self) -> Option<PathBuf> {
         self.restart_program.get().cloned()
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        if let Ok(generation) = self.current_generation() {
+            generation.begin_shutdown();
+        }
+    }
+
+    pub(crate) async fn finish_shutdown(&self) {
+        self.begin_shutdown();
+    }
+}
+
+fn admit_replacement(
+    current: RuntimeIdentity,
+    current_data_root: &Path,
+    expected: RuntimeIdentity,
+    replacement: RuntimeIdentity,
+    replacement_data_root: &Path,
+) -> Result<(), DesktopCommandError> {
+    if current != expected
+        || replacement.installation_id() != current.installation_id()
+        || replacement.service_generation() <= current.service_generation()
+    {
+        Err(DesktopCommandError::new(
+            "service_reconnect_rejected",
+            "The installed service reconnect did not prove a newer runtime for this installation.",
+        ))
+    } else if replacement.workspace_id() != current.workspace_id()
+        || replacement_data_root != current_data_root
+    {
+        Err(DesktopCommandError::new(
+            "service_relaunch_required",
+            "The installed service opened a different workspace. Relaunch Market Squawk to admit that workspace explicitly.",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn service_generation_changed() -> DesktopCommandError {
+    DesktopCommandError::new(
+        "service_generation_changed",
+        "The installed service changed while this request was running. Review the refreshed workspace before retrying.",
+    )
+}
+
+fn admit_webview_runtime(
+    admitted: RuntimeIdentity,
+    current: RuntimeIdentity,
+) -> Result<(), DesktopCommandError> {
+    if admitted == current {
+        Ok(())
+    } else {
+        Err(service_generation_changed())
+    }
+}
+
+impl DesktopGeneration {
+    fn try_new(
+        connection: DesktopServiceConnection,
+        context: &DesktopCompositionContext,
+    ) -> Result<Self, DesktopCommandError> {
+        let service_bootstrap = ServiceBootstrapSnapshot::try_from(connection.bootstrap)?;
+        let data_root = resolve_workspace_data_root(
+            &service_bootstrap,
+            &context.configured_data_root,
+            &context.service_data_root,
+        )?;
+        let local_paths = LocalPaths::open_existing(&data_root)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        let analytical_controller = DesktopAnalyticalController::try_open(
+            &local_paths,
+            service_bootstrap.runtime.workspace_id().as_uuid(),
+        )?;
+        let mcp_clients = DesktopMcpClientState::try_new(
+            &local_paths,
+            context.relay_program.clone(),
+            &context.service_data_root,
+            service_bootstrap.runtime,
+            service_bootstrap.mcp_endpoint_identity.clone(),
+            service_bootstrap.claude_code_credential_identity.clone(),
+            service_bootstrap.codex_credential_identity.clone(),
+        )
+        .map_err(|_error| DesktopCommandError::internal())?;
+        Ok(Self {
+            application: Arc::new(connection.application),
+            service_bootstrap,
+            data_root,
+            cancellation: CancellationToken::new(),
+            governance_authorizations: Mutex::new(HashMap::new()),
+            mcp_clients: Arc::new(mcp_clients),
+            analytical_controller: Arc::new(analytical_controller),
+            analytical_gate: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    fn try_replacement(
+        connection: DesktopServiceConnection,
+        context: &DesktopCompositionContext,
+        current: &Arc<Self>,
+        expected: RuntimeIdentity,
+    ) -> Result<Self, DesktopCommandError> {
+        let service_bootstrap = ServiceBootstrapSnapshot::try_from(connection.bootstrap)?;
+        let data_root = resolve_workspace_data_root(
+            &service_bootstrap,
+            &context.configured_data_root,
+            &context.service_data_root,
+        )?;
+        admit_replacement(
+            current.runtime(),
+            &current.data_root,
+            expected,
+            service_bootstrap.runtime,
+            &data_root,
+        )?;
+        Ok(Self {
+            application: Arc::new(connection.application),
+            service_bootstrap,
+            data_root,
+            cancellation: CancellationToken::new(),
+            governance_authorizations: Mutex::new(HashMap::new()),
+            mcp_clients: Arc::clone(&current.mcp_clients),
+            analytical_controller: Arc::clone(&current.analytical_controller),
+            analytical_gate: Arc::clone(&current.analytical_gate),
+        })
     }
 
     pub(crate) fn application(&self) -> Arc<LoopbackApplicationClient> {
@@ -431,16 +662,39 @@ impl DesktopState {
         self.service_bootstrap.mcp_ready
     }
 
-    pub(crate) fn mcp_authority_identities(&self) -> (&str, &str, &str) {
-        (
-            &self.service_bootstrap.mcp_endpoint_identity,
-            &self.service_bootstrap.claude_code_credential_identity,
-            &self.service_bootstrap.codex_credential_identity,
-        )
+    pub(crate) fn mcp_clients(&self) -> &DesktopMcpClientState {
+        self.mcp_clients.as_ref()
     }
 
-    async fn bootstrap(&self) -> Result<DesktopBootstrap, DesktopCommandError> {
-        let sessions = self.provider_sessions().await?;
+    pub(crate) fn analytical_controller(&self) -> &DesktopAnalyticalController {
+        self.analytical_controller.as_ref()
+    }
+
+    pub(crate) async fn analytical_retirement_fence(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.analytical_gate).lock_owned().await
+    }
+
+    async fn bootstrap(
+        self: &Arc<Self>,
+        state: &DesktopState,
+    ) -> Result<DesktopBootstrap, DesktopCommandError> {
+        let sessions = self.provider_sessions(state).await?;
+        Ok(self.present_bootstrap(&state.context.installation_status, sessions))
+    }
+
+    async fn prepare_bootstrap(
+        self: &Arc<Self>,
+        installation_status: &InstallStatus,
+    ) -> Result<DesktopBootstrap, DesktopCommandError> {
+        let sessions = self.provider_sessions_without_current().await?;
+        Ok(self.present_bootstrap(installation_status, sessions))
+    }
+
+    fn present_bootstrap(
+        &self,
+        installation_status: &InstallStatus,
+        sessions: Vec<Value>,
+    ) -> DesktopBootstrap {
         let capabilities = &self.service_bootstrap.operations;
         let operations = capabilities
             .iter()
@@ -474,14 +728,14 @@ impl DesktopState {
                 "The installed service did not report the complete local MCP contract as ready.",
             )
         };
-        let installation = &self.installation_status;
-        let installation = if installation.is_installed() && installation.is_healthy() {
+        let installation = if installation_status.is_installed() && installation_status.is_healthy()
+        {
             Readiness::new(
                 ReadinessState::Ready,
                 "Verified",
                 "The complete installed release and every retained component passed verification.",
             )
-        } else if installation.is_installed() {
+        } else if installation_status.is_installed() {
             Readiness::new(
                 ReadinessState::Unverified,
                 "Repair required",
@@ -494,7 +748,7 @@ impl DesktopState {
                 "No complete versioned Market Squawk release is active for this user.",
             )
         };
-        Ok(DesktopBootstrap::new(
+        DesktopBootstrap::new(
             env!("CARGO_PKG_VERSION"),
             if cfg!(debug_assertions) {
                 "development"
@@ -515,19 +769,41 @@ impl DesktopState {
             self.service_bootstrap.provider_profiles.clone(),
             Value::Array(sessions),
             operations,
-        ))
+        )
     }
 
-    async fn provider_sessions(&self) -> Result<Vec<Value>, DesktopCommandError> {
+    async fn provider_sessions(
+        self: &Arc<Self>,
+        state: &DesktopState,
+    ) -> Result<Vec<Value>, DesktopCommandError> {
         let result = invoke_application(
             ApplicationInvocation {
                 operation: SOURCE_STATUS_OPERATION.to_owned(),
                 arguments: Map::new(),
             },
+            state,
             self,
             InvocationAuthority::ReadOnly,
         )
         .await?;
+        Self::parse_provider_sessions(result)
+    }
+
+    async fn provider_sessions_without_current(
+        self: &Arc<Self>,
+    ) -> Result<Vec<Value>, DesktopCommandError> {
+        let result = invoke_generation_operation(
+            self,
+            SOURCE_STATUS_OPERATION,
+            Map::new(),
+            InvocationAuthority::ReadOnly,
+            true,
+        )
+        .await?;
+        Self::parse_provider_sessions(result)
+    }
+
+    fn parse_provider_sessions(result: Value) -> Result<Vec<Value>, DesktopCommandError> {
         let rows = match result.get("data") {
             Some(Value::Array(rows)) => rows,
             Some(Value::Null) => return Ok(Vec::new()),
@@ -662,10 +938,6 @@ impl DesktopState {
             authorizations.clear();
         }
     }
-
-    pub(crate) async fn finish_shutdown(&self) {
-        self.begin_shutdown();
-    }
 }
 
 fn resolve_workspace_data_root(
@@ -713,12 +985,15 @@ pub(crate) async fn desktop_bootstrap(
     app: tauri::AppHandle,
     bootstrap_state: State<'_, DesktopBootstrapState>,
 ) -> Result<DesktopStartup, DesktopCommandError> {
+    let _reconnect_guard = bootstrap_state.reconnect_gate.lock().await;
+    if let Some(status) = bootstrap_state.pending_status().await {
+        return Ok(DesktopStartup::BootstrapRequired(status));
+    }
     if let Some(state) = app.try_state::<DesktopState>() {
-        return state
-            .bootstrap()
-            .await
-            .map(Box::new)
-            .map(DesktopStartup::Ready);
+        let generation = state.current_generation()?;
+        let bootstrap = generation.bootstrap(&state).await?;
+        state.admit_current(&generation)?;
+        return Ok(DesktopStartup::Ready(Box::new(bootstrap)));
     }
     bootstrap_state
         .status()
@@ -732,8 +1007,9 @@ pub(crate) async fn desktop_service_bootstrap(
     window: tauri::Window,
     app: tauri::AppHandle,
     bootstrap_state: State<'_, DesktopBootstrapState>,
+    subscriptions: State<'_, DesktopEventSubscriptions>,
 ) -> Result<(), DesktopCommandError> {
-    if window.label() != "main" || app.try_state::<DesktopState>().is_some() {
+    if window.label() != "main" {
         return Err(DesktopCommandError::new(
             "service_bootstrap_unavailable",
             "The local service bootstrap action is not available for this window.",
@@ -752,6 +1028,7 @@ pub(crate) async fn desktop_service_bootstrap(
             DesktopBootstrapAction::RetryAfterForegroundKeyring
         }
     };
+    let _reconnect_guard = bootstrap_state.reconnect_gate.lock().await;
     let mut pending_guard = bootstrap_state.pending.lock().await;
     let pending = pending_guard.as_ref().ok_or_else(|| {
         DesktopCommandError::new(
@@ -759,7 +1036,11 @@ pub(crate) async fn desktop_service_bootstrap(
             "The local service bootstrap action is no longer available.",
         )
     })?;
-    let connection = service::complete_bootstrap(&pending.service, action)
+    let service = match pending {
+        PendingDesktopBootstrap::Initial { service, .. }
+        | PendingDesktopBootstrap::Reconnect { service, .. } => service,
+    };
+    let connection = service::complete_bootstrap(service, action)
         .await
         .map_err(|_error| {
             DesktopCommandError::new(
@@ -767,9 +1048,140 @@ pub(crate) async fn desktop_service_bootstrap(
                 "The local service could not complete credential bootstrap and reconnect.",
             )
         })?;
-    manage_ready_desktop(&app, connection, &pending.context)?;
-    *pending_guard = None;
+    match pending_guard
+        .as_ref()
+        .ok_or_else(DesktopCommandError::internal)?
+    {
+        PendingDesktopBootstrap::Initial { context, .. } => {
+            if app.try_state::<DesktopState>().is_some() {
+                return Err(DesktopCommandError::new(
+                    "service_bootstrap_unavailable",
+                    "The initial local service bootstrap is no longer current.",
+                ));
+            }
+            manage_ready_desktop(&app, connection, &context)?;
+        }
+        PendingDesktopBootstrap::Reconnect {
+            expected_runtime, ..
+        } => {
+            let state = app.try_state::<DesktopState>().ok_or_else(|| {
+                DesktopCommandError::new(
+                    "service_bootstrap_unavailable",
+                    "The reconnecting desktop service state is no longer available.",
+                )
+            })?;
+            if let Err(error) =
+                commit_reconnected_generation(&state, &subscriptions, *expected_runtime, connection)
+                    .await
+            {
+                // Foreground recovery already produced a connection. The old generation remains
+                // current on every preparation failure, so retaining a consumed bootstrap action
+                // would be misleading; a later reconnect must start fresh.
+                let _cleared = pending_guard.take();
+                return Err(error);
+            }
+        }
+    }
+    let _completed = pending_guard
+        .take()
+        .ok_or_else(DesktopCommandError::internal)?;
     Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_service_reconnect(
+    request: DesktopServiceReconnect,
+    window: tauri::Window,
+    state: State<'_, DesktopState>,
+    bootstrap_state: State<'_, DesktopBootstrapState>,
+    subscriptions: State<'_, DesktopEventSubscriptions>,
+) -> Result<DesktopStartup, DesktopCommandError> {
+    if window.label() != "main" {
+        return Err(DesktopCommandError::new(
+            "service_reconnect_unavailable",
+            "The installed service reconnect is not available for this window.",
+        ));
+    }
+    let _reconnect_guard = bootstrap_state.reconnect_gate.lock().await;
+    if bootstrap_state.pending.lock().await.is_some() {
+        return Err(DesktopCommandError::new(
+            "service_reconnect_pending",
+            "The installed service is already waiting for foreground recovery.",
+        ));
+    }
+    let generation = state.current_generation()?;
+    if generation.runtime() != request.expected_runtime() {
+        return Err(DesktopCommandError::new(
+            "service_reconnect_stale",
+            "The reconnect request belongs to an earlier desktop service generation.",
+        ));
+    }
+    let expected_runtime = generation.runtime();
+    let startup = service::reconnect_or_start(&state.service_authority())
+        .await
+        .map_err(|_error| {
+            DesktopCommandError::new(
+                "service_reconnect_failed",
+                "The installed service could not reconnect or restart within the local deadline.",
+            )
+        })?;
+    match startup {
+        DesktopServiceStartup::Ready(connection) => {
+            let bootstrap = commit_reconnected_generation(
+                &state,
+                &subscriptions,
+                expected_runtime,
+                *connection,
+            )
+            .await?;
+            Ok(DesktopStartup::Ready(Box::new(bootstrap)))
+        }
+        DesktopServiceStartup::BootstrapRequired(service) => {
+            let status = DesktopServiceBootstrapStatus::required(match service.requirement() {
+                BootstrapRequirement::EncryptedFallbackLocked => {
+                    DesktopServiceBootstrapRequirement::EncryptedFallbackLocked
+                }
+                BootstrapRequirement::ForegroundKeyringRetry => {
+                    DesktopServiceBootstrapRequirement::ForegroundKeyringRetry
+                }
+            });
+            *bootstrap_state.pending.lock().await = Some(PendingDesktopBootstrap::Reconnect {
+                service,
+                expected_runtime,
+            });
+            Ok(DesktopStartup::BootstrapRequired(status))
+        }
+    }
+}
+
+async fn commit_reconnected_generation(
+    state: &DesktopState,
+    subscriptions: &DesktopEventSubscriptions,
+    expected_runtime: RuntimeIdentity,
+    connection: DesktopServiceConnection,
+) -> Result<DesktopBootstrap, DesktopCommandError> {
+    let old = state.current_generation()?;
+    let retirement_fence = old.mcp_clients().retirement_fence().await;
+    state.admit_current(&old)?;
+    let analytical_fence = old.analytical_retirement_fence().await;
+    state.admit_current(&old)?;
+    let prepared = state
+        .prepare_replacement(&old, expected_runtime, connection)
+        .await?;
+    let retired = subscriptions
+        .stop_clear_and_replace(|| {
+            old.mcp_clients().commit_runtime_binding_while_fenced(
+                &retirement_fence,
+                prepared.mcp_binding,
+                || state.replace_generation(expected_runtime, Arc::clone(&prepared.generation)),
+            )
+        })
+        .await?;
+    retired.begin_shutdown();
+    drop(retirement_fence);
+    drop(analytical_fence);
+    drop(retired);
+    Ok(prepared.bootstrap)
 }
 
 #[tauri::command]
@@ -779,16 +1191,18 @@ pub(crate) async fn installation_control(
     state: State<'_, DesktopState>,
     app: tauri::AppHandle,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     if request.requires_confirmation() && !confirmed {
         return Err(DesktopCommandError::new(
             "confirmation_required",
             "Confirm the installation change before continuing.",
         ));
     }
-    let root = state.installation_root.clone();
+    let root = state.context.installation_root.clone();
     match request {
         InstallationControlCommand::Status => {
             let current = blocking_installation(move || installation_status(&root)).await?;
+            state.admit_current(&generation)?;
             Ok(json!({
                 "action": "status",
                 "status": current,
@@ -801,6 +1215,7 @@ pub(crate) async fn installation_control(
                 Ok(receipt) => receipt,
                 Err(CommandError::Lifecycle(InstallError::UpdateNotNewer)) => {
                     let current = blocking_installation(move || installation_status(&root)).await?;
+                    state.admit_current(&generation)?;
                     return Ok(json!({
                         "action": "update",
                         "status": current,
@@ -810,7 +1225,8 @@ pub(crate) async fn installation_control(
                 }
                 Err(error) => return Err(map_installation_error(error)),
             };
-            let current = prepare_installation_restart(root, &state).await?;
+            state.admit_current(&generation)?;
+            let current = prepare_installation_restart(root, &state, &generation).await?;
             request_installation_restart(&app);
             Ok(json!({
                 "action": "update",
@@ -823,7 +1239,9 @@ pub(crate) async fn installation_control(
             let operation_root = root.clone();
             let receipt =
                 blocking_installation(move || repair(RepairRequest::new(operation_root))).await?;
+            state.admit_current(&generation)?;
             let current = blocking_installation(move || installation_status(&root)).await?;
+            state.admit_current(&generation)?;
             Ok(json!({
                 "action": "repair",
                 "status": current,
@@ -836,7 +1254,8 @@ pub(crate) async fn installation_control(
             let receipt =
                 blocking_installation(move || rollback(RollbackRequest::new(operation_root)))
                     .await?;
-            let current = prepare_installation_restart(root, &state).await?;
+            state.admit_current(&generation)?;
+            let current = prepare_installation_restart(root, &state, &generation).await?;
             request_installation_restart(&app);
             Ok(json!({
                 "action": "rollback",
@@ -845,7 +1264,11 @@ pub(crate) async fn installation_control(
                 "restartRequired": true,
             }))
         }
-        InstallationControlCommand::Uninstall => uninstall_programs(root, &app).await,
+        InstallationControlCommand::Uninstall => {
+            let result = uninstall_programs(root, &app).await;
+            state.admit_current(&generation)?;
+            result
+        }
     }
 }
 
@@ -898,10 +1321,12 @@ async fn uninstall_programs(
 async fn prepare_installation_restart(
     root: PathBuf,
     state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
 ) -> Result<InstallStatus, DesktopCommandError> {
     let snapshot =
         blocking_installation(move || program_install_snapshot(&root, ProgramName::Desktop))
             .await?;
+    state.admit_current(generation)?;
     let current = snapshot.status().clone();
     let program = snapshot
         .program_path()
@@ -930,6 +1355,7 @@ where
 pub(crate) async fn invoke_application(
     mut request: ApplicationInvocation,
     state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
     authority: InvocationAuthority,
 ) -> Result<Value, DesktopCommandError> {
     if request.operation.is_empty()
@@ -950,6 +1376,7 @@ pub(crate) async fn invoke_application(
     }
     invoke_service_operation(
         state,
+        generation,
         &request.operation,
         request.arguments,
         authority,
@@ -965,6 +1392,7 @@ pub(crate) async fn invoke_private_application(
     operation: &'static str,
     mut arguments: Map<String, Value>,
     state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
     authority: InvocationAuthority,
 ) -> Result<Value, DesktopCommandError> {
     if matches!(
@@ -973,17 +1401,38 @@ pub(crate) async fn invoke_private_application(
     ) {
         arguments.insert("confirm".to_owned(), Value::Bool(true));
     }
-    invoke_service_operation(state, operation, arguments, authority, false).await
+    invoke_service_operation(state, generation, operation, arguments, authority, false).await
 }
 
 async fn invoke_service_operation(
     state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
     operation: &str,
     mut arguments: Map<String, Value>,
     authority: InvocationAuthority,
     apply_desktop_result_limits: bool,
 ) -> Result<Value, DesktopCommandError> {
-    let descriptor = state
+    state.admit_current(generation)?;
+    let result = invoke_generation_operation(
+        generation,
+        operation,
+        arguments,
+        authority,
+        apply_desktop_result_limits,
+    )
+    .await?;
+    state.admit_current(generation)?;
+    Ok(result)
+}
+
+async fn invoke_generation_operation(
+    generation: &Arc<DesktopGeneration>,
+    operation: &str,
+    mut arguments: Map<String, Value>,
+    authority: InvocationAuthority,
+    apply_desktop_result_limits: bool,
+) -> Result<Value, DesktopCommandError> {
+    let descriptor = generation
         .service_bootstrap
         .operations
         .iter()
@@ -1034,14 +1483,14 @@ async fn invoke_service_operation(
     }
     let request_id = RequestId::try_string(format!("desktop-{}", Uuid::new_v4()))
         .map_err(|_error| DesktopCommandError::internal())?;
-    let response = state
+    let response = generation
         .application
         .invoke_operation(
             request_id,
             operation,
             arguments,
             APPLICATION_REQUEST_TIMEOUT,
-            state.cancellation.child_token(),
+            generation.cancellation(),
         )
         .await
         .map_err(map_application_client_error)?;
@@ -1107,6 +1556,7 @@ pub(crate) async fn provider_onboarding(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     if request.requires_confirmation() && !confirmed {
         return Err(DesktopCommandError::new(
             "confirmation_required",
@@ -1114,7 +1564,7 @@ pub(crate) async fn provider_onboarding(
         ));
     }
     match request {
-        ProviderOnboardingCommand::Bootstrap => provider_bootstrap(&state).await,
+        ProviderOnboardingCommand::Bootstrap => provider_bootstrap(&state, &generation).await,
         ProviderOnboardingCommand::Start {
             surface_id,
             organization,
@@ -1153,7 +1603,8 @@ pub(crate) fn open_official_provider_page(
     provider_id: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), DesktopCommandError> {
-    let profiles = state
+    let generation = state.generation()?;
+    let profiles = generation
         .service_bootstrap
         .provider_profiles
         .as_array()
@@ -1175,7 +1626,8 @@ pub(crate) fn open_official_provider_page(
             "open_failed",
             "The official provider page could not be opened in the system browser.",
         )
-    })
+    })?;
+    state.admit_current(&generation)
 }
 
 #[tauri::command]
@@ -1183,7 +1635,8 @@ pub(crate) async fn open_protected_provider_setup(
     provider_id: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), DesktopCommandError> {
-    let supported = state
+    let generation = state.generation()?;
+    let supported = generation
         .service_bootstrap
         .provider_profiles
         .as_array()
@@ -1206,6 +1659,7 @@ pub(crate) async fn open_protected_provider_setup(
             arguments,
         },
         &state,
+        &generation,
         InvocationAuthority::ExactConfirmed(SOURCE_SETUP_OPERATION),
     )
     .await?;
@@ -1230,14 +1684,20 @@ pub(crate) async fn open_protected_provider_setup(
             "open_failed",
             "The protected provider setup could not be opened in the system browser.",
         )
-    })
+    })?;
+    state.admit_current(&generation)
 }
 
-async fn provider_bootstrap(state: &DesktopState) -> Result<Value, DesktopCommandError> {
+async fn provider_bootstrap(
+    state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
+) -> Result<Value, DesktopCommandError> {
+    let sessions = generation.provider_sessions(state).await?;
+    state.admit_current(generation)?;
     Ok(json!({
-        "profiles": state.service_bootstrap.provider_profiles,
-        "sessions": state.provider_sessions().await?,
-        "encryptedFileFallback": state.service_bootstrap.encrypted_file_fallback,
+        "profiles": generation.service_bootstrap.provider_profiles,
+        "sessions": sessions,
+        "encryptedFileFallback": generation.service_bootstrap.encrypted_file_fallback,
     }))
 }
 
@@ -1285,9 +1745,15 @@ pub(crate) fn decode_application_result(response: &Value) -> Result<Value, Deskt
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::path::Path;
 
-    use super::{decode_application_result, lossless_webview_value};
+    use market_squawk_runtime::{InstallationId, RuntimeIdentity, ServiceGeneration, WorkspaceId};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{
+        admit_replacement, admit_webview_runtime, decode_application_result, lossless_webview_value,
+    };
 
     #[test]
     fn native_success_returns_the_application_result_envelope() {
@@ -1332,5 +1798,42 @@ mod tests {
                 "safeCount": 42
             })
         );
+    }
+
+    #[test]
+    fn reconnect_requires_the_existing_workspace_root_and_a_new_webview_handoff()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let current = runtime_identity(1, 2, 7)?;
+        let replacement = runtime_identity(1, 2, 8)?;
+        let other_workspace = runtime_identity(1, 3, 8)?;
+        let root = Path::new("/canonical/workspace");
+
+        assert!(admit_replacement(current, root, current, replacement, root).is_ok());
+        assert!(admit_replacement(current, root, current, other_workspace, root).is_err());
+        assert!(
+            admit_replacement(
+                current,
+                root,
+                current,
+                replacement,
+                Path::new("/other/workspace"),
+            )
+            .is_err()
+        );
+        assert!(admit_webview_runtime(current, replacement).is_err());
+        assert!(admit_webview_runtime(replacement, replacement).is_ok());
+        Ok(())
+    }
+
+    fn runtime_identity(
+        installation: u128,
+        workspace: u128,
+        generation: u64,
+    ) -> Result<RuntimeIdentity, Box<dyn std::error::Error>> {
+        Ok(RuntimeIdentity::try_new(
+            InstallationId::try_from_uuid(Uuid::from_u128(installation))?,
+            WorkspaceId::try_from_uuid(Uuid::from_u128(workspace))?,
+            ServiceGeneration::try_new(generation)?,
+        )?)
     }
 }

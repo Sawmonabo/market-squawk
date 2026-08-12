@@ -26,6 +26,7 @@ import {
 export function AppSidebar() {
   const location = useLocation()
   const product = useProduct()
+  const navigationDisabled = product.status === "loading"
   const localStatus =
     product.status === "ready" ? product.bootstrap.storage.label : product.status
   const localStatusColor =
@@ -40,57 +41,55 @@ export function AppSidebar() {
       <SidebarHeader className="px-3 pt-4 pb-3">
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton
-              asChild
-              size="lg"
-              tooltip="Market Squawk workspace"
-              className="h-11 justify-center px-1 py-2 group-data-[collapsible=icon]:justify-center"
-            >
-              <Link to="/home" aria-label="Market Squawk workspace">
-                <span className="flex min-w-0 items-center leading-none">
-                  <span className="text-[18px] font-bold tracking-[-0.045em] text-white group-data-[collapsible=icon]:hidden">
-                    Market
-                  </span>
-                  <img
-                    src={marketSquawkMarkUrl}
-                    alt=""
-                    aria-hidden="true"
-                    className="ml-0.5 h-[21px] w-auto shrink-0 group-data-[collapsible=icon]:ml-0 group-data-[collapsible=icon]:h-7"
-                  />
-                  <span
-                    className="text-[18px] font-bold tracking-[-0.045em] text-primary group-data-[collapsible=icon]:hidden"
-                    style={{ marginLeft: "-1px" }}
-                  >
-                    quawk
-                  </span>
-                </span>
-              </Link>
-            </SidebarMenuButton>
+            {navigationDisabled ? (
+              <div
+                aria-label="Market Squawk workspace"
+                className="flex h-11 items-center justify-center px-1 py-2"
+              >
+                <Brand />
+              </div>
+            ) : (
+              <SidebarMenuButton
+                asChild
+                size="lg"
+                tooltip="Market Squawk workspace"
+                className="h-11 justify-center px-1 py-2 group-data-[collapsible=icon]:justify-center"
+              >
+                <Link to="/home" aria-label="Market Squawk workspace">
+                  <Brand />
+                </Link>
+              </SidebarMenuButton>
+            )}
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
 
       <SidebarContent>
-        <nav aria-label="Market Squawk">
-          {navigationSections.map((section, index) => (
-            <Fragment key={section.label}>
-              {index > 0 ? <SidebarSeparator /> : null}
-              <SidebarGroup>
-                <SidebarGroupLabel>{section.label}</SidebarGroupLabel>
-                <SidebarGroupContent>
-                  <SidebarMenu>
-                    {section.items.map((item) => (
-                      <ProductNavigationItem
-                        key={item.path}
-                        item={item}
-                        active={location.pathname === item.path}
-                      />
-                    ))}
-                  </SidebarMenu>
-                </SidebarGroupContent>
-              </SidebarGroup>
-            </Fragment>
-          ))}
+        <nav
+          aria-label="Market Squawk"
+          aria-disabled={navigationDisabled || undefined}
+        >
+          {navigationDisabled
+            ? null
+            : navigationSections.map((section, index) => (
+                <Fragment key={section.label}>
+                  {index > 0 ? <SidebarSeparator /> : null}
+                  <SidebarGroup>
+                    <SidebarGroupLabel>{section.label}</SidebarGroupLabel>
+                    <SidebarGroupContent>
+                      <SidebarMenu>
+                        {section.items.map((item) => (
+                          <ProductNavigationItem
+                            key={item.path}
+                            item={item}
+                            active={location.pathname === item.path}
+                          />
+                        ))}
+                      </SidebarMenu>
+                    </SidebarGroupContent>
+                  </SidebarGroup>
+                </Fragment>
+              ))}
         </nav>
       </SidebarContent>
 
@@ -122,6 +121,28 @@ export function AppSidebar() {
       </SidebarFooter>
       <SidebarRail />
     </Sidebar>
+  )
+}
+
+function Brand() {
+  return (
+    <span className="flex min-w-0 items-center leading-none">
+      <span className="text-[18px] font-bold tracking-[-0.045em] text-white group-data-[collapsible=icon]:hidden">
+        Market
+      </span>
+      <img
+        src={marketSquawkMarkUrl}
+        alt=""
+        aria-hidden="true"
+        className="ml-0.5 h-[21px] w-auto shrink-0 group-data-[collapsible=icon]:ml-0 group-data-[collapsible=icon]:h-7"
+      />
+      <span
+        className="text-[18px] font-bold tracking-[-0.045em] text-primary group-data-[collapsible=icon]:hidden"
+        style={{ marginLeft: "-1px" }}
+      >
+        quawk
+      </span>
+    </span>
   )
 }
 

@@ -139,6 +139,18 @@ pub(crate) enum DesktopServiceBootstrapCommand {
     RetryAfterForegroundKeyring,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct DesktopServiceReconnect {
+    expected_runtime: RuntimeIdentity,
+}
+
+impl DesktopServiceReconnect {
+    pub(crate) const fn expected_runtime(self) -> RuntimeIdentity {
+        self.expected_runtime
+    }
+}
+
 impl DesktopBootstrap {
     #[allow(
         clippy::too_many_arguments,

@@ -83,6 +83,9 @@ function transport(
     bootstrapService: async () => {
       throw new Error("Service bootstrap is not configured for this test.")
     },
+    reconnectService: async () => {
+      throw new Error("Service reconnect is not configured for this test.")
+    },
     installation: async () => ({
       action: "status",
       status: {
@@ -1703,12 +1706,22 @@ describe("Market Squawk desktop boundary", () => {
     let currentBootstrap = readyBootstrap
     let admittedServiceGeneration = readyBootstrap.runtime.serviceGeneration
     const issuedBootstrapGenerations: number[] = []
+    const reconnectRequests: DesktopBootstrap["runtime"][] = []
+    let retainedGenerationUnavailable = false
     const desktopEvents: {
       listener: ((event: DesktopEvent) => void) | null
       protocolError: ((error: Error) => void) | null
     } = { listener: null, protocolError: null }
     const eventSubscriptions: DesktopEventSubscriptionRequest[] = []
     const releasedEventSequences: string[] = []
+    let admitInitialEventSubscription!: () => void
+    const initialEventSubscriptionAdmission = new Promise<void>((resolve) => {
+      admitInitialEventSubscription = resolve
+    })
+    let admitReplacementEventSubscription!: () => void
+    const replacementEventSubscriptionAdmission = new Promise<void>((resolve) => {
+      admitReplacementEventSubscription = resolve
+    })
     const dashboardTransport: ProductTransport = {
       ...transport(readyBootstrap, undefined, async (request) => {
         issuedQueries.push(request)
@@ -1749,14 +1762,28 @@ describe("Market Squawk desktop boundary", () => {
         }
       }),
       bootstrap: async () => {
+        if (retainedGenerationUnavailable) {
+          throw new Error("The retained service generation is unavailable")
+        }
         admittedServiceGeneration = currentBootstrap.runtime.serviceGeneration
         issuedBootstrapGenerations.push(admittedServiceGeneration)
+        return currentBootstrap
+      },
+      reconnectService: async (expectedRuntime) => {
+        reconnectRequests.push(expectedRuntime)
+        retainedGenerationUnavailable = false
+        admittedServiceGeneration = currentBootstrap.runtime.serviceGeneration
         return currentBootstrap
       },
       subscribe: async (request, listener, onProtocolError) => {
         eventSubscriptions.push(request)
         desktopEvents.listener = listener
         desktopEvents.protocolError = onProtocolError
+        if (eventSubscriptions.length === 1) {
+          await initialEventSubscriptionAdmission
+        } else if (request.runtime.serviceGeneration === 3) {
+          await replacementEventSubscriptionAdmission
+        }
         return {
           receipt: {
             subscriptionId: `f49e02f6-8c47-43a5-bb33-${String(eventSubscriptions.length).padStart(12, "0")}`,
@@ -1802,6 +1829,15 @@ describe("Market Squawk desktop boundary", () => {
         <App transport={dashboardTransport} />
       </MemoryRouter>,
     )
+
+    await waitFor(() => expect(eventSubscriptions).toHaveLength(1))
+    expect(screen.queryByRole("heading", { name: "Research" })).toBeNull()
+    expect(readCount("macroDashboard")).toBe(0)
+    expect(readCount("sourceStatus")).toBe(0)
+    await act(async () => {
+      admitInitialEventSubscription()
+      await initialEventSubscriptionAdmission
+    })
 
     const heading = await screen.findByRole("heading", { name: "Research" })
     expect(heading.tagName).toBe("H1")
@@ -2223,11 +2259,44 @@ describe("Market Squawk desktop boundary", () => {
         serviceGeneration: 3,
       },
     }
+    retainedGenerationUnavailable = true
     await act(async () => {
       reportProtocolError(new Error("Malformed Desktop event"))
     })
-    await waitFor(() => {
-      expect(issuedBootstrapGenerations).toContain(3)
+    await waitFor(
+      () => {
+        expect(reconnectRequests).toEqual([
+          {
+            ...readyBootstrap.runtime,
+            serviceGeneration: 2,
+          },
+        ])
+        expect(eventSubscriptions.at(-1)).toEqual({
+          runtime: currentBootstrap.runtime,
+          afterSequence: "0",
+        })
+      },
+      { timeout: 3_000 },
+    )
+    const handoffNavigation = document.querySelector(
+      'nav[aria-label="Market Squawk"]',
+    )
+    expect(handoffNavigation?.getAttribute("aria-disabled")).toBe("true")
+    expect(handoffNavigation?.querySelectorAll("a")).toHaveLength(0)
+    expect(
+      screen.queryByRole("link", { name: "Market Squawk workspace" }),
+    ).toBeNull()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Search or run a command",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true)
+    expect(screen.queryByRole("heading", { name: "Risk" })).toBeNull()
+    await act(async () => {
+      admitReplacementEventSubscription()
+      await replacementEventSubscriptionAdmission
     })
     expect(await screen.findByText("Connected")).toBeTruthy()
 

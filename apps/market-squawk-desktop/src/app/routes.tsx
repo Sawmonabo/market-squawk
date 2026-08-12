@@ -1,6 +1,7 @@
 import { Component, lazy, Suspense, type ErrorInfo, type ReactNode } from "react"
 import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom"
 
+import { useProduct } from "@/app/product-context"
 import { McpPage } from "@/components/mcp-page"
 
 const OverviewPage = lazy(() =>
@@ -62,6 +63,9 @@ const SettingsPage = lazy(() =>
 
 export function AppRoutes() {
   const location = useLocation()
+  const product = useProduct()
+
+  if (product.status === "loading") return <RouteLoading />
 
   return (
     <RouteErrorBoundary key={location.pathname}>

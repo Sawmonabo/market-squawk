@@ -22,7 +22,7 @@ use market_squawk_services::RequestId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use tauri::State;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::{
@@ -44,8 +44,7 @@ const MCP_REVOKE_OPERATION: &str = "Mcp.RevokeCredential";
 
 /// Sole native mutation authority for supported MCP client registrations.
 pub(crate) struct DesktopMcpClientState {
-    runtime: RuntimeIdentity,
-    control_gate: AsyncMutex<()>,
+    control_gate: Arc<AsyncMutex<()>>,
     inner: Arc<Mutex<DesktopMcpClientAuthority>>,
 }
 
@@ -53,10 +52,16 @@ impl fmt::Debug for DesktopMcpClientState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DesktopMcpClientState")
-            .field("runtime", &self.runtime)
+            .field("runtime", &"[GENERATION-BOUND MCP AUTHORITY]")
             .field("inner", &"[MCP CLIENT REGISTRATION AUTHORITY]")
             .finish()
     }
+}
+
+/// A fully validated service-generation binding prepared before the Desktop swaps generations.
+pub(crate) struct DesktopMcpRuntimeBinding {
+    runtime: RuntimeIdentity,
+    authorities: BTreeMap<McpClientKind, McpRegistrationAuthority>,
 }
 
 impl DesktopMcpClientState {
@@ -74,43 +79,90 @@ impl DesktopMcpClientState {
         claude_credential_identity: impl Into<String>,
         codex_credential_identity: impl Into<String>,
     ) -> Result<Self, McpClientRegistrationError> {
-        let endpoint_identity = endpoint_identity.into();
-        let authorities = BTreeMap::from([
-            (
-                McpClientKind::ClaudeCode,
-                McpRegistrationAuthority::try_new(
-                    runtime,
-                    endpoint_identity.clone(),
-                    claude_credential_identity,
-                )?,
-            ),
-            (
-                McpClientKind::Codex,
-                McpRegistrationAuthority::try_new(
-                    runtime,
-                    endpoint_identity,
-                    codex_credential_identity,
-                )?,
-            ),
-        ]);
-        Ok(Self {
+        let binding = Self::prepare_runtime_binding(
             runtime,
-            control_gate: AsyncMutex::new(()),
+            endpoint_identity,
+            claude_credential_identity,
+            codex_credential_identity,
+        )?;
+        Ok(Self {
+            control_gate: Arc::new(AsyncMutex::new(())),
             inner: Arc::new(Mutex::new(DesktopMcpClientAuthority {
                 manager: McpClientRegistrationManager::try_new(
                     paths,
                     relay_program,
                     installation_data_root,
                 )?,
-                authorities,
+                binding,
             })),
         })
+    }
+
+    pub(crate) fn prepare_runtime_binding(
+        runtime: RuntimeIdentity,
+        endpoint_identity: impl Into<String>,
+        claude_credential_identity: impl Into<String>,
+        codex_credential_identity: impl Into<String>,
+    ) -> Result<DesktopMcpRuntimeBinding, McpClientRegistrationError> {
+        let endpoint_identity = endpoint_identity.into();
+        Ok(DesktopMcpRuntimeBinding {
+            runtime,
+            authorities: BTreeMap::from([
+                (
+                    McpClientKind::ClaudeCode,
+                    McpRegistrationAuthority::try_new(
+                        runtime,
+                        endpoint_identity.clone(),
+                        claude_credential_identity,
+                    )?,
+                ),
+                (
+                    McpClientKind::Codex,
+                    McpRegistrationAuthority::try_new(
+                        runtime,
+                        endpoint_identity,
+                        codex_credential_identity,
+                    )?,
+                ),
+            ]),
+        })
+    }
+
+    pub(crate) async fn retirement_fence(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.control_gate).lock_owned().await
+    }
+
+    /// Rebinds the retained receipt store while its exclusive async fence is held.
+    ///
+    /// The replacement closure runs only after the mutex has been acquired. It must atomically
+    /// replace the Desktop generation or fail without mutation; installing the already validated
+    /// binding after a successful replacement is infallible.
+    pub(crate) fn commit_runtime_binding_while_fenced<T>(
+        &self,
+        _fence: &OwnedMutexGuard<()>,
+        binding: DesktopMcpRuntimeBinding,
+        replace: impl FnOnce() -> Result<T, DesktopCommandError>,
+    ) -> Result<T, DesktopCommandError> {
+        let mut authority = self
+            .inner
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?;
+        let replaced = replace()?;
+        authority.binding = binding;
+        Ok(replaced)
+    }
+
+    fn runtime(&self) -> Result<RuntimeIdentity, DesktopCommandError> {
+        self.inner
+            .lock()
+            .map(|authority| authority.binding.runtime)
+            .map_err(|_error| DesktopCommandError::internal())
     }
 }
 
 struct DesktopMcpClientAuthority {
     manager: McpClientRegistrationManager,
-    authorities: BTreeMap<McpClientKind, McpRegistrationAuthority>,
+    binding: DesktopMcpRuntimeBinding,
 }
 
 impl DesktopMcpClientAuthority {
@@ -118,7 +170,8 @@ impl DesktopMcpClientAuthority {
         &self,
         client: McpClientKind,
     ) -> Result<McpRegistrationAuthority, McpClientRegistrationError> {
-        self.authorities
+        self.binding
+            .authorities
             .get(&client)
             .cloned()
             .ok_or(McpClientRegistrationError::InvalidAuthorityIdentity)
@@ -130,9 +183,12 @@ impl DesktopMcpClientAuthority {
         service: &McpServiceRuntimeStatus,
     ) -> Result<(), McpClientRegistrationError> {
         service.validate()?;
+        if runtime != self.binding.runtime {
+            return Err(McpClientRegistrationError::InvalidAuthorityIdentity);
+        }
         for facts in &service.clients {
             let current = self.authority(facts.client)?;
-            self.authorities.insert(
+            self.binding.authorities.insert(
                 facts.client,
                 McpRegistrationAuthority::try_new(
                     runtime,
@@ -614,20 +670,28 @@ impl McpClientControlCommand {
 #[tauri::command]
 pub(crate) async fn mcp_status(
     desktop: State<'_, DesktopState>,
-    clients: State<'_, DesktopMcpClientState>,
 ) -> Result<McpStatus, DesktopCommandError> {
-    admit_current_runtime(&desktop, &clients)?;
-    desktop
+    let generation = desktop.generation()?;
+    let clients = generation.mcp_clients();
+    let _control_guard = clients.control_gate.lock().await;
+    desktop.admit_current(&generation)?;
+    admit_current_runtime(&generation, clients)?;
+    generation
         .application()
-        .probe_ready(desktop.cancellation())
+        .probe_ready(generation.cancellation())
         .await
         .map_err(map_application_client_error)?;
-    let service =
-        invoke_mcp_service::<McpServiceRuntimeStatus>(&desktop, MCP_STATUS_OPERATION, json!({}))
-            .await?;
+    desktop.admit_current(&generation)?;
+    let service = invoke_mcp_service::<McpServiceRuntimeStatus>(
+        &desktop,
+        &generation,
+        MCP_STATUS_OPERATION,
+        json!({}),
+    )
+    .await?;
     service.validate().map_err(map_mcp_client_error)?;
     let response_service = service.clone();
-    let runtime = desktop.runtime();
+    let runtime = generation.runtime();
     let authority = Arc::clone(&clients.inner);
     let client_statuses = run_blocking(MCP_STATUS_TIMEOUT, move || {
         let mut authority = lock_authority(&authority)?;
@@ -635,7 +699,12 @@ pub(crate) async fn mcp_status(
         authority.inspect_all(&service).map_err(Into::into)
     })
     .await?;
-    Ok(status_response(&desktop, response_service, client_statuses))
+    desktop.admit_current(&generation)?;
+    Ok(status_response(
+        &generation,
+        response_service,
+        client_statuses,
+    ))
 }
 
 #[tauri::command]
@@ -643,7 +712,6 @@ pub(crate) async fn mcp_client_control(
     request: McpClientControlCommand,
     confirmed: bool,
     desktop: State<'_, DesktopState>,
-    clients: State<'_, DesktopMcpClientState>,
 ) -> Result<McpStatus, DesktopCommandError> {
     if !confirmed {
         return Err(DesktopCommandError::new(
@@ -651,25 +719,33 @@ pub(crate) async fn mcp_client_control(
             "Confirm this MCP client change before continuing.",
         ));
     }
-    admit_current_runtime(&desktop, &clients)?;
+    let generation = desktop.generation()?;
+    let clients = generation.mcp_clients();
     let _control_guard = clients.control_gate.lock().await;
-    if !desktop.mcp_ready() {
+    desktop.admit_current(&generation)?;
+    admit_current_runtime(&generation, clients)?;
+    if !generation.mcp_ready() {
         return Err(DesktopCommandError::new(
             "mcp_endpoint_unavailable",
             "The shared Market Squawk MCP endpoint is not ready.",
         ));
     }
-    desktop
+    generation
         .application()
-        .probe_ready(desktop.cancellation())
+        .probe_ready(generation.cancellation())
         .await
         .map_err(map_application_client_error)?;
+    desktop.admit_current(&generation)?;
 
-    let initial_service =
-        invoke_mcp_service::<McpServiceRuntimeStatus>(&desktop, MCP_STATUS_OPERATION, json!({}))
-            .await?;
+    let initial_service = invoke_mcp_service::<McpServiceRuntimeStatus>(
+        &desktop,
+        &generation,
+        MCP_STATUS_OPERATION,
+        json!({}),
+    )
+    .await?;
     initial_service.validate().map_err(map_mcp_client_error)?;
-    let runtime = desktop.runtime();
+    let runtime = generation.runtime();
     let preflight_service = initial_service.clone();
     let authority = Arc::clone(&clients.inner);
     run_blocking(MCP_STATUS_TIMEOUT, move || {
@@ -678,10 +754,12 @@ pub(crate) async fn mcp_client_control(
         authority.admit_control(request, &preflight_service)
     })
     .await?;
+    desktop.admit_current(&generation)?;
 
     if let Some(operation) = request.service_operation() {
         let mutation = invoke_mcp_service::<McpCredentialMutationReceipt>(
             &desktop,
+            &generation,
             operation,
             json!({"client": request.client()}),
         )
@@ -690,13 +768,18 @@ pub(crate) async fn mcp_client_control(
     }
 
     let effective_service = if request.service_operation().is_some() {
-        invoke_mcp_service::<McpServiceRuntimeStatus>(&desktop, MCP_STATUS_OPERATION, json!({}))
-            .await?
+        invoke_mcp_service::<McpServiceRuntimeStatus>(
+            &desktop,
+            &generation,
+            MCP_STATUS_OPERATION,
+            json!({}),
+        )
+        .await?
     } else {
         initial_service
     };
     effective_service.validate().map_err(map_mcp_client_error)?;
-    let runtime = desktop.runtime();
+    let runtime = generation.runtime();
     let timeout = request.timeout();
     let authority = Arc::clone(&clients.inner);
     run_blocking(timeout, move || {
@@ -724,13 +807,18 @@ pub(crate) async fn mcp_client_control(
         Ok(())
     })
     .await?;
+    desktop.admit_current(&generation)?;
 
-    let final_service =
-        invoke_mcp_service::<McpServiceRuntimeStatus>(&desktop, MCP_STATUS_OPERATION, json!({}))
-            .await?;
+    let final_service = invoke_mcp_service::<McpServiceRuntimeStatus>(
+        &desktop,
+        &generation,
+        MCP_STATUS_OPERATION,
+        json!({}),
+    )
+    .await?;
     final_service.validate().map_err(map_mcp_client_error)?;
     let response_service = final_service.clone();
-    let runtime = desktop.runtime();
+    let runtime = generation.runtime();
     let authority = Arc::clone(&clients.inner);
     let client_statuses = run_blocking(MCP_STATUS_TIMEOUT, move || {
         let mut authority = lock_authority(&authority)?;
@@ -738,18 +826,23 @@ pub(crate) async fn mcp_client_control(
         authority.inspect_all(&final_service).map_err(Into::into)
     })
     .await?;
-    Ok(status_response(&desktop, response_service, client_statuses))
+    desktop.admit_current(&generation)?;
+    Ok(status_response(
+        &generation,
+        response_service,
+        client_statuses,
+    ))
 }
 
 fn status_response(
-    desktop: &DesktopState,
+    generation: &crate::bridge::DesktopGeneration,
     runtime_status: McpServiceRuntimeStatus,
     clients: Vec<McpClientPresentation>,
 ) -> McpStatus {
-    let runtime = desktop.runtime();
+    let runtime = generation.runtime();
     McpStatus {
         service_ready: true,
-        shared_endpoint_ready: desktop.mcp_ready(),
+        shared_endpoint_ready: generation.mcp_ready(),
         workspace_id: runtime.workspace_id().as_uuid().to_string(),
         service_generation: runtime.service_generation().get(),
         protocol_version: MCP_PROTOCOL_VERSION,
@@ -761,36 +854,40 @@ fn status_response(
 
 async fn invoke_mcp_service<T: DeserializeOwned>(
     desktop: &DesktopState,
+    generation: &Arc<crate::bridge::DesktopGeneration>,
     operation: &str,
     arguments: serde_json::Value,
 ) -> Result<T, DesktopCommandError> {
     let request_id = RequestId::try_string(format!("desktop-mcp-{}", Uuid::new_v4()))
         .map_err(|_error| DesktopCommandError::internal())?;
-    let response = desktop
+    let response = generation
         .application()
         .invoke_operation(
             request_id,
             operation,
             arguments,
             MCP_SERVICE_TIMEOUT,
-            desktop.cancellation(),
+            generation.cancellation(),
         )
         .await
         .map_err(map_application_client_error)?;
+    desktop.admit_current(generation)?;
     let result = decode_application_result(response.result())?;
-    serde_json::from_value(result).map_err(|_error| {
+    let result = serde_json::from_value(result).map_err(|_error| {
         DesktopCommandError::new(
             "mcp_service_contract_invalid",
             "The shared MCP service returned an incompatible runtime contract.",
         )
-    })
+    })?;
+    desktop.admit_current(generation)?;
+    Ok(result)
 }
 
 fn admit_current_runtime(
-    desktop: &DesktopState,
+    generation: &crate::bridge::DesktopGeneration,
     clients: &DesktopMcpClientState,
 ) -> Result<(), DesktopCommandError> {
-    if clients.runtime != desktop.runtime() {
+    if clients.runtime()? != generation.runtime() {
         return Err(DesktopCommandError::new(
             "mcp_authority_stale",
             "The MCP client authority belongs to an earlier service generation. Restart Market Squawk and retry.",

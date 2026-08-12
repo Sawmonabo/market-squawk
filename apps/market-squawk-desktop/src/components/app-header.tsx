@@ -33,14 +33,22 @@ export function AppHeader() {
 
   React.useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key.toLowerCase() === "k" && (event.metaKey || event.ctrlKey)) {
+      if (
+        product.status !== "loading" &&
+        event.key.toLowerCase() === "k" &&
+        (event.metaKey || event.ctrlKey)
+      ) {
         event.preventDefault()
         setOpen((value) => !value)
       }
     }
     window.addEventListener("keydown", onKeyDown)
     return () => window.removeEventListener("keydown", onKeyDown)
-  }, [])
+  }, [product.status])
+
+  React.useEffect(() => {
+    if (product.status === "loading") setOpen(false)
+  }, [product.status])
 
   const choose = (path: string) => {
     navigate(path)
@@ -66,7 +74,10 @@ export function AppHeader() {
   return (
     <>
       <header className="flex h-14 shrink-0 items-center border-b border-border/80 bg-background/95 px-4">
-        <SidebarTrigger className="mr-3 text-muted-foreground" />
+        <SidebarTrigger
+          className="mr-3 text-muted-foreground"
+          disabled={product.status === "loading"}
+        />
         <Separator orientation="vertical" className="mr-3 h-4" />
         <div className="flex min-w-0 items-center gap-2 text-xs">
           <span className="text-muted-foreground">{currentSection.label}</span>
@@ -80,6 +91,7 @@ export function AppHeader() {
         <button
           type="button"
           onClick={() => setOpen(true)}
+          disabled={product.status === "loading"}
           className="ml-auto hidden h-8 min-w-52 items-center gap-2 rounded-lg border border-border bg-card/40 px-3 text-left text-[11px] text-muted-foreground transition-colors hover:bg-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:flex"
           aria-label="Search or run a command"
         >
@@ -161,7 +173,7 @@ export function AppHeader() {
       ) : null}
 
       <CommandDialog
-        open={open}
+        open={product.status !== "loading" && open}
         onOpenChange={setOpen}
         title="Navigate Market Squawk"
         description="Search the available product routes."
@@ -169,21 +181,23 @@ export function AppHeader() {
         <CommandInput placeholder="Search Market Squawk…" />
         <CommandList>
           <CommandEmpty>No matching route.</CommandEmpty>
-          {navigationSections.map((section) => (
-            <CommandGroup key={section.label} heading={section.label}>
-              {section.items.map((item) => (
-                <CommandItem
-                  key={item.path}
-                  value={item.label}
-                  onSelect={() => choose(item.path)}
-                >
-                  <item.icon aria-hidden="true" />
-                  <span>{item.label}</span>
-                  <CommandShortcut>Go</CommandShortcut>
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          ))}
+          {product.status !== "loading"
+            ? navigationSections.map((section) => (
+                <CommandGroup key={section.label} heading={section.label}>
+                  {section.items.map((item) => (
+                    <CommandItem
+                      key={item.path}
+                      value={item.label}
+                      onSelect={() => choose(item.path)}
+                    >
+                      <item.icon aria-hidden="true" />
+                      <span>{item.label}</span>
+                      <CommandShortcut>Go</CommandShortcut>
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              ))
+            : null}
         </CommandList>
       </CommandDialog>
     </>

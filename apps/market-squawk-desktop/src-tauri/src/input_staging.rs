@@ -4,6 +4,7 @@ use std::{
     ffi::OsStr,
     io::{Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, ambient_authority};
@@ -16,7 +17,10 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt as _;
 
 use crate::{
-    bridge::{DesktopState, InvocationAuthority, invoke_application, invoke_private_application},
+    bridge::{
+        DesktopGeneration, DesktopState, InvocationAuthority, invoke_application,
+        invoke_private_application,
+    },
     contracts::{ApplicationInvocation, DesktopCommandError, TrainingInputKind},
 };
 
@@ -81,6 +85,7 @@ pub(crate) async fn preview_portfolio_import(
     app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<Option<Value>, DesktopCommandError> {
+    let generation = state.generation()?;
     require_confirmation(
         confirmed,
         "Confirm the account before selecting a portfolio extraction file.",
@@ -108,7 +113,8 @@ pub(crate) async fn preview_portfolio_import(
     })
     .await
     .map_err(|_error| DesktopCommandError::internal())??;
-    let ticket = stage_admitted_input(admitted, PORTFOLIO_IMPORT_MEDIA_TYPE, &state).await?;
+    let ticket =
+        stage_admitted_input(admitted, PORTFOLIO_IMPORT_MEDIA_TYPE, &state, &generation).await?;
     let arguments = Map::from_iter([
         ("accountId".to_owned(), Value::String(account_id)),
         (
@@ -120,6 +126,7 @@ pub(crate) async fn preview_portfolio_import(
         PREVIEW_PORTFOLIO_IMPORT,
         arguments,
         &state,
+        &generation,
         InvocationAuthority::ExactConfirmed(PREVIEW_PORTFOLIO_IMPORT),
     )
     .await
@@ -134,6 +141,7 @@ pub(crate) async fn commit_portfolio_import(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     require_confirmation(
         confirmed,
         "Confirm the exact preview and interpretations before committing this portfolio import.",
@@ -152,6 +160,7 @@ pub(crate) async fn commit_portfolio_import(
         APPROVE_PORTFOLIO_IMPORT,
         approval_arguments,
         &state,
+        &generation,
         InvocationAuthority::ExactConfirmed(APPROVE_PORTFOLIO_IMPORT),
     )
     .await?;
@@ -181,6 +190,7 @@ pub(crate) async fn commit_portfolio_import(
         COMMIT_PORTFOLIO_IMPORT,
         commit_arguments,
         &state,
+        &generation,
         InvocationAuthority::ExactConfirmed(COMMIT_PORTFOLIO_IMPORT),
     )
     .await
@@ -192,6 +202,7 @@ pub(crate) async fn discard_portfolio_import(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     require_confirmation(
         confirmed,
         "Confirm that this uncommitted portfolio preview should be discarded.",
@@ -201,6 +212,7 @@ pub(crate) async fn discard_portfolio_import(
         DISCARD_PORTFOLIO_IMPORT,
         arguments,
         &state,
+        &generation,
         InvocationAuthority::ExactConfirmed(DISCARD_PORTFOLIO_IMPORT),
     )
     .await
@@ -213,6 +225,7 @@ pub(crate) async fn preview_research_file_import(
     app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<Option<Value>, DesktopCommandError> {
+    let generation = state.generation()?;
     require_confirmation(
         confirmed,
         "Confirm the research format before selecting a file to preview.",
@@ -242,7 +255,8 @@ pub(crate) async fn preview_research_file_import(
     })
     .await
     .map_err(|_error| DesktopCommandError::internal())??;
-    let ticket = stage_admitted_input(admitted, RESEARCH_FILE_MEDIA_TYPE, &state).await?;
+    let ticket =
+        stage_admitted_input(admitted, RESEARCH_FILE_MEDIA_TYPE, &state, &generation).await?;
     let arguments = Map::from_iter([
         (
             "inputTicketId".to_owned(),
@@ -257,6 +271,7 @@ pub(crate) async fn preview_research_file_import(
         PREVIEW_RESEARCH_FILE,
         arguments,
         &state,
+        &generation,
         InvocationAuthority::ExactConfirmed(PREVIEW_RESEARCH_FILE),
     )
     .await
@@ -270,6 +285,7 @@ pub(crate) async fn commit_research_file_import(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     require_confirmation(
         confirmed,
         "Confirm the preview and field mapping before importing this research file.",
@@ -287,6 +303,7 @@ pub(crate) async fn commit_research_file_import(
         COMMIT_RESEARCH_FILE,
         arguments,
         &state,
+        &generation,
         InvocationAuthority::ExactConfirmed(COMMIT_RESEARCH_FILE),
     )
     .await
@@ -298,6 +315,7 @@ pub(crate) async fn discard_research_file_import(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     require_confirmation(
         confirmed,
         "Confirm that this uncommitted research preview should be discarded.",
@@ -307,6 +325,7 @@ pub(crate) async fn discard_research_file_import(
         DISCARD_RESEARCH_FILE,
         arguments,
         &state,
+        &generation,
         InvocationAuthority::ExactConfirmed(DISCARD_RESEARCH_FILE),
     )
     .await
@@ -318,6 +337,7 @@ pub(crate) async fn start_backtest_from_file(
     app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<Option<Value>, DesktopCommandError> {
+    let generation = state.generation()?;
     if !confirmed {
         return Err(DesktopCommandError::new(
             "confirmation_required",
@@ -368,6 +388,7 @@ pub(crate) async fn start_backtest_from_file(
             arguments,
         },
         &state,
+        &generation,
         InvocationAuthority::ExactConfirmed("Analysis.StartBacktest"),
     )
     .await
@@ -380,6 +401,7 @@ pub(crate) async fn stage_training_input(
     app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<Option<Value>, DesktopCommandError> {
+    let generation = state.generation()?;
     let selected = tauri::async_runtime::spawn_blocking(move || {
         app.dialog()
             .file()
@@ -403,7 +425,7 @@ pub(crate) async fn stage_training_input(
     })
     .await
     .map_err(|_error| DesktopCommandError::internal())??;
-    let ticket = stage_admitted_input(admitted, kind.media_type(), &state).await?;
+    let ticket = stage_admitted_input(admitted, kind.media_type(), &state, &generation).await?;
     let value = serde_json::to_value(ticket).map_err(|_error| DesktopCommandError::internal())?;
     Ok(Some(super::bridge::lossless_webview_value(value)))
 }
@@ -492,15 +514,19 @@ async fn stage_admitted_input(
     admitted: AdmittedFile,
     media_type: &'static str,
     state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
 ) -> Result<InputTicket, DesktopCommandError> {
+    state.admit_current(generation)?;
     let admission = InputAdmission::try_sha256(media_type, admitted.byte_length, admitted.digest)
         .map_err(|_error| DesktopCommandError::internal())?;
     let mut input = tokio::fs::File::from_std(admitted.file);
-    state
+    let ticket = generation
         .application()
-        .stage_input(admission, &mut input, state.cancellation())
+        .stage_input(admission, &mut input, generation.cancellation())
         .await
-        .map_err(super::bridge::map_application_client_error)
+        .map_err(super::bridge::map_application_client_error)?;
+    state.admit_current(generation)?;
+    Ok(ticket)
 }
 
 fn require_confirmation(confirmed: bool, message: &'static str) -> Result<(), DesktopCommandError> {

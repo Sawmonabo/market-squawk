@@ -24,6 +24,7 @@ pub(crate) async fn dashboard_query(
     request: DashboardQueryCommand,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     let (operation, arguments) = match request {
         DashboardQueryCommand::Overview => ("Analysis.GetDecisionOverview", Map::new()),
         DashboardQueryCommand::MacroDashboard { provider, release } => {
@@ -499,6 +500,7 @@ pub(crate) async fn dashboard_query(
             arguments,
         },
         &state,
+        &generation,
         InvocationAuthority::ReadOnly,
     )
     .await?;
@@ -514,6 +516,7 @@ pub(crate) async fn operations_control(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     require_confirmation(confirmed)?;
     let (operation, arguments) = match request {
         OperationsControlCommand::CheckForUpdates => ("Operations.CheckForUpdates", Map::new()),
@@ -613,6 +616,7 @@ pub(crate) async fn operations_control(
             arguments,
         },
         &state,
+        &generation,
         InvocationAuthority::ExactConfirmed(operation),
     )
     .await
@@ -625,11 +629,20 @@ pub(crate) async fn fair_value_control(
     state: State<'_, DesktopState>,
     window: tauri::Window,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     match request {
         FairValueControlCommand::Measure { measurement } => {
             let mut arguments = Map::new();
             arguments.insert("measurement".to_owned(), Value::Object(measurement));
-            invoke_narrow("FairValue.Measure", arguments, true, confirmed, &state).await
+            invoke_narrow(
+                "FairValue.Measure",
+                arguments,
+                true,
+                confirmed,
+                &state,
+                &generation,
+            )
+            .await
         }
         FairValueControlCommand::Classify { measurement_id } => {
             invoke_narrow(
@@ -638,6 +651,7 @@ pub(crate) async fn fair_value_control(
                 true,
                 confirmed,
                 &state,
+                &generation,
             )
             .await
         }
@@ -649,6 +663,7 @@ pub(crate) async fn fair_value_control(
                 "FairValue.PreviewGovernanceAction",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ExactConfirmed("FairValue.PreviewGovernanceAction"),
             )
             .await
@@ -658,7 +673,7 @@ pub(crate) async fn fair_value_control(
             authorization_handles,
         } => {
             require_confirmation(confirmed)?;
-            let ticket_ids = state.consume_governance_authorizations(
+            let ticket_ids = generation.consume_governance_authorizations(
                 window.label(),
                 preview_id,
                 authorization_handles,
@@ -670,6 +685,7 @@ pub(crate) async fn fair_value_control(
                 "FairValue.CommitGovernanceAction",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ExactConfirmed("FairValue.CommitGovernanceAction"),
             )
             .await
@@ -684,6 +700,7 @@ pub(crate) async fn decision_control(
     state: State<'_, DesktopState>,
     window: tauri::Window,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     match request {
         DecisionControlCommand::SaveScreen {
             expected_revision,
@@ -697,6 +714,7 @@ pub(crate) async fn decision_control(
                 "Decision.SaveScreen",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ExactConfirmed("Decision.SaveScreen"),
             )
             .await
@@ -720,6 +738,7 @@ pub(crate) async fn decision_control(
                 "Decision.RunScreen",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ExactConfirmed("Decision.RunScreen"),
             )
             .await
@@ -731,6 +750,7 @@ pub(crate) async fn decision_control(
                 "Decision.PrepareDossier",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ReadOnly,
             )
             .await
@@ -743,6 +763,7 @@ pub(crate) async fn decision_control(
                 "Decision.CreateDossier",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ExactConfirmed("Decision.CreateDossier"),
             )
             .await
@@ -754,6 +775,7 @@ pub(crate) async fn decision_control(
                 "Decision.PrepareTargetSet",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ReadOnly,
             )
             .await
@@ -766,6 +788,7 @@ pub(crate) async fn decision_control(
                 "Decision.CreateTargetSet",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ExactConfirmed("Decision.CreateTargetSet"),
             )
             .await
@@ -778,6 +801,7 @@ pub(crate) async fn decision_control(
                 "Decision.ReevaluateTargetSet",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ExactConfirmed("Decision.ReevaluateTargetSet"),
             )
             .await
@@ -790,6 +814,7 @@ pub(crate) async fn decision_control(
                 "Decision.PreviewGovernanceAction",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ExactConfirmed("Decision.PreviewGovernanceAction"),
             )
             .await
@@ -799,7 +824,7 @@ pub(crate) async fn decision_control(
             authorization_handles,
         } => {
             require_confirmation(confirmed)?;
-            let ticket_ids = state.consume_governance_authorizations(
+            let ticket_ids = generation.consume_governance_authorizations(
                 window.label(),
                 preview_id,
                 authorization_handles,
@@ -811,6 +836,7 @@ pub(crate) async fn decision_control(
                 "Decision.CommitGovernanceAction",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ExactConfirmed("Decision.CommitGovernanceAction"),
             )
             .await
@@ -823,12 +849,14 @@ pub(crate) async fn governance_query(
     request: GovernanceQueryCommand,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     match request {
         GovernanceQueryCommand::ProvisioningStatus => {
             invoke_private_application(
                 "Governance.ProvisioningStatus",
                 Map::new(),
                 &state,
+                &generation,
                 InvocationAuthority::ReadOnly,
             )
             .await
@@ -841,6 +869,7 @@ pub(crate) async fn governance_query(
                 "Governance.ListPrincipals",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ReadOnly,
             )
             .await
@@ -855,6 +884,7 @@ pub(crate) async fn governance_control(
     state: State<'_, DesktopState>,
     window: tauri::Window,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     require_confirmation(confirmed)?;
     match request {
         GovernanceControlCommand::ProvisionPrincipalSet {
@@ -884,6 +914,7 @@ pub(crate) async fn governance_control(
                 "Governance.ProvisionPrincipalSet",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ExactConfirmed("Governance.ProvisionPrincipalSet"),
             )
             .await
@@ -901,10 +932,13 @@ pub(crate) async fn governance_control(
                 "Governance.AuthenticateAction",
                 arguments,
                 &state,
+                &generation,
                 InvocationAuthority::ExactConfirmed("Governance.AuthenticateAction"),
             )
             .await?;
-            state.retain_governance_authorization(window.label(), result)
+            let result = generation.retain_governance_authorization(window.label(), result)?;
+            state.admit_current(&generation)?;
+            Ok(result)
         }
     }
 }
@@ -915,6 +949,7 @@ pub(crate) async fn paper_control(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     let (operation, arguments, authority) = match request {
         PaperControlCommand::Targets => (
             "Execution.GetManualPaperTargets",
@@ -1008,6 +1043,7 @@ pub(crate) async fn paper_control(
             arguments,
         },
         &state,
+        &generation,
         authority,
     )
     .await
@@ -1019,6 +1055,7 @@ pub(crate) async fn analysis_control(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     let (operation, arguments, mutation) = match request {
         AnalysisControlCommand::FeatureDatasetOptions => (
             "Analysis.GetFeatureDatasetPreparationOptions",
@@ -1047,7 +1084,15 @@ pub(crate) async fn analysis_control(
             ("Analysis.StartPreparedBacktest", arguments, true)
         }
     };
-    invoke_narrow(operation, arguments, mutation, confirmed, &state).await
+    invoke_narrow(
+        operation,
+        arguments,
+        mutation,
+        confirmed,
+        &state,
+        &generation,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1056,6 +1101,7 @@ pub(crate) async fn model_control(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     let (operation, arguments, mutation) = match request {
         ModelControlCommand::Evaluate { model_id, input } => {
             let mut arguments = model_arguments(model_id);
@@ -1085,7 +1131,15 @@ pub(crate) async fn model_control(
             ("Model.StartPreparedForecast", arguments, true)
         }
     };
-    invoke_narrow(operation, arguments, mutation, confirmed, &state).await
+    invoke_narrow(
+        operation,
+        arguments,
+        mutation,
+        confirmed,
+        &state,
+        &generation,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1094,6 +1148,7 @@ pub(crate) async fn research_control(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     let (operation, arguments) = match request {
         ResearchControlCommand::DiscoverSourceObjects { provider, dataset } => (
             "Source.Discover",
@@ -1116,7 +1171,7 @@ pub(crate) async fn research_control(
             ("Research.StartExport", dataset_arguments(dataset))
         }
     };
-    invoke_narrow(operation, arguments, true, confirmed, &state).await
+    invoke_narrow(operation, arguments, true, confirmed, &state, &generation).await
 }
 
 #[tauri::command]
@@ -1125,6 +1180,7 @@ pub(crate) async fn job_control(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     let (operation, arguments, mutation) = match request {
         JobControlCommand::List {
             after_job_id,
@@ -1192,7 +1248,15 @@ pub(crate) async fn job_control(
             ("Job.Retry", arguments, true)
         }
     };
-    invoke_narrow(operation, arguments, mutation, confirmed, &state).await
+    invoke_narrow(
+        operation,
+        arguments,
+        mutation,
+        confirmed,
+        &state,
+        &generation,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1202,6 +1266,7 @@ pub(crate) async fn source_control(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     let operation = match action {
         SourceLifecycleAction::Start => "Source.Start",
         SourceLifecycleAction::Stop => "Source.Stop",
@@ -1239,7 +1304,7 @@ pub(crate) async fn source_control(
         request.public_configuration_sha256,
     );
     insert_optional(&mut arguments, "reason", request.reason);
-    invoke_narrow(operation, arguments, true, confirmed, &state).await
+    invoke_narrow(operation, arguments, true, confirmed, &state, &generation).await
 }
 
 async fn invoke_narrow(
@@ -1248,6 +1313,7 @@ async fn invoke_narrow(
     mutation: bool,
     confirmed: bool,
     state: &DesktopState,
+    generation: &std::sync::Arc<crate::bridge::DesktopGeneration>,
 ) -> Result<Value, DesktopCommandError> {
     if mutation && !confirmed {
         return Err(DesktopCommandError::new(
@@ -1266,6 +1332,7 @@ async fn invoke_narrow(
             arguments,
         },
         state,
+        generation,
         authority,
     )
     .await?;

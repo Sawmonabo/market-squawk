@@ -1403,12 +1403,18 @@ enum AnalyticalControllerResponse {
 }
 
 #[tauri::command]
-pub(crate) fn analytical_controller(
+pub(crate) async fn analytical_controller(
     request: AnalyticalControllerCommand,
     confirmed: bool,
-    controller: State<'_, DesktopAnalyticalController>,
+    state: State<'_, crate::bridge::DesktopState>,
 ) -> Result<serde_json::Value, DesktopCommandError> {
-    let response = controller.dispatch(request, confirmed)?;
+    let generation = state.generation()?;
+    let _fence = generation.analytical_retirement_fence().await;
+    state.admit_current(&generation)?;
+    let response = generation
+        .analytical_controller()
+        .dispatch(request, confirmed)?;
+    state.admit_current(&generation)?;
     serde_json::to_value(response).map_err(|_error| DesktopCommandError::internal())
 }
 

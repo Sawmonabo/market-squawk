@@ -53,6 +53,15 @@ class TauriTransport implements ProductTransport {
     await invoke("desktop_service_bootstrap", { request })
   }
 
+  async reconnectService(
+    expectedRuntime: Parameters<ProductTransport["reconnectService"]>[0],
+  ) {
+    const value = await invoke("desktop_service_reconnect", {
+      request: { expectedRuntime },
+    })
+    return desktopStartupSchema.parse(value)
+  }
+
   async installation(request: InstallationControlRequest, confirmed = false) {
     const value = await invoke("installation_control", {
       request,
@@ -296,6 +305,10 @@ class UnavailableBrowserTransport implements ProductTransport {
   }
 
   bootstrapService(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  reconnectService(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

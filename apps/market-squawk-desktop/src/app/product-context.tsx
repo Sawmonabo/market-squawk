@@ -1,7 +1,11 @@
 import * as React from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 
-import type { DesktopBootstrap, DesktopServiceBootstrap } from "@/lib/schemas"
+import type {
+  DesktopBootstrap,
+  DesktopServiceBootstrap,
+  DesktopStartup,
+} from "@/lib/schemas"
 import type { DesktopEventSubscription, ProductTransport } from "@/lib/transport"
 
 import {
@@ -76,10 +80,14 @@ export function ProductProvider({
 }) {
   const queryClient = useQueryClient()
   const recoveryInFlight = React.useRef<Promise<void> | null>(null)
+  const nativeReconnectInFlight = React.useRef<Promise<void> | null>(null)
   const [recoveryPending, setRecoveryPending] = React.useState(false)
   const [recoveryError, setRecoveryError] = React.useState<string | null>(null)
   const [eventConnection, setEventConnection] =
     React.useState<EventConnectionState>({ status: "inactive" })
+  const [eventAdmissionPending, setEventAdmissionPending] = React.useState(true)
+  const [eventAdmittedRuntime, setEventAdmittedRuntime] =
+    React.useState<DesktopBootstrap["runtime"] | null>(null)
   const [eventRetryGeneration, setEventRetryGeneration] = React.useState(0)
   const eventCursor = React.useRef<{
     runtime: DesktopBootstrap["runtime"]
@@ -95,6 +103,7 @@ export function ProductProvider({
   React.useEffect(() => {
     if (!bootstrap.data || "status" in bootstrap.data) {
       setEventConnection({ status: "inactive" })
+      setEventAdmissionPending(true)
       return
     }
     const scope = bootstrap.data.runtime
@@ -123,9 +132,51 @@ export function ProductProvider({
       if (current) void current.unsubscribe().catch(() => undefined)
     }
 
+    const reconnectNativeService = () => {
+      if (nativeReconnectInFlight.current) return
+      resyncing = true
+      setEventAdmissionPending(true)
+      connectionEpoch += 1
+      clearTimers()
+      releaseSubscription()
+      eventCursor.current = null
+      if (active) setEventConnection({ status: "resynchronizing" })
+      const attempt = (async () => {
+        try {
+          const startup = await transport.reconnectService(scope)
+          if (!active) return
+          await queryClient.cancelQueries({ queryKey: productKeys.root(scope) })
+          if (!active) return
+          queryClient.removeQueries({ queryKey: productKeys.root(scope) })
+          const current = queryClient.getQueryData<DesktopStartup>(
+            productKeys.bootstrap,
+          )
+          if (
+            current &&
+            !("status" in current) &&
+            !sameRuntime(current.runtime, scope)
+          ) {
+            return
+          }
+          queryClient.setQueryData(productKeys.bootstrap, startup)
+        } catch {
+          if (active) {
+            setEventConnection({
+              status: "unavailable",
+              attempts: reconnectAttempts,
+            })
+          }
+        } finally {
+          nativeReconnectInFlight.current = null
+        }
+      })()
+      nativeReconnectInFlight.current = attempt
+    }
+
     const resync = () => {
       if (!active || resyncing) return
       resyncing = true
+      setEventAdmissionPending(true)
       connectionEpoch += 1
       clearTimers()
       releaseSubscription()
@@ -136,12 +187,12 @@ export function ProductProvider({
       void bootstrap.refetch().then((result) => {
         if (!active) return
         const startup = result.data
-        if (
-          result.isError ||
-          !startup ||
-          "status" in startup
-        ) {
-          setEventConnection({ status: "unavailable", attempts: 0 })
+        if (result.isError || !startup) {
+          reconnectNativeService()
+          return
+        }
+        if ("status" in startup) {
+          setEventConnection({ status: "inactive" })
           return
         }
         if (!sameRuntime(scope, startup.runtime)) {
@@ -161,10 +212,7 @@ export function ProductProvider({
       if (stableTimer !== null) window.clearTimeout(stableTimer)
       stableTimer = null
       if (reconnectAttempts >= RECONNECT_DELAYS_MS.length) {
-        setEventConnection({
-          status: "unavailable",
-          attempts: reconnectAttempts,
-        })
+        reconnectNativeService()
         return
       }
       const delay = RECONNECT_DELAYS_MS[reconnectAttempts]
@@ -230,6 +278,8 @@ export function ProductProvider({
             return
           }
           subscription = connected
+          setEventAdmittedRuntime(receipt.runtime)
+          setEventAdmissionPending(false)
           setEventConnection({
             status: "connected",
             resumed: receipt.resumed,
@@ -308,38 +358,67 @@ export function ProductProvider({
     [bootstrap, transport],
   )
 
-  const state: ProductState = bootstrap.data
-    ? "status" in bootstrap.data
-      ? {
-          status: "error",
-          availability: "degraded",
-          bootstrap: null,
-          serviceBootstrap: bootstrap.data,
-          error:
-            "Secure local storage needs the foreground recovery action shown above. Navigation and stored workspace routes remain available.",
-        }
-      : {
-          status: "ready",
-          availability: "ready",
-          bootstrap: bootstrap.data,
-          serviceBootstrap: null,
-          error: null,
-        }
-    : bootstrap.isError
-      ? {
-          status: "error",
-          availability: "unavailable",
-          bootstrap: null,
-          serviceBootstrap: null,
-          error: messageFrom(bootstrap.error),
-        }
-      : {
-          status: "loading",
-          availability: "loading",
-          bootstrap: null,
-          serviceBootstrap: null,
-          error: null,
-        }
+  const readyBootstrap =
+    bootstrap.data && !("status" in bootstrap.data) ? bootstrap.data : null
+  const generationHandoffPending =
+    readyBootstrap !== null &&
+    (eventAdmissionPending ||
+      eventAdmittedRuntime === null ||
+      !sameRuntime(readyBootstrap.runtime, eventAdmittedRuntime))
+  const generationHandoffUnavailable =
+    generationHandoffPending && eventConnection.status === "unavailable"
+  let state: ProductState
+  if (generationHandoffUnavailable) {
+    state = {
+      status: "error",
+      availability: "unavailable",
+      bootstrap: null,
+      serviceBootstrap: null,
+      error:
+        "The Desktop could not establish an authenticated event connection for the current service generation.",
+    }
+  } else if (generationHandoffPending) {
+    state = {
+      status: "loading",
+      availability: "loading",
+      bootstrap: null,
+      serviceBootstrap: null,
+      error: null,
+    }
+  } else if (bootstrap.data && "status" in bootstrap.data) {
+    state = {
+      status: "error",
+      availability: "degraded",
+      bootstrap: null,
+      serviceBootstrap: bootstrap.data,
+      error:
+        "Secure local storage needs the foreground recovery action shown above. Navigation and stored workspace routes remain available.",
+    }
+  } else if (bootstrap.data) {
+    state = {
+      status: "ready",
+      availability: "ready",
+      bootstrap: bootstrap.data,
+      serviceBootstrap: null,
+      error: null,
+    }
+  } else if (bootstrap.isError) {
+    state = {
+      status: "error",
+      availability: "unavailable",
+      bootstrap: null,
+      serviceBootstrap: null,
+      error: messageFrom(bootstrap.error),
+    }
+  } else {
+    state = {
+      status: "loading",
+      availability: "loading",
+      bootstrap: null,
+      serviceBootstrap: null,
+      error: null,
+    }
+  }
 
   const value = React.useMemo<ProductContextValue>(
     () => ({
@@ -347,6 +426,7 @@ export function ProductProvider({
       transport,
       eventConnection,
       retryEventConnection: () => {
+        setEventAdmissionPending(true)
         setEventRetryGeneration((generation) => generation + 1)
       },
       recoverService,

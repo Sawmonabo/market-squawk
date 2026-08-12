@@ -296,6 +296,9 @@ export type ProviderOnboardingResult<
 export interface ProductTransport {
   bootstrap(): Promise<DesktopStartup>
   bootstrapService(request: DesktopServiceBootstrapRequest): Promise<void>
+  reconnectService(
+    expectedRuntime: DesktopBootstrap["runtime"],
+  ): Promise<DesktopStartup>
   installation(
     request: InstallationControlRequest,
     confirmed?: boolean,

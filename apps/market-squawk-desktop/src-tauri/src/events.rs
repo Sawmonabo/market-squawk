@@ -60,7 +60,7 @@ pub(crate) async fn subscribe_service_events(
     state: State<'_, DesktopState>,
     subscriptions: State<'_, DesktopEventSubscriptions>,
 ) -> Result<DesktopEventSubscriptionReceipt, DesktopCommandError> {
-    if window.label() != "main" || request.runtime() != state.runtime() {
+    if window.label() != "main" {
         return Err(DesktopCommandError::new(
             "event_subscription_rejected",
             "The event subscription does not belong to this window and service generation.",
@@ -69,9 +69,17 @@ pub(crate) async fn subscribe_service_events(
     let limit = EventPageLimit::try_new(EVENT_PAGE_LIMIT)
         .map_err(|_error| DesktopCommandError::internal())?;
     let subscription_id = Uuid::new_v4();
-    let runtime = state.runtime();
+    let generation = state.current_generation()?;
+    if request.runtime() != generation.runtime() {
+        return Err(DesktopCommandError::new(
+            "event_subscription_rejected",
+            "The event subscription does not belong to this window and service generation.",
+        ));
+    }
+    let runtime = generation.runtime();
     let requested_sequence = request.after_sequence();
     let mut registry = subscriptions.inner.lock().await;
+    state.admit_current(&generation)?;
     stop_active_subscription(&mut registry, None).await;
 
     let resumed_cursor = registry
@@ -101,11 +109,11 @@ pub(crate) async fn subscribe_service_events(
         registry.retained = None;
     }
     let cursor = Arc::new(Mutex::new(resumed_cursor));
-    let cancellation = state.cancellation();
+    let cancellation = generation.cancellation();
     let task = tauri::async_runtime::spawn(forward_service_events(
-        state.application(),
+        generation.application(),
         runtime,
-        state.service_operation_index(),
+        generation.service_operation_index(),
         limit,
         Arc::clone(&cursor),
         cancellation.clone(),
@@ -118,12 +126,31 @@ pub(crate) async fn subscribe_service_events(
         task,
         cursor,
     });
-    Ok(DesktopEventSubscriptionReceipt::new(
-        subscription_id,
-        runtime,
-        requested_sequence,
-        resumed,
-    ))
+    if let Err(error) = state.admit_current(&generation) {
+        stop_active_subscription(&mut registry, Some(subscription_id)).await;
+        registry.retained = None;
+        return Err(error);
+    }
+    let receipt =
+        DesktopEventSubscriptionReceipt::new(subscription_id, runtime, requested_sequence, resumed);
+    if let Err(error) = state.acknowledge_webview_runtime(&generation, runtime) {
+        stop_active_subscription(&mut registry, Some(subscription_id)).await;
+        registry.retained = None;
+        return Err(error);
+    }
+    Ok(receipt)
+}
+
+impl DesktopEventSubscriptions {
+    pub(crate) async fn stop_clear_and_replace<T>(
+        &self,
+        replace: impl FnOnce() -> Result<T, DesktopCommandError>,
+    ) -> Result<T, DesktopCommandError> {
+        let mut registry = self.inner.lock().await;
+        stop_active_subscription(&mut registry, None).await;
+        registry.retained = None;
+        replace()
+    }
 }
 
 #[tauri::command]

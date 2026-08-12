@@ -7,6 +7,7 @@ fn main() {
         "decision_control",
         "desktop_bootstrap",
         "desktop_service_bootstrap",
+        "desktop_service_reconnect",
         "discard_portfolio_import",
         "discard_research_file_import",
         "fair_value_control",

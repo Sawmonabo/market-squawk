@@ -13,6 +13,7 @@
     "allow-decision-control",
     "allow-desktop-bootstrap",
     "allow-desktop-service-bootstrap",
+    "allow-desktop-service-reconnect",
     "allow-discard-portfolio-import",
     "allow-discard-research-file-import",
     "allow-fair-value-control",
