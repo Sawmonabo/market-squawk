@@ -108,8 +108,9 @@ export type DashboardQuery =
     }
   | {
       query: "portfolioCandidateImpact"
-      accountId: string
-      candidate: Record<string, unknown>
+      instrumentId: string
+      proposedQuantity: string
+      scenarioShock: string
     }
   | {
       query:

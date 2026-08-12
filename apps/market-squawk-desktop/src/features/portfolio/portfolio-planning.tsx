@@ -27,7 +27,8 @@ import {
   shortIdentity,
 } from "./portfolio-format"
 
-const NONNEGATIVE_DECIMAL = /^\d+(?:\.\d+)?$/
+const NONNEGATIVE_DECIMAL = /^(?:0|[1-9]\d*)(?:\.\d+)?$/
+const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 
 export function PortfolioPlanning({
   account,
@@ -49,8 +50,8 @@ export function PortfolioPlanning({
         </p>
         <h2 className="mt-2 text-lg font-semibold">Portfolio planning</h2>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          Compare a cash-funded holding change or create a bounded rebalance proposal. These tools
-          cannot submit orders; any future order still requires centralized risk approval.
+          Compare an exact position quantity or create a bounded rebalance proposal. The service
+          selects the configured account and current evidence; these tools cannot submit orders.
         </p>
       </header>
       <div className="mt-5 grid gap-4 xl:grid-cols-2">
@@ -83,40 +84,33 @@ function CandidatePlanner({
   available: boolean
 }) {
   const [instrumentId, setInstrumentId] = React.useState(holdings[0]?.instrument_id ?? "")
-  const selected = holdings.find((holding) => holding.instrument_id === instrumentId) ?? holdings[0]
-  const [proposedValue, setProposedValue] = React.useState(selected?.market_value.amount ?? "")
+  const selected = holdings.find((holding) => holding.instrument_id === instrumentId)
+  const [proposedQuantity, setProposedQuantity] = React.useState(selected?.quantity ?? "")
   const [shock, setShock] = React.useState("-10")
   const [validation, setValidation] = React.useState<string | null>(null)
 
   React.useEffect(() => {
     const holding = holdings[0]
     setInstrumentId(holding?.instrument_id ?? "")
-    setProposedValue(holding?.market_value.amount ?? "")
+    setProposedQuantity(holding?.quantity ?? "")
   }, [account.currentRevision.revisionId, holdings])
 
   const mutation = useMutation({
     mutationFn: async ({
-      holding,
-      value,
+      selectedInstrumentId,
+      quantity,
       shockRate,
     }: {
-      holding: PortfolioHolding
-      value: string
+      selectedInstrumentId: string
+      quantity: string
       shockRate: string
     }) =>
       parsePortfolioResult(
         await transport.query({
           query: "portfolioCandidateImpact",
-          accountId: account.accountId,
-          candidate: {
-            instrumentId: holding.instrument_id,
-            proposedMarketValue: {
-              amount: value,
-              currency: account.currency,
-            },
-            funding: "portfolio_cash",
-            scenarioShock: shockRate,
-          },
+          instrumentId: selectedInstrumentId,
+          proposedQuantity: quantity,
+          scenarioShock: shockRate,
         }),
         portfolioCandidateImpactSchema,
       ).value,
@@ -125,18 +119,18 @@ function CandidatePlanner({
   const selectHolding = (nextId: string) => {
     setInstrumentId(nextId)
     const holding = holdings.find((row) => row.instrument_id === nextId)
-    setProposedValue(holding?.market_value.amount ?? "")
+    if (holding) setProposedQuantity(holding.quantity)
     mutation.reset()
   }
 
   const run = () => {
     setValidation(null)
-    if (!selected) {
-      setValidation("Choose an existing source-backed holding.")
+    if (!UUID.test(instrumentId)) {
+      setValidation("Choose a holding or enter the exact instrument ID for a new position.")
       return
     }
-    if (!NONNEGATIVE_DECIMAL.test(proposedValue)) {
-      setValidation("Enter a non-negative exact market value without currency symbols or commas.")
+    if (!NONNEGATIVE_DECIMAL.test(proposedQuantity)) {
+      setValidation("Enter a non-negative exact quantity without symbols, commas, or exponents.")
       return
     }
     const shockBasisPoints = percentageToBasisPoints(shock)
@@ -145,8 +139,8 @@ function CandidatePlanner({
       return
     }
     mutation.mutate({
-      holding: selected,
-      value: proposedValue,
+      selectedInstrumentId: instrumentId,
+      quantity: proposedQuantity,
       shockRate: basisPointsToUnitRate(shockBasisPoints),
     })
   }
@@ -155,44 +149,55 @@ function CandidatePlanner({
     <div className="rounded-lg border border-border bg-background/25 p-4">
       <div className="flex items-center gap-2">
         <Target className="size-4 text-primary" aria-hidden="true" />
-        <h3 className="text-sm font-semibold">Compare a holding target</h3>
+        <h3 className="text-sm font-semibold">Compare a position quantity</h3>
       </div>
       <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
-        Test a new value for an existing holding using portfolio cash. New assets remain unavailable
-        until pinned market evidence exists.
+        Choose a holding or enter an instrument ID for a new position. Market marks, terms, account,
+        and portfolio revision are resolved by the service from current evidence.
       </p>
       {!available ? (
         <Unavailable text="Candidate-impact analysis is not registered." />
-      ) : holdings.length === 0 ? (
-        <Unavailable text="Candidate analysis requires an existing holding." />
       ) : (
         <>
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
-            <label className="grid gap-1.5 text-xs sm:col-span-2">
-              <span className="font-medium">Holding</span>
-              <select
-                value={selected?.instrument_id ?? ""}
-                onChange={(event) => selectHolding(event.target.value)}
-                className="h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                {holdings.map((holding) => (
-                  <option key={holding.instrument_id} value={holding.instrument_id}>
-                    {shortIdentity(holding.instrument_id, "Asset")} · {formatMoney(holding.market_value)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="grid gap-1.5 text-xs">
-              <span className="font-medium">Proposed value ({account.currency})</span>
+            <label
+              htmlFor="portfolio-candidate-instrument"
+              className="grid gap-1.5 text-xs sm:col-span-2"
+            >
+              <span className="font-medium">Instrument ID</span>
               <Input
-                inputMode="decimal"
-                value={proposedValue}
-                onChange={(event) => setProposedValue(event.target.value)}
+                id="portfolio-candidate-instrument"
+                list="portfolio-candidate-instruments"
+                value={instrumentId}
+                onChange={(event) => selectHolding(event.target.value)}
+                placeholder="Choose a holding or enter an exact instrument ID"
               />
             </label>
-            <label className="grid gap-1.5 text-xs">
+            <datalist id="portfolio-candidate-instruments">
+              {holdings.map((holding) => (
+                <option key={holding.instrument_id} value={holding.instrument_id}>
+                  {shortIdentity(holding.instrument_id, "Asset")}
+                </option>
+              ))}
+            </datalist>
+            <label htmlFor="portfolio-candidate-quantity" className="grid gap-1.5 text-xs">
+              <span className="font-medium">Proposed quantity</span>
+              <Input
+                id="portfolio-candidate-quantity"
+                inputMode="decimal"
+                value={proposedQuantity}
+                onChange={(event) => setProposedQuantity(event.target.value)}
+              />
+              <span className="text-[10px] text-muted-foreground">
+                {selected
+                  ? `Current ${selected.quantity} · lot ${selected.lot_size}`
+                  : "Exact lot alignment is checked by the service."}
+              </span>
+            </label>
+            <label htmlFor="portfolio-candidate-shock" className="grid gap-1.5 text-xs">
               <span className="font-medium">Stress change (%)</span>
               <Input
+                id="portfolio-candidate-shock"
                 type="number"
                 inputMode="decimal"
                 min="-100"
@@ -216,17 +221,73 @@ function CandidatePlanner({
 }
 
 function CandidateResult({ result }: { result: PortfolioCandidateImpact }) {
+  const unavailable = [
+    ["Portfolio-wide current marks", result.availability.portfolioWideSelectedMarks],
+    ["Selected-source liquidity", result.availability.liquidity],
+    ["Settlement-backed sizing", result.availability.settlementBackedSizing],
+    ["Factor classification", result.availability.factorClassification],
+  ] as const
   return (
     <div className="mt-4 rounded-lg border border-border bg-card/30 p-4" aria-live="polite">
       <dl className="grid gap-3 sm:grid-cols-2">
+        <Fact label="Server-selected account" value={shortIdentity(result.accountId, "Account")} />
+        <Fact label="Portfolio revision" value={result.revisionId} />
         <Fact label="Current value" value={formatMoney(result.currentMarketValue)} />
         <Fact label="Proposed value" value={formatMoney(result.proposedMarketValue)} />
-        <Fact label="Projected cash" value={formatMoney(result.projectedCash)} />
+        <Fact label="Capital change" value={formatMoney(result.capitalChange)} />
+        <Fact label="Portfolio value" value={formatMoney(result.portfolioValue)} />
+        <Fact
+          label="Position type"
+          value={result.positionState === "zero_position" ? "New position" : "Existing holding"}
+        />
+        <Fact label="Current quantity" value={result.currentQuantity} />
+        <Fact label="Proposed quantity" value={result.proposedQuantity} />
         <Fact label="Concentration change" value={formatPercent(result.concentration.change)} />
-        <Fact label="Current stress impact" value={formatMoney(result.scenario.currentImpact)} />
-        <Fact label="Proposed stress impact" value={formatMoney(result.scenario.proposedImpact)} />
+        <Fact label="Marginal stress impact" value={formatMoney(result.scenario.marginalImpact)} />
+        <Fact label="Selected mark" value={formatMoney(result.markEvidence.unitMark)} />
+        <Fact label="Mark source" value={result.markEvidence.sourceId} />
+        <Fact label="Lot size" value={result.instrumentTerms.lotSize} />
+        <Fact label="Contract multiplier" value={result.instrumentTerms.contractMultiplier} />
       </dl>
+      <div className="mt-4 grid gap-2 sm:grid-cols-2">
+        <EvidenceStatus label="Exact fees" evidence={result.costEvidence.fees} />
+        <EvidenceStatus label="Exact slippage" evidence={result.costEvidence.slippage} />
+      </div>
+      <Alert className="mt-4 border-amber-400/25 bg-amber-400/5">
+        <AlertCircle aria-hidden="true" />
+        <AlertTitle>Risk review remains incomplete</AlertTitle>
+        <AlertDescription>
+          <ul className="mt-1 list-disc space-y-1 pl-4">
+            {unavailable.map(([label]) => (
+              <li key={label}>{label} is unavailable.</li>
+            ))}
+            {result.riskAdvisory.checksUnavailable.includes("fees") ? (
+              <li>Exact fees are unavailable.</li>
+            ) : null}
+            {result.riskAdvisory.checksUnavailable.includes("slippage") ? (
+              <li>Exact slippage is unavailable.</li>
+            ) : null}
+          </ul>
+        </AlertDescription>
+      </Alert>
       <AuthorityNote />
+    </div>
+  )
+}
+
+function EvidenceStatus({
+  label,
+  evidence,
+}: {
+  label: string
+  evidence: PortfolioCandidateImpact["costEvidence"]["fees"]
+}) {
+  return (
+    <div className="rounded-md border border-border/70 p-3 text-xs">
+      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+      <p className="mt-1 font-mono">
+        {evidence.status === "available" ? formatMoney(evidence.amount) : "Unavailable"}
+      </p>
     </div>
   )
 }
@@ -458,7 +519,9 @@ function AuthorityNote() {
   return (
     <div className="mt-4 flex gap-2 rounded-md border border-emerald-400/20 bg-emerald-400/5 p-3 text-[11px] leading-5 text-muted-foreground">
       <ShieldCheck className="mt-0.5 size-4 shrink-0 text-emerald-300" aria-hidden="true" />
-      <span>Analysis only. No order was created, approved, or submitted.</span>
+      <span>
+        Analysis only. No portfolio mutation, risk reservation, approval, or order was created.
+      </span>
     </div>
   )
 }

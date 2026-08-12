@@ -4147,7 +4147,7 @@ fn portfolio_candidate_impact() -> Value {
 fn portfolio_candidate_setup_evidence() -> Value {
     closed(
         vec![
-            ("setupRevision", bounded_unsigned_range(1, u64::MAX)),
+            ("setupRevision", positive_integer_text()),
             ("setupDigest", sha256()),
             ("configurationDigest", sha256()),
             ("profileDigest", sha256()),
@@ -4187,7 +4187,7 @@ fn portfolio_candidate_portfolio_evidence() -> Value {
 fn portfolio_candidate_instrument_terms() -> Value {
     closed(
         vec![
-            ("definitionRevision", bounded_unsigned_range(1, u64::MAX)),
+            ("definitionRevision", positive_integer_text()),
             ("priceTick", canonical_decimal_text()),
             ("lotSize", canonical_decimal_text()),
             ("quoteCurrency", recommendation_currency()),

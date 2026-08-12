@@ -142,7 +142,7 @@ fn manage_ready_desktop(
         .map_err(|_error| DesktopCommandError::internal())?;
     let analytical_controller = DesktopAnalyticalController::try_open(
         &local_paths,
-        *state.runtime().workspace_id().as_uuid(),
+        state.runtime().workspace_id().as_uuid(),
     )?;
     let (endpoint_identity, claude_credential_identity, codex_credential_identity) =
         state.mcp_authority_identities();

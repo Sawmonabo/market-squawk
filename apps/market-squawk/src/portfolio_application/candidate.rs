@@ -1065,7 +1065,7 @@ impl PortfolioCandidateImpactPreview {
             }),
         };
         let setup_evidence = json!({
-            "setupRevision": self.setup.setup_revision,
+            "setupRevision": self.setup.setup_revision.to_string(),
             "setupDigest": hex(&self.setup.setup_digest),
             "configurationDigest": hex(&self.setup.configuration_digest),
             "profileDigest": hex(&self.setup.profile_digest),
@@ -1087,7 +1087,7 @@ impl PortfolioCandidateImpactPreview {
             "artifactSha256": hex(&self.portfolio_artifact_sha256),
         });
         let instrument_terms = json!({
-            "definitionRevision": terms.definition_revision().get(),
+            "definitionRevision": terms.definition_revision().get().to_string(),
             "priceTick": terms.price_tick().as_decimal().to_string(),
             "lotSize": terms.lot_size().as_decimal().to_string(),
             "quoteCurrency": terms.quote_currency().as_str(),

@@ -285,8 +285,9 @@ pub(crate) enum DashboardQueryCommand {
         proposal: Map<String, Value>,
     },
     PortfolioCandidateImpact {
-        account_id: String,
-        candidate: Map<String, Value>,
+        instrument_id: Uuid,
+        proposed_quantity: String,
+        scenario_shock: String,
     },
     ModelBundles,
     Forecasts,

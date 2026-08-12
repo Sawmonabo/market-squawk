@@ -1,4 +1,5 @@
 import { act, render, screen, within } from "@testing-library/react"
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
 import { describe, expect, it } from "vitest"
@@ -8,6 +9,11 @@ import marketSquawkMarkSvg from "@/assets/market-squawk-mark.svg?raw"
 import { CredentialField } from "@/components/setup/credential-field"
 import type { AnalyticalControllerStatus } from "@/features/advanced/analytical-profile-contracts"
 import { lookupRoute } from "@/features/lookup/lookup-surface"
+import type {
+  PortfolioAccount,
+  PortfolioHolding,
+} from "@/features/portfolio/portfolio-contracts"
+import { PortfolioPlanning } from "@/features/portfolio/portfolio-planning"
 import type {
   ApplicationResult,
   DesktopBootstrap,
@@ -699,6 +705,196 @@ const unifiedKrakenMarket: ApplicationResult = {
   },
 }
 
+const portfolioAccountId = "55e7626c-81c8-4e78-8aa6-45a1d9c2949a"
+const heldInstrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
+const candidateInstrumentId = "0467d4c9-befd-5b7d-b4b5-99b673662c86"
+const portfolioRevisionId = "c".repeat(64)
+const portfolioAccount: PortfolioAccount = {
+  accountId: portfolioAccountId,
+  currency: "USD",
+  currentRevision: {
+    revisionId: portfolioRevisionId,
+    effectiveAtUnixNanos: "1800000000000000000",
+    availableAtUnixNanos: "1800000001000000000",
+    sourceId: "owned-portfolio-import",
+    sourceCoverage: ["owned-portfolio-import"],
+    artifactSha256: "d".repeat(64),
+    holdingCount: 1,
+    transactionCount: 1,
+    reconciliationDiscrepancies: 0,
+  },
+  holdingCount: 1,
+  transactionCount: 1,
+  reconciliationDiscrepancies: 0,
+}
+const portfolioHolding: PortfolioHolding = {
+  account_id: portfolioAccountId,
+  instrument_id: heldInstrumentId,
+  currency: "USD",
+  quantity: "10",
+  lot_size: "1",
+  market_value: { amount: "1000", currency: "USD" },
+  as_of: "1800000000000000000",
+  basis: { status: "missing" },
+  source_reference: "owned:holding:1",
+  revisionId: portfolioRevisionId,
+  effectiveAtUnixNanos: "1800000000000000000",
+  availableAtUnixNanos: "1800000001000000000",
+  sourceId: "owned-portfolio-import",
+  artifactSha256: "d".repeat(64),
+  markEvidence: {
+    sourceReference: "owned:holding:1",
+    observedAtUnixNanos: "1800000000000000000",
+    venue: null,
+    venueStatus: "not_applicable",
+    state: "source_reported",
+    quality: "direct_unverified",
+    executionEligible: false,
+    freshness: { status: "current", reason: "source_reported" },
+    fallback: { status: "not_used", reason: "source_reported" },
+  },
+}
+
+function candidateImpactResult(instrumentId: string): ApplicationResult {
+  const evidence = { algorithm: "sha256", bytes: "e".repeat(64) }
+  return {
+    data: {
+      accountId: portfolioAccountId,
+      revisionId: portfolioRevisionId,
+      setupEvidence: {
+        setupRevision: "1",
+        setupDigest: "1".repeat(64),
+        configurationDigest: "2".repeat(64),
+        profileDigest: "3".repeat(64),
+        catalogDigest: "4".repeat(64),
+      },
+      policy: "selected_market_candidate_impact_v3",
+      evidenceSchemaVersion: 1,
+      evidenceDigest: evidence,
+      portfolioEvidence: {
+        revisionId: portfolioRevisionId,
+        effectiveAtUnixNanos: "1800000000000000000",
+        availableAtUnixNanos: "1800000001000000000",
+        sourceId: "owned-portfolio-import",
+        sourceCoverage: ["owned-portfolio-import"],
+        artifactSha256: "d".repeat(64),
+      },
+      instrumentId,
+      positionState: "zero_position",
+      currentQuantity: "0",
+      proposedQuantity: "3",
+      currentMarketValue: { amount: "0", currency: "USD" },
+      proposedMarketValue: { amount: "300", currency: "USD" },
+      capitalChange: { amount: "300", currency: "USD" },
+      portfolioValue: { amount: "2500", currency: "USD" },
+      portfolioValueBasis:
+        "source_reported_holdings_with_selected_candidate_revalued",
+      instrumentTerms: {
+        definitionRevision: "3",
+        priceTick: "0.01",
+        lotSize: "1",
+        quoteCurrency: "USD",
+        settlementDenomination: { kind: "currency", currency: "USD" },
+        contractMultiplier: "1",
+      },
+      costEvidence: {
+        fees: { status: "unavailable", reason: "exact_fees" },
+        slippage: { status: "unavailable", reason: "exact_slippage" },
+      },
+      concentration: { current: "0", proposed: "0.12", change: "0.12" },
+      scenario: {
+        scope: "candidate_position_only",
+        shock: "-0.1",
+        currentImpact: { amount: "0", currency: "USD" },
+        proposedImpact: { amount: "-30", currency: "USD" },
+        marginalImpact: { amount: "-30", currency: "USD" },
+      },
+      markEvidence: {
+        status: "fresh_selected_market_observation",
+        instrumentId,
+        unitMark: { amount: "100", currency: "USD" },
+        markKind: "last_trade",
+        quality: "direct_verified",
+        sourceId: "selected-market-source",
+        observationDigest: evidence,
+        observedAtUnixNanos: "1800000002000000000",
+        availableAtUnixNanos: "1800000002000000001",
+        freshUntilUnixNanosExclusive: "1800000007000000000",
+        evaluatedAtUnixNanos: "1800000002000000002",
+        portfolioRevisionId,
+        selection: {
+          instrumentId,
+          sourceId: "selected-market-source",
+          policyRevision: 1,
+          policyDigest: evidence,
+          receiptDigest: evidence,
+          sourceStateRevision: "8",
+          selectedAtUnixNanos: "1800000002000000001",
+        },
+      },
+      availability: {
+        portfolioWideSelectedMarks: {
+          status: "unavailable",
+          reason: "portfolio_wide_selected_market_marks",
+        },
+        liquidity: {
+          status: "unavailable",
+          reason: "exact_selected_source_liquidity",
+        },
+        settlementBackedSizing: {
+          status: "unavailable",
+          reason: "settlement_backed_sizing",
+        },
+        factorClassification: {
+          status: "unavailable",
+          reason: "exact_factor_classification",
+        },
+      },
+      riskAdvisory: {
+        outcome: "indeterminate_at_evaluation",
+        evaluatedAtUnixNanos: "1800000002000000002",
+        checksEvaluated: [
+          "selected_account",
+          "current_portfolio_revision",
+          "fresh_selected_mark",
+          "instrument_terms",
+          "position_lot_alignment",
+        ],
+        checksUnavailable: [
+          "portfolio_wide_selected_marks",
+          "liquidity",
+          "settlement_backed_sizing",
+          "fees",
+          "slippage",
+        ],
+        evidenceDigest: evidence,
+        authority: "analysis_only",
+        reservation: false,
+        order: false,
+      },
+      authority: {
+        analysisOnly: true,
+        portfolioMutation: false,
+        executionAuthority: false,
+        riskAuthority: "analysis_only",
+        reservation: false,
+        order: false,
+        riskApprovalRequiredBeforeAnyOrder: true,
+      },
+    },
+    metadata: {
+      completeness: "complete",
+      returnedItems: 1,
+      availableItems: 1,
+      sourceCoverage: {
+        status: "complete",
+        providers: ["owned-portfolio-import", "selected-market-source"],
+      },
+      dataQuality: { status: "direct_verified" },
+    },
+  }
+}
+
 describe("Market Squawk desktop boundary", () => {
   it("keeps an instrument lookup bound to its exact Markets context", () => {
     const instrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
@@ -757,6 +953,76 @@ describe("Market Squawk desktop boundary", () => {
     await user.click(screen.getByText("Data confidence"))
     expect(screen.getAllByText("kraken").length).toBeGreaterThan(0)
     expect(screen.getByText("Checksum valid")).toBeTruthy()
+  })
+
+  it("keeps candidate impact server-resolved and visibly analysis-only", async () => {
+    const user = userEvent.setup()
+    const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
+    const readyBootstrap: DesktopBootstrap = {
+      ...blockedBootstrap,
+      operations: [
+        datasetRead(
+          "Portfolio.EvaluateCandidateImpact",
+          "portfolio",
+          "Evaluate one server-resolved candidate impact.",
+        ),
+      ],
+    }
+    const candidateTransport = transport(
+      readyBootstrap,
+      undefined,
+      async (request) => {
+        issuedQueries.push(request)
+        if (request.query === "portfolioCandidateImpact") {
+          return candidateImpactResult(request.instrumentId)
+        }
+        throw new Error(`Unexpected candidate query: ${request.query}`)
+      },
+    )
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PortfolioPlanning
+          account={portfolioAccount}
+          holdings={[portfolioHolding]}
+          bootstrap={readyBootstrap}
+          transport={candidateTransport}
+        />
+      </QueryClientProvider>,
+    )
+
+    const instrument = screen.getByLabelText("Instrument ID")
+    await user.clear(instrument)
+    await user.type(instrument, candidateInstrumentId)
+    const quantity = screen.getByLabelText(/^Proposed quantity/)
+    await user.clear(quantity)
+    await user.type(quantity, "3")
+    await user.click(screen.getByRole("button", { name: "Compare impact" }))
+
+    expect(await screen.findByText("Risk review remains incomplete")).toBeTruthy()
+    expect(issuedQueries).toEqual([
+      {
+        query: "portfolioCandidateImpact",
+        instrumentId: candidateInstrumentId,
+        proposedQuantity: "3",
+        scenarioShock: "-0.1",
+      },
+    ])
+    expect(screen.getByText("New position")).toBeTruthy()
+    expect(screen.getAllByText("USD 300")).toHaveLength(2)
+    expect(screen.getByText("Settlement-backed sizing is unavailable.")).toBeTruthy()
+    expect(screen.getAllByText("Unavailable")).toHaveLength(2)
+    expect(
+      screen.getByText(
+        "Analysis only. No portfolio mutation, risk reservation, approval, or order was created.",
+      ),
+    ).toBeTruthy()
+    expect(screen.queryByText("Projected cash")).toBeNull()
   })
 
   it("keeps fallback bootstrap native and enters the ready workspace only after reconnect", async () => {

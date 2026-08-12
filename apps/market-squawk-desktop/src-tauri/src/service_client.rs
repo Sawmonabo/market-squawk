@@ -151,11 +151,14 @@ pub(crate) async fn dashboard_query(
             ("Portfolio.ProposeRebalance", arguments)
         }
         DashboardQueryCommand::PortfolioCandidateImpact {
-            account_id,
-            candidate,
+            instrument_id,
+            proposed_quantity,
+            scenario_shock,
         } => {
-            let mut arguments = account_arguments(account_id);
-            arguments.insert("candidate".to_owned(), Value::Object(candidate));
+            let mut arguments = Map::new();
+            arguments.insert("instrumentId".to_owned(), json!(instrument_id));
+            arguments.insert("proposedQuantity".to_owned(), json!(proposed_quantity));
+            arguments.insert("scenarioShock".to_owned(), json!(scenario_shock));
             ("Portfolio.EvaluateCandidateImpact", arguments)
         }
         DashboardQueryCommand::ModelBundles => ("Model.ListBundles", Map::new()),

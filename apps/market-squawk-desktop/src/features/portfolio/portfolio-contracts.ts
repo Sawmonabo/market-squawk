@@ -171,29 +171,256 @@ export const portfolioRebalanceSchema = advancedReportBase.extend({
   }),
 })
 
-export const portfolioCandidateImpactSchema = advancedReportBase.extend({
-  instrumentId: z.string().min(1),
-  currentMarketValue: moneySchema,
-  proposedMarketValue: moneySchema,
-  projectedCash: moneySchema,
-  concentration: z.object({
-    current: exactDecimalSchema,
-    proposed: exactDecimalSchema,
-    change: exactDecimalSchema,
-  }),
-  scenario: z.object({
-    shock: exactDecimalSchema,
-    currentImpact: moneySchema,
-    proposedImpact: moneySchema,
-    marginalImpact: moneySchema,
-  }),
-  unavailable: z.array(z.string()),
-  authority: z.object({
-    analysisOnly: z.literal(true),
-    executionAuthority: z.literal(false),
-    riskApprovalRequiredBeforeAnyOrder: z.literal(true),
-  }),
-})
+const candidateDecimalSchema = z.string().regex(
+  /^-?(?:0|[1-9]\d*)(?:\.\d*[1-9])?$/,
+)
+const integerTextSchema = z.string().regex(/^-?\d+$/)
+const unsignedIntegerTextSchema = z.string().regex(/^\d+$/)
+const positiveU64TextSchema = z
+  .string()
+  .regex(/^[1-9]\d*$/)
+  .refine((value) => BigInt(value) <= 18_446_744_073_709_551_615n)
+const uuidSchema = z.string().uuid()
+const candidateCurrencySchema = z.string().regex(/^[A-Z]{3}$/)
+const candidateMoneySchema = z
+  .object({
+    amount: candidateDecimalSchema,
+    currency: candidateCurrencySchema,
+  })
+  .strict()
+const evidenceDigestSchema = z
+  .object({
+    algorithm: z.enum(["sha256", "blake3"]),
+    bytes: digestSchema,
+  })
+  .strict()
+const sha256EvidenceDigestSchema = z
+  .object({
+    algorithm: z.literal("sha256"),
+    bytes: digestSchema,
+  })
+  .strict()
+const unavailableEvidenceSchema = <Reason extends string>(reason: Reason) =>
+  z
+    .object({
+      status: z.literal("unavailable"),
+      reason: z.literal(reason),
+    })
+    .strict()
+const candidateCostSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      status: z.literal("available"),
+      amount: candidateMoneySchema,
+      evidenceDigest: evidenceDigestSchema,
+    })
+    .strict(),
+  z
+    .object({
+      status: z.literal("unavailable"),
+      reason: z.enum(["exact_fees", "exact_slippage"]),
+    })
+    .strict(),
+])
+const riskCheckSchema = z.enum([
+  "selected_account",
+  "current_portfolio_revision",
+  "fresh_selected_mark",
+  "instrument_terms",
+  "position_lot_alignment",
+  "portfolio_wide_selected_marks",
+  "liquidity",
+  "settlement_backed_sizing",
+  "fees",
+  "slippage",
+])
+
+export const portfolioCandidateImpactSchema = z
+  .object({
+    accountId: uuidSchema,
+    revisionId: digestSchema,
+    setupEvidence: z
+      .object({
+        setupRevision: positiveU64TextSchema,
+        setupDigest: digestSchema,
+        configurationDigest: digestSchema,
+        profileDigest: digestSchema,
+        catalogDigest: digestSchema,
+      })
+      .strict(),
+    policy: z.literal("selected_market_candidate_impact_v3"),
+    evidenceSchemaVersion: z.literal(1),
+    evidenceDigest: sha256EvidenceDigestSchema,
+    portfolioEvidence: z
+      .object({
+        revisionId: digestSchema,
+        effectiveAtUnixNanos: integerTextSchema,
+        availableAtUnixNanos: integerTextSchema,
+        sourceId: z.string().min(1).max(256),
+        sourceCoverage: z.array(z.string().min(1).max(256)).max(4_096),
+        artifactSha256: digestSchema,
+      })
+      .strict(),
+    instrumentId: uuidSchema,
+    positionState: z.enum(["zero_position", "existing_holding"]),
+    currentQuantity: candidateDecimalSchema,
+    proposedQuantity: candidateDecimalSchema,
+    currentMarketValue: candidateMoneySchema,
+    proposedMarketValue: candidateMoneySchema,
+    capitalChange: candidateMoneySchema,
+    portfolioValue: candidateMoneySchema,
+    portfolioValueBasis: z.literal(
+      "source_reported_holdings_with_selected_candidate_revalued",
+    ),
+    instrumentTerms: z
+      .object({
+        definitionRevision: positiveU64TextSchema,
+        priceTick: candidateDecimalSchema,
+        lotSize: candidateDecimalSchema,
+        quoteCurrency: candidateCurrencySchema,
+        settlementDenomination: z.union([
+          z
+            .object({
+              kind: z.literal("currency"),
+              currency: candidateCurrencySchema,
+            })
+            .strict(),
+          z
+            .object({
+              kind: z.literal("asset"),
+              instrumentId: uuidSchema,
+            })
+            .strict(),
+        ]),
+        contractMultiplier: candidateDecimalSchema,
+      })
+      .strict(),
+    costEvidence: z
+      .object({
+        fees: candidateCostSchema,
+        slippage: candidateCostSchema,
+      })
+      .strict(),
+    concentration: z
+      .object({
+        current: candidateDecimalSchema,
+        proposed: candidateDecimalSchema,
+        change: candidateDecimalSchema,
+      })
+      .strict(),
+    scenario: z
+      .object({
+        scope: z.literal("candidate_position_only"),
+        shock: candidateDecimalSchema,
+        currentImpact: candidateMoneySchema,
+        proposedImpact: candidateMoneySchema,
+        marginalImpact: candidateMoneySchema,
+      })
+      .strict(),
+    markEvidence: z
+      .object({
+        status: z.literal("fresh_selected_market_observation"),
+        instrumentId: uuidSchema,
+        unitMark: candidateMoneySchema,
+        markKind: z.enum(["last_trade", "midpoint"]),
+        quality: z.enum([
+          "direct_verified",
+          "direct_unverified",
+          "official_delayed",
+          "aggregated",
+          "indicative",
+          "modeled",
+          "estimated",
+        ]),
+        sourceId: z.string().min(1).max(256),
+        observationDigest: evidenceDigestSchema,
+        observedAtUnixNanos: integerTextSchema,
+        availableAtUnixNanos: integerTextSchema,
+        freshUntilUnixNanosExclusive: integerTextSchema,
+        evaluatedAtUnixNanos: integerTextSchema,
+        portfolioRevisionId: digestSchema,
+        selection: z
+          .object({
+            instrumentId: uuidSchema,
+            sourceId: z.string().min(1).max(256),
+            policyRevision: z.number().int().positive().max(4_294_967_295),
+            policyDigest: evidenceDigestSchema,
+            receiptDigest: evidenceDigestSchema,
+            sourceStateRevision: unsignedIntegerTextSchema.nullable(),
+            selectedAtUnixNanos: integerTextSchema,
+          })
+          .strict(),
+      })
+      .strict(),
+    availability: z
+      .object({
+        portfolioWideSelectedMarks: unavailableEvidenceSchema(
+          "portfolio_wide_selected_market_marks",
+        ),
+        liquidity: unavailableEvidenceSchema("exact_selected_source_liquidity"),
+        settlementBackedSizing: unavailableEvidenceSchema(
+          "settlement_backed_sizing",
+        ),
+        factorClassification: unavailableEvidenceSchema(
+          "exact_factor_classification",
+        ),
+      })
+      .strict(),
+    riskAdvisory: z
+      .object({
+        outcome: z.literal("indeterminate_at_evaluation"),
+        evaluatedAtUnixNanos: integerTextSchema,
+        checksEvaluated: z.array(riskCheckSchema).max(10),
+        checksUnavailable: z.array(riskCheckSchema).max(10),
+        evidenceDigest: evidenceDigestSchema,
+        authority: z.literal("analysis_only"),
+        reservation: z.literal(false),
+        order: z.literal(false),
+      })
+      .strict(),
+    authority: z
+      .object({
+        analysisOnly: z.literal(true),
+        portfolioMutation: z.literal(false),
+        executionAuthority: z.literal(false),
+        riskAuthority: z.literal("analysis_only"),
+        reservation: z.literal(false),
+        order: z.literal(false),
+        riskApprovalRequiredBeforeAnyOrder: z.literal(true),
+      })
+      .strict(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const identitiesMatch =
+      value.revisionId === value.portfolioEvidence.revisionId &&
+      value.revisionId === value.markEvidence.portfolioRevisionId &&
+      value.instrumentId === value.markEvidence.instrumentId &&
+      value.instrumentId === value.markEvidence.selection.instrumentId &&
+      value.markEvidence.sourceId === value.markEvidence.selection.sourceId
+    const currenciesMatch = [
+      value.currentMarketValue.currency,
+      value.proposedMarketValue.currency,
+      value.capitalChange.currency,
+      value.portfolioValue.currency,
+      value.scenario.currentImpact.currency,
+      value.scenario.proposedImpact.currency,
+      value.scenario.marginalImpact.currency,
+      value.markEvidence.unitMark.currency,
+      ...(value.costEvidence.fees.status === "available"
+        ? [value.costEvidence.fees.amount.currency]
+        : []),
+      ...(value.costEvidence.slippage.status === "available"
+        ? [value.costEvidence.slippage.amount.currency]
+        : []),
+    ].every((currency) => currency === value.instrumentTerms.quoteCurrency)
+    if (!identitiesMatch || !currenciesMatch) {
+      context.addIssue({
+        code: "custom",
+        message: "Candidate impact evidence identities do not match.",
+      })
+    }
+  })
 
 const reconciliationDetailSchema = z.object({
   field: z.enum(["cash", "market_value", "cost_basis"]),
