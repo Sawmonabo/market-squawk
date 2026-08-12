@@ -6,6 +6,17 @@
 )]
 
 pub(crate) mod alpaca;
+mod completed_session;
+
+pub(crate) use completed_session::{
+    CompletedMarketSessionAuthority, CompletedMarketSessionCandidate,
+    CompletedMarketSessionCandidateSnapshot, CompletedMarketSessionCurrentnessIdentity,
+    CompletedMarketSessionCurrentnessReceipt, CompletedMarketSessionCurrentnessResolution,
+    CompletedMarketSessionError, CompletedMarketSessionEvidenceAccessError,
+    CompletedMarketSessionEvidenceAuthority, CompletedMarketSessionReceipt,
+    CompletedMarketSessionRequest, CompletedMarketSessionResolution,
+    CompletedMarketSessionUnavailable,
+};
 
 use std::collections::HashSet;
 use std::mem::size_of;
