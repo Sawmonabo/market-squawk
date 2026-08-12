@@ -1361,3 +1361,41 @@ Issue `#38`, PR `#39`, and the Project item remain In Progress. The next barrier
 hosted run of the corrected exact head, followed by implementation of the accepted no-cost
 release-trust policy, publication of real assets, installed public-endpoint verification, grouped
 Quarter 4 acceptance, merge, and branch/worktree/cache closeout.
+
+## 2026-08-12 Federal Reserve Board H.15 dashboard checkpoint
+
+Pushed checkpoint `252abdba3d00a6afecae8605ed5a80643f41a76c` advances the installed-product
+candidate from provider contracts to one evidence-bound macro dashboard vertical. It includes the
+exact no-key Federal Reserve Board H.15 provider profile, bounded doctor and production routes,
+durable activation and restore, shared one-request-per-minute/single-flight admission, exact raw
+capture, current-schema Arrow/Parquet publication, a complete-or-error latest-known point-in-time
+reader for the eleven Treasury constant-maturity series, the closed `Macro.GetDashboard`
+application operation, the Tauri bridge, and the Desktop H.15 panel.
+
+The Desktop does not select a provider dataset, series set, cutoff, maturity order, revision, or
+financial arithmetic. The application derives those from the frozen Board contract and returns
+exact decimal strings or explicit provider missing states. The wire keeps the bounded pinned-query
+result digest separate from the final typed-selection digest and keeps durable publication
+readiness separate from current provider-runtime readiness.
+
+Focused checkpoint evidence, run without CI or a broad suite, includes:
+
+- Board adapter compilation and its existing authority/transport/capture proof;
+- sources compilation plus the exact empty-query-policy and paired provider-rate-clock proofs;
+- data compilation plus the existing publication/recovery proof covering all eleven series,
+  revision/knowledge selection, complete output, and restart-stable evidence;
+- application compilation, the existing operation-contract registry proof, and the existing
+  no-key provider activation/serialization/restore proof;
+- Desktop type checking and the existing grouped Research journey, including strict H.15 parsing,
+  observed and missing presentation, independent source readiness, and generation-resync removal
+  of stale evidence; and
+- repository Rust formatting and diff/whitespace checks.
+
+This checkpoint is not a live-provider, installed-service, native-WebView, or release acceptance
+claim. Debug-only scripted Board execution and a paired manual rate clock now preserve the exact
+official URLs and real durable policy for the next proof, but they are not yet threaded through the
+installed composition. The next barrier is to extend the existing installed control-plane test—no
+new target—through no-key doctor, governed minute advancement, full-history acquisition, MSJ1
+sealing, immutable publication, `Macro.GetDashboard`, same-root restart, and a zero-network
+post-restart read. A separately authorized real Board smoke remains required before calling the
+dashboard live-provider verified.
