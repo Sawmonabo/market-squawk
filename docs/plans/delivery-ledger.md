@@ -1432,3 +1432,87 @@ Native Tauri/WebView package acceptance remains later release evidence. The broa
 lacks its guided Find/Analyze producer, current Investment Brief and track-record Desktop wiring,
 governed recommendation-to-user-target handoff, several selected-provider publication/PIT/Desktop
 verticals, and the final unchanged-head Quarter 4/release gates.
+
+## 2026-08-12 selected-candidate analysis and Investment Brief checkpoint
+
+Pushed checkpoint `ca3901b520bb91e74a60f1d8f73d5feab722dbfc` closes the next generic
+analysis-evidence barrier without introducing a backend-owned guided/default workflow. The backend
+continues to expose independently composable capabilities and immutable results; the Desktop Tauri
+controller remains the owner of the opinionated Market Squawk Default V1 profile and eventual
+multi-step Find/Analyze orchestration.
+
+The decision authority now retains a complete selected-candidate binding rather than only an
+instrument or proposal coordinate. Its identity includes the exact immutable SavedScreen policy,
+screen revision and universe, as-of semantics, ordered predicates and null policies, ranking,
+result bound, admitted quality constraints and complete feature-semantic closure, as well as the
+exact ScreenRun, candidate rank/score/contributions, coverage, liquidity, portfolio revision,
+flags, and evidence identity. A selected-candidate analysis can be published only as one prepared
+bundle containing the proposal decision, publication, selected-candidate evidence, and immutable
+typed explanation. The application journal persists that bundle as one strict version-4 record;
+standalone proposal persistence rejects selected-candidate analyses so the binding cannot be
+silently omitted.
+
+The prepared append path stages every fallible validation before mutation, writes the durable
+record before committing the staged in-memory repository state, and poisons the authority on an
+impossible post-journal divergence. Recovery requires the exact SavedScreen and ScreenExecution to
+appear before the bundle, reconstructs and revalidates the selected-candidate evidence, and rejects
+out-of-order, partial, or mismatched public results. There is no legacy v3 compatibility reader or
+migration: this unreleased greenfield wire was updated in place to singular v4.
+
+The same checkpoint also adds generic research-only prerequisites for a future producer:
+
+- an exact-horizon conditional-mean price forecast projection with complete 50/80/95 calibration,
+  model, artifact, vintage, availability, expiry, and newest-valid selection evidence;
+- a strict recommendation-outcome signal-plan materializer over a complete paired subject and
+  benchmark PIT population, three non-overlapping two-year folds, conservative execution costs,
+  one-lot simulation quantities, complete caller-authorized Entry/NoAction/Unavailable evidence,
+  and fixed work bounds;
+- complete imported-portfolio/current-market analytical prerequisites with exact selected-source
+  marks and depth, exact-decimal historical 95% VaR/expected-shortfall authority, checked risk and
+  side-aware liquidity capacity, and repeated portfolio/market rechecks;
+- a generic evidence-derived market-reference identity approval that joins exact Nasdaq listing,
+  OpenFIGI mapping, canonical definition, coverage, rights, currentness, and expiry without
+  hard-coding a benchmark, ticker-derived UUID, currency, or consumer asset-class policy; and
+- pure automatic DCF, comparable, residual-income, and forecast-distribution calculation receipts
+  over genuine PIT valuation inputs and rights evidence. These calculations deliberately do not
+  claim to be governed `ValuationMeasurement`s yet; a separate evidence-origin/measurement adapter
+  remains required before classification, approval, or latest-valid selection.
+
+The Desktop Investment Brief now strictly admits the current complete
+`Decision.GetInvestmentAnalysis` response, including execution ineligibility, publication,
+projection, sizing, and realized-outcome sidecars, and cross-binds them to the generated proposal.
+It also invokes `Decision.GetRecommendationTrackRecord` with the exact publication profile,
+policy horizon, and one server-coordinate cutoff, then renders the complete fixed six-cohort
+envelope. Integer time coordinates cross the WebView boundary as canonical decimal text and are
+parsed in Tauri. React performs no financial calculation, account inference, dataset selection, or
+evidence authorship.
+
+Focused checkpoint evidence was:
+
+| Evidence | Result |
+| --- | --- |
+| Rust formatting and whitespace | `cargo +1.97.1 fmt --all -- --check` and `git diff --check` passed |
+| Serialized application compile | `CARGO_INCREMENTAL=0 cargo +1.97.1 check --locked -p market-squawk --lib` passed; only the existing warning backlog remained |
+| Atomic decision/restart proof | Existing `control_plane` decision-persistence case passed 1/1, with 31 filtered cases |
+| Desktop compile | `pnpm --dir apps/market-squawk-desktop typecheck` passed in the frozen Desktop lane |
+| Desktop critical journey | Existing grouped product-navigation case passed 1/1, with 6 skipped cases |
+| Storage hygiene | Reproducible `market-squawk` Cargo artifacts were reclaimed after the proof; `target/` returned to approximately 9.2 GiB, below the 20 GiB ceiling |
+
+The focused decision case forces a SQLite rejection of the prepared bundle and proves that no
+proposal, publication, or bundle row becomes visible. It then publishes the exact bundle, proves
+idempotency and conflict handling, reopens the same decision store, and verifies the complete
+SavedScreen/candidate/proposal/publication/explanation/projection identities. This is lane evidence,
+not clean exact-head release approval or a substitute for the unchanged-head gate.
+
+The branch was clean and upstream-aligned at `ca3901b5`, and the checkpoint was recorded on draft
+PR `#43`. No CI, broad workspace suite, release matrix, merge, or publication ran.
+
+The active next barrier is a generic application-owned PIT feature-dataset producer. It must derive
+features and labels from exact admitted research parents rather than accept caller-computed values,
+preflight and reauthorize rights, select a complete source-authored universe, pin all market
+definitions as of the knowledge cutoff, prove one evidence-backed completed market session, and
+publish a required immutable production receipt alongside the existing dataset generation. Only
+after those authorities freeze can the Desktop controller truthfully start/resume Find and Analyze.
+Provider-specific investment workflows, recommendation-to-governed-target adoption, explicit paper
+draft confirmation, native package acceptance, grouped Quarter 4 review, and exact-head release
+gates remain open.
