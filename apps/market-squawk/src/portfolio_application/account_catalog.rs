@@ -2,7 +2,7 @@
 
 use std::{
     fmt,
-    sync::{Arc, atomic::Ordering},
+    sync::{Weak, atomic::Ordering},
     time::Instant,
 };
 
@@ -185,7 +185,7 @@ impl PortfolioAccountCatalogSnapshot {
 /// Cloneable least-authority reader over the portfolio owner's immutable current image.
 #[derive(Clone)]
 pub(crate) struct PortfolioAccountCatalogReadCapability {
-    pub(super) runtime: Arc<Runtime>,
+    pub(super) runtime: Weak<Runtime>,
 }
 
 impl PortfolioAccountCatalogReadCapability {
@@ -195,11 +195,15 @@ impl PortfolioAccountCatalogReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<PortfolioAccountCatalogSnapshot, PortfolioAccountCatalogError> {
-        let _guard = self.runtime.admit()?;
-        ensure_live(&self.runtime, deadline, cancellation)?;
-        let image = self.runtime.image.load_full();
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or(PortfolioApplicationServiceError::Cancelled)?;
+        let _guard = runtime.admit()?;
+        ensure_live(&runtime, deadline, cancellation)?;
+        let image = runtime.image.load_full();
         let snapshot = PortfolioAccountCatalogSnapshot::try_from_image(&image)?;
-        ensure_live(&self.runtime, deadline, cancellation)?;
+        ensure_live(&runtime, deadline, cancellation)?;
         Ok(snapshot)
     }
 
@@ -212,11 +216,15 @@ impl PortfolioAccountCatalogReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), PortfolioAccountCatalogError> {
-        let _guard = self.runtime.admit()?;
-        ensure_live(&self.runtime, deadline, cancellation)?;
-        let image = self.runtime.image.load_full();
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or(PortfolioApplicationServiceError::Cancelled)?;
+        let _guard = runtime.admit()?;
+        ensure_live(&runtime, deadline, cancellation)?;
+        let image = runtime.image.load_full();
         let current = PortfolioAccountCatalogSnapshot::try_from_image(&image)?;
-        ensure_live(&self.runtime, deadline, cancellation)?;
+        ensure_live(&runtime, deadline, cancellation)?;
         if current.heads != expected.heads
             || current.account_count != expected.account_count
             || current.digest != expected.digest

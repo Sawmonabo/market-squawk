@@ -291,7 +291,7 @@ impl PortfolioApplicationService {
     /// Returns complete current account heads without import or publication authority.
     pub(crate) fn account_catalog_reader(&self) -> PortfolioAccountCatalogReadCapability {
         PortfolioAccountCatalogReadCapability {
-            runtime: Arc::clone(&self.runtime),
+            runtime: Arc::downgrade(&self.runtime),
         }
     }
 
