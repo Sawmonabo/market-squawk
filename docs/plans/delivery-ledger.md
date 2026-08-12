@@ -1399,7 +1399,8 @@ The exact focused command passed 1/1 with 31 filtered cases. The existing server
 candidate proof also passed after the lifecycle cut. Desktop TypeScript compilation and the existing
 grouped Research journey passed with the exact rolling provider/analytical identities. Rust
 formatting and diff/whitespace checks are clean. No CI or broad workspace suite ran at this
-checkpoint; generated Cargo output is approximately 14.2 GiB, below the 20 GiB ceiling.
+checkpoint; generated Cargo output is approximately 16.5 GiB after the final focused journey,
+below the 20 GiB ceiling.
 
 One separately authorized direct probe of the exact rolling URL returned HTTP 200 `text/csv`, 8,627
 bytes, SHA-256 `5c7bd008c221e1b33b6a865cf7d1bbb4620661f57908a4e7dd00822bf8104579`, and exactly 100 dates/1,100
