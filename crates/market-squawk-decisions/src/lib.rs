@@ -20,7 +20,9 @@ mod target;
 pub use authority::DecisionAuthority;
 pub use candidate::{
     CandidateAssessment, CandidateFlag, CandidateInput, CandidateScoreContribution,
-    MAX_CANDIDATE_FLAGS, MAX_SCREEN_INPUT_ROWS, ScreenExecution, ScreenFeatureObservation,
+    MAX_CANDIDATE_FLAGS, MAX_SCREEN_INPUT_ROWS,
+    SELECTED_CANDIDATE_ANALYSIS_EVIDENCE_SCHEMA_VERSION, ScreenExecution, ScreenFeatureObservation,
+    SelectedCandidateAnalysisEvidence,
 };
 pub use contracts::{
     CandidateRecord, Dossier, DossierEvidence, MAX_SCREEN_FEATURE_BINDINGS, ScreenFeatureBinding,
@@ -64,10 +66,12 @@ pub use investment_proposal::{
     UnavailableInvestmentAnalysis, ValuationEvidence,
 };
 pub use recommendation_outcome::{
-    AnalyticalProfileBindingReference, INVESTMENT_ANALYSIS_PUBLICATION_SCHEMA_VERSION,
+    AnalyticalProfileBindingReference, INVESTMENT_ANALYSIS_EXPLANATION_SCHEMA_VERSION,
+    INVESTMENT_ANALYSIS_PUBLICATION_SCHEMA_VERSION, InvestmentAnalysisConclusion,
+    InvestmentAnalysisExplanation, InvestmentAnalysisExplanationDigest,
     InvestmentAnalysisPublicationId, InvestmentAnalysisWorkflowReference,
-    PublishedInvestmentAnalysis, RECOMMENDATION_OUTCOME_STATUS_SCHEMA_VERSION,
-    RECOMMENDATION_TRACK_RECORD_MINIMUM_COMPLETED,
+    PreparedPublishedInvestmentAnalysis, PublishedInvestmentAnalysis,
+    RECOMMENDATION_OUTCOME_STATUS_SCHEMA_VERSION, RECOMMENDATION_TRACK_RECORD_MINIMUM_COMPLETED,
     RECOMMENDATION_TRACK_RECORD_MINIMUM_COVERAGE_PPM, RecommendationAfterTaxReturnAvailability,
     RecommendationBenchmarkReturnAvailability, RecommendationNetReturnAvailability,
     RecommendationOutcomeCohort, RecommendationOutcomeCurrentIndexEntry,
@@ -82,7 +86,7 @@ pub use repository::{
     AppendOutcome, DecisionJournalSnapshot, DecisionRecord, DecisionRepository,
     DecisionRepositoryError, DecisionRepositoryLimits, InvestmentAnalysisCurrentIndexEntry,
     InvestmentProposalIndexEntry, InvestmentProposalIndexOutcome, ScreenRunIndexEntry,
-    TargetIndexEntry,
+    StagedPublishedInvestmentAnalysisAppend, TargetIndexEntry,
 };
 pub use screen::{
     AsOfSemantics, ComparisonOperator, MAX_SCREEN_DATA_QUALITIES, MAX_SCREEN_RESULTS, NullPolicy,

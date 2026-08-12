@@ -17,9 +17,10 @@ use market_squawk_decisions::{
     DecisionRepositoryLimits, InvestmentAnalysisCurrentIndexEntry, InvestmentAnalysisId,
     InvestmentOutcomeProjection, InvestmentProposalDecision, InvestmentProposalId,
     InvestmentProposalIndexEntry, InvestmentSizingProjection, InvestmentTargetSetId,
-    PublishedInvestmentAnalysis, RecommendationOutcomeStatusRecord, RecommendationTrackRecord,
-    SavedScreen, ScreenExecution, ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry,
-    TargetInvalidation, TargetReview, TargetState, TargetStatus,
+    PreparedPublishedInvestmentAnalysis, PublishedInvestmentAnalysis,
+    RecommendationOutcomeStatusRecord, RecommendationTrackRecord, SavedScreen, ScreenExecution,
+    ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry, TargetInvalidation, TargetReview,
+    TargetState, TargetStatus,
 };
 use market_squawk_domain::{EvidenceDigest, RevisionNumber, SourceIdentifier, Timestamp};
 use market_squawk_platform::DecisionDatabaseLocation;
@@ -642,6 +643,49 @@ impl DecisionApplication {
         persist_outcome(&mut state, &encoded, outcome)
     }
 
+    /// Atomically persists one selected-candidate decision, explanation, and publication.
+    ///
+    /// Domain validation is staged before SQLite commit and installs into memory only after the
+    /// single immutable bundle row is durable. A post-commit staging divergence poisons the live
+    /// writer; canonical restart recovery then replays the complete row or none of it.
+    pub fn append_prepared_published_investment_analysis(
+        &self,
+        bundle: PreparedPublishedInvestmentAnalysis,
+    ) -> Result<AppendOutcome, DecisionApplicationError> {
+        let encoded = codec::prepared_published_investment_analysis(&bundle)?;
+        let mut state = self.writer()?;
+        let staged = state
+            .authority
+            .stage_prepared_published_investment_analysis(bundle)?;
+        let expected = staged.outcome();
+        let persisted = match state.journal.append(&encoded) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                state.poisoned = true;
+                return Err(error);
+            }
+        };
+        if persisted != expected {
+            state.poisoned = true;
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
+        let committed = match state
+            .authority
+            .commit_staged_published_investment_analysis(staged)
+        {
+            Ok(outcome) => outcome,
+            Err(_error) => {
+                state.poisoned = true;
+                return Err(DecisionApplicationError::InvalidPersistentState);
+            }
+        };
+        if committed != persisted {
+            state.poisoned = true;
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
+        Ok(committed)
+    }
+
     /// Persists one deterministic proposal-bound outcome projection sidecar.
     pub fn append_investment_outcome_projection(
         &self,
@@ -702,6 +746,18 @@ impl DecisionApplication {
             .reader()?
             .authority
             .get_investment_analysis_publication(analysis_id)?
+            .clone())
+    }
+
+    /// Returns one complete selected-candidate analysis bundle under a single reader lock.
+    pub fn get_prepared_published_investment_analysis(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Result<PreparedPublishedInvestmentAnalysis, DecisionApplicationError> {
+        Ok(self
+            .reader()?
+            .authority
+            .get_prepared_published_investment_analysis(analysis_id)?
             .clone())
     }
 

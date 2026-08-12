@@ -162,6 +162,11 @@ impl NasdaqReferenceUniverseService {
         })
     }
 
+    /// Projects the immutable source declaration used to qualify identity-resolution evidence.
+    pub(super) fn reference_identity_metadata(&self) -> &SourceMetadata {
+        self.source.metadata()
+    }
+
     async fn snapshot(
         &self,
         deadline: Instant,

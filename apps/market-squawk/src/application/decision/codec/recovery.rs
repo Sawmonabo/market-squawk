@@ -167,6 +167,28 @@ impl RecoveryContext {
                 }
                 ensure_appended(authority.append_investment_proposal(wire.decode()?)?)
             }
+            WireRecord::PreparedPublishedInvestmentAnalysis(wire) => {
+                let wire = *wire;
+                if wire.key()? != key {
+                    return Err(DecisionApplicationError::InvalidPersistentState);
+                }
+                let candidate_id = wire.candidate_id()?;
+                let screen_run_id = wire.screen_run_id()?;
+                // Append order is authority: a bundle never buffers or recreates its candidate.
+                // An out-of-order row therefore fails closed at this exact lookup.
+                let (run, candidate) = authority.get_candidate(&candidate_id)?;
+                if run.id() != &screen_run_id {
+                    return Err(DecisionApplicationError::InvalidPersistentState);
+                }
+                let run = run.clone();
+                let candidate = candidate.clone();
+                let screen = authority
+                    .get_screen(run.screen().id(), run.screen().revision())?
+                    .clone();
+                ensure_appended(authority.append_prepared_published_investment_analysis(
+                    wire.decode(&screen, &run, &candidate)?,
+                )?)
+            }
             WireRecord::InvestmentAnalysisPublication(wire) => {
                 if wire.key() != key {
                     return Err(DecisionApplicationError::InvalidPersistentState);

@@ -259,6 +259,11 @@ impl OpenFigiIdentityPublisher {
         })
     }
 
+    /// Projects the immutable source declaration used to qualify identity-resolution evidence.
+    pub(super) fn reference_identity_metadata(&self) -> &SourceMetadata {
+        self.client.metadata()
+    }
+
     /// Resolves and atomically publishes only exact FIGIs for one caller-selected subset.
     pub(crate) async fn resolve_selected_and_publish(
         &self,

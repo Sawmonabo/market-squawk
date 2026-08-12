@@ -12,6 +12,13 @@ use std::{
 };
 
 use async_trait::async_trait;
+use market_squawk_backtesting::{
+    BacktestDataset, MaterializedRecommendationSignalPlanV1,
+    RECOMMENDATION_OOS_EVALUATION_HORIZON_NANOS_V1, RecommendationBacktestLimits,
+    RecommendationBacktestPolicyV1, RecommendationSignalPlanMaterializationErrorV1,
+    RecommendationSignalPlanMaterializationInputV1, RecommendationSignalPlanMaterializerV1,
+};
+use market_squawk_data::{DatasetManifestRef, Sha256Digest};
 use market_squawk_domain::SourceIdentifier;
 use market_squawk_platform::{
     LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths, PathError,
@@ -139,6 +146,79 @@ impl GovernedBacktestInputRegistrationReceipt {
     }
 }
 
+/// Confined immutable recommendation materialization over one freshly resolved governed input.
+///
+/// This bundle exposes the pinned dataset and exact materialization evidence required by the pure
+/// recommendation kernel, but no query engine, registration mutation, repository, job, path,
+/// portfolio, order, risk, or execution authority.
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+pub(crate) struct GovernedRecommendationMaterializedInputV1 {
+    dataset: BacktestDataset,
+    signal_plan: MaterializedRecommendationSignalPlanV1,
+}
+
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+impl GovernedRecommendationMaterializedInputV1 {
+    /// Exact freshly pinned research dataset.
+    #[must_use]
+    pub(crate) const fn dataset(&self) -> &BacktestDataset {
+        &self.dataset
+    }
+
+    /// Dataset- and policy-bound strict signal-plan materialization.
+    #[must_use]
+    pub(crate) const fn signal_plan(&self) -> &MaterializedRecommendationSignalPlanV1 {
+        &self.signal_plan
+    }
+
+    /// Exact immutable dataset manifest.
+    #[must_use]
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        self.dataset.manifest()
+    }
+
+    /// Complete pinned dataset identity.
+    #[must_use]
+    pub(crate) const fn dataset_identity(&self) -> Sha256Digest {
+        self.dataset.identity()
+    }
+
+    /// Complete materialization receipt identity.
+    #[must_use]
+    pub(crate) const fn materialization_digest(&self) -> Sha256Digest {
+        self.signal_plan.digest()
+    }
+}
+
+/// Least-authority reader for one exact already-registered recommendation backtest input.
+///
+/// Implementations re-pin every catalog/query/instrument-definition receipt under the supplied
+/// lifecycle authority before resolving caller-supplied preauthorized instructions. They do not
+/// register inputs, publish terminals, choose economic instructions, or run jobs.
+#[async_trait]
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+pub(crate) trait GovernedRecommendationInputMaterializerV1: Send + Sync + 'static {
+    /// Resolves one exact command into immutable dataset and strict signal-plan evidence.
+    async fn materialize_recommendation_input(
+        &self,
+        command: &GovernedBacktestCommand,
+        policy: RecommendationBacktestPolicyV1,
+        input: RecommendationSignalPlanMaterializationInputV1,
+        limits: RecommendationBacktestLimits,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<GovernedRecommendationMaterializedInputV1, ServiceError>;
+}
+
 /// Fixed-namespace authority for immutable recipes and fresh point-in-time receipts.
 pub struct ProductionGovernedBacktestInputAuthority {
     store: Arc<LocalAuthorityStateStore>,
@@ -240,6 +320,90 @@ impl GovernedBacktestInputRegistrar for ProductionGovernedBacktestInputAuthority
         deadline: Instant,
     ) -> Result<GovernedBacktestInputRegistrationReceipt, ServiceError> {
         self.register(input, cancellation, deadline).await
+    }
+}
+
+#[async_trait]
+impl GovernedRecommendationInputMaterializerV1 for ProductionGovernedBacktestInputAuthority {
+    async fn materialize_recommendation_input(
+        &self,
+        command: &GovernedBacktestCommand,
+        policy: RecommendationBacktestPolicyV1,
+        input: RecommendationSignalPlanMaterializationInputV1,
+        limits: RecommendationBacktestLimits,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<GovernedRecommendationMaterializedInputV1, ServiceError> {
+        let evaluation_ends_at = input
+            .evaluation_starts_at()
+            .checked_add_nanos(RECOMMENDATION_OOS_EVALUATION_HORIZON_NANOS_V1)
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        let mut expected_instruments = [
+            policy.subject_instrument_id(),
+            policy.benchmark().instrument_id(),
+        ];
+        expected_instruments.sort_unstable();
+        let expected_time_ranges = [(input.evaluation_starts_at(), evaluation_ends_at)];
+        if command.scope().instruments() != expected_instruments.as_slice()
+            || command.scope().time_ranges() != expected_time_ranges.as_slice()
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let _call = RepositoryLifecycle::enter(&self.lifecycle, &cancellation, deadline)?;
+        let linked = LinkedOperation::new(
+            cancellation.clone(),
+            self.lifecycle.shutdown_token().clone(),
+            deadline,
+        );
+        let stored = self
+            .index
+            .lock()
+            .map_err(|_| ServiceError::Unavailable)?
+            .get(command.input_id())
+            .ok_or(ServiceError::NotFound)?;
+        let recipe =
+            InputRecipe::decode(stored.recipe_bytes()).map_err(|_| ServiceError::InvalidResult)?;
+        let registered_command = recipe
+            .core()
+            .command(stored.input_id().clone())
+            .map_err(|_| ServiceError::InvalidResult)?;
+        if &registered_command != command {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let expected = recipe.expected().map_err(|_| ServiceError::InvalidResult)?;
+        let materialized = self
+            .materializer
+            .materialize(recipe.core(), linked.token().clone(), deadline)
+            .await?;
+        if materialized.evidence != expected || materialized.input.cohort.is_some() {
+            return Err(ServiceError::InvalidResult);
+        }
+        let crate::PinnedBacktestInput {
+            query,
+            instrument_definitions,
+            execution_assumptions,
+            portfolio: _,
+            corporate_actions,
+            sources: _,
+            seed: _,
+            limits: dataset_limits,
+            experiment: _,
+            cohort: _,
+        } = materialized.input;
+        if execution_assumptions != policy.execution_assumptions() || corporate_actions.is_some() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let dataset =
+            BacktestDataset::try_from_pinned_query(query, instrument_definitions, dataset_limits)
+                .map_err(|_| ServiceError::InvalidResult)?;
+        let signal_plan =
+            RecommendationSignalPlanMaterializerV1::materialize(&dataset, policy, input, limits)
+                .map_err(map_recommendation_materialization_error)?;
+        ensure_operation_live(&cancellation, &self.lifecycle, deadline)?;
+        Ok(GovernedRecommendationMaterializedInputV1 {
+            dataset,
+            signal_plan,
+        })
     }
 }
 
@@ -377,6 +541,29 @@ fn map_registration_recipe_error(error: RecipeError) -> ServiceError {
     match error {
         RecipeError::Invalid => ServiceError::InvalidRequest,
         RecipeError::ResourceExhausted => ServiceError::ResourceExhausted,
+    }
+}
+
+fn map_recommendation_materialization_error(
+    error: RecommendationSignalPlanMaterializationErrorV1,
+) -> ServiceError {
+    match error {
+        RecommendationSignalPlanMaterializationErrorV1::LimitExceeded => {
+            ServiceError::ResourceExhausted
+        }
+        RecommendationSignalPlanMaterializationErrorV1::PolicyMismatch
+        | RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow
+        | RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction => {
+            ServiceError::InvalidRequest
+        }
+        RecommendationSignalPlanMaterializationErrorV1::DatasetScopeMismatch
+        | RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel
+        | RecommendationSignalPlanMaterializationErrorV1::IncompleteInstructionPopulation
+        | RecommendationSignalPlanMaterializationErrorV1::MissingEntryInFold
+        | RecommendationSignalPlanMaterializationErrorV1::InstructionEvidenceMismatch
+        | RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift => {
+            ServiceError::InvalidResult
+        }
     }
 }
 

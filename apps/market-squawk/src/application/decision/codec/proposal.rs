@@ -8,7 +8,8 @@ use market_squawk_decisions::{
     MarketReferencePriceKind, PortfolioPositionState, PortfolioRiskEvidence, PriceForecastEvidence,
     ProposalEvidenceWindow, ProposalForecastVintageId, ProposalUnavailableReason,
     RecommendationDerivationDigest, RecommendationEvidenceKind, RecommendationPolicy,
-    RecommendationPolicyDigest, TargetPriceCases, TargetPriceRange, ValuationEvidence,
+    RecommendationPolicyDigest, SelectedCandidateAnalysisEvidence, TargetPriceCases,
+    TargetPriceRange, ValuationEvidence,
 };
 use market_squawk_domain::{
     AccountId, BasisPoints, Currency, DataQuality, EvidenceDigest, InstrumentId, Money, Timestamp,
@@ -69,9 +70,36 @@ impl InvestmentProposalWire {
     }
 
     pub(super) fn decode(self) -> Result<InvestmentProposalDecision, DecisionApplicationError> {
-        let policy = self.policy.decode()?;
-        let evidence = self.evidence.decode()?;
-        match self.outcome {
+        let Self {
+            policy,
+            evidence,
+            outcome,
+        } = self;
+        Self::decode_with_evidence(outcome, evidence.decode()?, policy.decode()?)
+    }
+
+    pub(super) fn decode_with_selected_candidate(
+        self,
+        selected_candidate: SelectedCandidateAnalysisEvidence,
+    ) -> Result<InvestmentProposalDecision, DecisionApplicationError> {
+        let Self {
+            policy,
+            evidence,
+            outcome,
+        } = self;
+        let evidence = evidence
+            .decode()?
+            .try_with_selected_candidate(selected_candidate)
+            .map_err(invalid_state)?;
+        Self::decode_with_evidence(outcome, evidence, policy.decode()?)
+    }
+
+    fn decode_with_evidence(
+        outcome: InvestmentProposalOutcomeWire,
+        evidence: InvestmentAnalysisEvidence,
+        policy: RecommendationPolicy,
+    ) -> Result<InvestmentProposalDecision, DecisionApplicationError> {
+        match outcome {
             InvestmentProposalOutcomeWire::Generated(identity) => {
                 Ok(InvestmentProposalDecision::Generated(
                     InvestmentProposalAuthority::try_recover_generated(

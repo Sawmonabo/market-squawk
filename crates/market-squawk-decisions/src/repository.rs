@@ -6,13 +6,14 @@ use crate::{
     AnalyticalProfileBindingReference, CandidateId, DecisionDossier, GovernedTargetSet,
     InvestmentAnalysisId, InvestmentOutcomeProjection, InvestmentProjectionDigest,
     InvestmentProposalAuthority, InvestmentProposalDecision, InvestmentProposalId,
-    InvestmentSizingProjection, InvestmentTargetSetId, NoActionReason, ProposalUnavailableReason,
-    PublishedInvestmentAnalysis, RecommendationAction, RecommendationDerivationDigest,
-    RecommendationEvidenceDigest, RecommendationOutcomeCohort,
-    RecommendationOutcomeCurrentIndexEntry, RecommendationOutcomeStatus,
-    RecommendationOutcomeStatusRecord, RecommendationPolicyDigest, RecommendationTrackRecord,
-    RecommendationTrackRecordGroup, SavedScreen, ScreenExecution, ScreenId, ScreenRun, ScreenRunId,
-    TargetInvalidation, TargetReview, TargetReviewDisposition, TargetState, TargetStatus,
+    InvestmentSizingProjection, InvestmentTargetSetId, NoActionReason,
+    PreparedPublishedInvestmentAnalysis, ProposalUnavailableReason, PublishedInvestmentAnalysis,
+    RecommendationAction, RecommendationDerivationDigest, RecommendationEvidenceDigest,
+    RecommendationOutcomeCohort, RecommendationOutcomeCurrentIndexEntry,
+    RecommendationOutcomeStatus, RecommendationOutcomeStatusRecord, RecommendationPolicyDigest,
+    RecommendationTrackRecord, RecommendationTrackRecordGroup, SavedScreen, ScreenExecution,
+    ScreenId, ScreenRun, ScreenRunId, TargetInvalidation, TargetReview, TargetReviewDisposition,
+    TargetState, TargetStatus,
 };
 use market_squawk_domain::{AccountId, Currency, InstrumentId, RevisionNumber, Timestamp};
 
@@ -166,6 +167,28 @@ pub enum AppendOutcome {
     Appended,
     /// The exact same stable identity and immutable content was already present.
     AlreadyPresent,
+}
+
+/// Opaque, fully validated in-memory stage for one atomic proposal/publication bundle append.
+///
+/// The stage binds the repository coordinates observed during validation. Committing it after any
+/// intervening repository mutation fails closed, while the application writer lock allows SQLite
+/// to commit the encoded bundle before this infallible-capacity in-memory installation.
+#[derive(Debug)]
+pub struct StagedPublishedInvestmentAnalysisAppend {
+    outcome: AppendOutcome,
+    expected_record_count: usize,
+    expected_index_count: usize,
+    bundle: Option<PreparedPublishedInvestmentAnalysis>,
+    index_entry: Option<InvestmentAnalysisCurrentIndexEntry>,
+}
+
+impl StagedPublishedInvestmentAnalysisAppend {
+    /// Returns whether the exact immutable bundle is new or already retained.
+    #[must_use]
+    pub const fn outcome(&self) -> AppendOutcome {
+        self.outcome
+    }
 }
 
 /// Bounded discovery projection for one immutable saved-screen run.
@@ -413,6 +436,8 @@ pub enum DecisionRecord {
     InvestmentSizingProjection(InvestmentSizingProjection),
     /// Immutable pending, unavailable, or completed realized-outcome revision.
     RecommendationOutcomeStatus(RecommendationOutcomeStatusRecord),
+    /// Atomic selected-candidate proposal, explanation, and publication bundle.
+    PreparedPublishedInvestmentAnalysis(PreparedPublishedInvestmentAnalysis),
 }
 
 /// Fully typed restart payload. A durable application adapter controls byte persistence.
@@ -554,6 +579,9 @@ impl DecisionRepository {
                 }
                 DecisionRecord::RecommendationOutcomeStatus(value) => {
                     repository.append_recommendation_outcome_status(value)?;
+                }
+                DecisionRecord::PreparedPublishedInvestmentAnalysis(value) => {
+                    repository.append_prepared_published_investment_analysis(value)?;
                 }
             }
         }
@@ -832,7 +860,16 @@ impl DecisionRepository {
         &mut self,
         decision: InvestmentProposalDecision,
     ) -> Result<AppendOutcome, DecisionRepositoryError> {
-        if let Some(existing) = self.investment_proposal(decision.analysis_id()) {
+        if self
+            .prepared_published_investment_analysis(decision.analysis_id())
+            .is_some()
+        {
+            return Err(DecisionRepositoryError::Conflict);
+        }
+        if decision.evidence().selected_candidate().is_some() {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        if let Some(existing) = self.standalone_investment_proposal(decision.analysis_id()) {
             return if existing == &decision {
                 Ok(AppendOutcome::AlreadyPresent)
             } else {
@@ -860,12 +897,159 @@ impl DecisionRepository {
         Ok(AppendOutcome::Appended)
     }
 
+    /// Validates and stages a selected-candidate proposal/explanation/publication atomic append.
+    pub fn stage_prepared_published_investment_analysis(
+        &self,
+        bundle: PreparedPublishedInvestmentAnalysis,
+    ) -> Result<StagedPublishedInvestmentAnalysisAppend, DecisionRepositoryError> {
+        let analysis_id = bundle.decision().analysis_id();
+        if let Some(existing) = self.prepared_published_investment_analysis(analysis_id) {
+            return if existing == &bundle {
+                Ok(StagedPublishedInvestmentAnalysisAppend {
+                    outcome: AppendOutcome::AlreadyPresent,
+                    expected_record_count: self.records.len(),
+                    expected_index_count: self.investment_analysis_index.len(),
+                    bundle: None,
+                    index_entry: None,
+                })
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        if self.standalone_investment_proposal(analysis_id).is_some()
+            || self
+                .standalone_investment_analysis_publication(analysis_id)
+                .is_some()
+            || self.investment_analysis_current(analysis_id).is_some()
+        {
+            return Err(DecisionRepositoryError::Conflict);
+        }
+        if bundle.decision().proposal_id().is_some_and(|proposal_id| {
+            self.investment_proposals()
+                .any(|existing| existing.proposal_id() == Some(proposal_id))
+        }) {
+            return Err(DecisionRepositoryError::Conflict);
+        }
+        let (run, candidate) = self
+            .candidate(bundle.selected_candidate().candidate_id())
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        let screen = self
+            .screen(run.screen().id(), run.screen().revision())
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        let selected_candidate =
+            crate::SelectedCandidateAnalysisEvidence::try_new(screen, run, candidate)
+                .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        if &selected_candidate != bundle.selected_candidate()
+            || bundle.decision().evidence().selected_candidate()
+                != Some(bundle.selected_candidate())
+        {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        let regenerated_decision = InvestmentProposalAuthority::generate(
+            bundle.decision().evidence().clone(),
+            bundle.decision().policy().clone(),
+        )
+        .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        if regenerated_decision != *bundle.decision() {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        let regenerated = PreparedPublishedInvestmentAnalysis::try_new(
+            regenerated_decision,
+            selected_candidate,
+            bundle.publication().analytical_profile().clone(),
+            bundle.publication().workflow().clone(),
+            bundle.publication().published_at(),
+        )
+        .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        if regenerated != bundle {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        self.ensure_investment_record_capacity()?;
+        if self.records.len() >= self.limits.maximum_records
+            || self.records.len() >= self.records.capacity()
+            || self.investment_analysis_index.len() >= self.limits.maximum_investment_proposals
+            || self.investment_analysis_index.len() >= self.investment_analysis_index.capacity()
+        {
+            return Err(DecisionRepositoryError::Capacity);
+        }
+        Ok(StagedPublishedInvestmentAnalysisAppend {
+            outcome: AppendOutcome::Appended,
+            expected_record_count: self.records.len(),
+            expected_index_count: self.investment_analysis_index.len(),
+            index_entry: Some(InvestmentAnalysisCurrentIndexEntry::new(
+                bundle.publication().clone(),
+            )),
+            bundle: Some(bundle),
+        })
+    }
+
+    /// Installs one previously validated stage without allocation.
+    pub fn commit_staged_published_investment_analysis(
+        &mut self,
+        staged: StagedPublishedInvestmentAnalysisAppend,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        if staged.outcome == AppendOutcome::AlreadyPresent {
+            return Ok(AppendOutcome::AlreadyPresent);
+        }
+        if self.records.len() != staged.expected_record_count
+            || self.investment_analysis_index.len() != staged.expected_index_count
+        {
+            return Err(DecisionRepositoryError::StaleRevision);
+        }
+        if self.records.len() >= self.limits.maximum_records
+            || self.records.len() >= self.records.capacity()
+            || self.investment_analysis_index.len() >= self.limits.maximum_investment_proposals
+            || self.investment_analysis_index.len() >= self.investment_analysis_index.capacity()
+        {
+            return Err(DecisionRepositoryError::Capacity);
+        }
+        let bundle = staged
+            .bundle
+            .ok_or(DecisionRepositoryError::EvidenceMismatch)?;
+        let index_entry = staged
+            .index_entry
+            .ok_or(DecisionRepositoryError::EvidenceMismatch)?;
+        if self
+            .prepared_published_investment_analysis(bundle.decision().analysis_id())
+            .is_some()
+            || self
+                .investment_analysis_current(bundle.decision().analysis_id())
+                .is_some()
+        {
+            return Err(DecisionRepositoryError::Conflict);
+        }
+        // Both vectors reserve their full configured ceilings at repository creation. Every
+        // fallible check is complete above, so once the first push occurs no allocation or error
+        // path remains between the record and its derived currentness index.
+        self.records
+            .push(DecisionRecord::PreparedPublishedInvestmentAnalysis(bundle));
+        self.investment_analysis_index.push(index_entry);
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Atomically appends one generic selected-candidate proposal/publication bundle in memory.
+    pub fn append_prepared_published_investment_analysis(
+        &mut self,
+        bundle: PreparedPublishedInvestmentAnalysis,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        let staged = self.stage_prepared_published_investment_analysis(bundle)?;
+        self.commit_staged_published_investment_analysis(staged)
+    }
+
     /// Appends the sole immutable profile/workflow publication for one analysis.
     pub fn append_investment_analysis_publication(
         &mut self,
         publication: PublishedInvestmentAnalysis,
     ) -> Result<AppendOutcome, DecisionRepositoryError> {
-        if let Some(existing) = self.investment_analysis_publication(publication.analysis_id()) {
+        if self
+            .prepared_published_investment_analysis(publication.analysis_id())
+            .is_some()
+        {
+            return Err(DecisionRepositoryError::Conflict);
+        }
+        if let Some(existing) =
+            self.standalone_investment_analysis_publication(publication.analysis_id())
+        {
             return if existing == &publication {
                 Ok(AppendOutcome::AlreadyPresent)
             } else {
@@ -1258,6 +1442,21 @@ impl DecisionRepository {
     pub fn investment_proposals(&self) -> impl Iterator<Item = &InvestmentProposalDecision> {
         self.records.iter().filter_map(|record| match record {
             DecisionRecord::InvestmentProposal(decision) => Some(decision),
+            DecisionRecord::PreparedPublishedInvestmentAnalysis(bundle) => Some(bundle.decision()),
+            _ => None,
+        })
+    }
+
+    fn standalone_investment_proposal(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Option<&InvestmentProposalDecision> {
+        self.records.iter().find_map(|record| match record {
+            DecisionRecord::InvestmentProposal(decision)
+                if decision.analysis_id() == analysis_id =>
+            {
+                Some(decision)
+            }
             _ => None,
         })
     }
@@ -1281,6 +1480,40 @@ impl DecisionRepository {
                 if publication.analysis_id() == analysis_id =>
             {
                 Some(publication)
+            }
+            DecisionRecord::PreparedPublishedInvestmentAnalysis(bundle)
+                if bundle.publication().analysis_id() == analysis_id =>
+            {
+                Some(bundle.publication())
+            }
+            _ => None,
+        })
+    }
+
+    fn standalone_investment_analysis_publication(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Option<&PublishedInvestmentAnalysis> {
+        self.records.iter().find_map(|record| match record {
+            DecisionRecord::InvestmentAnalysisPublication(publication)
+                if publication.analysis_id() == analysis_id =>
+            {
+                Some(publication)
+            }
+            _ => None,
+        })
+    }
+
+    /// Returns one exact selected-candidate proposal/explanation/publication atomic bundle.
+    pub fn prepared_published_investment_analysis(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Option<&PreparedPublishedInvestmentAnalysis> {
+        self.records.iter().find_map(|record| match record {
+            DecisionRecord::PreparedPublishedInvestmentAnalysis(bundle)
+                if bundle.decision().analysis_id() == analysis_id =>
+            {
+                Some(bundle)
             }
             _ => None,
         })
@@ -1680,7 +1913,13 @@ impl DecisionRepository {
     fn investment_proposal_count(&self) -> usize {
         self.records
             .iter()
-            .filter(|record| matches!(record, DecisionRecord::InvestmentProposal(_)))
+            .filter(|record| {
+                matches!(
+                    record,
+                    DecisionRecord::InvestmentProposal(_)
+                        | DecisionRecord::PreparedPublishedInvestmentAnalysis(_)
+                )
+            })
             .count()
     }
 
@@ -1692,6 +1931,7 @@ impl DecisionRepository {
                     record,
                     DecisionRecord::InvestmentProposal(_)
                         | DecisionRecord::InvestmentAnalysisPublication(_)
+                        | DecisionRecord::PreparedPublishedInvestmentAnalysis(_)
                         | DecisionRecord::InvestmentOutcomeProjection(_)
                         | DecisionRecord::InvestmentSizingProjection(_)
                         | DecisionRecord::RecommendationOutcomeStatus(_)

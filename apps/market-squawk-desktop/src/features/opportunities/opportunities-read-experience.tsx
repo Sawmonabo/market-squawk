@@ -8,7 +8,7 @@ import {
   Search,
 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
+import { messageFrom, useProduct } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -19,6 +19,8 @@ import type { ProductTransport } from "@/lib/transport"
 import {
   parseInvestmentAnalysis,
   parseInvestmentAnalysisPage,
+  parseRecommendationTrackRecord,
+  recommendationTrackRecordRequestForAnalysis,
   type InvestmentAnalysisLocator,
 } from "./contracts"
 import {
@@ -26,6 +28,7 @@ import {
   BriefLoading,
   InvestmentBrief,
   locatorOutcomeLabel,
+  type TrackRecordPresentation,
 } from "./investment-brief"
 import { formatUnixNanos } from "./format"
 
@@ -41,7 +44,15 @@ export function OpportunitiesReadExperience({
   readAvailable: boolean
 }) {
   const [selectedAnalysisId, setSelectedAnalysisId] = useState<string | null>(null)
+  const product = useProduct()
   const controller = useAnalyticalControllerStatus(transport, scope)
+  const trackRecordOperationAvailable =
+    product.status === "ready" &&
+    product.bootstrap.operations.some(
+      (operation) =>
+        operation.readOnly &&
+        operation.name === "Decision.GetRecommendationTrackRecord",
+    )
   const analyses = useInfiniteQuery({
     queryKey: productKeys.operation(
       scope,
@@ -100,6 +111,79 @@ export function OpportunitiesReadExperience({
     },
     enabled: readAvailable && selectedIsRetained && !repeatedIdentity,
   })
+  const trackRecordRequestAvailability = useMemo(() => {
+    if (!selected.data || selected.dataUpdatedAt <= 0) return null
+    const evaluatedAtUnixNanos = (
+      BigInt(selected.dataUpdatedAt) * 1_000_000n
+    ).toString()
+    return recommendationTrackRecordRequestForAnalysis(
+      selected.data,
+      evaluatedAtUnixNanos,
+    )
+  }, [selected.data, selected.dataUpdatedAt])
+  const trackRecordRequest =
+    trackRecordRequestAvailability?.kind === "available"
+      ? trackRecordRequestAvailability.request
+      : null
+  const trackRecord = useQuery({
+    queryKey: productKeys.operation(
+      scope,
+      "decision",
+      "Decision.GetRecommendationTrackRecord",
+      trackRecordRequest ?? {
+        unavailable:
+          trackRecordRequestAvailability?.kind === "unavailable"
+            ? trackRecordRequestAvailability.reason
+            : "analysis_not_loaded",
+      },
+    ),
+    queryFn: async () => {
+      const request = trackRecordRequest
+      if (!request) {
+        throw new Error(
+          "The selected analysis does not expose a callable track-record binding.",
+        )
+      }
+      return parseRecommendationTrackRecord(
+        await transport.query({
+          query: "decisionRecommendationTrackRecord",
+          ...request,
+        }),
+        request,
+      )
+    },
+    enabled:
+      readAvailable &&
+      selectedIsRetained &&
+      !repeatedIdentity &&
+      trackRecordOperationAvailable &&
+      trackRecordRequest !== null,
+  })
+  const trackRecordPresentation: TrackRecordPresentation =
+    !trackRecordOperationAvailable
+      ? {
+          state: "unavailable",
+          detail:
+            "This installed service generation does not advertise the exact recommendation track-record read.",
+        }
+      : trackRecordRequestAvailability?.kind === "unavailable"
+        ? {
+            state: "unavailable",
+            detail: trackRecordUnavailableDetail(
+              trackRecordRequestAvailability.reason,
+            ),
+          }
+        : trackRecord.isPending
+          ? { state: "loading" }
+          : trackRecord.isError
+            ? {
+                state: "error",
+                detail: messageFrom(trackRecord.error),
+                onRetry: () => void trackRecord.refetch(),
+              }
+            : trackRecord.data
+              ? { state: "ready", value: trackRecord.data }
+              : { state: "loading" }
 
   return (
     <>
@@ -274,12 +358,33 @@ export function OpportunitiesReadExperience({
               </AlertDescription>
             </Alert>
           ) : (
-            <InvestmentBrief analysis={selected.data} />
+            <InvestmentBrief
+              analysis={selected.data}
+              trackRecord={trackRecordPresentation}
+              refreshing={selected.isFetching || trackRecord.isFetching}
+              onRefresh={() => void selected.refetch()}
+            />
           )}
         </div>
       ) : null}
     </>
   )
+}
+
+function trackRecordUnavailableDetail(
+  reason:
+    | "analysis_not_published"
+    | "profile_digest_algorithm_unsupported"
+    | "profile_identifier_unsupported",
+): string {
+  switch (reason) {
+    case "analysis_not_published":
+      return "This retained analysis has not been published under an exact analytical profile, so no profile-bound track record can be requested."
+    case "profile_digest_algorithm_unsupported":
+      return "The publication uses a profile digest algorithm that the current track-record operation cannot accept."
+    case "profile_identifier_unsupported":
+      return "The publication's analytical-profile binding is not accepted by the current track-record request contract."
+  }
 }
 
 function AnalysisHistoryCard({

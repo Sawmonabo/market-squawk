@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use market_squawk_data::Sha256Digest;
 use market_squawk_domain::{Currency, DigestAlgorithm, EvidenceDigest, InstrumentId, Timestamp};
 use market_squawk_modeling::{
-    CalibrationEvidence, ForecastCentralStatistic, ForecastOutcome, ForecastPath, ForecastValue,
-    ForecastVintage, ModelMetadata,
+    CalibrationEvidence, ForecastCentralStatistic, ForecastCoverage, ForecastOutcome, ForecastPath,
+    ForecastValue, ForecastVintage, ModelMetadata,
 };
 use market_squawk_platform::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
 use market_squawk_services::{
@@ -572,6 +572,232 @@ pub(crate) struct LatestValidForecast {
     forecast_artifact: ArtifactReference,
 }
 
+/// Exact typed reason one selected forecast cannot satisfy a requested price horizon.
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactHorizonPriceForecastUnavailableReason {
+    /// The selected model binding is not admitted as conditional-mean terminal-price evidence.
+    PriceEvidenceUnavailable(ForecastPriceUnavailableReason),
+    /// The admitted model predicts a different exact terminal horizon.
+    HorizonMismatch { selected_horizon_nanos: NonZeroU64 },
+    /// The selected price forecast has no admitted interval-calibration evidence.
+    CalibrationUnavailable,
+}
+
+/// Identity-bound refusal to reinterpret a selected vintage at a caller-requested horizon.
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExactHorizonPriceForecastUnavailable {
+    requested_horizon_nanos: NonZeroU64,
+    vintage_id: Sha256Digest,
+    instrument_id: InstrumentId,
+    output_binding_identity: Sha256Digest,
+    selection_receipt_digest: EvidenceDigest,
+    reason: ExactHorizonPriceForecastUnavailableReason,
+}
+
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+impl ExactHorizonPriceForecastUnavailable {
+    /// Exact positive horizon requested by the analysis policy.
+    #[must_use]
+    pub(crate) const fn requested_horizon_nanos(self) -> NonZeroU64 {
+        self.requested_horizon_nanos
+    }
+
+    /// Immutable selected vintage that could not satisfy the requested interpretation.
+    #[must_use]
+    pub(crate) const fn vintage_id(self) -> Sha256Digest {
+        self.vintage_id
+    }
+
+    /// Exact selected instrument.
+    #[must_use]
+    pub(crate) const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Model-admission identity retained even when the requested projection is unavailable.
+    #[must_use]
+    pub(crate) const fn output_binding_identity(self) -> Sha256Digest {
+        self.output_binding_identity
+    }
+
+    /// Complete newest-valid selection identity.
+    #[must_use]
+    pub(crate) const fn selection_receipt_digest(self) -> EvidenceDigest {
+        self.selection_receipt_digest
+    }
+
+    /// Closed reason this vintage cannot be used at the requested horizon.
+    #[must_use]
+    pub(crate) const fn reason(self) -> ExactHorizonPriceForecastUnavailableReason {
+        self.reason
+    }
+}
+
+/// One exact calibrated conditional-mean terminal-price projection.
+///
+/// This is research evidence only. It grants no proposal, sizing, risk, order, or execution
+/// authority and does not reinterpret generic regression output or an approximate horizon.
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ExactHorizonPriceForecastProjection<'forecast> {
+    price: &'forecast SelectedPriceForecast,
+    selection_receipt: &'forecast ForecastSelectionReceipt,
+    terminal: SelectedPriceForecastPoint,
+    intervals: SelectedPriceIntervals,
+    calibration: &'forecast CalibrationEvidence,
+}
+
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+impl ExactHorizonPriceForecastProjection<'_> {
+    /// Exact immutable forecast-vintage identity.
+    #[must_use]
+    pub(crate) const fn vintage_id(self) -> Sha256Digest {
+        self.price.vintage_id()
+    }
+
+    /// Exact forecasted instrument.
+    #[must_use]
+    pub(crate) const fn instrument_id(self) -> InstrumentId {
+        self.price.instrument_id()
+    }
+
+    /// Quote currency of the modeled price and every interval bound.
+    #[must_use]
+    pub(crate) const fn currency(self) -> Currency {
+        self.price.currency()
+    }
+
+    /// Exact positive terminal horizon admitted by the model and requested by the caller.
+    #[must_use]
+    pub(crate) const fn terminal_horizon_nanos(self) -> NonZeroU64 {
+        self.price.terminal_horizon_nanos()
+    }
+
+    /// Exact future effective coordinate of the single terminal point.
+    #[must_use]
+    pub(crate) const fn terminal_at(self) -> Timestamp {
+        self.terminal.target_at()
+    }
+
+    /// Model-estimated conditional-mean terminal price.
+    #[must_use]
+    pub(crate) const fn terminal_mean(self) -> ForecastValue {
+        self.terminal.central()
+    }
+
+    /// Complete nested marginal-coverage intervals at 50, 80, and 95 percent.
+    #[must_use]
+    pub(crate) const fn intervals(self) -> SelectedPriceIntervals {
+        self.intervals
+    }
+
+    /// Complete admitted interval-calibration identity.
+    #[must_use]
+    pub(crate) const fn calibration_identity(self) -> Sha256Digest {
+        self.calibration.identity()
+    }
+
+    /// Model-output admission identity authorizing the price/mean/horizon interpretation.
+    #[must_use]
+    pub(crate) const fn output_binding_identity(self) -> Sha256Digest {
+        self.price.output_binding_identity()
+    }
+
+    /// Exact complete-set newest-valid selection identity.
+    #[must_use]
+    pub(crate) const fn selection_receipt_digest(self) -> EvidenceDigest {
+        self.selection_receipt.receipt_digest()
+    }
+
+    /// Exact point-in-time selection cutoff.
+    #[must_use]
+    pub(crate) const fn selected_as_of(self) -> Timestamp {
+        Timestamp::from_unix_nanos(self.selection_receipt.as_of_unix_nanos())
+    }
+
+    /// Effective cutoff of the source-qualified observed series.
+    #[must_use]
+    pub(crate) const fn observed_through(self) -> Timestamp {
+        self.price.observed_through()
+    }
+
+    /// Conservative knowledge time of the complete forecast input.
+    #[must_use]
+    pub(crate) const fn available_at(self) -> Timestamp {
+        self.price.available_at()
+    }
+
+    /// Immutable publication time.
+    #[must_use]
+    pub(crate) const fn created_at(self) -> Timestamp {
+        self.price.created_at()
+    }
+
+    /// Exclusive model-risk expiry used by selection.
+    #[must_use]
+    pub(crate) const fn expires_at(self) -> Timestamp {
+        self.price.expires_at()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+impl<'forecast> ExactHorizonPriceForecastProjection<'forecast> {
+    /// Complete authority-owned newest-valid selection receipt.
+    #[must_use]
+    pub(crate) const fn selection_receipt(self) -> &'forecast ForecastSelectionReceipt {
+        self.selection_receipt
+    }
+
+    /// Complete bundle-, artifact-, window-, residual-, band-, and coverage-bound calibration.
+    #[must_use]
+    pub(crate) const fn calibration(self) -> &'forecast CalibrationEvidence {
+        self.calibration
+    }
+
+    /// Exact reloaded model metadata used to revalidate this vintage.
+    #[must_use]
+    pub(crate) const fn model_metadata(self) -> &'forecast ModelMetadata {
+        self.price.model_metadata()
+    }
+
+    /// Path-free controlled forecast artifact verified before selection returned.
+    #[must_use]
+    pub(crate) const fn forecast_artifact(self) -> &'forecast ArtifactReference {
+        self.price.forecast_artifact()
+    }
+}
+
+/// Exact calibrated terminal-price evidence or an identity-bound typed refusal.
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ExactHorizonPriceForecastEvidence<'forecast> {
+    Available(ExactHorizonPriceForecastProjection<'forecast>),
+    Unavailable(ExactHorizonPriceForecastUnavailable),
+}
+
 impl LatestValidForecast {
     /// Typed price evidence or an explicit non-price/unavailable result.
     #[must_use]
@@ -595,6 +821,139 @@ impl LatestValidForecast {
     #[must_use]
     pub(crate) const fn forecast_artifact(&self) -> &ArtifactReference {
         &self.forecast_artifact
+    }
+
+    /// Projects only an exact calibrated conditional-mean price at the requested horizon.
+    ///
+    /// A different admitted horizon, a non-price model, or absent calibration remains explicitly
+    /// unavailable. Internal identity or chronology drift is treated as corrupt retained state.
+    #[allow(
+        dead_code,
+        reason = "a generic analysis consumer uses this at the next composition seam"
+    )]
+    pub(crate) fn exact_horizon_price_projection(
+        &self,
+        requested_horizon_nanos: NonZeroU64,
+    ) -> Result<ExactHorizonPriceForecastEvidence<'_>, ForecastApplicationError> {
+        let (vintage_id, instrument_id, output_binding_identity) = match &self.price_evidence {
+            ForecastPriceEvidence::Available(price) => (
+                price.vintage_id(),
+                price.instrument_id(),
+                price.output_binding_identity(),
+            ),
+            ForecastPriceEvidence::Unavailable(unavailable) => {
+                return Ok(ExactHorizonPriceForecastEvidence::Unavailable(
+                    ExactHorizonPriceForecastUnavailable {
+                        requested_horizon_nanos,
+                        vintage_id: unavailable.vintage_id(),
+                        instrument_id: unavailable.instrument_id(),
+                        output_binding_identity: unavailable.output_binding_identity(),
+                        selection_receipt_digest: self.selection_receipt.receipt_digest(),
+                        reason:
+                            ExactHorizonPriceForecastUnavailableReason::PriceEvidenceUnavailable(
+                                unavailable.reason(),
+                            ),
+                    },
+                ));
+            }
+        };
+        let ForecastPriceEvidence::Available(price) = &self.price_evidence else {
+            return Err(ForecastApplicationError::CorruptIndex);
+        };
+        if price.terminal_horizon_nanos() != requested_horizon_nanos {
+            return Ok(ExactHorizonPriceForecastEvidence::Unavailable(
+                ExactHorizonPriceForecastUnavailable {
+                    requested_horizon_nanos,
+                    vintage_id,
+                    instrument_id,
+                    output_binding_identity,
+                    selection_receipt_digest: self.selection_receipt.receipt_digest(),
+                    reason: ExactHorizonPriceForecastUnavailableReason::HorizonMismatch {
+                        selected_horizon_nanos: price.terminal_horizon_nanos(),
+                    },
+                },
+            ));
+        }
+        let Some(calibration) = price.calibration() else {
+            return Ok(ExactHorizonPriceForecastEvidence::Unavailable(
+                ExactHorizonPriceForecastUnavailable {
+                    requested_horizon_nanos,
+                    vintage_id,
+                    instrument_id,
+                    output_binding_identity,
+                    selection_receipt_digest: self.selection_receipt.receipt_digest(),
+                    reason: ExactHorizonPriceForecastUnavailableReason::CalibrationUnavailable,
+                },
+            ));
+        };
+        let [terminal] = price.points() else {
+            return Err(ForecastApplicationError::CorruptIndex);
+        };
+        let expected_target = price
+            .observed_through()
+            .checked_add_nanos(
+                i64::try_from(requested_horizon_nanos.get())
+                    .map_err(|_error| ForecastApplicationError::CorruptIndex)?,
+            )
+            .map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+        let intervals = terminal
+            .intervals()
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        // Persistence already admitted this object through `verify_forecast_vintage_identity`,
+        // including its model/cutoff calibration match. Reconstruct it again here so this narrow
+        // projection independently rejects any locally retained calibration drift.
+        let revalidated_calibration = CalibrationEvidence::try_new(
+            price.model_metadata(),
+            calibration.method(),
+            calibration.window(),
+            calibration.policy_hash(),
+            calibration.residuals_hash(),
+            *calibration.bands(),
+            calibration.dependence_assumptions(),
+        )
+        .map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+        let nested = intervals.interval_95().lower() <= intervals.interval_80().lower()
+            && intervals.interval_80().lower() <= intervals.interval_50().lower()
+            && intervals.interval_50().lower() <= terminal.central()
+            && terminal.central() <= intervals.interval_50().upper()
+            && intervals.interval_50().upper() <= intervals.interval_80().upper()
+            && intervals.interval_80().upper() <= intervals.interval_95().upper();
+        if price.central_statistic() != ForecastCentralStatistic::ModelEstimatedConditionalMean
+            || terminal.target_at() != expected_target
+            || !nested
+            || calibration.identity().bytes() == [0; 32]
+            || &revalidated_calibration != calibration
+            || calibration.window().end() > price.observed_through()
+            || calibration.bands()[0].coverage() != ForecastCoverage::Fifty
+            || calibration.bands()[1].coverage() != ForecastCoverage::Eighty
+            || calibration.bands()[2].coverage() != ForecastCoverage::NinetyFive
+            || !self.selection_receipt.selection_complete()
+            || self.selection_receipt.instrument_id() != instrument_id
+            || self.selection_receipt.selected_vintage_id() != hex(vintage_id.bytes())
+            || self
+                .selection_receipt
+                .selected_observed_through_unix_nanos()
+                != price.observed_through().unix_nanos()
+            || self.selection_receipt.selected_available_at_unix_nanos()
+                != price.available_at().unix_nanos()
+            || self.selection_receipt.selected_created_at_unix_nanos()
+                != price.created_at().unix_nanos()
+            || self.selection_receipt.selected_expires_at_unix_nanos()
+                != price.expires_at().unix_nanos()
+            || price.model_metadata().metadata_hash() != self.model_metadata.metadata_hash()
+            || price.forecast_artifact() != &self.forecast_artifact
+        {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        Ok(ExactHorizonPriceForecastEvidence::Available(
+            ExactHorizonPriceForecastProjection {
+                price,
+                selection_receipt: &self.selection_receipt,
+                terminal: *terminal,
+                intervals,
+                calibration,
+            },
+        ))
     }
 }
 

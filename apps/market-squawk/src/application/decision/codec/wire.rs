@@ -4,6 +4,7 @@ use super::super::screen_workflow::ScreenJobPlanWire;
 use super::candidate::ExecutionWire;
 use super::dossier::DossierWire;
 use super::proposal::InvestmentProposalWire;
+use super::published_analysis::PreparedPublishedInvestmentAnalysisWire;
 use super::recommendation::{
     InvestmentAnalysisPublicationWire, InvestmentOutcomeProjectionWire,
     InvestmentSizingProjectionWire, RecommendationOutcomeStatusWire,
@@ -11,7 +12,7 @@ use super::recommendation::{
 use super::screen::ScreenWire;
 use super::target::{InvalidationWire, ReviewWire, TargetWire};
 
-pub(super) const WIRE_VERSION: u32 = 3;
+pub(super) const WIRE_VERSION: u32 = 4;
 pub(super) const KIND_SCREEN: i64 = 1;
 pub(super) const KIND_EXECUTION: i64 = 2;
 pub(super) const KIND_DOSSIER: i64 = 3;
@@ -44,6 +45,7 @@ pub(super) enum WireRecord {
     Invalidation(InvalidationWire),
     ScreenJobInput(Box<ScreenJobPlanWire>),
     InvestmentProposal(Box<InvestmentProposalWire>),
+    PreparedPublishedInvestmentAnalysis(Box<PreparedPublishedInvestmentAnalysisWire>),
     InvestmentAnalysisPublication(InvestmentAnalysisPublicationWire),
     InvestmentOutcomeProjection(InvestmentOutcomeProjectionWire),
     InvestmentSizingProjection(Box<InvestmentSizingProjectionWire>),
@@ -61,7 +63,8 @@ impl WireRecord {
             Self::Invalidation(_) => KIND_INVALIDATION,
             Self::ScreenJobInput(_) => KIND_SCREEN_JOB_INPUT,
             Self::InvestmentProposal(_) => KIND_INVESTMENT_PROPOSAL,
-            Self::InvestmentAnalysisPublication(_)
+            Self::PreparedPublishedInvestmentAnalysis(_)
+            | Self::InvestmentAnalysisPublication(_)
             | Self::InvestmentOutcomeProjection(_)
             | Self::InvestmentSizingProjection(_)
             | Self::RecommendationOutcomeStatus(_) => KIND_INVESTMENT_PROPOSAL,

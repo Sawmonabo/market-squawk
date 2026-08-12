@@ -7,11 +7,12 @@ use crate::{
     DecisionDossier, DecisionRepository, DecisionRepositoryError, GovernedTargetSet,
     InvestmentAnalysisCurrentIndexEntry, InvestmentAnalysisId, InvestmentOutcomeProjection,
     InvestmentProposalDecision, InvestmentProposalId, InvestmentProposalIndexEntry,
-    InvestmentSizingProjection, InvestmentTargetSetId, PublishedInvestmentAnalysis,
-    RecommendationOutcomeCurrentIndexEntry, RecommendationOutcomeSeriesId,
-    RecommendationOutcomeStatusRecord, RecommendationTrackRecord, SavedScreen, ScreenExecution,
-    ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry, TargetInvalidation, TargetReview,
-    TargetState, TargetStatus, candidate::execute,
+    InvestmentSizingProjection, InvestmentTargetSetId, PreparedPublishedInvestmentAnalysis,
+    PublishedInvestmentAnalysis, RecommendationOutcomeCurrentIndexEntry,
+    RecommendationOutcomeSeriesId, RecommendationOutcomeStatusRecord, RecommendationTrackRecord,
+    SavedScreen, ScreenExecution, ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry,
+    TargetInvalidation, TargetReview, TargetState, TargetStatus, candidate::execute,
+    repository::StagedPublishedInvestmentAnalysisAppend,
 };
 
 /// One transport-neutral workflow authority. Mutation requires exclusive access to the sole writer.
@@ -226,6 +227,33 @@ impl DecisionAuthority {
             .append_investment_analysis_publication(publication)
     }
 
+    /// Validates an atomic selected-candidate analysis bundle without mutating the repository.
+    pub fn stage_prepared_published_investment_analysis(
+        &self,
+        bundle: PreparedPublishedInvestmentAnalysis,
+    ) -> Result<StagedPublishedInvestmentAnalysisAppend, DecisionRepositoryError> {
+        self.repository
+            .stage_prepared_published_investment_analysis(bundle)
+    }
+
+    /// Commits one previously validated analysis bundle without allocating.
+    pub fn commit_staged_published_investment_analysis(
+        &mut self,
+        staged: StagedPublishedInvestmentAnalysisAppend,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        self.repository
+            .commit_staged_published_investment_analysis(staged)
+    }
+
+    /// Appends one selected-candidate analysis bundle during canonical recovery.
+    pub fn append_prepared_published_investment_analysis(
+        &mut self,
+        bundle: PreparedPublishedInvestmentAnalysis,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        self.repository
+            .append_prepared_published_investment_analysis(bundle)
+    }
+
     /// Appends one immutable proposal-bound outcome projection.
     pub fn append_investment_outcome_projection(
         &mut self,
@@ -269,6 +297,16 @@ impl DecisionAuthority {
     ) -> Result<&PublishedInvestmentAnalysis, DecisionRepositoryError> {
         self.repository
             .investment_analysis_publication(analysis_id)
+            .ok_or(DecisionRepositoryError::NotFound)
+    }
+
+    /// Returns one complete selected-candidate analysis bundle.
+    pub fn get_prepared_published_investment_analysis(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Result<&PreparedPublishedInvestmentAnalysis, DecisionRepositoryError> {
+        self.repository
+            .prepared_published_investment_analysis(analysis_id)
             .ok_or(DecisionRepositoryError::NotFound)
     }
 

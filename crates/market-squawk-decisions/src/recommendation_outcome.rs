@@ -12,12 +12,15 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     DecisionContentDigest, InvestmentAnalysisId, InvestmentProposalDecision, InvestmentProposalId,
-    ProposalExecutionEligibility, ProposalUnavailableReason, RecommendationAction,
+    NoActionReason, ProposalExecutionEligibility, ProposalUnavailableReason, RecommendationAction,
     RecommendationDerivationDigest, RecommendationEvidenceDigest, RecommendationPolicyDigest,
+    SelectedCandidateAnalysisEvidence,
 };
 
 /// Current schema for immutable investment-analysis publication bindings.
 pub const INVESTMENT_ANALYSIS_PUBLICATION_SCHEMA_VERSION: u16 = 1;
+/// Current schema for immutable typed investment-analysis explanations.
+pub const INVESTMENT_ANALYSIS_EXPLANATION_SCHEMA_VERSION: u16 = 1;
 /// Current schema for realized recommendation-outcome status records.
 pub const RECOMMENDATION_OUTCOME_STATUS_SCHEMA_VERSION: u16 = 1;
 /// Code-owned minimum completed observations before a group performance mean is displayed.
@@ -61,6 +64,10 @@ digest_identity!(
 digest_identity!(
     /// Content address of one exact recommendation-outcome status revision.
     RecommendationOutcomeStatusDigest
+);
+digest_identity!(
+    /// Content address of one immutable typed investment-analysis explanation.
+    InvestmentAnalysisExplanationDigest
 );
 
 /// Invalid publication or realized-outcome evidence.
@@ -312,6 +319,194 @@ impl PublishedInvestmentAnalysis {
     #[must_use]
     pub const fn execution_eligibility(&self) -> ProposalExecutionEligibility {
         self.execution_eligibility
+    }
+}
+
+/// Closed conclusion retained by the generic immutable analysis explanation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvestmentAnalysisConclusion {
+    /// Complete evidence produced a position-aware recommendation.
+    Generated(RecommendationAction),
+    /// Complete evidence caused the policy to abstain.
+    NoAction(NoActionReason),
+    /// Mandatory evidence was unavailable or inadmissible.
+    Unavailable(ProposalUnavailableReason),
+}
+
+/// Immutable typed explanation linking one proposal conclusion to its selected screen candidate.
+///
+/// The record contains no caller-authored narrative and grants no order or execution authority.
+/// Candidate rank and contribution detail remain in [`SelectedCandidateAnalysisEvidence`], while
+/// the analysis and proposal identities bind the complete policy, evidence, confidence, targets,
+/// and typed conclusion produced by the recommendation authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvestmentAnalysisExplanation {
+    explanation_digest: InvestmentAnalysisExplanationDigest,
+    analysis_id: InvestmentAnalysisId,
+    proposal_id: Option<InvestmentProposalId>,
+    policy_digest: RecommendationPolicyDigest,
+    evidence_digest: RecommendationEvidenceDigest,
+    derivation_digest: Option<RecommendationDerivationDigest>,
+    selected_candidate_evidence_digest: DecisionContentDigest,
+    conclusion: InvestmentAnalysisConclusion,
+    execution_eligibility: ProposalExecutionEligibility,
+}
+
+impl InvestmentAnalysisExplanation {
+    /// Derives the sole V1 typed explanation from an authoritative decision and exact candidate.
+    pub fn try_new(
+        decision: &InvestmentProposalDecision,
+        selected_candidate: &SelectedCandidateAnalysisEvidence,
+    ) -> Result<Self, RecommendationOutcomeError> {
+        if decision.evidence().selected_candidate() != Some(selected_candidate)
+            || decision.evidence().instrument_id() != selected_candidate.instrument_id()
+            || selected_candidate.as_of() > decision.evidence().as_of()
+            || selected_candidate.selected_at() > decision.evidence().as_of()
+        {
+            return Err(RecommendationOutcomeError::BindingMismatch);
+        }
+        let conclusion = match decision {
+            InvestmentProposalDecision::Generated(value) => {
+                InvestmentAnalysisConclusion::Generated(value.action())
+            }
+            InvestmentProposalDecision::NoAction(value) => {
+                InvestmentAnalysisConclusion::NoAction(value.reason())
+            }
+            InvestmentProposalDecision::Unavailable(value) => {
+                InvestmentAnalysisConclusion::Unavailable(value.reason())
+            }
+        };
+        let mut value = Self {
+            explanation_digest: InvestmentAnalysisExplanationDigest([0; 32]),
+            analysis_id: decision.analysis_id(),
+            proposal_id: decision.proposal_id(),
+            policy_digest: decision.policy_digest(),
+            evidence_digest: decision.evidence_digest(),
+            derivation_digest: decision.derivation_digest(),
+            selected_candidate_evidence_digest: selected_candidate.evidence_digest(),
+            conclusion,
+            execution_eligibility: ProposalExecutionEligibility::ResearchOnlyExecutionIneligible,
+        };
+        value.explanation_digest = investment_analysis_explanation_digest(&value);
+        Ok(value)
+    }
+
+    /// Returns the closed explanation schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        INVESTMENT_ANALYSIS_EXPLANATION_SCHEMA_VERSION
+    }
+
+    /// Returns the explanation's canonical SHA-256 content address.
+    #[must_use]
+    pub const fn explanation_digest(&self) -> InvestmentAnalysisExplanationDigest {
+        self.explanation_digest
+    }
+
+    /// Returns the authoritative analysis identity.
+    #[must_use]
+    pub const fn analysis_id(&self) -> InvestmentAnalysisId {
+        self.analysis_id
+    }
+
+    /// Returns the proposal identity for generated and no-action conclusions.
+    #[must_use]
+    pub const fn proposal_id(&self) -> Option<InvestmentProposalId> {
+        self.proposal_id
+    }
+
+    /// Returns the exact code-owned recommendation-policy identity.
+    #[must_use]
+    pub const fn policy_digest(&self) -> RecommendationPolicyDigest {
+        self.policy_digest
+    }
+
+    /// Returns the complete analysis-evidence commitment.
+    #[must_use]
+    pub const fn evidence_digest(&self) -> RecommendationEvidenceDigest {
+        self.evidence_digest
+    }
+
+    /// Returns the deterministic proposal derivation when one exists.
+    #[must_use]
+    pub const fn derivation_digest(&self) -> Option<RecommendationDerivationDigest> {
+        self.derivation_digest
+    }
+
+    /// Returns the exact selected-candidate evidence commitment.
+    #[must_use]
+    pub const fn selected_candidate_evidence_digest(&self) -> DecisionContentDigest {
+        self.selected_candidate_evidence_digest
+    }
+
+    /// Returns the code-owned typed conclusion.
+    #[must_use]
+    pub const fn conclusion(&self) -> InvestmentAnalysisConclusion {
+        self.conclusion
+    }
+
+    /// Returns the closed research-only execution marker.
+    #[must_use]
+    pub const fn execution_eligibility(&self) -> ProposalExecutionEligibility {
+        self.execution_eligibility
+    }
+}
+
+/// One immutable proposal, candidate explanation, and publication committed as a single record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedPublishedInvestmentAnalysis {
+    decision: InvestmentProposalDecision,
+    selected_candidate: SelectedCandidateAnalysisEvidence,
+    explanation: InvestmentAnalysisExplanation,
+    publication: PublishedInvestmentAnalysis,
+}
+
+impl PreparedPublishedInvestmentAnalysis {
+    /// Constructs a generic atomic publication bundle from pure, exact references.
+    pub fn try_new(
+        decision: InvestmentProposalDecision,
+        selected_candidate: SelectedCandidateAnalysisEvidence,
+        analytical_profile: AnalyticalProfileBindingReference,
+        workflow: InvestmentAnalysisWorkflowReference,
+        published_at: Timestamp,
+    ) -> Result<Self, RecommendationOutcomeError> {
+        let explanation = InvestmentAnalysisExplanation::try_new(&decision, &selected_candidate)?;
+        let publication = PublishedInvestmentAnalysis::try_new(
+            &decision,
+            analytical_profile,
+            workflow,
+            published_at,
+        )?;
+        Ok(Self {
+            decision,
+            selected_candidate,
+            explanation,
+            publication,
+        })
+    }
+
+    /// Returns the immutable generated, no-action, or unavailable decision.
+    #[must_use]
+    pub const fn decision(&self) -> &InvestmentProposalDecision {
+        &self.decision
+    }
+
+    /// Returns the exact retained candidate binding.
+    #[must_use]
+    pub const fn selected_candidate(&self) -> &SelectedCandidateAnalysisEvidence {
+        &self.selected_candidate
+    }
+
+    /// Returns the derived typed explanation.
+    #[must_use]
+    pub const fn explanation(&self) -> &InvestmentAnalysisExplanation {
+        &self.explanation
+    }
+
+    /// Returns the immutable analytical-profile/workflow publication.
+    #[must_use]
+    pub const fn publication(&self) -> &PublishedInvestmentAnalysis {
+        &self.publication
     }
 }
 
@@ -1224,6 +1419,43 @@ fn outcome_status_digest(
     RecommendationOutcomeStatusDigest(hash.finalize().into())
 }
 
+fn investment_analysis_explanation_digest(
+    value: &InvestmentAnalysisExplanation,
+) -> InvestmentAnalysisExplanationDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/investment-analysis-explanation/v1\0");
+    hash.update(value.analysis_id.bytes());
+    option_digest(
+        &mut hash,
+        value.proposal_id.map(InvestmentProposalId::bytes),
+    );
+    hash.update(value.policy_digest.bytes());
+    hash.update(value.evidence_digest.bytes());
+    option_digest(
+        &mut hash,
+        value
+            .derivation_digest
+            .map(RecommendationDerivationDigest::bytes),
+    );
+    digest_hash(&mut hash, value.selected_candidate_evidence_digest);
+    match value.conclusion {
+        InvestmentAnalysisConclusion::Generated(action) => {
+            hash.update([0, action_tag(action)]);
+        }
+        InvestmentAnalysisConclusion::NoAction(reason) => {
+            hash.update([1, no_action_reason_tag(reason)]);
+        }
+        InvestmentAnalysisConclusion::Unavailable(reason) => {
+            hash.update([2]);
+            // The analysis identity commits every field carried by the typed reason. The closed
+            // variant tag makes the explanation family independently unambiguous.
+            hash.update(proposal_unavailable_reason_tag(reason).to_be_bytes());
+        }
+    }
+    hash.update([0]);
+    InvestmentAnalysisExplanationDigest(hash.finalize().into())
+}
+
 fn profile_hash(hash: &mut Sha256, value: &AnalyticalProfileBindingReference) {
     text_hash(hash, value.profile_id.as_str());
     hash.update(value.revision.get().to_be_bytes());
@@ -1276,6 +1508,18 @@ const fn action_tag(value: RecommendationAction) -> u8 {
         RecommendationAction::Hold => 2,
         RecommendationAction::Trim => 3,
         RecommendationAction::Sell => 4,
+    }
+}
+
+const fn no_action_reason_tag(value: NoActionReason) -> u8 {
+    match value {
+        NoActionReason::ConflictingForecastAndValuation => 0,
+        NoActionReason::BacktestBelowPolicy => 1,
+        NoActionReason::LiquidityBelowPolicy => 2,
+        NoActionReason::PortfolioRiskBelowPolicy => 3,
+        NoActionReason::ConfidenceBelowPolicy => 4,
+        NoActionReason::PositionStateNotActionable => 5,
+        NoActionReason::GeneratedPriceOrderCollapsed => 6,
     }
 }
 

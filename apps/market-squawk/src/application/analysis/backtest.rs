@@ -39,6 +39,13 @@ pub use input_authority::{
     GovernedBacktestQueryLimitsInput, MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES,
     ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestInputAuthorityError,
 };
+#[allow(
+    unused_imports,
+    reason = "a generic analysis consumer uses this least-authority seam after composition"
+)]
+pub(crate) use input_authority::{
+    GovernedRecommendationInputMaterializerV1, GovernedRecommendationMaterializedInputV1,
+};
 pub use repository::{
     GovernedBacktestInputResolver, GovernedBacktestRepositoryLimits,
     ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,

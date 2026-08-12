@@ -3,22 +3,23 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use market_squawk::application::decision::{DecisionApplication, DecisionApplicationError};
 use market_squawk_analytics::{FeatureOutputType, StatisticalF64};
 use market_squawk_decisions::{
-    AnalyticalProfileBindingReference, AppendOutcome, AsOfSemantics, CandidatePortfolioSizingState,
-    CandidateSizingConstraints, ComparisonOperator, CostAdjustedPitBacktestEvidence,
-    DecisionContentDigest, DecisionContractError, DecisionRepositoryLimits,
-    ForecastCalibrationSummary, ForecastPriceRanges, InvestmentAnalysisEvidence,
-    InvestmentAnalysisEvidenceInput, InvestmentAnalysisWorkflowReference,
-    InvestmentOutcomeProjection, InvestmentProposalAuthority, InvestmentProposalDecision,
-    InvestmentProposalIndexOutcome, InvestmentSizingInputs, InvestmentSizingProjection,
-    LiquidityEvidence, MarketReferenceAdjustmentBasis, MarketReferenceEvidence,
-    MarketReferencePriceKind, NullPolicy, PortfolioPositionState, PortfolioRiskEvidence,
-    PriceForecastEvidence, ProposalEvidenceWindow, ProposalForecastVintageId,
-    PublishedInvestmentAnalysis, RankingDirection, RecommendationAction,
-    RecommendationOutcomeObservation, RecommendationOutcomePendingReason,
-    RecommendationOutcomeStatusRecord, RecommendationOutcomeUnavailableReason,
-    RecommendationPolicy, SavedScreen, ScreenConstraints, ScreenFeatureBinding, ScreenId,
-    ScreenPredicate, ScreenRanking, ScreenRevision, SizingCapacityAvailability, TargetPriceCases,
-    TargetPriceRange, ValuationEvidence,
+    AnalyticalProfileBindingReference, AppendOutcome, AsOfSemantics, CandidateFlag, CandidateId,
+    CandidateInput, CandidatePortfolioSizingState, CandidateSizingConstraints, ComparisonOperator,
+    CostAdjustedPitBacktestEvidence, DecisionContentDigest, DecisionContractError,
+    DecisionRepositoryLimits, ForecastCalibrationSummary, ForecastPriceRanges,
+    InvestmentAnalysisEvidence, InvestmentAnalysisEvidenceInput,
+    InvestmentAnalysisWorkflowReference, InvestmentOutcomeProjection, InvestmentProposalAuthority,
+    InvestmentProposalDecision, InvestmentProposalIndexOutcome, InvestmentSizingInputs,
+    InvestmentSizingProjection, LiquidityEvidence, MarketReferenceAdjustmentBasis,
+    MarketReferenceEvidence, MarketReferencePriceKind, NullPolicy, PortfolioPositionState,
+    PortfolioRiskEvidence, PreparedPublishedInvestmentAnalysis, PriceForecastEvidence,
+    ProposalEvidenceWindow, ProposalForecastVintageId, PublishedInvestmentAnalysis,
+    RankingDirection, RecommendationAction, RecommendationOutcomeObservation,
+    RecommendationOutcomePendingReason, RecommendationOutcomeStatusRecord,
+    RecommendationOutcomeUnavailableReason, RecommendationPolicy, SavedScreen, ScreenConstraints,
+    ScreenFeatureBinding, ScreenFeatureObservation, ScreenId, ScreenPredicate, ScreenRanking,
+    ScreenRevision, ScreenRun, ScreenRunId, SelectedCandidateAnalysisEvidence,
+    SizingCapacityAvailability, TargetPriceCases, TargetPriceRange, ValuationEvidence,
 };
 use market_squawk_domain::{
     AccountId, BasisPoints, Currency, DataQuality, Denomination, DigestAlgorithm, EvidenceDigest,
@@ -60,6 +61,39 @@ fn decision_append_is_durable_idempotent_and_recovers_under_one_writer_lease()
         content_digest(202)?,
     );
     let published_at = generated.evidence().as_of();
+    let candidate_as_of = generated
+        .evidence()
+        .as_of()
+        .checked_sub_nanos(2 * DAY_NANOS)?;
+    let candidate_selected_at = generated.evidence().as_of().checked_sub_nanos(DAY_NANOS)?;
+    let screen_run = ScreenRun::try_new(
+        ScreenRunId::try_new("run.restart-proof")?,
+        screen.revision().clone(),
+        candidate_as_of,
+        content_digest(42)?,
+        screen.universe_identity(),
+        screen.feature_bindings().to_vec(),
+    )?;
+    let candidate_value = StatisticalF64::try_new(0.9)?;
+    let candidate_coverage = StatisticalF64::try_new(0.9)?;
+    let candidate_liquidity = StatisticalF64::try_new(1_234.0)?;
+    let candidate_portfolio = PortfolioRevisionToken::from_bytes([44; 32]);
+    let candidate_input = CandidateInput::try_new(
+        CandidateId::try_new("candidate.restart-proof")?,
+        PROPOSAL_INSTRUMENT.parse::<InstrumentId>()?,
+        screen
+            .feature_bindings()
+            .iter()
+            .cloned()
+            .map(|binding| ScreenFeatureObservation::new(binding, Some(candidate_value)))
+            .collect(),
+        candidate_coverage,
+        candidate_liquidity,
+        DataQuality::DirectVerified,
+        Some(candidate_portfolio.clone()),
+        vec![CandidateFlag::ModelDependent],
+        content_digest(43)?,
+    )?;
     let generated_publication = PublishedInvestmentAnalysis::try_new(
         &generated,
         profile.clone(),
@@ -75,7 +109,7 @@ fn decision_append_is_durable_idempotent_and_recovers_under_one_writer_lease()
     let unavailable_publication = PublishedInvestmentAnalysis::try_new(
         &unavailable,
         profile.clone(),
-        workflow,
+        workflow.clone(),
         published_at,
     )?;
     let InvestmentProposalDecision::Generated(generated_value) = &generated else {
@@ -143,6 +177,61 @@ fn decision_append_is_durable_idempotent_and_recovers_under_one_writer_lease()
         application.save_screen(None, screen.clone())?,
         AppendOutcome::AlreadyPresent
     );
+    let execution =
+        application.run_screen(screen_run, vec![candidate_input], candidate_selected_at)?;
+    let selected_candidate = SelectedCandidateAnalysisEvidence::try_new(
+        &screen,
+        execution.run(),
+        execution
+            .candidates()
+            .first()
+            .ok_or("screen fixture did not retain its candidate")?,
+    )?;
+    assert!(selected_candidate.as_of() < generated.evidence().as_of());
+    assert!(selected_candidate.selected_at() < generated.evidence().as_of());
+    let selected_decision = InvestmentProposalAuthority::generate(
+        generated
+            .evidence()
+            .clone()
+            .try_with_selected_candidate(selected_candidate.clone())?,
+        generated.policy().clone(),
+    )?;
+    let prepared = PreparedPublishedInvestmentAnalysis::try_new(
+        selected_decision,
+        selected_candidate,
+        profile.clone(),
+        workflow.clone(),
+        published_at,
+    )?;
+    let prepared_analysis_id = prepared.decision().analysis_id();
+    install_prepared_bundle_rejection(location.path())?;
+    assert!(matches!(
+        application.append_prepared_published_investment_analysis(prepared.clone()),
+        Err(DecisionApplicationError::Persistence)
+    ));
+    assert_eq!(investment_record_count(location.path())?, 0);
+    remove_prepared_bundle_rejection(location.path())?;
+    drop(application);
+
+    let application = DecisionApplication::open(location.clone(), limits)?;
+    for result in [
+        application
+            .get_investment_proposal(prepared_analysis_id)
+            .map(|_| ()),
+        application
+            .get_investment_analysis_publication(prepared_analysis_id)
+            .map(|_| ()),
+        application
+            .get_prepared_published_investment_analysis(prepared_analysis_id)
+            .map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(DecisionApplicationError::Repository(
+                market_squawk_decisions::DecisionRepositoryError::NotFound
+            ))
+        ));
+    }
     assert_eq!(
         application.append_investment_proposal(generated.clone())?,
         AppendOutcome::Appended
@@ -157,6 +246,31 @@ fn decision_append_is_durable_idempotent_and_recovers_under_one_writer_lease()
             AppendOutcome::Appended
         );
     }
+    assert_eq!(
+        application.append_prepared_published_investment_analysis(prepared.clone())?,
+        AppendOutcome::Appended
+    );
+    assert_eq!(
+        application.append_prepared_published_investment_analysis(prepared.clone())?,
+        AppendOutcome::AlreadyPresent
+    );
+    let conflicting_prepared = PreparedPublishedInvestmentAnalysis::try_new(
+        prepared.decision().clone(),
+        prepared.selected_candidate().clone(),
+        profile.clone(),
+        InvestmentAnalysisWorkflowReference::new(
+            SourceIdentifier::try_from("workflow.other-analysis-v1")?,
+            NonZeroU32::new(1).ok_or(DecisionContractError::InvalidBound)?,
+            content_digest(209)?,
+        ),
+        published_at,
+    )?;
+    assert!(matches!(
+        application.append_prepared_published_investment_analysis(conflicting_prepared),
+        Err(DecisionApplicationError::Repository(
+            market_squawk_decisions::DecisionRepositoryError::Conflict
+        ))
+    ));
     for publication in [
         &generated_publication,
         &no_action_publication,
@@ -190,13 +304,37 @@ fn decision_append_is_durable_idempotent_and_recovers_under_one_writer_lease()
         DecisionApplication::open(location.clone(), limits),
         Err(DecisionApplicationError::Persistence)
     ));
-    assert_eq!(record_count(location.path())?, 13);
+    assert_eq!(record_count(location.path())?, 15);
 
     drop(application);
     let recovered = DecisionApplication::open(location.clone(), limits)?;
+    let recovered_screen =
+        recovered.get_screen(screen.revision().id(), screen.revision().revision())?;
+    assert_eq!(recovered_screen, screen);
     assert_eq!(
-        recovered.get_screen(screen.revision().id(), screen.revision().revision())?,
-        screen
+        recovered_screen.predicates()[0].operator(),
+        ComparisonOperator::GreaterThan
+    );
+    assert_eq!(
+        recovered_screen.predicates()[0].null_policy(),
+        NullPolicy::Include
+    );
+    assert_eq!(
+        recovered_screen.ranking().direction(),
+        RankingDirection::Ascending
+    );
+    assert_eq!(recovered_screen.maximum_results().get(), 3);
+    assert_eq!(
+        recovered_screen.constraints().minimum_coverage(),
+        StatisticalF64::try_new(0.85)?
+    );
+    assert_eq!(
+        recovered_screen.constraints().minimum_liquidity(),
+        StatisticalF64::try_new(1_200.0)?
+    );
+    assert_eq!(
+        recovered_screen.constraints().admitted_data_qualities(),
+        &[DataQuality::DirectVerified, DataQuality::OfficialDelayed]
     );
     assert_eq!(recovered.get_investment_proposal(analysis_id)?, generated);
     assert_eq!(
@@ -207,8 +345,42 @@ fn decision_append_is_durable_idempotent_and_recovers_under_one_writer_lease()
         recovered.get_investment_proposal(unavailable.analysis_id())?,
         unavailable
     );
-    let proposal_index = recovered.list_investment_proposal_index(3)?;
-    assert_eq!(proposal_index.len(), 3);
+    let recovered_prepared =
+        recovered.get_prepared_published_investment_analysis(prepared_analysis_id)?;
+    assert_eq!(recovered_prepared, prepared);
+    assert_eq!(
+        recovered_prepared.selected_candidate().coverage(),
+        candidate_coverage
+    );
+    assert_eq!(
+        recovered_prepared.selected_candidate().liquidity(),
+        candidate_liquidity
+    );
+    assert_eq!(
+        recovered_prepared.selected_candidate().data_quality(),
+        DataQuality::DirectVerified
+    );
+    assert_eq!(
+        recovered_prepared.selected_candidate().portfolio_impact(),
+        Some(&candidate_portfolio)
+    );
+    assert_eq!(
+        recovered_prepared.selected_candidate().flags(),
+        &[
+            CandidateFlag::ModelDependent,
+            CandidateFlag::PortfolioImpactBound,
+        ]
+    );
+    assert_eq!(
+        recovered.get_investment_proposal(prepared_analysis_id)?,
+        prepared.decision().clone()
+    );
+    assert_eq!(
+        recovered.get_investment_analysis_publication(prepared_analysis_id)?,
+        prepared.publication().clone()
+    );
+    let proposal_index = recovered.list_investment_proposal_index(4)?;
+    assert_eq!(proposal_index.len(), 4);
     assert_eq!(proposal_index[0].analysis_id(), analysis_id);
     assert_eq!(proposal_index[0].proposal_id(), generated.proposal_id());
     assert_eq!(
@@ -223,6 +395,7 @@ fn decision_append_is_durable_idempotent_and_recovers_under_one_writer_lease()
         proposal_index[2].outcome(),
         InvestmentProposalIndexOutcome::Unavailable(_)
     ));
+    assert_eq!(proposal_index[3].analysis_id(), prepared_analysis_id);
     assert_eq!(
         recovered.get_investment_analysis_publication(analysis_id)?,
         generated_publication
@@ -283,7 +456,11 @@ fn decision_append_is_durable_idempotent_and_recovers_under_one_writer_lease()
         recovered.append_recommendation_outcome_status(completed)?,
         AppendOutcome::AlreadyPresent
     );
-    assert_eq!(record_count(location.path())?, 13);
+    assert_eq!(
+        recovered.append_prepared_published_investment_analysis(prepared)?,
+        AppendOutcome::AlreadyPresent
+    );
+    assert_eq!(record_count(location.path())?, 15);
     Ok(())
 }
 
@@ -599,16 +776,16 @@ fn saved_screen() -> Result<SavedScreen, Box<dyn std::error::Error>> {
         AsOfSemantics::AvailableAtOrBeforeCutoff,
         vec![ScreenPredicate::new(
             binding.clone(),
-            ComparisonOperator::GreaterThanOrEqual,
-            StatisticalF64::try_new(0.5)?,
-            NullPolicy::Exclude,
+            ComparisonOperator::GreaterThan,
+            StatisticalF64::try_new(0.75)?,
+            NullPolicy::Include,
         )],
-        ScreenRanking::new(binding, RankingDirection::Descending),
-        NonZeroUsize::new(4).ok_or(DecisionContractError::InvalidBound)?,
+        ScreenRanking::new(binding, RankingDirection::Ascending),
+        NonZeroUsize::new(3).ok_or(DecisionContractError::InvalidBound)?,
         ScreenConstraints::try_new(
-            StatisticalF64::try_new(0.8)?,
-            StatisticalF64::try_new(1_000.0)?,
-            vec![DataQuality::DirectVerified],
+            StatisticalF64::try_new(0.85)?,
+            StatisticalF64::try_new(1_200.0)?,
+            vec![DataQuality::DirectVerified, DataQuality::OfficialDelayed],
         )?,
         registry.feature_registry(),
     )?)
@@ -618,4 +795,27 @@ fn record_count(path: &std::path::Path) -> rusqlite::Result<i64> {
     Connection::open(path)?.query_row("SELECT COUNT(*) FROM decision_records", [], |row| {
         row.get(0)
     })
+}
+
+fn investment_record_count(path: &std::path::Path) -> rusqlite::Result<i64> {
+    Connection::open(path)?.query_row(
+        "SELECT COUNT(*) FROM decision_records WHERE kind = 8",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn install_prepared_bundle_rejection(path: &std::path::Path) -> rusqlite::Result<()> {
+    Connection::open(path)?.execute_batch(
+        "CREATE TRIGGER reject_prepared_bundle
+         BEFORE INSERT ON decision_records
+         WHEN NEW.kind = 8 AND NEW.record_key LIKE 'prepared_%'
+         BEGIN
+             SELECT RAISE(ABORT, 'prepared bundle persistence rejection proof');
+         END;",
+    )
+}
+
+fn remove_prepared_bundle_rejection(path: &std::path::Path) -> rusqlite::Result<()> {
+    Connection::open(path)?.execute_batch("DROP TRIGGER reject_prepared_bundle;")
 }

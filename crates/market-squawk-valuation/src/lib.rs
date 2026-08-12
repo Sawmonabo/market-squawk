@@ -159,6 +159,7 @@ pub enum FairValueError {
 mod access;
 mod approval;
 mod assessment;
+mod automatic;
 mod evidence;
 mod measurement;
 mod persistence;
@@ -171,6 +172,19 @@ pub use approval::{
     ValuationApproval, ValuationApprovalId, ValuationOverride,
 };
 pub use assessment::{InputUseAssessment, InputUseAssessmentHash};
+pub use automatic::{
+    AutomaticValuationAssumption, AutomaticValuationAssumptionKind, AutomaticValuationCalculation,
+    AutomaticValuationConflict, AutomaticValuationError, AutomaticValuationIdentity,
+    AutomaticValuationInput, AutomaticValuationInputSetIdentity, AutomaticValuationIntermediate,
+    AutomaticValuationIntermediateKind, AutomaticValuationMethod, AutomaticValuationMethodReceipt,
+    AutomaticValuationRange, AutomaticValuationUnavailable, AutomaticValuationUncertainty,
+    ComparableCompaniesValuationRequest, ComparableCompanyInput, DcfCashFlow,
+    DiscountedCashFlowValuationRequest, ForecastDistributionPoint,
+    ForecastDistributionValuationRequest, PointInTimeValuationInput, ResidualIncomePeriod,
+    ResidualIncomeValuationRequest, ValuationArithmeticPolicy, ValuationRightsReceipt,
+    calculate_comparable_companies, calculate_discounted_cash_flow,
+    calculate_forecast_distribution, calculate_residual_income,
+};
 pub use evidence::{
     EvidenceOrigin, EvidenceVerification, FairValueEvidence, FairValueEvidenceHash,
 };

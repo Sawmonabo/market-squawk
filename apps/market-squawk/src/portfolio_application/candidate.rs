@@ -6,8 +6,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use market_squawk_domain::{
-    AccountId, DataQuality, Denomination, DigestAlgorithm, EvidenceDigest,
-    InstrumentExecutionTerms, InstrumentId, Money, SourceId, Timestamp,
+    AccountId, BasisPoints, DataQuality, Denomination, DigestAlgorithm, EvidenceDigest,
+    InstrumentExecutionTerms, InstrumentId, MarketDepth, Money, PriceTicks, QuantityLots, SourceId,
+    Timestamp,
 };
 use market_squawk_portfolio::PortfolioRevisionToken;
 use market_squawk_services::{
@@ -23,7 +24,7 @@ use crate::application::{
         CandidateTimestamps, FreshnessBasis, MarketInvestmentMarkBasis,
         MarketInvestmentObservation, MarketSelectionReceipt,
     },
-    recommendation::ResolvedRecommendationSetup,
+    recommendation::{RecommendationSetupResolution, ResolvedRecommendationSetup, SetupRequired},
 };
 
 use super::import::hex;
@@ -35,6 +36,7 @@ const CANDIDATE_IMPACT_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 const PORTFOLIO_VALUE_BASIS: &str = "source_reported_holdings_with_selected_candidate_revalued";
 const SCENARIO_SCOPE: &str = "candidate_position_only";
 const RISK_AUTHORITY: &str = "analysis_only";
+const MAXIMUM_ANALYTICAL_DEPTH_LEVELS_PER_SIDE: usize = 10_000;
 const AUTHORITY_BINDING: &str = concat!(
     "analysis_only;portfolio_mutation=false;execution_authority=false;",
     "risk_authority=analysis_only;risk_approval_required=true;",
@@ -76,6 +78,290 @@ impl PortfolioCandidateUnavailableReason {
 pub(crate) enum PortfolioCandidateAvailability<T> {
     Available(T),
     Unavailable(PortfolioCandidateUnavailableReason),
+}
+
+/// Bid/ask side of source-selected analytical liquidity evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PortfolioAnalysisLiquiditySide {
+    Bid,
+    Ask,
+}
+
+impl PortfolioAnalysisLiquiditySide {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bid => "bid",
+            Self::Ask => "ask",
+        }
+    }
+}
+
+/// Exact reason one side of the selected source cannot supply executable depth.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PortfolioAnalysisDepthUnavailableReason {
+    SourceDoesNotSupplyDepth,
+    SourceFreshnessDeadlineUnavailable,
+    SideUnavailable,
+    SideIncomplete,
+    NoExecutableLevels,
+}
+
+impl PortfolioAnalysisDepthUnavailableReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceDoesNotSupplyDepth => "selected_source_does_not_supply_depth",
+            Self::SourceFreshnessDeadlineUnavailable => {
+                "selected_source_depth_freshness_deadline_unavailable"
+            }
+            Self::SideUnavailable => "selected_source_side_unavailable",
+            Self::SideIncomplete => "selected_source_side_incomplete",
+            Self::NoExecutableLevels => "selected_source_has_no_executable_levels",
+        }
+    }
+}
+
+/// Exact side evidence or a source-preserving reason it is unavailable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PortfolioAnalysisDepthAvailability<T> {
+    Available(T),
+    Unavailable(PortfolioAnalysisDepthUnavailableReason),
+}
+
+/// Borrowed-lease extractor input. Production callers must copy levels before dropping the lease.
+#[derive(Debug)]
+pub(crate) enum PortfolioAnalysisDepthLevelsInput {
+    Available(Vec<(PriceTicks, QuantityLots)>),
+    Unavailable(PortfolioAnalysisDepthUnavailableReason),
+}
+
+/// One exact executable aggregate level from the selected source generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PortfolioAnalysisDepthLevel {
+    price_ticks: i64,
+    quantity_lots: i64,
+    unit_price: Money,
+    quantity: Decimal,
+    notional: Money,
+}
+
+impl PortfolioAnalysisDepthLevel {
+    pub(crate) const fn unit_price(self) -> Money {
+        self.unit_price
+    }
+
+    pub(crate) const fn quantity(self) -> Decimal {
+        self.quantity
+    }
+
+    pub(crate) const fn notional(self) -> Money {
+        self.notional
+    }
+}
+
+/// Complete bounded depth for one side of the exact selected source generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PortfolioAnalysisDepthSideEvidence {
+    side: PortfolioAnalysisLiquiditySide,
+    depth: MarketDepth,
+    levels: Box<[PortfolioAnalysisDepthLevel]>,
+    total_quantity: Decimal,
+    total_notional: Money,
+    evidence_digest: EvidenceDigest,
+}
+
+impl PortfolioAnalysisDepthSideEvidence {
+    pub(crate) const fn side(&self) -> PortfolioAnalysisLiquiditySide {
+        self.side
+    }
+
+    pub(crate) const fn depth(&self) -> MarketDepth {
+        self.depth
+    }
+
+    pub(crate) fn levels(&self) -> &[PortfolioAnalysisDepthLevel] {
+        &self.levels
+    }
+
+    pub(crate) const fn total_quantity(&self) -> Decimal {
+        self.total_quantity
+    }
+
+    pub(crate) const fn total_notional(&self) -> Money {
+        self.total_notional
+    }
+
+    pub(crate) const fn evidence_digest(&self) -> EvidenceDigest {
+        self.evidence_digest
+    }
+}
+
+/// Source-selected bid/ask depth and conservatively rounded quoted spread.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PortfolioAnalysisLiquidityEvidence {
+    bid: PortfolioAnalysisDepthAvailability<PortfolioAnalysisDepthSideEvidence>,
+    ask: PortfolioAnalysisDepthAvailability<PortfolioAnalysisDepthSideEvidence>,
+    quoted_spread_basis_points: Option<BasisPoints>,
+    depth: Option<MarketDepth>,
+    source_revision: Option<u64>,
+    observed_at: Option<Timestamp>,
+    available_at: Option<Timestamp>,
+    fresh_until: Option<Timestamp>,
+    evidence_digest: EvidenceDigest,
+}
+
+impl PortfolioAnalysisLiquidityEvidence {
+    /// Produces typed absence without borrowing depth from another source or generation.
+    pub(crate) fn unavailable(
+        market: &PortfolioCandidateMarketEvidence,
+        reason: PortfolioAnalysisDepthUnavailableReason,
+    ) -> Self {
+        let mut evidence = Self {
+            bid: PortfolioAnalysisDepthAvailability::Unavailable(reason),
+            ask: PortfolioAnalysisDepthAvailability::Unavailable(reason),
+            quoted_spread_basis_points: None,
+            depth: None,
+            source_revision: None,
+            observed_at: None,
+            available_at: None,
+            fresh_until: None,
+            evidence_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
+        };
+        evidence.evidence_digest = evidence.canonical_digest(market);
+        evidence
+    }
+
+    /// Copies a complete bounded bid/ask projection while the selected source lease is live.
+    pub(crate) fn try_from_selected_depth(
+        market: &PortfolioCandidateMarketEvidence,
+        depth: MarketDepth,
+        source_revision: u64,
+        observed_at: Timestamp,
+        available_at: Timestamp,
+        fresh_until: Timestamp,
+        bid: PortfolioAnalysisDepthLevelsInput,
+        ask: PortfolioAnalysisDepthLevelsInput,
+    ) -> Result<Self, PortfolioApplicationServiceError> {
+        if source_revision == 0
+            || depth == MarketDepth::OrderLevel
+            || observed_at > available_at
+            || available_at >= fresh_until
+            || market.selection.selected_at < available_at
+            || market.selection.selected_at >= fresh_until
+        {
+            // This read contains executable price aggregates, not individual-order authority.
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        let terms = market.execution_terms;
+        let bid = depth_side_from_input(
+            market,
+            terms,
+            depth,
+            PortfolioAnalysisLiquiditySide::Bid,
+            bid,
+        )?;
+        let ask = depth_side_from_input(
+            market,
+            terms,
+            depth,
+            PortfolioAnalysisLiquiditySide::Ask,
+            ask,
+        )?;
+        let quoted_spread_basis_points = match (&bid, &ask) {
+            (
+                PortfolioAnalysisDepthAvailability::Available(bid),
+                PortfolioAnalysisDepthAvailability::Available(ask),
+            ) => Some(conservative_spread_basis_points(bid, ask, terms)?),
+            _ => None,
+        };
+        let mut evidence = Self {
+            bid,
+            ask,
+            quoted_spread_basis_points,
+            depth: Some(depth),
+            source_revision: Some(source_revision),
+            observed_at: Some(observed_at),
+            available_at: Some(available_at),
+            fresh_until: Some(fresh_until),
+            evidence_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
+        };
+        evidence.evidence_digest = evidence.canonical_digest(market);
+        Ok(evidence)
+    }
+
+    pub(crate) const fn bid(
+        &self,
+    ) -> &PortfolioAnalysisDepthAvailability<PortfolioAnalysisDepthSideEvidence> {
+        &self.bid
+    }
+
+    pub(crate) const fn ask(
+        &self,
+    ) -> &PortfolioAnalysisDepthAvailability<PortfolioAnalysisDepthSideEvidence> {
+        &self.ask
+    }
+
+    pub(crate) const fn quoted_spread_basis_points(&self) -> Option<BasisPoints> {
+        self.quoted_spread_basis_points
+    }
+
+    pub(crate) const fn depth(&self) -> Option<MarketDepth> {
+        self.depth
+    }
+
+    pub(crate) const fn source_revision(&self) -> Option<u64> {
+        self.source_revision
+    }
+
+    pub(crate) const fn observed_at(&self) -> Option<Timestamp> {
+        self.observed_at
+    }
+
+    pub(crate) const fn available_at(&self) -> Option<Timestamp> {
+        self.available_at
+    }
+
+    pub(crate) const fn fresh_until(&self) -> Option<Timestamp> {
+        self.fresh_until
+    }
+
+    pub(crate) const fn evidence_digest(&self) -> EvidenceDigest {
+        self.evidence_digest
+    }
+
+    fn canonical_digest(&self, market: &PortfolioCandidateMarketEvidence) -> EvidenceDigest {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/portfolio-analysis-selected-liquidity/v1\0");
+        canonical_evidence_identity(&mut digest, market.selection.receipt_digest);
+        canonical_evidence_identity(&mut digest, market.observation.observation_digest);
+        canonical_text(&mut digest, market.selection.source_id.as_str());
+        canonical_optional_u64(&mut digest, market.selection.source_state_revision);
+        canonical_optional_u64(&mut digest, self.source_revision);
+        digest.update([market_depth_tag(self.depth)]);
+        canonical_optional_timestamp(&mut digest, self.observed_at);
+        canonical_optional_timestamp(&mut digest, self.available_at);
+        canonical_optional_timestamp(&mut digest, self.fresh_until);
+        for availability in [&self.bid, &self.ask] {
+            match availability {
+                PortfolioAnalysisDepthAvailability::Available(side) => {
+                    digest.update([1]);
+                    canonical_evidence_identity(&mut digest, side.evidence_digest);
+                }
+                PortfolioAnalysisDepthAvailability::Unavailable(reason) => {
+                    digest.update([0]);
+                    canonical_text(&mut digest, reason.as_str());
+                }
+            }
+        }
+        match self.quoted_spread_basis_points {
+            Some(spread) => {
+                digest.update([1]);
+                digest.update(spread.get().to_be_bytes());
+            }
+            None => digest.update([0]),
+        }
+        canonical_text(&mut digest, "analysis_only_no_execution_depth_authority");
+        EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
+    }
 }
 
 /// One exact externally produced candidate cost, when a source-specific producer is available.
@@ -469,7 +755,258 @@ pub(crate) struct PortfolioCandidateResolution {
     market: PortfolioCandidateMarketEvidence,
 }
 
+/// Exact durable recommendation setup and complete current account catalog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PortfolioAnalysisSetupSnapshot {
+    setup: ResolvedRecommendationSetup,
+    catalog: PortfolioAccountCatalogSnapshot,
+}
+
+impl PortfolioAnalysisSetupSnapshot {
+    pub(crate) fn try_new(
+        setup: ResolvedRecommendationSetup,
+        catalog: PortfolioAccountCatalogSnapshot,
+    ) -> Result<Self, PortfolioApplicationServiceError> {
+        if setup.catalog_digest() != catalog.digest()
+            || setup.available_accounts() != catalog.account_count()
+            || catalog.head(setup.selected_account().account_id()) != Some(setup.current_head())
+        {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        Ok(Self { setup, catalog })
+    }
+
+    pub(crate) const fn setup(&self) -> &ResolvedRecommendationSetup {
+        &self.setup
+    }
+
+    pub(crate) const fn catalog(&self) -> &PortfolioAccountCatalogSnapshot {
+        &self.catalog
+    }
+}
+
+/// Setup resolution keeps the complete catalog even when explicit user setup is still required.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PortfolioAnalysisSetupResolution {
+    Ready(PortfolioAnalysisSetupSnapshot),
+    SetupRequired {
+        catalog: PortfolioAccountCatalogSnapshot,
+        requirement: SetupRequired,
+    },
+}
+
+impl PortfolioAnalysisSetupResolution {
+    pub(crate) fn try_from_resolution(
+        resolution: RecommendationSetupResolution,
+        catalog: PortfolioAccountCatalogSnapshot,
+    ) -> Result<Self, PortfolioApplicationServiceError> {
+        match resolution {
+            RecommendationSetupResolution::Ready(setup) => {
+                PortfolioAnalysisSetupSnapshot::try_new(setup, catalog).map(Self::Ready)
+            }
+            RecommendationSetupResolution::SetupRequired(requirement) => {
+                if requirement.evidence().catalog_digest() != catalog.digest()
+                    || requirement.evidence().available_accounts() != catalog.account_count()
+                {
+                    return Err(PortfolioApplicationServiceError::InvalidRequest);
+                }
+                Ok(Self::SetupRequired {
+                    catalog,
+                    requirement,
+                })
+            }
+        }
+    }
+}
+
+/// Truthful reason an exact selected current mark could not be retained for one instrument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PortfolioAnalysisMarketUnavailableReason {
+    InstrumentDefinitionUnavailable,
+    NoEligibleSelectedSource,
+    NoFreshSelectedMark,
+    SourceFreshnessDeadlineUnavailable,
+}
+
+impl PortfolioAnalysisMarketUnavailableReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InstrumentDefinitionUnavailable => "instrument_definition_unavailable",
+            Self::NoEligibleSelectedSource => "no_eligible_selected_source",
+            Self::NoFreshSelectedMark => "no_fresh_selected_mark",
+            Self::SourceFreshnessDeadlineUnavailable => {
+                "selected_source_freshness_deadline_unavailable"
+            }
+        }
+    }
+}
+
+/// Complete selected mark and same-source liquidity, or a typed exact market-data gap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PortfolioAnalysisMarketAvailability {
+    Available {
+        market: PortfolioCandidateMarketEvidence,
+        liquidity: PortfolioAnalysisLiquidityEvidence,
+    },
+    Unavailable(PortfolioAnalysisMarketUnavailableReason),
+}
+
+/// One requested instrument in the complete canonical current-mark set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PortfolioAnalysisMarketEntry {
+    instrument_id: InstrumentId,
+    availability: PortfolioAnalysisMarketAvailability,
+}
+
+impl PortfolioAnalysisMarketEntry {
+    pub(crate) fn available(
+        instrument_id: InstrumentId,
+        market: PortfolioCandidateMarketEvidence,
+        liquidity: PortfolioAnalysisLiquidityEvidence,
+    ) -> Self {
+        Self {
+            instrument_id,
+            availability: PortfolioAnalysisMarketAvailability::Available { market, liquidity },
+        }
+    }
+
+    pub(crate) const fn unavailable(
+        instrument_id: InstrumentId,
+        reason: PortfolioAnalysisMarketUnavailableReason,
+    ) -> Self {
+        Self {
+            instrument_id,
+            availability: PortfolioAnalysisMarketAvailability::Unavailable(reason),
+        }
+    }
+
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    pub(crate) const fn availability(&self) -> &PortfolioAnalysisMarketAvailability {
+        &self.availability
+    }
+}
+
+/// Complete, requested-instrument-ordered market evidence for one setup and evaluation instant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PortfolioAnalysisMarketSet {
+    setup: PortfolioAnalysisSetupSnapshot,
+    entries: Box<[PortfolioAnalysisMarketEntry]>,
+    evaluated_at: Timestamp,
+    digest: EvidenceDigest,
+}
+
+impl PortfolioAnalysisMarketSet {
+    pub(crate) fn try_new(
+        setup: PortfolioAnalysisSetupSnapshot,
+        entries: Vec<PortfolioAnalysisMarketEntry>,
+        evaluated_at: Timestamp,
+    ) -> Result<Self, PortfolioApplicationServiceError> {
+        if entries.is_empty()
+            || evaluated_at != setup.setup.as_of()
+            || entries
+                .windows(2)
+                .any(|pair| pair[0].instrument_id >= pair[1].instrument_id)
+        {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        for entry in &entries {
+            if let PortfolioAnalysisMarketAvailability::Available { market, .. } =
+                &entry.availability
+                && (market.observation.instrument_id != entry.instrument_id
+                    || market.selection.instrument_id != entry.instrument_id
+                    || &market.portfolio_revision != setup.setup.current_head().revision())
+            {
+                return Err(PortfolioApplicationServiceError::InvalidRequest);
+            }
+        }
+        let mut value = Self {
+            setup,
+            entries: entries.into_boxed_slice(),
+            evaluated_at,
+            digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
+        };
+        value.digest = value.canonical_digest();
+        Ok(value)
+    }
+
+    pub(crate) const fn setup(&self) -> &PortfolioAnalysisSetupSnapshot {
+        &self.setup
+    }
+
+    pub(crate) fn entries(&self) -> &[PortfolioAnalysisMarketEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn entry(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Option<&PortfolioAnalysisMarketEntry> {
+        self.entries
+            .binary_search_by_key(&instrument_id, PortfolioAnalysisMarketEntry::instrument_id)
+            .ok()
+            .and_then(|index| self.entries.get(index))
+    }
+
+    pub(crate) const fn evaluated_at(&self) -> Timestamp {
+        self.evaluated_at
+    }
+
+    pub(crate) const fn digest(&self) -> EvidenceDigest {
+        self.digest
+    }
+
+    fn canonical_digest(&self) -> EvidenceDigest {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/portfolio-analysis-current-market-set/v1\0");
+        digest.update(self.setup.setup.authority_revision().to_be_bytes());
+        digest.update(self.setup.setup.authority_digest());
+        digest.update(self.setup.setup.configuration_digest());
+        canonical_evidence_identity(&mut digest, self.setup.catalog.digest());
+        digest.update(self.setup.setup.current_head().revision().bytes());
+        digest.update(self.evaluated_at.unix_nanos().to_be_bytes());
+        digest.update((self.entries.len() as u64).to_be_bytes());
+        for entry in &self.entries {
+            digest.update(entry.instrument_id.as_uuid().as_bytes());
+            match &entry.availability {
+                PortfolioAnalysisMarketAvailability::Available { market, liquidity } => {
+                    digest.update([1]);
+                    canonical_evidence_identity(&mut digest, market.observation.observation_digest);
+                    canonical_evidence_identity(&mut digest, market.selection.receipt_digest);
+                    canonical_evidence_identity(&mut digest, liquidity.evidence_digest);
+                    canonical_execution_terms(&mut digest, market.execution_terms);
+                }
+                PortfolioAnalysisMarketAvailability::Unavailable(reason) => {
+                    digest.update([0]);
+                    canonical_text(&mut digest, reason.as_str());
+                }
+            }
+        }
+        canonical_text(&mut digest, "analysis_only_complete_mark_set");
+        EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
+    }
+}
+
 impl PortfolioCandidateResolution {
+    pub(crate) fn try_from_parts(
+        setup: PortfolioAnalysisSetupSnapshot,
+        market: PortfolioCandidateMarketEvidence,
+    ) -> Result<Self, PortfolioApplicationServiceError> {
+        let setup_binding = PortfolioCandidateSetupBinding::try_from_resolved_setup(&setup.setup)?;
+        if market.observation.instrument_id != market.selection.instrument_id
+            || market.portfolio_revision != setup_binding.portfolio_revision
+        {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        Ok(Self {
+            setup: setup.setup,
+            catalog: setup.catalog,
+            market,
+        })
+    }
+
     /// Builds the only production candidate input from already-resolved typed authorities.
     pub(crate) fn try_from_authorities(
         setup: ResolvedRecommendationSetup,
@@ -541,6 +1078,33 @@ pub(crate) trait PortfolioCandidateResolutionAuthority: Send + Sync {
     async fn recheck(
         &self,
         expected: &PortfolioCandidateResolution,
+        as_of: Timestamp,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<(), PortfolioApplicationServiceError>;
+
+    /// Resolves explicit durable setup without requiring a candidate market observation.
+    async fn resolve_analysis_setup(
+        &self,
+        as_of: Timestamp,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<PortfolioAnalysisSetupResolution, PortfolioApplicationServiceError>;
+
+    /// Resolves every requested instrument in exact canonical order from current market owners.
+    async fn resolve_analysis_markets(
+        &self,
+        setup: &PortfolioAnalysisSetupSnapshot,
+        instrument_ids: &[InstrumentId],
+        as_of: Timestamp,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<PortfolioAnalysisMarketSet, PortfolioApplicationServiceError>;
+
+    /// Repeats exact setup and market resolution and rejects any changed typed evidence.
+    async fn recheck_analysis_markets(
+        &self,
+        expected: &PortfolioAnalysisMarketSet,
         as_of: Timestamp,
         deadline: Instant,
         cancellation: CancellationToken,
@@ -1655,6 +2219,156 @@ fn marked_value(
         .map_err(|_| PortfolioApplicationServiceError::Analytics)
 }
 
+fn depth_side_from_input(
+    market: &PortfolioCandidateMarketEvidence,
+    terms: InstrumentExecutionTerms,
+    depth: MarketDepth,
+    side: PortfolioAnalysisLiquiditySide,
+    input: PortfolioAnalysisDepthLevelsInput,
+) -> Result<
+    PortfolioAnalysisDepthAvailability<PortfolioAnalysisDepthSideEvidence>,
+    PortfolioApplicationServiceError,
+> {
+    let input = match input {
+        PortfolioAnalysisDepthLevelsInput::Available(input) => input,
+        PortfolioAnalysisDepthLevelsInput::Unavailable(reason) => {
+            return Ok(PortfolioAnalysisDepthAvailability::Unavailable(reason));
+        }
+    };
+    if input.is_empty() {
+        return Ok(PortfolioAnalysisDepthAvailability::Unavailable(
+            PortfolioAnalysisDepthUnavailableReason::NoExecutableLevels,
+        ));
+    }
+    if input.len() > MAXIMUM_ANALYTICAL_DEPTH_LEVELS_PER_SIDE {
+        return Err(PortfolioApplicationServiceError::ResourceExhausted);
+    }
+    let currency = market.observation.unit_mark.currency();
+    if terms.quote_currency() != currency {
+        return Err(PortfolioApplicationServiceError::InvalidRequest);
+    }
+    let mut levels = Vec::new();
+    levels
+        .try_reserve_exact(input.len())
+        .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?;
+    let mut prior_price = None;
+    let mut total_quantity = Decimal::ZERO;
+    let mut total_notional = Money::new(Decimal::ZERO, currency);
+    for (price, quantity) in input {
+        if price.get() <= 0 || quantity.get() <= 0 {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
+        if prior_price.is_some_and(|prior| match side {
+            PortfolioAnalysisLiquiditySide::Bid => price.get() >= prior,
+            PortfolioAnalysisLiquiditySide::Ask => price.get() <= prior,
+        }) {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
+        prior_price = Some(price.get());
+        let price_value = price
+            .checked_to_decimal(terms.price_tick())
+            .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
+        let quantity_value = quantity
+            .checked_to_decimal(terms.lot_size())
+            .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
+        if price_value <= Decimal::ZERO || quantity_value <= Decimal::ZERO {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
+        let unit_price = Money::new(price_value, currency);
+        let notional = marked_value(unit_price, quantity_value, terms.contract_multiplier())?;
+        if notional.amount() <= Decimal::ZERO {
+            return Err(PortfolioApplicationServiceError::Analytics);
+        }
+        total_quantity = total_quantity
+            .checked_add(quantity_value)
+            .ok_or(PortfolioApplicationServiceError::Analytics)?;
+        total_notional = total_notional
+            .checked_add(notional)
+            .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
+        levels.push(PortfolioAnalysisDepthLevel {
+            price_ticks: price.get(),
+            quantity_lots: quantity.get(),
+            unit_price,
+            quantity: quantity_value,
+            notional,
+        });
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/portfolio-analysis-selected-depth-side/v1\0");
+    canonical_evidence_identity(&mut digest, market.selection.receipt_digest);
+    canonical_evidence_identity(&mut digest, market.observation.observation_digest);
+    canonical_text(&mut digest, side.as_str());
+    digest.update([market_depth_tag(Some(depth))]);
+    digest.update((levels.len() as u64).to_be_bytes());
+    for level in &levels {
+        digest.update(level.price_ticks.to_be_bytes());
+        digest.update(level.quantity_lots.to_be_bytes());
+        canonical_money(&mut digest, level.unit_price);
+        canonical_decimal(&mut digest, level.quantity);
+        canonical_money(&mut digest, level.notional);
+    }
+    canonical_decimal(&mut digest, total_quantity);
+    canonical_money(&mut digest, total_notional);
+    Ok(PortfolioAnalysisDepthAvailability::Available(
+        PortfolioAnalysisDepthSideEvidence {
+            side,
+            depth,
+            levels: levels.into_boxed_slice(),
+            total_quantity,
+            total_notional,
+            evidence_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into()),
+        },
+    ))
+}
+
+fn conservative_spread_basis_points(
+    bid: &PortfolioAnalysisDepthSideEvidence,
+    ask: &PortfolioAnalysisDepthSideEvidence,
+    terms: InstrumentExecutionTerms,
+) -> Result<BasisPoints, PortfolioApplicationServiceError> {
+    let best_bid = bid
+        .levels
+        .first()
+        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+    let best_ask = ask
+        .levels
+        .first()
+        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+    if bid.side != PortfolioAnalysisLiquiditySide::Bid
+        || ask.side != PortfolioAnalysisLiquiditySide::Ask
+        || bid.depth != ask.depth
+        || best_bid.unit_price.currency() != terms.quote_currency()
+        || best_ask.unit_price.currency() != terms.quote_currency()
+        || best_bid.price_ticks > best_ask.price_ticks
+        || best_bid.price_ticks <= 0
+    {
+        return Err(PortfolioApplicationServiceError::CorruptPublication);
+    }
+    let difference = i128::from(best_ask.price_ticks)
+        .checked_sub(i128::from(best_bid.price_ticks))
+        .ok_or(PortfolioApplicationServiceError::Analytics)?;
+    let denominator = i128::from(best_ask.price_ticks)
+        .checked_add(i128::from(best_bid.price_ticks))
+        .ok_or(PortfolioApplicationServiceError::Analytics)?;
+    if difference < 0 || denominator <= 0 {
+        return Err(PortfolioApplicationServiceError::CorruptPublication);
+    }
+    // `(ask - bid) / midpoint * 10_000`, with exact tick-rational arithmetic and ceiling.
+    let numerator = difference
+        .checked_mul(20_000)
+        .ok_or(PortfolioApplicationServiceError::Analytics)?;
+    let spread = if numerator == 0 {
+        0
+    } else {
+        numerator
+            .checked_add(denominator - 1)
+            .and_then(|value| value.checked_div(denominator))
+            .ok_or(PortfolioApplicationServiceError::Analytics)?
+    };
+    let spread = i32::try_from(spread).map_err(|_| PortfolioApplicationServiceError::Analytics)?;
+    Ok(BasisPoints::new(spread))
+}
+
 fn cost_evidence_matches(
     cost: &PortfolioCandidateAvailability<PortfolioCandidateCost>,
     unavailable_reason: PortfolioCandidateUnavailableReason,
@@ -1744,6 +2458,16 @@ fn canonical_optional_u64(digest: &mut Sha256, value: Option<u64>) {
     }
 }
 
+fn canonical_optional_timestamp(digest: &mut Sha256, value: Option<Timestamp>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.unix_nanos().to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the digest binds the complete typed selected-mark and freshness evidence"
@@ -1810,6 +2534,15 @@ const fn data_quality_tag(quality: DataQuality) -> u8 {
         DataQuality::Estimated => 7,
         DataQuality::Stale => 8,
         DataQuality::Quarantined => 9,
+    }
+}
+
+const fn market_depth_tag(depth: Option<MarketDepth>) -> u8 {
+    match depth {
+        None => 0,
+        Some(MarketDepth::TopOfBook) => 1,
+        Some(MarketDepth::PriceLevel) => 2,
+        Some(MarketDepth::OrderLevel) => 3,
     }
 }
 

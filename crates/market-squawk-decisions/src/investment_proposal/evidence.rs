@@ -13,7 +13,9 @@ use market_squawk_valuation::{
     FairValueSelectionReceiptHash, MeasurementId, ValuationAmountBasis,
 };
 
-use crate::{DecisionContentDigest, TargetPriceCases, TargetPriceRange};
+use crate::{
+    DecisionContentDigest, SelectedCandidateAnalysisEvidence, TargetPriceCases, TargetPriceRange,
+};
 
 use super::{CONFIDENCE_PARTS_PER_MILLION, InvestmentProposalError, ProposalForecastVintageId};
 
@@ -1206,6 +1208,7 @@ pub struct InvestmentAnalysisEvidence {
     pub(super) backtest: Option<CostAdjustedPitBacktestEvidence>,
     pub(super) liquidity: Option<LiquidityEvidence>,
     pub(super) portfolio_risk: Option<PortfolioRiskEvidence>,
+    pub(super) selected_candidate: Option<SelectedCandidateAnalysisEvidence>,
 }
 
 impl InvestmentAnalysisEvidence {
@@ -1227,7 +1230,27 @@ impl InvestmentAnalysisEvidence {
             backtest: input.backtest,
             liquidity: input.liquidity,
             portfolio_risk: input.portfolio_risk,
+            selected_candidate: None,
         }
+    }
+
+    /// Adds an exact retained screen-candidate binding for a new selected-candidate analysis.
+    ///
+    /// Non-screen analyses may remain explicitly unbound through [`Self::new`]. This bound path
+    /// requires the same instrument plus a screen cutoff and selection time no later than the
+    /// analysis cutoff.
+    pub fn try_with_selected_candidate(
+        mut self,
+        selected_candidate: SelectedCandidateAnalysisEvidence,
+    ) -> Result<Self, InvestmentProposalError> {
+        if selected_candidate.instrument_id() != self.instrument_id
+            || selected_candidate.as_of() > self.as_of
+            || selected_candidate.selected_at() > self.as_of
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        self.selected_candidate = Some(selected_candidate);
+        Ok(self)
     }
 
     /// Returns the stable analysis instrument.
@@ -1288,6 +1311,12 @@ impl InvestmentAnalysisEvidence {
     #[must_use]
     pub const fn portfolio_risk(&self) -> Option<&PortfolioRiskEvidence> {
         self.portfolio_risk.as_ref()
+    }
+
+    /// Returns the exact selected-screen-candidate binding for an opt-in analysis.
+    #[must_use]
+    pub const fn selected_candidate(&self) -> Option<&SelectedCandidateAnalysisEvidence> {
+        self.selected_candidate.as_ref()
     }
 }
 

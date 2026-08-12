@@ -238,6 +238,33 @@ pub(crate) async fn dashboard_query(
             arguments.insert("limit".to_owned(), json!(limit));
             ("Decision.ListInvestmentAnalyses", arguments)
         }
+        DashboardQueryCommand::DecisionRecommendationTrackRecord {
+            profile_id,
+            profile_revision,
+            profile_digest,
+            horizon_nanos,
+            evaluated_at_unix_nanos,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("profileId".to_owned(), json!(profile_id));
+            arguments.insert("profileRevision".to_owned(), json!(profile_revision));
+            arguments.insert("profileDigest".to_owned(), json!(profile_digest));
+            arguments.insert(
+                "horizonNanos".to_owned(),
+                json!(parse_positive_i64(
+                    horizon_nanos,
+                    "The recommendation horizon must be a positive canonical signed decimal.",
+                )?),
+            );
+            arguments.insert(
+                "evaluatedAtUnixNanos".to_owned(),
+                json!(parse_canonical_i64(
+                    evaluated_at_unix_nanos,
+                    "The recommendation evaluation time must be canonical signed Unix nanoseconds.",
+                )?),
+            );
+            ("Decision.GetRecommendationTrackRecord", arguments)
+        }
         DashboardQueryCommand::DecisionTargetPreparation { dossier_id } => {
             let mut arguments = Map::new();
             arguments.insert("dossierId".to_owned(), json!(dossier_id));
@@ -1377,6 +1404,22 @@ fn operation_log_arguments(
 fn parse_unix_nanos(value: String) -> Result<i64, DesktopCommandError> {
     value.parse::<i64>().map_err(|_error| {
         DesktopCommandError::invalid_request("Log time filters must be signed Unix nanoseconds.")
+    })
+}
+
+fn parse_canonical_i64(value: String, message: &'static str) -> Result<i64, DesktopCommandError> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|parsed| parsed.to_string() == value)
+        .ok_or_else(|| DesktopCommandError::invalid_request(message))
+}
+
+fn parse_positive_i64(value: String, message: &'static str) -> Result<i64, DesktopCommandError> {
+    parse_canonical_i64(value, message).and_then(|parsed| {
+        (parsed > 0)
+            .then_some(parsed)
+            .ok_or_else(|| DesktopCommandError::invalid_request(message))
     })
 }
 

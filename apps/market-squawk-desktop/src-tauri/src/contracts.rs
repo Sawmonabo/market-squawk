@@ -340,6 +340,13 @@ pub(crate) enum DashboardQueryCommand {
         after_analysis_id: Option<String>,
         limit: u16,
     },
+    DecisionRecommendationTrackRecord {
+        profile_id: String,
+        profile_revision: u32,
+        profile_digest: String,
+        horizon_nanos: String,
+        evaluated_at_unix_nanos: String,
+    },
     DecisionTargetPreparation {
         dossier_id: String,
     },

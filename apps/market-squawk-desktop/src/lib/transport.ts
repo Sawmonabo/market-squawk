@@ -155,6 +155,14 @@ export type DashboardQuery =
       afterAnalysisId?: string
       limit: number
     }
+  | {
+      query: "decisionRecommendationTrackRecord"
+      profileId: string
+      profileRevision: number
+      profileDigest: string
+      horizonNanos: string
+      evaluatedAtUnixNanos: string
+    }
   | { query: "decisionTargetPreparation"; dossierId: string }
   | {
       query: "decisionTarget" | "decisionTargetStatus"

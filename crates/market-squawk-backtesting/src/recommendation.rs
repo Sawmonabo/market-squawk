@@ -4,9 +4,9 @@ use std::collections::BTreeSet;
 
 use market_squawk_data::Sha256Digest;
 use market_squawk_domain::{
-    AccountId, BasisPoints, ClientOrderId, Currency, DataQuality, InstrumentExecutionTerms,
-    InstrumentId, OrderId, OrderReasonCode, OrderSide, OrderType, QuantityLots, SourceIdentifier,
-    StrategyId, TimeInForce, Timestamp,
+    AccountId, BasisPoints, ClientOrderId, Currency, DataQuality, Denomination,
+    InstrumentExecutionTerms, InstrumentId, OrderId, OrderReasonCode, OrderSide, OrderType,
+    QuantityLots, SourceIdentifier, StrategyId, TimeInForce, Timestamp,
 };
 use market_squawk_execution::{OrderIntent, OrderIntentInput};
 use rust_decimal::Decimal;
@@ -15,10 +15,22 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::dataset::{BacktestDataset, BacktestObservation, HistoricalUniverseStatus};
-use crate::fills::{ResearchExecutionAssumptions, ResearchFill, ResearchFillSimulator};
+use crate::fills::{
+    RESEARCH_EXECUTION_POLICY_VERSION, ResearchExecutionAssumptions,
+    ResearchExecutionAssumptionsInput, ResearchFill, ResearchFillSimulator,
+    ResearchLiquidityPriority,
+};
 
-/// Exact fixed target coordinate for Default V1: 365 elapsed days after the PIT signal.
+/// Exact strict recommendation-outcome V1 target: 365 elapsed days after the PIT signal.
 pub const RECOMMENDATION_TARGET_HORIZON_NANOS_V1: i64 = 365 * 24 * 60 * 60 * 1_000_000_000;
+/// Exact number of independent OOS folds in the strict recommendation materialization.
+pub const RECOMMENDATION_OOS_FOLD_COUNT_V1: usize = 3;
+/// Exact elapsed two-year coordinate of each independent recommendation OOS fold.
+pub const RECOMMENDATION_OOS_FOLD_HORIZON_NANOS_V1: i64 =
+    2 * RECOMMENDATION_TARGET_HORIZON_NANOS_V1;
+/// Exact elapsed six-year coordinate covered by the three strict OOS folds.
+pub const RECOMMENDATION_OOS_EVALUATION_HORIZON_NANOS_V1: i64 =
+    3 * RECOMMENDATION_OOS_FOLD_HORIZON_NANOS_V1;
 /// Exact public name of the already fee/slippage-adjusted signal-return metric.
 pub const COST_ADJUSTED_TOTAL_RETURN_METRIC: &str = "cost-adjusted-total-return";
 /// Exact public name of peak-to-trough drawdown over the retained marked-equity path.
@@ -32,6 +44,26 @@ const HARD_MAX_EQUITY_POINTS_PER_OUTCOME: usize = 65_536;
 const HARD_MAX_TOTAL_EQUITY_POINTS: usize = 1_000_000;
 const HARD_MAX_OBSERVATION_VISITS: usize = 100_000_000;
 const HARD_MAX_EXECUTION_LAG_NANOS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000;
+
+/// Returns the existing code-owned conservative research cost and fill profile.
+///
+/// The profile is deterministic research evidence only. It is intentionally not a caller-tunable
+/// execution or profit assumption at the strict recommendation materialization boundary.
+pub fn recommendation_conservative_execution_assumptions_v1()
+-> Result<ResearchExecutionAssumptions, RecommendationBacktestError> {
+    ResearchExecutionAssumptions::try_new(ResearchExecutionAssumptionsInput {
+        version: RESEARCH_EXECUTION_POLICY_VERSION,
+        fee_basis_points: BasisPoints::new(10),
+        slippage_basis_points: BasisPoints::new(15),
+        maximum_random_slippage_basis_points: BasisPoints::new(5),
+        maximum_participation_basis_points: BasisPoints::new(500),
+        liquidity_priority: ResearchLiquidityPriority::SignalTimeThenOrderId,
+        latency_nanos: 5_000_000,
+        allow_partial_fills: true,
+        fee_decimal_scale: 8,
+    })
+    .map_err(|_| RecommendationBacktestError::InvalidPolicy)
+}
 
 /// Exact benchmark instrument selected by approved policy evidence, never by symbol inference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,7 +98,7 @@ impl RecommendationBenchmarkPolicyV1 {
     }
 }
 
-/// Untrusted complete input for the strict Default V1 outcome policy.
+/// Untrusted complete input for strict recommendation-outcome V1 evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecommendationBacktestPolicyV1Input {
     pub subject_instrument_id: InstrumentId,
@@ -198,7 +230,7 @@ impl RecommendationBacktestPolicyV1 {
         self.maximum_exit_lag_nanos
     }
 
-    /// Returns the strict Default V1 elapsed target horizon.
+    /// Returns the strict recommendation-outcome V1 elapsed target horizon.
     #[must_use]
     pub const fn target_horizon_nanos(self) -> i64 {
         RECOMMENDATION_TARGET_HORIZON_NANOS_V1
@@ -548,6 +580,677 @@ impl RecommendationSignalPlanV1 {
     pub fn signals(&self) -> &[RecommendationSignalV1] {
         &self.signals
     }
+}
+
+/// One preauthorized research instruction bound to exact subject and benchmark PIT rows.
+///
+/// The supplied instruction-evidence digest remains producer provenance. Materialization verifies
+/// the two source lineages and binds every field into the final signal evidence; it does not
+/// derive an economic threshold or confer execution authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecommendationPreauthorizedSignalV1 {
+    signal_id: SourceIdentifier,
+    signal_at: Timestamp,
+    available_at: Timestamp,
+    subject_lineage_digest: Sha256Digest,
+    benchmark_lineage_digest: Sha256Digest,
+    instruction_evidence_digest: Sha256Digest,
+    instruction: RecommendationSignalInstructionV1,
+}
+
+impl RecommendationPreauthorizedSignalV1 {
+    /// Constructs one exact Entry, NoAction, or typed Unavailable producer instruction.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "signal identity, PIT lineages, producer evidence, and instruction are independent"
+    )]
+    pub fn try_new(
+        signal_id: SourceIdentifier,
+        signal_at: Timestamp,
+        available_at: Timestamp,
+        subject_lineage_digest: Sha256Digest,
+        benchmark_lineage_digest: Sha256Digest,
+        instruction_evidence_digest: Sha256Digest,
+        instruction: RecommendationSignalInstructionV1,
+    ) -> Result<Self, RecommendationSignalPlanMaterializationErrorV1> {
+        if available_at > signal_at
+            || [
+                subject_lineage_digest,
+                benchmark_lineage_digest,
+                instruction_evidence_digest,
+            ]
+            .into_iter()
+            .any(|digest| digest.bytes() == [0; 32])
+            || matches!(instruction, RecommendationSignalInstructionV1::Censored(_))
+        {
+            return Err(RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction);
+        }
+        Ok(Self {
+            signal_id,
+            signal_at,
+            available_at,
+            subject_lineage_digest,
+            benchmark_lineage_digest,
+            instruction_evidence_digest,
+            instruction,
+        })
+    }
+
+    /// Exact producer-owned signal identity.
+    #[must_use]
+    pub const fn signal_id(&self) -> &SourceIdentifier {
+        &self.signal_id
+    }
+
+    /// Exact decision coordinate.
+    #[must_use]
+    pub const fn signal_at(&self) -> Timestamp {
+        self.signal_at
+    }
+
+    /// Conservative availability time of the complete instruction evidence.
+    #[must_use]
+    pub const fn available_at(&self) -> Timestamp {
+        self.available_at
+    }
+
+    /// Exact subject row lineage expected from the pinned dataset.
+    #[must_use]
+    pub const fn subject_lineage_digest(&self) -> Sha256Digest {
+        self.subject_lineage_digest
+    }
+
+    /// Exact benchmark row lineage expected from the same pinned dataset.
+    #[must_use]
+    pub const fn benchmark_lineage_digest(&self) -> Sha256Digest {
+        self.benchmark_lineage_digest
+    }
+
+    /// Immutable producer evidence for the already-derived instruction.
+    #[must_use]
+    pub const fn instruction_evidence_digest(&self) -> Sha256Digest {
+        self.instruction_evidence_digest
+    }
+
+    /// Exact producer-supplied instruction; the materializer does not reinterpret it.
+    #[must_use]
+    pub const fn instruction(&self) -> RecommendationSignalInstructionV1 {
+        self.instruction
+    }
+}
+
+/// Complete caller-selected start and preauthorized instruction population for strict resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecommendationSignalPlanMaterializationInputV1 {
+    preauthorized_signal_plan_digest: Sha256Digest,
+    evaluation_starts_at: Timestamp,
+    instructions: Vec<RecommendationPreauthorizedSignalV1>,
+}
+
+impl RecommendationSignalPlanMaterializationInputV1 {
+    /// Admits one nonempty bounded producer population under an opaque nonzero authority digest.
+    pub fn try_new(
+        preauthorized_signal_plan_digest: Sha256Digest,
+        evaluation_starts_at: Timestamp,
+        instructions: Vec<RecommendationPreauthorizedSignalV1>,
+    ) -> Result<Self, RecommendationSignalPlanMaterializationErrorV1> {
+        if preauthorized_signal_plan_digest.bytes() == [0; 32]
+            || instructions.is_empty()
+            || instructions.len() > HARD_MAX_RECOMMENDATION_SIGNALS
+        {
+            return Err(RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction);
+        }
+        Ok(Self {
+            preauthorized_signal_plan_digest,
+            evaluation_starts_at,
+            instructions,
+        })
+    }
+
+    /// Opaque immutable authority identity retained as provenance, never order authority.
+    #[must_use]
+    pub const fn preauthorized_signal_plan_digest(&self) -> Sha256Digest {
+        self.preauthorized_signal_plan_digest
+    }
+
+    /// Inclusive start of the exact elapsed six-year evaluation window.
+    #[must_use]
+    pub const fn evaluation_starts_at(&self) -> Timestamp {
+        self.evaluation_starts_at
+    }
+
+    /// Complete preauthorized producer population.
+    #[must_use]
+    pub fn instructions(&self) -> &[RecommendationPreauthorizedSignalV1] {
+        &self.instructions
+    }
+}
+
+/// Dataset- and policy-bound strict signal plan plus its materialization identity.
+///
+/// This wrapper is required by [`RecommendationBacktestKernelV1::run_materialized`]. Its private
+/// fields prevent a caller from substituting a plan produced against another dataset or policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedRecommendationSignalPlanV1 {
+    dataset_identity: Sha256Digest,
+    dataset_manifest_content: Sha256Digest,
+    object_graph_digest: Sha256Digest,
+    point_in_time_content: Sha256Digest,
+    point_in_time_audit: Sha256Digest,
+    policy_digest: Sha256Digest,
+    evaluation_starts_at: Timestamp,
+    evaluation_ends_at: Timestamp,
+    paired_observation_count: usize,
+    limits: RecommendationBacktestLimits,
+    signal_plan: RecommendationSignalPlanV1,
+    digest: Sha256Digest,
+}
+
+impl MaterializedRecommendationSignalPlanV1 {
+    /// Exact pinned dataset identity used during materialization.
+    #[must_use]
+    pub const fn dataset_identity(&self) -> Sha256Digest {
+        self.dataset_identity
+    }
+
+    /// Exact immutable dataset-manifest content identity.
+    #[must_use]
+    pub const fn dataset_manifest_content(&self) -> Sha256Digest {
+        self.dataset_manifest_content
+    }
+
+    /// Exact pinned object-graph identity.
+    #[must_use]
+    pub const fn object_graph_digest(&self) -> Sha256Digest {
+        self.object_graph_digest
+    }
+
+    /// Exact point-in-time content identity.
+    #[must_use]
+    pub const fn point_in_time_content(&self) -> Sha256Digest {
+        self.point_in_time_content
+    }
+
+    /// Exact point-in-time audit identity.
+    #[must_use]
+    pub const fn point_in_time_audit(&self) -> Sha256Digest {
+        self.point_in_time_audit
+    }
+
+    /// Exact strict recommendation policy identity.
+    #[must_use]
+    pub const fn policy_digest(&self) -> Sha256Digest {
+        self.policy_digest
+    }
+
+    /// Inclusive exact evaluation start.
+    #[must_use]
+    pub const fn evaluation_starts_at(&self) -> Timestamp {
+        self.evaluation_starts_at
+    }
+
+    /// Exclusive exact evaluation end and required simulation cutoff.
+    #[must_use]
+    pub const fn evaluation_ends_at(&self) -> Timestamp {
+        self.evaluation_ends_at
+    }
+
+    /// Number of exact subject/benchmark PIT coordinate pairs validated in one bounded scan.
+    #[must_use]
+    pub const fn paired_observation_count(&self) -> usize {
+        self.paired_observation_count
+    }
+
+    /// Exact bounded-work ceilings applied during materialization and required during evaluation.
+    #[must_use]
+    pub const fn limits(&self) -> RecommendationBacktestLimits {
+        self.limits
+    }
+
+    /// Complete canonical signal plan admitted by the materializer.
+    #[must_use]
+    pub const fn signal_plan(&self) -> &RecommendationSignalPlanV1 {
+        &self.signal_plan
+    }
+
+    /// Complete materialization receipt identity.
+    #[must_use]
+    pub const fn digest(&self) -> Sha256Digest {
+        self.digest
+    }
+
+    /// Consumes the receipt and returns the complete signal plan for controlled persistence.
+    #[must_use]
+    pub fn into_signal_plan(self) -> RecommendationSignalPlanV1 {
+        self.signal_plan
+    }
+
+    fn validate_against(
+        &self,
+        dataset: &BacktestDataset,
+        policy: RecommendationBacktestPolicyV1,
+        limits: RecommendationBacktestLimits,
+    ) -> Result<(), RecommendationSignalPlanMaterializationErrorV1> {
+        if self.dataset_identity != dataset.identity()
+            || self.dataset_manifest_content != dataset.manifest.content_hash()
+            || self.object_graph_digest != dataset.object_graph_digest()
+            || self.point_in_time_content != dataset.point_in_time_content
+            || self.point_in_time_audit != dataset.point_in_time_audit
+            || self.policy_digest != policy.digest()
+            || self.limits != limits
+            || self.signal_plan.completeness() != RecommendationSignalPlanCompletenessV1::Complete
+            || materialized_signal_plan_digest(self)? != self.digest
+        {
+            return Err(RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift);
+        }
+        Ok(())
+    }
+}
+
+/// Pure bounded resolver for the strict three-fold recommendation signal population.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RecommendationSignalPlanMaterializerV1;
+
+impl RecommendationSignalPlanMaterializerV1 {
+    /// Materializes exact paired PIT rows into three contiguous two-year OOS folds.
+    ///
+    /// Every subject decision coordinate must have exactly one preauthorized instruction with
+    /// exact subject and benchmark lineage. Entry is admitted only where the complete 365-day
+    /// outcome remains inside its fold; later coordinates must be NoAction or typed Unavailable.
+    /// The input dataset must contain only the two policy instruments as a complete paired panel
+    /// across the six-year range. The method derives no Entry/NoAction/Unavailable semantics.
+    pub fn materialize(
+        dataset: &BacktestDataset,
+        policy: RecommendationBacktestPolicyV1,
+        mut input: RecommendationSignalPlanMaterializationInputV1,
+        limits: RecommendationBacktestLimits,
+    ) -> Result<
+        MaterializedRecommendationSignalPlanV1,
+        RecommendationSignalPlanMaterializationErrorV1,
+    > {
+        let conservative = recommendation_conservative_execution_assumptions_v1()
+            .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::PolicyMismatch)?;
+        let one_lot = QuantityLots::new(1)
+            .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::PolicyMismatch)?;
+        if policy.subject_quantity() != one_lot
+            || policy.benchmark_quantity() != one_lot
+            || policy.execution_assumptions() != conservative
+        {
+            return Err(RecommendationSignalPlanMaterializationErrorV1::PolicyMismatch);
+        }
+        if input.instructions.len() > limits.max_signals
+            || dataset.observations.len() > limits.max_observation_visits
+        {
+            return Err(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded);
+        }
+        input.instructions.sort_unstable_by(|left, right| {
+            left.signal_at
+                .cmp(&right.signal_at)
+                .then_with(|| left.signal_id.cmp(&right.signal_id))
+        });
+        let mut signal_ids = BTreeSet::new();
+        if input
+            .instructions
+            .windows(2)
+            .any(|pair| pair[0].signal_at == pair[1].signal_at)
+            || input
+                .instructions
+                .iter()
+                .any(|signal| !signal_ids.insert(signal.signal_id.clone()))
+        {
+            return Err(RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction);
+        }
+
+        let folds = recommendation_oos_folds(input.evaluation_starts_at)?;
+        let evaluation_ends_at = folds
+            .last()
+            .map(RecommendationOosFoldV1::ends_at)
+            .ok_or(RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow)?;
+        let complete_outcome_offset = RECOMMENDATION_TARGET_HORIZON_NANOS_V1
+            .checked_add(policy.maximum_exit_lag_nanos())
+            .ok_or(RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow)?;
+        let signal_window_ends = folds
+            .iter()
+            .map(|fold| {
+                fold.ends_at()
+                    .checked_sub_nanos(complete_outcome_offset)
+                    .map_err(|_| {
+                        RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut paired_observation_count = 0_usize;
+        let mut fold_pair_counts = [0_usize; RECOMMENDATION_OOS_FOLD_COUNT_V1];
+        let mut fold_signal_counts = [0_usize; RECOMMENDATION_OOS_FOLD_COUNT_V1];
+        let mut fold_entry_counts = [0_usize; RECOMMENDATION_OOS_FOLD_COUNT_V1];
+        let mut fold_first = [None; RECOMMENDATION_OOS_FOLD_COUNT_V1];
+        let mut fold_last = [None; RECOMMENDATION_OOS_FOLD_COUNT_V1];
+        let mut previous_decision_at = None;
+        let mut expected_instruction_index = 0_usize;
+        let mut materialized_signals = Vec::new();
+        materialized_signals
+            .try_reserve_exact(input.instructions.len())
+            .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
+        let mut subject_terms = None;
+        let mut benchmark_terms = None;
+        let mut pairs = dataset.observations.chunks_exact(2);
+        for pair in &mut pairs {
+            let left = pair.first().ok_or(
+                RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
+            )?;
+            let right = pair.get(1).ok_or(
+                RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
+            )?;
+            if left.decision_at() != right.decision_at() {
+                return Err(
+                    RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
+                );
+            }
+            let (subject, benchmark) = if left.instrument_id() == policy.subject_instrument_id()
+                && right.instrument_id() == policy.benchmark().instrument_id()
+            {
+                (left, right)
+            } else if right.instrument_id() == policy.subject_instrument_id()
+                && left.instrument_id() == policy.benchmark().instrument_id()
+            {
+                (right, left)
+            } else {
+                return Err(RecommendationSignalPlanMaterializationErrorV1::DatasetScopeMismatch);
+            };
+            validate_materialization_observation(subject, policy.reporting_currency())?;
+            validate_materialization_observation(benchmark, policy.reporting_currency())?;
+            retain_stable_execution_terms(&mut subject_terms, subject.execution_terms)?;
+            retain_stable_execution_terms(&mut benchmark_terms, benchmark.execution_terms)?;
+            let decision_at = subject.decision_at();
+            if previous_decision_at.is_some_and(|previous: Timestamp| {
+                decision_at
+                    .unix_nanos()
+                    .checked_sub(previous.unix_nanos())
+                    .is_none_or(|gap| {
+                        gap <= 0
+                            || gap
+                                > policy
+                                    .maximum_entry_lag_nanos()
+                                    .min(policy.maximum_exit_lag_nanos())
+                    })
+            }) {
+                return Err(
+                    RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
+                );
+            }
+            previous_decision_at = Some(decision_at);
+            let fold_index = recommendation_fold_index(&folds, decision_at)
+                .ok_or(RecommendationSignalPlanMaterializationErrorV1::DatasetScopeMismatch)?;
+            paired_observation_count = paired_observation_count
+                .checked_add(1)
+                .ok_or(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
+            fold_pair_counts[fold_index] = fold_pair_counts[fold_index]
+                .checked_add(1)
+                .ok_or(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
+            let _ = fold_first[fold_index].get_or_insert(decision_at);
+            fold_last[fold_index] = Some(decision_at);
+
+            let instruction = input.instructions.get(expected_instruction_index).ok_or(
+                RecommendationSignalPlanMaterializationErrorV1::IncompleteInstructionPopulation,
+            )?;
+            if instruction.signal_at != decision_at
+                || instruction.available_at < subject.available_at()
+                || instruction.available_at < benchmark.available_at()
+                || instruction.subject_lineage_digest != subject.lineage_digest
+                || instruction.benchmark_lineage_digest != benchmark.lineage_digest
+                || (instruction.instruction == RecommendationSignalInstructionV1::Entry
+                    && (decision_at >= signal_window_ends[fold_index]
+                        || !materialization_entry_evidence(subject)
+                        || !materialization_entry_evidence(benchmark)))
+            {
+                return Err(
+                    RecommendationSignalPlanMaterializationErrorV1::InstructionEvidenceMismatch,
+                );
+            }
+            let evidence_digest = materialized_signal_evidence_digest(
+                dataset.identity(),
+                policy.digest(),
+                input.preauthorized_signal_plan_digest,
+                instruction,
+            )?;
+            materialized_signals.push(
+                RecommendationSignalV1::try_new(
+                    instruction.signal_id.clone(),
+                    fold_index,
+                    instruction.signal_at,
+                    instruction.available_at,
+                    evidence_digest,
+                    instruction.instruction,
+                )
+                .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction)?,
+            );
+            fold_signal_counts[fold_index] = fold_signal_counts[fold_index]
+                .checked_add(1)
+                .ok_or(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
+            if instruction.instruction == RecommendationSignalInstructionV1::Entry {
+                fold_entry_counts[fold_index] = fold_entry_counts[fold_index]
+                    .checked_add(1)
+                    .ok_or(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
+            }
+            expected_instruction_index = expected_instruction_index
+                .checked_add(1)
+                .ok_or(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
+        }
+        if !pairs.remainder().is_empty()
+            || expected_instruction_index != input.instructions.len()
+            || fold_pair_counts.contains(&0)
+            || fold_signal_counts.contains(&0)
+        {
+            return Err(
+                RecommendationSignalPlanMaterializationErrorV1::IncompleteInstructionPopulation,
+            );
+        }
+        if fold_entry_counts.contains(&0) {
+            return Err(RecommendationSignalPlanMaterializationErrorV1::MissingEntryInFold);
+        }
+        for (fold_index, fold) in folds.iter().enumerate() {
+            let first = fold_first[fold_index].ok_or(
+                RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
+            )?;
+            let last = fold_last[fold_index].ok_or(
+                RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
+            )?;
+            let maximum_first = fold
+                .starts_at()
+                .checked_add_nanos(policy.maximum_entry_lag_nanos())
+                .map_err(|_| {
+                    RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow
+                })?;
+            let minimum_last = fold
+                .ends_at()
+                .checked_sub_nanos(policy.maximum_exit_lag_nanos())
+                .map_err(|_| {
+                    RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow
+                })?;
+            if first > maximum_first || last < minimum_last {
+                return Err(
+                    RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
+                );
+            }
+        }
+        let signal_plan = RecommendationSignalPlanV1::try_new(
+            input.preauthorized_signal_plan_digest,
+            RecommendationSignalPlanCompletenessV1::Complete,
+            folds,
+            materialized_signals,
+        )
+        .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction)?;
+        let mut materialized = MaterializedRecommendationSignalPlanV1 {
+            dataset_identity: dataset.identity(),
+            dataset_manifest_content: dataset.manifest.content_hash(),
+            object_graph_digest: dataset.object_graph_digest(),
+            point_in_time_content: dataset.point_in_time_content,
+            point_in_time_audit: dataset.point_in_time_audit,
+            policy_digest: policy.digest(),
+            evaluation_starts_at: input.evaluation_starts_at,
+            evaluation_ends_at,
+            paired_observation_count,
+            limits,
+            signal_plan,
+            digest: Sha256Digest::new([0; 32]),
+        };
+        materialized.digest = materialized_signal_plan_digest(&materialized)?;
+        Ok(materialized)
+    }
+}
+
+fn recommendation_oos_folds(
+    starts_at: Timestamp,
+) -> Result<Vec<RecommendationOosFoldV1>, RecommendationSignalPlanMaterializationErrorV1> {
+    let mut folds = Vec::new();
+    folds
+        .try_reserve_exact(RECOMMENDATION_OOS_FOLD_COUNT_V1)
+        .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
+    let mut fold_starts_at = starts_at;
+    for fold_number in 1..=RECOMMENDATION_OOS_FOLD_COUNT_V1 {
+        let ends_at = fold_starts_at
+            .checked_add_nanos(RECOMMENDATION_OOS_FOLD_HORIZON_NANOS_V1)
+            .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow)?;
+        folds.push(
+            RecommendationOosFoldV1::try_new(
+                SourceIdentifier::try_from(format!("recommendation-oos-fold-{fold_number}-v1"))
+                    .map_err(|_| {
+                        RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow
+                    })?,
+                fold_starts_at,
+                ends_at,
+            )
+            .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow)?,
+        );
+        fold_starts_at = ends_at;
+    }
+    Ok(folds)
+}
+
+fn recommendation_fold_index(folds: &[RecommendationOosFoldV1], at: Timestamp) -> Option<usize> {
+    folds
+        .iter()
+        .position(|fold| at >= fold.starts_at() && at < fold.ends_at())
+}
+
+fn validate_materialization_observation(
+    observation: &BacktestObservation,
+    reporting_currency: Currency,
+) -> Result<(), RecommendationSignalPlanMaterializationErrorV1> {
+    if observation.execution_terms.quote_currency() != reporting_currency
+        || observation.execution_terms.settlement_denomination()
+            != Denomination::Currency(reporting_currency)
+        || observation.event_at() > observation.available_at()
+        || observation.available_at() > observation.decision_at()
+        || observation.lineage_digest.bytes() == [0; 32]
+    {
+        return Err(RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel);
+    }
+    Ok(())
+}
+
+fn retain_stable_execution_terms(
+    retained: &mut Option<InstrumentExecutionTerms>,
+    current: InstrumentExecutionTerms,
+) -> Result<(), RecommendationSignalPlanMaterializationErrorV1> {
+    match retained {
+        Some(expected) if *expected != current => {
+            Err(RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel)
+        }
+        Some(_) => Ok(()),
+        None => {
+            *retained = Some(current);
+            Ok(())
+        }
+    }
+}
+
+fn materialization_entry_evidence(observation: &BacktestObservation) -> bool {
+    observation.universe == HistoricalUniverseStatus::Eligible
+        && observation.mid_price.is_some()
+        && observation.executable_depth.get() > 0
+}
+
+fn materialized_signal_evidence_digest(
+    dataset_identity: Sha256Digest,
+    policy_digest: Sha256Digest,
+    preauthorized_signal_plan_digest: Sha256Digest,
+    signal: &RecommendationPreauthorizedSignalV1,
+) -> Result<Sha256Digest, RecommendationSignalPlanMaterializationErrorV1> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/materialized-recommendation-signal/v1\0");
+    hash.update(dataset_identity.bytes());
+    hash.update(policy_digest.bytes());
+    hash.update(preauthorized_signal_plan_digest.bytes());
+    update_text(&mut hash, signal.signal_id.as_str());
+    hash.update(signal.signal_at.unix_nanos().to_be_bytes());
+    hash.update(signal.available_at.unix_nanos().to_be_bytes());
+    hash.update(signal.subject_lineage_digest.bytes());
+    hash.update(signal.benchmark_lineage_digest.bytes());
+    hash.update(signal.instruction_evidence_digest.bytes());
+    update_instruction(&mut hash, signal.instruction);
+    Ok(Sha256Digest::new(hash.finalize().into()))
+}
+
+fn materialized_signal_plan_digest(
+    value: &MaterializedRecommendationSignalPlanV1,
+) -> Result<Sha256Digest, RecommendationSignalPlanMaterializationErrorV1> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/materialized-recommendation-signal-plan/v1\0");
+    hash.update(value.dataset_identity.bytes());
+    hash.update(value.dataset_manifest_content.bytes());
+    hash.update(value.object_graph_digest.bytes());
+    hash.update(value.point_in_time_content.bytes());
+    hash.update(value.point_in_time_audit.bytes());
+    hash.update(value.policy_digest.bytes());
+    hash.update(value.evaluation_starts_at.unix_nanos().to_be_bytes());
+    hash.update(value.evaluation_ends_at.unix_nanos().to_be_bytes());
+    hash.update(
+        u64::try_from(value.paired_observation_count)
+            .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?
+            .to_be_bytes(),
+    );
+    for limit in [
+        value.limits.max_folds,
+        value.limits.max_signals,
+        value.limits.max_equity_points_per_outcome,
+        value.limits.max_total_equity_points,
+        value.limits.max_observation_visits,
+    ] {
+        hash.update(
+            u64::try_from(limit)
+                .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?
+                .to_be_bytes(),
+        );
+    }
+    hash.update(value.signal_plan.digest().bytes());
+    Ok(Sha256Digest::new(hash.finalize().into()))
+}
+
+/// Typed refusal from strict signal-plan materialization.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RecommendationSignalPlanMaterializationErrorV1 {
+    #[error("recommendation materialization policy is not the strict one-lot conservative profile")]
+    PolicyMismatch,
+    #[error("recommendation materialization evaluation window is invalid")]
+    InvalidEvaluationWindow,
+    #[error("recommendation materialization dataset contains instruments or times outside scope")]
+    DatasetScopeMismatch,
+    #[error("recommendation materialization lacks a complete paired point-in-time panel")]
+    IncompletePointInTimePanel,
+    #[error("recommendation materialization instruction is invalid")]
+    InvalidInstruction,
+    #[error("recommendation materialization instruction population is incomplete")]
+    IncompleteInstructionPopulation,
+    #[error("recommendation materialization has no entry instruction in one or more OOS folds")]
+    MissingEntryInFold,
+    #[error("recommendation materialization instruction evidence does not match pinned rows")]
+    InstructionEvidenceMismatch,
+    #[error("recommendation materialization resource limit exceeded")]
+    LimitExceeded,
+    #[error("recommendation materialization receipt drifted from its dataset, policy, or plan")]
+    MaterializationDrift,
 }
 
 /// Exact evaluation, publication, availability, and expiry times.
@@ -1047,11 +1750,38 @@ impl RecommendationBacktestEvidenceV1 {
     }
 }
 
-/// Pure Default V1 recommendation-outcome evaluator.
+/// Pure strict recommendation-outcome V1 evaluator.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RecommendationBacktestKernelV1;
 
 impl RecommendationBacktestKernelV1 {
+    /// Evaluates only a dataset- and policy-bound strict signal-plan materialization.
+    ///
+    /// The publication cutoff must equal the materializer's exclusive six-year endpoint. This
+    /// prevents a caller from extending or shortening the simulation window after PIT resolution.
+    pub fn run_materialized(
+        dataset: &BacktestDataset,
+        policy: RecommendationBacktestPolicyV1,
+        materialized: &MaterializedRecommendationSignalPlanV1,
+        publication: RecommendationBacktestPublicationV1,
+        limits: RecommendationBacktestLimits,
+    ) -> Result<RecommendationBacktestEvidenceV1, RecommendationMaterializedBacktestErrorV1> {
+        materialized.validate_against(dataset, policy, limits)?;
+        if publication.simulation_cutoff() != materialized.evaluation_ends_at() {
+            return Err(
+                RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift.into(),
+            );
+        }
+        Self::run(
+            dataset,
+            policy,
+            materialized.signal_plan(),
+            publication,
+            limits,
+        )
+        .map_err(Into::into)
+    }
+
     /// Evaluates every predeclared signal with the existing deterministic fill simulator.
     pub fn run(
         dataset: &BacktestDataset,
@@ -1218,6 +1948,15 @@ impl RecommendationBacktestKernelV1 {
         evidence.digest = evidence_digest(&evidence)?;
         Ok(evidence)
     }
+}
+
+/// Strict materialization or research-outcome evaluation failure.
+#[derive(Debug, Error)]
+pub enum RecommendationMaterializedBacktestErrorV1 {
+    #[error(transparent)]
+    SignalPlan(#[from] RecommendationSignalPlanMaterializationErrorV1),
+    #[error(transparent)]
+    Backtest(#[from] RecommendationBacktestError),
 }
 
 enum RoundTripSimulation {

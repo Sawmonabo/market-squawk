@@ -4,6 +4,7 @@ pub(super) mod candidate;
 mod common;
 mod dossier;
 mod proposal;
+mod published_analysis;
 mod recommendation;
 mod recovery;
 pub(super) mod screen;
@@ -12,8 +13,9 @@ mod wire;
 
 use market_squawk_decisions::{
     DecisionDossier, GovernedTargetSet, InvestmentOutcomeProjection, InvestmentProposalDecision,
-    InvestmentSizingProjection, PublishedInvestmentAnalysis, RecommendationOutcomeStatusRecord,
-    SavedScreen, ScreenExecution, TargetInvalidation, TargetReview,
+    InvestmentSizingProjection, PreparedPublishedInvestmentAnalysis, PublishedInvestmentAnalysis,
+    RecommendationOutcomeStatusRecord, SavedScreen, ScreenExecution, TargetInvalidation,
+    TargetReview,
 };
 use market_squawk_domain::Timestamp;
 use serde::Serialize;
@@ -23,6 +25,7 @@ use self::candidate::ExecutionWire;
 use self::common::revision_key;
 use self::dossier::DossierWire;
 use self::proposal::InvestmentProposalWire;
+use self::published_analysis::PreparedPublishedInvestmentAnalysisWire;
 use self::recommendation::{
     InvestmentAnalysisPublicationWire, InvestmentOutcomeProjectionWire,
     InvestmentSizingProjectionWire, RecommendationOutcomeStatusWire,
@@ -137,6 +140,9 @@ pub(super) fn invalidation(
 pub(super) fn investment_proposal(
     decision: &InvestmentProposalDecision,
 ) -> Result<EncodedRecord, DecisionApplicationError> {
+    if decision.evidence().selected_candidate().is_some() {
+        return Err(DecisionApplicationError::InvalidPersistentState);
+    }
     let wire = InvestmentProposalWire::from(decision);
     EncodedRecord::try_new(
         KIND_INVESTMENT_PROPOSAL,
@@ -153,6 +159,17 @@ pub(super) fn investment_analysis_publication(
         KIND_INVESTMENT_PROPOSAL,
         wire.key(),
         WireRecord::InvestmentAnalysisPublication(wire),
+    )
+}
+
+pub(super) fn prepared_published_investment_analysis(
+    bundle: &PreparedPublishedInvestmentAnalysis,
+) -> Result<EncodedRecord, DecisionApplicationError> {
+    let wire = PreparedPublishedInvestmentAnalysisWire::from(bundle);
+    EncodedRecord::try_new(
+        KIND_INVESTMENT_PROPOSAL,
+        wire.key()?,
+        WireRecord::PreparedPublishedInvestmentAnalysis(Box::new(wire)),
     )
 }
 

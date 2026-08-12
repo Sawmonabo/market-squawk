@@ -168,7 +168,7 @@ pub(super) fn hash_policy(policy: &RecommendationPolicySemantics) -> [u8; 32] {
 }
 
 pub(super) fn hash_evidence(evidence: &InvestmentAnalysisEvidence) -> [u8; 32] {
-    let mut hash = CanonicalHasher::new(b"market-squawk/investment-analysis-evidence/v3");
+    let mut hash = CanonicalHasher::new(b"market-squawk/investment-analysis-evidence/v4");
     hash.instrument(evidence.instrument_id);
     hash.currency(evidence.currency);
     hash.account(evidence.account_id);
@@ -315,6 +315,9 @@ pub(super) fn hash_evidence(evidence: &InvestmentAnalysisEvidence) -> [u8; 32] {
             hash.window(value.window);
         }
         None => hash.tag(0),
+    }
+    if let Some(selected_candidate) = &evidence.selected_candidate {
+        hash.content(selected_candidate.evidence_digest());
     }
     hash.finish()
 }

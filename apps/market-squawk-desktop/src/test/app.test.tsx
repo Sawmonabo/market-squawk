@@ -1,4 +1,4 @@
-import { act, render, screen, within } from "@testing-library/react"
+import { act, render, screen, waitFor, within } from "@testing-library/react"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
@@ -373,6 +373,95 @@ function sourceStatusRead(): DesktopBootstrap["operations"][number] {
   }
 }
 
+function investmentAnalysisListRead(): DesktopBootstrap["operations"][number] {
+  return {
+    name: "Decision.ListInvestmentAnalyses",
+    description: "List retained investment analyses in durable append order.",
+    domain: "decision",
+    authorization: "read_only",
+    readOnly: true,
+    destructive: false,
+    inputSchema: {
+      type: "object",
+      properties: {
+        afterAnalysisId: { type: "string", pattern: "^[0-9a-f]{64}$" },
+        limit: { type: "integer", minimum: 1, maximum: 1_000 },
+        resultLimits: resultLimitsInputSchema,
+      },
+      required: ["limit", "resultLimits"],
+      additionalProperties: false,
+    },
+  }
+}
+
+function investmentAnalysisRead(): DesktopBootstrap["operations"][number] {
+  return {
+    name: "Decision.GetInvestmentAnalysis",
+    description: "Return one exact retained investment analysis.",
+    domain: "decision",
+    authorization: "read_only",
+    readOnly: true,
+    destructive: false,
+    inputSchema: {
+      type: "object",
+      properties: {
+        analysisId: { type: "string", pattern: "^[0-9a-f]{64}$" },
+        resultLimits: resultLimitsInputSchema,
+      },
+      required: ["analysisId", "resultLimits"],
+      additionalProperties: false,
+    },
+  }
+}
+
+function recommendationTrackRecordRead(): DesktopBootstrap["operations"][number] {
+  return {
+    name: "Decision.GetRecommendationTrackRecord",
+    description: "Return one exact analytical-profile recommendation track record.",
+    domain: "decision",
+    authorization: "read_only",
+    readOnly: true,
+    destructive: false,
+    inputSchema: {
+      type: "object",
+      properties: {
+        profileId: {
+          type: "string",
+          minLength: 1,
+          maxLength: 256,
+          pattern: "^[A-Za-z0-9_.:/-]+$",
+        },
+        profileRevision: {
+          type: "integer",
+          minimum: 1,
+          maximum: 4_294_967_295,
+        },
+        profileDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
+        horizonNanos: {
+          type: "integer",
+          minimum: 1,
+          maximum: 9_223_372_036_854_775_807,
+        },
+        evaluatedAtUnixNanos: {
+          type: "integer",
+          minimum: -9_223_372_036_854_775_808,
+          maximum: 9_223_372_036_854_775_807,
+        },
+        resultLimits: resultLimitsInputSchema,
+      },
+      required: [
+        "profileId",
+        "profileRevision",
+        "profileDigest",
+        "horizonNanos",
+        "evaluatedAtUnixNanos",
+        "resultLimits",
+      ],
+      additionalProperties: false,
+    },
+  }
+}
+
 const h15DashboardData = {
   schemaIdentity: "market-squawk-macro-dashboard/v1",
   binding: {
@@ -527,6 +616,436 @@ const inactiveH15SourceStatus: ApplicationResult = {
     },
     dataQuality: { status: "not_applicable" },
   },
+}
+
+const retainedAnalysisId = "c".repeat(64)
+const retainedProposalId = "d".repeat(64)
+const retainedDerivationDigest = "e".repeat(64)
+const retainedEvidenceDigest = "f".repeat(64)
+const retainedPolicyDigest = "1".repeat(64)
+const retainedProfileDigest = "2".repeat(64)
+const retainedProjectionDigest = "3".repeat(64)
+const retainedSizingDigest = "4".repeat(64)
+const retainedInstrumentId = "11111111-1111-4111-8111-111111111111"
+const retainedAccountId = "22222222-2222-4222-8222-222222222222"
+const retainedAsOf = "1800000000000000000"
+const retainedHorizonAt = "1831536000000000000"
+const retainedExpiresAt = "1800086400000000000"
+const retainedHorizonNanos = "31536000000000000"
+
+function retainedMoney(amount: string) {
+  return { amount, currency: "USD" }
+}
+
+function retainedRange(lower: string, upper: string) {
+  return { lower: retainedMoney(lower), upper: retainedMoney(upper) }
+}
+
+function retainedIdentity(character: string) {
+  return { algorithm: "sha256", digest: character.repeat(64) }
+}
+
+function retainedWindow(character: string) {
+  return {
+    observedAt: "1799999800000000000",
+    availableAt: "1799999900000000000",
+    expiresAt: "1800001000000000000",
+    contentIdentity: retainedIdentity(character),
+  }
+}
+
+const retainedPriceCases = {
+  downside: retainedMoney("80"),
+  base: retainedMoney("110"),
+  upside: retainedMoney("130"),
+}
+
+const retainedForecastRanges = {
+  downside: retainedRange("75", "85"),
+  base: retainedRange("100", "120"),
+  upside: retainedRange("125", "140"),
+}
+
+const retainedEvidenceReliability = {
+  meaning: "policy_weighted_evidence_reliability_v1",
+  valuePpm: 850_000,
+  components: [
+    ["forecast_calibration", 200_000],
+    ["valuation_agreement", 200_000],
+    ["backtest_stability", 150_000],
+    ["market_integrity", 150_000],
+    ["liquidity_capacity", 150_000],
+    ["portfolio_risk_capacity", 150_000],
+  ].map(([kind, weightPpm]) => ({ kind, valuePpm: 850_000, weightPpm })),
+}
+
+const retainedGeneratedResult = {
+  kind: "generated",
+  proposalId: retainedProposalId,
+  derivationDigest: retainedDerivationDigest,
+  action: "buy",
+  priceLadder: {
+    cases: retainedPriceCases,
+    ranges: {
+      ...retainedForecastRanges,
+      entry: retainedRange("95", "105"),
+      add: retainedRange("85", "95"),
+      trim: retainedRange("120", "130"),
+      exit: retainedRange("135", "145"),
+    },
+    addCase: retainedMoney("90"),
+  },
+  actionZoneSemantics: {
+    version: 1,
+    referenceZone: retainedRange("95", "105"),
+    triggerFloorExclusive: null,
+    triggerFloorInclusive: null,
+    triggerCeilingInclusive: retainedMoney("105"),
+  },
+  evidenceReliability: retainedEvidenceReliability,
+  horizonAt: retainedHorizonAt,
+  expiresAt: retainedExpiresAt,
+}
+
+const retainedInvestmentAnalysis: ApplicationResult = {
+  data: {
+    analysisId: retainedAnalysisId,
+    executionEligibility: "research_only_execution_ineligible",
+    policy: {
+      version: 1,
+      digest: retainedPolicyDigest,
+      actionZoneSemanticsVersion: 1,
+      horizonNanos: retainedHorizonNanos,
+      proposalLifetimeNanos: "86400000000000",
+      assumptions: [
+        "All values are bound to retained point-in-time evidence.",
+        "Gross price movement is not net portfolio profit.",
+        "The analysis creates no execution authority.",
+      ],
+      invalidationConditions: [
+        "The retained market mark expires.",
+        "The forecast or valuation binding changes.",
+        "The account-specific risk evidence changes.",
+      ],
+      limitations: [
+        "No guaranteed return is represented.",
+        "Forward costs and taxes are unavailable.",
+        "Sizing feasibility is not an order instruction.",
+      ],
+    },
+    evidence: {
+      instrumentId: retainedInstrumentId,
+      currency: "USD",
+      accountId: retainedAccountId,
+      asOf: retainedAsOf,
+      market: {
+        instrumentId: retainedInstrumentId,
+        price: retainedMoney("100"),
+        quality: "direct_verified",
+        priceKind: "last_trade",
+        adjustmentBasis: "unadjusted_spot",
+        selectionReceiptIdentity: retainedIdentity("5"),
+        selectedObservationIdentity: retainedIdentity("6"),
+        window: retainedWindow("7"),
+      },
+      priceForecast: {
+        instrumentId: retainedInstrumentId,
+        cases: retainedPriceCases,
+        ranges: retainedForecastRanges,
+        horizonAt: retainedHorizonAt,
+        expectedTerminal: {
+          statistic: "model_estimated_conditional_mean",
+          price: retainedMoney("110"),
+          horizonAt: retainedHorizonAt,
+          statisticIdentity: retainedIdentity("8"),
+        },
+        vintageId: "9".repeat(64),
+        outputBindingIdentity: retainedIdentity("a"),
+        calibrationIdentity: retainedIdentity("b"),
+        outcomeSetIdentity: retainedIdentity("c"),
+        calibration: {
+          nominalCoveragePpm: 800_000,
+          realizedCoveragePpm: 825_000,
+          completedOutcomes: 40,
+        },
+        window: retainedWindow("d"),
+      },
+      valuation: {
+        instrumentId: retainedInstrumentId,
+        fairValue: retainedMoney("112"),
+        basis: "per_instrument_unit",
+        horizonAt: retainedHorizonAt,
+        measurementId: "e".repeat(64),
+        classificationDecisionId: "f".repeat(64),
+        selectionReceiptHash: "1".repeat(64),
+        window: retainedWindow("2"),
+      },
+      backtest: {
+        instrumentId: retainedInstrumentId,
+        currency: "USD",
+        outcomeHorizonNanos: retainedHorizonNanos,
+        netReturnBasisPoints: "650",
+        maxDrawdownBasisPoints: "1200",
+        feeBasisPoints: "10",
+        slippageBasisPoints: "15",
+        maximumRandomSlippageBasisPoints: "20",
+        observations: 260,
+        trials: 100,
+        stabilityPpm: 850_000,
+        simulationCutoffAt: "1799999700000000000",
+        datasetIdentity: retainedIdentity("3"),
+        commandIdentity: retainedIdentity("4"),
+        terminalIdentity: retainedIdentity("5"),
+        reportIdentity: retainedIdentity("6"),
+        cohortIdentity: retainedIdentity("7"),
+        costModelIdentity: retainedIdentity("8"),
+        window: retainedWindow("9"),
+      },
+      liquidity: {
+        instrumentId: retainedInstrumentId,
+        currency: "USD",
+        quotedSpreadBasisPoints: "12",
+        capacityPpm: 900_000,
+        quality: "direct_verified",
+        assessmentIdentity: retainedIdentity("a"),
+        window: retainedWindow("b"),
+      },
+      portfolioRisk: {
+        instrumentId: retainedInstrumentId,
+        accountId: retainedAccountId,
+        currency: "USD",
+        portfolioRevision: "c".repeat(64),
+        positionState: { kind: "no_position" },
+        riskCapacityPpm: 900_000,
+        riskReportIdentity: retainedIdentity("d"),
+        window: retainedWindow("e"),
+      },
+    },
+    evidenceDigest: retainedEvidenceDigest,
+    publication: {
+      publicationId: "f".repeat(64),
+      publishedAt: "1800000100000000000",
+      executionEligibility: "research_only_execution_ineligible",
+      analyticalProfile: {
+        profileId: "market-squawk-default-v1",
+        revision: 1,
+        contentDigest: {
+          algorithm: "sha256",
+          digest: retainedProfileDigest,
+        },
+      },
+      workflow: {
+        workflowId: "market-squawk-investment-analysis-v1",
+        revision: 1,
+        contentDigest: retainedIdentity("1"),
+      },
+      accountSetup: {
+        accountId: retainedAccountId,
+        distinctFromAnalyticalProfile: true,
+      },
+      outcomeProjectionDigest: retainedProjectionDigest,
+      sizingProjectionDigest: retainedSizingDigest,
+    },
+    projection: {
+      resultDigest: retainedProjectionDigest,
+      proposalId: retainedProposalId,
+      derivationDigest: retainedDerivationDigest,
+      authority: "analysis_only_no_mutation_no_execution",
+      executionEligible: false,
+      mark: retainedMoney("100"),
+      horizonAt: retainedHorizonAt,
+      downside: {
+        priceRange: retainedForecastRanges.downside,
+        grossReturnFromMark: {
+          lowerNumerator: retainedMoney("-25"),
+          upperNumerator: retainedMoney("-15"),
+          denominator: retainedMoney("100"),
+        },
+      },
+      base: {
+        priceRange: retainedForecastRanges.base,
+        grossReturnFromMark: {
+          lowerNumerator: retainedMoney("0"),
+          upperNumerator: retainedMoney("20"),
+          denominator: retainedMoney("100"),
+        },
+      },
+      upside: {
+        priceRange: retainedForecastRanges.upside,
+        grossReturnFromMark: {
+          lowerNumerator: retainedMoney("25"),
+          upperNumerator: retainedMoney("40"),
+          denominator: retainedMoney("100"),
+        },
+      },
+      netPnl: {
+        kind: "unavailable",
+        reason: "exact_forward_cost_evidence_not_supplied",
+      },
+      benchmarkReturn: {
+        kind: "unavailable",
+        reason: "exact_proposal_time_benchmark_evidence_not_supplied",
+      },
+      afterTaxPnl: {
+        kind: "unavailable",
+        reason: "exact_tax_evidence_not_supplied",
+      },
+    },
+    sizing: {
+      resultDigest: retainedSizingDigest,
+      proposalId: retainedProposalId,
+      derivationDigest: retainedDerivationDigest,
+      authority: "analysis_only_no_mutation_no_execution",
+      executionEligible: false,
+      evaluatedAt: "1800000200000000000",
+      currentLots: "2",
+      hardFeasibleLots: { kind: "available", lower: "0", upper: "10" },
+      preferredFeasibleLots: { kind: "available", lower: "2", upper: "6" },
+      selectedTargetLots: null,
+      orderQuantity: null,
+    },
+    realizedOutcome: {
+      kind: "completed",
+      metric: "gross_instrument_price_return",
+      startMark: retainedMoney("100"),
+      endpointPrice: retainedMoney("110"),
+      grossPriceReturn: "0.1",
+      observedAt: "1831536100000000000",
+      availableAt: "1831536200000000000",
+      selectionReceiptIdentity: retainedIdentity("2"),
+      selectedObservationIdentity: retainedIdentity("3"),
+      corporateActionEvidenceIdentity: retainedIdentity("4"),
+      netReturn: {
+        kind: "unavailable",
+        reason: "exact_realized_cost_evidence_not_supplied",
+      },
+      benchmarkReturn: {
+        kind: "unavailable",
+        reason: "exact_benchmark_outcome_evidence_not_supplied",
+      },
+      afterTaxReturn: {
+        kind: "unavailable",
+        reason: "exact_tax_evidence_not_supplied",
+      },
+      settlement: {
+        kind: "unavailable",
+        reason: "no_execution_or_settlement_evidence",
+      },
+      seriesId: "5".repeat(64),
+      revision: 1,
+      statusDigest: "6".repeat(64),
+      evaluatedAt: "1831536300000000000",
+      executionEligible: false,
+    },
+    result: retainedGeneratedResult,
+  },
+  metadata: {
+    completeness: "complete",
+    returnedItems: 1,
+    availableItems: 1,
+    sourceCoverage: { status: "not_applicable" },
+    dataQuality: { status: "not_applicable" },
+  },
+}
+
+const retainedInvestmentAnalysisPage: ApplicationResult = {
+  data: {
+    completeness: "complete",
+    returnedCount: 1,
+    availableCount: 1,
+    nextAfterAnalysisId: null,
+    analyses: [
+      {
+        analysisId: retainedAnalysisId,
+        proposalId: retainedProposalId,
+        derivationDigest: retainedDerivationDigest,
+        instrumentId: retainedInstrumentId,
+        accountId: retainedAccountId,
+        currency: "USD",
+        asOf: retainedAsOf,
+        horizonAt: retainedHorizonAt,
+        expiresAt: retainedExpiresAt,
+        policyDigest: retainedPolicyDigest,
+        evidenceDigest: retainedEvidenceDigest,
+        outcome: { kind: "generated", action: "buy" },
+      },
+    ],
+  },
+  metadata: {
+    completeness: "complete",
+    returnedItems: 1,
+    availableItems: 1,
+    sourceCoverage: { status: "not_applicable" },
+    dataQuality: { status: "not_applicable" },
+  },
+}
+
+type TrackRecordQuery = Extract<
+  Parameters<ProductTransport["query"]>[0],
+  { query: "decisionRecommendationTrackRecord" }
+>
+
+function retainedTrackRecord(request: TrackRecordQuery): ApplicationResult {
+  const emptyGroup = (cohort: string) => ({
+    cohort,
+    publicationCount: 0,
+    dueCount: 0,
+    completedCount: 0,
+    pendingCount: 0,
+    unavailableCount: 0,
+    coveragePpm: 0,
+    performance: { kind: "unavailable", reason: "no_due_outcomes" },
+  })
+  return {
+    data: {
+      analyticalProfile: {
+        profileId: request.profileId,
+        revision: request.profileRevision,
+        contentDigest: {
+          algorithm: "sha256",
+          digest: request.profileDigest,
+        },
+      },
+      horizonNanos: request.horizonNanos,
+      evaluatedAt: request.evaluatedAtUnixNanos,
+      analysisUnavailableCount: 2,
+      minimumCompletedSamples: 30,
+      minimumCoveragePpm: 800_000,
+      groups: [
+        {
+          cohort: "buy",
+          publicationCount: 36,
+          dueCount: 36,
+          completedCount: 30,
+          pendingCount: 6,
+          unavailableCount: 0,
+          coveragePpm: 833_333,
+          performance: {
+            kind: "available",
+            metric: "mean_gross_instrument_price_return",
+            meanGrossPriceReturn: "0.08",
+            positiveOutcomes: 24,
+            zeroOutcomes: 1,
+            negativeOutcomes: 5,
+          },
+        },
+        emptyGroup("add"),
+        emptyGroup("hold"),
+        emptyGroup("trim"),
+        emptyGroup("sell"),
+        emptyGroup("no_action_control"),
+      ],
+      forecastCalibrationIncluded: false,
+      executionPerformanceIncluded: false,
+    },
+    metadata: {
+      completeness: "complete",
+      returnedItems: 6,
+      availableItems: 6,
+      sourceCoverage: { status: "not_applicable" },
+      dataQuality: { status: "not_applicable" },
+    },
+  }
 }
 
 const unifiedKrakenMarket: ApplicationResult = {
@@ -1066,6 +1585,7 @@ describe("Market Squawk desktop boundary", () => {
   })
 
   it("uses grouped product navigation to explore real research and AI connection state", async () => {
+    const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
     const readyBootstrap: DesktopBootstrap = {
       ...blockedBootstrap,
@@ -1092,6 +1612,9 @@ describe("Market Squawk desktop boundary", () => {
         ),
         macroDashboardRead(),
         sourceStatusRead(),
+        investmentAnalysisListRead(),
+        investmentAnalysisRead(),
+        recommendationTrackRecordRead(),
       ],
     }
     let currentBootstrap = readyBootstrap
@@ -1109,6 +1632,15 @@ describe("Market Squawk desktop boundary", () => {
             : h15DashboardResult
         }
         if (request.query === "sourceStatus") return inactiveH15SourceStatus
+        if (request.query === "decisionInvestmentAnalyses") {
+          return retainedInvestmentAnalysisPage
+        }
+        if (request.query === "decisionInvestmentAnalysis") {
+          return retainedInvestmentAnalysis
+        }
+        if (request.query === "decisionRecommendationTrackRecord") {
+          return retainedTrackRecord(request)
+        }
         return {
           data: null,
           metadata: {
@@ -1317,6 +1849,113 @@ describe("Market Squawk desktop boundary", () => {
       issuedQueries.filter((request) => request.query === "sourceStatus").length,
     ).toBeGreaterThan(initialSourceReads)
     expect(issuedBootstrapGenerations).toContain(2)
+
+    const refreshedNavigation = document.querySelector(
+      'nav[aria-label="Market Squawk"]',
+    )
+    expect(refreshedNavigation).toBeInstanceOf(HTMLElement)
+    if (!(refreshedNavigation instanceof HTMLElement)) {
+      throw new Error("The refreshed Market Squawk navigation is absent")
+    }
+    await user.click(
+      within(refreshedNavigation).getByRole("link", { name: "Opportunities" }),
+    )
+    expect(
+      await screen.findByRole("heading", { name: "Opportunities" }),
+    ).toBeTruthy()
+    const retainedAnalysisCard = await screen.findByRole("button", {
+      name: /Generated · Buy/,
+    })
+    await user.click(retainedAnalysisCard)
+    const briefHeading = await screen.findByRole("heading", {
+      name: "Investment Brief",
+    })
+    const brief = briefHeading.closest("section")
+    expect(brief).toBeInstanceOf(HTMLElement)
+    if (!(brief instanceof HTMLElement)) {
+      throw new Error("The exact retained Investment Brief is absent")
+    }
+    expect(within(brief).getByText("Research only — execution ineligible")).toBeTruthy()
+    expect(within(brief).getByText("Buy analysis generated")).toBeTruthy()
+    expect(within(brief).getByText("Gross outcome projection")).toBeTruthy()
+    expect(within(brief).getByText("Sizing feasibility — no selected target")).toBeTruthy()
+    expect(within(brief).getByText("Not selected")).toBeTruthy()
+    expect(within(brief).getByText("Not created")).toBeTruthy()
+    expect(within(brief).getByText("Current realized-outcome status")).toBeTruthy()
+    expect(within(brief).getByText("Gross price-return decimal")).toBeTruthy()
+    expect(within(brief).getByText("0.1")).toBeTruthy()
+    expect(
+      within(brief).getByText("Profile-bound recommendation track record"),
+    ).toBeTruthy()
+    expect(
+      await within(brief).findByText(
+        "Mean gross price-return decimal 0.08; 24 positive, 1 zero, 5 negative",
+      ),
+    ).toBeTruthy()
+    expect(
+      within(brief).getByText(
+        "Current-status outcomes for the exact published analytical profile and recommendation horizon. Cohorts remain separate; the service owns sample gates, coverage, and mean-return arithmetic. Forecast calibration and execution performance are not included.",
+      ),
+    ).toBeTruthy()
+
+    expect(
+      issuedQueries.filter(
+        (request) => request.query === "decisionInvestmentAnalyses",
+      ),
+    ).toEqual([{ query: "decisionInvestmentAnalyses", limit: 24 }])
+    expect(
+      issuedQueries.filter(
+        (request) => request.query === "decisionInvestmentAnalysis",
+      ),
+    ).toEqual([
+      { query: "decisionInvestmentAnalysis", analysisId: retainedAnalysisId },
+    ])
+    const trackRecordRequests = issuedQueries.filter(
+      (request): request is TrackRecordQuery =>
+        request.query === "decisionRecommendationTrackRecord",
+    )
+    expect(trackRecordRequests).toHaveLength(1)
+    expect(trackRecordRequests[0]).toEqual({
+      query: "decisionRecommendationTrackRecord",
+      profileId: "market-squawk-default-v1",
+      profileRevision: 1,
+      profileDigest: retainedProfileDigest,
+      horizonNanos: retainedHorizonNanos,
+      evaluatedAtUnixNanos: expect.stringMatching(/^[1-9]\d*$/),
+    })
+
+    const decisionReadsBeforeInvalidation = issuedQueries.filter((request) =>
+      request.query.startsWith("decisionInvestment"),
+    ).length
+    const trackReadsBeforeInvalidation = trackRecordRequests.length
+    const notifyDecisionEvent = desktopEvents.listener
+    if (!notifyDecisionEvent) {
+      throw new Error("The refreshed Desktop event subscription was not installed")
+    }
+    await act(async () => {
+      notifyDecisionEvent({
+        runtime: currentBootstrap.runtime,
+        sequence: "1",
+        body: {
+          type: "authority_changed",
+          domain: "decision",
+          operation: "Decision.ReviewTargetSet",
+          requestId: "wave-10d-decision-refresh",
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(
+        issuedQueries.filter((request) =>
+          request.query.startsWith("decisionInvestment"),
+        ).length,
+      ).toBeGreaterThan(decisionReadsBeforeInvalidation)
+      expect(
+        issuedQueries.filter(
+          (request) => request.query === "decisionRecommendationTrackRecord",
+        ).length,
+      ).toBeGreaterThan(trackReadsBeforeInvalidation)
+    })
 
     rendered.unmount()
     const mcpRendered = render(

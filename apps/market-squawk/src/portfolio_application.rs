@@ -8,6 +8,7 @@ mod candidate;
 mod import;
 mod model;
 mod read;
+mod recommendation;
 
 pub(crate) use account_catalog::{
     PortfolioAccountCatalogError, PortfolioAccountCatalogReadCapability,
@@ -19,7 +20,13 @@ pub(crate) use backup::{
 };
 pub(crate) use candidate::{
     ImportedPortfolioRiskAdvisory, ImportedPortfolioRiskAdvisoryOutcome,
-    ImportedPortfolioRiskCheck, PortfolioCandidateAvailability, PortfolioCandidateCost,
+    ImportedPortfolioRiskCheck, PortfolioAnalysisDepthAvailability, PortfolioAnalysisDepthLevel,
+    PortfolioAnalysisDepthLevelsInput, PortfolioAnalysisDepthSideEvidence,
+    PortfolioAnalysisDepthUnavailableReason, PortfolioAnalysisLiquidityEvidence,
+    PortfolioAnalysisLiquiditySide, PortfolioAnalysisMarketAvailability,
+    PortfolioAnalysisMarketEntry, PortfolioAnalysisMarketSet,
+    PortfolioAnalysisMarketUnavailableReason, PortfolioAnalysisSetupResolution,
+    PortfolioAnalysisSetupSnapshot, PortfolioCandidateAvailability, PortfolioCandidateCost,
     PortfolioCandidateImpactPreview, PortfolioCandidateImpactReadCapability,
     PortfolioCandidateImpactRequest, PortfolioCandidateMarkKind, PortfolioCandidateMarketEvidence,
     PortfolioCandidateMarketObservation, PortfolioCandidatePositionState,
@@ -30,6 +37,18 @@ pub(crate) use candidate::{
 pub(crate) use import::{
     GovernedImportCommitReceipt, PortfolioImportInterpretation, PortfolioImportPreview,
     ServerHeldPortfolioImportResolution,
+};
+pub(crate) use recommendation::{
+    PortfolioAnalysisCurrentPosition, PortfolioAnalysisHistoricalReturn,
+    PortfolioAnalysisHoldingSnapshot, PortfolioAnalysisLiquidityCapacityAvailability,
+    PortfolioAnalysisLiquidityCapacityEvidence, PortfolioAnalysisLiquidityCapacitySideEvidence,
+    PortfolioAnalysisLiquidityCapacityUnavailableReason, PortfolioAnalysisMarkedHolding,
+    PortfolioAnalysisMarkedPortfolioEvidence, PortfolioAnalysisPortfolioSnapshot,
+    PortfolioAnalysisPrerequisitePolicy, PortfolioAnalysisPrerequisiteResolution,
+    PortfolioAnalysisPrerequisiteUnavailableEvidence,
+    PortfolioAnalysisPrerequisiteUnavailableReason, PortfolioAnalysisRiskAvailability,
+    PortfolioAnalysisRiskEvidence, PortfolioAnalysisRiskUnavailableReason,
+    PortfolioRecommendationEvidence, resolve_portfolio_analysis_prerequisites,
 };
 
 use std::fmt;

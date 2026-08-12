@@ -7,6 +7,19 @@ const MAXIMUM_U32 = 4_294_967_295
 const PARTS_PER_MILLION = 1_000_000
 const MAXIMUM_PAGE_ANALYSES = 1_000
 const MAXIMUM_AVAILABLE_ANALYSES = 4_096
+const MINIMUM_TRACK_RECORD_SAMPLES = 30
+const MINIMUM_TRACK_RECORD_COVERAGE_PPM = 800_000
+const MINIMUM_I64 = -(2n ** 63n)
+const MAXIMUM_I64 = 2n ** 63n - 1n
+
+const TRACK_RECORD_COHORTS = [
+  "buy",
+  "add",
+  "hold",
+  "trim",
+  "sell",
+  "no_action_control",
+] as const
 
 const canonicalDigestSchema = z.string().regex(/^[0-9a-f]{64}$/)
 const nonzeroDigestSchema = canonicalDigestSchema.refine(
@@ -41,8 +54,25 @@ const nonnegativeIntegerSchema = canonicalIntegerSchema.refine(
   (value) => BigInt(value) >= 0n,
   "Expected a nonnegative lossless integer.",
 )
+const signedI64Schema = canonicalIntegerSchema.refine(
+  (value) => {
+    const parsed = BigInt(value)
+    return parsed >= MINIMUM_I64 && parsed <= MAXIMUM_I64
+  },
+  "Expected a signed 64-bit integer.",
+)
+const positiveI64Schema = signedI64Schema.refine(
+  (value) => BigInt(value) > 0n,
+  "Expected a positive signed 64-bit integer.",
+)
 const positiveU32Schema = z.number().int().min(1).max(MAXIMUM_U32)
+const nonnegativeU32Schema = z.number().int().min(0).max(MAXIMUM_U32)
 const ppmSchema = z.number().int().min(0).max(PARTS_PER_MILLION)
+const operationIdentifierSchema = z
+  .string()
+  .min(1)
+  .max(256)
+  .regex(/^[A-Za-z0-9_.:/-]+$/)
 
 const notApplicableSchema = z
   .object({ status: z.literal("not_applicable") })
@@ -468,15 +498,331 @@ const investmentAnalysisResultSchema = z.union([
   unavailableResultSchema,
 ])
 
+const analyticalProfileSchema = z
+  .object({
+    profileId: z.string().min(1).max(256),
+    revision: positiveU32Schema,
+    contentDigest: contentIdentitySchema,
+  })
+  .strict()
+
+const investmentAnalysisPublicationSchema = z
+  .object({
+    publicationId: nonzeroDigestSchema,
+    publishedAt: canonicalIntegerSchema,
+    executionEligibility: z.literal("research_only_execution_ineligible"),
+    analyticalProfile: analyticalProfileSchema,
+    workflow: z
+      .object({
+        workflowId: z.string().min(1).max(256),
+        revision: positiveU32Schema,
+        contentDigest: contentIdentitySchema,
+      })
+      .strict(),
+    accountSetup: z
+      .object({
+        accountId: canonicalUuidSchema,
+        distinctFromAnalyticalProfile: z.literal(true),
+      })
+      .strict(),
+    outcomeProjectionDigest: nonzeroDigestSchema.nullable(),
+    sizingProjectionDigest: nonzeroDigestSchema.nullable(),
+  })
+  .strict()
+
+function unavailableDisclosureSchema<const Reason extends string>(reason: Reason) {
+  return z
+    .object({
+      kind: z.literal("unavailable"),
+      reason: z.literal(reason),
+    })
+    .strict()
+}
+
+const grossMarkRelativeRangeSchema = z
+  .object({
+    priceRange: priceRangeSchema,
+    grossReturnFromMark: z
+      .object({
+        lowerNumerator: moneySchema,
+        upperNumerator: moneySchema,
+        denominator: moneySchema,
+      })
+      .strict(),
+  })
+  .strict()
+
+const investmentOutcomeProjectionSchema = z
+  .object({
+    resultDigest: nonzeroDigestSchema,
+    proposalId: nonzeroDigestSchema,
+    derivationDigest: nonzeroDigestSchema,
+    authority: z.literal("analysis_only_no_mutation_no_execution"),
+    executionEligible: z.literal(false),
+    mark: moneySchema,
+    horizonAt: canonicalIntegerSchema,
+    downside: grossMarkRelativeRangeSchema,
+    base: grossMarkRelativeRangeSchema,
+    upside: grossMarkRelativeRangeSchema,
+    netPnl: unavailableDisclosureSchema("exact_forward_cost_evidence_not_supplied"),
+    benchmarkReturn: unavailableDisclosureSchema(
+      "exact_proposal_time_benchmark_evidence_not_supplied",
+    ),
+    afterTaxPnl: unavailableDisclosureSchema("exact_tax_evidence_not_supplied"),
+  })
+  .strict()
+
+const sizingUnavailableReasonSchema = z.enum([
+  "capacity_not_supplied",
+  "capacity_not_yet_available",
+  "capacity_expired",
+  "capacity_range_contains_no_lots",
+  "cash_reserve_exceeds_gross_liquidatable_value",
+  "no_hard_feasible_lot_intersection",
+  "preferred_weight_range_contains_no_lots",
+  "no_preferred_feasible_lot_intersection",
+])
+
+const feasibleLotsSchema = z.union([
+  z
+    .object({
+      kind: z.literal("available"),
+      lower: nonnegativeIntegerSchema,
+      upper: nonnegativeIntegerSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("unavailable"),
+      reasons: z.array(sizingUnavailableReasonSchema).min(1).max(8),
+    })
+    .strict()
+    .superRefine((availability, context) => {
+      if (new Set(availability.reasons).size !== availability.reasons.length) {
+        context.addIssue({
+          code: "custom",
+          path: ["reasons"],
+          message: "The sizing projection repeats one unavailability reason.",
+        })
+      }
+    }),
+])
+
+const investmentSizingProjectionSchema = z
+  .object({
+    resultDigest: nonzeroDigestSchema,
+    proposalId: nonzeroDigestSchema,
+    derivationDigest: nonzeroDigestSchema,
+    authority: z.literal("analysis_only_no_mutation_no_execution"),
+    executionEligible: z.literal(false),
+    evaluatedAt: canonicalIntegerSchema,
+    currentLots: nonnegativeIntegerSchema,
+    hardFeasibleLots: feasibleLotsSchema,
+    preferredFeasibleLots: feasibleLotsSchema,
+    selectedTargetLots: z.null(),
+    orderQuantity: z.null(),
+  })
+  .strict()
+
+const recommendationOutcomeCommonSchema = {
+  seriesId: nonzeroDigestSchema,
+  revision: positiveU32Schema,
+  statusDigest: nonzeroDigestSchema,
+  evaluatedAt: canonicalIntegerSchema,
+  executionEligible: z.literal(false),
+} as const
+
+const recommendationOutcomeSchema = z.union([
+  z
+    .object({
+      kind: z.literal("pending"),
+      reason: z.enum(["awaiting_horizon", "awaiting_outcome_evidence"]),
+      ...recommendationOutcomeCommonSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("unavailable"),
+      reason: z.enum([
+        "analysis_unavailable",
+        "outcome_observation_unavailable",
+        "ambiguous_outcome_observation",
+        "incomplete_outcome_observation",
+        "corporate_action_evidence_unavailable",
+      ]),
+      ...recommendationOutcomeCommonSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("completed"),
+      metric: z.literal("gross_instrument_price_return"),
+      startMark: moneySchema,
+      endpointPrice: moneySchema,
+      grossPriceReturn: canonicalDecimalSchema,
+      observedAt: canonicalIntegerSchema,
+      availableAt: canonicalIntegerSchema,
+      selectionReceiptIdentity: contentIdentitySchema,
+      selectedObservationIdentity: contentIdentitySchema,
+      corporateActionEvidenceIdentity: contentIdentitySchema,
+      netReturn: unavailableDisclosureSchema(
+        "exact_realized_cost_evidence_not_supplied",
+      ),
+      benchmarkReturn: unavailableDisclosureSchema(
+        "exact_benchmark_outcome_evidence_not_supplied",
+      ),
+      afterTaxReturn: unavailableDisclosureSchema("exact_tax_evidence_not_supplied"),
+      settlement: unavailableDisclosureSchema("no_execution_or_settlement_evidence"),
+      ...recommendationOutcomeCommonSchema,
+    })
+    .strict(),
+])
+
+function sameMoney(
+  left: { amount: string; currency: string },
+  right: { amount: string; currency: string },
+): boolean {
+  return left.amount === right.amount && left.currency === right.currency
+}
+
+function samePriceRange(
+  left: { lower: { amount: string; currency: string }; upper: { amount: string; currency: string } },
+  right: { lower: { amount: string; currency: string }; upper: { amount: string; currency: string } },
+): boolean {
+  return sameMoney(left.lower, right.lower) && sameMoney(left.upper, right.upper)
+}
+
 export const investmentAnalysisSchema = z
   .object({
     analysisId: nonzeroDigestSchema,
+    executionEligibility: z.literal("research_only_execution_ineligible"),
     policy: recommendationPolicySchema,
     evidence: investmentAnalysisEvidenceSchema,
     evidenceDigest: nonzeroDigestSchema,
+    publication: investmentAnalysisPublicationSchema.nullable(),
+    projection: investmentOutcomeProjectionSchema.nullable(),
+    sizing: investmentSizingProjectionSchema.nullable(),
+    realizedOutcome: recommendationOutcomeSchema.nullable(),
     result: investmentAnalysisResultSchema,
   })
   .strict()
+  .superRefine((analysis, context) => {
+    const issue = (path: (string | number)[], message: string) => {
+      context.addIssue({ code: "custom", path, message })
+    }
+    const publication = analysis.publication
+    const projection = analysis.projection
+    const sizing = analysis.sizing
+    const realized = analysis.realizedOutcome
+
+    if (
+      publication &&
+      publication.accountSetup.accountId !== analysis.evidence.accountId
+    ) {
+      issue(
+        ["publication", "accountSetup", "accountId"],
+        "The publication is bound to a different proposal account.",
+      )
+    }
+    if (!publication && (projection || sizing || realized)) {
+      issue(
+        ["publication"],
+        "A current analysis sidecar exists without its required publication.",
+      )
+    }
+    if (
+      (publication?.outcomeProjectionDigest ?? null) !==
+      (projection?.resultDigest ?? null)
+    ) {
+      issue(
+        ["publication", "outcomeProjectionDigest"],
+        "The publication does not bind the current outcome projection.",
+      )
+    }
+    if (
+      (publication?.sizingProjectionDigest ?? null) !==
+      (sizing?.resultDigest ?? null)
+    ) {
+      issue(
+        ["publication", "sizingProjectionDigest"],
+        "The publication does not bind the current sizing projection.",
+      )
+    }
+
+    if (analysis.result.kind !== "generated" && (projection || sizing)) {
+      issue(
+        ["result"],
+        "Only a generated proposal can own projection or sizing sidecars.",
+      )
+    }
+    if (analysis.result.kind === "generated") {
+      const generated = analysis.result
+      if (
+        projection &&
+        (projection.proposalId !== generated.proposalId ||
+          projection.derivationDigest !== generated.derivationDigest ||
+          projection.horizonAt !== generated.horizonAt)
+      ) {
+        issue(
+          ["projection"],
+          "The outcome projection is not bound to the exact generated proposal.",
+        )
+      }
+      if (
+        sizing &&
+        (sizing.proposalId !== generated.proposalId ||
+          sizing.derivationDigest !== generated.derivationDigest)
+      ) {
+        issue(
+          ["sizing"],
+          "The sizing projection is not bound to the exact generated proposal.",
+        )
+      }
+      if (projection && analysis.evidence.market) {
+        if (!sameMoney(projection.mark, analysis.evidence.market.price)) {
+          issue(
+            ["projection", "mark"],
+            "The outcome projection uses a different retained market mark.",
+          )
+        }
+        const ranges = [
+          [projection.downside.priceRange, generated.priceLadder.ranges.downside],
+          [projection.base.priceRange, generated.priceLadder.ranges.base],
+          [projection.upside.priceRange, generated.priceLadder.ranges.upside],
+        ] as const
+        if (ranges.some(([left, right]) => !samePriceRange(left, right))) {
+          issue(
+            ["projection"],
+            "The outcome projection does not retain the generated price ranges.",
+          )
+        }
+      }
+    }
+
+    if (realized?.kind === "completed") {
+      if (analysis.result.kind === "unavailable") {
+        issue(
+          ["realizedOutcome"],
+          "An unavailable analysis cannot have a completed realized outcome.",
+        )
+      }
+      if (
+        analysis.evidence.market &&
+        !sameMoney(realized.startMark, analysis.evidence.market.price)
+      ) {
+        issue(
+          ["realizedOutcome", "startMark"],
+          "The realized outcome does not use the proposal's retained start mark.",
+        )
+      }
+      if (realized.startMark.currency !== realized.endpointPrice.currency) {
+        issue(
+          ["realizedOutcome", "endpointPrice", "currency"],
+          "The realized outcome endpoint uses a different currency.",
+        )
+      }
+    }
+  })
 
 const investmentAnalysisEnvelopeSchema = z
   .object({
@@ -636,6 +982,186 @@ const investmentAnalysisPageRequestSchema = z
   })
   .strict()
 
+const recommendationTrackRecordRequestSchema = z
+  .object({
+    profileId: operationIdentifierSchema,
+    profileRevision: positiveU32Schema,
+    profileDigest: nonzeroDigestSchema,
+    horizonNanos: positiveI64Schema,
+    evaluatedAtUnixNanos: signedI64Schema,
+  })
+  .strict()
+
+const recommendationTrackRecordPerformanceSchema = z.union([
+  z
+    .object({
+      kind: z.literal("unavailable"),
+      reason: z.literal("no_due_outcomes"),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("unavailable"),
+      reason: z.literal("insufficient_completed_samples"),
+      required: z.literal(MINIMUM_TRACK_RECORD_SAMPLES),
+      actual: nonnegativeU32Schema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("unavailable"),
+      reason: z.literal("insufficient_coverage"),
+      requiredPpm: z.literal(MINIMUM_TRACK_RECORD_COVERAGE_PPM),
+      actualPpm: ppmSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("available"),
+      metric: z.literal("mean_gross_instrument_price_return"),
+      meanGrossPriceReturn: canonicalDecimalSchema,
+      positiveOutcomes: nonnegativeU32Schema,
+      zeroOutcomes: nonnegativeU32Schema,
+      negativeOutcomes: nonnegativeU32Schema,
+    })
+    .strict(),
+])
+
+const recommendationTrackRecordGroupSchema = z
+  .object({
+    cohort: z.enum(TRACK_RECORD_COHORTS),
+    publicationCount: nonnegativeU32Schema,
+    dueCount: nonnegativeU32Schema,
+    completedCount: nonnegativeU32Schema,
+    pendingCount: nonnegativeU32Schema,
+    unavailableCount: nonnegativeU32Schema,
+    coveragePpm: ppmSchema,
+    performance: recommendationTrackRecordPerformanceSchema,
+  })
+  .strict()
+  .superRefine((group, context) => {
+    const issue = (path: (string | number)[], message: string) => {
+      context.addIssue({ code: "custom", path, message })
+    }
+    if (
+      group.publicationCount !==
+      group.completedCount + group.pendingCount + group.unavailableCount
+    ) {
+      issue(
+        ["publicationCount"],
+        "The track-record publication count contradicts its outcome counts.",
+      )
+    }
+    if (
+      group.completedCount + group.unavailableCount > group.dueCount ||
+      group.dueCount > group.publicationCount
+    ) {
+      issue(
+        ["dueCount"],
+        "The track-record due count contradicts the retained outcome counts.",
+      )
+    }
+    if (group.dueCount === 0 && group.coveragePpm !== 0) {
+      issue(
+        ["coveragePpm"],
+        "A cohort without due outcomes cannot report completed-outcome coverage.",
+      )
+    }
+
+    const performance = group.performance
+    if (performance.kind === "available") {
+      if (
+        group.completedCount < MINIMUM_TRACK_RECORD_SAMPLES ||
+        group.coveragePpm < MINIMUM_TRACK_RECORD_COVERAGE_PPM ||
+        performance.positiveOutcomes +
+          performance.zeroOutcomes +
+          performance.negativeOutcomes !==
+          group.completedCount
+      ) {
+        issue(
+          ["performance"],
+          "The available track-record summary contradicts its server-owned sample gates.",
+        )
+      }
+      return
+    }
+
+    switch (performance.reason) {
+      case "no_due_outcomes":
+        if (group.dueCount !== 0) {
+          issue(
+            ["performance"],
+            "The cohort reports no due outcomes despite a nonzero due count.",
+          )
+        }
+        break
+      case "insufficient_completed_samples":
+        if (
+          performance.actual !== group.completedCount ||
+          group.dueCount === 0 ||
+          group.completedCount >= MINIMUM_TRACK_RECORD_SAMPLES
+        ) {
+          issue(
+            ["performance"],
+            "The insufficient-sample disclosure contradicts the retained counts.",
+          )
+        }
+        break
+      case "insufficient_coverage":
+        if (
+          performance.actualPpm !== group.coveragePpm ||
+          group.completedCount < MINIMUM_TRACK_RECORD_SAMPLES ||
+          group.coveragePpm >= MINIMUM_TRACK_RECORD_COVERAGE_PPM
+        ) {
+          issue(
+            ["performance"],
+            "The insufficient-coverage disclosure contradicts the retained coverage.",
+          )
+        }
+        break
+    }
+  })
+
+export const recommendationTrackRecordSchema = z
+  .object({
+    analyticalProfile: analyticalProfileSchema,
+    horizonNanos: positiveI64Schema,
+    evaluatedAt: signedI64Schema,
+    analysisUnavailableCount: nonnegativeU32Schema,
+    minimumCompletedSamples: z.literal(MINIMUM_TRACK_RECORD_SAMPLES),
+    minimumCoveragePpm: z.literal(MINIMUM_TRACK_RECORD_COVERAGE_PPM),
+    groups: z.array(recommendationTrackRecordGroupSchema).length(TRACK_RECORD_COHORTS.length),
+    forecastCalibrationIncluded: z.literal(false),
+    executionPerformanceIncluded: z.literal(false),
+  })
+  .strict()
+  .superRefine((trackRecord, context) => {
+    trackRecord.groups.forEach((group, index) => {
+      if (group.cohort !== TRACK_RECORD_COHORTS[index]) {
+        context.addIssue({
+          code: "custom",
+          path: ["groups", index, "cohort"],
+          message: "The track-record cohorts are not in the server-owned canonical order.",
+        })
+      }
+    })
+  })
+
+const recommendationTrackRecordEnvelopeSchema = z
+  .object({
+    data: recommendationTrackRecordSchema,
+    metadata: z
+      .object({
+        completeness: z.literal("complete"),
+        returnedItems: z.literal(TRACK_RECORD_COHORTS.length),
+        availableItems: z.literal(TRACK_RECORD_COHORTS.length),
+        sourceCoverage: notApplicableSchema,
+        dataQuality: notApplicableSchema,
+      })
+      .strict(),
+  })
+  .strict()
+
 export type InvestmentAnalysis = z.infer<typeof investmentAnalysisSchema>
 export type InvestmentAnalysisEvidence = z.infer<
   typeof investmentAnalysisEvidenceSchema
@@ -646,6 +1172,44 @@ export type NoActionInvestmentAnalysis = z.infer<typeof noActionResultSchema>
 export type UnavailableInvestmentAnalysis = z.infer<typeof unavailableResultSchema>
 export type InvestmentAnalysisLocator = z.infer<typeof investmentAnalysisLocatorSchema>
 export type InvestmentAnalysisPage = z.infer<typeof investmentAnalysisPageSchema>
+export type RecommendationTrackRecord = z.infer<typeof recommendationTrackRecordSchema>
+export type RecommendationTrackRecordRequest = z.infer<
+  typeof recommendationTrackRecordRequestSchema
+>
+export type RecommendationTrackRecordRequestAvailability =
+  | { kind: "available"; request: RecommendationTrackRecordRequest }
+  | {
+      kind: "unavailable"
+      reason:
+        | "analysis_not_published"
+        | "profile_digest_algorithm_unsupported"
+        | "profile_identifier_unsupported"
+    }
+
+export function recommendationTrackRecordRequestForAnalysis(
+  analysis: InvestmentAnalysis,
+  evaluatedAtUnixNanos: string,
+): RecommendationTrackRecordRequestAvailability {
+  const profile = analysis.publication?.analyticalProfile
+  if (!profile) return { kind: "unavailable", reason: "analysis_not_published" }
+  if (profile.contentDigest.algorithm !== "sha256") {
+    return {
+      kind: "unavailable",
+      reason: "profile_digest_algorithm_unsupported",
+    }
+  }
+  const request = recommendationTrackRecordRequestSchema.safeParse({
+    profileId: profile.profileId,
+    profileRevision: profile.revision,
+    profileDigest: profile.contentDigest.digest,
+    horizonNanos: analysis.policy.horizonNanos,
+    evaluatedAtUnixNanos,
+  })
+  if (!request.success) {
+    return { kind: "unavailable", reason: "profile_identifier_unsupported" }
+  }
+  return { kind: "available", request: request.data }
+}
 
 export function parseInvestmentAnalysis(
   result: ApplicationResult,
@@ -685,4 +1249,29 @@ export function parseInvestmentAnalysisPage(
     throw new Error("The installed service returned inconsistent investment-analysis paging.")
   }
   return page
+}
+
+export function parseRecommendationTrackRecord(
+  result: ApplicationResult,
+  request: RecommendationTrackRecordRequest,
+): RecommendationTrackRecord {
+  const parsed = recommendationTrackRecordEnvelopeSchema.safeParse(result)
+  const expected = recommendationTrackRecordRequestSchema.safeParse(request)
+  if (!parsed.success || !expected.success) {
+    throw new Error("The installed service returned an unsupported recommendation track record.")
+  }
+  const trackRecord = parsed.data.data
+  if (
+    trackRecord.analyticalProfile.profileId !== expected.data.profileId ||
+    trackRecord.analyticalProfile.revision !== expected.data.profileRevision ||
+    trackRecord.analyticalProfile.contentDigest.algorithm !== "sha256" ||
+    trackRecord.analyticalProfile.contentDigest.digest !== expected.data.profileDigest ||
+    trackRecord.horizonNanos !== expected.data.horizonNanos ||
+    trackRecord.evaluatedAt !== expected.data.evaluatedAtUnixNanos
+  ) {
+    throw new Error(
+      "The installed service returned a recommendation track record for a different binding.",
+    )
+  }
+  return trackRecord
 }

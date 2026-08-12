@@ -8,6 +8,7 @@ mod kraken_l3;
 mod market_config;
 pub(crate) mod nasdaq_reference;
 pub(crate) mod openfigi_identity;
+mod reference_identity;
 mod specs;
 mod tradier;
 
@@ -67,6 +68,11 @@ pub use market_config::{
     PreparedKrakenL3MarketConfiguration, PreparedMarketProviderConfiguration,
     PreparedTradierMarketConfiguration, ProviderMarketConfigurationRequest,
     TradierMarketConfigurationInput,
+};
+pub(crate) use reference_identity::{
+    MarketReferenceIdentityApprovalV1, MarketReferenceIdentityAuthority,
+    MarketReferenceIdentityError, MarketReferenceIdentityRequest,
+    MarketReferenceIdentityResolution, MarketReferenceIdentityUnavailable,
 };
 pub use specs::{
     BlsAdapterActivation, BoardAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS,

@@ -1,11 +1,14 @@
-import { CircleAlert, FileText } from "lucide-react"
+import { CircleAlert, FileText, RefreshCw } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Button } from "@/components/ui/button"
+import { Skeleton } from "@/components/ui/skeleton"
 
 import type {
   InvestmentAnalysis,
   InvestmentAnalysisLocator,
   InvestmentAnalysisResult,
+  RecommendationTrackRecord,
 } from "./contracts"
 import { formatLosslessInteger, formatUnixNanos } from "./format"
 
@@ -15,7 +18,23 @@ type PriceRange = NonNullable<Evidence["priceForecast"]>["ranges"]["base"]
 type EvidenceWindow = NonNullable<Evidence["market"]>["window"]
 type ContentIdentity = EvidenceWindow["contentIdentity"]
 
-export function InvestmentBrief({ analysis }: { analysis: InvestmentAnalysis }) {
+export type TrackRecordPresentation =
+  | { state: "loading" }
+  | { state: "unavailable"; detail: string }
+  | { state: "error"; detail: string; onRetry: () => void }
+  | { state: "ready"; value: RecommendationTrackRecord }
+
+export function InvestmentBrief({
+  analysis,
+  trackRecord,
+  refreshing,
+  onRefresh,
+}: {
+  analysis: InvestmentAnalysis
+  trackRecord: TrackRecordPresentation
+  refreshing: boolean
+  onRefresh: () => void
+}) {
   const outcome = outcomeSummary(analysis.result)
   const reliability =
     analysis.result.kind === "unavailable"
@@ -40,8 +59,33 @@ export function InvestmentBrief({ analysis }: { analysis: InvestmentAnalysis }) 
             ranking, forecast a return, or turn the analysis into an order.
           </p>
         </div>
-        <OutcomeBadge kind={analysis.result.kind} label={outcome.label} />
+        <div className="flex flex-col items-end gap-3">
+          <OutcomeBadge kind={analysis.result.kind} label={outcome.label} />
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={onRefresh}
+            disabled={refreshing}
+          >
+            <RefreshCw
+              className={refreshing ? "animate-spin" : undefined}
+              aria-hidden="true"
+            />
+            Refresh current evidence
+          </Button>
+        </div>
       </div>
+
+      <Alert className="mt-5">
+        <CircleAlert aria-hidden="true" />
+        <AlertTitle>Research only — execution ineligible</AlertTitle>
+        <AlertDescription>
+          The installed service marks this analysis as {enumLabel(analysis.executionEligibility)}.
+          Projection and sizing evidence below creates no target, order, reservation, fill, or
+          settlement authority.
+        </AlertDescription>
+      </Alert>
 
       <div className="mt-5 rounded-lg border border-border bg-background/35 p-4">
         <p className="text-sm font-semibold">{outcome.title}</p>
@@ -85,6 +129,11 @@ export function InvestmentBrief({ analysis }: { analysis: InvestmentAnalysis }) 
         </Alert>
       ) : null}
 
+      <PublicationDetails analysis={analysis} />
+      <ProjectionDetails analysis={analysis} />
+      <SizingDetails analysis={analysis} />
+      <RealizedOutcomeDetails analysis={analysis} />
+      <TrackRecordDetails presentation={trackRecord} />
       <PolicyDetails policy={analysis.policy} />
       {reliability ? <ReliabilityDetails reliability={reliability} /> : null}
       <EvidenceDetails evidence={analysis.evidence} />
@@ -153,6 +202,354 @@ function GeneratedDetails({
           />
         </dl>
       </Disclosure>
+    </>
+  )
+}
+
+function PublicationDetails({ analysis }: { analysis: InvestmentAnalysis }) {
+  const publication = analysis.publication
+  return (
+    <Disclosure title="Publication and analytical binding">
+      {!publication ? (
+        <p className="text-xs leading-5 text-muted-foreground">
+          Not published. No analytical-profile/workflow publication or profile-bound track record
+          is claimed for this retained analysis.
+        </p>
+      ) : (
+        <>
+          <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            <Fact label="Publication identity" value={publication.publicationId} mono />
+            <Fact label="Published" value={formatUnixNanos(publication.publishedAt)} />
+            <Fact
+              label="Execution eligibility"
+              value={enumLabel(publication.executionEligibility)}
+            />
+            <Fact
+              label="Analytical profile"
+              value={publication.analyticalProfile.profileId}
+              mono
+            />
+            <Fact
+              label="Profile revision"
+              value={publication.analyticalProfile.revision.toLocaleString("en-US")}
+            />
+            <IdentityFact
+              label="Analytical profile content"
+              identity={publication.analyticalProfile.contentDigest}
+            />
+            <Fact label="Publishing workflow" value={publication.workflow.workflowId} mono />
+            <Fact
+              label="Workflow revision"
+              value={publication.workflow.revision.toLocaleString("en-US")}
+            />
+            <IdentityFact
+              label="Workflow content"
+              identity={publication.workflow.contentDigest}
+            />
+            <Fact label="Proposal account" value={publication.accountSetup.accountId} mono />
+            <Fact
+              label="Account/profile separation"
+              value="Confirmed — the brokerage account is not the analytical profile"
+            />
+            <Fact
+              label="Outcome projection digest"
+              value={publication.outcomeProjectionDigest ?? "Not published"}
+              mono={publication.outcomeProjectionDigest !== null}
+            />
+            <Fact
+              label="Sizing projection digest"
+              value={publication.sizingProjectionDigest ?? "Not published"}
+              mono={publication.sizingProjectionDigest !== null}
+            />
+          </dl>
+        </>
+      )}
+    </Disclosure>
+  )
+}
+
+function ProjectionDetails({ analysis }: { analysis: InvestmentAnalysis }) {
+  const projection = analysis.projection
+  if (!projection) {
+    return (
+      <Disclosure title="Gross outcome projection">
+        <p className="text-xs leading-5 text-muted-foreground">
+          No exact generated-proposal outcome projection is published for this analysis. The
+          desktop does not infer one from the price ladder.
+        </p>
+      </Disclosure>
+    )
+  }
+  const cases = [
+    ["Downside", projection.downside],
+    ["Base", projection.base],
+    ["Upside", projection.upside],
+  ] as const
+  return (
+    <Disclosure title="Gross outcome projection">
+      <p className="text-xs leading-5 text-muted-foreground">
+        Exact server-owned gross mark-relative evidence. The numerator and denominator are shown
+        without client-side division. Net P/L, benchmark-relative return, and after-tax P/L remain
+        explicitly unavailable.
+      </p>
+      <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        <Fact label="Projection identity" value={projection.resultDigest} mono />
+        <Fact label="Proposal identity" value={projection.proposalId} mono />
+        <Fact label="Derivation digest" value={projection.derivationDigest} mono />
+        <Fact label="Authority" value={enumLabel(projection.authority)} />
+        <Fact label="Execution eligible" value="No" />
+        <Fact label="Retained mark" value={money(projection.mark)} />
+        <Fact label="Horizon" value={formatUnixNanos(projection.horizonAt)} />
+        <Fact label="Net P/L" value={unavailableLabel(projection.netPnl.reason)} />
+        <Fact
+          label="Benchmark return"
+          value={unavailableLabel(projection.benchmarkReturn.reason)}
+        />
+        <Fact
+          label="After-tax P/L"
+          value={unavailableLabel(projection.afterTaxPnl.reason)}
+        />
+      </dl>
+      <div className="mt-5 grid gap-3 xl:grid-cols-3">
+        {cases.map(([label, value]) => (
+          <div key={label} className="rounded-lg border border-border bg-card/35 p-3">
+            <h3 className="text-xs font-semibold">{label}</h3>
+            <dl className="mt-3 grid gap-3">
+              <Fact label="Price range" value={priceRange(value.priceRange)} />
+              <Fact
+                label="Gross return lower expression"
+                value={`${money(value.grossReturnFromMark.lowerNumerator)} ÷ ${money(value.grossReturnFromMark.denominator)}`}
+              />
+              <Fact
+                label="Gross return upper expression"
+                value={`${money(value.grossReturnFromMark.upperNumerator)} ÷ ${money(value.grossReturnFromMark.denominator)}`}
+              />
+            </dl>
+          </div>
+        ))}
+      </div>
+    </Disclosure>
+  )
+}
+
+function SizingDetails({ analysis }: { analysis: InvestmentAnalysis }) {
+  const sizing = analysis.sizing
+  return (
+    <Disclosure title="Sizing feasibility — no selected target">
+      {!sizing ? (
+        <p className="text-xs leading-5 text-muted-foreground">
+          No exact sizing-feasibility sidecar is published. The desktop will not derive a quantity
+          from price, cash, risk, or portfolio evidence.
+        </p>
+      ) : (
+        <>
+          <p className="text-xs leading-5 text-muted-foreground">
+            The server evaluated feasible lot intervals only. It selected no target lots and
+            produced no order quantity.
+          </p>
+          <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            <Fact label="Sizing identity" value={sizing.resultDigest} mono />
+            <Fact label="Proposal identity" value={sizing.proposalId} mono />
+            <Fact label="Derivation digest" value={sizing.derivationDigest} mono />
+            <Fact label="Authority" value={enumLabel(sizing.authority)} />
+            <Fact label="Execution eligible" value="No" />
+            <Fact label="Evaluated" value={formatUnixNanos(sizing.evaluatedAt)} />
+            <Fact
+              label="Current lots"
+              value={formatLosslessInteger(sizing.currentLots)}
+            />
+            <Fact
+              label="Hard feasible lots"
+              value={feasibleLotsLabel(sizing.hardFeasibleLots)}
+            />
+            <Fact
+              label="Preferred feasible lots"
+              value={feasibleLotsLabel(sizing.preferredFeasibleLots)}
+            />
+            <Fact label="Selected target lots" value="Not selected" />
+            <Fact label="Order quantity" value="Not created" />
+          </dl>
+        </>
+      )}
+    </Disclosure>
+  )
+}
+
+function RealizedOutcomeDetails({ analysis }: { analysis: InvestmentAnalysis }) {
+  const outcome = analysis.realizedOutcome
+  return (
+    <Disclosure title="Current realized-outcome status">
+      {!outcome ? (
+        <p className="text-xs leading-5 text-muted-foreground">
+          No current outcome-status revision is published. Absence is not treated as a completed or
+          profitable result.
+        </p>
+      ) : (
+        <>
+          <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            <Fact label="Status" value={enumLabel(outcome.kind)} />
+            <Fact label="Outcome series" value={outcome.seriesId} mono />
+            <Fact label="Revision" value={outcome.revision.toLocaleString("en-US")} />
+            <Fact label="Status digest" value={outcome.statusDigest} mono />
+            <Fact label="Evaluated" value={formatUnixNanos(outcome.evaluatedAt)} />
+            <Fact label="Execution eligible" value="No" />
+            {outcome.kind === "pending" || outcome.kind === "unavailable" ? (
+              <Fact label="Reason" value={enumLabel(outcome.reason)} />
+            ) : null}
+          </dl>
+          {outcome.kind === "completed" ? (
+            <>
+              <p className="mt-4 text-xs leading-5 text-muted-foreground">
+                Gross instrument-price movement only. It is not portfolio profit, execution
+                performance, a benchmark-relative result, or an after-tax return.
+              </p>
+              <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                <Fact label="Metric" value={enumLabel(outcome.metric)} />
+                <Fact label="Start mark" value={money(outcome.startMark)} />
+                <Fact label="Endpoint price" value={money(outcome.endpointPrice)} />
+                <Fact label="Gross price-return decimal" value={outcome.grossPriceReturn} mono />
+                <Fact label="Observed" value={formatUnixNanos(outcome.observedAt)} />
+                <Fact label="Available" value={formatUnixNanos(outcome.availableAt)} />
+                <IdentityFact
+                  label="Endpoint selection receipt"
+                  identity={outcome.selectionReceiptIdentity}
+                />
+                <IdentityFact
+                  label="Selected endpoint observation"
+                  identity={outcome.selectedObservationIdentity}
+                />
+                <IdentityFact
+                  label="Corporate-action evidence"
+                  identity={outcome.corporateActionEvidenceIdentity}
+                />
+                <Fact label="Net return" value={unavailableLabel(outcome.netReturn.reason)} />
+                <Fact
+                  label="Benchmark return"
+                  value={unavailableLabel(outcome.benchmarkReturn.reason)}
+                />
+                <Fact
+                  label="After-tax return"
+                  value={unavailableLabel(outcome.afterTaxReturn.reason)}
+                />
+                <Fact
+                  label="Settlement"
+                  value={unavailableLabel(outcome.settlement.reason)}
+                />
+              </dl>
+            </>
+          ) : null}
+        </>
+      )}
+    </Disclosure>
+  )
+}
+
+function TrackRecordDetails({
+  presentation,
+}: {
+  presentation: TrackRecordPresentation
+}) {
+  return (
+    <Disclosure title="Profile-bound recommendation track record">
+      {presentation.state === "loading" ? (
+        <div className="grid gap-3 sm:grid-cols-2" aria-label="Loading recommendation track record">
+          <Skeleton className="h-24 w-full" />
+          <Skeleton className="h-24 w-full" />
+        </div>
+      ) : presentation.state === "unavailable" ? (
+        <p className="text-xs leading-5 text-muted-foreground">{presentation.detail}</p>
+      ) : presentation.state === "error" ? (
+        <Alert variant="destructive">
+          <CircleAlert aria-hidden="true" />
+          <AlertTitle>The exact track record could not be loaded</AlertTitle>
+          <AlertDescription>
+            {presentation.detail}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="mt-2"
+              onClick={presentation.onRetry}
+            >
+              Retry exact track record
+            </Button>
+          </AlertDescription>
+        </Alert>
+      ) : (
+        <TrackRecordReady value={presentation.value} />
+      )}
+    </Disclosure>
+  )
+}
+
+function TrackRecordReady({ value }: { value: RecommendationTrackRecord }) {
+  return (
+    <>
+      <p className="text-xs leading-5 text-muted-foreground">
+        Current-status outcomes for the exact published analytical profile and recommendation
+        horizon. Cohorts remain separate; the service owns sample gates, coverage, and mean-return
+        arithmetic. Forecast calibration and execution performance are not included.
+      </p>
+      <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        <Fact label="Analytical profile" value={value.analyticalProfile.profileId} mono />
+        <Fact
+          label="Profile revision"
+          value={value.analyticalProfile.revision.toLocaleString("en-US")}
+        />
+        <IdentityFact
+          label="Profile content"
+          identity={value.analyticalProfile.contentDigest}
+        />
+        <Fact
+          label="Exact horizon (nanoseconds)"
+          value={formatLosslessInteger(value.horizonNanos)}
+        />
+        <Fact label="Evaluated" value={formatUnixNanos(value.evaluatedAt)} />
+        <Fact
+          label="Unavailable analyses outside cohorts"
+          value={value.analysisUnavailableCount.toLocaleString("en-US")}
+        />
+        <Fact
+          label="Minimum completed samples"
+          value={value.minimumCompletedSamples.toLocaleString("en-US")}
+        />
+        <Fact
+          label="Minimum coverage"
+          value={`${value.minimumCoveragePpm.toLocaleString("en-US")} ppm`}
+        />
+        <Fact label="Forecast calibration included" value="No" />
+        <Fact label="Execution performance included" value="No" />
+      </dl>
+      <div className="mt-5 overflow-x-auto">
+        <table className="w-full min-w-[900px] border-collapse text-left text-xs">
+          <thead className="text-muted-foreground">
+            <tr className="border-b border-border">
+              <th className="px-2 py-2 font-medium">Cohort</th>
+              <th className="px-2 py-2 font-medium">Published</th>
+              <th className="px-2 py-2 font-medium">Due</th>
+              <th className="px-2 py-2 font-medium">Completed</th>
+              <th className="px-2 py-2 font-medium">Pending</th>
+              <th className="px-2 py-2 font-medium">Unavailable</th>
+              <th className="px-2 py-2 font-medium">Coverage</th>
+              <th className="px-2 py-2 font-medium">Server performance</th>
+            </tr>
+          </thead>
+          <tbody>
+            {value.groups.map((group) => (
+              <tr key={group.cohort} className="border-b border-border/70 last:border-0">
+                <td className="px-2 py-3 font-medium">{trackCohortLabel(group.cohort)}</td>
+                <td className="px-2 py-3">{group.publicationCount.toLocaleString("en-US")}</td>
+                <td className="px-2 py-3">{group.dueCount.toLocaleString("en-US")}</td>
+                <td className="px-2 py-3">{group.completedCount.toLocaleString("en-US")}</td>
+                <td className="px-2 py-3">{group.pendingCount.toLocaleString("en-US")}</td>
+                <td className="px-2 py-3">{group.unavailableCount.toLocaleString("en-US")}</td>
+                <td className="px-2 py-3">{group.coveragePpm.toLocaleString("en-US")} ppm</td>
+                <td className="px-2 py-3">{trackPerformanceLabel(group.performance)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </>
   )
 }
@@ -831,6 +1228,40 @@ function evidenceKindLabel(
     liquidity: "Liquidity",
     portfolio_risk: "Portfolio risk",
   }[value]
+}
+
+function feasibleLotsLabel(
+  value: NonNullable<InvestmentAnalysis["sizing"]>["hardFeasibleLots"],
+): string {
+  return value.kind === "available"
+    ? `${formatLosslessInteger(value.lower)} through ${formatLosslessInteger(value.upper)} lots`
+    : `Unavailable — ${value.reasons.map(enumLabel).join("; ")}`
+}
+
+function unavailableLabel(reason: string): string {
+  return `Unavailable — ${enumLabel(reason)}`
+}
+
+function trackCohortLabel(
+  cohort: RecommendationTrackRecord["groups"][number]["cohort"],
+): string {
+  return cohort === "no_action_control" ? "No-action control" : actionLabel(cohort)
+}
+
+function trackPerformanceLabel(
+  performance: RecommendationTrackRecord["groups"][number]["performance"],
+): string {
+  if (performance.kind === "available") {
+    return `Mean gross price-return decimal ${performance.meanGrossPriceReturn}; ${performance.positiveOutcomes} positive, ${performance.zeroOutcomes} zero, ${performance.negativeOutcomes} negative`
+  }
+  switch (performance.reason) {
+    case "no_due_outcomes":
+      return "Unavailable — no due outcomes"
+    case "insufficient_completed_samples":
+      return `Unavailable — ${performance.actual} completed; ${performance.required} required`
+    case "insufficient_coverage":
+      return `Unavailable — ${performance.actualPpm.toLocaleString("en-US")} ppm coverage; ${performance.requiredPpm.toLocaleString("en-US")} ppm required`
+  }
 }
 
 function money(value: Money): string {
