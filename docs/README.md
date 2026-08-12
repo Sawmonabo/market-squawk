@@ -9,14 +9,18 @@ delivery status, research, and historical evidence so each page has one clear jo
 | Document type | Documentation portal index |
 | Audience | Operators, users, integrators, maintainers, reviewers, and contributors |
 | Status | Current |
-| Last substantive review | 2026-08-03 |
+| Last substantive review | 2026-08-11 |
 
 ## Start by intent
 
 | I want to… | Start here |
 | --- | --- |
 | Understand the system and its boundaries | [Architecture](architecture/README.md) |
+| Understand the selected providers, canonical storage, workflow readiness, and remaining data gaps | [Market-data provider architecture](architecture/market-data-provider-architecture.md) |
+| Inspect one selected provider's exact contract, capacity evidence, mapping, and acceptance gate | [Selected provider contracts](reference/providers/README.md) |
+| Inspect the shared canonical schemas, clocks, precision, storage, PIT, and typed-read contract | [Canonical market-data schemas](reference/market-data-canonical-schemas.md) |
 | Install, configure, ingest, query, model, or operate Market Squawk | [Operations](operations/README.md) |
+| Create provider accounts and prepare the exact credential input | [Provider account setup](operations/provider-account-setup.md) |
 | Look up an exact desktop/CLI command, setting, MCP tool, source capability, quality class, or time field | [Reference](reference/README.md) |
 | See what is runnable and what still blocks the first complete release | [Delivery ledger](plans/delivery-ledger.md) |
 | Review the original dated requirement classification | [Historical gap analysis](plans/gap-analysis.md) |

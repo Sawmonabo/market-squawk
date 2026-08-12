@@ -1511,3 +1511,55 @@ acceptance path are maintained in
 the installed-product design and plan, and issue `#45`. Public README content remains product-
 focused; mutable head, progress, blocker, verification, and issue state remains only in the delivery
 ledger.
+
+## 2026-08-11 selected market-data and data-first resumption contract
+
+The V1 goal remains paused until the owner explicitly resumes it. On resume, data handling is the
+first implementation barrier because the Console workflows cannot be accepted over credentials or
+adapters alone. The binding target authorities are the
+[provider architecture](architecture/market-data-provider-architecture.md),
+[selected-provider contracts](reference/providers/README.md),
+[canonical schema and evidence contract](reference/market-data-canonical-schemas.md),
+[provider setup runbook](operations/provider-account-setup.md), credential-only
+[`market-squawk-provider-credentials/v1`](reference/market-squawk-provider-credentials.env.example)
+template, paused goal attachment, and current delivery-ledger entry.
+
+The selected sources are complementary: Alpaca Paper Only/Basic supplies the no-live-brokerage IEX
+current-data and stock-history core; owner-authorized Schwab supplies an optional read-only
+multi-asset REST and Streamer complement; Yahoo/yfinance is explicit-demand experimental
+enrichment; IEX HIST is a selected feed/date T+1 cold lane; Nasdaq Trader, OCC, and Cboe supply
+reference identity; SEC
+supplies company/fund evidence; FRED/ALFRED and the selected direct government sources supply macro,
+rates, fiscal, labor, national-account, demographic/trade, and energy evidence; and Tiingo is the
+optional supported mutual-fund NAV/EOD lane. Tiingo NAV uses the closed
+`ResearchObservation::FundNav(FundNavObservation)` research variant with exact fund/share-class,
+NAV date/value-or-missing state, availability, revision, and PIT evidence; EOD remains a separate
+bar family. Only those selected sources participate in new
+credential import, activation, scheduling, fallback, product composition, and release gates.
+
+No frontend calls a provider. Every source must complete
+`configured -> entitled -> producing -> durably published -> queryable -> workflow-composed ->
+restart/release-proven` through the existing protected secret store, provider-rate authority,
+bounded raw capture, closed canonical families, Arrow validation, immutable Parquet generations,
+SQLite manifests/control state, point-in-time selectors, and bounded typed application operations.
+Schwab uses only the code-owned market-data route allowlist plus minimum read-only User Preference
+bootstrap; it grants no account, position, transaction, or order use. The credential file remains a
+32-field one-time import/probe-intent format and must not become another provider, adapter, crate,
+service, configuration system, or endpoint/rate-policy surface.
+
+Provider capacity is accepted from requests and actual observations separately. Requested symbols,
+chain calls, pages, and decoded frames are not successful rows. Retained evidence must report valid
+returned components, missing/invalid dispositions, complete option contracts and non-null Greeks,
+accepted stream events, complete local bars, SEC/fund/macro manifest rows, and bytes written. FRED
+contracts remain version-specific: v1 uses offset pages up to 100,000 rows with no reviewed numeric
+v1 request-rate ceiling; v2 release observations use cursor pages up to 500,000 rows and a documented
+2-request/second throttle. One conservative 1-request/second shared application queue is the current
+policy, without conflating either version's pagination or provider facts.
+
+The implementation sequence is data-to-workflow vertical: thin credential import and doctors;
+reference identity plus Alpaca IEX into Markets; optional owner-enabled Schwab through the same
+publication/selection path; complete Alpaca/Schwab history into charts and exact analytical
+generations; SEC/macro/fund/options lanes; Yahoo and IEX HIST specialized lanes; then generated
+recommendations, portfolio/risk, and virtual paper over those same typed reads. An enabled flag,
+successful HTTP response, or published dataset cannot enable a workflow until its typed read,
+frontend composition, degradation behavior, and focused restart journey pass.

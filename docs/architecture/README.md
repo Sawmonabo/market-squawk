@@ -9,7 +9,7 @@ cross-cutting semantics, trust, deployment, quality, and accepted decisions.
 | Document type | Architecture index |
 | Audience | Operators, maintainers, integrators, reviewers, and contributors |
 | Status | Current |
-| Last substantive review | 2026-08-03 |
+| Last substantive review | 2026-08-11 |
 
 ## Reading path
 
@@ -40,6 +40,7 @@ implementation, not release-status journals or operator runbooks.
 | [Building blocks](building-blocks.md) | Which crate or adapter owns each responsibility, dependency, and authority boundary? |
 | [Live execution plane](live-execution-plane.md) | How do current provider frames become qualified instrument state and risk-evaluated paper actions? |
 | [Research data plane](research-data-plane.md) | How do source objects become immutable, queryable, point-in-time analytical generations? |
+| [Market-data provider architecture](market-data-provider-architecture.md) | Which selected providers supply each capability; how are raw/canonical/derived data published; when may a workflow become available; and which gaps remain? |
 | [Local control plane](control-plane.md) | How do Desktop, CLI, and named-client MCP relays use one authenticated per-user service, durable jobs, lifecycle, audit, and local capabilities? |
 | [Data, time, and provenance](data-time-and-provenance.md) | How are identity, knowledge time, source precision, revisions, and lineage preserved? |
 | [Security and trust boundaries](security-and-trust-boundaries.md) | Where do requests, bytes, credentials, evidence, and financial authority change trust level? |
@@ -73,6 +74,8 @@ implementation, not release-status journals or operator runbooks.
 - [Operations](../operations/README.md) provides current runnable procedures and recovery steps.
 - [Reference](../reference/README.md) specifies commands, configuration, MCP, source coverage,
   quality, and temporal contracts.
+- [Canonical market-data schemas](../reference/market-data-canonical-schemas.md) define the shared
+  provider-independent evidence, storage, PIT, analytical-binding, and typed-read contract.
 - [Delivery ledger](../plans/delivery-ledger.md) owns mutable implementation and release-blocker
   state.
 - [Historical architecture audits](../audits/architecture/) preserve superseded evidence and are

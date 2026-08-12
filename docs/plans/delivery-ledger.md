@@ -1,6 +1,6 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-08-09
+Last updated: 2026-08-11
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
@@ -13,7 +13,7 @@ evidence; it does not replace the README capability truth or the canonical relea
   release-branch integration is authorized in this execution scope.
 - The latest product-code checkpoint is
   `854e8c15ffdbed29c5f0d976b1216ab9396c52e1`. It completes the bounded account-group runtime for
-  Alpaca Basic, Tradier, and authenticated Kraken order-level depth; FIGI-backed non-execution
+  the then-configured market providers and authenticated order-level depth; FIGI-backed non-execution
   market identity and catalog persistence; source-preserving display and order-level actors;
   exact-session lifecycle recovery; deterministic source selection; and the unified Desktop
   feed, instrument workspace, individual-order view, and expandable Data confidence evidence.
@@ -37,6 +37,69 @@ evidence; it does not replace the README capability truth or the canonical relea
   providers, a searchable multi-asset universe, best-available-depth disclosure, deterministic
   source selection/downgrade evidence, and end-to-end use by forecasts, targets, backtests,
   portfolio analytics, risk, and paper workflows.
+- The audited market-data closure is now a V1 release blocker alongside that Markets work. The
+  maintained [provider architecture](../architecture/market-data-provider-architecture.md) assigns
+  Alpaca Paper Only/Basic to the governed free IEX live/WARM and stock-history core; Nasdaq Trader,
+  OCC, and Cboe to content-addressed reference discovery; SEC to company/fund evidence; FRED/ALFRED plus
+  direct government providers to macro; optional Tiingo to bounded daily mutual-fund NAV/EOD; and
+  a default-enabled pinned Yahoo contract to adaptive explicit-demand enrichment only. Low-capacity
+  free tiers are not admitted unless their complete assigned workload fits. Schwab's Individual
+  Trader API is now an optional owner-enabled complementary market-data source, not a base
+  dependency. Current
+  first-party documentation proves the 30-minute access/seven-day refresh lifecycle and one
+  Streamer connection/user; a bounded authenticated read-only probe proved the configured app's
+  multi-asset REST shapes, 500/500 single-request quote return, option/history/reference surfaces,
+  and five accepted Streamer services. Schwab still publishes no numeric market-data REST rate,
+  REST batch maximum, or Streamer symbol maximum, and normal-session sustainable throughput is not
+  release-proven. Its implementation therefore requires a strict market-data/User Preference
+  allowlist, protected token rotation, one multiplexed socket, adaptive capacity, exact
+  delay/feed/depth provenance, unlink/revocation handling, and no account/order routes. The exact
+  [credential input](../reference/market-squawk-provider-credentials.env.example) and
+  [account setup](../operations/provider-account-setup.md) are documented, but the strict
+  `market-squawk-provider-credentials/v1` thin parser/entry point is absent. It must reuse the
+  existing onboarding and secret-store path, not create a credential provider, adapter, crate,
+  service, authority, or configuration system. The former fixed Yahoo 25-symbol value had no
+  provider evidence and is removed: one shared runtime lane must measure actual attempts and
+  returns, coalesce/cache demand, and stop on its provider-wide 429 circuit. IEX HIST enablement
+  authorizes only explicitly selected, byte-admitted feed/date cold jobs and never an automatic
+  full-catalog download. Yahoo experimental/reference-file/IEX HIST lanes, owner-enabled Schwab,
+  optional Tiingo, BEA, Federal Reserve Board, Census, and EIA integrations; FRED v2 release bulk;
+  SEC N-PORT/N-CEN; complete Alpaca historical and current-batch composition; adaptive scheduling;
+  quota/quality telemetry; and the corresponding canonical product consumers remain incomplete.
+  Yahoo cannot become WARM or sole decision authority without a retained normal-session benchmark,
+  and the 8,000-symbol Alpaca target is conditional on an effective batch of at least 50 plus
+  authenticated rate/entitlement proof. The credential file is a design contract, not a current
+  runtime configuration claim. The per-source contracts are indexed under
+  [selected providers](../reference/providers/README.md), and the shared closed data families,
+  clocks, exact values, immutable generations, PIT selection, analytical bindings, and typed reads
+  are governed by the [canonical schema contract](../reference/market-data-canonical-schemas.md).
+  Tiingo NAV specifically requires the closed
+  `ResearchObservation::FundNav(FundNavObservation)` variant, exact fund/share-class and NAV-date
+  identity, value-or-missing state, availability/revision/PIT evidence, immutable publication, and
+  a bounded typed fund read; provider EOD bars cannot substitute for NAV.
+  FRED remains version-specific: v1 observations use up to 100,000 rows/page with offsets and no
+  reviewed numeric v1 request-rate ceiling; v2 release observations use up to 500,000 rows/page
+  with cursors and a documented 2-request/second throttle. Market Squawk retains one conservative
+  shared 1-request/second v1/v2 queue. Capacity acceptance must report actual valid returned
+  observations, contracts/Greeks, stream events, generated bars, manifest rows, and bytes separately
+  from requests and requested slots; full-session actuals remain unmeasured until retained probes
+  establish them.
+- Data-first resumption contract, 2026-08-11: the maintained provider architecture now defines the
+  full closure path `configured -> entitled -> producing -> published -> queryable -> composed ->
+  release-proven`. An enabled provider field is only import/probe intent. New sources must publish
+  exact raw evidence and canonical observations through the existing capture, SQLite authority,
+  Arrow/Parquet generation, manifest, PIT selector, and typed application-read boundaries before
+  any Desktop/CLI/MCP workflow becomes available. The required first verticals are: provider
+  import/doctors; reference identity plus Alpaca IEX into Markets search/current; owner-enabled
+  Schwab read-only market data; Alpaca/Schwab history into charts and reusable model/backtest
+  generations; SEC and macro into fundamentals/research; entitlement-gated options and optional
+  Tiingo funds; specialized Yahoo/IEX HIST lanes; then
+  recommendations, portfolio/risk, and virtual paper over those same typed reads. The exact
+  32-field credential/probe-intent example
+  schema and the owner-local credential file have matching field names; the local file remains
+  mode `0600`, and its values are not recorded here. The implementation goal remains paused until
+  the owner explicitly resumes it; this entry is the ready-to-resume authority, not an
+  implementation or acceptance claim.
 - The first dirty-tree integration review found concrete paper/live lifecycle, provider-switch,
   research-file client-isolation/crash-recovery, desktop bootstrap, startup-window, stored-source
   attribution, preview-retention, and development-runtime defects. The code checkpoint closes
@@ -64,20 +127,32 @@ evidence; it does not replace the README capability truth or the canonical relea
   checks.
 - Remaining barriers before the requested owner-test handoff are outcome-based:
 
-  1. Run the isolated no-account and credential-authorized live Market paths against exact current
+  1. Add the thin credential-file parser to the existing secret-store/provider-activation path—no
+     new credential crate or configuration system—then close the missing Alpaca Paper batch and
+     entitlement doctor, owner-enabled Schwab read-only OAuth/REST/Streamer adapter, Yahoo
+     experimental adapter, Nasdaq/OCC/Cboe reference ingestion, optional
+     IEX HIST and Tiingo lanes, BEA, Board, Census, EIA, FRED v2, SEC fund, Alpaca historical,
+     quota/checkpoint, raw-evidence publication, canonical schema/generation, PIT selector,
+     scheduler, telemetry, and fixed typed application surfaces without adding trading authority
+     or a parallel data application. Only the selected provider set participates in credentials,
+     scheduling, fallback, and product composition.
+  2. Run the isolated no-account and credential-authorized live Market paths against exact current
      provider responses. Prove startup, search, subscriptions, source selection, order-level
      resynchronization, rate budgeting, fallback disclosure, restart, stale-credential rejection,
      and shared Desktop/CLI/MCP reads before advertising that coverage as accepted.
-  2. Complete the unified non-technical investment workspace above the feed: bars, features,
-     forecasts, buy/add/trim/sell targets, backtests, fundamentals/filings, portfolio impact, risk,
-     and personalized opportunities. Optional options and derived-index children remain absent
-     unless their exact configured identity and source evidence exist.
-  3. Complete the resumable guided setup execution and every remaining shared-service/MCP,
+  3. Complete the unified non-technical investment workspace above those published typed reads:
+     Markets search/current/history, bars, options when entitled, funds/NAV, fundamentals/filings,
+     macro evidence, features, forecasts, buy/add/trim/sell targets, backtests, portfolio impact,
+     risk, virtual paper, and personalized opportunities. A provider is not complete
+     merely because its adapter runs; each intended workflow must consume its exact data or remain
+     explicitly unavailable. Derived-index children remain absent unless their configured identity
+     and source evidence exist.
+  4. Complete the resumable guided setup execution and every remaining shared-service/MCP,
      onboarding, research, Python/model, portfolio, decision, source, and restart workflow.
-  4. Run one focused installed integration/e2e pass, including every desktop route and every flow
+  5. Run one focused installed integration/e2e pass, including every desktop route and every flow
      not blocked by an unavailable user account or key, plus fresh shared Claude Code and Codex MCP
      clients and restart/stale-credential recovery.
-  5. Refresh the Python source closure only after the product source is final, freeze one unchanged
+  6. Refresh the Python source closure only after the product source is final, freeze one unchanged
      feature head, run the complete local release gate once, obtain all four
      platform installed-product proofs, close every grouped Quarter 4 finding, update PR #43 and
      the ledger with exact-head evidence, and prepare the owner-test package.
