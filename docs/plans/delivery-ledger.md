@@ -1405,9 +1405,30 @@ below the 20 GiB ceiling.
 One separately authorized direct probe of the exact rolling URL returned HTTP 200 `text/csv`, 8,627
 bytes, SHA-256 `5c7bd008c221e1b33b6a865cf7d1bbb4620661f57908a4e7dd00822bf8104579`, and exactly 100 dates/1,100
 cells. That validates the current official response shape but is not an installed-service smoke.
-The next serialized barrier is a real-network installed run under the durable one-request-per-minute
-authority through acquisition, raw sealing, publication, dashboard read, clean restart, and
-zero-network recovery. Native WebView/package acceptance remains later release evidence. The
-broader product still lacks its guided Find/Analyze producer, current Investment Brief and track
-record Desktop wiring, governed recommendation-to-user-target handoff, several selected-provider
-publication/PIT/Desktop verticals, and the final unchanged-head Quarter 4/release gates.
+The real-network installed barrier subsequently closed at exact source head
+`ba95a954883d4feb3dd328b40019682998c0b8e7`. The rebuilt CLI and service binaries were exercised
+against fresh, separate installation and workspace roots. The run completed the real no-key doctor,
+proved an immediate rolling discovery refusal under the durable one-request-per-minute authority,
+waited for the natural window, retrieved the exact 8,627-byte official response, and published its
+1,100 observations. The manifest content hash was
+`9904df0db93ef299d853b13d517d7ec2cb7109908770973df3097f1f4704b915`; the single raw object was
+26,994 bytes with content-addressed SHA-256
+`c51523f076698c74bbdef30841474541a81a6e0a80c4b25bdc721ef54e596abc`; and the single Parquet
+object was 295,309 bytes with SHA-256
+`516406c1ca4c85bdcad8e0d7075a04ebcd29efccdb0d4bb0df65c0e3adc9413e`.
+
+An authenticated MCP `Macro.GetDashboard` read returned all eleven ordered maturities for
+2026-08-10 with exact decimals, record provenance, immutable publication evidence, pinned result
+digest `8a7716bf6f4c8d8e1138e57f7b020613b5d3a7f2216dd6138de541562331602a`, and a separate final typed
+selection digest. The service then stopped cleanly and reopened the same workspace at generation 3.
+A local-only dashboard read returned the same manifest, object graph, pinned result digest, source
+payload identities, dates, revisions, and values; only the query and selection identities that bind
+the fresh evaluated-at cutoff changed. No post-restart source operation ran, and the raw/Parquet
+object counts and hashes remained unchanged. All temporary product processes were stopped after the
+proof. No CI or broad suite ran; the exact binary build left `target/` at approximately 19.9 GiB,
+below but close to the 20 GiB ceiling.
+
+Native Tauri/WebView package acceptance remains later release evidence. The broader product still
+lacks its guided Find/Analyze producer, current Investment Brief and track-record Desktop wiring,
+governed recommendation-to-user-target handoff, several selected-provider publication/PIT/Desktop
+verticals, and the final unchanged-head Quarter 4/release gates.

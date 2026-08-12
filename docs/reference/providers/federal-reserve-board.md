@@ -4,9 +4,9 @@
 | --- | --- |
 | Document type | Selected-provider target and evidence contract |
 | Audience | Operators, financial-data engineers, quantitative researchers, application integrators, and reviewers |
-| Status | H.15 profile, bounded doctor, rolling-dashboard source contract, activation binding, and registered research path implemented; scripted installed publication/read/restart proof passes, while real-network installed and release acceptance remain open |
+| Status | H.15 profile, bounded doctor, rolling-dashboard source contract, activation binding, and registered research path implemented; scripted and real-network installed publication/read/restart proofs pass, while native Desktop/package and release acceptance remain open |
 | Evidence cutoff | 2026-08-12, America/New_York |
-| Audit basis | `8fd91dad768affda2126ed91a5b97f1bd1e32209` plus the Wave 8B profile/documentation candidate |
+| Audit basis | exact-head real-network installed smoke at `ba95a954883d4feb3dd328b40019682998c0b8e7`, plus the subsequent evidence-only documentation refresh |
 
 ## Role and product workflows
 
@@ -106,6 +106,18 @@ capacity. Release retrieval outranks historical refresh; there is no periodic hi
   `MSJ1` seal, catalog/Parquet publication, typed history artifact, ordered 11-slot macro dashboard,
   stable same-root restart evidence, and zero provider HTTP after restart. This is deterministic
   fixture evidence, not a real-network installed run.
+- **RUNTIME-MEASURED VALUE (2026-08-12):** an exact-head installed-service run against fresh,
+  separate installation and workspace roots completed the real no-key doctor, enforced an immediate
+  production-discovery refusal, admitted the rolling request only after the durable 60-second
+  window, and retrieved HTTP 200 `text/csv` with 8,627 bytes and payload SHA-256
+  `5c7bd008c221e1b33b6a865cf7d1bbb4620661f57908a4e7dd00822bf8104579`.
+  Governed ingest sealed one 26,994-byte content-addressed `MSJ1` object and published exactly 1,100
+  rows in one 295,309-byte Parquet object under research schema v3. `Macro.GetDashboard` returned
+  all 11 ordered maturities for 2026-08-10 with complete provider/manifest/query/selection evidence.
+  After clean same-root service restart, a local-only dashboard read returned the same manifest,
+  object graph, pinned result digest, source payload identities, dates, revisions, and values; only
+  cutoff-dependent query and final-selection identities changed. No post-restart source operation
+  ran, and the raw and Parquet object sets and hashes remained unchanged.
 - **IMPLEMENTED CODE FACT:** the rolling provider dataset identity is
   `federal-reserve-board:h15:h15-treasury-constant-maturities:339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f`;
   its analytical identity is
@@ -162,11 +174,12 @@ cutoff. It may not claim that DDP itself supplies a complete vintage history.
   the shared capture protocol, register its exact analytical dataset identity, and
   serialize/restore the Board lifecycle surface. The full-history contract cannot substitute for
   that rolling dataset.
-- The scripted installed journey proves activation, rolling acquisition, rich raw capture and
-  sealing, durable catalog/Parquet publication, typed history and macro-dashboard reads, stable
-  evidence across a clean same-root restart, and zero post-restart provider HTTP. A real-network
-  installed retrieval has not yet proved those same boundaries; Desktop consumption plus
-  real-network restart and release acceptance remain open.
+- The scripted installed journey proves deterministic activation, rate enforcement, rolling
+  acquisition, rich raw capture and sealing, durable catalog/Parquet publication, typed history and
+  macro-dashboard reads, stable evidence across a clean same-root restart, and zero post-restart
+  provider HTTP. The exact-head real-network installed smoke independently closes official HTTPS
+  retrieval, raw sealing, 1,100-row publication, authenticated dashboard read, and same-root local
+  reread. Native Tauri/WebView package consumption and release acceptance remain open.
 - Reuse the existing research data plane for those seams. Do not create a parallel macro store,
   scheduler, or dashboard-only fetch path.
 
@@ -203,9 +216,9 @@ dashboard.
 - DDP does not supply pre-revision, real-time, or complete historical-as-known data.
 - Release-page, DDP-route, correction, and local availability can differ; no universal finality
   event is documented.
-- Scripted installed activation, durable rolling publication, typed reads, dashboard composition,
-  and same-root restart now pass. Real-network installed retrieval, raw sealing, publication,
-  workflow/Desktop consumption, and restart/release acceptance remain incomplete.
+- Scripted and real-network installed activation, durable rolling publication, typed dashboard
+  reads, and same-root restart now pass. Native Desktop/WebView package consumption, broader
+  workflow composition, and unchanged-head release acceptance remain incomplete.
 
 ## First-party sources
 

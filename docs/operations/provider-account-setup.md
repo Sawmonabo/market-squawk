@@ -115,7 +115,7 @@ makes explicitly selected feed/date jobs eligible; it never starts a full archiv
 | Tiingo Starter | Optional free Starter account and token | `TIINGO_API_TOKEN` | In-flight credential/request/NAV/EOD and serializable quota-ledger core exists; application-owned durable ledger binding, activation, publication, and fund read remain open |
 | SEC | No key; truthful organization/name and monitored email | `SEC_USER_AGENT_ORGANIZATION`, `SEC_USER_AGENT_EMAIL` | Company filing/fact foundations exist; N-PORT/N-CEN absent |
 | Treasury Fiscal Data/daily rates | No account or key | Enable flags only | Existing foundations |
-| Federal Reserve Board | No account or key | Enable flag only | Revision-4 profile and ten-date doctor remain current; the active production source is the distinct rolling 100-date H.15 dashboard contract with exact 1,100-observation validation. Scripted installed capture/publication/read/restart proof passes. Full history is unavailable pending partitioned resumable extraction; real-network installed and product acceptance remain open |
+| Federal Reserve Board | No account or key | Enable flag only | Revision-4 profile and ten-date doctor remain current; the active production source is the distinct rolling 100-date H.15 dashboard contract with exact 1,100-observation validation. Scripted and real-network installed capture/publication/read/restart proofs pass. Full history is unavailable pending partitioned resumable extraction; native Desktop/package and release acceptance remain open |
 
 ## 1. Alpaca Paper Only / Basic core
 
@@ -293,9 +293,9 @@ and prefers official bulk archives for large bootstrap work.
   100-date H.15 dashboard contract. Neither URL is operator-configurable. The full-history contract
   cannot use the one-batch source and remains unavailable until partitioned resumable extraction is
   implemented. The application can construct and restore the registered rolling Board research
-  source after successful onboarding. Its scripted installed capture, durable publication, typed
-  history/dashboard read, and same-root restart journey passes; real-network installed and Desktop
-  workflow acceptance remain open.
+  source after successful onboarding. Its scripted journey and exact-head real-network installed
+  smoke both pass capture, durable publication, typed dashboard read, and same-root restart. Native
+  Desktop/WebView workflow and release acceptance remain open.
 
 ## Completion checklist
 

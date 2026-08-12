@@ -227,8 +227,10 @@ profile/onboarding-doctor boundary and now has code-owned activation/source cons
 rich-capture binding, analytical-dataset registration, and lifecycle serialization/restore.
 The scripted installed Board journey proves rolling capture/sealing, durable catalog/Parquet
 publication, typed history and macro-dashboard reads, stable same-root restart evidence, and zero
-post-restart provider HTTP. Real-network installed retrieval/publication/restart acceptance,
-Desktop composition, and frozen-head acceptance remain separate gates. Read `source status`, `source
+post-restart provider HTTP. An exact-head real-network installed smoke independently proves the
+official no-key doctor, durable one-minute rate refusal, rolling retrieval, raw seal, 1,100-row
+publication, authenticated dashboard read, and same-root local reread. Native Desktop/package and
+frozen-head release acceptance remain separate gates. Read `source status`, `source
 coverage`, and the [delivery ledger](../plans/delivery-ledger.md) rather than inferring product
 availability from a profile release state or code-path presence.
 

@@ -394,10 +394,12 @@ primitives. The application now constructs that source under an active onboardin
 rich output to the shared capture protocol, registers the exact analytical dataset identity, and
 serializes/restores the lifecycle surface. The scripted installed journey proves 1,100-row rich
 capture and sealing, catalog/Parquet publication, typed history and macro-dashboard reads, stable
-evidence across a clean same-root restart, and zero provider HTTP after restart. Real-network
-installed retrieval/publication/restart acceptance and the Desktop macro workflow remain open.
-Therefore Board is intentionally absent from the implemented product-path matrix above. Its
-`available` profile state must not be rendered as generally available from scripted evidence alone.
+evidence across a clean same-root restart, and zero provider HTTP after restart. A separate
+exact-head real-network installed smoke now proves the official no-key doctor, durable rate refusal,
+rolling acquisition, `MSJ1` seal, 1,100-row Parquet publication, authenticated macro-dashboard
+read, and same-root local reread with unchanged immutable evidence. The native Desktop package and
+release gates remain open. Therefore Board remains absent from any matrix that denotes a fully
+released native product rather than a completed installed backend vertical.
 
 ### Lease-gated research adapters
 
@@ -428,9 +430,9 @@ The research metadata for these adapters uses a positive one-nanosecond `delayed
 Durable activation recipes now cover seven profile surfaces: SEC; BLS v1 and v2; Treasury Fiscal
 and daily XML; FRED/ALFRED; and Federal Reserve Board H.15. Recipes are secret-free and bind exact
 request and evidence digests. Restore code can reconstruct SEC, BLS v1, both Treasury surfaces,
-and Board without a credential when their authority remains valid; the scripted Board
-activation/publication/read/restart journey passes, while real-network installed acceptance remains
-open. BLS v2 and FRED return
+and Board without a credential when their authority remains valid; both the scripted Board journey
+and exact-head real-network installed publication/read/restart smoke pass. Native Desktop/package
+and release acceptance remain open. BLS v2 and FRED return
 `provider activation requires explicit foreground credential resume` and remain disabled until
 that explicit resume. Invalid evidence, authority, or adapter state quarantines the recipe.
 
@@ -449,10 +451,10 @@ At the reviewed commit, release and rights gates have concrete consequences:
 - Treasury Fiscal Data and daily-rate XML are available built-in official profiles with all six
   rights operations admitted by their separate dataset-level evidence.
 - Federal Reserve Board revision 4 admits the exact H.15 activation and restore code path; current
-  activation must select the rolling 100-date dataset. Scripted installed rolling capture,
-  publication, typed reads, dashboard composition, and same-root restart pass; real-network
-  installed and release acceptance remain incomplete, while full-history publication is unavailable
-  pending a partitioned resumable path.
+  activation must select the rolling 100-date dataset. Scripted and real-network installed rolling
+  capture, publication, typed dashboard reads, and same-root restart pass; native Desktop/package
+  and release acceptance remain incomplete, while full-history publication is unavailable pending
+  a partitioned resumable path.
 
 ### FRED durable-rights boundary
 
