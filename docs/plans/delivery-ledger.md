@@ -11,21 +11,19 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Active branch: `feature/v1-installed-product-experience`, based on
   `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
   release-branch integration is authorized in this execution scope.
-- The latest product-code checkpoint is
-  `66c989b23daa63b7c06542d207b67c64d02845a3`, tree
-  `50420c6cac021f82076e5ec236725da7740907c5`. It completes the bounded Federal Reserve Board H.15
-  rolling-dashboard product path through installed activation, governed acquisition, exact raw
-  sealing, 1,100-row publication, bounded typed reads, the Desktop contract, and same-root restart.
-  Its parent `faa784c94fd11708a1d2f3cb02af389dacf66a5f` removes a strong-reference cycle between the
-  portfolio candidate resolver and its owning portfolio runtime that otherwise retained the
-  research catalog's single-writer permit across installed shutdown. The earlier unified Markets
-  and release-evidence checkpoints remain part of this branch, but neither this focused product
-  checkpoint nor those earlier commits are a frozen release candidate.
-- The main checkout owns the feature branch. `.worktrees` is empty, no temporary lane branch exists,
-  and the scoped checkpoint series is pushed through the active draft PR. The root worktree was
-  clean at the product-code freeze before this delivery-ledger update. The Python source-closure
-  lock is intentionally not refreshed at this checkpoint because that release authority is updated
-  only after the remaining product source changes are final.
+- The latest pushed product-code checkpoint is
+  `215f27582d596707ae6e04a536b5c6e3aac00fc0`, tree
+  `d134d38071f1ee314f9a7b233b5f07723598e74f`. It preserves the bounded Federal Reserve Board H.15
+  dashboard vertical and Desktop service-generation reconnect barrier, then integrates the reviewed
+  phase-one/product-admission split, exact product-contract and catalog-endpoint boundaries,
+  governed sequential recommendation-study evidence, truthful Research/Desktop product status,
+  and the deliberately unavailable recommendation-facing forecast path described below.
+- The main checkout owns the feature branch. `.worktrees` is empty and no temporary lane branch
+  exists. The research/data authority slice is integrated and pushed. The only preserved
+  implementation overlay is the disjoint Desktop credential-import slice; it remains outside the
+  product-code checkpoint until its own exact verification and commit. The Python source-closure
+  lock is intentionally not refreshed because that release authority is updated only after the
+  remaining product source changes are final.
 - The approved Markets expansion is now a V1 release blocker in issue
   [#45](https://github.com/Sawmonabo/market-squawk/issues/45), the maintained installed-product
   design/plan, and the
@@ -471,9 +469,11 @@ Subsequent source-derived review established the current first-use handoff state
 
 - `source discover` now returns bounded exact provider objects without minting authority; confirmed
   ingestion independently discovers the selected object and consumes its process-local receipt.
-- `feature build` and `dataset build` now populate the durable public feature-dataset registry and
-  return `pythonExportSha256`; `market-squawk-train` consumes that exact export through a closed
-  configuration and emits authority-bound ONNX admission requests.
+- `feature build` and `dataset build` now publish only immutable phase-one analytical generations
+  and a deterministic phase-one descriptor. They do not populate the receipt-backed product
+  registry and do not authorize Python/model training. Product reads and `market-squawk-train`
+  require a separate code-owned Training-contract production receipt; no generic CLI, job, or
+  caller-materialized value path can mint one.
 - The Python release builder builds and signs the application, validator, and ONNX worker and
   installs the supported production training driver. Its code-owned producer emits deterministic
   static-shape linear and logistic graphs, with terminal `Sigmoid` required for
@@ -1516,3 +1516,59 @@ after those authorities freeze can the Desktop controller truthfully start/resum
 Provider-specific investment workflows, recommendation-to-governed-target adoption, explicit paper
 draft confirmation, native package acceptance, grouped Quarter 4 review, and exact-head release
 gates remain open.
+
+## 2026-08-12 feature-product authority remediation checkpoint
+
+Pushed checkpoint `215f27582d596707ae6e04a536b5c6e3aac00fc0`, tree
+`d134d38071f1ee314f9a7b233b5f07723598e74f`, integrates the reviewed research/data candidate. It
+separates caller-materialized phase-one analytical generations from product admission, removes the
+raw-generation bypass from `Analysis.GetFeatureDatasets`, and adds a non-cloneable, session-bound
+publisher for the closed price-return/fixed-horizon-forward-return Analysis and Training contracts.
+The final catalog transaction revalidates exact source roots, use, output rights, generation
+objects, contract, producer proof, descriptor, and receipt, then publishes the descriptor and
+canonical receipt atomically. Exact historical manifest reads remain selectable after a successor
+version, while relocated catalogs cannot re-fence a receipt bound to another catalog endpoint.
+
+Generic `dataset build` and `feature build` operations now report an immutable
+`phase_one_derived_generation`. Their operation result truthfully states that the phase-one
+operation did not itself admit a product. Live generic Research dataset reads make the narrower
+claim that product admission is not established on that surface; receipt-backed product status is
+owned by `Analysis.GetFeatureDatasets`. FRED/BLS provider release evidence retains raw publication,
+query, restart, and Train-rights facts but no longer counterfeits Python training from a generic
+phase-one descriptor. The provider closer therefore remains explicitly blocked until a real
+code-owned Training-contract producer receipt exists.
+
+Focused checkpoint evidence is intentionally thin:
+
+- the existing data recovery test proves phase-one invisibility, atomic publication/replay,
+  Analysis/Training isolation, exact v1 selection after v2, same-root restart, bounded backup
+  verification, and fail-closed rejection of a distinct-root restore whose retained catalog
+  endpoint does not match the live endpoint;
+- the existing control-plane backtest case proves a phase-one generation remains queryable but is
+  absent from the product registry, while the schema-v3 pinned backtest admission remains valid;
+- focused application/modeling/Python compilation, the exact backtest case, and the exact provider
+  release blocker passed; and
+- no CI, broad workspace suite, release build, package matrix, or source-lock refresh ran.
+
+The grouped staged-candidate review initially rejected seven Important findings. Remediation closed
+the live product-state wording, catalog endpoint binding, operator documentation, contract/use
+pairing, raw-versus-prepared provenance, exact-qualification bypass, and realized-target currentness
+findings. Forecast product selection is deliberately unavailable for current vintages: the only
+closed producer emits forward returns, while the prior exact-price path lacked a separately admitted
+Analysis dataset, a governed return-to-price/current-mark calculation, and a sealed prepared-vintage
+provenance chain. Raw and currently prepared forecasts remain research artifacts and cannot become
+recommendation-facing price evidence. The final grouped staged-index review accepted the exact
+64-path candidate at Critical 0, Important 0, Minor 0. Its binary patch SHA-256 was
+`053a26646511fe664880602bf118fe5d085a2e76ac0e182badd1ed7039804d8a`, and the committed diff has
+the same digest. The focused final app check, exact forecast selection test, exact output-contract
+test, exact publication/recovery test, and unchanged earlier lane gates all passed; no broad suite,
+CI, release build, package matrix, or source-lock refresh ran.
+
+After that checkpoint, the active product barrier is still the installed private producer. It must
+reconstruct retained completed-session evidence from the exact immutable manifest/capture graph,
+move the sole production publisher into the code-owned recipe, publish genuine separate Analysis
+and Training products, and retain their pairing/derivation receipts. Governed terminal-price
+forecasting, valuation, recommendation/targets, portfolio/risk, Alpaca Paper/IEX doctor and runtime
+activation, and the novice Find → Analyze → forecast/backtest → signal → paper journey remain open
+until those producer authorities exist. `.worktrees` remains empty. The only preserved dirty
+implementation state is the disjoint Desktop credential-import slice awaiting its own checkpoint.
