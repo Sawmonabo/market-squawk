@@ -19,7 +19,10 @@ import type {
   DesktopBootstrap,
   DesktopEvent,
 } from "@/lib/schemas"
-import type { ProductTransport } from "@/lib/transport"
+import type {
+  DesktopEventSubscriptionRequest,
+  ProductTransport,
+} from "@/lib/transport"
 
 const blockedBootstrap: DesktopBootstrap = {
   contractVersion: "market-squawk-desktop-v1",
@@ -217,7 +220,15 @@ function transport(
     },
     mcpClientControl: async () =>
       Promise.reject(new Error("MCP mutation is not configured for this test.")),
-    subscribe: async () => () => undefined,
+    subscribe: async (request) => ({
+      receipt: {
+        subscriptionId: "f49e02f6-8c47-43a5-bb33-030e8e0d12bb",
+        runtime: request.runtime,
+        sequence: request.afterSequence,
+        resumed: request.afterSequence !== "0",
+      },
+      unsubscribe: async () => undefined,
+    }),
     onboard,
     openOfficialProviderPage: async () => undefined,
     openProtectedProviderSetup: async () => undefined,
@@ -1694,7 +1705,10 @@ describe("Market Squawk desktop boundary", () => {
     const issuedBootstrapGenerations: number[] = []
     const desktopEvents: {
       listener: ((event: DesktopEvent) => void) | null
-    } = { listener: null }
+      protocolError: ((error: Error) => void) | null
+    } = { listener: null, protocolError: null }
+    const eventSubscriptions: DesktopEventSubscriptionRequest[] = []
+    const releasedEventSequences: string[] = []
     const dashboardTransport: ProductTransport = {
       ...transport(readyBootstrap, undefined, async (request) => {
         issuedQueries.push(request)
@@ -1739,10 +1753,24 @@ describe("Market Squawk desktop boundary", () => {
         issuedBootstrapGenerations.push(admittedServiceGeneration)
         return currentBootstrap
       },
-      subscribe: async (listener) => {
+      subscribe: async (request, listener, onProtocolError) => {
+        eventSubscriptions.push(request)
         desktopEvents.listener = listener
-        return () => {
-          if (desktopEvents.listener === listener) desktopEvents.listener = null
+        desktopEvents.protocolError = onProtocolError
+        return {
+          receipt: {
+            subscriptionId: `f49e02f6-8c47-43a5-bb33-${String(eventSubscriptions.length).padStart(12, "0")}`,
+            runtime: request.runtime,
+            sequence: request.afterSequence,
+            resumed: request.afterSequence !== "0",
+          },
+          unsubscribe: async () => {
+            releasedEventSequences.push(request.afterSequence)
+            if (desktopEvents.listener === listener) desktopEvents.listener = null
+            if (desktopEvents.protocolError === onProtocolError) {
+              desktopEvents.protocolError = null
+            }
+          },
         }
       },
     }
@@ -2155,6 +2183,53 @@ describe("Market Squawk desktop boundary", () => {
         accountReadsBeforePortfolioInvalidation,
       )
     })
+
+    const subscriptionsBeforeDisconnect = eventSubscriptions.length
+    const activeEventListener = desktopEvents.listener
+    if (!activeEventListener) {
+      throw new Error("The resumable Desktop event subscription is absent")
+    }
+    await act(async () => {
+      activeEventListener({
+        runtime: currentBootstrap.runtime,
+        sequence: "6",
+        body: {
+          type: "stream_disconnected",
+          reason: "service_event_stream_unavailable",
+        },
+      })
+    })
+    expect(screen.getByText("Retry 1/5")).toBeTruthy()
+    await waitFor(() => {
+      expect(eventSubscriptions.length).toBeGreaterThan(
+        subscriptionsBeforeDisconnect,
+      )
+    })
+    expect(eventSubscriptions.at(-1)).toEqual({
+      runtime: currentBootstrap.runtime,
+      afterSequence: "6",
+    })
+    expect(releasedEventSequences).toContain("0")
+    expect(await screen.findByText("Connected")).toBeTruthy()
+
+    const reportProtocolError = desktopEvents.protocolError
+    if (!reportProtocolError) {
+      throw new Error("The Desktop event protocol failure handler is absent")
+    }
+    currentBootstrap = {
+      ...readyBootstrap,
+      runtime: {
+        ...readyBootstrap.runtime,
+        serviceGeneration: 3,
+      },
+    }
+    await act(async () => {
+      reportProtocolError(new Error("Malformed Desktop event"))
+    })
+    await waitFor(() => {
+      expect(issuedBootstrapGenerations).toContain(3)
+    })
+    expect(await screen.findByText("Connected")).toBeTruthy()
 
     rendered.unmount()
     const mcpRendered = render(

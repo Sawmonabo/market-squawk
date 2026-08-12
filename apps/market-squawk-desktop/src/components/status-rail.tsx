@@ -1,7 +1,10 @@
 import * as React from "react"
 
 import type { ProductScope } from "@/app/query-client"
-import { useProduct } from "@/app/product-context"
+import {
+  type EventConnectionState,
+  useProduct,
+} from "@/app/product-context"
 import { GlobalLookup } from "@/features/lookup/global-lookup"
 import { useOperationalQueries } from "@/features/overview/use-overview"
 import type { ProductTransport } from "@/lib/transport"
@@ -26,10 +29,16 @@ export function StatusRail() {
         ready={product.status === "ready" && product.bootstrap.storage.state === "ready"}
       />
       {product.status === "ready" ? (
-        <ReadyStatusRail
-          transport={product.transport}
-          scope={product.bootstrap.runtime}
-        />
+        <>
+          <EventConnectionFact
+            state={product.eventConnection}
+            onRetry={product.retryEventConnection}
+          />
+          <ReadyStatusRail
+            transport={product.transport}
+            scope={product.bootstrap.runtime}
+          />
+        </>
       ) : null}
       <div className="ml-auto flex items-center gap-2">
         {product.status === "ready" ? (
@@ -41,6 +50,47 @@ export function StatusRail() {
         <CurrentClock />
       </div>
     </section>
+  )
+}
+
+function EventConnectionFact({
+  state,
+  onRetry,
+}: {
+  state: EventConnectionState
+  onRetry: () => void
+}) {
+  if (state.status === "unavailable") {
+    return (
+      <button
+        type="button"
+        className="font-medium text-[var(--danger)] hover:underline"
+        onClick={onRetry}
+      >
+        Updates unavailable · retry
+      </button>
+    )
+  }
+  const value = (() => {
+    switch (state.status) {
+      case "inactive":
+        return "Inactive"
+      case "connecting":
+        return "Connecting"
+      case "connected":
+        return "Connected"
+      case "reconnecting":
+        return `Retry ${state.attempt}/${state.maximumAttempts}`
+      case "resynchronizing":
+        return "Resynchronizing"
+    }
+  })()
+  return (
+    <StatusFact
+      label="Updates"
+      value={value}
+      ready={state.status === "connected"}
+    />
   )
 }
 

@@ -34,6 +34,7 @@
     "allow-source-control",
     "allow-stage-training-input",
     "allow-start-backtest-from-file",
-    "allow-subscribe-service-events"
+    "allow-subscribe-service-events",
+    "allow-unsubscribe-service-events"
   ]
 }

@@ -29,6 +29,7 @@ fn main() {
         "stage_training_input",
         "start_backtest_from_file",
         "subscribe_service_events",
+        "unsubscribe_service_events",
     ]);
     if let Err(error) =
         tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))

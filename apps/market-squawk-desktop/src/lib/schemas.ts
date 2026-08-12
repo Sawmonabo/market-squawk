@@ -532,7 +532,18 @@ export const desktopEventSchema = z.object({
       type: z.literal("resync_required"),
       reason: z.string(),
     }),
+    z.object({
+      type: z.literal("stream_disconnected"),
+      reason: z.string(),
+    }),
   ]),
+})
+
+export const desktopEventSubscriptionReceiptSchema = z.object({
+  subscriptionId: z.string().uuid(),
+  runtime: desktopBootstrapSchema.shape.runtime,
+  sequence: desktopEventSequenceSchema,
+  resumed: z.boolean(),
 })
 
 export const desktopServiceBootstrapSchema = z.object({
@@ -555,6 +566,9 @@ export type DesktopServiceBootstrap = z.infer<
 >
 export type DesktopStartup = z.infer<typeof desktopStartupSchema>
 export type DesktopEvent = z.infer<typeof desktopEventSchema>
+export type DesktopEventSubscriptionReceipt = z.infer<
+  typeof desktopEventSubscriptionReceiptSchema
+>
 export type EncryptedFileFallback = z.infer<
   typeof encryptedFileFallbackSchema
 >

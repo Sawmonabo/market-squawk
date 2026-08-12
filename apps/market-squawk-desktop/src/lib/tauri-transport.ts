@@ -4,6 +4,7 @@ import { analyticalControllerResponseSchema } from "@/features/advanced/analytic
 import {
   applicationResultSchema,
   desktopEventSchema,
+  desktopEventSubscriptionReceiptSchema,
   desktopStartupSchema,
   encryptedFileFallbackSchema,
   installationControlResultSchema,
@@ -188,15 +189,45 @@ class TauriTransport implements ProductTransport {
     return mcpClientsStatusSchema.parse(value)
   }
 
-  async subscribe(onEvent: Parameters<ProductTransport["subscribe"]>[0]) {
+  async subscribe(
+    request: Parameters<ProductTransport["subscribe"]>[0],
+    onEvent: Parameters<ProductTransport["subscribe"]>[1],
+    onProtocolError: Parameters<ProductTransport["subscribe"]>[2],
+  ) {
     let active = true
     const channel = new Channel<unknown>((value) => {
-      if (active) onEvent(desktopEventSchema.parse(value))
+      if (!active) return
+      const parsed = desktopEventSchema.safeParse(value)
+      if (parsed.success) {
+        onEvent(parsed.data)
+      } else {
+        active = false
+        onProtocolError(
+          new Error("The local service event stream violated its closed contract."),
+        )
+      }
     })
-    await invoke("subscribe_service_events", { onEvent: channel })
-    return () => {
+    const receiptResult = desktopEventSubscriptionReceiptSchema.safeParse(
+      await invoke("subscribe_service_events", { request, onEvent: channel }),
+    )
+    if (!receiptResult.success) {
       active = false
+      const error = new Error(
+        "The local service event subscription receipt violated its closed contract.",
+      )
+      onProtocolError(error)
+      throw error
     }
+    const receipt = receiptResult.data
+    let release: Promise<void> | null = null
+    const unsubscribe = () => {
+      active = false
+      release ??= invoke("unsubscribe_service_events", {
+        subscriptionId: receipt.subscriptionId,
+      })
+      return release
+    }
+    return { receipt, unsubscribe }
   }
 
   async onboard<Request extends ProviderOnboardingRequest>(

@@ -1,95 +1,259 @@
 //! Window-scoped, generation-aware service event forwarding.
 
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use market_squawk_runtime::{ApplicationClient, EventCursor, EventPageLimit};
+use market_squawk_runtime::{
+    ApplicationClient, ApplicationClientError, EventCursor, EventPageLimit,
+    LoopbackApplicationClient, RuntimeIdentity,
+};
 use serde_json::Value;
-use tauri::{State, ipc::Channel};
+use tauri::{State, Window, async_runtime::JoinHandle, ipc::Channel};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::{
     bridge::DesktopState,
-    contracts::{DesktopCommandError, DesktopEvent},
+    contracts::{
+        DesktopCommandError, DesktopEvent, DesktopEventSubscriptionReceipt,
+        DesktopEventSubscriptionRequest,
+    },
 };
 
 const EVENT_PAGE_LIMIT: usize = 128;
 const EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+#[derive(Debug, Default)]
+pub(crate) struct DesktopEventSubscriptions {
+    inner: tokio::sync::Mutex<SubscriptionRegistry>,
+}
+
+#[derive(Debug, Default)]
+struct SubscriptionRegistry {
+    active: Option<ActiveSubscription>,
+    retained: Option<RetainedCursor>,
+}
+
+#[derive(Debug)]
+struct ActiveSubscription {
+    id: Uuid,
+    runtime: RuntimeIdentity,
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
+    cursor: Arc<Mutex<Option<EventCursor>>>,
+}
+
+#[derive(Clone, Debug)]
+struct RetainedCursor {
+    runtime: RuntimeIdentity,
+    cursor: EventCursor,
+}
+
 #[tauri::command]
-pub(crate) fn subscribe_service_events(
+pub(crate) async fn subscribe_service_events(
+    request: DesktopEventSubscriptionRequest,
     on_event: Channel<DesktopEvent>,
+    window: Window,
     state: State<'_, DesktopState>,
-) -> Result<(), DesktopCommandError> {
-    let application = state.application();
+    subscriptions: State<'_, DesktopEventSubscriptions>,
+) -> Result<DesktopEventSubscriptionReceipt, DesktopCommandError> {
+    if window.label() != "main" || request.runtime() != state.runtime() {
+        return Err(DesktopCommandError::new(
+            "event_subscription_rejected",
+            "The event subscription does not belong to this window and service generation.",
+        ));
+    }
+    let limit = EventPageLimit::try_new(EVENT_PAGE_LIMIT)
+        .map_err(|_error| DesktopCommandError::internal())?;
+    let subscription_id = Uuid::new_v4();
     let runtime = state.runtime();
+    let requested_sequence = request.after_sequence();
+    let mut registry = subscriptions.inner.lock().await;
+    stop_active_subscription(&mut registry, None).await;
+
+    let resumed_cursor = registry
+        .retained
+        .as_ref()
+        .filter(|retained| {
+            retained.runtime == runtime && retained.cursor.sequence() == requested_sequence
+        })
+        .map(|retained| retained.cursor.clone());
+    let resumed = requested_sequence > 0 && resumed_cursor.is_some();
+    if requested_sequence > 0 && !resumed {
+        registry.retained = None;
+        let _ = on_event.send(DesktopEvent::resync_required(
+            runtime,
+            requested_sequence,
+            "service_event_cursor_unavailable",
+        ));
+        return Ok(DesktopEventSubscriptionReceipt::new(
+            subscription_id,
+            runtime,
+            requested_sequence,
+            false,
+        ));
+    }
+
+    if requested_sequence == 0 {
+        registry.retained = None;
+    }
+    let cursor = Arc::new(Mutex::new(resumed_cursor));
     let cancellation = state.cancellation();
-    let operations = state.service_operation_index();
-    tauri::async_runtime::spawn(async move {
-        let limit = match EventPageLimit::try_new(EVENT_PAGE_LIMIT) {
-            Ok(limit) => limit,
-            Err(_error) => return,
-        };
-        let mut cursor: Option<EventCursor> = None;
-        loop {
-            let previous_sequence = cursor.as_ref().map_or(0, EventCursor::sequence);
-            let page = application
-                .read_events(cursor, limit, cancellation.child_token())
-                .await;
-            let (values, next) = match page {
-                Ok(page) => page,
-                Err(_error) => {
-                    let _ = on_event.send(DesktopEvent::resync_required(
-                        runtime,
-                        previous_sequence,
-                        "service_event_stream_changed",
-                    ));
-                    return;
-                }
-            };
-            for (offset, value) in values.iter().enumerate() {
-                let Ok(offset) = u64::try_from(offset) else {
-                    return;
-                };
-                let Some(sequence) = previous_sequence
-                    .checked_add(offset)
-                    .and_then(|value| value.checked_add(1))
-                else {
-                    let _ = on_event.send(DesktopEvent::resync_required(
-                        runtime,
-                        previous_sequence,
-                        "service_event_sequence_exhausted",
-                    ));
-                    return;
-                };
-                let Some(event) = authority_changed(runtime, sequence, value, &operations) else {
-                    let _ = on_event.send(DesktopEvent::resync_required(
-                        runtime,
-                        previous_sequence,
-                        "invalid_service_event",
-                    ));
-                    return;
-                };
-                if on_event.send(event).is_err() {
-                    return;
-                }
-            }
-            let empty = values.is_empty();
-            cursor = Some(next);
-            if empty {
-                tokio::select! {
-                    () = cancellation.cancelled() => return,
-                    () = tokio::time::sleep(EMPTY_POLL_INTERVAL) => {}
-                }
-            }
-        }
+    let task = tauri::async_runtime::spawn(forward_service_events(
+        state.application(),
+        runtime,
+        state.service_operation_index(),
+        limit,
+        Arc::clone(&cursor),
+        cancellation.clone(),
+        on_event,
+    ));
+    registry.active = Some(ActiveSubscription {
+        id: subscription_id,
+        runtime,
+        cancellation,
+        task,
+        cursor,
     });
+    Ok(DesktopEventSubscriptionReceipt::new(
+        subscription_id,
+        runtime,
+        requested_sequence,
+        resumed,
+    ))
+}
+
+#[tauri::command]
+pub(crate) async fn unsubscribe_service_events(
+    subscription_id: Uuid,
+    subscriptions: State<'_, DesktopEventSubscriptions>,
+) -> Result<(), DesktopCommandError> {
+    let mut registry = subscriptions.inner.lock().await;
+    stop_active_subscription(&mut registry, Some(subscription_id)).await;
     Ok(())
 }
 
+async fn stop_active_subscription(registry: &mut SubscriptionRegistry, expected_id: Option<Uuid>) {
+    let Some(active) = registry.active.as_ref() else {
+        return;
+    };
+    if expected_id.is_some_and(|expected| expected != active.id) {
+        return;
+    }
+    let Some(active) = registry.active.take() else {
+        return;
+    };
+    active.cancellation.cancel();
+    let _ = active.task.await;
+    registry.retained = active
+        .cursor
+        .lock()
+        .ok()
+        .and_then(|cursor| cursor.clone())
+        .map(|cursor| RetainedCursor {
+            runtime: active.runtime,
+            cursor,
+        });
+}
+
+async fn forward_service_events(
+    application: Arc<LoopbackApplicationClient>,
+    runtime: RuntimeIdentity,
+    operations: BTreeMap<String, String>,
+    limit: EventPageLimit,
+    retained_cursor: Arc<Mutex<Option<EventCursor>>>,
+    cancellation: CancellationToken,
+    on_event: Channel<DesktopEvent>,
+) {
+    let mut cursor = match retained_cursor.lock() {
+        Ok(cursor) => cursor.clone(),
+        Err(_error) => return,
+    };
+    loop {
+        let previous_sequence = cursor.as_ref().map_or(0, EventCursor::sequence);
+        let page = application
+            .read_events(cursor.clone(), limit, cancellation.child_token())
+            .await;
+        let (values, next) = match page {
+            Ok(page) => page,
+            Err(ApplicationClientError::Interrupted) if cancellation.is_cancelled() => return,
+            Err(ApplicationClientError::Unavailable | ApplicationClientError::Interrupted) => {
+                let _ = on_event.send(DesktopEvent::stream_disconnected(
+                    runtime,
+                    previous_sequence,
+                    "service_event_stream_unavailable",
+                ));
+                return;
+            }
+            Err(ApplicationClientError::Rejected | ApplicationClientError::InvalidResponse) => {
+                let _ = on_event.send(DesktopEvent::resync_required(
+                    runtime,
+                    previous_sequence,
+                    "service_event_stream_changed",
+                ));
+                return;
+            }
+        };
+        for (offset, value) in values.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let Ok(offset) = u64::try_from(offset) else {
+                return;
+            };
+            let Some(sequence) = previous_sequence
+                .checked_add(offset)
+                .and_then(|value| value.checked_add(1))
+            else {
+                let _ = on_event.send(DesktopEvent::resync_required(
+                    runtime,
+                    previous_sequence,
+                    "service_event_sequence_exhausted",
+                ));
+                return;
+            };
+            let Some(event) = authority_changed(runtime, sequence, value, &operations) else {
+                let _ = on_event.send(DesktopEvent::resync_required(
+                    runtime,
+                    previous_sequence,
+                    "invalid_service_event",
+                ));
+                return;
+            };
+            if on_event.send(event).is_err() {
+                return;
+            }
+        }
+        let empty = values.is_empty();
+        cursor = Some(next);
+        let retained = retained_cursor.lock();
+        let Ok(mut retained) = retained else {
+            let _ = on_event.send(DesktopEvent::resync_required(
+                runtime,
+                previous_sequence,
+                "service_event_cursor_unavailable",
+            ));
+            return;
+        };
+        *retained = cursor.clone();
+        drop(retained);
+        if empty {
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                () = tokio::time::sleep(EMPTY_POLL_INTERVAL) => {}
+            }
+        }
+    }
+}
+
 fn authority_changed(
-    runtime: market_squawk_runtime::RuntimeIdentity,
+    runtime: RuntimeIdentity,
     sequence: u64,
     value: &Value,
-    operations: &std::collections::BTreeMap<String, String>,
+    operations: &BTreeMap<String, String>,
 ) -> Option<DesktopEvent> {
     let object = value.as_object()?;
     if object.len() != 3 || object.get("type")?.as_str()? != "application.changed" {

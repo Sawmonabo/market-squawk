@@ -1002,6 +1002,18 @@ impl DesktopEvent {
             body: DesktopEventBody::ResyncRequired { reason },
         }
     }
+
+    pub(crate) const fn stream_disconnected(
+        runtime: RuntimeIdentity,
+        sequence: u64,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            runtime,
+            sequence,
+            body: DesktopEventBody::StreamDisconnected { reason },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1019,6 +1031,69 @@ enum DesktopEventBody {
     ResyncRequired {
         reason: &'static str,
     },
+    StreamDisconnected {
+        reason: &'static str,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct DesktopEventSubscriptionRequest {
+    runtime: RuntimeIdentity,
+    #[serde(deserialize_with = "deserialize_u64_from_decimal")]
+    after_sequence: u64,
+}
+
+impl DesktopEventSubscriptionRequest {
+    pub(crate) const fn runtime(self) -> RuntimeIdentity {
+        self.runtime
+    }
+
+    pub(crate) const fn after_sequence(self) -> u64 {
+        self.after_sequence
+    }
+}
+
+fn deserialize_u64_from_decimal<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(serde::de::Error::custom(
+            "expected a canonical unsigned 64-bit decimal",
+        ));
+    }
+    value.parse().map_err(serde::de::Error::custom)
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DesktopEventSubscriptionReceipt {
+    subscription_id: Uuid,
+    runtime: RuntimeIdentity,
+    #[serde(serialize_with = "serialize_u64_as_decimal")]
+    sequence: u64,
+    resumed: bool,
+}
+
+impl DesktopEventSubscriptionReceipt {
+    pub(crate) const fn new(
+        subscription_id: Uuid,
+        runtime: RuntimeIdentity,
+        sequence: u64,
+        resumed: bool,
+    ) -> Self {
+        Self {
+            subscription_id,
+            runtime,
+            sequence,
+            resumed,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

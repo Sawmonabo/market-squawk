@@ -18,13 +18,18 @@ export function requiresResync(
   previousSequence: string,
   event: DesktopEvent,
 ): boolean {
-  return (
-    !sameRuntime(scope, event.runtime) ||
-    event.body.type === "resync_required" ||
-    BigInt(event.sequence) !== BigInt(previousSequence) + 1n
-  )
+  if (!sameRuntime(scope, event.runtime) || event.body.type === "resync_required") {
+    return true
+  }
+  return event.body.type === "stream_disconnected"
+    ? event.sequence !== previousSequence
+    : BigInt(event.sequence) !== BigInt(previousSequence) + 1n
 }
 
 export function affectedDomain(event: DesktopEvent): string | null {
   return event.body.type === "authority_changed" ? event.body.domain : null
+}
+
+export function isRetryableDisconnect(event: DesktopEvent): boolean {
+  return event.body.type === "stream_disconnected"
 }

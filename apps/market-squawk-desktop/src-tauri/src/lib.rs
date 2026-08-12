@@ -38,7 +38,7 @@ use bridge::{
     open_protected_provider_setup, provider_onboarding,
 };
 use contracts::DesktopCommandError;
-use events::subscribe_service_events;
+use events::{DesktopEventSubscriptions, subscribe_service_events, unsubscribe_service_events};
 use input_staging::{
     commit_portfolio_import, commit_research_file_import, discard_portfolio_import,
     discard_research_file_import, preview_portfolio_import, preview_research_file_import,
@@ -263,6 +263,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         selected_installation_data_root(args.installation_data_root.clone())?;
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(DesktopEventSubscriptions::default())
         .invoke_handler(tauri::generate_handler![
             analytical_controller,
             analysis_control,
@@ -293,7 +294,8 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             stage_training_input,
             start_backtest_from_file,
             commit_portfolio_import,
-            subscribe_service_events
+            subscribe_service_events,
+            unsubscribe_service_events
         ])
         .build(tauri::generate_context!())?;
     let installation = installation::prepare(app.handle(), installation_data_root.join("program"))?;

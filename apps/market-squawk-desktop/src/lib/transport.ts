@@ -4,7 +4,9 @@ import type {
 } from "@/features/advanced/analytical-profile-contracts"
 import type {
   ApplicationResult,
+  DesktopBootstrap,
   DesktopEvent,
+  DesktopEventSubscriptionReceipt,
   DesktopStartup,
   EncryptedFileFallback,
   InstallationControlResult,
@@ -14,6 +16,16 @@ import type {
   ProviderBootstrap,
   ProviderSession,
 } from "@/lib/schemas"
+
+export type DesktopEventSubscriptionRequest = {
+  runtime: DesktopBootstrap["runtime"]
+  afterSequence: DesktopEvent["sequence"]
+}
+
+export type DesktopEventSubscription = {
+  receipt: DesktopEventSubscriptionReceipt
+  unsubscribe: () => Promise<void>
+}
 
 export type SetupGoal =
   | "everything_recommended"
@@ -351,7 +363,11 @@ export interface ProductTransport {
     request: McpClientControlRequest,
     confirmed?: boolean,
   ): Promise<McpClientsStatus>
-  subscribe(onEvent: (event: DesktopEvent) => void): Promise<() => void>
+  subscribe(
+    request: DesktopEventSubscriptionRequest,
+    onEvent: (event: DesktopEvent) => void,
+    onProtocolError: (error: Error) => void,
+  ): Promise<DesktopEventSubscription>
   onboard<Request extends ProviderOnboardingRequest>(
     request: Request,
   ): Promise<ProviderOnboardingResult<Request>>
