@@ -1,6 +1,6 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-08-11
+Last updated: 2026-08-12
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
@@ -12,23 +12,20 @@ evidence; it does not replace the README capability truth or the canonical relea
   `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
   release-branch integration is authorized in this execution scope.
 - The latest product-code checkpoint is
-  `854e8c15ffdbed29c5f0d976b1216ab9396c52e1`. It completes the bounded account-group runtime for
-  the then-configured market providers and authenticated order-level depth; FIGI-backed non-execution
-  market identity and catalog persistence; source-preserving display and order-level actors;
-  exact-session lifecycle recovery; deterministic source selection; and the unified Desktop
-  feed, instrument workspace, individual-order view, and expandable Data confidence evidence.
-  Runtime composition is present, but real credentials, authorized network responses, reconnect,
-  rate-limit, restart, and fallback behavior remain acceptance evidence rather than inferred
-  coverage. Release-evidence correction
-  `9b007b71ec634aa3aca43bb97f64d16bbb9e05d2` separately replaces ordinary build-time Git-HEAD
-  binding with a deterministic measured-source closure while retaining exact candidate commit,
-  tree, and verification-script identity in the external authoritative evidence envelope. Neither
-  commit is a frozen release candidate.
-- The main checkout owns the feature branch. `.worktrees` is empty and no temporary lane branch
-  exists. Local and origin feature heads both point to `9b007b71`; the root worktree was clean and
-  unchanged immediately after the two scoped pushes. The Python source-closure lock is intentionally
-  not refreshed at this checkpoint because the binding goal requires that refresh only after the
-  remaining product source changes are final.
+  `66c989b23daa63b7c06542d207b67c64d02845a3`, tree
+  `50420c6cac021f82076e5ec236725da7740907c5`. It completes the bounded Federal Reserve Board H.15
+  rolling-dashboard product path through installed activation, governed acquisition, exact raw
+  sealing, 1,100-row publication, bounded typed reads, the Desktop contract, and same-root restart.
+  Its parent `faa784c94fd11708a1d2f3cb02af389dacf66a5f` removes a strong-reference cycle between the
+  portfolio candidate resolver and its owning portfolio runtime that otherwise retained the
+  research catalog's single-writer permit across installed shutdown. The earlier unified Markets
+  and release-evidence checkpoints remain part of this branch, but neither this focused product
+  checkpoint nor those earlier commits are a frozen release candidate.
+- The main checkout owns the feature branch. `.worktrees` is empty, no temporary lane branch exists,
+  and the scoped checkpoint series is pushed through the active draft PR. The root worktree was
+  clean at the product-code freeze before this delivery-ledger update. The Python source-closure
+  lock is intentionally not refreshed at this checkpoint because that release authority is updated
+  only after the remaining product source changes are final.
 - The approved Markets expansion is now a V1 release blocker in issue
   [#45](https://github.com/Sawmonabo/market-squawk/issues/45), the maintained installed-product
   design/plan, and the
@@ -1364,13 +1361,21 @@ Quarter 4 acceptance, merge, and branch/worktree/cache closeout.
 
 ## 2026-08-12 Federal Reserve Board H.15 dashboard checkpoint
 
-Pushed checkpoint `252abdba3d00a6afecae8605ed5a80643f41a76c` advances the installed-product
-candidate from provider contracts to one evidence-bound macro dashboard vertical. It includes the
-exact no-key Federal Reserve Board H.15 provider profile, bounded doctor and production routes,
-durable activation and restore, shared one-request-per-minute/single-flight admission, exact raw
-capture, current-schema Arrow/Parquet publication, a complete-or-error latest-known point-in-time
-reader for the eleven Treasury constant-maturity series, the closed `Macro.GetDashboard`
-application operation, the Tauri bridge, and the Desktop H.15 panel.
+Product checkpoint `66c989b23daa63b7c06542d207b67c64d02845a3`, with lifecycle correction parent
+`faa784c94fd11708a1d2f3cb02af389dacf66a5f`, advances the installed-product candidate from an
+evidence-bound dashboard contract to a bounded installed producer-to-consumer vertical. The active
+product dataset is the exact `Output.aspx` rolling response with lowercase `lastobs=100`: 100 dates
+by the eleven admitted Treasury constant-maturity series, or exactly 1,100 observations. The doctor
+remains a separate ten-date readiness contract. The exact full-history `Download.aspx` identity is
+preserved but fails closed with `PartitionedExtractionRequired` because its 179,311-observation
+2024 response cannot fit the indivisible 100,000-record/64 MiB publication boundary; future full
+history requires partitioned, checkpointed, resumable ingestion rather than raised bounds.
+
+The rolling contract digest is
+`339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f`. Its provider dataset is
+`federal-reserve-board:h15:h15-treasury-constant-maturities:339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f`;
+its analytical dataset is
+`federal-reserve-board.h15.h15-treasury-constant-maturities.339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f`.
 
 The Desktop does not select a provider dataset, series set, cutoff, maturity order, revision, or
 financial arithmetic. The application derives those from the frozen Board contract and returns
@@ -1378,24 +1383,30 @@ exact decimal strings or explicit provider missing states. The wire keeps the bo
 result digest separate from the final typed-selection digest and keeps durable publication
 readiness separate from current provider-runtime readiness.
 
-Focused checkpoint evidence, run without CI or a broad suite, includes:
+The existing installed control-plane journey now proves, without a new test target:
 
-- Board adapter compilation and its existing authority/transport/capture proof;
-- sources compilation plus the exact empty-query-policy and paired provider-rate-clock proofs;
-- data compilation plus the existing publication/recovery proof covering all eleven series,
-  revision/knowledge selection, complete output, and restart-stable evidence;
-- application compilation, the existing operation-contract registry proof, and the existing
-  no-key provider activation/serialization/restore proof;
-- Desktop type checking and the existing grouped Research journey, including strict H.15 parsing,
-  observed and missing presentation, independent source readiness, and generation-resync removal
-  of stale evidence; and
-- repository Rust formatting and diff/whitespace checks.
+- revision-4 no-key onboarding and the exact eleven-series/ten-date doctor;
+- one durable shared-rate refusal followed by admission after the governed 60-second advance;
+- one rolling production discovery, rich capture, `MSJ1` seal, catalog publication, immutable
+  Parquet manifest, and a 1,100-row bounded history artifact;
+- the closed `Macro.GetDashboard` output in canonical maturity order, including an exact latest
+  20-year `ND` state while preserving an older observed value;
+- clean installed shutdown and same-root reopen with stable manifest, object, artifact, and
+  dashboard evidence; and
+- zero provider HTTP calls after restart.
 
-This checkpoint is not a live-provider, installed-service, native-WebView, or release acceptance
-claim. Debug-only scripted Board execution and a paired manual rate clock now preserve the exact
-official URLs and real durable policy for the next proof, but they are not yet threaded through the
-installed composition. The next barrier is to extend the existing installed control-plane test—no
-new target—through no-key doctor, governed minute advancement, full-history acquisition, MSJ1
-sealing, immutable publication, `Macro.GetDashboard`, same-root restart, and a zero-network
-post-restart read. A separately authorized real Board smoke remains required before calling the
-dashboard live-provider verified.
+The exact focused command passed 1/1 with 31 filtered cases. The existing server-resolved portfolio
+candidate proof also passed after the lifecycle cut. Desktop TypeScript compilation and the existing
+grouped Research journey passed with the exact rolling provider/analytical identities. Rust
+formatting and diff/whitespace checks are clean. No CI or broad workspace suite ran at this
+checkpoint; generated Cargo output is approximately 14.2 GiB, below the 20 GiB ceiling.
+
+One separately authorized direct probe of the exact rolling URL returned HTTP 200 `text/csv`, 8,627
+bytes, SHA-256 `5c7bd008c221e1b33b6a865cf7d1bbb4620661f57908a4e7dd00822bf8104579`, and exactly 100 dates/1,100
+cells. That validates the current official response shape but is not an installed-service smoke.
+The next serialized barrier is a real-network installed run under the durable one-request-per-minute
+authority through acquisition, raw sealing, publication, dashboard read, clean restart, and
+zero-network recovery. Native WebView/package acceptance remains later release evidence. The
+broader product still lacks its guided Find/Analyze producer, current Investment Brief and track
+record Desktop wiring, governed recommendation-to-user-target handoff, several selected-provider
+publication/PIT/Desktop verticals, and the final unchanged-head Quarter 4/release gates.
