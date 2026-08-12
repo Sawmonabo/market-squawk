@@ -67,7 +67,7 @@ export function ManualPaperDraftPanel({
   const [pending, setPending] = React.useState<ManualPaperSubmit | null>(null)
   const [accepted, setAccepted] = React.useState<string | null>(null)
   const targets = useQuery({
-    queryKey: productKeys.operation(scope, "Execution", "Execution.GetManualPaperTargets", {}),
+    queryKey: productKeys.operation(scope, "execution", "Execution.GetManualPaperTargets", {}),
     enabled: enabled && manualPaper !== null,
     staleTime: 15_000,
     queryFn: async () => {

@@ -323,6 +323,27 @@ const resultLimitsInputSchema = {
   additionalProperties: false,
 }
 
+function localRead(
+  name: string,
+  domain: string,
+  description: string,
+): DesktopBootstrap["operations"][number] {
+  return {
+    name,
+    description,
+    domain,
+    authorization: "read_only",
+    readOnly: true,
+    destructive: false,
+    inputSchema: {
+      type: "object",
+      properties: { resultLimits: resultLimitsInputSchema },
+      required: ["resultLimits"],
+      additionalProperties: false,
+    },
+  }
+}
+
 function macroDashboardRead(): DesktopBootstrap["operations"][number] {
   return {
     name: "Macro.GetDashboard",
@@ -537,6 +558,19 @@ const h15DashboardData = {
   })),
 }
 
+const h15ProviderProfile: DesktopBootstrap["providerProfiles"][number] = {
+  id: "federal-reserve-board.data-download-program",
+  display_name: "Federal Reserve Board Data Download Program",
+  official_handoff_url: "https://www.federalreserve.gov/datadownload/",
+  handoff_instruction: "No account or credential is required.",
+  zero_fee: "No fee",
+  account_requirement: "No account",
+  credential_requirement: "No credential",
+  release_state: "selected",
+  coverage: "Federal Reserve Board H.15 selected interest rates",
+  quality_ceiling: "official_delayed",
+}
+
 const h15DashboardResult: ApplicationResult = {
   data: h15DashboardData,
   metadata: {
@@ -614,6 +648,28 @@ const inactiveH15SourceStatus: ApplicationResult = {
       status: "complete",
       providers: ["federal-reserve-board.data-download-program"],
     },
+    dataQuality: { status: "not_applicable" },
+  },
+}
+
+const stoppedPaperStatus: ApplicationResult = {
+  data: { state: "stopped", lastShutdownComplete: true },
+  metadata: {
+    completeness: "complete",
+    returnedItems: 1,
+    availableItems: 1,
+    sourceCoverage: { status: "not_applicable" },
+    dataQuality: { status: "not_applicable" },
+  },
+}
+
+const emptyRowsResult: ApplicationResult = {
+  data: null,
+  metadata: {
+    completeness: "complete",
+    returnedItems: 0,
+    availableItems: 0,
+    sourceCoverage: { status: "not_applicable" },
     dataQuality: { status: "not_applicable" },
   },
 }
@@ -1589,6 +1645,7 @@ describe("Market Squawk desktop boundary", () => {
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
     const readyBootstrap: DesktopBootstrap = {
       ...blockedBootstrap,
+      providerProfiles: [h15ProviderProfile],
       operations: [
         datasetRead(
           "Research.ListDatasets",
@@ -1615,6 +1672,21 @@ describe("Market Squawk desktop boundary", () => {
         investmentAnalysisListRead(),
         investmentAnalysisRead(),
         recommendationTrackRecordRead(),
+        localRead(
+          "Bot.GetStatus",
+          "bot",
+          "Return controlled paper-operation lifecycle and risk status.",
+        ),
+        localRead(
+          "Execution.GetOrders",
+          "execution",
+          "Return bounded paper orders and state transitions.",
+        ),
+        localRead(
+          "Execution.GetFills",
+          "execution",
+          "Return bounded paper fills.",
+        ),
       ],
     }
     let currentBootstrap = readyBootstrap
@@ -1632,6 +1704,16 @@ describe("Market Squawk desktop boundary", () => {
             : h15DashboardResult
         }
         if (request.query === "sourceStatus") return inactiveH15SourceStatus
+        if (request.query === "paperStatus") return stoppedPaperStatus
+        if (
+          request.query === "paperOrders" ||
+          request.query === "paperFills" ||
+          request.query === "portfolioAccounts" ||
+          request.query === "sourceCoverage" ||
+          request.query === "sourceHealth"
+        ) {
+          return emptyRowsResult
+        }
         if (request.query === "decisionInvestmentAnalyses") {
           return retainedInvestmentAnalysisPage
         }
@@ -1663,6 +1745,29 @@ describe("Market Squawk desktop boundary", () => {
           if (desktopEvents.listener === listener) desktopEvents.listener = null
         }
       },
+    }
+    const readCount = (
+      query: Parameters<ProductTransport["query"]>[0]["query"],
+    ) => issuedQueries.filter((request) => request.query === query).length
+    const notifyAuthorityChanged = async (
+      sequence: string,
+      domain: string,
+      operation: string,
+    ) => {
+      const listener = desktopEvents.listener
+      if (!listener) throw new Error("The Desktop event subscription was not installed")
+      await act(async () => {
+        listener({
+          runtime: currentBootstrap.runtime,
+          sequence,
+          body: {
+            type: "authority_changed",
+            domain,
+            operation,
+            requestId: `wave-12c-${domain}-refresh`,
+          },
+        })
+      })
     }
     const rendered = render(
       <MemoryRouter initialEntries={["/advanced/research-data"]}>
@@ -1797,12 +1902,8 @@ describe("Market Squawk desktop boundary", () => {
     ])
     expect(screen.queryByText("Operation arguments")).toBeNull()
 
-    const initialMacroReads = issuedQueries.filter(
-      (request) => request.query === "macroDashboard",
-    ).length
-    const initialSourceReads = issuedQueries.filter(
-      (request) => request.query === "sourceStatus",
-    ).length
+    const initialMacroReads = readCount("macroDashboard")
+    const initialSourceReads = readCount("sourceStatus")
     const notifyDesktopEvent = desktopEvents.listener
     if (!notifyDesktopEvent) {
       throw new Error("The Desktop event subscription was not installed")
@@ -1841,14 +1942,19 @@ describe("Market Squawk desktop boundary", () => {
     expect(
       within(refreshedH15Section).getByText("9".repeat(64)),
     ).toBeTruthy()
-    expect(
-      issuedQueries.filter((request) => request.query === "macroDashboard")
-        .length,
-    ).toBeGreaterThan(initialMacroReads)
-    expect(
-      issuedQueries.filter((request) => request.query === "sourceStatus").length,
-    ).toBeGreaterThan(initialSourceReads)
+    expect(readCount("macroDashboard")).toBeGreaterThan(initialMacroReads)
+    expect(readCount("sourceStatus")).toBeGreaterThan(initialSourceReads)
     expect(issuedBootstrapGenerations).toContain(2)
+
+    const macroReadsBeforeResearchInvalidation = readCount("macroDashboard")
+    const sourceReadsBeforeResearchInvalidation = readCount("sourceStatus")
+    await notifyAuthorityChanged("1", "research", "Research.IngestSource")
+    await waitFor(() => {
+      expect(readCount("macroDashboard")).toBeGreaterThan(
+        macroReadsBeforeResearchInvalidation,
+      )
+    })
+    expect(readCount("sourceStatus")).toBe(sourceReadsBeforeResearchInvalidation)
 
     const refreshedNavigation = document.querySelector(
       'nav[aria-label="Market Squawk"]',
@@ -1857,6 +1963,53 @@ describe("Market Squawk desktop boundary", () => {
     if (!(refreshedNavigation instanceof HTMLElement)) {
       throw new Error("The refreshed Market Squawk navigation is absent")
     }
+    await user.click(
+      within(refreshedNavigation).getByRole("link", {
+        name: "Connections & Sources",
+      }),
+    )
+    expect(await screen.findByRole("heading", { name: "Sources" })).toBeTruthy()
+    const boardSourceHeading = await screen.findByRole("heading", {
+      name: "Federal Reserve Board Data Download Program",
+    })
+    const boardSource = boardSourceHeading.closest("article")
+    expect(boardSource).toBeInstanceOf(HTMLElement)
+    if (!(boardSource instanceof HTMLElement)) {
+      throw new Error("The Federal Reserve Board source evidence is absent")
+    }
+    const lifecycleObserved = within(boardSource)
+      .getByText("Lifecycle observed")
+      .closest("div")
+    const runtimeObserved = within(boardSource)
+      .getByText("Runtime observed")
+      .closest("div")
+    expect(lifecycleObserved?.querySelector("dd")?.textContent).toBe(
+      new Date("2026-08-11T20:31:00Z").toLocaleString(),
+    )
+    expect(runtimeObserved?.querySelector("dd")?.textContent).toBe("Not reported")
+
+    await waitFor(() => {
+      expect(readCount("sourceCoverage")).toBeGreaterThan(0)
+      expect(readCount("sourceHealth")).toBeGreaterThan(0)
+    })
+    const sourceReadsBeforeSourceInvalidation = readCount("sourceStatus")
+    const coverageReadsBeforeSourceInvalidation = readCount("sourceCoverage")
+    const healthReadsBeforeSourceInvalidation = readCount("sourceHealth")
+    const macroReadsBeforeSourceInvalidation = readCount("macroDashboard")
+    await notifyAuthorityChanged("2", "source", "Source.Setup")
+    await waitFor(() => {
+      expect(readCount("sourceStatus")).toBeGreaterThan(
+        sourceReadsBeforeSourceInvalidation,
+      )
+      expect(readCount("sourceCoverage")).toBeGreaterThan(
+        coverageReadsBeforeSourceInvalidation,
+      )
+      expect(readCount("sourceHealth")).toBeGreaterThan(
+        healthReadsBeforeSourceInvalidation,
+      )
+    })
+    expect(readCount("macroDashboard")).toBe(macroReadsBeforeSourceInvalidation)
+
     await user.click(
       within(refreshedNavigation).getByRole("link", { name: "Opportunities" }),
     )
@@ -1928,22 +2081,7 @@ describe("Market Squawk desktop boundary", () => {
       request.query.startsWith("decisionInvestment"),
     ).length
     const trackReadsBeforeInvalidation = trackRecordRequests.length
-    const notifyDecisionEvent = desktopEvents.listener
-    if (!notifyDecisionEvent) {
-      throw new Error("The refreshed Desktop event subscription was not installed")
-    }
-    await act(async () => {
-      notifyDecisionEvent({
-        runtime: currentBootstrap.runtime,
-        sequence: "1",
-        body: {
-          type: "authority_changed",
-          domain: "decision",
-          operation: "Decision.ReviewTargetSet",
-          requestId: "wave-10d-decision-refresh",
-        },
-      })
-    })
+    await notifyAuthorityChanged("3", "decision", "Decision.ReviewTargetSet")
     await waitFor(() => {
       expect(
         issuedQueries.filter((request) =>
@@ -1955,6 +2093,67 @@ describe("Market Squawk desktop boundary", () => {
           (request) => request.query === "decisionRecommendationTrackRecord",
         ).length,
       ).toBeGreaterThan(trackReadsBeforeInvalidation)
+    })
+
+    await user.click(
+      within(refreshedNavigation).getByRole("link", { name: "Paper Execution" }),
+    )
+    expect(
+      await screen.findByRole("heading", { name: "Paper Execution" }),
+    ).toBeTruthy()
+    await waitFor(() => {
+      expect(readCount("paperStatus")).toBeGreaterThan(0)
+      expect(readCount("paperOrders")).toBeGreaterThan(0)
+      expect(readCount("paperFills")).toBeGreaterThan(0)
+    })
+    const statusReadsBeforeBotInvalidation = readCount("paperStatus")
+    const orderReadsBeforeBotInvalidation = readCount("paperOrders")
+    const fillReadsBeforeBotInvalidation = readCount("paperFills")
+    await notifyAuthorityChanged("4", "bot", "Bot.Stop")
+    await waitFor(() => {
+      expect(readCount("paperStatus")).toBeGreaterThan(
+        statusReadsBeforeBotInvalidation,
+      )
+    })
+    expect(readCount("paperOrders")).toBe(orderReadsBeforeBotInvalidation)
+    expect(readCount("paperFills")).toBe(fillReadsBeforeBotInvalidation)
+
+    const statusReadsBeforeExecutionInvalidation = readCount("paperStatus")
+    const orderReadsBeforeExecutionInvalidation = readCount("paperOrders")
+    const fillReadsBeforeExecutionInvalidation = readCount("paperFills")
+    await notifyAuthorityChanged("5", "execution", "Execution.Reconcile")
+    await waitFor(() => {
+      expect(readCount("paperOrders")).toBeGreaterThan(
+        orderReadsBeforeExecutionInvalidation,
+      )
+      expect(readCount("paperFills")).toBeGreaterThan(
+        fillReadsBeforeExecutionInvalidation,
+      )
+    })
+    expect(readCount("paperStatus")).toBe(statusReadsBeforeExecutionInvalidation)
+
+    const paperStatusReadsBeforeRisk = readCount("paperStatus")
+    const paperOrderReadsBeforeRisk = readCount("paperOrders")
+    await user.click(
+      within(refreshedNavigation).getByRole("link", {
+        name: "Risk & Recommendation Policy",
+      }),
+    )
+    expect(await screen.findByRole("heading", { name: "Risk" })).toBeTruthy()
+    expect(await screen.findByText("No portfolio risk is available")).toBeTruthy()
+    expect(readCount("paperStatus")).toBe(paperStatusReadsBeforeRisk)
+    expect(readCount("paperOrders")).toBe(paperOrderReadsBeforeRisk)
+
+    const accountReadsBeforePortfolioInvalidation = readCount("portfolioAccounts")
+    await notifyAuthorityChanged(
+      "6",
+      "portfolio",
+      "Portfolio.CommitRecommendationSetup",
+    )
+    await waitFor(() => {
+      expect(readCount("portfolioAccounts")).toBeGreaterThan(
+        accountReadsBeforePortfolioInvalidation,
+      )
     })
 
     rendered.unmount()

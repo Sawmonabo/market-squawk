@@ -59,7 +59,7 @@ function ReadyRiskPage({
   const accounts = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Portfolio",
+      "portfolio",
       "Portfolio.ListAccounts",
       {},
     ),
@@ -67,11 +67,11 @@ function ReadyRiskPage({
       parseRiskAccounts(await transport.query({ query: "portfolioAccounts" })),
   })
   const executionStatus = useQuery({
-    queryKey: productKeys.operation(bootstrap.runtime, "Bot", "Bot.GetStatus", {}),
+    queryKey: productKeys.operation(bootstrap.runtime, "bot", "Bot.GetStatus", {}),
     queryFn: async () => parsePaperStatus(await transport.query({ query: "paperStatus" })),
   })
   const executionOrders = useQuery({
-    queryKey: productKeys.operation(bootstrap.runtime, "Execution", "Execution.GetOrders", {}),
+    queryKey: productKeys.operation(bootstrap.runtime, "execution", "Execution.GetOrders", {}),
     queryFn: async () => parsePaperOrders(await transport.query({ query: "paperOrders" })),
   })
   const availableAccounts = accounts.data?.value ?? []
@@ -253,7 +253,7 @@ function AccountRisk({
   const risk = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Portfolio",
+      "portfolio",
       "Portfolio.GetRisk",
       { accountId: account.accountId },
     ),

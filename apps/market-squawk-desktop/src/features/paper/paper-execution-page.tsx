@@ -99,14 +99,14 @@ function ReadyPaperExecution({
     operationNames.has("Execution.GetManualPaperTargets") &&
     operationNames.has("Execution.SubmitManualPaperDraft")
   const status = useQuery({
-    queryKey: productKeys.operation(bootstrap.runtime, "Bot", "Bot.GetStatus", {}),
+    queryKey: productKeys.operation(bootstrap.runtime, "bot", "Bot.GetStatus", {}),
     enabled: statusAvailable,
     queryFn: async () => parsePaperStatus(await transport.query({ query: "paperStatus" })),
   })
   const orders = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Execution",
+      "execution",
       "Execution.GetOrders",
       {},
     ),
@@ -116,7 +116,7 @@ function ReadyPaperExecution({
   const fills = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Execution",
+      "execution",
       "Execution.GetFills",
       {},
     ),
@@ -138,13 +138,13 @@ function ReadyPaperExecution({
       setControlReceipt(receipt)
       await Promise.all([
         queryClient.invalidateQueries({
-          queryKey: productKeys.domain(bootstrap.runtime, "Bot"),
+          queryKey: productKeys.domain(bootstrap.runtime, "bot"),
         }),
         queryClient.invalidateQueries({
-          queryKey: productKeys.domain(bootstrap.runtime, "Execution"),
+          queryKey: productKeys.domain(bootstrap.runtime, "execution"),
         }),
         queryClient.invalidateQueries({
-          queryKey: productKeys.domain(bootstrap.runtime, "Portfolio"),
+          queryKey: productKeys.domain(bootstrap.runtime, "portfolio"),
         }),
       ])
     },
@@ -213,10 +213,10 @@ function ReadyPaperExecution({
             onAccepted={async () => {
               await Promise.all([
                 queryClient.invalidateQueries({
-                  queryKey: productKeys.domain(bootstrap.runtime, "Bot"),
+                  queryKey: productKeys.domain(bootstrap.runtime, "bot"),
                 }),
                 queryClient.invalidateQueries({
-                  queryKey: productKeys.domain(bootstrap.runtime, "Execution"),
+                  queryKey: productKeys.domain(bootstrap.runtime, "execution"),
                 }),
               ])
             }}

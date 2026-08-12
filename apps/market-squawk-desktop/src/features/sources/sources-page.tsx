@@ -71,7 +71,7 @@ function ReadySourcesPage({
     queries: bootstrap.providerProfiles.map((profile) => ({
       queryKey: productKeys.operation(
         bootstrap.runtime,
-        "Source",
+        "source",
         "Source.GetStatus",
         { sourceIds: [profile.id] },
       ),
@@ -82,7 +82,7 @@ function ReadySourcesPage({
   const coverage = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Source",
+      "source",
       "Source.GetCoverage",
       {},
     ),
@@ -91,7 +91,7 @@ function ReadySourcesPage({
   const health = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Source",
+      "source",
       "Source.GetHealth",
       {},
     ),
@@ -122,7 +122,7 @@ function ReadySourcesPage({
     queries: providerDatasets.map((dataset) => ({
       queryKey: productKeys.operation(
         bootstrap.runtime,
-        "Research",
+        "research",
         "Research.GetManifest",
         { dataset },
       ),
@@ -170,7 +170,7 @@ function ReadySourcesPage({
   }
   const refreshAuthority = () =>
     queryClient.invalidateQueries({
-      queryKey: productKeys.domain(bootstrap.runtime, "Source"),
+      queryKey: productKeys.domain(bootstrap.runtime, "source"),
     })
 
   return (
@@ -343,7 +343,14 @@ function SourceCard({
           label="Provider dataset"
           value={source.providerDatasetIdentifier ?? "None published"}
         />
-        <Fact label="Runtime observed" value={dateTime(source.observedAt)} />
+        <Fact
+          label="Lifecycle observed"
+          value={dateTime(source.lifecycle?.observedAt ?? null)}
+        />
+        <Fact
+          label="Runtime observed"
+          value={dateTime(source.runtimeObservedAt)}
+        />
         <Fact label="Cost condition" value={source.zeroFee ?? "Not reported"} />
         <Fact label="Release state" value={runtimeName(source.releaseState)} />
         <Fact label="Account" value={source.accountRequirement ?? "Not reported"} />

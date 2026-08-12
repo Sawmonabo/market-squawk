@@ -774,7 +774,7 @@ function macroSourceReadiness(
       detail:
         "The source status response did not contain a safely recognized acquisition state.",
       lifecycleObservedAt: source?.lifecycle?.observedAt ?? null,
-      runtimeObservedAt: source?.observedAt ?? null,
+      runtimeObservedAt: source?.runtimeObservedAt ?? null,
     }
   }
 
@@ -786,7 +786,7 @@ function macroSourceReadiness(
         detail:
           "Provider acquisition is active; stored publication readiness remains independently evidenced.",
         lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
-        runtimeObservedAt: source.observedAt,
+        runtimeObservedAt: source.runtimeObservedAt,
       }
     case "stopped":
     case "removed":
@@ -796,7 +796,7 @@ function macroSourceReadiness(
         detail:
           "Provider acquisition is inactive; the retained publication is still stored and queryable.",
         lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
-        runtimeObservedAt: source.observedAt,
+        runtimeObservedAt: source.runtimeObservedAt,
       }
     case "blocked":
       return {
@@ -805,7 +805,7 @@ function macroSourceReadiness(
         detail:
           "Provider acquisition requires attention; the retained publication is still stored and queryable.",
         lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
-        runtimeObservedAt: source.observedAt,
+        runtimeObservedAt: source.runtimeObservedAt,
       }
     case "unavailable":
     case "failed":
@@ -815,7 +815,7 @@ function macroSourceReadiness(
         detail:
           "Provider acquisition is unavailable; the retained publication is still stored and queryable.",
         lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
-        runtimeObservedAt: source.observedAt,
+        runtimeObservedAt: source.runtimeObservedAt,
       }
     default:
       return {
@@ -824,7 +824,7 @@ function macroSourceReadiness(
         detail:
           "Provider acquisition is changing or unrecognized; stored publication readiness remains independent.",
         lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
-        runtimeObservedAt: source.observedAt,
+        runtimeObservedAt: source.runtimeObservedAt,
       }
   }
 }

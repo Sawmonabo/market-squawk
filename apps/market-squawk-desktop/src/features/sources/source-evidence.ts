@@ -65,7 +65,7 @@ export interface SourceEvidence {
   integrity: string | null
   quality: string | null
   coverageState: string | null
-  observedAt: string | null
+  runtimeObservedAt: string | null
   latestSetupSessionId: string | null
   providerDatasetIdentifier: string | null
   storedData: StoredDataEvidence | null
@@ -369,7 +369,7 @@ function toEvidence(
     integrity: evidenceName(runtime?.integrity ?? runtimeHealth?.streamIntegrity),
     quality: evidenceName(runtime?.quality ?? runtimeHealth?.quality),
     coverageState: evidenceName(runtimeCoverage),
-    observedAt: unixNanos(
+    runtimeObservedAt: unixNanos(
       runtime?.observedAtUnixNanos ?? runtimeHealth?.observedAtUnixNanos,
     ),
     latestSetupSessionId:
