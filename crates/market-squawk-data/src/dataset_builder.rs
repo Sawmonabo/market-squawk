@@ -3,11 +3,15 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use market_squawk_domain::Timestamp;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::analytical_backup::AnalyticalOperationGate;
-use crate::{AnalyticalDataService, CatalogAuthority};
+use crate::{
+    AnalyticalDataService, CatalogAuthority, ResearchUse, ResearchUseDecisionDigest,
+    ResearchUseGraphDigest, ResearchUseRequest,
+};
 
 #[path = "dataset_builder/admission.rs"]
 mod admission;
@@ -40,6 +44,49 @@ pub trait DatasetBuildPrecommitAuthority: fmt::Debug + Send + Sync {
 
     /// Records that the derived-generation commit succeeded before any later fallible work.
     fn commit_succeeded(&self);
+}
+
+/// Immutable identities proven by one successful pre-read research-use evaluation.
+///
+/// This receipt is evidence for orchestration only. It contains no catalog session, permit,
+/// publication authority, or reusable capability; the opaque permit minted by the evaluation is
+/// dropped before this value is returned. Every build still performs its own authorization before
+/// reading inputs and again at its durable publication boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DatasetResearchUsePreflightReceipt {
+    request: ResearchUseRequest,
+    decision_digest: ResearchUseDecisionDigest,
+    graph_digest: ResearchUseGraphDigest,
+    expires_at: Timestamp,
+}
+
+impl DatasetResearchUsePreflightReceipt {
+    /// Returns exact roots, downstream use, and bounds evaluated by the authority.
+    pub const fn request(&self) -> &ResearchUseRequest {
+        &self.request
+    }
+
+    /// Returns the canonical durable decision identity produced by this evaluation.
+    pub const fn decision_digest(&self) -> ResearchUseDecisionDigest {
+        self.decision_digest
+    }
+
+    /// Returns the canonical exact transitive parent graph evaluated by the authority.
+    pub const fn graph_digest(&self) -> ResearchUseGraphDigest {
+        self.graph_digest
+    }
+
+    /// Returns the independently authorized downstream research use.
+    pub const fn research_use(&self) -> ResearchUse {
+        self.request.requested_use()
+    }
+
+    /// Returns the exclusive expiry of the ephemeral decision evaluated by this preflight.
+    ///
+    /// The receipt remains identity evidence after this time but never carries usable authority.
+    pub const fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
 }
 
 /// Rights-bound builder scoped to one active analytical catalog and artifact root.
@@ -90,6 +137,37 @@ impl<'service> DatasetBuilderService<'service> {
         cancellation: &CancellationToken,
     ) -> Result<(), DatasetBuildError> {
         build::validate_request_authority(self, request, cancellation)
+    }
+
+    /// Evaluates current ResearchUse rights before an orchestrator reads any parent generation.
+    ///
+    /// Only immutable request and graph identities cross this boundary. The authorization's
+    /// single-use permit is deliberately destroyed here and cannot be supplied to `build`; build
+    /// therefore re-traverses and reauthorizes the graph under its existing commit protocol. A
+    /// later [`DatasetBuildRequest`] must retain these exact roots, requested use, and limits;
+    /// equality with [`DatasetResearchUsePreflightReceipt::request`] is the producer's explicit
+    /// composition check, not authority conferred by this receipt.
+    pub fn preflight_research_use(
+        &self,
+        request: ResearchUseRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<DatasetResearchUsePreflightReceipt, DatasetBuildError> {
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_| DatasetBuildError::AuthorityLockPoisoned)?;
+        let authorization = authority.authorize_research_use(request.clone(), cancellation)?;
+        if authorization.research_use() != request.requested_use() {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        let receipt = DatasetResearchUsePreflightReceipt {
+            request,
+            decision_digest: authorization.decision_digest(),
+            graph_digest: authorization.graph().digest(),
+            expires_at: authorization.expires_at(),
+        };
+        drop(authorization);
+        Ok(receipt)
     }
 }
 

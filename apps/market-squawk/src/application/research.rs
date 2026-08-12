@@ -1356,6 +1356,7 @@ fn map_read_error(error: AnalyticalReadError) -> ServiceError {
         AnalyticalReadError::InvalidLimit
         | AnalyticalReadError::InstrumentLimitExceeded
         | AnalyticalReadError::InvalidKnowledgeRange
+        | AnalyticalReadError::UniverseMembershipReadMustBeExhaustive
         | AnalyticalReadError::InvalidMarketBarLimit
         | AnalyticalReadError::InvalidMarketBarEffectiveRange
         | AnalyticalReadError::InvalidFundNavLimit

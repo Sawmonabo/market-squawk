@@ -241,6 +241,21 @@ impl AuthorizedResearchUse {
         &self.graph
     }
 
+    /// Returns the durable canonical identity of the decision behind this capability.
+    pub const fn decision_digest(&self) -> ResearchUseDecisionDigest {
+        self.permit.decision_digest()
+    }
+
+    /// Returns the independently authorized downstream use without exposing the permit.
+    pub const fn research_use(&self) -> ResearchUse {
+        self.permit.research_use()
+    }
+
+    /// Returns the exclusive expiry of the process-local permit without exposing it.
+    pub const fn expires_at(&self) -> Timestamp {
+        self.permit.expires_at()
+    }
+
     /// Consumes the capability into one canonical, independently rights-bound publication.
     pub fn prepare_derived_publication(
         self,

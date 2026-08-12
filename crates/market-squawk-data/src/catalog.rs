@@ -66,10 +66,13 @@ pub use self::listing_reference::{
     MAX_LISTING_REFERENCE_SEARCH_ROWS,
 };
 pub use self::market_data_instruments::{
-    MARKET_DATA_INSTRUMENT_ID_NAMESPACE, MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS,
-    MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS, MarketDataInstrumentCatalogError,
-    MarketDataInstrumentMatchKind, MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
-    MarketDataInstrumentSearchMatch, MarketDataInstrumentSearchPage,
+    MARKET_DATA_INSTRUMENT_ID_NAMESPACE, MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS,
+    MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS, MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS,
+    MarketDataInstrumentCatalogError, MarketDataInstrumentMatchKind,
+    MarketDataInstrumentPopulationDisposition, MarketDataInstrumentPopulationExclusion,
+    MarketDataInstrumentPopulationExclusionReason, MarketDataInstrumentPopulationQuery,
+    MarketDataInstrumentPopulationSelection, MarketDataInstrumentReadCapability,
+    MarketDataInstrumentRecord, MarketDataInstrumentSearchMatch, MarketDataInstrumentSearchPage,
     MarketDataInstrumentSynchronization, MarketDataInstrumentSynchronizationCapability,
     MarketDataInstrumentSynchronizationReceipt, market_data_instrument_id,
 };

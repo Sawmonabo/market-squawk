@@ -343,6 +343,8 @@ pub enum AnalyticalObservationTemplate {
     MarketBar,
     /// Exact daily fund/share-class NAV observations.
     FundNav,
+    /// Exact historical universe-membership observations.
+    UniverseMembership,
     /// User-owned or licensed alternative-data observations.
     AlternativeData,
 }
@@ -356,6 +358,7 @@ impl AnalyticalObservationTemplate {
             Self::Macro => Some("macro"),
             Self::MarketBar => Some("market_bar"),
             Self::FundNav => Some("fund_nav"),
+            Self::UniverseMembership => Some("universe_membership"),
             Self::AlternativeData => Some("alternative_data"),
         }
     }
@@ -1142,6 +1145,11 @@ impl AnalyticalObservationReadRequest {
                 AnalyticalReadError::InstrumentLimitExceeded
             });
         }
+        if template == AnalyticalObservationTemplate::UniverseMembership
+            && (!instrument_ids.is_empty() || knowledge_range.is_some())
+        {
+            return Err(AnalyticalReadError::UniverseMembershipReadMustBeExhaustive);
+        }
         instrument_ids.sort_unstable();
         instrument_ids.dedup();
         Ok(Self {
@@ -1150,6 +1158,23 @@ impl AnalyticalObservationReadRequest {
             instrument_ids: instrument_ids.into_boxed_slice(),
             knowledge_range,
         })
+    }
+
+    /// Constructs the sole exhaustive exact-manifest universe-membership request.
+    ///
+    /// Instrument and availability filters are absent by construction. A successful query output
+    /// therefore covers every membership row in the exact manifest; a too-small caller
+    /// [`QueryLimits`] envelope fails with [`QueryError::RowLimitExceeded`] and returns no partial
+    /// output, preserving an explicit saturation proof.
+    pub fn try_universe_membership(
+        manifest: DatasetManifestRef,
+    ) -> Result<Self, AnalyticalReadError> {
+        Self::try_new(
+            manifest,
+            AnalyticalObservationTemplate::UniverseMembership,
+            Vec::new(),
+            None,
+        )
     }
 
     /// Returns the exact immutable input generation.
@@ -1220,6 +1245,7 @@ impl AnalyticalObservationReadRequest {
 #[derive(Debug)]
 pub struct AnalyticalObservationOutput {
     source_id: SourceId,
+    request: AnalyticalObservationReadRequest,
     output: PinnedQueryOutput,
 }
 
@@ -1308,6 +1334,11 @@ impl AnalyticalObservationOutput {
     /// Returns the source-rights namespace that owns the queried generation.
     pub const fn source_id(&self) -> &SourceId {
         &self.source_id
+    }
+
+    /// Returns the exact closed request whose complete execution produced this output.
+    pub const fn request(&self) -> &AnalyticalObservationReadRequest {
+        &self.request
     }
 
     /// Returns the non-forgeable manifest/object/query/result evidence.
@@ -1524,7 +1555,11 @@ impl AnalyticalReadCapability {
             }
             result = execution.as_mut() => result?,
         };
-        Ok(AnalyticalObservationOutput { source_id, output })
+        Ok(AnalyticalObservationOutput {
+            source_id,
+            request,
+            output,
+        })
     }
 
     /// Reads a bounded latest-known PIT snapshot for an exact source and code-owned Macro set.
@@ -1856,6 +1891,9 @@ pub enum AnalyticalReadError {
     /// An availability-time range was reversed.
     #[error("analytical observation knowledge range is invalid")]
     InvalidKnowledgeRange,
+    /// Universe membership must be read without instrument or availability filters.
+    #[error("analytical universe-membership read must be exhaustive")]
+    UniverseMembershipReadMustBeExhaustive,
     /// A typed market-bar request used zero or exceeded its fixed row ceiling.
     #[error("analytical market-bar limit is invalid")]
     InvalidMarketBarLimit,

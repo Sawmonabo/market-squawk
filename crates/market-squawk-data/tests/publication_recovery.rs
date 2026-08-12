@@ -18,7 +18,8 @@ use market_squawk_data::{
     AnalyticalDataService, AnalyticalFeatureDatasetSelection, AnalyticalFundNavReadLimit,
     AnalyticalFundNavReadRequest, AnalyticalMacroLatestKnownRequest,
     AnalyticalMacroSeriesAllowlist, AnalyticalManifestCatalog, AnalyticalMarketBarReadLimit,
-    AnalyticalMarketBarReadRequest, AnalyticalReadError, AnalyticalReadLimit, CatalogAuthority,
+    AnalyticalMarketBarReadRequest, AnalyticalObservationReadRequest,
+    AnalyticalObservationTemplate, AnalyticalReadError, AnalyticalReadLimit, CatalogAuthority,
     CatalogConfig, CatalogError, CatalogLimit, CatalogResultLimits, ChronologicalSplitPolicy,
     CommittedDataset, CompactionRequest, ComponentAdjustmentEvidence, ComponentKind,
     ComponentScope, ComponentSelector, ComponentValue, CorporateActionAdjustment,
@@ -32,9 +33,9 @@ use market_squawk_data::{
     OutcomeMarketBarSeries, OutcomeMarketBarUnavailableReason, ParquetStoreError,
     PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode, QueryArtifactReservationInput,
     QueryError, QueryLimits, QueryRequest, QueryResult, ResearchArrowBatch, ResearchIngestService,
-    ResearchQueryEngine, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet,
-    RightsBasis, RightsDecisionInput, Sha256Digest, SourceOperation, UniverseId, UniverseLimits,
-    UniverseMembership, extraction_provider_payload_digest,
+    ResearchQueryEngine, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseRequest,
+    ResearchUseSet, RightsBasis, RightsDecisionInput, Sha256Digest, SourceOperation, UniverseId,
+    UniverseLimits, UniverseMembership, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     AssetClass, AuthorizationBasis, AvailabilityEvidence as DomainAvailabilityEvidence,
@@ -1032,6 +1033,28 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
     let (service, source) =
         initialized_service_with_universe(&paths, catalog_config, store_config).await?;
     let instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
+    let research_limits = ResearchUseLimits::try_new(
+        8,
+        32,
+        32,
+        8,
+        1024 * 1024,
+        Duration::from_secs(2),
+        Duration::from_secs(30),
+    )?;
+    let preflight_request = ResearchUseRequest::try_new(
+        vec![source.manifest().clone()],
+        ResearchUse::LocalAnalysis,
+        research_limits,
+    )?;
+    let preflight = service
+        .dataset_builder()
+        .preflight_research_use(preflight_request.clone(), &CancellationToken::new())?;
+    assert_eq!(preflight.request(), &preflight_request);
+    assert_eq!(preflight.research_use(), ResearchUse::LocalAnalysis);
+    assert_ne!(preflight.decision_digest().bytes(), [0; 32]);
+    assert_ne!(preflight.graph_digest().bytes(), [0; 32]);
+    assert!(preflight.expires_at() > Timestamp::from_unix_nanos(0));
     let feature = FeatureLabelComponentSpec::try_new(
         ComponentKind::Feature,
         ComponentScope::Global,
@@ -1108,15 +1131,6 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
         MissingValuePolicy::Preserve,
         SourceIdentifier::try_from("dataset-builder-rust-v1")?,
     );
-    let research_limits = ResearchUseLimits::try_new(
-        8,
-        32,
-        32,
-        8,
-        1024 * 1024,
-        Duration::from_secs(2),
-        Duration::from_secs(30),
-    )?;
     let limits = DatasetBuildLimits::try_new(
         128,
         8,
@@ -1180,6 +1194,14 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
         "unexpected fabricated-membership result: {fabricated_result:?}"
     );
     let output_dataset = DatasetId::try_from("derived.feature-labels.gdp-v1")?;
+    assert_eq!(
+        preflight.request(),
+        &ResearchUseRequest::try_new(
+            inputs.parents().to_vec(),
+            ResearchUse::LocalAnalysis,
+            research_limits,
+        )?
+    );
     let request = DatasetBuildRequest::try_new(
         output_dataset.clone(),
         inputs,
@@ -1244,6 +1266,67 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
     let cancellation = CancellationToken::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     let reader = service.analytical_reader();
+    assert!(matches!(
+        AnalyticalObservationReadRequest::try_new(
+            source.manifest().clone(),
+            AnalyticalObservationTemplate::UniverseMembership,
+            vec![instrument],
+            None,
+        ),
+        Err(AnalyticalReadError::UniverseMembershipReadMustBeExhaustive)
+    ));
+    let membership_request =
+        AnalyticalObservationReadRequest::try_universe_membership(source.manifest().clone())?;
+    let membership = reader
+        .read_observations(
+            membership_request.clone(),
+            QueryLimits::try_new(
+                1,
+                256 * 1024,
+                16 * 1024 * 1024,
+                1,
+                64,
+                64,
+                Duration::from_secs(1),
+            )?,
+            deadline,
+            cancellation.clone(),
+        )
+        .await?;
+    assert_eq!(membership.request(), &membership_request);
+    assert_eq!(membership.output().manifest(), source.manifest());
+    let membership_rows: usize = match membership.output().result() {
+        QueryResult::Inline { batches, .. } => batches.iter().map(|batch| batch.num_rows()).sum(),
+        QueryResult::Artifact { .. } => return Err("membership result was not inline".into()),
+    };
+    assert_eq!(membership_rows, 1);
+    let saturated = reader
+        .read_observations(
+            AnalyticalObservationReadRequest::try_new(
+                source.manifest().clone(),
+                AnalyticalObservationTemplate::All,
+                Vec::new(),
+                None,
+            )?,
+            QueryLimits::try_new(
+                1,
+                256 * 1024,
+                16 * 1024 * 1024,
+                1,
+                64,
+                64,
+                Duration::from_secs(1),
+            )?,
+            deadline,
+            cancellation.clone(),
+        )
+        .await;
+    assert!(matches!(
+        saturated,
+        Err(AnalyticalReadError::Query(QueryError::RowLimitExceeded {
+            limit: 1
+        }))
+    ));
     let listed = reader
         .latest(built.manifest().dataset_id(), deadline, &cancellation)?
         .ok_or("missing built feature dataset")?;
@@ -1449,7 +1532,15 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
                 "SELECT component_kind, component_name, missing_reason FROM components \
                  ORDER BY component_kind, component_name",
             )?,
-            QueryLimits::try_new(8, 64 * 1024, 1024 * 1024, 1, 64, 64, Duration::from_secs(1))?,
+            QueryLimits::try_new(
+                8,
+                256 * 1024,
+                16 * 1024 * 1024,
+                1,
+                64,
+                64,
+                Duration::from_secs(1),
+            )?,
             CancellationToken::new(),
         )
         .await?;

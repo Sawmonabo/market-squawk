@@ -15,10 +15,12 @@ use market_squawk_data::{
     ListingReferencePublicationDisposition, ListingReferenceReadCapability,
     ListingReferenceRecordInput, ListingReferenceSourceFileInput,
     MAX_LISTING_REFERENCE_MEMBERSHIP_PAGE_ROWS, MarketDataInstrumentCatalogError,
-    MarketDataInstrumentMatchKind, MarketDataInstrumentReadCapability,
-    MarketDataInstrumentSynchronization, MarketDataInstrumentSynchronizationCapability,
-    OnboardingAppendOutcome, OnboardingReservationRequest, RightsBasis, RightsDecisionInput,
-    RightsError, SourceCursor, SourceOperation, market_data_instrument_id,
+    MarketDataInstrumentMatchKind, MarketDataInstrumentPopulationDisposition,
+    MarketDataInstrumentPopulationExclusionReason, MarketDataInstrumentPopulationQuery,
+    MarketDataInstrumentReadCapability, MarketDataInstrumentSynchronization,
+    MarketDataInstrumentSynchronizationCapability, OnboardingAppendOutcome,
+    OnboardingReservationRequest, RightsBasis, RightsDecisionInput, RightsError, SourceCursor,
+    SourceOperation, market_data_instrument_id,
 };
 use market_squawk_domain::{
     AssetClass, AssignmentVerification, AuthorizationBasis, AvailabilityEvidence,
@@ -897,13 +899,21 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
         figi.clone(),
         derived_id,
         10,
+        None,
         "Apple Incorporated",
         "AAPL.US",
         31,
     )?;
     let wrong_id = market_data_instrument_id(&Figi::try_from("BBG000BLNNH6")?)?;
-    let mismatched =
-        market_data_definition(figi.clone(), wrong_id, 11, "Wrong Identity", "WRONG.US", 32)?;
+    let mismatched = market_data_definition(
+        figi.clone(),
+        wrong_id,
+        11,
+        None,
+        "Wrong Identity",
+        "WRONG.US",
+        32,
+    )?;
     assert!(matches!(
         MarketDataInstrumentSynchronization::try_new(vec![initial.clone()], 2),
         Err(MarketDataInstrumentCatalogError::PartialBatch {
@@ -999,6 +1009,27 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
         .latest_by_figi(&figi, deadline(), &cancellation)?
         .ok_or(CatalogError::InvalidRecord)?;
     assert_eq!(retained.revision_sequence(), 1);
+    let canonical_population = MarketDataInstrumentPopulationQuery::try_new(
+        vec![wrong_id, derived_id],
+        retained.published_at(),
+        Timestamp::from_unix_nanos(10),
+    )?;
+    assert_eq!(
+        canonical_population,
+        MarketDataInstrumentPopulationQuery::try_new(
+            vec![derived_id, wrong_id],
+            retained.published_at(),
+            Timestamp::from_unix_nanos(10),
+        )?
+    );
+    assert!(matches!(
+        MarketDataInstrumentPopulationQuery::try_new(
+            vec![derived_id, derived_id],
+            retained.published_at(),
+            Timestamp::from_unix_nanos(10),
+        ),
+        Err(MarketDataInstrumentCatalogError::InvalidPopulationQuery)
+    ));
     let link = CompanySecurityIdentityLink::try_new(CompanySecurityIdentityLinkInput {
         schema_version: SchemaVersion::CURRENT,
         company_source_id: company.source_id().clone(),
@@ -1078,10 +1109,13 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
 
     let successor_effective_start =
         shift_timestamp(relationship.record().published_at(), 86_400_000_000_000)?;
+    let successor_effective_end = shift_timestamp(successor_effective_start, 86_400_000_000_000)?;
+    std::thread::sleep(Duration::from_millis(1));
     let successor = market_data_definition(
         figi.clone(),
         derived_id,
         successor_effective_start.unix_nanos(),
+        Some(successor_effective_end.unix_nanos()),
         "Apple Inc.",
         "AAPL.NEW",
         33,
@@ -1095,7 +1129,51 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
     let future_parent = reader
         .latest(derived_id, deadline(), &cancellation)?
         .ok_or(CatalogError::InvalidRecord)?;
+    assert!(future_parent.published_at() > retained.published_at());
     assert!(future_parent.published_at() < successor_effective_start);
+    let before_successor_query = MarketDataInstrumentPopulationQuery::try_new(
+        vec![derived_id],
+        retained.published_at(),
+        successor_effective_start,
+    )?;
+    let before_successor =
+        reader.pin_population_as_of(before_successor_query.clone(), deadline(), &cancellation)?;
+    assert_eq!(
+        before_successor.disposition(),
+        MarketDataInstrumentPopulationDisposition::Complete
+    );
+    assert_eq!(before_successor.records(), std::slice::from_ref(&retained));
+    let after_successor_query = MarketDataInstrumentPopulationQuery::try_new(
+        vec![derived_id],
+        future_parent.published_at(),
+        successor_effective_start,
+    )?;
+    let after_successor =
+        reader.pin_population_as_of(after_successor_query.clone(), deadline(), &cancellation)?;
+    assert_eq!(
+        after_successor.disposition(),
+        MarketDataInstrumentPopulationDisposition::Complete
+    );
+    assert_eq!(
+        after_successor.records(),
+        std::slice::from_ref(&future_parent)
+    );
+    let ended_query = MarketDataInstrumentPopulationQuery::try_new(
+        vec![derived_id],
+        future_parent.published_at(),
+        successor_effective_end,
+    )?;
+    let ended = reader.pin_population_as_of(ended_query.clone(), deadline(), &cancellation)?;
+    assert_eq!(
+        ended.disposition(),
+        MarketDataInstrumentPopulationDisposition::Unavailable
+    );
+    assert!(ended.records().is_empty());
+    assert_eq!(ended.exclusions().len(), 1);
+    assert_eq!(
+        ended.exclusions()[0].reason(),
+        MarketDataInstrumentPopulationExclusionReason::NoEffectiveRevision
+    );
     let still_current = relationship_reader.current(&query, deadline(), &cancellation)?;
     assert_eq!(
         still_current.disposition(),
@@ -1172,6 +1250,18 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
             .as_str(),
         "Apple Inc."
     );
+    assert_eq!(
+        reader.pin_population_as_of(before_successor_query, deadline(), &cancellation)?,
+        before_successor
+    );
+    assert_eq!(
+        reader.pin_population_as_of(after_successor_query, deadline(), &cancellation)?,
+        after_successor
+    );
+    assert_eq!(
+        reader.pin_population_as_of(ended_query, deadline(), &cancellation)?,
+        ended
+    );
     Ok(())
 }
 
@@ -1179,11 +1269,15 @@ fn market_data_definition(
     figi: Figi,
     instrument_id: InstrumentId,
     effective_start: i64,
+    effective_end: Option<i64>,
     display_name: &str,
     provider_symbol: &str,
     evidence_byte: u8,
 ) -> TestResult<MarketDataInstrumentDefinition> {
-    let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(effective_start), None)?;
+    let effective = EffectiveInterval::new(
+        Timestamp::from_unix_nanos(effective_start),
+        effective_end.map(Timestamp::from_unix_nanos),
+    )?;
     let exact = |byte| ExactPayloadEvidence::from_content_digest(digest(byte));
     let rights = || -> TestResult<IdentifierRightsPolicyReference> {
         Ok(IdentifierRightsPolicyReference::new(

@@ -291,6 +291,7 @@ fn map_analytical_error(error: AnalyticalReadError) -> FairValueProducerSelectio
         | AnalyticalReadError::InvalidMacroSeriesAllowlist
         | AnalyticalReadError::MacroSnapshotSourceOwnerMismatch
         | AnalyticalReadError::InvalidOutcomeMarketBarWindow
+        | AnalyticalReadError::UniverseMembershipReadMustBeExhaustive
         | AnalyticalReadError::InvalidObservationSchema => {
             FairValueProducerSelectionError::InvalidSelection
         }

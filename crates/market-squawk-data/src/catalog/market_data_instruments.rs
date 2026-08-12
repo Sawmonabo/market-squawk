@@ -30,9 +30,15 @@ pub const MARKET_DATA_INSTRUMENT_ID_NAMESPACE: Uuid =
 pub const MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS: usize = 65_536;
 /// Maximum current definitions returned by one search.
 pub const MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS: usize = 256;
+/// Maximum exact stable identities admitted by one point-in-time population pin.
+pub const MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS: usize = 256;
 const MAX_SEARCH_QUERY_BYTES: usize = 512;
 const MAX_REVISIONS_PER_INSTRUMENT: u32 = 16_384;
 const SQLITE_PROGRESS_OPERATIONS: i32 = 1_000;
+const POPULATION_QUERY_DOMAIN: &[u8] =
+    b"market-squawk/market-data-instrument-population-query/v1\0";
+const POPULATION_RECEIPT_DOMAIN: &[u8] =
+    b"market-squawk/market-data-instrument-population-receipt/v1\0";
 
 /// Derives the sole canonical internal identity for an assigned permanent FIGI.
 ///
@@ -150,6 +156,139 @@ impl MarketDataInstrumentRecord {
     /// Returns when this immutable revision first became durable locally.
     pub const fn published_at(&self) -> Timestamp {
         self.published_at
+    }
+}
+
+/// Canonical nonempty point-in-time request over exact stable instrument identities.
+///
+/// The constructor orders the caller's set and rejects repetition instead of silently changing
+/// its declared membership. Tickers, names, provider symbols, and execution eligibility are absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketDataInstrumentPopulationQuery {
+    instrument_ids: Box<[InstrumentId]>,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+    query_digest: EvidenceDigest,
+}
+
+impl MarketDataInstrumentPopulationQuery {
+    /// Constructs a bounded exact-identity population query with independent PIT coordinates.
+    pub fn try_new(
+        mut instrument_ids: Vec<InstrumentId>,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+    ) -> Result<Self, MarketDataInstrumentCatalogError> {
+        if instrument_ids.is_empty()
+            || instrument_ids.len() > MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS
+        {
+            return Err(MarketDataInstrumentCatalogError::InvalidPopulationQuery);
+        }
+        instrument_ids.sort_unstable();
+        if instrument_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(MarketDataInstrumentCatalogError::InvalidPopulationQuery);
+        }
+        let instrument_ids = instrument_ids.into_boxed_slice();
+        let query_digest = population_query_digest(&instrument_ids, knowledge_at, effective_at);
+        Ok(Self {
+            instrument_ids,
+            knowledge_at,
+            effective_at,
+            query_digest,
+        })
+    }
+
+    /// Returns the exact stable identities in canonical UUID order.
+    pub fn instrument_ids(&self) -> &[InstrumentId] {
+        &self.instrument_ids
+    }
+
+    /// Returns the inclusive local-knowledge cutoff for immutable catalog publication.
+    pub const fn knowledge_at(&self) -> Timestamp {
+        self.knowledge_at
+    }
+
+    /// Returns the exact instant at which the source-authored definition must be effective.
+    pub const fn effective_at(&self) -> Timestamp {
+        self.effective_at
+    }
+
+    /// Returns the canonical SHA-256 identity of the complete query.
+    pub const fn query_digest(&self) -> EvidenceDigest {
+        self.query_digest
+    }
+}
+
+/// Closed reason one requested stable identity has no selectable as-of definition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarketDataInstrumentPopulationExclusionReason {
+    /// No immutable revision was durably knowable at the requested knowledge cutoff.
+    NoKnownRevision,
+    /// Known revisions did not establish a definition effective at the requested instant.
+    NoEffectiveRevision,
+}
+
+/// One exact requested identity excluded without substituting a symbol or later revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MarketDataInstrumentPopulationExclusion {
+    instrument_id: InstrumentId,
+    reason: MarketDataInstrumentPopulationExclusionReason,
+}
+
+impl MarketDataInstrumentPopulationExclusion {
+    /// Returns the exact requested stable identity.
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the fail-closed exclusion reason.
+    pub const fn reason(self) -> MarketDataInstrumentPopulationExclusionReason {
+        self.reason
+    }
+}
+
+/// Closed completeness state for an exact requested population.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarketDataInstrumentPopulationDisposition {
+    /// Every requested member had exactly one knowable and effective immutable revision.
+    Complete,
+    /// At least one exact requested member was excluded; partial records are not a complete set.
+    Unavailable,
+}
+
+/// Ordered, digest-bound result of one atomic point-in-time market-definition pin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketDataInstrumentPopulationSelection {
+    query: MarketDataInstrumentPopulationQuery,
+    disposition: MarketDataInstrumentPopulationDisposition,
+    records: Box<[MarketDataInstrumentRecord]>,
+    exclusions: Box<[MarketDataInstrumentPopulationExclusion]>,
+    receipt_digest: EvidenceDigest,
+}
+
+impl MarketDataInstrumentPopulationSelection {
+    /// Returns the complete canonical request and its query digest.
+    pub const fn query(&self) -> &MarketDataInstrumentPopulationQuery {
+        &self.query
+    }
+
+    /// Returns whether the exact requested set was completely selectable.
+    pub const fn disposition(&self) -> MarketDataInstrumentPopulationDisposition {
+        self.disposition
+    }
+
+    /// Returns selected definitions in canonical stable-instrument order.
+    pub fn records(&self) -> &[MarketDataInstrumentRecord] {
+        &self.records
+    }
+
+    /// Returns excluded requested identities in canonical stable-instrument order.
+    pub fn exclusions(&self) -> &[MarketDataInstrumentPopulationExclusion] {
+        &self.exclusions
+    }
+
+    /// Returns the SHA-256 receipt binding query, disposition, records, and exclusions.
+    pub const fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
     }
 }
 
@@ -298,6 +437,26 @@ impl MarketDataInstrumentReadCapability {
             .latest_market_data_instrument_by_figi(permanent_figi, deadline, cancellation)
     }
 
+    /// Atomically pins one exact, bounded stable-identity set at independent knowledge/effective
+    /// coordinates.
+    ///
+    /// Each member selects the uniquely latest effective start durably published by the knowledge
+    /// cutoff. Missing or non-effective members remain ordered exclusions; the caller must require
+    /// [`MarketDataInstrumentPopulationDisposition::Complete`] before treating the records as the
+    /// requested population.
+    pub fn pin_population_as_of(
+        &self,
+        query: MarketDataInstrumentPopulationQuery,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentPopulationSelection, MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        self.authority
+            .try_lock()
+            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
+            .pin_market_data_instrument_population(query, deadline, cancellation)
+    }
+
     /// Searches FIGI, admitted display name, venue symbol, and accepted provider symbol.
     pub fn search(
         &self,
@@ -330,6 +489,9 @@ pub enum MarketDataInstrumentCatalogError {
     /// Required input was absent or invalid.
     #[error("market-data instrument input is invalid")]
     InvalidInput,
+    /// A population query was empty, repeated an identity, or exceeded its fixed set bound.
+    #[error("market-data instrument population query is invalid")]
+    InvalidPopulationQuery,
     /// Producer-declared batch cardinality did not match the submitted batch.
     #[error("partial market-data instrument batch: expected {expected}, received {actual}")]
     PartialBatch { expected: usize, actual: usize },
@@ -574,6 +736,73 @@ impl CatalogAuthority {
         classify_operation(result, deadline, cancellation)
     }
 
+    fn pin_market_data_instrument_population(
+        &self,
+        query: MarketDataInstrumentPopulationQuery,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentPopulationSelection, MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        let connection = &self.catalog().connection;
+        install_progress_handler(connection, deadline, cancellation)?;
+        let result = (|| {
+            let transaction = connection.unchecked_transaction()?;
+            let mut budget = ResultBudget::new(self.catalog().result_bytes);
+            let mut records = Vec::new();
+            records
+                .try_reserve_exact(query.instrument_ids.len())
+                .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+            let mut exclusions = Vec::new();
+            exclusions
+                .try_reserve_exact(query.instrument_ids.len())
+                .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+            for instrument_id in query.instrument_ids() {
+                check_operation(deadline, cancellation)?;
+                match select_population_member(
+                    &transaction,
+                    *instrument_id,
+                    query.knowledge_at,
+                    query.effective_at,
+                    &mut budget,
+                )? {
+                    PopulationMember::Record(record) => records.push(record),
+                    PopulationMember::Excluded(reason) => {
+                        budget
+                            .charge([size_of::<MarketDataInstrumentPopulationExclusion>()])
+                            .map_err(|_| {
+                                MarketDataInstrumentCatalogError::ResultByteLimitExceeded
+                            })?;
+                        exclusions.push(MarketDataInstrumentPopulationExclusion {
+                            instrument_id: *instrument_id,
+                            reason,
+                        });
+                    }
+                }
+            }
+            let disposition =
+                if exclusions.is_empty() && records.len() == query.instrument_ids().len() {
+                    MarketDataInstrumentPopulationDisposition::Complete
+                } else {
+                    MarketDataInstrumentPopulationDisposition::Unavailable
+                };
+            if records.len() + exclusions.len() != query.instrument_ids().len() {
+                return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+            }
+            let receipt_digest =
+                population_receipt_digest(query.query_digest, disposition, &records, &exclusions);
+            transaction.commit()?;
+            Ok(MarketDataInstrumentPopulationSelection {
+                query,
+                disposition,
+                records: records.into_boxed_slice(),
+                exclusions: exclusions.into_boxed_slice(),
+                receipt_digest,
+            })
+        })();
+        clear_progress_handler(connection)?;
+        classify_operation(result, deadline, cancellation)
+    }
+
     fn search_market_data_instruments(
         &self,
         query: &str,
@@ -626,6 +855,63 @@ impl CatalogAuthority {
         clear_progress_handler(connection)?;
         classify_operation(result, deadline, cancellation)
     }
+}
+
+enum PopulationMember {
+    Record(MarketDataInstrumentRecord),
+    Excluded(MarketDataInstrumentPopulationExclusionReason),
+}
+
+fn select_population_member(
+    transaction: &Transaction<'_>,
+    instrument_id: InstrumentId,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+    budget: &mut ResultBudget,
+) -> Result<PopulationMember, MarketDataInstrumentCatalogError> {
+    let instrument_text = instrument_id.to_string();
+    let mut statement = transaction.prepare(POPULATION_AS_OF_SQL)?;
+    let mut rows = statement.query_map(
+        params![
+            instrument_text,
+            knowledge_at.unix_nanos(),
+            effective_at.unix_nanos()
+        ],
+        decode_stored_row,
+    )?;
+    let selected = rows.next().transpose()?;
+    if rows.next().transpose()?.is_some() {
+        return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+    }
+    drop(rows);
+    drop(statement);
+    let Some(selected) = selected else {
+        let known: bool = transaction.query_row(
+            POPULATION_KNOWN_SQL,
+            params![instrument_id.to_string(), knowledge_at.unix_nanos()],
+            |row| row.get(0),
+        )?;
+        return Ok(PopulationMember::Excluded(if known {
+            MarketDataInstrumentPopulationExclusionReason::NoEffectiveRevision
+        } else {
+            MarketDataInstrumentPopulationExclusionReason::NoKnownRevision
+        }));
+    };
+    charge_row(&selected, budget)?;
+    let record = rebuild_record(selected)?;
+    let interval = record.definition().effective_interval();
+    if record.definition().instrument_id() != instrument_id
+        || record.published_at() > knowledge_at
+        || interval.starts_at() > effective_at
+    {
+        return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+    }
+    if interval.ends_at().is_some_and(|end| effective_at >= end) {
+        return Ok(PopulationMember::Excluded(
+            MarketDataInstrumentPopulationExclusionReason::NoEffectiveRevision,
+        ));
+    }
+    Ok(PopulationMember::Record(record))
 }
 
 fn prepare_definitions(
@@ -1101,6 +1387,71 @@ fn batch_digest(prepared: &[PreparedDefinition]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn population_query_digest(
+    instrument_ids: &[InstrumentId],
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(POPULATION_QUERY_DOMAIN);
+    hasher.update((instrument_ids.len() as u64).to_be_bytes());
+    for instrument_id in instrument_ids {
+        hasher.update(instrument_id.as_uuid().as_bytes());
+    }
+    hasher.update(knowledge_at.unix_nanos().to_be_bytes());
+    hasher.update(effective_at.unix_nanos().to_be_bytes());
+    digest(hasher.finalize().into())
+}
+
+fn population_receipt_digest(
+    query_digest: EvidenceDigest,
+    disposition: MarketDataInstrumentPopulationDisposition,
+    records: &[MarketDataInstrumentRecord],
+    exclusions: &[MarketDataInstrumentPopulationExclusion],
+) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(POPULATION_RECEIPT_DOMAIN);
+    hash_evidence(&mut hasher, query_digest);
+    hasher.update([match disposition {
+        MarketDataInstrumentPopulationDisposition::Complete => 1,
+        MarketDataInstrumentPopulationDisposition::Unavailable => 2,
+    }]);
+    hasher.update((records.len() as u64).to_be_bytes());
+    for record in records {
+        let definition = record.definition();
+        hasher.update(definition.instrument_id().as_uuid().as_bytes());
+        hash_evidence(&mut hasher, record.revision_digest());
+        hasher.update(record.revision_sequence().to_be_bytes());
+        hasher.update(record.published_at().unix_nanos().to_be_bytes());
+        let interval = definition.effective_interval();
+        hasher.update(interval.starts_at().unix_nanos().to_be_bytes());
+        match interval.ends_at() {
+            Some(end) => {
+                hasher.update([1]);
+                hasher.update(end.unix_nanos().to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    hasher.update((exclusions.len() as u64).to_be_bytes());
+    for exclusion in exclusions {
+        hasher.update(exclusion.instrument_id.as_uuid().as_bytes());
+        hasher.update([match exclusion.reason {
+            MarketDataInstrumentPopulationExclusionReason::NoKnownRevision => 1,
+            MarketDataInstrumentPopulationExclusionReason::NoEffectiveRevision => 2,
+        }]);
+    }
+    digest(hasher.finalize().into())
+}
+
+fn hash_evidence(hasher: &mut Sha256, evidence: EvidenceDigest) {
+    hasher.update([match evidence.algorithm() {
+        DigestAlgorithm::Sha256 => 1,
+        DigestAlgorithm::Blake3 => 2,
+    }]);
+    hasher.update(evidence.bytes());
+}
+
 const fn digest(bytes: [u8; 32]) -> EvidenceDigest {
     EvidenceDigest::new(DigestAlgorithm::Sha256, bytes)
 }
@@ -1176,6 +1527,38 @@ const STORED_COLUMNS: &str = "revisions.revision_digest, revisions.instrument_id
     revisions.figi_source_timestamp_ns, revisions.figi_observed_at_ns,
     revisions.figi_rights_policy_id, revisions.figi_terms_reference,
     revisions.definition_json, revisions.published_at_ns";
+
+const POPULATION_AS_OF_SQL: &str = "
+WITH selected_start AS (
+    SELECT MAX(candidate.effective_start_ns) AS effective_start_ns
+    FROM market_data_instrument_revisions AS candidate
+    WHERE candidate.instrument_id=?1
+      AND candidate.published_at_ns<=?2
+      AND candidate.effective_start_ns<=?3
+)
+SELECT revisions.revision_digest, revisions.instrument_id, revisions.permanent_figi,
+       revisions.revision_sequence, revisions.effective_start_ns,
+       revisions.effective_end_ns, revisions.reference_revision,
+       revisions.reference_algorithm, revisions.reference_payload_digest,
+       revisions.figi_source_id, revisions.figi_source_algorithm,
+       revisions.figi_source_payload_digest, revisions.figi_source_timestamp_ns,
+       revisions.figi_observed_at_ns, revisions.figi_rights_policy_id,
+       revisions.figi_terms_reference, revisions.definition_json,
+       revisions.published_at_ns
+FROM market_data_instrument_revisions AS revisions
+JOIN selected_start
+  ON selected_start.effective_start_ns=revisions.effective_start_ns
+WHERE revisions.instrument_id=?1
+  AND revisions.published_at_ns<=?2
+ORDER BY revisions.revision_digest
+LIMIT 2";
+
+const POPULATION_KNOWN_SQL: &str = "
+SELECT EXISTS(
+    SELECT 1
+    FROM market_data_instrument_revisions AS revisions
+    WHERE revisions.instrument_id=?1 AND revisions.published_at_ns<=?2
+)";
 
 const SEARCH_SQL: &str = "
 WITH matches AS (
