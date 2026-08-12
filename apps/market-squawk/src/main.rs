@@ -140,6 +140,7 @@ async fn run() -> Result<()> {
             run_config_command(command, &config, output)?;
         }
         command @ (Command::Source { .. }
+        | Command::Market { .. }
         | Command::Ingest { .. }
         | Command::Dataset { .. }
         | Command::Query { .. }

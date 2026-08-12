@@ -1,4 +1,6 @@
 use std::io::{Read as _, Seek as _, SeekFrom};
+use std::mem::size_of;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -31,7 +33,10 @@ use crate::schema::{
     FEATURE_LABEL_SCHEMA_VERSION, POLICY_DIGEST_KEY, SCHEMA_FINGERPRINT_KEY, SCHEMA_NAME_KEY,
     SCHEMA_VERSION_KEY, UNIVERSE_DIGEST_KEY,
 };
-use crate::{CatalogEndpointIdentity, DatasetArrowBatch, Sha256Digest};
+use crate::{
+    CatalogEndpointIdentity, ComponentKind, DatasetArrowBatch, FeatureLabelComponentSpec,
+    FeatureLabelMeasurement, FeatureLabelMeasurementBinding, Sha256Digest,
+};
 
 const CONTROL_EXPANSION: usize = 16;
 const CONTROL_OVERHEAD: usize = 64 * 1024;
@@ -125,7 +130,7 @@ pub(super) fn verify(
     location.validate_for_open()?;
     let mut hasher = new_selection_hasher(catalog_identity, export_sha256, as_of);
     let mut selected_rows = 0_usize;
-    let mut validator = RowSequenceValidator::new(&descriptor)?;
+    let mut validator = RowSequenceValidator::new(&descriptor, control_bytes)?;
     let artifacts = paths.artifacts()?.clone();
     for object in &descriptor.objects {
         check_control(deadline, cancellation)?;
@@ -143,7 +148,7 @@ pub(super) fn verify(
             &mut validator,
         )?;
     }
-    validator.finish()?;
+    let label_measurements = validator.finish()?;
     check_control(deadline, cancellation)?;
     catalog_file.validate_identity()?;
     location.validate_for_open()?;
@@ -159,6 +164,7 @@ pub(super) fn verify(
         selection_sha256: finish_selection_hash(hasher, selected_rows)?,
         selected_rows,
         as_of,
+        label_measurements,
     })
 }
 
@@ -180,7 +186,7 @@ fn admitted_descriptor(
         return Err(PythonDatasetCatalogError::UnknownAdmission);
     };
     if catalog.as_slice() != catalog_identity.bytes()
-        || digest_version != 1
+        || digest_version != 2
         || descriptor.is_empty()
         || descriptor.len() > max_bytes.min(1024 * 1024)
         || Sha256Digest::new(Sha256::digest(&descriptor).into()) != export_sha256
@@ -579,6 +585,9 @@ fn row(batch: &RecordBatch, index: usize) -> Result<PythonDatasetRow, PythonData
         .and_then(|array| array.as_any().downcast_ref::<TimestampNanosecondArray>())
         .ok_or(PythonDatasetCatalogError::CorruptAdmission)?
         .value(index);
+    let observed_effective = optional_timestamp(batch, "observed_effective_at", index)?;
+    let label_effective = optional_timestamp(batch, "label_effective_at", index)?;
+    let target_coordinate_kind = uint8(batch, "target_coordinate_kind")?.value(index);
     let split = uint8(batch, "split")?.value(index);
     let kind = uint8(batch, "component_kind")?.value(index);
     let name = padded_text(fixed("component_name")?, index)?;
@@ -622,6 +631,9 @@ fn row(batch: &RecordBatch, index: usize) -> Result<PythonDatasetRow, PythonData
         example,
         instrument,
         Timestamp::from_unix_nanos(cutoff),
+        observed_effective,
+        label_effective,
+        target_coordinate_kind,
         split,
         kind,
         name,
@@ -631,6 +643,18 @@ fn row(batch: &RecordBatch, index: usize) -> Result<PythonDatasetRow, PythonData
         currency,
         lineage,
     )
+}
+
+fn optional_timestamp(
+    batch: &RecordBatch,
+    name: &str,
+    index: usize,
+) -> Result<Option<Timestamp>, PythonDatasetCatalogError> {
+    let values = batch
+        .column_by_name(name)
+        .and_then(|array| array.as_any().downcast_ref::<TimestampNanosecondArray>())
+        .ok_or(PythonDatasetCatalogError::CorruptAdmission)?;
+    Ok((!values.is_null(index)).then(|| Timestamp::from_unix_nanos(values.value(index))))
 }
 
 fn uint8<'a>(
@@ -671,33 +695,106 @@ fn padded_text(
 
 struct RowSequenceValidator {
     components: Vec<(u8, String, u32)>,
+    component_specs: Vec<FeatureLabelComponentSpec>,
+    expected_measurements: Vec<Option<FeatureLabelMeasurement>>,
+    observed_measurements: Vec<Option<FeatureLabelMeasurement>>,
+    expected_horizons: Vec<Option<NonZeroU64>>,
+    observed_horizons: Vec<FixedHorizonState>,
     boundaries: [i64; 3],
     expected_counts: [usize; 3],
     observed_counts: [usize; 3],
-    current_key: Option<(i64, [u8; 16], String, u8)>,
+    current_key: Option<(i64, [u8; 16], String, u8, u8, Option<i64>, Option<i64>)>,
     previous_key: Option<(i64, [u8; 16], String)>,
     component_index: usize,
 }
 
 impl RowSequenceValidator {
-    fn new(descriptor: &Descriptor) -> Result<Self, PythonDatasetCatalogError> {
-        let components = descriptor
-            .components
-            .iter()
-            .map(|component| {
-                Ok((
-                    match component.kind.as_str() {
-                        "feature" => 1,
-                        "label" => 2,
-                        _ => return Err(PythonDatasetCatalogError::CorruptAdmission),
-                    },
-                    component.name.clone(),
-                    component.version,
-                ))
+    fn new(
+        descriptor: &Descriptor,
+        control_bytes: usize,
+    ) -> Result<Self, PythonDatasetCatalogError> {
+        let component_count = descriptor.components.len();
+        let component_name_bytes =
+            descriptor
+                .components
+                .iter()
+                .try_fold(0_usize, |total, component| {
+                    total
+                        .checked_add(component.name.len())
+                        .ok_or(PythonDatasetCatalogError::LimitExceeded)
+                })?;
+        let retained = size_of::<Self>()
+            .checked_add(
+                size_of::<(u8, String, u32)>()
+                    .checked_mul(component_count)
+                    .ok_or(PythonDatasetCatalogError::LimitExceeded)?,
+            )
+            .and_then(|value| value.checked_add(component_name_bytes))
+            .and_then(|value| {
+                value.checked_add(size_of::<FeatureLabelComponentSpec>() * component_count)
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .and_then(|value| value.checked_add(component_name_bytes))
+            .and_then(|value| {
+                size_of::<Option<FeatureLabelMeasurement>>()
+                    .checked_mul(component_count)
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .and_then(|bytes| value.checked_add(bytes))
+            })
+            .and_then(|value| {
+                size_of::<Option<NonZeroU64>>()
+                    .checked_add(size_of::<FixedHorizonState>())
+                    .and_then(|bytes| bytes.checked_mul(component_count))
+                    .and_then(|bytes| value.checked_add(bytes))
+            })
+            .ok_or(PythonDatasetCatalogError::LimitExceeded)?;
+        if retained > control_bytes {
+            return Err(PythonDatasetCatalogError::LimitExceeded);
+        }
+
+        let mut components = Vec::new();
+        components
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        let mut component_specs = Vec::new();
+        component_specs
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        let mut expected_measurements = Vec::new();
+        expected_measurements
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        let mut expected_horizons = Vec::new();
+        expected_horizons
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        for component in &descriptor.components {
+            let kind = match component.kind.as_str() {
+                "feature" => 1,
+                "label" => 2,
+                _ => return Err(PythonDatasetCatalogError::CorruptAdmission),
+            };
+            components.push((kind, component.name.clone(), component.version));
+            component_specs.push(component.spec()?);
+            expected_measurements.push(component.measurement()?);
+            expected_horizons.push(component.fixed_horizon_nanos()?);
+        }
+        let mut observed_measurements = Vec::new();
+        observed_measurements
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        observed_measurements.resize(component_count, None);
+        let mut observed_horizons = Vec::new();
+        observed_horizons
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        observed_horizons.resize(component_count, FixedHorizonState::Unseen);
         Ok(Self {
             components,
+            observed_measurements,
+            observed_horizons,
+            component_specs,
+            expected_measurements,
+            expected_horizons,
             boundaries: [
                 descriptor.split_policy.train_end_unix_nanos,
                 descriptor.split_policy.validation_end_unix_nanos,
@@ -737,11 +834,27 @@ impl RowSequenceValidator {
         {
             return Err(PythonDatasetCatalogError::CorruptAdmission);
         }
+        if row.component_kind == 2 && !matches!(&row.value, PythonDatasetValue::Missing(_)) {
+            let measurement = FeatureLabelMeasurement::try_from_parts(
+                row.unit.as_deref(),
+                row.currency.as_deref(),
+            )
+            .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?;
+            let retained = &mut self.observed_measurements[self.component_index];
+            if retained.is_some_and(|value| value != measurement) {
+                return Err(PythonDatasetCatalogError::CorruptAdmission);
+            }
+            *retained = Some(measurement);
+            self.observed_horizons[self.component_index].observe(row.fixed_horizon_nanos());
+        }
         let group = (
             row.cutoff_at.unix_nanos(),
             row.instrument_id,
             row.example_id.to_string(),
             row.split,
+            row.target_coordinate_kind,
+            row.observed_effective_at.map(Timestamp::unix_nanos),
+            row.label_effective_at.map(Timestamp::unix_nanos),
         );
         if self.component_index == 0 {
             let ordering = (group.0, group.1, group.2.clone());
@@ -769,10 +882,69 @@ impl RowSequenceValidator {
         Ok(())
     }
 
-    fn finish(self) -> Result<(), PythonDatasetCatalogError> {
-        if self.component_index != 0 || self.observed_counts != self.expected_counts {
+    fn finish(self) -> Result<Box<[FeatureLabelMeasurementBinding]>, PythonDatasetCatalogError> {
+        if self.component_index != 0
+            || self.observed_counts != self.expected_counts
+            || self.observed_measurements != self.expected_measurements
+            || self
+                .observed_horizons
+                .iter()
+                .map(|state| state.fixed())
+                .ne(self.expected_horizons.iter().copied())
+        {
             return Err(PythonDatasetCatalogError::CorruptAdmission);
         }
-        Ok(())
+        let binding_count = self
+            .component_specs
+            .iter()
+            .zip(&self.expected_measurements)
+            .filter(|(spec, measurement)| {
+                spec.kind() == ComponentKind::Label && measurement.is_some()
+            })
+            .count();
+        let mut bindings = Vec::new();
+        bindings
+            .try_reserve_exact(binding_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        for ((spec, measurement), horizon) in self
+            .component_specs
+            .into_iter()
+            .zip(self.expected_measurements)
+            .zip(self.expected_horizons)
+        {
+            if spec.kind() == ComponentKind::Label {
+                if let Some(measurement) = measurement {
+                    bindings.push(
+                        FeatureLabelMeasurementBinding::try_new(spec, measurement, horizon)
+                            .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?,
+                    );
+                }
+            }
+        }
+        Ok(bindings.into_boxed_slice())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FixedHorizonState {
+    Unseen,
+    Fixed(NonZeroU64),
+    Unsupported,
+}
+
+impl FixedHorizonState {
+    fn observe(&mut self, candidate: Option<NonZeroU64>) {
+        *self = match (*self, candidate) {
+            (Self::Unseen, Some(value)) => Self::Fixed(value),
+            (Self::Fixed(expected), Some(value)) if value == expected => Self::Fixed(expected),
+            (Self::Unsupported, _) | (_, None) | (Self::Fixed(_), Some(_)) => Self::Unsupported,
+        };
+    }
+
+    const fn fixed(self) -> Option<NonZeroU64> {
+        match self {
+            Self::Fixed(value) => Some(value),
+            Self::Unseen | Self::Unsupported => None,
+        }
     }
 }

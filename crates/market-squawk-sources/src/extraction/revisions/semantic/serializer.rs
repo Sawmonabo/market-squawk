@@ -1,4 +1,4 @@
-//! Shared deterministic PIT-v1 tagged binary serializer.
+//! Shared deterministic PIT-v2 tagged binary serializer.
 
 use std::fmt;
 
@@ -9,17 +9,17 @@ use serde::ser::{
 };
 use sha2::{Digest as _, Sha256};
 
-const PIT_IDENTITY_SCHEMA_VERSION: u16 = 1;
+const PIT_IDENTITY_SCHEMA_VERSION: u16 = 2;
 const MAX_COLLECTION_ELEMENTS: usize = 4_096;
 
-/// Cooperative control used while producing PIT-v1 canonical bytes.
+/// Cooperative control used while producing PIT-v2 canonical bytes.
 #[doc(hidden)]
 pub trait PitV1EncodingControl {
     /// Observes one bounded encoder operation.
     fn checkpoint(&mut self) -> Result<(), PitV1EncodingError>;
 }
 
-/// Failure to encode exact PIT-v1 canonical bytes.
+/// Failure to encode exact PIT-v2 canonical bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[doc(hidden)]
 pub enum PitV1EncodingError {
@@ -58,7 +58,7 @@ impl serde::ser::Error for PitV1EncodingError {
     }
 }
 
-/// Exact PIT-v1 encoder shared by revision assignment and point-in-time selection.
+/// Exact PIT-v2 encoder shared by revision assignment and point-in-time selection.
 #[doc(hidden)]
 pub struct PitV1CanonicalEncoder<'control> {
     hasher: Sha256,

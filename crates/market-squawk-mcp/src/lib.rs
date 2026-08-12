@@ -31,7 +31,10 @@ pub use http::{
     AuthenticatedMcpClient, HttpMcpConfig, McpHttpAuthError, McpHttpAuthenticator,
     McpHttpConfigError, McpHttpService,
 };
-pub use jobs::{JOB_RESOURCE_TEMPLATE, JobResourceError, job_resource_uri, parse_job_resource_uri};
+pub use jobs::{
+    JOB_RESOURCE_TEMPLATE, JobResourceError, JobResourceIdentity, job_resource_uri,
+    parse_job_resource_uri,
+};
 pub use limits::{McpLimitError, McpLimitSpec, McpLimits};
 pub use market_squawk_services::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,

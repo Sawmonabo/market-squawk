@@ -840,23 +840,88 @@ jobs:
           bootstrap="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-bootstrap-$TARGET$EXE"
           bundle="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-$MARKET_SQUAWK_RELEASE_VERSION-$TARGET.zip"
           manifest="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-release.json"
-          # Windows runner temp has runner-managed ACLs; exercise the per-user install boundary.
+          isolation_root="$RUNNER_TEMP/installed-product/terminal"
+          home="$isolation_root/home"
+          config="$isolation_root/config"
+          data="$isolation_root/data"
+          state="$isolation_root/state"
+          cache="$isolation_root/cache"
+          temporary="$isolation_root/tmp"
+          appdata="$isolation_root/appdata"
+          local_appdata="$isolation_root/local-appdata"
+          installed_cwd="$isolation_root/cwd"
+          umask 077
+          install -d -m 700 \
+            "$home" "$config" "$data" "$state" "$cache" "$temporary" \
+            "$appdata" "$local_appdata" "$installed_cwd"
+
+          env_program="$(command -v env)"
+          [[ "$env_program" = /* && -x "$env_program" ]]
+          case "$RUNNER_OS" in
+            Windows)
+              windows_root="${SYSTEMROOT:-${SystemRoot:-${WINDIR:-${windir:-}}}}"
+              [[ -n "$windows_root" ]]
+              installed_path="${windows_root}\\System32;${windows_root};${windows_root}\\System32\\Wbem;${windows_root}\\System32\\WindowsPowerShell\\v1.0"
+              ;;
+            macOS)
+              installed_path="/usr/bin:/bin:/usr/sbin:/sbin"
+              ;;
+            Linux)
+              installed_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+              ;;
+            *)
+              echo "unsupported installed-product smoke platform: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
+          installed_env=(
+            "$env_program" -i
+            "PATH=$installed_path"
+          )
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            install_root="$(cygpath -u "$LOCALAPPDATA")/MarketSquawk/ci-verification/program"
+            installed_env+=(
+              "HOME=$(cygpath -w "$home")"
+              "USERPROFILE=$(cygpath -w "$home")"
+              "APPDATA=$(cygpath -w "$appdata")"
+              "LOCALAPPDATA=$(cygpath -w "$local_appdata")"
+              "TEMP=$(cygpath -w "$temporary")"
+              "TMP=$(cygpath -w "$temporary")"
+              "XDG_CONFIG_HOME=$(cygpath -w "$config")"
+              "XDG_DATA_HOME=$(cygpath -w "$data")"
+              "XDG_STATE_HOME=$(cygpath -w "$state")"
+              "XDG_CACHE_HOME=$(cygpath -w "$cache")"
+              "SystemRoot=$windows_root"
+              "WINDIR=$windows_root"
+            )
+            windows_comspec="${COMSPEC:-${ComSpec:-}}"
+            windows_drive="${SYSTEMDRIVE:-${SystemDrive:-}}"
+            [[ -z "$windows_comspec" ]] || installed_env+=("ComSpec=$windows_comspec")
+            [[ -z "${PATHEXT:-}" ]] || installed_env+=("PATHEXT=$PATHEXT")
+            [[ -z "$windows_drive" ]] || installed_env+=("SystemDrive=$windows_drive")
+            install_root="$(cygpath -w "$data/MarketSquawk/program")"
           else
-            install_root="$RUNNER_TEMP/installed-product/program"
+            installed_env+=(
+              "HOME=$home"
+              "TMPDIR=$temporary"
+              "TMP=$temporary"
+              "TEMP=$temporary"
+              "XDG_CONFIG_HOME=$config"
+              "XDG_DATA_HOME=$data"
+              "XDG_STATE_HOME=$state"
+              "XDG_CACHE_HOME=$cache"
+            )
+            install_root="$data/MarketSquawk/program"
           fi
-          unset \
-            MARKET_SQUAWK_COMPONENT_ROOT \
-            MARKET_SQUAWK_PYTHON_PRODUCT \
-            MARKET_SQUAWK_RELEASE_OUTPUT \
-            MARKET_SQUAWK_RELEASE_VERSION \
-            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
-          "$bootstrap" --root "$install_root" install \
+          run_installed() (
+            set -euo pipefail
+            cd "$installed_cwd"
+            exec "${installed_env[@]}" "$@"
+          )
+          run_installed "$bootstrap" --root "$install_root" install \
             --manifest "$manifest" \
             --bundle "$bundle"
-          "$bootstrap" --root "$install_root" status --json
-          "$bootstrap" --root "$install_root" uninstall
+          run_installed "$bootstrap" --root "$install_root" status --json
+          run_installed "$bootstrap" --root "$install_root" uninstall
           [[ ! -e "$install_root" ]]
       - name: Collect bounded installed-service failure evidence
         if: failure()
@@ -864,21 +929,123 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            installation_data_root="$(cygpath -u "$LOCALAPPDATA")/MarketSquawk/ci-verification"
-          else
-            installation_data_root="$RUNNER_TEMP/installed-product"
-          fi
+          installation_data_root="$RUNNER_TEMP/installed-product/native/installation-data"
           diagnostics="$RUNNER_TEMP/installed-service-diagnostics"
           install -d -m 700 "$diagnostics"
-          startup="$installation_data_root/control/installed-service-startup/state.json"
-          logs="$installation_data_root/control/structured-logs"
-          if [[ -f "$startup" && ! -L "$startup" ]]; then
-            install -m 600 "$startup" "$diagnostics/startup-state.json"
-          fi
-          if [[ -d "$logs" && ! -L "$logs" ]]; then
-            cp -R -- "$logs" "$diagnostics/structured-logs"
-          fi
+          python3 - "$installation_data_root" "$diagnostics" <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          MAXIMUM_FILES = 16
+          MAXIMUM_FILE_BYTES = 64 * 1024
+          MAXIMUM_TOTAL_BYTES = 512 * 1024
+          MAXIMUM_SCANNED_ENTRIES = 256
+          SENSITIVE_VALUE = re.compile(
+              r'''(?i)(["']?(?:secret|credential|token|password|unlock|authorization)["']?'''
+              r'''\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)'''
+          )
+          BEARER_VALUE = re.compile(r"(?i)(bearer\s+)[a-z0-9._~+/=-]+")
+
+
+          def redacted(source: bytes) -> bytes:
+              text = source.decode("utf-8", errors="replace")
+              text = SENSITIVE_VALUE.sub(r"\1[REDACTED]", text)
+              text = BEARER_VALUE.sub(r"\1[REDACTED]", text)
+              return text.encode("utf-8")
+
+
+          source_root = pathlib.Path(sys.argv[1]).resolve(strict=False)
+          output_root = pathlib.Path(sys.argv[2]).resolve(strict=True)
+          candidates: list[tuple[str, pathlib.Path]] = []
+          startup = source_root / "control" / "installed-service-startup" / "state.json"
+          candidates.append(("startup-state.txt", startup))
+          log_root = source_root / "control" / "structured-logs"
+          stack = [log_root]
+          scanned = 0
+          log_index = 0
+          while stack and scanned < MAXIMUM_SCANNED_ENTRIES:
+              directory = stack.pop()
+              try:
+                  entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+              except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+                  continue
+              for entry in entries:
+                  scanned += 1
+                  if scanned > MAXIMUM_SCANNED_ENTRIES:
+                      break
+                  try:
+                      if entry.is_symlink():
+                          continue
+                      if entry.is_dir(follow_symlinks=False):
+                          stack.append(pathlib.Path(entry.path))
+                      elif entry.is_file(follow_symlinks=False):
+                          log_index += 1
+                          candidates.append(
+                              (f"structured-log-{log_index:03d}.txt", pathlib.Path(entry.path))
+                          )
+                  except OSError:
+                      continue
+
+          written = 0
+          total_bytes = 0
+          truncated_files = 0
+          for name, candidate in candidates:
+              if written >= MAXIMUM_FILES or total_bytes >= MAXIMUM_TOTAL_BYTES:
+                  break
+              try:
+                  metadata = candidate.lstat()
+                  resolved = candidate.resolve(strict=True)
+              except (FileNotFoundError, OSError):
+                  continue
+              if (
+                  candidate.is_symlink()
+                  or not candidate.is_file()
+                  or (resolved != source_root and source_root not in resolved.parents)
+              ):
+                  continue
+              limit = min(
+                  MAXIMUM_FILE_BYTES,
+                  MAXIMUM_TOTAL_BYTES - total_bytes,
+              )
+              try:
+                  with candidate.open("rb") as source:
+                      raw = source.read(limit + 1)
+              except OSError:
+                  continue
+              truncated = metadata.st_size > limit or len(raw) > limit
+              encoded = redacted(raw[:limit])
+              if len(encoded) > limit:
+                  encoded = encoded[:limit].decode("utf-8", errors="ignore").encode("utf-8")
+                  truncated = True
+              destination = output_root / name
+              descriptor = os.open(
+                  destination,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                  0o600,
+              )
+              with os.fdopen(descriptor, "wb") as output:
+                  output.write(encoded)
+              written += 1
+              total_bytes += len(encoded)
+              truncated_files += int(truncated)
+
+          summary = (
+              f"files={written}\n"
+              f"bytes={total_bytes}\n"
+              f"truncated_files={truncated_files}\n"
+              f"scanned_entries={scanned}\n"
+          )
+          summary_path = output_root / "collection-summary.txt"
+          descriptor = os.open(
+              summary_path,
+              os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+              0o600,
+          )
+          with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+              output.write(summary)
+          PY
       # actions/upload-artifact v7.0.1, verified release commit (2026-04-10).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: failure()
@@ -896,6 +1063,13 @@ jobs:
           set -euo pipefail
 
           [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]]
+          repository_root="$(pwd -P)"
+          env_program="$(command -v env)"
+          python3_program="$(command -v python3)"
+          smoke_mcp="$repository_root/scripts/smoke_mcp.py"
+          [[ "$env_program" = /* && -x "$env_program" ]]
+          [[ "$python3_program" = /* && -x "$python3_program" ]]
+          [[ -f "$smoke_mcp" && ! -L "$smoke_mcp" ]]
           dmg="$(find "target/$TARGET/release/bundle/dmg" \
             -maxdepth 1 -type f -name '*.dmg' -print)"
           [[ -n "$dmg" && "$dmg" != *$'\n'* ]]
@@ -906,16 +1080,50 @@ jobs:
           mount="$RUNNER_TEMP/market-squawk-dmg"
           application="$RUNNER_TEMP/Applications/Market Squawk.app"
           release_version="$MARKET_SQUAWK_RELEASE_VERSION"
-          home="$HOME"
-          state_search_root="$HOME/Library/Application Support"
-          requested_data="$RUNNER_TEMP/native-data"
-          log="$RUNNER_TEMP/native-desktop.log"
+          isolation_root="$RUNNER_TEMP/installed-product/native"
+          home="$isolation_root/home"
+          config="$isolation_root/config"
+          data="$isolation_root/data"
+          state_root="$isolation_root/state"
+          cache="$isolation_root/cache"
+          temporary="$isolation_root/tmp"
+          installed_cwd="$isolation_root/cwd"
+          installation_data_root="$isolation_root/installation-data"
+          requested_data="$isolation_root/workspace-data"
+          root="$installation_data_root/program"
+          state="$root/installation.json"
+          log="$isolation_root/native-desktop.log"
           desktop_pid=""
+          umask 077
           install -d -m 700 \
             "$mount" \
             "$RUNNER_TEMP/Applications" \
+            "$home" \
+            "$config" \
+            "$data" \
+            "$state_root" \
+            "$cache" \
+            "$temporary" \
+            "$installed_cwd" \
+            "$installation_data_root" \
             "$requested_data"
-          mkdir -p "$state_search_root"
+          installed_env=(
+            "$env_program" -i
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+            "HOME=$home"
+            "TMPDIR=$temporary"
+            "TMP=$temporary"
+            "TEMP=$temporary"
+            "XDG_CONFIG_HOME=$config"
+            "XDG_DATA_HOME=$data"
+            "XDG_STATE_HOME=$state_root"
+            "XDG_CACHE_HOME=$cache"
+          )
+          run_installed() (
+            set -euo pipefail
+            cd "$installed_cwd"
+            exec "${installed_env[@]}" "$@"
+          )
           cleanup() {
             if [[ -n "$desktop_pid" ]] && kill -0 "$desktop_pid" 2>/dev/null; then
               kill "$desktop_pid" 2>/dev/null || true
@@ -932,22 +1140,15 @@ jobs:
           ditto "$packaged" "$application"
           hdiutil detach "$mount"
 
-          unset \
-            MARKET_SQUAWK_COMPONENT_ROOT \
-            MARKET_SQUAWK_PYTHON_PRODUCT \
-            MARKET_SQUAWK_RELEASE_OUTPUT \
-            MARKET_SQUAWK_RELEASE_VERSION \
-            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
-          HOME="$home" "$application/Contents/MacOS/market-squawk-desktop" \
-            --data-dir "$requested_data" >"$log" 2>&1 &
+          run_installed \
+            "$application/Contents/MacOS/market-squawk-desktop" \
+            --data-dir "$requested_data" \
+            --installation-data-root "$installation_data_root" \
+            >"$log" 2>&1 &
           desktop_pid=$!
-          state=""
           for _attempt in {1..120}
           do
-            state="$(find "$state_search_root" -type f \
-              -path '*/program/installation.json' \
-              -print -quit)"
-            if [[ -n "$state" ]]; then
+            if [[ -f "$state" && ! -L "$state" ]]; then
               break
             fi
             if ! kill -0 "$desktop_pid" 2>/dev/null; then
@@ -956,14 +1157,13 @@ jobs:
             fi
             sleep 1
           done
-          [[ -n "$state" ]]
+          [[ -f "$state" && ! -L "$state" ]]
           sleep 3
           kill -0 "$desktop_pid"
           kill "$desktop_pid"
           wait "$desktop_pid" || true
           desktop_pid=""
 
-          root="$(dirname "$state")"
           data_root="$(dirname "$root")"
           installer="$(find "$root/versions" -type f \
             -path '*/bin/market-squawk-installer' -print)"
@@ -984,23 +1184,29 @@ jobs:
           sentinel_content='native-package-user-data-v1'
           install -d -m 700 "$(dirname "$sentinel")"
           printf '%s' "$sentinel_content" > "$sentinel"
-          HOME="$home" "$installer" --root "$root" status --json
-          HOME="$home" "$installer" --root "$root" repair
-          HOME="$home" "$installer" --root "$root" service status --json
-          HOME="$home" "$application_cli" --data-dir "$data_root" \
+          run_installed "$installer" --root "$root" status --json
+          run_installed "$installer" --root "$root" repair
+          run_installed "$installer" --root "$root" service status --json
+          run_installed "$application_cli" \
+            --data-dir "$data_root" \
+            --installation-data-root "$installation_data_root" \
             --output json doctor
-          HOME="$home" "$application_cli" --data-dir "$data_root" \
+          run_installed "$application_cli" \
+            --data-dir "$data_root" \
+            --installation-data-root "$installation_data_root" \
             --output json setup status
-          HOME="$home" "$runtime" -I -B -c \
+          run_installed "$runtime" -I -B -c \
             'import market_squawk, pyarrow; print(pyarrow.__version__)'
-          HOME="$home" "$training" --help >/dev/null
-          HOME="$home" "$runtime" -I -B -c \
+          run_installed "$training" --help >/dev/null
+          run_installed "$runtime" -I -B -c \
             'from market_squawk import training_environment_receipt; from market_squawk.finance import OperationContext, feature_contracts; receipt = training_environment_receipt(); contracts = feature_contracts(context=OperationContext(60000, 1000000)); assert len(receipt.sha256) == 64 and contracts'
-          HOME="$home" python3 scripts/smoke_mcp.py "$relay" \
+          run_installed "$python3_program" "$smoke_mcp" "$relay" \
             --installed-relay --running-service --data-dir "$data_root" \
+            --installation-data-root "$installation_data_root" \
             --client claude-code
-          HOME="$home" python3 scripts/smoke_mcp.py "$relay" \
+          run_installed "$python3_program" "$smoke_mcp" "$relay" \
             --installed-relay --running-service --data-dir "$data_root" \
+            --installation-data-root "$installation_data_root" \
             --client codex
 
           update_request="$RUNNER_TEMP/signed-update-request.json"
@@ -1021,12 +1227,16 @@ jobs:
               tests::signed_update_fixture_activates_and_rolls_back_an_installed_package \
               --locked -- --ignored --exact
           [[ -f "$update_evidence/receipt.json" ]]
-          HOME="$home" "$installer" --root "$root" status --json
-          HOME="$home" "$installer" --root "$root" service status --json
-          HOME="$home" "$application_cli" --data-dir "$data_root" \
+          run_installed "$installer" --root "$root" status --json
+          run_installed "$installer" --root "$root" service status --json
+          run_installed "$application_cli" \
+            --data-dir "$data_root" \
+            --installation-data-root "$installation_data_root" \
             --output json doctor
 
-          HOME="$home" "$application/Contents/MacOS/market-squawk-desktop" \
+          run_installed \
+            "$application/Contents/MacOS/market-squawk-desktop" \
+            --installation-data-root "$installation_data_root" \
             --native-uninstall
           [[ ! -e "$root" ]]
           [[ -f "$sentinel" ]]
@@ -1043,12 +1253,35 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ((git rev-parse HEAD).Trim() -ne $env:CANDIDATE_SHA) {
+          $runnerTemp = $env:RUNNER_TEMP
+          $target = $env:TARGET
+          $candidateSha = $env:CANDIDATE_SHA
+          $releaseVersion = $env:MARKET_SQUAWK_RELEASE_VERSION
+          $repositoryRoot = (Get-Location).ProviderPath
+          $smokeScript = Join-Path $repositoryRoot "scripts/smoke_mcp.py"
+          $python = (Get-Command python -CommandType Application).Source
+          if (
+            -not [IO.Path]::IsPathFullyQualified($python) -or
+            -not (Test-Path -LiteralPath $python -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $smokeScript -PathType Leaf)
+          ) {
+            throw "The native package smoke harness is unavailable."
+          }
+          $buildEnvironment = [System.Collections.Generic.Dictionary[string, string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+          )
+          foreach (
+            $entry in [Environment]::GetEnvironmentVariables("Process").GetEnumerator()
+          ) {
+            $buildEnvironment[[string]$entry.Key] = [string]$entry.Value
+          }
+
+          if ((git rev-parse HEAD).Trim() -ne $candidateSha) {
             throw "The native package smoke is not running at the frozen candidate."
           }
           $packages = @(
             Get-ChildItem `
-              -Path "target/$env:TARGET/release/bundle/nsis" `
+              -Path "target/$target/release/bundle/nsis" `
               -Filter "*.exe" `
               -File
           )
@@ -1063,9 +1296,106 @@ jobs:
           if ((Get-AuthenticodeSignature $package.FullName).Status -ne "NotSigned") {
             throw "The provenance-only NSIS package has unexpected publisher state."
           }
+
+          $isolationRoot = Join-Path $runnerTemp "installed-product/native"
+          $home = Join-Path $isolationRoot "home"
+          $config = Join-Path $isolationRoot "config"
+          $data = Join-Path $isolationRoot "data"
+          $stateRoot = Join-Path $isolationRoot "state"
+          $cache = Join-Path $isolationRoot "cache"
+          $temporary = Join-Path $isolationRoot "tmp"
+          $appData = Join-Path $isolationRoot "appdata"
+          $localAppData = Join-Path $isolationRoot "local-appdata"
+          $nativePackageRoot = Join-Path $isolationRoot "native-package"
+          $installedWorkingDirectory = Join-Path $isolationRoot "cwd"
+          $installationDataRoot = Join-Path $isolationRoot "installation-data"
+          $root = Join-Path $installationDataRoot "program"
+          $state = Join-Path $root "installation.json"
+          $requestedData = Join-Path $isolationRoot "workspace-data"
+          $stdout = Join-Path $isolationRoot "native-desktop.stdout.log"
+          $stderr = Join-Path $isolationRoot "native-desktop.stderr.log"
+          @(
+            $home,
+            $config,
+            $data,
+            $stateRoot,
+            $cache,
+            $temporary,
+            $appData,
+            $localAppData,
+            $nativePackageRoot,
+            $installedWorkingDirectory,
+            $installationDataRoot,
+            $requestedData
+          ) | ForEach-Object {
+            New-Item -ItemType Directory -Force -Path $_ | Out-Null
+          }
+
+          $smokeEnvironment = [System.Collections.Generic.Dictionary[string, string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+          )
+          if (-not $buildEnvironment.ContainsKey("SystemRoot")) {
+            throw "The Windows system root is unavailable."
+          }
+          $systemRoot = $buildEnvironment["SystemRoot"]
+          $smokeEnvironment["Path"] = @(
+            (Join-Path $systemRoot "System32"),
+            $systemRoot,
+            (Join-Path $systemRoot "System32/Wbem"),
+            (Join-Path $systemRoot "System32/WindowsPowerShell/v1.0")
+          ) -join [IO.Path]::PathSeparator
+          $smokeEnvironment["HOME"] = $home
+          $smokeEnvironment["USERPROFILE"] = $home
+          $smokeEnvironment["HOMEDRIVE"] = Split-Path -Qualifier $home
+          $smokeEnvironment["HOMEPATH"] = $home.Substring(
+            $smokeEnvironment["HOMEDRIVE"].Length
+          )
+          $smokeEnvironment["APPDATA"] = $appData
+          $smokeEnvironment["LOCALAPPDATA"] = $localAppData
+          $smokeEnvironment["TEMP"] = $temporary
+          $smokeEnvironment["TMP"] = $temporary
+          $smokeEnvironment["XDG_CONFIG_HOME"] = $config
+          $smokeEnvironment["XDG_DATA_HOME"] = $data
+          $smokeEnvironment["XDG_STATE_HOME"] = $stateRoot
+          $smokeEnvironment["XDG_CACHE_HOME"] = $cache
+          foreach ($name in @(
+            "SystemRoot",
+            "ComSpec",
+            "PATHEXT",
+            "WINDIR",
+            "SystemDrive"
+          )) {
+            if ($buildEnvironment.ContainsKey($name)) {
+              $smokeEnvironment[$name] = $buildEnvironment[$name]
+            }
+          }
+          function Set-ProcessEnvironment {
+            param([System.Collections.IDictionary]$Environment)
+
+            foreach ($name in @(
+              [Environment]::GetEnvironmentVariables("Process").Keys
+            )) {
+              [Environment]::SetEnvironmentVariable(
+                [string]$name,
+                $null,
+                "Process"
+              )
+            }
+            foreach ($entry in $Environment.GetEnumerator()) {
+              [Environment]::SetEnvironmentVariable(
+                [string]$entry.Key,
+                [string]$entry.Value,
+                "Process"
+              )
+            }
+          }
+
+          Set-ProcessEnvironment $smokeEnvironment
+          Set-Location $installedWorkingDirectory
           $install = Start-Process `
             -FilePath $package.FullName `
-            -ArgumentList "/S" `
+            -ArgumentList @("/S", "/D=$nativePackageRoot") `
+            -WorkingDirectory $installedWorkingDirectory `
             -Wait `
             -PassThru
           if ($install.ExitCode -ne 0) {
@@ -1075,7 +1405,7 @@ jobs:
           $desktopNames = @("market-squawk-desktop.exe", "Market Squawk.exe")
           $desktops = @(
             Get-ChildItem `
-              -Path $env:LOCALAPPDATA, $env:ProgramFiles `
+              -Path $nativePackageRoot `
               -File `
               -Recurse `
               -ErrorAction SilentlyContinue |
@@ -1086,44 +1416,25 @@ jobs:
             throw "The NSIS package did not install exactly one desktop executable."
           }
           $desktop = $desktops[0]
-          $releaseVersion = $env:MARKET_SQUAWK_RELEASE_VERSION
-          @(
-            "MARKET_SQUAWK_COMPONENT_ROOT",
-            "MARKET_SQUAWK_PYTHON_PRODUCT",
-            "MARKET_SQUAWK_RELEASE_OUTPUT",
-            "MARKET_SQUAWK_RELEASE_VERSION",
-            "MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT"
-          ) | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
-
-          $requestedData = Join-Path $env:RUNNER_TEMP "native-data"
-          $stdout = Join-Path $env:RUNNER_TEMP "native-desktop.stdout.log"
-          $stderr = Join-Path $env:RUNNER_TEMP "native-desktop.stderr.log"
           $packageProcess = Start-Process `
             -FilePath $desktop.FullName `
-            -ArgumentList @("--data-dir", $requestedData) `
+            -ArgumentList @(
+              "--data-dir",
+              $requestedData,
+              "--installation-data-root",
+              $installationDataRoot
+            ) `
+            -WorkingDirectory $installedWorkingDirectory `
             -RedirectStandardOutput $stdout `
             -RedirectStandardError $stderr `
             -PassThru
           $managedProcess = $null
           try {
-            $state = @()
             foreach ($attempt in 1..120) {
-              $state = @(
-                Get-ChildItem `
-                  -Path $env:LOCALAPPDATA `
-                  -Filter installation.json `
-                  -File `
-                  -Recurse `
-                  -ErrorAction SilentlyContinue |
-                  Where-Object { $_.DirectoryName -like "*Market*Squawk*program" }
-              )
-              if ($state.Count -gt 1) {
-                throw "The NSIS package created ambiguous managed program state."
-              }
-              if ($state.Count -eq 1) {
+              if (Test-Path -LiteralPath $state -PathType Leaf) {
                 $managedDesktops = @(
                   Get-ChildItem `
-                    -Path (Join-Path $state[0].DirectoryName "versions") `
+                    -Path (Join-Path $root "versions") `
                     -Filter market-squawk-desktop.exe `
                     -File `
                     -Recurse
@@ -1153,7 +1464,10 @@ jobs:
               }
               Start-Sleep -Seconds 1
             }
-            if ($state.Count -ne 1 -or $null -eq $managedProcess) {
+            if (
+              -not (Test-Path -LiteralPath $state -PathType Leaf) -or
+              $null -eq $managedProcess
+            ) {
               Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
               throw "The NSIS desktop did not activate and launch its managed release."
             }
@@ -1176,7 +1490,6 @@ jobs:
             }
           }
 
-          $root = $state[0].DirectoryName
           $dataRoot = Split-Path $root -Parent
           $installer = @(
             Get-ChildItem `
@@ -1233,9 +1546,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Installed-product repair failed." }
           & $installer[0].FullName --root $root service status --json
           if ($LASTEXITCODE -ne 0) { throw "Installed-service health failed." }
-          & $application[0].FullName --data-dir $dataRoot --output json doctor
+          & $application[0].FullName `
+            --data-dir $dataRoot `
+            --installation-data-root $installationDataRoot `
+            --output json doctor
           if ($LASTEXITCODE -ne 0) { throw "Installed CLI doctor failed." }
-          & $application[0].FullName --data-dir $dataRoot --output json setup status
+          & $application[0].FullName `
+            --data-dir $dataRoot `
+            --installation-data-root $installationDataRoot `
+            --output json setup status
           if ($LASTEXITCODE -ne 0) { throw "Installed setup status failed." }
           & $runtime[0].FullName -I -B -c `
             "import market_squawk, pyarrow; print(pyarrow.__version__)"
@@ -1245,28 +1564,33 @@ jobs:
           & $runtime[0].FullName -I -B -c `
             "from market_squawk import training_environment_receipt; from market_squawk.finance import OperationContext, feature_contracts; receipt = training_environment_receipt(); contracts = feature_contracts(context=OperationContext(60000, 1000000)); assert len(receipt.sha256) == 64 and contracts"
           if ($LASTEXITCODE -ne 0) { throw "Installed Python analytics admission failed." }
-          python scripts/smoke_mcp.py $relay[0].FullName `
+          & $python $smokeScript $relay[0].FullName `
             --installed-relay --running-service --data-dir $dataRoot `
+            --installation-data-root $installationDataRoot `
             --client claude-code
           if ($LASTEXITCODE -ne 0) { throw "Claude Code MCP smoke failed." }
-          python scripts/smoke_mcp.py $relay[0].FullName `
+          & $python $smokeScript $relay[0].FullName `
             --installed-relay --running-service --data-dir $dataRoot `
+            --installation-data-root $installationDataRoot `
             --client codex
           if ($LASTEXITCODE -ne 0) { throw "Codex MCP smoke failed." }
 
-          $updateEvidence = Join-Path $env:RUNNER_TEMP "signed-update-evidence"
-          $updateRequest = Join-Path $env:RUNNER_TEMP "signed-update-request.json"
+          $updateEvidence = Join-Path $runnerTemp "signed-update-evidence"
+          $updateRequest = Join-Path $runnerTemp "signed-update-request.json"
           $fixtureRequest = [ordered]@{
             installRoot = $root
-            manifest = Join-Path $env:RUNNER_TEMP `
+            manifest = Join-Path $runnerTemp `
               "complete-release/market-squawk-release.json"
-            bundle = Join-Path $env:RUNNER_TEMP `
-              "complete-release/market-squawk-$releaseVersion-$env:TARGET.zip"
+            bundle = Join-Path $runnerTemp `
+              "complete-release/market-squawk-$releaseVersion-$target.zip"
             evidenceDirectory = $updateEvidence
           }
           $fixtureRequest |
             ConvertTo-Json -Depth 3 |
             Set-Content -LiteralPath $updateRequest -Encoding utf8
+          # This build-tree fixture needs the MSVC/Cargo environment; no installed child runs here.
+          Set-ProcessEnvironment $buildEnvironment
+          Push-Location $repositoryRoot
           $env:MARKET_SQUAWK_UPDATE_FIXTURE_REQUEST = $updateRequest
           try {
             cargo test -p market-squawk-installer `
@@ -1278,6 +1602,9 @@ jobs:
           } finally {
             Remove-Item Env:MARKET_SQUAWK_UPDATE_FIXTURE_REQUEST `
               -ErrorAction SilentlyContinue
+            Pop-Location
+            Set-ProcessEnvironment $smokeEnvironment
+            Set-Location $installedWorkingDirectory
           }
           if (-not (Test-Path (Join-Path $updateEvidence "receipt.json") -PathType Leaf)) {
             throw "The signed update scenario did not publish its evidence receipt."
@@ -1286,9 +1613,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Post-rollback product status failed." }
           & $installer[0].FullName --root $root service status --json
           if ($LASTEXITCODE -ne 0) { throw "Post-rollback service health failed." }
-          & $application[0].FullName --data-dir $dataRoot --output json doctor
+          & $application[0].FullName `
+            --data-dir $dataRoot `
+            --installation-data-root $installationDataRoot `
+            --output json doctor
           if ($LASTEXITCODE -ne 0) { throw "Post-rollback CLI doctor failed." }
 
+          & $desktop.FullName `
+            --installation-data-root $installationDataRoot `
+            --native-uninstall
+          if ($LASTEXITCODE -ne 0) {
+            throw "The managed Windows product cleanup failed."
+          }
           $uninstallers = @(
             Get-ChildItem `
               -Path $desktop.DirectoryName `
@@ -1303,6 +1639,7 @@ jobs:
           $remove = Start-Process `
             -FilePath $uninstallers[0].FullName `
             -ArgumentList "/S" `
+            -WorkingDirectory $installedWorkingDirectory `
             -Wait `
             -PassThru
           if ($remove.ExitCode -ne 0) {
@@ -1331,6 +1668,17 @@ jobs:
           set -euo pipefail
 
           [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]]
+          repository_root="$(pwd -P)"
+          env_program="$(command -v env)"
+          python3_program="$(command -v python3)"
+          xvfb_run_program="$(command -v xvfb-run)"
+          smoke_mcp="$repository_root/scripts/smoke_mcp.py"
+          build_desktop="$repository_root/target/$TARGET/release/market-squawk-desktop"
+          [[ "$env_program" = /* && -x "$env_program" ]]
+          [[ "$python3_program" = /* && -x "$python3_program" ]]
+          [[ "$xvfb_run_program" = /* && -x "$xvfb_run_program" ]]
+          [[ -f "$smoke_mcp" && ! -L "$smoke_mcp" ]]
+          [[ -x "$build_desktop" && ! -L "$build_desktop" ]]
           mapfile -d '' appimages \
             < <(find "target/$TARGET/release/bundle/appimage" -maxdepth 1 \
               -type f -name '*.AppImage' -print0)
@@ -1342,17 +1690,44 @@ jobs:
           cp "${appimages[0]}" "$desktop"
           chmod u+x "$desktop"
 
-          unset \
-            MARKET_SQUAWK_COMPONENT_ROOT \
-            MARKET_SQUAWK_PYTHON_PRODUCT \
-            MARKET_SQUAWK_RELEASE_OUTPUT \
-            MARKET_SQUAWK_RELEASE_VERSION \
-            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
-          home="$HOME"
-          requested_data="$RUNNER_TEMP/native-data"
-          xdg="${XDG_DATA_HOME:-$HOME/.local/share}"
-          log="$RUNNER_TEMP/native-desktop.log"
+          isolation_root="$RUNNER_TEMP/installed-product/native"
+          home="$isolation_root/home"
+          config="$isolation_root/config"
+          data="$isolation_root/data"
+          state_root="$isolation_root/state"
+          cache="$isolation_root/cache"
+          temporary="$isolation_root/tmp"
+          xdg_runtime="$isolation_root/runtime"
+          installed_cwd="$isolation_root/cwd"
+          installation_data_root="$isolation_root/installation-data"
+          requested_data="$isolation_root/workspace-data"
+          root="$installation_data_root/program"
+          state="$root/installation.json"
+          log="$isolation_root/native-desktop.log"
           desktop_pid=""
+          umask 077
+          install -d -m 700 \
+            "$home" "$config" "$data" "$state_root" "$cache" \
+            "$temporary" "$xdg_runtime" "$installed_cwd" \
+            "$installation_data_root" "$requested_data"
+          installed_env=(
+            "$env_program" -i
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            "HOME=$home"
+            "TMPDIR=$temporary"
+            "TMP=$temporary"
+            "TEMP=$temporary"
+            "XDG_CONFIG_HOME=$config"
+            "XDG_DATA_HOME=$data"
+            "XDG_STATE_HOME=$state_root"
+            "XDG_CACHE_HOME=$cache"
+            "XDG_RUNTIME_DIR=$xdg_runtime"
+          )
+          run_installed() (
+            set -euo pipefail
+            cd "$installed_cwd"
+            exec "${installed_env[@]}" "$@"
+          )
           cleanup() {
             if [[ -n "$desktop_pid" ]] && kill -0 "$desktop_pid" 2>/dev/null; then
               pkill -TERM -P "$desktop_pid" 2>/dev/null || true
@@ -1361,19 +1736,16 @@ jobs:
             fi
           }
           trap cleanup EXIT
-          install -d -m 700 "$requested_data"
-          mkdir -p "$xdg"
-          APPIMAGE_EXTRACT_AND_RUN=1 \
-            HOME="$home" \
-            XDG_DATA_HOME="$xdg" \
-            xvfb-run -a "$desktop" --data-dir "$requested_data" >"$log" 2>&1 &
+          run_installed \
+            APPIMAGE_EXTRACT_AND_RUN=1 \
+            "$xvfb_run_program" -a "$desktop" \
+            --data-dir "$requested_data" \
+            --installation-data-root "$installation_data_root" \
+            >"$log" 2>&1 &
           desktop_pid=$!
-          state=""
           for _attempt in {1..120}
           do
-            state="$(find "$xdg" "$home" -type f \
-              -path '*/program/installation.json' -print -quit)"
-            if [[ -n "$state" ]]; then
+            if [[ -f "$state" && ! -L "$state" ]]; then
               break
             fi
             if ! kill -0 "$desktop_pid" 2>/dev/null; then
@@ -1382,7 +1754,7 @@ jobs:
             fi
             sleep 1
           done
-          [[ -n "$state" ]]
+          [[ -f "$state" && ! -L "$state" ]]
           sleep 3
           kill -0 "$desktop_pid"
           pkill -TERM -P "$desktop_pid" 2>/dev/null || true
@@ -1390,7 +1762,6 @@ jobs:
           wait "$desktop_pid" || true
           desktop_pid=""
 
-          root="$(dirname "$state")"
           data_root="$(dirname "$root")"
           installer="$(find "$root/versions" -type f \
             -path '*/bin/market-squawk-installer' -print)"
@@ -1411,30 +1782,29 @@ jobs:
           sentinel_content='native-package-user-data-v1'
           install -d -m 700 "$(dirname "$sentinel")"
           printf '%s' "$sentinel_content" > "$sentinel"
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            "$installer" --root "$root" status --json
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            "$installer" --root "$root" repair
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            "$installer" --root "$root" service status --json
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            "$application" --data-dir "$data_root" --output json doctor
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            "$application" --data-dir "$data_root" --output json setup status
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            "$runtime" -I -B -c \
+          run_installed "$installer" --root "$root" status --json
+          run_installed "$installer" --root "$root" repair
+          run_installed "$installer" --root "$root" service status --json
+          run_installed "$application" \
+            --data-dir "$data_root" \
+            --installation-data-root "$installation_data_root" \
+            --output json doctor
+          run_installed "$application" \
+            --data-dir "$data_root" \
+            --installation-data-root "$installation_data_root" \
+            --output json setup status
+          run_installed "$runtime" -I -B -c \
             'import market_squawk, pyarrow; print(pyarrow.__version__)'
-          HOME="$home" XDG_DATA_HOME="$xdg" "$training" --help >/dev/null
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            "$runtime" -I -B -c \
+          run_installed "$training" --help >/dev/null
+          run_installed "$runtime" -I -B -c \
             'from market_squawk import training_environment_receipt; from market_squawk.finance import OperationContext, feature_contracts; receipt = training_environment_receipt(); contracts = feature_contracts(context=OperationContext(60000, 1000000)); assert len(receipt.sha256) == 64 and contracts'
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            python3 scripts/smoke_mcp.py "$relay" \
+          run_installed "$python3_program" "$smoke_mcp" "$relay" \
             --installed-relay --running-service --data-dir "$data_root" \
+            --installation-data-root "$installation_data_root" \
             --client claude-code
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            python3 scripts/smoke_mcp.py "$relay" \
+          run_installed "$python3_program" "$smoke_mcp" "$relay" \
             --installed-relay --running-service --data-dir "$data_root" \
+            --installation-data-root "$installation_data_root" \
             --client codex
 
           update_request="$RUNNER_TEMP/signed-update-request.json"
@@ -1455,39 +1825,42 @@ jobs:
               tests::signed_update_fixture_activates_and_rolls_back_an_installed_package \
               --locked -- --ignored --exact
           [[ -f "$update_evidence/receipt.json" ]]
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            "$installer" --root "$root" status --json
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            "$installer" --root "$root" service status --json
-          HOME="$home" XDG_DATA_HOME="$xdg" \
-            "$application" --data-dir "$data_root" --output json doctor
+          run_installed "$installer" --root "$root" status --json
+          run_installed "$installer" --root "$root" service status --json
+          run_installed "$application" \
+            --data-dir "$data_root" \
+            --installation-data-root "$installation_data_root" \
+            --output json doctor
 
-          help="$(APPIMAGE_EXTRACT_AND_RUN=1 "$desktop" --help)"
+          help="$(run_installed \
+            APPIMAGE_EXTRACT_AND_RUN=1 "$desktop" --help)"
           if rg -F -- '--stdio-mcp' <<<"$help"; then
             echo "hidden AppImage MCP transport appeared in ordinary help" >&2
             exit 1
           fi
           stdout="$RUNNER_TEMP/appimage-mcp-outside.stdout"
           stderr="$RUNNER_TEMP/appimage-mcp-outside.stderr"
-          if "target/$TARGET/release/market-squawk-desktop" \
+          if run_installed \
+            "$build_desktop" \
             --stdio-mcp \
             --mcp-client codex \
             --data-dir "$RUNNER_TEMP/appimage-mcp-outside-data" \
+            --installation-data-root "$installation_data_root" \
             >"$stdout" 2>"$stderr"; then
             echo "hidden MCP transport ran outside a verified AppImage" >&2
             exit 1
           fi
           [[ ! -s "$stdout" ]]
           rg -F 'installed MCP transport is unavailable' "$stderr"
-          APPIMAGE_EXTRACT_AND_RUN=1 \
-            HOME="$home" \
-            XDG_DATA_HOME="$xdg" \
-            python3 scripts/smoke_mcp.py "$desktop" --desktop-appimage
+          run_installed \
+            APPIMAGE_EXTRACT_AND_RUN=1 \
+            "$python3_program" "$smoke_mcp" "$desktop" --desktop-appimage
 
-          APPIMAGE_EXTRACT_AND_RUN=1 \
-            HOME="$home" \
-            XDG_DATA_HOME="$xdg" \
-            "$desktop" --native-uninstall
+          run_installed \
+            APPIMAGE_EXTRACT_AND_RUN=1 \
+            "$desktop" \
+            --installation-data-root "$installation_data_root" \
+            --native-uninstall
           [[ ! -e "$root" ]]
           [[ -f "$sentinel" ]]
           [[ "$(cat "$sentinel")" == "$sentinel_content" ]]

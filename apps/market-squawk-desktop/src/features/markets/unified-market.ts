@@ -2,6 +2,181 @@ import { z } from "zod"
 
 import type { ApplicationResult } from "@/lib/schemas"
 
+const timestampSchema = z.iso.datetime({ offset: false, precision: 9 })
+const canonicalDecimalSchema = z
+  .string()
+  .regex(/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$/)
+const positiveIntegerTextSchema = z.string().regex(/^[1-9][0-9]*$/)
+
+const evidenceDigestSchema = z
+  .object({
+    algorithm: z.enum(["sha256", "blake3"]),
+    bytes: z.string().regex(/^[0-9a-f]{64}$/),
+  })
+  .strict()
+
+const sha256EvidenceDigestSchema = z
+  .object({
+    algorithm: z.literal("sha256"),
+    bytes: z.string().regex(/^[0-9a-f]{64}$/),
+  })
+  .strict()
+
+const marketTimingSchema = z.enum([
+  "real_time",
+  "delayed",
+  "end_of_day",
+  "historical",
+  "stored",
+])
+
+const marketDepthSchema = z.enum(["top_of_book", "price_level", "order_level"])
+
+const marketQualitySchema = z.enum([
+  "direct_verified",
+  "direct_unverified",
+  "official_delayed",
+  "aggregated",
+  "indicative",
+  "modeled",
+  "estimated",
+  "stale",
+  "quarantined",
+])
+
+const marketCoverageSchema = z.enum([
+  "consolidated",
+  "multi_venue_partial",
+  "single_venue",
+  "benchmark",
+  "reference",
+  "user_owned",
+])
+
+const marketIntegritySchema = z.enum([
+  "verified",
+  "unverified",
+  "not_applicable",
+  "failed",
+  "quarantined",
+])
+
+const marketFeatureAvailabilitySchema = z.discriminatedUnion("availability", [
+  z
+    .object({
+      availability: z.literal("available"),
+      sourceId: z.string().min(1),
+      venueId: z.string().min(1),
+      instrumentId: z.string().uuid(),
+      generation: positiveIntegerTextSchema,
+      availableAt: timestampSchema,
+      contentDigest: evidenceDigestSchema,
+      valueCount: z.number().int().nonnegative(),
+    })
+    .strict(),
+  z
+    .object({
+      availability: z.literal("unavailable"),
+      reason: z.enum([
+        "source_does_not_publish_live_features",
+        "incomplete_snapshot",
+        "no_exact_source_generation",
+        "available_after_selection",
+        "incomplete_value_set",
+      ]),
+    })
+    .strict(),
+])
+
+const marketInvestmentObservationSchema = z.discriminatedUnion("availability", [
+  z
+    .object({
+      availability: z.literal("available"),
+      instrumentId: z.string().uuid(),
+      mark: z
+        .object({
+          value: canonicalDecimalSchema,
+          currency: z.string().regex(/^[A-Z]{3}$/),
+          basis: z.enum(["fresh_last_trade", "fresh_bid_ask_midpoint"]),
+          evidenceIdentity: sha256EvidenceDigestSchema,
+          freshUntil: timestampSchema.nullable(),
+        })
+        .strict(),
+      selectionDigest: sha256EvidenceDigestSchema,
+      selectedAt: timestampSchema,
+      generation: positiveIntegerTextSchema.nullable(),
+      quality: marketQualitySchema,
+      depth: marketDepthSchema.nullable(),
+      coverage: marketCoverageSchema,
+      integrity: marketIntegritySchema,
+      features: marketFeatureAvailabilitySchema,
+    })
+    .strict(),
+  z
+    .object({
+      availability: z.literal("unavailable"),
+      reason: z.enum(["no_eligible_source", "no_fresh_last_trade_or_midpoint"]),
+    })
+    .strict(),
+])
+
+const marketDowngradeDimensionSchema = z.discriminatedUnion("dimension", [
+  z
+    .object({
+      dimension: z.literal("timing"),
+      required: marketTimingSchema,
+      selected: marketTimingSchema,
+    })
+    .strict(),
+  z
+    .object({
+      dimension: z.literal("depth"),
+      minimum: marketDepthSchema,
+      selected: marketDepthSchema.nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      dimension: z.literal("quality"),
+      minimum: marketQualitySchema,
+      selected: marketQualitySchema,
+    })
+    .strict(),
+  z
+    .object({
+      dimension: z.literal("coverage"),
+      required: marketCoverageSchema,
+      selected: marketCoverageSchema,
+    })
+    .strict(),
+  z
+    .object({
+      dimension: z.literal("freshness"),
+      maximumAgeNanos: z.number().int().nonnegative(),
+      selectedAgeNanos: z.number().int().nonnegative(),
+    })
+    .strict(),
+])
+
+const marketSelectionReceiptSchema = z
+  .object({
+    policyRevision: z.number().int().min(1).max(4_294_967_295),
+    policyCandidateLimit: z.number().int().min(1).max(4_096),
+    policyDigest: sha256EvidenceDigestSchema,
+    selectionDigest: sha256EvidenceDigestSchema,
+    selectedAt: timestampSchema,
+    eligibleCount: z.number().int().min(0).max(4_096),
+    rejectedCount: z.number().int().min(0).max(4_096),
+    availableAlternativeCount: z.number().int().min(0).max(4_096),
+    returnedAlternativeCount: z.number().int().min(0).max(8),
+    alternativesComplete: z.boolean(),
+    selectionClass: z
+      .enum(["exact_requirements", "admitted_downgrade"])
+      .nullable(),
+    downgradeDimensions: z.array(marketDowngradeDimensionSchema).max(5),
+  })
+  .strict()
+
 const quoteSchema = z
   .object({
     bidPrice: z.string().nullable(),
@@ -95,6 +270,7 @@ const orderBookSchema = z
     quality: z.string().min(1),
     freshness: z.enum(["uninitialized", "fresh", "stale"]),
     lastMarketAt: z.string().nullable(),
+    availableAt: timestampSchema,
     usableForSelection: z.boolean(),
     totalOrderCount: z.number().int().nonnegative(),
     returnedOrderCount: z.number().int().nonnegative(),
@@ -125,9 +301,10 @@ export const unifiedMarketRowSchema = z
     confidence: z.string().min(1),
     quote: quoteSchema,
     orderBook: orderBookSchema.nullable(),
+    marketObservation: marketInvestmentObservationSchema,
     selectedSource: selectedSourceSchema.nullable(),
     alternatives: z.array(z.record(z.string(), z.unknown())),
-    selectionReceipt: z.record(z.string(), z.unknown()),
+    selectionReceipt: marketSelectionReceiptSchema,
   })
   .strict()
 

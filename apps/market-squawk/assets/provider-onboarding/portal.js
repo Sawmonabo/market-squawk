@@ -44,6 +44,42 @@ const PROVIDER_COPY = Object.freeze({
       submitLabel: 'Save replacement and reconnect'
     }
   },
+  'alpaca.basic-market-data': {
+    mark: 'AL',
+    name: 'Alpaca Basic',
+    purpose:
+      'No-monthly-fee U.S. equity and ETF market data from Alpaca’s IEX feed, using your own Alpaca account credentials.',
+    examples: [
+      'Real-time IEX stock and ETF quotes',
+      'Up to 30 streamed symbols on the Basic plan',
+      'Delayed IEX historical market data'
+    ],
+    goals: ['live'],
+    effort: 'About 3 minutes',
+    access: 'API key required',
+    account:
+      'Alpaca’s Basic market-data option has no monthly data fee, but Alpaca still requires an account and Trading API key pair. Paper Trading is the recommended V1 realm and does not place real orders.',
+    handoffUrl: 'https://app.alpaca.markets/signup',
+    handoffInstruction:
+      'Create or sign in to Alpaca, open Paper Trading, generate an API key pair, and save the key ID and secret when Alpaca shows them. The secret is shown once. Return here instead of pasting either value into chat.',
+    setupSteps: [
+      'Open the official Alpaca dashboard and create or sign in to your account.',
+      'Choose Paper Trading for the recommended V1 setup.',
+      'Open API Keys and generate a new key pair.',
+      'Save the API key ID and secret key when Alpaca displays them; the secret is shown once.',
+      'Return here, choose the same Paper or Live realm, and submit both values once.'
+    ],
+    submitLabel: 'Save Alpaca key pair and activate',
+    renewal: {
+      manageLabel: 'Rotate API key pair',
+      title: 'Rotate the Alpaca API key pair',
+      description:
+        'Generate a replacement key pair in the same Alpaca Paper or Live realm, save the new secret when it is shown, and return with both replacement values.',
+      handoffUrl: 'https://app.alpaca.markets/',
+      continueLabel: 'I have the replacement key pair',
+      submitLabel: 'Save replacement and reconnect'
+    }
+  },
   'kraken.spot-public-market-data': {
     mark: 'KR',
     name: 'Kraken',
@@ -995,6 +1031,15 @@ function renderSecretStep(profile, session, resumedConfiguration) {
       secretField('Coinbase passphrase', 'passphrase', 1024),
       secretField('Coinbase API secret key — shown once', 'signing-secret', 1024)
     );
+  } else if (profile.id === 'alpaca.basic-market-data') {
+    fields.push(
+      secretField('Alpaca API key ID', 'alpaca-key-id', 4096),
+      secretField('Alpaca secret key — shown once', 'alpaca-secret-key', 4096),
+      selectField('Trading API realm', 'alpaca-trading-api-environment', [
+        ['paper', 'Paper Trading — recommended for V1'],
+        ['live', 'Live account credentials']
+      ])
+    );
   } else {
     const label =
       providerCopy(profile).credentialLabel || `${providerCopy(profile).name} API key`;
@@ -1048,6 +1093,13 @@ async function submitProviderSecret(profile, session, fields, resumedConfigurati
       passphrase: fields[1].input.value,
       signing_secret: fields[2].input.value
     });
+  } else if (profile.id === 'alpaca.basic-market-data') {
+    secret = JSON.stringify({
+      version: 1,
+      key_id: fields[0].input.value,
+      secret_key: fields[1].input.value,
+      trading_api_environment: fields[2].input.value
+    });
   } else {
     secret = fields[0].input.value;
   }
@@ -1073,6 +1125,7 @@ function buildConfiguration(profile, advanced) {
   if (
     profile.id === 'coinbase.public-market-data' ||
     profile.id === 'coinbase.exchange-direct-market-data' ||
+    profile.id === 'alpaca.basic-market-data' ||
     profile.id === 'kraken.spot-public-market-data'
   ) {
     return staticConfiguration({kind: 'source'});
@@ -2306,6 +2359,7 @@ function defaultActivationRequest(profile) {
   if (
     profile.id === 'coinbase.public-market-data' ||
     profile.id === 'coinbase.exchange-direct-market-data' ||
+    profile.id === 'alpaca.basic-market-data' ||
     profile.id === 'kraken.spot-public-market-data'
   ) {
     return {kind: 'source'};

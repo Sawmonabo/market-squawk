@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import json
 import os
@@ -27,6 +28,7 @@ SERVICE_START_TIMEOUT_SECONDS = 60.0
 APPIMAGE_EXTRACTION_TIMEOUT_SECONDS = 90.0
 MCP_PROTOCOL_VERSION = "2026-07-28"
 MAXIMUM_DIAGNOSTIC_BYTES = 8 * 1024
+MAXIMUM_INSTALLATION_ROOT_BYTES = 4 * 1024
 
 
 def isolated_child_environment(root: pathlib.Path) -> dict[str, str]:
@@ -81,6 +83,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("binary", nargs="?", default="target/debug/market-squawk")
     parser.add_argument("--client", choices=("claude-code", "codex"), default="codex")
     parser.add_argument("--data-dir", type=pathlib.Path)
+    parser.add_argument("--installation-data-root", type=pathlib.Path)
     parser.add_argument(
         "--running-service",
         action="store_true",
@@ -101,12 +104,24 @@ def parse_arguments() -> argparse.Namespace:
         parser.error("--running-service requires --data-dir")
     if arguments.installed_relay and not arguments.running_service:
         parser.error("--installed-relay requires --running-service")
+    if arguments.installation_data_root is not None and not arguments.running_service:
+        parser.error("--installation-data-root requires --running-service")
     return arguments
 
 
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
+
+
+def encode_installation_data_root(root: pathlib.Path) -> str:
+    canonical = root.resolve(strict=True)
+    value = str(canonical).encode("utf-8")
+    require(
+        0 < len(value) <= MAXIMUM_INSTALLATION_ROOT_BYTES,
+        "installed service root is invalid",
+    )
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
 def readline_with_timeout(stream: TextIO, timeout_seconds: float) -> str:
@@ -442,11 +457,15 @@ def main() -> int:
             else isolated_child_environment(pathlib.Path(temporary_user_root))
         )
         installation_data_root = (
-            None
-            if temporary_installation_parent is None
-            else str(
-                pathlib.Path(temporary_installation_parent).resolve(strict=True)
-                / "installation"
+            str(arguments.installation_data_root.resolve(strict=True))
+            if arguments.installation_data_root is not None
+            else (
+                None
+                if temporary_installation_parent is None
+                else str(
+                    pathlib.Path(temporary_installation_parent).resolve(strict=True)
+                    / "installation"
+                )
             )
         )
         installation_arguments = (
@@ -499,6 +518,15 @@ def main() -> int:
                 "--data-dir",
                 data_dir,
             ]
+            if installation_data_root is not None:
+                command.extend(
+                    [
+                        "--installation-data-root-encoded",
+                        encode_installation_data_root(
+                            pathlib.Path(installation_data_root)
+                        ),
+                    ]
+                )
         failure: BaseException | None = None
         try:
             if not arguments.running_service:

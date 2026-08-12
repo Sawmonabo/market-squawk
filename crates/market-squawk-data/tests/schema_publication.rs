@@ -13,8 +13,14 @@ use market_squawk_data::{
     FeatureLabelBatchBindings, ManifestCatalogError, ManifestObject, ManifestPlan, QueryLimits,
     QueryRequest, ResearchArrowBatch, Sha256Digest,
 };
+use market_squawk_domain::{
+    AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, MacroObservation,
+    PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
+    ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
+};
 use market_squawk_platform::LocalPaths;
 use rusqlite::{Connection, params};
+use rust_decimal::Decimal;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -63,6 +69,11 @@ fn schema_identity_is_causal_across_publication_pinning_and_restart() -> TestRes
                 .into_iter(),
             )?) as ArrayRef,
             Arc::new(TimestampNanosecondArray::from(vec![1_i64]).with_timezone_utc()) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(vec![None::<i64>]).with_timezone_utc())
+                as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(vec![None::<i64>]).with_timezone_utc())
+                as ArrayRef,
+            Arc::new(UInt8Array::from(vec![2_u8])) as ArrayRef,
             Arc::new(UInt8Array::from(vec![1_u8])) as ArrayRef,
             Arc::new(UInt8Array::from(vec![1_u8])) as ArrayRef,
             Arc::new(fixed_text(Some("return-1d"), 256)?) as ArrayRef,
@@ -95,6 +106,78 @@ fn schema_identity_is_causal_across_publication_pinning_and_restart() -> TestRes
         feature_batch.record_batch().columns().to_vec(),
     )?;
     assert!(DatasetArrowBatch::try_new(feature_labels.clone(), hostile).is_err());
+
+    let research_context = ResearchContext::new(
+        ResearchProvenance::try_new(ResearchProvenanceInput {
+            source_id: SourceId::try_from("schema-contract-fixture")?,
+            instrument_id: None,
+            venue_id: None,
+            source_identifier: SourceIdentifier::try_from("GDP:2026Q1:v1")?,
+            source_timestamp: None,
+            received_at: Timestamp::from_unix_nanos(110),
+            ingested_at: Timestamp::from_unix_nanos(120),
+            quality: DataQuality::OfficialDelayed,
+            payload_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+                "schema-contract:gdp:2026q1",
+            )?),
+            availability: AvailabilityEvidence::evidenced(
+                Timestamp::from_unix_nanos(100),
+                SourceIdentifier::try_from("schema-contract-release")?,
+            ),
+        })?,
+        ResearchTime::new(
+            Timestamp::from_unix_nanos(90),
+            Some(Timestamp::from_unix_nanos(100)),
+            RevisionNumber::new(1)?,
+            None,
+        )?,
+    )?;
+    let current_research = ResearchArrowBatch::try_from_observations(
+        SourceIdentifier::try_from("schema-contract-dataset")?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [11; 32]),
+        vec![ResearchObservation::Macro(MacroObservation::new(
+            research_context,
+            SourceIdentifier::try_from("GDP")?,
+            Decimal::new(25, 1),
+            SourceIdentifier::try_from("USD")?,
+        ))],
+    )?;
+    let current_contract_is_accepted =
+        DatasetArrowBatch::try_new(research.clone(), current_research.record_batch().clone())
+            .is_ok();
+    let mut mismatched_contracts_are_rejected = true;
+    for replacement in [
+        None,
+        Some("0000000000000000000000000000000000000000000000000000000000000000"),
+    ] {
+        let mut metadata = current_research.record_batch().schema().metadata().clone();
+        match replacement {
+            Some(identity) => {
+                metadata.insert(
+                    "market_squawk.research_payload_contract_sha256".to_owned(),
+                    identity.to_owned(),
+                );
+            }
+            None => {
+                metadata.remove("market_squawk.research_payload_contract_sha256");
+            }
+        }
+        let altered_schema = Arc::new(
+            current_research
+                .record_batch()
+                .schema()
+                .as_ref()
+                .clone()
+                .with_metadata(metadata),
+        );
+        let altered_batch = RecordBatch::try_new(
+            altered_schema,
+            current_research.record_batch().columns().to_vec(),
+        )?;
+        mismatched_contracts_are_rejected &=
+            DatasetArrowBatch::try_new(research.clone(), altered_batch).is_err();
+    }
+    assert!(current_contract_is_accepted && mismatched_contracts_are_rejected);
 
     let mut tampered_fingerprint = research.fingerprint();
     tampered_fingerprint[0] ^= 0xff;

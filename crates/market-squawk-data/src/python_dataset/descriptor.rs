@@ -1,6 +1,6 @@
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
-use market_squawk_domain::{SchemaVersion, Timestamp};
+use market_squawk_domain::{Currency, SchemaVersion, Timestamp};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -8,7 +8,7 @@ use super::{PythonDatasetCatalogError, PythonDatasetIdentity};
 use crate::{
     ChronologicalSplitPolicy, ComponentKind, ComponentScope, CorporateActionSensitivity,
     DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DatasetSchemaRef, DatasetSchemaRegistry,
-    FeatureLabelComponentSpec, Sha256Digest, UniverseId,
+    FeatureLabelComponentSpec, FeatureLabelMeasurement, Sha256Digest, UniverseId,
 };
 
 const MAX_OBJECTS: usize = 128;
@@ -49,9 +49,39 @@ pub(super) struct Dataset {
 pub(super) struct Component {
     pub(super) corporate_action_sensitivity: String,
     pub(super) kind: String,
+    measurement: NullableMeasurement,
     pub(super) name: String,
     pub(super) scope: String,
+    target: Target,
     pub(super) version: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+struct NullableMeasurement(Option<Measurement>);
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum Measurement {
+    #[serde(rename = "price")]
+    Price { currency: String },
+    #[serde(rename = "return")]
+    Return,
+    #[serde(rename = "probability")]
+    Probability,
+    #[serde(rename = "other_regression")]
+    OtherRegression,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum Target {
+    #[serde(rename = "not_applicable")]
+    NotApplicable,
+    #[serde(rename = "fixed_horizon_terminal")]
+    FixedHorizonTerminal { horizon_nanos: u64 },
+    #[serde(rename = "unsupported")]
+    Unsupported,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,7 +145,7 @@ impl Descriptor {
     }
 
     fn validate(&self) -> Result<(), PythonDatasetCatalogError> {
-        if self.schema_version != 2
+        if self.schema_version != 4
             || self.components.len() < 2
             || self.components.len() > MAX_COMPONENTS
             || self.objects.is_empty()
@@ -252,6 +282,51 @@ impl Dataset {
 
 impl Component {
     fn validate(&self) -> Result<(), PythonDatasetCatalogError> {
+        let _measurement = self.measurement()?;
+        let _target = self.fixed_horizon_nanos()?;
+        self.spec().map(|_spec| ())
+    }
+
+    pub(super) fn fixed_horizon_nanos(
+        &self,
+    ) -> Result<Option<NonZeroU64>, PythonDatasetCatalogError> {
+        match (self.kind.as_str(), &self.target) {
+            ("feature", Target::NotApplicable) | ("label", Target::Unsupported) => Ok(None),
+            ("label", Target::FixedHorizonTerminal { horizon_nanos }) => {
+                NonZeroU64::new(*horizon_nanos)
+                    .map(Some)
+                    .ok_or(PythonDatasetCatalogError::CorruptAdmission)
+            }
+            _ => Err(PythonDatasetCatalogError::CorruptAdmission),
+        }
+    }
+
+    pub(super) fn measurement(
+        &self,
+    ) -> Result<Option<FeatureLabelMeasurement>, PythonDatasetCatalogError> {
+        match (self.kind.as_str(), &self.measurement.0) {
+            ("feature", None) | ("label", None) => Ok(None),
+            ("label", Some(measurement)) => {
+                let measurement = match measurement {
+                    Measurement::Price { currency } => {
+                        let parsed = Currency::try_from(currency.as_str())
+                            .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?;
+                        if parsed.as_str() != currency {
+                            return Err(PythonDatasetCatalogError::CorruptAdmission);
+                        }
+                        FeatureLabelMeasurement::Price { currency: parsed }
+                    }
+                    Measurement::Return => FeatureLabelMeasurement::Return,
+                    Measurement::Probability => FeatureLabelMeasurement::Probability,
+                    Measurement::OtherRegression => FeatureLabelMeasurement::OtherRegression,
+                };
+                Ok(Some(measurement))
+            }
+            _ => Err(PythonDatasetCatalogError::CorruptAdmission),
+        }
+    }
+
+    pub(super) fn spec(&self) -> Result<FeatureLabelComponentSpec, PythonDatasetCatalogError> {
         let kind = match self.kind.as_str() {
             "feature" => ComponentKind::Feature,
             "label" => ComponentKind::Label,
@@ -275,8 +350,7 @@ impl Component {
             &self.name,
             NonZeroU32::new(self.version).ok_or(PythonDatasetCatalogError::CorruptAdmission)?,
         )
-        .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?;
-        Ok(())
+        .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)
     }
 }
 

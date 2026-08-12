@@ -508,9 +508,19 @@ export const mcpClientsStatusSchema = z.object({
   ).length(2),
 })
 
+const desktopEventSequenceSchema = z
+  .string()
+  .refine(
+    (value) =>
+      value.length <= 20 &&
+      /^(?:0|[1-9]\d*)$/.test(value) &&
+      BigInt(value) <= 18_446_744_073_709_551_615n,
+    { message: "Expected a canonical unsigned 64-bit decimal" },
+  )
+
 export const desktopEventSchema = z.object({
   runtime: desktopBootstrapSchema.shape.runtime,
-  sequence: z.number().int().nonnegative(),
+  sequence: desktopEventSequenceSchema,
   body: z.discriminatedUnion("type", [
     z.object({
       type: z.literal("authority_changed"),

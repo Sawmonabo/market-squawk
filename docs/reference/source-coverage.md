@@ -48,6 +48,17 @@ provider setup procedure or reproduce every provider response schema. Procedures
 [Source operations](../operations/source-operations.md); the only mutable completion state belongs
 in the [delivery ledger](../plans/delivery-ledger.md).
 
+The maintained [provider-contract index](providers/README.md) is deliberately separate. It records
+the approved target providers, current official contracts, account-specific probes, intended
+canonical destinations, and implementation gaps—including owner-enabled Schwab—without falsely
+adding those sources to the implemented product-path matrix below. The current selected-provider
+candidate contains provider-native core and transport code for Schwab, Yahoo, IEX HIST, OCC/Cboe
+reference, BEA, Census, EIA, and Tiingo; the Federal Reserve Board core is deliberately transport-
+free. Those crates do not become product paths until their application-owned doctor or entitlement
+probe, activation binding, durable canonical publication, point-in-time typed read, workflow
+composition, restart journey, and frozen-head acceptance are complete. The matrix below reports
+that end-to-end composition, not crate presence.
+
 ## Source identity and immutable metadata
 
 ### Identity types
@@ -544,6 +555,7 @@ contracts are in the [CLI reference](cli.md) and [MCP reference](mcp.md).
 
 - [Data quality](data-quality.md)
 - [Time and provenance](time-and-provenance.md)
+- [Configured provider contracts](providers/README.md)
 - [Configuration reference](configuration.md)
 - [CLI reference](cli.md)
 - [MCP reference](mcp.md)

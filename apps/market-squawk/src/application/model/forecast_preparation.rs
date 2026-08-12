@@ -121,7 +121,7 @@ impl ForecastInstrumentAvailability {
         decimal_scale: u8,
     ) -> Result<Self, ForecastEvidenceReadError> {
         if observed_from > observed_through
-            || available_at > observed_through
+            || available_at < observed_through
             || observed_points.get() > market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
             || decimal_scale > market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE
         {

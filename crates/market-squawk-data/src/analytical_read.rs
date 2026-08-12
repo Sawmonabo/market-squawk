@@ -1,11 +1,20 @@
 //! Least-authority immutable analytical catalog and fixed-template observation reads.
 
 use std::fmt;
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use market_squawk_domain::{InstrumentId, SourceId, Timestamp};
+use arrow::array::{Array as _, BinaryArray};
+use market_squawk_domain::{
+    BarTimestampBasis, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
+    FundNavObservation, InstrumentId, MarketBarAdjustment, MarketBarObservation,
+    MarketBarSessionEvidence, ProviderInstrumentId, ResearchObservation,
+    ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp, VenueId,
+};
+use market_squawk_sources::CanonicalObservationFamily;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -28,9 +37,20 @@ use crate::{
     PinnedMonetaryValue, PinnedQueryOutput, QueryError, QueryLimits, QueryRequest,
     ResearchQueryEngine, Sha256Digest, UniverseId,
 };
+use crate::{
+    PointInTimeCandidate, PointInTimeLimits, PointInTimePolicy, PointInTimeRequest,
+    PointInTimeRevisionMode, PointInTimeService,
+};
 
 const MAX_READ_ITEMS: usize = 64;
 const MAX_FILTER_INSTRUMENTS: usize = 256;
+const MAX_MARKET_BAR_ROWS: u32 = 50_000;
+const MAX_MARKET_BAR_REVISION_CANDIDATES: usize = 100_000;
+const MAX_FUND_NAV_ROWS: u32 = 10_000;
+const MAX_FUND_NAV_REVISION_CANDIDATES: usize = 100_000;
+const MAX_OUTCOME_MARKET_BAR_CANDIDATES: usize = 4_096;
+const OUTCOME_MARKET_BAR_QUERY_BYTES: u64 = 64 * 1024 * 1024;
+const OUTCOME_MARKET_BAR_QUERY_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 const OBSERVATION_TABLE: &str = "observations";
 
 /// Nonzero caller-selected page size under the analytical service ceiling.
@@ -316,6 +336,10 @@ pub enum AnalyticalObservationTemplate {
     Fundamental,
     /// Macroeconomic series observations and revisions.
     Macro,
+    /// Exact historical market-bar observations.
+    MarketBar,
+    /// Exact daily fund/share-class NAV observations.
+    FundNav,
     /// User-owned or licensed alternative-data observations.
     AlternativeData,
 }
@@ -327,9 +351,531 @@ impl AnalyticalObservationTemplate {
             Self::Filing => Some("filing"),
             Self::Fundamental => Some("fundamental"),
             Self::Macro => Some("macro"),
+            Self::MarketBar => Some("market_bar"),
+            Self::FundNav => Some("fund_nav"),
             Self::AlternativeData => Some("alternative_data"),
         }
     }
+}
+
+/// Nonzero Fund NAV result count under the fixed typed-read ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnalyticalFundNavReadLimit(NonZeroU32);
+
+impl AnalyticalFundNavReadLimit {
+    /// Constructs a typed NAV limit no greater than 10,000 rows.
+    pub fn try_new(value: u32) -> Result<Self, AnalyticalReadError> {
+        NonZeroU32::new(value)
+            .filter(|limit| limit.get() <= MAX_FUND_NAV_ROWS)
+            .map(Self)
+            .ok_or(AnalyticalReadError::InvalidFundNavLimit)
+    }
+
+    const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// Inclusive calendar-precision date range for daily NAV history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FundNavDateRange {
+    start: CalendarDate,
+    end: CalendarDate,
+}
+
+impl FundNavDateRange {
+    /// Constructs one non-reversed NAV-date range without inventing time-of-day precision.
+    pub fn try_new(start: CalendarDate, end: CalendarDate) -> Result<Self, AnalyticalReadError> {
+        if start > end {
+            Err(AnalyticalReadError::InvalidFundNavDateRange)
+        } else {
+            Ok(Self { start, end })
+        }
+    }
+
+    pub const fn start(self) -> CalendarDate {
+        self.start
+    }
+
+    pub const fn end(self) -> CalendarDate {
+        self.end
+    }
+}
+
+/// Exact immutable input for a typed single-fund/share-class NAV history read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyticalFundNavReadRequest {
+    manifest: DatasetManifestRef,
+    instrument_id: InstrumentId,
+    knowledge_cutoff: Timestamp,
+    date_range: Option<FundNavDateRange>,
+    revision_mode: PointInTimeRevisionMode,
+    limit: AnalyticalFundNavReadLimit,
+}
+
+impl AnalyticalFundNavReadRequest {
+    /// Validates the canonical schema and retains all fixed PIT/query bounds.
+    pub fn try_new(
+        manifest: DatasetManifestRef,
+        instrument_id: InstrumentId,
+        knowledge_cutoff: Timestamp,
+        date_range: Option<FundNavDateRange>,
+        revision_mode: PointInTimeRevisionMode,
+        limit: AnalyticalFundNavReadLimit,
+    ) -> Result<Self, AnalyticalReadError> {
+        let canonical = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(|_| AnalyticalReadError::InvalidObservationSchema)?;
+        if manifest.schema() != &canonical {
+            return Err(AnalyticalReadError::InvalidObservationSchema);
+        }
+        Ok(Self {
+            manifest,
+            instrument_id,
+            knowledge_cutoff,
+            date_range,
+            revision_mode,
+            limit,
+        })
+    }
+
+    pub const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    pub const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    pub const fn date_range(&self) -> Option<FundNavDateRange> {
+        self.date_range
+    }
+
+    pub const fn revision_mode(&self) -> PointInTimeRevisionMode {
+        self.revision_mode
+    }
+
+    fn sql(&self) -> String {
+        let mut filters = vec![
+            "observation_kind = 'fund_nav'".to_owned(),
+            format!("instrument_id = '{}'", self.instrument_id),
+            "available_at IS NOT NULL".to_owned(),
+            format!(
+                "CAST(available_at AS BIGINT) <= {}",
+                self.knowledge_cutoff.unix_nanos()
+            ),
+            "effective_date IS NOT NULL".to_owned(),
+        ];
+        if let Some(range) = self.date_range {
+            filters.push(format!(
+                "effective_date >= DATE '{}' AND effective_date <= DATE '{}'",
+                range.start, range.end
+            ));
+        }
+        format!(
+            "SELECT payload_json FROM {OBSERVATION_TABLE} WHERE {} \
+             ORDER BY effective_date, source_id, revision, payload_sha256, source_identifier \
+             LIMIT {}",
+            filters.join(" AND "),
+            MAX_FUND_NAV_REVISION_CANDIDATES + 1
+        )
+    }
+}
+
+/// Nonzero market-bar result count under the fixed typed-read ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnalyticalMarketBarReadLimit(NonZeroU32);
+
+impl AnalyticalMarketBarReadLimit {
+    /// Constructs a typed bar limit no greater than 50,000 rows.
+    pub fn try_new(value: u32) -> Result<Self, AnalyticalReadError> {
+        NonZeroU32::new(value)
+            .filter(|limit| limit.get() <= MAX_MARKET_BAR_ROWS)
+            .map(Self)
+            .ok_or(AnalyticalReadError::InvalidMarketBarLimit)
+    }
+
+    const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// Inclusive exact effective-time range for typed market-bar reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MarketBarEffectiveRange {
+    start: Timestamp,
+    end: Timestamp,
+}
+
+impl MarketBarEffectiveRange {
+    /// Constructs an inclusive range over exact bar timestamps.
+    pub fn try_new(start: Timestamp, end: Timestamp) -> Result<Self, AnalyticalReadError> {
+        if start > end {
+            Err(AnalyticalReadError::InvalidMarketBarEffectiveRange)
+        } else {
+            Ok(Self { start, end })
+        }
+    }
+
+    /// Returns the inclusive lower effective-time bound.
+    pub const fn start(self) -> Timestamp {
+        self.start
+    }
+
+    /// Returns the inclusive upper effective-time bound.
+    pub const fn end(self) -> Timestamp {
+        self.end
+    }
+}
+
+/// Exact immutable input for a typed, single-instrument point-in-time market-bar read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyticalMarketBarReadRequest {
+    manifest: DatasetManifestRef,
+    instrument_id: InstrumentId,
+    knowledge_cutoff: Timestamp,
+    effective_range: Option<MarketBarEffectiveRange>,
+    limit: AnalyticalMarketBarReadLimit,
+}
+
+impl AnalyticalMarketBarReadRequest {
+    /// Validates the canonical research schema and retains all fixed query bounds.
+    pub fn try_new(
+        manifest: DatasetManifestRef,
+        instrument_id: InstrumentId,
+        knowledge_cutoff: Timestamp,
+        effective_range: Option<MarketBarEffectiveRange>,
+        limit: AnalyticalMarketBarReadLimit,
+    ) -> Result<Self, AnalyticalReadError> {
+        let canonical = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(|_| AnalyticalReadError::InvalidObservationSchema)?;
+        if manifest.schema() != &canonical {
+            return Err(AnalyticalReadError::InvalidObservationSchema);
+        }
+        Ok(Self {
+            manifest,
+            instrument_id,
+            knowledge_cutoff,
+            effective_range,
+            limit,
+        })
+    }
+
+    /// Returns the exact immutable input generation.
+    pub const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    /// Returns the sole stable instrument admitted by this request.
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the conservative local-knowledge cutoff.
+    pub const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    /// Returns the optional exact bar-time range.
+    pub const fn effective_range(&self) -> Option<MarketBarEffectiveRange> {
+        self.effective_range
+    }
+
+    fn sql(&self) -> String {
+        let mut filters = vec![
+            "observation_kind = 'market_bar'".to_owned(),
+            format!("instrument_id = '{}'", self.instrument_id),
+            "available_at IS NOT NULL".to_owned(),
+            format!(
+                "CAST(available_at AS BIGINT) <= {}",
+                self.knowledge_cutoff.unix_nanos()
+            ),
+            "effective_at IS NOT NULL".to_owned(),
+        ];
+        if let Some(range) = self.effective_range {
+            filters.push(format!(
+                "CAST(effective_at AS BIGINT) >= {} AND CAST(effective_at AS BIGINT) <= {}",
+                range.start.unix_nanos(),
+                range.end.unix_nanos()
+            ));
+        }
+        let predicate = filters.join(" AND ");
+        format!(
+            "SELECT payload_json \
+             FROM {OBSERVATION_TABLE} \
+             WHERE {predicate} \
+             ORDER BY effective_at, source_id, venue_id, revision DESC, payload_sha256, \
+                      source_identifier \
+             LIMIT {}",
+            MAX_MARKET_BAR_REVISION_CANDIDATES + 1
+        )
+    }
+}
+
+/// Exact stable market-bar series whose realized outcome may be selected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutcomeMarketBarSeries {
+    instrument_id: InstrumentId,
+    source_id: SourceId,
+    venue_id: VenueId,
+    provider_instrument_id: ProviderInstrumentId,
+    feed: SourceIdentifier,
+    interval: SourceIdentifier,
+    adjustment: MarketBarAdjustment,
+    timestamp_basis: BarTimestampBasis,
+    session: MarketBarSessionEvidence,
+}
+
+impl OutcomeMarketBarSeries {
+    /// Constructs a fully qualified series without accepting a caller-supplied value or row bound.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every provider, venue, adjustment, timestamp, and session dimension stays explicit"
+    )]
+    pub const fn new(
+        instrument_id: InstrumentId,
+        source_id: SourceId,
+        venue_id: VenueId,
+        provider_instrument_id: ProviderInstrumentId,
+        feed: SourceIdentifier,
+        interval: SourceIdentifier,
+        adjustment: MarketBarAdjustment,
+        timestamp_basis: BarTimestampBasis,
+        session: MarketBarSessionEvidence,
+    ) -> Self {
+        Self {
+            instrument_id,
+            source_id,
+            venue_id,
+            provider_instrument_id,
+            feed,
+            interval,
+            adjustment,
+            timestamp_basis,
+            session,
+        }
+    }
+
+    /// Returns the stable internal instrument.
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the exact source-rights namespace.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact venue.
+    pub const fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+
+    /// Returns the exact provider instrument identity.
+    pub const fn provider_instrument_id(&self) -> &ProviderInstrumentId {
+        &self.provider_instrument_id
+    }
+
+    /// Returns the exact provider feed.
+    pub const fn feed(&self) -> &SourceIdentifier {
+        &self.feed
+    }
+
+    /// Returns the exact provider interval.
+    pub const fn interval(&self) -> &SourceIdentifier {
+        &self.interval
+    }
+
+    /// Returns the exact corporate-action adjustment.
+    pub const fn adjustment(&self) -> MarketBarAdjustment {
+        self.adjustment
+    }
+
+    /// Returns the exact provider timestamp boundary convention.
+    pub const fn timestamp_basis(&self) -> BarTimestampBasis {
+        self.timestamp_basis
+    }
+
+    /// Returns exact session kind, ruleset, and ruleset evidence.
+    pub const fn session(&self) -> &MarketBarSessionEvidence {
+        &self.session
+    }
+}
+
+/// Exact-manifest request for the first uniquely completed bar at or after a forecast horizon.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutcomeMarketBarRequest {
+    manifest: DatasetManifestRef,
+    series: OutcomeMarketBarSeries,
+    knowledge_cutoff: Timestamp,
+    horizon: Timestamp,
+    latest_eligible_completion: Timestamp,
+}
+
+impl OutcomeMarketBarRequest {
+    /// Validates the sole current research schema and the closed completion window.
+    pub fn try_new(
+        manifest: DatasetManifestRef,
+        series: OutcomeMarketBarSeries,
+        knowledge_cutoff: Timestamp,
+        horizon: Timestamp,
+        latest_eligible_completion: Timestamp,
+    ) -> Result<Self, AnalyticalReadError> {
+        let canonical = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(|_| AnalyticalReadError::InvalidObservationSchema)?;
+        if manifest.schema() != &canonical {
+            return Err(AnalyticalReadError::InvalidObservationSchema);
+        }
+        if horizon > latest_eligible_completion {
+            return Err(AnalyticalReadError::InvalidOutcomeMarketBarWindow);
+        }
+        Ok(Self {
+            manifest,
+            series,
+            knowledge_cutoff,
+            horizon,
+            latest_eligible_completion,
+        })
+    }
+
+    /// Returns the exact immutable input generation.
+    pub const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    /// Returns the fully qualified outcome series.
+    pub const fn series(&self) -> &OutcomeMarketBarSeries {
+        &self.series
+    }
+
+    /// Returns the conservative local-knowledge cutoff.
+    pub const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    /// Returns the inclusive forecast-horizon completion bound.
+    pub const fn horizon(&self) -> Timestamp {
+        self.horizon
+    }
+
+    /// Returns the inclusive latest eligible completion bound.
+    pub const fn latest_eligible_completion(&self) -> Timestamp {
+        self.latest_eligible_completion
+    }
+
+    fn sql(&self) -> String {
+        let source_id = sql_string_literal(self.series.source_id.as_str());
+        let venue_id = sql_string_literal(self.series.venue_id.as_str());
+        let instrument_id = self.series.instrument_id;
+        let cutoff = self.knowledge_cutoff.unix_nanos();
+        let latest = self.latest_eligible_completion.unix_nanos();
+        let completion_lower_bound = match self.series.timestamp_basis {
+            BarTimestampBasis::PeriodStart => String::new(),
+            BarTimestampBasis::PeriodEnd => format!(
+                " AND CAST(effective_at AS BIGINT) >= {}",
+                self.horizon.unix_nanos()
+            ),
+        };
+        format!(
+            "SELECT payload_json \
+             FROM {OBSERVATION_TABLE} \
+             WHERE observation_kind = 'market_bar' \
+               AND source_id = {source_id} \
+               AND instrument_id = '{instrument_id}' \
+               AND venue_id = {venue_id} \
+               AND available_at IS NOT NULL \
+               AND CAST(available_at AS BIGINT) <= {cutoff} \
+               AND effective_at IS NOT NULL \
+               AND CAST(effective_at AS BIGINT) <= {latest}{completion_lower_bound} \
+             ORDER BY effective_at, source_id, venue_id, revision DESC, payload_sha256, \
+                      source_identifier \
+             LIMIT {}",
+            MAX_OUTCOME_MARKET_BAR_CANDIDATES + 1
+        )
+    }
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Closed reason that an exact outcome bar could not be admitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutcomeMarketBarUnavailableReason {
+    /// The exact source-rights owner does not match the requested series.
+    SourceOwnerMismatch,
+    /// The fixed candidate ceiling was saturated, so uniqueness cannot be proven.
+    CandidateSetSaturated,
+    /// At least one returned candidate was incomplete or contradicted canonical projections.
+    IncompleteCandidate,
+    /// No completed exact-series bar was available inside the requested horizon window.
+    NoEligibleBar,
+    /// More than one exact-series bar shared the earliest eligible completion boundary.
+    AmbiguousCompletion,
+}
+
+/// Non-forgeable receipt for one producer-authored realized market-bar outcome.
+#[derive(Debug)]
+pub struct OutcomeMarketBarSelectedReceipt {
+    request: OutcomeMarketBarRequest,
+    request_digest: EvidenceDigest,
+    output: PinnedQueryOutput,
+    ordinal: u32,
+    payload_digest: EvidenceDigest,
+    receipt_digest: EvidenceDigest,
+    bar: MarketBarObservation,
+}
+
+impl OutcomeMarketBarSelectedReceipt {
+    /// Returns the complete exact-manifest selection request.
+    pub const fn request(&self) -> &OutcomeMarketBarRequest {
+        &self.request
+    }
+
+    /// Returns the digest of the complete request and series identity.
+    pub const fn request_digest(&self) -> EvidenceDigest {
+        self.request_digest
+    }
+
+    /// Returns exact manifest, object-graph, query, and result evidence.
+    pub const fn output(&self) -> &PinnedQueryOutput {
+        &self.output
+    }
+
+    /// Returns the selected row's zero-based ordinal in the exact query result.
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    /// Returns the digest of the exact canonical payload bytes selected.
+    pub const fn payload_digest(&self) -> EvidenceDigest {
+        self.payload_digest
+    }
+
+    /// Returns the receipt digest binding request, object/query/result graph, ordinal, and bar.
+    pub const fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
+    }
+
+    /// Returns the selected typed completed market bar.
+    pub const fn bar(&self) -> &MarketBarObservation {
+        &self.bar
+    }
+}
+
+/// Exact outcome selection or one closed fail-safe unavailable reason.
+#[derive(Debug)]
+pub enum OutcomeMarketBarSelection {
+    /// A uniquely earliest eligible completed bar and non-forgeable evidence receipt.
+    Selected(OutcomeMarketBarSelectedReceipt),
+    /// Selection failed closed without choosing a favorable price.
+    Unavailable(OutcomeMarketBarUnavailableReason),
 }
 
 /// Inclusive conservative availability-time filter for point-in-time observation reads.
@@ -466,6 +1012,56 @@ impl AnalyticalObservationReadRequest {
 pub struct AnalyticalObservationOutput {
     source_id: SourceId,
     output: PinnedQueryOutput,
+}
+
+/// Typed bars plus the non-forgeable evidence for their exact manifest-pinned query.
+#[derive(Debug)]
+pub struct AnalyticalMarketBarOutput {
+    source_id: SourceId,
+    output: PinnedQueryOutput,
+    bars: Box<[MarketBarObservation]>,
+}
+
+/// Typed NAV history plus non-forgeable evidence for its exact manifest-pinned query.
+#[derive(Debug)]
+pub struct AnalyticalFundNavOutput {
+    source_id: SourceId,
+    output: PinnedQueryOutput,
+    observations: Box<[FundNavObservation]>,
+}
+
+impl AnalyticalFundNavOutput {
+    /// Returns the source-rights namespace that owns the queried generation.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns exact manifest, object graph, query, and result evidence.
+    pub const fn output(&self) -> &PinnedQueryOutput {
+        &self.output
+    }
+
+    /// Returns NAV observations in canonical family/revision order under the requested PIT mode.
+    pub fn observations(&self) -> &[FundNavObservation] {
+        &self.observations
+    }
+}
+
+impl AnalyticalMarketBarOutput {
+    /// Returns the source-rights namespace that owns the queried generation.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact manifest, object graph, query, and result evidence.
+    pub const fn output(&self) -> &PinnedQueryOutput {
+        &self.output
+    }
+
+    /// Returns admitted bars in ascending effective-time and canonical-family order.
+    pub fn bars(&self) -> &[MarketBarObservation] {
+        &self.bars
+    }
 }
 
 impl AnalyticalObservationOutput {
@@ -691,6 +1287,160 @@ impl AnalyticalReadCapability {
         Ok(AnalyticalObservationOutput { source_id, output })
     }
 
+    /// Reads a bounded point-in-time bar series for exactly one stable instrument.
+    ///
+    /// The fixed query rejects unavailable future knowledge, then typed decoding selects the
+    /// latest admitted revision of each exact canonical bar family. Decoding revalidates instrument
+    /// identity, conservative availability, exact effective time, requested range, and row count
+    /// before any bar crosses this capability boundary.
+    pub async fn read_market_bars(
+        &self,
+        request: AnalyticalMarketBarReadRequest,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<AnalyticalMarketBarOutput, AnalyticalReadError> {
+        let (pinned, source_id, _) =
+            self.manifests
+                .read_exact(request.manifest(), deadline, &cancellation)?;
+        let query = QueryRequest::try_new(pinned.manifest().clone(), request.sql())?;
+        let engine = ResearchQueryEngine::from_pinned_dataset(
+            pinned,
+            OBSERVATION_TABLE,
+            Arc::clone(&self.objects),
+            cancellation.clone(),
+        )
+        .await?;
+        let operation_cancellation = cancellation.child_token();
+        let execution_cancellation = operation_cancellation.clone();
+        let execution = engine.query_pinned(query, limits, execution_cancellation);
+        tokio::pin!(execution);
+        let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(deadline_wait);
+        let output = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                return Err(AnalyticalReadError::Query(QueryError::Cancelled));
+            }
+            _ = deadline_wait.as_mut() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                return Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded));
+            }
+            result = execution.as_mut() => result?,
+        };
+        let bars = decode_market_bars(&output, &request)?;
+        Ok(AnalyticalMarketBarOutput {
+            source_id,
+            output,
+            bars,
+        })
+    }
+
+    /// Reads bounded exact daily NAV history for one resolved fund/share class.
+    ///
+    /// The query rejects future availability and preserves calendar-date precision. The shared
+    /// PIT selector then applies the requested latest-known or all-known revision policy before
+    /// any typed NAV crosses this capability boundary.
+    pub async fn read_fund_nav_history(
+        &self,
+        request: AnalyticalFundNavReadRequest,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<AnalyticalFundNavOutput, AnalyticalReadError> {
+        let (pinned, source_id, _) =
+            self.manifests
+                .read_exact(request.manifest(), deadline, &cancellation)?;
+        let query = QueryRequest::try_new(pinned.manifest().clone(), request.sql())?;
+        let engine = ResearchQueryEngine::from_pinned_dataset(
+            pinned,
+            OBSERVATION_TABLE,
+            Arc::clone(&self.objects),
+            cancellation.clone(),
+        )
+        .await?;
+        let operation_cancellation = cancellation.child_token();
+        let execution_cancellation = operation_cancellation.clone();
+        let execution = engine.query_pinned(query, limits, execution_cancellation);
+        tokio::pin!(execution);
+        let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(deadline_wait);
+        let output = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                return Err(AnalyticalReadError::Query(QueryError::Cancelled));
+            }
+            _ = deadline_wait.as_mut() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                return Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded));
+            }
+            result = execution.as_mut() => result?,
+        };
+        let observations =
+            decode_fund_nav_history(&output, &request, &source_id, deadline, &cancellation).await?;
+        Ok(AnalyticalFundNavOutput {
+            source_id,
+            output,
+            observations,
+        })
+    }
+
+    /// Selects the uniquely earliest exact-series completed bar at or after a forecast horizon.
+    ///
+    /// Candidate and execution bounds are code-owned. The caller cannot supply a row limit, price,
+    /// or tie-break, and an incomplete, saturated, unavailable, or ambiguous result fails closed.
+    pub async fn select_outcome_market_bar(
+        &self,
+        request: OutcomeMarketBarRequest,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<OutcomeMarketBarSelection, AnalyticalReadError> {
+        let (pinned, source_id, _) =
+            self.manifests
+                .read_exact(request.manifest(), deadline, &cancellation)?;
+        if &source_id != request.series().source_id() {
+            return Ok(OutcomeMarketBarSelection::Unavailable(
+                OutcomeMarketBarUnavailableReason::SourceOwnerMismatch,
+            ));
+        }
+        let query = QueryRequest::try_new(pinned.manifest().clone(), request.sql())?;
+        let engine = ResearchQueryEngine::from_pinned_dataset(
+            pinned,
+            OBSERVATION_TABLE,
+            Arc::clone(&self.objects),
+            cancellation.clone(),
+        )
+        .await?;
+        let operation_cancellation = cancellation.child_token();
+        let execution_cancellation = operation_cancellation.clone();
+        let limits = outcome_market_bar_query_limits()?;
+        let execution = engine.query_pinned(query, limits, execution_cancellation);
+        tokio::pin!(execution);
+        let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(deadline_wait);
+        let output = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                return Err(AnalyticalReadError::Query(QueryError::Cancelled));
+            }
+            _ = deadline_wait.as_mut() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                return Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded));
+            }
+            result = execution.as_mut() => result?,
+        };
+        select_outcome_from_output(request, output)
+    }
+
     /// Reads one producer-issued monetary observation from an exact immutable generation.
     ///
     /// The only selector is a bounded canonical row offset. Caller SQL, physical paths, catalog
@@ -802,6 +1552,33 @@ pub enum AnalyticalReadError {
     /// An availability-time range was reversed.
     #[error("analytical observation knowledge range is invalid")]
     InvalidKnowledgeRange,
+    /// A typed market-bar request used zero or exceeded its fixed row ceiling.
+    #[error("analytical market-bar limit is invalid")]
+    InvalidMarketBarLimit,
+    /// A typed market-bar effective-time range was reversed.
+    #[error("analytical market-bar effective-time range is invalid")]
+    InvalidMarketBarEffectiveRange,
+    /// A typed Fund NAV request used zero or exceeded its fixed row ceiling.
+    #[error("analytical Fund NAV limit is invalid")]
+    InvalidFundNavLimit,
+    /// A typed Fund NAV calendar-date range was reversed.
+    #[error("analytical Fund NAV date range is invalid")]
+    InvalidFundNavDateRange,
+    /// An outcome request reversed its inclusive horizon/completion window.
+    #[error("analytical outcome market-bar completion window is invalid")]
+    InvalidOutcomeMarketBarWindow,
+    /// Typed market-bar decoding requires a bounded inline query result.
+    #[error("analytical market-bar result must be inline")]
+    MarketBarResultRequiresInline,
+    /// A returned row violated the typed market-bar request or canonical payload contract.
+    #[error("analytical market-bar result is invalid")]
+    InvalidMarketBarResult,
+    /// Typed Fund NAV decoding requires a bounded inline query result.
+    #[error("analytical Fund NAV result must be inline")]
+    FundNavResultRequiresInline,
+    /// A returned row violated the typed Fund NAV request or canonical PIT contract.
+    #[error("analytical Fund NAV result is invalid")]
+    InvalidFundNavResult,
     /// Fixed observation templates require the canonical research-observation schema.
     #[error("analytical observation schema is invalid")]
     InvalidObservationSchema,
@@ -820,4 +1597,548 @@ pub enum AnalyticalReadError {
     /// Canonical feature-row verification failed.
     #[error("analytical forecast row verification failed: {0}")]
     PythonDataset(#[from] crate::PythonDatasetCatalogError),
+}
+
+async fn decode_fund_nav_history(
+    output: &PinnedQueryOutput,
+    request: &AnalyticalFundNavReadRequest,
+    source_id: &SourceId,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Box<[FundNavObservation]>, AnalyticalReadError> {
+    let crate::QueryResult::Inline { batches, .. } = output.result() else {
+        return Err(AnalyticalReadError::FundNavResultRequiresInline);
+    };
+    let row_count = batches.iter().try_fold(0_usize, |count, batch| {
+        count
+            .checked_add(batch.num_rows())
+            .ok_or(AnalyticalReadError::InvalidFundNavResult)
+    })?;
+    if row_count > MAX_FUND_NAV_REVISION_CANDIDATES {
+        return Err(AnalyticalReadError::InvalidFundNavResult);
+    }
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(row_count)
+        .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
+    for batch in batches {
+        let payloads = batch
+            .column_by_name("payload_json")
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or(AnalyticalReadError::InvalidFundNavResult)?;
+        if payloads.len() != batch.num_rows() {
+            return Err(AnalyticalReadError::InvalidFundNavResult);
+        }
+        for row in 0..payloads.len() {
+            if payloads.is_null(row) {
+                return Err(AnalyticalReadError::InvalidFundNavResult);
+            }
+            let observation = serde_json::from_slice::<ResearchObservation>(payloads.value(row))
+                .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
+            let ResearchObservation::FundNav(nav) = &observation else {
+                return Err(AnalyticalReadError::InvalidFundNavResult);
+            };
+            let provenance = nav.context().provenance();
+            let available_at = provenance
+                .availability()
+                .conservative_available_at()
+                .ok_or(AnalyticalReadError::InvalidFundNavResult)?;
+            if provenance.instrument_id() != Some(request.instrument_id)
+                || provenance.source_id() != source_id
+                || available_at > request.knowledge_cutoff
+                || request
+                    .date_range
+                    .is_some_and(|range| nav.nav_date() < range.start || nav.nav_date() > range.end)
+            {
+                return Err(AnalyticalReadError::InvalidFundNavResult);
+            }
+            // Local PIT history is conservative over every locally observed/published clock, not
+            // only the provider's source-availability coordinate.
+            if provenance.received_at() > request.knowledge_cutoff
+                || provenance.ingested_at() > request.knowledge_cutoff
+                || nav.canonical_published_at() > request.knowledge_cutoff
+            {
+                continue;
+            }
+            candidates.push(PointInTimeCandidate::new(
+                observation,
+                request.manifest.clone(),
+            ));
+        }
+    }
+    let effective_end = match request.date_range {
+        Some(range) => range.end,
+        None => CalendarDate::new(9999, 12, 31)
+            .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?,
+    };
+    let policy = PointInTimePolicy::try_new(NonZeroU32::MIN, request.revision_mode)
+        .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
+    let pit_limits = PointInTimeLimits::try_new(
+        MAX_FUND_NAV_REVISION_CANDIDATES,
+        MAX_FUND_NAV_REVISION_CANDIDATES,
+        MAX_FUND_NAV_REVISION_CANDIDATES,
+        MAX_FUND_NAV_REVISION_CANDIDATES,
+        256 * 1024 * 1024,
+    )
+    .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
+    let pit_request = PointInTimeRequest::try_new(
+        policy,
+        request.knowledge_cutoff,
+        None,
+        ResearchTemporalCoordinate::calendar_date(effective_end),
+        None,
+        pit_limits,
+    )
+    .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
+    let selection = PointInTimeService::new()
+        .select(&pit_request, &candidates, cancellation, deadline)
+        .await
+        .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
+    let result_limit = usize::try_from(request.limit.get())
+        .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
+    let mut observations = Vec::new();
+    observations
+        .try_reserve_exact(selection.records().len().min(result_limit))
+        .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
+    for record in selection.records().iter().take(result_limit) {
+        let ResearchObservation::FundNav(nav) = record.candidate().observation() else {
+            return Err(AnalyticalReadError::InvalidFundNavResult);
+        };
+        observations.push(nav.clone());
+    }
+    Ok(observations.into_boxed_slice())
+}
+
+fn decode_market_bars(
+    output: &PinnedQueryOutput,
+    request: &AnalyticalMarketBarReadRequest,
+) -> Result<Box<[MarketBarObservation]>, AnalyticalReadError> {
+    if inline_market_bar_row_count(output)? > MAX_MARKET_BAR_REVISION_CANDIDATES {
+        return Err(AnalyticalReadError::InvalidMarketBarResult);
+    }
+    let mut candidates = decode_market_bar_candidates(output)?;
+    for candidate in &candidates {
+        let provenance = candidate.bar.context().provenance();
+        if provenance.instrument_id() != Some(request.instrument_id)
+            || candidate.available_at > request.knowledge_cutoff
+            || request.effective_range.is_some_and(|range| {
+                candidate.effective_at < range.start || candidate.effective_at > range.end
+            })
+        {
+            return Err(AnalyticalReadError::InvalidMarketBarResult);
+        }
+    }
+    candidates = latest_market_bar_revisions(candidates)?;
+    candidates.sort_unstable_by(|left, right| {
+        left.effective_at
+            .cmp(&right.effective_at)
+            .then_with(|| left.family.exact_bytes().cmp(right.family.exact_bytes()))
+            .then_with(|| left.ordinal.cmp(&right.ordinal))
+    });
+    let result_limit = usize::try_from(request.limit.get())
+        .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
+    candidates.truncate(result_limit);
+    let mut bars = Vec::new();
+    bars.try_reserve_exact(candidates.len())
+        .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
+    bars.extend(candidates.into_iter().map(|candidate| candidate.bar));
+    Ok(bars.into_boxed_slice())
+}
+
+struct DecodedMarketBarCandidate {
+    ordinal: u32,
+    payload_digest: EvidenceDigest,
+    family: CanonicalObservationFamily,
+    effective_at: Timestamp,
+    available_at: Timestamp,
+    bar: MarketBarObservation,
+}
+
+struct DecodedOutcomeMarketBar {
+    ordinal: u32,
+    payload_digest: EvidenceDigest,
+    bar: MarketBarObservation,
+}
+
+fn inline_market_bar_row_count(output: &PinnedQueryOutput) -> Result<usize, AnalyticalReadError> {
+    let crate::QueryResult::Inline { batches, .. } = output.result() else {
+        return Err(AnalyticalReadError::MarketBarResultRequiresInline);
+    };
+    batches.iter().try_fold(0_usize, |count, batch| {
+        count
+            .checked_add(batch.num_rows())
+            .ok_or(AnalyticalReadError::InvalidMarketBarResult)
+    })
+}
+
+fn decode_market_bar_candidates(
+    output: &PinnedQueryOutput,
+) -> Result<Vec<DecodedMarketBarCandidate>, AnalyticalReadError> {
+    let crate::QueryResult::Inline { batches, .. } = output.result() else {
+        return Err(AnalyticalReadError::MarketBarResultRequiresInline);
+    };
+    let row_count = inline_market_bar_row_count(output)?;
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(row_count)
+        .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
+    let mut ordinal = 0_usize;
+    for batch in batches {
+        let payloads = batch
+            .column_by_name("payload_json")
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
+        if payloads.len() != batch.num_rows() {
+            return Err(AnalyticalReadError::InvalidMarketBarResult);
+        }
+        for row in 0..payloads.len() {
+            if payloads.is_null(row) {
+                return Err(AnalyticalReadError::InvalidMarketBarResult);
+            }
+            let payload = payloads.value(row);
+            let observation = serde_json::from_slice::<ResearchObservation>(payload)
+                .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
+            let family = CanonicalObservationFamily::try_from_observation(&observation)
+                .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
+            let ResearchObservation::MarketBar(bar) = observation else {
+                return Err(AnalyticalReadError::InvalidMarketBarResult);
+            };
+            let context = bar.context();
+            let effective_at = context
+                .time()
+                .effective()
+                .exact_timestamp()
+                .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
+            let available_at = context
+                .provenance()
+                .availability()
+                .conservative_available_at()
+                .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
+            candidates.push(DecodedMarketBarCandidate {
+                ordinal: u32::try_from(ordinal)
+                    .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?,
+                payload_digest: EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    Sha256::digest(payload).into(),
+                ),
+                family,
+                effective_at,
+                available_at,
+                bar,
+            });
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
+        }
+    }
+    Ok(candidates)
+}
+
+fn latest_market_bar_revisions(
+    mut candidates: Vec<DecodedMarketBarCandidate>,
+) -> Result<Vec<DecodedMarketBarCandidate>, AnalyticalReadError> {
+    candidates.sort_unstable_by(|left, right| {
+        left.family
+            .exact_bytes()
+            .cmp(right.family.exact_bytes())
+            .then_with(|| {
+                right
+                    .bar
+                    .context()
+                    .time()
+                    .revision()
+                    .get()
+                    .cmp(&left.bar.context().time().revision().get())
+            })
+            .then_with(|| {
+                left.payload_digest
+                    .bytes()
+                    .cmp(&right.payload_digest.bytes())
+            })
+            .then_with(|| left.ordinal.cmp(&right.ordinal))
+    });
+    let mut latest: Vec<DecodedMarketBarCandidate> = Vec::new();
+    latest
+        .try_reserve_exact(candidates.len())
+        .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
+    let mut current_family_start: Option<usize> = None;
+    for candidate in candidates {
+        let same_family = current_family_start
+            .and_then(|index| latest.get(index))
+            .is_some_and(|current| current.family.exact_bytes() == candidate.family.exact_bytes());
+        if !same_family {
+            current_family_start = Some(latest.len());
+            latest.push(candidate);
+            continue;
+        }
+        let family_start = current_family_start
+            .and_then(|index| latest.get(index))
+            .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
+        if family_start.bar.context().time().revision() == candidate.bar.context().time().revision()
+        {
+            latest.push(candidate);
+        }
+    }
+    Ok(latest)
+}
+
+fn outcome_market_bar_query_limits() -> Result<QueryLimits, AnalyticalReadError> {
+    QueryLimits::try_new_with_inline_bytes(
+        u64::try_from(MAX_OUTCOME_MARKET_BAR_CANDIDATES + 1)
+            .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?,
+        OUTCOME_MARKET_BAR_QUERY_BYTES,
+        OUTCOME_MARKET_BAR_QUERY_BYTES,
+        OUTCOME_MARKET_BAR_QUERY_MEMORY_BYTES,
+        1,
+        256,
+        256,
+        Duration::from_secs(30),
+    )
+    .map_err(Into::into)
+}
+
+fn select_outcome_from_output(
+    request: OutcomeMarketBarRequest,
+    output: PinnedQueryOutput,
+) -> Result<OutcomeMarketBarSelection, AnalyticalReadError> {
+    if inline_market_bar_row_count(&output)? > MAX_OUTCOME_MARKET_BAR_CANDIDATES {
+        return Ok(OutcomeMarketBarSelection::Unavailable(
+            OutcomeMarketBarUnavailableReason::CandidateSetSaturated,
+        ));
+    }
+    let candidates = match decode_market_bar_candidates(&output) {
+        Ok(candidates) => candidates,
+        Err(AnalyticalReadError::InvalidMarketBarResult) => {
+            return Ok(OutcomeMarketBarSelection::Unavailable(
+                OutcomeMarketBarUnavailableReason::IncompleteCandidate,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    for candidate in &candidates {
+        let provenance = candidate.bar.context().provenance();
+        let effective_before_horizon = request.series.timestamp_basis
+            == BarTimestampBasis::PeriodEnd
+            && candidate.effective_at < request.horizon;
+        if provenance.instrument_id() != Some(request.series.instrument_id)
+            || provenance.source_id() != &request.series.source_id
+            || provenance.venue_id() != Some(&request.series.venue_id)
+            || candidate.available_at > request.knowledge_cutoff
+            || candidate.effective_at > request.latest_eligible_completion
+            || effective_before_horizon
+        {
+            return Ok(OutcomeMarketBarSelection::Unavailable(
+                OutcomeMarketBarUnavailableReason::IncompleteCandidate,
+            ));
+        }
+    }
+    let candidates = match latest_market_bar_revisions(candidates) {
+        Ok(candidates) => candidates,
+        Err(AnalyticalReadError::InvalidMarketBarResult) => {
+            return Ok(OutcomeMarketBarSelection::Unavailable(
+                OutcomeMarketBarUnavailableReason::IncompleteCandidate,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+
+    let mut selected: Option<DecodedOutcomeMarketBar> = None;
+    let mut ambiguous = false;
+    for candidate in candidates {
+        if !outcome_series_matches(&candidate.bar, &request.series) {
+            continue;
+        }
+        let completed_at = candidate.bar.completed_at();
+        if completed_at < request.horizon || completed_at > request.latest_eligible_completion {
+            continue;
+        }
+        let candidate = DecodedOutcomeMarketBar {
+            ordinal: candidate.ordinal,
+            payload_digest: candidate.payload_digest,
+            bar: candidate.bar,
+        };
+        match selected.as_ref() {
+            None => {
+                selected = Some(candidate);
+                ambiguous = false;
+            }
+            Some(current) if candidate.bar.completed_at() < current.bar.completed_at() => {
+                selected = Some(candidate);
+                ambiguous = false;
+            }
+            Some(current) if candidate.bar.completed_at() == current.bar.completed_at() => {
+                ambiguous = true;
+            }
+            Some(_) => {}
+        }
+    }
+    if ambiguous {
+        return Ok(OutcomeMarketBarSelection::Unavailable(
+            OutcomeMarketBarUnavailableReason::AmbiguousCompletion,
+        ));
+    }
+    let Some(selected) = selected else {
+        return Ok(OutcomeMarketBarSelection::Unavailable(
+            OutcomeMarketBarUnavailableReason::NoEligibleBar,
+        ));
+    };
+    let request_digest = outcome_market_bar_request_digest(&request);
+    let receipt_digest = outcome_market_bar_receipt_digest(
+        request_digest,
+        &output,
+        selected.ordinal,
+        selected.payload_digest,
+        &selected.bar,
+    )?;
+    Ok(OutcomeMarketBarSelection::Selected(
+        OutcomeMarketBarSelectedReceipt {
+            request,
+            request_digest,
+            output,
+            ordinal: selected.ordinal,
+            payload_digest: selected.payload_digest,
+            receipt_digest,
+            bar: selected.bar,
+        },
+    ))
+}
+
+fn outcome_series_matches(bar: &MarketBarObservation, series: &OutcomeMarketBarSeries) -> bool {
+    bar.provider_instrument_id() == &series.provider_instrument_id
+        && bar.feed() == &series.feed
+        && bar.interval() == &series.interval
+        && bar.adjustment() == series.adjustment
+        && bar.time_semantics().timestamp_basis() == series.timestamp_basis
+        && bar.time_semantics().session() == &series.session
+}
+
+fn outcome_market_bar_request_digest(request: &OutcomeMarketBarRequest) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/outcome-market-bar-request/v1");
+    hash_manifest(&mut hash, request.manifest());
+    let series = request.series();
+    hash.update(series.instrument_id().as_uuid().as_bytes());
+    hash_str(&mut hash, series.source_id().as_str());
+    hash_str(&mut hash, series.venue_id().as_str());
+    hash_str(&mut hash, series.provider_instrument_id().as_str());
+    hash_str(&mut hash, series.feed().as_str());
+    hash_str(&mut hash, series.interval().as_str());
+    hash.update([market_bar_adjustment_digest_tag(series.adjustment())]);
+    hash.update([bar_timestamp_basis_digest_tag(series.timestamp_basis())]);
+    hash_market_bar_session(&mut hash, series.session());
+    hash_timestamp(&mut hash, request.knowledge_cutoff());
+    hash_timestamp(&mut hash, request.horizon());
+    hash_timestamp(&mut hash, request.latest_eligible_completion());
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn outcome_market_bar_receipt_digest(
+    request_digest: EvidenceDigest,
+    output: &PinnedQueryOutput,
+    ordinal: u32,
+    payload_digest: EvidenceDigest,
+    bar: &MarketBarObservation,
+) -> Result<EvidenceDigest, AnalyticalReadError> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/outcome-market-bar-selected/v1");
+    hash_evidence(&mut hash, request_digest);
+    hash_manifest(&mut hash, output.manifest());
+    hash_evidence(&mut hash, output.object_graph_digest());
+    hash_evidence(&mut hash, output.query_identity());
+    hash_evidence(&mut hash, output.result_digest());
+    hash.update(ordinal.to_be_bytes());
+    hash_evidence(&mut hash, payload_digest);
+    let context = bar.context();
+    let provenance = context.provenance();
+    hash_str(&mut hash, provenance.source_id().as_str());
+    hash_str(&mut hash, provenance.source_identifier().as_str());
+    hash_timestamp(&mut hash, bar.time_semantics().period_start());
+    hash_timestamp(&mut hash, bar.completed_at());
+    hash_timestamp(&mut hash, bar.time_semantics().provider_timestamp());
+    let available_at = provenance
+        .availability()
+        .conservative_available_at()
+        .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
+    hash_timestamp(&mut hash, available_at);
+    hash.update([bar_timestamp_basis_digest_tag(
+        bar.time_semantics().timestamp_basis(),
+    )]);
+    hash_market_bar_session(&mut hash, bar.time_semantics().session());
+    let close = bar.close().amount().normalize();
+    hash.update(close.mantissa().to_be_bytes());
+    hash.update(close.scale().to_be_bytes());
+    hash_str(&mut hash, bar.currency().as_str());
+    hash.update([data_quality_digest_tag(provenance.quality())]);
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hash.finalize().into(),
+    ))
+}
+
+fn hash_market_bar_session(hash: &mut Sha256, session: &MarketBarSessionEvidence) {
+    hash.update([match session.kind() {
+        market_squawk_domain::MarketBarSessionKind::Regular => 1,
+        market_squawk_domain::MarketBarSessionKind::Extended => 2,
+        market_squawk_domain::MarketBarSessionKind::Continuous => 3,
+        market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
+    }]);
+    hash_str(hash, session.ruleset().as_str());
+    hash_evidence(hash, session.evidence());
+}
+
+fn hash_evidence(hash: &mut Sha256, evidence: EvidenceDigest) {
+    hash.update([match evidence.algorithm() {
+        DigestAlgorithm::Sha256 => 1,
+        DigestAlgorithm::Blake3 => 2,
+    }]);
+    hash.update(evidence.bytes());
+}
+
+fn hash_manifest(hash: &mut Sha256, manifest: &DatasetManifestRef) {
+    hash_str(hash, manifest.dataset_id().as_str());
+    hash.update(manifest.manifest_version().to_be_bytes());
+    hash_str(hash, manifest.schema().name());
+    hash.update(manifest.schema_version().get().to_be_bytes());
+    hash.update(manifest.schema().fingerprint());
+    hash.update(manifest.content_hash().bytes());
+}
+
+fn hash_str(hash: &mut Sha256, value: &str) {
+    hash.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hash.update(value.as_bytes());
+}
+
+fn hash_timestamp(hash: &mut Sha256, timestamp: Timestamp) {
+    hash.update(timestamp.unix_nanos().to_be_bytes());
+}
+
+const fn market_bar_adjustment_digest_tag(adjustment: MarketBarAdjustment) -> u8 {
+    match adjustment {
+        MarketBarAdjustment::Raw => 1,
+        MarketBarAdjustment::Split => 2,
+        MarketBarAdjustment::Dividend => 3,
+        MarketBarAdjustment::SpinOff => 4,
+        MarketBarAdjustment::All => 5,
+    }
+}
+
+const fn bar_timestamp_basis_digest_tag(basis: BarTimestampBasis) -> u8 {
+    match basis {
+        BarTimestampBasis::PeriodStart => 1,
+        BarTimestampBasis::PeriodEnd => 2,
+    }
+}
+
+const fn data_quality_digest_tag(quality: DataQuality) -> u8 {
+    match quality {
+        DataQuality::DirectVerified => 1,
+        DataQuality::DirectUnverified => 2,
+        DataQuality::OfficialDelayed => 3,
+        DataQuality::Aggregated => 4,
+        DataQuality::Indicative => 5,
+        DataQuality::Modeled => 6,
+        DataQuality::Estimated => 7,
+        DataQuality::Stale => 8,
+        DataQuality::Quarantined => 9,
+    }
 }

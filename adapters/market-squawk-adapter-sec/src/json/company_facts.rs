@@ -37,6 +37,8 @@ pub struct CompanyFactOccurrence {
     filed_on: CalendarDate,
     period: CompanyFactPeriod,
     frame: Option<SourceIdentifier>,
+    fiscal_year: Option<u16>,
+    fiscal_period: Option<SourceIdentifier>,
 }
 
 impl CompanyFactOccurrence {
@@ -71,6 +73,14 @@ impl CompanyFactOccurrence {
     /// Returns the optional SEC frame identity.
     pub const fn frame(&self) -> Option<&SourceIdentifier> {
         self.frame.as_ref()
+    }
+    /// Returns the source-reported fiscal year when supplied.
+    pub const fn fiscal_year(&self) -> Option<u16> {
+        self.fiscal_year
+    }
+    /// Returns the exact source fiscal-period code when supplied.
+    pub const fn fiscal_period(&self) -> Option<&SourceIdentifier> {
+        self.fiscal_period.as_ref()
     }
 }
 
@@ -191,5 +201,34 @@ fn parse_company_fact(
         frame: optional_string(object, "frame")?
             .map(SourceIdentifier::try_from)
             .transpose()?,
+        fiscal_year: parse_optional_fiscal_year(object)?,
+        fiscal_period: parse_optional_fiscal_period(object)?,
     })
+}
+
+fn parse_optional_fiscal_year(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<u16>, SecParserError> {
+    match object.get("fy") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| *value != 0)
+            .map(Some)
+            .ok_or(SecParserError::InvalidFiscalContext),
+        Some(_) => Err(SecParserError::WrongType),
+    }
+}
+
+fn parse_optional_fiscal_period(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<SourceIdentifier>, SecParserError> {
+    match object.get("fp") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => SourceIdentifier::try_from(value.clone())
+            .map(Some)
+            .map_err(SecParserError::from),
+        Some(_) => Err(SecParserError::WrongType),
+    }
 }

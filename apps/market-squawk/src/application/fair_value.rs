@@ -1,6 +1,6 @@
 //! Evidence-resolving fair-value application service.
 
-use std::{collections::HashSet, fmt, str::FromStr, sync::Arc, time::Instant};
+use std::{collections::HashSet, fmt, num::NonZeroUsize, str::FromStr, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use chrono::DateTime;
@@ -15,10 +15,12 @@ use market_squawk_services::{
 use market_squawk_valuation::{
     ActorId, ApprovalStatus, ApprovedMarketAccess, AuditEventId, AuditEventKind,
     ClassificationRuleset, DecisionBasis, DecisionId, EvidenceOrigin, FairValueAuditCursor,
-    FairValueAuditEvent, FairValueError, FairValueEvidenceHash, FairValueLimits, FairValueService,
-    InputSignificance, MarketAccess, MarketAccessAssessmentId, MarketPriceSelection, MeasurementId,
-    OverrideProposal, RulesetHash, ValuationAmount, ValuationApprovalId, ValuationInput,
-    ValuationMeasurement, ValuationMeasurementSpec, ValuationMethod,
+    FairValueAuditEvent, FairValueError, FairValueEvidenceHash, FairValueLimits,
+    FairValueSelectionError, FairValueSelectionReceipt, FairValueSelectionRequest,
+    FairValueService, InputSignificance, MarketAccess, MarketAccessAssessmentId,
+    MarketPriceSelection, MeasurementId, OverrideProposal, RulesetHash, ValuationAmount,
+    ValuationAmountBasis, ValuationApprovalId, ValuationInput, ValuationMeasurement,
+    ValuationMeasurementSpec, ValuationMethod,
 };
 use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
@@ -62,6 +64,7 @@ const LIST_AUDIT_EVENTS: &str = "FairValue.ListAuditEvents";
 const BACKUP_ATTESTATION_MAGIC: [u8; 8] = *b"MSQFVA01";
 const BACKUP_ATTESTATION_FORMAT_VERSION: u16 = 1;
 const BACKUP_ATTESTATION_BYTES: usize = 115;
+const RECOMMENDATION_MAXIMUM_ELIGIBLE_SELECTIONS: usize = 256;
 
 /// Producer family named by one opaque, application-resolved receipt selector.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -389,7 +392,61 @@ pub struct FairValueDomainService {
     ruleset: ClassificationRuleset,
     maximum_inputs: usize,
     maximum_query_results: usize,
+    recommendation_maximum_eligible: NonZeroUsize,
     lifecycle: Arc<DomainLifecycle>,
+}
+
+/// Cloneable read-only fair-value authority for personalized investment analysis.
+///
+/// The capability selects only retained, governed evidence for one exact account, instrument,
+/// currency, and point-in-time cutoff. It carries no catalog mutation, producer-resolution, or
+/// approval authority and accepts no caller-supplied money or governance identity.
+#[derive(Clone)]
+pub(crate) struct FairValueRecommendationReadCapability {
+    state: Arc<Mutex<FairValueService>>,
+    maximum_eligible: NonZeroUsize,
+    lifecycle: Arc<DomainLifecycle>,
+}
+
+impl FairValueRecommendationReadCapability {
+    /// Selects the latest governed fair-value evidence without collapsing selector dispositions.
+    pub(crate) async fn select_latest(
+        &self,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        currency: Currency,
+        as_of: Timestamp,
+        context: &RequestContext,
+    ) -> Result<FairValueSelectionReceipt, ServiceError> {
+        let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        let request = FairValueSelectionRequest::new(
+            instrument_id,
+            currency,
+            ValuationAmountBasis::PerInstrumentUnit,
+            Some(account_id),
+            as_of,
+            self.maximum_eligible,
+        );
+        let state = lock_fair_value_state(&self.state, &self.lifecycle, context).await?;
+        let selected = state.select_latest_fair_value(request);
+        drop(state);
+        ensure_request_live(context, &self.lifecycle)?;
+        let receipt = selected.map_err(map_recommendation_selection_error)?;
+        if receipt.request() != request {
+            return Err(ServiceError::Internal);
+        }
+        Ok(receipt)
+    }
+}
+
+impl fmt::Debug for FairValueRecommendationReadCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FairValueRecommendationReadCapability")
+            .field("maximum_eligible", &self.maximum_eligible)
+            .field("lifecycle", &self.lifecycle)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Versioned owner-issued proof that service state and analytical catalog share one exact head.
@@ -671,15 +728,33 @@ impl FairValueDomainService {
         maximum_quote_age_nanos: u64,
     ) -> Result<Self, FairValueError> {
         let limits = service.limits();
+        let maximum_query_results = limits.max_query_results();
+        let recommendation_maximum_eligible = NonZeroUsize::new(
+            maximum_query_results.min(RECOMMENDATION_MAXIMUM_ELIGIBLE_SELECTIONS),
+        )
+        .ok_or(FairValueError::QueryLimitExceeded {
+            requested: 0,
+            limit: maximum_query_results,
+        })?;
         Ok(Self {
             state: Arc::new(Mutex::new(service)),
             resolver,
             selection_authority,
             ruleset: ClassificationRuleset::current(maximum_quote_age_nanos)?,
             maximum_inputs: limits.max_inputs_per_measurement(),
-            maximum_query_results: limits.max_query_results(),
+            maximum_query_results,
+            recommendation_maximum_eligible,
             lifecycle: DomainLifecycle::new(),
         })
+    }
+
+    /// Issues a cloneable read-only capability for personalized investment analysis.
+    pub(crate) fn recommendation_read_capability(&self) -> FairValueRecommendationReadCapability {
+        FairValueRecommendationReadCapability {
+            state: Arc::clone(&self.state),
+            maximum_eligible: self.recommendation_maximum_eligible,
+            lifecycle: Arc::clone(&self.lifecycle),
+        }
     }
 
     /// Retains the sole Fair Value writer and captures its exact analytical-catalog attestation.
@@ -1485,15 +1560,23 @@ impl FairValueDomainService {
         &self,
         context: &RequestContext,
     ) -> Result<MutexGuard<'_, FairValueService>, ServiceError> {
-        ensure_request_live(context, &self.lifecycle)?;
-        let deadline = tokio::time::Instant::from_std(context.deadline());
-        tokio::select! {
-            biased;
-            _ = context.cancellation().cancelled() => Err(ServiceError::Cancelled),
-            _ = self.lifecycle.shutdown_token().cancelled() => Err(ServiceError::Unavailable),
-            _ = tokio::time::sleep_until(deadline) => Err(ServiceError::DeadlineExceeded),
-            state = self.state.lock() => Ok(state),
-        }
+        lock_fair_value_state(&self.state, &self.lifecycle, context).await
+    }
+}
+
+async fn lock_fair_value_state<'state>(
+    state: &'state Mutex<FairValueService>,
+    lifecycle: &DomainLifecycle,
+    context: &RequestContext,
+) -> Result<MutexGuard<'state, FairValueService>, ServiceError> {
+    ensure_request_live(context, lifecycle)?;
+    let deadline = tokio::time::Instant::from_std(context.deadline());
+    tokio::select! {
+        biased;
+        _ = context.cancellation().cancelled() => Err(ServiceError::Cancelled),
+        _ = lifecycle.shutdown_token().cancelled() => Err(ServiceError::Unavailable),
+        _ = tokio::time::sleep_until(deadline) => Err(ServiceError::DeadlineExceeded),
+        state = state.lock() => Ok(state),
     }
 }
 
@@ -1510,6 +1593,10 @@ impl fmt::Debug for FairValueDomainService {
             .field("ruleset_hash", &self.ruleset.hash())
             .field("maximum_inputs", &self.maximum_inputs)
             .field("maximum_query_results", &self.maximum_query_results)
+            .field(
+                "recommendation_maximum_eligible",
+                &self.recommendation_maximum_eligible,
+            )
             .field("lifecycle", &self.lifecycle)
             .finish()
     }
@@ -1600,7 +1687,13 @@ impl ParsedMeasurement {
             .and_then(Value::as_u64)
             .and_then(|value| u8::try_from(value).ok())
             .ok_or(ServiceError::InvalidRequest)?;
-        let amount = ValuationAmount::try_new(Money::new(decimal, currency), scale)
+        let basis = match required_string(measurement, "amountBasis")? {
+            "per_instrument_unit" => ValuationAmountBasis::PerInstrumentUnit,
+            "reporting_entity_total" => ValuationAmountBasis::ReportingEntityTotal,
+            "position_total" => ValuationAmountBasis::PositionTotal,
+            _ => return Err(ServiceError::InvalidRequest),
+        };
+        let amount = ValuationAmount::try_new(Money::new(decimal, currency), scale, basis)
             .map_err(map_fair_value_error)?;
         let measurement_at = admitted_timestamp(measurement, "measurementAt")?;
         let prepared_at = admitted_timestamp(measurement, "preparedAt")?;
@@ -1977,7 +2070,7 @@ fn bounded_result(
     } else {
         ToolResultMetadata::complete_not_applicable()
     };
-    TypedToolResult::try_new(content, returned.max(1), metadata, limits).map_err(Into::into)
+    TypedToolResult::try_new(content, returned, metadata, limits).map_err(Into::into)
 }
 
 fn validate_resolved_input(
@@ -2129,6 +2222,15 @@ fn map_selection_error(error: FairValueProducerSelectionError) -> ServiceError {
         FairValueProducerSelectionError::DeadlineExceeded => ServiceError::DeadlineExceeded,
         FairValueProducerSelectionError::Unavailable => ServiceError::Unavailable,
         FairValueProducerSelectionError::Internal => ServiceError::Internal,
+    }
+}
+
+fn map_recommendation_selection_error(error: FairValueSelectionError) -> ServiceError {
+    match error {
+        FairValueSelectionError::FairValue(error) => map_fair_value_error(error),
+        FairValueSelectionError::TemporaryCapacityUnavailable { .. } => {
+            ServiceError::ResourceExhausted
+        }
     }
 }
 

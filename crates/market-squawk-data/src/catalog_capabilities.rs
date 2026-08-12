@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use std::{collections::BTreeSet, fmt};
 
-use market_squawk_domain::{InstrumentDefinition, InstrumentId, Timestamp};
+use market_squawk_domain::{
+    CompanyIdentityObservation, CompanyIdentitySurface, EvidenceDigest, InstrumentDefinition,
+    InstrumentId, SourceId, SourceIdentifier, Timestamp,
+};
 use market_squawk_sources::{CapabilityRegistrationOutcome, OnboardingEvent, ProviderCapability};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -52,6 +55,42 @@ impl CompanyIdentityReadCapability {
         self.lock()?
             .catalog()
             .search_company_identities(query, limit, deadline, cancellation)
+    }
+
+    /// Reads the exact current source-qualified company observation and its canonical parent.
+    ///
+    /// Names, tickers, and exchanges are absent from the query. The returned observation is
+    /// digest-revalidated and includes its source availability and ingestion coordinates; the
+    /// final timestamp is the successful parent ingest's durable completion time.
+    pub fn exact_current(
+        &self,
+        source_id: &SourceId,
+        provider_company_id: &SourceIdentifier,
+        surface: CompanyIdentitySurface,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<(CompanyIdentityObservation, EvidenceDigest, Timestamp)>,
+        crate::CompanySecurityIdentityCatalogError,
+    > {
+        self.authority
+            .try_lock()
+            .map_err(|_| crate::CompanySecurityIdentityCatalogError::AuthorityUnavailable)?
+            .exact_current_company_identity(
+                source_id,
+                provider_company_id,
+                surface,
+                deadline,
+                cancellation,
+            )
+    }
+
+    /// Narrows this company reader to exact company/security relationship reads.
+    ///
+    /// The derived capability retains no company publication, market publication, rights, or
+    /// execution authority.
+    pub fn security_relationships(&self) -> crate::CompanySecurityIdentityReadCapability {
+        crate::CompanySecurityIdentityReadCapability::new(Arc::clone(&self.authority))
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, CatalogAuthority>, CatalogError> {

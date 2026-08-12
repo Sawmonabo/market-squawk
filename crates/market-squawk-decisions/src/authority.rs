@@ -3,10 +3,15 @@
 use market_squawk_domain::{RevisionNumber, Timestamp};
 
 use crate::{
-    AppendOutcome, CandidateAssessment, CandidateInput, DecisionDossier, DecisionRepository,
-    DecisionRepositoryError, GovernedTargetSet, InvestmentTargetSetId, SavedScreen,
-    ScreenExecution, ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry, TargetInvalidation,
-    TargetReview, TargetState, TargetStatus, candidate::execute,
+    AnalyticalProfileBindingReference, AppendOutcome, CandidateAssessment, CandidateInput,
+    DecisionDossier, DecisionRepository, DecisionRepositoryError, GovernedTargetSet,
+    InvestmentAnalysisCurrentIndexEntry, InvestmentAnalysisId, InvestmentOutcomeProjection,
+    InvestmentProposalDecision, InvestmentProposalId, InvestmentProposalIndexEntry,
+    InvestmentSizingProjection, InvestmentTargetSetId, PublishedInvestmentAnalysis,
+    RecommendationOutcomeCurrentIndexEntry, RecommendationOutcomeSeriesId,
+    RecommendationOutcomeStatusRecord, RecommendationTrackRecord, SavedScreen, ScreenExecution,
+    ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry, TargetInvalidation, TargetReview,
+    TargetState, TargetStatus, candidate::execute,
 };
 
 /// One transport-neutral workflow authority. Mutation requires exclusive access to the sole writer.
@@ -202,6 +207,138 @@ impl DecisionAuthority {
         invalidation: TargetInvalidation,
     ) -> Result<AppendOutcome, DecisionRepositoryError> {
         self.repository.append_invalidation(invalidation)
+    }
+
+    /// Appends one immutable proposal result after pure recommendation-authority recomputation.
+    pub fn append_investment_proposal(
+        &mut self,
+        decision: InvestmentProposalDecision,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        self.repository.append_investment_proposal(decision)
+    }
+
+    /// Appends one immutable analytical-profile/workflow publication binding.
+    pub fn append_investment_analysis_publication(
+        &mut self,
+        publication: PublishedInvestmentAnalysis,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        self.repository
+            .append_investment_analysis_publication(publication)
+    }
+
+    /// Appends one immutable proposal-bound outcome projection.
+    pub fn append_investment_outcome_projection(
+        &mut self,
+        projection: InvestmentOutcomeProjection,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        self.repository
+            .append_investment_outcome_projection(projection)
+    }
+
+    /// Appends one immutable proposal-bound sizing projection.
+    pub fn append_investment_sizing_projection(
+        &mut self,
+        projection: InvestmentSizingProjection,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        self.repository
+            .append_investment_sizing_projection(projection)
+    }
+
+    /// Appends one contiguous recommendation-outcome status revision.
+    pub fn append_recommendation_outcome_status(
+        &mut self,
+        status: RecommendationOutcomeStatusRecord,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        self.repository.append_recommendation_outcome_status(status)
+    }
+
+    /// Returns one exact generated, no-action, or unavailable investment-analysis result.
+    pub fn get_investment_proposal(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Result<&InvestmentProposalDecision, DecisionRepositoryError> {
+        self.repository
+            .investment_proposal(analysis_id)
+            .ok_or(DecisionRepositoryError::NotFound)
+    }
+
+    /// Returns the immutable profile/workflow publication for one analysis.
+    pub fn get_investment_analysis_publication(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Result<&PublishedInvestmentAnalysis, DecisionRepositoryError> {
+        self.repository
+            .investment_analysis_publication(analysis_id)
+            .ok_or(DecisionRepositoryError::NotFound)
+    }
+
+    /// Returns the exact persisted outcome projection for one generated proposal.
+    pub fn get_investment_outcome_projection(
+        &self,
+        proposal_id: InvestmentProposalId,
+    ) -> Result<&InvestmentOutcomeProjection, DecisionRepositoryError> {
+        self.repository
+            .investment_outcome_projection(proposal_id)
+            .ok_or(DecisionRepositoryError::NotFound)
+    }
+
+    /// Returns the exact persisted sizing projection for one generated proposal.
+    pub fn get_investment_sizing_projection(
+        &self,
+        proposal_id: InvestmentProposalId,
+    ) -> Result<&InvestmentSizingProjection, DecisionRepositoryError> {
+        self.repository
+            .investment_sizing_projection(proposal_id)
+            .ok_or(DecisionRepositoryError::NotFound)
+    }
+
+    /// Returns the latest status for one recommendation-outcome series.
+    pub fn get_recommendation_outcome_current(
+        &self,
+        series_id: RecommendationOutcomeSeriesId,
+    ) -> Result<&RecommendationOutcomeCurrentIndexEntry, DecisionRepositoryError> {
+        self.repository
+            .recommendation_outcome_current(series_id)
+            .ok_or(DecisionRepositoryError::NotFound)
+    }
+
+    /// Returns one analysis currentness entry without append-order ranking.
+    pub fn get_investment_analysis_current(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Result<&InvestmentAnalysisCurrentIndexEntry, DecisionRepositoryError> {
+        self.repository
+            .investment_analysis_current(analysis_id)
+            .ok_or(DecisionRepositoryError::NotFound)
+    }
+
+    /// Computes action-separated current-status performance for one profile and horizon.
+    pub fn recommendation_track_record(
+        &self,
+        profile: &AnalyticalProfileBindingReference,
+        horizon_nanos: i64,
+        evaluated_at: Timestamp,
+    ) -> Result<RecommendationTrackRecord, DecisionRepositoryError> {
+        self.repository
+            .recommendation_track_record(profile, horizon_nanos, evaluated_at)
+    }
+
+    /// Lists bounded immutable investment-analysis locators in durable append order.
+    pub fn list_investment_proposal_index(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<InvestmentProposalIndexEntry>, DecisionRepositoryError> {
+        self.repository.list_investment_proposal_index(maximum)
+    }
+
+    /// Continues investment-analysis discovery after one exact retained analysis identity.
+    pub fn list_investment_proposal_index_after(
+        &self,
+        after: Option<InvestmentAnalysisId>,
+        maximum: usize,
+    ) -> Result<Vec<InvestmentProposalIndexEntry>, DecisionRepositoryError> {
+        self.repository
+            .list_investment_proposal_index_after(after, maximum)
     }
 
     /// Derives the current status of one exact revision from append-only lifecycle evidence.

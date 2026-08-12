@@ -4,11 +4,12 @@ use rust_decimal::Decimal;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::EffectiveInterval;
+use crate::{Currency, EffectiveInterval, EvidenceDigest, Money, ProviderInstrumentId, Timestamp};
 
 use super::{
-    CorporateActionKind, PositionSide, QuantityLots, ResearchContext, ResearchError,
-    SourceIdentifier, XbrlFactEvidence, require_instrument, validate_corporate_action,
+    CorporateActionKind, FundamentalFactContext, PositionSide, QuantityLots, ResearchContext,
+    ResearchError, SourceIdentifier, XbrlFactEvidence, require_instrument,
+    validate_corporate_action,
 };
 
 /// Regulatory or issuer filing identity and point-in-time context.
@@ -74,8 +75,7 @@ pub struct FundamentalObservation {
     context: ResearchContext,
     concept: SourceIdentifier,
     value: Decimal,
-    unit: SourceIdentifier,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fact_context: FundamentalFactContext,
     xbrl_evidence: Option<Box<XbrlFactEvidence>>,
 }
 
@@ -85,14 +85,15 @@ impl FundamentalObservation {
         context: ResearchContext,
         concept: SourceIdentifier,
         value: Decimal,
-        unit: SourceIdentifier,
+        fact_context: FundamentalFactContext,
     ) -> Result<Self, ResearchError> {
         require_instrument(&context)?;
+        fact_context.validate_research_context(&context)?;
         Ok(Self {
             context,
             concept,
             value: value.normalize(),
-            unit,
+            fact_context,
             xbrl_evidence: None,
         })
     }
@@ -107,16 +108,18 @@ impl FundamentalObservation {
         context: ResearchContext,
         concept: SourceIdentifier,
         value: Decimal,
-        unit: SourceIdentifier,
+        fact_context: FundamentalFactContext,
         xbrl_evidence: XbrlFactEvidence,
     ) -> Result<Self, ResearchError> {
         require_instrument(&context)?;
-        xbrl_evidence.validate_observation(&concept, &unit, value)?;
+        fact_context.validate_research_context(&context)?;
+        fact_context.validate_xbrl_evidence(&xbrl_evidence)?;
+        xbrl_evidence.validate_observation(&concept, fact_context.unit(), value)?;
         Ok(Self {
             context,
             concept,
             value: value.normalize(),
-            unit,
+            fact_context,
             xbrl_evidence: Some(Box::new(xbrl_evidence)),
         })
     }
@@ -136,9 +139,14 @@ impl FundamentalObservation {
         &self.concept
     }
 
+    /// Returns strict source-reported period, filing, fiscal, and revision context.
+    pub const fn fact_context(&self) -> &FundamentalFactContext {
+        &self.fact_context
+    }
+
     /// Returns the source-native unit identity.
     pub const fn unit(&self) -> &SourceIdentifier {
-        &self.unit
+        self.fact_context.unit()
     }
 
     /// Returns optional occurrence-level XBRL audit evidence.
@@ -153,10 +161,13 @@ struct FundamentalObservationWire {
     context: ResearchContext,
     concept: SourceIdentifier,
     value: Decimal,
-    unit: SourceIdentifier,
-    #[serde(default)]
-    xbrl_evidence: Option<XbrlFactEvidence>,
+    fact_context: FundamentalFactContext,
+    xbrl_evidence: RequiredOption<XbrlFactEvidence>,
 }
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct RequiredOption<T>(Option<T>);
 
 impl<'de> Deserialize<'de> for FundamentalObservation {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -164,15 +175,15 @@ impl<'de> Deserialize<'de> for FundamentalObservation {
         D: Deserializer<'de>,
     {
         let wire = FundamentalObservationWire::deserialize(deserializer)?;
-        match wire.xbrl_evidence {
+        match wire.xbrl_evidence.0 {
             Some(evidence) => Self::new_with_xbrl_evidence(
                 wire.context,
                 wire.concept,
                 wire.value,
-                wire.unit,
+                wire.fact_context,
                 evidence,
             ),
-            None => Self::new(wire.context, wire.concept, wire.value, wire.unit),
+            None => Self::new(wire.context, wire.concept, wire.value, wire.fact_context),
         }
         .map_err(serde::de::Error::custom)
     }
@@ -369,6 +380,426 @@ impl<'de> Deserialize<'de> for MacroObservation {
                 ResearchError::InvalidMacroValueState,
             )),
         }
+    }
+}
+
+/// Corporate-action adjustment applied by a historical-bar provider.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketBarAdjustment {
+    /// Preserve provider-reported raw prices.
+    Raw,
+    /// Apply split adjustments.
+    Split,
+    /// Apply cash-dividend adjustments.
+    Dividend,
+    /// Apply spin-off adjustments.
+    SpinOff,
+    /// Apply every provider-supported adjustment.
+    All,
+}
+
+/// Provider timestamp boundary retained by one completed market bar.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BarTimestampBasis {
+    /// The provider timestamp identifies the inclusive start of the aggregation period.
+    PeriodStart,
+    /// The provider timestamp identifies the exclusive end of the aggregation period.
+    PeriodEnd,
+}
+
+/// Source-neutral trading-session class used to interpret one market-bar period.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketBarSessionKind {
+    /// The venue's regular trading session.
+    Regular,
+    /// A session including trading outside the venue's regular session.
+    Extended,
+    /// A continuously traded market with no venue open/close boundary.
+    Continuous,
+    /// A provider-defined session whose exact rules are retained by evidence identity.
+    ProviderDefined,
+}
+
+/// Exact nonzero identity of the session rules used to close one market bar.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct MarketBarSessionEvidence {
+    kind: MarketBarSessionKind,
+    ruleset: SourceIdentifier,
+    evidence: EvidenceDigest,
+}
+
+impl MarketBarSessionEvidence {
+    /// Constructs explicit session evidence.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an all-zero digest, which cannot identify an admitted ruleset payload.
+    pub fn try_new(
+        kind: MarketBarSessionKind,
+        ruleset: SourceIdentifier,
+        evidence: EvidenceDigest,
+    ) -> Result<Self, ResearchError> {
+        if evidence.bytes() == [0; 32] {
+            return Err(ResearchError::InvalidMarketBarSessionEvidence);
+        }
+        Ok(Self {
+            kind,
+            ruleset,
+            evidence,
+        })
+    }
+
+    /// Returns the source-neutral session class.
+    pub const fn kind(&self) -> MarketBarSessionKind {
+        self.kind
+    }
+
+    /// Returns the exact session-ruleset identity.
+    pub const fn ruleset(&self) -> &SourceIdentifier {
+        &self.ruleset
+    }
+
+    /// Returns the exact evidence digest for the ruleset payload.
+    pub const fn evidence(&self) -> EvidenceDigest {
+        self.evidence
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketBarSessionEvidenceWire {
+    kind: MarketBarSessionKind,
+    ruleset: SourceIdentifier,
+    evidence: EvidenceDigest,
+}
+
+impl<'de> Deserialize<'de> for MarketBarSessionEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = MarketBarSessionEvidenceWire::deserialize(deserializer)?;
+        Self::try_new(wire.kind, wire.ruleset, wire.evidence).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Complete aggregation-period and session semantics for one completed market bar.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct BarTimeSemantics {
+    period_start: Timestamp,
+    period_end_exclusive: Timestamp,
+    timestamp_basis: BarTimestampBasis,
+    session: MarketBarSessionEvidence,
+}
+
+impl BarTimeSemantics {
+    /// Constructs one nonempty aggregation period without altering the provider timestamp anchor.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty or reversed period.
+    pub fn try_new(
+        period_start: Timestamp,
+        period_end_exclusive: Timestamp,
+        timestamp_basis: BarTimestampBasis,
+        session: MarketBarSessionEvidence,
+    ) -> Result<Self, ResearchError> {
+        if period_start >= period_end_exclusive {
+            return Err(ResearchError::InvalidMarketBarTimeRange);
+        }
+        Ok(Self {
+            period_start,
+            period_end_exclusive,
+            timestamp_basis,
+            session,
+        })
+    }
+
+    /// Returns the inclusive aggregation-period start.
+    pub const fn period_start(&self) -> Timestamp {
+        self.period_start
+    }
+
+    /// Returns the exclusive boundary at which the aggregation period is complete.
+    pub const fn period_end_exclusive(&self) -> Timestamp {
+        self.period_end_exclusive
+    }
+
+    /// Returns which exact period boundary the provider timestamp identifies.
+    pub const fn timestamp_basis(&self) -> BarTimestampBasis {
+        self.timestamp_basis
+    }
+
+    /// Returns exact evidence for the session rules used to determine the period.
+    pub const fn session(&self) -> &MarketBarSessionEvidence {
+        &self.session
+    }
+
+    /// Returns the exact provider timestamp boundary without rewriting it to bar completion.
+    pub const fn provider_timestamp(&self) -> Timestamp {
+        match self.timestamp_basis {
+            BarTimestampBasis::PeriodStart => self.period_start,
+            BarTimestampBasis::PeriodEnd => self.period_end_exclusive,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BarTimeSemanticsWire {
+    period_start: Timestamp,
+    period_end_exclusive: Timestamp,
+    timestamp_basis: BarTimestampBasis,
+    session: MarketBarSessionEvidence,
+}
+
+impl<'de> Deserialize<'de> for BarTimeSemantics {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BarTimeSemanticsWire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.period_start,
+            wire.period_end_exclusive,
+            wire.timestamp_basis,
+            wire.session,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Exact OHLCV market bar tied to canonical instrument, venue, provider, feed, and PIT evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MarketBarObservation {
+    context: ResearchContext,
+    provider_instrument_id: ProviderInstrumentId,
+    feed: SourceIdentifier,
+    interval: SourceIdentifier,
+    time_semantics: BarTimeSemantics,
+    adjustment: MarketBarAdjustment,
+    open: Money,
+    high: Money,
+    low: Money,
+    close: Money,
+    volume: Decimal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trade_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vwap: Option<Money>,
+}
+
+impl MarketBarObservation {
+    /// Constructs one exact instrument- and venue-scoped bar.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing canonical identity, non-exact effective time, mixed currencies,
+    /// nonpositive prices, negative volume, or prices outside the retained low/high envelope.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "bar identity, adjustment, OHLCV, and optional provider fields stay explicit"
+    )]
+    pub fn new(
+        context: ResearchContext,
+        provider_instrument_id: ProviderInstrumentId,
+        feed: SourceIdentifier,
+        interval: SourceIdentifier,
+        time_semantics: BarTimeSemantics,
+        adjustment: MarketBarAdjustment,
+        open: Money,
+        high: Money,
+        low: Money,
+        close: Money,
+        volume: Decimal,
+        trade_count: Option<u64>,
+        vwap: Option<Money>,
+    ) -> Result<Self, ResearchError> {
+        require_instrument(&context)?;
+        if context.provenance().venue_id().is_none() {
+            return Err(ResearchError::MissingVenue);
+        }
+        let Some(effective_at) = context.time().effective().exact_timestamp() else {
+            return Err(ResearchError::MarketBarRequiresExactEffectiveTime);
+        };
+        let provider_timestamp = time_semantics.provider_timestamp();
+        if effective_at != provider_timestamp
+            || context.provenance().source_timestamp() != Some(provider_timestamp)
+        {
+            return Err(ResearchError::MarketBarProviderTimestampMismatch);
+        }
+        if context
+            .provenance()
+            .availability()
+            .conservative_available_at()
+            .is_none_or(|available_at| available_at < time_semantics.period_end_exclusive())
+        {
+            return Err(ResearchError::MarketBarUnavailableBeforeCompletion);
+        }
+        let currency = open.currency();
+        if [high, low, close]
+            .into_iter()
+            .any(|price| price.currency() != currency)
+            || vwap.is_some_and(|price| price.currency() != currency)
+        {
+            return Err(ResearchError::MarketBarCurrencyMismatch);
+        }
+        if [open, high, low, close]
+            .into_iter()
+            .any(|price| price.amount() <= Decimal::ZERO)
+            || vwap.is_some_and(|price| price.amount() <= Decimal::ZERO)
+        {
+            return Err(ResearchError::NonPositiveMarketBarPrice);
+        }
+        if low.amount() > high.amount()
+            || open.amount() < low.amount()
+            || open.amount() > high.amount()
+            || close.amount() < low.amount()
+            || close.amount() > high.amount()
+        {
+            return Err(ResearchError::InvalidMarketBarRange);
+        }
+        if volume.is_sign_negative() {
+            return Err(ResearchError::NegativeMarketBarVolume);
+        }
+        Ok(Self {
+            context,
+            provider_instrument_id,
+            feed,
+            interval,
+            time_semantics,
+            adjustment,
+            open,
+            high,
+            low,
+            close,
+            volume: volume.normalize(),
+            trade_count,
+            vwap,
+        })
+    }
+
+    /// Returns point-in-time context and provenance.
+    pub const fn context(&self) -> &ResearchContext {
+        &self.context
+    }
+
+    /// Returns the exact source-native instrument identity validated against the canonical map.
+    pub const fn provider_instrument_id(&self) -> &ProviderInstrumentId {
+        &self.provider_instrument_id
+    }
+
+    /// Returns the exact provider feed identity.
+    pub const fn feed(&self) -> &SourceIdentifier {
+        &self.feed
+    }
+
+    /// Returns the exact provider bar-interval identity.
+    pub const fn interval(&self) -> &SourceIdentifier {
+        &self.interval
+    }
+
+    /// Returns exact completed-period, provider-anchor, and session semantics.
+    pub const fn time_semantics(&self) -> &BarTimeSemantics {
+        &self.time_semantics
+    }
+
+    /// Returns the exclusive period end at which this bar became complete.
+    pub const fn completed_at(&self) -> Timestamp {
+        self.time_semantics.period_end_exclusive()
+    }
+
+    /// Returns the retained corporate-action adjustment policy.
+    pub const fn adjustment(&self) -> MarketBarAdjustment {
+        self.adjustment
+    }
+
+    /// Returns the opening price.
+    pub const fn open(&self) -> Money {
+        self.open
+    }
+
+    /// Returns the high price.
+    pub const fn high(&self) -> Money {
+        self.high
+    }
+
+    /// Returns the low price.
+    pub const fn low(&self) -> Money {
+        self.low
+    }
+
+    /// Returns the closing price.
+    pub const fn close(&self) -> Money {
+        self.close
+    }
+
+    /// Returns exact provider-reported volume.
+    pub const fn volume(&self) -> Decimal {
+        self.volume
+    }
+
+    /// Returns provider-reported trade count when supplied.
+    pub const fn trade_count(&self) -> Option<u64> {
+        self.trade_count
+    }
+
+    /// Returns provider-reported VWAP when supplied.
+    pub const fn vwap(&self) -> Option<Money> {
+        self.vwap
+    }
+
+    /// Returns the single price currency proven by the constructor.
+    pub const fn currency(&self) -> Currency {
+        self.open.currency()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketBarObservationWire {
+    context: ResearchContext,
+    provider_instrument_id: ProviderInstrumentId,
+    feed: SourceIdentifier,
+    interval: SourceIdentifier,
+    time_semantics: BarTimeSemantics,
+    adjustment: MarketBarAdjustment,
+    open: Money,
+    high: Money,
+    low: Money,
+    close: Money,
+    volume: Decimal,
+    #[serde(default)]
+    trade_count: Option<u64>,
+    #[serde(default)]
+    vwap: Option<Money>,
+}
+
+impl<'de> Deserialize<'de> for MarketBarObservation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = MarketBarObservationWire::deserialize(deserializer)?;
+        Self::new(
+            wire.context,
+            wire.provider_instrument_id,
+            wire.feed,
+            wire.interval,
+            wire.time_semantics,
+            wire.adjustment,
+            wire.open,
+            wire.high,
+            wire.low,
+            wire.close,
+            wire.volume,
+            wire.trade_count,
+            wire.vwap,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

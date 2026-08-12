@@ -32,8 +32,12 @@ impl TreasuryHttpClient {
             return Err(TreasurySourceError::InvalidMetadata);
         };
         let bounds = policy.request_bounds();
-        let max_response_bytes = usize::try_from(bounds.max_response_bytes())
-            .map_err(|_| TreasurySourceError::InvalidMetadata)?;
+        let max_response_bytes = usize::try_from(
+            bounds
+                .max_response_bytes()
+                .min(market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGE_BYTES),
+        )
+        .map_err(|_| TreasurySourceError::InvalidMetadata)?;
         let total_timeout = Duration::from_nanos(bounds.total_timeout_nanos());
         let transport = Arc::new(ReqwestTreasuryTransport::try_new(bounds)?);
         Ok(Self {
@@ -54,8 +58,12 @@ impl TreasuryHttpClient {
         let bounds = policy.request_bounds();
         Ok(Self {
             transport,
-            max_response_bytes: usize::try_from(bounds.max_response_bytes())
-                .map_err(|_| TreasurySourceError::InvalidMetadata)?,
+            max_response_bytes: usize::try_from(
+                bounds
+                    .max_response_bytes()
+                    .min(market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGE_BYTES),
+            )
+            .map_err(|_| TreasurySourceError::InvalidMetadata)?,
             total_timeout: Duration::from_nanos(bounds.total_timeout_nanos()),
         })
     }

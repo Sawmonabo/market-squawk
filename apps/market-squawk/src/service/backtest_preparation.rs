@@ -73,7 +73,7 @@ impl InstalledBacktestPreparation {
                     .authority
                     .options(&catalog)
                     .map_err(ServiceError::from)?;
-                let count = options.datasets.len().max(1);
+                let count = options.datasets.len();
                 (encode(&options)?, count)
             }
             PREVIEW_BACKTEST => {

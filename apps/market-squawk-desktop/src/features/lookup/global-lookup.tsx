@@ -30,15 +30,15 @@ export function GlobalLookup({
           className="h-6 gap-1.5 px-2 font-mono text-[9px] uppercase tracking-wide text-muted-foreground"
         >
           <Search className="size-3" aria-hidden="true" />
-          Lookup
+          Search
         </Button>
       </DialogTrigger>
       <DialogContent className="max-h-[min(760px,calc(100vh-2rem))] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Look up your Market Squawk workspace</DialogTitle>
+          <DialogTitle>Search Market Squawk</DialogTitle>
           <DialogDescription>
-            Search bounded local indexes. Results come from the running service and clearly mark
-            categories that are not currently indexed.
+            Find an investment by ticker, company, FIGI, or supported identifier, or search your
+            local research and workspace records.
           </DialogDescription>
         </DialogHeader>
         <LookupSurface transport={transport} scope={scope} autoFocus />

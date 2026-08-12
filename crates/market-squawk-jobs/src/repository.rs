@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_platform::JobDatabaseLocation;
-use rusqlite::{Connection, OptionalExtension as _, params};
+use rusqlite::{Connection, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::task::TaskTracker;
 
@@ -328,23 +328,6 @@ impl JobRepository for SqliteJobRepository {
     ) -> Result<JobSnapshot, JobRepositoryError> {
         self.read(move |connection| read_snapshot(connection, id, generation))
             .await
-    }
-
-    async fn get_latest(&self, id: JobId) -> Result<JobSnapshot, JobRepositoryError> {
-        self.read(move |connection| {
-            let bytes = connection
-                .query_row(
-                    "SELECT snapshot_json FROM jobs WHERE job_id = ?1 \
-                     ORDER BY generation DESC LIMIT 1",
-                    [id.as_uuid().as_bytes().as_slice()],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .optional()
-                .map_err(map_sql)?
-                .ok_or(JobRepositoryError::NotFound)?;
-            decode_snapshot(&bytes)
-        })
-        .await
     }
 
     async fn list(

@@ -490,21 +490,11 @@ impl FairValueService {
             .approvals
             .get(&approval_id)
             .ok_or(FairValueError::ApprovalNotFound)?;
-        if at < approval.approved_at() {
-            return Ok(ApprovalStatus::NotYetEffective);
-        }
-        if self
-            .revocations
-            .get(&approval_id)
-            .is_some_and(|revocation| revocation.revoked_at() <= at)
-        {
-            return Ok(ApprovalStatus::Revoked);
-        }
-        if at > approval.expires_at() {
-            Ok(ApprovalStatus::Expired)
-        } else {
-            Ok(ApprovalStatus::Active)
-        }
+        Ok(super::queries::approval_status_at(
+            approval,
+            self.revocations.get(&approval_id).map(AsRef::as_ref),
+            at,
+        ))
     }
 
     /// Returns one immutable measurement by content identity.

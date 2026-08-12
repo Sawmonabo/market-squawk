@@ -182,6 +182,7 @@ function MeasurementPanel({ measurement }: { measurement: FairValueMeasurement }
     <Panel title="Measurement" icon={FileCheck2}>
       <dl className="grid gap-x-4 gap-y-3 sm:grid-cols-2">
         <Fact label="Amount" value={formatMoney(measurement.amount)} />
+        <Fact label="Amount basis" value={humanize(measurement.amount.amountBasis)} />
         <Fact label="Declared scale" value={String(measurement.amount.scale)} />
         <Fact label="Method" value={humanize(measurement.method)} />
         <Fact label="Input count" value={measurement.inputCount.toLocaleString()} />

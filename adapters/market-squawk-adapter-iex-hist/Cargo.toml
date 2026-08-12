@@ -1,0 +1,29 @@
+[package]
+name = "market-squawk-adapter-iex-hist"
+description = "Bounded, version-bound IEX HIST catalog planning and cold PCAP decoding core"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+async-compression = { version = "=0.4.42", features = ["gzip", "tokio"] }
+bytes.workspace = true
+crc32fast.workspace = true
+fs2.workspace = true
+futures-util.workspace = true
+httpdate.workspace = true
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+tokio-util.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

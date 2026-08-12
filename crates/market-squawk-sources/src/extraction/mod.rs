@@ -1,6 +1,7 @@
 //! Bounded discovery and research extraction contracts.
 
 mod batch;
+mod capture;
 mod contracts;
 mod revisions;
 
@@ -16,6 +17,13 @@ use crate::{
 };
 
 pub use batch::{ExtractionBatch, ExtractionBatchAccumulator, ExtractionContentIdentity};
+pub use capture::{
+    MAX_PROVIDER_CAPTURE_BYTES, MAX_PROVIDER_CAPTURE_PAGE_BYTES, MAX_PROVIDER_CAPTURE_PAGES,
+    ProviderCaptureError, ProviderCaptureMaterial, ProviderCaptureMaterialSealError,
+    ProviderCapturePageReceipt, ProviderCaptureRequestGraphComponent, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
+    SourceObjectCaptureIdentity,
+};
 pub use contracts::{
     AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryBatch, DiscoveryRequest,
     DiscoveryRequestId, ExtractionError, ExtractionRecord, ExtractionRequest, ExtractionRequestId,
@@ -263,6 +271,21 @@ impl InFlightExtractionRequest {
                 })
             }
         }
+    }
+
+    /// Records one completely handled successful provider response on the shared allocation.
+    ///
+    /// Callers must invoke this only after the response status, bounds, and payload have all been
+    /// validated. The operation consumes the in-flight request so one response cannot reset
+    /// refusal escalation more than once, and releases its concurrency slot on return. A success
+    /// does not erase a provider-directed cooldown established by another in-flight response.
+    ///
+    /// # Errors
+    ///
+    /// Fails when this request's extraction authority is stale, the coordinated budget is absent,
+    /// or shared provider-budget state cannot durably record the successful response.
+    pub fn record_success(self) -> Result<(), ExtractionAuthorityError> {
+        self.authority.record_success()
     }
 
     /// Completes one redirect response and admits the next exact request hop.

@@ -63,6 +63,9 @@ pub enum ForecastFeatureValue {
 pub struct ForecastFeatureRow {
     instrument_id: InstrumentId,
     cutoff_at: Timestamp,
+    observed_effective_at: Option<Timestamp>,
+    label_effective_at: Option<Timestamp>,
+    target_coordinate_kind: u8,
     component_kind: u8,
     component_name: Box<str>,
     component_version: u32,
@@ -77,6 +80,24 @@ impl ForecastFeatureRow {
 
     pub const fn cutoff_at(&self) -> Timestamp {
         self.cutoff_at
+    }
+
+    /// Returns the exact effective coordinate of the observed feature state, when the published
+    /// example retained timestamp precision.
+    pub const fn observed_effective_at(&self) -> Option<Timestamp> {
+        self.observed_effective_at
+    }
+
+    /// Returns the exact effective coordinate of the terminal label, when the published example
+    /// retained timestamp precision.
+    pub const fn label_effective_at(&self) -> Option<Timestamp> {
+        self.label_effective_at
+    }
+
+    /// Returns the closed publication tag: `1` is an exact terminal pair and `2` is explicitly
+    /// unsupported effective precision.
+    pub const fn target_coordinate_kind(&self) -> u8 {
+        self.target_coordinate_kind
     }
 
     pub const fn component_kind(&self) -> u8 {
@@ -289,6 +310,9 @@ fn decode_row(
             .ok_or(PythonDatasetCatalogError::CorruptAdmission)?
             .value(index),
     );
+    let observed_effective_at = optional_timestamp(batch, "observed_effective_at", index)?;
+    let label_effective_at = optional_timestamp(batch, "label_effective_at", index)?;
+    let target_coordinate_kind = uint8(batch, "target_coordinate_kind")?.value(index);
     let split = uint8(batch, "split")?.value(index);
     let component_kind = uint8(batch, "component_kind")?.value(index);
     let component_name = padded_text(fixed("component_name")?, index)?;
@@ -338,6 +362,9 @@ fn decode_row(
         example,
         instrument_bytes,
         cutoff_at,
+        observed_effective_at,
+        label_effective_at,
+        target_coordinate_kind,
         split,
         component_kind,
         component_name,
@@ -352,6 +379,9 @@ fn decode_row(
         ForecastFeatureRow {
             instrument_id,
             cutoff_at,
+            observed_effective_at,
+            label_effective_at,
+            target_coordinate_kind,
             component_kind,
             component_name: component_name.into(),
             component_version,
@@ -359,6 +389,18 @@ fn decode_row(
             lineage_sha256: Sha256Digest::new(lineage),
         },
     ))
+}
+
+fn optional_timestamp(
+    batch: &RecordBatch,
+    name: &str,
+    index: usize,
+) -> Result<Option<Timestamp>, PythonDatasetCatalogError> {
+    let values = batch
+        .column_by_name(name)
+        .and_then(|array| array.as_any().downcast_ref::<TimestampNanosecondArray>())
+        .ok_or(PythonDatasetCatalogError::CorruptAdmission)?;
+    Ok((!values.is_null(index)).then(|| Timestamp::from_unix_nanos(values.value(index))))
 }
 
 fn uint8<'a>(

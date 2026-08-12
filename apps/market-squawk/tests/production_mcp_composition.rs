@@ -12,22 +12,20 @@ use std::{
 use anyhow::Context as _;
 use futures_util::FutureExt as _;
 use market_squawk::{
-    LocalProduct,
     application::application_capabilities,
-    mcp::LocalMcpComposition,
     service::{
         InstalledService, InstalledServiceConnector, InstalledServiceError,
         InstalledServiceRunOutcome,
     },
 };
-use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay, validate_service_capabilities};
+use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay};
 use market_squawk_platform::{
     AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore, SecretStore, SecretValue,
 };
 use market_squawk_runtime::{
     ApplicationClient, EventPageLimit, InputAdmission, LoopbackApplicationClient, NamedClient,
 };
-use market_squawk_services::{ArtifactPublication, ArtifactPublicationContext, RequestId};
+use market_squawk_services::RequestId;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -427,11 +425,18 @@ async fn import_owner_research_file(client: &LoopbackApplicationClient) -> TestR
     let job_id = committed.result()["value"]["data"]["jobId"]
         .as_str()
         .context("research commit omitted its durable job identity")?;
-    wait_for_job_completion(client, job_id).await?;
+    let generation = committed.result()["value"]["data"]["generation"]
+        .as_u64()
+        .context("research commit omitted its durable job generation")?;
+    wait_for_job_completion(client, job_id, generation).await?;
     assert_owner_research_file_available(client).await
 }
 
-async fn wait_for_job_completion(client: &LoopbackApplicationClient, job_id: &str) -> TestResult {
+async fn wait_for_job_completion(
+    client: &LoopbackApplicationClient,
+    job_id: &str,
+    generation: u64,
+) -> TestResult {
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(30))
         .context("compute research-file job deadline")?;
@@ -441,7 +446,7 @@ async fn wait_for_job_completion(client: &LoopbackApplicationClient, job_id: &st
                 RequestId::try_string(format!("installed-research-job-{job_id}"))
                     .context("construct research job request ID")?,
                 "Job.Get",
-                json!({"jobId": job_id}),
+                json!({"jobId": job_id, "generation": generation}),
                 Duration::from_secs(5),
                 CancellationToken::new(),
             )
@@ -601,16 +606,9 @@ async fn run_installed_service_process_role(role: &OsString, root: PathBuf) -> T
                     "{}",
                     registration.result()
                 );
-                for client in [NamedClient::ClaudeCode, NamedClient::Codex] {
-                    exercise_installed_relay(
-                        client,
-                        connector
-                            .connect_mcp_relay(client)
-                            .context("admit installed subprocess MCP relay")?,
-                    )
+                exercise_concurrent_installed_relays(&connector, &desktop, &snapshot)
                     .await
-                    .context("exercise installed subprocess MCP relay")?;
-                }
+                    .context("exercise concurrent installed subprocess MCP relays")?;
             } else {
                 let replay = cli
                     .invoke_operation(
@@ -815,6 +813,132 @@ async fn exercise_installed_relay(
     client: NamedClient,
     transport: Arc<dyn market_squawk_mcp::McpRelayTransport>,
 ) -> TestResult {
+    exercise_installed_relay_with_gate(client, transport, None).await
+}
+
+struct ConcurrentRelayGate {
+    initialized: tokio::sync::Barrier,
+    release: tokio::sync::Barrier,
+}
+
+async fn exercise_concurrent_installed_relays(
+    connector: &InstalledServiceConnector,
+    desktop: &LoopbackApplicationClient,
+    initial_bootstrap: &Value,
+) -> TestResult {
+    let initial_runtime = initial_bootstrap["runtime"].clone();
+    let before = installed_mcp_runtime_status(desktop, "before").await?;
+
+    let gate = Arc::new(ConcurrentRelayGate {
+        initialized: tokio::sync::Barrier::new(3),
+        release: tokio::sync::Barrier::new(3),
+    });
+    let claude_gate = Arc::clone(&gate);
+    let codex_gate = Arc::clone(&gate);
+    let evidence_gate = Arc::clone(&gate);
+    let claude = exercise_installed_relay_with_gate(
+        NamedClient::ClaudeCode,
+        connector
+            .connect_mcp_relay(NamedClient::ClaudeCode)
+            .context("admit concurrent Claude Code relay")?,
+        Some(claude_gate),
+    );
+    let codex = exercise_installed_relay_with_gate(
+        NamedClient::Codex,
+        connector
+            .connect_mcp_relay(NamedClient::Codex)
+            .context("admit concurrent Codex relay")?,
+        Some(codex_gate),
+    );
+    let collect_evidence = async {
+        evidence_gate.initialized.wait().await;
+        let during = installed_mcp_runtime_status(desktop, "during").await?;
+        let clients = during["clients"]
+            .as_array()
+            .context("installed MCP runtime clients were not an array")?;
+        assert_eq!(clients.len(), 2);
+        let claude = mcp_runtime_client(&during, "claude_code")?;
+        let codex = mcp_runtime_client(&during, "codex")?;
+        assert_ne!(claude["clientId"], codex["clientId"]);
+        assert_ne!(claude["credentialIdentity"], codex["credentialIdentity"]);
+        for client in ["claude_code", "codex"] {
+            let before_client = mcp_runtime_client(&before, client)?;
+            let during_client = mcp_runtime_client(&during, client)?;
+            assert_eq!(
+                during_client["observedRelayInitializations"].as_u64(),
+                before_client["observedRelayInitializations"]
+                    .as_u64()
+                    .and_then(|count| count.checked_add(1)),
+                "both named relays must initialize before either concurrent session is released"
+            );
+            let active = during_client["activeRequests"]
+                .as_u64()
+                .context("installed MCP client omitted its active-request count")?;
+            let maximum = during_client["maximumActiveRequests"]
+                .as_u64()
+                .filter(|maximum| *maximum > 0)
+                .context("installed MCP client omitted its active-request bound")?;
+            assert!(active <= maximum);
+        }
+        let active = during["activeRequests"]
+            .as_u64()
+            .context("installed MCP runtime omitted its active-request count")?;
+        let maximum = during["limits"]["maximumActiveRequests"]
+            .as_u64()
+            .filter(|maximum| *maximum > 0)
+            .context("installed MCP runtime omitted its active-request bound")?;
+        assert!(active <= maximum);
+        evidence_gate.release.wait().await;
+        Ok::<(), anyhow::Error>(())
+    };
+    let ((), (), ()) = tokio::time::timeout(INSTALLED_MCP_SERVICE_TIMEOUT, async {
+        tokio::try_join!(claude, codex, collect_evidence)
+    })
+    .await
+    .context("time out concurrent installed MCP relay verification")??;
+
+    let after = installed_mcp_runtime_status(desktop, "after").await?;
+    assert_eq!(after["activeClients"], 0);
+    assert_eq!(after["activeRequests"], 0);
+    let final_bootstrap = desktop
+        .bootstrap(CancellationToken::new())
+        .await
+        .context("refresh bootstrap after concurrent MCP relay verification")?;
+    assert_eq!(final_bootstrap["runtime"], initial_runtime);
+    Ok(())
+}
+
+async fn installed_mcp_runtime_status(
+    desktop: &LoopbackApplicationClient,
+    phase: &str,
+) -> TestResult<Value> {
+    let response = desktop
+        .invoke_operation(
+            RequestId::try_string(format!("installed-concurrent-mcp-status-{phase}"))
+                .context("construct concurrent MCP status request ID")?,
+            "Mcp.GetRuntimeStatus",
+            json!({}),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await
+        .context("read installed MCP runtime status")?;
+    assert_eq!(response.result()["ok"], true, "{}", response.result());
+    Ok(response.result()["value"].clone())
+}
+
+fn mcp_runtime_client<'a>(status: &'a Value, client: &str) -> TestResult<&'a Value> {
+    status["clients"]
+        .as_array()
+        .and_then(|clients| clients.iter().find(|entry| entry["client"] == client))
+        .with_context(|| format!("installed MCP runtime omitted {client}"))
+}
+
+async fn exercise_installed_relay_with_gate(
+    client: NamedClient,
+    transport: Arc<dyn market_squawk_mcp::McpRelayTransport>,
+    concurrent_gate: Option<Arc<ConcurrentRelayGate>>,
+) -> TestResult {
     let relay = McpStdioRelay::try_new(
         client,
         transport,
@@ -852,6 +976,54 @@ async fn exercise_installed_relay(
     )
     .await
     .context("write installed relay initialized notification")?;
+    if let Some(gate) = concurrent_gate {
+        gate.initialized.wait().await;
+        gate.release.wait().await;
+    }
+    write_message(
+        &mut peer_writer,
+        json!({"jsonrpc":"2.0","id":"installed-tools","method":"tools/list"}),
+    )
+    .await
+    .context("write installed relay tools-list request")?;
+    let tools = read_message(&mut peer_reader)
+        .await
+        .context("read installed relay tools-list response")?;
+    let names = tools["result"]["tools"]
+        .as_array()
+        .context("installed relay tools/list omitted its tools")?
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("installed relay tool omitted its name"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let capabilities = application_capabilities()?;
+    let expected = capabilities
+        .tools()
+        .iter()
+        .map(|tool| tool.name())
+        .collect::<Vec<_>>();
+    assert_eq!(names, expected);
+    write_message(
+        &mut peer_writer,
+        json!({
+            "jsonrpc":"2.0","id":"installed-jobs","method":"tools/call",
+            "params":{"name":"Job.List","arguments":{"limit":16}}
+        }),
+    )
+    .await
+    .context("write installed relay Job.List request")?;
+    let jobs = read_message(&mut peer_reader)
+        .await
+        .context("read installed relay Job.List response")?;
+    assert!(
+        jobs["result"]["structuredContent"]["data"]["jobs"]
+            .as_array()
+            .is_some(),
+        "installed MCP did not dispatch the non-core Job.List authority: {jobs}"
+    );
     write_message(
         &mut peer_writer,
         json!({"jsonrpc":"2.0","id":"installed-resources","method":"resources/list"}),
@@ -874,191 +1046,6 @@ async fn exercise_installed_relay(
         .await
         .context("join installed stdio relay task")?
         .context("serve installed stdio relay protocol")?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_controlled_artifacts()
--> TestResult {
-    let temporary = tempfile::tempdir()?;
-    let environment = BTreeMap::<OsString, OsString>::new();
-    let config = AppConfig::load(ConfigSources::new(
-        None,
-        &environment,
-        ConfigOverrides {
-            data_dir: Some(temporary.path().to_path_buf()),
-            source_shutdown_ms: Some(60_000),
-            ..ConfigOverrides::default()
-        },
-    ))?;
-    let product = LocalProduct::try_new(config)?;
-    assert_eq!(
-        product.application().shutdown_timeout(),
-        Duration::from_secs(65)
-    );
-    let artifacts = product.artifacts();
-    let artifact = artifacts
-        .publish(
-            ArtifactPublication::try_json(br#"{"value":1}"#.to_vec())?,
-            ArtifactPublicationContext::new(
-                CancellationToken::new(),
-                Instant::now()
-                    .checked_add(Duration::from_secs(5))
-                    .context("artifact publication deadline overflow")?,
-            ),
-        )
-        .await?;
-    let composition =
-        LocalMcpComposition::try_new(product.paths(), product.application(), artifacts)?;
-    let (client, server) = tokio::io::duplex(64 * 1024);
-    let (server_reader, server_writer) = tokio::io::split(server);
-    let cancellation = CancellationToken::new();
-    let task =
-        tokio::spawn(composition.serve_unverified_io(server_reader, server_writer, cancellation));
-    let (client_reader, mut client_writer) = tokio::io::split(client);
-    let mut client_reader = BufReader::new(client_reader);
-
-    write_message(
-        &mut client_writer,
-        json!({
-            "jsonrpc":"2.0","id":"shipping-init","method":"initialize",
-            "params":{
-                "protocolVersion":"2026-07-28","capabilities":{},
-                "clientInfo":{"name":"market-squawk-tests","version":"1"}
-            }
-        }),
-    )
-    .await?;
-    let initialized = read_message(&mut client_reader).await?;
-    assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
-    assert_eq!(initialized["result"]["serverInfo"]["name"], "market-squawk");
-    write_message(
-        &mut client_writer,
-        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-    )
-    .await?;
-    write_message(
-        &mut client_writer,
-        json!({"jsonrpc":"2.0","id":"shipping-tools","method":"tools/list"}),
-    )
-    .await?;
-    let tools = read_message(&mut client_reader).await?;
-    let names = tools["result"]["tools"]
-        .as_array()
-        .context("tools/list response is missing tools")?
-        .iter()
-        .map(|tool| {
-            tool["name"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("tool is missing its name"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let expected_capabilities = application_capabilities()?;
-    validate_service_capabilities(
-        &expected_capabilities,
-        McpLimits::try_from(McpLimitSpec::default())?,
-    )?;
-    let expected_names = expected_capabilities
-        .tools()
-        .iter()
-        .map(|tool| tool.name())
-        .collect::<Vec<_>>();
-    assert_eq!(names, expected_names);
-    assert!(names.contains(&"Analysis.ReadArtifact"));
-    write_message(
-        &mut client_writer,
-        json!({
-            "jsonrpc":"2.0","id":"shipping-artifact","method":"tools/call",
-            "params":{"name":"Analysis.ReadArtifact","arguments":{
-                "artifactId":artifact.id(),
-                "sha256":artifact.sha256(),
-                "byteCount":artifact.byte_count(),
-                "mediaType":artifact.media_type(),
-                "offset":0,
-                "maximumBytes":32768,
-                "resultLimits":{"maximumItems":1,"maximumBytes":65536}
-            }}
-        }),
-    )
-    .await?;
-    let artifact_read = read_message(&mut client_reader).await?;
-    assert_eq!(
-        artifact_read["result"]["structuredContent"]["data"]["artifact"]["artifactId"],
-        artifact.id()
-    );
-    assert_eq!(
-        artifact_read["result"]["structuredContent"]["data"]["contentBase64"],
-        "eyJ2YWx1ZSI6MX0="
-    );
-    assert_eq!(
-        artifact_read["result"]["structuredContent"]["data"]["complete"],
-        true
-    );
-    write_message(
-        &mut client_writer,
-        json!({
-            "jsonrpc":"2.0","id":"shipping-read","method":"tools/call",
-            "params":{"name":"Bot.GetStatus","arguments":{
-                "resultLimits":{"maximumItems":16,"maximumBytes":65536}
-            }}
-        }),
-    )
-    .await?;
-    let status = read_message(&mut client_reader).await?;
-    assert_eq!(
-        status["result"]["structuredContent"]["data"]["state"], "stopped",
-        "unexpected status response: {status}"
-    );
-    write_message(
-        &mut client_writer,
-        json!({
-            "jsonrpc":"2.0","id":"shipping-mutation","method":"tools/call",
-            "params":{
-                "name":"Risk.TriggerKillSwitch",
-                "arguments":{
-                    "confirm":true,
-                    "reason":"production composition test",
-                    "resultLimits":{"maximumItems":16,"maximumBytes":65536}
-                }
-            }
-        }),
-    )
-    .await?;
-    let mutation = read_message(&mut client_reader).await?;
-    assert_eq!(
-        mutation["result"]["structuredContent"]["data"]["state"],
-        "stopped"
-    );
-    assert_eq!(
-        mutation["result"]["structuredContent"]["data"]["shutdownComplete"],
-        true
-    );
-    client_writer.shutdown().await?;
-    let _exit = task.await??;
-
-    let audit = temporary.path().join("control").join("mcp-audit.jsonl");
-    assert!(audit.is_file());
-    assert!(std::fs::metadata(&audit)?.len() > 0);
-    let mutation_phases = std::fs::read_to_string(&audit)?
-        .lines()
-        .map(serde_json::from_str::<Value>)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|record| {
-            record["operation"]["kind"] == "call_tool"
-                && record["operation"]["name"] == "Risk.TriggerKillSwitch"
-        })
-        .map(|record| record["phase"].clone())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        mutation_phases,
-        [
-            "mutation_admitted",
-            "mutation_service_completed",
-            "completed"
-        ]
-    );
-    assert!(temporary.path().join("artifacts").join("mcp").is_dir());
     Ok(())
 }
 

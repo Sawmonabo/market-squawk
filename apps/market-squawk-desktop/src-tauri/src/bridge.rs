@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
+use crate::analytical_controller::DesktopAnalyticalController;
 use crate::contracts::{
     ApplicationInvocation, DesktopBootstrap, DesktopCommandError, DesktopServiceBootstrapCommand,
     DesktopServiceBootstrapRequirement, DesktopServiceBootstrapStatus, DesktopStartup,
@@ -125,6 +126,7 @@ fn manage_ready_desktop(
 ) -> Result<(), DesktopCommandError> {
     if app.try_state::<DesktopState>().is_some()
         || app.try_state::<DesktopMcpClientState>().is_some()
+        || app.try_state::<DesktopAnalyticalController>().is_some()
     {
         return Err(DesktopCommandError::internal());
     }
@@ -138,6 +140,10 @@ fn manage_ready_desktop(
     )?;
     let local_paths = LocalPaths::open_existing(state.data_root())
         .map_err(|_error| DesktopCommandError::internal())?;
+    let analytical_controller = DesktopAnalyticalController::try_open(
+        &local_paths,
+        *state.runtime().workspace_id().as_uuid(),
+    )?;
     let (endpoint_identity, claude_credential_identity, codex_credential_identity) =
         state.mcp_authority_identities();
     let mcp_clients = DesktopMcpClientState::try_new(
@@ -150,7 +156,7 @@ fn manage_ready_desktop(
         codex_credential_identity,
     )
     .map_err(|_error| DesktopCommandError::internal())?;
-    if !app.manage(state) || !app.manage(mcp_clients) {
+    if !app.manage(state) || !app.manage(mcp_clients) || !app.manage(analytical_controller) {
         return Err(DesktopCommandError::internal());
     }
     Ok(())

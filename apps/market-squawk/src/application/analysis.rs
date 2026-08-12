@@ -35,15 +35,20 @@ pub use backtest::{
     BacktestPreparationCatalog, BacktestPreparationDatasetInput, BacktestPreparationError,
     BacktestPreparationLimits, BacktestPreparationOptions, BacktestPreparationPreview,
     BacktestPreparationReceipt, BacktestPreparationSelection, BacktestScope,
-    GovernedBacktestAuthority, GovernedBacktestCohortCandidateRegistrationInput,
-    GovernedBacktestCohortMemberRegistrationInput, GovernedBacktestCohortRegistrationInput,
-    GovernedBacktestCommand, GovernedBacktestCorporateActionsInput,
-    GovernedBacktestInputAuthorityLimits, GovernedBacktestInputRegistrar,
-    GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationJsonError,
-    GovernedBacktestInputRegistrationReceipt, GovernedBacktestInputResolver,
-    GovernedBacktestPortfolioSeedInput, GovernedBacktestPreparationAuthority,
-    GovernedBacktestPrepublishAuthority, GovernedBacktestQueryLimitsInput, GovernedBacktestRecord,
-    GovernedBacktestReportReference, GovernedBacktestRepository, GovernedBacktestRepositoryLimits,
+    GovernedBacktestArtifactEvidence, GovernedBacktestAuthority,
+    GovernedBacktestCohortCandidateRegistrationInput, GovernedBacktestCohortDiagnosticsEvidence,
+    GovernedBacktestCohortEvaluationEvidence, GovernedBacktestCohortMemberRegistrationInput,
+    GovernedBacktestCohortRegistrationInput, GovernedBacktestCommand,
+    GovernedBacktestCorporateActionsInput, GovernedBacktestDiscoveryCompleteness,
+    GovernedBacktestDiscoveryEntry, GovernedBacktestDiscoveryPage, GovernedBacktestDiscoveryQuery,
+    GovernedBacktestEvidence, GovernedBacktestEvidenceGap, GovernedBacktestInputAuthorityLimits,
+    GovernedBacktestInputRegistrar, GovernedBacktestInputRegistrationInput,
+    GovernedBacktestInputRegistrationJsonError, GovernedBacktestInputRegistrationReceipt,
+    GovernedBacktestInputResolver, GovernedBacktestPortfolioSeedInput,
+    GovernedBacktestPreparationAuthority, GovernedBacktestPrepublishAuthority,
+    GovernedBacktestQueryLimitsInput, GovernedBacktestRecommendationEvidence,
+    GovernedBacktestRecord, GovernedBacktestReportReference, GovernedBacktestRepository,
+    GovernedBacktestRepositoryLimits, GovernedBacktestSuccessfulTerminalEvidence,
     MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES, ProductionBacktestAuthority,
     ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestInputAuthorityError,
     ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,
@@ -795,7 +800,7 @@ fn source_result(
     let metadata = dataset_metadata(scope, returned, available)?;
     TypedToolResult::try_new(
         content,
-        returned.max(1),
+        returned,
         metadata,
         admitted_result_limits(request, context)?,
     )
@@ -895,8 +900,7 @@ fn empty_feature_page_result(limits: ServiceLimits) -> Result<TypedToolResult, S
         | ServiceContractError::Json(JsonContractError::EncodingOrBytes) => {
             ServiceError::ResourceExhausted
         }
-        ServiceContractError::ZeroItemsForNonNullResult
-        | ServiceContractError::InvalidMetadata
+        ServiceContractError::InvalidMetadata
         | ServiceContractError::InvalidCompleteness
         | ServiceContractError::SourceEvidencePolicy
         | ServiceContractError::Json(_) => ServiceError::InvalidResult,
@@ -936,8 +940,7 @@ fn feature_page_metadata(
     };
     metadata.map_err(|error| match error {
         ServiceContractError::InvalidMetadata => FeaturePageCandidateError::DoesNotFit,
-        ServiceContractError::ZeroItemsForNonNullResult
-        | ServiceContractError::TooManyItems
+        ServiceContractError::TooManyItems
         | ServiceContractError::InvalidCompleteness
         | ServiceContractError::SourceEvidencePolicy
         | ServiceContractError::Json(_) => FeaturePageCandidateError::Invariant,
@@ -1004,7 +1007,7 @@ where
                 "hasMore": actual_has_more,
                 "nextAfterDataset": next_after_dataset
             }),
-            returned.max(1),
+            returned,
             metadata,
             limits,
         ) {
@@ -1014,8 +1017,7 @@ where
                 | ServiceContractError::Json(JsonContractError::EncodingOrBytes),
             ) => {}
             Err(
-                ServiceContractError::ZeroItemsForNonNullResult
-                | ServiceContractError::InvalidMetadata
+                ServiceContractError::InvalidMetadata
                 | ServiceContractError::InvalidCompleteness
                 | ServiceContractError::SourceEvidencePolicy
                 | ServiceContractError::Json(_),
@@ -1030,7 +1032,16 @@ fn map_feature_read_error(error: AnalyticalReadError) -> ServiceError {
         AnalyticalReadError::InvalidLimit
         | AnalyticalReadError::InstrumentLimitExceeded
         | AnalyticalReadError::InvalidKnowledgeRange
+        | AnalyticalReadError::InvalidMarketBarLimit
+        | AnalyticalReadError::InvalidMarketBarEffectiveRange
+        | AnalyticalReadError::InvalidFundNavLimit
+        | AnalyticalReadError::InvalidFundNavDateRange
+        | AnalyticalReadError::InvalidOutcomeMarketBarWindow
         | AnalyticalReadError::InvalidObservationSchema => ServiceError::InvalidRequest,
+        AnalyticalReadError::MarketBarResultRequiresInline
+        | AnalyticalReadError::InvalidMarketBarResult
+        | AnalyticalReadError::FundNavResultRequiresInline
+        | AnalyticalReadError::InvalidFundNavResult => ServiceError::InvalidResult,
         AnalyticalReadError::Manifest(ManifestCatalogError::Cancelled)
         | AnalyticalReadError::Query(QueryError::Cancelled) => ServiceError::Cancelled,
         AnalyticalReadError::Manifest(ManifestCatalogError::DeadlineExceeded)
@@ -1143,8 +1154,7 @@ fn bounded_artifact_read_result(
         | ServiceContractError::Json(JsonContractError::EncodingOrBytes) => {
             ServiceError::ResourceExhausted
         }
-        ServiceContractError::ZeroItemsForNonNullResult
-        | ServiceContractError::InvalidMetadata
+        ServiceContractError::InvalidMetadata
         | ServiceContractError::InvalidCompleteness
         | ServiceContractError::SourceEvidencePolicy
         | ServiceContractError::Json(_) => ServiceError::InvalidResult,

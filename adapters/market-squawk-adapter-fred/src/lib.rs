@@ -6,9 +6,9 @@ mod series;
 mod vintages;
 
 pub use client::{
-    FredApiKey, FredExtractedPage, FredPageObjectIdentity, FredSeriesMetadata,
-    FredSeriesMetadataDocument, FredSource, FredSourceError, MAX_FRED_EPHEMERAL_PAGE_RECORDS,
-    fred_series_endpoint_rule,
+    FredApiKey, FredExtractedPage, FredExtractionOutput, FredPageObjectIdentity,
+    FredSeriesMetadata, FredSeriesMetadataDocument, FredSource, FredSourceError,
+    MAX_FRED_EPHEMERAL_PAGE_RECORDS, fred_series_endpoint_rule,
 };
 pub use rights::{
     CURRENT_FRED_RIGHTS_ARTIFACT_BYTE_LENGTH, CURRENT_FRED_RIGHTS_ARTIFACT_SHA256,

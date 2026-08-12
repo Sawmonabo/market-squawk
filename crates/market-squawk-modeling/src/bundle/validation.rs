@@ -6,26 +6,23 @@ use std::num::{NonZeroU32, NonZeroU64};
 
 use market_squawk_analytics::{FeatureKey, FeatureRegistry};
 use market_squawk_data::{ComponentKind, ComponentScope, CorporateActionSensitivity, Sha256Digest};
-use market_squawk_domain::Timestamp;
-use serde::{Deserialize, Serialize};
+use market_squawk_domain::{Currency, Timestamp};
+use serde::{Deserialize, Serialize, ser::SerializeMap as _};
 
 use super::BundleError;
 use crate::native::NativeArtifact;
 use crate::{
     BundleExpectations, CalibrationBand, CalibrationMethod, CalibrationWindow, DecisionThresholds,
-    FeatureNormalizer, ForecastCalibrationArtifacts, ForecastCoverage, MAX_MODEL_FEATURES,
-    ModelFeatureBinding, ModelFormat, ModelOutputSemantics, RealizedCoverage, ValidationMetric,
-    ValidationMetricName,
+    FeatureNormalizer, ForecastCalibrationArtifacts, ForecastCentralStatistic, ForecastCoverage,
+    ForecastEstimatorProfile, ForecastMeasurement, ForecastTargetMeaning,
+    ForecastTrainingObjective, ForecastTransform, MAX_MODEL_FEATURES, ModelFeatureBinding,
+    ModelFormat, ModelOutputSemantics, RealizedCoverage, ValidationMetric, ValidationMetricName,
 };
 
-pub(super) const LEGACY_METADATA_SCHEMA_VERSION: u32 = 4;
-pub(super) const METADATA_SCHEMA_VERSION: u32 = 5;
-pub(super) const FORECAST_METADATA_SCHEMA_VERSION: u32 = 6;
+pub(super) const METADATA_SCHEMA_VERSION: u32 = 9;
 pub(super) const NATIVE_FORMAT_VERSION: u32 = 1;
 pub(super) const NATIVE_ARTIFACT_SCHEMA_VERSION: u32 = 1;
-pub(super) const TRAINING_RUN_SCHEMA_VERSION: u32 = 2;
-pub(super) const OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION: u32 = 3;
-pub(super) const FORECAST_TRAINING_RUN_SCHEMA_VERSION: u32 = 4;
+pub(super) const TRAINING_RUN_SCHEMA_VERSION: u32 = 7;
 pub(super) const FORECAST_POLICY_SCHEMA_VERSION: u32 = 1;
 pub(super) const FORECAST_RESIDUALS_PATH: &str = "calibration/residuals.f64le";
 pub(super) const FORECAST_POLICY_PATH: &str = "calibration/policy.json";
@@ -42,7 +39,9 @@ pub(super) struct MetadataWire {
     pub(super) bundle_version: u64,
     pub(super) model_id: String,
     pub(super) artifact: ArtifactRefWire,
-    pub(super) output_semantics: Option<String>,
+    pub(super) output_semantics: String,
+    pub(super) output_measurement: OutputMeasurementWire,
+    pub(super) output_statistic: OutputStatisticWire,
     pub(super) training_run: FileRefWire,
     pub(super) forecast_calibration: Option<ForecastCalibrationRefWire>,
     pub(super) features: Vec<FeatureWire>,
@@ -57,6 +56,92 @@ pub(super) struct MetadataWire {
     pub(super) intended_use: String,
     pub(super) limitations: Vec<String>,
     pub(super) fallback: FallbackWire,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OutputStatisticWire {
+    estimator: ForecastEstimatorWire,
+    objective: String,
+    output_transform: String,
+    statistic: String,
+    target: ForecastTargetWire,
+    target_transform: String,
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum ForecastTargetWire {
+    #[serde(rename = "fixed_horizon_terminal")]
+    FixedHorizonTerminal { horizon_nanos: u64 },
+    #[serde(rename = "unsupported")]
+    Unsupported,
+}
+
+impl Serialize for ForecastTargetWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(match self {
+            Self::FixedHorizonTerminal { .. } => 2,
+            Self::Unsupported => 1,
+        }))?;
+        match self {
+            Self::FixedHorizonTerminal { horizon_nanos } => {
+                map.serialize_entry("horizon_nanos", horizon_nanos)?;
+                map.serialize_entry("kind", "fixed_horizon_terminal")?;
+            }
+            Self::Unsupported => map.serialize_entry("kind", "unsupported")?,
+        }
+        map.end()
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum ForecastEstimatorWire {
+    #[serde(rename = "sealed_direct_least_squares_v1")]
+    SealedDirectLeastSquaresV1,
+    #[serde(rename = "sealed_direct_ridge_v1")]
+    SealedDirectRidgeV1 { ridge_alpha: f64 },
+    #[serde(rename = "sealed_binary_logistic_v1")]
+    SealedBinaryLogisticV1,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub(super) enum OutputMeasurementWire {
+    #[serde(rename = "price")]
+    Price { currency: String },
+    #[serde(rename = "return")]
+    Return,
+    #[serde(rename = "probability")]
+    Probability,
+    #[serde(rename = "other_regression")]
+    OtherRegression,
+}
+
+impl Serialize for OutputMeasurementWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(match self {
+            Self::Price { .. } => 2,
+            Self::Return | Self::Probability | Self::OtherRegression => 1,
+        }))?;
+        match self {
+            Self::Price { currency } => {
+                map.serialize_entry("currency", currency)?;
+                map.serialize_entry("kind", "price")?;
+            }
+            Self::Return => map.serialize_entry("kind", "return")?,
+            Self::Probability => map.serialize_entry("kind", "probability")?,
+            Self::OtherRegression => map.serialize_entry("kind", "other_regression")?,
+        }
+        map.end()
+    }
 }
 
 #[derive(Deserialize, PartialEq)]
@@ -194,33 +279,34 @@ pub(super) struct TrainingTrialWire {
     dataset_export_sha256: String,
     environment_sha256: String,
     features: Vec<TrainingFeatureWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forecast: Option<ForecastTrialWire>,
     label: LabelWire,
     missing_policy: String,
     model_id: String,
     model_kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output_semantics: Option<String>,
+    output_measurement: OutputMeasurementWire,
+    output_semantics: String,
+    output_statistic: OutputStatisticWire,
     seed: u64,
     split_counts: SplitCountsWire,
     split_sha256: String,
     training_code_revision: String,
     training_period: TrainingPeriodWire,
     universe_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    forecast: Option<ForecastTrialWire>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ForecastTrialWire {
-    strategy: String,
     horizons: Vec<u32>,
     lags: Vec<u32>,
     observed_cutoff_unix_nanos: i64,
-    rolling_splits: u32,
-    ridge_alpha: f64,
-    selection_sha256: String,
     package_versions: BTreeMap<String, String>,
+    ridge_alpha: f64,
+    rolling_splits: u32,
+    selection_sha256: String,
+    strategy: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -381,14 +467,8 @@ pub(super) fn validate_training_run(
     expectations: &BundleExpectations,
     format: ModelFormat,
     output_semantics: ModelOutputSemantics,
-    output_semantics_bound: bool,
 ) -> Result<(), BundleError> {
-    if !matches!(
-        run.schema_version,
-        TRAINING_RUN_SCHEMA_VERSION
-            | OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION
-            | FORECAST_TRAINING_RUN_SCHEMA_VERSION
-    ) {
+    if run.schema_version != TRAINING_RUN_SCHEMA_VERSION {
         return Err(BundleError::UnsupportedTrainingRunVersion);
     }
     let trial_bytes = serde_json::to_vec(&run.trial).map_err(|_| BundleError::TrainingRunSyntax)?;
@@ -399,27 +479,26 @@ pub(super) fn validate_training_run(
     let trial = &run.trial;
     validate_dataset(&trial.dataset, expectations)?;
     validate_label(&trial.label, expectations)?;
-    let (expected_kind, expected_output_semantics) = match run.schema_version {
-        TRAINING_RUN_SCHEMA_VERSION => (
-            match format {
-                ModelFormat::NativeLinear => "native_linear",
-                ModelFormat::NativeLogistic => "native_logistic",
-                ModelFormat::Onnx => "onnx",
-            },
-            None,
-        ),
-        OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION => (
-            match output_semantics {
-                ModelOutputSemantics::Regression => "linear",
-                ModelOutputSemantics::BinaryProbability => "logistic",
-            },
-            Some(output_semantics_name(output_semantics)),
-        ),
-        FORECAST_TRAINING_RUN_SCHEMA_VERSION => (
-            "linear",
-            Some(output_semantics_name(ModelOutputSemantics::Regression)),
-        ),
-        _ => return Err(BundleError::UnsupportedTrainingRunVersion),
+    let expected_kind = match format {
+        ModelFormat::NativeLinear => "native_linear",
+        ModelFormat::NativeLogistic => "native_logistic",
+        ModelFormat::Onnx => match output_semantics {
+            ModelOutputSemantics::Regression => "linear",
+            ModelOutputSemantics::BinaryProbability => "logistic",
+        },
+    };
+    let forecast_relationships_match = match (
+        &run.forecast_calibration,
+        &metadata.forecast_calibration,
+        &trial.forecast,
+    ) {
+        (None, None, None) => true,
+        (Some(run_calibration), Some(metadata_calibration), Some(_)) => {
+            run_calibration == metadata_calibration
+                && format == ModelFormat::Onnx
+                && output_semantics == ModelOutputSemantics::Regression
+        }
+        _ => false,
     };
     let relationships_match =
         trial.bundle_id == metadata.bundle_id
@@ -437,28 +516,10 @@ pub(super) fn validate_training_run(
             && trial.label == metadata.label
             && trial.model_id == metadata.model_id
             && trial.model_kind == expected_kind
-            && trial.output_semantics.as_deref() == expected_output_semantics
-            && output_semantics_bound
-                == matches!(
-                    run.schema_version,
-                    OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION | FORECAST_TRAINING_RUN_SCHEMA_VERSION
-                )
-            && match run.schema_version {
-                FORECAST_TRAINING_RUN_SCHEMA_VERSION => {
-                    metadata.schema_version == FORECAST_METADATA_SCHEMA_VERSION
-                        && format == ModelFormat::Onnx
-                        && output_semantics == ModelOutputSemantics::Regression
-                        && run.forecast_calibration == metadata.forecast_calibration
-                        && run.forecast_calibration.is_some()
-                        && trial.forecast.is_some()
-                }
-                _ => {
-                    metadata.schema_version != FORECAST_METADATA_SCHEMA_VERSION
-                        && run.forecast_calibration.is_none()
-                        && metadata.forecast_calibration.is_none()
-                        && trial.forecast.is_none()
-                }
-            }
+            && trial.output_semantics == output_semantics_name(output_semantics)
+            && trial.output_measurement == metadata.output_measurement
+            && trial.output_statistic == metadata.output_statistic
+            && forecast_relationships_match
             && trial.training_code_revision == metadata.training_code_revision
             && trial.environment_sha256 == metadata.training_environment_sha256
             && trial.training_period == metadata.training_period
@@ -527,6 +588,35 @@ pub(super) fn validate_training_run(
         {
             return Err(BundleError::TrainingRunRelationshipMismatch);
         }
+    }
+    let estimator_matches_producer = match (
+        format,
+        output_semantics,
+        &trial.forecast,
+        &trial.output_statistic.estimator,
+    ) {
+        (
+            ModelFormat::NativeLinear | ModelFormat::Onnx,
+            ModelOutputSemantics::Regression,
+            None,
+            ForecastEstimatorWire::SealedDirectLeastSquaresV1,
+        ) => true,
+        (
+            ModelFormat::Onnx,
+            ModelOutputSemantics::Regression,
+            Some(forecast),
+            ForecastEstimatorWire::SealedDirectRidgeV1 { ridge_alpha },
+        ) => ridge_alpha.to_bits() == forecast.ridge_alpha.to_bits(),
+        (
+            ModelFormat::NativeLogistic | ModelFormat::Onnx,
+            ModelOutputSemantics::BinaryProbability,
+            None,
+            ForecastEstimatorWire::SealedBinaryLogisticV1,
+        ) => true,
+        _ => false,
+    };
+    if !estimator_matches_producer {
+        return Err(BundleError::TrainingRunRelationshipMismatch);
     }
     Ok(())
 }
@@ -694,45 +784,118 @@ pub(super) fn validate_thresholds(
 }
 
 pub(super) fn validate_output_semantics(
-    metadata_schema_version: u32,
-    value: Option<&str>,
+    value: &str,
     format: ModelFormat,
-    expected: Option<ModelOutputSemantics>,
-) -> Result<(ModelOutputSemantics, bool), BundleError> {
-    let (semantics, bound) = match metadata_schema_version {
-        LEGACY_METADATA_SCHEMA_VERSION if value.is_none() && expected.is_none() => (
-            match format {
-                ModelFormat::NativeLinear | ModelFormat::Onnx => ModelOutputSemantics::Regression,
-                ModelFormat::NativeLogistic => ModelOutputSemantics::BinaryProbability,
-            },
-            false,
-        ),
-        METADATA_SCHEMA_VERSION | FORECAST_METADATA_SCHEMA_VERSION => {
-            let semantics = match value {
-                Some("regression") => ModelOutputSemantics::Regression,
-                Some("binary_probability") => ModelOutputSemantics::BinaryProbability,
-                _ => return Err(BundleError::InvalidOutputSemantics),
-            };
-            if expected != Some(semantics) {
-                return Err(BundleError::InvalidOutputSemantics);
-            }
-            (semantics, true)
-        }
+    expected: ModelOutputSemantics,
+) -> Result<ModelOutputSemantics, BundleError> {
+    let semantics = match value {
+        "regression" => ModelOutputSemantics::Regression,
+        "binary_probability" => ModelOutputSemantics::BinaryProbability,
         _ => return Err(BundleError::InvalidOutputSemantics),
     };
-    if matches!(
-        (format, semantics),
-        (
-            ModelFormat::NativeLinear,
-            ModelOutputSemantics::BinaryProbability
-        ) | (
-            ModelFormat::NativeLogistic,
-            ModelOutputSemantics::Regression
+    if semantics != expected
+        || matches!(
+            (format, semantics),
+            (
+                ModelFormat::NativeLinear,
+                ModelOutputSemantics::BinaryProbability
+            ) | (
+                ModelFormat::NativeLogistic,
+                ModelOutputSemantics::Regression
+            )
         )
-    ) {
+    {
         return Err(BundleError::InvalidOutputSemantics);
     }
-    Ok((semantics, bound))
+    Ok(semantics)
+}
+
+pub(super) fn validate_output_measurement(
+    value: &OutputMeasurementWire,
+    expectations: &BundleExpectations,
+) -> Result<(), BundleError> {
+    let expected = expectations.output_binding();
+    if measurement(value)? == expected.measurement() {
+        Ok(())
+    } else {
+        Err(BundleError::InvalidOutputMeasurement)
+    }
+}
+
+pub(super) fn validate_output_statistic(
+    value: &OutputStatisticWire,
+    expectations: &BundleExpectations,
+) -> Result<(), BundleError> {
+    let expected = expectations.output_binding();
+    let statistic = match value.statistic.as_str() {
+        "model_estimated_conditional_mean" => {
+            ForecastCentralStatistic::ModelEstimatedConditionalMean
+        }
+        "unavailable" => ForecastCentralStatistic::Unavailable,
+        _ => return Err(BundleError::InvalidOutputMeasurement),
+    };
+    let target = match value.target {
+        ForecastTargetWire::FixedHorizonTerminal { horizon_nanos } => {
+            ForecastTargetMeaning::FixedHorizonTerminal {
+                horizon_nanos: NonZeroU64::new(horizon_nanos)
+                    .ok_or(BundleError::InvalidOutputMeasurement)?,
+            }
+        }
+        ForecastTargetWire::Unsupported => ForecastTargetMeaning::Unsupported,
+    };
+    let transform = |value: &str| match value {
+        "identity" => Ok(ForecastTransform::Identity),
+        "logistic" => Ok(ForecastTransform::Logistic),
+        _ => Err(BundleError::InvalidOutputMeasurement),
+    };
+    let objective = match value.objective.as_str() {
+        "squared_error" => ForecastTrainingObjective::SquaredError,
+        "binary_cross_entropy" => ForecastTrainingObjective::BinaryCrossEntropy,
+        _ => return Err(BundleError::InvalidOutputMeasurement),
+    };
+    let estimator = match value.estimator {
+        ForecastEstimatorWire::SealedDirectLeastSquaresV1 => {
+            ForecastEstimatorProfile::SealedDirectLeastSquaresV1
+        }
+        ForecastEstimatorWire::SealedDirectRidgeV1 { ridge_alpha } => {
+            if !ridge_alpha.is_finite() || ridge_alpha < 0.0 {
+                return Err(BundleError::InvalidOutputMeasurement);
+            }
+            ForecastEstimatorProfile::SealedDirectRidgeV1 {
+                ridge_alpha_bits: ridge_alpha.to_bits(),
+            }
+        }
+        ForecastEstimatorWire::SealedBinaryLogisticV1 => {
+            ForecastEstimatorProfile::SealedBinaryLogisticV1
+        }
+    };
+    if statistic == expected.central_statistic()
+        && target == expected.target()
+        && transform(&value.target_transform)? == expected.target_transform()
+        && transform(&value.output_transform)? == expected.output_transform()
+        && objective == expected.objective()
+        && estimator == expected.estimator()
+    {
+        Ok(())
+    } else {
+        Err(BundleError::InvalidOutputMeasurement)
+    }
+}
+
+fn measurement(value: &OutputMeasurementWire) -> Result<ForecastMeasurement, BundleError> {
+    match value {
+        OutputMeasurementWire::Price { currency } => {
+            let parsed = Currency::try_from(currency.as_str())
+                .map_err(|_| BundleError::InvalidOutputMeasurement)?;
+            if parsed.as_str() != currency {
+                return Err(BundleError::InvalidOutputMeasurement);
+            }
+            Ok(ForecastMeasurement::Price { currency: parsed })
+        }
+        OutputMeasurementWire::Return => Ok(ForecastMeasurement::Return),
+        OutputMeasurementWire::Probability => Ok(ForecastMeasurement::Probability),
+        OutputMeasurementWire::OtherRegression => Ok(ForecastMeasurement::OtherRegression),
+    }
 }
 
 const fn output_semantics_name(value: ModelOutputSemantics) -> &'static str {

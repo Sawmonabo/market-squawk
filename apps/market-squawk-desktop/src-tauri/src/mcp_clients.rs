@@ -205,6 +205,55 @@ impl DesktopMcpClientAuthority {
             .collect()
     }
 
+    fn verify_client_connections(
+        &self,
+        requested_client: McpClientKind,
+        service: &McpServiceRuntimeStatus,
+    ) -> Result<(), McpClientRegistrationError> {
+        let requested_facts = service
+            .client(requested_client)
+            .ok_or(McpClientRegistrationError::InvalidAuthorityIdentity)?;
+        if requested_facts.access_revoked {
+            return Err(McpClientRegistrationError::OwnershipRequired {
+                client: requested_client,
+            });
+        }
+        let requested_authority = self.authority(requested_client)?;
+        let requested_status = self
+            .manager
+            .inspect_with_authority(requested_client, &requested_authority)?;
+        if requested_status.state() != McpClientState::Owned {
+            return Err(McpClientRegistrationError::OwnershipRequired {
+                client: requested_client,
+            });
+        }
+
+        let other_client = match requested_client {
+            McpClientKind::ClaudeCode => McpClientKind::Codex,
+            McpClientKind::Codex => McpClientKind::ClaudeCode,
+        };
+        let other_facts = service
+            .client(other_client)
+            .ok_or(McpClientRegistrationError::InvalidAuthorityIdentity)?;
+        let other_is_current =
+            if other_facts.access_revoked || other_facts.credential_rotation_recovery_pending {
+                false
+            } else {
+                let other_authority = self.authority(other_client)?;
+                self.manager
+                    .inspect_with_authority(other_client, &other_authority)?
+                    .state()
+                    == McpClientState::Owned
+            };
+
+        if other_is_current {
+            self.manager.verify_concurrent_clients()?;
+        } else {
+            self.manager.verify_protocol(requested_client)?;
+        }
+        Ok(())
+    }
+
     fn admit_control(
         &self,
         request: McpClientControlCommand,
@@ -669,23 +718,7 @@ pub(crate) async fn mcp_client_control(
                 authority.manager.disconnect(client)?;
             }
             McpClientControlCommand::Verify { client } => {
-                if effective_service
-                    .client(client)
-                    .is_none_or(|facts| facts.access_revoked)
-                {
-                    return Err(McpClientRegistrationError::OwnershipRequired { client }.into());
-                }
-                let registration_authority = authority.authority(client)?;
-                let current = authority
-                    .manager
-                    .inspect_with_authority(client, &registration_authority)?;
-                if current.state() != McpClientState::Owned {
-                    return Err(McpClientRegistrationError::OwnershipRequired { client }.into());
-                }
-                authority.manager.verify_protocol(client)?;
-                authority
-                    .manager
-                    .inspect_with_authority(client, &registration_authority)?;
+                authority.verify_client_connections(client, &effective_service)?;
             }
         }
         Ok(())

@@ -1,6 +1,6 @@
 //! Transport-neutral application access to the sole durable job authority.
 
-use std::{fmt, sync::Arc, time::Instant};
+use std::{fmt, sync::Arc};
 
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_jobs::{
@@ -12,17 +12,14 @@ use market_squawk_jobs::{
 use market_squawk_services::{RequestId, ToolAuthorization, ToolDescriptor, TypedToolRequest};
 use serde::Serialize;
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-const COMPATIBILITY_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Re-admits a `Start*` request through the exact existing terminal-operation descriptor.
 ///
-/// This is the only compatibility translation used by job-backed application operations. It
-/// preserves the already admitted argument object while preventing a caller from selecting either
-/// operation name dynamically. The code-owned `confirm` marker is removed only when the existing
-/// terminal authority is read-only, because that descriptor correctly rejects mutation fields.
+/// This code-owned translation preserves the already admitted argument object while preventing a
+/// caller from selecting either operation name dynamically. The `confirm` marker is removed only
+/// when the terminal authority is read-only, because that descriptor correctly rejects mutation
+/// fields.
 pub fn terminal_request_for_start(
     start: &TypedToolRequest,
     expected_start: &str,
@@ -305,30 +302,13 @@ impl<R: JobRepository + 'static> JobApplication<R> {
             .map_err(Into::into)
     }
 
-    /// Compatibility wrapper for a former blocking terminal operation.
-    ///
-    /// Admission is durably acknowledged first. The caller then waits only until its existing
-    /// deadline or cancellation token; disconnecting this compatibility request never cancels the
-    /// admitted job.
-    pub async fn start_and_wait(
+    /// Returns one sanitized view for an exact stable identity and execution generation.
+    pub async fn get(
         &self,
-        admission: JobAdmission,
-        origin: JobOrigin,
-        request_id: RequestId,
-        admitted_at: Timestamp,
-        cancellation: &CancellationToken,
-        deadline: Instant,
+        id: JobId,
+        generation: JobGeneration,
     ) -> Result<JobView, JobApplicationError> {
-        let receipt = self
-            .start(admission, origin, request_id, admitted_at)
-            .await?;
-        self.wait_terminal(receipt.job_id(), cancellation, deadline)
-            .await
-    }
-
-    /// Returns one sanitized latest-generation view by stable job identity.
-    pub async fn get(&self, id: JobId) -> Result<JobView, JobApplicationError> {
-        let snapshot = self.repository.get_latest(id).await?;
+        let snapshot = self.repository.get(id, generation).await?;
         JobView::from_snapshot(&snapshot)
     }
 
@@ -400,38 +380,6 @@ impl<R: JobRepository + 'static> JobApplication<R> {
             .map(|snapshot| JobReceipt::from_snapshot(&snapshot))
             .map_err(Into::into)
     }
-
-    /// Waits only for the caller's bounded compatibility deadline.
-    ///
-    /// Cancelling or disconnecting this wait never cancels the durable job. New clients reconnect
-    /// with [`Self::get`] or [`Self::watch`].
-    pub async fn wait_terminal(
-        &self,
-        id: JobId,
-        cancellation: &CancellationToken,
-        deadline: Instant,
-    ) -> Result<JobView, JobApplicationError> {
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(JobApplicationError::WaitCancelled);
-            }
-            if Instant::now() >= deadline {
-                return Err(JobApplicationError::WaitDeadlineExceeded);
-            }
-            let view = self.get(id).await?;
-            if view.state().is_terminal() {
-                return Ok(view);
-            }
-            tokio::select! {
-                () = cancellation.cancelled() => {
-                    return Err(JobApplicationError::WaitCancelled);
-                }
-                () = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                    deadline.min(Instant::now() + COMPATIBILITY_WAIT_POLL),
-                )) => {}
-            }
-        }
-    }
 }
 
 impl<R: JobRepository + 'static> fmt::Debug for JobApplication<R> {
@@ -459,12 +407,6 @@ pub enum JobApplicationError {
     /// The runner scheduler rejected or could not complete the operation.
     #[error("durable job authority rejected or could not complete the operation")]
     Authority,
-    /// The compatibility client stopped waiting; the durable job remains active.
-    #[error("job compatibility wait was cancelled")]
-    WaitCancelled,
-    /// The compatibility deadline elapsed; the durable job remains active.
-    #[error("job compatibility wait exceeded its deadline")]
-    WaitDeadlineExceeded,
 }
 
 impl From<JobContractError> for JobApplicationError {

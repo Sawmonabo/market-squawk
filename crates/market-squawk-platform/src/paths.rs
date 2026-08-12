@@ -20,6 +20,7 @@ use crate::input::{ControlledImportInputRoot, InputFileError};
 use crate::journal::ParentDirectorySync;
 use crate::{
     JournalError, JournalReader, JournalSinkConstructionError, JournalSinkLimits, JournalWriter,
+    SealedResearchJournalStore, SealedResearchJournalStoreError,
 };
 
 pub use self::catalog::{
@@ -758,6 +759,21 @@ impl LocalPaths {
         source: &str,
     ) -> Result<JournalWriter, JournalSinkConstructionError> {
         self.open_journal_writer_with_limits(source, JournalSinkLimits::standard())
+    }
+
+    /// Opens the single-owner sealed research-segment authority under the prepared journal root.
+    ///
+    /// The returned store retains an exclusive cross-process owner lock. Construct it once during
+    /// application composition and share that owner; a live append journal remains a separate,
+    /// non-authoritative diagnostic sink.
+    pub fn sealed_research_journal_store(
+        &self,
+    ) -> Result<SealedResearchJournalStore, SealedResearchJournalStoreError> {
+        let directory = self
+            .journal_capability
+            .as_ref()
+            .ok_or(SealedResearchJournalStoreError::PreparedCapabilityRequired)?;
+        SealedResearchJournalStore::try_from_journal_directory(Arc::clone(directory))
     }
 
     /// Opens a current journal under explicit, separate fixed sink limits.

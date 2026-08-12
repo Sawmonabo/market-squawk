@@ -347,10 +347,28 @@ pub(crate) struct BacktestPerformanceStatistics {
     pub(crate) observations: usize,
     pub(crate) skewness: f64,
     pub(crate) excess_kurtosis: f64,
+    pub(crate) maximum_drawdown: Decimal,
 }
 
 impl BacktestPerformanceStatistics {
     fn from_equity_marks(marks: &[Decimal]) -> Result<Self, BacktestError> {
+        let mut peak = marks
+            .first()
+            .copied()
+            .filter(|mark| *mark > Decimal::ZERO)
+            .ok_or(BacktestError::PerformanceMetrics)?;
+        let mut maximum_drawdown = Decimal::ZERO;
+        for mark in marks.iter().copied().skip(1) {
+            if mark > peak {
+                peak = mark;
+                continue;
+            }
+            let drawdown = peak
+                .checked_sub(mark)
+                .and_then(|decline| decline.checked_div(peak))
+                .ok_or(BacktestError::PerformanceMetrics)?;
+            maximum_drawdown = maximum_drawdown.max(drawdown);
+        }
         let returns = marks
             .windows(2)
             .map(|window| {
@@ -372,6 +390,7 @@ impl BacktestPerformanceStatistics {
                 observations: returns.len(),
                 skewness: 0.0,
                 excess_kurtosis: 0.0,
+                maximum_drawdown,
             });
         }
         let count = returns.len() as f64;
@@ -416,6 +435,7 @@ impl BacktestPerformanceStatistics {
                 observations: returns.len(),
                 skewness,
                 excess_kurtosis,
+                maximum_drawdown,
             })
         } else {
             Err(BacktestError::PerformanceMetrics)

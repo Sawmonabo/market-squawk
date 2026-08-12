@@ -54,8 +54,8 @@ const goalCopy: Record<SetupGoal, { label: string; detail: string }> = {
     detail: "Use the managed local runtime and admitted model bundles.",
   },
   practice_paper_execution: {
-    label: "Practice paper execution",
-    detail: "Keep a stopped-by-default paper account behind central risk.",
+    label: "Paper execution",
+    detail: "Use a stopped-by-default virtual account with live-market evidence and central risk.",
   },
   use_claude_code: {
     label: "Use Claude Code",

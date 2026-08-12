@@ -15,7 +15,7 @@ use std::{
 
 use market_squawk_domain::{
     ChecksumTarget, ConnectionGeneration, DataQuality, InstrumentId, SourceId, SourceIdentifier,
-    VenueId,
+    Timestamp, VenueId,
 };
 use market_squawk_live::{
     DepthLimit, OrderLevelBatch, OrderLevelBatchPayload, OrderLevelBook, OrderLevelBookError,
@@ -425,6 +425,7 @@ pub(crate) struct OrderLevelOrdersRead {
     phase: OrderLevelPhase,
     quality: DataQuality,
     freshness: MarketFreshness,
+    available_at: Timestamp,
     total_order_count: usize,
     orders: Vec<OrderLevelEntry>,
     _ticket: ReadBudgetTicket,
@@ -445,6 +446,10 @@ impl OrderLevelOrdersRead {
 
     pub(crate) const fn freshness(&self) -> MarketFreshness {
         self.freshness
+    }
+
+    pub(crate) const fn available_at(&self) -> Timestamp {
+        self.available_at
     }
 
     pub(crate) const fn total_order_count(&self) -> usize {
@@ -1255,6 +1260,9 @@ fn owned_orders(
     if book.phase() == OrderLevelPhase::AwaitingSnapshot {
         return Err(OrderLevelReadError::Unavailable);
     }
+    let available_at = book
+        .available_at()
+        .ok_or(OrderLevelReadError::Unavailable)?;
     let total_order_count = book.orders().len();
     let orders = book
         .try_owned_orders(maximum_orders)
@@ -1269,6 +1277,7 @@ fn owned_orders(
         phase: book.phase(),
         quality: book.quality(),
         freshness: book.freshness(),
+        available_at,
         total_order_count,
         orders,
         _ticket: ticket,

@@ -177,6 +177,7 @@ impl CalibrationBand {
 /// Complete bundle-bound evidence required before interval production.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalibrationEvidence {
+    pub(super) identity: Sha256Digest,
     pub(super) model_id: ModelId,
     pub(super) bundle_id: BundleId,
     pub(super) bundle_version: NonZeroU64,
@@ -187,7 +188,9 @@ pub struct CalibrationEvidence {
     pub(super) method: CalibrationMethod,
     pub(super) window: CalibrationWindow,
     pub(super) policy_hash: Sha256Digest,
+    pub(super) policy_size_bytes: u64,
     pub(super) residuals_hash: Sha256Digest,
+    pub(super) residuals_size_bytes: u64,
     pub(super) bands: [CalibrationBand; 3],
     pub(super) dependence_assumptions: Box<str>,
 }
@@ -208,14 +211,15 @@ impl CalibrationEvidence {
         dependence_assumptions: impl AsRef<str>,
     ) -> Result<Self, ForecastError> {
         let assumptions = dependence_assumptions.as_ref();
-        let admitted_matches = metadata.forecast_calibration().is_none_or(|admitted| {
-            admitted.method() == method
-                && admitted.window() == window
-                && admitted.policy_hash() == policy_hash
-                && admitted.residuals_hash() == residuals_hash
-                && admitted.bands() == &bands
-                && admitted.dependence_assumptions() == assumptions
-        });
+        let Some(admitted) = metadata.forecast_calibration() else {
+            return Err(ForecastError::InvalidCalibration);
+        };
+        let admitted_matches = admitted.method() == method
+            && admitted.window() == window
+            && admitted.policy_hash() == policy_hash
+            && admitted.residuals_hash() == residuals_hash
+            && admitted.bands() == &bands
+            && admitted.dependence_assumptions() == assumptions;
         if policy_hash.bytes() == [0; 32]
             || residuals_hash.bytes() == [0; 32]
             || assumptions.is_empty()
@@ -232,7 +236,19 @@ impl CalibrationEvidence {
         {
             return Err(ForecastError::InvalidCalibration);
         }
+        let identity = digest_calibration_evidence(
+            metadata,
+            method,
+            window,
+            policy_hash,
+            admitted.policy_size_bytes(),
+            residuals_hash,
+            admitted.residuals_size_bytes(),
+            &bands,
+            assumptions,
+        )?;
         Ok(Self {
+            identity,
             model_id: metadata.model_id(),
             bundle_id: metadata.bundle_id().clone(),
             bundle_version: metadata.bundle_version(),
@@ -243,10 +259,18 @@ impl CalibrationEvidence {
             method,
             window,
             policy_hash,
+            policy_size_bytes: admitted.policy_size_bytes(),
             residuals_hash,
+            residuals_size_bytes: admitted.residuals_size_bytes(),
             bands,
             dependence_assumptions: assumptions.into(),
         })
+    }
+
+    /// Versioned canonical identity of the complete admitted calibration evidence.
+    #[must_use]
+    pub const fn identity(&self) -> Sha256Digest {
+        self.identity
     }
 
     /// Selected interval method.
@@ -267,10 +291,22 @@ impl CalibrationEvidence {
         self.policy_hash
     }
 
+    /// Exact retained interval-policy artifact size.
+    #[must_use]
+    pub const fn policy_size_bytes(&self) -> u64 {
+        self.policy_size_bytes
+    }
+
     /// Exact canonical retained-residual artifact digest.
     #[must_use]
     pub const fn residuals_hash(&self) -> Sha256Digest {
         self.residuals_hash
+    }
+
+    /// Exact retained residual artifact size.
+    #[must_use]
+    pub const fn residuals_size_bytes(&self) -> u64 {
+        self.residuals_size_bytes
     }
 
     /// Ordered 50/80/95 band definitions.
@@ -293,6 +329,81 @@ impl CalibrationEvidence {
             && self.training_run_hash == metadata.training_run_hash()
             && self.dataset_export_hash == metadata.dataset().export_digest()
             && self.feature_semantic_digests.as_ref() == metadata.feature_semantic_digests()
+            && metadata.forecast_calibration().is_some_and(|admitted| {
+                admitted.method() == self.method
+                    && admitted.window() == self.window
+                    && admitted.policy_hash() == self.policy_hash
+                    && admitted.policy_size_bytes() == self.policy_size_bytes
+                    && admitted.residuals_hash() == self.residuals_hash
+                    && admitted.residuals_size_bytes() == self.residuals_size_bytes
+                    && admitted.bands() == &self.bands
+                    && admitted.dependence_assumptions() == self.dependence_assumptions.as_ref()
+            })
             && self.window.end() <= cutoff
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the canonical identity binds every independently admitted calibration coordinate"
+)]
+fn digest_calibration_evidence(
+    metadata: &ModelMetadata,
+    method: CalibrationMethod,
+    window: CalibrationWindow,
+    policy_hash: Sha256Digest,
+    policy_size_bytes: u64,
+    residuals_hash: Sha256Digest,
+    residuals_size_bytes: u64,
+    bands: &[CalibrationBand; 3],
+    assumptions: &str,
+) -> Result<Sha256Digest, ForecastError> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/calibration-evidence/v1\0");
+    hash.update(metadata.model_id().as_uuid().as_bytes());
+    update_bounded(&mut hash, metadata.bundle_id().as_str().as_bytes())?;
+    hash.update(metadata.bundle_version().get().to_be_bytes());
+    hash.update(metadata.metadata_hash().bytes());
+    hash.update(metadata.training_run_hash().bytes());
+    hash.update(metadata.dataset().export_digest().bytes());
+    hash.update(metadata.dataset().selection_digest().bytes());
+    hash.update(
+        u64::try_from(metadata.feature_semantic_digests().len())
+            .map_err(|_| ForecastError::InvalidCalibration)?
+            .to_be_bytes(),
+    );
+    for digest in metadata.feature_semantic_digests() {
+        hash.update(digest.as_bytes());
+    }
+    hash.update([match method {
+        CalibrationMethod::MapieEnbpi => 1,
+        CalibrationMethod::MapieAci => 2,
+        CalibrationMethod::ResidualQuantile => 3,
+    }]);
+    hash.update(window.start().unix_nanos().to_be_bytes());
+    hash.update(window.end().unix_nanos().to_be_bytes());
+    hash.update(window.observations().get().to_be_bytes());
+    hash.update(policy_hash.bytes());
+    hash.update(policy_size_bytes.to_be_bytes());
+    hash.update(residuals_hash.bytes());
+    hash.update(residuals_size_bytes.to_be_bytes());
+    for band in bands {
+        hash.update(band.coverage().basis_points().to_be_bytes());
+        hash.update(band.lower_offset().to_bits().to_be_bytes());
+        hash.update(band.upper_offset().to_bits().to_be_bytes());
+        hash.update(band.realized().covered().to_be_bytes());
+        hash.update(band.realized().total().get().to_be_bytes());
+    }
+    update_bounded(&mut hash, assumptions.as_bytes())?;
+    Ok(Sha256Digest::new(hash.finalize().into()))
+}
+
+fn update_bounded(hash: &mut Sha256, value: &[u8]) -> Result<(), ForecastError> {
+    hash.update(
+        u64::try_from(value.len())
+            .map_err(|_| ForecastError::InvalidCalibration)?
+            .to_be_bytes(),
+    );
+    hash.update(value);
+    Ok(())
 }

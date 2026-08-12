@@ -587,7 +587,7 @@ function JobReceiptStatus({ receipt, job, loading, error }: { receipt: BackupJob
           <h2 id="backup-job-heading" className="mt-1 text-sm font-semibold">{job ? humanize(job.kind) : "Queued operation"}</h2>
           <p className="mt-1 text-xs text-muted-foreground">Job {shortId(receipt.jobId)} · generation {receipt.generation} · initial state {humanize(receipt.state)}.</p>
         </div>
-        <Button asChild size="sm" variant="outline"><Link to="/logs">Open Job surface</Link></Button>
+        <Button asChild size="sm" variant="outline"><Link to="/system/logs-diagnostics">Open Job surface</Link></Button>
       </div>
       {error ? <InlineFailure detail={`The job could not be refreshed: ${messageFrom(error)}`} /> : null}
       {!job && !error ? <p className="mt-3 text-xs text-muted-foreground">{loading ? "Reconnecting to durable job evidence…" : "The queued job is not in this bounded page yet. Reconnect through the Job surface; this receipt does not prove completion."}</p> : null}

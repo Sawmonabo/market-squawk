@@ -11,11 +11,16 @@ use std::thread::JoinHandle as ThreadJoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
+use market_squawk_adapter_bea::BeaUserId;
+use market_squawk_adapter_census::CensusApiKey;
 use market_squawk_adapter_coinbase::CoinbaseDirectHmacSigner;
+use market_squawk_adapter_eia::EiaApiKey;
 use market_squawk_adapter_fred::{
     FredParseLimits, FredSeriesMetadata, FredTermsDocumentRole, MAX_FRED_SERVICE_PERMISSION_BYTES,
     MAX_FRED_TERMS_DOCUMENT_BYTES,
 };
+use market_squawk_adapter_schwab::SchwabApplicationCredentialEnvelope;
+use market_squawk_adapter_tiingo::TiingoApiToken;
 use market_squawk_adapter_treasury::{
     DailyParYieldCurvePage, FiscalDataParseLimits, TreasuryYieldCurveProfile,
 };
@@ -573,27 +578,7 @@ impl ProviderOnboardingService {
         request: StartOnboardingRequest,
         cancellation: CancellationToken,
     ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
-        let profile = self
-            .profiles
-            .get(&request.surface_id)
-            .ok_or(ProviderOnboardingError::UnknownProfile)?;
-        validate_declared_contact(profile, &request)?;
-        let public_configuration = provider_public_configuration(profile, &request)?;
-        self.register_profile_capabilities(profile)?;
-        let deadline_at = wall_deadline(SESSION_DURATION)?;
-        let operation_id = Uuid::new_v4();
-        let reservation_request = OnboardingReservationRequest::try_new(
-            profile.capability(),
-            public_configuration,
-            profile.capability().maximum_authority().clone(),
-            SourceIdentifier::try_from("local-portal-user")?,
-            SourceIdentifier::try_from(format!("provider-onboarding-{operation_id}"))?,
-            deadline_at,
-            0,
-        )?;
-        let reservation = self
-            .catalog
-            .reserve_provider_onboarding(&reservation_request)?;
+        let (profile, reservation) = self.reserve_session(&request)?;
 
         match profile.release_state() {
             ProfileReleaseState::RightsBlocked => {}
@@ -634,6 +619,64 @@ impl ProviderOnboardingService {
             ProfileReleaseState::Available | ProfileReleaseState::RightsLimited => {}
         }
         self.resume(reservation.session_id())
+    }
+
+    /// Starts a durable local session without probing or activating a provider.
+    ///
+    /// This is the credential-bundle import boundary: it records exact enabled intent and public
+    /// configuration, while later doctor/activation work remains an explicit operation. It never
+    /// performs network I/O. Refresh-gated no-credential profiles retain their refresh-required
+    /// event so the imported intent cannot be mistaken for availability.
+    pub(crate) fn start_deferred(
+        &self,
+        request: StartOnboardingRequest,
+    ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
+        let (profile, reservation) = self.reserve_session(&request)?;
+        if profile.release_state() == ProfileReleaseState::RefreshRequired
+            && profile.capability().setup_mode() == market_squawk_sources::SetupMode::NoCredential
+        {
+            self.append(
+                &reservation,
+                1,
+                OnboardingEvent::RefreshRequired {
+                    evidence_digest: event_digest(
+                        b"refresh-required",
+                        reservation.session_id(),
+                        None,
+                    ),
+                },
+            )?;
+        }
+        self.resume(reservation.session_id())
+    }
+
+    fn reserve_session<'a>(
+        &'a self,
+        request: &StartOnboardingRequest,
+    ) -> Result<(&'a ProviderOnboardingProfile, OnboardingReservation), ProviderOnboardingError>
+    {
+        let profile = self
+            .profiles
+            .get(&request.surface_id)
+            .ok_or(ProviderOnboardingError::UnknownProfile)?;
+        validate_declared_contact(profile, request)?;
+        let public_configuration = provider_public_configuration(profile, request)?;
+        self.register_profile_capabilities(profile)?;
+        let deadline_at = wall_deadline(SESSION_DURATION)?;
+        let operation_id = Uuid::new_v4();
+        let reservation_request = OnboardingReservationRequest::try_new(
+            profile.capability(),
+            public_configuration,
+            profile.capability().maximum_authority().clone(),
+            SourceIdentifier::try_from("local-portal-user")?,
+            SourceIdentifier::try_from(format!("provider-onboarding-{operation_id}"))?,
+            deadline_at,
+            0,
+        )?;
+        let reservation = self
+            .catalog
+            .reserve_provider_onboarding(&reservation_request)?;
+        Ok((profile, reservation))
     }
 
     /// Imports one secret through the bounded blocking-operation executor.
@@ -2335,23 +2378,9 @@ fn provider_public_configuration(
         "bls.v1-unregistered" => {
             BTreeMap::from([("registration_mode".to_owned(), "unregistered_v1".to_owned())])
         }
-        "bls.v2-registered" => BTreeMap::from([
-            (
-                "administrative_email".to_owned(),
-                request
-                    .administrative_email
-                    .clone()
-                    .ok_or(ProviderOnboardingError::AdministrativeContactRequired)?,
-            ),
-            (
-                "organization".to_owned(),
-                request
-                    .organization
-                    .clone()
-                    .ok_or(ProviderOnboardingError::AdministrativeContactRequired)?,
-            ),
-            ("registration_mode".to_owned(), "registered_v2".to_owned()),
-        ]),
+        "bls.v2-registered" => {
+            BTreeMap::from([("registration_mode".to_owned(), "registered_v2".to_owned())])
+        }
         _ => BTreeMap::new(),
     };
     ProviderPublicConfiguration::try_new(fields)
@@ -2377,14 +2406,8 @@ fn validate_recovered_public_configuration(
                 && configuration.get("registration_mode") == Some("unregistered_v1")
         }
         "bls.v2-registered" => {
-            configuration.iter().len() == 3
+            configuration.iter().len() == 1
                 && configuration.get("registration_mode") == Some("registered_v2")
-                && configuration
-                    .get("organization")
-                    .is_some_and(|value| valid_optional_contact(Some(value), false))
-                && configuration
-                    .get("administrative_email")
-                    .is_some_and(|value| valid_optional_contact(Some(value), true))
         }
         _ => configuration.is_empty(),
     };
@@ -2410,6 +2433,13 @@ fn validate_secret_shape(
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
         }
+        "schwab.trader-api-market-data" => {
+            SchwabApplicationCredentialEnvelope::try_parse(value).is_ok()
+        }
+        "bea.api-data" => BeaUserId::try_new(value.to_owned()).is_ok(),
+        "census.data-api" => CensusApiKey::try_new(value.to_owned()).is_ok(),
+        "eia.api-v2" => EiaApiKey::try_new(value.to_owned()).is_ok(),
+        "tiingo.starter-eod-nav" => TiingoApiToken::try_new(value.to_owned()).is_ok(),
         "coinbase.exchange-direct-market-data" => {
             CoinbaseDirectHmacSigner::try_from_secret_envelope(value).is_ok()
         }
@@ -2857,10 +2887,30 @@ mod tests {
             &[SourceIdentifier::try_from("alpaca.market-data.read")?]
         );
         let alpaca_secret = SecretValue::new(
-            r#"{"version":1,"key_id":"fixture-key-id","secret_key":"fixture-secret-key"}"#
-                .to_owned(),
+            r#"{"version":1,"key_id":"fixture-key-id","secret_key":"fixture-secret-key","trading_api_environment":"paper"}"#.to_owned(),
         )?;
         validate_secret_shape(alpaca, &alpaca_secret)?;
+        assert!(
+            validate_secret_shape(
+                alpaca,
+                &SecretValue::new(
+                    r#"{"version":1,"key_id":"fixture-key-id","secret_key":"fixture-secret-key"}"#
+                        .to_owned(),
+                )?,
+            )
+            .is_err()
+        );
+        let paper_alpaca = AlpacaCredentialEnvelope::try_parse(alpaca_secret.expose_secret())?;
+        assert_eq!(
+            paper_alpaca.trading_api_environment(),
+            market_squawk_adapter_alpaca::AlpacaTradingApiEnvironment::Paper
+        );
+        assert!(
+            AlpacaCredentialEnvelope::try_parse(
+                r#"{"version":1,"key_id":"fixture-key-id","secret_key":"fixture-secret-key","trading_api_environment":"live"}"#,
+            )
+            .is_err()
+        );
         validate_probe_semantics(
             alpaca.id(),
             br#"{"quote":{"t":"2026-08-09T12:00:00Z","ap":100.01,"bp":100.00}}"#,

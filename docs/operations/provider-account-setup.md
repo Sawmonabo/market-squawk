@@ -7,31 +7,76 @@ then fill the local credential template. It does not enable providers by itself.
 | --- | --- |
 | Document type | Operator setup runbook |
 | Audience | Local Market Squawk owner/operator |
-| Status | Account preparation is current; direct file import is required but not implemented |
+| Status | Account preparation and one-time installed credential import are implemented; provider activation/publication/workflow integration remains in flight |
 | Last substantive review | 2026-08-11 |
-| Implementation review basis | Provider documentation and capacity review current on 2026-08-11; repository audit base `3a2f24ddbe88a886d9ba6458dd141774e3716a9d` plus preserved overlay |
+| Implementation review basis | Provider documentation and capacity review current on 2026-08-11; repository audit base `1b723108` plus preserved in-flight overlay; not frozen-head acceptance |
 
 ## Important current boundary
 
 The exact fill-in file is
 [market-squawk-provider-credentials.env.example](../reference/market-squawk-provider-credentials.env.example).
-Copy it outside this repository and fill placeholders there. The strict
-`market-squawk-provider-credentials/v1` thin parser/entry point does not yet exist, so the current
-application cannot consume the completed file. Several providers also still need adapters. Do not
-source the file in a shell or put secrets in ordinary application environment variables.
+Copy it outside this repository and fill placeholders there. The installed CLI now consumes the
+strict `market-squawk-provider-credentials/v1` contract through the existing provider-onboarding
+and protected-secret-store service. Do not source the file in a shell or put its secrets in
+ordinary application environment variables, startup TOML, or CLI arguments.
 
 The standard local path is
 `~/.config/market-squawk/market-squawk-provider-credentials.env`; its containing directory must
-exist and the file must be readable only by the local owner. The repository example and local file
-must have the same 32 field names, including the schema identifier, but enabled flags and secret
-values are operator-specific. Endpoint, callback, rate, batch, and cadence settings do not belong
-in this credential file.
+exist and the file must be readable only by the local owner. On POSIX systems use directory mode
+`0700` and file mode `0600`. The repository example and local file must have the same 32 ordered
+field names, including the schema identifier, but enabled flags and secret values are
+operator-specific. Endpoint, callback, authentication-route, provider-limit, application-budget,
+batch, pagination, and cadence settings do not belong in this credential file; they are code-owned.
 
-Market Squawk's target support is one thin parser/entry point in the existing provider-onboarding
-and protected-secret-store path. It is not a new provider, adapter, crate, service, secret store, or
-runtime configuration system. It accepts only documented fields, delegates them to the already
-owning provider flows, discovers runtime account IDs/tokens there, returns one redacted receipt, and
-rejects unknown, duplicate, or malformed input.
+The import is one thin entry point in the existing provider-onboarding and protected-secret-store
+path. It is not a new provider, adapter, crate, service, secret store, or runtime configuration
+system. It accepts only the documented ordered fields, delegates enabled entries to the already
+owning flows, returns one secret-free 17-provider receipt, and rejects unknown, duplicate,
+out-of-order, malformed, placeholder, or enablement-inconsistent input. It does not discover an
+account, call a provider, run a doctor, activate collection, publish data, or trade.
+
+Create the protected POSIX copy once, fill it, and import it through the installed application
+service:
+
+```bash
+install -d -m 700 "${HOME}/.config/market-squawk"
+cp /absolute/path/to/market-squawk/docs/reference/market-squawk-provider-credentials.env.example \
+  "${HOME}/.config/market-squawk/market-squawk-provider-credentials.env"
+chmod 600 "${HOME}/.config/market-squawk/market-squawk-provider-credentials.env"
+
+market-squawk --output json source import-credentials \
+  "${HOME}/.config/market-squawk/market-squawk-provider-credentials.env" --confirm
+```
+
+Supply the normal explicit `--config <PATH>` option too when the installed service uses a
+non-default product configuration. Keep the source file until the secret-free receipt is retained;
+the importer does not delete it.
+
+The 17 receipt-provider mappings are:
+
+| Receipt provider | Selected profile | Input mode |
+| --- | --- | --- |
+| `schwab` | `schwab.trader-api-market-data` rev 3 | App key and secret |
+| `alpaca` | `alpaca.basic-market-data` rev 3 | Paper key pair |
+| `yahoo_finance_experimental` | `yahoo-finance.experimental-enrichment` rev 3 | No secret |
+| `nasdaq_trader_reference` | `nasdaq-trader-symbol-directory-reference` rev 3 | No secret |
+| `occ_options_reference` | `occ.options-reference` rev 3 | No secret |
+| `cboe_options_reference` | `cboe.options-reference` rev 3 | No secret |
+| `iex_hist` | `iex.hist-feed-files` rev 3 | No secret |
+| `bls` | `bls.v2-registered` rev 3 | Registration key |
+| `bea` | `bea.api-data` rev 3 | UserID |
+| `census` | `census.data-api` rev 3 | API key |
+| `eia` | `eia.api-v2` rev 3 | API key |
+| `fred_alfred` | `fred-alfred.api-v1-v2` rev 5 | API key |
+| `tiingo` | `tiingo.starter-eod-nav` rev 3 | API token |
+| `sec` | `sec.edgar-public` rev 4 | Public organization/contact values; no secret |
+| `treasury_fiscal_data` | `treasury.fiscal-data` rev 4 | No secret |
+| `treasury_daily_rates` | `treasury.daily-rates-xml` rev 4 | No secret |
+| `federal_reserve_board_direct` | `federal-reserve-board.data-download-program` rev 3 | No secret |
+
+Every row returns exactly one disposition: `disabled`, `credential_stored_unverified`,
+`probe_required`, or `profile_unavailable`. These are secret-free import outcomes, not provider
+responses or availability claims.
 
 ### What “enabled” and “available” mean
 
@@ -57,20 +102,20 @@ makes explicitly selected feed/date jobs eligible; it never starts a full archiv
 
 | Provider | What you must create | Template field | Current product status |
 | --- | --- | --- | --- |
-| Alpaca Paper Only / Basic | Free email-only Paper account and Paper key pair | `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY`; realm is exactly `paper` | Substantive integration exists; this credential passed IEX snapshots and indicative-option REST, but recurring/historical/WebSocket release acceptance remains open |
-| Yahoo adaptive enrichment | No account or key | Enabled for explicit-demand, runtime-admitted reads; broad WARM remains disabled | Adapter and normal-session acceptance remain incomplete; no numeric provider capacity is published |
-| Nasdaq Trader, OCC, Cboe reference | No account or key | Enable flags only | Nasdaq equity/ETF listing foundation exists; Nasdaq option/bond lifecycle coverage and OCC/Cboe adapters remain incomplete |
-| IEX HIST | No account or key | Enabled for explicitly selected, byte-admitted feed/date T+1 jobs | Cold PCAP adapter/storage benchmark absent; no automatic catalog download |
-| Charles Schwab Trader API — Individual | Existing Schwab brokerage relationship, approved Individual app, and interactive OAuth consent | `SCHWAB_APP_KEY`, `SCHWAB_APP_SECRET`; callback and OAuth tokens are deliberately absent | Optional complementary provider; REST and five Streamer services passed a bounded read-only probe, while normal-session capacity and maintained adapter/workflow composition remain open |
-| BLS | Free registered API v2 key | `BLS_REGISTRATION_KEY` | Provider foundation exists |
-| BEA | Free API UserID | `BEA_USER_ID` | Adapter absent |
-| Census | Free Data API key | `CENSUS_API_KEY` | Adapter absent |
-| EIA | Free API v2 key | `EIA_API_KEY` | Adapter absent |
-| FRED/ALFRED | Free FRED account and API key | `FRED_API_KEY` | v1 foundation exists; v2 release-bulk absent |
-| Tiingo Starter | Optional free Starter account and token | `TIINGO_API_TOKEN` | Optional adapter/quota ledger absent |
+| Alpaca Paper Only / Basic | Free email-only Paper account and Paper key pair | `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY`; realm is exactly `paper` | Substantive IEX live/options/history/calendar core exists; doctor, recurring batch, publication, PIT read, and product acceptance remain open |
+| Yahoo adaptive enrichment | No account or key | Enabled for explicit-demand, runtime-admitted reads; broad WARM remains disabled | In-flight bounded request/response adapter exists; activation, runtime benchmark, publication, and product acceptance remain open |
+| Nasdaq Trader, OCC, Cboe reference | No account or key | Enable flags only | Nasdaq reference service exists and OCC/Cboe reference adapter core is in flight; durable lifecycle publication and product acceptance remain open |
+| IEX HIST | No account or key | Enabled for explicitly selected, byte-admitted feed/date T+1 jobs | In-flight catalog, bounded transport, PCAP decode, receipt, and job-planning core exists; application ownership, canonical publication, storage benchmark, and product read remain open |
+| Charles Schwab Trader API — Individual | Existing Schwab brokerage relationship, approved Individual app, and interactive OAuth consent | `SCHWAB_APP_KEY`, `SCHWAB_APP_SECRET`; callback and OAuth tokens are deliberately absent | In-flight read-only OAuth/REST/Streamer core exists; installed activation binding, normal-session capacity, publication, typed reads, and product composition remain open |
+| BLS | Free registered API v2 key | `BLS_REGISTRATION_KEY` | Provider foundation exists; registered-v2 probe/activation and complete publication remain open |
+| BEA | Free API UserID | `BEA_USER_ID` | In-flight typed query/parser/pacing adapter exists; installed transport, publication, PIT read, and product composition remain open |
+| Census | Free Data API key | `CENSUS_API_KEY` | In-flight discovery/query/response adapter exists; installed transport, publication, PIT read, and product composition remain open |
+| EIA | Free API v2 key | `EIA_API_KEY` | In-flight metadata/query/canonical adapter exists; installed transport, publication, PIT read, and product composition remain open |
+| FRED/ALFRED | Free FRED account and API key | `FRED_API_KEY` | v1 foundation exists; v2 release bulk and complete product composition remain open |
+| Tiingo Starter | Optional free Starter account and token | `TIINGO_API_TOKEN` | In-flight credential/request/NAV/EOD and serializable quota-ledger core exists; application-owned durable ledger binding, activation, publication, and fund read remain open |
 | SEC | No key; truthful organization/name and monitored email | `SEC_USER_AGENT_ORGANIZATION`, `SEC_USER_AGENT_EMAIL` | Company filing/fact foundations exist; N-PORT/N-CEN absent |
 | Treasury Fiscal Data/daily rates | No account or key | Enable flags only | Existing foundations |
-| Federal Reserve Board | No account or key | Enable flag only | Direct adapter absent |
+| Federal Reserve Board | No account or key | Enable flag only | In-flight direct-release model/parser/publication core exists; installed transport, activation, PIT read, and product composition remain open |
 
 ## 1. Alpaca Paper Only / Basic core
 
@@ -271,8 +316,11 @@ and prefers official bulk archives for large bootstrap work.
 [x] Federal Reserve Board direct: no key
 ```
 
-Completing the checklist closes credential collection only. It does not close the missing importer,
-missing adapters, provider entitlements, authenticated probes, or the external data gaps documented
-in the [provider architecture](../architecture/market-data-provider-architecture.md).
+Completing the checklist and running the installed import closes credential collection and local
+delegation only. The current candidate contains the selected profiles and in-flight adapter cores,
+but it does not close provider entitlements, doctors/authenticated probes, activation bindings,
+schedulers, durable raw/canonical publication, PIT reads, product workflow composition, restart
+proof, or the external data gaps documented in the
+[provider architecture](../architecture/market-data-provider-architecture.md).
 The shared canonical destinations and point-in-time evidence rules are in the
 [canonical schema contract](../reference/market-data-canonical-schemas.md).

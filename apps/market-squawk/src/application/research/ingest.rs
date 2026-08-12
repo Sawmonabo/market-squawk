@@ -16,7 +16,8 @@ use market_squawk_data::{
     SourceOperation, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
-    CompanyIdentityObservation, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
+    CompanyIdentityObservation, DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier,
+    Timestamp,
 };
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
@@ -26,11 +27,12 @@ use market_squawk_sources::{
     AuthoritativeSourceRegistry, DiscoveryBatch, DiscoveryRequest, ExtractionBatch,
     ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
     MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
-    RegisteredSource, RegistryError, SourceError, SourceMetadata, SourceObject,
-    built_in_provider_profiles,
+    ProviderCaptureMaterial, RegisteredSource, RegistryError, SourceClass, SourceError,
+    SourceMetadata, SourceObject, SourceObjectCaptureIdentity, built_in_provider_profiles,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -47,9 +49,14 @@ const STANDARD_EXTRACTION_DURATION: Duration = Duration::from_secs(60);
 const STANDARD_DISCOVERY_RECEIPT_RETENTION: Duration = Duration::from_secs(5 * 60);
 const MAXIMUM_PREPUBLISHED_RESEARCH_SOURCES: usize = 64;
 
+mod alpaca_historical;
 mod provider_runtime;
 mod selection;
 
+pub(crate) use alpaca_historical::{
+    AlpacaHistoricalManagedSource, AlpacaHistoricalPlanAdmissionError,
+    AlpacaHistoricalPlanDirectoryAuthority, AlpacaHistoricalPlanReceipt,
+};
 use provider_runtime::ResearchProviderAdmission;
 pub use provider_runtime::ResearchProviderRuntimeGeneration;
 pub(crate) use provider_runtime::{
@@ -374,6 +381,7 @@ pub struct ResearchRevisionPlanError;
 pub struct ManagedExtraction {
     batch: ExtractionBatch,
     company_identity: Option<CompanyIdentityObservation>,
+    capture_material: Option<ProviderCaptureMaterial>,
 }
 
 impl ManagedExtraction {
@@ -381,12 +389,64 @@ impl ManagedExtraction {
         Self {
             batch,
             company_identity: None,
+            capture_material: None,
         }
+    }
+}
+
+/// One bounded discovery batch plus exact provider bytes that must follow its selected object.
+#[derive(Debug)]
+pub struct ManagedDiscovery {
+    batch: DiscoveryBatch,
+    capture_material: Option<ProviderCaptureMaterial>,
+}
+
+impl ManagedDiscovery {
+    fn inspection_only(batch: DiscoveryBatch) -> Self {
+        Self {
+            batch,
+            capture_material: None,
+        }
+    }
+
+    fn with_capture(
+        batch: DiscoveryBatch,
+        capture_material: ProviderCaptureMaterial,
+    ) -> Result<Self, ExtractionSourceError> {
+        let [object] = batch.objects() else {
+            return Err(invalid_capture_protocol());
+        };
+        let receipt = capture_material.receipt();
+        let capture_identity = SourceObjectCaptureIdentity::try_from_capture(receipt)
+            .map_err(|_error| invalid_capture_protocol())?;
+        if receipt.source_id() != object.source_id()
+            || receipt.metadata_revision() != object.metadata_revision()
+            || receipt.dataset() != object.dataset()
+            || capture_identity != object.capture_identity()
+        {
+            return Err(invalid_capture_protocol());
+        }
+        Ok(Self {
+            batch,
+            capture_material: Some(capture_material),
+        })
     }
 }
 
 /// Production extraction adapter plus its source-specific revision authority.
 pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'static {
+    /// Discovers source objects while retaining exact response material when extraction consumes
+    /// a discovery-time provider representation.
+    fn discover_managed(
+        &self,
+        authority: market_squawk_sources::ExtractionAuthority,
+        request: DiscoveryRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ManagedDiscovery, ExtractionSourceError>> {
+        let discovered = self.discover(authority, request, cancellation);
+        Box::pin(async move { discovered.await.map(ManagedDiscovery::inspection_only) })
+    }
+
     /// Extracts one analytical batch with source-specific reference metadata from the same bytes.
     fn extract_managed(
         &self,
@@ -394,6 +454,12 @@ pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'sta
         request: ExtractionRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
+        if !matches!(
+            self.metadata().source_class(),
+            SourceClass::LocalFile | SourceClass::PortfolioExport
+        ) {
+            return Box::pin(async { Err(invalid_capture_protocol()) });
+        }
         let extracted = self.extract(authority, request, cancellation);
         Box::pin(async move { extracted.await.map(ManagedExtraction::analytical_only) })
     }
@@ -430,6 +496,95 @@ pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'sta
         &self,
         batch: &ExtractionBatch,
     ) -> Result<Option<ExtractionRevisionPlan>, ResearchRevisionPlanError>;
+}
+
+fn invalid_capture_protocol() -> ExtractionSourceError {
+    SourceError::InvalidProtocolState.into()
+}
+
+fn bind_single_provider_capture(
+    batch: ExtractionBatch,
+    capture_material: ProviderCaptureMaterial,
+) -> Result<ManagedExtraction, ExtractionSourceError> {
+    let batch = batch
+        .try_bind_provider_capture(capture_material.receipt())
+        .map_err(|_error| invalid_capture_protocol())?;
+    Ok(ManagedExtraction {
+        batch,
+        company_identity: None,
+        capture_material: Some(capture_material),
+    })
+}
+
+fn capture_material_matches_batch(
+    capture_material: &ProviderCaptureMaterial,
+    batch: &ExtractionBatch,
+) -> bool {
+    let receipt = capture_material.receipt();
+    let object = batch.request().object();
+    receipt.source_id() == object.source_id()
+        && receipt.metadata_revision() == object.metadata_revision()
+        && receipt.dataset() == object.dataset()
+        && SourceObjectCaptureIdentity::try_from_capture(receipt)
+            .is_ok_and(|identity| identity == object.capture_identity())
+}
+
+fn bind_provider_capture_graph(
+    batch: ExtractionBatch,
+    graph_purpose: &'static [u8],
+    components: Vec<ProviderCaptureMaterial>,
+) -> Result<ManagedExtraction, ExtractionSourceError> {
+    let graph_identity = provider_capture_graph_identity(&batch, graph_purpose, &components)?;
+    let dataset = batch.request().object().dataset().clone();
+    let capture_material =
+        ProviderCaptureMaterial::try_combine_request_graph(dataset, graph_identity, components)
+            .map_err(|_error| invalid_capture_protocol())?;
+    bind_single_provider_capture(batch, capture_material)
+}
+
+fn provider_capture_graph_identity(
+    batch: &ExtractionBatch,
+    graph_purpose: &'static [u8],
+    components: &[ProviderCaptureMaterial],
+) -> Result<EvidenceDigest, ExtractionSourceError> {
+    let object = batch.request().object();
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/provider-request-graph-composition/v1\0");
+    update_capture_graph_field(&mut digest, graph_purpose)?;
+    update_capture_graph_field(&mut digest, object.source_id().as_str().as_bytes())?;
+    update_capture_graph_field(
+        &mut digest,
+        object
+            .metadata_revision()
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
+    update_capture_graph_field(&mut digest, object.dataset().as_str().as_bytes())?;
+    let component_count =
+        u64::try_from(components.len()).map_err(|_error| invalid_capture_protocol())?;
+    digest.update(component_count.to_be_bytes());
+    for component in components {
+        update_capture_graph_field(
+            &mut digest,
+            component.receipt().dataset().as_str().as_bytes(),
+        )?;
+        digest.update(component.receipt().request_set_identity().bytes());
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn update_capture_graph_field(
+    digest: &mut Sha256,
+    value: &[u8],
+) -> Result<(), ExtractionSourceError> {
+    let length = u64::try_from(value.len()).map_err(|_error| invalid_capture_protocol())?;
+    digest.update(length.to_be_bytes());
+    digest.update(value);
+    Ok(())
 }
 
 /// Rights-bound static research adapter sealed before its coordinator is published.
@@ -501,6 +656,20 @@ impl fmt::Debug for PrepublishedResearchSourceRegistration {
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_sec::SecEdgarSource {
+    fn discover_managed(
+        &self,
+        authority: market_squawk_sources::ExtractionAuthority,
+        request: DiscoveryRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ManagedDiscovery, ExtractionSourceError>> {
+        let discovered = self.discover_with_capture(authority, request, cancellation);
+        Box::pin(async move {
+            let result = discovered.await?;
+            let (batch, capture_material) = result.into_parts();
+            ManagedDiscovery::with_capture(batch, capture_material)
+        })
+    }
+
     fn extract_managed(
         &self,
         authority: market_squawk_sources::ExtractionAuthority,
@@ -514,6 +683,7 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_sec::SecEdgarSour
                 ManagedExtraction {
                     batch,
                     company_identity,
+                    capture_material: None,
                 }
             })
         })
@@ -530,6 +700,23 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_sec::SecEdgarSour
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_fred::FredSource {
+    fn extract_managed(
+        &self,
+        authority: market_squawk_sources::ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
+        let extracted = self.extract_with_capture(authority, request, cancellation);
+        Box::pin(async move {
+            let (batch, captures) = extracted.await?.into_parts();
+            bind_provider_capture_graph(
+                batch,
+                b"fred-series-metadata-and-observation-page/v1",
+                captures.into_vec(),
+            )
+        })
+    }
+
     fn rights_subject(
         &self,
         dataset: &SourceIdentifier,
@@ -561,6 +748,19 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_fred::FredSource 
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_bls::BlsSource {
+    fn extract_managed(
+        &self,
+        authority: market_squawk_sources::ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
+        let extracted = self.extract_with_capture(authority, request, cancellation);
+        Box::pin(async move {
+            let (batch, capture_material) = extracted.await?.into_parts();
+            bind_single_provider_capture(batch, capture_material)
+        })
+    }
+
     fn discovery_dataset_identifier(&self) -> Option<&SourceIdentifier> {
         Some(self.dataset())
     }
@@ -587,6 +787,19 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_bls::BlsSource {
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_treasury::TreasurySource {
+    fn extract_managed(
+        &self,
+        authority: market_squawk_sources::ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
+        let extracted = self.extract_with_capture(authority, request, cancellation);
+        Box::pin(async move {
+            let (batch, capture_material) = extracted.await?.into_parts();
+            bind_single_provider_capture(batch, capture_material)
+        })
+    }
+
     fn analytical_dataset(
         &self,
         batch: &ExtractionBatch,
@@ -900,7 +1113,7 @@ impl ProductionResearchIngestCoordinator {
                 operation_deadline,
             )
             .await?;
-        ResearchSourceObjectListing::new(profile.clone(), prepared.metadata, discovery)
+        ResearchSourceObjectListing::new(profile.clone(), prepared.metadata, discovery.batch)
     }
 
     /// Discovers exact source objects from one already registered provider profile.
@@ -952,7 +1165,8 @@ impl ProductionResearchIngestCoordinator {
             &prepared.metadata,
             &prepared.rights,
             &prepared.admission,
-            discovery,
+            discovery.batch,
+            discovery.capture_material,
             self.limits.discovery_receipt_retention,
             observed_monotonic,
             observed_wall,
@@ -977,7 +1191,7 @@ impl ProductionResearchIngestCoordinator {
         context: &RequestContext,
         operation: &CancellationToken,
         operation_deadline: Instant,
-    ) -> Result<(PreparedExtraction, DiscoveryBatch, Instant, Timestamp), ServiceError> {
+    ) -> Result<(PreparedExtraction, ManagedDiscovery, Instant, Timestamp), ServiceError> {
         if effective_at.is_some() || max_results.get() > self.limits.discovery_objects.get() {
             return Err(ServiceError::InvalidRequest);
         }
@@ -992,9 +1206,11 @@ impl ProductionResearchIngestCoordinator {
         let request = DiscoveryRequest::try_new(dataset.clone(), None, max_results, deadline)
             .map_err(|_error| ServiceError::InvalidRequest)?;
         let discovery = await_extraction(
-            prepared
-                .source
-                .discover(prepared.authority.clone(), request, operation.clone()),
+            prepared.source.discover_managed(
+                prepared.authority.clone(),
+                request,
+                operation.clone(),
+            ),
             context,
             operation,
             &prepared.admission,
@@ -1006,7 +1222,7 @@ impl ProductionResearchIngestCoordinator {
             .admission
             .ensure_live()
             .map_err(|_error| ServiceError::Unavailable)?;
-        if discovery.objects().iter().any(|object| {
+        if discovery.batch.objects().iter().any(|object| {
             object.source_id() != prepared.metadata.source_id()
                 || object.metadata_revision() != prepared.metadata.revision()
         }) {
@@ -1101,7 +1317,7 @@ impl ProductionResearchIngestCoordinator {
         )
         .map_err(|_error| ServiceError::InvalidRequest)?;
         let discovery = await_extraction(
-            prepared.source.discover(
+            prepared.source.discover_managed(
                 prepared.authority.clone(),
                 discovery_request,
                 operation.clone(),
@@ -1113,6 +1329,7 @@ impl ProductionResearchIngestCoordinator {
         )
         .await?;
         let mut matches = discovery
+            .batch
             .objects()
             .iter()
             .filter(|object| object.object_id() == object_id);
@@ -1123,6 +1340,7 @@ impl ProductionResearchIngestCoordinator {
         self.extract_prepared_object(
             prepared,
             object,
+            discovery.capture_material,
             context,
             operation,
             operation_deadline,
@@ -1170,6 +1388,7 @@ impl ProductionResearchIngestCoordinator {
             authority,
             object,
             admission,
+            capture_material,
         } = prepared;
         self.extract_prepared_object(
             PreparedExtraction {
@@ -1180,6 +1399,7 @@ impl ProductionResearchIngestCoordinator {
                 admission,
             },
             object,
+            capture_material,
             context,
             operation,
             operation_deadline,
@@ -1196,6 +1416,7 @@ impl ProductionResearchIngestCoordinator {
         &self,
         prepared: PreparedExtraction,
         object: SourceObject,
+        discovery_capture: Option<ProviderCaptureMaterial>,
         context: &RequestContext,
         operation: &CancellationToken,
         operation_deadline: Instant,
@@ -1225,7 +1446,29 @@ impl ProductionResearchIngestCoordinator {
         let ManagedExtraction {
             batch,
             company_identity,
+            capture_material: extraction_capture,
         } = managed;
+        let (batch, capture_material) = match (discovery_capture, extraction_capture) {
+            (Some(_), Some(_)) => return Err(ServiceError::InvalidResult),
+            (Some(capture_material), None) => {
+                let batch = batch
+                    .try_bind_provider_capture(capture_material.receipt())
+                    .map_err(|_error| ServiceError::InvalidResult)?;
+                (batch, Some(capture_material))
+            }
+            (None, capture_material) => (batch, capture_material),
+        };
+        let local_source = matches!(
+            prepared.metadata.source_class(),
+            SourceClass::LocalFile | SourceClass::PortfolioExport
+        );
+        if local_source == capture_material.is_some()
+            || !capture_material
+                .as_ref()
+                .is_none_or(|capture| capture_material_matches_batch(capture, &batch))
+        {
+            return Err(ServiceError::InvalidResult);
+        }
         let revisions = prepared
             .source
             .revision_plan(&batch)
@@ -1246,6 +1489,7 @@ impl ProductionResearchIngestCoordinator {
             metadata: prepared.metadata,
             batch,
             company_identity,
+            capture_material,
             revisions,
             analytical_dataset,
             payload_digest,
@@ -1369,6 +1613,7 @@ struct AuthorizedExtraction {
     metadata: SourceMetadata,
     batch: ExtractionBatch,
     company_identity: Option<CompanyIdentityObservation>,
+    capture_material: Option<ProviderCaptureMaterial>,
     revisions: Option<ExtractionRevisionPlan>,
     analytical_dataset: DatasetId,
     payload_digest: EvidenceDigest,
@@ -1428,6 +1673,7 @@ impl ProductionResearchIngestCoordinator {
             metadata: source_metadata,
             batch,
             company_identity,
+            capture_material,
             revisions,
             analytical_dataset,
             payload_digest,
@@ -1447,20 +1693,24 @@ impl ProductionResearchIngestCoordinator {
             }),
             None => provider,
         };
-        let ingest = match revisions {
-            Some(revisions) => ResearchIngestRequest::with_provider_revisions(
+        let ingest = match (revisions, capture_material) {
+            (Some(revisions), Some(capture_material)) => {
+                ResearchIngestRequest::with_provider_revisions_and_capture(
+                    source_metadata.clone(),
+                    rights,
+                    analytical_dataset,
+                    batch,
+                    revisions,
+                    capture_material,
+                )
+            }
+            (None, None) => ResearchIngestRequest::locally_observed(
                 source_metadata.clone(),
                 rights,
                 analytical_dataset,
                 batch,
-                revisions,
             ),
-            None => ResearchIngestRequest::locally_observed(
-                source_metadata.clone(),
-                rights,
-                analytical_dataset,
-                batch,
-            ),
+            _ => return Err(ServiceError::InvalidResult),
         }
         .map_err(map_research_error)?;
         let ingest = match company_identity {
@@ -1726,6 +1976,9 @@ fn map_ingest_error(error: IngestError) -> ServiceError {
         | IngestError::TerminalRun
         | IngestError::IncompleteSuccessfulRun
         | IngestError::ReplayConflict
+        | IngestError::ProviderCaptureRequired
+        | IngestError::ProviderCapture(_)
+        | IngestError::SealedProviderCapture(_)
         | IngestError::AuthorityLockPoisoned => ServiceError::Unavailable,
     }
 }
@@ -1740,6 +1993,7 @@ fn map_research_error(error: ResearchServiceError) -> ServiceError {
         ResearchServiceError::Path(_)
         | ResearchServiceError::Catalog(_)
         | ResearchServiceError::Manifest(_)
+        | ResearchServiceError::ProviderCaptureStore(_)
         | ResearchServiceError::Dataset(_) => ServiceError::Unavailable,
     }
 }

@@ -3,14 +3,17 @@
 pub(super) mod candidate;
 mod common;
 mod dossier;
+mod proposal;
+mod recommendation;
 mod recovery;
 pub(super) mod screen;
 mod target;
 mod wire;
 
 use market_squawk_decisions::{
-    DecisionDossier, GovernedTargetSet, SavedScreen, ScreenExecution, TargetInvalidation,
-    TargetReview,
+    DecisionDossier, GovernedTargetSet, InvestmentOutcomeProjection, InvestmentProposalDecision,
+    InvestmentSizingProjection, PublishedInvestmentAnalysis, RecommendationOutcomeStatusRecord,
+    SavedScreen, ScreenExecution, TargetInvalidation, TargetReview,
 };
 use market_squawk_domain::Timestamp;
 use serde::Serialize;
@@ -19,12 +22,17 @@ use sha2::{Digest as _, Sha256};
 use self::candidate::ExecutionWire;
 use self::common::revision_key;
 use self::dossier::DossierWire;
+use self::proposal::InvestmentProposalWire;
+use self::recommendation::{
+    InvestmentAnalysisPublicationWire, InvestmentOutcomeProjectionWire,
+    InvestmentSizingProjectionWire, RecommendationOutcomeStatusWire,
+};
 pub(super) use self::recovery::RecoveryContext;
 use self::screen::ScreenWire;
 use self::target::{InvalidationWire, ReviewWire, TargetWire};
 use self::wire::{
-    KIND_DOSSIER, KIND_EXECUTION, KIND_INVALIDATION, KIND_REVIEW, KIND_SCREEN,
-    KIND_SCREEN_JOB_INPUT, KIND_TARGET, WIRE_VERSION, WireEnvelope, WireRecord,
+    KIND_DOSSIER, KIND_EXECUTION, KIND_INVALIDATION, KIND_INVESTMENT_PROPOSAL, KIND_REVIEW,
+    KIND_SCREEN, KIND_SCREEN_JOB_INPUT, KIND_TARGET, WIRE_VERSION, WireEnvelope, WireRecord,
 };
 use super::DecisionApplicationError;
 use super::screen_workflow::{ScreenJobPlan, ScreenJobPlanWire};
@@ -123,6 +131,61 @@ pub(super) fn invalidation(
         KIND_INVALIDATION,
         invalidation.id().as_str().to_owned(),
         WireRecord::Invalidation(InvalidationWire::from(invalidation)),
+    )
+}
+
+pub(super) fn investment_proposal(
+    decision: &InvestmentProposalDecision,
+) -> Result<EncodedRecord, DecisionApplicationError> {
+    let wire = InvestmentProposalWire::from(decision);
+    EncodedRecord::try_new(
+        KIND_INVESTMENT_PROPOSAL,
+        wire.key()?,
+        WireRecord::InvestmentProposal(Box::new(wire)),
+    )
+}
+
+pub(super) fn investment_analysis_publication(
+    publication: &PublishedInvestmentAnalysis,
+) -> Result<EncodedRecord, DecisionApplicationError> {
+    let wire = InvestmentAnalysisPublicationWire::from(publication);
+    EncodedRecord::try_new(
+        KIND_INVESTMENT_PROPOSAL,
+        wire.key(),
+        WireRecord::InvestmentAnalysisPublication(wire),
+    )
+}
+
+pub(super) fn investment_outcome_projection(
+    projection: &InvestmentOutcomeProjection,
+) -> Result<EncodedRecord, DecisionApplicationError> {
+    let wire = InvestmentOutcomeProjectionWire::from(projection);
+    EncodedRecord::try_new(
+        KIND_INVESTMENT_PROPOSAL,
+        wire.key(),
+        WireRecord::InvestmentOutcomeProjection(wire),
+    )
+}
+
+pub(super) fn investment_sizing_projection(
+    projection: &InvestmentSizingProjection,
+) -> Result<EncodedRecord, DecisionApplicationError> {
+    let wire = InvestmentSizingProjectionWire::from(projection);
+    EncodedRecord::try_new(
+        KIND_INVESTMENT_PROPOSAL,
+        wire.key(),
+        WireRecord::InvestmentSizingProjection(Box::new(wire)),
+    )
+}
+
+pub(super) fn recommendation_outcome_status(
+    status: &RecommendationOutcomeStatusRecord,
+) -> Result<EncodedRecord, DecisionApplicationError> {
+    let wire = RecommendationOutcomeStatusWire::from(status);
+    EncodedRecord::try_new(
+        KIND_INVESTMENT_PROPOSAL,
+        wire.key(),
+        WireRecord::RecommendationOutcomeStatus(wire),
     )
 }
 

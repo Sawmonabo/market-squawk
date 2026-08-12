@@ -117,13 +117,24 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
             {
                 return Err(ForecastEvidenceReadError::InvalidEvidence);
             }
-            let instruments = instrument_inventory(evidence.rows())?;
+            let instruments =
+                instrument_inventory(metadata, evidence.rows(), evidence.fence().as_of())?;
             if instruments.is_empty() {
                 continue;
             }
-            let step = inferred_step(evidence.rows()).ok_or(ForecastEvidenceReadError::NotFound)?;
+            let (maximum_horizon_points, step) = metadata
+                .output_binding()
+                .expected_terminal_price_horizon_nanos()
+                .map_or_else(
+                    || {
+                        inferred_step(evidence.rows())
+                            .map(|step| (MAX_HORIZON_POINTS, step))
+                            .ok_or(ForecastEvidenceReadError::NotFound)
+                    },
+                    |step| Ok((1, step)),
+                )?;
             let policy = ForecastEvidencePolicy::try_new(
-                NonZeroU16::new(MAX_HORIZON_POINTS)
+                NonZeroU16::new(maximum_horizon_points)
                     .ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
                 step,
                 NonZeroU64::new(MAX_VALIDITY_NANOS)
@@ -194,25 +205,46 @@ fn authority_for_evidence(evidence: &ForecastDatasetEvidence) -> Sha256Digest {
 }
 
 fn instrument_inventory(
+    metadata: &ModelMetadata,
     rows: &[ForecastFeatureRow],
+    available_at: Timestamp,
 ) -> Result<Vec<ForecastInstrumentAvailability>, ForecastEvidenceReadError> {
     let mut by_instrument: BTreeMap<InstrumentId, (BTreeSet<Timestamp>, Option<u8>)> =
         BTreeMap::new();
-    for row in rows.iter().filter(|row| row.component_kind() == 2) {
-        let ForecastFeatureValue::Decimal { scale, .. } = row.value() else {
-            return Err(ForecastEvidenceReadError::InvalidEvidence);
+    for row in rows.iter().filter(|row| model_label(row, metadata)) {
+        let scale = match row.value() {
+            ForecastFeatureValue::Decimal { scale, .. } => *scale,
+            ForecastFeatureValue::Missing => continue,
+            ForecastFeatureValue::Float(_) => {
+                return Err(ForecastEvidenceReadError::InvalidEvidence);
+            }
         };
+        let effective_at = exact_label_effective(row)?;
+        if available_at < effective_at {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
         let (cutoffs, retained_scale) = by_instrument.entry(row.instrument_id()).or_default();
         if retained_scale
-            .replace(*scale)
-            .is_some_and(|value| value != *scale)
-            || !cutoffs.insert(row.cutoff_at())
+            .replace(scale)
+            .is_some_and(|value| value != scale)
+            || !cutoffs.insert(effective_at)
         {
             return Err(ForecastEvidenceReadError::InvalidEvidence);
         }
     }
+    let admitted_horizon = metadata
+        .output_binding()
+        .expected_terminal_price_horizon_nanos();
     by_instrument
         .into_iter()
+        .filter(|(instrument, _history)| {
+            admitted_horizon.is_none_or(|horizon| {
+                rows.iter().any(|row| {
+                    current_expected_origin(row, metadata, *instrument, available_at, horizon)
+                        .is_some()
+                })
+            })
+        })
         .map(|(instrument, (cutoffs, scale))| {
             let first = cutoffs
                 .first()
@@ -229,7 +261,7 @@ fn instrument_inventory(
                 instrument,
                 first,
                 last,
-                last,
+                available_at,
                 count,
                 scale.ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
             )
@@ -243,7 +275,7 @@ fn inferred_step(rows: &[ForecastFeatureRow]) -> Option<NonZeroU64> {
         by_instrument
             .entry(row.instrument_id())
             .or_default()
-            .insert(row.cutoff_at());
+            .insert(exact_label_effective(row).ok()?);
     }
     let mut expected = None;
     for cutoffs in by_instrument.into_values() {
@@ -275,6 +307,12 @@ fn materialize(
     evidence: &ForecastDatasetEvidence,
 ) -> Result<PreparedForecastEvidence, ForecastEvidenceReadError> {
     let metadata = request.model().metadata();
+    if let Some(horizon) = metadata
+        .output_binding()
+        .expected_terminal_price_horizon_nanos()
+    {
+        return materialize_expected_terminal_price(request, evidence, horizon);
+    }
     let instrument = request.selection().instrument_id();
     let mut labels = evidence
         .rows()
@@ -286,11 +324,14 @@ fn materialize(
                 && row.component_version() == metadata.label().version().get()
         })
         .collect::<Vec<_>>();
-    labels.sort_unstable_by_key(|row| row.cutoff_at());
+    if labels.iter().any(|row| exact_label_effective(row).is_err()) {
+        return Err(ForecastEvidenceReadError::InvalidEvidence);
+    }
+    labels.sort_unstable_by_key(|row| row.label_effective_at());
     if labels.len() < MINIMUM_HISTORY
         || labels
             .windows(2)
-            .any(|pair| pair[0].cutoff_at() >= pair[1].cutoff_at())
+            .any(|pair| pair[0].label_effective_at() >= pair[1].label_effective_at())
     {
         return Err(ForecastEvidenceReadError::NotFound);
     }
@@ -310,9 +351,14 @@ fn materialize(
             if *scale != decimal_scale {
                 return Err(ForecastEvidenceReadError::InvalidEvidence);
             }
+            let observed_at = exact_label_effective(row)?;
+            let available_at = evidence.fence().as_of();
+            if available_at < observed_at {
+                return Err(ForecastEvidenceReadError::InvalidEvidence);
+            }
             ForecastObservedPoint::try_new(
-                row.cutoff_at(),
-                row.cutoff_at(),
+                observed_at,
+                available_at,
                 ForecastValue::try_new(*mantissa, *scale)
                     .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?,
                 row.lineage_sha256(),
@@ -323,20 +369,220 @@ fn materialize(
         .collect::<Result<Vec<_>, _>>()?;
     let observed_cutoff = labels
         .last()
+        .map(|row| exact_label_effective(row))
+        .transpose()?
+        .ok_or(ForecastEvidenceReadError::NotFound)?;
+    let feature_cutoff = labels
+        .last()
         .map(|row| row.cutoff_at())
         .ok_or(ForecastEvidenceReadError::NotFound)?;
-    let row = coefficient_row(metadata, evidence.rows(), instrument, observed_cutoff)?;
+    let row = coefficient_row(metadata, evidence.rows(), instrument, feature_cutoff)?;
     let inputs = (0..usize::from(request.selection().horizon().points().get()))
         .map(|_| row.clone().into_boxed_slice())
         .collect::<Vec<_>>();
     PreparedForecastEvidence::try_new(
         request,
         observed_cutoff,
-        observed_cutoff,
+        evidence.fence().as_of(),
         decimal_scale,
         observed_history,
         inputs,
     )
+}
+
+fn materialize_expected_terminal_price(
+    request: ForecastEvidenceMaterializationRequest,
+    evidence: &ForecastDatasetEvidence,
+    admitted_horizon: NonZeroU64,
+) -> Result<PreparedForecastEvidence, ForecastEvidenceReadError> {
+    if request.selection().horizon().points().get() != 1
+        || request.selection().horizon().step_nanos() != admitted_horizon
+    {
+        return Err(ForecastEvidenceReadError::InvalidEvidence);
+    }
+    let metadata = request.model().metadata();
+    let instrument = request.selection().instrument_id();
+    let available_at = evidence.fence().as_of();
+    let mut origins = evidence
+        .rows()
+        .iter()
+        .filter(|row| {
+            model_label(row, metadata) && matches!(row.value(), ForecastFeatureValue::Missing)
+        })
+        .filter_map(|row| {
+            current_expected_origin(row, metadata, instrument, available_at, admitted_horizon)
+                .map(|(observed, target)| (row, observed, target))
+        })
+        .collect::<Vec<_>>();
+    origins.sort_unstable_by_key(|(row, observed, target)| (*observed, row.cutoff_at(), *target));
+    let (origin_row, observed_cutoff, target_at) = origins
+        .last()
+        .copied()
+        .ok_or(ForecastEvidenceReadError::NotFound)?;
+    if origins.iter().rev().skip(1).any(|(row, observed, target)| {
+        *observed == observed_cutoff
+            && row.cutoff_at() == origin_row.cutoff_at()
+            && *target == target_at
+    }) {
+        return Err(ForecastEvidenceReadError::InvalidEvidence);
+    }
+
+    let mut labels = evidence
+        .rows()
+        .iter()
+        .filter(|row| {
+            row.instrument_id() == instrument
+                && model_label(row, metadata)
+                && matches!(row.value(), ForecastFeatureValue::Decimal { .. })
+        })
+        .filter(|row| {
+            exact_terminal_coordinates(row).is_ok_and(|(observed, target)| {
+                target <= observed_cutoff
+                    && target
+                        .unix_nanos()
+                        .checked_sub(observed.unix_nanos())
+                        .and_then(|value| u64::try_from(value).ok())
+                        .and_then(NonZeroU64::new)
+                        == Some(admitted_horizon)
+            })
+        })
+        .collect::<Vec<_>>();
+    labels.sort_unstable_by_key(|row| row.label_effective_at());
+    if labels.len() < MINIMUM_HISTORY
+        || labels
+            .windows(2)
+            .any(|pair| pair[0].label_effective_at() >= pair[1].label_effective_at())
+        || labels.last().and_then(|row| row.label_effective_at()) != Some(observed_cutoff)
+    {
+        return Err(ForecastEvidenceReadError::NotFound);
+    }
+    let decimal_scale = labels
+        .first()
+        .and_then(|row| match row.value() {
+            ForecastFeatureValue::Decimal { scale, .. } => Some(*scale),
+            ForecastFeatureValue::Float(_) | ForecastFeatureValue::Missing => None,
+        })
+        .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+    let observed_history = labels
+        .iter()
+        .map(|row| {
+            let ForecastFeatureValue::Decimal { mantissa, scale } = row.value() else {
+                return Err(ForecastEvidenceReadError::InvalidEvidence);
+            };
+            let observed_at = exact_label_effective(row)?;
+            if *scale != decimal_scale
+                || row.cutoff_at() < observed_at
+                || row.cutoff_at() > available_at
+            {
+                return Err(ForecastEvidenceReadError::InvalidEvidence);
+            }
+            ForecastObservedPoint::try_new(
+                observed_at,
+                row.cutoff_at(),
+                ForecastValue::try_new(*mantissa, *scale)
+                    .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?,
+                row.lineage_sha256(),
+                DataQuality::Aggregated,
+            )
+            .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let row = coefficient_row_at_origin(
+        metadata,
+        evidence.rows(),
+        instrument,
+        origin_row.cutoff_at(),
+        observed_cutoff,
+        target_at,
+    )?;
+    PreparedForecastEvidence::try_new(
+        request,
+        observed_cutoff,
+        available_at,
+        decimal_scale,
+        observed_history,
+        vec![row.into_boxed_slice()],
+    )
+}
+
+fn model_label(row: &ForecastFeatureRow, metadata: &ModelMetadata) -> bool {
+    row.component_kind() == 2
+        && row.component_name() == metadata.label().name()
+        && row.component_version() == metadata.label().version().get()
+}
+
+fn current_expected_origin(
+    row: &ForecastFeatureRow,
+    metadata: &ModelMetadata,
+    instrument: InstrumentId,
+    available_at: Timestamp,
+    admitted_horizon: NonZeroU64,
+) -> Option<(Timestamp, Timestamp)> {
+    if row.instrument_id() != instrument
+        || !model_label(row, metadata)
+        || !matches!(row.value(), ForecastFeatureValue::Missing)
+    {
+        return None;
+    }
+    let (observed, target) = exact_terminal_coordinates(row).ok()?;
+    let horizon = target
+        .unix_nanos()
+        .checked_sub(observed.unix_nanos())
+        .and_then(|value| u64::try_from(value).ok())
+        .and_then(NonZeroU64::new)?;
+    (horizon == admitted_horizon
+        && row.cutoff_at() <= available_at
+        && observed <= available_at
+        && available_at < target)
+        .then_some((observed, target))
+}
+
+fn exact_label_effective(row: &ForecastFeatureRow) -> Result<Timestamp, ForecastEvidenceReadError> {
+    exact_terminal_coordinates(row).map(|(_observed, label)| label)
+}
+
+fn exact_terminal_coordinates(
+    row: &ForecastFeatureRow,
+) -> Result<(Timestamp, Timestamp), ForecastEvidenceReadError> {
+    match (
+        row.target_coordinate_kind(),
+        row.observed_effective_at(),
+        row.label_effective_at(),
+    ) {
+        (1, Some(observed), Some(label)) if label > observed => Ok((observed, label)),
+        _ => Err(ForecastEvidenceReadError::InvalidEvidence),
+    }
+}
+
+fn coefficient_row_at_origin(
+    metadata: &ModelMetadata,
+    rows: &[ForecastFeatureRow],
+    instrument: InstrumentId,
+    cutoff: Timestamp,
+    observed: Timestamp,
+    target: Timestamp,
+) -> Result<Vec<f64>, ForecastEvidenceReadError> {
+    metadata
+        .features()
+        .iter()
+        .map(|binding| {
+            let mut candidates = rows.iter().filter(|row| {
+                row.instrument_id() == instrument
+                    && row.cutoff_at() == cutoff
+                    && row.component_kind() == 1
+                    && row.component_name() == binding.key().name()
+                    && row.component_version() == binding.key().version().get()
+                    && exact_terminal_coordinates(row) == Ok((observed, target))
+            });
+            let selected = candidates
+                .next()
+                .ok_or(ForecastEvidenceReadError::NotFound)?;
+            if candidates.next().is_some() {
+                return Err(ForecastEvidenceReadError::InvalidEvidence);
+            }
+            finite_value(selected)
+        })
+        .collect()
 }
 
 fn coefficient_row(

@@ -7,6 +7,7 @@ import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
+import { OpportunitiesReadExperience } from "@/features/opportunities"
 import type { ProductTransport } from "@/lib/transport"
 
 import { CandidateDossierWorkspace } from "./candidate-dossier"
@@ -27,7 +28,7 @@ export function DecisionsPage() {
       <DecisionsFrame>
         <Alert variant="destructive">
           <AlertCircle aria-hidden="true" />
-          <AlertTitle>Decision workspace unavailable</AlertTitle>
+          <AlertTitle>Opportunities are unavailable</AlertTitle>
           <AlertDescription>{product.error}</AlertDescription>
         </Alert>
         <Button type="button" className="mt-4" onClick={product.refresh}>
@@ -37,28 +38,21 @@ export function DecisionsPage() {
     )
   }
 
-  const hasDecisionReads = product.bootstrap.operations.some(
-    (operation) => operation.name === "Decision.ListScreens",
+  const readOperationNames = new Set(
+    product.bootstrap.operations
+      .filter((operation) => operation.readOnly)
+      .map((operation) => operation.name),
   )
-  if (!hasDecisionReads) {
-    return (
-      <DecisionsFrame>
-        <Alert>
-          <AlertCircle aria-hidden="true" />
-          <AlertTitle>Decision records are not exposed</AlertTitle>
-          <AlertDescription>
-            This installed service does not advertise the closed Decision read contract.
-            Update or repair the installation before using this workspace.
-          </AlertDescription>
-        </Alert>
-      </DecisionsFrame>
-    )
-  }
 
   return (
     <ReadyDecisions
       transport={product.transport}
       scope={product.bootstrap.runtime}
+      investmentReadsAvailable={
+        readOperationNames.has("Decision.ListInvestmentAnalyses") &&
+        readOperationNames.has("Decision.GetInvestmentAnalysis")
+      }
+      manualAnalysisAvailable={readOperationNames.has("Decision.ListScreens")}
     />
   )
 }
@@ -66,9 +60,13 @@ export function DecisionsPage() {
 function ReadyDecisions({
   transport,
   scope,
+  investmentReadsAvailable,
+  manualAnalysisAvailable,
 }: {
   transport: ProductTransport
   scope: ProductScope
+  investmentReadsAvailable: boolean
+  manualAnalysisAvailable: boolean
 }) {
   const [targetDossier, setTargetDossier] = useState<DecisionDossierView | null>(null)
   const screens = useQuery({
@@ -79,83 +77,116 @@ function ReadyDecisions({
       parseDecisionScreens(
         await transport.query({ query: "decisionScreens", limit: SCREEN_LIMIT }),
       ),
+    enabled: manualAnalysisAvailable,
   })
 
   return (
     <DecisionsFrame>
-      <header className="flex flex-col gap-4 border-b border-border pb-6 md:flex-row md:items-end md:justify-between">
-        <div>
-          <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">
-            Evidence-bound research judgment
-          </p>
-          <h1 className="mt-2 text-3xl font-semibold tracking-tight">Decisions</h1>
-          <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Follow durable screens into candidate evidence, global dossiers, and governed target
-            revisions without collapsing observed data, modeled analysis, judgment, or execution.
-          </p>
-        </div>
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => void screens.refetch()}
-          disabled={screens.isFetching}
+      <OpportunitiesReadExperience
+        transport={transport}
+        scope={scope}
+        readAvailable={investmentReadsAvailable}
+      />
+
+      <details className="mt-10 rounded-xl border border-border bg-card/35 p-5">
+        <summary
+          className={
+            "cursor-pointer list-none focus-visible:outline-none " +
+            "focus-visible:ring-2 focus-visible:ring-ring"
+          }
         >
-          <RefreshCw
-            className={screens.isFetching ? "animate-spin" : undefined}
-            aria-hidden="true"
-          />
-          Refresh screens
-        </Button>
-      </header>
+          <span className="text-base font-semibold">Advanced manual analysis</span>
+          <span className="mt-1 block max-w-3xl text-xs leading-5 text-muted-foreground">
+            Build and inspect manual screens, candidate dossiers, and governed target revisions.
+            These expert tools remain separate from retained Investment Briefs.
+          </span>
+        </summary>
 
-      <div className="mt-5">
-        <DecisionBoundaries />
-      </div>
-
-      {screens.isPending ? (
-        <ScreensLoading />
-      ) : screens.isError ? (
-        <Alert variant="destructive" className="mt-6">
-          <AlertCircle aria-hidden="true" />
-          <AlertTitle>Saved screens could not be loaded</AlertTitle>
-          <AlertDescription>
-            {messageFrom(screens.error)}
+        <div className="mt-5 border-t border-border pt-5">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
+                Evidence-bound research judgment
+              </p>
+              <h2 className="mt-1 text-lg font-semibold">Manual screens and targets</h2>
+            </div>
             <Button
               type="button"
               variant="outline"
-              size="sm"
-              className="mt-2"
               onClick={() => void screens.refetch()}
+              disabled={!manualAnalysisAvailable || screens.isFetching}
             >
-              Retry
+              <RefreshCw
+                className={screens.isFetching ? "animate-spin" : undefined}
+                aria-hidden="true"
+              />
+              Refresh screens
             </Button>
-          </AlertDescription>
-        </Alert>
-      ) : (
-        <>
-          <ScreenBuilder
-            transport={transport}
-            scope={scope}
-            screens={screens.data}
-            onSaved={async () => {
-              await screens.refetch()
-            }}
-          />
-          <SavedScreens screens={screens.data} />
-        </>
-      )}
+          </div>
 
-      <CandidateDossierWorkspace
-        transport={transport}
-        scope={scope}
-        selectedTargetDossierId={targetDossier?.id ?? null}
-        onSelectTargetDossier={setTargetDossier}
-      />
-      <TargetGovernanceWorkspace
-        transport={transport}
-        scope={scope}
-        dossier={targetDossier}
-      />
+          <div className="mt-5">
+            <DecisionBoundaries />
+          </div>
+
+          {!manualAnalysisAvailable ? (
+            <Alert className="mt-6">
+              <AlertCircle aria-hidden="true" />
+              <AlertTitle>Manual decision records are not exposed</AlertTitle>
+              <AlertDescription>
+                This installed service does not advertise the closed saved-screen read contract.
+                Update or repair the installation before using the advanced manual workspace.
+              </AlertDescription>
+            </Alert>
+          ) : screens.isPending ? (
+            <ScreensLoading />
+          ) : screens.isError ? (
+            <Alert variant="destructive" className="mt-6">
+              <AlertCircle aria-hidden="true" />
+              <AlertTitle>Saved screens could not be loaded</AlertTitle>
+              <AlertDescription>
+                {messageFrom(screens.error)}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="mt-2"
+                  onClick={() => void screens.refetch()}
+                >
+                  Retry
+                </Button>
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <>
+              <ScreenBuilder
+                transport={transport}
+                scope={scope}
+                screens={screens.data}
+                onSaved={async () => {
+                  await screens.refetch()
+                }}
+              />
+              <SavedScreens screens={screens.data} />
+            </>
+          )}
+
+          {manualAnalysisAvailable ? (
+            <>
+              <CandidateDossierWorkspace
+                transport={transport}
+                scope={scope}
+                selectedTargetDossierId={targetDossier?.id ?? null}
+                onSelectTargetDossier={setTargetDossier}
+              />
+              <TargetGovernanceWorkspace
+                transport={transport}
+                scope={scope}
+                dossier={targetDossier}
+              />
+            </>
+          ) : null}
+        </div>
+      </details>
     </DecisionsFrame>
   )
 }
@@ -170,8 +201,17 @@ function DecisionsLoading() {
       <Skeleton className="h-4 w-36" />
       <Skeleton className="mt-3 h-10 w-56" />
       <Skeleton className="mt-3 h-5 w-full max-w-2xl" />
-      <ScreensLoading />
+      <OpportunityLoading />
     </DecisionsFrame>
+  )
+}
+
+function OpportunityLoading() {
+  return (
+    <div className="mt-6 grid gap-3 xl:grid-cols-2" aria-label="Loading Opportunities">
+      <Skeleton className="h-52 w-full" />
+      <Skeleton className="h-52 w-full" />
+    </div>
   )
 }
 

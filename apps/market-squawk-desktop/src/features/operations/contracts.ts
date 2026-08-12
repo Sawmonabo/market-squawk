@@ -4,6 +4,14 @@ import type { ApplicationResult } from "@/lib/schemas"
 import { losslessIntegerSchema } from "@/lib/lossless-integer"
 
 const U64_MAX = 18_446_744_073_709_551_615n
+const canonicalUnsignedU64Schema = z.string().refine(
+  isCanonicalUnsignedU64,
+  { message: "Expected a canonical unsigned 64-bit decimal" },
+)
+const canonicalPositiveU64Schema = canonicalUnsignedU64Schema.refine(
+  (value) => value !== "0",
+  { message: "Expected a positive canonical 64-bit decimal" },
+)
 const unsignedU64Schema = losslessIntegerSchema.refine(
   (value) => {
     const parsed = BigInt(value)
@@ -15,6 +23,14 @@ const positiveU64Schema = unsignedU64Schema.refine(
   (value) => BigInt(value) > 0n,
   { message: "Expected a positive 64-bit integer" },
 )
+
+function isCanonicalUnsignedU64(value: string): boolean {
+  return (
+    value.length <= 20 &&
+    /^(?:0|[1-9]\d*)$/.test(value) &&
+    BigInt(value) <= U64_MAX
+  )
+}
 
 const jobStateSchema = z.enum([
   "queued",
@@ -86,8 +102,8 @@ const artifactReadSchema = z
 
 export const jobViewSchema = z.object({
   jobId: z.string().uuid(),
-  generation: z.number().int().positive(),
-  sequence: z.number().int().nonnegative(),
+  generation: canonicalPositiveU64Schema,
+  sequence: canonicalUnsignedU64Schema,
   kind: z.string().min(1),
   state: jobStateSchema,
   phase: z.string().min(1).nullable(),
@@ -122,9 +138,9 @@ const jobEventSchema = z.object({
 
 const jobEventPageSchema = z.object({
   events: z
-    .array(z.tuple([z.number().int().nonnegative(), jobEventSchema]))
+    .array(z.tuple([canonicalUnsignedU64Schema, jobEventSchema]))
     .max(4_096),
-  next: z.number().int().nonnegative().nullable(),
+  next: canonicalUnsignedU64Schema.nullable(),
 })
 
 const runtimeStatusSchema = z
@@ -178,7 +194,7 @@ export function parseRuntimeStatus(result: ApplicationResult): RuntimeStatus {
 
 export function parseCurrentConfirmation(
   result: ApplicationResult,
-  expectedSequence: number,
+  expectedSequence: JobView["sequence"],
 ): JobConfirmationEvidence | null {
   const page = jobEventPageSchema.parse(result.data)
   const current = page.events.find(

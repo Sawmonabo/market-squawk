@@ -2,25 +2,25 @@
 
 mod contracts;
 
-pub(crate) use contracts::system_timestamp;
 pub use contracts::{
     RetrievedCompanyFacts, RetrievedSecBytes, RetrievedSubmissions, RetrievedXbrlDocument,
     SecClientError, SecContact, SecExtractionHealth, SecExtractionHealthState, SecObjectLocator,
 };
+pub(crate) use contracts::{deterministic_capture_uuid, system_timestamp};
 use contracts::{health_for_http_status, validation_health_for_error};
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures_util::StreamExt as _;
 use market_squawk_domain::{
-    AvailabilityEvidence, DigestAlgorithm, EvidenceDigest, ProviderIdentityRegistry,
+    DigestAlgorithm, EvidenceDigest, ProviderIdentityRegistry, SourceIdentifier,
 };
 use market_squawk_sources::{
     AuthorizationMode, ExtractionAuthority, ExtractionAuthorityError, ExtractionRedirectPermit,
-    HttpRequestBounds, NetworkAccessPolicy, SourceMetadata, SourceMetadataProvider,
-    TlsProviderCapability,
+    HttpRequestBounds, MAX_PROVIDER_CAPTURE_PAGE_BYTES, NetworkAccessPolicy,
+    ProviderCapturePageReceipt, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    SourceMetadata, SourceMetadataProvider, TlsProviderCapability,
 };
 use reqwest::header::{
     ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, RETRY_AFTER,
@@ -288,9 +288,15 @@ impl SecEdgarSource {
         let request_bounds = self.request_bounds(authority)?;
         let mut current = locator.url().to_owned();
         let mut redirect_permit: Option<ExtractionRedirectPermit> = None;
+        let mut force_unconditional = false;
         loop {
             self.validate_authority(authority)?;
-            let conditional = self.representation_registry.conditional_request(&current)?;
+            let conditional = if force_unconditional {
+                None
+            } else {
+                self.representation_registry.conditional_request(&current)?
+            };
+            let request_identity = sec_request_identity(&current, conditional.as_ref());
             let mut request = self.client.get(&current);
             if let Some(validators) = conditional {
                 if let Some(etag) = validators.etag() {
@@ -350,34 +356,19 @@ impl SecEdgarSource {
                 ));
             }
             if status.as_u16() == 304 {
-                let validators = self.response_validators(response.headers())?;
                 drop(response);
-                let raw_store = Arc::clone(&self.raw_store);
-                let representations = Arc::clone(&self.representation_registry);
-                let retained_locator = current.clone();
-                let max_bytes = request_bounds.max_response_bytes();
-                let retrieved = self
-                    .run_blocking(cancellation, move |worker_cancellation| {
-                        let retained = representations.record_not_modified_cancellable(
-                            &retained_locator,
-                            validators,
-                            worker_cancellation,
-                        )?;
-                        let bytes = raw_store.read_verified_bounded_cancellable(
-                            &retained.evidence(),
-                            max_bytes.min(retained.size_bytes()),
-                            worker_cancellation,
-                        )?;
-                        if u64::try_from(bytes.len()).ok() != Some(retained.size_bytes()) {
-                            return Err(SecClientError::RawEvidenceMismatch);
-                        }
-                        Ok(retrieved_from_representation(bytes, retained))
-                    })
-                    .await;
                 in_flight.validate_current()?;
                 self.validate_authority(authority)?;
                 in_flight.release();
-                return self.finish_local_retrieval(retrieved);
+                if force_unconditional {
+                    self.update_health(SecExtractionHealthState::InvalidResponse, Some(304))?;
+                    return Err(SecClientError::InvalidCaptureMaterial);
+                }
+                // A 304 has no provider body to seal. Repeat once without validators so an exact
+                // successful response body, not a local cache replay, backs publication.
+                force_unconditional = true;
+                redirect_permit = None;
+                continue;
             }
             if !status.is_success() {
                 let health = health_for_http_status(status.as_u16());
@@ -388,8 +379,15 @@ impl SecEdgarSource {
                 return Err(SecClientError::HttpStatus(status.as_u16()));
             }
             let validators = self.response_validators(response.headers())?;
+            let effective_max_response_bytes = request_bounds
+                .max_response_bytes()
+                .min(MAX_PROVIDER_CAPTURE_PAGE_BYTES);
             if let Some(length) = response.content_length() {
                 in_flight.validate_response_size(length)?;
+                if length > effective_max_response_bytes {
+                    self.update_health(SecExtractionHealthState::InvalidResponse, None)?;
+                    return Err(SecClientError::ResponseTooLarge);
+                }
             }
             let read_timeout = Duration::from_nanos(request_bounds.read_timeout_nanos());
             let initial_capacity = response
@@ -434,6 +432,10 @@ impl SecEdgarSource {
                 let new_size =
                     u64::try_from(new_len).map_err(|_| SecClientError::ResponseTooLarge)?;
                 in_flight.validate_response_size(new_size)?;
+                if new_size > effective_max_response_bytes {
+                    self.update_health(SecExtractionHealthState::InvalidResponse, None)?;
+                    return Err(SecClientError::ResponseTooLarge);
+                }
                 bytes
                     .try_reserve(chunk.len())
                     .map_err(|_| SecClientError::AllocationFailed)?;
@@ -441,6 +443,8 @@ impl SecEdgarSource {
             }
             drop(stream);
             in_flight.validate_current()?;
+            let body_received_at = system_timestamp()?;
+            let response_status = status.as_u16();
             let raw_store = Arc::clone(&self.raw_store);
             let representations = Arc::clone(&self.representation_registry);
             let retained_locator = current.clone();
@@ -460,12 +464,22 @@ impl SecEdgarSource {
                         validators,
                         worker_cancellation,
                     )?;
-                    Ok(retrieved_from_representation(bytes, retained))
+                    Ok((bytes, retained))
                 })
                 .await;
             in_flight.validate_current()?;
             self.validate_authority(authority)?;
             in_flight.release();
+            let retrieved = retrieved.and_then(|(bytes, retained)| {
+                retrieved_from_representation(
+                    bytes,
+                    retained,
+                    &self.metadata,
+                    request_identity,
+                    response_status,
+                    body_received_at,
+                )
+            });
             return self.finish_local_retrieval(retrieved);
         }
     }
@@ -540,7 +554,15 @@ impl SecEdgarSource {
             }
             Err(SecClientError::Cancelled) => Err(SecClientError::Cancelled),
             Err(error) => {
-                self.update_health(SecExtractionHealthState::LocalFailure, None)?;
+                let state = match error {
+                    SecClientError::ResponseTooLarge
+                    | SecClientError::InvalidCaptureMaterial
+                    | SecClientError::ProviderCapture(_) => {
+                        SecExtractionHealthState::InvalidResponse
+                    }
+                    _ => SecExtractionHealthState::LocalFailure,
+                };
+                self.update_health(state, None)?;
                 Err(error)
             }
         }
@@ -635,15 +657,68 @@ fn response_validators(
 fn retrieved_from_representation(
     bytes: Vec<u8>,
     representation: SecRepresentation,
-) -> RetrievedSecBytes {
-    RetrievedSecBytes {
-        bytes: Bytes::from(bytes),
-        evidence: representation.evidence(),
-        received_at: representation.first_observed_at(),
-        availability: AvailabilityEvidence::local_first_observed(
-            representation.first_observed_at(),
-        ),
-        locator: Some(representation.locator().to_owned()),
-        retrieval_revision: Some(representation.retrieval_revision()),
+    metadata: &SourceMetadata,
+    request_identity: EvidenceDigest,
+    http_status: u16,
+    body_received_at: market_squawk_domain::Timestamp,
+) -> Result<RetrievedSecBytes, SecClientError> {
+    let body_bytes = u64::try_from(bytes.len()).map_err(|_| SecClientError::ResponseTooLarge)?;
+    let page = ProviderCapturePageReceipt::try_new(
+        0,
+        request_identity,
+        None,
+        None,
+        http_status,
+        body_bytes,
+        representation.evidence(),
+        body_received_at,
+    )?;
+    let dataset = SourceIdentifier::try_from(representation.locator())?;
+    let capture_receipt = ProviderCaptureSetReceipt::try_new(
+        metadata.source_id().clone(),
+        metadata.revision().clone(),
+        dataset,
+        request_identity,
+        ProviderCaptureTerminalDisposition::StandaloneResponse,
+        vec![page],
+    )?;
+    Ok(RetrievedSecBytes::captured_online(
+        bytes,
+        representation.evidence(),
+        representation.first_observed_at(),
+        representation.locator().to_owned(),
+        representation.retrieval_revision(),
+        capture_receipt,
+    ))
+}
+
+fn sec_request_identity(locator: &str, conditional: Option<&SecHttpValidators>) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/sec-http-get-request/v1");
+    hash_capture_field(&mut hash, b"GET");
+    hash_capture_field(&mut hash, locator.as_bytes());
+    match conditional {
+        Some(validators) => {
+            hash.update([1]);
+            hash_optional_capture_field(&mut hash, validators.etag().map(str::as_bytes));
+            hash_optional_capture_field(&mut hash, validators.last_modified().map(str::as_bytes));
+        }
+        None => hash.update([0]),
     }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn hash_optional_capture_field(hash: &mut Sha256, value: Option<&[u8]>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash_capture_field(hash, value);
+        }
+        None => hash.update([0]),
+    }
+}
+
+fn hash_capture_field(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
 }

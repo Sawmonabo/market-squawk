@@ -196,7 +196,7 @@ export function ResearchIngestion({
             Complete a research source setup before discovering provider objects.
           </p>
           <Button asChild className="mt-3" size="sm">
-            <Link to="/sources">Open Sources</Link>
+            <Link to="/connections/sources">Open Connections & Sources</Link>
           </Button>
         </div>
       ) : (

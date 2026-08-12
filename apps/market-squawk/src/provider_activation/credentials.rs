@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use hmac::{Hmac, Mac as _};
-use market_squawk_adapter_alpaca::{AlpacaCredentials, AlpacaError};
+use market_squawk_adapter_alpaca::{AlpacaCredentials, AlpacaError, AlpacaTradingApiEnvironment};
 use market_squawk_adapter_kraken::KRAKEN_L3_GET_TOKEN_ENDPOINT;
 use market_squawk_adapter_tradier::{TradierAccessToken, TradierCredentialError};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
@@ -23,7 +23,7 @@ const TRADIER_PROFILE_ENDPOINT: &str = "https://api.tradier.com/v1/user/profile"
 const MAX_CREDENTIAL_ENVELOPE_BYTES: usize = 16 * 1024;
 const MAX_KRAKEN_KEY_BYTES: usize = 4_096;
 const MAX_KRAKEN_SECRET_BYTES: usize = 4_096;
-const ALPACA_ACCOUNT_BINDING_DOMAIN: &[u8] = b"market-squawk/alpaca-account-binding/v1\0";
+const ALPACA_ACCOUNT_BINDING_DOMAIN: &[u8] = b"market-squawk/alpaca-account-binding/v2\0";
 const KRAKEN_ACCOUNT_BINDING_DOMAIN: &[u8] = b"market-squawk/kraken-account-binding/v1\0";
 static KRAKEN_NONCE_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 
@@ -32,6 +32,7 @@ type HmacSha512 = Hmac<Sha512>;
 pub(crate) struct AlpacaCredentialEnvelope {
     key_id: Zeroizing<String>,
     secret_key: Zeroizing<String>,
+    trading_api_environment: AlpacaTradingApiEnvironment,
 }
 
 impl AlpacaCredentialEnvelope {
@@ -43,13 +44,21 @@ impl AlpacaCredentialEnvelope {
             version,
             key_id: SecretCredentialField(key_id),
             secret_key: SecretCredentialField(secret_key),
+            trading_api_environment,
         } = serde_json::from_str(envelope)
             .map_err(|_error| ProviderCredentialError::InvalidEnvelope)?;
         if version != 1 {
             return Err(ProviderCredentialError::InvalidEnvelope);
         }
         AlpacaCredentials::try_new(key_id.to_string(), secret_key.to_string())?;
-        Ok(Self { key_id, secret_key })
+        let trading_api_environment = match trading_api_environment {
+            AlpacaTradingApiEnvironmentWire::Paper => AlpacaTradingApiEnvironment::Paper,
+        };
+        Ok(Self {
+            key_id,
+            secret_key,
+            trading_api_environment,
+        })
     }
 
     pub(crate) fn verification_request(
@@ -66,7 +75,20 @@ impl AlpacaCredentialEnvelope {
     }
 
     pub(crate) fn account_digest(&self) -> EvidenceDigest {
-        account_digest(ALPACA_ACCOUNT_BINDING_DOMAIN, self.key_id.as_bytes())
+        let mut hasher = Sha256::new();
+        hasher.update(ALPACA_ACCOUNT_BINDING_DOMAIN);
+        hasher.update((self.key_id.len() as u64).to_be_bytes());
+        hasher.update(self.key_id.as_bytes());
+        hasher.update([match self.trading_api_environment {
+            AlpacaTradingApiEnvironment::Live => 1,
+            AlpacaTradingApiEnvironment::Paper => 2,
+        }]);
+        EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
+    }
+
+    /// Returns the exact Trading API realm declared by this verified credential envelope.
+    pub(crate) const fn trading_api_environment(&self) -> AlpacaTradingApiEnvironment {
+        self.trading_api_environment
     }
 
     pub(crate) fn into_credentials(self) -> Result<AlpacaCredentials, ProviderCredentialError> {
@@ -263,6 +285,13 @@ struct AlpacaCredentialWire {
     version: u8,
     key_id: SecretCredentialField,
     secret_key: SecretCredentialField,
+    trading_api_environment: AlpacaTradingApiEnvironmentWire,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AlpacaTradingApiEnvironmentWire {
+    Paper,
 }
 
 #[derive(Deserialize)]

@@ -1,15 +1,25 @@
 //! Durable forecast generation, immutable vintages, and realized-outcome presentation.
 
-use std::{num::NonZeroUsize, path::Path, sync::Arc};
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    path::Path,
+    sync::Arc,
+};
 
+use async_trait::async_trait;
 use market_squawk_data::Sha256Digest;
-use market_squawk_modeling::{ForecastOutcome, ForecastPath, ForecastVintage};
+use market_squawk_domain::{Currency, DigestAlgorithm, EvidenceDigest, InstrumentId, Timestamp};
+use market_squawk_modeling::{
+    CalibrationEvidence, ForecastCentralStatistic, ForecastOutcome, ForecastPath, ForecastValue,
+    ForecastVintage, ModelMetadata,
+};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
 use market_squawk_services::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
-    ArtifactRepository,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReadContext,
+    ArtifactReadRequest, ArtifactReference, ArtifactRepository,
 };
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -18,9 +28,12 @@ use persistence::{
     validate_digest,
 };
 
-use super::runtime::{
-    ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
-    RetainedRuntimeBackup,
+use super::{
+    ModelDomainService,
+    runtime::{
+        ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
+        RetainedRuntimeBackup,
+    },
 };
 
 mod generation;
@@ -32,15 +45,595 @@ pub const START_FORECAST: &str = "Model.StartForecast";
 pub const GENERATE_FORECAST: &str = "Model.GenerateForecast";
 /// Reads one exact immutable forecast vintage.
 pub const GET_FORECAST: &str = "Model.GetForecast";
+/// Selects and fully revalidates the newest nonexpired forecast for one exact instrument.
+pub const SELECT_LATEST_VALID_FORECAST: &str = "Model.SelectLatestValidForecast";
 /// Lists bounded immutable forecast-vintage summaries.
 pub const LIST_FORECASTS: &str = "Model.ListForecasts";
 /// Reads bounded immutable outcomes appended to one vintage.
 pub const GET_FORECAST_OUTCOMES: &str = "Model.GetForecastOutcomes";
 
-const INDEX_SCHEMA_VERSION: u32 = 1;
+const INDEX_SCHEMA_VERSION: u32 = 3;
+const FORECAST_PAYLOAD_SCHEMA_VERSION: u32 = 3;
 const MAXIMUM_VINTAGES: usize = 100_000;
 const MAXIMUM_OUTCOMES: usize = 1_000_000;
 const MAXIMUM_DRIFT_OUTCOMES: usize = 4_096;
+const FORECAST_SELECTION_POLICY_REVISION: u32 = 1;
+
+/// Stable newest-valid ordering used by the internal investment-workspace read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ForecastSelectionOrder {
+    /// Newest publication, then freshest observation/input, then the lowest immutable identity.
+    NewestCreatedAtObservedThroughAvailableAtThenLowestVintageId,
+}
+
+impl ForecastSelectionOrder {
+    const fn canonical_bytes(self) -> &'static [u8] {
+        match self {
+            Self::NewestCreatedAtObservedThroughAvailableAtThenLowestVintageId => {
+                b"newest_created_at_observed_through_available_at_then_lowest_vintage_id"
+            }
+        }
+    }
+
+    /// Stable operation-facing name included in the canonically identified receipt.
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NewestCreatedAtObservedThroughAvailableAtThenLowestVintageId => {
+                "newest_created_at_observed_through_available_at_then_lowest_vintage_id"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForecastSelectionReceiptBody {
+    policy_revision: u32,
+    selection_order: ForecastSelectionOrder,
+    instrument_id: InstrumentId,
+    as_of_unix_nanos: i64,
+    considered_vintage_count: usize,
+    retained_vintage_hard_ceiling: usize,
+    eligible_vintage_count: usize,
+    competing_eligible_vintage_count: usize,
+    selection_complete: bool,
+    selected_vintage_id: String,
+    selected_created_at_unix_nanos: i64,
+    selected_observed_through_unix_nanos: i64,
+    selected_available_at_unix_nanos: i64,
+    selected_expires_at_unix_nanos: i64,
+}
+
+/// Exact, canonically identified proof that the complete retained forecast set was considered.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ForecastSelectionReceipt {
+    #[serde(flatten)]
+    body: ForecastSelectionReceiptBody,
+    receipt_digest: EvidenceDigest,
+}
+
+impl ForecastSelectionReceipt {
+    fn try_new(body: ForecastSelectionReceiptBody) -> Result<Self, ForecastApplicationError> {
+        let receipt_digest = forecast_selection_receipt_digest(&body)?;
+        Ok(Self {
+            body,
+            receipt_digest,
+        })
+    }
+
+    /// Code-owned selection-policy revision.
+    #[must_use]
+    pub(crate) const fn policy_revision(&self) -> u32 {
+        self.body.policy_revision
+    }
+
+    /// Exact deterministic ordering applied to every eligible vintage.
+    #[must_use]
+    pub(crate) const fn selection_order(&self) -> ForecastSelectionOrder {
+        self.body.selection_order
+    }
+
+    /// Exact requested instrument.
+    #[must_use]
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.body.instrument_id
+    }
+
+    /// Exact point-in-time selection cutoff.
+    #[must_use]
+    pub(crate) const fn as_of_unix_nanos(&self) -> i64 {
+        self.body.as_of_unix_nanos
+    }
+
+    /// Complete number of retained vintages examined before eligibility filtering.
+    #[must_use]
+    pub(crate) const fn considered_vintage_count(&self) -> usize {
+        self.body.considered_vintage_count
+    }
+
+    /// Hard retained ceiling under which the complete selection was performed.
+    #[must_use]
+    pub(crate) const fn retained_vintage_hard_ceiling(&self) -> usize {
+        self.body.retained_vintage_hard_ceiling
+    }
+
+    /// Number of exact-instrument, available, published, and nonexpired vintages considered.
+    #[must_use]
+    pub(crate) const fn eligible_vintage_count(&self) -> usize {
+        self.body.eligible_vintage_count
+    }
+
+    /// Other eligible vintages that lost the deterministic ordering comparison.
+    #[must_use]
+    pub(crate) const fn competing_eligible_vintage_count(&self) -> usize {
+        self.body.competing_eligible_vintage_count
+    }
+
+    /// Whether the receipt covers the complete retained set without truncation.
+    #[must_use]
+    pub(crate) const fn selection_complete(&self) -> bool {
+        self.body.selection_complete
+    }
+
+    /// Immutable identity selected by the recorded deterministic order.
+    #[must_use]
+    pub(crate) fn selected_vintage_id(&self) -> &str {
+        &self.body.selected_vintage_id
+    }
+
+    /// Exact selected publication time.
+    #[must_use]
+    pub(crate) const fn selected_created_at_unix_nanos(&self) -> i64 {
+        self.body.selected_created_at_unix_nanos
+    }
+
+    /// Exact selected effective observation cutoff.
+    #[must_use]
+    pub(crate) const fn selected_observed_through_unix_nanos(&self) -> i64 {
+        self.body.selected_observed_through_unix_nanos
+    }
+
+    /// Exact selected conservative knowledge time.
+    #[must_use]
+    pub(crate) const fn selected_available_at_unix_nanos(&self) -> i64 {
+        self.body.selected_available_at_unix_nanos
+    }
+
+    /// Exact exclusive model-risk expiry.
+    #[must_use]
+    pub(crate) const fn selected_expires_at_unix_nanos(&self) -> i64 {
+        self.body.selected_expires_at_unix_nanos
+    }
+
+    /// Versioned SHA-256 identity of every canonical receipt field.
+    #[must_use]
+    pub(crate) const fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
+    }
+}
+
+fn forecast_selection_receipt_digest(
+    body: &ForecastSelectionReceiptBody,
+) -> Result<EvidenceDigest, ForecastApplicationError> {
+    let mut digest = Sha256::new();
+    update_receipt_digest_field(
+        &mut digest,
+        b"domain",
+        b"market-squawk/forecast-selection-receipt/v1",
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"policy_revision",
+        &body.policy_revision.to_be_bytes(),
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selection_order",
+        body.selection_order.canonical_bytes(),
+    )?;
+    let instrument_id = body.instrument_id.as_uuid();
+    update_receipt_digest_field(&mut digest, b"instrument_id", instrument_id.as_bytes())?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"as_of_unix_nanos",
+        &body.as_of_unix_nanos.to_be_bytes(),
+    )?;
+    update_receipt_digest_count(
+        &mut digest,
+        b"considered_vintage_count",
+        body.considered_vintage_count,
+    )?;
+    update_receipt_digest_count(
+        &mut digest,
+        b"retained_vintage_hard_ceiling",
+        body.retained_vintage_hard_ceiling,
+    )?;
+    update_receipt_digest_count(
+        &mut digest,
+        b"eligible_vintage_count",
+        body.eligible_vintage_count,
+    )?;
+    update_receipt_digest_count(
+        &mut digest,
+        b"competing_eligible_vintage_count",
+        body.competing_eligible_vintage_count,
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selection_complete",
+        &[u8::from(body.selection_complete)],
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_vintage_id",
+        body.selected_vintage_id.as_bytes(),
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_created_at_unix_nanos",
+        &body.selected_created_at_unix_nanos.to_be_bytes(),
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_observed_through_unix_nanos",
+        &body.selected_observed_through_unix_nanos.to_be_bytes(),
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_available_at_unix_nanos",
+        &body.selected_available_at_unix_nanos.to_be_bytes(),
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_expires_at_unix_nanos",
+        &body.selected_expires_at_unix_nanos.to_be_bytes(),
+    )?;
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn update_receipt_digest_count(
+    digest: &mut Sha256,
+    field: &[u8],
+    value: usize,
+) -> Result<(), ForecastApplicationError> {
+    let value = u64::try_from(value).map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+    update_receipt_digest_field(digest, field, &value.to_be_bytes())
+}
+
+fn update_receipt_digest_field(
+    digest: &mut Sha256,
+    field: &[u8],
+    value: &[u8],
+) -> Result<(), ForecastApplicationError> {
+    let field_length =
+        u64::try_from(field.len()).map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+    let value_length =
+        u64::try_from(value.len()).map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+    digest.update(field_length.to_be_bytes());
+    digest.update(field);
+    digest.update(value_length.to_be_bytes());
+    digest.update(value);
+    Ok(())
+}
+
+/// Whether the selected admitted forecast can supply governed price evidence.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ForecastPriceEvidence {
+    /// Exact admitted conditional-mean terminal-price evidence.
+    Available(Box<SelectedPriceForecast>),
+    /// The selected vintage is valid forecast evidence, but cannot be interpreted as a price.
+    Unavailable(SelectedForecastPriceUnavailable),
+}
+
+/// Closed reason that one valid selected forecast cannot supply price evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForecastPriceUnavailableReason {
+    /// The admitted model predicts a dimensionless return rather than a price.
+    ReturnMeasurement,
+    /// The admitted model predicts a probability rather than a price.
+    ProbabilityMeasurement,
+    /// The admitted regression output is explicitly not a price.
+    OtherRegressionMeasurement,
+    /// Exact rows do not prove one fixed positive terminal horizon.
+    TerminalHorizonUnavailable,
+    /// The sealed estimator output is not admitted as a conditional mean.
+    CentralStatisticUnavailable,
+}
+
+/// Exact selected identity retained when price interpretation is unavailable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedForecastPriceUnavailable {
+    vintage_id: Sha256Digest,
+    instrument_id: InstrumentId,
+    output_binding_identity: Sha256Digest,
+    reason: ForecastPriceUnavailableReason,
+}
+
+impl SelectedForecastPriceUnavailable {
+    /// Exact selected immutable forecast identity.
+    #[must_use]
+    pub(crate) const fn vintage_id(&self) -> Sha256Digest {
+        self.vintage_id
+    }
+
+    /// Exact instrument that was selected.
+    #[must_use]
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Exact admitted binding identity retained for every current measurement.
+    #[must_use]
+    pub(crate) const fn output_binding_identity(&self) -> Sha256Digest {
+        self.output_binding_identity
+    }
+
+    /// Closed non-price reason; callers must surface this as unavailable, never as a price.
+    #[must_use]
+    pub(crate) const fn reason(&self) -> ForecastPriceUnavailableReason {
+        self.reason
+    }
+}
+
+/// One exact fixed-scale interval in the selected forecast currency.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedPriceInterval {
+    lower: ForecastValue,
+    upper: ForecastValue,
+}
+
+impl SelectedPriceInterval {
+    /// Inclusive lower value.
+    #[must_use]
+    pub(crate) const fn lower(self) -> ForecastValue {
+        self.lower
+    }
+
+    /// Inclusive upper value.
+    #[must_use]
+    pub(crate) const fn upper(self) -> ForecastValue {
+        self.upper
+    }
+}
+
+/// Exact calibrated 50/80/95 price intervals for one future point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedPriceIntervals {
+    interval_50: SelectedPriceInterval,
+    interval_80: SelectedPriceInterval,
+    interval_95: SelectedPriceInterval,
+}
+
+impl SelectedPriceIntervals {
+    /// Realized-marginal 50-percent interval; not a per-observation guarantee.
+    #[must_use]
+    pub(crate) const fn interval_50(self) -> SelectedPriceInterval {
+        self.interval_50
+    }
+
+    /// Realized-marginal 80-percent interval; not a per-observation guarantee.
+    #[must_use]
+    pub(crate) const fn interval_80(self) -> SelectedPriceInterval {
+        self.interval_80
+    }
+
+    /// Realized-marginal 95-percent interval; not a per-observation guarantee.
+    #[must_use]
+    pub(crate) const fn interval_95(self) -> SelectedPriceInterval {
+        self.interval_95
+    }
+}
+
+/// One typed future price point from the selected immutable vintage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedPriceForecastPoint {
+    target_at: Timestamp,
+    central: ForecastValue,
+    intervals: Option<SelectedPriceIntervals>,
+}
+
+impl SelectedPriceForecastPoint {
+    /// Exact future effective time.
+    #[must_use]
+    pub(crate) const fn target_at(self) -> Timestamp {
+        self.target_at
+    }
+
+    /// Exact fixed-scale modeled price in the enclosing forecast currency.
+    #[must_use]
+    pub(crate) const fn central(self) -> ForecastValue {
+        self.central
+    }
+
+    /// Calibrated intervals when exact admitted calibration evidence exists.
+    #[must_use]
+    pub(crate) const fn intervals(self) -> Option<SelectedPriceIntervals> {
+        self.intervals
+    }
+}
+
+/// Complete typed price evidence from one selected and model-revalidated forecast vintage.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SelectedPriceForecast {
+    vintage_id: Sha256Digest,
+    instrument_id: InstrumentId,
+    currency: Currency,
+    central_statistic: ForecastCentralStatistic,
+    terminal_horizon_nanos: NonZeroU64,
+    observed_through: Timestamp,
+    available_at: Timestamp,
+    created_at: Timestamp,
+    expires_at: Timestamp,
+    output_binding_identity: Sha256Digest,
+    model_metadata: ModelMetadata,
+    forecast_artifact: ArtifactReference,
+    points: Box<[SelectedPriceForecastPoint]>,
+    calibration: Option<CalibrationEvidence>,
+}
+
+impl SelectedPriceForecast {
+    /// Exact selected immutable forecast identity.
+    #[must_use]
+    pub(crate) const fn vintage_id(&self) -> Sha256Digest {
+        self.vintage_id
+    }
+
+    /// Exact forecasted instrument.
+    #[must_use]
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Exact model-admitted quote currency for every returned point.
+    #[must_use]
+    pub(crate) const fn currency(&self) -> Currency {
+        self.currency
+    }
+
+    /// Exact admitted statistical meaning of every central point.
+    #[must_use]
+    pub(crate) const fn central_statistic(&self) -> ForecastCentralStatistic {
+        self.central_statistic
+    }
+
+    /// Exact positive effective-time offset of the terminal-price label.
+    #[must_use]
+    pub(crate) const fn terminal_horizon_nanos(&self) -> NonZeroU64 {
+        self.terminal_horizon_nanos
+    }
+
+    /// Effective cutoff of the source-qualified observed series.
+    #[must_use]
+    pub(crate) const fn observed_through(&self) -> Timestamp {
+        self.observed_through
+    }
+
+    /// Conservative knowledge time of the complete forecast input.
+    #[must_use]
+    pub(crate) const fn available_at(&self) -> Timestamp {
+        self.available_at
+    }
+
+    /// Publication time of the immutable vintage.
+    #[must_use]
+    pub(crate) const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+
+    /// Exclusive model-risk expiry time used by selection.
+    #[must_use]
+    pub(crate) const fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
+
+    /// Versioned model-admission identity that authorizes price interpretation.
+    #[must_use]
+    pub(crate) const fn output_binding_identity(&self) -> Sha256Digest {
+        self.output_binding_identity
+    }
+
+    /// Exact reloaded admitted model metadata matched against the durable payload.
+    #[must_use]
+    pub(crate) const fn model_metadata(&self) -> &ModelMetadata {
+        &self.model_metadata
+    }
+
+    /// Exact path-free controlled forecast artifact reference.
+    #[must_use]
+    pub(crate) const fn forecast_artifact(&self) -> &ArtifactReference {
+        &self.forecast_artifact
+    }
+
+    /// Complete ordered future price path.
+    #[must_use]
+    pub(crate) fn points(&self) -> &[SelectedPriceForecastPoint] {
+        &self.points
+    }
+
+    /// Exact reconstructed admitted calibration evidence, when intervals exist.
+    #[must_use]
+    pub(crate) const fn calibration(&self) -> Option<&CalibrationEvidence> {
+        self.calibration.as_ref()
+    }
+}
+
+/// Complete selected typed forecast evidence and the authority-owned selection receipt.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LatestValidForecast {
+    price_evidence: ForecastPriceEvidence,
+    selection_receipt: ForecastSelectionReceipt,
+    model_metadata: ModelMetadata,
+    forecast_artifact: ArtifactReference,
+}
+
+impl LatestValidForecast {
+    /// Typed price evidence or an explicit non-price/unavailable result.
+    #[must_use]
+    pub(crate) const fn price_evidence(&self) -> &ForecastPriceEvidence {
+        &self.price_evidence
+    }
+
+    /// Exact non-truncated selection proof.
+    #[must_use]
+    pub(crate) const fn selection_receipt(&self) -> &ForecastSelectionReceipt {
+        &self.selection_receipt
+    }
+
+    /// Exact reloaded model authority common to available and unavailable price evidence.
+    #[must_use]
+    pub(crate) const fn model_metadata(&self) -> &ModelMetadata {
+        &self.model_metadata
+    }
+
+    /// Exact controlled artifact read and verified before either result variant is returned.
+    #[must_use]
+    pub(crate) const fn forecast_artifact(&self) -> &ArtifactReference {
+        &self.forecast_artifact
+    }
+}
+
+/// Least-authority lifecycle and complete-object ceiling for one typed forecast evidence read.
+#[derive(Clone, Debug)]
+pub(crate) struct ForecastEvidenceReadContext {
+    artifact: ArtifactReadContext,
+    maximum_artifact_bytes: NonZeroUsize,
+}
+
+impl ForecastEvidenceReadContext {
+    /// Binds service-owned cancellation/deadline authority to the admitted complete-object bound.
+    #[must_use]
+    pub(crate) const fn new(
+        artifact: ArtifactReadContext,
+        maximum_artifact_bytes: NonZeroUsize,
+    ) -> Self {
+        Self {
+            artifact,
+            maximum_artifact_bytes,
+        }
+    }
+
+    fn ensure_live(&self) -> Result<(), ArtifactError> {
+        self.artifact.ensure_live()
+    }
+}
+
+/// Least-authority typed forecast read retained before model service trait erasure.
+#[async_trait]
+pub(crate) trait ForecastEvidenceReader: Send + Sync {
+    /// Selects one exact nonexpired vintage and verifies its model and controlled artifact.
+    async fn latest_valid_for_instrument(
+        &self,
+        instrument_id: InstrumentId,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError>;
+}
 
 /// Closed storage and result ceilings for one installed forecast authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,6 +972,61 @@ impl ForecastApplicationService {
     }
 }
 
+#[async_trait]
+impl ForecastEvidenceReader for ModelDomainService {
+    async fn latest_valid_for_instrument(
+        &self,
+        instrument_id: InstrumentId,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError> {
+        let forecasts = self
+            .forecasts
+            .as_ref()
+            .ok_or(ForecastApplicationError::Unavailable)?;
+        context.ensure_live()?;
+        let selected = {
+            let index = forecasts.index.lock().await;
+            context.ensure_live()?;
+            let selected = index.latest_valid_for_instrument(
+                instrument_id,
+                as_of,
+                forecasts.limits.maximum_vintages,
+            )?;
+            context.ensure_live()?;
+            selected
+        };
+        let image = self.read_image.load();
+        let (model_id, bundle_id, bundle_version) = selected.vintage.typed_model_coordinate()?;
+        let bundle = image
+            .registry
+            .get(&bundle_id, bundle_version)
+            .map_err(|_error| ForecastApplicationError::Unavailable)?
+            .ok_or(ForecastApplicationError::Unavailable)?;
+        let metadata = bundle.metadata();
+        if metadata.model_id() != model_id {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        let reference = selected.vintage.artifact_reference()?;
+        let artifact = forecasts
+            .artifacts
+            .read(
+                ArtifactReadRequest::try_new(reference.clone(), context.maximum_artifact_bytes)?,
+                context.artifact.clone(),
+            )
+            .await?;
+        context.ensure_live()?;
+        selected.vintage.verify_artifact_read(&artifact)?;
+        let price_evidence = selected.vintage.revalidated_price_evidence(metadata)?;
+        Ok(LatestValidForecast {
+            price_evidence,
+            selection_receipt: selected.receipt,
+            model_metadata: metadata.clone(),
+            forecast_artifact: reference,
+        })
+    }
+}
+
 fn drift_monitoring_value(
     index: &ForecastIndex,
     vintage: &VintageRecord,
@@ -471,7 +1119,7 @@ pub enum ForecastApplicationError {
     /// Durable local state is unavailable.
     #[error(transparent)]
     State(#[from] LocalAuthorityStateStoreError),
-    /// Controlled forecast payload publication failed.
+    /// Controlled forecast payload publication or verified access failed.
     #[error(transparent)]
     Artifact(#[from] ArtifactError),
     /// Restore attempted to reuse an authority outside a fresh inactive workspace.

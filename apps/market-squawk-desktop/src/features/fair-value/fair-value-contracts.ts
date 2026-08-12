@@ -5,11 +5,18 @@ import type { ApplicationResult } from "@/lib/schemas"
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/)
 const identifierSchema = z.string().min(1)
 
-const amountSchema = z.object({
-  amount: z.string().regex(/^-?\d+(?:\.\d+)?$/),
-  currency: z.string().regex(/^[A-Z]{3}$/),
-  scale: z.number().int().nonnegative(),
-})
+const amountSchema = z
+  .object({
+    amount: z.string().regex(/^-?\d+(?:\.\d+)?$/),
+    currency: z.string().regex(/^[A-Z]{3}$/),
+    scale: z.number().int().nonnegative(),
+    amountBasis: z.enum([
+      "per_instrument_unit",
+      "reporting_entity_total",
+      "position_total",
+    ]),
+  })
+  .strict()
 
 const hierarchySchema = z.enum([
   "level_1",

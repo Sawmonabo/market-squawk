@@ -44,11 +44,15 @@ export function JobCard({
   mutationPending: boolean
   onAction: (action: PendingJobAction) => void
 }) {
+  const currentSequence = BigInt(job.sequence)
+  const afterSequence = (
+    currentSequence > 0n ? currentSequence - 1n : 0n
+  ).toString()
   const confirmationQuery = useQuery({
     queryKey: productKeys.operation(scope, "job", "Job.Watch", {
       jobId: job.jobId,
       generation: job.generation,
-      afterSequence: Math.max(0, job.sequence - 1),
+      afterSequence,
       limit: 1,
     }),
     enabled: job.state === "awaiting_confirmation",
@@ -58,7 +62,7 @@ export function JobCard({
           action: "watch",
           jobId: job.jobId,
           generation: job.generation,
-          afterSequence: Math.max(0, job.sequence - 1),
+          afterSequence,
           limit: 1,
         }),
         job.sequence,

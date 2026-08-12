@@ -11,13 +11,15 @@ use arrow::compute::concat_batches;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
-    AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
-    MetadataRevision, ResearchContext, ResearchObservation, ResearchTemporalCoordinate,
-    RevisionNumber, SchemaVersion, SourceId, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, Currency, DataQuality, DigestAlgorithm, EvidenceDigest,
+    ExactPayloadEvidence, MetadataRevision, ResearchContext, ResearchObservation,
+    ResearchTemporalCoordinate, RevisionNumber, SchemaVersion, SourceId, SourceIdentifier,
+    Timestamp,
 };
 use market_squawk_sources::{
     AvailabilityEvidence as SourceAvailabilityEvidence, CanonicalObservationPayload,
-    DiscoveryRequestId, ExtractionBatch, ExtractionRequestId, payload_matches_exact_evidence,
+    DiscoveryRequestId, ExtractionBatch, ExtractionRequestId, ProviderCaptureTerminalDisposition,
+    SealedProviderCaptureSetReceipt, SourceObjectCaptureIdentity, payload_matches_exact_evidence,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -27,7 +29,8 @@ use thiserror::Error;
 
 use crate::schema::{
     DATASET_KEY, REQUEST_DIGEST_KEY, RESEARCH_RECORD_SCHEMA, RESEARCH_SCHEMA_NAME,
-    RESEARCH_SCHEMA_VERSION, SCHEMA_VERSION_KEY, decode_hex, research_schema,
+    RESEARCH_SCHEMA_VERSION, SCHEMA_VERSION_KEY, decode_hex, research_payload_contract_for,
+    research_schema,
 };
 pub use crate::schema::{
     DatasetSchemaError, DatasetSchemaRef, DatasetSchemaRegistry, FeatureLabelBatchBindings,
@@ -85,6 +88,8 @@ struct ExtractionRowLineage {
     superseded_time: Option<ResearchTemporalCoordinate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     revision_assignment: Option<RevisionAssignmentLineage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_capture: Option<ProviderCaptureRowLineage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -93,6 +98,28 @@ struct RevisionAssignmentLineage {
     semantic_payload_identity: EvidenceDigest,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ProviderCaptureRowLineage {
+    receipt_digest: EvidenceDigest,
+    capture_content_digest: EvidenceDigest,
+    capture_observation_digest: EvidenceDigest,
+    request_set_identity: EvidenceDigest,
+    terminal: ProviderCaptureTerminalDisposition,
+    page_count: u16,
+    total_body_bytes: u64,
+    sealed_relative_reference: Box<str>,
+    sealed_content_digest: EvidenceDigest,
+    sealed_size_bytes: u64,
+    sealed_physical_receipt_digest: EvidenceDigest,
+}
+
+#[derive(Deserialize)]
+struct ResearchObservationEnvelopeTag<'payload> {
+    #[serde(borrow)]
+    observation: &'payload str,
+}
+
+const CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION: u16 = 5;
 const EXTRACTION_LINEAGE_SCHEMA_VERSION: u16 = 4;
 const LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION: u16 = 3;
 
@@ -101,7 +128,7 @@ impl ResearchArrowBatch {
     pub fn try_from_extraction_batch(
         extraction: &ExtractionBatch,
     ) -> Result<Self, ArrowConversionError> {
-        Self::try_from_extraction_batch_with_revisions(extraction, None)
+        Self::try_from_extraction_batch_with_revisions(extraction, None, None)
     }
 
     /// Returns source-validated canonical observations before durable revision rebinding.
@@ -135,6 +162,7 @@ impl ResearchArrowBatch {
                 revision: record.revision().clone(),
                 superseded_time: record.superseded_time().cloned(),
                 revision_assignment: None,
+                provider_capture: None,
             }));
             validate_row_lineage(
                 &lineage,
@@ -152,16 +180,35 @@ impl ResearchArrowBatch {
         extraction: &ExtractionBatch,
         revisions: &[RevisionNumber],
     ) -> Result<Self, ArrowConversionError> {
-        Self::try_from_extraction_batch_with_revisions(extraction, Some(revisions))
+        Self::try_from_extraction_batch_with_revisions(extraction, Some(revisions), None)
+    }
+
+    pub(crate) fn try_from_extraction_batch_with_assigned_revisions_and_provider_capture(
+        extraction: &ExtractionBatch,
+        revisions: &[RevisionNumber],
+        capture: &SealedProviderCaptureSetReceipt,
+    ) -> Result<Self, ArrowConversionError> {
+        Self::try_from_extraction_batch_with_revisions(extraction, Some(revisions), Some(capture))
     }
 
     fn try_from_extraction_batch_with_revisions(
         extraction: &ExtractionBatch,
         revisions: Option<&[RevisionNumber]>,
+        capture: Option<&SealedProviderCaptureSetReceipt>,
     ) -> Result<Self, ArrowConversionError> {
         let original_observations = Self::validated_extraction_observations(extraction)?;
         if revisions.is_some_and(|values| values.len() != original_observations.len()) {
             return Err(ArrowConversionError::RevisionAssignmentMismatch);
+        }
+        let capture_lineage = capture
+            .map(|capture| provider_capture_lineage(extraction, capture))
+            .transpose()?;
+        if matches!(
+            extraction.request().object().capture_identity(),
+            SourceObjectCaptureIdentity::Paged { .. }
+        ) != capture_lineage.is_some()
+        {
+            return Err(ArrowConversionError::ProviderCaptureRequired);
         }
         let request = serde_json::to_vec(extraction.request())?;
         let request_digest =
@@ -195,7 +242,9 @@ impl ResearchArrowBatch {
                 None => original,
             };
             lineages.push(RowLineage::Extraction(Box::new(ExtractionRowLineage {
-                schema_version: if assignment.is_some() {
+                schema_version: if capture_lineage.is_some() {
+                    CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                } else if assignment.is_some() {
                     EXTRACTION_LINEAGE_SCHEMA_VERSION
                 } else {
                     LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION
@@ -216,6 +265,7 @@ impl ResearchArrowBatch {
                 revision: record.revision().clone(),
                 superseded_time: record.superseded_time().cloned(),
                 revision_assignment: assignment,
+                provider_capture: capture_lineage.clone(),
             })));
             observations.push(observation);
         }
@@ -418,16 +468,8 @@ impl ResearchArrowBatch {
             qualities.push(quality_name(provenance.quality()));
             let value = analytical_value(observation);
             value_states.push(value.state);
-            missing_markers.push(
-                value
-                    .missing_marker
-                    .map(|marker| marker.as_str().to_owned()),
-            );
-            missing_reasons.push(
-                value
-                    .missing_reason
-                    .map(|reason| reason.as_str().to_owned()),
-            );
+            missing_markers.push(value.missing_marker.map(str::to_owned));
+            missing_reasons.push(value.missing_reason.map(str::to_owned));
             mantissas.push(value.decimal.map(|decimal| decimal.mantissa()));
             scales.push(
                 value
@@ -435,12 +477,17 @@ impl ResearchArrowBatch {
                     .map(|decimal| u8::try_from(decimal.scale()))
                     .transpose()?,
             );
-            units.push(value.unit.map(|unit| unit.as_str().to_owned()));
+            units.push(value.unit.map(str::to_owned));
             currencies.push(
                 value
-                    .unit
-                    .filter(|unit| is_currency(unit.as_str()))
-                    .map(|unit| unit.as_str().to_owned()),
+                    .currency
+                    .map(|currency| currency.as_str().to_owned())
+                    .or_else(|| {
+                        value
+                            .unit
+                            .filter(|unit| is_currency(unit))
+                            .map(|unit| (*unit).to_owned())
+                    }),
             );
         }
 
@@ -705,7 +752,7 @@ impl ResearchArrowBatch {
             return Err(ArrowConversionError::InvalidSchema);
         }
         let mut hash = Sha256::new();
-        hash.update(b"market-squawk/research-row-lineage/v2");
+        hash.update(b"market-squawk/research-row-lineage/v3");
         for ((request_digest, lineage), payload_digest) in
             request_digests.iter().zip(lineages).zip(payload_digests)
         {
@@ -903,6 +950,60 @@ impl From<ResearchArrowBatch> for DatasetArrowBatch {
     }
 }
 
+fn provider_capture_lineage(
+    extraction: &ExtractionBatch,
+    sealed: &SealedProviderCaptureSetReceipt,
+) -> Result<ProviderCaptureRowLineage, ArrowConversionError> {
+    let capture = sealed.capture();
+    let segment = sealed.segment();
+    let object = extraction.request().object();
+    let page_count = u16::try_from(capture.pages().len())
+        .map_err(|_| ArrowConversionError::ExtractionBindingMismatch)?;
+    let expected_capture = SourceObjectCaptureIdentity::try_from_capture(capture)
+        .map_err(|_| ArrowConversionError::ExtractionBindingMismatch)?;
+    if page_count == 0
+        || capture.source_id() != object.source_id()
+        || capture.metadata_revision() != object.metadata_revision()
+        || capture.dataset() != object.dataset()
+        || object.evidence().content_digest() != capture.content_digest()
+        || object.expected_bytes() != Some(capture.total_body_bytes())
+        || object.capture_identity() != expected_capture
+        || segment.frames().len() != capture.pages().len()
+    {
+        return Err(ArrowConversionError::ExtractionBindingMismatch);
+    }
+    Ok(ProviderCaptureRowLineage {
+        receipt_digest: sealed.receipt_digest(),
+        capture_content_digest: capture.content_digest(),
+        capture_observation_digest: capture.observation_digest(),
+        request_set_identity: capture.request_set_identity(),
+        terminal: capture.terminal(),
+        page_count,
+        total_body_bytes: capture.total_body_bytes(),
+        sealed_relative_reference: segment.relative_reference().into(),
+        sealed_content_digest: segment.content_digest(),
+        sealed_size_bytes: segment.size_bytes(),
+        sealed_physical_receipt_digest: segment.physical_receipt_digest(),
+    })
+}
+
+fn valid_provider_capture_lineage(lineage: &ProviderCaptureRowLineage) -> bool {
+    lineage.page_count != 0
+        && lineage.total_body_bytes != 0
+        && !lineage.sealed_relative_reference.is_empty()
+        && lineage.sealed_size_bytes != 0
+        && [
+            lineage.receipt_digest,
+            lineage.capture_content_digest,
+            lineage.capture_observation_digest,
+            lineage.request_set_identity,
+            lineage.sealed_content_digest,
+            lineage.sealed_physical_receipt_digest,
+        ]
+        .into_iter()
+        .all(|digest| digest.algorithm() == DigestAlgorithm::Sha256 && digest.bytes() != [0; 32])
+}
+
 fn validate_row_lineage(
     lineage: &RowLineage,
     dataset: &SourceIdentifier,
@@ -910,6 +1011,7 @@ fn validate_row_lineage(
     observation: &ResearchObservation,
     payload: &[u8],
 ) -> Result<(), ArrowConversionError> {
+    validate_research_payload_contract(observation, payload)?;
     let context = observation_context(observation);
     let provenance = context.provenance();
     let time = context.time();
@@ -917,7 +1019,9 @@ fn validate_row_lineage(
         RowLineage::Extraction(lineage) => {
             matches!(
                 lineage.schema_version,
-                LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION | EXTRACTION_LINEAGE_SCHEMA_VERSION
+                LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                    | EXTRACTION_LINEAGE_SCHEMA_VERSION
+                    | CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION
             ) && lineage.source_id == *provenance.source_id()
                 && lineage.dataset == *dataset
                 && lineage.request_digest.algorithm() == DigestAlgorithm::Sha256
@@ -927,10 +1031,20 @@ fn validate_row_lineage(
                 && lineage.published_time.as_ref() == time.published()
                 && availability_basis_matches(&lineage.availability, provenance.availability())
                 && lineage.superseded_time.as_ref() == time.superseded()
+                && match &lineage.provider_capture {
+                    Some(capture) => {
+                        lineage.schema_version == CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                            && valid_provider_capture_lineage(capture)
+                    }
+                    None => lineage.schema_version != CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION,
+                }
                 && match &lineage.revision_assignment {
                     Some(assignment) => {
-                        lineage.schema_version == EXTRACTION_LINEAGE_SCHEMA_VERSION
-                            && assignment.assigned_revision == time.revision()
+                        matches!(
+                            lineage.schema_version,
+                            EXTRACTION_LINEAGE_SCHEMA_VERSION
+                                | CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                        ) && assignment.assigned_revision == time.revision()
                             && CanonicalObservationPayload::try_from_observation(observation)
                                 .is_ok_and(|semantic| {
                                     semantic.identity() == assignment.semantic_payload_identity
@@ -960,6 +1074,55 @@ fn validate_row_lineage(
     } else {
         Err(ArrowConversionError::ExtractionBindingMismatch)
     }
+}
+
+fn validate_research_payload_contract(
+    observation: &ResearchObservation,
+    payload: &[u8],
+) -> Result<(), ArrowConversionError> {
+    let contract = research_payload_contract_for(observation);
+    let envelope: ResearchObservationEnvelopeTag<'_> = serde_json::from_slice(payload)?;
+    if envelope.observation != contract.json_tag() {
+        return Err(ArrowConversionError::PayloadContractMismatch);
+    }
+    let semantic_payload = CanonicalObservationPayload::try_from_observation(observation)
+        .map_err(ArrowConversionError::PayloadContractEncoding)?;
+    if semantic_payload_tag(semantic_payload.exact_bytes()) != Some(contract.semantic_tag()) {
+        return Err(ArrowConversionError::PayloadContractMismatch);
+    }
+    Ok(())
+}
+
+fn semantic_payload_tag(payload: &[u8]) -> Option<u8> {
+    const MAGIC: &[u8] = b"MSQPIT";
+    const IDENTITY_SCHEMA_VERSION: u16 = 2;
+    const DOMAIN: &[u8] = b"market-squawk/pit/payload";
+
+    let version_start = MAGIC.len();
+    let domain_length_start = version_start.checked_add(size_of::<u16>())?;
+    let domain_start = domain_length_start.checked_add(size_of::<u64>())?;
+    if payload.get(..version_start)? != MAGIC
+        || u16::from_le_bytes(
+            payload
+                .get(version_start..domain_length_start)?
+                .try_into()
+                .ok()?,
+        ) != IDENTITY_SCHEMA_VERSION
+    {
+        return None;
+    }
+    let domain_length = usize::try_from(u64::from_le_bytes(
+        payload
+            .get(domain_length_start..domain_start)?
+            .try_into()
+            .ok()?,
+    ))
+    .ok()?;
+    let tag_index = domain_start.checked_add(domain_length)?;
+    if payload.get(domain_start..tag_index)? != DOMAIN {
+        return None;
+    }
+    payload.get(tag_index).copied()
 }
 
 #[derive(Debug)]
@@ -1064,9 +1227,18 @@ pub enum ArrowConversionError {
     /// Durable assignments were not aligned one-for-one with normalized extraction records.
     #[error("durable revision assignments do not match the extraction batch")]
     RevisionAssignmentMismatch,
+    /// A paged provider extraction omitted its exact verified sealed-capture receipt.
+    #[error("paged provider extraction requires a verified sealed-capture receipt")]
+    ProviderCaptureRequired,
     /// Exact observed-revision evidence could not be constructed.
     #[error("observed revision authority rejected canonical evidence")]
     RevisionAuthority(market_squawk_sources::ObservedRevisionError),
+    /// An observation could not be represented by its registered semantic payload encoder.
+    #[error("canonical research payload encoding does not match the registered contract")]
+    PayloadContractEncoding(#[source] market_squawk_sources::ObservedRevisionError),
+    /// The JSON discriminator or PIT semantic tag disagreed with the closed payload contract.
+    #[error("canonical research payload tag does not match the registered contract")]
+    PayloadContractMismatch,
     /// Rebinding a retained canonical observation exposed invalid source state.
     #[error("canonical observation revision rebinding failed")]
     Research(#[from] market_squawk_domain::ResearchError),
@@ -1119,6 +1291,8 @@ fn observation_context(observation: &ResearchObservation) -> &ResearchContext {
         ResearchObservation::Filing(value) => value.context(),
         ResearchObservation::Fundamental(value) => value.context(),
         ResearchObservation::Macro(value) => value.context(),
+        ResearchObservation::MarketBar(value) => value.context(),
+        ResearchObservation::FundNav(value) => value.context(),
         ResearchObservation::PortfolioPosition(value) => value.context(),
         ResearchObservation::Transaction(value) => value.context(),
         ResearchObservation::CorporateAction(value) => value.context(),
@@ -1128,24 +1302,16 @@ fn observation_context(observation: &ResearchObservation) -> &ResearchContext {
 }
 
 const fn observation_kind(observation: &ResearchObservation) -> &'static str {
-    match observation {
-        ResearchObservation::Filing(_) => "filing",
-        ResearchObservation::Fundamental(_) => "fundamental",
-        ResearchObservation::Macro(_) => "macro",
-        ResearchObservation::PortfolioPosition(_) => "portfolio_position",
-        ResearchObservation::Transaction(_) => "transaction",
-        ResearchObservation::CorporateAction(_) => "corporate_action",
-        ResearchObservation::UniverseMembership(_) => "universe_membership",
-        ResearchObservation::AlternativeData(_) => "alternative_data",
-    }
+    research_payload_contract_for(observation).json_tag()
 }
 
 struct AnalyticalValue<'a> {
     state: &'static str,
     decimal: Option<Decimal>,
-    unit: Option<&'a SourceIdentifier>,
-    missing_marker: Option<&'a SourceIdentifier>,
-    missing_reason: Option<&'a SourceIdentifier>,
+    unit: Option<&'a str>,
+    currency: Option<Currency>,
+    missing_marker: Option<&'a str>,
+    missing_reason: Option<&'a str>,
 }
 
 fn analytical_value(observation: &ResearchObservation) -> AnalyticalValue<'_> {
@@ -1153,7 +1319,8 @@ fn analytical_value(observation: &ResearchObservation) -> AnalyticalValue<'_> {
         ResearchObservation::Fundamental(value) => AnalyticalValue {
             state: "observed",
             decimal: Some(value.value()),
-            unit: Some(value.unit()),
+            unit: Some(value.unit().as_str()),
+            currency: None,
             missing_marker: None,
             missing_reason: None,
         },
@@ -1161,14 +1328,16 @@ fn analytical_value(observation: &ResearchObservation) -> AnalyticalValue<'_> {
             Some(missing) => AnalyticalValue {
                 state: "missing",
                 decimal: None,
-                unit: Some(value.unit()),
-                missing_marker: Some(missing.marker()),
-                missing_reason: missing.reason(),
+                unit: Some(value.unit().as_str()),
+                currency: None,
+                missing_marker: Some(missing.marker().as_str()),
+                missing_reason: missing.reason().map(SourceIdentifier::as_str),
             },
             None => AnalyticalValue {
                 state: "observed",
                 decimal: value.value().observed_value(),
-                unit: Some(value.unit()),
+                unit: Some(value.unit().as_str()),
+                currency: None,
                 missing_marker: None,
                 missing_reason: None,
             },
@@ -1176,17 +1345,55 @@ fn analytical_value(observation: &ResearchObservation) -> AnalyticalValue<'_> {
         ResearchObservation::AlternativeData(value) => AnalyticalValue {
             state: "observed",
             decimal: Some(value.value()),
-            unit: value.unit(),
+            unit: value.unit().map(SourceIdentifier::as_str),
+            currency: None,
             missing_marker: None,
             missing_reason: None,
+        },
+        ResearchObservation::MarketBar(value) => AnalyticalValue {
+            state: "observed",
+            decimal: Some(value.close().amount()),
+            unit: None,
+            currency: Some(value.currency()),
+            missing_marker: None,
+            missing_reason: None,
+        },
+        ResearchObservation::FundNav(value) => match value.value() {
+            market_squawk_domain::FundNavValue::Observed(money) => AnalyticalValue {
+                state: "observed",
+                decimal: Some(money.amount()),
+                unit: Some("per_share"),
+                currency: Some(money.currency()),
+                missing_marker: None,
+                missing_reason: None,
+            },
+            market_squawk_domain::FundNavValue::Missing(missing) => AnalyticalValue {
+                state: "missing",
+                decimal: None,
+                unit: Some("per_share"),
+                currency: Some(value.currency()),
+                missing_marker: Some(fund_nav_missing_name(missing)),
+                missing_reason: None,
+            },
         },
         _ => AnalyticalValue {
             state: "not_applicable",
             decimal: None,
             unit: None,
+            currency: None,
             missing_marker: None,
             missing_reason: None,
         },
+    }
+}
+
+const fn fund_nav_missing_name(missing: market_squawk_domain::FundNavMissingState) -> &'static str {
+    match missing {
+        market_squawk_domain::FundNavMissingState::NotYetPublished => "not_yet_published",
+        market_squawk_domain::FundNavMissingState::Unsupported => "unsupported",
+        market_squawk_domain::FundNavMissingState::SourceMissing => "source_missing",
+        market_squawk_domain::FundNavMissingState::Invalid => "invalid",
+        market_squawk_domain::FundNavMissingState::Unavailable => "unavailable",
     }
 }
 

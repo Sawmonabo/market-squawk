@@ -4,18 +4,22 @@ use std::str::FromStr;
 
 use market_squawk_domain::{
     AggressorSide, AlternativeDataObservation, AuctionEvent, AuctionPhase, AvailabilityEvidence,
-    BookDeltaEvent, BookLevel, BookSnapshotEvent, CorporateActionEvent, CorporateActionKind,
-    CorporateActionObservation, CoverageStatus, Currency, DataQuality, DecodedLiveProvenanceInput,
-    DigestAlgorithm, EvidenceDigest, FilingObservation, FundamentalObservation, HaltTransition,
-    InstrumentId, InstrumentStatusEvent, LiveEventClass, LiveProvenance, MacroMissingValue,
-    MacroObservation, MarketDepth, MarketEvent, MarketEventError, MarketSide, MergerConsideration,
-    Money, NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
-    NormalizedPortfolioTransactionError, NormalizedPortfolioTransactionEvidence,
-    NormalizedPortfolioTransactionEvidenceInput, PayloadReference, PositionObservation,
-    PositionSide, PriceTicks, QuantityLots, QuoteEvent, ResearchContext, ResearchError,
-    ResearchObservation, ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber,
-    SourceId, SourceIdentifier, Timestamp, TradeEvent, TradingHaltEvent, TradingStatus,
-    TransactionObservation,
+    BookDeltaEvent, BookLevel, BookSnapshotEvent, CalendarDate, CorporateActionEvent,
+    CorporateActionKind, CorporateActionObservation, CoverageStatus, Currency, DataQuality,
+    DecodedLiveProvenanceInput, DigestAlgorithm, EvidenceDigest, FilingObservation,
+    FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
+    FundamentalDimensionContext, FundamentalFactContext, FundamentalFactContextInput,
+    FundamentalObservation, FundamentalPeriod, FundamentalRestatementStatus,
+    FundamentalRevisionOrder, HaltTransition, InstrumentId, InstrumentStatusEvent, LiveEventClass,
+    LiveProvenance, MacroMissingValue, MacroObservation, MarketDepth, MarketEvent,
+    MarketEventError, MarketSide, MergerConsideration, Money, NormalizedPortfolioLotMethod,
+    NormalizedPortfolioTransactionClass, NormalizedPortfolioTransactionError,
+    NormalizedPortfolioTransactionEvidence, NormalizedPortfolioTransactionEvidenceInput,
+    PayloadReference, PositionObservation, PositionSide, PriceTicks, QuantityLots, QuoteEvent,
+    ResearchContext, ResearchError, ResearchObservation, ResearchProvenance,
+    ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber,
+    SchemaVersion, SourceId, SourceIdentifier, Timestamp, TradeEvent, TradingHaltEvent,
+    TradingStatus, TransactionObservation,
 };
 use rust_decimal::Decimal;
 
@@ -70,6 +74,43 @@ fn research_context(instrument: bool) -> Result<ResearchContext, Box<dyn Error>>
         )?,
     )
     .map_err(Into::into)
+}
+
+fn fundamental_fixture() -> Result<(ResearchContext, FundamentalFactContext), Box<dyn Error>> {
+    let start = CalendarDate::new(2025, 1, 1)?;
+    let end = CalendarDate::new(2025, 12, 31)?;
+    let revision = RevisionNumber::new(1)?;
+    let context = ResearchContext::new(
+        research_context(true)?.provenance().clone(),
+        ResearchTime::try_new_with_coordinates(
+            ResearchTemporalCoordinate::calendar_date(end),
+            None,
+            revision,
+            None,
+        )?,
+    )?;
+    let fact_context = FundamentalFactContext::try_new(FundamentalFactContextInput {
+        schema_version: SchemaVersion::CURRENT,
+        period: FundamentalPeriod::duration(start, end)?,
+        unit: SourceIdentifier::try_from("USD")?,
+        accession: SourceIdentifier::try_from("record-7")?,
+        filing_form: None,
+        amendment_status: FundamentalAmendmentStatus::Unavailable,
+        filed_on: None,
+        frame: None,
+        fiscal_year: None,
+        fiscal_period: None,
+        cadence: FundamentalCadence::Unavailable,
+        xbrl_context_id: None,
+        dimensions: FundamentalDimensionContext::unavailable(),
+        consolidation: FundamentalConsolidation::Unavailable,
+        revision_order: FundamentalRevisionOrder::new(
+            revision,
+            SourceIdentifier::try_from("historical-file-order-v1")?,
+        ),
+        restatement_status: FundamentalRestatementStatus::Unavailable,
+    })?;
+    Ok((context, fact_context))
 }
 
 #[test]
@@ -239,11 +280,12 @@ fn canonical_research_family_has_non_marker_payloads() -> Result<(), Box<dyn Err
         SourceIdentifier::try_from("10-K")?,
         SourceIdentifier::try_from("0000320193-26-000001")?,
     )?);
+    let (fundamental_context, fact_context) = fundamental_fixture()?;
     let fundamental = ResearchObservation::Fundamental(FundamentalObservation::new(
-        research_context(true)?,
+        fundamental_context,
         SourceIdentifier::try_from("Revenue")?,
         Decimal::new(1_234, 0),
-        SourceIdentifier::try_from("USD")?,
+        fact_context,
     )?);
     let macro_observation = ResearchObservation::Macro(MacroObservation::new(
         research_context(false)?,
@@ -546,11 +588,12 @@ fn research_payload_fields_are_available_through_typed_views() -> Result<(), Box
         SourceIdentifier::try_from("10-Q")?,
         SourceIdentifier::try_from("accession-1")?,
     )?;
+    let (fundamental_context, fact_context) = fundamental_fixture()?;
     let fundamental = FundamentalObservation::new(
-        research_context(true)?,
+        fundamental_context,
         SourceIdentifier::try_from("Assets")?,
         Decimal::new(42, 0),
-        SourceIdentifier::try_from("USD")?,
+        fact_context,
     )?;
     let macro_observation = MacroObservation::new(
         research_context(false)?,

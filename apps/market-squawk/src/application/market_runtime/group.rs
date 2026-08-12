@@ -33,6 +33,10 @@ use crate::{
 };
 
 use super::{
+    alpaca_historical::{
+        AlpacaHistoricalCapabilityError, AlpacaHistoricalCapabilityOwner,
+        AlpacaHistoricalRuntimeCapability,
+    },
     configuration::{
         AccountMarketSurface, PreparedMarketProviderConfigurationRequest,
         validate_resolved_configuration,
@@ -135,7 +139,12 @@ impl AccountMarketRuntimeGroup {
         cancellation: &CancellationToken,
     ) -> Result<Self, ServiceError> {
         validate_resolved_configuration(request, &prepared)?;
-        let generation = MarketRuntimeGroupGeneration::try_from_prepared(request, &prepared)?;
+        let runtime_incarnation = Uuid::new_v4();
+        let generation = MarketRuntimeGroupGeneration::try_from_prepared(
+            request,
+            &prepared,
+            runtime_incarnation,
+        )?;
         let evidence = MarketProviderGroupLifecycleEvidence {
             surface_id: SourceIdentifier::try_from(request.surface().surface_id())
                 .map_err(|_error| ServiceError::ResourceExhausted)?,
@@ -197,6 +206,7 @@ impl AccountMarketRuntimeGroup {
             }
         };
         if let Err(error) = ensure_before(deadline, cancellation) {
+            runtime.begin_shutdown();
             group_cancellation.cancel();
             if let Err(cleanup_error) = runtime.shutdown().await {
                 tracing::error!(%cleanup_error, "account-market post-start cleanup failed");
@@ -204,6 +214,7 @@ impl AccountMarketRuntimeGroup {
             return Err(error);
         }
         if group_cancellation.is_cancelled() || !runtime.is_healthy() {
+            runtime.begin_shutdown();
             group_cancellation.cancel();
             runtime.shutdown().await?;
             return Err(ServiceError::Unavailable);
@@ -300,7 +311,31 @@ impl AccountMarketRuntimeGroup {
             .is_some_and(|current| Arc::ptr_eq(current, descriptor))
     }
 
+    pub(super) fn alpaca_historical_capability(
+        &self,
+    ) -> Result<Option<AlpacaHistoricalRuntimeCapability>, AlpacaHistoricalCapabilityError> {
+        match &self.runtime {
+            AccountMarketRuntime::Alpaca(runtime) => runtime.historical_capability().map(Some),
+            AccountMarketRuntime::Tradier(_) | AccountMarketRuntime::KrakenLevel3(_) => Ok(None),
+        }
+    }
+
+    pub(super) fn owns_alpaca_historical_capability(
+        &self,
+        capability: &AlpacaHistoricalRuntimeCapability,
+    ) -> bool {
+        match &self.runtime {
+            AccountMarketRuntime::Alpaca(runtime) => runtime.owns_historical_capability(capability),
+            AccountMarketRuntime::Tradier(_) | AccountMarketRuntime::KrakenLevel3(_) => false,
+        }
+    }
+
+    pub(super) fn begin_shutdown(&self) {
+        self.runtime.begin_shutdown();
+    }
+
     pub(super) async fn shutdown(self) -> Result<(), ServiceError> {
+        self.begin_shutdown();
         self.runtime.shutdown().await
     }
 }
@@ -332,6 +367,12 @@ impl AccountMarketRuntime {
         }
     }
 
+    fn begin_shutdown(&self) {
+        if let Self::Alpaca(runtime) = self {
+            runtime.begin_shutdown();
+        }
+    }
+
     async fn shutdown(self) -> Result<(), ServiceError> {
         match self {
             Self::Alpaca(runtime) => runtime.shutdown().await,
@@ -345,9 +386,10 @@ impl AccountMarketRuntime {
 }
 
 struct AlpacaRuntimeGroup {
-    _activation: AlpacaBasicAccountActivation,
-    iex: ProductionDisplaySourceRuntime,
+    historical: AlpacaHistoricalCapabilityOwner,
     options: Option<ProductionDisplaySourceRuntime>,
+    iex: ProductionDisplaySourceRuntime,
+    _activation: AlpacaBasicAccountActivation,
 }
 
 impl AlpacaRuntimeGroup {
@@ -359,13 +401,29 @@ impl AlpacaRuntimeGroup {
                 .is_none_or(ProductionDisplaySourceRuntime::is_healthy)
     }
 
+    fn historical_capability(
+        &self,
+    ) -> Result<AlpacaHistoricalRuntimeCapability, AlpacaHistoricalCapabilityError> {
+        self.historical.issue()
+    }
+
+    fn owns_historical_capability(&self, capability: &AlpacaHistoricalRuntimeCapability) -> bool {
+        self.historical.owns(capability)
+    }
+
+    fn begin_shutdown(&self) {
+        self.historical.begin_shutdown();
+    }
+
     async fn shutdown(self) -> Result<(), ServiceError> {
         let Self {
             _activation,
+            historical,
             iex,
             options,
         } = self;
         let mut failure = None;
+        retain_shutdown_error(&mut failure, historical.shutdown().await);
         if let Some(options) = options {
             retain_shutdown_error(
                 &mut failure,
@@ -492,6 +550,8 @@ async fn start_alpaca(
     .await?;
     activation_guard.disarm();
     let credentials = activation.credentials();
+    let historical =
+        AlpacaHistoricalCapabilityOwner::try_new(&activation, group_cancellation.child_token())?;
     let iex_config = activation
         .take_iex_config()
         .ok_or(ServiceError::Unavailable)?;
@@ -534,6 +594,7 @@ async fn start_alpaca(
                     Some(runtime)
                 }
                 Err(error) => {
+                    historical.begin_shutdown();
                     group_cancellation.cancel();
                     cleanup_display_runtime(iex, "Alpaca IEX partial-start cleanup").await;
                     return Err(error);
@@ -541,12 +602,14 @@ async fn start_alpaca(
             }
         }
         Some(_unexpected) => {
+            historical.begin_shutdown();
             group_cancellation.cancel();
             cleanup_display_runtime(iex, "Alpaca IEX invalid-topology cleanup").await;
             return Err(ServiceError::Unavailable);
         }
         None if !options_expected => None,
         None => {
+            historical.begin_shutdown();
             group_cancellation.cancel();
             cleanup_display_runtime(iex, "Alpaca IEX invalid-topology cleanup").await;
             return Err(ServiceError::Unavailable);
@@ -555,6 +618,7 @@ async fn start_alpaca(
     Ok((
         AlpacaRuntimeGroup {
             _activation: activation,
+            historical,
             iex,
             options,
         },

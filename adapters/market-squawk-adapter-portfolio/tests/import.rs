@@ -370,6 +370,7 @@ fn observation_revision(observation: &ResearchObservation) -> RevisionNumber {
         ResearchObservation::Filing(value) => value.context().time().revision(),
         ResearchObservation::Fundamental(value) => value.context().time().revision(),
         ResearchObservation::Macro(value) => value.context().time().revision(),
+        ResearchObservation::MarketBar(value) => value.context().time().revision(),
         ResearchObservation::PortfolioPosition(value) => value.context().time().revision(),
         ResearchObservation::Transaction(value) => value.context().time().revision(),
         ResearchObservation::CorporateAction(value) => value.context().time().revision(),

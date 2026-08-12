@@ -15,9 +15,11 @@ use market_squawk_sources::{
     BackoffPolicy, BudgetScope, BudgetWindowSemantics, CoverageDomain, DiscoveryRequest,
     EndpointPolicy, ExtractionAuthority, ExtractionAuthorityError, ExtractionRequest,
     ExtractionSource, ExtractionSourceError, FreshnessPolicy, HistoricalCapability,
-    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow, SourceCapabilities,
-    SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
+    ProviderCaptureTerminalDisposition, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::{BlsSource, PageCache, RetrievedBlsPage, exact_evidence, parse_object_id};
@@ -82,14 +84,10 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
     let now = system_timestamp()?;
     let config = source_config()?;
     let transport = Arc::new(ScriptedTransport {
-        responses: Mutex::new(VecDeque::from([BlsHttpResponse {
-            status: 200,
-            retry_after: None,
-            content_encoding: None,
-            content_type: Some(b"application/json".to_vec()),
-            body: Bytes::from_static(COMPLETE_RESPONSE),
-            received_at: now,
-        }])),
+        responses: Mutex::new(VecDeque::from([
+            complete_http_response(now),
+            complete_http_response(now),
+        ])),
         request_count: Mutex::new(0),
     });
     let invalid_metadata = source_metadata(now, &config, false)?;
@@ -121,19 +119,68 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
         .first()
         .ok_or("missing BLS source object")?
         .clone();
-    let extraction = source
-        .extract(
-            authority,
-            ExtractionRequest::try_new(
-                object,
-                NonZeroU32::new(10).ok_or("nonzero record bound")?,
-                NonZeroU64::new(1024 * 1024).ok_or("nonzero byte bound")?,
-                deadline,
-            )?,
-            CancellationToken::new(),
-        )
+    let extraction_request = ExtractionRequest::try_new(
+        object,
+        NonZeroU32::new(10).ok_or("nonzero record bound")?,
+        NonZeroU64::new(1024 * 1024).ok_or("nonzero byte bound")?,
+        deadline,
+    )?;
+    assert!(matches!(
+        source
+            .extract(
+                authority.clone(),
+                extraction_request.clone(),
+                CancellationToken::new(),
+            )
+            .await,
+        Err(ExtractionSourceError::Source(
+            market_squawk_sources::SourceError::InvalidProtocolState
+        ))
+    ));
+    let normalized = source
+        .normalized_page(&authority, &extraction_request, CancellationToken::new())
         .await?;
-    let revisions = source.revision_plan(&extraction)?;
+    assert_eq!(
+        normalized.capture_material().records()[0].payload(),
+        COMPLETE_RESPONSE
+    );
+    let output = source
+        .extract_with_capture(authority, extraction_request, CancellationToken::new())
+        .await?;
+    let capture = output.capture_material();
+    let capture_receipt = capture.receipt();
+    assert_eq!(capture_receipt.source_id().as_str(), "bls-public-test");
+    assert_eq!(capture_receipt.dataset(), source.dataset());
+    assert_eq!(
+        capture_receipt.terminal(),
+        ProviderCaptureTerminalDisposition::StandaloneResponse
+    );
+    assert_eq!(
+        capture_receipt.total_body_bytes(),
+        u64::try_from(COMPLETE_RESPONSE.len())?
+    );
+    assert_eq!(capture_receipt.pages().len(), 1);
+    let page_receipt = &capture_receipt.pages()[0];
+    assert_eq!(page_receipt.ordinal(), 0);
+    assert_eq!(page_receipt.http_status(), 200);
+    assert_eq!(page_receipt.received_at(), now);
+    let expected_body_digest: [u8; 32] = Sha256::digest(COMPLETE_RESPONSE).into();
+    assert_eq!(page_receipt.body_digest().bytes(), expected_body_digest);
+    assert_eq!(capture.records().len(), 1);
+    let raw = &capture.records()[0];
+    assert_eq!(raw.source(), "bls-public-test");
+    assert_eq!(raw.source_sequence(), Some(0));
+    assert!(raw.exchange_at().is_none());
+    assert_eq!(
+        raw.received_at().timestamp_nanos_opt(),
+        Some(now.unix_nanos())
+    );
+    assert_eq!(raw.payload(), COMPLETE_RESPONSE);
+    assert!(!raw.event_id().is_nil());
+    assert!(!raw.connection_id().is_nil());
+
+    let extraction = output.batch();
+    let revisions = source.revision_plan(extraction)?;
     assert_eq!(extraction.records().len(), 1);
     assert!(revisions.is_locally_observed());
     let record = &extraction.records()[0];
@@ -182,7 +229,7 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
             .request_count
             .lock()
             .map_err(|_| "request log poisoned")?,
-        1
+        2
     );
     let health = source.health()?;
     assert!(health.last_attempt_at().is_some());
@@ -221,7 +268,7 @@ async fn authority_loss_during_completed_work_prevents_every_publication() -> Te
     source.queue_test_publication_action(None)?;
     source.queue_test_publication_action(Some(registry))?;
     let extraction = source
-        .extract(
+        .extract_with_capture(
             authority,
             extraction_request(object, deadline)?,
             CancellationToken::new(),
@@ -242,14 +289,10 @@ fn source_harness(
     let config = source_config()?;
     let metadata = source_metadata(now, &config, true)?;
     let transport = Arc::new(ScriptedTransport {
-        responses: Mutex::new(VecDeque::from([BlsHttpResponse {
-            status: 200,
-            retry_after: None,
-            content_encoding: None,
-            content_type: Some(b"application/json".to_vec()),
-            body: Bytes::from_static(COMPLETE_RESPONSE),
-            received_at: now,
-        }])),
+        responses: Mutex::new(VecDeque::from([
+            complete_http_response(now),
+            complete_http_response(now),
+        ])),
         request_count: Mutex::new(0),
     });
     let source = BlsSource::try_new_with_transport(metadata.clone(), config, transport)?;
@@ -262,6 +305,17 @@ fn source_harness(
         authority,
         now.checked_add_nanos(60_000_000_000)?,
     ))
+}
+
+fn complete_http_response(received_at: Timestamp) -> BlsHttpResponse {
+    BlsHttpResponse {
+        status: 200,
+        retry_after: None,
+        content_encoding: None,
+        content_type: Some(b"application/json".to_vec()),
+        body: Bytes::from_static(COMPLETE_RESPONSE),
+        received_at,
+    }
 }
 
 fn discovery_request(source: &BlsSource, deadline: Timestamp) -> TestResult<DiscoveryRequest> {

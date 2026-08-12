@@ -16,7 +16,7 @@ pub use client::{
 };
 pub use composite::SecCompositeBounds;
 pub use evidence_store::{RawEvidenceError, RawEvidenceStore};
-pub use extraction::SecExtractionResult;
+pub use extraction::{SecDiscoveryResult, SecExtractionResult};
 pub use json::{
     CompanyFactOccurrence, CompanyFactPeriod, CompanyFactsDocument, SecFiling, SecFormerName,
     SecParserError, SecParserLimits, SecSubmissionCompanyMetadata, SecTickerExchangePair,

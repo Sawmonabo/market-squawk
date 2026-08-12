@@ -18,8 +18,9 @@ import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 import {
-  allNavigation,
   navigationForPath,
+  navigationSectionForPath,
+  navigationSections,
 } from "@/lib/navigation"
 
 export function AppHeader() {
@@ -27,6 +28,7 @@ export function AppHeader() {
   const navigate = useNavigate()
   const product = useProduct()
   const current = navigationForPath(location.pathname)
+  const currentSection = navigationSectionForPath(location.pathname)
   const [open, setOpen] = React.useState(false)
 
   React.useEffect(() => {
@@ -67,19 +69,12 @@ export function AppHeader() {
         <SidebarTrigger className="mr-3 text-muted-foreground" />
         <Separator orientation="vertical" className="mr-3 h-4" />
         <div className="flex min-w-0 items-center gap-2 text-xs">
-          <span className="text-muted-foreground">
-            {current.path.startsWith("/updates") ||
-            current.path.startsWith("/backup") ||
-            current.path.startsWith("/logs") ||
-            current.path.startsWith("/settings")
-              ? "Operations"
-              : current.label}
-          </span>
+          <span className="text-muted-foreground">{currentSection.label}</span>
           <span className="text-muted-foreground/50" aria-hidden="true">
             ›
           </span>
           <span className="truncate font-medium text-foreground">
-            {current.path === "/overview" ? "Welcome" : current.label}
+            {current.label}
           </span>
         </div>
         <button
@@ -174,9 +169,9 @@ export function AppHeader() {
         <CommandInput placeholder="Search Market Squawk…" />
         <CommandList>
           <CommandEmpty>No matching route.</CommandEmpty>
-          <CommandGroup heading="Product">
-            {allNavigation.map((item) => {
-              return (
+          {navigationSections.map((section) => (
+            <CommandGroup key={section.label} heading={section.label}>
+              {section.items.map((item) => (
                 <CommandItem
                   key={item.path}
                   value={item.label}
@@ -186,9 +181,9 @@ export function AppHeader() {
                   <span>{item.label}</span>
                   <CommandShortcut>Go</CommandShortcut>
                 </CommandItem>
-              )
-            })}
-          </CommandGroup>
+              ))}
+            </CommandGroup>
+          ))}
         </CommandList>
       </CommandDialog>
     </>

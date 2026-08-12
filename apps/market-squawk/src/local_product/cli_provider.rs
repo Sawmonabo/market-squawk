@@ -1026,7 +1026,7 @@ fn runtime_generation_digest(
     generation: &ResearchProviderRuntimeGeneration,
 ) -> Result<EvidenceDigest, CliProviderActivationError> {
     generation
-        .identity_digest()
+        .generation_digest()
         .map_err(ProviderAdapterActivationError::from)
         .map_err(CliProviderActivationError::Activation)
 }

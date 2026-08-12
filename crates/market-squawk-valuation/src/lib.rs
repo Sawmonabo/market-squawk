@@ -178,12 +178,17 @@ pub use measurement::{
     ActorId, CommittedMarketInputRequest, InputId, InputInstrumentRelation, InputObservability,
     InputSignificance, MarketAccess, MarketActivity, MarketActivityPolicy,
     MarketActivityPolicyHash, MarketPriceSelection, MeasurementId, PriceAdjustment,
-    ValuationAmount, ValuationInput, ValuationMeasurement, ValuationMeasurementSpec,
-    ValuationMethod,
+    ValuationAmount, ValuationAmountBasis, ValuationInput, ValuationMeasurement,
+    ValuationMeasurementSpec, ValuationMethod,
 };
 pub use rules::{
     ClassificationDecision, ClassificationRuleset, DecisionBasis, DecisionId, DecisionReason,
     DecisionReasonCode, Predicate, PredicateResult, RulesetHash,
+};
+pub use service::queries::{
+    FairValueSelectionDisposition, FairValueSelectionError, FairValueSelectionOrderEntry,
+    FairValueSelectionReceipt, FairValueSelectionReceiptHash, FairValueSelectionRequest,
+    SelectedFairValueEvidence,
 };
 pub use service::{
     AuditEventId, AuditEventKind, FairValueAuditCursor, FairValueAuditEvent, FairValueAuditPage,

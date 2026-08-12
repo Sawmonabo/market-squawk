@@ -263,8 +263,8 @@ export function firstResultEvidence(
   }
   if (!facts.overviewReady) {
     return unavailableEvidence(
-      "Overview owner data is unavailable",
-      `${facts.overviewError ?? "The Overview read failed."} No first result is inferred. Refresh owner evidence, then open Overview.`,
+      "Home owner data is unavailable",
+      `${facts.overviewError ?? "The Home read failed."} No first result is inferred. Refresh owner evidence, then open Home.`,
     )
   }
 
@@ -275,9 +275,9 @@ export function firstResultEvidence(
         facts.marketsReady,
         facts.marketResults > 0,
         "A verified public market result is available",
-        `${facts.marketResults} observed market trade result${facts.marketResults === 1 ? " is" : "s are"} available to Overview with source, time, and quality evidence.`,
+        `${facts.marketResults} observed market trade result${facts.marketResults === 1 ? " is" : "s are"} available to Home with source, time, and quality evidence.`,
         "The planned public market result is unavailable",
-        "No observed market trade is available. Finish every included provider outcome in Sources, refresh evidence, then open Overview.",
+        "No observed market trade is available. Finish every included provider outcome in Sources, refresh evidence, then open Home.",
       )
     case "point_in_time_research_result":
       return resultEvidence(
@@ -286,7 +286,7 @@ export function firstResultEvidence(
         "A point-in-time research result is available",
         `${facts.researchCount} durable research dataset${facts.researchCount === 1 ? " is" : "s are"} available with lineage evidence.`,
         "The planned research result is unavailable",
-        "No durable research dataset exists. Complete a controlled Research workflow, refresh evidence, then open Overview.",
+        "No durable research dataset exists. Complete a controlled Research workflow, refresh evidence, then open Home.",
       )
     case "reconciled_portfolio_summary":
       return resultEvidence(
@@ -295,7 +295,7 @@ export function firstResultEvidence(
         "A reconciled portfolio result is available",
         `${facts.reconciledPortfolioCount} portfolio account${facts.reconciledPortfolioCount === 1 ? " has" : "s have"} zero reconciliation discrepancies.`,
         "The planned portfolio result is unavailable",
-        "No reconciled portfolio account exists. Complete the controlled Portfolio import and reconciliation workflow, refresh evidence, then open Overview.",
+        "No reconciled portfolio account exists. Complete the controlled Portfolio import and reconciliation workflow, refresh evidence, then open Home.",
       )
     case "admitted_model_forecast":
       return resultEvidence(
@@ -304,7 +304,7 @@ export function firstResultEvidence(
         "An admitted-model forecast is available",
         `${facts.forecastCount} durable forecast${facts.forecastCount === 1 ? " is" : "s are"} available from the forecast owner.`,
         "The planned forecast result is unavailable",
-        "No admitted-model forecast exists. Verify the model runtime and complete a Models forecast workflow, refresh evidence, then open Overview.",
+        "No admitted-model forecast exists. Verify the model runtime and complete a Models forecast workflow, refresh evidence, then open Home.",
       )
     case "stopped_paper_and_risk_review":
       return resultEvidence(
@@ -313,7 +313,7 @@ export function firstResultEvidence(
         "A stopped paper and central-risk review is available",
         "The paper lifecycle is stopped and the installed Bot, Execution, and central Risk surface is closed and available.",
         "The planned paper and risk result is unavailable",
-        "Paper/risk owner evidence is not ready. Open Paper Execution and Risk, restore the stopped safe state, then refresh and open Overview.",
+        "Paper/risk owner evidence is not ready. Open Paper Execution and Risk, restore the stopped safe state, then refresh and open Home.",
       )
     case "verified_mcp_safe_read":
       return resultEvidence(
@@ -322,7 +322,7 @@ export function firstResultEvidence(
         "A verified MCP safe-read result is available",
         "At least one separately owned AI client has a real handshake, discovery, and bounded safe-read result.",
         "The planned MCP safe-read result is unavailable",
-        "Neither Claude Code nor Codex has a verified safe read. Complete one client's own MCP connect and verify workflow, then refresh and open Overview.",
+        "Neither Claude Code nor Codex has a verified safe read. Complete one client's own MCP connect and verify workflow, then refresh and open Home.",
       )
     default:
       return unavailableEvidence(

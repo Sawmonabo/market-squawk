@@ -5,6 +5,16 @@ use serde_json::{Map, Value, json};
 use crate::ToolArtifactPolicy;
 
 const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
+const UPPERCASE_CURRENCY_PATTERN: &str = "^[A-Z]{3}$";
+const LOWERCASE_SHA256_PATTERN: &str = "^[0-9a-f]{64}$";
+const LOWERCASE_IEEE754_HEX_PATTERN: &str = "^[0-9a-f]{16}$";
+const NANOSECOND_UTC_TIMESTAMP_PATTERN: &str =
+    "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{9}Z$";
+const CANONICAL_DECIMAL_PATTERN: &str = "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]*[1-9])?$";
+const POSITIVE_INTEGER_PATTERN: &str = "^[1-9][0-9]*$";
+const UNSIGNED_INTEGER_PATTERN: &str = "^[0-9]+$";
+const INTEGER_PATTERN: &str = "^-?[0-9]+$";
+const MEDIA_TYPE_PATTERN: &str = "^[A-Za-z0-9/.+\\-]+$";
 
 pub(crate) fn validate_data_schema(schema: &Value) -> bool {
     schema_definition_is_supported(schema, true)
@@ -163,6 +173,7 @@ fn schema_definition_is_supported(schema: &Value, root: bool) -> bool {
                 | "minProperties"
                 | "maxProperties"
                 | "format"
+                | "pattern"
                 | "description"
         )
     }) {
@@ -179,6 +190,7 @@ fn schema_definition_is_supported(schema: &Value, root: bool) -> bool {
     };
     type_is_supported
         && string_format_is_supported(schema, schema_type)
+        && string_pattern_is_supported(schema, schema_type)
         && numeric_keyword_is_number(schema, "minimum")
         && numeric_keyword_is_number(schema, "maximum")
         && unsigned_keyword_is_integer(schema, "minLength")
@@ -190,6 +202,25 @@ fn schema_definition_is_supported(schema: &Value, root: bool) -> bool {
         && schema
             .get("enum")
             .is_none_or(|values| values.as_array().is_some_and(|values| !values.is_empty()))
+}
+
+fn string_pattern_is_supported(schema: &Map<String, Value>, schema_type: &str) -> bool {
+    match schema.get("pattern") {
+        None => true,
+        Some(Value::String(pattern)) if schema_type == "string" => matches!(
+            pattern.as_str(),
+            UPPERCASE_CURRENCY_PATTERN
+                | LOWERCASE_SHA256_PATTERN
+                | LOWERCASE_IEEE754_HEX_PATTERN
+                | NANOSECOND_UTC_TIMESTAMP_PATTERN
+                | CANONICAL_DECIMAL_PATTERN
+                | POSITIVE_INTEGER_PATTERN
+                | UNSIGNED_INTEGER_PATTERN
+                | INTEGER_PATTERN
+                | MEDIA_TYPE_PATTERN
+        ),
+        Some(_) => false,
+    }
 }
 
 fn string_format_is_supported(schema: &Map<String, Value>, schema_type: &str) -> bool {
@@ -281,6 +312,7 @@ fn validate_instance(schema: &Value, value: &Value) -> bool {
                 schema.get("minLength"),
                 schema.get("maxLength"),
             ) && string_format_matches(schema.get("format"), value)
+                && string_pattern_matches(schema.get("pattern"), value)
         }),
         Some("integer") => {
             (value.as_i64().is_some() || value.as_u64().is_some())
@@ -303,6 +335,84 @@ fn validate_instance(schema: &Value, value: &Value) -> bool {
             .is_some_and(|value| validate_object_instance(schema, value)),
         _ => false,
     }
+}
+
+fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {
+    match pattern.and_then(Value::as_str) {
+        None => true,
+        Some(UPPERCASE_CURRENCY_PATTERN) => {
+            value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_uppercase())
+        }
+        Some(LOWERCASE_SHA256_PATTERN) => lowercase_hex_matches(value, 64),
+        Some(LOWERCASE_IEEE754_HEX_PATTERN) => lowercase_hex_matches(value, 16),
+        Some(NANOSECOND_UTC_TIMESTAMP_PATTERN) => nanosecond_utc_timestamp_matches(value),
+        Some(CANONICAL_DECIMAL_PATTERN) => canonical_decimal_matches(value),
+        Some(POSITIVE_INTEGER_PATTERN) => positive_integer_matches(value),
+        Some(UNSIGNED_INTEGER_PATTERN) => {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        Some(INTEGER_PATTERN) => integer_matches(value),
+        Some(MEDIA_TYPE_PATTERN) => {
+            !value.is_empty()
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'+' | b'-')
+                })
+        }
+        Some(_) => false,
+    }
+}
+
+fn lowercase_hex_matches(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn nanosecond_utc_timestamp_matches(value: &str) -> bool {
+    if value.len() != 30 {
+        return false;
+    }
+    value.bytes().enumerate().all(|(index, byte)| match index {
+        4 | 7 => byte == b'-',
+        10 => byte == b'T',
+        13 | 16 => byte == b':',
+        19 => byte == b'.',
+        29 => byte == b'Z',
+        _ => byte.is_ascii_digit(),
+    })
+}
+
+fn canonical_decimal_matches(value: &str) -> bool {
+    let unsigned = value.strip_prefix('-').unwrap_or(value);
+    let mut components = unsigned.split('.');
+    let Some(integer) = components.next() else {
+        return false;
+    };
+    let fraction = components.next();
+    if components.next().is_some()
+        || integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || (integer.len() > 1 && integer.starts_with('0'))
+    {
+        return false;
+    }
+    fraction.is_none_or(|fraction| {
+        !fraction.is_empty()
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+            && !fraction.ends_with('0')
+    })
+}
+
+fn positive_integer_matches(value: &str) -> bool {
+    value.as_bytes().split_first().is_some_and(|(first, rest)| {
+        (b'1'..=b'9').contains(first) && rest.iter().all(u8::is_ascii_digit)
+    })
+}
+
+fn integer_matches(value: &str) -> bool {
+    let unsigned = value.strip_prefix('-').unwrap_or(value);
+    !unsigned.is_empty() && unsigned.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn string_format_matches(format: Option<&Value>, value: &str) -> bool {
@@ -371,7 +481,9 @@ fn bounded_number(value: &Value, minimum: Option<&Value>, maximum: Option<&Value
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_data, validate_data_schema};
+    use super::{
+        CANONICAL_DECIMAL_PATTERN, LOWERCASE_SHA256_PATTERN, validate_data, validate_data_schema,
+    };
     use serde_json::json;
 
     #[test]
@@ -406,5 +518,29 @@ mod tests {
             &json!("2026-07-26T12:34:56.123456789Z")
         ));
         assert!(!validate_data(&timestamp_schema, &json!("2026-07-26")));
+
+        let sha256_schema = json!({
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": LOWERCASE_SHA256_PATTERN,
+        });
+        assert!(validate_data_schema(&sha256_schema));
+        assert!(validate_data(
+            &sha256_schema,
+            &json!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        ));
+        assert!(!validate_data(
+            &sha256_schema,
+            &json!("0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF")
+        ));
+
+        let decimal_schema = json!({"type": "string", "pattern": CANONICAL_DECIMAL_PATTERN});
+        assert!(validate_data_schema(&decimal_schema));
+        assert!(validate_data(&decimal_schema, &json!("-12.34")));
+        assert!(!validate_data(&decimal_schema, &json!("01.0")));
+        assert!(!validate_data_schema(
+            &json!({"type": "string", "pattern": "^.*$"})
+        ));
     }
 }

@@ -4,9 +4,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use market_squawk_domain::{
-    AssetClass, AuthorizationBasis, CoverageDelay, DataQuality, DigestAlgorithm, EffectiveInterval,
-    EvidenceDigest, ExactPayloadEvidence, InstrumentId, MetadataRevision,
-    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
+    AssetClass, AuthorizationBasis, BarTimeSemantics, BarTimestampBasis, CoverageDelay, Currency,
+    DataQuality, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
+    InstrumentId, MarketBarSessionEvidence, MarketBarSessionKind, MetadataRevision,
+    ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
+    VenueId,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, FreshnessPolicy,
@@ -16,7 +18,9 @@ use market_squawk_sources::{
 use crate::config::ALPACA_PROVIDER;
 use crate::{
     ALPACA_BASIC_EQUITY_SYMBOL_LIMIT, ALPACA_HISTORICAL_EXCLUSION_NANOS, AlpacaAdjustment,
-    AlpacaCredentials, AlpacaHistoricalEquityConfig, AlpacaHistoricalEquityDataset,
+    AlpacaCredentials, AlpacaHistoricalBarTimeAuthority, AlpacaHistoricalBarTimeRequest,
+    AlpacaHistoricalEquityConfig, AlpacaHistoricalEquityDatasetPlan,
+    AlpacaHistoricalEquityPreflightPlan, AlpacaHistoricalLookback, AlpacaHistoricalSeriesSemantics,
     AlpacaIexDecoder, AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionMapping,
     AlpacaOptionsDecoder, AlpacaOptionsLiveConfig, AlpacaTimeframe, AlpacaTransportLimits,
 };
@@ -120,22 +124,38 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
     let _decoder = AlpacaOptionsDecoder::try_new(&options)?;
     assert!(AlpacaOptionMapping::try_new("*".to_owned(), instrument(101)?).is_err());
 
-    let historical_dataset = AlpacaHistoricalEquityDataset::try_new(
-        identifier("alpaca:iex-bars:AAPL:1Day:2024")?,
-        mapping,
-        AlpacaTimeframe::day(),
-        Timestamp::from_unix_nanos(1_704_067_200_000_000_000),
-        Timestamp::from_unix_nanos(1_735_689_599_000_000_000),
-        AlpacaAdjustment::All,
-        NonZeroU16::new(1_000).ok_or("page limit must be nonzero")?,
+    let session = MarketBarSessionEvidence::try_new(
+        MarketBarSessionKind::Regular,
+        identifier("iex-regular-session-rules-2024")?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [10; 32]),
     )?;
+    let historical_dataset = AlpacaHistoricalEquityDatasetPlan::bind_preflight(
+        AlpacaHistoricalEquityPreflightPlan::try_new(
+            mapping.clone(),
+            AlpacaTimeframe::day(),
+            Timestamp::from_unix_nanos(1_735_690_500_000_000_000),
+            AlpacaHistoricalLookback::try_from_days(366)?,
+            AlpacaAdjustment::All,
+        )?,
+        AlpacaHistoricalSeriesSemantics::new(BarTimestampBasis::PeriodStart, session.clone()),
+    );
+    let later_window_same_series = AlpacaHistoricalEquityDatasetPlan::bind_preflight(
+        AlpacaHistoricalEquityPreflightPlan::try_new(
+            mapping,
+            AlpacaTimeframe::day(),
+            Timestamp::from_unix_nanos(1_735_776_900_000_000_000),
+            AlpacaHistoricalLookback::try_from_days(366)?,
+            AlpacaAdjustment::All,
+        )?,
+        AlpacaHistoricalSeriesSemantics::new(BarTimestampBasis::PeriodStart, session.clone()),
+    );
     let historical = AlpacaHistoricalEquityConfig::try_new(
         SourceId::try_from("alpaca-basic-history-test")?,
         revision("alpaca-basic-history-test-v1", 8)?,
         authorization.clone(),
         evidence(9),
         effective,
-        vec![historical_dataset],
+        vec![historical_dataset, later_window_same_series],
         freshness()?,
         budget(&authorization)?,
         HttpRequestBounds::default(),
@@ -150,7 +170,81 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
     );
     assert!(!historical.metadata().capabilities().live());
     assert!(historical.metadata().capabilities().extraction());
+    let provider_datasets = historical
+        .provider_dataset_identifiers()
+        .collect::<Vec<_>>();
+    assert_eq!(provider_datasets.len(), 2);
+    assert_ne!(provider_datasets[0], provider_datasets[1]);
+    for provider_dataset in &provider_datasets {
+        assert!(
+            provider_dataset
+                .as_str()
+                .starts_with("alpaca:historical-equity:v1:")
+        );
+        assert_eq!(provider_dataset.as_str().len(), 92);
+        assert!(!provider_dataset.as_str().contains("AAPL"));
+    }
+    let provider_instrument = ProviderInstrumentId::try_from("AAPL")?;
+    let currency = Currency::try_from("USD")?;
+    let first_analytical_dataset = historical
+        .dataset(provider_datasets[0])
+        .ok_or("registered historical dataset must exist")?
+        .analytical_dataset_identifier(historical.metadata(), &provider_instrument, currency)?;
+    let second_analytical_dataset = historical
+        .dataset(provider_datasets[1])
+        .ok_or("registered historical dataset must exist")?
+        .analytical_dataset_identifier(historical.metadata(), &provider_instrument, currency)?;
+    assert_eq!(first_analytical_dataset, second_analytical_dataset);
+    assert!(
+        first_analytical_dataset
+            .as_str()
+            .starts_with("alpaca.historical-equity.v1.")
+    );
+    assert_eq!(first_analytical_dataset.as_str().len(), 92);
+    assert!(!first_analytical_dataset.as_str().contains("AAPL"));
+
+    let provider_timestamp = Timestamp::from_unix_nanos(1_704_067_200_000_000_000);
+    let semantics = BarTimeSemantics::try_new(
+        provider_timestamp,
+        Timestamp::from_unix_nanos(1_704_153_600_000_000_000),
+        BarTimestampBasis::PeriodStart,
+        session,
+    )?;
+    let request = AlpacaHistoricalBarTimeRequest::new(
+        instrument(1)?,
+        VenueId::try_from("iex")?,
+        ProviderInstrumentId::try_from("AAPL")?,
+        identifier("1Day")?,
+        provider_timestamp,
+    );
+    let time_authority = DeterministicBarTimeAuthority {
+        expected: request.clone(),
+        semantics: semantics.clone(),
+    };
+    time_authority.validate_current()?;
+    assert_eq!(time_authority.resolve(&request)?, semantics);
     Ok(())
+}
+
+struct DeterministicBarTimeAuthority {
+    expected: AlpacaHistoricalBarTimeRequest,
+    semantics: BarTimeSemantics,
+}
+
+impl AlpacaHistoricalBarTimeAuthority for DeterministicBarTimeAuthority {
+    fn validate_current(&self) -> Result<(), crate::AlpacaError> {
+        Ok(())
+    }
+
+    fn resolve(
+        &self,
+        request: &AlpacaHistoricalBarTimeRequest,
+    ) -> Result<BarTimeSemantics, crate::AlpacaError> {
+        if request != &self.expected {
+            return Err(crate::AlpacaError::Protocol);
+        }
+        Ok(self.semantics.clone())
+    }
 }
 
 fn instrument(value: u128) -> TestResult<InstrumentId> {

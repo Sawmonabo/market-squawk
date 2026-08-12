@@ -1,7 +1,8 @@
 //! Stable identities for build specifications, selectors, policies, and output rows.
 
 use market_squawk_domain::{
-    AvailabilityEvidence, EvidenceDigest, ResearchTemporalCoordinate, SourceId, SourceIdentifier,
+    AvailabilityEvidence, EvidenceDigest, FundamentalPeriod, ResearchTemporalCoordinate, SourceId,
+    SourceIdentifier,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -238,18 +239,16 @@ fn encode_family(hash: &mut Sha256, family: &ObservationFamilyKey) {
         ObservationFamilyKey::Fundamental {
             source_id,
             instrument_id,
-            source_record,
             concept,
             unit,
-            effective,
+            period,
         } => {
             hash.update([2]);
             put_str(hash, source_id.as_str());
             hash.update(instrument_id.as_uuid().as_bytes());
-            put_str(hash, source_record.as_str());
             put_str(hash, concept.as_str());
             put_str(hash, unit.as_str());
-            encode_temporal(hash, effective);
+            encode_fundamental_period(hash, *period);
         }
         ObservationFamilyKey::Macro {
             source_id,
@@ -260,6 +259,73 @@ fn encode_family(hash: &mut Sha256, family: &ObservationFamilyKey) {
             put_str(hash, source_id.as_str());
             put_str(hash, series.as_str());
             encode_temporal(hash, effective);
+        }
+        ObservationFamilyKey::MarketBar {
+            source_id,
+            instrument_id,
+            venue_id,
+            provider_instrument_id,
+            feed,
+            interval,
+            adjustment,
+            timestamp_basis,
+            session,
+            effective,
+        } => {
+            hash.update([9]);
+            put_str(hash, source_id.as_str());
+            hash.update(instrument_id.as_uuid().as_bytes());
+            put_str(hash, venue_id.as_str());
+            put_str(hash, provider_instrument_id.as_str());
+            put_str(hash, feed.as_str());
+            put_str(hash, interval.as_str());
+            hash.update([match adjustment {
+                market_squawk_domain::MarketBarAdjustment::Raw => 1,
+                market_squawk_domain::MarketBarAdjustment::Split => 2,
+                market_squawk_domain::MarketBarAdjustment::Dividend => 3,
+                market_squawk_domain::MarketBarAdjustment::SpinOff => 4,
+                market_squawk_domain::MarketBarAdjustment::All => 5,
+            }]);
+            hash.update([match timestamp_basis {
+                market_squawk_domain::BarTimestampBasis::PeriodStart => 1,
+                market_squawk_domain::BarTimestampBasis::PeriodEnd => 2,
+            }]);
+            hash.update([match session.kind() {
+                market_squawk_domain::MarketBarSessionKind::Regular => 1,
+                market_squawk_domain::MarketBarSessionKind::Extended => 2,
+                market_squawk_domain::MarketBarSessionKind::Continuous => 3,
+                market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
+            }]);
+            put_str(hash, session.ruleset().as_str());
+            hash.update([match session.evidence().algorithm() {
+                market_squawk_domain::DigestAlgorithm::Sha256 => 1,
+                market_squawk_domain::DigestAlgorithm::Blake3 => 2,
+            }]);
+            hash.update(session.evidence().bytes());
+            encode_temporal(hash, effective);
+        }
+        ObservationFamilyKey::FundNav {
+            source_id,
+            provider_product,
+            provider_channel,
+            instrument_id,
+            provider_instrument_id,
+            nav_date,
+            valuation_basis,
+            currency,
+        } => {
+            hash.update([10]);
+            put_str(hash, source_id.as_str());
+            put_str(hash, provider_product.as_source_identifier().as_str());
+            put_str(hash, provider_channel.as_source_identifier().as_str());
+            hash.update(instrument_id.as_uuid().as_bytes());
+            put_str(hash, provider_instrument_id.as_str());
+            hash.update(nav_date.year().to_be_bytes());
+            hash.update([nav_date.month(), nav_date.day()]);
+            hash.update([match valuation_basis {
+                market_squawk_domain::FundNavValuationBasis::PerShare => 1,
+            }]);
+            put_str(hash, currency.as_str());
         }
         ObservationFamilyKey::PortfolioPosition {
             source_id,
@@ -354,6 +420,23 @@ fn encode_temporal(hash: &mut Sha256, coordinate: &ResearchTemporalCoordinate) {
         put_str(hash, period.code().as_str());
     } else {
         hash.update([0]);
+    }
+}
+
+fn encode_fundamental_period(hash: &mut Sha256, period: FundamentalPeriod) {
+    match period {
+        FundamentalPeriod::Instant { instant } => {
+            hash.update([1]);
+            hash.update(instant.year().to_be_bytes());
+            hash.update([instant.month(), instant.day()]);
+        }
+        FundamentalPeriod::Duration { start, end } => {
+            hash.update([2]);
+            hash.update(start.year().to_be_bytes());
+            hash.update([start.month(), start.day()]);
+            hash.update(end.year().to_be_bytes());
+            hash.update([end.month(), end.day()]);
+        }
     }
 }
 

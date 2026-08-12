@@ -20,14 +20,24 @@ import type { PaperStatus } from "./contracts"
 const COINBASE_DIRECT_SURFACE = "coinbase.exchange-direct-market-data"
 const MAXIMUM_REASON_LENGTH = 200
 
+export interface PaperControlAvailability {
+  start: boolean
+  stop: boolean
+  cancel: boolean
+  reconcile: boolean
+  killSwitch: boolean
+}
+
 export function PaperControlPanel({
   status,
   sessions,
+  availability,
   busy,
   onRequest,
 }: {
   status: PaperStatus | undefined
   sessions: ProviderSession[]
+  availability: PaperControlAvailability
   busy: boolean
   onRequest: (request: PaperControlRequest) => void
 }) {
@@ -41,6 +51,13 @@ export function PaperControlPanel({
     )
   }
   if (status.state === "stopped") {
+    if (!availability.start) {
+      return (
+        <ControlFrame title="Paper controls">
+          <ControlUnavailable operation="Bot.Start" />
+        </ControlFrame>
+      )
+    }
     return <StartPaperForm sessions={sessions} busy={busy} onRequest={onRequest} />
   }
   if (status.state === "stopping") {
@@ -53,7 +70,12 @@ export function PaperControlPanel({
     )
   }
   return (
-    <RunningPaperControls status={status} busy={busy} onRequest={onRequest} />
+    <RunningPaperControls
+      status={status}
+      availability={availability}
+      busy={busy}
+      onRequest={onRequest}
+    />
   )
 }
 
@@ -113,6 +135,10 @@ function StartPaperForm({
             <option value="kraken">Kraken public market data</option>
             <option value="coinbase-direct">Coinbase authorized direct data</option>
           </select>
+          <FieldMessage>
+            This chooses live market evidence for a virtual paper adapter. It does not connect a
+            brokerage account or authorize a real order.
+          </FieldMessage>
         </Field>
         {provider === "coinbase-direct" ? (
           <Field label="Authorized Coinbase session" htmlFor="paper-provider-session">
@@ -150,11 +176,11 @@ function StartPaperForm({
             <option value="book_imbalance">Automated book-imbalance strategy</option>
           </select>
           <FieldMessage>
-            Automated mode is explicit and still uses verified market data, central risk, loss
-            limits, durable audit, and the same stop controls.
+            Automated mode is an explicit paper-only market-signal strategy. It does not convert an
+            investment recommendation into an order, and every intent still passes central risk.
           </FieldMessage>
         </Field>
-        <Field label="Starting cash" htmlFor="paper-initial-cash">
+        <Field label="Virtual starting cash" htmlFor="paper-initial-cash">
           <Input
             id="paper-initial-cash"
             value={initialCash}
@@ -195,10 +221,12 @@ function StartPaperForm({
 
 function RunningPaperControls({
   status,
+  availability,
   busy,
   onRequest,
 }: {
   status: Exclude<PaperStatus, { state: "stopped" | "stopping" }>
+  availability: PaperControlAvailability
   busy: boolean
   onRequest: (request: PaperControlRequest) => void
 }) {
@@ -207,9 +235,13 @@ function RunningPaperControls({
   const reasonValid =
     normalizedReason.length >= 3 && normalizedReason.length <= MAXIMUM_REASON_LENGTH
   const running = status.state === "running"
+  const actionAvailable =
+    availability.stop ||
+    (running && (availability.reconcile || availability.killSwitch))
 
   return (
     <ControlFrame title="Paper operation controls">
+      {!actionAvailable ? <ControlUnavailable operation="paper mutation operations" /> : null}
       <div className="grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
         <Field label="Reason for stop action" htmlFor="paper-stop-reason">
           <Input
@@ -226,6 +258,7 @@ function RunningPaperControls({
         </Field>
         <div className="flex flex-wrap gap-2">
           {running &&
+          availability.reconcile &&
           (status.reconciliationRequired || !status.financialReconciliationCurrent) ? (
             <Button
               type="button"
@@ -237,16 +270,18 @@ function RunningPaperControls({
               Reconcile
             </Button>
           ) : null}
-          <Button
-            type="button"
-            variant="outline"
-            disabled={busy || !reasonValid}
-            onClick={() => onRequest({ action: "stop", reason: normalizedReason })}
-          >
-            <Square aria-hidden="true" />
-            Stop
-          </Button>
-          {running ? (
+          {availability.stop ? (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={busy || !reasonValid}
+              onClick={() => onRequest({ action: "stop", reason: normalizedReason })}
+            >
+              <Square aria-hidden="true" />
+              Stop
+            </Button>
+          ) : null}
+          {running && availability.killSwitch ? (
             <Button
               type="button"
               variant="destructive"
@@ -320,7 +355,7 @@ function ConfirmationFacts({ request }: { request: PaperControlRequest }) {
       <dl className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 sm:grid-cols-2">
         <Fact label="Source" value={request.provider} />
         <Fact label="Operation mode" value={request.strategyMode} />
-        <Fact label="Starting cash" value={request.initialCash} />
+        <Fact label="Virtual starting cash" value={request.initialCash} />
         <Fact label="Fee basis points" value={request.feeBasisPoints.toLocaleString()} />
         {request.providerSessionId ? (
           <Fact label="Provider session" value={request.providerSessionId} />
@@ -343,6 +378,15 @@ function ControlFrame({ title, children }: { title: string; children: React.Reac
       <h2 className="text-base font-semibold">{title}</h2>
       <div className="mt-4">{children}</div>
     </section>
+  )
+}
+
+function ControlUnavailable({ operation }: { operation: string }) {
+  return (
+    <p className="rounded-lg border border-dashed border-border p-3 text-xs leading-5 text-muted-foreground">
+      Setup required: the installed service does not advertise {operation}, so this page does not
+      construct or submit that action.
+    </p>
   )
 }
 
@@ -406,7 +450,7 @@ function confirmationTitle(request: PaperControlRequest) {
 function confirmationDescription(request: PaperControlRequest) {
   switch (request.action) {
     case "start":
-      return "Market Squawk will start the selected simulated operation. Every resulting intent still requires central risk approval."
+      return "Market Squawk will start a virtual operation backed by the selected live market source. No brokerage order is authorized, and every resulting intent still requires central risk approval."
     case "stop":
       return "Market Squawk will stop the current paper runtime and retain authority until shutdown reconciliation completes."
     case "cancel":
@@ -414,7 +458,7 @@ function confirmationDescription(request: PaperControlRequest) {
     case "reconcile":
       return "The dispatcher will reconcile orders, fills, balances, positions, and its source binding."
     case "triggerKillSwitch":
-      return "This stops only the current paper operation with the exact reason shown below."
+      return "This stops only the current virtual paper operation with the exact reason shown below; it does not instruct a brokerage account."
   }
 }
 

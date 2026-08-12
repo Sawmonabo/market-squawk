@@ -72,10 +72,15 @@ pub use extraction::{
     MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
     MAX_OBSERVED_REVISION_BATCH_BYTES, MAX_OBSERVED_REVISION_BATCH_RECORDS,
     MAX_OBSERVED_SEMANTIC_PAYLOAD_BYTES, MAX_OBSERVED_VERSION_EVIDENCE_BYTES,
+    MAX_PROVIDER_CAPTURE_BYTES, MAX_PROVIDER_CAPTURE_PAGE_BYTES, MAX_PROVIDER_CAPTURE_PAGES,
     ObservedProviderOrder, ObservedRevisionAssignments, ObservedRevisionAuthority,
     ObservedRevisionBatch, ObservedRevisionError, ObservedRevisionRecord, ObservedSemanticPayload,
     ObservedVersionEvidence, ObservedVersionKind, PitV1CanonicalEncoder, PitV1EncodingControl,
-    PitV1EncodingError, SourceObject, payload_matches_exact_evidence,
+    PitV1EncodingError, ProviderCaptureError, ProviderCaptureMaterial,
+    ProviderCaptureMaterialSealError, ProviderCapturePageReceipt,
+    ProviderCaptureRequestGraphComponent, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt, SourceObject,
+    SourceObjectCaptureIdentity, payload_matches_exact_evidence,
 };
 pub use health::{
     AuthorizationHealth, BudgetHealth, ConnectionLiveness, CoverageHealth, HealthErrorClass,

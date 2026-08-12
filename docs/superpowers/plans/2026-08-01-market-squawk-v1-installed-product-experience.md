@@ -716,7 +716,7 @@ named stdio clients.
 - [ ] **Step 4: Add stable resources and job compatibility**
 
   Add bounded resource templates for service/workspace/source/model/job/artifact metadata and
-  `market-squawk://jobs/{job_id}` event/result inspection. Do not advertise RMCP Tasks, MRTR,
+  `market-squawk://jobs/{job_id}/generations/{generation}` event/result inspection. Do not advertise RMCP Tasks, MRTR,
   input-required, subscriptions, or request-state capabilities unless a later task in this plan
   implements and proves that exact stable capability. The typed `Job.*` tools/resources are the V1
   durable-operation authority.

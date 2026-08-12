@@ -19,7 +19,9 @@ mod operations_activity_bindings;
 mod operations_bootstrap;
 mod operations_composition;
 mod portfolio_import;
+mod provider_credential_import;
 mod ready_admission;
+mod recommendation_setup;
 mod research_dataset;
 mod research_file_import;
 mod resources;
@@ -81,6 +83,7 @@ use operations_bootstrap::{PreparedInstalledOperations, ReadyInstalledOperations
 use crate::{AppConfig, LocalProduct, LocalProductError, jobs::InstalledJobAuthority};
 
 use self::portfolio_import::InstalledPortfolioImportOperations;
+use self::provider_credential_import::InstalledProviderCredentialImport;
 use self::research_file_import::InstalledResearchFileImportOperations;
 use self::runtime::{PreparedRuntime, current_timestamp};
 use self::workspace_selector::{WorkspacePlacement, WorkspaceSelector, WorkspaceSelectorError};
@@ -484,6 +487,30 @@ impl InstalledService {
                 config.clone(),
                 &selected_workspace_guard,
             )?;
+            let provider_capture_recovery = CancellationToken::new();
+            let research = product.research();
+            let provider_capture_report = match tokio::time::timeout(
+                CLIENT_TIMEOUT,
+                research.recover_provider_capture_store(&provider_capture_recovery),
+            )
+            .await
+            {
+                Ok(Ok(report)) => report,
+                Ok(Err(error)) => {
+                    return Err(InstalledServiceError::ProviderCaptureRecovery(error));
+                }
+                Err(_elapsed) => {
+                    provider_capture_recovery.cancel();
+                    return Err(InstalledServiceError::ProviderCaptureRecoveryDeadline);
+                }
+            };
+            tracing::info!(
+                quarantined_staging = provider_capture_report.quarantined_staging().len(),
+                quarantined_objects = provider_capture_report.quarantined_objects().len(),
+                retained_quarantine_entries =
+                    provider_capture_report.retained_quarantine_entries(),
+                "verified retained provider captures before provider runtime restoration"
+            );
             let source_recovery_deadline = std::time::Instant::now()
                 .checked_add(CLIENT_TIMEOUT)
                 .ok_or(InstalledServiceError::InvalidComposition)?;
@@ -941,11 +968,17 @@ async fn compose_transport(
         runtime.runtime(),
     )
     .map_err(|error| InstalledServiceError::ResearchFileImportState(error.to_string()))?;
+    let provider_credential_import = InstalledProviderCredentialImport::new(
+        product.provider_onboarding(),
+        Arc::clone(&inputs),
+        runtime.runtime(),
+    );
     let services = Arc::new(
         InstalledToolServices::try_new(
             InstalledToolServiceAuthorities::new(
                 Arc::clone(&application),
                 operations.application(),
+                operations.recommendation_setup(),
                 product,
                 jobs,
             ),
@@ -954,6 +987,7 @@ async fn compose_transport(
                 Arc::clone(&inputs),
                 runtime.runtime(),
                 portfolio_import,
+                provider_credential_import,
                 research_file_import,
             ),
         )
@@ -1430,6 +1464,12 @@ pub enum InstalledServiceError {
     /// Durable guided research-file import or recovery state is unavailable.
     #[error("installed-service research file import state is unavailable: {0}")]
     ResearchFileImportState(String),
+    /// Exact retained provider-response bytes could not be verified during startup.
+    #[error("installed-service provider-capture recovery is unavailable")]
+    ProviderCaptureRecovery(#[source] crate::ResearchServiceError),
+    /// Exact retained provider-response verification exceeded the startup deadline.
+    #[error("installed-service provider-capture recovery exceeded its startup deadline")]
+    ProviderCaptureRecoveryDeadline,
     /// A concrete backup, recovery, or update authority rejected startup state.
     #[error("installed-service operations {stage} is unavailable")]
     OperationsAuthority {

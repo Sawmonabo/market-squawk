@@ -13,7 +13,6 @@ import {
   Landmark,
   Logs,
   Network,
-  Search,
   Settings,
   ShieldCheck,
   ServerCog,
@@ -29,79 +28,123 @@ export interface NavigationItem {
   domain?: string
 }
 
-const overviewNavigation: NavigationItem = {
-  label: "Overview",
-  path: "/overview",
+export interface NavigationSection {
+  label: string
+  items: NavigationItem[]
+}
+
+const homeNavigation: NavigationItem = {
+  label: "Home",
+  path: "/home",
   icon: Boxes,
 }
 
-export const workspaceNavigation: NavigationItem[] = [
-  overviewNavigation,
-  { label: "Lookup", path: "/lookup", icon: Search, domain: "analysis" },
+export const everydayNavigation: NavigationItem[] = [
+  homeNavigation,
   { label: "Markets", path: "/markets", icon: BarChart3, domain: "market" },
-  { label: "Sources", path: "/sources", icon: Database, domain: "source" },
   {
-    label: "Research",
-    path: "/research",
-    icon: FlaskConical,
-    domain: "research",
-  },
-  {
-    label: "Portfolios",
-    path: "/portfolios",
-    icon: BriefcaseBusiness,
-    domain: "portfolio",
-  },
-  { label: "Models", path: "/models", icon: Bot, domain: "model" },
-  {
-    label: "Decisions",
-    path: "/decisions",
+    label: "Opportunities",
+    path: "/opportunities",
     icon: Crosshair,
     domain: "decision",
   },
   {
-    label: "Backtests",
-    path: "/backtests",
-    icon: FileClock,
-    domain: "analysis",
+    label: "Portfolio",
+    path: "/portfolio",
+    icon: BriefcaseBusiness,
+    domain: "portfolio",
   },
+]
+
+export const paperExecutionNavigation: NavigationItem[] = [
   {
     label: "Paper Execution",
     path: "/paper-execution",
     icon: FileTerminal,
     domain: "execution",
   },
-  { label: "Risk", path: "/risk", icon: ShieldCheck, domain: "bot" },
+]
+
+export const advancedNavigation: NavigationItem[] = [
+  { label: "Advanced Overview", path: "/advanced", icon: Boxes },
   {
-    label: "Fair Value",
-    path: "/fair-value",
+    label: "Research & Data",
+    path: "/advanced/research-data",
+    icon: FlaskConical,
+    domain: "research",
+  },
+  {
+    label: "Models & Forecasts",
+    path: "/advanced/models-forecasts",
+    icon: Bot,
+    domain: "model",
+  },
+  {
+    label: "Backtests",
+    path: "/advanced/backtests",
+    icon: FileClock,
+    domain: "analysis",
+  },
+  {
+    label: "Valuation & Targets",
+    path: "/advanced/valuation-targets",
     icon: Landmark,
     domain: "fair_value",
   },
-  { label: "MCP", path: "/mcp", icon: Network },
+  {
+    label: "Risk & Recommendation Policy",
+    path: "/advanced/risk-recommendation-policy",
+    icon: ShieldCheck,
+    domain: "bot",
+  },
 ]
 
-export const operationsNavigation: NavigationItem[] = [
-  { label: "Operations", path: "/operations", icon: ServerCog },
-  { label: "Updates", path: "/updates", icon: Activity },
+export const connectionsSystemNavigation: NavigationItem[] = [
+  {
+    label: "Connections & Sources",
+    path: "/connections/sources",
+    icon: Database,
+    domain: "source",
+  },
+  { label: "AI Connections", path: "/system/ai-connections", icon: Network },
+  {
+    label: "Operations & Jobs",
+    path: "/system/operations-jobs",
+    icon: ServerCog,
+  },
+  { label: "Updates & Repair", path: "/system/updates-repair", icon: Activity },
   {
     label: "Backup & Recovery",
-    path: "/backup-recovery",
+    path: "/system/backup-recovery",
     icon: ArchiveRestore,
   },
-  { label: "Logs", path: "/logs", icon: Logs },
-  { label: "Settings", path: "/settings", icon: Settings },
+  { label: "Logs & Diagnostics", path: "/system/logs-diagnostics", icon: Logs },
+  { label: "Settings", path: "/system/settings", icon: Settings },
 ]
 
-export const allNavigation = [
-  ...workspaceNavigation,
-  ...operationsNavigation,
+const everydaySection: NavigationSection = {
+  label: "Everyday",
+  items: everydayNavigation,
+}
+
+export const navigationSections: NavigationSection[] = [
+  everydaySection,
+  { label: "Simulated execution", items: paperExecutionNavigation },
+  { label: "Advanced", items: advancedNavigation },
+  { label: "Connections & System", items: connectionsSystemNavigation },
 ]
+
+export const allNavigation = navigationSections.flatMap((section) => section.items)
 
 export function navigationForPath(pathname: string) {
+  return allNavigation.find((item) => item.path === pathname) ?? homeNavigation
+}
+
+export function navigationSectionForPath(pathname: string) {
   return (
-    allNavigation.find((item) => item.path === pathname) ??
-    overviewNavigation
+    navigationSections.find((section) =>
+      section.items.some((item) => item.path === pathname),
+    ) ?? everydaySection
   )
 }
 

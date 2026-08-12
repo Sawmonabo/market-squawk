@@ -27,8 +27,10 @@ pub use model::{
     ChronologicalSplitPolicy, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
     ComponentSelector, ComponentValue, CorporateActionSensitivity, DatasetBuildInputs,
     DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest, DatasetExample,
-    DatasetOutputAuthorization, DatasetSplit, DatasetSplitCounts, FeatureLabelComponentInput,
-    FeatureLabelComponentSpec, FeatureLabelDataset, MissingValuePolicy,
+    DatasetOutputAuthorization, DatasetSplit, DatasetSplitCounts, FEATURE_LABEL_PROBABILITY_UNIT,
+    FEATURE_LABEL_RETURN_UNIT, FeatureLabelComponentInput, FeatureLabelComponentSpec,
+    FeatureLabelDataset, FeatureLabelMeasurement, FeatureLabelMeasurementBinding,
+    MissingValuePolicy,
 };
 
 /// Process-local authority that must remain live through derived-generation publication.

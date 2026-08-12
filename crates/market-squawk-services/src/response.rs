@@ -242,9 +242,6 @@ impl TypedToolResult {
         metadata: ToolResultMetadata,
         limits: ServiceLimits,
     ) -> Result<Self, ServiceContractError> {
-        if item_count == 0 && !structured_content.is_null() {
-            return Err(ServiceContractError::ZeroItemsForNonNullResult);
-        }
         if item_count > limits.maximum_result_items() {
             return Err(ServiceContractError::TooManyItems);
         }
@@ -450,9 +447,6 @@ impl Write for BoundedCounter {
 /// Invalid service response construction.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ServiceContractError {
-    /// Non-null structured content must declare at least one logical item.
-    #[error("non-null service results must declare at least one logical item")]
-    ZeroItemsForNonNullResult,
     /// Logical result item count exceeded the request ceiling.
     #[error("service result item limit exceeded")]
     TooManyItems,
@@ -468,4 +462,28 @@ pub enum ServiceContractError {
     /// Structured JSON violated its depth, container, string, or encoded-byte ceiling.
     #[error("service result JSON contract failed: {0}")]
     Json(#[from] JsonContractError),
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ToolResultMetadata, TypedToolResult};
+    use crate::{JsonStructureLimits, ServiceLimits};
+
+    #[test]
+    fn complete_empty_page_reports_zero_items() -> Result<(), Box<dyn std::error::Error>> {
+        let structure = JsonStructureLimits::try_new(8, 1_024, 16, 16)?;
+        let limits = ServiceLimits::try_new(1_024, 16, 4_096, 16, structure)?;
+        let result = TypedToolResult::try_new(
+            json!({"items": []}),
+            0,
+            ToolResultMetadata::complete_not_applicable(),
+            limits,
+        )?;
+        let envelope = result.into_envelope();
+        assert_eq!(envelope["metadata"]["returnedItems"], 0);
+        assert_eq!(envelope["metadata"]["availableItems"], 0);
+        Ok(())
+    }
 }

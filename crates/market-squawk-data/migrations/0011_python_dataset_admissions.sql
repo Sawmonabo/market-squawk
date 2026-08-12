@@ -7,12 +7,12 @@ WHEN NOT (
         NEW.schema_name = 'market_squawk.research_observations'
         AND NEW.schema_version = 3
         AND NEW.schema_fingerprint =
-            X'8d7dd570339626df758de3aab0bf49677551ec31491cd20e3eadd3748232c6c8'
+            X'4c11d3d99dd0128d236783b2891f92dd54a38182eebe8432ccf7a582fb3d5f68'
     ) OR (
         NEW.schema_name = 'market_squawk.feature_label_components'
-        AND NEW.schema_version = 2
+        AND NEW.schema_version = 3
         AND NEW.schema_fingerprint =
-            X'12a2745f755b8614ff52e8210fa5e7c9ffb621e6301afdba58d60fa63a838ce9'
+            X'ca7f3447c5c353181b3776f2980a55dcbc54ae69a75b9231d5925912444322a4'
     )
 ) BEGIN
     SELECT RAISE(ABORT, 'analytical generation schema identity is not registered');
@@ -35,7 +35,7 @@ CREATE TABLE python_dataset_admissions (
         length(descriptor_json) BETWEEN 1 AND 1048576
         AND json_valid(CAST(descriptor_json AS TEXT))
     ),
-    selection_digest_version INTEGER NOT NULL CHECK (selection_digest_version = 1),
+    selection_digest_version INTEGER NOT NULL CHECK (selection_digest_version = 2),
     registered_at_ns INTEGER NOT NULL,
     UNIQUE (dataset_id, manifest_version),
     FOREIGN KEY (dataset_id, manifest_version)

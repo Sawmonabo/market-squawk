@@ -1,0 +1,34 @@
+[package]
+name = "market-squawk-adapter-federal-reserve"
+description = "Bounded Federal Reserve Board DDP and release-file adapter core"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+chrono.workspace = true
+csv.workspace = true
+futures-util.workspace = true
+httpdate.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-platform.workspace = true
+market-squawk-sources.workspace = true
+quick-xml.workspace = true
+reqwest.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true

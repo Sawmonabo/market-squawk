@@ -1,17 +1,21 @@
 //! Conservative point-in-time normalization of SEC Company Facts.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use market_squawk_domain::{
-    DataQuality, FilingObservation, FundamentalObservation, PayloadHash, PayloadReference,
+    DataQuality, FilingObservation, FundamentalAmendmentStatus, FundamentalCadence,
+    FundamentalConsolidation, FundamentalDimensionContext, FundamentalFactContext,
+    FundamentalFactContextInput, FundamentalObservation, FundamentalPeriod,
+    FundamentalRestatementStatus, FundamentalRevisionOrder, PayloadHash, PayloadReference,
     ProviderIdentityRegistry, ProviderInstrumentId, ResearchContext, ResearchObservation,
     ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
-    RevisionNumber, SourceId, SourceIdentifier, Timestamp,
+    RevisionNumber, SchemaVersion, SourceId, SourceIdentifier, Timestamp,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::{RetrievedCompanyFacts, RetrievedSubmissions, SecFiling};
+use crate::{CompanyFactOccurrence, RetrievedCompanyFacts, RetrievedSubmissions, SecFiling};
 
 /// Normalizes complete SEC submissions into canonical point-in-time filing observations.
 pub fn normalize_filings(
@@ -172,35 +176,27 @@ pub fn normalize_company_facts_with_cancellation(
         .try_reserve(retrieved.document().occurrences().len())
         .map_err(|_| SecNormalizationError::AllocationFailed)?;
     ordered.extend(retrieved.document().occurrences().iter());
-    ordered.sort_by_key(|occurrence| {
-        (
-            occurrence.filed_on(),
-            occurrence.accession().as_str().to_owned(),
-            occurrence.concept().as_str().to_owned(),
-            occurrence.unit().as_str().to_owned(),
-            occurrence.period().start(),
-            occurrence.period().end(),
-        )
-    });
-    let mut revisions: BTreeMap<(String, String, Option<String>, String), u32> = BTreeMap::new();
+    ordered.sort_unstable_by(|left, right| compare_company_facts(left, right));
     let mut observations = Vec::new();
     observations
         .try_reserve(ordered.len())
         .map_err(|_| SecNormalizationError::AllocationFailed)?;
+    let revision_ruleset = SourceIdentifier::try_from("sec-companyfacts-revision-order-v1")?;
+    let mut previous_family: Option<&CompanyFactOccurrence> = None;
+    let mut family_revision = 0_u32;
     for occurrence in ordered {
         check_cancelled(cancellation)?;
+        if previous_family.is_some_and(|previous| same_company_fact_family(previous, occurrence)) {
+            family_revision = family_revision
+                .checked_add(1)
+                .ok_or(SecNormalizationError::RevisionOverflow)?;
+        } else {
+            family_revision = 1;
+        }
+        previous_family = Some(occurrence);
         let start = occurrence.period().start().map(|date| date.to_string());
         let end = occurrence.period().end().to_string();
-        let key = (
-            occurrence.concept().as_str().to_owned(),
-            occurrence.unit().as_str().to_owned(),
-            start.clone(),
-            end.clone(),
-        );
-        let revision = revisions.entry(key).or_insert(0);
-        *revision = revision
-            .checked_add(1)
-            .ok_or(SecNormalizationError::RevisionOverflow)?;
+        let revision = RevisionNumber::new(family_revision)?;
         let source_identifier = SourceIdentifier::try_from(format!(
             "{}:{}:{}:{}:{}",
             occurrence.accession(),
@@ -229,19 +225,79 @@ pub fn normalize_company_facts_with_cancellation(
             Some(ResearchTemporalCoordinate::calendar_date(
                 occurrence.filed_on(),
             )),
-            RevisionNumber::new(*revision)?,
+            revision,
             None,
         )?;
+        let period = match occurrence.period().start() {
+            Some(start) => FundamentalPeriod::duration(start, occurrence.period().end())?,
+            None => FundamentalPeriod::instant(occurrence.period().end()),
+        };
+        let fact_context = FundamentalFactContext::try_new(FundamentalFactContextInput {
+            schema_version: SchemaVersion::CURRENT,
+            period,
+            unit: occurrence.unit().clone(),
+            accession: occurrence.accession().clone(),
+            filing_form: Some(occurrence.form().clone()),
+            amendment_status: amendment_status(occurrence.form()),
+            filed_on: Some(occurrence.filed_on()),
+            frame: occurrence.frame().cloned(),
+            fiscal_year: occurrence.fiscal_year(),
+            fiscal_period: occurrence.fiscal_period().cloned(),
+            cadence: company_facts_cadence(occurrence.fiscal_period()),
+            xbrl_context_id: None,
+            dimensions: FundamentalDimensionContext::unavailable(),
+            consolidation: FundamentalConsolidation::Unavailable,
+            revision_order: FundamentalRevisionOrder::new(revision, revision_ruleset.clone()),
+            restatement_status: FundamentalRestatementStatus::Unavailable,
+        })?;
         observations.push(ResearchObservation::Fundamental(
             FundamentalObservation::new(
                 ResearchContext::new(provenance, research_time)?,
                 occurrence.concept().clone(),
                 occurrence.value(),
-                occurrence.unit().clone(),
+                fact_context,
             )?,
         ));
     }
     Ok(observations)
+}
+
+fn compare_company_facts(left: &CompanyFactOccurrence, right: &CompanyFactOccurrence) -> Ordering {
+    left.concept()
+        .cmp(right.concept())
+        .then_with(|| left.unit().cmp(right.unit()))
+        .then_with(|| left.period().start().cmp(&right.period().start()))
+        .then_with(|| left.period().end().cmp(&right.period().end()))
+        .then_with(|| left.filed_on().cmp(&right.filed_on()))
+        .then_with(|| left.accession().cmp(right.accession()))
+        .then_with(|| left.form().cmp(right.form()))
+        .then_with(|| left.frame().cmp(&right.frame()))
+        .then_with(|| left.fiscal_year().cmp(&right.fiscal_year()))
+        .then_with(|| left.fiscal_period().cmp(&right.fiscal_period()))
+        .then_with(|| left.value().cmp(&right.value()))
+}
+
+fn same_company_fact_family(left: &CompanyFactOccurrence, right: &CompanyFactOccurrence) -> bool {
+    left.concept() == right.concept()
+        && left.unit() == right.unit()
+        && left.period() == right.period()
+}
+
+fn amendment_status(form: &SourceIdentifier) -> FundamentalAmendmentStatus {
+    if form.as_str().ends_with("/A") {
+        FundamentalAmendmentStatus::Amendment
+    } else {
+        FundamentalAmendmentStatus::Original
+    }
+}
+
+fn company_facts_cadence(period: Option<&SourceIdentifier>) -> FundamentalCadence {
+    match period.map(SourceIdentifier::as_str) {
+        None => FundamentalCadence::Unavailable,
+        Some("FY" | "CY") => FundamentalCadence::Annual,
+        Some("Q1" | "Q2" | "Q3" | "Q4") => FundamentalCadence::Quarterly,
+        Some(_) => FundamentalCadence::Other,
+    }
 }
 
 fn check_cancelled(cancellation: &CancellationToken) -> Result<(), SecNormalizationError> {
@@ -265,6 +321,8 @@ pub enum SecNormalizationError {
     RevisionOverflow,
     #[error("SEC canonical normalization bounded allocation failed")]
     AllocationFailed,
+    #[error(transparent)]
+    FundamentalContext(#[from] market_squawk_domain::FundamentalContextError),
     #[error("SEC publication time is later than local ingestion")]
     PublicationAfterIngestion,
     #[error(transparent)]

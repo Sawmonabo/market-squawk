@@ -29,6 +29,7 @@ pub(crate) enum MarketSelectionError {
     InvalidExecutionEligibility,
     TooManyCandidates { maximum: usize, actual: usize },
     DuplicateCandidateIdentity,
+    ReceiptEncoding,
     Allocation,
 }
 
@@ -84,6 +85,9 @@ impl fmt::Display for MarketSelectionError {
             ),
             Self::DuplicateCandidateIdentity => {
                 formatter.write_str("candidate identities must be unique")
+            }
+            Self::ReceiptEncoding => {
+                formatter.write_str("selection receipt cannot be represented canonically")
             }
             Self::Allocation => formatter.write_str("bounded selection allocation failed"),
         }
@@ -304,28 +308,34 @@ impl<'a> SelectedMarketSource<'a> {
 pub(crate) struct MarketSelectionReceipt {
     policy_revision: u32,
     policy_digest: EvidenceDigest,
+    policy_candidate_limit: usize,
     request: MarketSelectionRequest,
     eligible: Vec<EligibleCandidate>,
     rejected: Vec<RejectedCandidate>,
     selected_at: Timestamp,
+    selection_digest: EvidenceDigest,
 }
 
 impl MarketSelectionReceipt {
     pub(super) const fn new(
         policy_revision: u32,
         policy_digest: EvidenceDigest,
+        policy_candidate_limit: usize,
         request: MarketSelectionRequest,
         eligible: Vec<EligibleCandidate>,
         rejected: Vec<RejectedCandidate>,
         selected_at: Timestamp,
+        selection_digest: EvidenceDigest,
     ) -> Self {
         Self {
             policy_revision,
             policy_digest,
+            policy_candidate_limit,
             request,
             eligible,
             rejected,
             selected_at,
+            selection_digest,
         }
     }
 
@@ -335,6 +345,10 @@ impl MarketSelectionReceipt {
 
     pub(crate) const fn policy_digest(&self) -> EvidenceDigest {
         self.policy_digest
+    }
+
+    pub(crate) const fn policy_candidate_limit(&self) -> usize {
+        self.policy_candidate_limit
     }
 
     pub(crate) const fn request(&self) -> &MarketSelectionRequest {
@@ -351,6 +365,11 @@ impl MarketSelectionReceipt {
 
     pub(crate) const fn selected_at(&self) -> Timestamp {
         self.selected_at
+    }
+
+    /// SHA-256 commitment to the complete ordered request, evidence, decision, and policy receipt.
+    pub(crate) const fn selection_digest(&self) -> EvidenceDigest {
+        self.selection_digest
     }
 
     pub(crate) fn selected(&self) -> Option<SelectedMarketSource<'_>> {

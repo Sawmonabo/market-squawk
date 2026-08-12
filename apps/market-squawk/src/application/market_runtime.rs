@@ -1,11 +1,16 @@
 //! Bounded multi-provider market-runtime ownership shared by every local presentation.
 
+mod alpaca_historical;
 mod configuration;
 mod display;
 mod generation;
 mod group;
 mod kraken;
 
+pub(crate) use alpaca_historical::{
+    AlpacaHistoricalCompositeCalendarAuthority, AlpacaHistoricalLookupError,
+    AlpacaHistoricalRuntimeCapability,
+};
 pub(crate) use configuration::{
     AccountMarketSurface, PreparedMarketProviderConfigurationRequest,
     PreparedMarketProviderConfigurationResolver,
@@ -36,6 +41,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use self::{
+    alpaca_historical::AlpacaHistoricalCapabilityError,
     display::DisplaySourceDescriptor,
     group::{AccountMarketRuntimeGroup, AccountMarketRuntimeLimits},
     kraken::KrakenSourceDescriptor,
@@ -204,6 +210,7 @@ pub(crate) struct MarketRuntimeRegistry {
     display: DisplayMarketDirectory,
     order_level: OrderLevelDirectory,
     account_limits: AccountMarketRuntimeLimits,
+    shutdown: Mutex<Option<Result<(), ServiceError>>>,
     mutation: Mutex<()>,
     entries: Mutex<Vec<MarketRuntimeEntry>>,
 }
@@ -260,6 +267,7 @@ impl MarketRuntimeRegistry {
             display,
             order_level,
             account_limits,
+            shutdown: Mutex::new(None),
             mutation: Mutex::new(()),
             entries: Mutex::new(entries),
         }))
@@ -598,6 +606,68 @@ impl MarketRuntimeRegistry {
             return Err(ServiceError::Unavailable);
         }
         Ok(Some(evidence.clone()))
+    }
+
+    /// Returns the historical subordinate for one exact active Alpaca account group.
+    ///
+    /// This lookup never chooses a provider, resolves setup, reopens account authority, or reads a
+    /// credential. The returned capability is bound to the already active session, configuration,
+    /// credential generation, and process-wide rate authority.
+    pub(crate) async fn alpaca_historical_capability(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<AlpacaHistoricalRuntimeCapability, AlpacaHistoricalLookupError> {
+        if request.surface() != AccountMarketSurface::AlpacaBasic {
+            return Err(AlpacaHistoricalLookupError::NotConfigured);
+        }
+        ensure_alpaca_historical_lookup(&self.accepting, deadline, cancellation)?;
+        let _mutation = bounded_lock(&self.mutation, deadline, cancellation)
+            .await
+            .map_err(|_error| AlpacaHistoricalLookupError::Transitioning)?;
+        ensure_alpaca_historical_lookup(&self.accepting, deadline, cancellation)?;
+        let surface_id = try_surface_identifier(AccountMarketSurface::AlpacaBasic)
+            .map_err(|_error| AlpacaHistoricalLookupError::Transitioning)?;
+        let capability = {
+            let entries = bounded_lock(&self.entries, deadline, cancellation)
+                .await
+                .map_err(|_error| AlpacaHistoricalLookupError::Transitioning)?;
+            let entry = entries
+                .iter()
+                .find(|entry| entry.surface_id == surface_id)
+                .ok_or(AlpacaHistoricalLookupError::NotConfigured)?;
+            validate_alpaca_historical_entry(entry, request)?;
+            let MarketRuntime::Account(group) = &entry.runtime else {
+                return Err(AlpacaHistoricalLookupError::Stale);
+            };
+            group
+                .alpaca_historical_capability()
+                .map_err(map_alpaca_historical_capability_error)?
+                .ok_or(AlpacaHistoricalLookupError::Stale)?
+        };
+        capability
+            .require_current(deadline, cancellation)
+            .await
+            .map_err(map_alpaca_historical_capability_error)?;
+        ensure_alpaca_historical_lookup(&self.accepting, deadline, cancellation)?;
+        {
+            let entries = bounded_lock(&self.entries, deadline, cancellation)
+                .await
+                .map_err(|_error| AlpacaHistoricalLookupError::Transitioning)?;
+            let entry = entries
+                .iter()
+                .find(|entry| entry.surface_id == surface_id)
+                .ok_or(AlpacaHistoricalLookupError::Transitioning)?;
+            validate_alpaca_historical_entry(entry, request)?;
+            let MarketRuntime::Account(group) = &entry.runtime else {
+                return Err(AlpacaHistoricalLookupError::Stale);
+            };
+            if !group.owns_alpaca_historical_capability(&capability) || capability.is_revoked() {
+                return Err(AlpacaHistoricalLookupError::Transitioning);
+            }
+        }
+        Ok(capability)
     }
 
     async fn verify_owned(
@@ -1139,10 +1209,15 @@ impl MarketRuntimeRegistry {
     pub(crate) async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
         self.begin_shutdown();
         let cleanup = CancellationToken::new();
+        let mut shutdown = bounded_lock(&self.shutdown, deadline, &cleanup).await?;
+        if let Some(result) = *shutdown {
+            return result;
+        }
         let _mutation = match bounded_lock(&self.mutation, deadline, &cleanup).await {
             Ok(mutation) => mutation,
             Err(error) => {
                 self.lifecycle.cancel();
+                *shutdown = Some(Err(error));
                 return Err(error);
             }
         };
@@ -1151,6 +1226,7 @@ impl MarketRuntimeRegistry {
                 Ok(entries) => entries,
                 Err(error) => {
                     self.lifecycle.cancel();
+                    *shutdown = Some(Err(error));
                     return Err(error);
                 }
             };
@@ -1221,7 +1297,9 @@ impl MarketRuntimeRegistry {
         if Instant::now() >= deadline {
             failure.get_or_insert(ServiceError::DeadlineExceeded);
         }
-        failure.map_or(Ok(()), Err)
+        let result = failure.map_or(Ok(()), Err);
+        *shutdown = Some(result);
+        result
     }
 
     async fn remove_unhealthy_owned(
@@ -1354,6 +1432,11 @@ impl fmt::Debug for MarketRuntimeRegistry {
 impl Drop for MarketRuntimeRegistry {
     fn drop(&mut self) {
         self.begin_shutdown();
+        if let Ok(entries) = self.entries.try_lock() {
+            for entry in entries.iter() {
+                entry.begin_shutdown();
+            }
+        }
         self.lifecycle.cancel();
     }
 }
@@ -1415,6 +1498,7 @@ impl MarketRuntimeEntry {
         if let Some(exports) = self.exports.as_ref() {
             exports.begin_shutdown();
         }
+        self.runtime.begin_shutdown();
         self.cancellation.cancel();
     }
 
@@ -1470,6 +1554,12 @@ impl MarketRuntime {
             Self::Public(runtime) => runtime.is_healthy(),
             Self::CoinbaseDirect(runtime) => runtime.is_healthy(),
             Self::Account(runtime) => runtime.is_healthy(),
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        if let Self::Account(runtime) = self {
+            runtime.begin_shutdown();
         }
     }
 
@@ -1712,6 +1802,57 @@ fn ensure_before(deadline: Instant, cancellation: &CancellationToken) -> Result<
 fn try_surface_identifier(surface: AccountMarketSurface) -> Result<SourceIdentifier, ServiceError> {
     SourceIdentifier::try_from(surface.surface_id())
         .map_err(|_error| ServiceError::ResourceExhausted)
+}
+
+fn ensure_alpaca_historical_lookup(
+    accepting: &std::sync::atomic::AtomicBool,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), AlpacaHistoricalLookupError> {
+    if cancellation.is_cancelled()
+        || Instant::now() >= deadline
+        || !accepting.load(std::sync::atomic::Ordering::Acquire)
+    {
+        Err(AlpacaHistoricalLookupError::Transitioning)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_alpaca_historical_entry(
+    entry: &MarketRuntimeEntry,
+    request: PreparedMarketProviderConfigurationRequest,
+) -> Result<(), AlpacaHistoricalLookupError> {
+    if entry.onboarding_session_id != Some(request.onboarding_session_id()) {
+        return Err(AlpacaHistoricalLookupError::Stale);
+    }
+    let evidence = entry
+        .runtime
+        .account_evidence()
+        .ok_or(AlpacaHistoricalLookupError::Stale)?;
+    if evidence.public_configuration_digest() != request.expected_public_configuration_digest()
+        || evidence.surface_id().as_str() != AccountMarketSurface::AlpacaBasic.surface_id()
+        || evidence.onboarding_session_id() != request.onboarding_session_id()
+    {
+        return Err(AlpacaHistoricalLookupError::Stale);
+    }
+    if !entry.is_healthy() {
+        return Err(AlpacaHistoricalLookupError::Inactive);
+    }
+    Ok(())
+}
+
+const fn map_alpaca_historical_capability_error(
+    error: AlpacaHistoricalCapabilityError,
+) -> AlpacaHistoricalLookupError {
+    match error {
+        AlpacaHistoricalCapabilityError::Stale => AlpacaHistoricalLookupError::Stale,
+        AlpacaHistoricalCapabilityError::Revoked
+        | AlpacaHistoricalCapabilityError::Cancelled
+        | AlpacaHistoricalCapabilityError::DeadlineExceeded => {
+            AlpacaHistoricalLookupError::Transitioning
+        }
+    }
 }
 
 fn validate_account_evidence(

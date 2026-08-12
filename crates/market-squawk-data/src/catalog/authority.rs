@@ -153,7 +153,14 @@ impl Catalog {
                  + (SELECT COUNT(*) FROM market_data_instrument_identities)
                  + (SELECT COUNT(*) FROM market_data_instrument_revisions)
                  + (SELECT COUNT(*) FROM market_data_instrument_current)
-                 + (SELECT COUNT(*) FROM market_data_instrument_search_terms)",
+                 + (SELECT COUNT(*) FROM market_data_instrument_search_terms)
+                 + (SELECT COUNT(*) FROM company_security_link_events)
+                 + (SELECT COUNT(*) FROM company_security_link_current)
+                 + (SELECT COUNT(*) FROM provider_capture_sets)
+                 + (SELECT COUNT(*) FROM provider_capture_pages)
+                 + (SELECT COUNT(*) FROM provider_capture_frames)
+                 + (SELECT COUNT(*) FROM ingest_run_capture_inputs)
+                 + (SELECT COUNT(*) FROM analytical_generation_capture_inputs)",
             [],
             |row| row.get(0),
         )?;

@@ -11,14 +11,17 @@ use std::{
 };
 
 use market_squawk_analytics::FeatureSemanticDigest;
-use market_squawk_data::{Sha256Digest, UniverseId};
-use market_squawk_domain::{DataQuality, InstrumentId, ModelId, Timestamp};
+use market_squawk_data::{
+    ComponentKind, ComponentScope, CorporateActionSensitivity, FeatureLabelComponentSpec,
+    Sha256Digest, UniverseId,
+};
+use market_squawk_domain::{Currency, DataQuality, InstrumentId, ModelId, Timestamp};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    BundleId, InferenceBackend, InferenceError, ModelInput, ModelMetadata, TrainingDatasetIdentity,
-    TrainingPeriod,
+    BundleId, InferenceBackend, InferenceError, ModelInput, ModelMetadata, ModelOutputSemantics,
+    TrainingDatasetIdentity, TrainingPeriod,
 };
 
 mod calibration;
@@ -31,9 +34,14 @@ pub use calibration::{
     RealizedCoverage,
 };
 pub use contracts::{
-    ForecastError, ForecastHorizon, ForecastInterval, ForecastIntervals, ForecastObservedPoint,
-    ForecastPath, ForecastPoint, ForecastRequest, ForecastValue, MAX_FORECAST_DECIMAL_SCALE,
+    ForecastCentralStatistic, ForecastError, ForecastEstimatorProfile, ForecastHorizon,
+    ForecastInterval, ForecastIntervals, ForecastMeasurement, ForecastObservedPoint,
+    ForecastOutputBinding, ForecastPath, ForecastPoint, ForecastRequest, ForecastTargetMeaning,
+    ForecastTrainingObjective, ForecastTransform, ForecastValue, MAX_FORECAST_DECIMAL_SCALE,
     MAX_FORECAST_OBSERVED_POINTS, MAX_FORECAST_POINTS,
 };
 pub use engine::ResearchForecastBackend;
-pub use evidence::{ForecastOutcome, ForecastOutcomeId, ForecastVintage, ForecastVintageId};
+pub use evidence::{
+    ForecastOutcome, ForecastOutcomeId, ForecastVintage, ForecastVintageId,
+    verify_forecast_vintage_identity,
+};

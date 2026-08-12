@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use market_squawk_domain::{EvidenceDigest, SchemaVersion, SourceIdentifier};
+use market_squawk_domain::{EvidenceDigest, ResearchObservation, SchemaVersion, SourceIdentifier};
 use market_squawk_sources::CURRENT_RESEARCH_RECORD_SCHEMA;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -13,6 +13,8 @@ use thiserror::Error;
 pub(crate) const SCHEMA_NAME_KEY: &str = "market_squawk.schema";
 pub(crate) const SCHEMA_VERSION_KEY: &str = "market_squawk.schema_version";
 pub(crate) const SCHEMA_FINGERPRINT_KEY: &str = "market_squawk.schema_fingerprint_sha256";
+pub(crate) const RESEARCH_PAYLOAD_CONTRACT_KEY: &str =
+    "market_squawk.research_payload_contract_sha256";
 pub(crate) const DATASET_KEY: &str = "market_squawk.dataset";
 pub(crate) const REQUEST_DIGEST_KEY: &str = "market_squawk.request_sha256";
 pub(crate) const BUILD_DIGEST_KEY: &str = "market_squawk.build_sha256";
@@ -22,7 +24,7 @@ pub(crate) const RESEARCH_SCHEMA_NAME: &str = "market_squawk.research_observatio
 pub(crate) const FEATURE_LABEL_SCHEMA_NAME: &str = "market_squawk.feature_label_components";
 pub(crate) const RESEARCH_RECORD_SCHEMA: &str = CURRENT_RESEARCH_RECORD_SCHEMA;
 pub(crate) const RESEARCH_SCHEMA_VERSION: u16 = 3;
-pub(crate) const FEATURE_LABEL_SCHEMA_VERSION: u16 = 2;
+pub(crate) const FEATURE_LABEL_SCHEMA_VERSION: u16 = 3;
 pub(crate) const FEATURE_LABEL_EXAMPLE_ID_BYTES: i32 = 256;
 pub(crate) const FEATURE_LABEL_INSTRUMENT_ID_BYTES: i32 = 16;
 pub(crate) const FEATURE_LABEL_COMPONENT_NAME_BYTES: i32 = 256;
@@ -31,6 +33,116 @@ pub(crate) const FEATURE_LABEL_CURRENCY_BYTES: i32 = 3;
 pub(crate) const FEATURE_LABEL_MISSING_REASON_BYTES: i32 = 256;
 
 const MAX_SCHEMA_NAME_BYTES: usize = 128;
+
+const RESEARCH_PAYLOAD_CONTRACT_DOMAIN: &[u8] =
+    b"market-squawk/research-observation-payload-contract/v1";
+const RESEARCH_PAYLOAD_ENVELOPE_CONTRACT: &[u8] = b"serde-json:adjacently-tagged;tag=observation;content=payload;rename=snake_case;deny_unknown_fields=true|semantic:MSQPIT;identity_schema=2;domain=market-squawk/pit/payload;integers=little-endian;bytes=u64-length-prefixed;decimal=normalized-i128-mantissa+u32-scale";
+
+/// One closed JSON discriminator and its canonical PIT semantic encoder identity.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResearchPayloadContractEntry {
+    json_tag: &'static str,
+    semantic_tag: u8,
+    semantic_encoder: &'static str,
+}
+
+impl ResearchPayloadContractEntry {
+    /// Returns the exact serde discriminator and Arrow observation-kind label.
+    pub(crate) const fn json_tag(self) -> &'static str {
+        self.json_tag
+    }
+
+    /// Returns the first variant byte written by the canonical semantic payload encoder.
+    pub(crate) const fn semantic_tag(self) -> u8 {
+        self.semantic_tag
+    }
+}
+
+const FILING_PAYLOAD_CONTRACT: ResearchPayloadContractEntry = ResearchPayloadContractEntry {
+    json_tag: "filing",
+    semantic_tag: 1,
+    semantic_encoder: "filing-v1:form_type,accession",
+};
+const FUNDAMENTAL_PAYLOAD_CONTRACT: ResearchPayloadContractEntry = ResearchPayloadContractEntry {
+    json_tag: "fundamental",
+    semantic_tag: 2,
+    semantic_encoder: "fundamental-v2:concept,normalized_decimal,fact_context,optional_xbrl_evidence",
+};
+const MACRO_PAYLOAD_CONTRACT: ResearchPayloadContractEntry = ResearchPayloadContractEntry {
+    json_tag: "macro",
+    semantic_tag: 3,
+    semantic_encoder: "macro-v1:series,value_state(observed=1|missing=2),value_or_marker_reason,unit",
+};
+const MARKET_BAR_PAYLOAD_CONTRACT: ResearchPayloadContractEntry = ResearchPayloadContractEntry {
+    json_tag: "market_bar",
+    semantic_tag: 10,
+    semantic_encoder: "market_bar-v1:provider_instrument,feed,interval,adjustment(raw=1|split=2|dividend=3|spin_off=4|all=5),period_start,period_end,timestamp_basis(start=1|end=2),session(kind=1..4,ruleset,evidence_algorithm,evidence),ohlc,currency,volume,optional_trade_count,optional_vwap",
+};
+const FUND_NAV_PAYLOAD_CONTRACT: ResearchPayloadContractEntry = ResearchPayloadContractEntry {
+    json_tag: "fund_nav",
+    semantic_tag: 11,
+    semantic_encoder: "fund_nav-v1:provider_instrument,instrument_reference_revision,provider_product,provider_channel,nav_date,valuation_basis(per_share=1),currency,value_state(observed=1|missing=2),money_or_missing_reason(1..5),canonical_published_at,native_schema+entitlement+request+raw_object+raw_row+page+checkpoint+completeness+disposition_lineage,source_revision+correction+finality+predecessor+successor_evidence",
+};
+const PORTFOLIO_POSITION_PAYLOAD_CONTRACT: ResearchPayloadContractEntry =
+    ResearchPayloadContractEntry {
+        json_tag: "portfolio_position",
+        semantic_tag: 4,
+        semantic_encoder: "portfolio_position-v1:account,side(long=1|short=2),absolute_quantity",
+    };
+const TRANSACTION_PAYLOAD_CONTRACT: ResearchPayloadContractEntry = ResearchPayloadContractEntry {
+    json_tag: "transaction",
+    semantic_tag: 5,
+    semantic_encoder: "transaction-v1:account,transaction_type,source_record_id",
+};
+const CORPORATE_ACTION_PAYLOAD_CONTRACT: ResearchPayloadContractEntry =
+    ResearchPayloadContractEntry {
+        json_tag: "corporate_action",
+        semantic_tag: 6,
+        semantic_encoder: "corporate_action-v1:canonical_serde_action",
+    };
+const UNIVERSE_MEMBERSHIP_PAYLOAD_CONTRACT: ResearchPayloadContractEntry =
+    ResearchPayloadContractEntry {
+        json_tag: "universe_membership",
+        semantic_tag: 8,
+        semantic_encoder: "universe_membership-v1:universe,start,optional_end",
+    };
+const ALTERNATIVE_DATA_PAYLOAD_CONTRACT: ResearchPayloadContractEntry =
+    ResearchPayloadContractEntry {
+        json_tag: "alternative_data",
+        semantic_tag: 7,
+        semantic_encoder: "alternative_data-v1:dataset,field,normalized_decimal,optional_unit",
+    };
+
+const RESEARCH_PAYLOAD_CONTRACT: [ResearchPayloadContractEntry; 10] = [
+    FILING_PAYLOAD_CONTRACT,
+    FUNDAMENTAL_PAYLOAD_CONTRACT,
+    MACRO_PAYLOAD_CONTRACT,
+    MARKET_BAR_PAYLOAD_CONTRACT,
+    FUND_NAV_PAYLOAD_CONTRACT,
+    PORTFOLIO_POSITION_PAYLOAD_CONTRACT,
+    TRANSACTION_PAYLOAD_CONTRACT,
+    CORPORATE_ACTION_PAYLOAD_CONTRACT,
+    UNIVERSE_MEMBERSHIP_PAYLOAD_CONTRACT,
+    ALTERNATIVE_DATA_PAYLOAD_CONTRACT,
+];
+
+/// Selects the sole registered payload-contract entry for a typed observation.
+pub(crate) const fn research_payload_contract_for(
+    observation: &ResearchObservation,
+) -> ResearchPayloadContractEntry {
+    match observation {
+        ResearchObservation::Filing(_) => FILING_PAYLOAD_CONTRACT,
+        ResearchObservation::Fundamental(_) => FUNDAMENTAL_PAYLOAD_CONTRACT,
+        ResearchObservation::Macro(_) => MACRO_PAYLOAD_CONTRACT,
+        ResearchObservation::MarketBar(_) => MARKET_BAR_PAYLOAD_CONTRACT,
+        ResearchObservation::FundNav(_) => FUND_NAV_PAYLOAD_CONTRACT,
+        ResearchObservation::PortfolioPosition(_) => PORTFOLIO_POSITION_PAYLOAD_CONTRACT,
+        ResearchObservation::Transaction(_) => TRANSACTION_PAYLOAD_CONTRACT,
+        ResearchObservation::CorporateAction(_) => CORPORATE_ACTION_PAYLOAD_CONTRACT,
+        ResearchObservation::UniverseMembership(_) => UNIVERSE_MEMBERSHIP_PAYLOAD_CONTRACT,
+        ResearchObservation::AlternativeData(_) => ALTERNATIVE_DATA_PAYLOAD_CONTRACT,
+    }
+}
 
 /// Exact immutable identity of one registered Arrow dataset schema.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -137,7 +249,7 @@ impl DatasetSchemaRegistry {
 
     /// Returns the exact canonical research-observation identity.
     pub fn canonical_research_observations(self) -> Result<DatasetSchemaRef, DatasetSchemaError> {
-        identity_for_schema(RESEARCH_SCHEMA_NAME, research_schema_definition())
+        identity_for_schema(RESEARCH_SCHEMA_NAME, research_schema_definition()?)
     }
 
     /// Returns the exact typed long-form feature/label component identity.
@@ -150,7 +262,7 @@ impl DatasetSchemaRegistry {
     /// Unknown names or versions and known names with altered fingerprints fail closed.
     pub fn resolve(self, schema_ref: &DatasetSchemaRef) -> Result<SchemaRef, DatasetSchemaError> {
         let schema = match (schema_ref.name(), schema_ref.version().get()) {
-            (RESEARCH_SCHEMA_NAME, RESEARCH_SCHEMA_VERSION) => research_schema_definition(),
+            (RESEARCH_SCHEMA_NAME, RESEARCH_SCHEMA_VERSION) => research_schema_definition()?,
             (FEATURE_LABEL_SCHEMA_NAME, FEATURE_LABEL_SCHEMA_VERSION) => {
                 feature_label_schema_definition()
             }
@@ -248,10 +360,21 @@ pub(crate) fn schema_ref_from_metadata(
         .get(SCHEMA_FINGERPRINT_KEY)
         .and_then(|value| decode_hex(value))
         .ok_or(DatasetSchemaError::FingerprintMismatch)?;
+    if name == RESEARCH_SCHEMA_NAME {
+        let expected_payload_contract = encode_hex(research_payload_contract_digest()?);
+        if schema
+            .metadata()
+            .get(RESEARCH_PAYLOAD_CONTRACT_KEY)
+            .map(String::as_str)
+            != Some(expected_payload_contract.as_str())
+        {
+            return Err(DatasetSchemaError::FingerprintMismatch);
+        }
+    }
     DatasetSchemaRef::try_new(name, version, fingerprint)
 }
 
-fn research_schema_definition() -> Schema {
+fn research_schema_definition() -> Result<Schema, DatasetSchemaError> {
     let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()));
     let fields = vec![
         Field::new("schema_version", DataType::UInt16, false),
@@ -307,7 +430,7 @@ fn research_schema_definition() -> Schema {
         Field::new("payload_sha256", DataType::Binary, false),
         Field::new("payload_json", DataType::Binary, false),
     ];
-    Schema::new_with_metadata(
+    Ok(Schema::new_with_metadata(
         fields,
         HashMap::from([
             (SCHEMA_NAME_KEY.to_owned(), RESEARCH_SCHEMA_NAME.to_owned()),
@@ -323,8 +446,12 @@ fn research_schema_definition() -> Schema {
                 "market_squawk.timestamp_timezone".to_owned(),
                 "UTC".to_owned(),
             ),
+            (
+                RESEARCH_PAYLOAD_CONTRACT_KEY.to_owned(),
+                encode_hex(research_payload_contract_digest()?),
+            ),
         ]),
-    )
+    ))
 }
 
 fn feature_label_schema_definition() -> Schema {
@@ -341,7 +468,10 @@ fn feature_label_schema_definition() -> Schema {
                 DataType::FixedSizeBinary(FEATURE_LABEL_INSTRUMENT_ID_BYTES),
                 false,
             ),
-            Field::new("cutoff_at", timestamp, false),
+            Field::new("cutoff_at", timestamp.clone(), false),
+            Field::new("observed_effective_at", timestamp.clone(), true),
+            Field::new("label_effective_at", timestamp, true),
+            Field::new("target_coordinate_kind", DataType::UInt8, false),
             Field::new("split", DataType::UInt8, false),
             Field::new("component_kind", DataType::UInt8, false),
             Field::new(
@@ -381,7 +511,7 @@ fn feature_label_schema_definition() -> Schema {
             ),
             (
                 "market_squawk.component_layout".to_owned(),
-                "fixed-width-long-form-v2".to_owned(),
+                "fixed-width-long-form-v3".to_owned(),
             ),
             (
                 "market_squawk.timestamp_timezone".to_owned(),
@@ -421,6 +551,20 @@ fn fingerprint_schema(schema: &Schema) -> Result<[u8; 32], DatasetSchemaError> {
         update_field(&mut digest, field)?;
     }
     update_metadata(&mut digest, schema.metadata())?;
+    Ok(digest.finalize().into())
+}
+
+fn research_payload_contract_digest() -> Result<[u8; 32], DatasetSchemaError> {
+    let mut digest = Sha256::new();
+    update_bytes(&mut digest, RESEARCH_PAYLOAD_CONTRACT_DOMAIN)?;
+    update_bytes(&mut digest, RESEARCH_RECORD_SCHEMA.as_bytes())?;
+    update_bytes(&mut digest, RESEARCH_PAYLOAD_ENVELOPE_CONTRACT)?;
+    update_length(&mut digest, RESEARCH_PAYLOAD_CONTRACT.len())?;
+    for entry in RESEARCH_PAYLOAD_CONTRACT {
+        update_bytes(&mut digest, entry.json_tag.as_bytes())?;
+        digest.update([entry.semantic_tag]);
+        update_bytes(&mut digest, entry.semantic_encoder.as_bytes())?;
+    }
     Ok(digest.finalize().into())
 }
 

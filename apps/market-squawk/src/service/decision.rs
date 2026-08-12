@@ -1,6 +1,7 @@
 //! Closed transport adapter over the sole durable investment-decision authority.
 
 mod dossier_preparation;
+mod investment_analysis;
 mod screen_workflow;
 mod target_preparation;
 
@@ -39,7 +40,8 @@ use crate::application::{
 use crate::portfolio_application::PortfolioFairValueReadCapability;
 
 use self::{
-    dossier_preparation::DossierPreparationOperations, screen_workflow::ScreenWorkflowOperations,
+    dossier_preparation::DossierPreparationOperations,
+    investment_analysis::InvestmentAnalysisOperations, screen_workflow::ScreenWorkflowOperations,
     target_preparation::TargetPreparationOperations,
 };
 
@@ -61,6 +63,7 @@ pub(super) struct InstalledDecisionOperations {
     decisions: Arc<DecisionApplication>,
     features: ProductionFeatureRegistry,
     dossier_preparation: DossierPreparationOperations,
+    investment_analysis: InvestmentAnalysisOperations,
     screen_workflow: ScreenWorkflowOperations,
     target_preparation: TargetPreparationOperations,
 }
@@ -81,6 +84,7 @@ impl InstalledDecisionOperations {
                 application,
                 runtime,
             ),
+            investment_analysis: InvestmentAnalysisOperations::new(Arc::clone(&decisions)),
             screen_workflow: ScreenWorkflowOperations::new(
                 Arc::clone(&decisions),
                 analytical_reader,
@@ -97,6 +101,7 @@ impl InstalledDecisionOperations {
 
     pub(super) fn owns(operation: &str) -> bool {
         DossierPreparationOperations::owns(operation)
+            || InvestmentAnalysisOperations::owns(operation)
             || TargetPreparationOperations::owns(operation)
             || matches!(
                 operation,
@@ -138,6 +143,9 @@ impl InstalledDecisionOperations {
         if DossierPreparationOperations::owns(request.name()) {
             return self.dossier_preparation.call(request, context).await;
         }
+        if InvestmentAnalysisOperations::owns(request.name()) {
+            return self.investment_analysis.call(request, context);
+        }
         if TargetPreparationOperations::owns(request.name()) {
             return self.target_preparation.call(request, context);
         }
@@ -158,7 +166,7 @@ impl InstalledDecisionOperations {
                     .decisions
                     .list_screens(input.limit)
                     .map_err(map_application)?;
-                let count = screens.len().max(1);
+                let count = screens.len();
                 (
                     json!({"screens": screens.iter().map(screen_value).collect::<Vec<_>>() }),
                     count,
@@ -170,7 +178,7 @@ impl InstalledDecisionOperations {
                     .decisions
                     .get_candidates(&ScreenRunId::try_new(input.run_id).map_err(invalid)?)
                     .map_err(map_application)?;
-                let count = candidates.len().max(1);
+                let count = candidates.len();
                 (
                     json!({"candidates": candidates.iter().map(candidate_value).collect::<Vec<_>>() }),
                     count,
@@ -190,7 +198,7 @@ impl InstalledDecisionOperations {
                 let next_after = trim_next(&mut runs, input.limit, |entry| {
                     entry.run().id().as_str().to_owned()
                 });
-                let count = runs.len().max(1);
+                let count = runs.len();
                 (
                     json!({
                         "runs": runs.iter().map(screen_run_index_value).collect::<Vec<_>>(),
@@ -226,7 +234,7 @@ impl InstalledDecisionOperations {
                 let next_after = trim_next(&mut dossiers, input.limit, |dossier| {
                     dossier.dossier().id().as_str().to_owned()
                 });
-                let count = dossiers.len().max(1);
+                let count = dossiers.len();
                 (
                     json!({
                         "dossiers": dossiers.iter().map(dossier_value).collect::<Vec<_>>(),
@@ -249,7 +257,7 @@ impl InstalledDecisionOperations {
                     .decisions
                     .list_targets(&target_id(&input.target_id)?)
                     .map_err(map_application)?;
-                let count = targets.len().max(1);
+                let count = targets.len();
                 (
                     json!({"targets": targets.iter().map(target_state_value).collect::<Vec<_>>() }),
                     count,
@@ -268,7 +276,7 @@ impl InstalledDecisionOperations {
                 let next_after = trim_next(&mut targets, input.limit, |entry| {
                     entry.id().as_str().to_owned()
                 });
-                let count = targets.len().max(1);
+                let count = targets.len();
                 (
                     json!({
                         "targets": targets.iter().map(target_index_value).collect::<Vec<_>>(),
@@ -319,6 +327,7 @@ impl std::fmt::Debug for InstalledDecisionOperations {
             .field("decisions", &"[DURABLE DECISION AUTHORITY]")
             .field("features", &"[CODE-OWNED FEATURE REGISTRY]")
             .field("dossier_preparation", &self.dossier_preparation)
+            .field("investment_analysis", &self.investment_analysis)
             .field("screen_workflow", &self.screen_workflow)
             .field("target_preparation", &self.target_preparation)
             .finish()
@@ -821,7 +830,7 @@ fn target_state_value(state: &TargetState) -> Value {
             "targetId": invalidation.target_id().as_str(),
             "targetRevision": invalidation.target_revision().get(),
             "kind": invalidation_kind_name(invalidation.kind()),
-            "actor": invalidation.actor().map(DecisionActorId::as_str),
+            "actor": invalidation.actor().as_str(),
             "observedAt": invalidation.observed_at(),
             "contentIdentity": invalidation.content_identity().evidence_digest(),
         })),

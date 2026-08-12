@@ -952,6 +952,12 @@ pub enum CatalogError {
     /// A publication did not name an active reserved run.
     #[error("catalog run is unknown or is not reserved")]
     RunStateConflict,
+    /// A sealed provider capture does not match its exact source object and ingest run.
+    #[error("provider capture does not match the source object or ingest run")]
+    ProviderCaptureMismatch,
+    /// A repeated provider-capture admission differs from retained immutable evidence.
+    #[error("provider capture conflicts with retained immutable evidence")]
+    ProviderCaptureConflict,
     /// Backups are never overwritten.
     #[error("catalog backup destination already exists")]
     BackupAlreadyExists,

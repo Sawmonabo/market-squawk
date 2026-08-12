@@ -1,27 +1,29 @@
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::VecDeque;
-#[cfg(test)]
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use market_squawk_domain::{
     DataQuality, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
     SourceIdentifier, Timestamp,
 };
+use market_squawk_platform::RawCaptureRecord;
 #[cfg(test)]
 use market_squawk_sources::AuthoritativeSourceRegistry;
 use market_squawk_sources::{
     AuthorizationMode, BudgetWindowSemantics, CoverageDomain, DiscoveryBatch, DiscoveryRequest,
     ExtractionAuthority, ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan,
     ExtractionSource, ExtractionSourceError, HistoricalCapability, ProviderBudgetPolicy,
-    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
-    SourceProtocolProfile, payload_matches_exact_evidence,
+    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, SourceClass, SourceError, SourceMetadata,
+    SourceMetadataProvider, SourceObject, SourceProtocolProfile, payload_matches_exact_evidence,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::client::{BlsHttpClient, RetrievedBlsPage, ensure_deadline_open, system_timestamp};
 use crate::{
@@ -47,6 +49,33 @@ pub struct BlsSourceConfig {
     plan: BlsRequestPlan,
     series_metadata: BTreeMap<String, BlsSeriesMetadata>,
     dataset: SourceIdentifier,
+}
+
+/// Indivisible BLS extraction handoff containing canonical rows and their exact response bytes.
+///
+/// Application composition must seal [`Self::capture_material`] before publishing
+/// [`Self::batch`] as a durable canonical generation.
+#[derive(Debug)]
+pub struct BlsExtractionOutput {
+    batch: ExtractionBatch,
+    capture_material: ProviderCaptureMaterial,
+}
+
+impl BlsExtractionOutput {
+    /// Returns the source-neutral canonical extraction batch.
+    pub const fn batch(&self) -> &ExtractionBatch {
+        &self.batch
+    }
+
+    /// Returns the exact bounded provider response material that must be sealed before publish.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture_material
+    }
+
+    /// Consumes the rich handoff into its canonical batch and exact raw capture material.
+    pub fn into_parts(self) -> (ExtractionBatch, ProviderCaptureMaterial) {
+        (self.batch, self.capture_material)
+    }
 }
 
 /// Registered, allowlisted, budget-coordinated BLS extraction producer.
@@ -291,6 +320,17 @@ impl BlsSource {
         request: &ExtractionRequest,
         cancellation: CancellationToken,
     ) -> Result<BlsNormalizedPage, ExtractionSourceError> {
+        self.normalized_page_impl(authority, request, cancellation, true)
+            .await
+    }
+
+    async fn normalized_page_impl(
+        &self,
+        authority: &ExtractionAuthority,
+        request: &ExtractionRequest,
+        cancellation: CancellationToken,
+        allow_discovery_cache: bool,
+    ) -> Result<BlsNormalizedPage, ExtractionSourceError> {
         self.validate_authority(authority)?;
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
@@ -309,13 +349,16 @@ impl BlsSource {
             .chunks()
             .get(chunk_index)
             .ok_or(SourceError::InvalidProtocolState)?;
-        let cached = self
-            .cache
-            .lock()
-            .map_err(|_| SourceError::InvalidProtocolState)?
-            .pages
-            .get(request.object().object_id().as_str())
-            .cloned();
+        let cached = if allow_discovery_cache {
+            self.cache
+                .lock()
+                .map_err(|_| SourceError::InvalidProtocolState)?
+                .pages
+                .get(request.object().object_id().as_str())
+                .cloned()
+        } else {
+            None
+        };
         let page = match cached {
             Some(page) => {
                 let bytes = Bytes::from_owner(page.bytes);
@@ -363,6 +406,7 @@ impl BlsSource {
             return Err(ExtractionSourceError::Cancelled);
         }
         ensure_deadline_open(request.deadline())?;
+        let capture_material = self.capture_material(request, &page)?;
         let observed_at = request.object().effective_interval().starts_at();
         let ingested_at = system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
         let records = canonical_records(
@@ -403,26 +447,37 @@ impl BlsSource {
         authority.validate_current()?;
         Ok(BlsNormalizedPage {
             received_at: observed_at,
+            response_received_at: page.received_at,
             source_payload_sha256: page.sha256_hex,
             exact_payload: page.bytes,
             payloads,
             records,
+            capture_material,
         })
     }
 
-    async fn extract_impl(
+    /// Produces canonical BLS records together with the exact bounded response material.
+    ///
+    /// The response capture contains one standalone page for the exact request-plan chunk. Its
+    /// request identity binds source revision, full request-plan dataset, tier, endpoint, chunk
+    /// ordinal, series, and year window, but never the registered-v2 secret.
+    pub async fn extract_with_capture(
         &self,
         authority: ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
-    ) -> Result<ExtractionBatch, ExtractionSourceError> {
+    ) -> Result<BlsExtractionOutput, ExtractionSourceError> {
         let page = self
-            .normalized_page(&authority, &request, cancellation)
+            .normalized_page_impl(&authority, &request, cancellation, false)
             .await?;
+        let BlsNormalizedPage {
+            records,
+            capture_material,
+            ..
+        } = page;
         let schema = SourceIdentifier::try_from("market-squawk-research-v3")
             .map_err(|_| SourceError::InvalidProtocolState)?;
-        let records = page
-            .records
+        let records = records
             .into_iter()
             .map(|record| {
                 market_squawk_sources::ExtractionRecord::try_new_with_time(
@@ -442,7 +497,69 @@ impl BlsSource {
         #[cfg(test)]
         self.apply_test_publication_action()?;
         authority.validate_current()?;
-        Ok(batch)
+        Ok(BlsExtractionOutput {
+            batch,
+            capture_material,
+        })
+    }
+
+    fn capture_material(
+        &self,
+        request: &ExtractionRequest,
+        page: &RetrievedBlsPage,
+    ) -> Result<ProviderCaptureMaterial, ExtractionSourceError> {
+        let (chunk_index, _) = parse_object_id(request.object().object_id())?;
+        let chunk = self
+            .config
+            .plan()
+            .chunks()
+            .get(chunk_index)
+            .ok_or(SourceError::InvalidProtocolState)?;
+        let request_identity =
+            capture_request_identity(&self.metadata, &self.config, chunk_index, chunk)?;
+        let body_bytes =
+            u64::try_from(page.bytes.len()).map_err(|_| SourceError::InvalidProtocolState)?;
+        let body_digest =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&page.bytes).into());
+        let page_receipt = ProviderCapturePageReceipt::try_new(
+            0,
+            request_identity,
+            None,
+            None,
+            200,
+            body_bytes,
+            body_digest,
+            page.received_at,
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        let receipt = ProviderCaptureSetReceipt::try_new(
+            self.metadata.source_id().clone(),
+            self.metadata.revision().clone(),
+            self.config.dataset().clone(),
+            request_identity,
+            ProviderCaptureTerminalDisposition::StandaloneResponse,
+            vec![page_receipt],
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        let connection_id =
+            Uuid::new_v5(&Uuid::NAMESPACE_URL, &receipt.observation_digest().bytes());
+        let mut event_identity = Sha256::new();
+        event_identity.update(b"market-squawk/bls-provider-capture-event/v1");
+        event_identity.update(receipt.observation_digest().bytes());
+        event_identity.update(body_digest.bytes());
+        let event_id = Uuid::new_v5(&connection_id, &event_identity.finalize());
+        let record = RawCaptureRecord::try_new_live(
+            event_id,
+            Arc::from(self.metadata.source_id().as_str()),
+            connection_id,
+            Some(0),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(page.received_at.unix_nanos()),
+            page.bytes.clone(),
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        ProviderCaptureMaterial::try_new(receipt, vec![record])
+            .map_err(|_| SourceError::InvalidProtocolState.into())
     }
 
     fn validate_authority(
@@ -551,7 +668,8 @@ impl ExtractionSource for BlsSource {
         request: ExtractionRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<ExtractionBatch, ExtractionSourceError>> {
-        Box::pin(self.extract_impl(authority, request, cancellation))
+        let _ = (authority, request, cancellation);
+        Box::pin(async { Err(SourceError::InvalidProtocolState.into()) })
     }
 }
 
@@ -577,6 +695,53 @@ fn exact_evidence(payload: &[u8]) -> ExactPayloadEvidence {
         DigestAlgorithm::Sha256,
         digest.into(),
     ))
+}
+
+fn capture_request_identity(
+    metadata: &SourceMetadata,
+    config: &BlsSourceConfig,
+    chunk_index: usize,
+    chunk: &crate::BlsRequestChunk,
+) -> Result<EvidenceDigest, ExtractionSourceError> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/bls-provider-capture-request/v1");
+    hash_capture_field(&mut hash, metadata.source_id().as_str().as_bytes())?;
+    hash_capture_field(
+        &mut hash,
+        metadata
+            .revision()
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
+    hash_capture_field(&mut hash, config.dataset().as_str().as_bytes())?;
+    hash_capture_field(&mut hash, config.authorization().endpoint().as_bytes())?;
+    hash.update(
+        u16::try_from(chunk_index)
+            .map_err(|_| SourceError::InvalidProtocolState)?
+            .to_be_bytes(),
+    );
+    hash.update(chunk.start_year().to_be_bytes());
+    hash.update(chunk.end_year().to_be_bytes());
+    hash.update(
+        u16::try_from(chunk.series().len())
+            .map_err(|_| SourceError::InvalidProtocolState)?
+            .to_be_bytes(),
+    );
+    for series_id in chunk.series() {
+        hash_capture_field(&mut hash, series_id.as_bytes())?;
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hash.finalize().into(),
+    ))
+}
+
+fn hash_capture_field(hash: &mut Sha256, value: &[u8]) -> Result<(), ExtractionSourceError> {
+    let length = u16::try_from(value.len()).map_err(|_| SourceError::InvalidProtocolState)?;
+    hash.update(length.to_be_bytes());
+    hash.update(value);
+    Ok(())
 }
 
 fn parse_object_id(object_id: &SourceIdentifier) -> Result<(usize, &str), ExtractionSourceError> {

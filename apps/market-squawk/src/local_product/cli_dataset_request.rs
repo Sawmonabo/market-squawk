@@ -18,9 +18,10 @@ use market_squawk_data::{
     UniverseMembership,
 };
 use market_squawk_domain::{
-    AvailabilityEvidence, CalendarDate, Currency, DigestAlgorithm, EffectiveInterval,
-    EvidenceDigest, InstrumentId, ResearchPeriod, ResearchTemporalCoordinate, SchemaVersion,
-    SourceId, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, BarTimestampBasis, CalendarDate, Currency, DigestAlgorithm,
+    EffectiveInterval, EvidenceDigest, FundamentalPeriod, InstrumentId, MarketBarAdjustment,
+    MarketBarSessionEvidence, ProviderInstrumentId, ResearchPeriod, ResearchTemporalCoordinate,
+    SchemaVersion, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_platform::UserOwnedInputEvidence;
 use rust_decimal::Decimal;
@@ -406,14 +407,25 @@ enum ObservationFamilyDto {
     Fundamental {
         source_id: SourceId,
         instrument_id: InstrumentId,
-        source_record: SourceIdentifier,
         concept: SourceIdentifier,
         unit: SourceIdentifier,
-        effective: TemporalCoordinateDto,
+        period: FundamentalPeriod,
     },
     Macro {
         source_id: SourceId,
         series: SourceIdentifier,
+        effective: TemporalCoordinateDto,
+    },
+    MarketBar {
+        source_id: SourceId,
+        instrument_id: InstrumentId,
+        venue_id: VenueId,
+        provider_instrument_id: ProviderInstrumentId,
+        feed: SourceIdentifier,
+        interval: SourceIdentifier,
+        adjustment: MarketBarAdjustment,
+        timestamp_basis: BarTimestampBasis,
+        session: MarketBarSessionEvidence,
         effective: TemporalCoordinateDto,
     },
     PortfolioPosition {
@@ -464,17 +476,15 @@ impl ObservationFamilyDto {
             Self::Fundamental {
                 source_id,
                 instrument_id,
-                source_record,
                 concept,
                 unit,
-                effective,
+                period,
             } => ObservationFamilyKey::Fundamental {
                 source_id,
                 instrument_id,
-                source_record,
                 concept,
                 unit,
-                effective: effective.into_domain()?,
+                period,
             },
             Self::Macro {
                 source_id,
@@ -483,6 +493,29 @@ impl ObservationFamilyDto {
             } => ObservationFamilyKey::Macro {
                 source_id,
                 series,
+                effective: effective.into_domain()?,
+            },
+            Self::MarketBar {
+                source_id,
+                instrument_id,
+                venue_id,
+                provider_instrument_id,
+                feed,
+                interval,
+                adjustment,
+                timestamp_basis,
+                session,
+                effective,
+            } => ObservationFamilyKey::MarketBar {
+                source_id,
+                instrument_id,
+                venue_id,
+                provider_instrument_id,
+                feed,
+                interval,
+                adjustment,
+                timestamp_basis,
+                session,
                 effective: effective.into_domain()?,
             },
             Self::PortfolioPosition {

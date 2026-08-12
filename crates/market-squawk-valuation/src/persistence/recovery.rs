@@ -97,11 +97,8 @@ pub(crate) fn recover(
             let measurement = measurements
                 .get(&MeasurementId(*measurement_id))
                 .ok_or(FairValueError::CorruptPersistence)?;
-            let value = ClassificationRuleset::versioned(
-                ruleset_version.unwrap_or(1),
-                *max_quote_age_nanos,
-            )?
-            .classify(measurement)?;
+            let ruleset = current_ruleset_from_payload(*ruleset_version, *max_quote_age_nanos)?;
+            let value = ruleset.classify(measurement)?;
             ensure_id(value.id().bytes(), id.bytes())?;
             insert_unique(&mut decisions, *id, std::sync::Arc::new(value))?;
         }
@@ -223,6 +220,18 @@ pub(crate) fn recover(
         revocations,
         market_access,
     })
+}
+
+fn current_ruleset_from_payload(
+    ruleset_version: u32,
+    max_quote_age_nanos: u64,
+) -> Result<ClassificationRuleset, FairValueError> {
+    let ruleset = ClassificationRuleset::current(max_quote_age_nanos)
+        .map_err(|_| FairValueError::CorruptPersistence)?;
+    if ruleset_version != ruleset.version() {
+        return Err(FairValueError::CorruptPersistence);
+    }
+    Ok(ruleset)
 }
 
 fn evidence_from_payload(payload: EvidencePayload) -> Result<FairValueEvidence, FairValueError> {
@@ -351,7 +360,7 @@ fn input_from_payload(
                 .ok_or(FairValueError::CorruptPersistence)
         })
         .transpose()?;
-    ValuationInput::try_from_persisted_v1_spec(ValuationInputSpec {
+    ValuationInput::try_from_spec(ValuationInputSpec {
         subject_instrument_id: instrument(&payload.subject_instrument_id)?,
         reference_instrument_id: instrument(&payload.reference_instrument_id)?,
         relationship: relation_from_tag(payload.relationship)?,
@@ -464,6 +473,7 @@ pub(super) fn amount_payload(value: ValuationAmount) -> AmountPayload {
         decimal_scale: value.money().amount().scale(),
         currency: value.money().currency().as_str().to_owned(),
         accounting_scale: value.scale(),
+        basis: crate::measurement::amount_basis_tag(value.basis()),
     }
 }
 
@@ -475,7 +485,17 @@ fn amount_from_payload(value: AmountPayload) -> Result<ValuationAmount, FairValu
                 .map_err(|_| FairValueError::CorruptPersistence)?,
         ),
         value.accounting_scale,
+        amount_basis_from_tag(value.basis)?,
     )
+}
+
+fn amount_basis_from_tag(value: u8) -> Result<ValuationAmountBasis, FairValueError> {
+    match value {
+        1 => Ok(ValuationAmountBasis::PerInstrumentUnit),
+        2 => Ok(ValuationAmountBasis::ReportingEntityTotal),
+        3 => Ok(ValuationAmountBasis::PositionTotal),
+        _ => Err(FairValueError::CorruptPersistence),
+    }
 }
 
 pub(super) fn use_assessment_payload(value: &InputUseAssessment) -> UseAssessmentPayload {

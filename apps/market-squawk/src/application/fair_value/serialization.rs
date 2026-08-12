@@ -9,8 +9,8 @@ use market_squawk_valuation::{
     ApprovalRevocation, ApprovalStatus, ClassificationDecision, DecisionBasis, DecisionReason,
     DecisionReasonCode, EvidenceOrigin, EvidenceVerification, FairValueEvidence,
     InputInstrumentRelation, InputObservability, InputSignificance, MarketAccess, MarketActivity,
-    Predicate, PredicateResult, PriceAdjustment, ValuationAmount, ValuationApproval,
-    ValuationInput, ValuationMeasurement, ValuationMethod,
+    Predicate, PredicateResult, PriceAdjustment, ValuationAmount, ValuationAmountBasis,
+    ValuationApproval, ValuationInput, ValuationMeasurement, ValuationMethod,
 };
 use serde_json::{Value, json};
 
@@ -273,7 +273,12 @@ fn amount_value(amount: ValuationAmount) -> Value {
     json!({
         "amount": amount.money().amount().to_string(),
         "currency": amount.money().currency().as_str(),
-        "scale": amount.scale()
+        "scale": amount.scale(),
+        "amountBasis": match amount.basis() {
+            ValuationAmountBasis::PerInstrumentUnit => "per_instrument_unit",
+            ValuationAmountBasis::ReportingEntityTotal => "reporting_entity_total",
+            ValuationAmountBasis::PositionTotal => "position_total",
+        }
     })
 }
 
@@ -419,6 +424,5 @@ const fn reason_name(value: DecisionReasonCode) -> &'static str {
         DecisionReasonCode::EvidenceQuarantined => "evidence_quarantined",
         DecisionReasonCode::UnobservableSignificantInput => "unobservable_significant_input",
         DecisionReasonCode::OverrideApplied => "override_applied",
-        DecisionReasonCode::InputUseAssessmentMissing => "input_use_assessment_missing",
     }
 }

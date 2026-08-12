@@ -13,11 +13,11 @@ use arrow::json::ArrayWriter;
 use async_trait::async_trait;
 use chrono::DateTime;
 use market_squawk_data::{
-    AnalyticalGeneration, AnalyticalObservationReadRequest, AnalyticalObservationTemplate,
-    AnalyticalReadCapability, AnalyticalReadError, AnalyticalReadLimit, DatasetId,
-    DatasetManifestRef, GenerationKind, GenerationParentRelation, IngestPrecommitAuthority,
-    ManifestCatalogError, PinnedArtifactQueryRequest, PinnedQueryOutput, QueryError, QueryLimits,
-    QueryResult,
+    AnalyticalFundNavOutput, AnalyticalFundNavReadRequest, AnalyticalGeneration,
+    AnalyticalObservationReadRequest, AnalyticalObservationTemplate, AnalyticalReadCapability,
+    AnalyticalReadError, AnalyticalReadLimit, DatasetId, DatasetManifestRef, GenerationKind,
+    GenerationParentRelation, IngestPrecommitAuthority, ManifestCatalogError,
+    PinnedArtifactQueryRequest, PinnedQueryOutput, QueryError, QueryLimits, QueryResult,
 };
 use market_squawk_domain::{InstrumentId, SourceIdentifier, Timestamp};
 use market_squawk_services::{
@@ -219,6 +219,29 @@ impl ResearchApplicationServices {
         Arc::new(MacroDomainService {
             controller: Arc::clone(&self.controller),
         })
+    }
+
+    /// Reads bounded, manifest-pinned Fund NAV history through the application lifecycle.
+    ///
+    /// This is an application-core seam only. It neither selects a provider nor grants ingestion,
+    /// publication, network, or operation-registration authority.
+    pub async fn read_fund_nav_history(
+        &self,
+        request: AnalyticalFundNavReadRequest,
+        limits: ServiceLimits,
+        context: &RequestContext,
+    ) -> Result<AnalyticalFundNavOutput, ServiceError> {
+        let _call = DomainLifecycle::enter(&self.controller.lifecycle, context)?;
+        self.controller
+            .reader
+            .read_fund_nav_history(
+                request,
+                query_limits(limits, context)?,
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await
+            .map_err(map_read_error)
     }
 }
 
@@ -657,7 +680,7 @@ async fn observation_result(
                     "rowCount": object.row_count(),
                 },
             });
-            TypedToolResult::try_new(content, returned.max(1), metadata, limits).map_err(Into::into)
+            TypedToolResult::try_new(content, returned, metadata, limits).map_err(Into::into)
         }
     }
 }
@@ -910,7 +933,16 @@ fn map_read_error(error: AnalyticalReadError) -> ServiceError {
         AnalyticalReadError::InvalidLimit
         | AnalyticalReadError::InstrumentLimitExceeded
         | AnalyticalReadError::InvalidKnowledgeRange
+        | AnalyticalReadError::InvalidMarketBarLimit
+        | AnalyticalReadError::InvalidMarketBarEffectiveRange
+        | AnalyticalReadError::InvalidFundNavLimit
+        | AnalyticalReadError::InvalidFundNavDateRange
+        | AnalyticalReadError::InvalidOutcomeMarketBarWindow
         | AnalyticalReadError::InvalidObservationSchema => ServiceError::InvalidRequest,
+        AnalyticalReadError::MarketBarResultRequiresInline
+        | AnalyticalReadError::InvalidMarketBarResult
+        | AnalyticalReadError::FundNavResultRequiresInline
+        | AnalyticalReadError::InvalidFundNavResult => ServiceError::InvalidResult,
         AnalyticalReadError::ForecastDatasetUnavailable => ServiceError::NotFound,
         AnalyticalReadError::Parquet(_) | AnalyticalReadError::PythonDataset(_) => {
             ServiceError::Unavailable
@@ -937,6 +969,7 @@ fn map_manifest_error(error: ManifestCatalogError) -> ServiceError {
         | ManifestCatalogError::SchemaMismatch
         | ManifestCatalogError::SchemaIdentity(_)
         | ManifestCatalogError::CorruptCatalog
+        | ManifestCatalogError::CaptureInputLimitExceeded { .. }
         | ManifestCatalogError::LockPoisoned
         | ManifestCatalogError::Plan(_)
         | ManifestCatalogError::Path(_)

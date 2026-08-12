@@ -1,5 +1,6 @@
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core"
 
+import { analyticalControllerResponseSchema } from "@/features/advanced/analytical-profile-contracts"
 import {
   applicationResultSchema,
   desktopEventSchema,
@@ -62,6 +63,14 @@ class TauriTransport implements ProductTransport {
   async query(request: DashboardQuery) {
     const value = await invoke("dashboard_query", { request })
     return applicationResultSchema.parse(value)
+  }
+
+  async analyticalController(
+    request: Parameters<ProductTransport["analyticalController"]>[0],
+    confirmed = false,
+  ) {
+    const value = await invoke("analytical_controller", { request, confirmed })
+    return analyticalControllerResponseSchema.parse(value)
   }
 
   async researchControl(request: ResearchControlRequest, confirmed = false) {
@@ -264,6 +273,10 @@ class UnavailableBrowserTransport implements ProductTransport {
   }
 
   query(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  analyticalController(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

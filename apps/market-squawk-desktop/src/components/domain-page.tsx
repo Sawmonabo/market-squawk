@@ -20,7 +20,7 @@ export function DomainPage({
   if (product.status !== "ready") {
     return (
       <PageFrame title={title} description={description}>
-        <Unavailable message="Return to Overview and restore the local application connection." />
+        <Unavailable message="Return to Home and restore the local application connection." />
       </PageFrame>
     )
   }

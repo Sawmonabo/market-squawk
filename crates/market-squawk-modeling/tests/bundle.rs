@@ -4,6 +4,13 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use crate::{
+    BundleError, BundleExpectations, BundleId, BundleMetadataRef, BundleRegistration,
+    ControlledModelRoot, ForecastCentralStatistic, ForecastEstimatorProfile, ForecastMeasurement,
+    ForecastOutputBinding, ForecastTargetMeaning, ForecastTrainingObjective, ForecastTransform,
+    MAX_ARTIFACT_BYTES, ModelBundle, ModelOutputSemantics, ModelRegistry, ModelRegistryError,
+    TrainingDatasetIdentity, TrainingPeriod,
+};
 use market_squawk_analytics::{
     FeatureKey, FeatureMetadata, FeatureRegistry, LiveFeatureCatalog, LiveFeatureCatalogConfig,
 };
@@ -13,11 +20,6 @@ use market_squawk_data::{
     FeatureLabelComponentSpec, Sha256Digest, UniverseId,
 };
 use market_squawk_domain::{ModelId, Timestamp};
-use market_squawk_modeling::{
-    BundleError, BundleExpectations, BundleId, BundleMetadataRef, BundleRegistration,
-    ControlledModelRoot, MAX_ARTIFACT_BYTES, ModelBundle, ModelRegistry, ModelRegistryError,
-    TrainingDatasetIdentity, TrainingPeriod,
-};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -66,7 +68,7 @@ impl Fixture {
         bundle_metadata_hash: Sha256Digest,
         artifact_hash: Sha256Digest,
     ) -> TestResult<BundleExpectations> {
-        Ok(BundleExpectations::try_new(
+        Ok(BundleExpectations::try_new_with_output_binding(
             self.expectations.model_id(),
             self.expectations.bundle_id().clone(),
             self.expectations.bundle_version(),
@@ -79,6 +81,7 @@ impl Fixture {
             bundle_metadata_hash,
             artifact_hash,
             self.expectations.training_run_hash(),
+            self.expectations.output_binding().clone(),
         )?)
     }
 }
@@ -484,7 +487,40 @@ fn valid_fixture_with_identity(
         NonZeroU32::MIN,
     )?;
     let model_id = ModelId::from_str(model_id)?;
-    let expectations = BundleExpectations::try_new(
+    let output_semantics = if format == "native_logistic" {
+        ModelOutputSemantics::BinaryProbability
+    } else {
+        ModelOutputSemantics::Regression
+    };
+    let output_measurement = if format == "native_logistic" {
+        ForecastMeasurement::Probability
+    } else {
+        ForecastMeasurement::Return
+    };
+    let output_binding = ForecastOutputBinding::try_from_admitted_model(
+        output_semantics,
+        output_measurement,
+        ForecastCentralStatistic::Unavailable,
+        ForecastTargetMeaning::Unsupported,
+        ForecastTransform::Identity,
+        if format == "native_logistic" {
+            ForecastTransform::Logistic
+        } else {
+            ForecastTransform::Identity
+        },
+        if format == "native_logistic" {
+            ForecastTrainingObjective::BinaryCrossEntropy
+        } else {
+            ForecastTrainingObjective::SquaredError
+        },
+        if format == "native_logistic" {
+            ForecastEstimatorProfile::SealedBinaryLogisticV1
+        } else {
+            ForecastEstimatorProfile::SealedDirectLeastSquaresV1
+        },
+        label.clone(),
+    )?;
+    let expectations = BundleExpectations::try_new_with_output_binding(
         model_id,
         BundleId::try_new(bundle_id)?,
         NonZeroU64::new(bundle_version)
@@ -498,6 +534,7 @@ fn valid_fixture_with_identity(
         Sha256Digest::new([3; 32]),
         Sha256Digest::new([4; 32]),
         Sha256Digest::new([2; 32]),
+        output_binding,
     )?;
 
     let feature_json = feature_keys
@@ -555,7 +592,7 @@ fn valid_fixture_with_identity(
         json!({"negative_max": -0.5, "positive_min": 0.5, "minimum_confidence": 0.0})
     };
     let mut metadata = json!({
-        "schema_version": 4,
+        "schema_version": 9,
         "bundle_id": bundle_id,
         "bundle_version": bundle_version,
         "model_id": model_id.to_string(),
@@ -606,7 +643,36 @@ fn valid_fixture_with_identity(
         "decision_thresholds": thresholds,
         "intended_use": "bounded directional ranking for verified market features",
         "limitations": ["not calibrated for unverified or stale features"],
-        "fallback": {"policy": "no_action", "reason": "model contract unavailable"}
+        "fallback": {"policy": "no_action", "reason": "model contract unavailable"},
+        "output_measurement": if format == "native_logistic" {
+            json!({"kind": "probability"})
+        } else {
+            json!({"kind": "return"})
+        },
+        "output_statistic": if format == "native_logistic" {
+            json!({
+                "estimator": {"kind": "sealed_binary_logistic_v1"},
+                "objective": "binary_cross_entropy",
+                "output_transform": "logistic",
+                "statistic": "unavailable",
+                "target": {"kind": "unsupported"},
+                "target_transform": "identity"
+            })
+        } else {
+            json!({
+                "estimator": {"kind": "sealed_direct_least_squares_v1"},
+                "objective": "squared_error",
+                "output_transform": "identity",
+                "statistic": "unavailable",
+                "target": {"kind": "unsupported"},
+                "target_transform": "identity"
+            })
+        },
+        "output_semantics": if format == "native_logistic" {
+            "binary_probability"
+        } else {
+            "regression"
+        }
     });
     mutate(&mut metadata, &mut artifact);
 
@@ -638,7 +704,14 @@ fn valid_fixture_with_identity(
         "label": metadata["label"],
         "missing_policy": "reject",
         "model_id": metadata["model_id"],
-        "model_kind": format,
+        "model_kind": if format == "onnx" {
+            "linear"
+        } else {
+            format
+        },
+        "output_measurement": metadata["output_measurement"],
+        "output_statistic": metadata["output_statistic"],
+        "output_semantics": metadata["output_semantics"],
         "seed": 17,
         "split_counts": {"test": 1, "train": 7, "validation": 2},
         "split_sha256": hex([36; 32]),
@@ -648,7 +721,7 @@ fn valid_fixture_with_identity(
     });
     let trial_sha256 = hex(sha256(&serde_json::to_vec(&trial)?));
     let training_run_bytes = serde_json::to_vec(&json!({
-        "schema_version": 2,
+        "schema_version": 7,
         "trial": trial,
         "trial_sha256": trial_sha256,
         "validation_metrics": metadata["validation_metrics"]
@@ -661,7 +734,7 @@ fn valid_fixture_with_identity(
     metadata["training_run"]["size_bytes"] = json!(training_run_bytes.len());
     let metadata_bytes = serde_json::to_vec(&metadata)?;
     let bundle_metadata_sha256 = sha256(&metadata_bytes);
-    let expectations = BundleExpectations::try_new(
+    let expectations = BundleExpectations::try_new_with_output_binding(
         expectations.model_id(),
         expectations.bundle_id().clone(),
         expectations.bundle_version(),
@@ -674,6 +747,7 @@ fn valid_fixture_with_identity(
         Sha256Digest::new(bundle_metadata_sha256),
         Sha256Digest::new(artifact_sha256),
         Sha256Digest::new(training_run_sha256),
+        expectations.output_binding().clone(),
     )?;
     let artifact_name = if artifact_override.is_some() {
         "model.onnx"

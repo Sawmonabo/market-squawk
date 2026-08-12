@@ -8,8 +8,10 @@ const OverviewPage = lazy(() =>
     default: module.OverviewPage,
   })),
 )
-const LookupPage = lazy(() =>
-  import("@/features/lookup").then((module) => ({ default: module.LookupPage })),
+const AdvancedOverviewPage = lazy(() =>
+  import("@/features/advanced/advanced-overview-page").then((module) => ({
+    default: module.AdvancedOverviewPage,
+  })),
 )
 
 const MarketsPage = lazy(() =>
@@ -65,25 +67,25 @@ export function AppRoutes() {
     <RouteErrorBoundary key={location.pathname}>
       <Suspense fallback={<RouteLoading />}>
         <Routes>
-          <Route path="/overview" element={<OverviewPage />} />
-          <Route path="/lookup" element={<LookupPage />} />
+          <Route path="/home" element={<OverviewPage />} />
           <Route path="/markets" element={<MarketsPage />} />
-          <Route path="/sources" element={<SourcesPage />} />
-          <Route path="/research" element={<ResearchPage />} />
-          <Route path="/portfolios" element={<PortfolioPage />} />
-          <Route path="/models" element={<ModelsPage />} />
-          <Route path="/decisions" element={<DecisionsPage />} />
-          <Route path="/backtests" element={<BacktestsPage />} />
+          <Route path="/opportunities" element={<DecisionsPage />} />
+          <Route path="/portfolio" element={<PortfolioPage />} />
           <Route path="/paper-execution" element={<PaperExecutionPage />} />
-          <Route path="/risk" element={<RiskPage />} />
-          <Route path="/fair-value" element={<FairValuePage />} />
-          <Route path="/updates" element={<LifecyclePage />} />
-          <Route path="/mcp" element={<McpPage />} />
-          <Route path="/operations" element={<OperationsPage />} />
-          <Route path="/logs" element={<LogsPage />} />
-          <Route path="/backup-recovery" element={<BackupRecoveryPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<Navigate to="/overview" replace />} />
+          <Route path="/advanced" element={<AdvancedOverviewPage />} />
+          <Route path="/advanced/research-data" element={<ResearchPage />} />
+          <Route path="/advanced/models-forecasts" element={<ModelsPage />} />
+          <Route path="/advanced/backtests" element={<BacktestsPage />} />
+          <Route path="/advanced/valuation-targets" element={<FairValuePage />} />
+          <Route path="/advanced/risk-recommendation-policy" element={<RiskPage />} />
+          <Route path="/connections/sources" element={<SourcesPage />} />
+          <Route path="/system/ai-connections" element={<McpPage />} />
+          <Route path="/system/operations-jobs" element={<OperationsPage />} />
+          <Route path="/system/updates-repair" element={<LifecyclePage />} />
+          <Route path="/system/backup-recovery" element={<BackupRecoveryPage />} />
+          <Route path="/system/logs-diagnostics" element={<LogsPage />} />
+          <Route path="/system/settings" element={<SettingsPage />} />
+          <Route path="*" element={<Navigate to="/home" replace />} />
         </Routes>
       </Suspense>
     </RouteErrorBoundary>
@@ -114,14 +116,14 @@ class RouteErrorBoundary extends Component<
           </p>
           <h1 className="mt-2 text-xl font-semibold">This page could not load</h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            Your local service and the rest of the workspace remain available. Return to Overview,
+            Your local service and the rest of the workspace remain available. Return to Home,
             then reopen this page after checking its status.
           </p>
           <Link
             className="mt-5 inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground"
-            to="/overview"
+            to="/home"
           >
-            Return to Overview
+            Return to Home
           </Link>
         </section>
       </main>

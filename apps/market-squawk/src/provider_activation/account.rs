@@ -200,6 +200,14 @@ impl ProviderAccountRuntimeAuthority {
             .require_active(&self.lease)
     }
 
+    /// Revalidates this exact active account lease without waiting for the onboarding mutation
+    /// lock. Synchronous downstream callbacks must fail closed while that lock is unavailable.
+    pub(super) fn require_current_now(&self) -> Result<(), crate::ProviderOnboardingError> {
+        self.onboarding
+            .try_acquire_runtime_mutation_authority()?
+            .require_active(&self.lease)
+    }
+
     pub(super) fn next_persisted_nonce(
         &self,
         candidate: u64,

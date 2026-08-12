@@ -284,6 +284,11 @@ fn map_analytical_error(error: AnalyticalReadError) -> FairValueProducerSelectio
             | QueryError::InvalidSource
             | QueryError::ManifestPinMismatch,
         )
+        | AnalyticalReadError::InvalidMarketBarLimit
+        | AnalyticalReadError::InvalidMarketBarEffectiveRange
+        | AnalyticalReadError::InvalidFundNavLimit
+        | AnalyticalReadError::InvalidFundNavDateRange
+        | AnalyticalReadError::InvalidOutcomeMarketBarWindow
         | AnalyticalReadError::InvalidObservationSchema => {
             FairValueProducerSelectionError::InvalidSelection
         }
@@ -294,6 +299,10 @@ fn map_analytical_error(error: AnalyticalReadError) -> FairValueProducerSelectio
         | AnalyticalReadError::InvalidLimit
         | AnalyticalReadError::InstrumentLimitExceeded
         | AnalyticalReadError::InvalidKnowledgeRange
+        | AnalyticalReadError::MarketBarResultRequiresInline
+        | AnalyticalReadError::InvalidMarketBarResult
+        | AnalyticalReadError::FundNavResultRequiresInline
+        | AnalyticalReadError::InvalidFundNavResult
         | AnalyticalReadError::Query(_) => FairValueProducerSelectionError::Internal,
     }
 }
@@ -313,6 +322,7 @@ fn map_portfolio_error(
         Error::Path
         | Error::Authority
         | Error::SnapshotUnavailable
+        | Error::StateChanged
         | Error::RestoreTargetNotFresh => FairValueProducerSelectionError::Unavailable,
         Error::CorruptPublication | Error::Publication | Error::Analytics => {
             FairValueProducerSelectionError::Internal

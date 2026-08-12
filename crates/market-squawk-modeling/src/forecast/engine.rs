@@ -13,6 +13,14 @@ pub trait ResearchForecastBackend: InferenceBackend {
         calibration: Option<&CalibrationEvidence>,
     ) -> Result<ForecastPath, ForecastError> {
         let metadata = self.metadata();
+        let output_binding = metadata.output_binding();
+        if !output_binding.admits_path_horizon(request.horizon) {
+            return Err(ForecastError::InvalidHorizon);
+        }
+        let price_bound = matches!(
+            output_binding.measurement(),
+            ForecastMeasurement::Price { .. }
+        );
         if calibration.is_some_and(|value| !value.matches(metadata, request.observed_cutoff)) {
             return Err(ForecastError::CalibrationIdentityMismatch);
         }
@@ -23,9 +31,17 @@ pub trait ResearchForecastBackend: InferenceBackend {
         for (index, input) in request.inputs.iter().enumerate() {
             let output = self.infer(input)?;
             let central = ForecastValue::try_from_f64(output.score(), request.decimal_scale)?;
+            if price_bound && central.mantissa() <= 0 {
+                return Err(ForecastError::InvalidDecimal);
+            }
             let intervals = calibration
                 .map(|evidence| ForecastIntervals::from_calibration(central, evidence))
                 .transpose()?;
+            if price_bound
+                && intervals.is_some_and(|value| value.interval_95().lower().mantissa() <= 0)
+            {
+                return Err(ForecastError::InvalidInterval);
+            }
             points.push(ForecastPoint {
                 target_at: request.horizon.target_at(request.observed_cutoff, index)?,
                 central,
@@ -45,6 +61,7 @@ pub trait ResearchForecastBackend: InferenceBackend {
             metadata_hash: metadata.metadata_hash(),
             artifact_hash: metadata.artifact_hash(),
             training_run_hash: metadata.training_run_hash(),
+            output_binding: output_binding.clone(),
             dataset: metadata.dataset().clone(),
             universe_id: metadata.universe_id().clone(),
             training_period: metadata.training_period(),

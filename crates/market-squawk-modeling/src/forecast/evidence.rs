@@ -38,13 +38,19 @@ impl ForecastVintage {
             .ok_or(ForecastError::InvalidHorizon)?
             .target_at;
         if artifact_hash.bytes() == [0; 32]
+            || !path.output_binding.admits_path_horizon(path.horizon)
             || created_at < path.available_at
             || created_at >= first_target
             || expires_at <= created_at
         {
             return Err(ForecastError::InvalidVintage);
         }
-        let id = ForecastVintageId(digest_vintage(&path, created_at, expires_at, artifact_hash));
+        let id = ForecastVintageId(digest_vintage(
+            &path,
+            created_at,
+            expires_at,
+            artifact_hash,
+        )?);
         Ok(Self {
             id,
             path,
@@ -83,6 +89,132 @@ impl ForecastVintage {
     pub const fn artifact_hash(&self) -> Sha256Digest {
         self.artifact_hash
     }
+}
+
+/// Reconstitutes the single current forecast-vintage contract and verifies its content identity.
+///
+/// Durable adapters use this boundary after strict wire decoding. The verifier reconstructs the
+/// private [`ForecastPath`] representation from exact admitted model metadata, recomputes any
+/// calibrated intervals, and then delegates identity construction to [`ForecastVintage::try_new`].
+/// No adapter-owned serialization or duplicate vintage digest policy is accepted.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    reason = "every retained path, model, calibration, publication, and artifact coordinate remains explicit"
+)]
+pub fn verify_forecast_vintage_identity(
+    expected_vintage_id: Sha256Digest,
+    metadata: &ModelMetadata,
+    instrument_id: InstrumentId,
+    observed_cutoff: Timestamp,
+    available_at: Timestamp,
+    horizon: ForecastHorizon,
+    observed_history: &[ForecastObservedPoint],
+    retained_points: &[(Timestamp, ForecastValue, Option<[[ForecastValue; 2]; 3]>)],
+    calibration: Option<&CalibrationEvidence>,
+    created_at: Timestamp,
+    expires_at: Timestamp,
+    controlled_artifact_hash: Sha256Digest,
+) -> Result<(), ForecastError> {
+    if available_at < observed_cutoff
+        || retained_points.len() != usize::from(horizon.points().get())
+        || !metadata.output_binding().admits_path_horizon(horizon)
+        || metadata.forecast_calibration().is_some() != calibration.is_some()
+        || calibration.is_some_and(|value| !value.matches(metadata, observed_cutoff))
+    {
+        return Err(ForecastError::InvalidVintage);
+    }
+    let decimal_scale = retained_points
+        .first()
+        .ok_or(ForecastError::InvalidHorizon)?
+        .1
+        .scale();
+    if observed_history.len() > MAX_FORECAST_OBSERVED_POINTS
+        || observed_history.iter().any(|point| {
+            point.value().scale() != decimal_scale
+                || point.observed_at() > observed_cutoff
+                || point.available_at() > available_at
+        })
+        || observed_history
+            .windows(2)
+            .any(|pair| pair[0].observed_at() >= pair[1].observed_at())
+        || (!observed_history.is_empty()
+            && observed_history
+                .last()
+                .is_none_or(|point| point.observed_at() != observed_cutoff))
+    {
+        return Err(ForecastError::InvalidObservedHistory);
+    }
+
+    let price_bound = matches!(
+        metadata.output_binding().measurement(),
+        ForecastMeasurement::Price { .. }
+    );
+    let mut points = Vec::new();
+    points
+        .try_reserve_exact(retained_points.len())
+        .map_err(|_| ForecastError::Capacity)?;
+    for (index, (target_at, central, retained_intervals)) in
+        retained_points.iter().copied().enumerate()
+    {
+        if horizon.target_at(observed_cutoff, index)? != target_at
+            || central.scale() != decimal_scale
+            || (price_bound && central.mantissa() <= 0)
+        {
+            return Err(ForecastError::InvalidVintage);
+        }
+        let intervals = calibration
+            .map(|value| ForecastIntervals::from_calibration(central, value))
+            .transpose()?;
+        if retained_intervals != intervals.map(forecast_interval_bounds)
+            || (price_bound
+                && intervals.is_some_and(|value| value.interval_95().lower().mantissa() <= 0))
+        {
+            return Err(ForecastError::InvalidVintage);
+        }
+        points.push(ForecastPoint {
+            target_at,
+            central,
+            intervals,
+        });
+    }
+
+    let path = ForecastPath {
+        instrument_id,
+        observed_cutoff,
+        available_at,
+        horizon,
+        observed_history: observed_history.into(),
+        points: points.into_boxed_slice(),
+        model_id: metadata.model_id(),
+        bundle_id: metadata.bundle_id().clone(),
+        bundle_version: metadata.bundle_version(),
+        metadata_hash: metadata.metadata_hash(),
+        artifact_hash: metadata.artifact_hash(),
+        training_run_hash: metadata.training_run_hash(),
+        output_binding: metadata.output_binding().clone(),
+        dataset: metadata.dataset().clone(),
+        universe_id: metadata.universe_id().clone(),
+        training_period: metadata.training_period(),
+        feature_semantic_digests: metadata.feature_semantic_digests().into(),
+        calibration: calibration.cloned(),
+        quality: DataQuality::Modeled,
+        limitations: metadata.limitations().into(),
+        fallback_reason: metadata.fallback_reason().into(),
+    };
+    let vintage = ForecastVintage::try_new(path, created_at, expires_at, controlled_artifact_hash)?;
+    if vintage.id().bytes() != expected_vintage_id.bytes() {
+        return Err(ForecastError::InvalidVintage);
+    }
+    Ok(())
+}
+
+fn forecast_interval_bounds(value: ForecastIntervals) -> [[ForecastValue; 2]; 3] {
+    [
+        [value.interval_50().lower(), value.interval_50().upper()],
+        [value.interval_80().lower(), value.interval_80().upper()],
+        [value.interval_95().lower(), value.interval_95().upper()],
+    ]
 }
 
 /// Content-addressed immutable realized-outcome identity.
@@ -214,9 +346,9 @@ fn digest_vintage(
     created_at: Timestamp,
     expires_at: Timestamp,
     artifact_hash: Sha256Digest,
-) -> [u8; 32] {
+) -> Result<[u8; 32], ForecastError> {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/forecast-vintage/v1\0");
+    hash.update(b"market-squawk/forecast-vintage/v4\0");
     hash.update(path.instrument_id.as_uuid().as_bytes());
     hash.update(path.observed_cutoff.unix_nanos().to_be_bytes());
     hash.update(path.available_at.unix_nanos().to_be_bytes());
@@ -228,6 +360,7 @@ fn digest_vintage(
     hash.update(path.metadata_hash.bytes());
     hash.update(path.artifact_hash.bytes());
     hash.update(path.training_run_hash.bytes());
+    hash.update(path.output_binding.identity().bytes());
     hash.update(path.dataset.export_digest().bytes());
     hash.update(path.dataset.selection_digest().bytes());
     hash.update(created_at.unix_nanos().to_be_bytes());
@@ -261,12 +394,41 @@ fn digest_vintage(
     }
     if let Some(calibration) = &path.calibration {
         hash.update([1]);
+        hash.update(calibration.identity().bytes());
+        hash.update([match calibration.method() {
+            CalibrationMethod::MapieEnbpi => 1,
+            CalibrationMethod::MapieAci => 2,
+            CalibrationMethod::ResidualQuantile => 3,
+        }]);
+        hash.update(calibration.window().start().unix_nanos().to_be_bytes());
+        hash.update(calibration.window().end().unix_nanos().to_be_bytes());
+        hash.update(calibration.window().observations().get().to_be_bytes());
         hash.update(calibration.policy_hash.bytes());
+        hash.update(calibration.policy_size_bytes().to_be_bytes());
         hash.update(calibration.residuals_hash.bytes());
+        hash.update(calibration.residuals_size_bytes().to_be_bytes());
+        for band in calibration.bands() {
+            hash.update(band.coverage().basis_points().to_be_bytes());
+            hash.update(band.lower_offset().to_bits().to_be_bytes());
+            hash.update(band.upper_offset().to_bits().to_be_bytes());
+            hash.update(band.realized().covered().to_be_bytes());
+            hash.update(band.realized().total().get().to_be_bytes());
+        }
+        update_vintage_bytes(&mut hash, calibration.dependence_assumptions().as_bytes())?;
     } else {
         hash.update([0]);
     }
-    hash.finalize().into()
+    Ok(hash.finalize().into())
+}
+
+fn update_vintage_bytes(hash: &mut Sha256, value: &[u8]) -> Result<(), ForecastError> {
+    hash.update(
+        u64::try_from(value.len())
+            .map_err(|_| ForecastError::InvalidVintage)?
+            .to_be_bytes(),
+    );
+    hash.update(value);
+    Ok(())
 }
 
 fn digest_outcome(

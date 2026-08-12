@@ -28,11 +28,11 @@ use crate::{
     FairValueError, FairValueEvidence, FairValueEvidenceHash, InputId, InputInstrumentRelation,
     InputObservability, InputSignificance, InputUseAssessment, MarketAccess,
     MarketAccessAssessmentId, MarketActivity, MeasurementId, OverrideId, PriceAdjustment,
-    ValuationAmount, ValuationApprovalId, ValuationInput, ValuationMeasurement,
-    ValuationMeasurementSpec, ValuationMethod,
+    ValuationAmount, ValuationAmountBasis, ValuationApprovalId, ValuationInput,
+    ValuationMeasurement, ValuationMeasurementSpec, ValuationMethod,
 };
 
-const PAYLOAD_VERSION: u16 = 1;
+const PAYLOAD_VERSION: u16 = 2;
 
 pub(crate) use recovery::recover;
 pub(crate) use write::{
@@ -158,6 +158,7 @@ struct AmountPayload {
     decimal_scale: u32,
     currency: String,
     accounting_scale: u8,
+    basis: u8,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -193,8 +194,7 @@ enum DecisionPayload {
         version: u16,
         measurement_id: [u8; 32],
         max_quote_age_nanos: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ruleset_version: Option<u32>,
+        ruleset_version: u32,
     },
     Override {
         version: u16,

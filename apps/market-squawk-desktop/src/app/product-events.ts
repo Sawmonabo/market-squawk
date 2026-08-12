@@ -15,13 +15,13 @@ export function sameRuntime(
 
 export function requiresResync(
   scope: ProductScope,
-  previousSequence: number,
+  previousSequence: string,
   event: DesktopEvent,
 ): boolean {
   return (
     !sameRuntime(scope, event.runtime) ||
     event.body.type === "resync_required" ||
-    event.sequence !== previousSequence + 1
+    BigInt(event.sequence) !== BigInt(previousSequence) + 1n
   )
 }
 

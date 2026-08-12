@@ -533,7 +533,8 @@ class TrainingBundleContracts(unittest.TestCase):
                 "regression",
                 "018f3c2a-91ab-7ccd-b3de-123456789abc",
                 "fixture-linear",
-                None,
+                (5, 25, 35, 65, 75, 105),
+                {"kind": "price", "currency": "USD"},
                 False,
             ),
             (
@@ -542,6 +543,7 @@ class TrainingBundleContracts(unittest.TestCase):
                 "018f3c2a-91ab-7ccd-b3de-223456789abc",
                 "fixture-logistic",
                 (0, 10, 0, 10, 0, 10),
+                {"kind": "probability"},
                 True,
             ),
         )
@@ -553,6 +555,7 @@ class TrainingBundleContracts(unittest.TestCase):
                     model_id,
                     bundle_id,
                     label_mantissas,
+                    output_measurement,
                     terminal_sigmoid,
                 ) = case
                 with self.subTest(model_kind=model_kind):
@@ -565,6 +568,7 @@ class TrainingBundleContracts(unittest.TestCase):
                     digest = _fixture(
                         data_root,
                         label_mantissas=label_mantissas,
+                        label_measurement=output_measurement,
                         initialize_root=_initialize_signed_data_root,
                     )
                     dataset = open_dataset(
@@ -643,6 +647,55 @@ class TrainingBundleContracts(unittest.TestCase):
                             request["backend"]["outputSemantics"],
                         ],
                         [output_semantics] * 3,
+                    )
+                    self.assertEqual(
+                        [
+                            json.loads(first.candidate.training_run_bytes)["trial"][
+                                "output_measurement"
+                            ],
+                            json.loads(first.candidate.metadata_bytes)[
+                                "output_measurement"
+                            ],
+                            json.loads(first.authority_bytes)["output_measurement"],
+                        ],
+                        [output_measurement] * 3,
+                    )
+                    expected_statistic = {
+                        "estimator": {
+                            "kind": (
+                                "sealed_direct_least_squares_v1"
+                                if model_kind == "linear"
+                                else "sealed_binary_logistic_v1"
+                            )
+                        },
+                        "objective": (
+                            "squared_error"
+                            if model_kind == "linear"
+                            else "binary_cross_entropy"
+                        ),
+                        "output_transform": (
+                            "identity" if model_kind == "linear" else "logistic"
+                        ),
+                        "statistic": (
+                            "model_estimated_conditional_mean"
+                            if model_kind == "linear"
+                            else "unavailable"
+                        ),
+                        "target": {
+                            "horizon_nanos": 10,
+                            "kind": "fixed_horizon_terminal",
+                        },
+                        "target_transform": "identity",
+                    }
+                    self.assertEqual(
+                        [
+                            json.loads(first.candidate.training_run_bytes)["trial"][
+                                "output_statistic"
+                            ],
+                            json.loads(first.candidate.metadata_bytes)["output_statistic"],
+                            json.loads(first.authority_bytes)["output_statistic"],
+                        ],
+                        [expected_statistic] * 3,
                     )
                     self.assertEqual(
                         request["backend"]["modelSha256"],

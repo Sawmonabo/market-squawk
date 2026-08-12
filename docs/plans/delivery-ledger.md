@@ -55,21 +55,29 @@ evidence; it does not replace the README capability truth or the canonical relea
   allowlist, protected token rotation, one multiplexed socket, adaptive capacity, exact
   delay/feed/depth provenance, unlink/revocation handling, and no account/order routes. The exact
   [credential input](../reference/market-squawk-provider-credentials.env.example) and
-  [account setup](../operations/provider-account-setup.md) are documented, but the strict
-  `market-squawk-provider-credentials/v1` thin parser/entry point is absent. It must reuse the
-  existing onboarding and secret-store path, not create a credential provider, adapter, crate,
-  service, authority, or configuration system. The former fixed Yahoo 25-symbol value had no
-  provider evidence and is removed: one shared runtime lane must measure actual attempts and
-  returns, coalesce/cache demand, and stop on its provider-wide 429 circuit. IEX HIST enablement
-  authorizes only explicitly selected, byte-admitted feed/date cold jobs and never an automatic
-  full-catalog download. Yahoo experimental/reference-file/IEX HIST lanes, owner-enabled Schwab,
-  optional Tiingo, BEA, Federal Reserve Board, Census, and EIA integrations; FRED v2 release bulk;
-  SEC N-PORT/N-CEN; complete Alpaca historical and current-batch composition; adaptive scheduling;
-  quota/quality telemetry; and the corresponding canonical product consumers remain incomplete.
+  [account setup](../operations/provider-account-setup.md) are documented. The current working
+  candidate implements the strict 32-field `market-squawk-provider-credentials/v1` parser and the
+  one-time installed command
+  `market-squawk source import-credentials <absolute-file> --confirm`. It stages bounded bytes to
+  the existing onboarding/secret-store service and returns exactly 17 secret-free provider
+  dispositions: `disabled`, `credential_stored_unverified`, `probe_required`, or
+  `profile_unavailable`. Import never probes, activates, schedules, publishes, or trades. This is
+  dirty-tree implementation status, not frozen-head acceptance. The former fixed Yahoo 25-symbol
+  value had no provider evidence and is removed: one shared runtime lane must measure actual
+  attempts and returns, coalesce/cache demand, and stop on its provider-wide 429 circuit. IEX HIST
+  enablement authorizes only explicitly selected, byte-admitted feed/date cold jobs and never an
+  automatic full-catalog download. Current in-flight core/transport adapters now exist for Yahoo,
+  IEX HIST, OCC/Cboe reference, owner-enabled Schwab, optional Tiingo, BEA, Federal Reserve Board,
+  Census, and EIA; installed activation bindings, doctors, transport completion where applicable,
+  publication, PIT reads, and product composition remain incomplete. FRED v2 release bulk; SEC
+  N-PORT/N-CEN; complete Alpaca historical and current-batch composition; adaptive scheduling;
+  quota/quality telemetry; and the corresponding canonical product consumers also remain
+  incomplete.
   Yahoo cannot become WARM or sole decision authority without a retained normal-session benchmark,
   and the 8,000-symbol Alpaca target is conditional on an effective batch of at least 50 plus
-  authenticated rate/entitlement proof. The credential file is a design contract, not a current
-  runtime configuration claim. The per-source contracts are indexed under
+  authenticated rate/entitlement proof. The credential file is one-time operator input, not a
+  startup/runtime configuration layer and not an availability claim. The per-source contracts are
+  indexed under
   [selected providers](../reference/providers/README.md), and the shared closed data families,
   clocks, exact values, immutable generations, PIT selection, analytical bindings, and typed reads
   are governed by the [canonical schema contract](../reference/market-data-canonical-schemas.md).
@@ -97,7 +105,9 @@ evidence; it does not replace the README capability truth or the canonical relea
   recommendations, portfolio/risk, and virtual paper over those same typed reads. The exact
   32-field credential/probe-intent example
   schema and the owner-local credential file have matching field names; the local file remains
-  mode `0600`, and its values are not recorded here. The implementation goal remains paused until
+  mode `0600`, and its values are not recorded here. Import produces only Configured,
+  Probe-required, Disabled, or Profile-unavailable evidence. Available still requires the complete
+  chain above. The implementation goal remains paused until
   the owner explicitly resumes it; this entry is the ready-to-resume authority, not an
   implementation or acceptance claim.
 - The first dirty-tree integration review found concrete paper/live lifecycle, provider-switch,
@@ -127,11 +137,11 @@ evidence; it does not replace the README capability truth or the canonical relea
   checks.
 - Remaining barriers before the requested owner-test handoff are outcome-based:
 
-  1. Add the thin credential-file parser to the existing secret-store/provider-activation path—no
-     new credential crate or configuration system—then close the missing Alpaca Paper batch and
-     entitlement doctor, owner-enabled Schwab read-only OAuth/REST/Streamer adapter, Yahoo
-     experimental adapter, Nasdaq/OCC/Cboe reference ingestion, optional
-     IEX HIST and Tiingo lanes, BEA, Board, Census, EIA, FRED v2, SEC fund, Alpaca historical,
+  1. Carry the implemented credential import through exact provider doctors and activation without
+     adding a credential crate or configuration system, then close the Alpaca Paper batch and
+     entitlement doctor, owner-enabled Schwab read-only OAuth/REST/Streamer binding, Yahoo
+     experimental binding, Nasdaq/OCC/Cboe reference ingestion, optional IEX HIST and Tiingo
+     lanes, BEA, Board, Census, EIA, FRED v2, SEC fund, Alpaca historical,
      quota/checkpoint, raw-evidence publication, canonical schema/generation, PIT selector,
      scheduler, telemetry, and fixed typed application surfaces without adding trading authority
      or a parallel data application. Only the selected provider set participates in credentials,

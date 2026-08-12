@@ -4,14 +4,20 @@ mod backup;
 mod codec;
 pub(crate) mod dossier_preparation;
 mod persistence;
+pub(crate) mod recommendation;
 pub(crate) mod screen_workflow;
 pub(crate) mod target_preparation;
+mod workspace;
 
 use std::{collections::BTreeMap, fmt, sync::Mutex, time::Instant};
 
 use market_squawk_decisions::{
-    AppendOutcome, CandidateAssessment, CandidateInput, DecisionAuthority, DecisionDossier,
-    DecisionRepository, DecisionRepositoryError, DecisionRepositoryLimits, InvestmentTargetSetId,
+    AnalyticalProfileBindingReference, AppendOutcome, CandidateAssessment, CandidateInput,
+    DecisionAuthority, DecisionDossier, DecisionRepository, DecisionRepositoryError,
+    DecisionRepositoryLimits, InvestmentAnalysisCurrentIndexEntry, InvestmentAnalysisId,
+    InvestmentOutcomeProjection, InvestmentProposalDecision, InvestmentProposalId,
+    InvestmentProposalIndexEntry, InvestmentSizingProjection, InvestmentTargetSetId,
+    PublishedInvestmentAnalysis, RecommendationOutcomeStatusRecord, RecommendationTrackRecord,
     SavedScreen, ScreenExecution, ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry,
     TargetInvalidation, TargetReview, TargetState, TargetStatus,
 };
@@ -32,6 +38,13 @@ use self::target_preparation::{
     PreparedTargetPreview, TargetEvidenceInventory, TargetPreparationCommitKind,
     TargetPreparationDraft, TargetPreparationError, TargetPreparationFence,
     TargetPreparationReceipt, TargetReferenceMarkSelector,
+};
+pub(crate) use self::workspace::{
+    DecisionWorkspaceCandidate, DecisionWorkspaceCandidateRun, DecisionWorkspaceCompleteness,
+    DecisionWorkspaceQuery, DecisionWorkspaceRead, DecisionWorkspaceReadError,
+    DecisionWorkspaceReadLimits, DecisionWorkspaceSelectionCounts,
+    DecisionWorkspaceSelectionReceipt, DecisionWorkspaceSnapshot, DecisionWorkspaceTargetHead,
+    DecisionWorkspaceTruncationReason,
 };
 
 /// Typed application failure that does not leak SQLite, lock, or filesystem internals.
@@ -92,6 +105,29 @@ pub struct DecisionApplication {
     state: Mutex<DecisionState>,
 }
 
+/// One immutable proposal-index snapshot with its exact remaining locator count.
+#[derive(Debug)]
+pub(crate) struct InvestmentProposalIndexReadPage {
+    entries: Vec<InvestmentProposalIndexEntry>,
+    available: usize,
+}
+
+/// One-lock current read of a proposal, its publication, and generated-proposal sidecars.
+#[derive(Debug)]
+pub(crate) struct InvestmentAnalysisRead {
+    pub(crate) decision: InvestmentProposalDecision,
+    pub(crate) current: Option<InvestmentAnalysisCurrentIndexEntry>,
+    pub(crate) outcome_projection: Option<InvestmentOutcomeProjection>,
+    pub(crate) sizing_projection: Option<InvestmentSizingProjection>,
+}
+
+impl InvestmentProposalIndexReadPage {
+    /// Separates the bounded locator page from its exact same-snapshot availability count.
+    pub(crate) fn into_parts(self) -> (Vec<InvestmentProposalIndexEntry>, usize) {
+        (self.entries, self.available)
+    }
+}
+
 impl DecisionApplication {
     /// Opens the fixed decision database, acquires its sole writer lease, and canonically replays
     /// every committed row before making the authority available.
@@ -99,10 +135,10 @@ impl DecisionApplication {
         location: DecisionDatabaseLocation,
         limits: DecisionRepositoryLimits,
     ) -> Result<Self, DecisionApplicationError> {
-        let journal = DecisionJournal::open(location)?;
+        let journal = DecisionJournal::open(location, limits)?;
         let repository = DecisionRepository::try_new(limits)?;
         let mut authority = DecisionAuthority::new(repository);
-        let mut recovery = RecoveryContext::try_new()?;
+        let mut recovery = RecoveryContext::try_new(limits.maximum_screen_runs())?;
         let _semantic_sha256 = journal.recover(&mut authority, &mut recovery)?;
         let screen_job_inputs = recovery.into_screen_job_inputs();
         Ok(Self {
@@ -182,6 +218,11 @@ impl DecisionApplication {
                     Err(ScreenWorkflowError::Conflict)
                 };
             }
+            if state.screen_job_inputs.len() >= state.limits.maximum_screen_runs() {
+                return Err(ScreenWorkflowError::Application(
+                    DecisionApplicationError::Capacity,
+                ));
+            }
             if state
                 .authority
                 .repository()
@@ -216,6 +257,11 @@ impl DecisionApplication {
             } else {
                 Err(ScreenWorkflowError::Conflict)
             };
+        }
+        if state.screen_job_inputs.len() >= state.limits.maximum_screen_runs() {
+            return Err(ScreenWorkflowError::Application(
+                DecisionApplicationError::Capacity,
+            ));
         }
         if state
             .authority
@@ -566,6 +612,240 @@ impl DecisionApplication {
         let mut state = self.writer()?;
         let outcome = state.authority.invalidate_target(invalidation)?;
         persist_outcome(&mut state, &encoded, outcome)
+    }
+
+    /// Persists one constructor-governed proposal after independent authority recomputation.
+    ///
+    /// This typed composition boundary accepts neither raw financial scalars nor caller-selected
+    /// recommendation fields. It grants no generation, workflow, sizing, order, or execution
+    /// authority and is deliberately not registered as a service, MCP, or Desktop operation.
+    pub fn append_investment_proposal(
+        &self,
+        decision: InvestmentProposalDecision,
+    ) -> Result<AppendOutcome, DecisionApplicationError> {
+        let encoded = codec::investment_proposal(&decision)?;
+        let mut state = self.writer()?;
+        let outcome = state.authority.append_investment_proposal(decision)?;
+        persist_outcome(&mut state, &encoded, outcome)
+    }
+
+    /// Persists the sole immutable analytical-profile/workflow publication for one analysis.
+    pub fn append_investment_analysis_publication(
+        &self,
+        publication: PublishedInvestmentAnalysis,
+    ) -> Result<AppendOutcome, DecisionApplicationError> {
+        let encoded = codec::investment_analysis_publication(&publication)?;
+        let mut state = self.writer()?;
+        let outcome = state
+            .authority
+            .append_investment_analysis_publication(publication)?;
+        persist_outcome(&mut state, &encoded, outcome)
+    }
+
+    /// Persists one deterministic proposal-bound outcome projection sidecar.
+    pub fn append_investment_outcome_projection(
+        &self,
+        projection: InvestmentOutcomeProjection,
+    ) -> Result<AppendOutcome, DecisionApplicationError> {
+        let encoded = codec::investment_outcome_projection(&projection)?;
+        let mut state = self.writer()?;
+        let outcome = state
+            .authority
+            .append_investment_outcome_projection(projection)?;
+        persist_outcome(&mut state, &encoded, outcome)
+    }
+
+    /// Persists one deterministic proposal-bound sizing projection sidecar.
+    pub fn append_investment_sizing_projection(
+        &self,
+        projection: InvestmentSizingProjection,
+    ) -> Result<AppendOutcome, DecisionApplicationError> {
+        let encoded = codec::investment_sizing_projection(&projection)?;
+        let mut state = self.writer()?;
+        let outcome = state
+            .authority
+            .append_investment_sizing_projection(projection)?;
+        persist_outcome(&mut state, &encoded, outcome)
+    }
+
+    /// Persists one contiguous pending, unavailable, or completed outcome status revision.
+    pub fn append_recommendation_outcome_status(
+        &self,
+        status: RecommendationOutcomeStatusRecord,
+    ) -> Result<AppendOutcome, DecisionApplicationError> {
+        let encoded = codec::recommendation_outcome_status(&status)?;
+        let mut state = self.writer()?;
+        let outcome = state
+            .authority
+            .append_recommendation_outcome_status(status)?;
+        persist_outcome(&mut state, &encoded, outcome)
+    }
+
+    /// Returns one exact complete generated, no-action, or unavailable investment analysis.
+    pub fn get_investment_proposal(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Result<InvestmentProposalDecision, DecisionApplicationError> {
+        Ok(self
+            .reader()?
+            .authority
+            .get_investment_proposal(analysis_id)?
+            .clone())
+    }
+
+    /// Returns the profile/workflow publication bound to one analysis.
+    pub fn get_investment_analysis_publication(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Result<PublishedInvestmentAnalysis, DecisionApplicationError> {
+        Ok(self
+            .reader()?
+            .authority
+            .get_investment_analysis_publication(analysis_id)?
+            .clone())
+    }
+
+    /// Returns the exact durable outcome projection for one generated proposal.
+    pub fn get_investment_outcome_projection(
+        &self,
+        proposal_id: InvestmentProposalId,
+    ) -> Result<InvestmentOutcomeProjection, DecisionApplicationError> {
+        Ok(self
+            .reader()?
+            .authority
+            .get_investment_outcome_projection(proposal_id)?
+            .clone())
+    }
+
+    /// Returns the exact durable sizing projection for one generated proposal.
+    pub fn get_investment_sizing_projection(
+        &self,
+        proposal_id: InvestmentProposalId,
+    ) -> Result<InvestmentSizingProjection, DecisionApplicationError> {
+        Ok(self
+            .reader()?
+            .authority
+            .get_investment_sizing_projection(proposal_id)?
+            .clone())
+    }
+
+    /// Returns the current profile, projection, sizing, and outcome locator for one analysis.
+    pub fn get_investment_analysis_current(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Result<InvestmentAnalysisCurrentIndexEntry, DecisionApplicationError> {
+        Ok(self
+            .reader()?
+            .authority
+            .get_investment_analysis_current(analysis_id)?
+            .clone())
+    }
+
+    /// Atomically reads one proposal and every presently published analysis sidecar.
+    pub(crate) fn read_investment_analysis(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Result<InvestmentAnalysisRead, DecisionApplicationError> {
+        let state = self.reader()?;
+        let repository = state.authority.repository();
+        let decision = repository
+            .investment_proposal(analysis_id)
+            .ok_or(DecisionRepositoryError::NotFound)?
+            .clone();
+        let current = repository.investment_analysis_current(analysis_id).cloned();
+        let (outcome_projection, sizing_projection) =
+            decision.proposal_id().map_or((None, None), |proposal_id| {
+                (
+                    repository
+                        .investment_outcome_projection(proposal_id)
+                        .cloned(),
+                    repository
+                        .investment_sizing_projection(proposal_id)
+                        .cloned(),
+                )
+            });
+        Ok(InvestmentAnalysisRead {
+            decision,
+            current,
+            outcome_projection,
+            sizing_projection,
+        })
+    }
+
+    /// Computes current-status performance grouped by exact profile, action, and horizon.
+    pub fn recommendation_track_record(
+        &self,
+        profile: &AnalyticalProfileBindingReference,
+        horizon_nanos: i64,
+        evaluated_at: Timestamp,
+    ) -> Result<RecommendationTrackRecord, DecisionApplicationError> {
+        self.reader()?
+            .authority
+            .recommendation_track_record(profile, horizon_nanos, evaluated_at)
+            .map_err(Into::into)
+    }
+
+    /// Lists bounded immutable investment-analysis locators in durable append order.
+    pub fn list_investment_proposal_index(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<InvestmentProposalIndexEntry>, DecisionApplicationError> {
+        self.reader()?
+            .authority
+            .list_investment_proposal_index(maximum)
+            .map_err(Into::into)
+    }
+
+    /// Continues proposal discovery strictly after one exact retained analysis identity.
+    pub fn list_investment_proposal_index_after(
+        &self,
+        after: Option<InvestmentAnalysisId>,
+        maximum: usize,
+    ) -> Result<Vec<InvestmentProposalIndexEntry>, DecisionApplicationError> {
+        self.reader()?
+            .authority
+            .list_investment_proposal_index_after(after, maximum)
+            .map_err(Into::into)
+    }
+
+    /// Atomically reads a bounded append-order proposal index and its exact remaining count.
+    ///
+    /// The count and locators are derived while holding one reader guard, so a concurrent append
+    /// cannot make completeness metadata disagree with the returned page.
+    pub(crate) fn read_investment_proposal_index_page_after(
+        &self,
+        after: Option<InvestmentAnalysisId>,
+        maximum: usize,
+    ) -> Result<InvestmentProposalIndexReadPage, DecisionApplicationError> {
+        if maximum == 0 {
+            return Err(DecisionRepositoryError::InvalidLimits.into());
+        }
+        let state = self.reader()?;
+        let repository = state.authority.repository();
+        let available = if let Some(cursor) = after {
+            let mut proposals = repository.investment_proposals();
+            if proposals
+                .position(|proposal| proposal.analysis_id() == cursor)
+                .is_none()
+            {
+                return Err(DecisionRepositoryError::NotFound.into());
+            }
+            proposals.count()
+        } else {
+            repository.investment_proposals().count()
+        };
+        if available > state.limits.maximum_investment_proposals()
+            || available > state.limits.maximum_records()
+        {
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
+        let entries = state
+            .authority
+            .list_investment_proposal_index_after(after, maximum)?;
+        if entries.len() > maximum || entries.len() > available {
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
+        Ok(InvestmentProposalIndexReadPage { entries, available })
     }
 
     /// Effective append-derived status.

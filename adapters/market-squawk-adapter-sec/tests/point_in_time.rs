@@ -6,11 +6,12 @@ use market_squawk_adapter_sec::{
     normalize_company_facts, normalize_filings,
 };
 use market_squawk_domain::{
-    AvailabilityEvidence, EffectiveInterval, EvidenceDigest, InstrumentId, MetadataRevision,
-    PayloadHashAlgorithm, ProviderIdentityEvidence, ProviderIdentityRecord,
-    ProviderIdentityRecordInput, ProviderIdentityRegistry, ProviderInstrumentId,
-    ResearchObservation, ResearchTemporalCoordinate, ResearchTemporalPrecision, SourceId,
-    SourceIdentifier, Timestamp,
+    AvailabilityEvidence, EffectiveInterval, EvidenceDigest, FundamentalAmendmentStatus,
+    FundamentalCadence, FundamentalConsolidation, FundamentalPeriod, FundamentalRestatementStatus,
+    InstrumentId, MetadataRevision, PayloadHashAlgorithm, ProviderIdentityEvidence,
+    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentityRegistry,
+    ProviderInstrumentId, ResearchObservation, ResearchTemporalCoordinate,
+    ResearchTemporalPrecision, SourceId, SourceIdentifier, Timestamp,
 };
 use uuid::Uuid;
 
@@ -75,6 +76,53 @@ fn company_facts_resolve_cik_and_preserve_amendments_as_pit_revisions() -> Resul
                         .map(ResearchTemporalCoordinate::precision),
                     Some(ResearchTemporalPrecision::CalendarDate)
                 );
+                let source = fact.fact_context();
+                assert_eq!(source.unit().as_str(), "USD");
+                assert!(matches!(source.period(), FundamentalPeriod::Instant { .. }));
+                assert_eq!(source.period().end().to_string(), "2025-06-28");
+                assert_eq!(source.fiscal_year(), Some(2025));
+                assert_eq!(
+                    source.fiscal_period().map(SourceIdentifier::as_str),
+                    Some("Q3")
+                );
+                assert_eq!(source.cadence(), FundamentalCadence::Quarterly);
+                assert!(source.dimensions().dimensions().is_none());
+                assert_eq!(
+                    source.consolidation(),
+                    FundamentalConsolidation::Unavailable
+                );
+                assert!(matches!(
+                    source.restatement_status(),
+                    FundamentalRestatementStatus::Unavailable
+                ));
+                assert_eq!(
+                    source.revision_order().ordinal(),
+                    fact.context().time().revision()
+                );
+                if source.accession().as_str() == "0000320193-25-000080" {
+                    assert_eq!(
+                        source.amendment_status(),
+                        FundamentalAmendmentStatus::Amendment
+                    );
+                    assert_eq!(
+                        source.filing_form().map(SourceIdentifier::as_str),
+                        Some("10-Q/A")
+                    );
+                    assert!(source.frame().is_none());
+                } else {
+                    assert_eq!(
+                        source.amendment_status(),
+                        FundamentalAmendmentStatus::Original
+                    );
+                    assert_eq!(
+                        source.filing_form().map(SourceIdentifier::as_str),
+                        Some("10-Q")
+                    );
+                    assert_eq!(
+                        source.frame().map(SourceIdentifier::as_str),
+                        Some("CY2025Q2I")
+                    );
+                }
                 Some(fact.context().time().revision().get())
             }
             _ => None,

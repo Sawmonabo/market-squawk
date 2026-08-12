@@ -106,7 +106,7 @@ impl InstalledForecastPreparation {
                     .await
                     .map_err(map_preparation)?;
                 let labels = self.labels_for_catalog(&catalog, context)?;
-                let item_count = catalog.models().len().max(1);
+                let item_count = catalog.models().len();
                 (catalog_value(&catalog, &labels), item_count)
             }
             PREPARE_FORECAST => {

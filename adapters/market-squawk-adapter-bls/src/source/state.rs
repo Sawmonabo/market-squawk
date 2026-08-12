@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use market_squawk_domain::{SourceIdentifier, Timestamp};
-use market_squawk_sources::{MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceError};
+use market_squawk_sources::{
+    MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, ProviderCaptureMaterial, SourceError,
+};
 
 use super::normalize::CanonicalBlsRecord;
 use crate::client::RetrievedBlsPage;
@@ -102,19 +104,29 @@ impl std::fmt::Debug for RetrievedBlsPage {
 }
 
 /// A normalized BLS response page retaining local availability and exact source evidence.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BlsNormalizedPage {
     pub(super) received_at: Timestamp,
+    pub(super) response_received_at: Timestamp,
     pub(super) source_payload_sha256: String,
     pub(super) exact_payload: Bytes,
     pub(super) payloads: Vec<Bytes>,
     pub(super) records: Vec<CanonicalBlsRecord>,
+    pub(super) capture_material: ProviderCaptureMaterial,
 }
 
 impl BlsNormalizedPage {
     /// Returns when this process first observed the exact source response.
     pub const fn received_at(&self) -> Timestamp {
         self.received_at
+    }
+
+    /// Returns the socket-boundary time for the exact response bytes retained by this page.
+    ///
+    /// This can be later than [`Self::received_at`] when an evicted discovery response is
+    /// re-fetched under the same exact content identity.
+    pub const fn response_received_at(&self) -> Timestamp {
+        self.response_received_at
     }
 
     /// Returns the lowercase SHA-256 identity of the exact provider response.
@@ -130,6 +142,11 @@ impl BlsNormalizedPage {
     /// Returns normalized research-v3 payloads without fabricated temporal precision.
     pub fn payloads(&self) -> &[Bytes] {
         &self.payloads
+    }
+
+    /// Returns the exact bounded provider response material used to normalize this page.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture_material
     }
 }
 

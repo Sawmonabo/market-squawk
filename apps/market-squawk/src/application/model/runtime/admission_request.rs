@@ -172,7 +172,7 @@ enum BackendAdmissionWire {
         #[serde(rename = "outputShape")]
         output_shape: Vec<usize>,
         #[serde(rename = "outputSemantics")]
-        output_semantics: Option<OnnxOutputSemanticsWire>,
+        output_semantics: OnnxOutputSemanticsWire,
         #[serde(rename = "inferenceDeadlineMillis")]
         inference_deadline_millis: u64,
         fallback: OnnxFallbackWire,
@@ -194,26 +194,15 @@ impl BackendAdmissionWire {
             } => {
                 let model_digest = Sha256Digest::new(parse_sha256(&model_sha256)?);
                 let deadline = Duration::from_millis(inference_deadline_millis);
-                let policy = if let Some(output_semantics) = output_semantics {
-                    OnnxModelPolicy::try_new_with_output_semantics(
-                        model_digest,
-                        opset,
-                        &input_shape,
-                        &output_shape,
-                        output_semantics.into_domain(),
-                        deadline,
-                        fallback.into_domain(),
-                    )
-                } else {
-                    OnnxModelPolicy::try_new(
-                        model_digest,
-                        opset,
-                        &input_shape,
-                        &output_shape,
-                        deadline,
-                        fallback.into_domain(),
-                    )
-                }
+                let policy = OnnxModelPolicy::try_new_with_output_semantics(
+                    model_digest,
+                    opset,
+                    &input_shape,
+                    &output_shape,
+                    output_semantics.into_domain(),
+                    deadline,
+                    fallback.into_domain(),
+                )
                 .map_err(|_| ProductionModelRuntimeError::InvalidAdmission)?;
                 Ok(ModelBackendAdmission::Onnx(policy))
             }

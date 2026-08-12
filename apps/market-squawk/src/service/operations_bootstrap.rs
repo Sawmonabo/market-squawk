@@ -37,6 +37,7 @@ use crate::{
         },
         logs::DiagnosticArtifactPublisher,
         operations::{OperationsApplicationServices, UpdateAvailabilityEvidence},
+        recommendation::RecommendationSetupAuthority,
         settings::{
             DurableSettingsStore, SettingKey, SettingValue, SettingsSeed, SettingsSnapshot,
         },
@@ -80,6 +81,7 @@ pub(super) struct PreparedInstalledOperations {
     settings_seed: SettingsSeed,
     settings_lifecycle: SettingsLifecycleAuthority,
     settings_operations: Arc<ProductionSettingsOperations>,
+    recommendation_setup: Arc<RecommendationSetupAuthority>,
     activity: Arc<RuntimeActivityCoordinator>,
     recovery: Arc<DurableRecoveryState>,
     recovery_bridge: Arc<WorkspaceRecoveryBridge>,
@@ -97,6 +99,7 @@ pub(super) struct ReadyInstalledOperations {
     workspaces: Arc<DurableWorkspaceRegistry>,
     recovery_bridge: Arc<WorkspaceRecoveryBridge>,
     settings_operations: Arc<ProductionSettingsOperations>,
+    recommendation_setup: Arc<RecommendationSetupAuthority>,
 }
 
 impl ReadyInstalledOperations {
@@ -118,6 +121,10 @@ impl ReadyInstalledOperations {
 
     pub(super) fn settings_operations(&self) -> Arc<ProductionSettingsOperations> {
         Arc::clone(&self.settings_operations)
+    }
+
+    pub(super) fn recommendation_setup(&self) -> Arc<RecommendationSetupAuthority> {
+        Arc::clone(&self.recommendation_setup)
     }
 
     pub(super) fn reconcile_settings_startup(&self) -> Result<(), InstalledServiceError> {
@@ -250,6 +257,13 @@ impl PreparedInstalledOperations {
             SetupPlanAuthority::try_open(control_path, selection.identity().workspace_id())
                 .map_err(|_error| InstalledServiceError::CompositionStage("setup plan"))?,
         );
+        let recommendation_setup = Arc::new(
+            RecommendationSetupAuthority::try_open(
+                control_path,
+                selection.identity().workspace_id(),
+            )
+            .map_err(|_error| InstalledServiceError::CompositionStage("recommendation setup"))?,
+        );
         let activity = Arc::new(RuntimeActivityCoordinator::new(
             RuntimeActivityLimits::try_new(
                 4_096,
@@ -290,6 +304,7 @@ impl PreparedInstalledOperations {
             settings_seed,
             settings_lifecycle,
             settings_operations,
+            recommendation_setup,
             activity,
             recovery,
             recovery_bridge,
@@ -351,6 +366,7 @@ impl PreparedInstalledOperations {
         let workspace_backup = try_compose_installed_workspace_backup(
             product,
             Arc::clone(&self.settings_operations),
+            Arc::clone(&self.recommendation_setup),
             jobs,
             runners.backup(),
             bundles,
@@ -446,6 +462,7 @@ impl PreparedInstalledOperations {
             workspaces: self.workspaces,
             recovery_bridge: self.recovery_bridge,
             settings_operations: self.settings_operations,
+            recommendation_setup: self.recommendation_setup,
         })
     }
 }

@@ -33,9 +33,6 @@ pub(super) fn call(
             scenario::evaluate_batch(revision, scope, request, context)
         }
         "Portfolio.ProposeRebalance" => planning::rebalance(revision, scope, request, context),
-        "Portfolio.EvaluateCandidateImpact" => {
-            planning::candidate_impact(revision, scope, request, context)
-        }
         _ => Err(PortfolioApplicationServiceError::InvalidRequest),
     }
 }

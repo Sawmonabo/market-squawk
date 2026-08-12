@@ -1,3 +1,4 @@
+import { Fragment } from "react"
 import { ChevronsUpDown, LockKeyhole } from "lucide-react"
 import { Link, useLocation } from "react-router-dom"
 
@@ -19,8 +20,7 @@ import {
 } from "@/components/ui/sidebar"
 import {
   type NavigationItem,
-  operationsNavigation,
-  workspaceNavigation,
+  navigationSections,
 } from "@/lib/navigation"
 
 export function AppSidebar() {
@@ -46,7 +46,7 @@ export function AppSidebar() {
               tooltip="Market Squawk workspace"
               className="h-11 justify-center px-1 py-2 group-data-[collapsible=icon]:justify-center"
             >
-              <Link to="/overview" aria-label="Market Squawk workspace">
+              <Link to="/home" aria-label="Market Squawk workspace">
                 <span className="flex min-w-0 items-center leading-none">
                   <span className="text-[18px] font-bold tracking-[-0.045em] text-white group-data-[collapsible=icon]:hidden">
                     Market
@@ -72,37 +72,25 @@ export function AppSidebar() {
 
       <SidebarContent>
         <nav aria-label="Market Squawk">
-          <SidebarGroup>
-            <SidebarGroupLabel>Workspace</SidebarGroupLabel>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                {workspaceNavigation.map((item) => (
-                  <ProductNavigationItem
-                    key={item.path}
-                    item={item}
-                    active={location.pathname === item.path}
-                  />
-                ))}
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
-
-          <SidebarSeparator />
-
-          <SidebarGroup>
-            <SidebarGroupLabel>Operations</SidebarGroupLabel>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                {operationsNavigation.map((item) => (
-                  <ProductNavigationItem
-                    key={item.path}
-                    item={item}
-                    active={location.pathname === item.path}
-                  />
-                ))}
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
+          {navigationSections.map((section, index) => (
+            <Fragment key={section.label}>
+              {index > 0 ? <SidebarSeparator /> : null}
+              <SidebarGroup>
+                <SidebarGroupLabel>{section.label}</SidebarGroupLabel>
+                <SidebarGroupContent>
+                  <SidebarMenu>
+                    {section.items.map((item) => (
+                      <ProductNavigationItem
+                        key={item.path}
+                        item={item}
+                        active={location.pathname === item.path}
+                      />
+                    ))}
+                  </SidebarMenu>
+                </SidebarGroupContent>
+              </SidebarGroup>
+            </Fragment>
+          ))}
         </nav>
       </SidebarContent>
 

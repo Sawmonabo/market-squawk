@@ -177,14 +177,6 @@ const executionAssumptionsSchema = z
     }
   })
 
-const legacyArtifactSchema = z
-  .object({
-    reference: z.string().min(1),
-    digest: digestSchema,
-    byteCount: z.number().int().positive(),
-  })
-  .strict()
-
 const controlledReportArtifactSchema = z
   .object({
     artifactId: z.string().regex(/^backtest-report-[0-9a-f]{64}$/),
@@ -220,26 +212,24 @@ const completedStatusSchema = z
   .object({
     state: z.literal("completed"),
     resultDigest: digestSchema,
-    artifact: z.union([legacyArtifactSchema, controlledReportArtifactSchema]),
+    artifact: controlledReportArtifactSchema,
     metrics: z.array(metricSchema).max(256),
     datasetPartition: z
       .object({
         startsAtUnixNanos: losslessIntegerSchema,
         endsAtUnixNanos: losslessIntegerSchema,
       })
-      .strict()
-      .nullable(),
+      .strict(),
     fillCount: z.number().int().nonnegative(),
-    partialFillCount: z.number().int().nonnegative().optional(),
+    partialFillCount: z.number().int().nonnegative(),
     noActionCount: z.number().int().nonnegative(),
     accountingReconciliation: z.literal("independent"),
-    executionAssumptions: executionAssumptionsSchema.optional(),
-    cohortDiagnostics: cohortDiagnosticsSchema.optional(),
+    executionAssumptions: executionAssumptionsSchema,
+    cohortDiagnostics: cohortDiagnosticsSchema,
   })
   .strict()
   .superRefine((status, context) => {
     if (
-      status.datasetPartition &&
       compareLosslessIntegers(
         status.datasetPartition.startsAtUnixNanos,
         status.datasetPartition.endsAtUnixNanos,
@@ -250,16 +240,22 @@ const completedStatusSchema = z
         message: "The dataset partition is not ordered.",
       })
     }
+    if (status.partialFillCount > status.fillCount) {
+      context.addIssue({
+        code: "custom",
+        message: "The partial-fill count exceeds the complete fill count.",
+      })
+    }
   })
 
 const backtestRecordSchema = z
   .object({
-    recordVersion: z.union([z.literal(1), z.literal(2)]),
+    recordVersion: z.literal(2),
     runId: digestSchema,
     datasetIdentity: digestSchema,
     objectGraphDigest: digestSchema,
     executionAssumptionDigest: digestSchema,
-    cohortAuthorityDigest: digestSchema.nullable(),
+    cohortAuthorityDigest: digestSchema,
     cohortUniverseDigest: digestSchema.nullable(),
     seed: z.number().int().nonnegative(),
     selectionCriterion: z.string().min(1),
@@ -271,35 +267,14 @@ const backtestRecordSchema = z
   .strict()
   .superRefine((record, context) => {
     if (
-      (record.cohortAuthorityDigest === null) !==
-      (record.cohortUniverseDigest === null)
+      record.status.state === "completed" &&
+      record.status.cohortDiagnostics.state === "completed" &&
+      record.cohortUniverseDigest === null
     ) {
       context.addIssue({
         code: "custom",
-        message: "The cohort evidence pair is incomplete.",
+        message: "Completed cohort diagnostics require the exact cohort universe binding.",
       })
-    }
-    if (record.recordVersion === 2 && record.status.state === "completed") {
-      if (
-        !("artifactId" in record.status.artifact) ||
-        record.status.partialFillCount === undefined ||
-        record.status.executionAssumptions === undefined ||
-        record.status.cohortDiagnostics === undefined
-      ) {
-        context.addIssue({
-          code: "custom",
-          message: "The V2 governed record is missing required evidence.",
-        })
-      }
-      if (
-        record.status.cohortDiagnostics?.state === "completed" &&
-        (record.cohortAuthorityDigest === null || record.cohortUniverseDigest === null)
-      ) {
-        context.addIssue({
-          code: "custom",
-          message: "Completed cohort diagnostics require the exact cohort authority bindings.",
-        })
-      }
     }
   })
 

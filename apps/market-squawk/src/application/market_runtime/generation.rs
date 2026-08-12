@@ -1,9 +1,10 @@
-//! Deterministic identity for one exact account-backed runtime group configuration.
+//! Versioned identity for one exact account-backed runtime-group incarnation.
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
 use market_squawk_services::ServiceError;
 use market_squawk_sources::SourceMetadata;
 use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
 
 use crate::{
     provider_activation::PreparedMarketProviderConfiguration,
@@ -12,9 +13,9 @@ use crate::{
 
 use super::configuration::PreparedMarketProviderConfigurationRequest;
 
-const GROUP_GENERATION_DOMAIN: &[u8] = b"market-squawk/market-runtime-group-generation/v1\0";
+const GROUP_GENERATION_DOMAIN: &[u8] = b"market-squawk/market-runtime-group-generation/v2\0";
 
-/// SHA-256 identity of one exact account lease and its prepared child-source configurations.
+/// SHA-256 identity of one fresh runtime incarnation, exact account lease, and prepared children.
 ///
 /// This is deliberately not a [`market_squawk_domain::ConnectionGeneration`]. Each child source
 /// mints and retains its real connection generation independently.
@@ -29,9 +30,14 @@ impl MarketRuntimeGroupGeneration {
     pub(super) fn try_from_prepared(
         request: PreparedMarketProviderConfigurationRequest,
         prepared: &PreparedMarketProviderConfiguration,
+        runtime_incarnation: Uuid,
     ) -> Result<Self, ServiceError> {
+        if runtime_incarnation.is_nil() {
+            return Err(ServiceError::Unavailable);
+        }
         let mut hasher = Sha256::new();
         hasher.update(GROUP_GENERATION_DOMAIN);
+        hasher.update(runtime_incarnation.as_bytes());
         update_text(&mut hasher, request.surface().surface_id())?;
         hasher.update(request.onboarding_session_id().as_bytes());
         update_evidence(&mut hasher, request.expected_public_configuration_digest());

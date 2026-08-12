@@ -3,10 +3,15 @@ use serde::{Deserialize, Serialize};
 use super::super::screen_workflow::ScreenJobPlanWire;
 use super::candidate::ExecutionWire;
 use super::dossier::DossierWire;
+use super::proposal::InvestmentProposalWire;
+use super::recommendation::{
+    InvestmentAnalysisPublicationWire, InvestmentOutcomeProjectionWire,
+    InvestmentSizingProjectionWire, RecommendationOutcomeStatusWire,
+};
 use super::screen::ScreenWire;
 use super::target::{InvalidationWire, ReviewWire, TargetWire};
 
-pub(super) const WIRE_VERSION: u32 = 1;
+pub(super) const WIRE_VERSION: u32 = 3;
 pub(super) const KIND_SCREEN: i64 = 1;
 pub(super) const KIND_EXECUTION: i64 = 2;
 pub(super) const KIND_DOSSIER: i64 = 3;
@@ -14,6 +19,7 @@ pub(super) const KIND_TARGET: i64 = 4;
 pub(super) const KIND_REVIEW: i64 = 5;
 pub(super) const KIND_INVALIDATION: i64 = 6;
 pub(super) const KIND_SCREEN_JOB_INPUT: i64 = 7;
+pub(super) const KIND_INVESTMENT_PROPOSAL: i64 = 8;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -23,7 +29,12 @@ pub(super) struct WireEnvelope {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub(super) enum WireRecord {
     Screen(ScreenWire),
     Execution(ExecutionWire),
@@ -32,6 +43,11 @@ pub(super) enum WireRecord {
     Review(ReviewWire),
     Invalidation(InvalidationWire),
     ScreenJobInput(Box<ScreenJobPlanWire>),
+    InvestmentProposal(Box<InvestmentProposalWire>),
+    InvestmentAnalysisPublication(InvestmentAnalysisPublicationWire),
+    InvestmentOutcomeProjection(InvestmentOutcomeProjectionWire),
+    InvestmentSizingProjection(Box<InvestmentSizingProjectionWire>),
+    RecommendationOutcomeStatus(RecommendationOutcomeStatusWire),
 }
 
 impl WireRecord {
@@ -44,6 +60,11 @@ impl WireRecord {
             Self::Review(_) => KIND_REVIEW,
             Self::Invalidation(_) => KIND_INVALIDATION,
             Self::ScreenJobInput(_) => KIND_SCREEN_JOB_INPUT,
+            Self::InvestmentProposal(_) => KIND_INVESTMENT_PROPOSAL,
+            Self::InvestmentAnalysisPublication(_)
+            | Self::InvestmentOutcomeProjection(_)
+            | Self::InvestmentSizingProjection(_)
+            | Self::RecommendationOutcomeStatus(_) => KIND_INVESTMENT_PROPOSAL,
         }
     }
 }

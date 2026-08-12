@@ -215,6 +215,7 @@ fn map_portfolio_backup_error(error: PortfolioApplicationServiceError) -> Produc
         | PortfolioApplicationServiceError::DeadlineExceeded
         | PortfolioApplicationServiceError::Import
         | PortfolioApplicationServiceError::SnapshotUnavailable
+        | PortfolioApplicationServiceError::StateChanged
         | PortfolioApplicationServiceError::RestoreTargetNotFresh
         | PortfolioApplicationServiceError::Analytics => ProductBackupError::SnapshotMismatch,
     }

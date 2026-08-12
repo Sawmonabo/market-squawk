@@ -281,6 +281,23 @@ impl ExtractionRecord {
         self.superseded_time.as_ref()
     }
 
+    pub(super) fn try_rebind_request(
+        self,
+        request: &ExtractionRequest,
+    ) -> Result<Self, ExtractionError> {
+        Self::try_new_with_time(
+            request,
+            self.schema,
+            self.evidence,
+            self.effective_time,
+            self.published_time,
+            self.availability,
+            self.revision,
+            self.superseded_time,
+            self.payload.as_bytes().clone(),
+        )
+    }
+
     pub(crate) fn matches_request(&self, request: &ExtractionRequest) -> bool {
         self.source_id == request.object.source_id
             && self.metadata_revision == request.object.metadata_revision
@@ -438,7 +455,7 @@ pub enum ExtractionError {
     UnsupportedTemporalSchema { found: u16 },
     #[error("discovery or extraction request identity does not match")]
     RequestBindingMismatch,
-    #[error("source identity or metadata revision does not match")]
+    #[error("source identity, metadata revision, or dataset does not match")]
     SourceBindingMismatch,
     #[error("extraction record object evidence does not match its exact request")]
     ObjectBindingMismatch,
@@ -481,11 +498,7 @@ fn extraction_request_id(
     deadline: Timestamp,
 ) -> ExtractionRequestId {
     let mut hash = Sha256::new();
-    if matches!(object.availability, AvailabilityEvidence::Unknown) {
-        hash.update(b"market-squawk/extraction-request/v2");
-    } else {
-        hash.update(b"market-squawk/extraction-request/v3");
-    }
+    hash.update(b"market-squawk/extraction-request/v4");
     hash_field(
         &mut hash,
         b"source_id",
@@ -517,6 +530,7 @@ fn extraction_request_id(
         object.media_type.as_str().as_bytes(),
     );
     hash_evidence(&mut hash, b"object_evidence", &object.evidence);
+    object.capture_identity.hash_into(&mut hash);
     hash_field(
         &mut hash,
         b"effective_starts_at",
@@ -524,9 +538,15 @@ fn extraction_request_id(
     );
     hash_optional_timestamp(&mut hash, b"effective_ends_at", object.effective.ends_at());
     hash_optional_timestamp(&mut hash, b"published_at", object.published_at);
-    if !matches!(object.availability, AvailabilityEvidence::Unknown) {
-        hash_availability(&mut hash, &object.availability);
-    }
+    hash_field(
+        &mut hash,
+        b"object_availability_presence",
+        &[u8::from(!matches!(
+            object.availability,
+            AvailabilityEvidence::Unknown
+        ))],
+    );
+    hash_availability(&mut hash, &object.availability);
     hash_optional_u64(&mut hash, b"expected_bytes", object.expected_bytes);
     hash_field(&mut hash, b"max_records", &max_records.get().to_be_bytes());
     hash_field(&mut hash, b"max_bytes", &max_bytes.get().to_be_bytes());

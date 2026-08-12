@@ -59,7 +59,11 @@ impl ValuationInput {
             .map_err(|_| FairValueError::InvalidAmount)?;
         let scale = u8::try_from(terms.price_tick().as_decimal().scale())
             .map_err(|_| FairValueError::InvalidAmount)?;
-        let amount = ValuationAmount::try_new(Money::new(decimal, terms.quote_currency()), scale)?;
+        let amount = ValuationAmount::try_new(
+            Money::new(decimal, terms.quote_currency()),
+            scale,
+            ValuationAmountBasis::PerInstrumentUnit,
+        )?;
         let (market_activity, activity_set_hash) =
             derive_market_activity(receipts, selected, measurement_at, activity_policy)?;
         let market_access = match market_access_assessment {
@@ -144,6 +148,7 @@ impl ValuationInput {
                 value.currency(),
             ),
             value.scale(),
+            ValuationAmountBasis::ReportingEntityTotal,
         )?;
         let verification = if value.available_at().is_some()
             && (value.source_timestamp().is_some() || value.effective_at().is_some())
@@ -215,6 +220,7 @@ impl ValuationInput {
                 value.currency(),
             ),
             value.scale(),
+            ValuationAmountBasis::ReportingEntityTotal,
         )?;
         let evidence = FairValueEvidence::try_from_parts(FairValueEvidenceParts {
             source_id: SourceId::try_from("market-squawk.analytics")
@@ -291,7 +297,8 @@ impl ValuationInput {
         let amount_money = position.market_value();
         let scale = u8::try_from(amount_money.amount().scale())
             .map_err(|_| FairValueError::InvalidAmount)?;
-        let amount = ValuationAmount::try_new(amount_money, scale)?;
+        let amount =
+            ValuationAmount::try_new(amount_money, scale, ValuationAmountBasis::PositionTotal)?;
         let point_in_time_digest = portfolio_evidence_digest(revision);
         let token = revision.token();
         let source_identifier = digest_identifier("portfolio-revision-", token.bytes())?;
@@ -411,16 +418,6 @@ impl ValuationInput {
         Self::try_from_validated_spec(spec)
     }
 
-    /// Reconstructs the exact v1 shape emitted before analytical use assessments were mandatory.
-    pub(crate) fn try_from_persisted_v1_spec(
-        spec: ValuationInputSpec,
-    ) -> Result<Self, FairValueError> {
-        if !is_unassessed_analytics(&spec) {
-            return Self::try_from_spec(spec);
-        }
-        Self::try_from_validated_spec(spec)
-    }
-
     fn try_from_validated_spec(spec: ValuationInputSpec) -> Result<Self, FairValueError> {
         let same = spec.subject_instrument_id == spec.reference_instrument_id;
         if same != (spec.relationship == InputInstrumentRelation::Identical) {
@@ -470,7 +467,7 @@ impl ValuationInput {
                 )?,
             )?,
         )?;
-        let mut hash = CanonicalHasher::new(b"market-squawk/valuation-input/v1");
+        let mut hash = CanonicalHasher::new(b"market-squawk/valuation-input/v2");
         hash.bytes(spec.subject_instrument_id.as_uuid().as_bytes());
         hash.bytes(spec.reference_instrument_id.as_uuid().as_bytes());
         hash.u8(relation_tag(spec.relationship));
@@ -513,11 +510,6 @@ impl ValuationInput {
             use_assessment: spec.use_assessment,
             retained_bytes,
         })
-    }
-
-    pub(crate) fn is_legacy_unassessed_analytics(&self) -> bool {
-        matches!(self.evidence.origin(), EvidenceOrigin::Analytics { .. })
-            && self.use_assessment.is_none()
     }
 
     /// Returns immutable input identity.

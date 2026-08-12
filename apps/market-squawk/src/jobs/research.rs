@@ -916,6 +916,7 @@ fn map_research_service_error(error: ResearchServiceError) -> JobRunError {
         | ResearchServiceError::Path(_)
         | ResearchServiceError::Catalog(_)
         | ResearchServiceError::Manifest(_)
+        | ResearchServiceError::ProviderCaptureStore(_)
         | ResearchServiceError::Ingest(_)
         | ResearchServiceError::IngestAuthorityMismatch
         | ResearchServiceError::Rights(_)

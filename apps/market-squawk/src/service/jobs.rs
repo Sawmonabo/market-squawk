@@ -63,10 +63,13 @@ impl InstalledJobOperations {
                 )?
             }
             "Job.Get" => {
-                let input: IdentityRequest = decode(&arguments)?;
+                let input: GetRequest = decode(&arguments)?;
                 encode(
                     self.application
-                        .get(parse_id(&input.job_id)?)
+                        .get(
+                            parse_id(&input.job_id)?,
+                            parse_generation(input.generation)?,
+                        )
                         .await
                         .map_err(map_application)?,
                 )?
@@ -175,9 +178,13 @@ impl InstalledJobOperations {
             .map_err(Into::into)
     }
 
-    pub(super) async fn view(&self, job_id: &str) -> Result<JobView, ServiceError> {
+    pub(super) async fn view(
+        &self,
+        job_id: &str,
+        generation: u64,
+    ) -> Result<JobView, ServiceError> {
         self.application
-            .get(parse_id(job_id)?)
+            .get(parse_id(job_id)?, parse_generation(generation)?)
             .await
             .map_err(map_application)
     }
@@ -201,8 +208,9 @@ struct ListRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct IdentityRequest {
+struct GetRequest {
     job_id: String,
+    generation: u64,
 }
 
 #[derive(Deserialize)]
@@ -275,8 +283,6 @@ fn ensure_live(context: &RequestContext) -> Result<(), ServiceError> {
 fn map_application(error: JobApplicationError) -> ServiceError {
     match error {
         JobApplicationError::NotFound => ServiceError::NotFound,
-        JobApplicationError::WaitCancelled => ServiceError::Cancelled,
-        JobApplicationError::WaitDeadlineExceeded => ServiceError::DeadlineExceeded,
         JobApplicationError::Contract => ServiceError::InvalidRequest,
         JobApplicationError::Repository | JobApplicationError::Authority => {
             ServiceError::Unavailable

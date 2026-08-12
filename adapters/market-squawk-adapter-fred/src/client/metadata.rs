@@ -6,7 +6,7 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     ApiEndpointRule, ExtractionAuthority, ExtractionSourceError, NetworkPolicyError, PathScope,
-    QueryParameterRule, QuerySensitivity, SourceError,
+    ProviderCaptureMaterial, QueryParameterRule, QuerySensitivity, SourceError,
 };
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -16,7 +16,10 @@ use crate::{FredOperation, FredParseLimits, FredRightsDisposition};
 
 use super::http::system_timestamp;
 use super::lineage::{evidence_for_payload, map_adapter_error};
-use super::{FredDataset, FredHttpRequest, FredSource, FredSourceError, acquire_request_permit};
+use super::{
+    FredDataset, FredHttpRequest, FredSource, FredSourceError, acquire_request_permit,
+    standalone_capture_material,
+};
 
 const SERIES_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series";
 const MAX_METADATA_STRING_BYTES: usize = 8 * 1024;
@@ -167,7 +170,7 @@ impl FredSeriesMetadata {
 }
 
 /// One exact FRED series-metadata response bound to its source and dataset identities.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct FredSeriesMetadataDocument {
     source_id: SourceId,
     metadata_revision: MetadataRevision,
@@ -177,6 +180,7 @@ pub struct FredSeriesMetadataDocument {
     response_length: u64,
     evidence: ExactPayloadEvidence,
     received_at: Timestamp,
+    capture: ProviderCaptureMaterial,
 }
 
 impl FredSeriesMetadataDocument {
@@ -218,6 +222,16 @@ impl FredSeriesMetadataDocument {
     /// Returns when this process completed receipt of the exact response.
     pub const fn received_at(&self) -> Timestamp {
         self.received_at
+    }
+
+    /// Returns the exact metadata response ready for source-neutral raw sealing.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture
+    }
+
+    /// Consumes the document into its exact metadata response material.
+    pub fn into_capture_material(self) -> ProviderCaptureMaterial {
+        self.capture
     }
 }
 
@@ -345,6 +359,8 @@ impl FredSource {
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         let evidence =
             evidence_for_payload(&response.body, &public_url).map_err(map_adapter_error)?;
+        let capture =
+            standalone_capture_material(&self.metadata, dataset.clone(), &public_url, &response)?;
         Ok(FredSeriesMetadataDocument {
             source_id: self.metadata.source_id().clone(),
             metadata_revision: self.metadata.revision().clone(),
@@ -354,6 +370,7 @@ impl FredSource {
             response_length,
             evidence,
             received_at: response.received_at,
+            capture,
         })
     }
 }

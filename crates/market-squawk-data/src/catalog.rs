@@ -3,6 +3,7 @@
 mod authority;
 mod backup;
 mod company_identity;
+mod company_security;
 mod diagnostics;
 mod evidence;
 mod fair_value;
@@ -11,6 +12,7 @@ mod market_data_instruments;
 mod migration_preflight;
 mod observed_revisions;
 mod onboarding;
+mod provider_capture;
 mod publication;
 mod query_artifacts;
 mod records;
@@ -33,6 +35,15 @@ pub use self::company_identity::{
     CompanyIdentityMatchKind, CompanyIdentityMatchReason, CompanyIdentitySearchMatch,
     CompanyIdentitySearchPage,
 };
+pub use self::company_security::{
+    CompanySecurityIdentityCatalogError, CompanySecurityIdentityDisposition,
+    CompanySecurityIdentityExclusion, CompanySecurityIdentityExclusionReason,
+    CompanySecurityIdentityQuery, CompanySecurityIdentityReadCapability,
+    CompanySecurityIdentityRecord, CompanySecurityIdentitySelection,
+    CompanySecurityIdentitySelectionReceipt, CompanySecurityLinkPublicationCapability,
+    CompanySecurityLinkPublicationDisposition, CompanySecurityLinkPublicationReceipt,
+    CompanySecuritySelectionReceiptEntry, MAX_COMPANY_SECURITY_SELECTION_ROWS,
+};
 pub use self::diagnostics::{CatalogDiagnosticSnapshot, ProviderOnboardingDiagnostic};
 pub use self::fair_value::{
     FairValueCatalogAuditEvent, FairValueCatalogCommit, FairValueCatalogLink,
@@ -44,11 +55,14 @@ pub use self::listing_reference::{
     ListingReferenceDirectoryPresence, ListingReferenceError, ListingReferenceExchangeCode,
     ListingReferenceFileEvidence, ListingReferenceFileKind, ListingReferenceFinancialStatus,
     ListingReferenceGenerationInput, ListingReferenceGenerationReceipt,
-    ListingReferenceMarketCategory, ListingReferenceMatchKind,
+    ListingReferenceGenerationSelection, ListingReferenceMarketCategory, ListingReferenceMatchKind,
+    ListingReferenceMembershipCursor, ListingReferenceMembershipPage,
+    ListingReferenceMembershipPageState, ListingReferenceMembershipSelectionReceipt,
     ListingReferencePublicationCapability, ListingReferencePublicationDisposition,
     ListingReferencePublicationReceipt, ListingReferenceReadCapability, ListingReferenceRecord,
     ListingReferenceRecordInput, ListingReferenceRightsState, ListingReferenceSearchMatch,
-    ListingReferenceSearchPage, ListingReferenceSourceFileInput, MAX_LISTING_REFERENCE_RECORDS,
+    ListingReferenceSearchPage, ListingReferenceSourceFileInput,
+    MAX_LISTING_REFERENCE_MEMBERSHIP_PAGE_ROWS, MAX_LISTING_REFERENCE_RECORDS,
     MAX_LISTING_REFERENCE_SEARCH_ROWS,
 };
 pub use self::market_data_instruments::{
@@ -75,6 +89,7 @@ pub use self::types::{
 };
 pub(crate) use observed_revisions::CatalogObservedRevisionAuthority;
 pub use observed_revisions::StoredObservedRevision;
+pub(crate) use provider_capture::provider_capture_matches_batch;
 pub use publication::PublishedIngest;
 #[cfg(test)]
 pub(crate) use query_artifacts::QueryArtifactBindCheckpoint;

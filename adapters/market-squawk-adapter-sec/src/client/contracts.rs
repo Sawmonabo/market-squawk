@@ -1,13 +1,22 @@
 //! Validated SEC locators, retained representations, health, and typed failures.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use market_squawk_domain::{AvailabilityEvidence, EvidenceDigest, Timestamp};
+use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
+use market_squawk_sources::{
+    ProviderCaptureError, ProviderCaptureMaterial, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition,
+};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use uuid::Uuid;
 
 use crate::{
     CompanyFactsDocument, ParsedXbrlDocument, RawEvidenceError, RawEvidenceStore, SecParserError,
@@ -128,6 +137,7 @@ pub struct RetrievedSecBytes {
     pub(super) availability: AvailabilityEvidence,
     pub(super) locator: Option<String>,
     pub(super) retrieval_revision: Option<u64>,
+    pub(super) capture_receipt: Option<ProviderCaptureSetReceipt>,
 }
 
 impl RetrievedSecBytes {
@@ -161,6 +171,40 @@ impl RetrievedSecBytes {
         self.retrieval_revision
     }
 
+    /// Returns the source-neutral receipt for an exact online response body.
+    ///
+    /// Offline imports and local composite manifests deliberately have no provider capture.
+    pub const fn capture_receipt(&self) -> Option<&ProviderCaptureSetReceipt> {
+        self.capture_receipt.as_ref()
+    }
+
+    /// Rebuilds the exact body-only material required by the shared raw publication boundary.
+    ///
+    /// Request headers, including the identifying SEC `User-Agent`, are structurally absent.
+    pub fn capture_material(&self) -> Result<Option<ProviderCaptureMaterial>, SecClientError> {
+        let Some(receipt) = self.capture_receipt.as_ref() else {
+            return Ok(None);
+        };
+        let page = receipt
+            .pages()
+            .first()
+            .filter(|page| {
+                receipt.pages().len() == 1
+                    && receipt.terminal() == ProviderCaptureTerminalDisposition::StandaloneResponse
+                    && receipt.request_set_identity() == page.request_identity()
+                    && page.body_digest() == self.evidence
+                    && self.locator.as_deref() == Some(receipt.dataset().as_str())
+                    && self.retrieval_revision.is_some()
+            })
+            .ok_or(SecClientError::InvalidCaptureMaterial)?;
+        if page.body_bytes()
+            != u64::try_from(self.bytes.len()).map_err(|_| SecClientError::ResponseTooLarge)?
+        {
+            return Err(SecClientError::InvalidCaptureMaterial);
+        }
+        provider_capture_material(receipt.clone(), self.bytes.clone()).map(Some)
+    }
+
     pub(crate) fn restored_online(
         bytes: Vec<u8>,
         evidence: EvidenceDigest,
@@ -175,6 +219,26 @@ impl RetrievedSecBytes {
             availability: AvailabilityEvidence::local_first_observed(received_at),
             locator: Some(locator),
             retrieval_revision: Some(retrieval_revision),
+            capture_receipt: None,
+        }
+    }
+
+    pub(crate) fn captured_online(
+        bytes: Vec<u8>,
+        evidence: EvidenceDigest,
+        first_observed_at: Timestamp,
+        locator: String,
+        retrieval_revision: u64,
+        capture_receipt: ProviderCaptureSetReceipt,
+    ) -> Self {
+        Self {
+            bytes: Bytes::from(bytes),
+            evidence,
+            received_at: first_observed_at,
+            availability: AvailabilityEvidence::local_first_observed(first_observed_at),
+            locator: Some(locator),
+            retrieval_revision: Some(retrieval_revision),
+            capture_receipt: Some(capture_receipt),
         }
     }
 
@@ -190,6 +254,7 @@ impl RetrievedSecBytes {
             availability: AvailabilityEvidence::Unknown,
             locator: None,
             retrieval_revision: None,
+            capture_receipt: None,
         }
     }
 
@@ -205,6 +270,7 @@ impl RetrievedSecBytes {
             availability: AvailabilityEvidence::local_first_observed(available_at),
             locator: None,
             retrieval_revision: None,
+            capture_receipt: None,
         }
     }
 }
@@ -301,6 +367,7 @@ impl RetrievedCompanyFacts {
                 availability,
                 locator: None,
                 retrieval_revision: None,
+                capture_receipt: None,
             },
         })
     }
@@ -313,6 +380,11 @@ impl RetrievedCompanyFacts {
     /// Returns exact immutable source evidence.
     pub const fn raw(&self) -> &RetrievedSecBytes {
         &self.raw
+    }
+
+    /// Returns the exact online Company Facts response material, or `None` for an offline import.
+    pub fn capture_material(&self) -> Result<Option<ProviderCaptureMaterial>, SecClientError> {
+        self.raw.capture_material()
     }
 }
 
@@ -333,6 +405,57 @@ impl RetrievedXbrlDocument {
     pub const fn raw(&self) -> &RetrievedSecBytes {
         &self.raw
     }
+
+    /// Returns the exact online filing/XBRL response material.
+    pub fn capture_material(&self) -> Result<ProviderCaptureMaterial, SecClientError> {
+        self.raw
+            .capture_material()?
+            .ok_or(SecClientError::InvalidCaptureMaterial)
+    }
+}
+
+pub(crate) fn provider_capture_material(
+    receipt: ProviderCaptureSetReceipt,
+    bytes: Bytes,
+) -> Result<ProviderCaptureMaterial, SecClientError> {
+    if receipt.pages().len() != 1 {
+        return Err(SecClientError::InvalidCaptureMaterial);
+    }
+    let page = receipt
+        .pages()
+        .first()
+        .ok_or(SecClientError::InvalidCaptureMaterial)?;
+    let received_at = DateTime::<Utc>::from_timestamp_nanos(page.received_at().unix_nanos());
+    let record = RawCaptureRecord::try_new_live(
+        deterministic_capture_uuid(b"event", &receipt, 0),
+        Arc::from(receipt.source_id().as_str()),
+        deterministic_capture_uuid(b"connection", &receipt, 0),
+        Some(0),
+        None,
+        received_at,
+        bytes,
+    )?;
+    ProviderCaptureMaterial::try_new(receipt, vec![record]).map_err(Into::into)
+}
+
+pub(crate) fn deterministic_capture_uuid(
+    tag: &[u8],
+    receipt: &ProviderCaptureSetReceipt,
+    ordinal: u16,
+) -> Uuid {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/sec-provider-capture-id/v1");
+    hash.update((tag.len() as u64).to_be_bytes());
+    hash.update(tag);
+    hash.update(receipt.request_set_identity().bytes());
+    hash.update(receipt.observation_digest().bytes());
+    hash.update(ordinal.to_be_bytes());
+    let mut bytes: [u8; 16] = hash.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 prefix has a fixed length");
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 /// Current extraction-specific provider health.
@@ -405,10 +528,13 @@ pub(super) const fn validation_health_for_error(
         | SecClientError::CompanyIdentity(_)
         | SecClientError::InvalidCompanionSet
         | SecClientError::InvalidCompositeRepresentation
+        | SecClientError::InvalidCaptureMaterial
+        | SecClientError::ProviderCapture(_)
         | SecClientError::CompanionObjectLimitExceeded
         | SecClientError::CompositeByteLimitExceeded => {
             Some(SecExtractionHealthState::InvalidResponse)
         }
+        SecClientError::RawCapture(_) => Some(SecExtractionHealthState::LocalFailure),
         _ => Some(SecExtractionHealthState::LocalFailure),
     }
 }
@@ -512,6 +638,8 @@ pub enum SecClientError {
     InvalidCompanionSet,
     #[error("SEC composite representation evidence is incomplete")]
     InvalidCompositeRepresentation,
+    #[error("SEC provider capture material is incomplete or inconsistent")]
+    InvalidCaptureMaterial,
     #[error("SEC composite-manifest serialization failed")]
     CompositeSerialization,
     #[error("SEC conditional-response validator header is invalid")]
@@ -550,6 +678,10 @@ pub enum SecClientError {
     CompanyIdentity(#[from] market_squawk_domain::CompanyIdentityError),
     #[error(transparent)]
     RevisionAuthority(#[from] market_squawk_sources::ObservedRevisionError),
+    #[error(transparent)]
+    ProviderCapture(#[from] ProviderCaptureError),
+    #[error(transparent)]
+    RawCapture(#[from] RawCaptureRecordError),
 }
 
 impl From<RawEvidenceError> for SecClientError {

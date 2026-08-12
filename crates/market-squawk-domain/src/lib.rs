@@ -3,6 +3,7 @@
 mod capture;
 mod classification;
 mod company_identity;
+mod company_security;
 mod denomination;
 mod digest;
 mod evidence;
@@ -47,6 +48,11 @@ pub use company_identity::{
     CompanyIdentityError, CompanyIdentityObservation, CompanyIdentityObservationInput,
     CompanyIdentitySurface, FormerCompanyName, MAX_COMPANY_FORMER_NAMES,
     MAX_COMPANY_SECURITY_ASSOCIATIONS, ProviderReportedSecurityAssociation,
+};
+pub use company_security::{
+    CommonEquitySuitability, CompanySecurityIdentityError, CompanySecurityIdentityLink,
+    CompanySecurityIdentityLinkInput, CompanySecurityKind, CompanySecurityLinkTransition,
+    CompanySecurityRelationshipKind, CompanySecurityResolutionBasis,
 };
 pub use denomination::Denomination;
 pub use digest::DigestAlgorithm;
@@ -101,10 +107,18 @@ pub use provenance::{
     ResearchTemporalPrecision, ResearchTime, RevisionNumber,
 };
 pub use research::{
-    AlternativeDataObservation, CorporateActionObservation, FilingObservation,
-    FundamentalObservation, MAX_XBRL_DIMENSIONS, MAX_XBRL_GRAPH_EVENTS, MAX_XBRL_RELATIONSHIP_REFS,
-    MAX_XBRL_RELATIONSHIPS, MAX_XBRL_UNIT_MEASURES, MacroMissingValue, MacroObservation,
-    MacroValue, NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
+    AlternativeDataObservation, BarTimeSemantics, BarTimestampBasis, CorporateActionObservation,
+    FilingObservation, FundNavCompleteness, FundNavCorrectionState, FundNavDisposition,
+    FundNavEntitlementEvidence, FundNavFinality, FundNavLineage, FundNavMissingState,
+    FundNavNativeSchema, FundNavObservation, FundNavObservationInput, FundNavRevisionEvidence,
+    FundNavValuationBasis, FundNavValue, FundamentalAmendmentStatus, FundamentalCadence,
+    FundamentalConsolidation, FundamentalContextError, FundamentalDimensionContext,
+    FundamentalFactContext, FundamentalFactContextInput, FundamentalObservation, FundamentalPeriod,
+    FundamentalRestatementStatus, FundamentalRevisionOrder, MAX_XBRL_DIMENSIONS,
+    MAX_XBRL_GRAPH_EVENTS, MAX_XBRL_RELATIONSHIP_REFS, MAX_XBRL_RELATIONSHIPS,
+    MAX_XBRL_UNIT_MEASURES, MacroMissingValue, MacroObservation, MacroValue, MarketBarAdjustment,
+    MarketBarObservation, MarketBarSessionEvidence, MarketBarSessionKind,
+    NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
     NormalizedPortfolioTransactionError, NormalizedPortfolioTransactionEvidence,
     NormalizedPortfolioTransactionEvidenceInput, PositionObservation, PositionSide, ResearchError,
     ResearchObservation, TransactionObservation, UniverseMembershipObservation,

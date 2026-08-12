@@ -23,8 +23,8 @@ pub use query::{TreasuryDatasetProfile, TreasuryFiscalQuery, TreasuryPageRequest
 pub use rates::{AverageInterestRate, TreasuryRateError, TreasuryRateProfile};
 pub use source::{
     RetrievedDailyRatePage, RetrievedFiscalDataPage, RetrievedYieldCurvePage,
-    TreasuryDailyRatesConfig, TreasurySource, TreasurySourceConfig, TreasurySourceError,
-    TreasurySourceHealth,
+    TreasuryDailyRatesConfig, TreasuryExtractionOutput, TreasurySource, TreasurySourceConfig,
+    TreasurySourceError, TreasurySourceHealth,
 };
 pub use yield_curve::{
     DailyParYieldCurveObservation, DailyParYieldCurvePage, TreasuryYieldCurvePageRequest,

@@ -167,18 +167,31 @@ async fn exercise_source(
         .first()
         .ok_or("missing discovered object")?
         .clone();
-    let extraction = source
-        .extract(
-            authority,
-            ExtractionRequest::try_new(
-                object,
-                NonZeroU32::new(10_000).ok_or("nonzero record count")?,
-                NonZeroU64::new(16 * 1024 * 1024).ok_or("nonzero byte count")?,
-                deadline,
-            )?,
-            CancellationToken::new(),
-        )
+    let extraction_request = ExtractionRequest::try_new(
+        object,
+        NonZeroU32::new(10_000).ok_or("nonzero record count")?,
+        NonZeroU64::new(16 * 1024 * 1024).ok_or("nonzero byte count")?,
+        deadline,
+    )?;
+    assert!(matches!(
+        source
+            .extract(
+                authority.clone(),
+                extraction_request.clone(),
+                CancellationToken::new(),
+            )
+            .await,
+        Err(market_squawk_sources::ExtractionSourceError::Source(
+            market_squawk_sources::SourceError::InvalidProtocolState
+        ))
+    ));
+    let output = source
+        .extract_with_capture(authority, extraction_request, CancellationToken::new())
         .await?;
+    assert_eq!(output.capture_material().records().len(), 1);
+    assert_eq!(output.capture_material().records()[0].payload(), payload);
+    let (extraction, capture) = output.into_parts();
+    assert_eq!(capture.receipt().pages().len(), 1);
     let revisions = source.revision_plan(&extraction)?;
     assert_eq!(
         revisions.is_locally_observed(),

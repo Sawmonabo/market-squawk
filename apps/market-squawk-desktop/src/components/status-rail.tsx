@@ -75,11 +75,6 @@ function ReadyStatusRail({
         value={activeJobs === null ? statusLabel(status.jobs.status) : `${activeJobs} active`}
         ready={status.jobs.status === "ready"}
       />
-      <StatusFact
-        label="Paper"
-        value={status.paper.status === "ready" ? status.paper.data.state : statusLabel(status.paper.status)}
-        ready={status.paper.status === "ready" && status.paper.data.state === "running"}
-      />
     </>
   )
 }

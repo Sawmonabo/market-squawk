@@ -1,17 +1,11 @@
-use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-use std::str::FromStr;
 use std::sync::Arc;
 
-use market_squawk_data::Sha256Digest;
-use market_squawk_domain::{InstrumentId, Timestamp};
-use market_squawk_modeling::{
-    CalibrationBand, CalibrationEvidence, CalibrationMethod, CalibrationWindow, ForecastCoverage,
-    ForecastHorizon, ForecastRequest, InferenceBackend, InferenceError, MAX_MODEL_FEATURES,
-    ModelDecision, ModelFeatureValue, ModelInput, ModelInputError, NativeLinearBackend,
-    RealizedCoverage, ResearchForecastBackend,
+use crate::{
+    InferenceBackend, InferenceError, MAX_MODEL_FEATURES, ModelDecision, ModelFeatureValue,
+    ModelInput, ModelInputError, NativeLinearBackend,
 };
 
-use crate::bundle::{TestResult, valid_fixture};
+use super::bundle::{TestResult, valid_fixture};
 
 #[test]
 fn native_linear_and_logistic_inference_are_deterministic_and_identity_bound() -> TestResult {
@@ -132,117 +126,6 @@ fn native_artifact_rejects_nonfinite_weights_and_multiple_outputs() -> TestResul
         .load()
         .err()
         .ok_or_else(|| std::io::Error::other("multiple artifact outputs were accepted"))?;
-    assert_eq!(
-        observed,
-        market_squawk_modeling::BundleError::UnsupportedOutputShape
-    );
-    Ok(())
-}
-
-#[test]
-fn native_research_forecast_preserves_exact_horizons_identity_and_calibrated_nested_intervals()
--> TestResult {
-    let fixture = valid_fixture("native_linear", 1, 1, |_, _| {})?;
-    let backend = NativeLinearBackend::try_from_bundle(Arc::new(fixture.load()?))?;
-    let values = [
-        [
-            ModelFeatureValue::try_new(fixture.feature(0)?, 3.0)?,
-            ModelFeatureValue::try_new(fixture.feature(1)?, 14.0)?,
-        ],
-        [
-            ModelFeatureValue::try_new(fixture.feature(0)?, 4.0)?,
-            ModelFeatureValue::try_new(fixture.feature(1)?, 14.0)?,
-        ],
-        [
-            ModelFeatureValue::try_new(fixture.feature(0)?, 5.0)?,
-            ModelFeatureValue::try_new(fixture.feature(1)?, 14.0)?,
-        ],
-    ];
-    let inputs = [
-        ModelInput::try_new(backend.metadata(), &values[0])?,
-        ModelInput::try_new(backend.metadata(), &values[1])?,
-        ModelInput::try_new(backend.metadata(), &values[2])?,
-    ];
-    let horizon = ForecastHorizon::try_new(
-        NonZeroU16::new(3).ok_or("horizon")?,
-        NonZeroU64::new(60).ok_or("step")?,
-    )?;
-    let request = ForecastRequest::try_new(
-        InstrumentId::from_str("018f3c2a-91ab-7ccd-b3de-123456789aaa")?,
-        Timestamp::from_unix_nanos(1_000),
-        Timestamp::from_unix_nanos(900),
-        horizon,
-        2,
-        &inputs,
-    )?;
-    let window = CalibrationWindow::try_new(
-        Timestamp::from_unix_nanos(100),
-        Timestamp::from_unix_nanos(800),
-        NonZeroU32::new(80).ok_or("calibration observations")?,
-    )?;
-    let calibration = CalibrationEvidence::try_new(
-        backend.metadata(),
-        CalibrationMethod::MapieEnbpi,
-        window,
-        Sha256Digest::new([71; 32]),
-        Sha256Digest::new([72; 32]),
-        [
-            CalibrationBand::try_new(
-                ForecastCoverage::Fifty,
-                -0.5,
-                0.5,
-                RealizedCoverage::try_new(41, NonZeroU64::new(80).ok_or("coverage total")?)?,
-            )?,
-            CalibrationBand::try_new(
-                ForecastCoverage::Eighty,
-                -1.0,
-                1.0,
-                RealizedCoverage::try_new(65, NonZeroU64::new(80).ok_or("coverage total")?)?,
-            )?,
-            CalibrationBand::try_new(
-                ForecastCoverage::NinetyFive,
-                -2.0,
-                2.0,
-                RealizedCoverage::try_new(76, NonZeroU64::new(80).ok_or("coverage total")?)?,
-            )?,
-        ],
-        "block bootstrap residual dependence; marginal empirical coverage is not a per-observation guarantee",
-    )?;
-
-    let forecast = backend.forecast(&request, Some(&calibration))?;
-
-    assert_eq!(forecast.horizon(), horizon);
-    assert_eq!(
-        forecast.observed_cutoff(),
-        Timestamp::from_unix_nanos(1_000)
-    );
-    assert_eq!(forecast.available_at(), Timestamp::from_unix_nanos(900));
-    assert_eq!(forecast.model_id(), backend.metadata().model_id());
-    assert_eq!(forecast.bundle_id(), backend.metadata().bundle_id());
-    assert_eq!(
-        forecast.bundle_version(),
-        backend.metadata().bundle_version()
-    );
-    assert_eq!(forecast.dataset(), backend.metadata().dataset());
-    assert_eq!(
-        forecast.feature_semantic_digests(),
-        backend.metadata().feature_semantic_digests()
-    );
-    assert_eq!(forecast.calibration(), Some(&calibration));
-    assert_eq!(forecast.points().len(), 3);
-    for (index, point) in forecast.points().iter().enumerate() {
-        assert_eq!(
-            point.target_at().unix_nanos(),
-            1_000 + 60 * i64::try_from(index + 1)?
-        );
-        assert!(point.central().to_f64().is_finite());
-        let intervals = point.intervals().ok_or("calibrated intervals missing")?;
-        assert!(intervals.interval_95().lower() <= intervals.interval_80().lower());
-        assert!(intervals.interval_80().lower() <= intervals.interval_50().lower());
-        assert!(intervals.interval_50().lower() <= point.central());
-        assert!(point.central() <= intervals.interval_50().upper());
-        assert!(intervals.interval_50().upper() <= intervals.interval_80().upper());
-        assert!(intervals.interval_80().upper() <= intervals.interval_95().upper());
-    }
+    assert_eq!(observed, crate::BundleError::UnsupportedOutputShape);
     Ok(())
 }

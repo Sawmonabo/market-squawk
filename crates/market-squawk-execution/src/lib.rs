@@ -61,8 +61,10 @@ pub use portfolio::{
     PortfolioServicePublisher, portfolio_execution_state,
 };
 pub use risk::{
-    MarketRiskInput, MarketRiskInputError, PreAuthorityRiskOutcome, RiskOutcome, RiskRejection,
-    RiskRejectionCode, RiskService, RiskServiceConfig, RiskServiceError,
+    MarketRiskInput, MarketRiskInputError, PaperRiskAdvisoryDraft, PreAuthorityRiskOutcome,
+    RiskAdvisoryAuthority, RiskAdvisoryCheck, RiskAdvisoryError, RiskAdvisoryEvidence,
+    RiskAdvisoryGeneration, RiskAdvisoryGenerationError, RiskAdvisoryOutcome, RiskOutcome,
+    RiskRejection, RiskRejectionCode, RiskService, RiskServiceConfig, RiskServiceError,
 };
 pub use strategy::{
     BookImbalancePaperStrategy, BookImbalancePaperStrategyConfig,

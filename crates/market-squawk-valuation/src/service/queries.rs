@@ -1,5 +1,14 @@
 //! Bounded immutable fair-value read capabilities.
 
+mod selection;
+
+pub(super) use selection::approval_status_at;
+pub use selection::{
+    FairValueSelectionDisposition, FairValueSelectionError, FairValueSelectionOrderEntry,
+    FairValueSelectionReceipt, FairValueSelectionReceiptHash, FairValueSelectionRequest,
+    SelectedFairValueEvidence,
+};
+
 use super::*;
 
 impl FairValueService {
@@ -194,6 +203,33 @@ impl FairValueService {
             .take(limit)
             .map(Arc::clone)
             .collect())
+    }
+
+    /// Selects the latest exact-instrument, currency-compatible, approved fair-value evidence.
+    ///
+    /// Business times and catalog-trusted append times are both evaluated through
+    /// `request.as_of()`. Ordering is measurement time descending, preparation time descending,
+    /// stable measurement and decision identities, then approval time descending and stable
+    /// approval identity. Co-leading measurements or multiple active decisions for the leading
+    /// measurement return an explicit conflict rather than arbitrary accounting authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed limit, temporary-capacity, or corrupt-persistence failure.
+    pub fn select_latest_fair_value(
+        &self,
+        request: FairValueSelectionRequest,
+    ) -> Result<FairValueSelectionReceipt, FairValueSelectionError> {
+        self.validate_query_limit(request.max_eligible())?;
+        selection::select_latest_from_retained(
+            &self.measurements,
+            &self.decisions,
+            &self.overrides,
+            &self.approvals,
+            &self.revocations,
+            &self.audit,
+            request,
+        )
     }
 
     fn require_measurement(

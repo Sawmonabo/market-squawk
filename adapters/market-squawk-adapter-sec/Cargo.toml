@@ -17,6 +17,7 @@ chrono.workspace = true
 futures-util.workspace = true
 libc.workspace = true
 market-squawk-domain.workspace = true
+market-squawk-platform.workspace = true
 market-squawk-sources.workspace = true
 quick-xml.workspace = true
 reqwest.workspace = true

@@ -154,8 +154,7 @@ function BacktestsWorkspace({
   })
   const reportArtifact = React.useMemo(() => {
     if (resultQuery.data?.status.state !== "completed") return null
-    const artifact = resultQuery.data.status.artifact
-    return "artifactId" in artifact ? artifact : null
+    return resultQuery.data.status.artifact
   }, [resultQuery.data])
   const reportQuery = useQuery({
     queryKey: productKeys.operation(scope, "analysis", "Analysis.ReadArtifact", {
@@ -920,11 +919,11 @@ function BacktestRecordView({
 }) {
   const metrics = record.status.state === "completed" ? record.status.metrics : []
   const pbo =
-    record.status.state === "completed" && record.status.cohortDiagnostics?.state === "completed"
+    record.status.state === "completed" && record.status.cohortDiagnostics.state === "completed"
       ? record.status.cohortDiagnostics.probabilityOfBacktestOverfitting
       : null
   const deflated =
-    record.status.state === "completed" && record.status.cohortDiagnostics?.state === "completed"
+    record.status.state === "completed" && record.status.cohortDiagnostics.state === "completed"
       ? record.status.cohortDiagnostics.deflatedPerformanceProbability
       : null
 
@@ -946,11 +945,7 @@ function BacktestRecordView({
         <EvidenceFact
           icon={GitCompareArrows}
           label="Cohort authority"
-          value={
-            record.cohortAuthorityDigest
-              ? shortDigest(record.cohortAuthorityDigest)
-              : "Not supplied"
-          }
+          value={shortDigest(record.cohortAuthorityDigest)}
           detail={
             record.cohortUniverseDigest
               ? `Universe ${shortDigest(record.cohortUniverseDigest)}`
@@ -1009,11 +1004,7 @@ function CompletedResult({
         <ResultFact label="Simulated fills" value={status.fillCount.toLocaleString()} />
         <ResultFact
           label="Partial fills"
-          value={
-            status.partialFillCount === undefined
-              ? "Legacy record"
-              : status.partialFillCount.toLocaleString()
-          }
+          value={status.partialFillCount.toLocaleString()}
         />
         <ResultFact label="No-action decisions" value={status.noActionCount.toLocaleString()} />
       </div>
@@ -1047,28 +1038,24 @@ function CompletedResult({
           unavailable="No completed controlled cohort evaluation qualifies this terminal, so no multiple-testing-adjusted probability is available."
         />
       </div>
-      <ExecutionAssumptions assumptions={status.executionAssumptions ?? null} />
+      <ExecutionAssumptions assumptions={status.executionAssumptions} />
       <div className="rounded-xl border border-border bg-background/25 p-4 text-xs leading-relaxed text-muted-foreground">
         <p>
           Accounting reconciliation: <span className="font-medium text-foreground">independent</span>.
           The governed report is {status.artifact.byteCount.toLocaleString()} bytes.
         </p>
-        {"artifactId" in status.artifact ? (
-          <div className="mt-3 flex flex-wrap items-center gap-3">
-            <Button size="sm" variant="outline" disabled={reportState === "loading"} onClick={onReadReport ?? undefined}>
-              {reportState === "loading" ? "Retrieving report…" : "Retrieve controlled report"}
-            </Button>
-            <span>
-              {reportState === "retrieved"
-                ? "The first bounded report segment was verified and retrieved."
-                : typeof reportState === "string"
-                  ? `Report retrieval failed: ${reportState}`
-                  : `ID ${shortDigest(status.artifact.artifactId)} · SHA-256 ${shortDigest(status.artifact.sha256)}`}
-            </span>
-          </div>
-        ) : (
-          <p className="mt-2">This legacy terminal has no compatible controlled report identity.</p>
-        )}
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <Button size="sm" variant="outline" disabled={reportState === "loading"} onClick={onReadReport ?? undefined}>
+            {reportState === "loading" ? "Retrieving report…" : "Retrieve controlled report"}
+          </Button>
+          <span>
+            {reportState === "retrieved"
+              ? "The first bounded report segment was verified and retrieved."
+              : typeof reportState === "string"
+                ? `Report retrieval failed: ${reportState}`
+                : `ID ${shortDigest(status.artifact.artifactId)} · SHA-256 ${shortDigest(status.artifact.sha256)}`}
+          </span>
+        </div>
       </div>
     </>
   )
@@ -1077,16 +1064,8 @@ function CompletedResult({
 function ExecutionAssumptions({
   assumptions,
 }: {
-  assumptions: Extract<BacktestRecord["status"], { state: "completed" }>["executionAssumptions"] | null
+  assumptions: Extract<BacktestRecord["status"], { state: "completed" }>["executionAssumptions"]
 }) {
-  if (!assumptions) {
-    return (
-      <UnavailableCard
-        title="Execution assumptions are legacy-only"
-        detail="This terminal binds an assumption digest but predates the readable V2 fee, spread, slippage, latency, participation, liquidity, and partial-fill evidence."
-      />
-    )
-  }
   const facts = [
     ["Fee", `${assumptions.feeBasisPoints} bp`],
     ["Spread", "Observed point-in-time half spread"],

@@ -138,8 +138,7 @@ pub(super) fn call(
         "Portfolio.GetAttribution"
         | "Portfolio.EvaluateScenario"
         | "Portfolio.EvaluateScenarioBatch"
-        | "Portfolio.ProposeRebalance"
-        | "Portfolio.EvaluateCandidateImpact" => {
+        | "Portfolio.ProposeRebalance" => {
             super::advanced::call(image, revision, &scope, request, context)
         }
         _ => Err(PortfolioApplicationServiceError::InvalidRequest),

@@ -3,13 +3,12 @@
 use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
-use market_squawk_jobs::JobId;
 use market_squawk_services::RequestContext;
 use rmcp::model::{Resource, ResourceTemplate};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::jobs::{JOB_RESOURCE_TEMPLATE, parse_job_resource_uri};
+use crate::jobs::{JOB_RESOURCE_TEMPLATE, JobResourceIdentity, parse_job_resource_uri};
 
 const SERVICE_URI: &str = "market-squawk://service";
 const WORKSPACE_URI: &str = "market-squawk://workspace";
@@ -28,8 +27,8 @@ pub enum McpResourceRequest {
     Source(Arc<str>),
     /// Registered model metadata by opaque model identity.
     Model(Arc<str>),
-    /// Durable job event/result inspection by typed job identity.
-    Job(JobId),
+    /// Durable job event/result inspection by exact typed generation identity.
+    Job(JobResourceIdentity),
     /// Published artifact metadata by opaque artifact identity.
     Artifact(Arc<str>),
 }
@@ -47,8 +46,8 @@ impl McpResourceRequest {
         if uri == WORKSPACE_URI {
             return Ok(Self::Workspace);
         }
-        if let Ok(job_id) = parse_job_resource_uri(uri) {
-            return Ok(Self::Job(job_id));
+        if let Ok(identity) = parse_job_resource_uri(uri) {
+            return Ok(Self::Job(identity));
         }
         parse_opaque_path(uri, "market-squawk://sources/")
             .map(Self::Source)

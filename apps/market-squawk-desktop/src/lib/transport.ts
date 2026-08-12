@@ -1,4 +1,8 @@
 import type {
+  AnalyticalControllerRequest,
+  AnalyticalControllerResponse,
+} from "@/features/advanced/analytical-profile-contracts"
+import type {
   ApplicationResult,
   DesktopEvent,
   DesktopStartup,
@@ -113,6 +117,11 @@ export type DashboardQuery =
     }
   | { query: "modelMetadata"; modelId: string }
   | {
+      query: "latestValidForecast"
+      instrumentId: string
+      asOf: string
+    }
+  | {
       query: "modelPrediction"
       modelId: string
       input: Record<string, unknown>
@@ -134,6 +143,12 @@ export type DashboardQuery =
     }
   | { query: "decisionDossier"; dossierId: string }
   | { query: "decisionDossierPreparation"; candidateId: string }
+  | { query: "decisionInvestmentAnalysis"; analysisId: string }
+  | {
+      query: "decisionInvestmentAnalyses"
+      afterAnalysisId?: string
+      limit: number
+    }
   | { query: "decisionTargetPreparation"; dossierId: string }
   | {
       query: "decisionTarget" | "decisionTargetStatus"
@@ -260,6 +275,10 @@ export interface ProductTransport {
     confirmed?: boolean,
   ): Promise<InstallationControlResult>
   query(request: DashboardQuery): Promise<ApplicationResult>
+  analyticalController(
+    request: AnalyticalControllerRequest,
+    confirmed?: boolean,
+  ): Promise<AnalyticalControllerResponse>
   researchControl(
     request: ResearchControlRequest,
     confirmed?: boolean,
@@ -584,25 +603,25 @@ export type ManualPaperRequest =
 
 export type JobControlRequest =
   | { action: "list"; afterJobId?: string; limit: number }
-  | { action: "get"; jobId: string }
+  | { action: "get"; jobId: string; generation: string }
   | {
       action: "watch"
       jobId: string
-      generation: number
-      afterSequence: number
+      generation: string
+      afterSequence: string
       limit: number
     }
   | {
       action: "cancel" | "retry"
       jobId: string
-      generation: number
-      expectedSequence: number
+      generation: string
+      expectedSequence: string
     }
   | {
       action: "confirm"
       jobId: string
-      generation: number
-      expectedSequence: number
+      generation: string
+      expectedSequence: string
       identity: string
       digest: string
     }

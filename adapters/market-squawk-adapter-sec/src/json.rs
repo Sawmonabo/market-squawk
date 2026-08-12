@@ -612,6 +612,7 @@ pub enum SecParserError {
     InvalidDate,
     InvalidTimestamp,
     InvalidPeriod,
+    InvalidFiscalContext,
     InvalidDecimal,
     NonNumericCompanyFact,
     ConflictingAccession,

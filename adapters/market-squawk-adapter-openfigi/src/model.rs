@@ -15,8 +15,11 @@ pub const OPENFIGI_V3_PROVIDER: &str = "openfigi-v3";
 pub const OPENFIGI_PUBLIC_REQUESTS_PER_WINDOW: u32 = 25;
 /// One minute expressed in nanoseconds for the unauthenticated shared budget.
 pub const OPENFIGI_PUBLIC_REQUEST_WINDOW_NANOS: u64 = 60_000_000_000;
-/// Official V3 unauthenticated mapping-job ceiling.
-pub const OPENFIGI_PUBLIC_MAX_JOBS: usize = 10;
+/// Conservative V3 unauthenticated mapping-job ceiling.
+///
+/// OpenFIGI's current documentation disagrees between five and ten jobs for unauthenticated
+/// requests. This uses the stricter published ceiling until the provider contract is unambiguous.
+pub const OPENFIGI_PUBLIC_MAX_JOBS: usize = 5;
 /// Official authenticated request ceiling for one six-second window.
 pub const OPENFIGI_API_KEY_REQUESTS_PER_WINDOW: u32 = 25;
 /// Six seconds expressed in nanoseconds for an API-key-qualified shared budget.
@@ -30,7 +33,7 @@ const MAX_RATE_HEADER_BYTES: usize = 20;
 /// OpenFIGI mapping access tier selected by evidence-backed source metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenFigiAccess {
-    /// No account or API key; the adapter enforces ten jobs and 25 requests per minute.
+    /// No account or API key; the adapter enforces five jobs and 25 requests per minute.
     Public,
     /// User-authorized API key; the key is borrowed only for each request.
     ApiKey,

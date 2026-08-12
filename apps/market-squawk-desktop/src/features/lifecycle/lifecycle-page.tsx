@@ -697,7 +697,7 @@ function JobReceipt({ receipt }: { receipt: LifecycleJobReceipt }) {
       <CheckCircle2 aria-hidden="true" />
       <AlertTitle>Durable lifecycle job accepted</AlertTitle>
       <AlertDescription>
-        Receipt {receipt.jobId} at generation {receipt.generation} is queued. <Link className="underline underline-offset-4" to="/operations">Reconnect in Operations</Link> for current phase, health evidence, recovery state, and terminal receipt.
+        Receipt {receipt.jobId} at generation {receipt.generation} is queued. <Link className="underline underline-offset-4" to="/system/operations-jobs">Reconnect in Operations</Link> for current phase, health evidence, recovery state, and terminal receipt.
       </AlertDescription>
     </Alert>
   )

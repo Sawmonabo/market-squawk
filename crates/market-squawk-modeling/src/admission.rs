@@ -11,17 +11,19 @@ use market_squawk_analytics::{
 };
 use market_squawk_data::{
     CatalogEndpointIdentity, ComponentKind, ComponentScope, CorporateActionSensitivity,
-    FeatureLabelComponentSpec, PythonDatasetCatalogError, PythonDatasetSelection,
-    PythonDatasetVerificationLimits, Sha256Digest, verify_python_dataset,
+    FeatureLabelComponentSpec, FeatureLabelMeasurement, PythonDatasetCatalogError,
+    PythonDatasetSelection, PythonDatasetVerificationLimits, Sha256Digest, verify_python_dataset,
 };
-use market_squawk_domain::{ModelId, RoundingPolicy, Timestamp};
+use market_squawk_domain::{Currency, ModelId, RoundingPolicy, Timestamp};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    BundleError, BundleExpectations, BundleId, BundleMetadataRef, ControlledModelRoot, ModelBundle,
+    BundleError, BundleExpectations, BundleId, BundleMetadataRef, ControlledModelRoot,
+    ForecastCentralStatistic, ForecastEstimatorProfile, ForecastMeasurement, ForecastOutputBinding,
+    ForecastTargetMeaning, ForecastTrainingObjective, ForecastTransform, ModelBundle,
     ModelOutputSemantics, TrainingDatasetIdentity, TrainingPeriod, VerifiedTrainingEnvironment,
 };
 
@@ -328,13 +330,12 @@ fn expectations(
     selection: &PythonDatasetSelection,
     environment: Option<&VerifiedTrainingEnvironment>,
 ) -> Result<BundleExpectations, ModelAdmissionError> {
-    let output_semantics = match (wire.schema_version, wire.output_semantics.as_deref()) {
-        (5, None) => None,
-        (6, Some("regression")) => Some(ModelOutputSemantics::Regression),
-        (6, Some("binary_probability")) => Some(ModelOutputSemantics::BinaryProbability),
+    let output_semantics = match wire.output_semantics.as_str() {
+        "regression" => ModelOutputSemantics::Regression,
+        "binary_probability" => ModelOutputSemantics::BinaryProbability,
         _ => return Err(ModelAdmissionError::InvalidAuthority),
     };
-    if !matches!(wire.schema_version, 5 | 6)
+    if wire.schema_version != 8
         || wire.label.kind != "label"
         || !dataset_matches_selection(&wire.dataset, selection)?
         || wire.universe_id != selection.identity().universe_id().as_str()
@@ -399,39 +400,126 @@ fn expectations(
     let bundle_metadata_hash = Sha256Digest::new(parse_hex(&wire.bundle_metadata_sha256)?);
     let artifact_hash = Sha256Digest::new(parse_hex(&wire.artifact_sha256)?);
     let training_run_hash = Sha256Digest::new(parse_hex(&wire.training_run_sha256)?);
-    let result = if let Some(output_semantics) = output_semantics {
-        BundleExpectations::try_new_with_output_semantics(
-            model_id,
-            bundle_id,
-            bundle_version,
-            dataset,
-            identity.universe_id().clone(),
-            training_period,
-            label,
-            &wire.training_code_revision,
-            training_environment_hash,
-            bundle_metadata_hash,
-            artifact_hash,
-            training_run_hash,
-            output_semantics,
-        )
-    } else {
-        BundleExpectations::try_new(
-            model_id,
-            bundle_id,
-            bundle_version,
-            dataset,
-            identity.universe_id().clone(),
-            training_period,
-            label,
-            &wire.training_code_revision,
-            training_environment_hash,
-            bundle_metadata_hash,
-            artifact_hash,
-            training_run_hash,
-        )
+    let output_binding = output_binding(
+        &wire.output_measurement,
+        &wire.output_statistic,
+        output_semantics,
+        &label,
+        selection,
+    )?;
+    BundleExpectations::try_new_with_output_binding(
+        model_id,
+        bundle_id,
+        bundle_version,
+        dataset,
+        identity.universe_id().clone(),
+        training_period,
+        label,
+        &wire.training_code_revision,
+        training_environment_hash,
+        bundle_metadata_hash,
+        artifact_hash,
+        training_run_hash,
+        output_binding,
+    )
+    .map_err(|_| ModelAdmissionError::InvalidAuthority)
+}
+
+fn output_binding(
+    wire: &OutputMeasurementWire,
+    statistic_wire: &OutputStatisticWire,
+    output_semantics: ModelOutputSemantics,
+    label: &FeatureLabelComponentSpec,
+    selection: &PythonDatasetSelection,
+) -> Result<ForecastOutputBinding, ModelAdmissionError> {
+    let measurement = match wire {
+        OutputMeasurementWire::Price { currency } => {
+            let encoded = currency.as_str();
+            let currency =
+                Currency::try_from(encoded).map_err(|_| ModelAdmissionError::InvalidAuthority)?;
+            if currency.as_str() != encoded {
+                return Err(ModelAdmissionError::InvalidAuthority);
+            }
+            FeatureLabelMeasurement::Price { currency }
+        }
+        OutputMeasurementWire::Return => FeatureLabelMeasurement::Return,
+        OutputMeasurementWire::Probability => FeatureLabelMeasurement::Probability,
+        OutputMeasurementWire::OtherRegression => FeatureLabelMeasurement::OtherRegression,
     };
-    result.map_err(|_| ModelAdmissionError::InvalidAuthority)
+    if selection.label_measurement(label) != Some(measurement) {
+        return Err(ModelAdmissionError::InvalidAuthority);
+    }
+    let measurement = match measurement {
+        FeatureLabelMeasurement::Price { currency } => ForecastMeasurement::Price { currency },
+        FeatureLabelMeasurement::Return => ForecastMeasurement::Return,
+        FeatureLabelMeasurement::Probability => ForecastMeasurement::Probability,
+        FeatureLabelMeasurement::OtherRegression => ForecastMeasurement::OtherRegression,
+    };
+    let expected_target = selection
+        .label_fixed_horizon_nanos(label)
+        .map_or(ForecastTargetMeaning::Unsupported, |horizon_nanos| {
+            ForecastTargetMeaning::FixedHorizonTerminal { horizon_nanos }
+        });
+    let target = match statistic_wire.target {
+        TargetWire::FixedHorizonTerminal { horizon_nanos } => {
+            ForecastTargetMeaning::FixedHorizonTerminal {
+                horizon_nanos: NonZeroU64::new(horizon_nanos)
+                    .ok_or(ModelAdmissionError::InvalidAuthority)?,
+            }
+        }
+        TargetWire::Unsupported => ForecastTargetMeaning::Unsupported,
+    };
+    if target != expected_target {
+        return Err(ModelAdmissionError::InvalidAuthority);
+    }
+    let central_statistic = match statistic_wire.statistic.as_str() {
+        "model_estimated_conditional_mean" => {
+            ForecastCentralStatistic::ModelEstimatedConditionalMean
+        }
+        "unavailable" => ForecastCentralStatistic::Unavailable,
+        _ => return Err(ModelAdmissionError::InvalidAuthority),
+    };
+    let target_transform = transform(&statistic_wire.target_transform)?;
+    let output_transform = transform(&statistic_wire.output_transform)?;
+    let objective = match statistic_wire.objective.as_str() {
+        "squared_error" => ForecastTrainingObjective::SquaredError,
+        "binary_cross_entropy" => ForecastTrainingObjective::BinaryCrossEntropy,
+        _ => return Err(ModelAdmissionError::InvalidAuthority),
+    };
+    let estimator = match statistic_wire.estimator {
+        EstimatorWire::SealedDirectLeastSquaresV1 => {
+            ForecastEstimatorProfile::SealedDirectLeastSquaresV1
+        }
+        EstimatorWire::SealedDirectRidgeV1 { ridge_alpha } => {
+            if !ridge_alpha.is_finite() || ridge_alpha < 0.0 {
+                return Err(ModelAdmissionError::InvalidAuthority);
+            }
+            ForecastEstimatorProfile::SealedDirectRidgeV1 {
+                ridge_alpha_bits: ridge_alpha.to_bits(),
+            }
+        }
+        EstimatorWire::SealedBinaryLogisticV1 => ForecastEstimatorProfile::SealedBinaryLogisticV1,
+    };
+    ForecastOutputBinding::try_from_admitted_model(
+        output_semantics,
+        measurement,
+        central_statistic,
+        target,
+        target_transform,
+        output_transform,
+        objective,
+        estimator,
+        label.clone(),
+    )
+    .map_err(|_| ModelAdmissionError::InvalidAuthority)
+}
+
+fn transform(value: &str) -> Result<ForecastTransform, ModelAdmissionError> {
+    match value {
+        "identity" => Ok(ForecastTransform::Identity),
+        "logistic" => Ok(ForecastTransform::Logistic),
+        _ => Err(ModelAdmissionError::InvalidAuthority),
+    }
 }
 
 fn dataset_matches_selection(
@@ -487,7 +575,9 @@ const fn nibble(value: u8) -> Option<u8> {
 #[serde(deny_unknown_fields)]
 struct ExpectationsWire {
     schema_version: u32,
-    output_semantics: Option<String>,
+    output_semantics: String,
+    output_measurement: OutputMeasurementWire,
+    output_statistic: OutputStatisticWire,
     model_id: String,
     bundle_id: String,
     bundle_version: u64,
@@ -500,6 +590,50 @@ struct ExpectationsWire {
     bundle_metadata_sha256: String,
     artifact_sha256: String,
     training_run_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputStatisticWire {
+    statistic: String,
+    target: TargetWire,
+    target_transform: String,
+    output_transform: String,
+    objective: String,
+    estimator: EstimatorWire,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum TargetWire {
+    #[serde(rename = "fixed_horizon_terminal")]
+    FixedHorizonTerminal { horizon_nanos: u64 },
+    #[serde(rename = "unsupported")]
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum EstimatorWire {
+    #[serde(rename = "sealed_direct_least_squares_v1")]
+    SealedDirectLeastSquaresV1,
+    #[serde(rename = "sealed_direct_ridge_v1")]
+    SealedDirectRidgeV1 { ridge_alpha: f64 },
+    #[serde(rename = "sealed_binary_logistic_v1")]
+    SealedBinaryLogisticV1,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum OutputMeasurementWire {
+    #[serde(rename = "price")]
+    Price { currency: String },
+    #[serde(rename = "return")]
+    Return,
+    #[serde(rename = "probability")]
+    Probability,
+    #[serde(rename = "other_regression")]
+    OtherRegression,
 }
 
 #[derive(Deserialize)]

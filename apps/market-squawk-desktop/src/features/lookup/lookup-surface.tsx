@@ -33,8 +33,8 @@ const categoryLabels: Record<LookupCategory, string> = {
   instrument: "Instruments",
   job: "Running work",
   model: "Models",
-  portfolio: "Portfolios",
-  provider: "Sources",
+  portfolio: "Portfolio",
+  provider: "Connections & sources",
   screen: "Saved screens",
   target: "Investment targets",
 }
@@ -79,7 +79,7 @@ export function LookupSurface({
         />
       </div>
 
-      <div className="flex flex-wrap gap-2" aria-label="Limit lookup categories">
+      <div className="flex flex-wrap gap-2" aria-label="Limit search categories">
         {lookupCategories.map((category) => {
           const selected = categories.includes(category)
           return (
@@ -143,7 +143,7 @@ function LookupResults({
   if (state.status === "unavailable") {
     return (
       <div role="alert" className="rounded-xl border border-destructive/40 bg-destructive/5 p-4">
-        <p className="text-sm font-medium text-destructive">Lookup is unavailable</p>
+        <p className="text-sm font-medium text-destructive">Search is unavailable</p>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">{state.message}</p>
       </div>
     )
@@ -317,35 +317,35 @@ export function lookupRoute(match: LookupMatch) {
     return `/markets?instrumentId=${encodeURIComponent(match.destination.instrumentId)}`
   }
   if (match.destination?.kind === "research_company") {
-    return `/research?companyId=${encodeURIComponent(match.destination.providerCompanyId)}`
+    return `/advanced/research-data?companyId=${encodeURIComponent(match.destination.providerCompanyId)}`
   }
-  if (match.category === "provider") return "/sources"
-  if (match.category === "dataset") return "/research"
-  if (match.category === "screen") return "/decisions"
-  if (match.category === "model") return "/models"
-  if (match.category === "portfolio") return "/portfolios"
-  if (match.category === "target") return "/decisions"
-  if (match.category === "job") return "/overview"
+  if (match.category === "provider") return "/connections/sources"
+  if (match.category === "dataset") return "/advanced/research-data"
+  if (match.category === "screen") return "/opportunities"
+  if (match.category === "model") return "/advanced/models-forecasts"
+  if (match.category === "portfolio") return "/portfolio"
+  if (match.category === "target") return "/advanced/valuation-targets"
+  if (match.category === "job") return "/system/operations-jobs"
   if (match.category === "command" && typeof match.detail.domain === "string") {
     const domain = match.detail.domain.toLowerCase()
     const paths: Record<string, string> = {
-      analysis: "/backtests",
-      bot: "/risk",
-      decision: "/decisions",
+      analysis: "/advanced/backtests",
+      bot: "/advanced/risk-recommendation-policy",
+      decision: "/opportunities",
       execution: "/paper-execution",
-      fairvalue: "/fair-value",
-      fundamental: "/research",
-      job: "/overview",
-      macro: "/research",
+      fairvalue: "/advanced/valuation-targets",
+      fundamental: "/advanced/research-data",
+      job: "/system/operations-jobs",
+      macro: "/advanced/research-data",
       market: "/markets",
-      model: "/models",
-      portfolio: "/portfolios",
-      research: "/research",
-      source: "/sources",
+      model: "/advanced/models-forecasts",
+      portfolio: "/portfolio",
+      research: "/advanced/research-data",
+      source: "/connections/sources",
     }
-    return paths[domain] ?? "/overview"
+    return paths[domain] ?? "/home"
   }
-  return "/overview"
+  return "/home"
 }
 
 function groupMatches(matches: LookupMatch[]) {

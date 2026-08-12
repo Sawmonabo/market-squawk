@@ -79,7 +79,7 @@ impl TargetPreparationOperations {
                         now,
                     )
                     .map_err(map_preparation)?;
-                let item_count = inventory.reference_marks.len().max(1);
+                let item_count = inventory.reference_marks.len();
                 (inventory_value(&inventory), item_count)
             }
             PREPARE_TARGET => {

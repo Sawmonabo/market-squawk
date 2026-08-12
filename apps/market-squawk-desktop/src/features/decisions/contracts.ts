@@ -149,7 +149,16 @@ const dossierFairValueOptionSchema = z
     selector: z.string().regex(/^fair-value:[0-9a-f]{64}$/),
     measurementId: z.string().regex(/^[0-9a-f]{64}$/),
     accountId: z.string().min(1),
-    amount: moneySchema.extend({ scale: z.number().int().nonnegative() }).strict(),
+    amount: moneySchema
+      .extend({
+        scale: z.number().int().nonnegative(),
+        amountBasis: z.enum([
+          "per_instrument_unit",
+          "reporting_entity_total",
+          "position_total",
+        ]),
+      })
+      .strict(),
     measurementAt: timestampSchema,
     preparedAt: timestampSchema,
     method: z.enum([

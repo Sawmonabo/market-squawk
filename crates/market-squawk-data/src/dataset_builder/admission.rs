@@ -134,7 +134,7 @@ pub(super) fn register(
             "INSERT OR IGNORE INTO python_dataset_admissions
              (export_sha256, catalog_identity, dataset_id, manifest_version, descriptor_json,
               selection_digest_version, registered_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, 2, ?6)",
             params![
                 export_hash.bytes(),
                 catalog_identity.bytes(),
@@ -167,7 +167,7 @@ pub(super) fn register(
                     || retained_dataset != dataset_id
                     || u64::try_from(*version).ok() != Some(manifest_version)
                     || bytes.as_slice() != export_bytes
-                    || *digest_version != 1
+                    || *digest_version != 2
             },
         ) {
             return Err(PythonDatasetCatalogError::CorruptAdmission);

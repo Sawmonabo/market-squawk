@@ -79,6 +79,7 @@ use crate::application::analysis::{
     ProductionBacktestAuthority, ProductionGovernedBacktestInputAuthority,
     ProductionGovernedBacktestRepository,
 };
+use crate::application::company_security_resolution::CompanySecurityResolutionAuthority;
 use crate::application::decision::{DecisionApplication, DecisionApplicationError};
 use crate::application::governance::{
     DecisionGovernanceActionFactory, FairValueGovernanceActionFactory,
@@ -194,6 +195,7 @@ pub struct LocalProduct {
     artifacts: Arc<ControlledArtifactRepository>,
     application: Arc<Application>,
     research: Arc<ResearchService>,
+    company_security_resolution: Arc<CompanySecurityResolutionAuthority>,
     research_ingest: Arc<ProductionResearchIngestCoordinator>,
     source_lifecycle: Arc<ProductionSourceLifecycleAuthority>,
     paper_activity: Arc<dyn PaperRuntimeActivityAuthority>,
@@ -285,6 +287,11 @@ impl LocalProduct {
         I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
     {
         let research = Arc::new(open_research(&paths)?);
+        let company_security_resolution = Arc::new(CompanySecurityResolutionAuthority::new(
+            research.company_identities(),
+            research.market_data_instruments(),
+            research.company_security_link_publication(),
+        ));
         let configured_instruments = configured_live_instruments(&config)?;
         if !configured_instruments.is_empty() {
             research.synchronize_configured_instruments(
@@ -554,6 +561,7 @@ impl LocalProduct {
             artifacts,
             application,
             research,
+            company_security_resolution,
             research_ingest,
             source_lifecycle,
             paper_activity,
@@ -625,6 +633,11 @@ impl LocalProduct {
     /// Returns the analytical publication and point-in-time read authority.
     pub fn research(&self) -> Arc<ResearchService> {
         Arc::clone(&self.research)
+    }
+
+    /// Returns the explicit, evidence-bound company/security resolution workflow.
+    pub(crate) fn company_security_resolution(&self) -> Arc<CompanySecurityResolutionAuthority> {
+        Arc::clone(&self.company_security_resolution)
     }
 
     /// Returns the sole registered extraction coordinator.
@@ -952,7 +965,7 @@ fn experiment_limits() -> Result<ExperimentLimits, LocalProductError> {
 }
 
 fn decision_repository_limits() -> Result<DecisionRepositoryLimits, LocalProductError> {
-    DecisionRepositoryLimits::try_new(4_096, 8_192, 64, 8_192, 8_192, 16_384, 8_192)
+    DecisionRepositoryLimits::try_new(4_096, 8_192, 64, 8_192, 8_192, 16_384, 8_192, 4_096)
         .map_err(|_error| LocalProductError::InvalidCodeOwnedLimit)
 }
 

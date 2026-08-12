@@ -418,11 +418,11 @@ function ReferenceMarketCard({ row, selected, onSelect }: {
         <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
           Current price
         </p>
-        <p className="mt-1 text-sm font-medium">Connect free U.S. market data</p>
+        <p className="mt-1 text-sm font-medium">Connect an account-backed market feed</p>
       </div>
       <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-border/70 pt-4">
         <Fact label="Identity" value="Official listing" />
-        <Fact label="Price coverage" value="Account required" />
+        <Fact label="Price coverage" value="Provider credentials required" />
         <Fact label="Round lot" value={`${row.roundLotSize.toLocaleString()} shares`} />
         <Fact label="Updated" value={dateTime(row.availableAt)} />
       </dl>
@@ -446,12 +446,13 @@ function ReferenceWorkspace({ row }: { row: ReferenceMarketRow }) {
             {row.symbol} · {row.name}
           </h2>
           <p className="mt-2 max-w-2xl text-xs leading-5 text-muted-foreground">
-            Market Squawk found this U.S. listing without inventing a price. Connect a supported
-            free account to add current quotes, charts, signals, forecasts, backtests, and
-            portfolio impact to this same workspace.
+            Market Squawk found this U.S. listing without inventing a price. The supported no-cost
+            U.S. IEX option still requires an Alpaca account and API credentials. Connect it to add
+            current quotes, charts, signals, forecasts, backtests, and portfolio impact to this
+            same workspace.
           </p>
         </div>
-        <EvidenceBadge label="Account required for prices" tone="neutral" />
+        <EvidenceBadge label="Provider account required for prices" tone="neutral" />
       </div>
       <dl className="mt-5 grid gap-4 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
         <Fact label="Listing venue" value={row.venueId} />
@@ -478,7 +479,12 @@ function MarketCard({ row, selected, onSelect }: {
   onSelect: () => void
 }) {
   const source = row.selectedSource
-  const primaryPrice = row.quote.lastPrice ?? row.quote.midPrice ?? row.quote.bidPrice
+  const observation = row.marketObservation
+  const mark = observation.availability === "available" ? observation.mark : null
+  const markSummary =
+    observation.availability === "available"
+      ? `${markBasisName(observation.mark.basis)} · ${observation.mark.freshUntil ? `fresh through ${dateTime(observation.mark.freshUntil)}` : "no precise freshness deadline reported"}`
+      : marketObservationUnavailableName(observation.reason)
   return (
     <button
       type="button"
@@ -512,9 +518,14 @@ function MarketCard({ row, selected, onSelect }: {
         />
       </div>
       <div className="mt-5">
-        <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Current price</p>
+        <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          Selected market mark
+        </p>
         <p className="mt-1 font-mono text-2xl font-semibold">
-          {primaryPrice ? `${primaryPrice} ${row.quoteCurrency}` : "Not available"}
+          {mark ? `${mark.value} ${mark.currency}` : "Not available"}
+        </p>
+        <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+          {markSummary}
         </p>
       </div>
       <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-border/70 pt-4">
@@ -580,15 +591,26 @@ function InstrumentWorkspace({
 
   return (
     <section className="mt-4" aria-labelledby="instrument-workspace-title">
-      <div className="mb-3">
-        <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-          Instrument-scoped reads
-        </p>
-        <h2 id="instrument-workspace-title" className="mt-1 text-lg font-semibold">
-          Trades, quotes, book, and cross-source comparison
-        </h2>
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+            Instrument-scoped reads
+          </p>
+          <h2 id="instrument-workspace-title" className="mt-1 text-lg font-semibold">
+            Trades, quotes, book, and cross-source comparison
+          </h2>
+        </div>
+        <div className="max-w-xs">
+          <Button type="button" size="sm" disabled aria-describedby="analyze-readiness">
+            Analyze this investment
+          </Button>
+          <p id="analyze-readiness" className="mt-2 text-[10px] leading-4 text-muted-foreground">
+            The selected identity is exact, but canonical analysis inputs and the restart-proven
+            Desktop workflow are not composed yet. This control starts no work.
+          </p>
+        </div>
       </div>
-      {market?.selectedSource ? <SelectedSourceSummary row={market} /> : null}
+      {market ? <SelectedSourceSummary row={market} /> : null}
       {market?.orderBook ? <IndividualOrderBook book={market.orderBook} /> : null}
       <div className="grid gap-4 xl:grid-cols-2">
         <InstrumentPanel
@@ -711,45 +733,150 @@ function InstrumentWorkspace({
 
 function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
   const source = row.selectedSource
-  if (!source) return null
+  const observation = row.marketObservation
+  const mark = observation.availability === "available" ? observation.mark : null
+  const features = observation.availability === "available" ? observation.features : null
+  const receipt = row.selectionReceipt
 
   return (
     <section className="mb-4 rounded-xl border border-border bg-card/35 p-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-            Chosen automatically
+            Selected market evidence
           </p>
           <h3 className="mt-1 text-sm font-semibold">
-            {humanize(source.providerId)} · {source.providerSymbol ?? row.symbol}
+            {source
+              ? `${humanize(source.providerId)} · ${source.providerSymbol ?? row.symbol}`
+              : `${row.symbol} · no eligible source`}
           </h3>
           <p className="mt-1 max-w-2xl text-[11px] leading-5 text-muted-foreground">
-            Market Squawk selected the best eligible current source for this instrument. Any delay,
-            coverage limit, or confidence downgrade remains attached below.
+            {observation.availability === "available"
+              ? "This mark comes from the exact source selected for this instrument. Its timing, coverage, and evidence remain attached below."
+              : marketObservationUnavailableName(observation.reason)}
           </p>
         </div>
         <EvidenceBadge
-          label={source.freshness.freshAtSelection ? "Current" : "Not current"}
-          tone={source.freshness.freshAtSelection ? "good" : "bad"}
+          label={mark ? "Selected mark available" : "Mark unavailable"}
+          tone={mark ? "good" : "bad"}
         />
       </div>
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Fact label="Confidence" value={row.confidence} />
-        <Fact label="Coverage" value={humanize(source.coverage)} />
-        <Fact label="Market depth" value={source.depthLabel} />
-        <Fact label="Updated" value={dateTime(source.freshness.availableAt)} />
+        <Fact
+          label="Selected mark"
+          value={mark ? `${mark.value} ${mark.currency}` : "Not available"}
+        />
+        <Fact label="Mark basis" value={mark ? markBasisName(mark.basis) : "Not available"} />
+        <Fact
+          label="Fresh through"
+          value={
+            mark
+              ? mark.freshUntil
+                ? dateTime(mark.freshUntil)
+                : "No precise deadline reported"
+              : "Not available"
+          }
+        />
+        <Fact label="Selected at" value={dateTime(receipt.selectedAt)} />
       </dl>
       <details className="mt-4 rounded-lg border border-border bg-background/30 p-3">
-        <summary className="cursor-pointer text-xs font-semibold">Data confidence</summary>
+        <summary className="cursor-pointer text-xs font-semibold">
+          Source, quality, and evidence details
+        </summary>
         <dl className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <Fact label="Provider" value={source.providerId} />
-          <Fact label="Source" value={source.sourceId} />
-          <Fact label="Venue" value={source.venueId ?? "Not reported"} />
-          <Fact label="Provider channel" value={source.providerChannel} />
-          <Fact label="Timing" value={humanize(source.timing)} />
-          <Fact label="Quality" value={humanize(source.quality)} />
-          <Fact label="Source health" value={humanize(source.health)} />
-          <Fact label="Integrity" value={humanize(source.integrity.state)} />
+          <Fact label="Provider" value={source?.providerId ?? "Not selected"} />
+          <Fact label="Source" value={source?.sourceId ?? "Not selected"} />
+          <Fact label="Venue" value={source?.venueId ?? "Not reported"} />
+          <Fact label="Provider channel" value={source?.providerChannel ?? "Not selected"} />
+          <Fact label="Timing" value={source ? humanize(source.timing) : "Not available"} />
+          <Fact label="Source health" value={source ? humanize(source.health) : "Not available"} />
+          <Fact
+            label="Quality"
+            value={
+              observation.availability === "available"
+                ? humanize(observation.quality)
+                : "Not available"
+            }
+          />
+          <Fact
+            label="Market depth"
+            value={
+              observation.availability === "available"
+                ? observation.depth
+                  ? humanize(observation.depth)
+                  : "No market book"
+                : "Not available"
+            }
+          />
+          <Fact
+            label="Coverage"
+            value={
+              observation.availability === "available"
+                ? humanize(observation.coverage)
+                : "Not available"
+            }
+          />
+          <Fact
+            label="Integrity"
+            value={
+              observation.availability === "available"
+                ? humanize(observation.integrity)
+                : "Not available"
+            }
+          />
+          <Fact
+            label="Connection generation"
+            value={
+              observation.availability === "available"
+                ? observation.generation ?? "Not reported"
+                : "Not available"
+            }
+          />
+          <Fact
+            label="Feature status"
+            value={features ? marketFeatureAvailabilityName(features) : "Not available"}
+          />
+          <Fact
+            label="Feature observed"
+            value={
+              features?.availability === "available"
+                ? dateTime(features.availableAt)
+                : "Not available"
+            }
+          />
+          <Fact
+            label="Eligible sources"
+            value={`${receipt.eligibleCount.toLocaleString()} eligible · ${receipt.rejectedCount.toLocaleString()} rejected`}
+          />
+          <Fact
+            label="Selection result"
+            value={receipt.selectionClass ? humanize(receipt.selectionClass) : "No source selected"}
+          />
+          <Fact
+            label="Selection downgrades"
+            value={marketDowngradeSummary(receipt.downgradeDimensions)}
+          />
+          <Fact
+            label="Selection receipt"
+            value={digestName(receipt.selectionDigest)}
+          />
+          <Fact
+            label="Selection policy"
+            value={`Revision ${receipt.policyRevision.toLocaleString()} · up to ${receipt.policyCandidateLimit.toLocaleString()} sources`}
+          />
+          <Fact label="Policy digest" value={digestName(receipt.policyDigest)} />
+          <Fact
+            label="Mark evidence"
+            value={mark ? digestName(mark.evidenceIdentity) : "Not available"}
+          />
+          <Fact
+            label="Feature evidence"
+            value={
+              features?.availability === "available"
+                ? digestName(features.contentDigest)
+                : "Not available"
+            }
+          />
         </dl>
       </details>
     </section>
@@ -789,6 +916,7 @@ function IndividualOrderBook({
         Showing {book.returnedOrderCount.toLocaleString()} of {book.totalOrderCount.toLocaleString()}
         {book.sampleTruncated ? " distinct orders in a bounded identity-stable sample." : " distinct orders."}
         {book.lastMarketAt ? ` Last market update ${dateTime(book.lastMarketAt)}.` : ""}
+        {` Available to this installation ${dateTime(book.availableAt)}.`}
       </p>
     </section>
   )
@@ -1029,6 +1157,84 @@ function Fact({ label, value }: { label: string; value: string }) {
       <dd className="mt-1 break-words text-xs text-foreground/85">{value}</dd>
     </div>
   )
+}
+
+function markBasisName(
+  value: Extract<
+    UnifiedMarketRow["marketObservation"],
+    { availability: "available" }
+  >["mark"]["basis"],
+): string {
+  switch (value) {
+    case "fresh_last_trade":
+      return "Last completed trade"
+    case "fresh_bid_ask_midpoint":
+      return "Midpoint of current bid and ask"
+  }
+}
+
+function marketObservationUnavailableName(
+  value: Extract<
+    UnifiedMarketRow["marketObservation"],
+    { availability: "unavailable" }
+  >["reason"],
+): string {
+  switch (value) {
+    case "no_eligible_source":
+      return "No source met the current data requirements."
+    case "no_fresh_last_trade_or_midpoint":
+      return "The selected source has no fresh trade or bid-and-ask midpoint."
+  }
+}
+
+function marketFeatureAvailabilityName(
+  value: Extract<
+    UnifiedMarketRow["marketObservation"],
+    { availability: "available" }
+  >["features"],
+): string {
+  if (value.availability === "available") {
+    return `${value.valueCount.toLocaleString()} source-matched feature ${value.valueCount === 1 ? "value" : "values"}`
+  }
+  switch (value.reason) {
+    case "source_does_not_publish_live_features":
+      return "This source does not publish live features"
+    case "incomplete_snapshot":
+      return "Feature snapshot is incomplete"
+    case "no_exact_source_generation":
+      return "No features match this exact source connection"
+    case "available_after_selection":
+      return "Features arrived after this mark was selected"
+    case "incomplete_value_set":
+      return "Feature values are incomplete"
+  }
+}
+
+function marketDowngradeSummary(
+  values: UnifiedMarketRow["selectionReceipt"]["downgradeDimensions"],
+): string {
+  if (values.length === 0) return "None"
+  return values
+    .map((value) => {
+      switch (value.dimension) {
+        case "timing":
+          return `Timing: ${humanize(value.required)} to ${humanize(value.selected)}`
+        case "depth":
+          return `Depth: ${humanize(value.minimum)} to ${value.selected ? humanize(value.selected) : "no market book"}`
+        case "quality":
+          return `Quality: ${humanize(value.minimum)} to ${humanize(value.selected)}`
+        case "coverage":
+          return `Coverage: ${humanize(value.required)} to ${humanize(value.selected)}`
+        case "freshness":
+          return "Freshness: older than requested"
+      }
+    })
+    .join(" · ")
+}
+
+function digestName(value: { algorithm: "sha256" | "blake3"; bytes: string }): string {
+  const algorithm = value.algorithm === "sha256" ? "SHA-256" : "BLAKE3"
+  return `${algorithm} · ${value.bytes}`
 }
 
 function qualityName(value: string | null) {

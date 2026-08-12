@@ -23,6 +23,7 @@ const REVIEW_DATE: &str = "2026-07-23";
 const PROJECT_HANDOFF: &str = "https://github.com/Sawmonabo/market-squawk";
 const SECOND_NANOS: u64 = 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
+const HOUR_NANOS: u64 = 60 * MINUTE_NANOS;
 const DAY_NANOS: u64 = 86_400 * SECOND_NANOS;
 const LEGACY_REPORT_DIGEST: EvidenceDigest = EvidenceDigest::new(
     DigestAlgorithm::Sha256,
@@ -96,11 +97,30 @@ const BLS_PUBLIC_V1_AUTHORITY_DIGEST: EvidenceDigest = EvidenceDigest::new(
         0xf1, 0x82,
     ],
 );
+const SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST: EvidenceDigest = EvidenceDigest::new(
+    DigestAlgorithm::Sha256,
+    [
+        0x7a, 0x1f, 0x05, 0xd3, 0xf6, 0x48, 0x04, 0xea, 0xa8, 0x23, 0xde, 0x65, 0x92, 0x3c, 0x87,
+        0x5e, 0x10, 0x75, 0xa4, 0x80, 0x18, 0x7c, 0xe4, 0x4a, 0xec, 0x94, 0xe1, 0xf6, 0xb9, 0xc0,
+        0x8f, 0xfa,
+    ],
+);
 const COINBASE_DIRECT_PROFILE: &str = "coinbase.exchange-direct-market-data";
 const SEC_PROFILE: &str = "sec.edgar-public";
 const BLS_PUBLIC_V1_PROFILE: &str = "bls.v1-unregistered";
 const FRED_PROFILE: &str = FRED_ALFRED_API_SURFACE_ID;
 const ALPACA_BASIC_PROFILE: &str = "alpaca.basic-market-data";
+const NASDAQ_REFERENCE_PROFILE: &str = "nasdaq-trader-symbol-directory-reference";
+const SCHWAB_MARKET_DATA_PROFILE: &str = "schwab.trader-api-market-data";
+const YAHOO_ENRICHMENT_PROFILE: &str = "yahoo-finance.experimental-enrichment";
+const IEX_HIST_PROFILE: &str = "iex.hist-feed-files";
+const OCC_REFERENCE_PROFILE: &str = "occ.options-reference";
+const CBOE_REFERENCE_PROFILE: &str = "cboe.options-reference";
+const BEA_PROFILE: &str = "bea.api-data";
+const CENSUS_PROFILE: &str = "census.data-api";
+const EIA_PROFILE: &str = "eia.api-v2";
+const FEDERAL_RESERVE_BOARD_PROFILE: &str = "federal-reserve-board.data-download-program";
+const TIINGO_PROFILE: &str = "tiingo.starter-eod-nav";
 const TRADIER_MARKET_DATA_PROFILE: &str = "tradier.brokerage-market-data";
 const KRAKEN_L3_PROFILE: &str = "kraken.spot-authenticated-level3-market-data";
 const TREASURY_DAILY_RATES_PROFILE: &str = "treasury.daily-rates-xml";
@@ -116,6 +136,8 @@ const FRED_REVISION_FOUR_AUTHORITY_SOURCE: &str =
 const FRED_SELF_HOSTED_AUTHORITY_SOURCE: &str = "MSQ-FRED-ALFRED-SELF-HOSTED-AUTHORITY-2026-07-26";
 const FRED_TERMS_MANIFEST_SOURCE: &str = "MSQ-FRED-RIGHTS-MANIFEST-2026-07-26";
 const FRED_UNRATE_RIGHTS_SOURCE: &str = "MSQ-FRED-UNRATE-PUBLIC-DOMAIN-2026-07-26";
+const SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE: &str =
+    "MSQ-SELECTED-MARKET-DATA-ARCHITECTURE-2026-08-11";
 /// Code-owned completed year used by the bounded Treasury daily-rate onboarding probe.
 pub const TREASURY_DAILY_RATES_PROBE_YEAR: u16 = 2025;
 
@@ -168,7 +190,17 @@ const RIGHTS_USER_OWNED: &[DataUseRight] = &[
     DataUseRight::new(DataUseOperation::Export, OperationAdmission::Admitted),
     DataUseRight::new(DataUseOperation::Redistribute, OperationAdmission::Pending),
 ];
-
+const RIGHTS_LOCAL_PERSONAL_RESEARCH: &[DataUseRight] = &[
+    DataUseRight::new(DataUseOperation::Retrieve, OperationAdmission::Admitted),
+    DataUseRight::new(DataUseOperation::Display, OperationAdmission::Admitted),
+    DataUseRight::new(DataUseOperation::Persist, OperationAdmission::Admitted),
+    DataUseRight::new(
+        DataUseOperation::ModelTraining,
+        OperationAdmission::Admitted,
+    ),
+    DataUseRight::new(DataUseOperation::Export, OperationAdmission::Blocked),
+    DataUseRight::new(DataUseOperation::Redistribute, OperationAdmission::Blocked),
+];
 const EXCHANGE_DUTIES: &[&str] = &[
     "preserve exact provider and venue provenance",
     "do not admit persistence, modeling, export, or redistribution without a later rights decision",
@@ -289,9 +321,23 @@ const KRAKEN_EVIDENCE: &[ProfileEvidence] = &[
 ];
 const ALPACA_BASIC_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "ALPACA-PAPER-ONLY",
+        "https://docs.alpaca.markets/us/docs/paper-trading",
+        "2026-08-11",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
         "ALPACA-BASIC-COVERAGE",
         "https://docs.alpaca.markets/us/docs/about-market-data-api",
-        "2026-08-09",
+        "2026-08-11",
         None,
         false,
     ),
@@ -305,7 +351,7 @@ const ALPACA_BASIC_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
         "ALPACA-MARKET-DATA-STREAMING",
         "https://docs.alpaca.markets/us/v1.1/docs/streaming-market-data",
-        "2026-08-09",
+        "2026-08-11",
         None,
         false,
     ),
@@ -313,6 +359,259 @@ const ALPACA_BASIC_EVIDENCE: &[ProfileEvidence] = &[
         "ALPACA-REDISTRIBUTION-GUIDANCE",
         "https://alpaca.markets/support/redistribute-alpaca-api",
         "2026-08-09",
+        None,
+        true,
+    ),
+];
+const NASDAQ_REFERENCE_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "NASDAQ-SYMBOL-DIRECTORY-DEFINITIONS",
+        "https://www.nasdaqtrader.com/trader.aspx?id=symboldirdefs",
+        "2026-08-11",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "NASDAQ-LISTED-DIRECTORY",
+        "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+        "2026-08-11",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "NASDAQ-OTHER-LISTED-DIRECTORY",
+        "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+        "2026-08-11",
+        None,
+        true,
+    ),
+];
+const SCHWAB_MARKET_DATA_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "SCHWAB-TRADER-API-INDIVIDUAL",
+        "https://developer.schwab.com/products/trader-api--individual",
+        "2026-08-11",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "SCHWAB-MARKET-DATA-PRODUCTION-DOCUMENTATION",
+        "https://contentdelivery.schwab.com/api/content/rtcontent/asset/market-data-production--trader-api--individual--documentation",
+        "2026-08-11",
+        None,
+        true,
+    ),
+];
+const YAHOO_ENRICHMENT_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "YFINANCE-API-REFERENCE",
+        "https://ranaroussi.github.io/yfinance/reference/index.html",
+        "2026-08-11",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "YAHOO-FINANCE-EXCHANGE-DELAYS",
+        "https://help.yahoo.com/kb/finance/article-exchanges-data-delays-sln2310.html",
+        "2026-08-11",
+        None,
+        true,
+    ),
+];
+const IEX_HIST_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "IEX-HIST-MARKET-DATA",
+        "https://iextrading.com/trading/market-data/index.html",
+        "2026-08-11",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "IEX-TOPS-SPECIFICATION",
+        "https://www.iex.io/documents/tops-v1-66",
+        "2026-08-11",
+        None,
+        true,
+    ),
+];
+const OCC_REFERENCE_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "OCC-DIRECTORY-OF-LISTED-PRODUCTS",
+        "https://www.theocc.com/market-data/market-data-reports/series-and-trading-data/directory-of-listed-products",
+        "2026-08-11",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "OCC-INFORMATION-MEMOS",
+        "https://infomemo.theocc.com/infomemo/search-memo",
+        "2026-08-11",
+        None,
+        true,
+    ),
+];
+const CBOE_REFERENCE_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "CBOE-US-OPTIONS-REFERENCE-DATA",
+        "https://www.cboe.com/markets/us/options/market-statistics/reference-data",
+        "2026-08-11",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "CBOE-TITANIUM-SYMBOLOGY",
+        "https://www.cboe.com/document/tech-spec/document/technical-specifications/cboe-titanium-u.s.-equitiesoptionsfutures-symbology-reference",
+        "2026-08-11",
+        None,
+        true,
+    ),
+];
+const BEA_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "BEA-API-USER-GUIDE",
+        "https://apps.bea.gov/api/_pdf/bea_web_service_api_user_guide.pdf",
+        "2026-08-11",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "BEA-CORRECTION-POLICY",
+        "https://www.bea.gov/about/policies-and-information/correction",
+        "2026-08-11",
+        None,
+        true,
+    ),
+];
+const CENSUS_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "CENSUS-DATA-API-GUIDE",
+        "https://www.census.gov/data/developers/guidance/api-user-guide.html",
+        "2026-08-11",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "CENSUS-AVAILABLE-DATA",
+        "https://www.census.gov/data/developers/guidance/api-user-guide.Available_Data.html",
+        "2026-08-11",
+        None,
+        true,
+    ),
+];
+const EIA_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "EIA-API-V2-TECHNICAL-DOCUMENTATION",
+        "https://www.eia.gov/opendata/documentation.php",
+        "2026-08-11",
+        None,
+        true,
+    ),
+];
+const FEDERAL_RESERVE_BOARD_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "FEDERAL-RESERVE-BOARD-DDP",
+        "https://www.federalreserve.gov/datadownload/",
+        "2026-08-11",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "FEDERAL-RESERVE-BOARD-DDP-HELP",
+        "https://www.federalreserve.gov/datadownload/help/",
+        "2026-08-11",
+        None,
+        true,
+    ),
+];
+const TIINGO_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "TIINGO-EOD-DOCUMENTATION",
+        "https://www.tiingo.com/documentation/end-of-day",
+        "2026-08-11",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "TIINGO-STARTER-PRICING",
+        "https://www.tiingo.com/about/pricing",
+        "2026-08-11",
         None,
         true,
     ),
@@ -645,6 +944,17 @@ pub fn built_in_provider_profiles() -> Result<ProviderProfileRegistry, ProviderP
         build(coinbase()?)?,
         build(coinbase_direct()?)?,
         build(alpaca_basic()?)?,
+        build(nasdaq_reference()?)?,
+        build(schwab_market_data()?)?,
+        build(yahoo_enrichment()?)?,
+        build(iex_hist()?)?,
+        build(occ_reference()?)?,
+        build(cboe_reference()?)?,
+        build(bea()?)?,
+        build(census()?)?,
+        build(eia()?)?,
+        build(federal_reserve_board()?)?,
+        build(tiingo()?)?,
         build(tradier_market_data()?)?,
         build(kraken()?)?,
         build(kraken_l3()?)?,
@@ -977,7 +1287,10 @@ fn build_capability_with_rights_state(
 fn initial_credential_kind(profile_id: &str, credentialed: bool) -> CredentialKind {
     if !credentialed {
         CredentialKind::None
-    } else if matches!(profile_id, ALPACA_BASIC_PROFILE | KRAKEN_L3_PROFILE) {
+    } else if matches!(
+        profile_id,
+        ALPACA_BASIC_PROFILE | SCHWAB_MARKET_DATA_PROFILE | KRAKEN_L3_PROFILE
+    ) {
         CredentialKind::ApiKeyPair
     } else {
         CredentialKind::ApiKey
@@ -1005,6 +1318,12 @@ fn capability_evidence(
         evidence.push(EvidenceBinding::new(
             SourceIdentifier::try_from("MSQ-COINBASE-DIRECT-COMPOSITION-AUDIT-2026-07-25")?,
             COINBASE_DIRECT_COMPOSITION_DIGEST,
+        ));
+    }
+    if is_selected_architecture_profile(spec.id) && revision.get() >= 3 {
+        evidence.push(EvidenceBinding::new(
+            SourceIdentifier::try_from(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE)?,
+            SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST,
         ));
     }
     if spec.id == TREASURY_DAILY_RATES_PROFILE && revision.get() >= 4 {
@@ -1052,6 +1371,24 @@ fn has_provider_release_revision(profile_id: &str) -> bool {
             | "bls.v2-registered"
             | "treasury.daily-rates-xml"
             | "treasury.fiscal-data"
+    ) || is_selected_architecture_profile(profile_id)
+}
+
+fn is_selected_architecture_profile(profile_id: &str) -> bool {
+    matches!(
+        profile_id,
+        ALPACA_BASIC_PROFILE
+            | NASDAQ_REFERENCE_PROFILE
+            | SCHWAB_MARKET_DATA_PROFILE
+            | YAHOO_ENRICHMENT_PROFILE
+            | IEX_HIST_PROFILE
+            | OCC_REFERENCE_PROFILE
+            | CBOE_REFERENCE_PROFILE
+            | BEA_PROFILE
+            | CENSUS_PROFILE
+            | EIA_PROFILE
+            | FEDERAL_RESERVE_BOARD_PROFILE
+            | TIINGO_PROFILE
     )
 }
 
@@ -1111,6 +1448,60 @@ fn built_in_budget(
             1,
             backoff,
         ),
+        // Nasdaq Trader publishes no numeric automated-download ceiling for these two files.
+        // This matches the existing reference service's conservative shared application budget.
+        NASDAQ_REFERENCE_PROFILE => simple_budget(
+            "nasdaq-trader-symbol-directory",
+            None,
+            8,
+            MINUTE_NANOS,
+            1,
+            backoff,
+        ),
+        // These refresh-required profiles use local non-network probes. Their one-per-minute
+        // placeholder budgets are not recurring provider capacity and confer no network authority.
+        SCHWAB_MARKET_DATA_PROFILE => simple_budget(
+            "schwab-trader-api",
+            Some("schwab.trader-api.account-template"),
+            1,
+            MINUTE_NANOS,
+            1,
+            backoff,
+        ),
+        YAHOO_ENRICHMENT_PROFILE => simple_budget(
+            "yahoo-finance-experimental",
+            None,
+            1,
+            MINUTE_NANOS,
+            1,
+            backoff,
+        ),
+        IEX_HIST_PROFILE => simple_budget("iex-hist", None, 1, MINUTE_NANOS, 1, backoff),
+        OCC_REFERENCE_PROFILE => simple_budget("occ-reference", None, 1, MINUTE_NANOS, 1, backoff),
+        CBOE_REFERENCE_PROFILE => {
+            simple_budget("cboe-reference", None, 1, MINUTE_NANOS, 1, backoff)
+        }
+        BEA_PROFILE => simple_budget(
+            "us-bea",
+            Some("bea.api-user-template"),
+            60,
+            MINUTE_NANOS,
+            1,
+            backoff,
+        ),
+        CENSUS_PROFILE => census_budget(backoff),
+        EIA_PROFILE => simple_budget(
+            "us-eia",
+            Some("eia.api-key-template"),
+            1,
+            SECOND_NANOS,
+            1,
+            backoff,
+        ),
+        FEDERAL_RESERVE_BOARD_PROFILE => {
+            simple_budget("federal-reserve-board", None, 1, MINUTE_NANOS, 1, backoff)
+        }
+        TIINGO_PROFILE => tiingo_budget(backoff),
         TRADIER_MARKET_DATA_PROFILE => simple_budget(
             "tradier-brokerage",
             Some("tradier.brokerage.account-template"),
@@ -1230,6 +1621,54 @@ fn bls_budget(
     )?)
 }
 
+fn census_budget(backoff: BackoffPolicy) -> Result<ProviderBudgetPolicy, ProviderProfileError> {
+    let windows = [
+        ProviderBudgetWindow::try_new(
+            NonZeroU32::new(1).ok_or(ProviderProfileError::InvalidProfile)?,
+            nonzero_u64(SECOND_NANOS)?,
+            BudgetWindowSemantics::Sliding,
+        )?,
+        ProviderBudgetWindow::try_new(
+            NonZeroU32::new(400).ok_or(ProviderProfileError::InvalidProfile)?,
+            nonzero_u64(DAY_NANOS)?,
+            BudgetWindowSemantics::Sliding,
+        )?,
+    ];
+    Ok(ProviderBudgetPolicy::try_new_conjunctive(
+        BudgetScope::with_authorization_account(
+            SourceIdentifier::try_from("us-census")?,
+            SourceIdentifier::try_from("census.api-key-template")?,
+        ),
+        &windows,
+        NonZeroU16::new(1).ok_or(ProviderProfileError::InvalidProfile)?,
+        backoff,
+    )?)
+}
+
+fn tiingo_budget(backoff: BackoffPolicy) -> Result<ProviderBudgetPolicy, ProviderProfileError> {
+    let windows = [
+        ProviderBudgetWindow::try_new(
+            NonZeroU32::new(40).ok_or(ProviderProfileError::InvalidProfile)?,
+            nonzero_u64(HOUR_NANOS)?,
+            BudgetWindowSemantics::Sliding,
+        )?,
+        ProviderBudgetWindow::try_new(
+            NonZeroU32::new(800).ok_or(ProviderProfileError::InvalidProfile)?,
+            nonzero_u64(DAY_NANOS)?,
+            BudgetWindowSemantics::Sliding,
+        )?,
+    ];
+    Ok(ProviderBudgetPolicy::try_new_conjunctive(
+        BudgetScope::with_authorization_account(
+            SourceIdentifier::try_from("tiingo")?,
+            SourceIdentifier::try_from("tiingo.starter-account-template")?,
+        ),
+        &windows,
+        NonZeroU16::new(1).ok_or(ProviderProfileError::InvalidProfile)?,
+        backoff,
+    )?)
+}
+
 fn nonzero_u64(value: u64) -> Result<NonZeroU64, ProviderProfileError> {
     NonZeroU64::new(value).ok_or(ProviderProfileError::InvalidProfile)
 }
@@ -1303,17 +1742,17 @@ fn coinbase_direct() -> Result<BuiltInSpec, ProviderProfileError> {
 fn alpaca_basic() -> Result<BuiltInSpec, ProviderProfileError> {
     Ok(BuiltInSpec {
         id: ALPACA_BASIC_PROFILE,
-        display_name: "Alpaca Basic market data",
+        display_name: "Alpaca Paper Only / Basic market data",
         official_entry: "https://app.alpaca.markets/signup",
         setup: ProfileActivationMode::ManualSecretImport,
         zero_fee: ZeroFeeStatus::Confirmed,
         account: Requirement::RequiredProviderControlled,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RightsLimited,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("alpaca.market-data.read"),
         permissions: &["market-data.read"],
-        coverage: "One user-authorized Alpaca Basic account: real-time US equities and ETFs from IEX only with at most 30 streamed symbols at DirectUnverified quality; indicative US options with at most 200 quote subscriptions at Indicative quality; delayed IEX history at Aggregated quality; top-of-book only and never consolidated SIP or OPRA coverage",
+        coverage: "One Alpaca Paper Only key generation in the paper realm: Basic real-time US equities and ETFs from IEX only with an official 30-symbol WebSocket ceiling at DirectUnverified quality; indicative US options with an official 200-quote WebSocket ceiling at Indicative quality; IEX stock history since 2016 with the Basic latest-15-minute restriction and an official 200 historical-calls/minute ceiling; top-of-book only and never consolidated SIP, NBBO, OPRA, Level II, or execution coverage",
         quality: DataQuality::DirectUnverified,
         probe: VerificationProbe::network_exact_public_query(
             ProbeTransport::HttpGet,
@@ -1321,21 +1760,428 @@ fn alpaca_basic() -> Result<BuiltInSpec, ProviderProfileError> {
             "https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest?feed=iex",
             &[("feed", "iex")],
         )?,
-        rights: RIGHTS_LIMITED,
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
         duties: &[
-            "retain the exact IEX-only or indicative-options source label on every observation",
-            "enforce one shared account budget and the Basic-plan stream and symbol ceilings",
-            "use this credential only with code-owned market-data endpoints and never for order submission",
-            "do not admit persistence, modeling, export, or redistribution without a later rights decision",
+            "retain the exact IEX-only or indicative-options provider and feed label on every raw, canonical, and derived observation",
+            "admit persistence and model use only inside owner-local personal research datasets",
+            "enforce one shared Paper account budget plus the official Basic ceilings of 200 historical calls per minute, 30 equity stream symbols, and 200 option quote subscriptions",
+            "use this credential only with code-owned data.alpaca.markets and market-data WebSocket endpoints and never with account, position, order, or trading endpoints",
+            "keep source-data export and redistribution closed",
         ],
-        persistence_evidence_source_id: None,
-        rotation: "create a replacement Trading API key pair and import one complete version-1 envelope as a higher generation",
-        revocation: "delete the exact Alpaca key remotely, then delete the exact local generation",
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
+        rotation: "create a replacement Paper Trading API key pair and import one complete version-1 envelope as a higher generation",
+        revocation: "delete the exact Alpaca Paper key remotely, then delete the exact local generation",
         recovery: COMMON_RECOVERY,
         evidence: ALPACA_BASIC_EVIDENCE,
         rate_policy: "alpaca.basic-market-data.account-rate-policy.v1",
         refresh_trigger: "ALPACA-BASIC-MARKET-DATA",
-        handoff_instruction: "Create a zero-monthly-fee Alpaca Trading API account, then import one version-1 envelope containing key_id and secret_key. Market Squawk admits only the Basic IEX and indicative-options market-data surfaces.",
+        handoff_instruction: "Create a free email-only Alpaca Paper Only account, generate its Paper key pair, then import one version-1 envelope containing key_id, secret_key, and trading_api_environment set exactly to paper. Market Squawk grants only read-only Basic market-data authority; live-realm credentials and every account, position, order, and trading surface are rejected.",
+    })
+}
+
+fn nasdaq_reference() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: NASDAQ_REFERENCE_PROFILE,
+        display_name: "Nasdaq Trader current symbol-directory reference",
+        official_entry: "https://www.nasdaqtrader.com/",
+        setup: ProfileActivationMode::NoCredential,
+        zero_fee: ZeroFeeStatus::NoCredentialFeeNotEstablished,
+        account: Requirement::NotRequired,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RightsLimited,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: None,
+        permissions: &[],
+        coverage: "Current Nasdaq-listed and other-exchange-listed US equity and ETF reference identity from exactly nasdaqlisted.txt and otherlisted.txt: symbols, security names, listing venues, market categories, financial/test/ETF flags, round lots, and provider file timestamps; process-local reference only, never a quote, trade, book, current price, trading-status, historical-lifecycle, or execution source",
+        quality: DataQuality::OfficialDelayed,
+        probe: VerificationProbe::network(
+            ProbeTransport::HttpGet,
+            "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+            None,
+        )?,
+        rights: RIGHTS_LIMITED,
+        duties: &[
+            "bind this profile to the existing NasdaqReferenceUniverseService and its exact two code-owned directory endpoints",
+            "retain provider file timestamps and exact Nasdaq versus other-exchange listing provenance",
+            "keep normalized directory rows process-local and reacquire them after restart",
+            "never promote reference identity to quote, trade, market-status, book-depth, or execution evidence",
+        ],
+        persistence_evidence_source_id: None,
+        rotation: "not applicable: this surface has no credential",
+        revocation: "disable the reference profile locally; there is no provider credential to revoke",
+        recovery: COMMON_RECOVERY,
+        evidence: NASDAQ_REFERENCE_EVIDENCE,
+        rate_policy: "nasdaq-trader-symbol-directory-reference.rate-policy.v1",
+        refresh_trigger: "NASDAQ-SYMBOL-DIRECTORY",
+        handoff_instruction: "No account or key is required; continue with the bounded code-owned Nasdaq-listed directory probe. Activation reuses the existing NasdaqReferenceUniverseService, which fetches and validates both exact directory files.",
+    })
+}
+
+fn schwab_market_data() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: SCHWAB_MARKET_DATA_PROFILE,
+        display_name: "Charles Schwab Trader API read-only market data",
+        official_entry: "https://developer.schwab.com/products/trader-api--individual",
+        setup: ProfileActivationMode::ManualSecretImport,
+        zero_fee: ZeroFeeStatus::NotSeparatelyEstablished,
+        account: Requirement::RequiredProviderControlled,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RefreshRequired,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: Some("schwab.market-data.read"),
+        permissions: &["market-data.read", "streamer-bootstrap.read"],
+        coverage: "Optional owner-enabled target for Schwab Trader API market-data REST quotes, price history, option and expiration chains, movers, market hours, instruments/reference data, and one Streamer connection carrying selected level-one, named-book, chart, and screener services; source semantics remain provider/service-specific and never imply SIP, NBBO, OPRA, consolidated depth, account access, or execution; the provider-native read-only REST, Streamer, OAuth-contract, and bounded HTTP/WebSocket transport core is present, while application-owned OAuth callback/token persistence, entitlement doctor, activation binding, raw/canonical publication, PIT typed reads, product composition, and restart/release proof remain absent",
+        quality: DataQuality::DirectUnverified,
+        probe: VerificationProbe::local(
+            "Schwab's provider-native REST, Streamer, OAuth-contract, and bounded transport core is installed, but application-owned OAuth/token authority, bounded entitlement doctor, activation, publication, PIT read, and product proof are not; activation remains refresh_required",
+        ),
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: &[
+            "import only the application key and secret pair; authorization codes, access tokens, and refresh tokens may enter only the application-owned protected OAuth/token authority that still requires composition",
+            "use the exact code-owned https://127.0.0.1:8182 callback and never accept an operator-supplied provider endpoint",
+            "allowlist only market-data routes plus trader/v1/userPreference fields required for Streamer bootstrap; never admit account, position, order, or trading authority",
+            "retain Schwab endpoint or Streamer service, provider symbol, named venue/book, account realm, event and receive clocks, sequence, reconnect, and delay or indicative fields",
+            "admit at most one Streamer connection; no recurring REST budget or numeric symbol ceiling exists until measured runtime evidence is frozen",
+        ],
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
+        rotation: "after application-owned token authority is composed, rotate the provider application secret or seven-day refresh-token generation atomically in protected provider state",
+        revocation: "revoke the Schwab application or token remotely, then delete the exact local secret and token generations",
+        recovery: REFRESH_RECOVERY,
+        evidence: SCHWAB_MARKET_DATA_EVIDENCE,
+        rate_policy: "schwab.trader-api-market-data.pending-rate-policy.v1",
+        refresh_trigger: "SCHWAB-TRADER-API-MARKET-DATA",
+        handoff_instruction: "Import the configured Schwab application key and secret pair only. The provider-native read-only core and transports are present; the profile remains unavailable until application-owned OAuth/token lifecycle, bounded entitlement doctor, activation binding, canonical publication, PIT reads, product composition, and restart/release proof are implemented.",
+    })
+}
+
+fn yahoo_enrichment() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: YAHOO_ENRICHMENT_PROFILE,
+        display_name: "Yahoo Finance experimental explicit-demand enrichment",
+        official_entry: "https://ranaroussi.github.io/yfinance/reference/index.html",
+        setup: ProfileActivationMode::NoCredential,
+        zero_fee: ZeroFeeStatus::NoCredentialFeeNotEstablished,
+        account: Requirement::NotRequired,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RefreshRequired,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: None,
+        permissions: &[],
+        coverage: "Experimental no-key target for explicit-demand quote components, index and fund facts, price history, corporate actions, option expirations/chains, and search hints through a pinned and hashed yfinance-lineage request, cookie/crumb HTTP, parsing, admission, cache, and raw-evidence core; never a scheduled broad-market lane, authoritative tick source, sole decision input, or SIP/NBBO/OPRA substitute; application-owned doctor, governed activation, canonical publication, PIT typed read, frontend composition, and restart/release proof remain absent",
+        quality: DataQuality::Aggregated,
+        probe: VerificationProbe::local(
+            "Yahoo's pinned provider-native request, cookie/crumb HTTP, parsing, admission, and raw-evidence core is installed, but the application doctor, governed activation, canonical publication, PIT read, and product proof are not; activation remains refresh_required",
+        ),
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: &[
+            "permit only a user-visible explicit-demand operation; never schedule recurring broad-market collection",
+            "pin and hash the exact client release and retain effective arguments, upstream attempts, cache, repair, fallback, and response provenance",
+            "serialize one provider lane, coalesce identical work, prefer a bounded fresh cache, and begin with zero automatic transient retries",
+            "treat every returned field independently and never upgrade it to SIP, NBBO, OPRA, consolidated, or authoritative semantics",
+            "no numeric provider rate, daily quota, watchlist maximum, batch ceiling, or streaming ceiling is admitted until dated runtime evidence is frozen",
+        ],
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
+        rotation: "not applicable: this selected surface has no credential",
+        revocation: "disable the experimental source locally and remove its bounded cache and pending jobs",
+        recovery: REFRESH_RECOVERY,
+        evidence: YAHOO_ENRICHMENT_EVIDENCE,
+        rate_policy: "yahoo-finance.experimental-enrichment.pending-rate-policy.v1",
+        refresh_trigger: "YAHOO-FINANCE-EXPERIMENTAL",
+        handoff_instruction: "No account or key is required. The pinned, bounded provider-native core is present; the profile remains unavailable until its application doctor, governed explicit-demand activation, canonical publication, PIT read, frontend composition, and restart/release proof are implemented.",
+    })
+}
+
+fn iex_hist() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: IEX_HIST_PROFILE,
+        display_name: "IEX HIST selected feed files",
+        official_entry: "https://iextrading.com/trading/market-data/index.html",
+        setup: ProfileActivationMode::NoCredential,
+        zero_fee: ZeroFeeStatus::NoCredentialFeeNotEstablished,
+        account: Requirement::NotRequired,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RefreshRequired,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: None,
+        permissions: &[],
+        coverage: "Explicit feed-and-date cold-research target for T+1 IEX HIST TOPS top-of-book/last-sale/status/auction messages, DEEP displayed price-level depth, and DEEP+ displayed order-level depth within the provider-described recent 12-month window; always IEX venue-specific, never live, consolidated, or a complete market-wide book; provider-native catalog selection, bounded cold-job download/materialization, versioned PCAP decode, planning, and receipt core are present, while application doctor/activation, canonical publication, PIT reads, product composition, and restart/release proof remain absent",
+        quality: DataQuality::OfficialDelayed,
+        probe: VerificationProbe::local(
+            "IEX HIST catalog, bounded cold transport/materialization, versioned decoder, planning, and receipt core are installed, but application activation, canonical publication, PIT read, and product proof are not; activation remains refresh_required",
+        ),
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: &[
+            "admit only an explicit feed and trade date after catalog descriptor, compressed bytes, expanded-byte ceiling, disk reserve, and exact feed-spec version are frozen",
+            "retain venue IEX, feed and transport versions, file date, message type, source clock, sequence, local availability, decoder version, and raw digest",
+            "quarantine gaps, corrupt packets, unsupported versions, duplicates, resets, out-of-order messages, and clock anomalies",
+            "never automatically mirror the archive or infer stable retention, numeric request capacity, checksums, or replay guarantees",
+        ],
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
+        rotation: "not applicable: this selected surface has no credential",
+        revocation: "disable new IEX HIST jobs locally; retained immutable research evidence remains governed by its manifests",
+        recovery: REFRESH_RECOVERY,
+        evidence: IEX_HIST_EVIDENCE,
+        rate_policy: "iex.hist-feed-files.pending-rate-policy.v1",
+        refresh_trigger: "IEX-HIST-FEED-FILES",
+        handoff_instruction: "No key is required. The bounded catalog, cold transport, materialization, and versioned decode core is present; the profile remains unavailable until application doctor/activation, canonical publication, PIT selection, product composition, and restart/release proof are implemented.",
+    })
+}
+
+fn occ_reference() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: OCC_REFERENCE_PROFILE,
+        display_name: "OCC listed-options and contract-event reference",
+        official_entry: "https://www.theocc.com/market-data/market-data-reports/series-and-trading-data/directory-of-listed-products",
+        setup: ProfileActivationMode::NoCredential,
+        zero_fee: ZeroFeeStatus::NoCredentialFeeNotEstablished,
+        account: Requirement::NotRequired,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RefreshRequired,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: None,
+        permissions: &[],
+        coverage: "No-key target for OCC Directory of Listed Products option root/product/series discovery and complete Information Memo plus attachment evidence for adjustments, symbol or expiration changes, settlement, and deliverables; reference and operative-event evidence only, never live quotes, trades, Greeks, depth, current tradability, or execution; exact selected/daily DLP and memo request plans, bounded injected-HTTP transport contracts, decoders, complete-document requirements, and publication-catalog conflict handling are present, while an application executor/doctor, activation, durable canonical publication, PIT typed read, Options composition, and restart/release proof remain absent",
+        quality: DataQuality::OfficialDelayed,
+        probe: VerificationProbe::local(
+            "OCC request plans, bounded transport contracts, DLP/memo decoders, and publication-catalog core are installed, but the application executor/doctor, activation, durable canonical publisher, PIT read, and Options proof are not; activation remains refresh_required",
+        ),
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: &[
+            "freeze the exact supported machine batch request, record layout, control records, completion signal, effective-time rules, and byte and row bounds before acquisition",
+            "retain each directory response, record layout, memo, and attachment as separate exact evidence with posting, effective, first-observed, and publication clocks",
+            "never interpret a memo title alone or treat a format-valid OCC/OSI symbol as proof of listing or activity",
+            "do not invent a numeric provider limit; one shared bounded reference queue may only be admitted after the doctor proves a current route",
+        ],
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
+        rotation: "not applicable: this selected surface has no credential",
+        revocation: "disable future OCC reference jobs locally",
+        recovery: REFRESH_RECOVERY,
+        evidence: OCC_REFERENCE_EVIDENCE,
+        rate_policy: "occ.options-reference.pending-rate-policy.v1",
+        refresh_trigger: "OCC-OPTIONS-REFERENCE",
+        handoff_instruction: "No key is required. The selected OCC request, transport-contract, decoder, and publication-catalog core is present; the profile remains unavailable until an application executor/doctor, activation, content-addressed canonical publication, PIT read, Options composition, and restart/release proof are implemented.",
+    })
+}
+
+fn cboe_reference() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: CBOE_REFERENCE_PROFILE,
+        display_name: "Cboe venue-specific options reference",
+        official_entry: "https://www.cboe.com/markets/us/options/market-statistics/reference-data",
+        setup: ProfileActivationMode::NoCredential,
+        zero_fee: ZeroFeeStatus::NoCredentialFeeNotEstablished,
+        account: Requirement::NotRequired,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RefreshRequired,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: None,
+        permissions: &[],
+        coverage: "No-key initial target for the four separate C1, BZX Options, C2 Options, and EDGX Options All Series files plus frozen Cboe Symbol ID/OSI symbology mappings; venue-specific option identity only, never a consolidated chain, OPRA quote, trade, Greek, depth, current tradability, or execution source; exact four-file request plans, schema freezes, redirect/byte-bounded injected-HTTP transport contracts, decoders, and publication-catalog conflict handling are present, while an application executor/doctor, activation, durable canonical publication, PIT typed read, Options composition, and restart/release proof remain absent",
+        quality: DataQuality::OfficialDelayed,
+        probe: VerificationProbe::local(
+            "Cboe four-file request plans, schema freezes, bounded transport contracts, decoders, and publication-catalog core are installed, but the application executor/doctor, activation, durable canonical publisher, PIT read, and Options proof are not; activation remains refresh_required",
+        ),
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: &[
+            "treat each venue and reference family as a distinct exact object and preserve redirect, bytes, digest, schema, row count, and local availability",
+            "retain Cboe Symbol ID, OSI and other source-native aliases without silently collapsing cross-venue evidence",
+            "initial implementation may admit only the four All Series files; every other family needs its own frozen schema and bounds",
+            "do not invent a numeric provider limit; fetch each admitted publication once through one shared bounded reference queue",
+        ],
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
+        rotation: "not applicable: this selected surface has no credential",
+        revocation: "disable future Cboe reference jobs locally",
+        recovery: REFRESH_RECOVERY,
+        evidence: CBOE_REFERENCE_EVIDENCE,
+        rate_policy: "cboe.options-reference.pending-rate-policy.v1",
+        refresh_trigger: "CBOE-OPTIONS-REFERENCE",
+        handoff_instruction: "No key is required. The four All Series request, schema, bounded transport-contract, decoder, and publication-catalog core is present; the profile remains unavailable until an application executor/doctor, activation, durable canonical publication, PIT read, Options composition, and restart/release proof are implemented.",
+    })
+}
+
+fn bea() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: BEA_PROFILE,
+        display_name: "Bureau of Economic Analysis API",
+        official_entry: "https://apps.bea.gov/api/signup/",
+        setup: ProfileActivationMode::ManualSecretImport,
+        zero_fee: ZeroFeeStatus::NotSeparatelyEstablished,
+        account: Requirement::RequiredProviderControlled,
+        // Organization/email are collected by BEA when the UserID is issued; the runtime API
+        // authenticates with the UserID alone and the credential bundle intentionally stores no
+        // duplicate registration-form metadata.
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RefreshRequired,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: Some("bea.data.read"),
+        permissions: &["data.read"],
+        coverage: "Credentialed metadata-driven target for BEA national, regional, industry, personal-income, and international accounts through GetDatasetList, parameter discovery, and exact GetData coordinates; official ceilings are 100 requests, 100 MB, and 30 errors per minute per API user, while the selected application budgets are 60 requests, 60 MB, and 10 errors per minute; provider-native authentication, request/metadata/data parsing, correction evidence, bounded HTTPS, dataset contracts, and raw-capture source core are present, while an application redacted doctor, durable multidimensional quota authority, activation, canonical publication, PIT typed read, product composition, and restart/release proof remain absent",
+        quality: DataQuality::OfficialDelayed,
+        probe: VerificationProbe::local(
+            "BEA's metadata-driven request, parser, correction, bounded HTTPS, dataset-contract, and raw-capture core is installed, but the application redacted doctor, durable multidimensional quota authority, activation, canonical publisher, PIT read, and product proof are not; activation remains refresh_required",
+        ),
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: &[
+            "import the 36-character UserID as one protected API-key value and redact it from every URL, log, trace, error, receipt, and diagnostic",
+            "discover datasets, parameters, and values through BEA metadata and address response dimensions by name rather than assuming one common table schema",
+            "enforce one shared 60-request, 60-MB, and 10-error per-minute application ledger and honor HTTP 429 Retry-After",
+            "retain exact dataset dimensions, units, multipliers, notes, correction evidence, response identity, and point-in-time availability",
+        ],
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
+        rotation: "create a replacement BEA UserID and import it as a higher protected generation",
+        revocation: "remove the exact local credential generation and disable the provider; use provider support for any remote account action",
+        recovery: REFRESH_RECOVERY,
+        evidence: BEA_EVIDENCE,
+        rate_policy: "bea.api-data.pending-rate-policy.v1",
+        refresh_trigger: "BEA-API-DATA",
+        handoff_instruction: "Import the configured 36-character BEA UserID. The provider-native metadata, transport, correction, and capture core is present; the profile remains unavailable until an application redacted doctor, durable multidimensional quota authority, activation, canonical macro publication, PIT read, product composition, and restart/release proof are implemented.",
+    })
+}
+
+fn census() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: CENSUS_PROFILE,
+        display_name: "U.S. Census Data API",
+        official_entry: "https://api.census.gov/data/key_signup.html",
+        setup: ProfileActivationMode::ManualSecretImport,
+        zero_fee: ZeroFeeStatus::NotSeparatelyEstablished,
+        account: Requirement::RequiredProviderControlled,
+        // Census collects contact details during key issuance. The Data API request contract uses
+        // only the issued key, so provider onboarding does not require those details again.
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RefreshRequired,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: Some("census.data.read"),
+        permissions: &["data.read"],
+        coverage: "Credentialed cold-research target for exact Census dataset-vintage-variable-geography coordinates spanning demographic, household, business, trade, and geographic statistical evidence; current provider request, daily, variable, row, and pagination maxima remain unverified, with selected application safety limits of one request per second and 400 requests per day; provider-native query grammar, discovery/response contracts, bounded HTTPS, and raw-capture source core are present, while an application redacted doctor, activation, durable canonical publication, PIT typed read, product composition, and restart/release proof remain absent",
+        quality: DataQuality::OfficialDelayed,
+        probe: VerificationProbe::local(
+            "Census query, discovery, response, bounded HTTPS, dataset-contract, and raw-capture core is installed, but the application redacted doctor, activation, durable canonical publisher, PIT read, and product proof are not; activation remains refresh_required",
+        ),
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: &[
+            "import the API key as one protected value and redact the complete secret-bearing query from every URL, log, trace, error, receipt, and diagnostic",
+            "freeze current discovery and query grammar for each admitted dataset; never treat one popular-family list as a permanent catalog",
+            "enforce one shared one-request-per-second and 400-request-per-day application ledger without presenting either value as a provider limit",
+            "retain dataset and vintage, variables, group metadata, geography/FIPS, annotations, response header, raw digest, revisions, and point-in-time availability",
+        ],
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
+        rotation: "request and import a replacement Census API key as a higher protected generation",
+        revocation: "remove the exact local credential generation and disable the provider; use provider support for any remote key action",
+        recovery: REFRESH_RECOVERY,
+        evidence: CENSUS_EVIDENCE,
+        rate_policy: "census.data-api.pending-rate-policy.v1",
+        refresh_trigger: "CENSUS-DATA-API",
+        handoff_instruction: "Import the configured Census API key. The provider-native query, discovery, response, transport, and capture core is present; the profile remains unavailable until an application redacted doctor, activation, durable canonical macro/reference publication, PIT read, product composition, and restart/release proof are implemented.",
+    })
+}
+
+fn eia() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: EIA_PROFILE,
+        display_name: "U.S. Energy Information Administration API v2",
+        official_entry: "https://www.eia.gov/opendata/register.php",
+        setup: ProfileActivationMode::ManualSecretImport,
+        zero_fee: ZeroFeeStatus::NotSeparatelyEstablished,
+        account: Requirement::RequiredProviderControlled,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RefreshRequired,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: Some("eia.data.read"),
+        permissions: &["data.read"],
+        coverage: "Credentialed metadata-driven API v2 target for petroleum, natural-gas, electricity, inventory, production, consumption, and price observations; JSON pages have an official 5,000-row maximum and XML pages 300, while no numeric provider request rate is established and the application ceiling is one shared request per second; provider-native route metadata, request construction, bounded pagination, exact transport/capture, revision planning, and canonical-mapping core are present, while an application redacted doctor, activation, durable checkpoints/publication, PIT typed read, product composition, and restart/release proof remain absent",
+        quality: DataQuality::OfficialDelayed,
+        probe: VerificationProbe::local(
+            "EIA route-metadata, request, bounded pagination, transport/capture, revision, and canonical-mapping core is installed, but the application redacted doctor, activation, durable checkpoints/publisher, PIT read, and product proof are not; activation remains refresh_required",
+        ),
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: &[
+            "import the API key as one protected value and redact the complete secret-bearing query from every URL, log, trace, error, receipt, and diagnostic",
+            "discover and freeze each route through metadata and retain route, dimensions, units, frequency, explicit sort, bounds, API version, and secret-free request echo",
+            "enforce one shared application ceiling of one request per second and may only lower it without new reviewed evidence",
+            "page JSON at no more than 5,000 rows and require bounded offset coverage through response total before publication",
+        ],
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
+        rotation: "request and import a replacement EIA API key as a higher protected generation",
+        revocation: "remove the exact local credential generation and disable the provider; use provider support for any remote key action",
+        recovery: REFRESH_RECOVERY,
+        evidence: EIA_EVIDENCE,
+        rate_policy: "eia.api-v2.pending-rate-policy.v1",
+        refresh_trigger: "EIA-API-V2",
+        handoff_instruction: "Import the configured EIA API key. The provider-native metadata, request, transport/capture, pagination, revision, and mapping core is present; the profile remains unavailable until an application redacted doctor, activation, durable checkpoints/canonical publication, PIT read, product composition, and restart/release proof are implemented.",
+    })
+}
+
+fn federal_reserve_board() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: FEDERAL_RESERVE_BOARD_PROFILE,
+        display_name: "Federal Reserve Board Data Download Program",
+        official_entry: "https://www.federalreserve.gov/datadownload/",
+        setup: ProfileActivationMode::NoCredential,
+        zero_fee: ZeroFeeStatus::NoCredentialFeeNotEstablished,
+        account: Requirement::NotRequired,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RefreshRequired,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: None,
+        permissions: &[],
+        coverage: "No-key release-driven target for Federal Reserve Board Data Download Program current-definition statistical releases, initially H.15 rates, with exact generated package URLs and matching CSV, Excel, or XML/SDMX structures; DDP is not a vintage-history authority, publishes one frequency per output file, has no established numeric request ceiling, and is limited by application policy to one request per minute; a transport-free provider-native request/schema/parser/source/publication core plus bounded response-receipt contracts is present, while application-owned HTTPS retrieval and budget binding, doctor, activation, durable canonical publication, PIT typed read, product composition, and restart/release proof remain absent",
+        quality: DataQuality::OfficialDelayed,
+        probe: VerificationProbe::local(
+            "the Board DDP request/schema/parser/source/publication core and response-receipt contracts are installed, but application HTTPS retrieval/budget binding, doctor, activation, durable canonical publisher, PIT read, and product proof are not; activation remains refresh_required",
+        ),
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: &[
+            "freeze release, series, frequency, bounds, format, exact generated automation URL, and matching structure/schema digests for every admitted package",
+            "enforce one shared release-driven application queue at no more than one request per minute without presenting it as a provider limit",
+            "retain scheduled release, publication, route availability, correction or repost, local receipt, schema, and local revision as separate evidence",
+            "never claim DDP supplies pre-revision or complete real-time vintage history",
+        ],
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
+        rotation: "not applicable: this selected surface has no credential",
+        revocation: "disable future Board DDP jobs locally",
+        recovery: REFRESH_RECOVERY,
+        evidence: FEDERAL_RESERVE_BOARD_EVIDENCE,
+        rate_policy: "federal-reserve-board.data-download-program.pending-rate-policy.v1",
+        refresh_trigger: "FEDERAL-RESERVE-BOARD-DDP",
+        handoff_instruction: "No key is required. The transport-free Board request, schema, parser, source, publication, and response-receipt core is present; the profile remains unavailable until application HTTPS acquisition, doctor/activation, durable canonical publication, PIT selection, product composition, and restart/release proof are implemented.",
+    })
+}
+
+fn tiingo() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: TIINGO_PROFILE,
+        display_name: "Tiingo Starter EOD and mutual-fund NAV",
+        official_entry: "https://www.tiingo.com/documentation/general",
+        setup: ProfileActivationMode::ManualSecretImport,
+        zero_fee: ZeroFeeStatus::Confirmed,
+        account: Requirement::RequiredProviderControlled,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RefreshRequired,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: Some("tiingo.eod.read"),
+        permissions: &["daily.read"],
+        coverage: "Optional credentialed target for supported mutual-fund daily NAV plus curated raw and adjusted equity/ETF EOD, dividends, and split factors; official Starter limits are 50 requests/hour, 1,000/day, 500 unique symbols/month, and 1 GB/month, with application budgets of 40/hour, 800/day, 400 symbols/month, and 800 MB/month; provider-native authentication, request planning, bounded HTTP/capture, decoding, NAV/EOD semantics, four-dimensional quota-state contracts, and canonical FundNav mapping are present, while an application redacted doctor, durable quota-store binding, activation, final canonical publication, PIT typed read, fund workflow composition, and restart/release proof remain absent",
+        quality: DataQuality::Aggregated,
+        probe: VerificationProbe::local(
+            "Tiingo authentication, request, bounded HTTP/capture, decoder, NAV/EOD, quota-state, and FundNav-mapping core is installed, but the application redacted doctor, durable quota-store binding, activation, final canonical publisher, PIT read, and product proof are not; activation remains refresh_required",
+        ),
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: &[
+            "import the token as one protected value and redact it from URLs, headers, logs, traces, errors, receipts, and diagnostics",
+            "require per-ticker metadata and non-null coverage dates before treating a symbol as supported",
+            "enforce persistent conjunctive budgets of 40 requests/hour, 800/day, 400 unique symbols/month, and 800 MB/month; the current profile budget encodes only request windows until the symbol and byte ledger exists",
+            "retain raw and adjusted EOD, dividend cash, split factor, and mutual-fund NAV as separate source-authored evidence with provisional/correction clocks",
+            "never fabricate intraday mutual-fund prices or interpret four equal NAV fields as intraday OHLC trades",
+        ],
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
+        rotation: "create or retrieve a replacement Tiingo token and import it as a higher protected generation",
+        revocation: "revoke or replace the provider token, then delete the exact local generation",
+        recovery: REFRESH_RECOVERY,
+        evidence: TIINGO_EVIDENCE,
+        rate_policy: "tiingo.starter-eod-nav.pending-rate-policy.v1",
+        refresh_trigger: "TIINGO-STARTER-EOD-NAV",
+        handoff_instruction: "Import the configured Tiingo API token. The provider-native HTTP/capture, decoder, quota-state, NAV/EOD, and FundNav-mapping core is present; the profile remains unavailable until an application redacted doctor, durable quota-store binding, activation, final canonical publication, PIT read, Funds composition, and restart/release proof are implemented.",
     })
 }
 
@@ -1562,7 +2408,10 @@ fn bls_v2() -> Result<BuiltInSpec, ProviderProfileError> {
         setup: ProfileActivationMode::ManualSecretImport,
         zero_fee: ZeroFeeStatus::NotSeparatelyEstablished,
         account: Requirement::RequiredProviderControlled,
-        contact: Requirement::RequiredNonSecret,
+        // BLS collects organization/email in its registration engine, but API v2 calls require
+        // only the issued registration key. Do not expand the exact credential-bundle schema with
+        // registration-form metadata that the runtime does not consume.
+        contact: Requirement::NotRequired,
         release: ProfileReleaseState::RefreshRequired,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("bls.timeseries.read"),

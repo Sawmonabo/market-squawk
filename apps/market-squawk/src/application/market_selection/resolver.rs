@@ -2,12 +2,13 @@ use std::cmp::Ordering;
 
 use market_squawk_domain::{DataQuality, ExecutionEligibility};
 
+use super::digest::selection_receipt_digest;
+use super::receipt::{CandidateRejectionReason, EligibleCandidate, RejectedCandidate};
 use super::requirements::{depth_preference, quality_preference};
 use super::{
-    AdmittedDowngrade, BudgetAvailability, CandidateRejectionReason, DowngradeDimension,
-    EligibleCandidate, FreshnessBasis, HealthState, IntegrityState, MarketSelectionError,
-    MarketSelectionPolicy, MarketSelectionReceipt, MarketSelectionRequest, RejectedCandidate,
-    RightsState, SourceCandidate,
+    AdmittedDowngrade, BudgetAvailability, DowngradeDimension, FreshnessBasis, HealthState,
+    IntegrityState, MarketSelectionError, MarketSelectionPolicy, MarketSelectionReceipt,
+    MarketSelectionRequest, RightsState, SourceCandidate,
 };
 
 const MAXIMUM_REJECTION_REASONS: usize = 24;
@@ -75,13 +76,24 @@ pub(crate) fn select_market_source(
             .stable_cmp(right.candidate().identity())
     });
 
+    let selection_digest = selection_receipt_digest(
+        policy.revision(),
+        policy.digest(),
+        policy.maximum_candidates(),
+        &request,
+        &eligible,
+        &rejected,
+        selected_at,
+    )?;
     Ok(MarketSelectionReceipt::new(
         policy.revision(),
         policy.digest(),
+        policy.maximum_candidates(),
         request,
         eligible,
         rejected,
         selected_at,
+        selection_digest,
     ))
 }
 

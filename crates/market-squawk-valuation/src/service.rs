@@ -2,7 +2,7 @@
 
 mod memory;
 mod operations;
-mod queries;
+pub(crate) mod queries;
 mod recovery;
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -14,9 +14,8 @@ market-squawk-domain.workspace = true
 market-squawk-modeling.workspace = true
 market-squawk-portfolio.workspace = true
 market-squawk-valuation.workspace = true
-
-[dev-dependencies]
 rust_decimal.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

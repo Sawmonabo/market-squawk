@@ -1,9 +1,11 @@
 use market_squawk_domain::{
-    AssetClass, ConnectionGeneration, DataQuality, ExecutionEligibility, InstrumentId, MarketDepth,
-    ProviderChannel, ProviderProduct, SourceId, SourceIdentifier, Timestamp, VenueId,
+    AssetClass, ConnectionGeneration, Currency, DataQuality, ExecutionEligibility, InstrumentId,
+    MarketDepth, ProviderChannel, ProviderProduct, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
+use rust_decimal::Decimal;
 use uuid::Uuid;
 
+use super::receipt::CandidateRejectionReason;
 use super::*;
 
 fn source_identifier(value: &str) -> Result<SourceIdentifier, Box<dyn std::error::Error>> {
@@ -135,6 +137,108 @@ fn selection_is_deterministic_downgrade_is_explicit_and_execution_fails_closed()
     );
     assert_eq!(selected.eligible().len(), 2);
     assert!(selected.rejected().is_empty());
+    let selection_digest = selected.selection_digest();
+    let repeated = select_market_source(
+        policy,
+        display_request(DowngradePolicy::deny())?,
+        vec![
+            candidate(
+                "alpha",
+                "observation-alpha",
+                ObservationTiming::RealTime,
+                DataQuality::DirectVerified,
+                MarketCoverage::Consolidated,
+                ExecutionEligibility::Eligible,
+            )?,
+            candidate(
+                "beta",
+                "observation-beta",
+                ObservationTiming::RealTime,
+                DataQuality::DirectVerified,
+                MarketCoverage::Consolidated,
+                ExecutionEligibility::Eligible,
+            )?,
+        ],
+    )?;
+    assert_eq!(repeated.selection_digest(), selection_digest);
+    let tampered = select_market_source(
+        policy,
+        display_request(DowngradePolicy::deny())?,
+        vec![
+            candidate(
+                "alpha",
+                "observation-alpha-changed",
+                ObservationTiming::RealTime,
+                DataQuality::DirectVerified,
+                MarketCoverage::Consolidated,
+                ExecutionEligibility::Eligible,
+            )?,
+            candidate(
+                "beta",
+                "observation-beta",
+                ObservationTiming::RealTime,
+                DataQuality::DirectVerified,
+                MarketCoverage::Consolidated,
+                ExecutionEligibility::Eligible,
+            )?,
+        ],
+    )?;
+    assert_ne!(tampered.selection_digest(), selection_digest);
+    let selected_source = selected.selected().ok_or("missing selected source")?;
+    assert!(selected_generation_matches(
+        selected_source,
+        ConnectionGeneration::new(1)?
+    ));
+    assert!(!selected_generation_matches(
+        selected_source,
+        ConnectionGeneration::new(2)?
+    ));
+    let usd = Currency::try_from("USD")?;
+    let mark_identity = |value, fresh_until, evidence_revision| {
+        super::investment::synthetic_mark_evidence_identity(
+            selected_source,
+            selection_digest,
+            selected.selected_at(),
+            value,
+            usd,
+            MarketInvestmentMarkBasis::FreshBidAskMidpoint,
+            fresh_until,
+            evidence_revision,
+        )
+    };
+    let exact_mark_identity = mark_identity(
+        Decimal::new(12_345, 2),
+        Some(Timestamp::from_unix_nanos(120)),
+        7,
+    )?;
+    assert_eq!(
+        mark_identity(
+            Decimal::new(123_450, 3),
+            Some(Timestamp::from_unix_nanos(120)),
+            7,
+        )?,
+        exact_mark_identity
+    );
+    assert_ne!(
+        mark_identity(
+            Decimal::new(12_345, 2),
+            Some(Timestamp::from_unix_nanos(120)),
+            8,
+        )?,
+        exact_mark_identity
+    );
+    assert_ne!(
+        mark_identity(
+            Decimal::new(12_345, 2),
+            Some(Timestamp::from_unix_nanos(121)),
+            7,
+        )?,
+        exact_mark_identity
+    );
+    assert_ne!(
+        mark_identity(Decimal::new(12_345, 2), None, 7)?,
+        exact_mark_identity
+    );
 
     let downgrade_policy = DowngradePolicy::try_new(
         &[ObservationTiming::Delayed],

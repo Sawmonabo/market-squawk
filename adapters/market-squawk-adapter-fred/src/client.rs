@@ -3,20 +3,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use market_squawk_domain::{
-    CalendarDate, DataQuality, EffectiveInterval, ExactPayloadEvidence, SourceIdentifier, Timestamp,
+    CalendarDate, DataQuality, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
+    ExactPayloadEvidence, SourceIdentifier, Timestamp,
 };
+use market_squawk_platform::RawCaptureRecord;
 use market_squawk_sources::{
     AuthorizationMode, CURRENT_RESEARCH_RECORD_SCHEMA, CoverageDomain, DiscoveryBatch,
     DiscoveryRequest, ExtractionAuthority, ExtractionAuthorityError, ExtractionBatch,
     ExtractionRecord, ExtractionRequest, ExtractionRequestPermit, ExtractionRevisionEvidence,
     ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HistoricalCapability,
-    NetworkAccessPolicy, ObservedProviderOrder, ObservedRevisionError, SourceClass, SourceError,
+    MAX_PROVIDER_CAPTURE_PAGE_BYTES, NetworkAccessPolicy, ObservedProviderOrder,
+    ObservedRevisionError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SourceClass, SourceError,
     SourceMetadata, SourceMetadataProvider, SourceObject, payload_matches_exact_evidence,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::series::parse_date;
@@ -187,11 +193,12 @@ impl FredDataset {
 }
 
 /// One exact, request-bound page retrieved for ephemeral inspection.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct FredExtractedPage {
     page_evidence: ExactPayloadEvidence,
     received_at: Timestamp,
     canonical_payloads: Vec<Bytes>,
+    captures: Box<[ProviderCaptureMaterial]>,
 }
 
 impl FredExtractedPage {
@@ -208,6 +215,60 @@ impl FredExtractedPage {
     /// Returns canonical observations retaining exact civil-date semantics.
     pub fn canonical_payloads(&self) -> &[Bytes] {
         &self.canonical_payloads
+    }
+
+    /// Returns the exact series-metadata and observation responses in request order.
+    ///
+    /// Ephemeral callers may inspect these materials without sealing them; durable composition
+    /// must instead use [`FredSource::extract_with_capture`] and seal both before publication.
+    pub fn captures(&self) -> &[ProviderCaptureMaterial] {
+        &self.captures
+    }
+
+    /// Consumes the bounded inspection page and its exact response material.
+    pub fn into_parts(
+        self,
+    ) -> (
+        ExactPayloadEvidence,
+        Timestamp,
+        Vec<Bytes>,
+        Box<[ProviderCaptureMaterial]>,
+    ) {
+        (
+            self.page_evidence,
+            self.received_at,
+            self.canonical_payloads,
+            self.captures,
+        )
+    }
+}
+
+/// Canonical FRED observations paired with every exact response required for raw sealing.
+///
+/// Captures are ordered as the series-metadata response followed by the exact observation page.
+/// The extraction request's page-object identity continues to bind offset, limit, returned rows,
+/// provider total, and terminal disposition; these standalone HTTP captures do not recast
+/// application-selected offsets as a provider cursor chain.
+#[derive(Debug)]
+pub struct FredExtractionOutput {
+    batch: ExtractionBatch,
+    captures: Box<[ProviderCaptureMaterial]>,
+}
+
+impl FredExtractionOutput {
+    /// Returns the canonical shared extraction batch.
+    pub const fn batch(&self) -> &ExtractionBatch {
+        &self.batch
+    }
+
+    /// Returns exact metadata and observation response material in request order.
+    pub fn captures(&self) -> &[ProviderCaptureMaterial] {
+        &self.captures
+    }
+
+    /// Consumes the application handoff. Both captures must be sealed before publishing `batch`.
+    pub fn into_parts(self) -> (ExtractionBatch, Box<[ProviderCaptureMaterial]>) {
+        (self.batch, self.captures)
     }
 }
 
@@ -414,8 +475,12 @@ impl FredSource {
         if discovery_page_records == 0 || discovery_page_records > 100_000 {
             return Err(FredSourceError::InvalidConfiguration);
         }
-        let response_limit = usize::try_from(bounds.max_response_bytes())
-            .map_err(|_| FredSourceError::InvalidConfiguration)?;
+        let response_limit = usize::try_from(
+            bounds
+                .max_response_bytes()
+                .min(MAX_PROVIDER_CAPTURE_PAGE_BYTES),
+        )
+        .map_err(|_| FredSourceError::InvalidConfiguration)?;
         Ok(Self {
             metadata,
             api_key,
@@ -525,11 +590,14 @@ impl FredSource {
                 },
             ));
         }
+        let captures =
+            vec![series_metadata.into_capture_material(), fetched.capture].into_boxed_slice();
         Ok(FredExtractedPage {
             page_evidence: evidence_for_payload(&fetched.response.body, &fetched.public_url)
                 .map_err(map_adapter_error)?,
             received_at: fetched.response.received_at,
             canonical_payloads,
+            captures,
         })
     }
 
@@ -654,12 +722,14 @@ impl FredSource {
         DiscoveryBatch::try_new(&request, objects).map_err(ExtractionSourceError::from)
     }
 
-    async fn extract_impl(
+    /// Refetches one discovered page and returns canonical observations together with the exact
+    /// series-metadata and observation response material required before durable publication.
+    pub async fn extract_with_capture(
         &self,
         authority: ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
-    ) -> Result<ExtractionBatch, ExtractionSourceError> {
+    ) -> Result<FredExtractionOutput, ExtractionSourceError> {
         self.validate_authority(&authority)?;
         if request.object().source_id() != self.metadata.source_id()
             || request.object().metadata_revision() != self.metadata.revision()
@@ -753,7 +823,10 @@ impl FredSource {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        ExtractionBatch::try_new(&request, records).map_err(ExtractionSourceError::from)
+        let batch = ExtractionBatch::try_new(&request, records)?;
+        let captures =
+            vec![series_metadata.into_capture_material(), fetched.capture].into_boxed_slice();
+        Ok(FredExtractionOutput { batch, captures })
     }
 
     async fn fetch_page(
@@ -867,11 +940,28 @@ impl FredSource {
         )
         .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         let digest = Sha256::digest(&response.body).into();
+        let capture = standalone_capture_material(
+            &self.metadata,
+            SourceIdentifier::try_from(match dataset.namespace {
+                FredNamespace::Fred => format!(
+                    "fred:series-observations:{}:{}:{}",
+                    dataset.series_id, dataset.realtime_start, dataset.realtime_end
+                ),
+                FredNamespace::Alfred => format!(
+                    "alfred:series-observations:{}:{}:{}",
+                    dataset.series_id, dataset.realtime_start, dataset.realtime_end
+                ),
+            })
+            .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?,
+            &public_url,
+            &response,
+        )?;
         Ok(FetchedPage {
             response,
             page,
             digest,
             public_url,
+            capture,
         })
     }
 
@@ -911,7 +1001,8 @@ impl ExtractionSource for FredSource {
         request: ExtractionRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<ExtractionBatch, ExtractionSourceError>> {
-        Box::pin(self.extract_impl(authority, request, cancellation))
+        let _ = (authority, request, cancellation);
+        Box::pin(async { Err(SourceError::InvalidProtocolState.into()) })
     }
 }
 
@@ -920,6 +1011,7 @@ struct FetchedPage {
     page: FredObservationPage,
     digest: [u8; 32],
     public_url: url::Url,
+    capture: ProviderCaptureMaterial,
 }
 
 struct FredPageRequest<'a> {
@@ -965,6 +1057,77 @@ async fn acquire_request_permit(
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+fn standalone_capture_material(
+    metadata: &SourceMetadata,
+    dataset: SourceIdentifier,
+    public_url: &url::Url,
+    response: &FredHttpResponse,
+) -> Result<ProviderCaptureMaterial, ExtractionSourceError> {
+    let request_identity = secret_free_request_identity(public_url);
+    let body_bytes = u64::try_from(response.body.len())
+        .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+    let body_digest = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256::digest(&response.body).into(),
+    );
+    let page = ProviderCapturePageReceipt::try_new(
+        0,
+        request_identity,
+        None,
+        None,
+        response.status,
+        body_bytes,
+        body_digest,
+        response.received_at,
+    )
+    .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+    let receipt = ProviderCaptureSetReceipt::try_new(
+        metadata.source_id().clone(),
+        metadata.revision().clone(),
+        dataset,
+        request_identity,
+        ProviderCaptureTerminalDisposition::StandaloneResponse,
+        vec![page],
+    )
+    .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+    let record = RawCaptureRecord::try_new_live(
+        deterministic_capture_uuid(b"event", &receipt),
+        Arc::from(metadata.source_id().as_str()),
+        deterministic_capture_uuid(b"connection", &receipt),
+        Some(0),
+        None,
+        DateTime::<Utc>::from_timestamp_nanos(response.received_at.unix_nanos()),
+        response.body.clone(),
+    )
+    .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+    ProviderCaptureMaterial::try_new(receipt, vec![record])
+        .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))
+}
+
+fn secret_free_request_identity(public_url: &url::Url) -> EvidenceDigest {
+    let bytes = public_url.as_str().as_bytes();
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/fred-public-request-identity/v1");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn deterministic_capture_uuid(tag: &[u8], receipt: &ProviderCaptureSetReceipt) -> Uuid {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/fred-raw-capture-id/v1");
+    hash.update((tag.len() as u64).to_be_bytes());
+    hash.update(tag);
+    hash.update(receipt.request_set_identity().bytes());
+    hash.update(receipt.observation_digest().bytes());
+    let mut bytes: [u8; 16] = hash.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 prefix has a fixed length");
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 #[cfg(test)]

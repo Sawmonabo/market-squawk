@@ -1,18 +1,24 @@
-#[cfg(test)]
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
-use market_squawk_domain::{DataQuality, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
+};
+use market_squawk_platform::RawCaptureRecord;
 use market_squawk_sources::{
     AuthorizationMode, CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
     ExtractionBatch, ExtractionRequest, ExtractionRevisionEvidence, ExtractionRevisionPlan,
     ExtractionSource, ExtractionSourceError, HistoricalCapability, ObservedProviderOrder,
-    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
+    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, SourceClass, SourceError, SourceMetadata,
+    SourceMetadataProvider, SourceProtocolProfile,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::client::{JSON_MEDIA_TYPE, TreasuryHttpClient, XML_MEDIA_TYPE, system_timestamp};
 use crate::{
@@ -285,11 +291,12 @@ impl TreasurySourceHealth {
 }
 
 /// A fetched Fiscal Data page retaining exact bytes and evidence of its first local observation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RetrievedFiscalDataPage {
     received_at: Timestamp,
     bytes: Bytes,
     page: FiscalDataPage,
+    capture: ProviderCaptureMaterial,
 }
 
 impl RetrievedFiscalDataPage {
@@ -307,14 +314,25 @@ impl RetrievedFiscalDataPage {
     pub const fn page(&self) -> &FiscalDataPage {
         &self.page
     }
+
+    /// Returns the exact Fiscal Data response ready for source-neutral raw sealing.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture
+    }
+
+    /// Consumes the parsed page and its exact raw response material together.
+    pub fn into_parts(self) -> (Timestamp, Bytes, FiscalDataPage, ProviderCaptureMaterial) {
+        (self.received_at, self.bytes, self.page, self.capture)
+    }
 }
 
 /// A fetched daily-rate page retaining exact bytes and evidence of its first local observation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RetrievedDailyRatePage {
     received_at: Timestamp,
     bytes: Bytes,
     page: TreasuryDailyRatePage,
+    capture: ProviderCaptureMaterial,
 }
 
 impl RetrievedDailyRatePage {
@@ -332,10 +350,56 @@ impl RetrievedDailyRatePage {
     pub const fn page(&self) -> &TreasuryDailyRatePage {
         &self.page
     }
+
+    /// Returns the exact daily-rate response ready for source-neutral raw sealing.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture
+    }
+
+    /// Consumes the parsed page and its exact raw response material together.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Timestamp,
+        Bytes,
+        TreasuryDailyRatePage,
+        ProviderCaptureMaterial,
+    ) {
+        (self.received_at, self.bytes, self.page, self.capture)
+    }
 }
 
 /// Backward-compatible name for one retrieved Treasury daily-rate page.
 pub type RetrievedYieldCurvePage = RetrievedDailyRatePage;
+
+/// Canonical Treasury rows paired with the exact single response that produced them.
+///
+/// Each discovered source object identifies one provider page, so its extraction capture is a
+/// standalone one-response set. Fiscal total pages and daily-rate terminal state remain validated
+/// by the provider-native page before this output is constructed, while the object identity binds
+/// the exact page number, request digest, and response digest.
+#[derive(Debug)]
+pub struct TreasuryExtractionOutput {
+    batch: ExtractionBatch,
+    capture: ProviderCaptureMaterial,
+}
+
+impl TreasuryExtractionOutput {
+    /// Returns the canonical shared extraction batch.
+    pub const fn batch(&self) -> &ExtractionBatch {
+        &self.batch
+    }
+
+    /// Returns the exact provider response that must be sealed before publishing the batch.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture
+    }
+
+    /// Consumes the application handoff into canonical and exact raw components.
+    pub fn into_parts(self) -> (ExtractionBatch, ProviderCaptureMaterial) {
+        (self.batch, self.capture)
+    }
+}
 
 /// Allowlisted Treasury research producer requiring registry authority per request.
 pub struct TreasurySource {
@@ -554,6 +618,13 @@ impl TreasurySource {
                     })?;
                 Ok(RetrievedFiscalDataPage {
                     received_at: response.received_at,
+                    capture: capture_material(
+                        &self.metadata,
+                        fiscal_provider_dataset(query).map_err(map_adapter_error)?,
+                        request.request_digest(),
+                        response.received_at,
+                        response.bytes.clone(),
+                    )?,
                     bytes: response.bytes,
                     page,
                 })
@@ -603,6 +674,13 @@ impl TreasurySource {
                 )?;
                 Ok(RetrievedDailyRatePage {
                     received_at: response.received_at,
+                    capture: capture_material(
+                        &self.metadata,
+                        request.dataset().clone(),
+                        request.request_digest(),
+                        response.received_at,
+                        response.bytes.clone(),
+                    )?,
                     bytes: response.bytes,
                     page,
                 })
@@ -751,12 +829,14 @@ impl TreasurySource {
         DiscoveryBatch::try_new(&request, objects).map_err(ExtractionSourceError::from)
     }
 
-    async fn extract_impl(
+    /// Refetches one discovered Treasury page and returns its canonical rows with the exact raw
+    /// response material required before durable publication.
+    pub async fn extract_with_capture(
         &self,
         authority: ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
-    ) -> Result<ExtractionBatch, ExtractionSourceError> {
+    ) -> Result<TreasuryExtractionOutput, ExtractionSourceError> {
         self.validate_authority(&authority)?;
         if request.object().source_id() != self.metadata.source_id()
             || request.object().metadata_revision() != self.metadata.revision()
@@ -771,8 +851,7 @@ impl TreasurySource {
         }
         let parsed = ParsedObjectId::parse(request.object().object_id())?;
         let limits = FiscalDataParseLimits::production_defaults();
-        let ingested_at;
-        let records = match (&self.config, parsed.kind) {
+        let (records, capture) = match (&self.config, parsed.kind) {
             (TreasurySourceConfig::AverageInterestRates(query), ObjectKind::Fiscal) => {
                 let page_request = query.page(parsed.page_number).map_err(|_| {
                     ExtractionSourceError::Source(SourceError::InvalidProtocolState)
@@ -792,14 +871,15 @@ impl TreasurySource {
                     parsed.payload_digest,
                     retrieved.exact_payload(),
                 )?;
-                ingested_at = system_timestamp().map_err(map_adapter_error)?;
-                canonical_fiscal_records(
+                let ingested_at = system_timestamp().map_err(map_adapter_error)?;
+                let records = canonical_fiscal_records(
                     &self.metadata,
                     retrieved.page(),
                     retrieved.received_at(),
                     ingested_at,
                 )
-                .map_err(map_adapter_error)?
+                .map_err(map_adapter_error)?;
+                (records, retrieved.capture)
             }
             (TreasurySourceConfig::DailyRates(config), ObjectKind::DailyRate) => {
                 let query = config
@@ -823,14 +903,15 @@ impl TreasurySource {
                     parsed.payload_digest,
                     retrieved.exact_payload(),
                 )?;
-                ingested_at = system_timestamp().map_err(map_adapter_error)?;
-                canonical_daily_rate_records(
+                let ingested_at = system_timestamp().map_err(map_adapter_error)?;
+                let records = canonical_daily_rate_records(
                     &self.metadata,
                     retrieved.page(),
                     retrieved.received_at(),
                     ingested_at,
                 )
-                .map_err(map_adapter_error)?
+                .map_err(map_adapter_error)?;
+                (records, retrieved.capture)
             }
             _ => {
                 return Err(ExtractionSourceError::Source(
@@ -863,7 +944,8 @@ impl TreasurySource {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        ExtractionBatch::try_new(&request, records).map_err(ExtractionSourceError::from)
+        let batch = ExtractionBatch::try_new(&request, records)?;
+        Ok(TreasuryExtractionOutput { batch, capture })
     }
 
     fn validate_authority(
@@ -934,8 +1016,67 @@ impl ExtractionSource for TreasurySource {
         request: ExtractionRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<ExtractionBatch, ExtractionSourceError>> {
-        Box::pin(self.extract_impl(authority, request, cancellation))
+        let _ = (authority, request, cancellation);
+        Box::pin(async { Err(SourceError::InvalidProtocolState.into()) })
     }
+}
+
+fn capture_material(
+    metadata: &SourceMetadata,
+    dataset: SourceIdentifier,
+    request_digest: [u8; 32],
+    received_at: Timestamp,
+    body: Bytes,
+) -> Result<ProviderCaptureMaterial, ExtractionSourceError> {
+    let request_identity = EvidenceDigest::new(DigestAlgorithm::Sha256, request_digest);
+    let body_bytes = u64::try_from(body.len()).map_err(|_| invalid_protocol())?;
+    let body_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&body).into());
+    let page = ProviderCapturePageReceipt::try_new(
+        0,
+        request_identity,
+        None,
+        None,
+        200,
+        body_bytes,
+        body_digest,
+        received_at,
+    )
+    .map_err(|_| invalid_protocol())?;
+    let receipt = ProviderCaptureSetReceipt::try_new(
+        metadata.source_id().clone(),
+        metadata.revision().clone(),
+        dataset,
+        request_identity,
+        ProviderCaptureTerminalDisposition::StandaloneResponse,
+        vec![page],
+    )
+    .map_err(|_| invalid_protocol())?;
+    let record = RawCaptureRecord::try_new_live(
+        deterministic_capture_uuid(b"event", &receipt),
+        Arc::from(metadata.source_id().as_str()),
+        deterministic_capture_uuid(b"connection", &receipt),
+        Some(0),
+        None,
+        DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
+        body,
+    )
+    .map_err(|_| invalid_protocol())?;
+    ProviderCaptureMaterial::try_new(receipt, vec![record]).map_err(|_| invalid_protocol())
+}
+
+fn deterministic_capture_uuid(tag: &[u8], receipt: &ProviderCaptureSetReceipt) -> Uuid {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/treasury-raw-capture-id/v1");
+    hash.update((tag.len() as u64).to_be_bytes());
+    hash.update(tag);
+    hash.update(receipt.request_set_identity().bytes());
+    hash.update(receipt.observation_digest().bytes());
+    let mut bytes: [u8; 16] = hash.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 prefix has a fixed length");
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {

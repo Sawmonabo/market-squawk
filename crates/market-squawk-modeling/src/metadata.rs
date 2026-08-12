@@ -11,7 +11,7 @@ use market_squawk_data::{
 use market_squawk_domain::{ModelId, Timestamp};
 use thiserror::Error;
 
-use crate::{CalibrationBand, CalibrationMethod, CalibrationWindow};
+use crate::{CalibrationBand, CalibrationMethod, CalibrationWindow, ForecastOutputBinding};
 
 /// Maximum features consumed by one native model.
 pub const MAX_MODEL_FEATURES: usize = 1_024;
@@ -387,7 +387,7 @@ impl TrainingPeriod {
     }
 }
 
-/// Trusted, caller-supplied relationships against which untrusted bundle bytes are admitted.
+/// Admission-owned relationships against which untrusted bundle bytes are admitted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BundleExpectations {
     model_id: ModelId,
@@ -402,20 +402,15 @@ pub struct BundleExpectations {
     bundle_metadata_hash: Sha256Digest,
     artifact_hash: Sha256Digest,
     training_run_hash: Sha256Digest,
-    output_semantics: Option<ModelOutputSemantics>,
+    output_binding: ForecastOutputBinding,
 }
 
 impl BundleExpectations {
-    /// Constructs complete independent admission expectations.
-    ///
-    /// # Errors
-    ///
-    /// Rejects a non-label component or invalid code revision.
     #[allow(
         clippy::too_many_arguments,
         reason = "independent reproducibility identities remain explicit"
     )]
-    pub fn try_new(
+    pub(crate) fn try_new_with_output_binding(
         model_id: ModelId,
         bundle_id: BundleId,
         bundle_version: NonZeroU64,
@@ -428,79 +423,7 @@ impl BundleExpectations {
         bundle_metadata_hash: Sha256Digest,
         artifact_hash: Sha256Digest,
         training_run_hash: Sha256Digest,
-    ) -> Result<Self, ModelMetadataError> {
-        Self::try_new_internal(
-            model_id,
-            bundle_id,
-            bundle_version,
-            dataset,
-            universe_id,
-            training_period,
-            label,
-            training_code_revision,
-            training_environment_hash,
-            bundle_metadata_hash,
-            artifact_hash,
-            training_run_hash,
-            None,
-        )
-    }
-
-    /// Constructs expectations that independently bind the model output interpretation.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "independent reproducibility identities remain explicit"
-    )]
-    pub fn try_new_with_output_semantics(
-        model_id: ModelId,
-        bundle_id: BundleId,
-        bundle_version: NonZeroU64,
-        dataset: TrainingDatasetIdentity,
-        universe_id: UniverseId,
-        training_period: TrainingPeriod,
-        label: FeatureLabelComponentSpec,
-        training_code_revision: impl AsRef<str>,
-        training_environment_hash: Sha256Digest,
-        bundle_metadata_hash: Sha256Digest,
-        artifact_hash: Sha256Digest,
-        training_run_hash: Sha256Digest,
-        output_semantics: ModelOutputSemantics,
-    ) -> Result<Self, ModelMetadataError> {
-        Self::try_new_internal(
-            model_id,
-            bundle_id,
-            bundle_version,
-            dataset,
-            universe_id,
-            training_period,
-            label,
-            training_code_revision,
-            training_environment_hash,
-            bundle_metadata_hash,
-            artifact_hash,
-            training_run_hash,
-            Some(output_semantics),
-        )
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "independent reproducibility identities remain explicit"
-    )]
-    fn try_new_internal(
-        model_id: ModelId,
-        bundle_id: BundleId,
-        bundle_version: NonZeroU64,
-        dataset: TrainingDatasetIdentity,
-        universe_id: UniverseId,
-        training_period: TrainingPeriod,
-        label: FeatureLabelComponentSpec,
-        training_code_revision: impl AsRef<str>,
-        training_environment_hash: Sha256Digest,
-        bundle_metadata_hash: Sha256Digest,
-        artifact_hash: Sha256Digest,
-        training_run_hash: Sha256Digest,
-        output_semantics: Option<ModelOutputSemantics>,
+        output_binding: ForecastOutputBinding,
     ) -> Result<Self, ModelMetadataError> {
         let training_code_revision = training_code_revision.as_ref();
         if label.kind() != ComponentKind::Label
@@ -509,6 +432,7 @@ impl BundleExpectations {
             || bundle_metadata_hash.bytes() == [0; 32]
             || artifact_hash.bytes() == [0; 32]
             || training_run_hash.bytes() == [0; 32]
+            || output_binding.label() != &label
         {
             return Err(ModelMetadataError::InvalidExpectations);
         }
@@ -525,7 +449,7 @@ impl BundleExpectations {
             bundle_metadata_hash,
             artifact_hash,
             training_run_hash,
-            output_semantics,
+            output_binding,
         })
     }
 
@@ -601,10 +525,16 @@ impl BundleExpectations {
         self.training_run_hash
     }
 
-    /// Returns the independently approved output interpretation when the authority schema binds it.
+    /// Returns the independently admitted output interpretation.
     #[must_use]
-    pub const fn output_semantics(&self) -> Option<ModelOutputSemantics> {
-        self.output_semantics
+    pub const fn output_semantics(&self) -> ModelOutputSemantics {
+        self.output_binding.output_semantics()
+    }
+
+    /// Returns the model-admission-owned output measurement binding.
+    #[must_use]
+    pub const fn output_binding(&self) -> &ForecastOutputBinding {
+        &self.output_binding
     }
 }
 
@@ -694,8 +624,7 @@ pub struct ModelMetadata {
     forecast_calibration: Option<ForecastCalibrationArtifacts>,
     format: ModelFormat,
     format_version: u32,
-    output_semantics: ModelOutputSemantics,
-    output_semantics_bound: bool,
+    output_binding: ForecastOutputBinding,
     features: Box<[ModelFeatureBinding]>,
     feature_semantic_digests: Box<[FeatureSemanticDigest]>,
     dataset: TrainingDatasetIdentity,
@@ -722,8 +651,6 @@ impl ModelMetadata {
         artifact_hash: Sha256Digest,
         format: ModelFormat,
         format_version: u32,
-        output_semantics: ModelOutputSemantics,
-        output_semantics_bound: bool,
         features: Vec<ModelFeatureBinding>,
         validation_metrics: Vec<ValidationMetric>,
         decision_thresholds: DecisionThresholds,
@@ -746,8 +673,7 @@ impl ModelMetadata {
             forecast_calibration: None,
             format,
             format_version,
-            output_semantics,
-            output_semantics_bound,
+            output_binding: expectations.output_binding.clone(),
             features: features.into_boxed_slice(),
             feature_semantic_digests,
             dataset: expectations.dataset.clone(),
@@ -833,12 +759,19 @@ impl ModelMetadata {
     /// Returns the authority-bound interpretation of the single model output.
     #[must_use]
     pub const fn output_semantics(&self) -> ModelOutputSemantics {
-        self.output_semantics
+        self.output_binding.output_semantics()
+    }
+
+    /// Returns the admitted output measurement and exact label identity.
+    ///
+    #[must_use]
+    pub const fn output_binding(&self) -> &ForecastOutputBinding {
+        &self.output_binding
     }
 
     #[cfg(feature = "onnx-tract")]
     pub(crate) const fn output_semantics_bound(&self) -> bool {
-        self.output_semantics_bound
+        true
     }
 
     /// Returns coefficient-ordered Task 12 feature bindings.
@@ -925,6 +858,7 @@ impl ModelMetadata {
             .checked_add(self.dataset.retained_bytes()?)?
             .checked_add(self.universe_id.as_str().len())?
             .checked_add(self.label.name().len())?
+            .checked_add(self.output_binding.label().name().len())?
             .checked_add(self.training_code_revision.len())?
             .checked_add(self.intended_use.len())?
             .checked_add(self.fallback_reason.len())?

@@ -44,7 +44,7 @@ export function LookupPage() {
         <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">
           Local workspace index
         </p>
-        <h1 className="mt-2 text-3xl font-semibold tracking-tight">Lookup</h1>
+        <h1 className="mt-2 text-3xl font-semibold tracking-tight">Search</h1>
         <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
           Find instruments, local sources, research datasets, screens, jobs, and safe application
           actions. Results come from bounded local indexes in the installed service.
@@ -62,7 +62,7 @@ export function LookupPage() {
       ) : (
         <Alert>
           <CircleAlert aria-hidden="true" />
-          <AlertTitle>Lookup is unavailable</AlertTitle>
+          <AlertTitle>Search is unavailable</AlertTitle>
           <AlertDescription>
             The installed service does not advertise the bounded Analysis.Lookup operation. Restore
             or update the local service before relying on workspace search.

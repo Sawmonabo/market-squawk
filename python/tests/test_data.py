@@ -27,7 +27,7 @@ from market_squawk.finance import OperationContext
 BUILD = "33" * 32
 MANIFEST = "31" * 32
 POLICY = "35" * 32
-SCHEMA = "12a2745f755b8614ff52e8210fa5e7c9ffb621e6301afdba58d60fa63a838ce9"
+SCHEMA = "ca7f3447c5c353181b3776f2980a55dcbc54ae69a75b9231d5925912444322a4"
 UNIVERSE = "34" * 32
 INSTRUMENT = "0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1"
 PARENT_SCHEMA = "8d7dd570339626df758de3aab0bf49677551ec31491cd20e3eadd3748232c6c8"
@@ -55,8 +55,14 @@ def _fixture(
     *,
     corrupt_split: bool = False,
     label_mantissas: tuple[int, ...] | None = None,
+    label_measurement: dict[str, str] | None = None,
     initialize_root: Callable[[Path], None] | None = None,
 ) -> str:
+    output_measurement = (
+        {"kind": "other_regression"}
+        if label_measurement is None
+        else label_measurement
+    )
     for directory in ("artifacts", "control", "journal"):
         (root / directory).mkdir()
     if initialize_root is not None:
@@ -64,12 +70,12 @@ def _fixture(
         _verify_initialized_root(root)
     metadata = {
         b"market_squawk.build_sha256": BUILD.encode(),
-        b"market_squawk.component_layout": b"fixed-width-long-form-v2",
+        b"market_squawk.component_layout": b"fixed-width-long-form-v3",
         b"market_squawk.dataset": b"fixture-training",
         b"market_squawk.policy_sha256": POLICY.encode(),
         b"market_squawk.schema": b"market_squawk.feature_label_components",
         b"market_squawk.schema_fingerprint_sha256": SCHEMA.encode(),
-        b"market_squawk.schema_version": b"2",
+        b"market_squawk.schema_version": b"3",
         b"market_squawk.timestamp_timezone": b"UTC",
         b"market_squawk.universe_sha256": UNIVERSE.encode(),
     }
@@ -78,6 +84,17 @@ def _fixture(
             pa.field("example_id", pa.binary(256), nullable=False),
             pa.field("instrument_id", pa.binary(16), nullable=False),
             pa.field("cutoff_at", pa.timestamp("ns", tz="+00:00"), nullable=False),
+            pa.field(
+                "observed_effective_at",
+                pa.timestamp("ns", tz="+00:00"),
+                nullable=True,
+            ),
+            pa.field(
+                "label_effective_at",
+                pa.timestamp("ns", tz="+00:00"),
+                nullable=True,
+            ),
+            pa.field("target_coordinate_kind", pa.uint8(), nullable=False),
             pa.field("split", pa.uint8(), nullable=False),
             pa.field("component_kind", pa.uint8(), nullable=False),
             pa.field("component_name", pa.binary(256), nullable=False),
@@ -108,24 +125,69 @@ def _fixture(
         [
             _fixed([value for value in example_ids for _ in range(2)], 256),
             pa.array([UUID(INSTRUMENT).bytes] * 12, type=pa.binary(16)),
-            pa.array([value for value in cutoffs for _ in range(2)], type=schema.field("cutoff_at").type),
+            pa.array(
+                [value for value in cutoffs for _ in range(2)],
+                type=schema.field("cutoff_at").type,
+            ),
+            pa.array(
+                [value - 20 for value in cutoffs for _ in range(2)],
+                type=schema.field("observed_effective_at").type,
+            ),
+            pa.array(
+                [value - 10 for value in cutoffs for _ in range(2)],
+                type=schema.field("label_effective_at").type,
+            ),
+            pa.array([1] * 12, type=pa.uint8()),
             pa.array(
                 [2] * 12
                 if corrupt_split
-                else [{"train": 1, "validation": 2}[value] for value in splits for _ in range(2)],
+                else [
+                    {"train": 1, "validation": 2}[value]
+                    for value in splits
+                    for _ in range(2)
+                ],
                 type=pa.uint8(),
             ),
             pa.array([1, 2] * 6, type=pa.uint8()),
             _fixed(["research.price-return", "forward-return"] * 6, 256),
             pa.array([1] * 12, type=pa.uint32()),
-            pa.array([value for feature in feature_values for value in (feature, None)], type=pa.float64()),
+            pa.array(
+                [value for feature in feature_values for value in (feature, None)],
+                type=pa.float64(),
+            ),
             pa.array(
                 [value for label in label_mantissas for value in (None, Decimal(label))],
                 type=pa.decimal128(38, 0),
             ),
-            pa.array([value for _ in label_mantissas for value in (None, 1)], type=pa.uint8()),
-            _fixed(["ratio", None] * 6, 32),
-            _fixed([None, None] * 6, 3),
+            pa.array(
+                [value for _ in label_mantissas for value in (None, 1)],
+                type=pa.uint8(),
+            ),
+            _fixed(
+                [
+                    value
+                    for _ in label_mantissas
+                    for value in (
+                        "ratio",
+                        {
+                            "return": "market-squawk.return",
+                            "probability": "market-squawk.probability",
+                        }.get(output_measurement.get("kind")),
+                    )
+                ],
+                32,
+            ),
+            _fixed(
+                [
+                    value
+                    for _ in label_mantissas
+                    for value in (
+                        None,
+                        output_measurement.get("currency"),
+                    )
+                ],
+                3,
+            ),
             _fixed([None] * 12, 256),
             pa.array(lineages, type=pa.binary(32)),
         ],
@@ -149,15 +211,22 @@ def _fixture(
             {
                 "corporate_action_sensitivity": "requires_adjustment",
                 "kind": "feature",
+                "measurement": None,
                 "name": "research.price-return",
                 "scope": "instrument",
+                "target": {"kind": "not_applicable"},
                 "version": 1,
             },
             {
                 "corporate_action_sensitivity": "requires_adjustment",
                 "kind": "label",
+                "measurement": output_measurement,
                 "name": "forward-return",
                 "scope": "instrument",
+                "target": {
+                    "horizon_nanos": 10,
+                    "kind": "fixed_horizon_terminal",
+                },
                 "version": 1,
             },
         ],
@@ -169,7 +238,7 @@ def _fixture(
             "policy_sha256": POLICY,
             "schema_name": "market_squawk.feature_label_components",
             "schema_sha256": SCHEMA,
-            "schema_version": 2,
+            "schema_version": 3,
             "universe_id": "fixture-universe",
             "universe_sha256": UNIVERSE,
         },
@@ -198,7 +267,7 @@ def _fixture(
             }
         ],
         "point_in_time": {"revision_mode": "latest_known", "version": 1},
-        "schema_version": 2,
+        "schema_version": 4,
         "split_counts": {"test": 0, "train": 4, "validation": 2},
         "split_policy": {
             "test_end_unix_nanos": 600,
@@ -387,7 +456,7 @@ def _insert_catalog_fixture(
         ),
     )
     connection.execute(
-        "INSERT INTO dataset_manifests VALUES (?1, 'fixture-training', 2, ?2, 2, ?3, 4)",
+        "INSERT INTO dataset_manifests VALUES (?1, 'fixture-training', 3, ?2, 2, ?3, 4)",
         (
             "018f3c2a-91ab-7ccd-b3de-123456789ab6",
             artifacts[1][0],
@@ -410,7 +479,7 @@ def _insert_catalog_fixture(
     connection.execute(
         """INSERT INTO analytical_generations VALUES (
                2, 'fixture-training', 1, ?1, ?2, 12, ?3,
-               'market_squawk.feature_label_components', 2, ?4, ?5,
+               'market_squawk.feature_label_components', 3, ?4, ?5,
                'derived', 1, ?6, 4)""",
         (
             bytes.fromhex(MANIFEST),
@@ -438,7 +507,7 @@ def _insert_catalog_fixture(
         (bytes.fromhex(PARENT_SCHEMA), bytes.fromhex("41" * 32)),
     )
     connection.execute(
-        "INSERT INTO python_dataset_admissions VALUES (?1, ?2, 'fixture-training', 1, ?3, 1, 4)",
+        "INSERT INTO python_dataset_admissions VALUES (?1, ?2, 'fixture-training', 1, ?3, 2, 4)",
         (bytes.fromhex(export_sha256), catalog_identity, export_bytes),
     )
 
@@ -472,6 +541,19 @@ class DatasetContracts(unittest.TestCase):
             self.assertEqual(result.rows[1]["value_decimal_mantissa"], Decimal("-5"))
             self.assertEqual(result.rows[1]["value_decimal_scale"], 1)
             self.assertEqual(result.rows[0]["lineage_sha256"], bytes([1]) * 32)
+            self.assertEqual(
+                result.rows[0]["observed_effective_at"], UtcNanoseconds(80)
+            )
+            self.assertEqual(result.rows[0]["label_effective_at"], UtcNanoseconds(90))
+            target = next(
+                component.target
+                for component in result.components
+                if component.kind == "label"
+            )
+            self.assertEqual(
+                (target.kind, target.horizon_nanos),
+                ("fixed_horizon_terminal", 10),
+            )
             self.assertFalse(result.complete)
 
             aware = datetime(1970, 1, 1, tzinfo=timezone.utc)

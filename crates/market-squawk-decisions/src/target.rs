@@ -448,7 +448,7 @@ pub struct TargetInvalidation {
     target_id: InvestmentTargetSetId,
     target_revision: RevisionNumber,
     kind: InvalidationKind,
-    actor: Option<DecisionActorId>,
+    actor: DecisionActorId,
     observed_at: Timestamp,
     content_identity: DecisionContentDigest,
 }
@@ -464,32 +464,6 @@ impl TargetInvalidation {
         target: &InvestmentTargetSet,
         kind: InvalidationKind,
         actor: DecisionActorId,
-        observed_at: Timestamp,
-        content_identity: DecisionContentDigest,
-    ) -> Result<Self, DecisionContractError> {
-        Self::try_new_inner(id, target, kind, Some(actor), observed_at, content_identity)
-    }
-
-    /// Recovers a schema-v1 invalidation that predates persisted governance principals.
-    ///
-    /// New workflow commits must use [`Self::try_new`], which always binds the authenticated actor
-    /// selected by the service-owned governance session. This compatibility constructor exists only
-    /// to preserve old immutable journal evidence during one-way recovery.
-    pub fn try_new_legacy(
-        id: TargetInvalidationId,
-        target: &InvestmentTargetSet,
-        kind: InvalidationKind,
-        observed_at: Timestamp,
-        content_identity: DecisionContentDigest,
-    ) -> Result<Self, DecisionContractError> {
-        Self::try_new_inner(id, target, kind, None, observed_at, content_identity)
-    }
-
-    fn try_new_inner(
-        id: TargetInvalidationId,
-        target: &InvestmentTargetSet,
-        kind: InvalidationKind,
-        actor: Option<DecisionActorId>,
         observed_at: Timestamp,
         content_identity: DecisionContentDigest,
     ) -> Result<Self, DecisionContractError> {
@@ -531,12 +505,10 @@ impl TargetInvalidation {
         self.kind
     }
 
-    /// Authenticated governance principal that committed this invalidation, when the immutable
-    /// record was created by the current V1 workflow. `None` is retained only for recovered
-    /// schema-v1 journal evidence that predates principal persistence.
+    /// Returns the authenticated governance principal that committed this invalidation.
     #[must_use]
-    pub const fn actor(&self) -> Option<&DecisionActorId> {
-        self.actor.as_ref()
+    pub const fn actor(&self) -> &DecisionActorId {
+        &self.actor
     }
 
     /// Returns when invalidating evidence was observed.

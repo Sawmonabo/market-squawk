@@ -1,0 +1,32 @@
+[package]
+name = "market-squawk-adapter-bea"
+description = "Bounded metadata-driven Bureau of Economic Analysis macro adapter core"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-platform.workspace = true
+market-squawk-sources.workspace = true
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

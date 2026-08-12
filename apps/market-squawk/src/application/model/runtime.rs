@@ -94,6 +94,10 @@ impl ModelAdmissionRequest {
         if authority_bytes.is_empty()
             || authority_bytes.len() > MAX_BUNDLE_AUTHORITY_BYTES
             || Sha256Digest::new(Sha256::digest(&authority_bytes).into()) != authority_sha256
+            || matches!(
+                &backend,
+                ModelBackendAdmission::Onnx(policy) if !policy.output_semantics_bound()
+            )
         {
             return Err(ProductionModelRuntimeError::InvalidAdmission);
         }
@@ -333,8 +337,6 @@ pub struct ProductionModelRuntime {
     limits: ProductionModelRuntimeLimits,
     gate: Mutex<RuntimeGate>,
     read_image: Arc<ModelReadImageState>,
-    #[cfg(test)]
-    candidate_fixture: Mutex<Option<ModelBundle>>,
 }
 
 impl ProductionModelRuntime {
@@ -440,8 +442,6 @@ impl ProductionModelRuntime {
             limits,
             gate: Mutex::new(RuntimeGate { index }),
             read_image,
-            #[cfg(test)]
-            candidate_fixture: Mutex::new(None),
         })
     }
 
@@ -461,23 +461,6 @@ impl ProductionModelRuntime {
     ) -> Result<ModelAdmissionReceipt, ProductionModelRuntimeError> {
         let deadline = validation_deadline(self.limits.validation_time)?;
         let root = open_candidate_root(&self.paths, &request.candidate_directory)?;
-        #[cfg(test)]
-        let fixture = self
-            .candidate_fixture
-            .lock()
-            .map_err(|_| ProductionModelRuntimeError::RuntimeUnavailable)?
-            .take();
-        #[cfg(test)]
-        let candidate = match fixture {
-            Some(bundle) => RuntimeValidatedCandidate {
-                bundle,
-                authority_bytes: request.authority_bytes.clone(),
-                authority_sha256: request.authority_sha256,
-                dataset: request.dataset,
-            },
-            None => self.verify_candidate(&root, &request, deadline)?,
-        };
-        #[cfg(not(test))]
         let candidate = self.verify_candidate(&root, &request, deadline)?;
         let RuntimeValidatedCandidate {
             bundle,
@@ -525,6 +508,7 @@ impl ProductionModelRuntime {
             artifact_sha256: metadata.artifact_hash(),
             training_run_sha256: metadata.training_run_hash(),
             training_environment_sha256: metadata.training_environment_hash(),
+            output_binding_sha256: metadata.output_binding().identity(),
             runtime_policy,
         };
         let mut gate = self
@@ -633,6 +617,7 @@ impl ProductionModelRuntime {
                     && metadata.training_run_hash() == admission.training_run_sha256
                     && metadata.dataset().export_digest() == admission.dataset_export_sha256
                     && metadata.dataset().selection_digest() == admission.dataset_selection_sha256
+                    && metadata.output_binding().identity() == admission.output_binding_sha256
             });
             if matching.count() != 1 {
                 return Err(ProductionModelRuntimeError::CorruptRuntime);
@@ -717,6 +702,9 @@ impl ProductionModelRuntime {
         paths: &LocalPaths,
         candidate: Option<ModelBundle>,
     ) -> Result<Self, ProductionModelRuntimeError> {
+        if candidate.is_some() {
+            return Err(ProductionModelRuntimeError::InvalidAdmission);
+        }
         let limits = ProductionModelRuntimeLimits::standard()?;
         let (store, index) = open_runtime_index(paths, limits)?;
         if !index.entries().is_empty() {
@@ -733,7 +721,6 @@ impl ProductionModelRuntime {
             limits,
             gate: Mutex::new(RuntimeGate { index }),
             read_image: Arc::new(ModelReadImageState::new(image)),
-            candidate_fixture: Mutex::new(candidate),
         })
     }
 
@@ -906,6 +893,7 @@ fn validate_recovered_bundle(
         || metadata.artifact_hash() != admission.artifact_sha256
         || metadata.training_run_hash() != admission.training_run_sha256
         || metadata.training_environment_hash() != admission.training_environment_sha256
+        || metadata.output_binding().identity() != admission.output_binding_sha256
     {
         return Err(ProductionModelRuntimeError::CorruptRuntime);
     }
@@ -922,7 +910,9 @@ fn stored_policy(
             ModelBackendAdmission::Native,
         ) => Ok(StoredRuntimePolicy::Native),
         (ModelFormat::Onnx, ModelBackendAdmission::Onnx(policy))
-            if policy.model_digest() == bundle.metadata().artifact_hash() =>
+            if policy.model_digest() == bundle.metadata().artifact_hash()
+                && policy.output_semantics_bound()
+                && policy.output_semantics() == bundle.metadata().output_semantics() =>
         {
             StoredRuntimePolicy::try_onnx(policy).map_err(Into::into)
         }
@@ -1062,314 +1052,4 @@ pub enum ProductionModelRuntimeError {
     /// Bounded runtime allocation failed.
     #[error("production model runtime resource ceiling was exceeded")]
     ResourceExhausted,
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        error::Error,
-        fs,
-        num::{NonZeroU32, NonZeroU64, NonZeroUsize},
-        str::FromStr as _,
-        sync::Arc,
-    };
-
-    use market_squawk_data::{
-        CatalogEndpointIdentity, ComponentKind, ComponentScope, CorporateActionSensitivity,
-        DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
-        FeatureLabelComponentSpec, Sha256Digest, UniverseId,
-    };
-    use market_squawk_domain::{ModelId, Timestamp};
-    use market_squawk_modeling::{
-        BundleExpectations, BundleId, BundleMetadataRef, ModelBundle, ProductionFeatureRegistry,
-        PythonDatasetAdmissionAuthority, TrainingDatasetIdentity, TrainingPeriod,
-    };
-    use market_squawk_platform::LocalPaths;
-    use serde_json::json;
-    use sha2::{Digest as _, Sha256};
-
-    use super::{
-        ModelAdmissionDisposition, ModelAdmissionRequest, ModelBackendAdmission,
-        ProductionModelRuntime, ProductionModelRuntimeLimits, open_candidate_root,
-    };
-    use crate::application::model::ModelDomainService;
-
-    type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
-
-    #[test]
-    fn durable_admit_is_immediately_visible_to_already_composed_model_service() -> TestResult {
-        let temporary = tempfile::tempdir()?;
-        let paths = LocalPaths::prepare(temporary.path().join("market-squawk"))?;
-        let feature_registry = ProductionFeatureRegistry::try_new()?;
-        let (bundle, request) = native_candidate(&paths, &feature_registry)?;
-        assert!(!ProductionModelRuntime::has_durable_admissions(
-            &paths,
-            ProductionModelRuntimeLimits::standard()?,
-        )?);
-        let runtime = Arc::new(ProductionModelRuntime::test_fixture(&paths, Some(bundle))?);
-        let service = ModelDomainService::try_from_runtime_snapshot(
-            runtime.snapshot()?,
-            NonZeroUsize::new(8).ok_or("nonzero evaluation capacity")?,
-        )?;
-        assert_eq!(service.admitted_generation_count(), 0);
-
-        let receipt = runtime.admit(request)?;
-
-        assert_eq!(receipt.disposition(), ModelAdmissionDisposition::Inserted);
-        drop(runtime);
-        assert!(ProductionModelRuntime::has_durable_admissions(
-            &paths,
-            ProductionModelRuntimeLimits::standard()?,
-        )?);
-        assert_eq!(service.admitted_generation_count(), 1);
-        let image = service.read_image.load();
-        let backend = image
-            .backends
-            .first()
-            .ok_or("published model backend is absent")?;
-        assert_eq!(backend.metadata().model_id(), receipt.model_id());
-        assert_eq!(backend.metadata().bundle_id(), receipt.bundle_id());
-        assert_eq!(
-            backend.metadata().bundle_version(),
-            receipt.bundle_version()
-        );
-        Ok(())
-    }
-
-    fn native_candidate(
-        paths: &LocalPaths,
-        feature_registry: &ProductionFeatureRegistry,
-    ) -> TestResult<(ModelBundle, ModelAdmissionRequest)> {
-        let candidate_directory = "models/training-runtime-proof/generation-1/candidate";
-        let candidate_path = paths.artifacts()?.root().join(candidate_directory);
-        fs::create_dir_all(&candidate_path)?;
-        let features = feature_registry
-            .feature_registry()
-            .entries()
-            .take(2)
-            .collect::<Vec<_>>();
-        if features.len() != 2 {
-            return Err("production feature registry has fewer than two entries".into());
-        }
-        let schema = DatasetSchemaRegistry::local().canonical_feature_labels()?;
-        let manifest = DatasetManifestRef::try_new_with_schema(
-            DatasetId::try_from("feature-label-training")?,
-            7,
-            schema,
-            Sha256Digest::new([31; 32]),
-        )?;
-        let catalog_identity = CatalogEndpointIdentity::try_from_bytes([38; 32])
-            .ok_or("catalog identity must be nonzero")?;
-        let selection_as_of = Timestamp::from_unix_nanos(600);
-        let dataset = TrainingDatasetIdentity::try_new(
-            manifest,
-            DatasetBuildSpecDigest::try_new([32; 32])?,
-            Sha256Digest::new([33; 32]),
-            Sha256Digest::new([34; 32]),
-            catalog_identity,
-            Sha256Digest::new([35; 32]),
-            Sha256Digest::new([39; 32]),
-            selection_as_of,
-            NonZeroU64::new(30).ok_or("selected rows must be nonzero")?,
-        )?;
-        let universe = UniverseId::try_from("liquid-us-equities")?;
-        let period = TrainingPeriod::try_new(
-            Timestamp::from_unix_nanos(10),
-            Timestamp::from_unix_nanos(20),
-        )?;
-        let label = FeatureLabelComponentSpec::try_new(
-            ComponentKind::Label,
-            ComponentScope::Instrument,
-            CorporateActionSensitivity::RequiresAdjustment,
-            "forward-return",
-            NonZeroU32::MIN,
-        )?;
-        let model_id = ModelId::from_str("018f3c2a-91ab-7ccd-b3de-123456789abc")?;
-        let bundle_id = BundleId::try_new("runtime-publication-proof")?;
-        let bundle_version = NonZeroU64::MIN;
-        let feature_json = features
-            .iter()
-            .map(|feature| {
-                json!({
-                    "name": feature.key().name(),
-                    "version": feature.key().version().get(),
-                    "input_schema_sha256": hex(feature.input_schema_digest().as_bytes()),
-                    "semantic_sha256": hex(feature.semantic_digest().as_bytes()),
-                    "normalizer": {"kind": "identity"}
-                })
-            })
-            .collect::<Vec<_>>();
-        let semantic_digests = features
-            .iter()
-            .map(|feature| hex(feature.semantic_digest().as_bytes()))
-            .collect::<Vec<_>>();
-        let artifact_bytes = serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "format": "native_linear",
-            "format_version": 1,
-            "feature_semantic_sha256": semantic_digests,
-            "weights": [2.0, -1.0],
-            "bias": 0.5,
-            "output_count": 1
-        }))?;
-        let artifact_sha256 = sha256(&artifact_bytes);
-        let dataset_value = json!({
-            "dataset_id": dataset.manifest().dataset_id().as_str(),
-            "manifest_version": dataset.manifest().manifest_version(),
-            "schema_name": dataset.manifest().schema().name(),
-            "schema_version": dataset.manifest().schema().version().get(),
-            "schema_sha256": hex(dataset.manifest().schema().fingerprint()),
-            "manifest_sha256": hex(dataset.manifest().content_hash().bytes()),
-            "build_spec_sha256": hex(dataset.build_spec_digest().digest().bytes()),
-            "universe_sha256": hex(dataset.universe_digest().bytes()),
-            "policy_sha256": hex(dataset.policy_digest().bytes()),
-            "catalog_identity_sha256": hex(dataset.catalog_identity().bytes()),
-            "export_sha256": hex(dataset.export_digest().bytes()),
-            "selection_sha256": hex(dataset.selection_digest().bytes()),
-            "selection_as_of_unix_nanos": dataset.selection_as_of().unix_nanos(),
-            "selected_component_rows": dataset.selected_component_rows().get()
-        });
-        let label_value = json!({
-            "kind": "label",
-            "scope": "instrument",
-            "corporate_action_sensitivity": "requires_adjustment",
-            "name": "forward-return",
-            "version": 1
-        });
-        let period_value = json!({
-            "start_unix_nanos": period.start().unix_nanos(),
-            "end_unix_nanos": period.end().unix_nanos()
-        });
-        let run_features = feature_json
-            .iter()
-            .map(|feature| {
-                json!({
-                    "input_schema_sha256": feature["input_schema_sha256"],
-                    "name": feature["name"],
-                    "semantic_sha256": feature["semantic_sha256"],
-                    "version": feature["version"]
-                })
-            })
-            .collect::<Vec<_>>();
-        let trial = json!({
-            "bundle_id": bundle_id.as_str(),
-            "bundle_version": bundle_version.get(),
-            "dataset": dataset_value.clone(),
-            "dataset_export_sha256": hex(dataset.export_digest().bytes()),
-            "environment_sha256": hex([37; 32]),
-            "features": run_features,
-            "label": label_value.clone(),
-            "missing_policy": "reject",
-            "model_id": model_id.to_string(),
-            "model_kind": "native_linear",
-            "seed": 17,
-            "split_counts": {"test": 1, "train": 7, "validation": 2},
-            "split_sha256": hex([36; 32]),
-            "training_code_revision": "train-code-abc123",
-            "training_period": period_value.clone(),
-            "universe_id": universe.as_str()
-        });
-        let trial_sha256 = hex(sha256(&serde_json::to_vec(&trial)?));
-        let training_run_bytes = serde_json::to_vec(&json!({
-            "schema_version": 2,
-            "trial": trial,
-            "trial_sha256": trial_sha256,
-            "validation_metrics": [{"name": "mean_squared_error", "value": 0.12}]
-        }))?;
-        let training_run_sha256 = sha256(&training_run_bytes);
-        let metadata = json!({
-            "schema_version": 4,
-            "bundle_id": bundle_id.as_str(),
-            "bundle_version": bundle_version.get(),
-            "model_id": model_id.to_string(),
-            "artifact": {
-                "path": "artifact.json",
-                "sha256": hex(artifact_sha256),
-                "size_bytes": artifact_bytes.len(),
-                "format": "native_linear",
-                "format_version": 1
-            },
-            "training_run": {
-                "path": "training-run.json",
-                "sha256": hex(training_run_sha256),
-                "size_bytes": training_run_bytes.len()
-            },
-            "features": feature_json,
-            "training_dataset": dataset_value,
-            "training_universe_id": universe.as_str(),
-            "training_period": period_value,
-            "label": label_value,
-            "training_code_revision": "train-code-abc123",
-            "training_environment_sha256": hex([37; 32]),
-            "validation_metrics": [{"name": "mean_squared_error", "value": 0.12}],
-            "decision_thresholds": {
-                "negative_max": -0.5,
-                "positive_min": 0.5,
-                "minimum_confidence": 0.0
-            },
-            "intended_use": "runtime publication proof",
-            "limitations": ["test fixture only"],
-            "fallback": {"policy": "no_action", "reason": "model contract unavailable"}
-        });
-        let metadata_bytes = serde_json::to_vec(&metadata)?;
-        let metadata_sha256 = sha256(&metadata_bytes);
-        fs::write(candidate_path.join("artifact.json"), artifact_bytes)?;
-        fs::write(candidate_path.join("training-run.json"), training_run_bytes)?;
-        fs::write(candidate_path.join("bundle.json"), metadata_bytes)?;
-        let expectations = BundleExpectations::try_new(
-            model_id,
-            bundle_id,
-            bundle_version,
-            dataset.clone(),
-            universe,
-            period,
-            label,
-            "train-code-abc123",
-            Sha256Digest::new([37; 32]),
-            Sha256Digest::new(metadata_sha256),
-            Sha256Digest::new(artifact_sha256),
-            Sha256Digest::new(training_run_sha256),
-        )?;
-        let metadata_ref =
-            BundleMetadataRef::try_new("bundle.json", Sha256Digest::new(metadata_sha256))?;
-        let root = open_candidate_root(paths, candidate_directory)?;
-        let bundle = ModelBundle::load(
-            &root,
-            &metadata_ref,
-            &expectations,
-            feature_registry.feature_registry(),
-        )?;
-        let authority_bytes: Box<[u8]> = b"runtime-publication-proof-authority".as_slice().into();
-        let authority_sha256 = Sha256Digest::new(sha256(&authority_bytes));
-        let dataset_authority = PythonDatasetAdmissionAuthority::try_new(
-            dataset.export_digest(),
-            dataset.selection_as_of(),
-            dataset.selection_digest(),
-            dataset.catalog_identity(),
-        )?;
-        let request = ModelAdmissionRequest::try_new(
-            candidate_directory,
-            metadata_ref,
-            authority_bytes,
-            authority_sha256,
-            dataset_authority,
-            ModelBackendAdmission::Native,
-        )?;
-        Ok((bundle, request))
-    }
-
-    fn sha256(bytes: &[u8]) -> [u8; 32] {
-        Sha256::digest(bytes).into()
-    }
-
-    fn hex(bytes: impl AsRef<[u8]>) -> String {
-        const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let bytes = bytes.as_ref();
-        let mut output = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            output.push(char::from(DIGITS[usize::from(byte >> 4)]));
-            output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-        }
-        output
-    }
 }

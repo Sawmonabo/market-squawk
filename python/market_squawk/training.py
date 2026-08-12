@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 import random
 import re
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 from uuid import UUID
 
@@ -128,6 +129,8 @@ class ForecastTrainingProposal:
     training_run_sha256: str
     artifacts: tuple[ForecastArtifact, ...]
     forecast_metadata: Mapping[str, Any]
+    output_measurement: Mapping[str, Any]
+    output_statistic: Mapping[str, Any]
     dataset: DatasetResult = field(repr=False, compare=False)
 
 
@@ -205,6 +208,10 @@ class TrainingRun:
         output_semantics = (
             "binary_probability" if model_kind == "logistic" else "regression"
         )
+        output_measurement = config["output_measurement"]
+        output_statistic = _output_statistic(
+            config["output_target"], output_measurement, model_kind
+        )
         bundle_format = (
             f"native_{model_kind}" if artifact_format == "native" else "onnx"
         )
@@ -221,6 +228,9 @@ class TrainingRun:
             "model_kind": (
                 f"native_{model_kind}" if artifact_format == "native" else model_kind
             ),
+            "output_measurement": output_measurement,
+            "output_statistic": output_statistic,
+            "output_semantics": output_semantics,
             "seed": self.seed,
             "split_counts": split_counts,
             "split_sha256": split_sha256,
@@ -228,12 +238,10 @@ class TrainingRun:
             "training_period": period,
             "universe_id": self.dataset.universe_id,
         }
-        if artifact_format == "onnx":
-            trial["output_semantics"] = output_semantics
         trial_sha256 = hashlib.sha256(_canonical(trial)).hexdigest()
         metrics = [{"name": fitted.metric_name, "value": fitted.metric_value}]
         run_record = {
-            "schema_version": 2 if artifact_format == "native" else 3,
+            "schema_version": 7,
             "trial": trial,
             "trial_sha256": trial_sha256,
             "validation_metrics": metrics,
@@ -266,7 +274,7 @@ class TrainingRun:
             else {"negative_max": -0.5, "positive_min": 0.5, "minimum_confidence": 0.0}
         )
         metadata = {
-            "schema_version": 4 if artifact_format == "native" else 5,
+            "schema_version": 9,
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
             "model_id": self.model_id,
@@ -296,9 +304,10 @@ class TrainingRun:
             "intended_use": "bounded local research trained from one exact point-in-time generation",
             "limitations": ["candidate requires independent Rust admission before production use"],
             "fallback": {"policy": "no_action", "reason": "model contract unavailable"},
+            "output_measurement": output_measurement,
+            "output_statistic": output_statistic,
+            "output_semantics": output_semantics,
         }
-        if artifact_format == "onnx":
-            metadata["output_semantics"] = output_semantics
         if artifact_format == "native":
             candidate = BundleCandidate(metadata, artifact, run_record)
         else:
@@ -314,7 +323,7 @@ class TrainingRun:
                 ) from error
             candidate = BundleCandidate.onnx(metadata, onnx_artifact, run_record)
         authority = {
-            "schema_version": 5 if artifact_format == "native" else 6,
+            "schema_version": 8,
             "model_id": self.model_id,
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
@@ -327,9 +336,10 @@ class TrainingRun:
             "training_code_revision": self.training_code_revision,
             "training_environment_sha256": self.environment_sha256,
             "training_run_sha256": candidate.training_run_sha256,
+            "output_measurement": output_measurement,
+            "output_statistic": output_statistic,
+            "output_semantics": output_semantics,
         }
-        if artifact_format == "onnx":
-            authority["output_semantics"] = output_semantics
         return TrainingProposal(candidate, authority, self.dataset)
 
     def fit_research_forecast(
@@ -358,6 +368,10 @@ class TrainingRun:
         ):
             raise TrainingValidationError("forecast specification is invalid")
         config = self._validated_config("linear", "onnx")
+        output_measurement = config["output_measurement"]
+        output_statistic = _research_output_statistic(
+            config["output_target"], specification
+        )
         estimate = _checked_mul(
             max(1, len(self.dataset.rows)),
             _checked_mul(
@@ -476,6 +490,8 @@ class TrainingRun:
             "model_id": self.model_id,
             "model_kind": "linear",
             "output_semantics": "regression",
+            "output_measurement": output_measurement,
+            "output_statistic": output_statistic,
             "seed": self.seed,
             "split_counts": split_counts,
             "split_sha256": split_sha256,
@@ -494,7 +510,7 @@ class TrainingRun:
             },
         }
         record = {
-            "schema_version": 4,
+            "schema_version": 7,
             "trial": trial,
             "trial_sha256": hashlib.sha256(_canonical(trial)).hexdigest(),
             "validation_metrics": [
@@ -518,6 +534,8 @@ class TrainingRun:
             hashlib.sha256(encoded).hexdigest(),
             tuple(artifacts),
             forecast_metadata,
+            MappingProxyType(dict(output_measurement)),
+            MappingProxyType(dict(output_statistic)),
             self.dataset,
         )
 
@@ -558,7 +576,7 @@ class TrainingRun:
         label = dict(self.label.mapping() if isinstance(self.label, ComponentIdentity) else self.label)
         if set(label) != {"kind", "scope", "corporate_action_sensitivity", "name", "version"}:
             raise TrainingValidationError("label identity is incomplete")
-        if label["kind"] != "label" or label["scope"] not in {"instrument", "account", "global"}:
+        if label["kind"] != "label" or label["scope"] != "instrument":
             raise TrainingValidationError("label kind or scope is invalid")
         if label["corporate_action_sensitivity"] not in {"not_applicable", "requires_adjustment"}:
             raise TrainingValidationError("label corporate-action policy is invalid")
@@ -592,7 +610,79 @@ class TrainingRun:
             raise TrainingValidationError("label differs from the Task 11 component contract")
         if any(("feature", feature["name"], feature["version"]) not in dataset_components for feature in features):
             raise TrainingValidationError("feature is absent from the Task 11 component contract")
-        return {"dataset": dataset, "label": label, "features": features}
+        if admitted_label.measurement is None:
+            raise TrainingValidationError(
+                "training requires a measurement-bound Task 11 label"
+            )
+        output_measurement = dict(admitted_label.measurement.mapping())
+        output_target = dict(admitted_label.target.mapping())
+        compatible = (
+            model_kind == "linear"
+            and output_measurement["kind"]
+            in {"price", "return", "other_regression"}
+        ) or (
+            model_kind == "logistic"
+            and output_measurement["kind"] == "probability"
+        )
+        if not compatible:
+            raise TrainingValidationError(
+                "model output semantics contradict the admitted label measurement"
+            )
+        return {
+            "dataset": dataset,
+            "label": label,
+            "features": features,
+            "output_measurement": output_measurement,
+            "output_target": output_target,
+        }
+
+
+def _output_statistic(
+    target: Mapping[str, Any], measurement: Mapping[str, Any], model_kind: str
+) -> Mapping[str, Any]:
+    """Seal the exact estimator meaning; only a qualified price target is an expected value."""
+
+    if model_kind == "linear":
+        statistic = (
+            "model_estimated_conditional_mean"
+            if measurement["kind"] == "price"
+            and target["kind"] == "fixed_horizon_terminal"
+            else "unavailable"
+        )
+        objective = "squared_error"
+        output_transform = "identity"
+        estimator = {"kind": "sealed_direct_least_squares_v1"}
+    else:
+        statistic = "unavailable"
+        objective = "binary_cross_entropy"
+        output_transform = "logistic"
+        estimator = {"kind": "sealed_binary_logistic_v1"}
+    return {
+        "statistic": statistic,
+        "target": dict(target),
+        "target_transform": "identity",
+        "output_transform": output_transform,
+        "objective": objective,
+        "estimator": estimator,
+    }
+
+
+def _research_output_statistic(
+    target: Mapping[str, Any], specification: ForecastSpecification
+) -> Mapping[str, Any]:
+    """Bind Ridge provenance while refusing expected-value semantics for offset-index paths."""
+
+    return {
+        "statistic": "unavailable",
+        "target": dict(target),
+        "target_transform": "identity",
+        "output_transform": "identity",
+        "objective": "squared_error",
+        "estimator": {
+            "kind": "sealed_direct_ridge_v1",
+            "ridge_alpha": specification.ridge_alpha,
+        },
+    }
 
 
 def _dataset_matrix(
@@ -651,6 +741,17 @@ def _dataset_matrix(
                     for row in group
                 ],
                 "cutoff_unix_nanos": group[0]["cutoff_at"].unix_nanos,
+                "observed_effective_unix_nanos": (
+                    None
+                    if group[0]["observed_effective_at"] is None
+                    else group[0]["observed_effective_at"].unix_nanos
+                ),
+                "label_effective_unix_nanos": (
+                    None
+                    if group[0]["label_effective_at"] is None
+                    else group[0]["label_effective_at"].unix_nanos
+                ),
+                "target_coordinate_kind": group[0]["target_coordinate_kind"],
                 "example_id": group[0]["example_id"],
                 "instrument_id": group[0]["instrument_id"],
                 "split": split,
@@ -664,7 +765,7 @@ def _dataset_matrix(
             {
                 "dataset_export_sha256": dataset.export_sha256,
                 "examples": evidence,
-                "schema_version": 1,
+                "schema_version": 2,
             }
         )
     ).hexdigest()
@@ -829,8 +930,6 @@ def _linear_fit(
             vector[left] += augmented[left] * targets[index]
             for right in range(width):
                 matrix[left][right] += augmented[left] * augmented[right]
-    for index in range(width - 1):
-        matrix[index][index] += 1e-12
     solution = _solve(matrix, vector, context)
     return solution[:-1], solution[-1]
 

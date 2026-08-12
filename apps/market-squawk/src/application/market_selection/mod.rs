@@ -4,13 +4,9 @@
 //! consumes already-observed source candidates and returns a deterministic, source-preserving
 //! selection receipt for the application read model.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    reason = "the Wave M1 selection contract is consumed by the immediately following read-model integration"
-)]
-
 mod candidate;
+mod digest;
+mod investment;
 mod receipt;
 mod requirements;
 mod resolver;
@@ -20,10 +16,15 @@ pub(crate) use candidate::{
     CandidateIdentity, CandidateIntegrity, CandidateTimestamps, HealthState, IntegrityState,
     ProviderBudgetSnapshot, RightsAdmission, RightsState, SourceCandidate,
 };
+pub(crate) use investment::{
+    LiveMarketInvestmentSource, MarketFeatureEvidence, MarketFeatureUnavailableReason,
+    MarketInvestmentMarkBasis, MarketInvestmentObservation, MarketInvestmentRead,
+    MarketInvestmentReadError, MarketInvestmentUnavailableReason, SelectedMarketInvestmentSource,
+    read_market_investment_observation, selected_generation_matches,
+};
 pub(crate) use receipt::{
-    AdmittedDowngrade, CandidateRejectionReason, DowngradeDimension, EligibleCandidate,
-    MarketSelectionError, MarketSelectionReceipt, RejectedCandidate, SelectedMarketSource,
-    SelectionClass,
+    AdmittedDowngrade, DowngradeDimension, MarketSelectionError, MarketSelectionReceipt,
+    SelectedMarketSource, SelectionClass,
 };
 pub(crate) use requirements::{
     DowngradePolicy, FreshnessBasis, FreshnessRequirement, MarketCoverage, MarketOperation,

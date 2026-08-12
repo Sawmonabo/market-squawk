@@ -1,6 +1,7 @@
 import { z } from "zod"
 
 import type { ApplicationResult } from "@/lib/schemas"
+import type { PaperControlRequest } from "@/lib/transport"
 
 const timestampSchema = z.union([z.string(), z.number().int()])
 
@@ -132,7 +133,8 @@ const paperStatusSchema = z.discriminatedUnion("state", [
   z.object({ state: z.literal("stopping") }),
   z.object({
     state: z.literal("failed"),
-    provider: z.string().min(1),
+    provider: z.string().min(1).optional(),
+    reason: z.string().min(1).optional(),
     requiresStop: z.literal(true),
   }),
   z.object({
@@ -159,6 +161,7 @@ const paperStatusSchema = z.discriminatedUnion("state", [
 const paperOrderSchema = z
   .object({
     orderId: z.string().min(1),
+    accountId: z.string().min(1).optional(),
     state: z.string().min(1),
     requestedLots: z.number().int().nonnegative(),
     filledLots: z.number().int().nonnegative().optional(),
@@ -191,6 +194,44 @@ const paperOrderSchema = z
   })
   .loose()
 
+const startReceiptSchema = z
+  .object({
+    state: z.literal("running"),
+    provider: z.enum(["coinbase", "coinbase-direct", "kraken"]),
+    strategyMode: z.enum(["manual", "book_imbalance"]),
+  })
+  .strict()
+
+const stopReceiptSchema = z
+  .object({
+    state: z.literal("stopped"),
+    shutdownComplete: z.boolean(),
+    reason: z.string().min(1),
+  })
+  .strict()
+
+const cancelReceiptSchema = z
+  .object({
+    orderId: z.string().min(1),
+    status: z.enum(["pending", "canceled", "already_terminal"]),
+    observedAt: timestampSchema,
+    cumulativeFilledLots: z.number().int().nonnegative(),
+    averageFillPriceTicks: z.number().int().nullable(),
+    maximumFillPriceTicks: z.number().int().nullable(),
+    cumulativeFees: moneySchema,
+  })
+  .strict()
+
+const reconcileReceiptSchema = z
+  .object({
+    observedAt: timestampSchema,
+    orderCount: z.number().int().nonnegative(),
+    accountCount: z.number().int().nonnegative(),
+    sourceBound: z.boolean(),
+    reconciliationRequired: z.boolean(),
+  })
+  .strict()
+
 const paperFillSchema = z
   .object({
     sequence: z.number().int().nonnegative(),
@@ -214,6 +255,11 @@ export type PaperPosition = z.infer<typeof paperPositionSchema>
 export type PaperRiskLimits = z.infer<typeof riskLimitsSchema>
 export type PaperAuditDecision = z.infer<typeof auditDecisionSchema>
 export type PaperRiskDecisions = z.infer<typeof riskDecisionsSchema>
+export type PaperControlReceipt =
+  | { action: "start"; value: z.infer<typeof startReceiptSchema> }
+  | { action: "stop" | "triggerKillSwitch"; value: z.infer<typeof stopReceiptSchema> }
+  | { action: "cancel"; value: z.infer<typeof cancelReceiptSchema> }
+  | { action: "reconcile"; value: z.infer<typeof reconcileReceiptSchema> }
 
 export interface PaperResult<T> {
   value: T
@@ -232,6 +278,45 @@ export function parsePaperOrders(result: ApplicationResult): PaperResult<PaperOr
 
 export function parsePaperFills(result: ApplicationResult): PaperResult<PaperFill[]> {
   return boundary(result, parseNullableRows(result.data, paperFillSchema))
+}
+
+export function parsePaperControlReceipt(
+  result: ApplicationResult,
+  request: PaperControlRequest,
+): PaperControlReceipt {
+  if (
+    result.metadata.completeness !== "complete" ||
+    result.metadata.returnedItems !== 1 ||
+    result.metadata.availableItems !== 1
+  ) {
+    throw new Error("The installed service returned incomplete paper-control evidence.")
+  }
+  switch (request.action) {
+    case "start": {
+      const value = startReceiptSchema.parse(result.data)
+      if (value.provider !== request.provider || value.strategyMode !== request.strategyMode) {
+        throw new Error("The paper-start receipt does not match the confirmed request.")
+      }
+      return { action: request.action, value }
+    }
+    case "stop":
+    case "triggerKillSwitch": {
+      const value = stopReceiptSchema.parse(result.data)
+      if (value.reason !== request.reason) {
+        throw new Error("The paper-stop receipt does not match the confirmed reason.")
+      }
+      return { action: request.action, value }
+    }
+    case "cancel": {
+      const value = cancelReceiptSchema.parse(result.data)
+      if (value.orderId !== request.orderId) {
+        throw new Error("The paper-cancel receipt does not match the confirmed order.")
+      }
+      return { action: request.action, value }
+    }
+    case "reconcile":
+      return { action: request.action, value: reconcileReceiptSchema.parse(result.data) }
+  }
 }
 
 function parseNullableRows<T>(value: unknown, schema: z.ZodType<T>): T[] {

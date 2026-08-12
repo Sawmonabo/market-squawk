@@ -266,12 +266,12 @@ function StepPrimaryAction({
         </Button>
         {step.id === "file_and_portfolio_import" ? (
           <Button asChild size="sm" variant="outline">
-            <Link to="/research">Open owned-file research</Link>
+            <Link to="/advanced/research-data">Open owned-file research</Link>
           </Button>
         ) : null}
         {step.id === "paper_and_risk" ? (
           <Button asChild size="sm" variant="outline">
-            <Link to="/risk">Review central risk</Link>
+            <Link to="/advanced/risk-recommendation-policy">Review central risk</Link>
           </Button>
         ) : null}
       </div>
@@ -282,30 +282,30 @@ function StepPrimaryAction({
 function primaryAction(step: PlanStepId, selection: SetupPlanSelection) {
   switch (step) {
     case "goals_and_starter_plan":
-      return { to: "/overview", label: "Return to plan controls" }
+      return { to: "/home", label: "Return to plan controls" }
     case "storage_retention_time_and_disk":
-      return { to: "/settings", label: "Open Settings" }
+      return { to: "/system/settings", label: "Open Settings" }
     case "public_and_zero_fee_providers":
-      return { to: "/sources", label: "Open Sources" }
+      return { to: "/connections/sources", label: "Open Connections & Sources" }
     case "file_and_portfolio_import":
       return selection.goals.includes("research_investments") &&
         !selection.goals.includes("manage_portfolio")
-        ? { to: "/research", label: "Open Research imports" }
-        : { to: "/portfolios", label: "Open Portfolio import" }
+        ? { to: "/advanced/research-data", label: "Open Research imports" }
+        : { to: "/portfolio", label: "Open Portfolio import" }
     case "model_runtime":
-      return { to: "/models", label: "Open Models" }
+      return { to: "/advanced/models-forecasts", label: "Open Models" }
     case "paper_and_risk":
       return { to: "/paper-execution", label: "Open Paper Execution" }
     case "claude_code":
-      return { to: "/mcp", label: "Open Claude Code setup" }
+      return { to: "/system/ai-connections", label: "Open Claude Code setup" }
     case "codex":
-      return { to: "/mcp", label: "Open Codex setup" }
+      return { to: "/system/ai-connections", label: "Open Codex setup" }
     case "backup":
-      return { to: "/backup-recovery", label: "Open Backup & Recovery" }
+      return { to: "/system/backup-recovery", label: "Open Backup & Recovery" }
     case "review":
-      return { to: "/overview", label: "Open capability review" }
+      return { to: "/home", label: "Open capability review" }
     case "first_useful_result":
-      return { to: "/overview", label: "Open Overview" }
+      return { to: "/home", label: "Open Home" }
   }
 }
 

@@ -71,7 +71,7 @@ export function ProductProvider({
     if (!bootstrap.data || "status" in bootstrap.data) return
     const scope = bootstrap.data.runtime
     let active = true
-    let previousSequence = 0
+    let previousSequence = "0"
     let unsubscribe: (() => void) | undefined
 
     const resync = () => {

@@ -14,6 +14,9 @@ use crate::{
     },
 };
 
+// Canonical string conversion happens after the shared bridge's size check, so retain its cap.
+const MAXIMUM_CANONICAL_JOB_RESULT_BYTES: usize = 1024 * 1024;
+
 #[tauri::command]
 pub(crate) async fn dashboard_query(
     request: DashboardQueryCommand,
@@ -144,6 +147,15 @@ pub(crate) async fn dashboard_query(
         }
         DashboardQueryCommand::ModelBundles => ("Model.ListBundles", Map::new()),
         DashboardQueryCommand::Forecasts => ("Model.ListForecasts", Map::new()),
+        DashboardQueryCommand::LatestValidForecast {
+            instrument_id,
+            as_of,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("instrumentId".to_owned(), json!(instrument_id));
+            arguments.insert("asOf".to_owned(), json!(as_of));
+            ("Model.SelectLatestValidForecast", arguments)
+        }
         DashboardQueryCommand::ModelMetadata { model_id } => {
             ("Model.GetMetadata", model_arguments(model_id))
         }
@@ -195,6 +207,20 @@ pub(crate) async fn dashboard_query(
             let mut arguments = Map::new();
             arguments.insert("candidateId".to_owned(), json!(candidate_id));
             ("Decision.GetDossierPreparation", arguments)
+        }
+        DashboardQueryCommand::DecisionInvestmentAnalysis { analysis_id } => {
+            let mut arguments = Map::new();
+            arguments.insert("analysisId".to_owned(), json!(analysis_id));
+            ("Decision.GetInvestmentAnalysis", arguments)
+        }
+        DashboardQueryCommand::DecisionInvestmentAnalyses {
+            after_analysis_id,
+            limit,
+        } => {
+            let mut arguments = Map::new();
+            insert_optional(&mut arguments, "afterAnalysisId", after_analysis_id);
+            arguments.insert("limit".to_owned(), json!(limit));
+            ("Decision.ListInvestmentAnalyses", arguments)
         }
         DashboardQueryCommand::DecisionTargetPreparation { dossier_id } => {
             let mut arguments = Map::new();
@@ -424,7 +450,7 @@ pub(crate) async fn dashboard_query(
             ("Setup.PreviewPlan", arguments)
         }
     };
-    invoke_application(
+    let mut result = invoke_application(
         ApplicationInvocation {
             operation: operation.to_owned(),
             arguments,
@@ -432,7 +458,11 @@ pub(crate) async fn dashboard_query(
         &state,
         InvocationAuthority::ReadOnly,
     )
-    .await
+    .await?;
+    if operation == "Job.List" {
+        canonicalize_job_result(operation, &mut result)?;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1064,7 +1094,14 @@ pub(crate) async fn job_control(
             arguments.insert("limit".to_owned(), json!(limit));
             ("Job.List", arguments, false)
         }
-        JobControlCommand::Get { job_id } => ("Job.Get", map_with_job_id(job_id), false),
+        JobControlCommand::Get { job_id, generation } => {
+            let mut arguments = map_with_job_id(job_id);
+            arguments.insert(
+                "generation".to_owned(),
+                json!(parse_job_generation(generation)?),
+            );
+            ("Job.Get", arguments, false)
+        }
         JobControlCommand::Watch {
             job_id,
             generation,
@@ -1072,8 +1109,14 @@ pub(crate) async fn job_control(
             limit,
         } => {
             let mut arguments = map_with_job_id(job_id);
-            arguments.insert("generation".to_owned(), json!(generation));
-            arguments.insert("afterSequence".to_owned(), json!(after_sequence));
+            arguments.insert(
+                "generation".to_owned(),
+                json!(parse_job_generation(generation)?),
+            );
+            arguments.insert(
+                "afterSequence".to_owned(),
+                json!(parse_job_sequence(after_sequence)?),
+            );
             arguments.insert("limit".to_owned(), json!(limit));
             ("Job.Watch", arguments, false)
         }
@@ -1081,11 +1124,10 @@ pub(crate) async fn job_control(
             job_id,
             generation,
             expected_sequence,
-        } => (
-            "Job.Cancel",
-            job_mutation_arguments(job_id, generation, expected_sequence),
-            true,
-        ),
+        } => {
+            let arguments = job_mutation_arguments(job_id, generation, expected_sequence)?;
+            ("Job.Cancel", arguments, true)
+        }
         JobControlCommand::Confirm {
             job_id,
             generation,
@@ -1093,7 +1135,7 @@ pub(crate) async fn job_control(
             identity,
             digest,
         } => {
-            let mut arguments = job_mutation_arguments(job_id, generation, expected_sequence);
+            let mut arguments = job_mutation_arguments(job_id, generation, expected_sequence)?;
             arguments.insert("identity".to_owned(), json!(identity));
             arguments.insert("digest".to_owned(), json!(digest));
             ("Job.Confirm", arguments, true)
@@ -1102,11 +1144,10 @@ pub(crate) async fn job_control(
             job_id,
             generation,
             expected_sequence,
-        } => (
-            "Job.Retry",
-            job_mutation_arguments(job_id, generation, expected_sequence),
-            true,
-        ),
+        } => {
+            let arguments = job_mutation_arguments(job_id, generation, expected_sequence)?;
+            ("Job.Retry", arguments, true)
+        }
     };
     invoke_narrow(operation, arguments, mutation, confirmed, &state).await
 }
@@ -1176,7 +1217,7 @@ async fn invoke_narrow(
     } else {
         InvocationAuthority::ReadOnly
     };
-    invoke_application(
+    let mut result = invoke_application(
         ApplicationInvocation {
             operation: operation.to_owned(),
             arguments,
@@ -1184,7 +1225,14 @@ async fn invoke_narrow(
         state,
         authority,
     )
-    .await
+    .await?;
+    if matches!(
+        operation,
+        "Job.List" | "Job.Get" | "Job.Watch" | "Job.Cancel" | "Job.Confirm" | "Job.Retry"
+    ) {
+        canonicalize_job_result(operation, &mut result)?;
+    }
+    Ok(result)
 }
 
 fn require_confirmation(confirmed: bool) -> Result<(), DesktopCommandError> {
@@ -1316,6 +1364,35 @@ fn parse_unix_nanos(value: String) -> Result<i64, DesktopCommandError> {
     })
 }
 
+fn parse_job_generation(value: String) -> Result<u64, DesktopCommandError> {
+    parse_canonical_u64(&value)
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| {
+            DesktopCommandError::invalid_request(
+                "The job generation must be a positive canonical unsigned decimal.",
+            )
+        })
+}
+
+fn parse_job_sequence(value: String) -> Result<u64, DesktopCommandError> {
+    parse_canonical_u64(&value).ok_or_else(|| {
+        DesktopCommandError::invalid_request(
+            "The job sequence must be a canonical unsigned decimal.",
+        )
+    })
+}
+
+fn parse_canonical_u64(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || (bytes.len() > 1 && bytes[0] == b'0')
+        || !bytes.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    value.parse::<u64>().ok()
+}
+
 fn parse_unsigned_decimal(
     value: String,
     message: &'static str,
@@ -1381,13 +1458,115 @@ fn source_arguments(source_ids: Option<Vec<String>>) -> Map<String, Value> {
 
 fn job_mutation_arguments(
     job_id: uuid::Uuid,
-    generation: u64,
-    expected_sequence: u64,
-) -> Map<String, Value> {
+    generation: String,
+    expected_sequence: String,
+) -> Result<Map<String, Value>, DesktopCommandError> {
     let mut arguments = map_with_job_id(job_id);
-    arguments.insert("generation".to_owned(), json!(generation));
-    arguments.insert("expectedSequence".to_owned(), json!(expected_sequence));
-    arguments
+    arguments.insert(
+        "generation".to_owned(),
+        json!(parse_job_generation(generation)?),
+    );
+    arguments.insert(
+        "expectedSequence".to_owned(),
+        json!(parse_job_sequence(expected_sequence)?),
+    );
+    Ok(arguments)
+}
+
+fn canonicalize_job_result(
+    operation: &'static str,
+    result: &mut Value,
+) -> Result<(), DesktopCommandError> {
+    let data = result
+        .get_mut("data")
+        .ok_or_else(DesktopCommandError::internal)?;
+    match operation {
+        "Job.List" => {
+            let jobs = data
+                .get_mut("jobs")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(DesktopCommandError::internal)?;
+            for job in jobs {
+                canonicalize_job_view(job)?;
+            }
+        }
+        "Job.Get" | "Job.Cancel" | "Job.Confirm" => canonicalize_job_view(data)?,
+        "Job.Retry" => canonicalize_job_receipt(data)?,
+        "Job.Watch" => canonicalize_job_event_page(data)?,
+        _ => return Err(DesktopCommandError::internal()),
+    }
+    let bytes = serde_json::to_vec(result).map_err(|_error| DesktopCommandError::internal())?;
+    if bytes.len() > MAXIMUM_CANONICAL_JOB_RESULT_BYTES {
+        return Err(DesktopCommandError::new(
+            "resource_exhausted",
+            "The operation result exceeds the dashboard safety limit.",
+        ));
+    }
+    Ok(())
+}
+
+fn canonicalize_job_view(value: &mut Value) -> Result<(), DesktopCommandError> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(DesktopCommandError::internal)?;
+    canonicalize_unsigned_field(object, "generation", true)?;
+    canonicalize_unsigned_field(object, "sequence", false)
+}
+
+fn canonicalize_job_receipt(value: &mut Value) -> Result<(), DesktopCommandError> {
+    canonicalize_job_view(value)
+}
+
+fn canonicalize_job_event_page(value: &mut Value) -> Result<(), DesktopCommandError> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(DesktopCommandError::internal)?;
+    let events = object
+        .get_mut("events")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(DesktopCommandError::internal)?;
+    for event in events {
+        let tuple = event
+            .as_array_mut()
+            .filter(|tuple| tuple.len() == 2)
+            .ok_or_else(DesktopCommandError::internal)?;
+        canonicalize_unsigned_value(&mut tuple[0], false)?;
+    }
+    let next = object
+        .get_mut("next")
+        .ok_or_else(DesktopCommandError::internal)?;
+    if !next.is_null() {
+        canonicalize_unsigned_value(next, false)?;
+    }
+    Ok(())
+}
+
+fn canonicalize_unsigned_field(
+    object: &mut Map<String, Value>,
+    field: &'static str,
+    positive: bool,
+) -> Result<(), DesktopCommandError> {
+    let value = object
+        .get_mut(field)
+        .ok_or_else(DesktopCommandError::internal)?;
+    canonicalize_unsigned_value(value, positive)
+}
+
+fn canonicalize_unsigned_value(
+    value: &mut Value,
+    positive: bool,
+) -> Result<(), DesktopCommandError> {
+    // The shared bridge has already converted values outside JavaScript's safe range to strings.
+    // Normalize both possible internal Serde representations to one WebView contract.
+    let parsed = match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(decimal) => parse_canonical_u64(decimal),
+        _ => None,
+    }
+    .filter(|value| !positive || *value > 0)
+    .ok_or_else(DesktopCommandError::internal)?;
+    *value = Value::String(parsed.to_string());
+    Ok(())
 }
 
 fn insert_optional<T: serde::Serialize>(

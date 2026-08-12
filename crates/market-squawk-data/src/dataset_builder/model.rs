@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 use std::mem::size_of;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
 use market_squawk_domain::{
@@ -57,6 +57,126 @@ pub enum CorporateActionSensitivity {
     NotApplicable,
     /// Non-raw policies require exact producer evidence for the selected action plan.
     RequiresAdjustment,
+}
+
+/// Code-owned unit tag for a dimensionless return label.
+pub const FEATURE_LABEL_RETURN_UNIT: &str = "market-squawk.return";
+/// Code-owned unit tag for a probability label.
+pub const FEATURE_LABEL_PROBABILITY_UNIT: &str = "market-squawk.probability";
+
+/// Closed measurement derived from the admitted rows of one numeric label.
+///
+/// This contract is produced from the row-level unit and currency columns. It is not inferred from
+/// a label name and cannot be supplied by a model-training caller.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FeatureLabelMeasurement {
+    /// A monetary price in one exact quote currency.
+    Price { currency: Currency },
+    /// A dimensionless return using [`FEATURE_LABEL_RETURN_UNIT`].
+    Return,
+    /// A probability using [`FEATURE_LABEL_PROBABILITY_UNIT`].
+    Probability,
+    /// A numeric regression measurement that is explicitly none of the above.
+    OtherRegression,
+}
+
+impl FeatureLabelMeasurement {
+    pub(crate) fn try_from_parts(
+        unit: Option<&str>,
+        currency: Option<&str>,
+    ) -> Result<Self, DatasetBuildError> {
+        let currency = currency
+            .map(Currency::try_from)
+            .transpose()
+            .map_err(|_| DatasetBuildError::InvalidRequest)?;
+        match (unit, currency) {
+            (None, Some(currency)) => Ok(Self::Price { currency }),
+            (Some(FEATURE_LABEL_RETURN_UNIT), None) => Ok(Self::Return),
+            (Some(FEATURE_LABEL_PROBABILITY_UNIT), None) => Ok(Self::Probability),
+            (None | Some(_), None) => Ok(Self::OtherRegression),
+            (Some(_), Some(_)) => Err(DatasetBuildError::InvalidRequest),
+        }
+    }
+
+    pub(super) fn try_from_value(
+        value: &ComponentValue,
+    ) -> Result<Option<Self>, DatasetBuildError> {
+        match value {
+            ComponentValue::Float {
+                value,
+                unit,
+                currency,
+            } => {
+                let measurement = Self::try_from_parts(
+                    unit.as_ref().map(SourceIdentifier::as_str),
+                    currency.as_ref().map(Currency::as_str),
+                )?;
+                if matches!(measurement, Self::Price { .. }) && *value <= 0.0 {
+                    return Err(DatasetBuildError::InvalidRequest);
+                }
+                Ok(Some(measurement))
+            }
+            ComponentValue::Decimal {
+                value,
+                unit,
+                currency,
+            } => {
+                let measurement = Self::try_from_parts(
+                    unit.as_ref().map(SourceIdentifier::as_str),
+                    currency.as_ref().map(Currency::as_str),
+                )?;
+                if matches!(measurement, Self::Price { .. }) && *value <= Decimal::ZERO {
+                    return Err(DatasetBuildError::InvalidRequest);
+                }
+                Ok(Some(measurement))
+            }
+            ComponentValue::Missing { .. } => Ok(None),
+        }
+    }
+}
+
+/// One exact label contract and the measurement consistently derived from all retained rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeatureLabelMeasurementBinding {
+    label: FeatureLabelComponentSpec,
+    measurement: FeatureLabelMeasurement,
+    fixed_horizon_nanos: Option<NonZeroU64>,
+}
+
+impl FeatureLabelMeasurementBinding {
+    pub(crate) fn try_new(
+        label: FeatureLabelComponentSpec,
+        measurement: FeatureLabelMeasurement,
+        fixed_horizon_nanos: Option<NonZeroU64>,
+    ) -> Result<Self, DatasetBuildError> {
+        if label.kind() != ComponentKind::Label {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        Ok(Self {
+            label,
+            measurement,
+            fixed_horizon_nanos,
+        })
+    }
+
+    /// Returns the exact label component contract.
+    #[must_use]
+    pub const fn label(&self) -> &FeatureLabelComponentSpec {
+        &self.label
+    }
+
+    /// Returns the closed row-derived measurement.
+    #[must_use]
+    pub const fn measurement(&self) -> FeatureLabelMeasurement {
+        self.measurement
+    }
+
+    /// Returns the exact label-effective offset from the feature-effective coordinate only when
+    /// every retained numeric label row proved the same positive nanosecond horizon.
+    #[must_use]
+    pub const fn fixed_horizon_nanos(&self) -> Option<NonZeroU64> {
+        self.fixed_horizon_nanos
+    }
 }
 
 impl CorporateActionSensitivity {
@@ -1054,6 +1174,7 @@ pub struct FeatureLabelDataset {
     pub(super) point_in_time_policy: PointInTimePolicy,
     pub(super) missing_value_policy: MissingValuePolicy,
     pub(super) component_specs: Box<[FeatureLabelComponentSpec]>,
+    pub(super) label_measurements: Box<[FeatureLabelMeasurementBinding]>,
 }
 
 impl FeatureLabelDataset {
@@ -1085,6 +1206,12 @@ impl FeatureLabelDataset {
     /// Returns admitted examples by chronological split.
     pub const fn split_counts(&self) -> DatasetSplitCounts {
         self.split_counts
+    }
+
+    /// Returns the exact measurements derived from all retained numeric label rows.
+    #[must_use]
+    pub fn label_measurements(&self) -> &[FeatureLabelMeasurementBinding] {
+        &self.label_measurements
     }
 
     /// Produces the bounded canonical Task 11 descriptor consumed by Python research training.
@@ -1211,21 +1338,52 @@ fn family_dynamic_bytes(family: &ObservationFamilyKey) -> Result<usize, DatasetB
         } => checked_family_dynamic(source_id, &[accession.as_str()], None),
         ObservationFamilyKey::Fundamental {
             source_id,
-            source_record,
             concept,
             unit,
-            effective,
             ..
-        } => checked_family_dynamic(
-            source_id,
-            &[source_record.as_str(), concept.as_str(), unit.as_str()],
-            Some(effective),
-        ),
+        } => checked_family_dynamic(source_id, &[concept.as_str(), unit.as_str()], None),
         ObservationFamilyKey::Macro {
             source_id,
             series,
             effective,
         } => checked_family_dynamic(source_id, &[series.as_str()], Some(effective)),
+        ObservationFamilyKey::MarketBar {
+            source_id,
+            venue_id,
+            provider_instrument_id,
+            feed,
+            interval,
+            session,
+            effective,
+            ..
+        } => checked_family_dynamic(
+            source_id,
+            &[
+                venue_id.as_str(),
+                provider_instrument_id.as_str(),
+                feed.as_str(),
+                interval.as_str(),
+                session.ruleset().as_str(),
+            ],
+            Some(effective),
+        ),
+        ObservationFamilyKey::FundNav {
+            source_id,
+            provider_product,
+            provider_channel,
+            provider_instrument_id,
+            currency,
+            ..
+        } => checked_family_dynamic(
+            source_id,
+            &[
+                provider_product.as_source_identifier().as_str(),
+                provider_channel.as_source_identifier().as_str(),
+                provider_instrument_id.as_str(),
+                currency.as_str(),
+            ],
+            None,
+        ),
         ObservationFamilyKey::PortfolioPosition {
             source_id,
             account_id,
@@ -1314,6 +1472,8 @@ const fn selector_instrument(family: &ObservationFamilyKey) -> Option<Instrument
     match family {
         ObservationFamilyKey::Filing { instrument_id, .. }
         | ObservationFamilyKey::Fundamental { instrument_id, .. }
+        | ObservationFamilyKey::MarketBar { instrument_id, .. }
+        | ObservationFamilyKey::FundNav { instrument_id, .. }
         | ObservationFamilyKey::PortfolioPosition { instrument_id, .. }
         | ObservationFamilyKey::CorporateAction { instrument_id, .. }
         | ObservationFamilyKey::UniverseMembership { instrument_id, .. } => Some(*instrument_id),
@@ -1341,6 +1501,8 @@ const fn selector_scope(family: &ObservationFamilyKey) -> SelectorScope {
         }
         ObservationFamilyKey::Filing { .. }
         | ObservationFamilyKey::Fundamental { .. }
+        | ObservationFamilyKey::MarketBar { .. }
+        | ObservationFamilyKey::FundNav { .. }
         | ObservationFamilyKey::PortfolioPosition { .. }
         | ObservationFamilyKey::CorporateAction { .. }
         | ObservationFamilyKey::UniverseMembership { .. } => SelectorScope::Global,

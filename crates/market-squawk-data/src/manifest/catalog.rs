@@ -35,6 +35,7 @@ use crate::{
 const REFERENCE_MEMBERSHIP_CHUNK: usize = 128;
 const FEATURE_DATASET_MEMBERSHIP_CHUNK: usize = 128;
 const MAX_FEATURE_DATASET_LEGACY_CANDIDATES: usize = 4_096;
+const MAX_GENERATION_CAPTURE_INPUTS: usize = 4_096;
 const SQLITE_PROGRESS_OPERATIONS: i32 = 1_000;
 
 /// Maximum immutable Python dataset-admission rows retained by one local catalog.
@@ -326,6 +327,7 @@ impl AnalyticalManifestCatalog {
                 && pinned.generation_kind == kind
                 && pinned.build_spec_digest.is_none()
                 && generation_source_input_matches(&transaction, &existing, kind, source_input)?
+                && generation_capture_inputs_match_manifest(&transaction, &existing)?
             {
                 transaction.commit()?;
                 return Ok(existing);
@@ -411,12 +413,8 @@ impl AnalyticalManifestCatalog {
                 anchor.created_at().unix_nanos(),
             ],
         )?;
-        insert_generation_source_input(
-            &transaction,
-            transaction.last_insert_rowid(),
-            kind,
-            source_input,
-        )?;
+        let generation_sequence = transaction.last_insert_rowid();
+        insert_generation_source_input(&transaction, generation_sequence, kind, source_input)?;
         let prior_objects = previous
             .as_ref()
             .map(PinnedDataset::objects)
@@ -459,6 +457,7 @@ impl AnalyticalManifestCatalog {
         if let Some(parent) = parent.as_ref() {
             insert_generation_parent(&transaction, &plan.dataset_id, version, 0, parent)?;
         }
+        insert_generation_capture_inputs(&transaction, generation_sequence)?;
         let manifest = DatasetManifestRef::try_new_with_schema(
             plan.dataset_id.clone(),
             version,
@@ -541,6 +540,7 @@ impl AnalyticalManifestCatalog {
                 && pinned.generation_kind == GenerationKind::Derived
                 && pinned.build_spec_digest == Some(build_spec_digest)
                 && pinned.parents.as_ref() == requested_parents
+                && generation_capture_inputs_match_manifest(&transaction, &existing)?
             {
                 transaction.commit()?;
                 return Ok(existing);
@@ -587,6 +587,7 @@ impl AnalyticalManifestCatalog {
                 anchor.created_at().unix_nanos(),
             ],
         )?;
+        let generation_sequence = transaction.last_insert_rowid();
         for (ordinal, (artifact, object)) in
             canonical_artifacts.iter().zip(&plan.objects).enumerate()
         {
@@ -602,6 +603,7 @@ impl AnalyticalManifestCatalog {
         for (ordinal, parent) in requested_parents.iter().enumerate() {
             insert_generation_parent(&transaction, &plan.dataset_id, version, ordinal, parent)?;
         }
+        insert_generation_capture_inputs(&transaction, generation_sequence)?;
         let manifest = DatasetManifestRef::try_new_with_schema(
             plan.dataset_id.clone(),
             version,
@@ -1320,6 +1322,9 @@ pub enum ManifestCatalogError {
     /// Stored generation membership exceeds the configured reader ceiling.
     #[error("analytical generation exceeds the {max_objects}-object reader ceiling")]
     ObjectLimitExceeded { max_objects: usize },
+    /// Transitive provider-capture lineage exceeds the fixed generation ceiling.
+    #[error("analytical generation exceeds the {max}-provider-capture input ceiling")]
+    CaptureInputLimitExceeded { max: usize },
     /// Candidate reachability work exceeds the explicit operation ceiling.
     #[error("analytical reference lookup exceeds the {max_candidates}-candidate work ceiling")]
     ReferenceWorkLimitExceeded { max_candidates: usize },
@@ -1569,6 +1574,9 @@ fn load_pinned(
         generation_kind,
         parent_count,
     )?;
+    if !generation_capture_inputs_match_manifest(connection, reference)? {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
     let retrieval_limit = max_objects
         .checked_add(1)
         .ok_or(ManifestCatalogError::CountOverflow)?;
@@ -1964,6 +1972,169 @@ fn generation_source_input_matches(
         (GenerationKind::Ingest | GenerationKind::Compaction | GenerationKind::Derived, _) => false,
     };
     Ok(exists)
+}
+
+fn insert_generation_capture_inputs(
+    transaction: &Transaction<'_>,
+    generation_sequence: i64,
+) -> Result<(), ManifestCatalogError> {
+    if generation_sequence <= 0 {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    let kind: String = transaction.query_row(
+        "SELECT generation_kind FROM analytical_generations WHERE generation_sequence=?1",
+        [generation_sequence],
+        |row| row.get(0),
+    )?;
+    let inserted = match kind.as_str() {
+        "ingest" | "compaction" | "derived" => transaction.execute(
+            "INSERT INTO analytical_generation_capture_inputs
+             (generation_sequence, input_ordinal, capture_receipt_digest, run_id, source_id)
+             WITH candidates AS (
+                 SELECT capture_input.capture_receipt_digest,
+                        capture_input.run_id,
+                        capture_input.source_id
+                 FROM analytical_generation_source_inputs AS source_input
+                 JOIN ingest_run_capture_inputs AS capture_input USING (run_id)
+                 WHERE source_input.generation_sequence=?1
+                 UNION
+                 SELECT parent_input.capture_receipt_digest,
+                        parent_input.run_id,
+                        parent_input.source_id
+                 FROM analytical_generation_parents AS edge
+                 JOIN analytical_generation_capture_inputs AS parent_input
+                   ON parent_input.generation_sequence=edge.parent_generation_sequence
+                 JOIN analytical_generations AS child
+                   ON child.dataset_id=edge.child_dataset_id
+                  AND child.manifest_version=edge.child_manifest_version
+                 WHERE child.generation_sequence=?1
+             )
+             SELECT ?1,
+                    ROW_NUMBER() OVER (
+                        ORDER BY capture_receipt_digest, run_id, source_id
+                    ) - 1,
+                    capture_receipt_digest, run_id, source_id
+             FROM candidates
+             ORDER BY capture_receipt_digest, run_id, source_id
+             LIMIT ?2",
+            params![
+                generation_sequence,
+                i64::try_from(MAX_GENERATION_CAPTURE_INPUTS)
+                    .map_err(|_| ManifestCatalogError::CountOverflow)?
+            ],
+        )?,
+        _ => return Err(ManifestCatalogError::CorruptCatalog),
+    };
+    let expected =
+        expected_generation_capture_input_count(transaction, generation_sequence, &kind)?;
+    if expected < 0
+        || usize::try_from(expected)
+            .ok()
+            .is_none_or(|count| count > MAX_GENERATION_CAPTURE_INPUTS || count != inserted)
+    {
+        return Err(ManifestCatalogError::CaptureInputLimitExceeded {
+            max: MAX_GENERATION_CAPTURE_INPUTS,
+        });
+    }
+    Ok(())
+}
+
+fn expected_generation_capture_input_count(
+    transaction: &Connection,
+    generation_sequence: i64,
+    kind: &str,
+) -> Result<i64, ManifestCatalogError> {
+    match kind {
+        "ingest" | "compaction" | "derived" => Ok(transaction.query_row(
+            "WITH candidates AS (
+                 SELECT capture_input.capture_receipt_digest
+                 FROM analytical_generation_source_inputs AS source_input
+                 JOIN ingest_run_capture_inputs AS capture_input USING (run_id)
+                 WHERE source_input.generation_sequence=?1
+                 UNION
+                 SELECT parent_input.capture_receipt_digest
+                 FROM analytical_generation_parents AS edge
+                 JOIN analytical_generation_capture_inputs AS parent_input
+                   ON parent_input.generation_sequence=edge.parent_generation_sequence
+                 JOIN analytical_generations AS child
+                   ON child.dataset_id=edge.child_dataset_id
+                  AND child.manifest_version=edge.child_manifest_version
+                 WHERE child.generation_sequence=?1
+             )
+             SELECT COUNT(*) FROM candidates",
+            [generation_sequence],
+            |row| row.get(0),
+        )?),
+        _ => Err(ManifestCatalogError::CorruptCatalog),
+    }
+}
+
+fn generation_capture_inputs_match_manifest(
+    transaction: &Connection,
+    manifest: &DatasetManifestRef,
+) -> Result<bool, ManifestCatalogError> {
+    let (sequence, kind): (i64, String) = transaction.query_row(
+        "SELECT generation_sequence, generation_kind FROM analytical_generations
+         WHERE dataset_id=?1 AND manifest_version=?2",
+        params![
+            manifest.dataset_id().as_str(),
+            to_i64(manifest.manifest_version())?
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let expected = expected_generation_capture_input_count(transaction, sequence, &kind)?;
+    let ordinal_shape: bool = transaction.query_row(
+        "SELECT COUNT(*)=0
+             OR (
+                 MIN(input_ordinal)=0
+                 AND MAX(input_ordinal)=COUNT(*)-1
+             )
+         FROM analytical_generation_capture_inputs
+         WHERE generation_sequence=?1",
+        [sequence],
+        |row| row.get(0),
+    )?;
+    let exact: bool = transaction.query_row(
+        "WITH candidates AS (
+             SELECT capture_input.capture_receipt_digest,
+                    capture_input.run_id,
+                    capture_input.source_id
+             FROM analytical_generation_source_inputs AS source_input
+             JOIN ingest_run_capture_inputs AS capture_input USING (run_id)
+             WHERE source_input.generation_sequence=?1
+             UNION
+             SELECT parent_input.capture_receipt_digest,
+                    parent_input.run_id,
+                    parent_input.source_id
+             FROM analytical_generation_parents AS edge
+             JOIN analytical_generation_capture_inputs AS parent_input
+               ON parent_input.generation_sequence=edge.parent_generation_sequence
+             JOIN analytical_generations AS child
+               ON child.dataset_id=edge.child_dataset_id
+              AND child.manifest_version=edge.child_manifest_version
+             WHERE child.generation_sequence=?1
+         ),
+         expected AS (
+             SELECT ROW_NUMBER() OVER (
+                        ORDER BY capture_receipt_digest, run_id, source_id
+                    ) - 1 AS input_ordinal,
+                    capture_receipt_digest, run_id, source_id
+             FROM candidates
+         ),
+         actual AS (
+             SELECT input_ordinal, capture_receipt_digest, run_id, source_id
+             FROM analytical_generation_capture_inputs
+             WHERE generation_sequence=?1
+         )
+         SELECT NOT EXISTS(SELECT * FROM expected EXCEPT SELECT * FROM actual)
+            AND NOT EXISTS(SELECT * FROM actual EXCEPT SELECT * FROM expected)",
+        [sequence],
+        |row| row.get(0),
+    )?;
+    Ok(exact
+        && ordinal_shape
+        && expected >= 0
+        && usize::try_from(expected).is_ok_and(|count| count <= MAX_GENERATION_CAPTURE_INPUTS))
 }
 
 fn generation_source(

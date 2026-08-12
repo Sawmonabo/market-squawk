@@ -1,5 +1,10 @@
 import * as React from "react"
-import { AlertCircle, BriefcaseBusiness, RefreshCw } from "lucide-react"
+import {
+  AlertCircle,
+  BriefcaseBusiness,
+  ChevronDown,
+  RefreshCw,
+} from "lucide-react"
 
 import { messageFrom, useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -18,9 +23,11 @@ import { PortfolioImportWorkflow } from "./portfolio-import-workflow"
 import {
   AllocationPanel,
   ExposurePanel,
+  FinancialPositionCoverage,
   PerformancePanel,
   PortfolioSummary,
   ProvenancePanel,
+  RecommendationSetupPanel,
   ReconciliationPanel,
   RiskPanel,
 } from "./portfolio-panels"
@@ -69,7 +76,7 @@ function PortfolioWorkspace({
   const accounts = usePortfolioAccounts(transport, bootstrap)
   const rows = accounts.query.data?.pages.flatMap((page) => page.value) ?? []
   const [selectedId, setSelectedId] = React.useState<string | null>(null)
-  const selected = rows.find((account) => account.accountId === selectedId) ?? rows[0] ?? null
+  const selected = rows.find((account) => account.accountId === selectedId) ?? null
   const details = usePortfolioDetails(
     transport,
     bootstrap.runtime,
@@ -78,10 +85,13 @@ function PortfolioWorkspace({
   )
 
   React.useEffect(() => {
-    if (selected && selected.accountId !== selectedId) {
-      setSelectedId(selected.accountId)
+    if (
+      selectedId !== null &&
+      !rows.some((account) => account.accountId === selectedId)
+    ) {
+      setSelectedId(null)
     }
-  }, [selected, selectedId])
+  }, [rows, selectedId])
 
   if (!accounts.available) {
     return (
@@ -106,12 +116,13 @@ function PortfolioWorkspace({
       <header className="flex flex-col gap-4 border-b border-border pb-6 lg:flex-row lg:items-end lg:justify-between">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">
-            Your invested assets
+            Your supported financial position
           </p>
-          <h1 className="mt-2 text-3xl font-semibold tracking-tight">Portfolios</h1>
+          <h1 className="mt-2 text-3xl font-semibold tracking-tight">Portfolio</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Understand what you own, how it has changed, where risk is concentrated, and which
-            source evidence supports every displayed value.
+            Review every returned account and asset without assuming it is a stock portfolio.
+            Market Squawk keeps imported investments, account cash, missing bank coverage, and
+            unavailable liabilities clearly separated.
           </p>
         </div>
         <Button
@@ -127,15 +138,6 @@ function PortfolioWorkspace({
         </Button>
       </header>
 
-      <PortfolioImportWorkflow
-        bootstrap={bootstrap}
-        selectedAccountId={selected?.accountId ?? null}
-        onCommitted={async () => {
-          await accounts.query.refetch()
-          await details.refresh()
-        }}
-      />
-
       {accounts.query.isPending ? (
         <PortfolioLoading />
       ) : accounts.query.isError ? (
@@ -145,12 +147,26 @@ function PortfolioWorkspace({
           retry={() => void accounts.query.refetch()}
         />
       ) : rows.length === 0 ? (
-        <EmptyPortfolio />
-      ) : selected ? (
         <>
-          <AccountPicker
+          <FinancialPositionCoverage
             accounts={rows}
-            selected={selected}
+            holdingsAvailable={hasOperation(bootstrap, "Portfolio.GetHoldings")}
+            performanceAvailable={hasOperation(bootstrap, "Portfolio.GetPerformance")}
+            transactionsAvailable={hasOperation(bootstrap, "Portfolio.GetTransactions")}
+          />
+          <EmptyPortfolio />
+        </>
+      ) : (
+        <>
+          <FinancialPositionCoverage
+            accounts={rows}
+            holdingsAvailable={hasOperation(bootstrap, "Portfolio.GetHoldings")}
+            performanceAvailable={hasOperation(bootstrap, "Portfolio.GetPerformance")}
+            transactionsAvailable={hasOperation(bootstrap, "Portfolio.GetTransactions")}
+          />
+          <AccountDirectory
+            accounts={rows}
+            selectedId={selectedId}
             select={setSelectedId}
             loadMore={
               accounts.query.hasNextPage
@@ -159,14 +175,41 @@ function PortfolioWorkspace({
             }
             loadingMore={accounts.query.isFetchingNextPage}
           />
-          <DetailWorkspace
-            account={selected}
-            details={details}
-            bootstrap={bootstrap}
-            transport={transport}
-          />
+          <RecommendationSetupPanel selectedAccount={selected} />
+          {selected ? (
+            <DetailWorkspace
+              account={selected}
+              details={details}
+              bootstrap={bootstrap}
+              transport={transport}
+            />
+          ) : (
+            <SelectAccountPrompt />
+          )}
         </>
-      ) : null}
+      )}
+
+      <details className="group mt-5 rounded-xl border border-border bg-card/30 p-4">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary">
+          <span>Import or update account evidence</span>
+          <ChevronDown
+            className="size-4 text-muted-foreground transition-transform group-open:rotate-180"
+            aria-hidden="true"
+          />
+        </summary>
+        <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
+          This advanced local workflow imports an immutable account revision. It does not connect
+          a bank, classify an account, or select an account for recommendations.
+        </p>
+        <PortfolioImportWorkflow
+          bootstrap={bootstrap}
+          selectedAccountId={selected?.accountId ?? null}
+          onCommitted={async () => {
+            await accounts.query.refetch()
+            await details.refresh()
+          }}
+        />
+      </details>
     </PortfolioFrame>
   )
 }
@@ -272,34 +315,49 @@ function DetailWorkspace({
         )}
       </div>
 
-      <PortfolioHistory account={account} bootstrap={bootstrap} transport={transport} />
+      <details className="group rounded-xl border border-border bg-card/20 p-4">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary">
+          <span>Advanced history, stress tests, planning, and evidence</span>
+          <ChevronDown
+            className="size-4 text-muted-foreground transition-transform group-open:rotate-180"
+            aria-hidden="true"
+          />
+        </summary>
+        <p className="mt-2 text-xs leading-5 text-muted-foreground">
+          Open this workspace to compare immutable revisions, run deterministic scenarios, draft
+          analysis-only changes, and inspect provenance. None of these controls can place an order.
+        </p>
+        <div className="mt-4 space-y-4">
+          <PortfolioHistory account={account} bootstrap={bootstrap} transport={transport} />
 
-      <div className="grid gap-4 2xl:grid-cols-2">
-        <PortfolioScenarios
-          account={account}
-          holdings={holdings ?? []}
-          bootstrap={bootstrap}
-          transport={transport}
-        />
-        <PortfolioPlanning
-          account={account}
-          holdings={holdings ?? []}
-          bootstrap={bootstrap}
-          transport={transport}
-        />
-      </div>
+          <div className="grid gap-4 2xl:grid-cols-2">
+            <PortfolioScenarios
+              account={account}
+              holdings={holdings ?? []}
+              bootstrap={bootstrap}
+              transport={transport}
+            />
+            <PortfolioPlanning
+              account={account}
+              holdings={holdings ?? []}
+              bootstrap={bootstrap}
+              transport={transport}
+            />
+          </div>
 
-      <div className="grid gap-4 xl:grid-cols-2">
-        {details.holdings.data ? (
-          <ProvenancePanel account={account} holdingsResult={details.holdings.data} />
-        ) : (
-          <InlineUnavailable text="Mark provenance is unavailable without holding evidence." />
-        )}
-        <ReconciliationPanel
-          account={account}
-          performance={details.performance.data?.value ?? null}
-        />
-      </div>
+          <div className="grid gap-4 xl:grid-cols-2">
+            {details.holdings.data ? (
+              <ProvenancePanel account={account} holdingsResult={details.holdings.data} />
+            ) : (
+              <InlineUnavailable text="Mark provenance is unavailable without holding evidence." />
+            )}
+            <ReconciliationPanel
+              account={account}
+              performance={details.performance.data?.value ?? null}
+            />
+          </div>
+        </div>
+      </details>
     </div>
   )
 }
@@ -319,50 +377,116 @@ function detailName(operation: string) {
   }
 }
 
-function AccountPicker({
+function AccountDirectory({
   accounts,
-  selected,
+  selectedId,
   select,
   loadMore,
   loadingMore,
 }: {
   accounts: PortfolioAccount[]
-  selected: PortfolioAccount
+  selectedId: string | null
   select: (accountId: string) => void
   loadMore: (() => void) | null
   loadingMore: boolean
 }) {
   return (
-    <section className="mt-5 flex flex-col gap-4 rounded-xl border border-border bg-card/35 p-4 md:flex-row md:items-center md:justify-between">
-      <div>
-        <label htmlFor="portfolio-account" className="text-xs font-semibold">
-          Portfolio account
-        </label>
-        <p className="mt-1 text-[11px] text-muted-foreground">
-          Choose the account whose latest available revision you want to inspect.
-        </p>
-      </div>
-      <div className="flex flex-wrap items-center gap-2">
-        <select
-          id="portfolio-account"
-          value={selected.accountId}
-          onChange={(event) => select(event.target.value)}
-          className="h-9 min-w-60 rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          {accounts.map((account) => (
-            <option key={account.accountId} value={account.accountId}>
-              {shortIdentity(account.accountId, "Account")} · {account.currency.toUpperCase()}
-            </option>
-          ))}
-        </select>
+    <section
+      className="mt-5 rounded-xl border border-border bg-card/35 p-5"
+      aria-labelledby="portfolio-accounts"
+    >
+      <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
+            Returned accounts
+          </p>
+          <h2 id="portfolio-accounts" className="mt-2 text-lg font-semibold">
+            Choose an account to inspect
+          </h2>
+          <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
+            Selection controls only this page. It does not select a recommendation account, and
+            Market Squawk never chooses the first returned account on your behalf.
+          </p>
+        </div>
         {loadMore ? (
           <Button variant="outline" size="sm" onClick={loadMore} disabled={loadingMore}>
-            {loadingMore ? "Loading…" : "Load more"}
+            {loadingMore ? "Loading…" : "Load more accounts"}
           </Button>
         ) : null}
       </div>
+      <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        {accounts.map((account) => {
+          const selected = selectedId === account.accountId
+          return (
+            <button
+              key={account.accountId}
+              type="button"
+              aria-pressed={selected}
+              onClick={() => select(account.accountId)}
+              className={`rounded-lg border p-4 text-left transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary ${
+                selected
+                  ? "border-primary/60 bg-primary/10"
+                  : "border-border bg-background/30 hover:border-primary/30 hover:bg-background/50"
+              }`}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold">
+                    {shortIdentity(account.accountId, "Account")}
+                  </p>
+                  <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">
+                    {account.accountId}
+                  </p>
+                </div>
+                <span className="rounded-md border border-border px-2 py-1 font-mono text-[10px]">
+                  {account.currency.toUpperCase()}
+                </span>
+              </div>
+              <dl className="mt-4 grid grid-cols-2 gap-3 text-xs">
+                <AccountFact label="Account type" value="Not supplied" />
+                <AccountFact label="Source" value={account.currentRevision.sourceId} />
+                <AccountFact label="Assets" value={account.holdingCount.toLocaleString()} />
+                <AccountFact
+                  label="Transactions"
+                  value={account.transactionCount.toLocaleString()}
+                />
+              </dl>
+              <p className="mt-4 text-[11px] font-medium text-primary">
+                {selected ? "Selected for inspection" : "Inspect this account"}
+              </p>
+            </button>
+          )
+        })}
+      </div>
     </section>
   )
+}
+
+function AccountFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</dt>
+      <dd className="mt-1 truncate font-mono text-[11px]">{value}</dd>
+    </div>
+  )
+}
+
+function SelectAccountPrompt() {
+  return (
+    <section className="mt-5 rounded-xl border border-dashed border-border bg-card/20 p-7 text-center">
+      <BriefcaseBusiness className="mx-auto size-6 text-muted-foreground" aria-hidden="true" />
+      <h2 className="mt-4 text-lg font-semibold">Select an account to view its evidence</h2>
+      <p className="mx-auto mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+        Market Squawk will load holdings, account cash, performance, exposure, and risk only after
+        you make an explicit selection. Accounts in different currencies are never silently
+        combined.
+      </p>
+    </section>
+  )
+}
+
+function hasOperation(bootstrap: DesktopBootstrap, operation: string) {
+  return bootstrap.operations.some((candidate) => candidate.name === operation)
 }
 
 function PortfolioFrame({ children }: { children: React.ReactNode }) {
@@ -408,10 +532,12 @@ function EmptyPortfolio() {
   return (
     <section className="mt-6 rounded-xl border border-border bg-card/45 p-7">
       <BriefcaseBusiness className="size-6 text-muted-foreground" aria-hidden="true" />
-      <h2 className="mt-4 text-lg font-semibold">No portfolio account has been imported</h2>
+      <h2 className="mt-4 text-lg font-semibold">No account evidence has been imported</h2>
       <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-        Use the protected local import above to select a portfolio extraction batch, review its
-        normalized records and reconciliation evidence, and commit an immutable revision.
+        Open{" "}
+        <span className="font-medium text-foreground">Import or update account evidence</span>
+        {" "}below to select a portfolio extraction batch, review its normalized records and
+        reconciliation evidence, and commit an immutable revision.
       </p>
     </section>
   )

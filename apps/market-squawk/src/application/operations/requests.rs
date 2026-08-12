@@ -165,7 +165,6 @@ pub(super) fn result_item_count(value: &Value) -> usize {
         .filter_map(|field| object.get(field).and_then(Value::as_array).map(Vec::len))
         .max()
         .unwrap_or(1)
-        .max(1)
 }
 
 pub(super) fn map_backup_error(_error: super::super::backup::ProductBackupError) -> ServiceError {

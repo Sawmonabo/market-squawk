@@ -12,7 +12,7 @@ use market_squawk::application::analysis::{
     GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationReceipt,
     GovernedBacktestPrepublishAuthority, GovernedBacktestRecord,
 };
-use market_squawk::application::job::{JobApplication, JobApplicationError};
+use market_squawk::application::job::{JobApplication, JobReceipt, JobView};
 use market_squawk::application::{ApplicationDomainService, application_capabilities};
 use market_squawk::cli::{Cli, Command, FeatureCommand};
 use market_squawk::jobs::BacktestJobRunner;
@@ -56,7 +56,9 @@ use market_squawk_domain::{
     SourceIdentifier, Timestamp, UniverseMembershipObservation,
 };
 use market_squawk_execution::{BoundedOrderIntents, StrategyError};
-use market_squawk_jobs::{JobActivityClass, JobOrigin, JobRunner, JobRunnerRegistration, JobState};
+use market_squawk_jobs::{
+    JobActivityClass, JobOrigin, JobRunner, JobRunnerRegistration, JobState, SqliteJobRepository,
+};
 use market_squawk_portfolio::{PortfolioLimitInput, PortfolioLimits};
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ResultCompleteness, ServiceError,
@@ -76,6 +78,26 @@ use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+async fn wait_for_exact_terminal(
+    application: &JobApplication<SqliteJobRepository>,
+    receipt: JobReceipt,
+    timeout: Duration,
+) -> TestResult<JobView> {
+    let terminal = tokio::time::timeout(timeout, async {
+        loop {
+            let view = application
+                .get(receipt.job_id(), receipt.generation())
+                .await?;
+            if view.state().is_terminal() {
+                return Ok::<JobView, Box<dyn Error>>(view);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
+    Ok(terminal)
+}
 
 #[derive(Debug)]
 struct ControlledBacktestAuthority {
@@ -192,28 +214,10 @@ async fn job_domain_start_backtest_returns_before_completion_and_survives_discon
     .await??;
     governed.started.acquire().await?.forget();
 
-    let disconnected = CancellationToken::new();
-    disconnected.cancel();
-    assert_eq!(
-        application
-            .wait_terminal(
-                receipt.job_id(),
-                &disconnected,
-                Instant::now() + Duration::from_secs(1),
-            )
-            .await,
-        Err(JobApplicationError::WaitCancelled)
-    );
-
+    drop(application);
     governed.release.notify_one();
     let reconnected = JobApplication::new(jobs.repository(), jobs.authority());
-    let completed = reconnected
-        .wait_terminal(
-            receipt.job_id(),
-            &CancellationToken::new(),
-            Instant::now() + Duration::from_secs(2),
-        )
-        .await?;
+    let completed = wait_for_exact_terminal(&reconnected, receipt, Duration::from_secs(2)).await?;
     assert_eq!(completed.state(), JobState::Completed);
     assert!(completed.result().is_some());
 
@@ -259,7 +263,9 @@ async fn job_domain_explicit_backtest_cancel_cannot_publish_a_governed_record() 
         )
         .await?;
     governed.started.acquire().await?.forget();
-    let running = application.get(receipt.job_id()).await?;
+    let running = application
+        .get(receipt.job_id(), receipt.generation())
+        .await?;
     assert_eq!(running.state(), JobState::Running);
 
     application
@@ -270,13 +276,7 @@ async fn job_domain_explicit_backtest_cancel_cannot_publish_a_governed_record() 
             Timestamp::from_unix_nanos(101),
         )
         .await?;
-    let terminal = application
-        .wait_terminal(
-            receipt.job_id(),
-            &CancellationToken::new(),
-            Instant::now() + Duration::from_secs(2),
-        )
-        .await?;
+    let terminal = wait_for_exact_terminal(&application, receipt, Duration::from_secs(2)).await?;
     assert_eq!(terminal.state(), JobState::Cancelled);
     assert!(!governed.published.load(Ordering::Acquire));
 
@@ -299,15 +299,15 @@ fn governed_command_fixture() -> TestResult<GovernedBacktestCommand> {
 fn governed_record_fixture() -> TestResult<GovernedBacktestRecord> {
     let digest = "11".repeat(32);
     Ok(GovernedBacktestRecord::try_from_persisted(json!({
-        "recordVersion": 1,
+        "recordVersion": 2,
         "runId": digest,
         "datasetIdentity": "22".repeat(32),
         "objectGraphDigest": "33".repeat(32),
         "executionAssumptionDigest": "44".repeat(32),
-        "cohortAuthorityDigest": null,
+        "cohortAuthorityDigest": "55".repeat(32),
         "cohortUniverseDigest": null,
         "seed": 7,
-        "selectionCriterion": "total-return",
+        "selectionCriterion": "cost-adjusted-total-return",
         "status": {"state": "failed"}
     }))?)
 }
@@ -400,7 +400,7 @@ fn production_backtest_inventory_is_confined_to_the_controlled_artifact_root()
     let input_contract: fn(PinnedBacktestInput) -> PinnedInstrumentDefinitions =
         |input| input.instrument_definitions;
     let _ = input_contract;
-    assert!(paths.artifacts()?.root().join("backtesting/v1").is_dir());
+    assert!(paths.artifacts()?.root().join("backtesting/v3").is_dir());
     Ok(())
 }
 

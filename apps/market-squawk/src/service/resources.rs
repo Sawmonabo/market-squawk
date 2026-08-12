@@ -135,8 +135,12 @@ impl McpResourceProvider for InstalledResourceProvider {
                 self.application_resource("Model.GetMetadata", arguments, context)
                     .await
             }
-            McpResourceRequest::Job(job_id) => {
-                let snapshot = self.jobs.get_latest(job_id).await.map_err(map_job_error)?;
+            McpResourceRequest::Job(identity) => {
+                let snapshot = self
+                    .jobs
+                    .get(identity.job_id(), identity.generation())
+                    .await
+                    .map_err(map_job_error)?;
                 let value = serde_json::to_value(snapshot)
                     .map_err(|_error| McpResourceError::InvalidDocument)?;
                 McpResourceDocument::try_new(value, 1)

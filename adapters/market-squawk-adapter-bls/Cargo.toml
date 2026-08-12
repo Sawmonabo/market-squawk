@@ -10,8 +10,10 @@ publish = false
 
 [dependencies]
 bytes.workspace = true
+chrono.workspace = true
 futures-util.workspace = true
 market-squawk-domain.workspace = true
+market-squawk-platform.workspace = true
 market-squawk-sources.workspace = true
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
 rust_decimal.workspace = true
@@ -21,6 +23,7 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+uuid.workspace = true
 zeroize.workspace = true
 
 [lints]

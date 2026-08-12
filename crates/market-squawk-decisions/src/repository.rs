@@ -3,11 +3,18 @@
 use std::fmt;
 
 use crate::{
-    CandidateId, DecisionDossier, GovernedTargetSet, InvestmentTargetSetId, SavedScreen,
-    ScreenExecution, ScreenId, ScreenRun, ScreenRunId, TargetInvalidation, TargetReview,
-    TargetReviewDisposition, TargetState, TargetStatus,
+    AnalyticalProfileBindingReference, CandidateId, DecisionDossier, GovernedTargetSet,
+    InvestmentAnalysisId, InvestmentOutcomeProjection, InvestmentProjectionDigest,
+    InvestmentProposalAuthority, InvestmentProposalDecision, InvestmentProposalId,
+    InvestmentSizingProjection, InvestmentTargetSetId, NoActionReason, ProposalUnavailableReason,
+    PublishedInvestmentAnalysis, RecommendationAction, RecommendationDerivationDigest,
+    RecommendationEvidenceDigest, RecommendationOutcomeCohort,
+    RecommendationOutcomeCurrentIndexEntry, RecommendationOutcomeStatus,
+    RecommendationOutcomeStatusRecord, RecommendationPolicyDigest, RecommendationTrackRecord,
+    RecommendationTrackRecordGroup, SavedScreen, ScreenExecution, ScreenId, ScreenRun, ScreenRunId,
+    TargetInvalidation, TargetReview, TargetReviewDisposition, TargetState, TargetStatus,
 };
-use market_squawk_domain::{InstrumentId, RevisionNumber};
+use market_squawk_domain::{AccountId, Currency, InstrumentId, RevisionNumber, Timestamp};
 
 const MAX_REPOSITORY_LIMIT: usize = 65_536;
 const MAX_REPOSITORY_CANDIDATES: usize = 1_000_000;
@@ -22,6 +29,7 @@ pub struct DecisionRepositoryLimits {
     maximum_target_revisions: usize,
     maximum_reviews: usize,
     maximum_invalidations: usize,
+    maximum_investment_proposals: usize,
     maximum_records: usize,
 }
 
@@ -39,6 +47,7 @@ impl DecisionRepositoryLimits {
         maximum_target_revisions: usize,
         maximum_reviews: usize,
         maximum_invalidations: usize,
+        maximum_investment_proposals: usize,
     ) -> Result<Self, DecisionRepositoryError> {
         let values = [
             maximum_screen_revisions,
@@ -48,6 +57,7 @@ impl DecisionRepositoryLimits {
             maximum_target_revisions,
             maximum_reviews,
             maximum_invalidations,
+            maximum_investment_proposals,
         ];
         if values
             .into_iter()
@@ -61,6 +71,7 @@ impl DecisionRepositoryLimits {
             .and_then(|value| value.checked_add(maximum_target_revisions))
             .and_then(|value| value.checked_add(maximum_reviews))
             .and_then(|value| value.checked_add(maximum_invalidations))
+            .and_then(|value| value.checked_add(maximum_investment_proposals))
             .ok_or(DecisionRepositoryError::InvalidLimits)?;
         let maximum_candidates = maximum_screen_runs
             .checked_mul(maximum_candidates_per_run)
@@ -77,8 +88,74 @@ impl DecisionRepositoryLimits {
             maximum_target_revisions,
             maximum_reviews,
             maximum_invalidations,
+            maximum_investment_proposals,
             maximum_records,
         })
+    }
+
+    /// Returns the maximum durable saved-screen executions.
+    #[must_use]
+    pub const fn maximum_screen_runs(self) -> usize {
+        self.maximum_screen_runs
+    }
+
+    /// Returns the shared maximum for proposal, publication, projection, and outcome records.
+    #[must_use]
+    pub const fn maximum_investment_proposals(self) -> usize {
+        self.maximum_investment_proposals
+    }
+
+    /// Returns the complete domain-record ceiling, excluding application-owned journal rows.
+    #[must_use]
+    pub const fn maximum_records(self) -> usize {
+        self.maximum_records
+    }
+}
+
+/// Current publication and sidecar locator for one immutable investment analysis.
+///
+/// Entries are keyed by analysis identity and updated only from validated immutable records. They
+/// are not an append-order or profitability ranking.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvestmentAnalysisCurrentIndexEntry {
+    publication: PublishedInvestmentAnalysis,
+    outcome_projection_digest: Option<InvestmentProjectionDigest>,
+    sizing_projection_digest: Option<InvestmentProjectionDigest>,
+    current_outcome: Option<RecommendationOutcomeCurrentIndexEntry>,
+}
+
+impl InvestmentAnalysisCurrentIndexEntry {
+    fn new(publication: PublishedInvestmentAnalysis) -> Self {
+        Self {
+            publication,
+            outcome_projection_digest: None,
+            sizing_projection_digest: None,
+            current_outcome: None,
+        }
+    }
+
+    /// Returns the canonical immutable profile/workflow publication.
+    #[must_use]
+    pub const fn publication(&self) -> &PublishedInvestmentAnalysis {
+        &self.publication
+    }
+
+    /// Returns the current exact outcome-projection identity when persisted.
+    #[must_use]
+    pub const fn outcome_projection_digest(&self) -> Option<InvestmentProjectionDigest> {
+        self.outcome_projection_digest
+    }
+
+    /// Returns the current exact sizing-projection identity when persisted.
+    #[must_use]
+    pub const fn sizing_projection_digest(&self) -> Option<InvestmentProjectionDigest> {
+        self.sizing_projection_digest
+    }
+
+    /// Returns the latest contiguous realized-outcome status when one exists.
+    #[must_use]
+    pub const fn current_outcome(&self) -> Option<&RecommendationOutcomeCurrentIndexEntry> {
+        self.current_outcome.as_ref()
     }
 }
 
@@ -173,6 +250,140 @@ impl TargetIndexEntry {
     }
 }
 
+/// Closed outcome summary for one immutable investment-analysis locator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvestmentProposalIndexOutcome {
+    /// Complete evidence produced a position-aware recommendation.
+    Generated(RecommendationAction),
+    /// Complete evidence required an explicit abstention.
+    NoAction(NoActionReason),
+    /// Mandatory evidence was missing or inadmissible.
+    Unavailable(ProposalUnavailableReason),
+}
+
+/// Bounded append-derived locator for one immutable investment-analysis result.
+///
+/// This projection grants no generation, ranking, current-profile, order, or execution authority.
+/// Consumers use its exact analysis identity to retrieve the complete recomputed decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvestmentProposalIndexEntry {
+    analysis_id: InvestmentAnalysisId,
+    proposal_id: Option<InvestmentProposalId>,
+    derivation_digest: Option<RecommendationDerivationDigest>,
+    instrument_id: InstrumentId,
+    account_id: AccountId,
+    currency: Currency,
+    as_of: Timestamp,
+    horizon_at: Timestamp,
+    expires_at: Timestamp,
+    policy_digest: RecommendationPolicyDigest,
+    evidence_digest: RecommendationEvidenceDigest,
+    outcome: InvestmentProposalIndexOutcome,
+}
+
+impl InvestmentProposalIndexEntry {
+    fn from_decision(decision: &InvestmentProposalDecision) -> Self {
+        let evidence = decision.evidence();
+        let outcome = match decision {
+            InvestmentProposalDecision::Generated(value) => {
+                InvestmentProposalIndexOutcome::Generated(value.action())
+            }
+            InvestmentProposalDecision::NoAction(value) => {
+                InvestmentProposalIndexOutcome::NoAction(value.reason())
+            }
+            InvestmentProposalDecision::Unavailable(value) => {
+                InvestmentProposalIndexOutcome::Unavailable(value.reason())
+            }
+        };
+        Self {
+            analysis_id: decision.analysis_id(),
+            proposal_id: decision.proposal_id(),
+            derivation_digest: decision.derivation_digest(),
+            instrument_id: evidence.instrument_id(),
+            account_id: evidence.account_id(),
+            currency: evidence.currency(),
+            as_of: evidence.as_of(),
+            horizon_at: decision.horizon_at(),
+            expires_at: decision.expires_at(),
+            policy_digest: decision.policy_digest(),
+            evidence_digest: decision.evidence_digest(),
+            outcome,
+        }
+    }
+
+    /// Returns the stable identity shared by generated, no-action, and unavailable results.
+    #[must_use]
+    pub const fn analysis_id(&self) -> InvestmentAnalysisId {
+        self.analysis_id
+    }
+
+    /// Returns the proposal identity for generated and no-action results.
+    #[must_use]
+    pub const fn proposal_id(&self) -> Option<InvestmentProposalId> {
+        self.proposal_id
+    }
+
+    /// Returns the exact derivation commitment for generated and no-action results.
+    #[must_use]
+    pub const fn derivation_digest(&self) -> Option<RecommendationDerivationDigest> {
+        self.derivation_digest
+    }
+
+    /// Returns the stable instrument analyzed by this result.
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the exact portfolio account bound into this analysis.
+    #[must_use]
+    pub const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    /// Returns the analysis denomination.
+    #[must_use]
+    pub const fn currency(&self) -> Currency {
+        self.currency
+    }
+
+    /// Returns the point-in-time evidence cutoff.
+    #[must_use]
+    pub const fn as_of(&self) -> Timestamp {
+        self.as_of
+    }
+
+    /// Returns the exact code-owned analysis horizon.
+    #[must_use]
+    pub const fn horizon_at(&self) -> Timestamp {
+        self.horizon_at
+    }
+
+    /// Returns the exclusive result expiry.
+    #[must_use]
+    pub const fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
+
+    /// Returns the exact code-owned recommendation-policy identity.
+    #[must_use]
+    pub const fn policy_digest(&self) -> RecommendationPolicyDigest {
+        self.policy_digest
+    }
+
+    /// Returns the commitment to every supplied or absent evidence field.
+    #[must_use]
+    pub const fn evidence_digest(&self) -> RecommendationEvidenceDigest {
+        self.evidence_digest
+    }
+
+    /// Returns the compact typed result family and conclusion.
+    #[must_use]
+    pub const fn outcome(&self) -> InvestmentProposalIndexOutcome {
+        self.outcome
+    }
+}
+
 /// One typed persisted record. No variant contains a path, query, formula, credential, or order.
 #[derive(Clone, Debug, PartialEq)]
 #[allow(
@@ -192,6 +403,16 @@ pub enum DecisionRecord {
     Review(TargetReview),
     /// Immutable invalidation evidence.
     Invalidation(TargetInvalidation),
+    /// Immutable evidence-bound investment-analysis result.
+    InvestmentProposal(InvestmentProposalDecision),
+    /// Immutable analytical-profile/workflow publication binding.
+    InvestmentAnalysisPublication(PublishedInvestmentAnalysis),
+    /// Immutable exact mark-relative projection sidecar.
+    InvestmentOutcomeProjection(InvestmentOutcomeProjection),
+    /// Immutable exact sizing-feasibility sidecar.
+    InvestmentSizingProjection(InvestmentSizingProjection),
+    /// Immutable pending, unavailable, or completed realized-outcome revision.
+    RecommendationOutcomeStatus(RecommendationOutcomeStatusRecord),
 }
 
 /// Fully typed restart payload. A durable application adapter controls byte persistence.
@@ -229,7 +450,7 @@ pub enum DecisionRepositoryError {
     Conflict,
     /// The expected head revision does not equal the current head.
     StaleRevision,
-    /// A referenced saved screen, run, candidate, dossier, target, or revision does not exist.
+    /// A referenced screen, run, candidate, dossier, target, revision, or analysis does not exist.
     NotFound,
     /// A supplied identity or semantic binding does not match its authoritative parent.
     EvidenceMismatch,
@@ -259,6 +480,8 @@ pub struct DecisionRepository {
     limits: DecisionRepositoryLimits,
     records: Vec<DecisionRecord>,
     target_index: Vec<TargetIndexEntry>,
+    investment_analysis_index: Vec<InvestmentAnalysisCurrentIndexEntry>,
+    recommendation_outcome_index: Vec<RecommendationOutcomeCurrentIndexEntry>,
 }
 
 impl DecisionRepository {
@@ -272,10 +495,20 @@ impl DecisionRepository {
         target_index
             .try_reserve_exact(limits.maximum_target_revisions)
             .map_err(|_error| DecisionRepositoryError::Allocation)?;
+        let mut investment_analysis_index = Vec::new();
+        investment_analysis_index
+            .try_reserve_exact(limits.maximum_investment_proposals)
+            .map_err(|_error| DecisionRepositoryError::Allocation)?;
+        let mut recommendation_outcome_index = Vec::new();
+        recommendation_outcome_index
+            .try_reserve_exact(limits.maximum_investment_proposals)
+            .map_err(|_error| DecisionRepositoryError::Allocation)?;
         Ok(Self {
             limits,
             records,
             target_index,
+            investment_analysis_index,
+            recommendation_outcome_index,
         })
     }
 
@@ -306,6 +539,21 @@ impl DecisionRepository {
                 }
                 DecisionRecord::Invalidation(value) => {
                     repository.append_invalidation(value)?;
+                }
+                DecisionRecord::InvestmentProposal(value) => {
+                    repository.append_investment_proposal(value)?;
+                }
+                DecisionRecord::InvestmentAnalysisPublication(value) => {
+                    repository.append_investment_analysis_publication(value)?;
+                }
+                DecisionRecord::InvestmentOutcomeProjection(value) => {
+                    repository.append_investment_outcome_projection(value)?;
+                }
+                DecisionRecord::InvestmentSizingProjection(value) => {
+                    repository.append_investment_sizing_projection(value)?;
+                }
+                DecisionRecord::RecommendationOutcomeStatus(value) => {
+                    repository.append_recommendation_outcome_status(value)?;
                 }
             }
         }
@@ -466,6 +714,12 @@ impl DecisionRepository {
         if target.target().revision().get() != required {
             return Err(DecisionRepositoryError::StaleRevision);
         }
+        let dossier = self
+            .dossier(target.target().dossier_id())
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        if dossier.dossier().instrument_id() != target.target().instrument_id() {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
         if let Some(prior) = current {
             let Some(previous) = self.target_revision(target.target().id(), prior) else {
                 return Err(DecisionRepositoryError::NotFound);
@@ -565,6 +819,230 @@ impl DecisionRepository {
         let revision = invalidation.target_revision();
         self.push(DecisionRecord::Invalidation(invalidation))?;
         self.set_index_status(&target_id, revision, TargetStatus::NeedsReview);
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Appends one immutable investment-analysis result only after exact authority recomputation.
+    ///
+    /// The stable analysis identity is unique across generated, no-action, and unavailable results.
+    /// Generated and no-action proposal identities are also globally unique. The repository accepts
+    /// neither caller-selected output fields nor a typed value that the pure authority cannot
+    /// reproduce exactly from its retained policy and evidence.
+    pub fn append_investment_proposal(
+        &mut self,
+        decision: InvestmentProposalDecision,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        if let Some(existing) = self.investment_proposal(decision.analysis_id()) {
+            return if existing == &decision {
+                Ok(AppendOutcome::AlreadyPresent)
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        if decision.proposal_id().is_some_and(|proposal_id| {
+            self.investment_proposals()
+                .any(|existing| existing.proposal_id() == Some(proposal_id))
+        }) {
+            return Err(DecisionRepositoryError::Conflict);
+        }
+        let regenerated = InvestmentProposalAuthority::generate(
+            decision.evidence().clone(),
+            decision.policy().clone(),
+        )
+        .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        if regenerated != decision {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        if self.investment_record_count() >= self.limits.maximum_investment_proposals {
+            return Err(DecisionRepositoryError::Capacity);
+        }
+        self.push(DecisionRecord::InvestmentProposal(decision))?;
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Appends the sole immutable profile/workflow publication for one analysis.
+    pub fn append_investment_analysis_publication(
+        &mut self,
+        publication: PublishedInvestmentAnalysis,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        if let Some(existing) = self.investment_analysis_publication(publication.analysis_id()) {
+            return if existing == &publication {
+                Ok(AppendOutcome::AlreadyPresent)
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        let decision = self
+            .investment_proposal(publication.analysis_id())
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        let regenerated = PublishedInvestmentAnalysis::try_new(
+            decision,
+            publication.analytical_profile().clone(),
+            publication.workflow().clone(),
+            publication.published_at(),
+        )
+        .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        if regenerated != publication {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        self.ensure_investment_record_capacity()?;
+        self.push(DecisionRecord::InvestmentAnalysisPublication(
+            publication.clone(),
+        ))?;
+        self.investment_analysis_index
+            .push(InvestmentAnalysisCurrentIndexEntry::new(publication));
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Appends one deterministic generated-proposal outcome projection sidecar.
+    pub fn append_investment_outcome_projection(
+        &mut self,
+        projection: InvestmentOutcomeProjection,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        let proposal_id = projection.binding().proposal_id();
+        if let Some(existing) = self.investment_outcome_projection(proposal_id) {
+            return if existing == &projection {
+                Ok(AppendOutcome::AlreadyPresent)
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        let (analysis_id, generated) = self
+            .generated_investment_proposal(proposal_id)
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        if self.investment_analysis_publication(analysis_id).is_none() {
+            return Err(DecisionRepositoryError::NotFound);
+        }
+        let regenerated =
+            InvestmentOutcomeProjection::try_from_proposal(generated, projection.position_scale())
+                .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        if regenerated != projection {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        self.ensure_investment_record_capacity()?;
+        self.push(DecisionRecord::InvestmentOutcomeProjection(
+            projection.clone(),
+        ))?;
+        self.investment_analysis_index_entry_mut(analysis_id)?
+            .outcome_projection_digest = Some(projection.result_digest());
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Appends one deterministic generated-proposal sizing-feasibility sidecar.
+    pub fn append_investment_sizing_projection(
+        &mut self,
+        projection: InvestmentSizingProjection,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        let proposal_id = projection.binding().proposal_id();
+        if let Some(existing) = self.investment_sizing_projection(proposal_id) {
+            return if existing == &projection {
+                Ok(AppendOutcome::AlreadyPresent)
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        let (analysis_id, generated) = self
+            .generated_investment_proposal(proposal_id)
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        if self.investment_analysis_publication(analysis_id).is_none() {
+            return Err(DecisionRepositoryError::NotFound);
+        }
+        let regenerated =
+            InvestmentSizingProjection::try_from_proposal(generated, projection.inputs().clone())
+                .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        if regenerated != projection {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        self.ensure_investment_record_capacity()?;
+        self.push(DecisionRecord::InvestmentSizingProjection(
+            projection.clone(),
+        ))?;
+        self.investment_analysis_index_entry_mut(analysis_id)?
+            .sizing_projection_digest = Some(projection.result_digest());
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Appends one contiguous pending, unavailable, or completed outcome status revision.
+    pub fn append_recommendation_outcome_status(
+        &mut self,
+        status: RecommendationOutcomeStatusRecord,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        if let Some(existing) =
+            self.recommendation_outcome_status(status.series_id(), status.revision())
+        {
+            return if existing == &status {
+                Ok(AppendOutcome::AlreadyPresent)
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        let decision = self
+            .investment_proposal(status.analysis_id())
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        let publication = self
+            .investment_analysis_publication(status.analysis_id())
+            .ok_or(DecisionRepositoryError::NotFound)?
+            .clone();
+        let regenerated = match status.status() {
+            RecommendationOutcomeStatus::Pending(reason) => {
+                RecommendationOutcomeStatusRecord::try_pending(
+                    decision,
+                    &publication,
+                    status.revision(),
+                    status.previous_status_digest(),
+                    status.evaluated_at(),
+                    reason,
+                )
+            }
+            RecommendationOutcomeStatus::Unavailable(reason) => {
+                RecommendationOutcomeStatusRecord::try_unavailable(
+                    decision,
+                    &publication,
+                    status.revision(),
+                    status.previous_status_digest(),
+                    status.evaluated_at(),
+                    reason,
+                )
+            }
+            RecommendationOutcomeStatus::Completed(outcome) => {
+                RecommendationOutcomeStatusRecord::try_completed(
+                    decision,
+                    &publication,
+                    status.revision(),
+                    status.previous_status_digest(),
+                    status.evaluated_at(),
+                    outcome.observation(),
+                )
+            }
+        }
+        .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        if regenerated != status {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        let current = self.recommendation_outcome_current(status.series_id());
+        match current {
+            None if status.revision().get() == 1 && status.previous_status_digest().is_none() => {}
+            Some(current)
+                if matches!(current.status(), RecommendationOutcomeStatus::Pending(_))
+                    && status.revision().get() == current.revision().get().saturating_add(1)
+                    && status.previous_status_digest() == Some(current.status_digest()) => {}
+            None | Some(_) => return Err(DecisionRepositoryError::StaleRevision),
+        }
+        self.ensure_investment_record_capacity()?;
+        self.push(DecisionRecord::RecommendationOutcomeStatus(status.clone()))?;
+        let current_entry = RecommendationOutcomeCurrentIndexEntry::new(&publication, &status);
+        if let Some(existing) = self
+            .recommendation_outcome_index
+            .iter_mut()
+            .find(|entry| entry.series_id() == status.series_id())
+        {
+            *existing = current_entry.clone();
+        } else {
+            self.recommendation_outcome_index
+                .push(current_entry.clone());
+        }
+        self.investment_analysis_index_entry_mut(status.analysis_id())?
+            .current_outcome = Some(current_entry);
         Ok(AppendOutcome::Appended)
     }
 
@@ -776,6 +1254,239 @@ impl DecisionRepository {
         })
     }
 
+    /// Lists immutable investment-analysis results in durable append order without allocating.
+    pub fn investment_proposals(&self) -> impl Iterator<Item = &InvestmentProposalDecision> {
+        self.records.iter().filter_map(|record| match record {
+            DecisionRecord::InvestmentProposal(decision) => Some(decision),
+            _ => None,
+        })
+    }
+
+    /// Finds one exact generated, no-action, or unavailable investment-analysis result.
+    pub fn investment_proposal(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Option<&InvestmentProposalDecision> {
+        self.investment_proposals()
+            .find(|decision| decision.analysis_id() == analysis_id)
+    }
+
+    /// Returns the sole immutable profile/workflow publication for one analysis.
+    pub fn investment_analysis_publication(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Option<&PublishedInvestmentAnalysis> {
+        self.records.iter().find_map(|record| match record {
+            DecisionRecord::InvestmentAnalysisPublication(publication)
+                if publication.analysis_id() == analysis_id =>
+            {
+                Some(publication)
+            }
+            _ => None,
+        })
+    }
+
+    /// Returns one durable outcome projection by generated proposal identity.
+    pub fn investment_outcome_projection(
+        &self,
+        proposal_id: InvestmentProposalId,
+    ) -> Option<&InvestmentOutcomeProjection> {
+        self.records.iter().find_map(|record| match record {
+            DecisionRecord::InvestmentOutcomeProjection(projection)
+                if projection.binding().proposal_id() == proposal_id =>
+            {
+                Some(projection)
+            }
+            _ => None,
+        })
+    }
+
+    /// Returns one durable sizing projection by generated proposal identity.
+    pub fn investment_sizing_projection(
+        &self,
+        proposal_id: InvestmentProposalId,
+    ) -> Option<&InvestmentSizingProjection> {
+        self.records.iter().find_map(|record| match record {
+            DecisionRecord::InvestmentSizingProjection(projection)
+                if projection.binding().proposal_id() == proposal_id =>
+            {
+                Some(projection)
+            }
+            _ => None,
+        })
+    }
+
+    /// Returns one exact immutable recommendation-outcome status revision.
+    pub fn recommendation_outcome_status(
+        &self,
+        series_id: crate::RecommendationOutcomeSeriesId,
+        revision: RevisionNumber,
+    ) -> Option<&RecommendationOutcomeStatusRecord> {
+        self.records.iter().find_map(|record| match record {
+            DecisionRecord::RecommendationOutcomeStatus(status)
+                if status.series_id() == series_id && status.revision() == revision =>
+            {
+                Some(status)
+            }
+            _ => None,
+        })
+    }
+
+    /// Returns the latest contiguous status for one recommendation-outcome series.
+    pub fn recommendation_outcome_current(
+        &self,
+        series_id: crate::RecommendationOutcomeSeriesId,
+    ) -> Option<&RecommendationOutcomeCurrentIndexEntry> {
+        self.recommendation_outcome_index
+            .iter()
+            .find(|entry| entry.series_id() == series_id)
+    }
+
+    /// Returns the profile-bound current analysis locator without append-order ranking.
+    pub fn investment_analysis_current(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Option<&InvestmentAnalysisCurrentIndexEntry> {
+        self.investment_analysis_index
+            .iter()
+            .find(|entry| entry.publication().analysis_id() == analysis_id)
+    }
+
+    /// Lists canonical analysis currentness locators ordered by stable analysis identity.
+    pub fn list_investment_analysis_current_index(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<InvestmentAnalysisCurrentIndexEntry>, DecisionRepositoryError> {
+        if maximum == 0 {
+            return Err(DecisionRepositoryError::InvalidLimits);
+        }
+        let mut entries = self.investment_analysis_index.clone();
+        entries.sort_by_key(|entry| entry.publication().analysis_id());
+        entries.truncate(maximum);
+        Ok(entries)
+    }
+
+    /// Computes a current-status track record for one exact profile and horizon duration.
+    ///
+    /// Each action and the no-action control remain separate. Missing status records count against
+    /// due-outcome coverage, and no append ordering or survivorship filter affects the denominator.
+    pub fn recommendation_track_record(
+        &self,
+        analytical_profile: &AnalyticalProfileBindingReference,
+        horizon_nanos: i64,
+        evaluated_at: Timestamp,
+    ) -> Result<RecommendationTrackRecord, DecisionRepositoryError> {
+        if horizon_nanos <= 0 {
+            return Err(DecisionRepositoryError::InvalidLimits);
+        }
+        let cohorts = [
+            RecommendationOutcomeCohort::Generated(RecommendationAction::Buy),
+            RecommendationOutcomeCohort::Generated(RecommendationAction::Add),
+            RecommendationOutcomeCohort::Generated(RecommendationAction::Hold),
+            RecommendationOutcomeCohort::Generated(RecommendationAction::Trim),
+            RecommendationOutcomeCohort::Generated(RecommendationAction::Sell),
+            RecommendationOutcomeCohort::NoActionControl,
+        ];
+        let mut groups = cohorts
+            .into_iter()
+            .map(RecommendationTrackRecordGroup::empty)
+            .collect::<Vec<_>>();
+        let mut analysis_unavailable_count = 0_u32;
+        for entry in &self.investment_analysis_index {
+            let publication = entry.publication();
+            if publication.analytical_profile() != analytical_profile
+                || publication
+                    .horizon_at()
+                    .unix_nanos()
+                    .checked_sub(publication.as_of().unix_nanos())
+                    != Some(horizon_nanos)
+            {
+                continue;
+            }
+            let decision = self
+                .investment_proposal(publication.analysis_id())
+                .ok_or(DecisionRepositoryError::NotFound)?;
+            let cohort = match decision {
+                InvestmentProposalDecision::Generated(value) => {
+                    RecommendationOutcomeCohort::Generated(value.action())
+                }
+                InvestmentProposalDecision::NoAction(_) => {
+                    RecommendationOutcomeCohort::NoActionControl
+                }
+                InvestmentProposalDecision::Unavailable(_) => {
+                    analysis_unavailable_count = analysis_unavailable_count
+                        .checked_add(1)
+                        .ok_or(DecisionRepositoryError::Capacity)?;
+                    continue;
+                }
+            };
+            let group = groups
+                .iter_mut()
+                .find(|group| group.cohort() == cohort)
+                .ok_or(DecisionRepositoryError::EvidenceMismatch)?;
+            group
+                .observe(
+                    publication.horizon_at() <= evaluated_at,
+                    entry.current_outcome().map(|current| current.status()),
+                )
+                .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        }
+        for group in &mut groups {
+            group
+                .finalize()
+                .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        }
+        Ok(RecommendationTrackRecord::new(
+            analytical_profile.clone(),
+            horizon_nanos,
+            evaluated_at,
+            analysis_unavailable_count,
+            groups,
+        ))
+    }
+
+    /// Lists bounded immutable investment-analysis locators in durable append order.
+    pub fn list_investment_proposal_index(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<InvestmentProposalIndexEntry>, DecisionRepositoryError> {
+        self.list_investment_proposal_index_after(None, maximum)
+    }
+
+    /// Continues investment-analysis discovery strictly after an exact retained analysis identity.
+    ///
+    /// An unknown cursor fails closed rather than restarting at the beginning and presenting a
+    /// misleading duplicate page. The projection is derived from immutable source records and owns
+    /// no independent recommendation or current-profile authority.
+    pub fn list_investment_proposal_index_after(
+        &self,
+        after: Option<InvestmentAnalysisId>,
+        maximum: usize,
+    ) -> Result<Vec<InvestmentProposalIndexEntry>, DecisionRepositoryError> {
+        if maximum == 0 {
+            return Err(DecisionRepositoryError::InvalidLimits);
+        }
+        let count = self.investment_proposal_count().min(maximum);
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(count)
+            .map_err(|_error| DecisionRepositoryError::Allocation)?;
+        let mut decisions = self.investment_proposals();
+        if let Some(after) = after
+            && decisions
+                .position(|decision| decision.analysis_id() == after)
+                .is_none()
+        {
+            return Err(DecisionRepositoryError::NotFound);
+        }
+        result.extend(
+            decisions
+                .take(maximum)
+                .map(InvestmentProposalIndexEntry::from_decision),
+        );
+        Ok(result)
+    }
+
     /// Derives target status from immutable history; it never rewrites approval or target bytes.
     pub fn target_status(
         &self,
@@ -964,5 +1675,63 @@ impl DecisionRepository {
             .iter()
             .filter(|record| matches!(record, DecisionRecord::Invalidation(_)))
             .count()
+    }
+
+    fn investment_proposal_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| matches!(record, DecisionRecord::InvestmentProposal(_)))
+            .count()
+    }
+
+    fn investment_record_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record,
+                    DecisionRecord::InvestmentProposal(_)
+                        | DecisionRecord::InvestmentAnalysisPublication(_)
+                        | DecisionRecord::InvestmentOutcomeProjection(_)
+                        | DecisionRecord::InvestmentSizingProjection(_)
+                        | DecisionRecord::RecommendationOutcomeStatus(_)
+                )
+            })
+            .count()
+    }
+
+    fn ensure_investment_record_capacity(&self) -> Result<(), DecisionRepositoryError> {
+        if self.investment_record_count() >= self.limits.maximum_investment_proposals {
+            Err(DecisionRepositoryError::Capacity)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn generated_investment_proposal(
+        &self,
+        proposal_id: InvestmentProposalId,
+    ) -> Option<(InvestmentAnalysisId, &crate::GeneratedInvestmentProposal)> {
+        self.investment_proposals()
+            .find_map(|decision| match decision {
+                InvestmentProposalDecision::Generated(value)
+                    if value.proposal_id() == proposal_id =>
+                {
+                    Some((value.analysis_id(), value))
+                }
+                InvestmentProposalDecision::Generated(_)
+                | InvestmentProposalDecision::NoAction(_)
+                | InvestmentProposalDecision::Unavailable(_) => None,
+            })
+    }
+
+    fn investment_analysis_index_entry_mut(
+        &mut self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Result<&mut InvestmentAnalysisCurrentIndexEntry, DecisionRepositoryError> {
+        self.investment_analysis_index
+            .iter_mut()
+            .find(|entry| entry.publication().analysis_id() == analysis_id)
+            .ok_or(DecisionRepositoryError::NotFound)
     }
 }

@@ -39,6 +39,9 @@ pub enum AlpacaError {
     /// A provider payload violated the selected protocol schema.
     #[error("Alpaca provider payload is invalid")]
     Protocol,
+    /// Exact raw provider responses could not satisfy the shared durable-capture contract.
+    #[error("Alpaca provider response capture material is invalid")]
+    CaptureMaterial,
     /// A bounded allocation failed.
     #[error("Alpaca bounded allocation failed")]
     Allocation,

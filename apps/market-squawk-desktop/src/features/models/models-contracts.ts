@@ -4,6 +4,18 @@ import type { ApplicationResult } from "@/lib/schemas"
 import { losslessIntegerSchema } from "@/lib/lossless-integer"
 
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/)
+const U64_MAX = 18_446_744_073_709_551_615n
+const canonicalUnsignedU64Schema = z.string().refine(
+  (value) =>
+    value.length <= 20 &&
+    /^(?:0|[1-9]\d*)$/.test(value) &&
+    BigInt(value) <= U64_MAX,
+  { message: "Expected a canonical unsigned 64-bit decimal" },
+)
+const canonicalPositiveU64Schema = canonicalUnsignedU64Schema.refine(
+  (value) => value !== "0",
+  { message: "Expected a positive canonical 64-bit decimal" },
+)
 
 const manifestSchema = z.object({
   dataset: z.string().min(1),
@@ -319,8 +331,8 @@ const forecastOutcomesSchema = z.object({
 
 const jobSchema = z.object({
   jobId: z.string().uuid(),
-  generation: z.number().int().positive(),
-  sequence: z.number().int().nonnegative(),
+  generation: canonicalPositiveU64Schema,
+  sequence: canonicalUnsignedU64Schema,
   kind: z.string().min(1),
   state: z.enum([
     "queued",

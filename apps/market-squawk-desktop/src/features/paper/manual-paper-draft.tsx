@@ -120,8 +120,9 @@ export function ManualPaperDraftPanel({
           </h2>
           <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
             Choose an active target, your side, order constraint, and whole-lot quantity. The next
-            qualified committed Direct Verified event supplies live execution terms. Central pre-trade
-            risk still evaluates every resulting intent before paper dispatch.
+            qualified committed event from the running live-market source supplies execution terms.
+            The target is not automatic order authority: central pre-trade risk still evaluates
+            every resulting intent before virtual paper dispatch.
           </p>
         </div>
         <ShieldCheck className="size-5 text-primary" aria-hidden="true" />
@@ -313,8 +314,8 @@ export function ManualPaperDraftPanel({
             <DialogTitle>Submit this controlled paper draft?</DialogTitle>
             <DialogDescription>
               Review the exact target-backed request. Submission occupies one bounded manual draft
-              slot and waits for the next qualified committed Direct Verified event; it still must
-              pass central pre-trade risk before paper dispatch.
+              slot and waits for the next qualified committed event from the running live-market
+              source; it still must pass central pre-trade risk before virtual paper dispatch.
             </DialogDescription>
           </DialogHeader>
           {pending && selected ? <ConfirmationEvidence request={pending} target={selected} /> : null}

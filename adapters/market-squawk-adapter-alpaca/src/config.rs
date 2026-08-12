@@ -3,20 +3,24 @@ use std::num::NonZeroU16;
 use std::time::Duration;
 
 use market_squawk_domain::{
-    AssetClass, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-    EffectiveInterval, ExactPayloadEvidence, InstrumentId, IntegrityRule, LiveEventClass,
-    ProviderChannel, ProviderProduct, RevisionBoundPayloadEvidence, RuleVersion, SchemaVersion,
-    SequenceCapability, SnapshotApplicability, SourceId, SourceIdentifier, Timestamp, VenueId,
+    AssetClass, BarTimestampBasis, ChecksumCapability, CoverageDelay, DataQuality,
+    DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
+    InstrumentId, IntegrityRule, LiveEventClass, MarketBarSessionEvidence, ProviderChannel,
+    ProviderInstrumentId, ProviderProduct, RevisionBoundPayloadEvidence, RuleVersion,
+    SchemaVersion, SequenceCapability, SnapshotApplicability, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
 };
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, ChecksumValidationProfile,
-    CoverageTopology, FreshnessPolicy, HistoricalCapability, HttpRequestBounds, InstrumentCoverage,
-    LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy, PathScope,
-    ProviderBudgetPolicy, ProviderNumericPolicy, QueryParameterRule, QuerySensitivity,
-    SemanticInterpretationProfile, SequenceValidationProfile, SourceCapabilities, SourceClass,
-    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    CoverageDomain, CoverageTopology, FreshnessPolicy, HistoricalCapability, HttpRequestBounds,
+    InstrumentCoverage, InstrumentCoverageMembership, LiveCoverageDeclaration, LiveCoverageRule,
+    LiveProtocolProfile, NetworkAccessPolicy, PathScope, ProviderBudgetPolicy,
+    ProviderNumericPolicy, QueryParameterRule, QuerySensitivity, SemanticInterpretationProfile,
+    SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SourceMetadataInput, SourceProtocolProfile,
 };
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::AlpacaError;
 
@@ -28,6 +32,10 @@ pub const ALPACA_BASIC_OPTION_SYMBOL_LIMIT: usize = 200;
 pub const ALPACA_BASIC_HISTORICAL_REQUESTS_PER_MINUTE: u32 = 200;
 /// Alpaca Basic historical exclusion window, in nanoseconds.
 pub const ALPACA_HISTORICAL_EXCLUSION_NANOS: u64 = 900_000_000_000;
+/// Minimum contiguous lookback admitted for one historical analysis plan.
+pub const ALPACA_HISTORICAL_MIN_LOOKBACK_DAYS: u16 = 30;
+/// Maximum contiguous lookback admitted for one historical analysis plan.
+pub const ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS: u16 = 3_650;
 
 pub(crate) const ALPACA_PROVIDER: &str = "alpaca-market-data";
 pub(crate) const ALPACA_IEX_ENDPOINT: &str = "wss://stream.data.alpaca.markets/v2/iex";
@@ -42,7 +50,10 @@ const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_SUBSCRIPTION_BYTES: usize = 64 * 1024;
 const HISTORICAL_FLOOR_UNIX_NANOS: i64 = 1_451_606_400_000_000_000;
 const HISTORICAL_PAGE_LIMIT: u16 = 10_000;
+const NANOS_PER_DAY: u64 = 86_400_000_000_000;
 const NANOS_PER_MINUTE: u64 = 60_000_000_000;
+const PROVIDER_DATASET_PREFIX: &str = "alpaca:historical-equity:v1:";
+const ANALYTICAL_DATASET_PREFIX: &str = "alpaca.historical-equity.v1.";
 
 /// Stable provider symbol to internal instrument mapping for an equity or ETF.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -398,6 +409,11 @@ impl AlpacaTimeframe {
             TimeframeUnit::Month => format!("{}Month", self.multiple),
         }
     }
+
+    /// Returns the exact bounded provider timeframe identifier.
+    pub fn provider_identifier(self) -> Result<SourceIdentifier, AlpacaError> {
+        SourceIdentifier::try_from(self.provider_value()).map_err(Into::into)
+    }
 }
 
 /// Alpaca historical corporate-action adjustment policy.
@@ -427,10 +443,68 @@ impl AlpacaAdjustment {
     }
 }
 
-/// One bounded historical IEX bar dataset registered with the extraction source.
+/// Code-owned contiguous lookback admitted for one historical analysis request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AlpacaHistoricalLookback {
+    days: NonZeroU16,
+}
+
+impl AlpacaHistoricalLookback {
+    /// Constructs a bounded lookback without accepting arbitrary start and end coordinates.
+    pub fn try_from_days(days: u16) -> Result<Self, AlpacaError> {
+        NonZeroU16::new(days)
+            .filter(|days| {
+                (ALPACA_HISTORICAL_MIN_LOOKBACK_DAYS..=ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS)
+                    .contains(&days.get())
+            })
+            .map(|days| Self { days })
+            .ok_or(AlpacaError::InvalidHistoricalPlan)
+    }
+
+    /// Returns the admitted whole-day lookback.
+    pub const fn days(self) -> u16 {
+        self.days.get()
+    }
+}
+
+/// Stable provider timestamp and session-ruleset identity required before a plan is admitted.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AlpacaHistoricalEquityDataset {
-    dataset: SourceIdentifier,
+pub struct AlpacaHistoricalSeriesSemantics {
+    timestamp_basis: BarTimestampBasis,
+    session: MarketBarSessionEvidence,
+}
+
+impl AlpacaHistoricalSeriesSemantics {
+    /// Binds one provider timestamp convention to exact versioned session evidence.
+    pub const fn new(
+        timestamp_basis: BarTimestampBasis,
+        session: MarketBarSessionEvidence,
+    ) -> Self {
+        Self {
+            timestamp_basis,
+            session,
+        }
+    }
+
+    /// Returns which aggregation-period boundary the provider timestamp identifies.
+    pub const fn timestamp_basis(&self) -> BarTimestampBasis {
+        self.timestamp_basis
+    }
+
+    /// Returns the exact session rules required from the per-bar time authority.
+    pub const fn session(&self) -> &MarketBarSessionEvidence {
+        &self.session
+    }
+}
+
+/// Bounded historical request coordinates admitted before any session identity is minted.
+///
+/// This value intentionally cannot be registered as a provider dataset. The authenticated
+/// preflight must first retain the exact terminal pagination graph and returned provider
+/// timestamps, after which the runtime can obtain exact calendar authority and bind final series
+/// semantics without a placeholder identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlpacaHistoricalEquityPreflightPlan {
     mapping: AlpacaInstrumentMapping,
     timeframe: AlpacaTimeframe,
     start: Timestamp,
@@ -439,35 +513,164 @@ pub struct AlpacaHistoricalEquityDataset {
     page_limit: NonZeroU16,
 }
 
-impl AlpacaHistoricalEquityDataset {
-    /// Constructs a deterministic bounded query plan.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "historical query identity stays explicit"
-    )]
+impl AlpacaHistoricalEquityPreflightPlan {
+    /// Anchors a contiguous bounded lookback at the delayed-data boundary for `analysis_at`.
+    ///
+    /// Callers cannot provide independent start/end coordinates. Runtime extraction separately
+    /// verifies the derived end against the current trusted historical-exclusion boundary.
     pub fn try_new(
-        dataset: SourceIdentifier,
         mapping: AlpacaInstrumentMapping,
         timeframe: AlpacaTimeframe,
-        start: Timestamp,
-        end: Timestamp,
+        analysis_at: Timestamp,
+        lookback: AlpacaHistoricalLookback,
         adjustment: AlpacaAdjustment,
-        page_limit: NonZeroU16,
     ) -> Result<Self, AlpacaError> {
-        if start.unix_nanos() < HISTORICAL_FLOOR_UNIX_NANOS
-            || end <= start
-            || page_limit.get() > HISTORICAL_PAGE_LIMIT
-        {
+        let exclusion = i64::try_from(ALPACA_HISTORICAL_EXCLUSION_NANOS)
+            .map_err(|_| AlpacaError::InvalidHistoricalPlan)?;
+        let end = analysis_at
+            .checked_sub_nanos(exclusion)
+            .map_err(|_| AlpacaError::InvalidHistoricalPlan)?;
+        let lookback_nanos = u64::from(lookback.days())
+            .checked_mul(NANOS_PER_DAY)
+            .and_then(|nanos| i64::try_from(nanos).ok())
+            .ok_or(AlpacaError::InvalidHistoricalPlan)?;
+        let start = end
+            .checked_sub_nanos(lookback_nanos)
+            .map_err(|_| AlpacaError::InvalidHistoricalPlan)?;
+        if start.unix_nanos() < HISTORICAL_FLOOR_UNIX_NANOS || end <= start {
             return Err(AlpacaError::InvalidHistoricalPlan);
         }
         Ok(Self {
-            dataset,
             mapping,
             timeframe,
             start,
             end,
             adjustment,
-            page_limit,
+            page_limit: NonZeroU16::new(HISTORICAL_PAGE_LIMIT).ok_or(AlpacaError::Protocol)?,
+        })
+    }
+
+    /// Returns the exact provider/internal instrument mapping requested by this preflight.
+    pub const fn mapping(&self) -> &AlpacaInstrumentMapping {
+        &self.mapping
+    }
+
+    /// Returns the exact provider timeframe bound into this plan.
+    pub const fn timeframe(&self) -> AlpacaTimeframe {
+        self.timeframe
+    }
+
+    /// Returns the inclusive historical request start coordinate.
+    pub const fn start(&self) -> Timestamp {
+        self.start
+    }
+
+    /// Returns the inclusive historical request end coordinate.
+    pub const fn end(&self) -> Timestamp {
+        self.end
+    }
+
+    /// Returns the exact provider adjustment policy.
+    pub const fn adjustment(&self) -> AlpacaAdjustment {
+        self.adjustment
+    }
+
+    /// Returns the code-owned provider page ceiling.
+    pub const fn page_limit(&self) -> u16 {
+        self.page_limit.get()
+    }
+}
+
+/// Final unregistered historical plan whose identities include exact composite calendar evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlpacaHistoricalEquityDatasetPlan {
+    mapping: AlpacaInstrumentMapping,
+    timeframe: AlpacaTimeframe,
+    start: Timestamp,
+    end: Timestamp,
+    adjustment: AlpacaAdjustment,
+    series_semantics: AlpacaHistoricalSeriesSemantics,
+    page_limit: NonZeroU16,
+}
+
+impl AlpacaHistoricalEquityDatasetPlan {
+    /// Finalizes only an exact preflight plan with runtime-produced series semantics.
+    pub fn bind_preflight(
+        preflight: AlpacaHistoricalEquityPreflightPlan,
+        series_semantics: AlpacaHistoricalSeriesSemantics,
+    ) -> Self {
+        Self {
+            mapping: preflight.mapping,
+            timeframe: preflight.timeframe,
+            start: preflight.start,
+            end: preflight.end,
+            adjustment: preflight.adjustment,
+            series_semantics,
+            page_limit: preflight.page_limit,
+        }
+    }
+
+    /// Returns the exact provider timeframe bound into this final plan.
+    pub const fn timeframe(&self) -> AlpacaTimeframe {
+        self.timeframe
+    }
+
+    /// Returns the inclusive historical request start coordinate.
+    pub const fn start(&self) -> Timestamp {
+        self.start
+    }
+
+    /// Returns the inclusive historical request end coordinate.
+    pub const fn end(&self) -> Timestamp {
+        self.end
+    }
+
+    /// Returns the stable provider timestamp and session-ruleset contract for this series.
+    pub const fn series_semantics(&self) -> &AlpacaHistoricalSeriesSemantics {
+        &self.series_semantics
+    }
+
+    pub(crate) fn matches_preflight(
+        &self,
+        preflight: &AlpacaHistoricalEquityPreflightPlan,
+    ) -> bool {
+        self.mapping == preflight.mapping
+            && self.timeframe == preflight.timeframe
+            && self.start == preflight.start
+            && self.end == preflight.end
+            && self.adjustment == preflight.adjustment
+            && self.page_limit == preflight.page_limit
+    }
+}
+
+/// One source-generation-bound historical IEX request dataset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlpacaHistoricalEquityDataset {
+    dataset: SourceIdentifier,
+    mapping: AlpacaInstrumentMapping,
+    timeframe: AlpacaTimeframe,
+    start: Timestamp,
+    end: Timestamp,
+    adjustment: AlpacaAdjustment,
+    series_semantics: AlpacaHistoricalSeriesSemantics,
+    page_limit: NonZeroU16,
+}
+
+impl AlpacaHistoricalEquityDataset {
+    fn bind(
+        metadata: &SourceMetadata,
+        plan: AlpacaHistoricalEquityDatasetPlan,
+    ) -> Result<Self, AlpacaError> {
+        let dataset = provider_dataset_identifier(metadata, &plan)?;
+        Ok(Self {
+            dataset,
+            mapping: plan.mapping,
+            timeframe: plan.timeframe,
+            start: plan.start,
+            end: plan.end,
+            adjustment: plan.adjustment,
+            series_semantics: plan.series_semantics,
+            page_limit: plan.page_limit,
         })
     }
 
@@ -496,13 +699,73 @@ impl AlpacaHistoricalEquityDataset {
         self.adjustment
     }
 
+    pub(crate) const fn series_semantics(&self) -> &AlpacaHistoricalSeriesSemantics {
+        &self.series_semantics
+    }
+
     pub(crate) const fn page_limit(&self) -> u16 {
         self.page_limit.get()
+    }
+
+    pub(crate) fn matches_preflight(
+        &self,
+        preflight: &AlpacaHistoricalEquityPreflightPlan,
+    ) -> bool {
+        self.mapping == preflight.mapping
+            && self.timeframe == preflight.timeframe
+            && self.start == preflight.start
+            && self.end == preflight.end
+            && self.adjustment == preflight.adjustment
+            && self.page_limit == preflight.page_limit
+    }
+
+    pub(crate) fn verify_provider_identity(
+        &self,
+        metadata: &SourceMetadata,
+    ) -> Result<(), AlpacaError> {
+        if !has_strict_provider_dataset_grammar(&self.dataset)
+            || provider_dataset_identifier_for_bound(metadata, self)? != self.dataset
+        {
+            return Err(AlpacaError::InvalidHistoricalPlan);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn analytical_dataset_identifier(
+        &self,
+        metadata: &SourceMetadata,
+        provider_instrument_id: &ProviderInstrumentId,
+        currency: market_squawk_domain::Currency,
+    ) -> Result<SourceIdentifier, AlpacaError> {
+        self.verify_provider_identity(metadata)?;
+        if provider_instrument_id.as_str() != self.mapping.symbol() {
+            return Err(AlpacaError::InvalidCoverage);
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/alpaca-historical-analytical-series/v1\0");
+        hash_source_generation(&mut digest, metadata);
+        digest.update(self.mapping.instrument().as_uuid().as_bytes());
+        hash_str(&mut digest, provider_instrument_id.as_str());
+        hash_str(&mut digest, IEX_VENUE);
+        hash_str(&mut digest, "iex");
+        hash_str(&mut digest, &self.timeframe.provider_value());
+        hash_str(&mut digest, self.adjustment.as_str());
+        digest.update([asset_class_tag(self.mapping.asset_class())]);
+        hash_str(&mut digest, currency.as_str());
+        digest.update([bar_timestamp_basis_tag(
+            self.series_semantics.timestamp_basis(),
+        )]);
+        hash_session(&mut digest, self.series_semantics.session());
+        SourceIdentifier::try_from(format!(
+            "{ANALYTICAL_DATASET_PREFIX}{}",
+            encode_lower_hex(digest.finalize().into())
+        ))
+        .map_err(Into::into)
     }
 }
 
 /// Immutable extraction-only configuration for delayed IEX historical bars.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AlpacaHistoricalEquityConfig {
     metadata: SourceMetadata,
     datasets: BTreeMap<String, AlpacaHistoricalEquityDataset>,
@@ -521,7 +784,7 @@ impl AlpacaHistoricalEquityConfig {
         authorization: AuthorizationGrant,
         coverage_evidence: ExactPayloadEvidence,
         effective: EffectiveInterval,
-        datasets: Vec<AlpacaHistoricalEquityDataset>,
+        datasets: Vec<AlpacaHistoricalEquityDatasetPlan>,
         freshness: FreshnessPolicy,
         budget: ProviderBudgetPolicy,
         request_bounds: HttpRequestBounds,
@@ -530,24 +793,15 @@ impl AlpacaHistoricalEquityConfig {
         if datasets.is_empty() || datasets.len() > 4_096 {
             return Err(AlpacaError::InvalidCoverage);
         }
-        let mut by_id = BTreeMap::new();
-        for dataset in datasets {
-            if by_id
-                .insert(dataset.dataset().as_str().to_owned(), dataset)
-                .is_some()
-            {
-                return Err(AlpacaError::InvalidCoverage);
-            }
-        }
-        let instruments = by_id
-            .values()
-            .map(|dataset| dataset.mapping().instrument())
+        let instruments = datasets
+            .iter()
+            .map(|dataset| dataset.mapping.instrument())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
         let mut asset_classes = Vec::new();
-        for dataset in by_id.values() {
-            let asset_class = dataset.mapping().asset_class();
+        for dataset in &datasets {
+            let asset_class = dataset.mapping.asset_class();
             if !asset_classes.contains(&asset_class) {
                 asset_classes.push(asset_class);
             }
@@ -584,6 +838,16 @@ impl AlpacaHistoricalEquityConfig {
             ),
             SourceProtocolProfile::NotLive,
         ))?;
+        let mut by_id = BTreeMap::new();
+        for plan in datasets {
+            let dataset = AlpacaHistoricalEquityDataset::bind(&metadata, plan)?;
+            if by_id
+                .insert(dataset.dataset().as_str().to_owned(), dataset)
+                .is_some()
+            {
+                return Err(AlpacaError::InvalidCoverage);
+            }
+        }
         Ok(Self {
             metadata,
             datasets: by_id,
@@ -591,9 +855,49 @@ impl AlpacaHistoricalEquityConfig {
         })
     }
 
+    /// Binds exactly one click-specific plan beneath immutable generation-wide source metadata.
+    ///
+    /// The parent metadata is retained byte-for-byte. It must already declare the exact delayed
+    /// IEX historical surface, request bounds, shared account budget, and affirmative membership
+    /// for the plan's internal instrument. The click window therefore changes only the provider
+    /// dataset identity and never manufactures a new source generation or profile.
+    pub fn try_bind_one_plan(
+        parent_metadata: SourceMetadata,
+        plan: AlpacaHistoricalEquityDatasetPlan,
+        request_bounds: HttpRequestBounds,
+    ) -> Result<Self, AlpacaError> {
+        validate_historical_parent_metadata(&parent_metadata, &plan, request_bounds)?;
+        let dataset = AlpacaHistoricalEquityDataset::bind(&parent_metadata, plan)?;
+        let mut datasets = BTreeMap::new();
+        datasets.insert(dataset.dataset().as_str().to_owned(), dataset);
+        Ok(Self {
+            metadata: parent_metadata,
+            datasets,
+            request_bounds,
+        })
+    }
+
+    /// Validates immutable generation-wide metadata before the long-lived source is claimed.
+    ///
+    /// Instrument membership and plan-window effectiveness are checked separately by
+    /// [`Self::try_bind_one_plan`] because they are exact per-click coordinates.
+    pub fn validate_parent_metadata(
+        metadata: &SourceMetadata,
+        request_bounds: HttpRequestBounds,
+    ) -> Result<(), AlpacaError> {
+        validate_historical_parent_surface(metadata, request_bounds)
+    }
+
     /// Returns immutable delayed, extraction-only metadata.
     pub const fn metadata(&self) -> &SourceMetadata {
         &self.metadata
+    }
+
+    /// Returns every exact source-generation- and window-bound provider dataset identity.
+    pub fn provider_dataset_identifiers(&self) -> impl ExactSizeIterator<Item = &SourceIdentifier> {
+        self.datasets
+            .values()
+            .map(AlpacaHistoricalEquityDataset::dataset)
     }
 
     pub(crate) fn dataset(
@@ -603,8 +907,254 @@ impl AlpacaHistoricalEquityConfig {
         self.datasets.get(identifier.as_str())
     }
 
+    pub(crate) fn datasets(&self) -> impl ExactSizeIterator<Item = &AlpacaHistoricalEquityDataset> {
+        self.datasets.values()
+    }
+
     pub(crate) const fn request_bounds(&self) -> HttpRequestBounds {
         self.request_bounds
+    }
+}
+
+fn validate_historical_parent_metadata(
+    metadata: &SourceMetadata,
+    plan: &AlpacaHistoricalEquityDatasetPlan,
+    request_bounds: HttpRequestBounds,
+) -> Result<(), AlpacaError> {
+    validate_historical_parent_surface(metadata, request_bounds)?;
+    let coverage = metadata.coverage();
+    let membership = coverage.instruments().membership(plan.mapping.instrument());
+    if !coverage
+        .asset_classes()
+        .contains(&plan.mapping.asset_class())
+        || !matches!(
+            membership,
+            InstrumentCoverageMembership::Enumerated
+                | InstrumentCoverageMembership::EvidenceBackedUniverse
+        )
+        || !metadata.is_effective_at(plan.start)
+        || !metadata.is_effective_at(plan.end)
+    {
+        return Err(AlpacaError::InvalidCoverage);
+    }
+    Ok(())
+}
+
+fn validate_historical_parent_surface(
+    metadata: &SourceMetadata,
+    request_bounds: HttpRequestBounds,
+) -> Result<(), AlpacaError> {
+    let iex = VenueId::try_from(IEX_VENUE)?;
+    let coverage = metadata.coverage();
+    let expected_network =
+        NetworkAccessPolicy::Allowlisted(historical_endpoint_policy(request_bounds)?);
+    let expected_capabilities = SourceCapabilities::new(
+        false,
+        true,
+        SequenceCapability::Unsupported,
+        ChecksumCapability::Unsupported,
+        HistoricalCapability::Historical,
+        false,
+    );
+    if metadata.provider().as_str() != ALPACA_PROVIDER
+        || metadata.source_class() != SourceClass::Broker
+        || metadata.authorization().mode() != AuthorizationMode::UserAuthorized
+        || metadata.quality_ceiling() != DataQuality::Aggregated
+        || coverage.domain() != CoverageDomain::Instruments
+        || coverage
+            .asset_classes()
+            .iter()
+            .any(|asset_class| !matches!(asset_class, AssetClass::Equity | AssetClass::Fund))
+        || !coverage.topology().is_partial()
+        || coverage.topology().venues() != [iex]
+        || coverage.live().is_some()
+        || coverage.delay() != CoverageDelay::Delayed(ALPACA_HISTORICAL_EXCLUSION_NANOS)
+        || coverage.delivery() != DeliveryEvidence::AuthorizedBroker
+        || metadata.network_policy() != &expected_network
+        || metadata.capabilities() != expected_capabilities
+        || metadata.protocol_profile() != &SourceProtocolProfile::NotLive
+    {
+        return Err(AlpacaError::InvalidCoverage);
+    }
+    let budget = metadata.budget_policy().ok_or(AlpacaError::InvalidBudget)?;
+    validate_authorization_and_budget(metadata.authorization(), budget)
+}
+
+fn provider_dataset_identifier(
+    metadata: &SourceMetadata,
+    plan: &AlpacaHistoricalEquityDatasetPlan,
+) -> Result<SourceIdentifier, AlpacaError> {
+    provider_dataset_identifier_from_parts(
+        metadata,
+        &plan.mapping,
+        plan.timeframe,
+        plan.start,
+        plan.end,
+        plan.adjustment,
+        &plan.series_semantics,
+    )
+}
+
+fn provider_dataset_identifier_for_bound(
+    metadata: &SourceMetadata,
+    dataset: &AlpacaHistoricalEquityDataset,
+) -> Result<SourceIdentifier, AlpacaError> {
+    provider_dataset_identifier_from_parts(
+        metadata,
+        &dataset.mapping,
+        dataset.timeframe,
+        dataset.start,
+        dataset.end,
+        dataset.adjustment,
+        &dataset.series_semantics,
+    )
+}
+
+fn provider_dataset_identifier_from_parts(
+    metadata: &SourceMetadata,
+    mapping: &AlpacaInstrumentMapping,
+    timeframe: AlpacaTimeframe,
+    start: Timestamp,
+    end: Timestamp,
+    adjustment: AlpacaAdjustment,
+    series_semantics: &AlpacaHistoricalSeriesSemantics,
+) -> Result<SourceIdentifier, AlpacaError> {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/alpaca-historical-provider-dataset/v1\0");
+    hash_source_generation(&mut digest, metadata);
+    digest.update(mapping.instrument().as_uuid().as_bytes());
+    hash_str(&mut digest, mapping.symbol());
+    hash_str(&mut digest, IEX_VENUE);
+    hash_str(&mut digest, "iex");
+    hash_str(&mut digest, &timeframe.provider_value());
+    hash_str(&mut digest, adjustment.as_str());
+    hash_timestamp(&mut digest, start);
+    hash_timestamp(&mut digest, end);
+    digest.update([bar_timestamp_basis_tag(series_semantics.timestamp_basis())]);
+    hash_session(&mut digest, series_semantics.session());
+    SourceIdentifier::try_from(format!(
+        "{PROVIDER_DATASET_PREFIX}{}",
+        encode_lower_hex(digest.finalize().into())
+    ))
+    .map_err(Into::into)
+}
+
+fn has_strict_provider_dataset_grammar(dataset: &SourceIdentifier) -> bool {
+    dataset
+        .as_str()
+        .strip_prefix(PROVIDER_DATASET_PREFIX)
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn hash_source_generation(hash: &mut Sha256, metadata: &SourceMetadata) {
+    hash.update(metadata.schema_version().get().to_be_bytes());
+    hash_str(hash, metadata.source_id().as_str());
+    hash_str(hash, metadata.revision().as_source_identifier().as_str());
+    hash_exact_evidence(hash, metadata.revision_evidence().payload_evidence());
+    hash_str(hash, metadata.provider().as_str());
+    hash_exact_evidence(hash, metadata.coverage().evidence());
+    hash_effective_interval(hash, metadata.coverage().effective_interval());
+    let authorization = metadata.authorization();
+    hash.update([authorization_mode_tag(authorization.mode())]);
+    hash_str(hash, authorization.basis().as_source_identifier().as_str());
+    hash_exact_evidence(hash, authorization.evidence());
+    hash_effective_interval(hash, authorization.effective_interval());
+}
+
+fn hash_effective_interval(hash: &mut Sha256, effective: EffectiveInterval) {
+    hash_timestamp(hash, effective.starts_at());
+    match effective.ends_at() {
+        Some(end) => {
+            hash.update([1]);
+            hash_timestamp(hash, end);
+        }
+        None => hash.update([0]),
+    }
+}
+
+fn hash_exact_evidence(hash: &mut Sha256, evidence: &ExactPayloadEvidence) {
+    hash_evidence(hash, evidence.content_digest());
+}
+
+fn hash_evidence(hash: &mut Sha256, evidence: EvidenceDigest) {
+    hash.update([digest_algorithm_tag(evidence.algorithm())]);
+    hash.update(evidence.bytes());
+}
+
+fn hash_session(hash: &mut Sha256, session: &MarketBarSessionEvidence) {
+    hash.update([match session.kind() {
+        market_squawk_domain::MarketBarSessionKind::Regular => 1,
+        market_squawk_domain::MarketBarSessionKind::Extended => 2,
+        market_squawk_domain::MarketBarSessionKind::Continuous => 3,
+        market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
+    }]);
+    hash_str(hash, session.ruleset().as_str());
+    hash_evidence(hash, session.evidence());
+}
+
+fn hash_str(hash: &mut Sha256, value: &str) {
+    let length = match u64::try_from(value.len()) {
+        Ok(length) => length,
+        Err(_) => u64::MAX,
+    };
+    hash.update(length.to_be_bytes());
+    hash.update(value.as_bytes());
+}
+
+fn hash_timestamp(hash: &mut Sha256, value: Timestamp) {
+    hash.update(value.unix_nanos().to_be_bytes());
+}
+
+fn encode_lower_hex(bytes: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+const fn authorization_mode_tag(mode: AuthorizationMode) -> u8 {
+    match mode {
+        AuthorizationMode::PublicInterface => 1,
+        AuthorizationMode::UserAuthorized => 2,
+        AuthorizationMode::Licensed => 3,
+        AuthorizationMode::UserOwnedLocal => 4,
+    }
+}
+
+const fn digest_algorithm_tag(algorithm: DigestAlgorithm) -> u8 {
+    match algorithm {
+        DigestAlgorithm::Sha256 => 1,
+        DigestAlgorithm::Blake3 => 2,
+    }
+}
+
+const fn asset_class_tag(asset_class: AssetClass) -> u8 {
+    match asset_class {
+        AssetClass::Equity => 1,
+        AssetClass::FixedIncome => 2,
+        AssetClass::Option => 3,
+        AssetClass::Future => 4,
+        AssetClass::ForeignExchange => 5,
+        AssetClass::Crypto => 6,
+        AssetClass::Commodity => 7,
+        AssetClass::Fund => 8,
+        AssetClass::Index => 9,
+        AssetClass::Cash => 10,
+    }
+}
+
+const fn bar_timestamp_basis_tag(basis: BarTimestampBasis) -> u8 {
+    match basis {
+        BarTimestampBasis::PeriodStart => 1,
+        BarTimestampBasis::PeriodEnd => 2,
     }
 }
 

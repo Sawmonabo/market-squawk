@@ -702,7 +702,7 @@ fn build_registration(
 }
 
 fn experiment(comparison: &str) -> Result<BacktestExperimentPlan, BacktestPreparationError> {
-    let selection_criterion = SourceIdentifier::try_from("total-return")
+    let selection_criterion = SourceIdentifier::try_from("cost-adjusted-total-return")
         .map_err(|_| BacktestPreparationError::InvalidSelection)?;
     if comparison == "single-run" {
         return Ok(BacktestExperimentPlan {
@@ -817,8 +817,10 @@ fn walk_forward_cohort(
                             parameter_value.clone(),
                         )],
                         search_space: vec![search_space()?],
-                        selection_criterion: SourceIdentifier::try_from("total-return")
-                            .map_err(|_| BacktestPreparationError::InvalidSelection)?,
+                        selection_criterion: SourceIdentifier::try_from(
+                            "cost-adjusted-total-return",
+                        )
+                        .map_err(|_| BacktestPreparationError::InvalidSelection)?,
                     },
                 });
             }

@@ -88,7 +88,7 @@ impl InstalledAnalysisOperations {
         ensure_live(context)?;
         TypedToolResult::try_new(
             content,
-            count.max(1),
+            count,
             ToolResultMetadata::complete_not_applicable(),
             context.limits(),
         )
@@ -427,8 +427,6 @@ fn ensure_live(context: &RequestContext) -> Result<(), ServiceError> {
 fn map_job(error: JobApplicationError) -> ServiceError {
     match error {
         JobApplicationError::NotFound => ServiceError::NotFound,
-        JobApplicationError::WaitCancelled => ServiceError::Cancelled,
-        JobApplicationError::WaitDeadlineExceeded => ServiceError::DeadlineExceeded,
         JobApplicationError::Contract => ServiceError::InvalidRequest,
         JobApplicationError::Repository | JobApplicationError::Authority => {
             ServiceError::Unavailable

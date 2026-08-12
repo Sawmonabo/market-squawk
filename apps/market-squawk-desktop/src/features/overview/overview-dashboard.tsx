@@ -1,55 +1,79 @@
 import * as React from "react"
 import {
   Activity,
-  Bot,
   BriefcaseBusiness,
   CircleAlert,
+  Clock3,
   Database,
   Gauge,
-  Search,
+  ListChecks,
   ServerCog,
+  ShieldAlert,
+  Sparkles,
 } from "lucide-react"
 import { Link } from "react-router-dom"
 
 import type { ProductScope } from "@/app/query-client"
-import { useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
+import type { InvestmentAnalysisPage } from "@/features/opportunities/contracts"
+import {
+  formatPercent,
+  formatTimestamp,
+} from "@/features/portfolio/portfolio-format"
+import type {
+  PortfolioAccount,
+  PortfolioExposure,
+  PortfolioPerformance,
+  PortfolioRisk,
+} from "@/features/portfolio/portfolio-contracts"
+import {
+  usePortfolioAccounts,
+  usePortfolioDetails,
+} from "@/features/portfolio/use-portfolio"
+import { formatMoney, humanize } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
-import { LookupSurface } from "@/features/lookup/lookup-surface"
-import { compactMoney, formatPercent, formatTimestamp } from "@/features/portfolio/portfolio-format"
-import { usePortfolioAccounts, usePortfolioDetails } from "@/features/portfolio/use-portfolio"
-import type { MarketSnapshot, OverviewJob, PaperStatus } from "./schemas"
+import type { MarketSnapshot, OverviewJob, SourceHealth } from "./schemas"
 import { type ReadState, useOverviewQueries } from "./use-overview"
+
+type OverviewQueries = ReturnType<typeof useOverviewQueries>
+type PortfolioAccountsRead = ReturnType<typeof usePortfolioAccounts>
 
 export function OverviewDashboard({
   transport,
   scope,
+  bootstrap,
 }: {
   transport: ProductTransport
   scope: ProductScope
+  bootstrap: DesktopBootstrap
 }) {
-  const product = useProduct()
   const queries = useOverviewQueries(transport, scope)
-  const activeJobs =
+  const accounts = usePortfolioAccounts(transport, bootstrap)
+  const analysisJobs =
     queries.jobs.status === "ready"
-      ? queries.jobs.data.jobs.filter((job) => !isTerminal(job.state))
+      ? queries.jobs.data.jobs.filter(
+          (job) => !isTerminal(job.state) && isAnalysisJob(job.kind),
+        )
       : []
 
   return (
     <div className="space-y-4">
-      <section aria-label="Current workspace status" className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <section
+        aria-label="Home summary"
+        className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4"
+      >
         <StatusCard
           icon={ServerCog}
           label="Data sources"
-          value={countValue(queries.sources, "configured")}
+          value={countValue(queries.sources, "source records")}
           state={queries.sources.status}
           detail={
             queries.sources.status === "ready"
-              ? "Current provider health, not just setup status."
+              ? sourceReadinessDetail(queries.sources.data)
               : queries.sources.message
           }
         />
@@ -61,327 +85,693 @@ export function OverviewDashboard({
           detail={
             queries.markets.status === "ready"
               ? freshMarketDetail(queries.markets.data)
-              : "No qualified live snapshot is available right now."
+              : queries.markets.message
           }
         />
         <StatusCard
           icon={Gauge}
-          label="Active work"
-          value={`${activeJobs.length} job${activeJobs.length === 1 ? "" : "s"}`}
+          label="Running analyses"
+          value={
+            queries.jobs.status === "ready"
+              ? analysisJobs.length.toLocaleString()
+              : "Unavailable"
+          }
           state={queries.jobs.status}
-          detail={queries.jobs.status === "ready" ? "Durable jobs survive page changes." : queries.jobs.message}
+          detail={
+            queries.jobs.status === "ready"
+              ? queries.jobs.data.next
+                ? "Count from the first bounded job page; more jobs are retained."
+                : "Current analytical, research, forecasting, and decision jobs."
+              : queries.jobs.message
+          }
         />
         <StatusCard
-          icon={Bot}
-          label="Paper execution"
-          value={queries.paper.status === "ready" ? friendlyState(queries.paper.data.state) : "Unavailable"}
-          state={queries.paper.status}
-          detail={paperDetail(queries.paper)}
+          icon={Sparkles}
+          label="Retained analyses"
+          value={analysisCount(queries.analyses)}
+          state={queries.analyses.status}
+          detail={
+            queries.analyses.status === "ready"
+              ? "Durable analyses, not an opportunity ranking."
+              : queries.analyses.message
+          }
         />
       </section>
 
-      {product.status === "ready" ? (
-        <PortfolioTruth
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1.25fr)_minmax(340px,0.75fr)]">
+        <PortfolioSummary
           transport={transport}
-          bootstrap={product.bootstrap}
+          scope={scope}
+          bootstrap={bootstrap}
+          accounts={accounts}
         />
-      ) : null}
-
-      <section className="grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
-        <div className="rounded-xl border border-border bg-card/45 p-5">
-          <div className="mb-4 flex items-start gap-3">
-            <span className="rounded-lg border border-border bg-background/70 p-2.5">
-              <Search className="size-4 text-primary" aria-hidden="true" />
-            </span>
-            <div>
-              <h2 className="text-base font-semibold">Look up anything in your workspace</h2>
-              <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                Find real local sources, research datasets, screens, jobs, and safe application actions.
-              </p>
-            </div>
-          </div>
-          <LookupSurface transport={transport} scope={scope} />
-        </div>
-
-        <DecisionQueue overview={queries.overview} activeJobs={activeJobs} />
+        <RecommendationSummary analyses={queries.analyses} />
       </section>
 
-      <section className="grid gap-4 lg:grid-cols-2">
-        <LiveMarketPanel markets={queries.markets} />
-        <SourceHealthPanel sources={queries.sources} />
+      <section className="grid gap-4 xl:grid-cols-2">
+        <RunningAnalysisPanel jobs={queries.jobs} analysisJobs={analysisJobs} />
+        <SetupGuidance
+          accounts={accounts}
+          overview={queries.overview}
+          sources={queries.sources}
+          analyses={queries.analyses}
+        />
+      </section>
+
+      <section aria-labelledby="home-evidence-title" className="space-y-3 pt-1">
+        <div>
+          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+            Current context
+          </p>
+          <h2 id="home-evidence-title" className="mt-1 text-base font-semibold">
+            Market and source evidence
+          </h2>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            These are compact service summaries. Markets and Connections &amp; Sources retain the
+            complete workspaces.
+          </p>
+        </div>
+        <div className="grid gap-4 lg:grid-cols-2">
+          <LiveMarketPanel markets={queries.markets} />
+          <SourceHealthPanel sources={queries.sources} />
+        </div>
       </section>
     </div>
   )
 }
 
-function PortfolioTruth({
+function PortfolioSummary({
   transport,
+  scope,
   bootstrap,
+  accounts,
 }: {
   transport: ProductTransport
+  scope: ProductScope
   bootstrap: DesktopBootstrap
+  accounts: PortfolioAccountsRead
 }) {
-  const accounts = usePortfolioAccounts(transport, bootstrap)
-  const accountRows = accounts.query.data?.pages.flatMap((page) => page.value) ?? []
-  const [selectedId, setSelectedId] = React.useState<string | null>(null)
+  const accountRows =
+    accounts.query.data?.pages.flatMap((page) => page.value) ?? []
+  const [selectedAccountId, setSelectedAccountId] = React.useState("")
   const account =
-    accountRows.find((candidate) => candidate.accountId === selectedId) ??
-    accountRows[0] ??
-    null
+    accountRows.find(
+      (candidate) => candidate.accountId === selectedAccountId,
+    ) ?? null
   const details = usePortfolioDetails(
     transport,
-    bootstrap.runtime,
+    scope,
     bootstrap,
     account?.accountId ?? null,
   )
 
   if (!accounts.available) {
     return (
-      <PortfolioEmpty
-        title="Portfolio truth is not available"
-        detail="The installed service does not expose the account index. Restore or complete Portfolio setup before relying on account, holding, performance, exposure, or risk totals."
+      <PortfolioUnavailable
+        title="Portfolio summary is unavailable"
+        detail="This installed service does not expose the account index. Home will not invent an account, value, currency, or cash balance."
       />
     )
   }
   if (accounts.query.isPending) {
-    return <Skeleton className="h-56 rounded-xl" />
+    return <Skeleton className="h-80 rounded-xl" />
   }
   if (accounts.query.isError) {
     return (
-      <PortfolioEmpty
+      <PortfolioUnavailable
         title="Portfolio accounts could not be read"
-        detail={accounts.query.error instanceof Error ? accounts.query.error.message : "The installed service rejected the account query."}
+        detail={
+          accounts.query.error instanceof Error
+            ? accounts.query.error.message
+            : "The installed service rejected the account query."
+        }
       />
     )
   }
-  if (!account) {
+  if (accountRows.length === 0) {
     return (
-      <PortfolioEmpty
+      <PortfolioUnavailable
         title="No portfolio account is loaded"
-        detail="Import a supported portfolio source to see holdings, performance, exposure, and risk here. Market Squawk will not invent an account or assume a reporting currency."
+        detail="Import a supported account before Home can show an account-bound value. Market Squawk will not combine currencies or substitute the paper account."
       />
     )
   }
 
+  return (
+    <section
+      className="rounded-xl border border-border bg-card/45 p-5"
+      aria-labelledby="portfolio-summary-title"
+    >
+      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+        <div className="flex items-start gap-3">
+          <span className="rounded-lg border border-border bg-background/70 p-2.5">
+            <BriefcaseBusiness
+              className="size-4 text-primary"
+              aria-hidden="true"
+            />
+          </span>
+          <div>
+            <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+              Financial position
+            </p>
+            <h2 id="portfolio-summary-title" className="mt-1 text-base font-semibold">
+              One account, one currency, one revision
+            </h2>
+            <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
+              Choose an account explicitly for this Home summary. This temporary display choice
+              does not set the durable recommendation account.
+            </p>
+          </div>
+        </div>
+        <Button asChild variant="outline" size="sm">
+          <Link to="/portfolio">Open Portfolio</Link>
+        </Button>
+      </div>
+
+      <label className="mt-4 block max-w-xl text-xs font-medium">
+        Account to summarize
+        <select
+          className="mt-2 h-9 w-full rounded-md border border-input bg-background px-3 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          value={account?.accountId ?? ""}
+          onChange={(event) => setSelectedAccountId(event.target.value)}
+        >
+          <option value="">Choose an account</option>
+          {accountRows.map((candidate) => (
+            <option key={candidate.accountId} value={candidate.accountId}>
+              {candidate.accountId} · {candidate.currency.toUpperCase()}
+            </option>
+          ))}
+        </select>
+      </label>
+      {accounts.query.hasNextPage ? (
+        <p className="mt-2 text-[10px] leading-4 text-muted-foreground">
+          This bounded Home read contains only the returned account page. Open Portfolio to inspect
+          the complete account index.
+        </p>
+      ) : null}
+
+      {account === null ? (
+        <div className="mt-4 rounded-lg border border-dashed border-border p-5">
+          <p className="text-xs font-medium">Choose before values are read</p>
+          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+            Home never falls back to the first account. No portfolio details are requested until
+            you make an explicit display choice.
+          </p>
+        </div>
+      ) : (
+        <SelectedPortfolioSummary account={account} details={details} />
+      )}
+    </section>
+  )
+}
+
+function SelectedPortfolioSummary({
+  account,
+  details,
+}: {
+  account: PortfolioAccount
+  details: ReturnType<typeof usePortfolioDetails>
+}) {
   const holdings = details.holdings.data?.value ?? null
   const performance = details.performance.data?.value ?? null
   const exposure = details.exposure.data?.value ?? null
   const risk = details.risk.data?.value ?? null
-  const expectedAccountId = account.accountId
   const expectedRevisionId = account.currentRevision.revisionId
   const changedWhileReading =
     holdings?.some(
       (holding) =>
-        holding.account_id !== expectedAccountId ||
+        holding.account_id !== account.accountId ||
         holding.revisionId !== expectedRevisionId,
     ) === true ||
     [performance, exposure, risk].some(
       (detail) =>
         detail !== null &&
-        (detail.accountId !== expectedAccountId ||
+        (detail.accountId !== account.accountId ||
           detail.revisionId !== expectedRevisionId),
     )
-  const detailLoading = {
-    performance:
-      details.operationAvailable["Portfolio.GetPerformance"] &&
-      details.performance.isPending,
-    exposure:
-      details.operationAvailable["Portfolio.GetExposure"] &&
-      details.exposure.isPending,
-    risk:
-      details.operationAvailable["Portfolio.GetRisk"] && details.risk.isPending,
+
+  if (changedWhileReading) {
+    return (
+      <Alert className="mt-4">
+        <CircleAlert aria-hidden="true" />
+        <AlertTitle>Portfolio changed while Home was reading it</AlertTitle>
+        <AlertDescription>
+          At least one result belongs to a different account or revision. Home is withholding all
+          mixed-revision values. Refresh or reopen the account in Portfolio.
+        </AlertDescription>
+      </Alert>
+    )
   }
-  const unavailable = [
-    !details.operationAvailable["Portfolio.GetHoldings"] ? "holdings" : null,
-    !details.operationAvailable["Portfolio.GetPerformance"] ? "performance" : null,
-    !details.operationAvailable["Portfolio.GetExposure"] ? "exposure" : null,
-    !details.operationAvailable["Portfolio.GetRisk"] ? "risk" : null,
-  ].filter((value): value is string => value !== null)
+
   const failures = [
     details.holdings.error,
     details.performance.error,
     details.exposure.error,
     details.risk.error,
   ].filter((value): value is Error => value instanceof Error)
-
-  if (changedWhileReading) {
-    return (
-      <section className="rounded-xl border border-amber-400/30 bg-amber-400/5 p-5" aria-labelledby="portfolio-changed-title">
-        <div className="flex items-start gap-3">
-          <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-300" aria-hidden="true" />
-          <div>
-            <h2 id="portfolio-changed-title" className="text-sm font-semibold">
-              Portfolio changed while details were being read
-            </h2>
-            <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-              At least one detail response belongs to a different account or revision. No mixed-revision portfolio values are shown. Refresh the account and its details together before relying on this summary.
-            </p>
-            <Button
-              className="mt-3"
-              size="sm"
-              variant="outline"
-              disabled={accounts.query.isFetching || details.isFetching}
-              onClick={() => {
-                void accounts.query.refetch().then(() => details.refresh())
-              }}
-            >
-              Refresh portfolio truth
-            </Button>
-          </div>
-        </div>
-      </section>
-    )
-  }
+  const currentValue = factFromPerformance(
+    performance,
+    details.performance.isPending,
+  )
+  const reportedCash = performance?.accountingEvidence?.cash.amount ?? null
 
   return (
-    <section className="rounded-xl border border-border bg-card/45 p-5" aria-labelledby="portfolio-truth-title">
-      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-        <div className="flex items-start gap-3">
-          <span className="rounded-lg border border-border bg-background/70 p-2.5">
-            <BriefcaseBusiness className="size-4 text-primary" aria-hidden="true" />
-          </span>
-          <div>
-            <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">Portfolio truth</p>
-            <h2 id="portfolio-truth-title" className="mt-1 text-base font-semibold">Account, holdings, performance, exposure, and risk</h2>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              Values below come from one selected immutable account revision. Accounts with different currencies are never silently combined.
-            </p>
-          </div>
-        </div>
-        <Button asChild variant="outline" size="sm">
-          <Link to="/portfolios">Open Portfolios</Link>
-        </Button>
-      </div>
-
-      {accountRows.length > 1 ? (
-        <label className="mt-4 block max-w-xl text-xs font-medium">
-          Account
-          <select
-            className="mt-2 h-9 w-full rounded-md border border-input bg-background px-3 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            value={account.accountId}
-            onChange={(event) => setSelectedId(event.target.value)}
-          >
-            {accountRows.map((candidate) => (
-              <option key={candidate.accountId} value={candidate.accountId}>
-                {candidate.accountId} · {candidate.currency.toUpperCase()}
-              </option>
-            ))}
-          </select>
-        </label>
-      ) : null}
-
-      {unavailable.length ? (
-        <p className="mt-4 rounded-lg border border-border bg-background/35 p-3 text-[11px] leading-5 text-muted-foreground">
-          This service does not expose {unavailable.join(", ")} for the selected account. Open Portfolios to complete or repair the missing capability.
-        </p>
-      ) : null}
-      {failures.length ? (
-        <p className="mt-4 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[11px] leading-5 text-destructive">
+    <div className="mt-4">
+      {failures.length > 0 ? (
+        <p className="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[11px] leading-5 text-destructive">
           {failures.map((failure) => failure.message).join(" · ")}
         </p>
       ) : null}
 
-      <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <TruthFact
           label="Current value"
-          value={
-            performance
-              ? compactMoney(performance.currentValue)
-              : detailLoading.performance
-                ? "Loading…"
-                : "Unavailable"
-          }
+          value={currentValue.value}
+          detail={currentValue.detail}
+        />
+        <TruthFact
+          label="Recent performance"
+          value="Not available"
           detail={
-            performance?.historyStatus ??
-            (detailLoading.performance
-              ? "Reading the selected account revision."
-              : "No performance truth returned.")
+            performance?.timeWeightedReturn === undefined
+              ? "No comparable performance result was returned."
+              : "The service returns an available-history time-weighted return, but no bounded recent-period start for Home to label as recent."
           }
         />
         <TruthFact
-          label="Holdings"
-          value={account.holdingCount.toLocaleString()}
-          detail={`${account.transactionCount.toLocaleString()} retained transactions.`}
-        />
-        <TruthFact
-          label="Performance"
-          value={
-            performance
-              ? formatPercent(performance.timeWeightedReturn)
-              : detailLoading.performance
-                ? "Loading…"
-                : "Unavailable"
-          }
+          label="Available cash"
+          value="Not available"
           detail={
-            detailLoading.performance
-              ? "Reading the selected account revision."
-              : performance?.periods === undefined
-                ? "Comparable history unavailable."
-                : `${performance.periods.toLocaleString()} comparable periods.`
+            reportedCash
+              ? `The account reports ${formatMoney(reportedCash)}, but settlement availability and reservations are not included.`
+              : "No source-reported cash evidence was returned; settlement availability is also absent."
           }
         />
         <TruthFact
-          label="Net exposure"
-          value={
-            exposure?.net
-              ? compactMoney(exposure.net)
-              : detailLoading.exposure
-                ? "Loading…"
-                : "Unavailable"
-          }
-          detail={
-            exposure?.calculationStatus ??
-            (detailLoading.exposure
-              ? "Reading the selected account revision."
-              : "No exposure calculation returned.")
-          }
-        />
-        <TruthFact
-          label="Historical value at risk"
-          value={
-            risk
-              ? formatPercent(risk.valueAtRisk)
-              : detailLoading.risk
-                ? "Loading…"
-                : "Unavailable"
-          }
+          label="Major risk alerts"
+          value="Not available"
           detail={
             risk
-              ? `${formatPercent(risk.confidence)} confidence · ${risk.observations?.toLocaleString() ?? "unknown"} observations.`
-              : detailLoading.risk
-                ? "Reading the selected account revision."
-                : "No historical VaR estimate returned."
+              ? "The current risk read supplies historical measures, not alert severity, active limit breaches, or an all-clear state."
+              : "No typed alert or active-limit state was returned."
           }
         />
       </div>
 
-      <dl className="mt-4 grid gap-3 border-t border-border pt-4 text-[10px] sm:grid-cols-2 xl:grid-cols-4">
-        <TruthEvidence label="Reporting currency" value={account.currency.toUpperCase()} />
-        <TruthEvidence label="Portfolio source" value={account.currentRevision.sourceId} />
-        <TruthEvidence label="Effective at" value={formatTimestamp(account.currentRevision.effectiveAtUnixNanos)} />
-        <TruthEvidence label="Available to analysis" value={formatTimestamp(account.currentRevision.availableAtUnixNanos)} />
-        <TruthEvidence label="Revision" value={account.currentRevision.revisionId} mono />
-        <TruthEvidence label="Artifact" value={account.currentRevision.artifactSha256} mono />
-        <TruthEvidence label="Source coverage" value={account.currentRevision.sourceCoverage.join(", ") || "Not reported"} />
-        <TruthEvidence
-          label="Reconciliation"
-          value={account.reconciliationDiscrepancies === 0 ? "No retained discrepancy" : `${account.reconciliationDiscrepancies} retained discrepancies`}
-        />
-      </dl>
+      <details className="mt-4 rounded-lg border border-border bg-background/35 px-4 py-3">
+        <summary className="cursor-pointer text-xs font-medium">
+          Additional account evidence
+        </summary>
+        <p className="mt-2 text-[10px] leading-4 text-muted-foreground">
+          These values retain their backend labels. They do not fill the missing recent-period,
+          settlement-availability, or alert-classification contracts above.
+        </p>
+        <dl className="mt-3 grid gap-3 text-[10px] sm:grid-cols-2 xl:grid-cols-4">
+          <EvidenceFact
+            label="Source-reported cash"
+            value={reportedCash ? formatMoney(reportedCash) : "Not returned"}
+          />
+          <EvidenceFact
+            label="Available-history return"
+            value={formatAvailableHistoryReturn(performance)}
+          />
+          <EvidenceFact
+            label="Net exposure"
+            value={formatExposure(exposure)}
+          />
+          <EvidenceFact
+            label="Historical value at risk"
+            value={formatHistoricalValueAtRisk(risk)}
+          />
+          <EvidenceFact
+            label="Reporting currency"
+            value={account.currency.toUpperCase()}
+          />
+          <EvidenceFact
+            label="Holdings"
+            value={account.holdingCount.toLocaleString()}
+          />
+          <EvidenceFact
+            label="Revision effective at"
+            value={formatTimestamp(account.currentRevision.effectiveAtUnixNanos)}
+          />
+          <EvidenceFact
+            label="Available to analysis"
+            value={formatTimestamp(account.currentRevision.availableAtUnixNanos)}
+          />
+          <EvidenceFact
+            label="Revision"
+            value={account.currentRevision.revisionId}
+            mono
+          />
+          <EvidenceFact
+            label="Portfolio source"
+            value={account.currentRevision.sourceId}
+          />
+        </dl>
+      </details>
+    </div>
+  )
+}
+
+function RecommendationSummary({
+  analyses,
+}: {
+  analyses: OverviewQueries["analyses"]
+}) {
+  return (
+    <section
+      className="rounded-xl border border-border bg-card/45 p-5"
+      aria-labelledby="recommendation-summary-title"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+            Recommendations
+          </p>
+          <h2 id="recommendation-summary-title" className="mt-1 text-base font-semibold">
+            What may need attention
+          </h2>
+        </div>
+        <Sparkles className="size-5 text-primary" aria-hidden="true" />
+      </div>
+
+      {analyses.status === "loading" ? (
+        <div className="mt-5 space-y-3">
+          <Skeleton className="h-16 rounded-lg" />
+          <Skeleton className="h-16 rounded-lg" />
+        </div>
+      ) : analyses.status === "unavailable" ? (
+        <Alert className="mt-5">
+          <CircleAlert aria-hidden="true" />
+          <AlertTitle>Retained analyses are unavailable</AlertTitle>
+          <AlertDescription>{analyses.message}</AlertDescription>
+        </Alert>
+      ) : analyses.data.availableCount === 0 ? (
+        <div className="mt-5 rounded-lg border border-dashed border-border p-5">
+          <p className="text-xs font-medium">No persisted investment analysis exists yet</p>
+          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+            Home will not fill this space with saved screens, manual targets, or market movers.
+          </p>
+        </div>
+      ) : (
+        <RecommendationFacts page={analyses.data} />
+      )}
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        <Button asChild size="sm" variant="outline">
+          <Link to="/opportunities">Open Opportunities</Link>
+        </Button>
+      </div>
     </section>
   )
 }
 
-function PortfolioEmpty({ title, detail }: { title: string; detail: string }) {
+function RecommendationFacts({ page }: { page: InvestmentAnalysisPage }) {
+  const generatedInPage = page.analyses.filter(
+    (analysis) => analysis.outcome.kind === "generated",
+  )
+  const heldActionsInPage = generatedInPage.filter(
+    (analysis) =>
+      analysis.outcome.kind === "generated" &&
+      analysis.outcome.action !== "buy",
+  )
+
+  return (
+    <div className="mt-5 space-y-3">
+      <QueueItem
+        label="Retained analyses"
+        value={page.availableCount.toLocaleString()}
+        detail={`${generatedInPage.length.toLocaleString()} generated and ${heldActionsInPage.length.toLocaleString()} non-Buy action records appear in this ${page.completeness} append-order page.`}
+      />
+      <QueueItem
+        label="Strongest current opportunities"
+        value="Not available"
+        detail="The typed read has no ranking receipt, score, or server-selected strongest set. Home will not promote the first appended record."
+      />
+      <QueueItem
+        label="Current held-position actions"
+        value="Not available"
+        detail="Retained Add, Hold, Trim, or Sell records do not include a current supersession and invalidation status for Home."
+      />
+      <QueueItem
+        label="Changed, expired, or invalidated"
+        value="Not available"
+        detail="The list supplies valid-through timestamps but no authoritative current-status, change, supersession, or invalidation feed. Home does not compare them with the browser clock."
+      />
+      {page.completeness === "truncated" ? (
+        <p className="rounded-lg border border-border bg-background/35 p-3 text-[10px] leading-4 text-muted-foreground">
+          This Home read is intentionally bounded. More retained append-order analyses exist; the
+          page is not a complete ranking.
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+function RunningAnalysisPanel({
+  jobs,
+  analysisJobs,
+}: {
+  jobs: OverviewQueries["jobs"]
+  analysisJobs: OverviewJob[]
+}) {
+  return (
+    <section
+      className="rounded-xl border border-border bg-card/45 p-5"
+      aria-labelledby="running-analysis-title"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+            Work in progress
+          </p>
+          <h2 id="running-analysis-title" className="mt-1 text-base font-semibold">
+            Running analyses
+          </h2>
+        </div>
+        <Clock3 className="size-5 text-primary" aria-hidden="true" />
+      </div>
+
+      {jobs.status === "loading" ? (
+        <Skeleton className="mt-5 h-32 rounded-lg" />
+      ) : jobs.status === "unavailable" ? (
+        <Alert className="mt-5">
+          <CircleAlert aria-hidden="true" />
+          <AlertTitle>Job status is unavailable</AlertTitle>
+          <AlertDescription>{jobs.message}</AlertDescription>
+        </Alert>
+      ) : analysisJobs.length === 0 ? (
+        <div className="mt-5 rounded-lg border border-dashed border-border p-5">
+          <p className="text-xs font-medium">
+            {jobs.data.next
+              ? "No running analysis appeared in the first job page"
+              : "No analysis is running"}
+          </p>
+          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+            {jobs.data.next
+              ? "More jobs are retained, so this bounded page cannot establish a complete zero."
+              : "The complete returned job page has no active research, model, analysis, or decision job."}
+          </p>
+        </div>
+      ) : (
+        <ul className="mt-5 divide-y divide-border">
+          {analysisJobs.slice(0, 4).map((job) => (
+            <li key={job.jobId} className="py-3 first:pt-0 last:pb-0">
+              <div className="flex items-baseline justify-between gap-3">
+                <p className="truncate text-xs font-medium" title={job.kind}>
+                  {humanize(job.kind)}
+                </p>
+                <span className="font-mono text-[9px] uppercase tracking-wider text-primary">
+                  {humanize(job.state)}
+                </span>
+              </div>
+              <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
+                {job.phase ? humanize(job.phase) : "No phase reported"}
+                {job.completedUnits !== null && job.completedUnits !== undefined
+                  ? ` · ${job.completedUnits.toLocaleString()} completed${job.totalUnits !== null && job.totalUnits !== undefined ? ` of ${job.totalUnits.toLocaleString()}` : ""}`
+                  : ""}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <Button asChild className="mt-4" size="sm" variant="outline">
+        <Link to="/system/operations-jobs">Open Operations &amp; Jobs</Link>
+      </Button>
+    </section>
+  )
+}
+
+function SetupGuidance({
+  accounts,
+  overview,
+  sources,
+  analyses,
+}: {
+  accounts: PortfolioAccountsRead
+  overview: OverviewQueries["overview"]
+  sources: OverviewQueries["sources"]
+  analyses: OverviewQueries["analyses"]
+}) {
+  const accountCount =
+    accounts.query.data?.pages.reduce(
+      (count, page) => count + page.value.length,
+      0,
+    ) ?? 0
+  const activeSources =
+    sources.status === "ready" && sources.data
+      ? sources.data.filter(
+          (source) => source.runtimeHealth.state === "active",
+        ).length
+      : 0
+
+  return (
+    <section
+      className="rounded-xl border border-border bg-card/45 p-5"
+      aria-labelledby="setup-guidance-title"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+            Readiness
+          </p>
+          <h2 id="setup-guidance-title" className="mt-1 text-base font-semibold">
+            What to set up next
+          </h2>
+        </div>
+        <ListChecks className="size-5 text-primary" aria-hidden="true" />
+      </div>
+
+      <div className="mt-5 space-y-3">
+        <GuidanceItem
+          icon={Sparkles}
+          title="Automatic opportunity search is not available yet"
+          detail="This Desktop build has no typed Find opportunities workflow command. The disabled Home control starts nothing and creates no analysis."
+          path="/opportunities"
+          linkLabel="Review retained analyses"
+        />
+        {accounts.query.isPending ? (
+          <GuidanceItem
+            icon={BriefcaseBusiness}
+            title="Checking portfolio accounts"
+            detail="Home is waiting for the bounded account read and does not infer that an account is missing while it is still loading."
+            path="/portfolio"
+            linkLabel="Open Portfolio"
+          />
+        ) : !accounts.available || accounts.query.isError || accountCount === 0 ? (
+          <GuidanceItem
+            icon={BriefcaseBusiness}
+            title="Add a portfolio account"
+            detail="Recommendations need an explicit account and currency. Home never selects the first account or substitutes simulated paper balances."
+            path="/portfolio"
+            linkLabel="Open Portfolio"
+          />
+        ) : (
+          <GuidanceItem
+            icon={BriefcaseBusiness}
+            title="Recommendation-account selection is not readable here yet"
+            detail="Accounts are present, but the current Desktop transport does not expose the durable recommendation account and profile. Home will not infer either one."
+            path="/portfolio"
+            linkLabel="Open Portfolio setup"
+          />
+        )}
+        {sources.status === "unavailable" ||
+        (sources.status === "ready" && activeSources === 0) ? (
+          <GuidanceItem
+            icon={ServerCog}
+            title="Connect or start a data source"
+            detail={
+              sources.status === "unavailable"
+                ? "Home cannot read provider health, so it cannot claim the data foundation is ready."
+                : "No returned source reports an active runtime. Market and research coverage must remain explicit."
+            }
+            path="/connections/sources"
+            linkLabel="Open Connections & Sources"
+          />
+        ) : null}
+        {overview.status === "unavailable" ||
+        (overview.status === "ready" && overview.data.datasets.count === 0) ? (
+          <GuidanceItem
+            icon={Database}
+            title="Research data needs attention"
+            detail={
+              overview.status === "unavailable"
+                ? "The research-readiness summary is unavailable. Home does not infer a usable dataset."
+                : "The service returned no admitted research dataset in this bounded summary."
+            }
+            path="/advanced/research-data"
+            linkLabel="Open Research & Data"
+          />
+        ) : null}
+        {analyses.status === "unavailable" ? (
+          <GuidanceItem
+            icon={ShieldAlert}
+            title="Investment-analysis history needs repair"
+            detail="The typed persisted-analysis read is unavailable. Home will not replace it with manual targets or saved screens."
+            path="/opportunities"
+            linkLabel="Open Opportunities"
+          />
+        ) : null}
+      </div>
+    </section>
+  )
+}
+
+function GuidanceItem({
+  icon: Icon,
+  title,
+  detail,
+  path,
+  linkLabel,
+}: {
+  icon: typeof Sparkles
+  title: string
+  detail: string
+  path: string
+  linkLabel: string
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-background/35 p-3">
+      <div className="flex items-start gap-3">
+        <Icon className="mt-0.5 size-4 shrink-0 text-amber-300" aria-hidden="true" />
+        <div>
+          <p className="text-xs font-medium">{title}</p>
+          <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{detail}</p>
+          <Link
+            className="mt-2 inline-flex text-[10px] font-medium text-primary underline-offset-4 hover:underline"
+            to={path}
+          >
+            {linkLabel}
+          </Link>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function PortfolioUnavailable({
+  title,
+  detail,
+}: {
+  title: string
+  detail: string
+}) {
   return (
     <section className="rounded-xl border border-border bg-card/45 p-5">
       <div className="flex items-start gap-3">
-        <BriefcaseBusiness className="mt-0.5 size-4 text-primary" aria-hidden="true" />
+        <BriefcaseBusiness
+          className="mt-0.5 size-4 text-primary"
+          aria-hidden="true"
+        />
         <div>
           <h2 className="text-sm font-semibold">{title}</h2>
-          <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">{detail}</p>
+          <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
+            {detail}
+          </p>
           <Button asChild className="mt-3" size="sm">
-            <Link to="/portfolios">Open Portfolios</Link>
+            <Link to="/portfolio">Open Portfolio</Link>
           </Button>
         </div>
       </div>
@@ -389,111 +779,42 @@ function PortfolioEmpty({ title, detail }: { title: string; detail: string }) {
   )
 }
 
-function TruthFact({ label, value, detail }: { label: string; value: string; detail: string }) {
-  return (
-    <div className="rounded-lg border border-border bg-background/35 p-3">
-      <p className="font-mono text-[9px] uppercase tracking-wider text-muted-foreground">{label}</p>
-      <p className="mt-2 text-base font-semibold">{value}</p>
-      <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{detail}</p>
-    </div>
-  )
-}
-
-function TruthEvidence({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
-  return (
-    <div className="min-w-0">
-      <dt className="uppercase tracking-wider text-muted-foreground">{label}</dt>
-      <dd className={`mt-1 break-all text-foreground/80 ${mono ? "font-mono" : ""}`}>{value}</dd>
-    </div>
-  )
-}
-
-function DecisionQueue({
-  overview,
-  activeJobs,
-}: {
-  overview: ReturnType<typeof useOverviewQueries>["overview"]
-  activeJobs: OverviewJob[]
-}) {
-  return (
-    <section className="rounded-xl border border-border bg-card/45 p-5" aria-labelledby="decision-queue-title">
-      <div className="flex items-center justify-between">
-        <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">Decision queue</p>
-          <h2 id="decision-queue-title" className="mt-1 text-base font-semibold">What deserves attention</h2>
-        </div>
-        <Gauge className="size-5 text-primary" aria-hidden="true" />
-      </div>
-      {overview.status === "loading" ? (
-        <div className="mt-5 space-y-3">
-          <Skeleton className="h-14 rounded-lg" />
-          <Skeleton className="h-14 rounded-lg" />
-          <Skeleton className="h-14 rounded-lg" />
-        </div>
-      ) : overview.status === "unavailable" ? (
-        <Alert className="mt-5">
-          <CircleAlert aria-hidden="true" />
-          <AlertTitle>Decision summary unavailable</AlertTitle>
-          <AlertDescription>{overview.message}</AlertDescription>
-        </Alert>
-      ) : (
-        <div className="mt-5 space-y-3">
-          <QueueItem
-            label="Research foundation"
-            value={`${overview.data.datasets.count} dataset${overview.data.datasets.count === 1 ? "" : "s"}`}
-            detail={overview.data.datasets.hasMore ? "More datasets are available in Research." : "Complete bounded dataset index."}
-          />
-          <QueueItem
-            label="Saved decision screens"
-            value={`${overview.data.screens.count} screen${overview.data.screens.count === 1 ? "" : "s"}`}
-            detail="Point-in-time screen definitions available for research workflows."
-          />
-          <QueueItem
-            label="Work in progress"
-            value={`${activeJobs.length} active`}
-            detail={activeJobs[0] ? `${activeJobs[0].kind} · ${friendlyState(activeJobs[0].state)}` : "No durable job currently needs attention."}
-          />
-          {overview.data.unavailable.length > 0 ? (
-            <details className="rounded-lg border border-border bg-background/35 px-3 py-2">
-              <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground">
-                Evidence not available in this summary ({overview.data.unavailable.length})
-              </summary>
-              <ul className="mt-2 space-y-2 text-[11px] leading-4 text-muted-foreground">
-                {overview.data.unavailable.map((item) => (
-                  <li key={item.category}>
-                    <strong className="capitalize text-foreground/75">{item.category}:</strong> {item.reason}
-                  </li>
-                ))}
-              </ul>
-            </details>
-          ) : null}
-        </div>
-      )}
-    </section>
-  )
-}
-
 function LiveMarketPanel({
   markets,
 }: {
-  markets: ReturnType<typeof useOverviewQueries>["markets"]
+  markets: OverviewQueries["markets"]
 }) {
   return (
-    <EvidencePanel title="Live market truth" icon={Activity} state={markets.status} message={markets.message}>
+    <EvidencePanel
+      title="Live market truth"
+      icon={Activity}
+      state={markets.status}
+      message={markets.message}
+    >
       {markets.status === "ready" && markets.data && markets.data.length > 0 ? (
         <ul className="divide-y divide-border">
           {markets.data.slice(0, 5).map((stream) => (
-            <li key={`${stream.sourceId}:${stream.instrumentId}`} className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
-              <span className={`size-2 rounded-full ${stream.freshAtReference ? "bg-[var(--success)]" : "bg-[var(--warning)]"}`} aria-hidden="true" />
+            <li
+              key={`${stream.sourceId}:${stream.instrumentId}`}
+              className="flex items-center gap-3 py-3 first:pt-0 last:pb-0"
+            >
+              <span
+                className={`size-2 rounded-full ${stream.freshAtReference ? "bg-[var(--success)]" : "bg-[var(--warning)]"}`}
+                aria-hidden="true"
+              />
               <span className="min-w-0 flex-1">
-                <span className="block truncate text-xs font-medium">{stream.instrumentId}</span>
+                <span className="block truncate text-xs font-medium">
+                  {stream.instrumentId}
+                </span>
                 <span className="mt-0.5 block truncate font-mono text-[9px] text-muted-foreground">
                   {stream.sourceId} · {stream.venueId}
                 </span>
               </span>
               <span className="text-right text-[10px] text-muted-foreground">
-                <span className="block capitalize">{stream.currentDisplayQuality.replaceAll("_", " ")}</span>
-                <span className="block capitalize">{stream.tradingStatus.replaceAll("_", " ")}</span>
+                <span className="block">
+                  {humanize(stream.currentDisplayQuality)}
+                </span>
+                <span className="block">{humanize(stream.tradingStatus)}</span>
               </span>
             </li>
           ))}
@@ -506,26 +827,45 @@ function LiveMarketPanel({
 function SourceHealthPanel({
   sources,
 }: {
-  sources: ReturnType<typeof useOverviewQueries>["sources"]
+  sources: OverviewQueries["sources"]
 }) {
   return (
-    <EvidencePanel title="Source health" icon={ServerCog} state={sources.status} message={sources.message}>
+    <EvidencePanel
+      title="Source health"
+      icon={ServerCog}
+      state={sources.status}
+      message={sources.message}
+    >
       {sources.status === "ready" && sources.data && sources.data.length > 0 ? (
         <ul className="divide-y divide-border">
           {sources.data.slice(0, 5).map((source) => {
-            const runtimeState = firstText(source.runtimeHealth, ["state", "phase", "status"]) ?? "Not active"
+            const runtimeState =
+              firstText(source.runtimeHealth, ["state", "phase", "status"]) ??
+              "not_active"
             return (
-              <li key={source.surfaceId} className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
+              <li
+                key={source.surfaceId}
+                className="flex items-center gap-3 py-3 first:pt-0 last:pb-0"
+              >
                 <span className="rounded-md border border-border bg-background/60 p-2">
-                  <ServerCog className="size-3.5 text-primary" aria-hidden="true" />
+                  <ServerCog
+                    className="size-3.5 text-primary"
+                    aria-hidden="true"
+                  />
                 </span>
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-xs font-medium">{source.surfaceId}</span>
-                  <span className="mt-0.5 block text-[10px] capitalize text-muted-foreground">
-                    {source.onboardingState?.replaceAll("_", " ") ?? "Not configured"}
+                  <span className="block truncate text-xs font-medium">
+                    {source.surfaceId}
+                  </span>
+                  <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                    {source.onboardingState
+                      ? humanize(source.onboardingState)
+                      : "Not configured"}
                   </span>
                 </span>
-                <span className="text-[10px] capitalize text-muted-foreground">{runtimeState.replaceAll("_", " ")}</span>
+                <span className="text-[10px] text-muted-foreground">
+                  {humanize(runtimeState)}
+                </span>
               </li>
             )
           })}
@@ -552,20 +892,24 @@ function EvidencePanel({
     <section className="rounded-xl border border-border bg-card/45 p-5">
       <div className="mb-4 flex items-center gap-2">
         <Icon className="size-4 text-primary" aria-hidden="true" />
-        <h2 className="text-sm font-semibold">{title}</h2>
+        <h3 className="text-sm font-semibold">{title}</h3>
       </div>
       {state === "loading" ? <Skeleton className="h-28 rounded-lg" /> : null}
       {state === "unavailable" ? (
         <div className="rounded-lg border border-border bg-background/35 p-4">
           <p className="text-xs font-medium">Not available right now</p>
-          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{message}</p>
+          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+            {message}
+          </p>
         </div>
       ) : null}
       {state === "ready" && !children ? (
         <p className="rounded-lg border border-dashed border-border p-5 text-center text-xs text-muted-foreground">
           No current records were returned.
         </p>
-      ) : children}
+      ) : (
+        children
+      )}
     </section>
   )
 }
@@ -592,14 +936,69 @@ function StatusCard({
           aria-label={state}
         />
       </div>
-      <p className="mt-4 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">{label}</p>
-      <p className="mt-1 text-lg font-semibold">{state === "loading" ? "Checking…" : value}</p>
-      <p className="mt-1 min-h-8 text-[10px] leading-4 text-muted-foreground">{detail}</p>
+      <p className="mt-4 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+        {label}
+      </p>
+      <p className="mt-1 text-lg font-semibold">
+        {state === "loading" ? "Checking…" : value}
+      </p>
+      <p className="mt-1 min-h-8 text-[10px] leading-4 text-muted-foreground">
+        {detail}
+      </p>
     </section>
   )
 }
 
-function QueueItem({ label, value, detail }: { label: string; value: string; detail: string }) {
+function TruthFact({
+  label,
+  value,
+  detail,
+}: {
+  label: string
+  value: string
+  detail: string
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-background/35 p-3">
+      <p className="font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+        {label}
+      </p>
+      <p className="mt-2 text-base font-semibold">{value}</p>
+      <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{detail}</p>
+    </div>
+  )
+}
+
+function EvidenceFact({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string
+  value: string
+  mono?: boolean
+}) {
+  return (
+    <div className="min-w-0">
+      <dt className="uppercase tracking-wider text-muted-foreground">{label}</dt>
+      <dd
+        className={`mt-1 break-all text-foreground/80 ${mono ? "font-mono" : ""}`}
+      >
+        {value}
+      </dd>
+    </div>
+  )
+}
+
+function QueueItem({
+  label,
+  value,
+  detail,
+}: {
+  label: string
+  value: string
+  detail: string
+}) {
   return (
     <div className="rounded-lg border border-border bg-background/35 p-3">
       <div className="flex items-baseline justify-between gap-3">
@@ -611,21 +1010,77 @@ function QueueItem({ label, value, detail }: { label: string; value: string; det
   )
 }
 
-function countValue<T extends readonly unknown[] | null>(state: ReadState<T>, suffix: string) {
-  return state.status === "ready" ? `${state.data?.length ?? 0} ${suffix}` : "Unavailable"
+function factFromPerformance(
+  performance: PortfolioPerformance | null,
+  loading: boolean,
+): { value: string; detail: string } {
+  if (performance) {
+    return {
+      value: formatMoney(performance.currentValue),
+      detail: "Backend-calculated value for the selected immutable account revision.",
+    }
+  }
+  if (loading) {
+    return {
+      value: "Loading…",
+      detail: "Reading the selected account revision.",
+    }
+  }
+  return {
+    value: "Not available",
+    detail: "No current-value result was returned for this account revision.",
+  }
+}
+
+function formatAvailableHistoryReturn(
+  performance: PortfolioPerformance | null,
+): string {
+  if (performance?.timeWeightedReturn === undefined) return "Not returned"
+  const periods =
+    performance.periods === undefined
+      ? "period count not returned"
+      : `${performance.periods.toLocaleString()} comparable periods`
+  return `${formatPercent(performance.timeWeightedReturn)} · ${periods}`
+}
+
+function formatExposure(exposure: PortfolioExposure | null): string {
+  return exposure?.net ? formatMoney(exposure.net) : "Not returned"
+}
+
+function formatHistoricalValueAtRisk(risk: PortfolioRisk | null): string {
+  if (risk?.valueAtRisk === undefined) return "Not returned"
+  return `${formatPercent(risk.valueAtRisk)} at ${formatPercent(risk.confidence)} confidence`
+}
+
+function countValue<T extends readonly unknown[] | null>(
+  state: ReadState<T>,
+  suffix: string,
+) {
+  return state.status === "ready"
+    ? `${state.data?.length ?? 0} ${suffix}`
+    : "Unavailable"
+}
+
+function analysisCount(state: ReadState<InvestmentAnalysisPage>) {
+  return state.status === "ready"
+    ? state.data.availableCount.toLocaleString()
+    : "Unavailable"
+}
+
+function sourceReadinessDetail(sources: SourceHealth) {
+  if (!sources || sources.length === 0) return "No source records were returned."
+  const active = sources.filter(
+    (source) => source.runtimeHealth.state === "active",
+  ).length
+  return `${active} of ${sources.length} returned sources report an active runtime.`
 }
 
 function freshMarketDetail(markets: MarketSnapshot) {
-  if (!markets || markets.length === 0) return "No active qualified live streams."
+  if (!markets || markets.length === 0) {
+    return "No active qualified live streams."
+  }
   const fresh = markets.filter((stream) => stream.freshAtReference).length
   return `${fresh} of ${markets.length} streams are fresh at the service reference time.`
-}
-
-function paperDetail(paper: ReadState<PaperStatus>) {
-  if (paper.status !== "ready") return paper.message ?? "Paper state is unavailable."
-  if (paper.data.state !== "running") return "No orders can be submitted until the paper runtime is explicitly started."
-  if (paper.data.reconciliationRequired) return "Reconciliation is required before normal operation can continue."
-  return `${paper.data.orders ?? 0} orders · ${paper.data.fills ?? 0} fills · ${paper.data.positions ?? 0} positions`
 }
 
 function firstText(values: Record<string, unknown>, keys: string[]) {
@@ -636,8 +1091,10 @@ function firstText(values: Record<string, unknown>, keys: string[]) {
   return null
 }
 
-function friendlyState(value: string) {
-  return value.replaceAll("_", " ").replace(/^./, (first) => first.toUpperCase())
+function isAnalysisJob(kind: string) {
+  return ["analysis.", "decision.", "model.", "research."].some((prefix) =>
+    kind.startsWith(prefix),
+  )
 }
 
 function isTerminal(state: string) {

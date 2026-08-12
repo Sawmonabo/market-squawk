@@ -17,8 +17,8 @@ use market_squawk_sources::{
     AvailabilityEvidence as ExtractionAvailabilityEvidence, DiscoveryBatch, DiscoveryRequest,
     ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest,
     ExtractionRevisionEvidence, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
-    MAX_EXTRACTION_RECORD_BYTES, ObservedProviderOrder, SourceError, SourceMetadataProvider,
-    SourceObject,
+    MAX_EXTRACTION_RECORD_BYTES, ObservedProviderOrder, ProviderCaptureMaterial, SourceError,
+    SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -42,6 +42,33 @@ pub struct SecExtractionResult {
     company_identity: Option<CompanyIdentityObservation>,
 }
 
+/// Indivisible SEC discovery handoff containing one source object and its exact HTTP body set.
+///
+/// Application composition must seal [`Self::capture_material`] before retaining the discovery
+/// object or permitting canonical research/company-identity publication from it.
+#[derive(Debug)]
+pub struct SecDiscoveryResult {
+    batch: DiscoveryBatch,
+    capture_material: ProviderCaptureMaterial,
+}
+
+impl SecDiscoveryResult {
+    /// Returns the ordinary source-neutral discovery batch.
+    pub const fn batch(&self) -> &DiscoveryBatch {
+        &self.batch
+    }
+
+    /// Returns the exact bounded body-only provider material backing this discovery.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture_material
+    }
+
+    /// Consumes the capture-first application handoff.
+    pub fn into_parts(self) -> (DiscoveryBatch, ProviderCaptureMaterial) {
+        (self.batch, self.capture_material)
+    }
+}
+
 impl SecExtractionResult {
     /// Returns the ordinary source-agnostic analytical batch.
     pub const fn batch(&self) -> &ExtractionBatch {
@@ -57,13 +84,100 @@ impl SecExtractionResult {
     pub fn into_parts(self) -> (ExtractionBatch, Option<CompanyIdentityObservation>) {
         (self.batch, self.company_identity)
     }
-
-    fn into_batch(self) -> ExtractionBatch {
-        self.batch
-    }
 }
 
 impl SecEdgarSource {
+    /// Discovers one SEC source object together with every exact HTTP body required for raw
+    /// publication.
+    ///
+    /// Complete submissions produces one terminal ordered capture containing the current object
+    /// and every provider-declared companion. Company Facts produces one standalone capture.
+    pub fn discover_with_capture(
+        &self,
+        authority: ExtractionAuthority,
+        request: DiscoveryRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<SecDiscoveryResult, ExtractionSourceError>> {
+        Box::pin(async move {
+            self.validate_authority(&authority)
+                .map_err(map_client_error)?;
+            let child = cancellation.child_token();
+            let remaining = deadline_remaining(request.deadline())?;
+            let dataset = DatasetLocator::parse(request.dataset().as_str())?;
+            let (retrieved, object_id, capture_material) = tokio::time::timeout(remaining, async {
+                match dataset {
+                    DatasetLocator::Submissions(cik) => self
+                        .fetch_complete_submissions(
+                            &authority,
+                            cik,
+                            SecCompositeBounds::production_defaults(),
+                            request.deadline(),
+                            child.clone(),
+                        )
+                        .await
+                        .and_then(|value| {
+                            let object_id = SourceIdentifier::try_from(format!(
+                                "sec.submissions.composite.CIK{}",
+                                value.document().cik()
+                            ))?;
+                            let capture_material = value
+                                .capture_material()?
+                                .ok_or(SecClientError::InvalidCaptureMaterial)?;
+                            Ok((value.raw().clone(), object_id, capture_material))
+                        }),
+                    DatasetLocator::CompanyFacts(cik) => self
+                        .fetch_company_facts(&authority, cik, child.clone())
+                        .await
+                        .and_then(|value| {
+                            let object_id = value
+                                .raw()
+                                .locator()
+                                .ok_or(SecClientError::InvalidCompositeRepresentation)
+                                .and_then(|locator| {
+                                    SourceIdentifier::try_from(locator).map_err(Into::into)
+                                })?;
+                            let capture_material = value
+                                .capture_material()?
+                                .ok_or(SecClientError::InvalidCaptureMaterial)?;
+                            Ok((value.raw().clone(), object_id, capture_material))
+                        }),
+                }
+            })
+            .await
+            .map_err(|_| {
+                child.cancel();
+                ExtractionSourceError::DeadlineExceeded
+            })?
+            .map_err(map_client_error)?;
+            self.validate_authority(&authority)
+                .map_err(map_client_error)?;
+            let capture_identity =
+                SourceObjectCaptureIdentity::try_from_capture(capture_material.receipt())
+                    .map_err(|_| invalid_protocol())?;
+            let object = SourceObject::try_new_with_capture_identity(
+                self.metadata().source_id().clone(),
+                self.metadata().revision().clone(),
+                &request,
+                object_id,
+                SourceIdentifier::try_from("application/json").map_err(|_| invalid_protocol())?,
+                ExactPayloadEvidence::from_content_digest(retrieved.evidence()),
+                capture_identity,
+                market_squawk_domain::EffectiveInterval::new(retrieved.received_at(), None)
+                    .map_err(|_| invalid_protocol())?,
+                None,
+                extraction_availability(retrieved.availability()),
+                Some(u64::try_from(retrieved.bytes().len()).map_err(|_| invalid_protocol())?),
+            )?;
+            let batch = DiscoveryBatch::try_new(&request, vec![object])?;
+            self.validate_authority(&authority)
+                .map_err(map_client_error)?;
+            Ok(SecDiscoveryResult {
+                batch,
+                capture_material,
+            })
+        })
+    }
+
     /// Builds provider-owned revision evidence aligned to one extracted SEC batch.
     ///
     /// Exact canonical source-record identity is the version token. The SEC acceptance timestamp,
@@ -177,71 +291,8 @@ impl ExtractionSource for SecEdgarSource {
         request: DiscoveryRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<DiscoveryBatch, ExtractionSourceError>> {
-        Box::pin(async move {
-            self.validate_authority(&authority)
-                .map_err(map_client_error)?;
-            let child = cancellation.child_token();
-            let remaining = deadline_remaining(request.deadline())?;
-            let dataset = DatasetLocator::parse(request.dataset().as_str())?;
-            let (retrieved, object_id) = tokio::time::timeout(remaining, async {
-                match dataset {
-                    DatasetLocator::Submissions(cik) => self
-                        .fetch_complete_submissions(
-                            &authority,
-                            cik,
-                            SecCompositeBounds::production_defaults(),
-                            request.deadline(),
-                            child.clone(),
-                        )
-                        .await
-                        .and_then(|value| {
-                            SourceIdentifier::try_from(format!(
-                                "sec.submissions.composite.CIK{}",
-                                value.document().cik()
-                            ))
-                            .map(|object_id| (value.raw().clone(), object_id))
-                            .map_err(Into::into)
-                        }),
-                    DatasetLocator::CompanyFacts(cik) => self
-                        .fetch_company_facts(&authority, cik, child.clone())
-                        .await
-                        .and_then(|value| {
-                            let object_id = value
-                                .raw()
-                                .locator()
-                                .ok_or(SecClientError::InvalidCompositeRepresentation)
-                                .and_then(|locator| {
-                                    SourceIdentifier::try_from(locator).map_err(Into::into)
-                                })?;
-                            Ok((value.raw().clone(), object_id))
-                        }),
-                }
-            })
-            .await
-            .map_err(|_| {
-                child.cancel();
-                ExtractionSourceError::DeadlineExceeded
-            })?
-            .map_err(map_client_error)?;
-            self.validate_authority(&authority)
-                .map_err(map_client_error)?;
-            let object = SourceObject::try_new(
-                self.metadata().source_id().clone(),
-                self.metadata().revision().clone(),
-                &request,
-                object_id,
-                SourceIdentifier::try_from("application/json").map_err(|_| invalid_protocol())?,
-                ExactPayloadEvidence::from_content_digest(retrieved.evidence()),
-                market_squawk_domain::EffectiveInterval::new(retrieved.received_at(), None)
-                    .map_err(|_| invalid_protocol())?,
-                None,
-                Some(u64::try_from(retrieved.bytes().len()).map_err(|_| invalid_protocol())?),
-            )?;
-            let batch = DiscoveryBatch::try_new(&request, vec![object])?;
-            self.validate_authority(&authority)
-                .map_err(map_client_error)?;
-            Ok(batch)
-        })
+        let _ = (authority, request, cancellation);
+        Box::pin(async { Err(SourceError::InvalidProtocolState.into()) })
     }
 
     fn extract(
@@ -250,8 +301,8 @@ impl ExtractionSource for SecEdgarSource {
         request: ExtractionRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<ExtractionBatch, ExtractionSourceError>> {
-        let extracted = self.extract_with_company_identity(authority, request, cancellation);
-        Box::pin(async move { extracted.await.map(SecExtractionResult::into_batch) })
+        let _ = (authority, request, cancellation);
+        Box::pin(async { Err(SourceError::InvalidProtocolState.into()) })
     }
 }
 
@@ -650,7 +701,10 @@ fn map_client_error(error: SecClientError) -> ExtractionSourceError {
         | SecClientError::Normalization(_)
         | SecClientError::Xbrl(_)
         | SecClientError::RevisionAuthority(_)
+        | SecClientError::ProviderCapture(_)
+        | SecClientError::RawCapture(_)
         | SecClientError::RegistrationMismatch
+        | SecClientError::InvalidCaptureMaterial
         | SecClientError::InvalidCompositeRepresentation
         | SecClientError::InvalidCompanionSet => SourceError::InvalidProtocolState,
         _ => SourceError::Network,

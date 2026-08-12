@@ -330,6 +330,18 @@ impl ExtractionAuthority {
             fallback_jitter_sample_basis_points,
         ))
     }
+
+    pub(crate) fn record_success(&self) -> Result<(), crate::ExtractionAuthorityError> {
+        self.validate_current()?;
+        let budget = self
+            .budget
+            .as_ref()
+            .ok_or(crate::ExtractionAuthorityError::BudgetNotConfigured)?;
+        budget
+            .record_success()
+            .map_err(|reason| crate::ExtractionAuthorityError::BudgetUnavailable { reason })?;
+        self.validate_current()
+    }
 }
 
 impl AuthoritativeSourceRegistry {

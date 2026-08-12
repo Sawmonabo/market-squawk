@@ -47,7 +47,8 @@ use crate::{
 
 use super::{
     backup::ManagedBackupRepository,
-    settings::{ProductionSettingsOperations, SettingsLifecycleAuthority},
+    configuration_backup::restore_configuration_component_absent,
+    settings::SettingsLifecycleAuthority,
     source_data_backup::validate_fresh_restore,
     workspace_backup::{
         FreshWorkspaceRestoreAuthority, FreshWorkspaceRestoreSession,
@@ -397,8 +398,10 @@ impl FreshWorkspaceRestoreSession for InstalledFreshWorkspaceRestoreSession {
             self.policy.object_store,
             AnalyticalRestoreMode::Fresh,
         )?;
+        let target_workspace = self.fresh.descriptor.workspace_id();
         let finalizer = InstalledWorkspaceRestoreFinalizer {
             paths: self.fresh.paths.clone(),
+            target_workspace,
             snapshot: self.snapshot,
             policy: self.policy,
             staging: self.staging,
@@ -416,6 +419,7 @@ impl FreshWorkspaceRestoreSession for InstalledFreshWorkspaceRestoreSession {
 
 struct InstalledWorkspaceRestoreFinalizer {
     paths: LocalPaths,
+    target_workspace: WorkspaceId,
     snapshot: crate::application::backup::ProductBackupSnapshot,
     policy: Arc<WorkspaceRestorePolicy>,
     staging: RestoreStagingDirectory,
@@ -442,11 +446,12 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
         ensure_live(cancellation)?;
         let configuration =
             self.read_component(ProductBackupComponentKind::Configuration, cancellation)?;
-        let _settings = ProductionSettingsOperations::restore_workspace_configuration_absent(
+        restore_configuration_component_absent(
             self.paths
                 .control_root()
                 .map_err(|_| ProductBackupError::InvalidRestoreTarget)?
                 .root(),
+            self.target_workspace,
             self.policy.settings_seed.clone(),
             self.policy.settings_lifecycle.clone(),
             &configuration,

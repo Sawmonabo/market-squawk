@@ -520,7 +520,7 @@ function EmptyResearch() {
         dataset here only after its immutable generation is durably published.
       </p>
       <Button asChild className="mt-5">
-        <Link to="/sources">Review research sources</Link>
+        <Link to="/connections/sources">Review research sources</Link>
       </Button>
     </section>
   )
@@ -532,7 +532,7 @@ function UnavailableResearch() {
       <AlertCircle aria-hidden="true" />
       <AlertTitle>Research service is not ready</AlertTitle>
       <AlertDescription>
-        Restore the installed Research service from Overview before opening
+        Restore the installed Research service from Home before opening
         local analytical datasets.
       </AlertDescription>
     </Alert>

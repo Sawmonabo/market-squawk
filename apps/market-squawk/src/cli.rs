@@ -91,6 +91,13 @@ pub enum Command {
         command: SourceCommand,
     },
 
+    /// Read the bounded unified market view.
+    Market {
+        /// Market operation.
+        #[command(subcommand)]
+        command: MarketCommand,
+    },
+
     /// Capture direct Coinbase Exchange data into the local journal.
     Capture(CaptureArguments),
 
@@ -234,6 +241,14 @@ pub enum ConfigCommand {
 /// Provider-source operation.
 #[derive(Debug, Subcommand)]
 pub enum SourceCommand {
+    /// Import the exact provider credential bundle through the protected installed service.
+    ImportCredentials {
+        /// Filled copy of `market-squawk-provider-credentials.env.example`.
+        bundle: PathBuf,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Register a code-supported provider profile in the local catalog.
     Register {
         /// Code-owned provider identifier.
@@ -306,6 +321,13 @@ pub enum SourceCommand {
         )]
         max_records: u16,
     },
+}
+
+/// Unified market-data operation.
+#[derive(Debug, Subcommand)]
+pub enum MarketCommand {
+    /// Return one source-preserving bounded view per exact instrument.
+    UnifiedFeed,
 }
 
 /// Direct capture arguments.
@@ -704,10 +726,13 @@ pub enum JobCommand {
         #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
         limit: u16,
     },
-    /// Read the latest generation of one job.
+    /// Read one exact generation of a job.
     Get {
         /// Durable job identity.
         job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
     },
     /// Read one bounded event page after an exact generation cursor.
     Watch {

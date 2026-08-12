@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use market_squawk_data::{AnalyticalReadError, QueryError};
 use market_squawk_platform::UserAuthorizedInputRoot;
-use market_squawk_runtime::{ApplicationClientError, LoopbackApplicationClient};
+use market_squawk_runtime::{
+    ApplicationClient, ApplicationClientError, InputAdmission, LoopbackApplicationClient,
+};
 use market_squawk_services::{
     ArtifactError, JsonStructureLimits, RequestContext, RequestId, ServiceLimits,
     ToolResultMetadata, TypedToolResult,
@@ -23,8 +25,8 @@ use crate::application::{
 use crate::cli::{
     BacktestCommand, BackupOperationsCommand, BackupRetentionCommand, BotCommand, Command,
     DatasetCommand, ExecutionCommand, FairValueCommand, FeatureCommand, IngestCommand, JobCommand,
-    LogDomainArgument, LogOperationsCommand, LogQueryArguments, LogSeverityArgument, ModelCommand,
-    OperationsCommand, OperationsPreviewConfirmationArguments, PortfolioCommand,
+    LogDomainArgument, LogOperationsCommand, LogQueryArguments, LogSeverityArgument, MarketCommand,
+    ModelCommand, OperationsCommand, OperationsPreviewConfirmationArguments, PortfolioCommand,
     ProgramRollbackCommand, QueryCommand, RestoreCommand, SettingsChangeArguments,
     SettingsChangeCommand, SettingsOperationsCommand, SettingsRollbackCommand, SetupApplyArguments,
     SetupCommand, SetupGoalArgument, SetupPreviewArguments, SetupStarterPlanArgument,
@@ -168,6 +170,7 @@ async fn execute(
 ) -> Result<CliProductResult, CliProductError> {
     match command {
         Command::Source { command } => source(authority, command).await,
+        Command::Market { command } => market(authority, command).await,
         Command::Ingest { command } => ingest(authority, command).await,
         Command::Dataset { command } => dataset(authority, command).await,
         Command::Query { command } => query(authority, command).await,
@@ -194,11 +197,32 @@ async fn execute(
     }
 }
 
+async fn market(
+    authority: CliAuthority<'_>,
+    command: MarketCommand,
+) -> Result<CliProductResult, CliProductError> {
+    match command {
+        MarketCommand::UnifiedFeed => {
+            invoke(
+                authority,
+                "Market.GetUnifiedFeed",
+                &mut Map::new(),
+                None,
+                "unified market feed read",
+            )
+            .await
+        }
+    }
+}
+
 async fn source(
     authority: CliAuthority<'_>,
     command: SourceCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
+        SourceCommand::ImportCredentials { bundle, confirm } => {
+            return import_provider_credentials(authority, &bundle, confirm).await;
+        }
         SourceCommand::Register { provider, confirm } => (
             "Source.Register",
             json_object(json!({"provider": provider, "confirm": confirm}))?,
@@ -270,6 +294,51 @@ async fn source(
         }
     };
     invoke(authority, operation, &mut arguments, None, summary).await
+}
+
+async fn import_provider_credentials(
+    authority: CliAuthority<'_>,
+    path: &Path,
+    confirm: bool,
+) -> Result<CliProductResult, CliProductError> {
+    if !confirm {
+        return Err(CliProductError::ConfirmationRequired);
+    }
+    let CliAuthority::Installed(client) = authority else {
+        return Err(CliProductError::InstalledServiceRequired {
+            operation: "Source.ImportCredentialBundle",
+        });
+    };
+    let input = read_bounded_input_with_limit(path, 64 * 1024)?;
+    let byte_length =
+        u64::try_from(input.as_bytes().len()).map_err(|_error| CliProductError::RequestFile)?;
+    let admission = InputAdmission::try_new(
+        market_squawk_domain::SourceIdentifier::try_from("market-squawk.provider-credentials.v1")
+            .map_err(|_error| CliProductError::RuntimeRequest)?,
+        byte_length,
+        input.digest(),
+    )
+    .map_err(|_error| CliProductError::RuntimeRequest)?;
+    let exact_bytes = input.into_bytes();
+    let mut bytes = exact_bytes.as_ref();
+    let ticket = client
+        .stage_input(admission, &mut bytes, CancellationToken::new())
+        .await?;
+    let arguments = json!({
+        "inputTicketId": ticket.id(),
+        "confirm": true,
+        "resultLimits": {
+            "maximumItems": 17,
+            "maximumBytes": 1_048_576,
+        },
+    });
+    invoke_without_result_limits(
+        authority,
+        "Source.ImportCredentialBundle",
+        arguments,
+        "provider credential bundle imported",
+    )
+    .await
 }
 
 async fn ingest(
@@ -842,9 +911,9 @@ async fn job(
             }
             ("Job.List", Value::Object(arguments), "durable jobs listed")
         }
-        JobCommand::Get { job_id } => (
+        JobCommand::Get { job_id, generation } => (
             "Job.Get",
-            json!({"jobId": job_id.to_string()}),
+            json!({"jobId": job_id.to_string(), "generation": generation}),
             "durable job read",
         ),
         JobCommand::Watch {
@@ -1699,12 +1768,19 @@ fn read_json_object(path: &Path) -> Result<Map<String, Value>, CliProductError> 
 fn read_bounded_input(
     path: &Path,
 ) -> Result<market_squawk_platform::BoundedInput, CliProductError> {
+    read_bounded_input_with_limit(path, CLI_JSON_MAXIMUM_BYTES)
+}
+
+fn read_bounded_input_with_limit(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<market_squawk_platform::BoundedInput, CliProductError> {
     let absolute = admitted_absolute_path(path)?;
     let parent = absolute.parent().ok_or(CliProductError::RequestFile)?;
     let name = absolute.file_name().ok_or(CliProductError::RequestFile)?;
     UserAuthorizedInputRoot::open(parent)
         .and_then(|root| root.resolve(PathBuf::from(name)))
-        .and_then(|input| input.open_bounded(CLI_JSON_MAXIMUM_BYTES))
+        .and_then(|input| input.open_bounded(maximum_bytes))
         .and_then(|input| input.read_bounded())
         .map_err(|_| CliProductError::RequestFile)
 }

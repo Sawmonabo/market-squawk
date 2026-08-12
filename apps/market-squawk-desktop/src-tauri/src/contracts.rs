@@ -4,7 +4,7 @@ use std::fmt;
 
 use market_squawk::{ProviderPortalActivationRequest, application::setup::SetupPlanSelection};
 use market_squawk_runtime::RuntimeIdentity;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -286,6 +286,10 @@ pub(crate) enum DashboardQueryCommand {
     },
     ModelBundles,
     Forecasts,
+    LatestValidForecast {
+        instrument_id: Uuid,
+        as_of: String,
+    },
     ModelMetadata {
         model_id: String,
     },
@@ -323,6 +327,13 @@ pub(crate) enum DashboardQueryCommand {
     },
     DecisionDossierPreparation {
         candidate_id: String,
+    },
+    DecisionInvestmentAnalysis {
+        analysis_id: String,
+    },
+    DecisionInvestmentAnalyses {
+        after_analysis_id: Option<String>,
+        limit: u16,
     },
     DecisionTargetPreparation {
         dossier_id: String,
@@ -882,29 +893,30 @@ pub(crate) enum JobControlCommand {
     },
     Get {
         job_id: Uuid,
+        generation: String,
     },
     Watch {
         job_id: Uuid,
-        generation: u64,
-        after_sequence: u64,
+        generation: String,
+        after_sequence: String,
         limit: u16,
     },
     Cancel {
         job_id: Uuid,
-        generation: u64,
-        expected_sequence: u64,
+        generation: String,
+        expected_sequence: String,
     },
     Confirm {
         job_id: Uuid,
-        generation: u64,
-        expected_sequence: u64,
+        generation: String,
+        expected_sequence: String,
         identity: String,
         digest: String,
     },
     Retry {
         job_id: Uuid,
-        generation: u64,
-        expected_sequence: u64,
+        generation: String,
+        expected_sequence: String,
     },
 }
 
@@ -936,8 +948,16 @@ pub(crate) enum SourceLifecycleAction {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopEvent {
     runtime: RuntimeIdentity,
+    #[serde(serialize_with = "serialize_u64_as_decimal")]
     sequence: u64,
     body: DesktopEventBody,
+}
+
+fn serialize_u64_as_decimal<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.collect_str(value)
 }
 
 impl DesktopEvent {

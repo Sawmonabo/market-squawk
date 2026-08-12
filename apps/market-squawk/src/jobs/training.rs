@@ -773,18 +773,17 @@ mod tests {
         fs::{self, File},
         io::Read as _,
         sync::Arc,
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
     use market_squawk_jobs::{
         AdmittedProcessProgram, JobActivityClass, JobOrigin, JobRunner, JobRunnerRegistration,
-        JobState, ProcessProgramError,
+        JobState, ProcessProgramError, SqliteJobRepository,
     };
     use market_squawk_platform::LocalPaths;
     use market_squawk_services::RequestId;
     use sha2::{Digest as _, Sha256};
-    use tokio_util::sync::CancellationToken;
 
     use super::{
         GovernedTrainingInput, INPUT_AUTHORITY, KIND, MAXIMUM_PENDING, RESULT_AUTHORITY,
@@ -795,11 +794,34 @@ mod tests {
         ProductionModelRuntime, ProductionModelRuntimeLimits,
     };
     use crate::{
-        application::{job::JobApplication, model::ModelDomainService},
+        application::{
+            job::{JobApplication, JobReceipt, JobView},
+            model::ModelDomainService,
+        },
         jobs::InstalledJobAuthority,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
+    async fn wait_for_exact_terminal(
+        application: &JobApplication<SqliteJobRepository>,
+        receipt: JobReceipt,
+        timeout: Duration,
+    ) -> TestResult<JobView> {
+        let terminal = tokio::time::timeout(timeout, async {
+            loop {
+                let view = application
+                    .get(receipt.job_id(), receipt.generation())
+                    .await?;
+                if view.state().is_terminal() {
+                    return Ok::<JobView, Box<dyn Error + Send + Sync>>(view);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await??;
+        Ok(terminal)
+    }
 
     #[tokio::test]
     async fn failed_contained_training_process_publishes_neither_runtime_admission_nor_model_read_image()
@@ -860,13 +882,8 @@ mod tests {
                 Timestamp::from_unix_nanos(100),
             )
             .await?;
-        let terminal = application
-            .wait_terminal(
-                receipt.job_id(),
-                &CancellationToken::new(),
-                Instant::now() + Duration::from_secs(10),
-            )
-            .await?;
+        let terminal =
+            wait_for_exact_terminal(&application, receipt, Duration::from_secs(10)).await?;
 
         assert_eq!(terminal.state(), JobState::Failed);
         assert!(terminal.result().is_none());

@@ -146,13 +146,14 @@ async fn discovery_and_ephemeral_extraction_are_exact_source_request_and_payload
     let mut complete_body: serde_json::Value =
         serde_json::from_slice(include_bytes!("../../fixtures/observations.json"))?;
     complete_body["count"] = serde_json::json!(2);
+    let complete_body = Bytes::from(serde_json::to_vec(&complete_body)?);
     let source = source(
         now,
         FredHttpResponse {
             status: 200,
             retry_after: None,
             content_encoding: None,
-            body: Bytes::from(serde_json::to_vec(&complete_body)?),
+            body: complete_body.clone(),
             received_at: now,
         },
         "fred-discovery-test-user",
@@ -245,10 +246,19 @@ async fn discovery_and_ephemeral_extraction_are_exact_source_request_and_payload
         .map_err(|error| format!("ephemeral extraction failed: {error:?}"))?;
     assert_eq!(page.canonical_payloads().len(), 2);
     assert_eq!(page.received_at(), now);
+    assert_eq!(page.captures().len(), 2);
+    assert_eq!(
+        page.captures()[0].records()[0].payload(),
+        EXACT_SERIES_RESPONSE
+    );
+    assert_eq!(
+        page.captures()[1].records()[0].payload(),
+        complete_body.as_ref()
+    );
     assert!(matches!(
         source
             .source
-            .extract(
+            .extract_with_capture(
                 source.authority.clone(),
                 extraction,
                 CancellationToken::new(),
@@ -267,11 +277,12 @@ async fn durable_extraction_emits_canonical_schema_v3_macro_observations() -> Te
     let mut complete_body: serde_json::Value =
         serde_json::from_slice(include_bytes!("../../fixtures/observations.json"))?;
     complete_body["count"] = serde_json::json!(2);
+    let observation_body = Bytes::from(serde_json::to_vec(&complete_body)?);
     let observations_response = FredHttpResponse {
         status: 200,
         retry_after: None,
         content_encoding: None,
-        body: Bytes::from(serde_json::to_vec(&complete_body)?),
+        body: observation_body.clone(),
         received_at: now,
     };
     let source = source_with_options(
@@ -308,14 +319,38 @@ async fn durable_extraction_emits_canonical_schema_v3_macro_observations() -> Te
         NonZeroU64::new(1024 * 1024).ok_or("nonzero byte limit")?,
         deadline,
     )?;
-    let batch = source
+    assert!(matches!(
+        source
+            .source
+            .extract(
+                source.authority.clone(),
+                extraction.clone(),
+                CancellationToken::new(),
+            )
+            .await,
+        Err(market_squawk_sources::ExtractionSourceError::Source(
+            SourceError::InvalidProtocolState
+        ))
+    ));
+    let output = source
         .source
-        .extract(
+        .extract_with_capture(
             source.authority.clone(),
             extraction,
             CancellationToken::new(),
         )
         .await?;
+    assert_eq!(output.captures().len(), 2);
+    assert_eq!(
+        output.captures()[0].records()[0].payload(),
+        EXACT_SERIES_RESPONSE
+    );
+    assert_eq!(
+        output.captures()[1].records()[0].payload(),
+        observation_body.as_ref()
+    );
+    let (batch, captures) = output.into_parts();
+    assert_eq!(captures.len(), 2);
     let revisions = source.source.revision_plan(&batch)?;
 
     assert_eq!(batch.records().len(), 2);
@@ -524,6 +559,11 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
         document.response_bytes(),
         document.evidence()
     ));
+    assert_eq!(document.capture_material().records().len(), 1);
+    assert_eq!(
+        document.capture_material().records()[0].payload(),
+        EXACT_SERIES_RESPONSE
+    );
     let locator = document
         .evidence()
         .version_pinned_locator()

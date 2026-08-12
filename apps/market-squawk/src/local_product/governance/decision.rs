@@ -373,14 +373,10 @@ fn hash_latest_invalidation(hash: &mut Sha256, state: &TargetState) {
     hash.update([1]);
     hash.update(length(invalidation.id().as_str().as_bytes()));
     hash.update(invalidation.id().as_str().as_bytes());
-    match invalidation.actor() {
-        Some(actor) => {
-            hash.update([1]);
-            hash.update(length(actor.as_str().as_bytes()));
-            hash.update(actor.as_str().as_bytes());
-        }
-        None => hash.update([0]),
-    }
+    let actor = invalidation.actor();
+    hash.update([1]);
+    hash.update(length(actor.as_str().as_bytes()));
+    hash.update(actor.as_str().as_bytes());
     hash.update(invalidation.observed_at().unix_nanos().to_be_bytes());
     hash.update([target_invalidation_kind_code(invalidation.kind())]);
     hash_decision_digest(hash, invalidation.content_identity());

@@ -799,6 +799,83 @@ impl DisplayMarketSnapshotLease {
     pub(crate) const fn terminal_failure(&self) -> Option<DisplayMarketTerminalFailure> {
         self.terminal_failure
     }
+
+    /// Selects the exact observation used for source admission and downstream market evidence.
+    pub(crate) fn selection_observation(&self) -> Option<&DisplayMarketReadObservation> {
+        let mut selected = None;
+        for candidate in [self.quote(), self.trade()].into_iter().flatten() {
+            if selected.is_none_or(|current| display_observation_is_better(candidate, current)) {
+                selected = Some(candidate);
+            }
+        }
+        selected.or(self.status())
+    }
+}
+
+fn display_observation_is_better(
+    candidate: &DisplayMarketReadObservation,
+    current: &DisplayMarketReadObservation,
+) -> bool {
+    let candidate_provenance = candidate.observation().provenance();
+    let current_provenance = current.observation().provenance();
+    display_availability_rank(candidate.availability())
+        .cmp(&display_availability_rank(current.availability()))
+        .then_with(|| {
+            display_depth_rank(candidate_provenance.display_depth())
+                .cmp(&display_depth_rank(current_provenance.display_depth()))
+        })
+        .then_with(|| {
+            display_quality_rank(display_current_quality(candidate))
+                .cmp(&display_quality_rank(display_current_quality(current)))
+        })
+        .then_with(|| {
+            candidate_provenance
+                .received_at()
+                .cmp(&current_provenance.received_at())
+        })
+        .is_gt()
+}
+
+const fn display_current_quality(observation: &DisplayMarketReadObservation) -> DataQuality {
+    match observation.availability() {
+        DisplayMarketAvailability::Fresh { .. } => observation.observation().provenance().quality(),
+        DisplayMarketAvailability::Stale { .. } | DisplayMarketAvailability::Expired { .. } => {
+            DataQuality::Stale
+        }
+        DisplayMarketAvailability::Quarantined { .. } => DataQuality::Quarantined,
+    }
+}
+
+const fn display_availability_rank(availability: DisplayMarketAvailability) -> u8 {
+    match availability {
+        DisplayMarketAvailability::Fresh { .. } => 4,
+        DisplayMarketAvailability::Stale { .. } => 3,
+        DisplayMarketAvailability::Expired { .. } => 2,
+        DisplayMarketAvailability::Quarantined { .. } => 1,
+    }
+}
+
+const fn display_depth_rank(depth: Option<MarketDepth>) -> u8 {
+    match depth {
+        Some(MarketDepth::OrderLevel) => 3,
+        Some(MarketDepth::PriceLevel) => 2,
+        Some(MarketDepth::TopOfBook) => 1,
+        None => 0,
+    }
+}
+
+const fn display_quality_rank(quality: DataQuality) -> u8 {
+    match quality {
+        DataQuality::DirectVerified => 9,
+        DataQuality::DirectUnverified => 8,
+        DataQuality::OfficialDelayed => 7,
+        DataQuality::Aggregated => 6,
+        DataQuality::Indicative => 5,
+        DataQuality::Modeled => 4,
+        DataQuality::Estimated => 3,
+        DataQuality::Stale => 2,
+        DataQuality::Quarantined => 1,
+    }
 }
 
 #[derive(Debug)]

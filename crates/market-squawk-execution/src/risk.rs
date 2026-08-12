@@ -1,12 +1,15 @@
 //! Deterministic pre-authority risk assessment and atomic account reservation.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use market_squawk_domain::{
-    ApprovalId, DataQuality, InstrumentExecutionTerms, OrderSide, OrderType, PriceTicks, Timestamp,
+    AccountId, ApprovalId, DataQuality, Denomination, InstrumentExecutionTerms, InstrumentId,
+    OrderSide, OrderType, PriceTicks, RuleVersion, Timestamp,
 };
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use market_squawk_live::{CurrentAuthorityGate, LiveExecutionCapability};
@@ -16,9 +19,10 @@ use crate::approval::approved_order_from_risk;
 use crate::audit::{ExecutionAuditContext, ExecutionAuditEvidence, ExecutionAuditPermit};
 use crate::clock::{monotonic_deadline, system_now};
 use crate::{
-    AccountReservationError, AccountRiskCoordinator, AccountRiskReservation, AccountRiskViolation,
-    ApprovedOrder, ExecutionAuditEvent, ExecutionAuditKind, ExecutionAuditWriter,
-    ExecutionMarketReference, ExecutionPriceBound, OrderIntent, RiskLimits, RiskPolicyIdentity,
+    AccountRecoverySnapshotError, AccountReservationError, AccountRiskCoordinator,
+    AccountRiskReservation, AccountRiskViolation, ApprovedOrder, ExecutionAuditEvent,
+    ExecutionAuditKind, ExecutionAuditWriter, ExecutionMarketReference, ExecutionPriceBound,
+    OrderIntent, OrderIntentDigest, PortfolioReadError, RiskLimits, RiskPolicyIdentity,
 };
 
 /// Structurally validated but authority-free market input for pre-dispatch risk.
@@ -38,6 +42,9 @@ pub struct MarketRiskInput {
 }
 
 impl MarketRiskInput {
+    /// Canonical market-input digest format version.
+    pub const DIGEST_VERSION: u8 = 1;
+
     /// Constructs bounded authority-free market risk input.
     ///
     /// # Errors
@@ -110,6 +117,25 @@ impl MarketRiskInput {
     /// Returns the side-aware estimated execution price.
     pub const fn estimated_execution_price(self) -> PriceTicks {
         self.estimated_execution_price
+    }
+
+    /// Returns the versioned SHA-256 identity of every risk-relevant market input field.
+    #[must_use]
+    pub fn digest(self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/market-risk-input\0");
+        digest.update([Self::DIGEST_VERSION]);
+        update_market_execution_terms(&mut digest, self.execution_terms);
+        digest.update([data_quality_tag(self.quality)]);
+        digest.update([
+            u8::from(self.source_eligible),
+            u8::from(self.instrument_trading),
+        ]);
+        digest.update(self.observed_at.unix_nanos().to_be_bytes());
+        digest.update(self.valid_until.unix_nanos().to_be_bytes());
+        digest.update(self.reference_price.get().to_be_bytes());
+        digest.update(self.estimated_execution_price.get().to_be_bytes());
+        digest.finalize().into()
     }
 }
 
@@ -193,6 +219,275 @@ impl RiskRejection {
             reasons: reasons.into_boxed_slice(),
         }
     }
+}
+
+/// Exact non-authoritative state generation required by one risk advisory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskAdvisoryGeneration {
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    account_revision: NonZeroU64,
+    position_revision_digest: [u8; 32],
+    position_content_digest: [u8; 32],
+    position_publication_generation: u64,
+    policy: RiskPolicyIdentity,
+    limits_digest: [u8; 32],
+}
+
+impl RiskAdvisoryGeneration {
+    /// Constructs one exact account, position, and risk-policy precondition.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "account, position, and policy generations remain independently explicit"
+    )]
+    pub fn try_new(
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        account_revision: NonZeroU64,
+        position_revision_digest: [u8; 32],
+        position_content_digest: [u8; 32],
+        position_publication_generation: u64,
+        policy: RiskPolicyIdentity,
+        limits_digest: [u8; 32],
+    ) -> Result<Self, RiskAdvisoryGenerationError> {
+        if position_revision_digest == [0; 32]
+            || position_content_digest == [0; 32]
+            || position_publication_generation == 0
+            || policy.digest() == [0; 32]
+            || limits_digest == [0; 32]
+        {
+            return Err(RiskAdvisoryGenerationError::InvalidIdentity);
+        }
+        Ok(Self {
+            account_id,
+            instrument_id,
+            account_revision,
+            position_revision_digest,
+            position_content_digest,
+            position_publication_generation,
+            policy,
+            limits_digest,
+        })
+    }
+
+    pub const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    pub const fn account_revision(&self) -> NonZeroU64 {
+        self.account_revision
+    }
+
+    pub const fn position_revision_digest(&self) -> [u8; 32] {
+        self.position_revision_digest
+    }
+
+    pub const fn position_content_digest(&self) -> [u8; 32] {
+        self.position_content_digest
+    }
+
+    pub const fn position_publication_generation(&self) -> u64 {
+        self.position_publication_generation
+    }
+
+    pub const fn policy(&self) -> RiskPolicyIdentity {
+        self.policy
+    }
+
+    pub const fn limits_digest(&self) -> [u8; 32] {
+        self.limits_digest
+    }
+}
+
+/// Structurally invalid advisory generation.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RiskAdvisoryGenerationError {
+    /// Digests and monotonic generations must be nonzero.
+    #[error("risk advisory generation identity is invalid")]
+    InvalidIdentity,
+}
+
+/// Fully specified authority-free paper draft evaluated only for current analytical guidance.
+#[derive(Debug)]
+pub struct PaperRiskAdvisoryDraft<'draft> {
+    intent: &'draft OrderIntent,
+    market: MarketRiskInput,
+    generation: &'draft RiskAdvisoryGeneration,
+}
+
+impl<'draft> PaperRiskAdvisoryDraft<'draft> {
+    /// Binds a validated hypothetical order and market image to exact state generations.
+    pub const fn new(
+        intent: &'draft OrderIntent,
+        market: MarketRiskInput,
+        generation: &'draft RiskAdvisoryGeneration,
+    ) -> Self {
+        Self {
+            intent,
+            market,
+            generation,
+        }
+    }
+
+    pub const fn intent(&self) -> &OrderIntent {
+        self.intent
+    }
+
+    pub const fn market(&self) -> MarketRiskInput {
+        self.market
+    }
+
+    pub const fn generation(&self) -> &RiskAdvisoryGeneration {
+        self.generation
+    }
+}
+
+/// Closed advisory check families exposed without execution authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskAdvisoryCheck {
+    /// Exact risk policy, ruleset, limits, and chronology.
+    Policy,
+    /// Current hypothetical market, order shape, price, and freshness.
+    Market,
+    /// Exact authoritative account generation.
+    AccountGeneration,
+    /// Exact immutable portfolio/position generation.
+    PositionGeneration,
+    /// Current account, position, capacity, loss, and exposure constraints.
+    AccountLimits,
+    /// Final account and portfolio state remained unchanged through evaluation.
+    StateRecheck,
+}
+
+/// Current-time analytical conclusion that conveys no future or execution authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskAdvisoryOutcome {
+    /// Every available check passed only at `evaluated_at`.
+    WouldPassAtEvaluation,
+    /// At least one deterministic check rejected the hypothetical draft at `evaluated_at`.
+    WouldRejectAtEvaluation,
+    /// No deterministic rejection was found, but one or more checks could not be evaluated.
+    IndeterminateAtEvaluation,
+}
+
+/// Least-authority classification permanently attached to every advisory result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskAdvisoryAuthority {
+    /// Evidence is informational and cannot reserve, approve, dispatch, or be upgraded in place.
+    AnalysisOnly,
+}
+
+/// Typed, immutable evidence from one non-reserving current-state risk advisory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskAdvisoryEvidence {
+    intent_digest: OrderIntentDigest,
+    generation: RiskAdvisoryGeneration,
+    market_input_digest: [u8; 32],
+    evaluated_at: Timestamp,
+    valid_until: Timestamp,
+    kill_switch: bool,
+    checks_evaluated: Box<[RiskAdvisoryCheck]>,
+    checks_unavailable: Box<[RiskAdvisoryCheck]>,
+    outcome: RiskAdvisoryOutcome,
+    reasons: Box<[RiskRejectionCode]>,
+    authority: RiskAdvisoryAuthority,
+    digest: [u8; 32],
+}
+
+impl RiskAdvisoryEvidence {
+    /// Canonical full-evidence digest format version.
+    pub const DIGEST_VERSION: u8 = 1;
+
+    pub const fn intent_digest(&self) -> OrderIntentDigest {
+        self.intent_digest
+    }
+
+    pub const fn generation(&self) -> &RiskAdvisoryGeneration {
+        &self.generation
+    }
+
+    pub const fn policy_digest(&self) -> [u8; 32] {
+        self.generation.policy.digest()
+    }
+
+    pub const fn ruleset_version(&self) -> RuleVersion {
+        self.generation.policy.ruleset_version()
+    }
+
+    pub const fn limits_digest(&self) -> [u8; 32] {
+        self.generation.limits_digest
+    }
+
+    /// Returns the exact versioned market-input identity evaluated by this advisory.
+    pub const fn market_input_digest(&self) -> [u8; 32] {
+        self.market_input_digest
+    }
+
+    /// Returns the trusted current evaluation instant. A pass is true only at this instant.
+    pub const fn evaluated_at(&self) -> Timestamp {
+        self.evaluated_at
+    }
+
+    /// Returns the conservative evidence expiry, never an assertion that a pass remains current.
+    pub const fn valid_until(&self) -> Timestamp {
+        self.valid_until
+    }
+
+    pub const fn kill_switch(&self) -> bool {
+        self.kill_switch
+    }
+
+    pub const fn checks_evaluated(&self) -> &[RiskAdvisoryCheck] {
+        &self.checks_evaluated
+    }
+
+    pub const fn checks_unavailable(&self) -> &[RiskAdvisoryCheck] {
+        &self.checks_unavailable
+    }
+
+    pub const fn outcome(&self) -> RiskAdvisoryOutcome {
+        self.outcome
+    }
+
+    pub const fn reasons(&self) -> &[RiskRejectionCode] {
+        &self.reasons
+    }
+
+    pub const fn authority(&self) -> RiskAdvisoryAuthority {
+        self.authority
+    }
+
+    /// Returns the versioned SHA-256 identity of every field in this advisory result.
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+/// Fail-closed advisory construction or exact-state failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RiskAdvisoryError {
+    /// Trusted current time could not be read.
+    #[error("trusted time is unavailable for risk advisory")]
+    ClockUnavailable,
+    /// Exact account state could not be read without mutation.
+    #[error("account state is unavailable for risk advisory: {0}")]
+    AccountStateUnavailable(AccountRecoverySnapshotError),
+    /// Exact portfolio/position state could not be read.
+    #[error("portfolio state is unavailable for risk advisory: {0}")]
+    PositionStateUnavailable(PortfolioReadError),
+    /// The supplied account, position, or risk-policy generation is not current.
+    #[error("risk advisory generation does not match current state")]
+    GenerationMismatch,
+    /// Account or position state changed while the advisory was evaluated.
+    #[error("risk advisory state changed during evaluation")]
+    StateChanged,
 }
 
 /// Authority-free risk outcome.
@@ -286,6 +581,210 @@ impl RiskService {
 
     pub(crate) fn audit_writer(&self) -> ExecutionAuditWriter {
         self.audit.clone()
+    }
+
+    /// Captures the exact non-authoritative account, position, and risk-policy generation.
+    ///
+    /// The account image must be quiescent because this read deliberately refuses to coexist with
+    /// a reservation. The returned value is only a compare-and-evaluate precondition.
+    pub fn current_advisory_generation(
+        &self,
+        intent: &OrderIntent,
+    ) -> Result<RiskAdvisoryGeneration, RiskAdvisoryError> {
+        let account = self
+            .accounts
+            .snapshot_recovery_state(intent.account_id())
+            .map_err(RiskAdvisoryError::AccountStateUnavailable)?;
+        let (position, _snapshot) = self
+            .portfolio
+            .bind_current(
+                intent.account_id(),
+                intent.execution_terms().instrument_id(),
+                intent.side(),
+                self.limits.currency(),
+            )
+            .map_err(RiskAdvisoryError::PositionStateUnavailable)?;
+        let rechecked_account = self
+            .accounts
+            .snapshot_recovery_state(intent.account_id())
+            .map_err(RiskAdvisoryError::AccountStateUnavailable)?;
+        if account != rechecked_account {
+            return Err(RiskAdvisoryError::StateChanged);
+        }
+        self.portfolio
+            .recheck(&position)
+            .map_err(|_error| RiskAdvisoryError::StateChanged)?;
+        RiskAdvisoryGeneration::try_new(
+            intent.account_id(),
+            intent.execution_terms().instrument_id(),
+            account.revision(),
+            position.revision().bytes(),
+            position.content_digest(),
+            position.publication_generation(),
+            self.config.policy,
+            self.limits.digest(),
+        )
+        .map_err(|_error| RiskAdvisoryError::GenerationMismatch)
+    }
+
+    /// Evaluates a hypothetical paper order without reserving or consuming any authority.
+    ///
+    /// This path performs no audit admission, nonce publication, rate-event publication, account
+    /// reservation, live-capability consumption, approval construction, or dispatch conversion.
+    /// A `WouldPassAtEvaluation` result is true only at `evaluated_at`; every later action must run
+    /// the ordinary current-authority risk path from the beginning.
+    pub fn evaluate_advisory(
+        &self,
+        draft: &PaperRiskAdvisoryDraft<'_>,
+    ) -> Result<RiskAdvisoryEvidence, RiskAdvisoryError> {
+        let intent = draft.intent;
+        let market = draft.market;
+        let generation = draft.generation;
+        let limits_digest = self.limits.digest();
+        if generation.account_id != intent.account_id()
+            || generation.instrument_id != intent.execution_terms().instrument_id()
+            || generation.policy != self.config.policy
+            || generation.limits_digest != limits_digest
+        {
+            return Err(RiskAdvisoryError::GenerationMismatch);
+        }
+
+        let now = system_now().map_err(|_error| RiskAdvisoryError::ClockUnavailable)?;
+        let account = self
+            .accounts
+            .snapshot_recovery_state(intent.account_id())
+            .map_err(RiskAdvisoryError::AccountStateUnavailable)?;
+        if account.account_id() != generation.account_id
+            || account.revision() != generation.account_revision
+        {
+            return Err(RiskAdvisoryError::GenerationMismatch);
+        }
+        let (position, snapshot) = self
+            .portfolio
+            .bind_current(
+                intent.account_id(),
+                intent.execution_terms().instrument_id(),
+                intent.side(),
+                self.limits.currency(),
+            )
+            .map_err(RiskAdvisoryError::PositionStateUnavailable)?;
+        if position.account_id() != generation.account_id
+            || position.revision().bytes() != generation.position_revision_digest
+            || position.content_digest() != generation.position_content_digest
+            || position.publication_generation() != generation.position_publication_generation
+        {
+            return Err(RiskAdvisoryError::GenerationMismatch);
+        }
+
+        let mut evaluated = Vec::with_capacity(6);
+        let mut unavailable = Vec::with_capacity(1);
+        let mut reasons = Vec::new();
+        evaluated.extend([
+            RiskAdvisoryCheck::Policy,
+            RiskAdvisoryCheck::Market,
+            RiskAdvisoryCheck::AccountGeneration,
+            RiskAdvisoryCheck::PositionGeneration,
+        ]);
+        let prior_wall_nanos = self.last_wall_nanos.load(Ordering::Acquire);
+        if now.wall.unix_nanos() < prior_wall_nanos {
+            reasons.push(RiskRejectionCode::ClockRollback);
+        }
+        if now.wall > self.config.policy_valid_until {
+            reasons.push(RiskRejectionCode::PolicyExpired);
+        }
+        if self.limits.kill_switch() {
+            reasons.push(RiskRejectionCode::Account(AccountRiskViolation::KillSwitch));
+        }
+        self.evaluate_market(intent, &market, now.wall, &mut reasons);
+        let execution_price_bound =
+            execution_price_bound(intent, market.estimated_execution_price(), &self.limits);
+        if execution_price_bound.is_none() {
+            reasons.push(RiskRejectionCode::Account(
+                AccountRiskViolation::ArithmeticOverflow,
+            ));
+            unavailable.push(RiskAdvisoryCheck::AccountLimits);
+        } else if let Some(execution_price_bound) = execution_price_bound {
+            match self.accounts.assess_for_portfolio(
+                intent,
+                execution_price_bound.maximum_price(),
+                &self.limits,
+                &snapshot,
+            ) {
+                Ok(()) => evaluated.push(RiskAdvisoryCheck::AccountLimits),
+                Err(rejection) if account_assessment_unavailable(&rejection) => {
+                    unavailable.push(RiskAdvisoryCheck::AccountLimits);
+                    extend_account_reasons(&mut reasons, &rejection);
+                }
+                Err(rejection) => {
+                    evaluated.push(RiskAdvisoryCheck::AccountLimits);
+                    extend_account_reasons(&mut reasons, &rejection);
+                }
+            }
+        }
+
+        self.portfolio
+            .recheck(&position)
+            .map_err(|_error| RiskAdvisoryError::StateChanged)?;
+        let rechecked_account = self
+            .accounts
+            .snapshot_recovery_state(intent.account_id())
+            .map_err(|_error| RiskAdvisoryError::StateChanged)?;
+        if rechecked_account != account {
+            return Err(RiskAdvisoryError::StateChanged);
+        }
+        evaluated.push(RiskAdvisoryCheck::StateRecheck);
+
+        evaluated.sort_unstable();
+        evaluated.dedup();
+        unavailable.sort_unstable();
+        unavailable.dedup();
+        reasons.sort_unstable();
+        reasons.dedup();
+        let has_definitive_rejection = reasons
+            .iter()
+            .any(|reason| !advisory_reason_is_unavailable(*reason));
+        let outcome = if has_definitive_rejection {
+            RiskAdvisoryOutcome::WouldRejectAtEvaluation
+        } else if unavailable.is_empty() {
+            RiskAdvisoryOutcome::WouldPassAtEvaluation
+        } else {
+            RiskAdvisoryOutcome::IndeterminateAtEvaluation
+        };
+        let intent_digest = intent.digest();
+        let market_input_digest = market.digest();
+        let valid_until = intent
+            .expires_at()
+            .min(market.valid_until())
+            .min(self.config.policy_valid_until);
+        let kill_switch = self.limits.kill_switch();
+        let authority = RiskAdvisoryAuthority::AnalysisOnly;
+        let digest = advisory_evidence_digest(
+            intent_digest,
+            generation,
+            market_input_digest,
+            now.wall,
+            valid_until,
+            kill_switch,
+            &evaluated,
+            &unavailable,
+            outcome,
+            &reasons,
+            authority,
+        );
+        Ok(RiskAdvisoryEvidence {
+            intent_digest,
+            generation: generation.clone(),
+            market_input_digest,
+            evaluated_at: now.wall,
+            valid_until,
+            kill_switch,
+            checks_evaluated: evaluated.into_boxed_slice(),
+            checks_unavailable: unavailable.into_boxed_slice(),
+            outcome,
+            reasons: reasons.into_boxed_slice(),
+            authority,
+            digest,
+        })
     }
 
     /// Returns the exact checked risk graph charge used before runtime ownership transfer.
@@ -858,6 +1357,231 @@ fn extend_account_reasons(
             .copied()
             .map(RiskRejectionCode::Account),
     );
+}
+
+fn account_assessment_unavailable(rejection: &AccountReservationError) -> bool {
+    rejection.reasons().iter().all(|reason| {
+        matches!(
+            reason,
+            AccountRiskViolation::AccountCoordinatorBusy
+                | AccountRiskViolation::AccountCoordinatorPoisoned
+                | AccountRiskViolation::ClockFailure
+        )
+    })
+}
+
+const fn advisory_reason_is_unavailable(reason: RiskRejectionCode) -> bool {
+    matches!(
+        reason,
+        RiskRejectionCode::Account(
+            AccountRiskViolation::AccountCoordinatorBusy
+                | AccountRiskViolation::AccountCoordinatorPoisoned
+                | AccountRiskViolation::ClockFailure
+        )
+    )
+}
+
+fn update_market_execution_terms(digest: &mut Sha256, terms: InstrumentExecutionTerms) {
+    digest.update(terms.instrument_id().as_uuid().as_bytes());
+    digest.update(terms.definition_revision().get().to_be_bytes());
+    update_advisory_decimal(digest, terms.price_tick().as_decimal());
+    update_advisory_decimal(digest, terms.lot_size().as_decimal());
+    digest.update(terms.quote_currency().as_str().as_bytes());
+    match terms.settlement_denomination() {
+        Denomination::Currency(currency) => {
+            digest.update([0]);
+            digest.update(currency.as_str().as_bytes());
+        }
+        Denomination::Asset(instrument_id) => {
+            digest.update([1]);
+            digest.update(instrument_id.as_uuid().as_bytes());
+        }
+    }
+    update_advisory_decimal(digest, terms.contract_multiplier());
+}
+
+fn update_advisory_decimal(digest: &mut Sha256, value: rust_decimal::Decimal) {
+    let normalized = value.normalize();
+    digest.update(normalized.mantissa().to_be_bytes());
+    digest.update(normalized.scale().to_be_bytes());
+}
+
+const fn data_quality_tag(quality: DataQuality) -> u8 {
+    match quality {
+        DataQuality::DirectVerified => 1,
+        DataQuality::DirectUnverified => 2,
+        DataQuality::OfficialDelayed => 3,
+        DataQuality::Aggregated => 4,
+        DataQuality::Indicative => 5,
+        DataQuality::Modeled => 6,
+        DataQuality::Estimated => 7,
+        DataQuality::Stale => 8,
+        DataQuality::Quarantined => 9,
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the canonical result identity keeps every evidence dimension explicit"
+)]
+fn advisory_evidence_digest(
+    intent_digest: OrderIntentDigest,
+    generation: &RiskAdvisoryGeneration,
+    market_input_digest: [u8; 32],
+    evaluated_at: Timestamp,
+    valid_until: Timestamp,
+    kill_switch: bool,
+    checks_evaluated: &[RiskAdvisoryCheck],
+    checks_unavailable: &[RiskAdvisoryCheck],
+    outcome: RiskAdvisoryOutcome,
+    reasons: &[RiskRejectionCode],
+    authority: RiskAdvisoryAuthority,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/risk-advisory-evidence\0");
+    digest.update([RiskAdvisoryEvidence::DIGEST_VERSION]);
+    digest.update(intent_digest.as_bytes());
+    digest.update(generation.account_id.as_uuid().as_bytes());
+    digest.update(generation.instrument_id.as_uuid().as_bytes());
+    digest.update(generation.account_revision.get().to_be_bytes());
+    digest.update(generation.position_revision_digest);
+    digest.update(generation.position_content_digest);
+    digest.update(generation.position_publication_generation.to_be_bytes());
+    digest.update(generation.policy.digest());
+    digest.update(generation.policy.ruleset_version().get().to_be_bytes());
+    digest.update(generation.limits_digest);
+    digest.update(market_input_digest);
+    digest.update(evaluated_at.unix_nanos().to_be_bytes());
+    digest.update(valid_until.unix_nanos().to_be_bytes());
+    digest.update([u8::from(kill_switch)]);
+    update_advisory_checks(&mut digest, checks_evaluated);
+    update_advisory_checks(&mut digest, checks_unavailable);
+    digest.update([advisory_outcome_tag(outcome)]);
+    digest.update(
+        u32::try_from(reasons.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    for reason in reasons {
+        digest.update(risk_rejection_code_tag(*reason).to_be_bytes());
+    }
+    digest.update([advisory_authority_tag(authority)]);
+    digest.finalize().into()
+}
+
+fn update_advisory_checks(digest: &mut Sha256, checks: &[RiskAdvisoryCheck]) {
+    digest.update(
+        u32::try_from(checks.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    for check in checks {
+        digest.update([advisory_check_tag(*check)]);
+    }
+}
+
+const fn advisory_check_tag(check: RiskAdvisoryCheck) -> u8 {
+    match check {
+        RiskAdvisoryCheck::Policy => 1,
+        RiskAdvisoryCheck::Market => 2,
+        RiskAdvisoryCheck::AccountGeneration => 3,
+        RiskAdvisoryCheck::PositionGeneration => 4,
+        RiskAdvisoryCheck::AccountLimits => 5,
+        RiskAdvisoryCheck::StateRecheck => 6,
+    }
+}
+
+const fn advisory_outcome_tag(outcome: RiskAdvisoryOutcome) -> u8 {
+    match outcome {
+        RiskAdvisoryOutcome::WouldPassAtEvaluation => 1,
+        RiskAdvisoryOutcome::WouldRejectAtEvaluation => 2,
+        RiskAdvisoryOutcome::IndeterminateAtEvaluation => 3,
+    }
+}
+
+const fn advisory_authority_tag(authority: RiskAdvisoryAuthority) -> u8 {
+    match authority {
+        RiskAdvisoryAuthority::AnalysisOnly => 1,
+    }
+}
+
+const fn risk_rejection_code_tag(reason: RiskRejectionCode) -> u16 {
+    match reason {
+        RiskRejectionCode::ClockFailure => 1,
+        RiskRejectionCode::ClockRollback => 2,
+        RiskRejectionCode::Authority => 3,
+        RiskRejectionCode::ApprovalIdentity => 4,
+        RiskRejectionCode::AuditUnavailable => 5,
+        RiskRejectionCode::PolicyExpired => 6,
+        RiskRejectionCode::MarketDepthUnavailable => 7,
+        RiskRejectionCode::SourceQuality => 8,
+        RiskRejectionCode::SourceIneligible => 9,
+        RiskRejectionCode::SourceStale => 10,
+        RiskRejectionCode::MarketTimestampInFuture => 11,
+        RiskRejectionCode::MarketPredatesSignal => 12,
+        RiskRejectionCode::InstrumentNotTrading => 13,
+        RiskRejectionCode::InstrumentDefinitionMismatch => 14,
+        RiskRejectionCode::IntentExpired => 15,
+        RiskRejectionCode::InvalidReferencePrice => 16,
+        RiskRejectionCode::OrderPriceLimit => 17,
+        RiskRejectionCode::StopNotTriggered => 18,
+        RiskRejectionCode::IntentSlippageLimit => 19,
+        RiskRejectionCode::PolicySlippageLimit => 20,
+        RiskRejectionCode::PriceDeviationLimit => 21,
+        RiskRejectionCode::Account(violation) => 0x0100 | account_violation_tag(violation),
+        RiskRejectionCode::Portfolio(error) => 0x0200 | portfolio_error_tag(error),
+    }
+}
+
+const fn account_violation_tag(violation: AccountRiskViolation) -> u16 {
+    match violation {
+        AccountRiskViolation::KillSwitch => 1,
+        AccountRiskViolation::AccountNotFound => 2,
+        AccountRiskViolation::AccountIneligible => 3,
+        AccountRiskViolation::ReconciliationRequired => 4,
+        AccountRiskViolation::InstrumentIneligible => 5,
+        AccountRiskViolation::CurrencyMismatch => 6,
+        AccountRiskViolation::PortfolioStateMismatch => 7,
+        AccountRiskViolation::UnsupportedSettlement => 8,
+        AccountRiskViolation::IntentExpired => 9,
+        AccountRiskViolation::IntentLifetimeExceeded => 10,
+        AccountRiskViolation::DuplicateClientOrder => 11,
+        AccountRiskViolation::DuplicateOrder => 12,
+        AccountRiskViolation::IdempotencyCapacity => 13,
+        AccountRiskViolation::IdempotencyRevisionExhausted => 14,
+        AccountRiskViolation::ReservationCapacity => 15,
+        AccountRiskViolation::OrderRateLimit => 16,
+        AccountRiskViolation::OrderNotionalLimit => 17,
+        AccountRiskViolation::PositionLimit => 18,
+        AccountRiskViolation::InsufficientPosition => 19,
+        AccountRiskViolation::InsufficientCash => 20,
+        AccountRiskViolation::ExposureLimit => 21,
+        AccountRiskViolation::LeverageLimit => 22,
+        AccountRiskViolation::CapitalLimit => 23,
+        AccountRiskViolation::LossLimit => 24,
+        AccountRiskViolation::DrawdownLimit => 25,
+        AccountRiskViolation::ArithmeticOverflow => 26,
+        AccountRiskViolation::AccountCoordinatorBusy => 27,
+        AccountRiskViolation::AccountCoordinatorPoisoned => 28,
+        AccountRiskViolation::ClockFailure => 29,
+    }
+}
+
+const fn portfolio_error_tag(error: PortfolioReadError) -> u16 {
+    match error {
+        PortfolioReadError::RevokedCapability => 1,
+        PortfolioReadError::MissingAccount => 2,
+        PortfolioReadError::StaleRevision => 3,
+        PortfolioReadError::RevokedRevision => 4,
+        PortfolioReadError::QueryBound => 5,
+        PortfolioReadError::CurrencyMismatch => 6,
+        PortfolioReadError::IncompleteBasis => 7,
+        PortfolioReadError::ContentMismatch => 8,
+        PortfolioReadError::PublicationRollback => 9,
+        PortfolioReadError::PublicationHistoryExhausted => 10,
+        PortfolioReadError::PublicationGenerationExhausted => 11,
+        PortfolioReadError::PublicationUnavailable => 12,
+    }
 }
 
 fn commit_audit(

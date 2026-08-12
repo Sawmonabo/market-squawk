@@ -23,6 +23,7 @@ import {
   parsePortfolioMeasurementHoldings,
   parsePortfolioMeasurementPrincipals,
   parsePortfolioMeasurementResult,
+  type PortfolioMeasurementAmountBasis,
   type PortfolioMeasurementMethod,
   verifyPortfolioMeasurementEvidence,
 } from "./portfolio-measurement-contracts"
@@ -70,6 +71,8 @@ export function PortfolioMeasurementWorkflow({
   const [amount, setAmount] = React.useState("")
   const [currency, setCurrency] = React.useState("")
   const [scale, setScale] = React.useState("2")
+  const [amountBasis, setAmountBasis] =
+    React.useState<PortfolioMeasurementAmountBasis>("per_instrument_unit")
   const [method, setMethod] = React.useState<PortfolioMeasurementMethod>("market_approach")
   const [significance, setSignificance] =
     React.useState<PortfolioMeasurementSignificance>("significant")
@@ -237,6 +240,7 @@ export function PortfolioMeasurementWorkflow({
         amount,
         currency,
         scale: scaleNumber,
+        amountBasis,
         method,
         preparedBy: context.principal.principalId,
         at,
@@ -251,6 +255,7 @@ export function PortfolioMeasurementWorkflow({
               amount: expected.amount,
               currency: expected.currency,
               scale: expected.scale,
+              amountBasis: expected.amountBasis,
               measurementAt: at,
               preparedAt: at,
               preparedBy: expected.preparedBy,
@@ -367,7 +372,7 @@ export function PortfolioMeasurementWorkflow({
       ) : accounts.isSuccess && accountSelections.length === 0 ? (
         <WorkflowNotice
           title="Import a portfolio first"
-          message="A portfolio-backed measurement needs one current account and holding. Open Portfolios, import and reconcile your records, then return here."
+          message="A portfolio-backed measurement needs one current account and holding. Open Portfolio, import and reconcile your records, then return here."
         />
       ) : principals.isSuccess && principalSelections.length === 0 ? (
         <WorkflowNotice
@@ -469,7 +474,7 @@ export function PortfolioMeasurementWorkflow({
             />
           ) : null}
 
-          <div className="grid gap-4 lg:grid-cols-3">
+          <div className="grid gap-4 lg:grid-cols-4">
             <MeasurementField
               label="3. Valuation amount"
               htmlFor="fair-value-amount"
@@ -488,6 +493,26 @@ export function PortfolioMeasurementWorkflow({
                   measure.reset()
                 }}
               />
+            </MeasurementField>
+            <MeasurementField
+              label="Amount basis"
+              htmlFor="fair-value-amount-basis"
+              detail="Per-unit values can support investment recommendations; entity and position totals remain explicitly separate."
+            >
+              <select
+                id="fair-value-amount-basis"
+                aria-describedby="fair-value-amount-basis-help"
+                value={amountBasis}
+                onChange={(event) => {
+                  setAmountBasis(event.target.value as PortfolioMeasurementAmountBasis)
+                  measure.reset()
+                }}
+                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <option value="per_instrument_unit">Per instrument unit</option>
+                <option value="reporting_entity_total">Entire reporting entity</option>
+                <option value="position_total">Entire portfolio position</option>
+              </select>
             </MeasurementField>
             <MeasurementField
               label="Currency"

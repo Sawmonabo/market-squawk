@@ -20,7 +20,8 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
-    PayloadReference, ResearchObservation, SourceIdentifier,
+    FundamentalConsolidation, FundamentalRestatementStatus, PayloadReference, ResearchObservation,
+    SourceIdentifier,
 };
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
@@ -1606,18 +1607,32 @@ async fn verify_sec_publication(
             (ResearchObservation::Fundamental(value), "fundamental") => {
                 let context = value.context();
                 let provenance = context.provenance();
+                let fact_context = value.fact_context();
                 (
                     context,
-                    sec_fact_identity_matches(
-                        provenance.source_identifier().as_str(),
-                        value.concept().as_str(),
-                        value.unit().as_str(),
-                    ) && provenance.source_timestamp().is_none()
-                        && context.time().effective().calendar_date_value().is_some()
-                        && context
-                            .time()
-                            .published()
-                            .is_some_and(|value| value.calendar_date_value().is_some()),
+                    provenance.source_timestamp().is_none()
+                        && fact_context.filing_form().is_some()
+                        && fact_context.period().end()
+                            == context
+                                .time()
+                                .effective()
+                                .calendar_date_value()
+                                .ok_or_else(|| anyhow!("SEC fact effective date is not exact"))?
+                        && fact_context.filed_on().is_some()
+                        && fact_context.filed_on()
+                            == context
+                                .time()
+                                .published()
+                                .and_then(|published| published.calendar_date_value())
+                        && fact_context.revision_order().ordinal() == context.time().revision()
+                        && value.xbrl_evidence().is_none()
+                        && fact_context.xbrl_context_id().is_none()
+                        && fact_context.dimensions().dimensions().is_none()
+                        && fact_context.consolidation() == FundamentalConsolidation::Unavailable
+                        && matches!(
+                            fact_context.restatement_status(),
+                            FundamentalRestatementStatus::Unavailable
+                        ),
                 )
             }
             _ => bail!("SEC query returned the wrong canonical observation family"),
@@ -1677,22 +1692,6 @@ async fn verify_sec_publication(
         query_operation: operation.to_owned(),
         provenance_verified_rows: row_count,
     })
-}
-
-fn sec_fact_identity_matches(identity: &str, concept: &str, unit: &str) -> bool {
-    let mut fields = identity.split(':');
-    fields.next().is_some_and(|accession| !accession.is_empty())
-        && fields.next() == Some(concept)
-        && fields.next() == Some(unit)
-        && fields
-            .next()
-            .is_some_and(|start| start == "instant" || valid_iso_date(start))
-        && fields.next().is_some_and(valid_iso_date)
-        && fields.next().is_none()
-}
-
-fn valid_iso_date(value: &str) -> bool {
-    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
 }
 
 fn required_lower_hex_bytes(value: Option<&Value>, field: &str) -> Result<Vec<u8>> {

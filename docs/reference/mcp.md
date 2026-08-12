@@ -175,7 +175,7 @@ Four JSON templates are also advertised:
 ```text
 market-squawk://sources/{source_id}
 market-squawk://models/{model_id}
-market-squawk://jobs/{job_id}
+market-squawk://jobs/{job_id}/generations/{generation}
 market-squawk://artifacts/{artifact_id}
 ```
 

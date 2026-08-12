@@ -41,13 +41,23 @@ export function PortfolioSummary({
   return (
     <section
       aria-label="Portfolio summary"
-      className="grid overflow-hidden rounded-xl border border-border bg-card/45 sm:grid-cols-2 xl:grid-cols-4"
+      className="grid overflow-hidden rounded-xl border border-border bg-card/45 sm:grid-cols-2 xl:grid-cols-5"
     >
       <SummaryFact
         icon={WalletCards}
-        label="Portfolio value"
+        label="Account value"
         value={performance ? compactMoney(performance.currentValue) : "Unavailable"}
-        help="Cash plus the source-backed market value of the selected holdings."
+        help="Source-reported cash plus source-backed asset values for this account only."
+      />
+      <SummaryFact
+        icon={BadgeDollarSign}
+        label="Account cash"
+        value={
+          performance?.accountingEvidence
+            ? compactMoney(performance.accountingEvidence.cash.amount)
+            : "Unavailable"
+        }
+        help="The exact source-reported cash snapshot; not an inferred checking or savings balance."
       />
       <SummaryFact
         icon={Activity}
@@ -61,9 +71,9 @@ export function PortfolioSummary({
       />
       <SummaryFact
         icon={Layers3}
-        label="Holdings"
+        label="Assets"
         value={(holdings?.length ?? account.holdingCount).toLocaleString()}
-        help={`${account.transactionCount.toLocaleString()} source transactions in this revision.`}
+        help={`${account.transactionCount.toLocaleString()} source transactions; no stock-only assumption.`}
       />
       <SummaryFact
         icon={
@@ -78,6 +88,122 @@ export function PortfolioSummary({
         help="A zero count does not prove that every possible total was supplied."
         tone={account.reconciliationDiscrepancies === 0 ? "default" : "warning"}
       />
+    </section>
+  )
+}
+
+export function FinancialPositionCoverage({
+  accounts,
+  holdingsAvailable,
+  performanceAvailable,
+  transactionsAvailable,
+}: {
+  accounts: PortfolioAccount[]
+  holdingsAvailable: boolean
+  performanceAvailable: boolean
+  transactionsAvailable: boolean
+}) {
+  return (
+    <section
+      className="mt-5 rounded-xl border border-border bg-card/35 p-5"
+      aria-label="Financial-position coverage"
+    >
+      <PanelHeading
+        eyebrow="What this workspace can represent"
+        title="Financial-position coverage"
+        detail="Available means the installed service exposes a typed source-backed read. Setup required and Unavailable are evidence gaps—not zero balances."
+      />
+      <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        <CoverageItem
+          label="Imported accounts"
+          state={accounts.length > 0 ? "available" : "setup"}
+          detail={
+            accounts.length > 0
+              ? `${accounts.length.toLocaleString()} account record${accounts.length === 1 ? "" : "s"} returned. Their account classifications were not supplied.`
+              : "Import an exact account revision before Portfolio can show account evidence."
+          }
+        />
+        <CoverageItem
+          label="Investments and other assets"
+          state={holdingsAvailable ? "available" : "unavailable"}
+          detail={
+            holdingsAvailable
+              ? "Generic asset IDs, quantities, marks, and cost-basis states are available after account selection."
+              : "The installed service does not expose the typed holdings operation."
+          }
+        />
+        <CoverageItem
+          label="Account cash"
+          state={performanceAvailable ? "available" : "unavailable"}
+          detail={
+            performanceAvailable
+              ? "Source-reported cash appears with the selected account's accounting evidence. It is not inferred from holdings."
+              : "The installed service does not expose the typed performance/accounting response required for cash."
+          }
+        />
+        <CoverageItem
+          label="Transactions, income, and fees"
+          state={transactionsAvailable ? "available" : "unavailable"}
+          detail={
+            transactionsAvailable
+              ? "Source classifications are retained. Generic income does not establish dividend, interest, or withholding detail."
+              : "The installed service does not expose typed account transactions."
+          }
+        />
+        <CoverageItem
+          label="Bank, checking, and savings synchronization"
+          state="setup"
+          detail="The current Portfolio contract has no live bank connection, account subtype, or synchronized bank-balance authority."
+        />
+        <CoverageItem
+          label="Liabilities and net worth"
+          state="unavailable"
+          detail="No liability or cross-account net-worth contract is exposed. Accounts and currencies are never silently combined."
+        />
+        <CoverageItem
+          label="Recommendation account and profile"
+          state="setup"
+          detail="Durable recommendation-account selection and its plain-language allocation profile are not wired to Desktop yet."
+        />
+      </div>
+    </section>
+  )
+}
+
+export function RecommendationSetupPanel({
+  selectedAccount,
+}: {
+  selectedAccount: PortfolioAccount | null
+}) {
+  return (
+    <section
+      className="mt-5 rounded-xl border border-amber-400/25 bg-amber-400/5 p-5"
+      aria-labelledby="portfolio-recommendation-setup"
+    >
+      <div className="flex gap-3">
+        <ShieldAlert className="mt-0.5 size-4 shrink-0 text-amber-300" aria-hidden="true" />
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-amber-200">
+            Setup required
+          </p>
+          <h2 id="portfolio-recommendation-setup" className="mt-2 text-base font-semibold">
+            Recommendation account and profile are not connected
+          </h2>
+          <p className="mt-2 text-xs leading-5 text-muted-foreground">
+            {selectedAccount
+              ? `${shortIdentity(selectedAccount.accountId, "Account")} is selected only for inspection on this page. `
+              : "No account is selected for inspection. "}
+            The current Desktop contract cannot read or commit the separate durable account and
+            allocation profile used for personalized Add, Hold, Trim, or Sell recommendations.
+            Market Squawk will not reuse the first account or this page selection as that authority.
+          </p>
+          <p className="mt-3 text-xs leading-5 text-muted-foreground">
+            Position-specific recommendations are Unavailable until that setup authority and its
+            typed Desktop workflow are wired. Existing holdings, cash, performance, and risk
+            evidence below remain independently usable.
+          </p>
+        </div>
+      </div>
     </section>
   )
 }
@@ -492,6 +618,36 @@ function ExposureList({
       ) : (
         <p className="mt-3 text-xs text-muted-foreground">No classified exposure returned.</p>
       )}
+    </div>
+  )
+}
+
+function CoverageItem({
+  label,
+  state,
+  detail,
+}: {
+  label: string
+  state: "available" | "setup" | "unavailable"
+  detail: string
+}) {
+  const stateLabel =
+    state === "available" ? "Available" : state === "setup" ? "Setup required" : "Unavailable"
+  const classes =
+    state === "available"
+      ? "border-emerald-400/20 bg-emerald-400/5 text-emerald-200"
+      : state === "setup"
+        ? "border-amber-400/20 bg-amber-400/5 text-amber-200"
+        : "border-border bg-background/30 text-muted-foreground"
+  return (
+    <div className={`rounded-lg border p-4 ${classes}`}>
+      <div className="flex items-start justify-between gap-3">
+        <h3 className="text-sm font-semibold text-foreground">{label}</h3>
+        <span className="shrink-0 rounded-md border border-current/20 px-2 py-1 text-[9px] font-medium uppercase tracking-wider">
+          {stateLabel}
+        </span>
+      </div>
+      <p className="mt-3 text-xs leading-5 text-muted-foreground">{detail}</p>
     </div>
   )
 }

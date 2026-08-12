@@ -55,7 +55,10 @@ pub use input::{
 };
 pub use journal::{
     JournalError, JournalReader, JournalReplayAuthority, JournalSinkConstructionError,
-    JournalSinkLimits, JournalWriter,
+    JournalSinkLimits, JournalWriter, SealedResearchJournalFrameReceipt,
+    SealedResearchJournalRecoveryReport, SealedResearchJournalSegment,
+    SealedResearchJournalSegmentClaim, SealedResearchJournalSegmentReceipt,
+    SealedResearchJournalStore, SealedResearchJournalStoreError,
 };
 pub use paths::{
     ArtifactPathError, ArtifactRoot, CatalogFileGuard, CatalogLocation, CatalogRestoreScanGuard,

@@ -1,15 +1,31 @@
 //! Lifecycle-owned transport-neutral portfolio imports, immutable reads, and analytics.
 
+mod account_catalog;
 mod advanced;
 mod analytics;
 mod backup;
+mod candidate;
 mod import;
 mod model;
 mod read;
 
+pub(crate) use account_catalog::{
+    PortfolioAccountCatalogError, PortfolioAccountCatalogReadCapability,
+    PortfolioAccountCatalogSnapshot, PortfolioAccountHead,
+};
 pub(crate) use backup::{
     PORTFOLIO_BACKUP_PRODUCER, PORTFOLIO_BACKUP_SCHEMA, PortfolioBackupAuthority,
     PortfolioBackupComponent, RetainedPortfolioBackupSnapshot, TRANSACTION_BACKUP_SCHEMA,
+};
+pub(crate) use candidate::{
+    ImportedPortfolioRiskAdvisory, ImportedPortfolioRiskAdvisoryOutcome,
+    ImportedPortfolioRiskCheck, PortfolioCandidateAvailability, PortfolioCandidateCost,
+    PortfolioCandidateImpactPreview, PortfolioCandidateImpactReadCapability,
+    PortfolioCandidateImpactRequest, PortfolioCandidateMarkKind, PortfolioCandidateMarketEvidence,
+    PortfolioCandidateMarketObservation, PortfolioCandidatePositionState,
+    PortfolioCandidateResolution, PortfolioCandidateResolutionAuthority,
+    PortfolioCandidateSetupBinding, PortfolioCandidateSourceSelection,
+    PortfolioCandidateUnavailableReason,
 };
 pub(crate) use import::{
     GovernedImportCommitReceipt, PortfolioImportInterpretation, PortfolioImportPreview,
@@ -19,7 +35,7 @@ pub(crate) use import::{
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Instant;
@@ -140,6 +156,9 @@ pub enum PortfolioApplicationServiceError {
     /// A consistent backup cannot be retained while a governed import is pending.
     #[error("portfolio backup snapshot is unavailable while an import is pending")]
     SnapshotUnavailable,
+    /// The immutable portfolio image changed while a read-only calculation was in flight.
+    #[error("portfolio state changed during calculation")]
+    StateChanged,
     /// Restore was directed at a workspace that already contains portfolio authority state.
     #[error("portfolio restore target is not fresh")]
     RestoreTargetNotFresh,
@@ -161,6 +180,7 @@ impl PortfolioApplicationServiceError {
             Self::Path
             | Self::Authority
             | Self::SnapshotUnavailable
+            | Self::StateChanged
             | Self::RestoreTargetNotFresh => ServiceError::Unavailable,
             Self::CorruptPublication | Self::Publication | Self::Analytics => {
                 ServiceError::Internal
@@ -210,6 +230,7 @@ impl PortfolioApplicationService {
                 limits,
                 authority: std::sync::Mutex::new(authority),
                 image: ArcSwap::from(Arc::new(image)),
+                candidate_resolution: OnceLock::new(),
                 accepting: AtomicBool::new(true),
                 cancellation: CancellationToken::new(),
                 active: AtomicUsize::new(0),
@@ -265,6 +286,37 @@ impl PortfolioApplicationService {
         PortfolioFairValueReadCapability {
             runtime: Arc::clone(&self.runtime),
         }
+    }
+
+    /// Returns complete current account heads without import or publication authority.
+    pub(crate) fn account_catalog_reader(&self) -> PortfolioAccountCatalogReadCapability {
+        PortfolioAccountCatalogReadCapability {
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+
+    /// Returns read-only, current-revision candidate-impact access for the unified workspace.
+    ///
+    /// This capability accepts only typed, source-selected market evidence. It cannot import or
+    /// mutate holdings, approve risk, create an order, or reuse caller-authored public JSON as a
+    /// market mark.
+    pub(crate) fn candidate_impact_reader(&self) -> PortfolioCandidateImpactReadCapability {
+        PortfolioCandidateImpactReadCapability {
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+
+    /// Installs the sole server-owned selected-account and market-evidence resolver.
+    ///
+    /// Registration is one-time and confers no portfolio mutation or execution authority.
+    pub(crate) fn register_candidate_resolution_authority(
+        &self,
+        authority: Arc<dyn PortfolioCandidateResolutionAuthority>,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        self.runtime
+            .candidate_resolution
+            .set(authority)
+            .map_err(|_| PortfolioApplicationServiceError::Authority)
     }
 
     /// Prepares a non-mutating portfolio import from bytes already claimed by native input
@@ -548,6 +600,7 @@ struct Runtime {
     limits: PortfolioApplicationLimits,
     authority: std::sync::Mutex<ImportAuthority>,
     image: ArcSwap<PortfolioReadImage>,
+    candidate_resolution: OnceLock<Arc<dyn PortfolioCandidateResolutionAuthority>>,
     accepting: AtomicBool,
     cancellation: CancellationToken,
     active: AtomicUsize,
@@ -631,6 +684,21 @@ impl ApplicationDomainService for PortfolioApplicationService {
             })
             .await
             .map_err(|_| ServiceError::Internal)?
+            .map_err(|error| error.as_service_error());
+        }
+        if request.name() == "Portfolio.EvaluateCandidateImpact" {
+            let authority = self
+                .runtime
+                .candidate_resolution
+                .get()
+                .cloned()
+                .ok_or(ServiceError::Unavailable)?;
+            let reader = self.candidate_impact_reader();
+            let _guard = guard;
+            return candidate::call_resolved_candidate_impact(
+                &authority, &reader, &request, &context,
+            )
+            .await
             .map_err(|error| error.as_service_error());
         }
         let _guard = guard;

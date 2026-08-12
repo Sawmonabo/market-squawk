@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest"
 import { App } from "@/app/app"
 import marketSquawkMarkSvg from "@/assets/market-squawk-mark.svg?raw"
 import { CredentialField } from "@/components/setup/credential-field"
+import type { AnalyticalControllerStatus } from "@/features/advanced/analytical-profile-contracts"
 import { lookupRoute } from "@/features/lookup/lookup-surface"
 import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
@@ -84,6 +85,8 @@ function transport(
       restartRequired: false,
     }),
     query,
+    analyticalController: async () =>
+      analyticalControllerStatus(bootstrap.runtime.workspaceId),
     researchControl: async () =>
       query({ query: "researchDatasets" }),
     datasetPreparation: async () =>
@@ -211,6 +214,71 @@ function transport(
   }
 }
 
+function analyticalControllerStatus(workspaceId: string): AnalyticalControllerStatus {
+  const digest = "73ed06501d2693749c6966f0a8fdcf10c48b8f03632959c0c847ee8a4be9db54"
+  const profileId = "0467d4c9-befd-5b7d-b4b5-99b673662c86"
+  const config = {
+    supportedInvestmentPolicy: { kind: "default_required" as const },
+    pointInTimeDatasetPolicy: { kind: "default_required" as const },
+    requiredFeatureSet: { kind: "default_required" as const },
+    modelBundlePolicy: { kind: "default_required" as const },
+    trainingCalibrationPolicy: { kind: "default_required" as const },
+    forecastHorizonPolicy: { kind: "default_required" as const },
+    valuationPolicy: { kind: "default_required" as const },
+    backtestCostPolicy: { kind: "default_required" as const },
+    recommendationPolicy: { kind: "default_required" as const },
+    riskFreshnessAbstentionPolicy: { kind: "default_required" as const },
+  }
+  const profile = {
+    profileId,
+    ownerWorkspaceId: workspaceId,
+    displayName: "Market Squawk Default V1",
+    kind: "default" as const,
+    version: 1,
+    revision: "1",
+    configDigest: digest,
+    config,
+    validationState: "default_immutable" as const,
+    lastValidation: null,
+    createdAt: "1800000000000000000",
+    updatedAt: "1800000000000000000",
+  }
+  return {
+    kind: "status",
+    controllerSchemaVersion: 1,
+    ownerWorkspaceId: workspaceId,
+    controllerRevision: "1",
+    activeProfile: {
+      profileId,
+      ownerWorkspaceId: workspaceId,
+      displayName: profile.displayName,
+      kind: "default",
+      version: 1,
+      profileRevision: "1",
+      configDigest: digest,
+      activationRevision: "1",
+      activatedAt: "1800000000000000000",
+    },
+    profiles: [profile],
+    workflowRuns: [],
+    workflowReadiness: {
+      state: "blocked",
+      blockers: [
+        {
+          code: "canonical_data_and_backend_composition_required",
+          detail: "Required canonical data and pure backend operations are not composed.",
+          owner: "installed_application",
+        },
+        {
+          code: "desktop_start_resume_not_registered",
+          detail: "Find and Analyze start commands are intentionally absent.",
+          owner: "desktop",
+        },
+      ],
+    },
+  }
+}
+
 function datasetRead(
   name: string,
   domain: string,
@@ -286,6 +354,7 @@ const unifiedKrakenMarket: ApplicationResult = {
         quality: "direct_unverified",
         freshness: "fresh",
         lastMarketAt: "2026-08-09T14:30:00Z",
+        availableAt: "2026-08-09T14:30:00.011000000Z",
         usableForSelection: true,
         totalOrderCount: 2,
         returnedOrderCount: 2,
@@ -324,6 +393,34 @@ const unifiedKrakenMarket: ApplicationResult = {
           },
         ],
       },
+      marketObservation: {
+        availability: "available",
+        instrumentId: "7e8299e7-9757-4441-926f-d0b22c767a65",
+        mark: {
+          value: "68000.2",
+          currency: "USD",
+          basis: "fresh_last_trade",
+          evidenceIdentity: {
+            algorithm: "sha256",
+            bytes: "11".repeat(32),
+          },
+          freshUntil: "2026-08-09T14:30:05.000000000Z",
+        },
+        selectionDigest: {
+          algorithm: "sha256",
+          bytes: "22".repeat(32),
+        },
+        selectedAt: "2026-08-09T14:30:00.011000000Z",
+        generation: "1",
+        quality: "direct_unverified",
+        depth: "order_level",
+        coverage: "single_venue",
+        integrity: "verified",
+        features: {
+          availability: "unavailable",
+          reason: "source_does_not_publish_live_features",
+        },
+      },
       selectedSource: {
         surfaceId: "kraken-l3",
         providerId: "kraken",
@@ -352,7 +449,26 @@ const unifiedKrakenMarket: ApplicationResult = {
         },
       },
       alternatives: [],
-      selectionReceipt: { policyRevision: 1 },
+      selectionReceipt: {
+        policyRevision: 1,
+        policyCandidateLimit: 256,
+        policyDigest: {
+          algorithm: "sha256",
+          bytes: "33".repeat(32),
+        },
+        selectionDigest: {
+          algorithm: "sha256",
+          bytes: "22".repeat(32),
+        },
+        selectedAt: "2026-08-09T14:30:00.011000000Z",
+        eligibleCount: 1,
+        rejectedCount: 0,
+        availableAlternativeCount: 0,
+        returnedAlternativeCount: 0,
+        alternativesComplete: true,
+        selectionClass: "exact_requirements",
+        downgradeDimensions: [],
+      },
     },
   ],
   metadata: {
@@ -447,7 +563,7 @@ describe("Market Squawk desktop boundary", () => {
     } satisfies ProductTransport
 
     render(
-      <MemoryRouter initialEntries={["/overview"]}>
+      <MemoryRouter initialEntries={["/home"]}>
         <App transport={bootstrapTransport} />
       </MemoryRouter>,
     )
@@ -463,7 +579,7 @@ describe("Market Squawk desktop boundary", () => {
     ).toBeTruthy()
   })
 
-  it("uses accessible product navigation to explore real research and MCP state", async () => {
+  it("uses grouped product navigation to explore real research and AI connection state", async () => {
     const readyBootstrap: DesktopBootstrap = {
       ...blockedBootstrap,
       operations: [
@@ -490,7 +606,7 @@ describe("Market Squawk desktop boundary", () => {
       ],
     }
     const rendered = render(
-      <MemoryRouter initialEntries={["/research"]}>
+      <MemoryRouter initialEntries={["/advanced/research-data"]}>
         <App transport={transport(readyBootstrap)} />
       </MemoryRouter>,
     )
@@ -535,6 +651,13 @@ describe("Market Squawk desktop boundary", () => {
       throw new Error("Market Squawk navigation is absent")
     }
     expect(navigation.querySelectorAll("a,button")).toHaveLength(18)
+    expect(within(navigation).getByText("Everyday")).toBeTruthy()
+    expect(within(navigation).getByText("Advanced", { exact: true })).toBeTruthy()
+    expect(within(navigation).getByText("Connections & System")).toBeTruthy()
+    expect(within(navigation).queryByRole("link", { name: "Lookup" })).toBeNull()
+    expect(
+      await within(navigation).findByRole("link", { name: "Opportunities" }),
+    ).toBeTruthy()
     const paperExecution = await within(navigation).findByRole("link", {
       name: "Paper Execution",
     })
@@ -549,7 +672,7 @@ describe("Market Squawk desktop boundary", () => {
 
     rendered.unmount()
     const mcpRendered = render(
-      <MemoryRouter initialEntries={["/mcp"]}>
+      <MemoryRouter initialEntries={["/system/ai-connections"]}>
         <App transport={transport(readyBootstrap)} />
       </MemoryRouter>,
     )
@@ -559,7 +682,7 @@ describe("Market Squawk desktop boundary", () => {
 
     mcpRendered.unmount()
     render(
-      <MemoryRouter initialEntries={["/updates"]}>
+      <MemoryRouter initialEntries={["/system/updates-repair"]}>
         <App transport={transport(readyBootstrap)} />
       </MemoryRouter>,
     )
@@ -570,7 +693,7 @@ describe("Market Squawk desktop boundary", () => {
 
   it("never promotes an unverified backend state to installation readiness", async () => {
     render(
-      <MemoryRouter initialEntries={["/overview"]}>
+      <MemoryRouter initialEntries={["/home"]}>
         <App transport={transport()} />
       </MemoryRouter>,
     )

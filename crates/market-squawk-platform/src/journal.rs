@@ -20,6 +20,16 @@ use thiserror::Error;
 
 use crate::{RawCaptureRecord, RawCaptureRecordError, raw_record::MAX_SERIALIZED_RECORD_BYTES};
 
+#[path = "journal/sealed.rs"]
+mod sealed;
+
+pub use sealed::{
+    SealedResearchJournalFrameReceipt, SealedResearchJournalRecoveryReport,
+    SealedResearchJournalSegment, SealedResearchJournalSegmentClaim,
+    SealedResearchJournalSegmentReceipt, SealedResearchJournalStore,
+    SealedResearchJournalStoreError,
+};
+
 const CURRENT_MAGIC: &[u8; 4] = b"MSJ1";
 const MAX_RECORD_BYTES: usize = MAX_SERIALIZED_RECORD_BYTES;
 const DEFAULT_MAX_RECORDS: usize = 1_000_000;
@@ -253,6 +263,61 @@ struct BoundedCrcForwardWriter<'a, W> {
     hasher: Hasher,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct WrittenJournalFrame {
+    pub(super) serialized_payload_bytes: usize,
+}
+
+pub(super) fn write_current_frame<W: Write>(
+    writer: &mut W,
+    record: &RawCaptureRecord,
+) -> Result<WrittenJournalFrame, JournalError> {
+    let mut first_pass = CountingCrcWriter::new(MAX_RECORD_BYTES);
+    if let Err(error) = serde_json::to_writer(&mut first_pass, record) {
+        if first_pass.attempted_bytes > MAX_RECORD_BYTES {
+            return Err(JournalError::RecordTooLarge {
+                bytes: first_pass.attempted_bytes,
+                max: MAX_RECORD_BYTES,
+            });
+        }
+        return Err(JournalError::Json(error));
+    }
+    let (payload_bytes, crc) = first_pass.finish();
+    if payload_bytes > MAX_RECORD_BYTES {
+        return Err(JournalError::RecordTooLarge {
+            bytes: payload_bytes,
+            max: MAX_RECORD_BYTES,
+        });
+    }
+    let length = u32::try_from(payload_bytes)?;
+    writer
+        .write_all(&length.to_le_bytes())
+        .map_err(|source| JournalError::io("failed to write journal length", source))?;
+    writer
+        .write_all(&crc.to_le_bytes())
+        .map_err(|source| JournalError::io("failed to write journal checksum", source))?;
+    let mut second_pass = BoundedCrcForwardWriter::new(writer, payload_bytes);
+    if let Err(error) = serde_json::to_writer(&mut second_pass, record) {
+        if error.is_io() {
+            let kind = error.io_error_kind().unwrap_or(std::io::ErrorKind::Other);
+            return Err(JournalError::io(
+                "failed to write journal payload",
+                std::io::Error::new(kind, error),
+            ));
+        }
+        return Err(JournalError::Json(error));
+    }
+    let (written_bytes, written_crc) = second_pass.finish();
+    if written_bytes != payload_bytes || written_crc != crc {
+        return Err(JournalError::InvalidRecord(
+            "journal serialization passes produced different bytes".to_owned(),
+        ));
+    }
+    Ok(WrittenJournalFrame {
+        serialized_payload_bytes: payload_bytes,
+    })
+}
+
 impl<'a, W> BoundedCrcForwardWriter<'a, W> {
     fn new(inner: &'a mut W, expected_bytes: usize) -> Self {
         Self {
@@ -409,47 +474,7 @@ impl JournalWriter {
 
     /// Appends one CRC-framed compatibility record to the buffer.
     pub fn append(&mut self, record: &RawCaptureRecord) -> Result<(), JournalError> {
-        let mut first_pass = CountingCrcWriter::new(MAX_RECORD_BYTES);
-        if let Err(error) = serde_json::to_writer(&mut first_pass, record) {
-            if first_pass.attempted_bytes > MAX_RECORD_BYTES {
-                return Err(JournalError::RecordTooLarge {
-                    bytes: first_pass.attempted_bytes,
-                    max: MAX_RECORD_BYTES,
-                });
-            }
-            return Err(JournalError::Json(error));
-        }
-        let (payload_bytes, crc) = first_pass.finish();
-        if payload_bytes > MAX_RECORD_BYTES {
-            return Err(JournalError::RecordTooLarge {
-                bytes: payload_bytes,
-                max: MAX_RECORD_BYTES,
-            });
-        }
-        let length = u32::try_from(payload_bytes)?;
-        self.writer
-            .write_all(&length.to_le_bytes())
-            .map_err(|source| JournalError::io("failed to write journal length", source))?;
-        self.writer
-            .write_all(&crc.to_le_bytes())
-            .map_err(|source| JournalError::io("failed to write journal checksum", source))?;
-        let mut second_pass = BoundedCrcForwardWriter::new(&mut self.writer, payload_bytes);
-        if let Err(error) = serde_json::to_writer(&mut second_pass, record) {
-            if error.is_io() {
-                let kind = error.io_error_kind().unwrap_or(std::io::ErrorKind::Other);
-                return Err(JournalError::io(
-                    "failed to write journal payload",
-                    std::io::Error::new(kind, error),
-                ));
-            }
-            return Err(JournalError::Json(error));
-        }
-        let (written_bytes, written_crc) = second_pass.finish();
-        if written_bytes != payload_bytes || written_crc != crc {
-            return Err(JournalError::InvalidRecord(
-                "journal serialization passes produced different bytes".to_owned(),
-            ));
-        }
+        let _frame = write_current_frame(&mut self.writer, record)?;
         Ok(())
     }
 

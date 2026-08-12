@@ -1028,20 +1028,25 @@ async fn cleanup_registrations(
     directory: &OrderLevelDirectory,
     registrations: Vec<OrderLevelRegistration>,
 ) -> Result<(), KrakenLevel3RuntimeError> {
-    let deadline = Instant::now()
-        .checked_add(IO_TIMEOUT)
-        .ok_or(KrakenLevel3RuntimeError::ResourceAccounting)?;
+    let now = Instant::now();
+    let (deadline, mut first_error) = now.checked_add(IO_TIMEOUT).map_or_else(
+        || (now, Some(KrakenLevel3RuntimeError::ResourceAccounting)),
+        |deadline| (deadline, None),
+    );
     let cleanup = CancellationToken::new();
     for registration in registrations {
         let key = registration.key().clone();
         drop(registration);
-        if directory.unregister(&key, &cleanup, deadline).await?
-            != OrderLevelActorShutdown::Graceful
-        {
-            return Err(KrakenLevel3RuntimeError::ActorShutdownIncomplete);
+        let error = match directory.unregister(&key, &cleanup, deadline).await {
+            Ok(OrderLevelActorShutdown::Graceful) => None,
+            Ok(_) => Some(KrakenLevel3RuntimeError::ActorShutdownIncomplete),
+            Err(error) => Some(KrakenLevel3RuntimeError::from(error)),
+        };
+        if first_error.is_none() {
+            first_error = error;
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 fn actor_limits(
@@ -1105,19 +1110,25 @@ async fn unregister_generation_actors(
     actors: &mut GenerationActors,
     timeout: Duration,
 ) -> Result<(), KrakenLevel3RuntimeError> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or(KrakenLevel3RuntimeError::ResourceAccounting)?;
+    let now = Instant::now();
+    let (deadline, mut first_error) = now.checked_add(timeout).map_or_else(
+        || (now, Some(KrakenLevel3RuntimeError::ResourceAccounting)),
+        |deadline| (deadline, None),
+    );
     let cleanup = CancellationToken::new();
     for key in &actors.keys {
-        if directory.unregister(key, &cleanup, deadline).await? != OrderLevelActorShutdown::Graceful
-        {
-            return Err(KrakenLevel3RuntimeError::ActorShutdownIncomplete);
+        let error = match directory.unregister(key, &cleanup, deadline).await {
+            Ok(OrderLevelActorShutdown::Graceful) => None,
+            Ok(_) => Some(KrakenLevel3RuntimeError::ActorShutdownIncomplete),
+            Err(error) => Some(KrakenLevel3RuntimeError::from(error)),
+        };
+        if first_error.is_none() {
+            first_error = error;
         }
     }
     actors.monitors.abort_all();
     while actors.monitors.join_next().await.is_some() {}
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 fn quarantine_actors(

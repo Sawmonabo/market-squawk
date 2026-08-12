@@ -371,7 +371,7 @@ impl OperationsApplicationServices {
     ) -> Result<TypedToolResult, ServiceError> {
         TypedToolResult::try_new(
             value,
-            item_count.max(1),
+            item_count,
             ToolResultMetadata::complete_not_applicable(),
             limits,
         )

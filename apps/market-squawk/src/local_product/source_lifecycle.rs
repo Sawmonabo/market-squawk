@@ -672,7 +672,7 @@ impl ProductionSourceLifecycleAuthority {
                     .await
                     .map_err(map_live_error)?;
                 let current = validate_account_group_evidence(request, &current)?;
-                if current.digest() != previous.digest() {
+                if current == previous {
                     let cleanup = self
                         .live
                         .stop_account_group(

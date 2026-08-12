@@ -3,6 +3,7 @@ import type { z } from "zod"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { messageFrom } from "@/app/product-context"
+import { parseInvestmentAnalysisPage } from "@/features/opportunities/contracts"
 import type { ApplicationResult } from "@/lib/schemas"
 import type { DashboardQuery, ProductTransport } from "@/lib/transport"
 
@@ -10,7 +11,6 @@ import {
   decisionOverviewSchema,
   jobListSchema,
   marketSnapshotSchema,
-  paperStatusSchema,
   sourceHealthSchema,
 } from "./schemas"
 
@@ -22,8 +22,11 @@ export type ReadState<T> =
 const OVERVIEW_INPUT = { query: "overview" } as const
 const SOURCE_INPUT = { query: "sourceHealth" } as const
 const MARKET_INPUT = { query: "marketSnapshot" } as const
-const PAPER_INPUT = { query: "paperStatus" } as const
 const JOB_INPUT = { query: "jobs", limit: 24 } as const
+const ANALYSIS_INPUT = {
+  query: "decisionInvestmentAnalyses",
+  limit: 12,
+} as const
 
 export function useOverviewQueries(
   transport: ProductTransport,
@@ -37,8 +40,19 @@ export function useOverviewQueries(
     OVERVIEW_INPUT,
     decisionOverviewSchema,
   )
-  const operational = useOperationalQueries(transport, scope)
-  return { overview, ...operational }
+  const analyses = useParsedProductQuery(
+    transport,
+    scope,
+    "decision",
+    "investment-analyses",
+    ANALYSIS_INPUT,
+    (result) =>
+      parseInvestmentAnalysisPage(result, { limit: ANALYSIS_INPUT.limit }),
+  )
+  const sources = useSourceHealthQuery(transport, scope)
+  const markets = useMarketSnapshotQuery(transport, scope)
+  const jobs = useJobListQuery(transport, scope)
+  return { overview, analyses, sources, markets, jobs }
 }
 
 export function useOperationalQueries(
@@ -46,39 +60,49 @@ export function useOperationalQueries(
   scope: ProductScope,
 ) {
   return {
-    sources: useProductQuery(
-      transport,
-      scope,
-      "source",
-      "health",
-      SOURCE_INPUT,
-      sourceHealthSchema,
-    ),
-    markets: useProductQuery(
-      transport,
-      scope,
-      "market",
-      "snapshot",
-      MARKET_INPUT,
-      marketSnapshotSchema,
-    ),
-    paper: useProductQuery(
-      transport,
-      scope,
-      "bot",
-      "status",
-      PAPER_INPUT,
-      paperStatusSchema,
-    ),
-    jobs: useProductQuery(
-      transport,
-      scope,
-      "job",
-      "list",
-      JOB_INPUT,
-      jobListSchema,
-    ),
+    sources: useSourceHealthQuery(transport, scope),
+    markets: useMarketSnapshotQuery(transport, scope),
+    jobs: useJobListQuery(transport, scope),
   }
+}
+
+function useSourceHealthQuery(
+  transport: ProductTransport,
+  scope: ProductScope,
+) {
+  return useProductQuery(
+    transport,
+    scope,
+    "source",
+    "health",
+    SOURCE_INPUT,
+    sourceHealthSchema,
+  )
+}
+
+function useMarketSnapshotQuery(
+  transport: ProductTransport,
+  scope: ProductScope,
+) {
+  return useProductQuery(
+    transport,
+    scope,
+    "market",
+    "snapshot",
+    MARKET_INPUT,
+    marketSnapshotSchema,
+  )
+}
+
+function useJobListQuery(transport: ProductTransport, scope: ProductScope) {
+  return useProductQuery(
+    transport,
+    scope,
+    "job",
+    "list",
+    JOB_INPUT,
+    jobListSchema,
+  )
 }
 
 function useProductQuery<Schema extends z.ZodType>(
@@ -89,6 +113,32 @@ function useProductQuery<Schema extends z.ZodType>(
   input: DashboardQuery,
   schema: Schema,
 ): ReadState<z.infer<Schema>> {
+  return useParsedProductQuery(
+    transport,
+    scope,
+    domain,
+    operation,
+    input,
+    (result) => {
+      const parsed = parseApplicationData(result, schema)
+      if (!parsed.success) {
+        throw new Error(
+          "The installed service returned data this screen cannot safely interpret.",
+        )
+      }
+      return parsed.data
+    },
+  )
+}
+
+function useParsedProductQuery<Result>(
+  transport: ProductTransport,
+  scope: ProductScope,
+  domain: string,
+  operation: string,
+  input: DashboardQuery,
+  parse: (result: ApplicationResult) => Result,
+): ReadState<Result> {
   const query = useQuery({
     queryKey: productKeys.operation(scope, domain, operation, input),
     queryFn: () => transport.query(input),
@@ -100,14 +150,11 @@ function useProductQuery<Schema extends z.ZodType>(
   if (query.isError) {
     return { status: "unavailable", data: null, message: messageFrom(query.error) }
   }
-  const parsed = parseApplicationData(query.data, schema)
-  return parsed.success
-    ? { status: "ready", data: parsed.data, message: null }
-    : {
-        status: "unavailable",
-        data: null,
-        message: "The installed service returned data this screen cannot safely interpret.",
-      }
+  try {
+    return { status: "ready", data: parse(query.data), message: null }
+  } catch (error) {
+    return { status: "unavailable", data: null, message: messageFrom(error) }
+  }
 }
 
 function parseApplicationData<Schema extends z.ZodType>(

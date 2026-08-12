@@ -17,7 +17,14 @@ use crate::{
     BacktestStrategyClass, BacktestStrategyFactory, BacktestStrategyInstance,
     BacktestStrategyRegistry, BacktestTrialPlan, ExperimentError, ExperimentInventory,
     ExperimentLimits, ExperimentLimitsInput, HistoricalUniverseStatus,
-    MAX_COHORT_CANDIDATES_PER_FOLD, PortfolioSeed, RESEARCH_EXECUTION_POLICY_VERSION,
+    MAX_COHORT_CANDIDATES_PER_FOLD, PortfolioSeed, RECOMMENDATION_TARGET_HORIZON_NANOS_V1,
+    RESEARCH_EXECUTION_POLICY_VERSION, RecommendationAggregateEvidenceV1,
+    RecommendationBacktestKernelV1, RecommendationBacktestLimits,
+    RecommendationBacktestLimitsInput, RecommendationBacktestPolicyV1,
+    RecommendationBacktestPolicyV1Input, RecommendationBacktestPublicationV1,
+    RecommendationBenchmarkAggregateV1, RecommendationBenchmarkPolicyV1, RecommendationOosFoldV1,
+    RecommendationSignalDispositionV1, RecommendationSignalInstructionV1,
+    RecommendationSignalPlanCompletenessV1, RecommendationSignalPlanV1, RecommendationSignalV1,
     ResearchExecutionAssumptions, ResearchExecutionAssumptionsInput, ResearchLiquidityPriority,
     TrialComponentBinding, TrialDatasetPartition, TrialId, TrialMetric, TrialParameter,
     TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
@@ -221,6 +228,10 @@ fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() 
         result.accounting_reconciliation(),
         AccountingReconciliation::Independent
     );
+    assert_eq!(
+        result.performance().maximum_drawdown,
+        Decimal::new(2_222, 6)
+    );
     Ok(())
 }
 
@@ -348,7 +359,7 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
         BacktestTrialPlan::new(
             Vec::new(),
             Vec::new(),
-            SourceIdentifier::try_from("total-return")?,
+            SourceIdentifier::try_from("cost-adjusted-total-return")?,
         ),
         &CancellationToken::new(),
     )?;
@@ -359,12 +370,25 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
         return Err("expected completed terminal".into());
     };
     assert_eq!(result.run().fills().len(), 2);
-    assert_eq!(completion.metrics().len(), 7);
+    assert_eq!(completion.metrics().len(), 8);
     assert_eq!(
         completion
-            .dataset_partition()
-            .ok_or("missing dataset partition")?
-            .ends_at(),
+            .metrics()
+            .iter()
+            .find(|metric| metric.name().as_str() == "cost-adjusted-total-return")
+            .map(TrialMetric::value),
+        rust_decimal::prelude::ToPrimitive::to_f64(&Decimal::new(15_536, 6))
+    );
+    assert_eq!(
+        completion
+            .metrics()
+            .iter()
+            .find(|metric| metric.name().as_str() == "maximum-drawdown")
+            .map(TrialMetric::value),
+        rust_decimal::prelude::ToPrimitive::to_f64(&Decimal::new(2_222, 6))
+    );
+    assert_eq!(
+        completion.dataset_partition().ends_at(),
         Timestamp::from_unix_nanos(30)
     );
     assert!(
@@ -373,6 +397,180 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
             .join(completion.artifact().reference())
             .is_file()
     );
+    Ok(())
+}
+
+#[test]
+fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -> TestResult {
+    const DAY: i64 = 24 * 60 * 60 * 1_000_000_000;
+    let subject_terms = execution_terms()?;
+    let benchmark_terms = InstrumentExecutionTerms::try_new(
+        "00000000-0000-0000-0000-000000000021".parse()?,
+        InstrumentDefinitionRevision::try_from(1)?,
+        TickSize::try_from_decimal(Decimal::ONE)?,
+        LotSize::try_from_decimal(Decimal::ONE)?,
+        Currency::try_from("USD")?,
+        Denomination::Currency(Currency::try_from("USD")?),
+        Decimal::ONE,
+    )?;
+    let signal_times = [DAY, 401 * DAY, 801 * DAY];
+    let mut observations = Vec::new();
+    let mut lineage = 20_u8;
+    for signal_at in signal_times {
+        for (offset, subject_price, benchmark_price) in [
+            (10, 100, 100),
+            (180 * DAY, 90, 100),
+            (RECOMMENDATION_TARGET_HORIZON_NANOS_V1 + 10, 120, 105),
+        ] {
+            observations.push(recommendation_observation(
+                subject_terms,
+                signal_at + offset,
+                subject_price,
+                lineage,
+            )?);
+            lineage = lineage.checked_add(1).ok_or("lineage overflow")?;
+            observations.push(recommendation_observation(
+                benchmark_terms,
+                signal_at + offset,
+                benchmark_price,
+                lineage,
+            )?);
+            lineage = lineage.checked_add(1).ok_or("lineage overflow")?;
+        }
+    }
+    let dataset = BacktestDataset::try_new(BacktestDatasetInput {
+        manifest: feature_manifest()?,
+        object_graph_digest: Sha256Digest::new([42; 32]),
+        point_in_time_content: Sha256Digest::new([43; 32]),
+        point_in_time_audit: Sha256Digest::new([44; 32]),
+        instrument_definition_content: Sha256Digest::new([45; 32]),
+        instrument_definition_audit: Sha256Digest::new([46; 32]),
+        observations,
+    })?;
+    let folds = signal_times
+        .iter()
+        .enumerate()
+        .map(|(index, signal_at)| -> Result<_, Box<dyn Error>> {
+            Ok(RecommendationOosFoldV1::try_new(
+                SourceIdentifier::try_from(format!("oos-fold-{index}"))?,
+                Timestamp::from_unix_nanos(*signal_at),
+                Timestamp::from_unix_nanos(signal_at + RECOMMENDATION_TARGET_HORIZON_NANOS_V1 + 21),
+            )?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let mut signals = signal_times
+        .iter()
+        .enumerate()
+        .map(|(fold_index, signal_at)| -> Result<_, Box<dyn Error>> {
+            Ok(RecommendationSignalV1::try_new(
+                SourceIdentifier::try_from(format!("entry-{fold_index}"))?,
+                fold_index,
+                Timestamp::from_unix_nanos(*signal_at),
+                Timestamp::from_unix_nanos(*signal_at),
+                Sha256Digest::new([u8::try_from(fold_index + 1)?; 32]),
+                RecommendationSignalInstructionV1::Entry,
+            )?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    signals.push(RecommendationSignalV1::try_new(
+        SourceIdentifier::try_from("no-action-0")?,
+        0,
+        Timestamp::from_unix_nanos(signal_times[0] + 1),
+        Timestamp::from_unix_nanos(signal_times[0] + 1),
+        Sha256Digest::new([9; 32]),
+        RecommendationSignalInstructionV1::NoAction,
+    )?);
+    let policy = RecommendationBacktestPolicyV1::try_new(RecommendationBacktestPolicyV1Input {
+        subject_instrument_id: subject_terms.instrument_id(),
+        benchmark: RecommendationBenchmarkPolicyV1::try_new(
+            benchmark_terms.instrument_id(),
+            Sha256Digest::new([10; 32]),
+        )?,
+        reporting_currency: Currency::try_from("USD")?,
+        subject_quantity: QuantityLots::new(1)?,
+        benchmark_quantity: QuantityLots::new(1)?,
+        maximum_entry_lag_nanos: 20,
+        maximum_exit_lag_nanos: 20,
+        execution_assumptions: research_assumptions()?,
+        seed: 7,
+    })?;
+    let limits = RecommendationBacktestLimits::try_new(RecommendationBacktestLimitsInput {
+        max_folds: 3,
+        max_signals: 8,
+        max_equity_points_per_outcome: 8,
+        max_total_equity_points: 64,
+        max_observation_visits: 1_000,
+    })?;
+    let cutoff = signal_times[2] + RECOMMENDATION_TARGET_HORIZON_NANOS_V1 + 10;
+    let publication = RecommendationBacktestPublicationV1::try_new(
+        Timestamp::from_unix_nanos(cutoff),
+        Timestamp::from_unix_nanos(cutoff + 1),
+        Timestamp::from_unix_nanos(cutoff + 2),
+        Timestamp::from_unix_nanos(cutoff + 3),
+        Timestamp::from_unix_nanos(cutoff + 4),
+    )?;
+    let complete = RecommendationSignalPlanV1::try_new(
+        Sha256Digest::new([11; 32]),
+        RecommendationSignalPlanCompletenessV1::Complete,
+        folds.clone(),
+        signals.clone(),
+    )?;
+    let evidence =
+        RecommendationBacktestKernelV1::run(&dataset, policy, &complete, publication, limits)?;
+    assert_eq!(evidence.results().len(), signals.len());
+    assert_eq!(
+        evidence
+            .results()
+            .iter()
+            .filter(|result| matches!(
+                result.disposition(),
+                RecommendationSignalDispositionV1::Completed { .. }
+            ))
+            .count(),
+        3
+    );
+    assert!(evidence.results().iter().any(|result| matches!(
+        result.disposition(),
+        RecommendationSignalDispositionV1::NoAction
+    )));
+    assert_eq!(
+        evidence.results()[0].target_at().unix_nanos()
+            - signal_times[evidence.results()[0].fold_index()],
+        RECOMMENDATION_TARGET_HORIZON_NANOS_V1
+    );
+    let RecommendationAggregateEvidenceV1::Available(aggregate) = evidence.aggregate() else {
+        return Err("expected complete recommendation aggregate".into());
+    };
+    assert_eq!(aggregate.observation_count(), 3);
+    assert_eq!(aggregate.trial_count(), 3);
+    assert!(aggregate.worst_maximum_drawdown() > Decimal::ZERO);
+    assert!(aggregate.positive_fold_stability() > Decimal::ZERO);
+    assert_eq!(aggregate.positive_fold_stability_ppm(), 1_000_000);
+    assert!(matches!(
+        aggregate.benchmark(),
+        RecommendationBenchmarkAggregateV1::Available { .. }
+    ));
+    assert_eq!(
+        evidence.digest(),
+        RecommendationBacktestKernelV1::run(&dataset, policy, &complete, publication, limits,)?
+            .digest()
+    );
+
+    let truncated = RecommendationSignalPlanV1::try_new(
+        Sha256Digest::new([11; 32]),
+        RecommendationSignalPlanCompletenessV1::Truncated {
+            total_signal_count: signals.len() + 1,
+        },
+        folds,
+        signals,
+    )?;
+    let truncated_evidence =
+        RecommendationBacktestKernelV1::run(&dataset, policy, &truncated, publication, limits)?;
+    assert!(matches!(
+        truncated_evidence.aggregate(),
+        RecommendationAggregateEvidenceV1::Unavailable(_)
+    ));
+    assert_ne!(evidence.digest(), truncated_evidence.digest());
     Ok(())
 }
 
@@ -437,7 +635,7 @@ fn governed_trial_identity_binds_every_immutable_request_input() -> TestResult {
                 seed: request.seed(),
                 parameters: Vec::new(),
                 search_space: Vec::new(),
-                selection_criterion: SourceIdentifier::try_from("total-return")?,
+                selection_criterion: SourceIdentifier::try_from("cost-adjusted-total-return")?,
             })?
             .id(),
         );
@@ -494,7 +692,7 @@ fn post_reservation_validation_fails_terminally_before_artifact_publication() ->
             BacktestTrialPlan::new(
                 Vec::new(),
                 Vec::new(),
-                SourceIdentifier::try_from("total-return")?,
+                SourceIdentifier::try_from("cost-adjusted-total-return")?,
             ),
             &CancellationToken::new(),
         ),
@@ -503,16 +701,16 @@ fn post_reservation_validation_fails_terminally_before_artifact_publication() ->
         ))
     ));
     assert_eq!(
-        std::fs::read_dir(temporary.path().join("backtesting/v1/reservations"))?.count(),
+        std::fs::read_dir(temporary.path().join("backtesting/v3/reservations"))?.count(),
         1
     );
-    let terminal_directory = std::fs::read_dir(temporary.path().join("backtesting/v1/terminals"))?
+    let terminal_directory = std::fs::read_dir(temporary.path().join("backtesting/v3/terminals"))?
         .next()
         .ok_or("missing failed terminal directory")??
         .path();
     assert_eq!(std::fs::read_dir(terminal_directory)?.count(), 1);
     assert_eq!(
-        std::fs::read_dir(temporary.path().join("backtesting/v1/artifacts/sha256"))?.count(),
+        std::fs::read_dir(temporary.path().join("backtesting/v3/artifacts/sha256"))?.count(),
         0
     );
     Ok(())
@@ -611,7 +809,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
                         SourceIdentifier::try_from("slow")?,
                     ],
                 )?],
-                SourceIdentifier::try_from("total-return")?,
+                SourceIdentifier::try_from("cost-adjusted-total-return")?,
             )
             .with_cohort_universe(universe.clone()),
             &CancellationToken::new(),
@@ -619,7 +817,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
         Err(BacktestServiceError::InvalidCohort)
     ));
     assert_eq!(
-        std::fs::read_dir(temporary.path().join("backtesting/v1/reservations"))?.count(),
+        std::fs::read_dir(temporary.path().join("backtesting/v3/reservations"))?.count(),
         0
     );
     let (first_fold, selection_candidates, first_candidates) = completed_cohort_fold(
@@ -636,7 +834,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
                 BacktestCohortFold::try_new(second_candidates[..2].to_vec())?,
             ],
             selection_candidates[..2].to_vec(),
-            SourceIdentifier::try_from("total-return")?,
+            SourceIdentifier::try_from("cost-adjusted-total-return")?,
         ),
         Err(ExperimentError::InvalidDiagnostic)
     ));
@@ -645,7 +843,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
             cohort_universe(&[(10, 40), (70, 100), (130, 160)], 40)?,
             vec![first_fold.clone(), second_fold.clone()],
             selection_candidates.clone(),
-            SourceIdentifier::try_from("total-return")?,
+            SourceIdentifier::try_from("cost-adjusted-total-return")?,
         ),
         Err(ExperimentError::InvalidDiagnostic)
     ));
@@ -658,7 +856,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
                 .chain(&second_selection)
                 .copied()
                 .collect(),
-            SourceIdentifier::try_from("total-return")?,
+            SourceIdentifier::try_from("cost-adjusted-total-return")?,
         ),
         Err(ExperimentError::InvalidDiagnostic)
     ));
@@ -689,21 +887,21 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
             second_fold.clone(),
         ],
         authority_selection,
-        SourceIdentifier::try_from("total-return")?,
+        SourceIdentifier::try_from("cost-adjusted-total-return")?,
     )?;
     assert!(matches!(
         service.evaluate_cohort(authority_plan),
         Err(BacktestServiceError::InvalidCohort)
     ));
     assert_eq!(
-        std::fs::read_dir(temporary.path().join("backtesting/v1/cohorts"))?.count(),
+        std::fs::read_dir(temporary.path().join("backtesting/v3/cohorts"))?.count(),
         0
     );
     let plan = BacktestCohortPlan::try_new(
         universe,
         vec![first_fold, second_fold],
         selection_candidates.clone(),
-        SourceIdentifier::try_from("total-return")?,
+        SourceIdentifier::try_from("cost-adjusted-total-return")?,
     )?;
     let constrained_plan = plan.clone();
 
@@ -722,7 +920,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
     );
     assert!((0.0..=1.0).contains(&evaluation.deflated_performance().probability()));
     assert_eq!(
-        std::fs::read_dir(temporary.path().join("backtesting/v1/cohorts"))?.count(),
+        std::fs::read_dir(temporary.path().join("backtesting/v3/cohorts"))?.count(),
         1
     );
     let evaluation_id = evaluation.id();
@@ -752,7 +950,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
         .collect::<String>();
     let evaluation_path = temporary
         .path()
-        .join("backtesting/v1/cohorts")
+        .join("backtesting/v3/cohorts")
         .join(format!("{evaluation_hex}.json"));
     let original_evaluation = std::fs::read(&evaluation_path)?;
     let mut cardinality_mismatch: serde_json::Value = serde_json::from_slice(&original_evaluation)?;
@@ -808,118 +1006,6 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
         Err(ExperimentError::Unavailable)
     ));
 
-    const V1_TRIAL_ID: [u8; 32] = [
-        204, 192, 179, 164, 28, 112, 23, 169, 97, 98, 112, 138, 90, 51, 232, 124, 231, 70, 161,
-        146, 67, 140, 231, 172, 104, 88, 18, 93, 39, 92, 71, 221,
-    ];
-    const V1_RESERVATION: &str = r#"{"schema_version":1,"trial_id":"ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd","spec":{"dataset_identity":"0101010101010101010101010101010101010101010101010101010101010101","object_graph_digest":"0202020202020202020202020202020202020202020202020202020202020202","execution_assumption_digest":"0303030303030303030303030303030303030303030303030303030303030303","model":null,"strategy":{"name":"strategy-v1","digest":"0505050505050505050505050505050505050505050505050505050505050505"},"code":{"name":"code-revision","digest":"0606060606060606060606060606060606060606060606060606060606060606"},"configuration_digest":"0707070707070707070707070707070707070707070707070707070707070707","seed":7,"parameters":[],"search_space":[],"selection_criterion":"total-return"}}"#;
-    std::fs::write(
-        temporary
-            .path()
-            .join("backtesting/v1/reservations/ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd.json"),
-        V1_RESERVATION,
-    )?;
-    let legacy_id = TrialId::from_digest(Sha256Digest::new(V1_TRIAL_ID));
-    assert_eq!(inventory.trial(legacy_id)?.spec().id(), legacy_id);
-
-    let legacy_attempt_terminal_parent = temporary.path().join(
-        "backtesting/v1/terminals/ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd",
-    );
-    std::fs::create_dir(&legacy_attempt_terminal_parent)?;
-    let legacy_attempt_terminal = legacy_attempt_terminal_parent.join("00000000000000000001.json");
-    std::fs::write(&legacy_attempt_terminal, b"{}")?;
-    assert!(matches!(
-        inventory.trial(legacy_id),
-        Err(ExperimentError::CorruptRecord)
-    ));
-    std::fs::remove_file(legacy_attempt_terminal)?;
-
-    let legacy_artifact = br#"{"legacy":true}"#;
-    let legacy_artifact_reference = "backtesting/v1/artifacts/sha256/60/600bfa81b1561fa6281505a8630327ec94da208976f36c142c781b0b46a95725.json";
-    let legacy_terminal_path = temporary
-        .path()
-        .join("backtesting/v1/terminals/ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd.json");
-    std::fs::write(
-        &legacy_terminal_path,
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
-            "trial_id": "ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd",
-            "status": "completed",
-            "completed": {
-                "result_digest": "0909090909090909090909090909090909090909090909090909090909090909",
-                "artifact_reference": legacy_artifact_reference,
-                "artifact_digest": "600bfa81b1561fa6281505a8630327ec94da208976f36c142c781b0b46a95725",
-                "artifact_bytes": legacy_artifact.len(),
-                "metrics": [],
-                "probability_of_backtest_overfitting": 0.25,
-                "probability_fold_count": 2,
-                "deflated_performance_probability": 0.75,
-                "expected_maximum_sharpe": 0.5,
-                "selected": true
-            },
-            "failed": null
-        }))?,
-    )?;
-    assert!(matches!(
-        inventory.trial(legacy_id),
-        Err(ExperimentError::CorruptRecord)
-    ));
-    let legacy_artifact_path = temporary.path().join(legacy_artifact_reference);
-    std::fs::create_dir_all(
-        legacy_artifact_path
-            .parent()
-            .ok_or("missing legacy artifact parent")?,
-    )?;
-    std::fs::write(&legacy_artifact_path, legacy_artifact)?;
-    assert!(matches!(
-        inventory.trial(legacy_id)?.status(),
-        TrialStatus::Completed(_)
-    ));
-    std::fs::write(&legacy_artifact_path, b"xxxxxxxxxxxxxxx")?;
-    assert!(matches!(
-        inventory.trial(legacy_id),
-        Err(ExperimentError::CorruptRecord)
-    ));
-
-    const V2_TRIAL_ID: [u8; 32] = [
-        62, 253, 167, 147, 117, 60, 225, 151, 9, 248, 210, 184, 142, 210, 23, 180, 136, 19, 17,
-        215, 191, 201, 233, 214, 201, 33, 9, 47, 49, 121, 83, 50,
-    ];
-    const V2_TRIAL_HEX: &str = "3efda793753ce19709f8d2b88ed217b4881311d7bfc9e9d6c921092f31795332";
-    const V2_RESERVATION: &str = r#"{"schema_version":2,"trial_id":"3efda793753ce19709f8d2b88ed217b4881311d7bfc9e9d6c921092f31795332","spec":{"dataset_identity":"0101010101010101010101010101010101010101010101010101010101010101","object_graph_digest":"0202020202020202020202020202020202020202020202020202020202020202","execution_assumption_digest":"0303030303030303030303030303030303030303030303030303030303030303","run_input_digest":"0404040404040404040404040404040404040404040404040404040404040404","model":null,"strategy":{"name":"strategy-v1","digest":"0505050505050505050505050505050505050505050505050505050505050505"},"code":{"name":"code-revision","digest":"0606060606060606060606060606060606060606060606060606060606060606"},"configuration_digest":"0707070707070707070707070707070707070707070707070707070707070707","seed":7,"parameters":[],"search_space":[],"selection_criterion":"total-return"}}"#;
-    std::fs::write(
-        temporary
-            .path()
-            .join(format!("backtesting/v1/reservations/{V2_TRIAL_HEX}.json")),
-        V2_RESERVATION,
-    )?;
-    let v2_terminal_path = temporary
-        .path()
-        .join(format!("backtesting/v1/terminals/{V2_TRIAL_HEX}.json"));
-    let failed_terminal = |schema_version| {
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": schema_version,
-            "trial_id": V2_TRIAL_HEX,
-            "status": "failed",
-            "completed": null,
-            "failed": {
-                "code": "legacy-failure",
-                "evidence_digest": "0808080808080808080808080808080808080808080808080808080808080808"
-            }
-        }))
-    };
-    std::fs::write(&v2_terminal_path, failed_terminal(1)?)?;
-    let v2_id = TrialId::from_digest(Sha256Digest::new(V2_TRIAL_ID));
-    assert!(matches!(
-        inventory.trial(v2_id),
-        Err(ExperimentError::CorruptRecord)
-    ));
-    std::fs::write(&v2_terminal_path, failed_terminal(2)?)?;
-    assert!(matches!(
-        inventory.trial(v2_id)?.status(),
-        TrialStatus::Failed(_)
-    ));
-
     let spec = test_trial_spec()?;
 
     let _first = inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(100), 10)?;
@@ -932,7 +1018,7 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
         .collect::<String>();
     let current_attempt_terminals = temporary
         .path()
-        .join("backtesting/v1/terminals")
+        .join("backtesting/v3/terminals")
         .join(&current_trial_hex);
     std::fs::create_dir(&current_attempt_terminals)?;
     let orphan_terminal = current_attempt_terminals.join("00000000000000000003.json");
@@ -942,27 +1028,6 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
         Err(ExperimentError::CorruptRecord)
     ));
     std::fs::remove_file(orphan_terminal)?;
-    let current_legacy_terminal = temporary
-        .path()
-        .join(format!("backtesting/v1/terminals/{current_trial_hex}.json"));
-    std::fs::write(
-        &current_legacy_terminal,
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 2,
-            "trial_id": current_trial_hex,
-            "status": "failed",
-            "completed": null,
-            "failed": {
-                "code": "wrong-path",
-                "evidence_digest": "0808080808080808080808080808080808080808080808080808080808080808"
-            }
-        }))?,
-    )?;
-    assert!(matches!(
-        inventory.trial(spec.id()),
-        Err(ExperimentError::CorruptRecord)
-    ));
-    std::fs::remove_file(current_legacy_terminal)?;
     assert!(matches!(
         inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(110), 10),
         Err(ExperimentError::TrialInProgress)
@@ -984,13 +1049,13 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
             result_digest: Sha256Digest::new([9; 32]),
             artifact: artifact.clone(),
             metrics: vec![TrialMetric::try_new(
-                SourceIdentifier::try_from("total-return")?,
+                SourceIdentifier::try_from("cost-adjusted-total-return")?,
                 0.1,
             )?],
-            dataset_partition: Some(TrialDatasetPartition::try_new(
+            dataset_partition: TrialDatasetPartition::try_new(
                 Timestamp::from_unix_nanos(10),
                 Timestamp::from_unix_nanos(30),
-            )?),
+            )?,
         },
     )?;
     inventory.complete(recovered, completion, artifact_bytes)?;
@@ -998,7 +1063,7 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
     let final_path = temporary.path().join(artifact.reference());
     let pending_path = temporary
         .path()
-        .join("backtesting/v1/pending")
+        .join("backtesting/v3/pending")
         .join(current_trial_hex)
         .join("00000000000000000002.json");
     std::fs::create_dir_all(pending_path.parent().ok_or("missing pending parent")?)?;
@@ -1043,7 +1108,7 @@ fn attempt_recovery_rejects_noncanonical_unbound_or_gapped_namespace() -> TestRe
         .collect::<String>();
     let attempts = temporary
         .path()
-        .join("backtesting/v1/attempts")
+        .join("backtesting/v3/attempts")
         .join(trial_hex);
     let first_path = attempts.join("00000000000000000001.json");
     let first_bytes = std::fs::read(&first_path)?;
@@ -1244,7 +1309,7 @@ fn run_governed_request(
                     SourceIdentifier::try_from("slow")?,
                 ],
             )?],
-            SourceIdentifier::try_from("total-return")?,
+            SourceIdentifier::try_from("cost-adjusted-total-return")?,
         )
         .with_cohort_universe(universe.clone()),
         &CancellationToken::new(),
@@ -1320,7 +1385,7 @@ fn test_trial_spec() -> Result<TrialSpec, Box<dyn Error>> {
         seed: request.seed(),
         parameters: Vec::new(),
         search_space: Vec::new(),
-        selection_criterion: SourceIdentifier::try_from("total-return")?,
+        selection_criterion: SourceIdentifier::try_from("cost-adjusted-total-return")?,
     })?)
 }
 
@@ -1475,6 +1540,27 @@ fn observation(
         universe: HistoricalUniverseStatus::Eligible,
         features: Vec::new(),
         lineage_digest: Sha256Digest::new([u8::try_from(at)?; 32]),
+    })?)
+}
+
+fn recommendation_observation(
+    execution_terms: InstrumentExecutionTerms,
+    at: i64,
+    mid_price_ticks: i64,
+    lineage: u8,
+) -> Result<BacktestObservation, Box<dyn Error>> {
+    Ok(BacktestObservation::try_new(BacktestObservationInput {
+        execution_terms,
+        event_at: Timestamp::from_unix_nanos(at - 2),
+        available_at: Timestamp::from_unix_nanos(at - 1),
+        decision_at: Timestamp::from_unix_nanos(at),
+        stale_at: Timestamp::from_unix_nanos(at + 5),
+        mid_price: Some(PriceTicks::new(mid_price_ticks)),
+        spread_basis_points: BasisPoints::new(20),
+        executable_depth: QuantityLots::new(10)?,
+        universe: HistoricalUniverseStatus::Eligible,
+        features: Vec::new(),
+        lineage_digest: Sha256Digest::new([lineage; 32]),
     })?)
 }
 

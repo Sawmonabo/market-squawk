@@ -74,7 +74,7 @@ impl DecisionApplication {
 }
 
 impl RetainedDecisionBackupSnapshot {
-    /// Returns the complete immutable SQLite image, including all six typed journal record kinds.
+    /// Returns the complete immutable SQLite image, including all eight typed journal record kinds.
     pub(crate) fn bytes(&self) -> &[u8] {
         self.journal.bytes()
     }
@@ -150,6 +150,6 @@ fn validated_backup(
 fn semantic_revision(state: &DecisionState) -> Result<[u8; 32], DecisionApplicationError> {
     let repository = DecisionRepository::try_new(state.limits)?;
     let mut authority = DecisionAuthority::new(repository);
-    let mut recovery = RecoveryContext::try_new()?;
+    let mut recovery = RecoveryContext::try_new(state.limits.maximum_screen_runs())?;
     state.journal.recover(&mut authority, &mut recovery)
 }

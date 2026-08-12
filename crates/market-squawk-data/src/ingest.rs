@@ -13,7 +13,8 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     ExtractionBatch, ExtractionContentIdentity, ExtractionError, ExtractionRevisionPlan,
-    ObservedRevisionAuthority, ObservedRevisionError, SourceClass, SourceMetadata,
+    ObservedRevisionAuthority, ObservedRevisionError, ProviderCaptureError,
+    SealedProviderCaptureSetReceipt, SourceClass, SourceMetadata, SourceObjectCaptureIdentity,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -26,6 +27,7 @@ use crate::catalog::CatalogObservedRevisionAuthority;
 #[cfg(test)]
 use crate::catalog::QueryArtifactBindCheckpoint;
 use crate::catalog::QueryArtifactPublisher;
+use crate::catalog::provider_capture_matches_batch;
 use crate::parquet_store::MAX_SCAN_OBJECTS;
 use crate::parquet_store::{ArtifactRootIdentity, QueryArtifactWriterAdmission};
 use crate::query::QueryArtifactMemoryLease;
@@ -48,6 +50,25 @@ const REVISION_ASSIGNMENT_DEADLINE: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedDataset {
     pinned: PinnedDataset,
+}
+
+/// Non-forgeable, secret-free binding of one verified sealed provider capture to one ingest run.
+#[derive(Clone, Debug)]
+pub struct ProviderCaptureInput {
+    run_id: uuid::Uuid,
+    receipt: SealedProviderCaptureSetReceipt,
+}
+
+impl ProviderCaptureInput {
+    /// Returns the exact ingest run that owns this provider capture.
+    pub const fn run_id(&self) -> uuid::Uuid {
+        self.run_id
+    }
+
+    /// Returns the complete verified provider and sealed-segment receipt.
+    pub const fn receipt(&self) -> &SealedProviderCaptureSetReceipt {
+        &self.receipt
+    }
 }
 
 impl CommittedDataset {
@@ -840,6 +861,16 @@ impl AnalyticalDataService {
         crate::CompanyIdentityReadCapability::new(Arc::clone(&self.authority))
     }
 
+    /// Returns the sole narrow publisher for evidence-authorized company/security links.
+    ///
+    /// The capability publishes only a fully constructed domain link and owns no review,
+    /// preview, confirmation, or consumer-workflow policy.
+    pub fn company_security_link_publication(
+        &self,
+    ) -> crate::CompanySecurityLinkPublicationCapability {
+        crate::CompanySecurityLinkPublicationCapability::new(Arc::clone(&self.authority))
+    }
+
     /// Returns bounded canonical-instrument publication authority over the sole catalog writer.
     pub fn instrument_catalog(&self) -> crate::InstrumentCatalogCapability {
         crate::InstrumentCatalogCapability::new(Arc::clone(&self.authority))
@@ -910,6 +941,112 @@ impl AnalyticalDataService {
         authority
             .reserve_ingest(identity, &grant)
             .map_err(Into::into)
+    }
+
+    /// Durably binds one already sealed provider capture to its exact reserved ingest run.
+    ///
+    /// The raw provider bytes remain solely in the sealed `MSJ1` store. The catalog retains only
+    /// bounded immutable receipts, the non-authoritative reopen claim, and normalized page/frame
+    /// facts. A repeated exact admission is idempotent; another run or source is rejected.
+    pub fn retain_provider_capture_input(
+        &self,
+        reservation: &IngestReservation,
+        batch: &ExtractionBatch,
+        receipt: SealedProviderCaptureSetReceipt,
+    ) -> Result<ProviderCaptureInput, IngestError> {
+        if !matches!(
+            batch.request().object().capture_identity(),
+            SourceObjectCaptureIdentity::Paged { .. }
+        ) || !provider_capture_matches_batch(&receipt, batch)
+        {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
+        let payload_digest = extraction_provider_payload_digest(batch);
+        let source_id = batch.request().object().source_id();
+        let authority = self.lock_authority()?;
+        self.validate_run(&authority, reservation, payload_digest, Some(source_id))?;
+        authority.retain_provider_capture(reservation, batch, &receipt)?;
+        Ok(ProviderCaptureInput {
+            run_id: reservation.run_id(),
+            receipt,
+        })
+    }
+
+    /// Reacquires provider-capture authority after restart by fully verifying the stored claim.
+    ///
+    /// A persisted claim is never upgraded on catalog evidence alone. The sealed store reopens,
+    /// hashes, and validates the exact `MSJ1` object before the provider receipt is rebound.
+    pub fn recover_provider_capture_input(
+        &self,
+        reservation: &IngestReservation,
+        batch: &ExtractionBatch,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+    ) -> Result<ProviderCaptureInput, IngestError> {
+        self.recover_provider_capture_input_if_present(reservation, batch, store)?
+            .ok_or(IngestError::ProviderCaptureRequired)
+    }
+
+    /// Reacquires a retained provider capture when this exact run already owns one.
+    ///
+    /// `Ok(None)` means the validated reserved run has no retained capture yet. Corrupt,
+    /// mismatched, or unverifiable retained state remains an error, so callers may safely seal
+    /// and retain fresh material only for the genuinely absent case.
+    pub fn recover_provider_capture_input_if_present(
+        &self,
+        reservation: &IngestReservation,
+        batch: &ExtractionBatch,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+    ) -> Result<Option<ProviderCaptureInput>, IngestError> {
+        let payload_digest = extraction_provider_payload_digest(batch);
+        let source_id = batch.request().object().source_id();
+        let persisted = {
+            let authority = self.lock_authority()?;
+            self.validate_run(&authority, reservation, payload_digest, Some(source_id))?;
+            authority.provider_capture_for_run(reservation.run_id())?
+        };
+        let Some(persisted) = persisted else {
+            return Ok(None);
+        };
+        let verified = store.open_verified_claim(persisted.claim())?;
+        let receipt = SealedProviderCaptureSetReceipt::try_bind(
+            persisted.capture().clone(),
+            verified.receipt().clone(),
+        )?;
+        if receipt.receipt_digest() != persisted.receipt_digest()
+            || !provider_capture_matches_batch(&receipt, batch)
+        {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
+        Ok(Some(ProviderCaptureInput {
+            run_id: reservation.run_id(),
+            receipt,
+        }))
+    }
+
+    /// Reconciles the sealed-response store against the complete immutable catalog receipt set.
+    ///
+    /// This is the startup boundary for quarantining incomplete stages and unreferenced final
+    /// objects. Every catalog claim is decoded and cross-checked against its run/page/frame rows,
+    /// then the sealed store verifies every retained object before moving anything.
+    pub async fn recover_provider_capture_store(
+        &self,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        cancellation: &CancellationToken,
+    ) -> Result<market_squawk_platform::SealedResearchJournalRecoveryReport, IngestError> {
+        let _operation = self
+            .operation_gate
+            .acquire(cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        let authority = self.lock_authority()?;
+        let claims = authority.authoritative_provider_capture_claims()?;
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        Ok(store.recover_after_catalog_scan(&claims)?)
     }
 
     /// Returns sealed backup authority for this exact active catalog and artifact root.
@@ -1131,12 +1268,25 @@ impl AnalyticalDataService {
         analytical_dataset: DatasetId,
         batch: ExtractionBatch,
         revision_plan: Option<ExtractionRevisionPlan>,
+        provider_capture: Option<ProviderCaptureInput>,
         company_identity: Option<CompanyIdentityObservation>,
         cancellation: CancellationToken,
         precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
     ) -> Result<CommittedDataset, IngestError> {
         let payload_digest = extraction_provider_payload_digest(&batch);
         let source_id = batch.request().object().source_id().clone();
+        let paged_capture = matches!(
+            batch.request().object().capture_identity(),
+            SourceObjectCaptureIdentity::Paged { .. }
+        );
+        if paged_capture != provider_capture.is_some()
+            || provider_capture.as_ref().is_some_and(|input| {
+                input.run_id != reservation.run_id()
+                    || !provider_capture_matches_batch(&input.receipt, &batch)
+            })
+        {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
         if company_identity.as_ref().is_some_and(|identity| {
             identity.source_id() != &source_id
                 || identity.parent_ingest_payload_evidence().content_digest() != payload_digest
@@ -1149,6 +1299,11 @@ impl AnalyticalDataService {
             let authority = self.lock_authority()?;
             let run =
                 self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
+            self.validate_provider_capture_input(
+                &authority,
+                &reservation,
+                provider_capture.as_ref(),
+            )?;
             if run.state() == IngestRunState::Failed {
                 return Err(IngestError::TerminalRun);
             }
@@ -1194,10 +1349,17 @@ impl AnalyticalDataService {
             .assign(observed_batch, deadline, cancellation.clone())
             .await
             .map_err(map_revision_error)?;
-        let converted = ResearchArrowBatch::try_from_extraction_batch_with_assigned_revisions(
-            &batch,
-            assignments.as_slice(),
-        )?;
+        let converted = match provider_capture.as_ref() {
+            Some(capture) => ResearchArrowBatch::try_from_extraction_batch_with_assigned_revisions_and_provider_capture(
+                &batch,
+                assignments.as_slice(),
+                &capture.receipt,
+            )?,
+            None => ResearchArrowBatch::try_from_extraction_batch_with_assigned_revisions(
+                &batch,
+                assignments.as_slice(),
+            )?,
+        };
         let schema = converted.schema_ref().clone();
         let lineage = converted.lineage_digest()?;
         let converted = DatasetArrowBatch::from(converted);
@@ -1212,6 +1374,11 @@ impl AnalyticalDataService {
             let authority = self.lock_authority()?;
             let run =
                 self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
+            self.validate_provider_capture_input(
+                &authority,
+                &reservation,
+                provider_capture.as_ref(),
+            )?;
             if run.state() == IngestRunState::Failed {
                 return Err(IngestError::TerminalRun);
             }
@@ -1233,6 +1400,7 @@ impl AnalyticalDataService {
 
         let authority = self.lock_authority()?;
         let run = self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
+        self.validate_provider_capture_input(&authority, &reservation, provider_capture.as_ref())?;
         if let Some(committed) = self.reconcile_existing(
             &authority,
             &reservation,
@@ -1276,6 +1444,7 @@ impl AnalyticalDataService {
             batch,
             None,
             None,
+            None,
             cancellation,
             Some(precommit_authority),
         )
@@ -1298,6 +1467,58 @@ impl AnalyticalDataService {
             batch,
             Some(revisions),
             None,
+            None,
+            cancellation,
+            Some(precommit_authority),
+        )
+        .await
+    }
+
+    /// Ingests provider revisions whose exact response pages were durably retained and verified.
+    pub async fn ingest_with_revision_plan_and_provider_capture(
+        &self,
+        reservation: IngestReservation,
+        analytical_dataset: DatasetId,
+        batch: ExtractionBatch,
+        revisions: ExtractionRevisionPlan,
+        provider_capture: ProviderCaptureInput,
+        cancellation: CancellationToken,
+    ) -> Result<CommittedDataset, IngestError> {
+        self.ingest_batch(
+            reservation,
+            analytical_dataset,
+            batch,
+            Some(revisions),
+            Some(provider_capture),
+            None,
+            cancellation,
+            None,
+        )
+        .await
+    }
+
+    /// Retains provider response lineage and caller authority through the same final commit.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "provider revisions, capture, cancellation, and publication authority stay explicit"
+    )]
+    pub async fn ingest_with_revision_plan_provider_capture_and_precommit_authority(
+        &self,
+        reservation: IngestReservation,
+        analytical_dataset: DatasetId,
+        batch: ExtractionBatch,
+        revisions: ExtractionRevisionPlan,
+        provider_capture: ProviderCaptureInput,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Result<CommittedDataset, IngestError> {
+        self.ingest_batch(
+            reservation,
+            analytical_dataset,
+            batch,
+            Some(revisions),
+            Some(provider_capture),
+            None,
             cancellation,
             Some(precommit_authority),
         )
@@ -1319,6 +1540,35 @@ impl AnalyticalDataService {
             analytical_dataset,
             batch,
             Some(revisions),
+            None,
+            Some(company_identity),
+            cancellation,
+            None,
+        )
+        .await
+    }
+
+    /// Ingests provider revisions and company identity from one durably verified response set.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "provider revision, capture, identity, and cancellation remain explicit"
+    )]
+    pub async fn ingest_with_revision_plan_provider_capture_and_company_identity(
+        &self,
+        reservation: IngestReservation,
+        analytical_dataset: DatasetId,
+        batch: ExtractionBatch,
+        revisions: ExtractionRevisionPlan,
+        provider_capture: ProviderCaptureInput,
+        company_identity: CompanyIdentityObservation,
+        cancellation: CancellationToken,
+    ) -> Result<CommittedDataset, IngestError> {
+        self.ingest_batch(
+            reservation,
+            analytical_dataset,
+            batch,
+            Some(revisions),
+            Some(provider_capture),
             Some(company_identity),
             cancellation,
             None,
@@ -1346,6 +1596,36 @@ impl AnalyticalDataService {
             analytical_dataset,
             batch,
             Some(revisions),
+            None,
+            Some(company_identity),
+            cancellation,
+            Some(precommit_authority),
+        )
+        .await
+    }
+
+    /// Retains provider response lineage, company identity, and caller authority through commit.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "provider revision, capture, identity, cancellation, and publication authority stay explicit"
+    )]
+    pub async fn ingest_with_revision_plan_provider_capture_company_identity_and_precommit_authority(
+        &self,
+        reservation: IngestReservation,
+        analytical_dataset: DatasetId,
+        batch: ExtractionBatch,
+        revisions: ExtractionRevisionPlan,
+        provider_capture: ProviderCaptureInput,
+        company_identity: CompanyIdentityObservation,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Result<CommittedDataset, IngestError> {
+        self.ingest_batch(
+            reservation,
+            analytical_dataset,
+            batch,
+            Some(revisions),
+            Some(provider_capture),
             Some(company_identity),
             cancellation,
             Some(precommit_authority),
@@ -1373,6 +1653,29 @@ impl AnalyticalDataService {
             return Err(IngestError::PersistRightsRequired);
         }
         Ok(run)
+    }
+
+    fn validate_provider_capture_input(
+        &self,
+        authority: &CatalogAuthority,
+        reservation: &IngestReservation,
+        input: Option<&ProviderCaptureInput>,
+    ) -> Result<(), IngestError> {
+        let retained = authority.provider_capture_for_run(reservation.run_id())?;
+        match (input, retained) {
+            (None, None) => Ok(()),
+            (Some(input), Some(retained))
+                if input.run_id == reservation.run_id()
+                    && input.receipt.receipt_digest() == retained.receipt_digest()
+                    && input.receipt.capture() == retained.capture()
+                    && input.receipt.segment().claim() == retained.claim() =>
+            {
+                Ok(())
+            }
+            (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => {
+                Err(IngestError::ProviderCaptureRequired)
+            }
+        }
     }
 
     fn reconcile_committed_run(
@@ -1569,6 +1872,7 @@ impl ResearchIngestService for AnalyticalDataService {
             batch,
             None,
             None,
+            None,
             cancellation,
             None,
         )
@@ -1588,6 +1892,7 @@ impl ResearchIngestService for AnalyticalDataService {
             analytical_dataset,
             batch,
             Some(revisions),
+            None,
             None,
             cancellation,
             None,
@@ -1632,6 +1937,15 @@ pub enum IngestError {
     /// Canonical extraction content identity could not be constructed.
     #[error("extraction batch semantic identity construction failed")]
     ContentIdentity(#[source] ExtractionError),
+    /// A paged provider extraction omitted or mismatched its exact retained capture authority.
+    #[error("paged provider extraction requires its exact verified retained capture")]
+    ProviderCaptureRequired,
+    /// Provider page/frame and sealed-segment receipts could not be bound exactly.
+    #[error("provider capture receipt is invalid")]
+    ProviderCapture(#[from] ProviderCaptureError),
+    /// The sealed provider response object could not be reopened and verified.
+    #[error("sealed provider capture could not be verified")]
+    SealedProviderCapture(#[from] market_squawk_platform::SealedResearchJournalStoreError),
     /// Source-specific revision evidence or durable assignment failed.
     #[error("observed revision assignment failed")]
     RevisionAuthority(#[source] ObservedRevisionError),

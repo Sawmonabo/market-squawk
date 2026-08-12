@@ -22,7 +22,7 @@ use crate::{
     application::{
         Application, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
         DatasetPreparationSelection, lifecycle::WorkspaceRuntimeIdentity,
-        operations::OperationsApplicationServices,
+        operations::OperationsApplicationServices, recommendation::RecommendationSetupAuthority,
     },
     jobs::{InstalledJobAuthority, InstalledJobRunners},
 };
@@ -35,6 +35,10 @@ use super::{
     jobs::InstalledJobOperations,
     operations::InstalledOperations,
     portfolio_import::InstalledPortfolioImportOperations,
+    provider_credential_import::{
+        IMPORT_PROVIDER_CREDENTIAL_BUNDLE, InstalledProviderCredentialImport,
+    },
+    recommendation_setup::InstalledRecommendationSetupOperations,
     research_dataset::InstalledResearchDatasetPreparation,
     research_file_import::{InstalledResearchFileImportOperations, PreparedResearchFileCommit},
 };
@@ -70,6 +74,8 @@ pub(super) struct InstalledToolServices {
     decisions: InstalledDecisionOperations,
     operations: InstalledOperations,
     portfolio_import: InstalledPortfolioImportOperations,
+    recommendation_setup: InstalledRecommendationSetupOperations,
+    provider_credential_import: InstalledProviderCredentialImport,
     research_file_import: InstalledResearchFileImportOperations,
     research_file_job_repository: Arc<SqliteJobRepository>,
     research_file_job_authority: Arc<JobAuthority<SqliteJobRepository>>,
@@ -79,6 +85,7 @@ pub(super) struct InstalledToolServices {
 pub(super) struct InstalledToolServiceAuthorities<'a> {
     application: Arc<Application>,
     operations: Arc<OperationsApplicationServices>,
+    recommendation_setup: Arc<RecommendationSetupAuthority>,
     product: &'a LocalProduct,
     jobs: &'a InstalledJobAuthority,
 }
@@ -87,12 +94,14 @@ impl<'a> InstalledToolServiceAuthorities<'a> {
     pub(super) fn new(
         application: Arc<Application>,
         operations: Arc<OperationsApplicationServices>,
+        recommendation_setup: Arc<RecommendationSetupAuthority>,
         product: &'a LocalProduct,
         jobs: &'a InstalledJobAuthority,
     ) -> Self {
         Self {
             application,
             operations,
+            recommendation_setup,
             product,
             jobs,
         }
@@ -105,6 +114,7 @@ pub(super) struct InstalledToolServiceRuntime {
     inputs: Arc<InputStager>,
     runtime: RuntimeIdentity,
     portfolio_import: InstalledPortfolioImportOperations,
+    provider_credential_import: InstalledProviderCredentialImport,
     research_file_import: InstalledResearchFileImportOperations,
 }
 
@@ -114,6 +124,7 @@ impl InstalledToolServiceRuntime {
         inputs: Arc<InputStager>,
         runtime: RuntimeIdentity,
         portfolio_import: InstalledPortfolioImportOperations,
+        provider_credential_import: InstalledProviderCredentialImport,
         research_file_import: InstalledResearchFileImportOperations,
     ) -> Self {
         Self {
@@ -121,6 +132,7 @@ impl InstalledToolServiceRuntime {
             inputs,
             runtime,
             portfolio_import,
+            provider_credential_import,
             research_file_import,
         }
     }
@@ -134,6 +146,7 @@ impl InstalledToolServices {
         let InstalledToolServiceAuthorities {
             application,
             operations,
+            recommendation_setup,
             product,
             jobs,
         } = authorities;
@@ -142,6 +155,7 @@ impl InstalledToolServices {
             inputs,
             runtime,
             portfolio_import,
+            provider_credential_import,
             research_file_import,
         } = runtime_resources;
         let forecast_preparation =
@@ -175,6 +189,12 @@ impl InstalledToolServices {
             )?,
             operations: installed_operations,
             portfolio_import,
+            recommendation_setup: InstalledRecommendationSetupOperations::try_new(
+                recommendation_setup,
+                product.portfolio().account_catalog_reader(),
+                runtime,
+            )?,
+            provider_credential_import,
             research_file_import,
             research_file_job_repository: jobs.repository(),
             research_file_job_authority: jobs.authority(),
@@ -199,7 +219,10 @@ impl InstalledToolServices {
                 .await?;
         }
         for (preview_id, receipt) in committed {
-            let view = self.jobs.view(receipt.job_id()).await?;
+            let view = self
+                .jobs
+                .view(receipt.job_id(), receipt.generation())
+                .await?;
             if view.generation().get() != receipt.generation()
                 || view.kind().as_str() != RESEARCH_INGEST_JOB_KIND
             {
@@ -231,13 +254,19 @@ impl InstalledToolServices {
             let (result, reconciled_existing) = self
                 .start_research_file_import_job(&mut prepared, context)
                 .await?;
+            let generation = result
+                .structured_content()
+                .get("generation")
+                .and_then(Value::as_u64)
+                .filter(|generation| *generation > 0)
+                .ok_or(ServiceError::InvalidResult)?;
             self.research_file_import
                 .complete_commit(prepared.preview_id(), &result)?;
             drop(prepared);
             if !reconciled_existing {
                 return Ok(());
             }
-            let view = self.jobs.view(&job_id).await?;
+            let view = self.jobs.view(&job_id, generation).await?;
             if !research_file_import_requires_restart(&view)?
                 || !self
                     .research_file_import
@@ -479,10 +508,11 @@ impl InstalledToolServices {
             }
         }
 
+        let terminal = self.terminal_request(prepared.request(), "Research.IngestSource")?;
         let admission = self
             .runners
             .ingest()
-            .admit(prepared.request().clone(), context.limits(), admitted_at)
+            .admit(terminal, context.limits(), admitted_at)
             .map_err(map_research_admission)?;
         let spec = admission
             .clone()
@@ -724,6 +754,11 @@ impl std::fmt::Debug for InstalledToolServices {
             .field("decisions", &"[DURABLE DECISION AUTHORITY]")
             .field("operations", &self.operations)
             .field("portfolio_import", &self.portfolio_import)
+            .field("recommendation_setup", &self.recommendation_setup)
+            .field(
+                "provider_credential_import",
+                &self.provider_credential_import,
+            )
             .field("research_file_import", &self.research_file_import)
             .finish()
     }
@@ -839,7 +874,7 @@ impl ToolServices for InstalledToolServices {
                             );
                             ServiceError::from(error)
                         })?;
-                    let item_count = options.datasets.len().max(1);
+                    let item_count = options.datasets.len();
                     (encode(&options)?, item_count)
                 }
                 PREVIEW_FEATURE_DATASET => {
@@ -946,6 +981,45 @@ impl ToolServices for InstalledToolServices {
                 return Err(ServiceError::InvalidRequest);
             }
             let result = self.portfolio_import.call(request, context).await?;
+            result
+                .validate_for(&descriptor)
+                .map_err(ServiceError::from)?;
+            return Ok(result);
+        }
+        if InstalledRecommendationSetupOperations::owns(request.name()) {
+            let descriptor = self
+                .application
+                .capabilities()
+                .find(request.name())
+                .cloned()
+                .ok_or(ServiceError::NotFound)?;
+            if descriptor.version() != request.version()
+                || descriptor.contract() != request.contract()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let result = self.recommendation_setup.call(&request, &context)?;
+            result
+                .validate_for(&descriptor)
+                .map_err(ServiceError::from)?;
+            return Ok(result);
+        }
+        if request.name() == IMPORT_PROVIDER_CREDENTIAL_BUNDLE {
+            let descriptor = self
+                .application
+                .capabilities()
+                .find(request.name())
+                .cloned()
+                .ok_or(ServiceError::NotFound)?;
+            if descriptor.version() != request.version()
+                || descriptor.contract() != request.contract()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let result = self
+                .provider_credential_import
+                .call(&request, &context)
+                .await?;
             result
                 .validate_for(&descriptor)
                 .map_err(ServiceError::from)?;

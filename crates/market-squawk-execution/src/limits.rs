@@ -9,6 +9,7 @@ use market_squawk_domain::{
 };
 use rust_decimal::Decimal;
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::OrderIntent;
@@ -300,6 +301,51 @@ impl RiskLimits {
         }
     }
 
+    /// Returns the canonical SHA-256 identity of every execution-relevant policy limit.
+    ///
+    /// The eligible-instrument set is already retained in canonical order, so this digest is
+    /// stable across process generations and contains no reservation or execution authority.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/risk-limits/v1\0");
+        update_text(&mut digest, self.input.currency.as_str());
+        digest.update(
+            u64::try_from(self.input.eligible_instruments.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for instrument_id in &self.input.eligible_instruments {
+            digest.update(instrument_id.as_uuid().as_bytes());
+        }
+        digest.update(self.input.maximum_position_lots.to_be_bytes());
+        for money in [
+            self.input.maximum_order_notional,
+            self.input.maximum_gross_exposure,
+            self.input.minimum_capital,
+            self.input.maximum_loss,
+            self.input.maximum_drawdown,
+        ] {
+            update_money(&mut digest, money);
+        }
+        for basis_points in [
+            self.input.maximum_leverage,
+            self.input.maximum_fee,
+            self.input.maximum_price_deviation,
+            self.input.maximum_slippage,
+        ] {
+            digest.update(basis_points.get().to_be_bytes());
+        }
+        digest.update(self.input.maximum_orders_per_window.get().to_be_bytes());
+        digest.update(self.input.order_rate_window_nanos.to_be_bytes());
+        digest.update(self.input.reservation_ttl_nanos.to_be_bytes());
+        digest.update([
+            u8::from(self.input.allow_short),
+            u8::from(self.input.kill_switch),
+        ]);
+        digest.finalize().into()
+    }
+
     pub(crate) const fn currency(&self) -> Currency {
         self.input.currency
     }
@@ -396,6 +442,18 @@ impl RiskLimits {
             )
             .ok_or(RiskLimitsError::RetainedSizeOverflow)
     }
+}
+
+fn update_money(digest: &mut Sha256, money: Money) {
+    let amount = money.amount().normalize();
+    digest.update(amount.mantissa().to_be_bytes());
+    digest.update(amount.scale().to_be_bytes());
+    update_text(digest, money.currency().as_str());
+}
+
+fn update_text(digest: &mut Sha256, value: &str) {
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value.as_bytes());
 }
 
 #[derive(Clone, Copy, Debug)]

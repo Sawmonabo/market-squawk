@@ -10,16 +10,18 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::DateTime;
 use market_squawk_data::{DatasetManifestRef, Sha256Digest};
-use market_squawk_domain::ModelId;
+use market_squawk_domain::{InstrumentId, ModelId, Timestamp};
 use market_squawk_modeling::{
-    BundleId, FeatureNormalizer, InferenceBackend, ModelBundle, ModelDecision, ModelFeatureValue,
-    ModelFormat, ModelInput, ModelMetadata, ModelOutput, ModelRegistry, TrainingDatasetIdentity,
-    ValidationMetricName,
+    BundleId, CalibrationEvidence, CalibrationMethod, FeatureNormalizer, ForecastCentralStatistic,
+    ForecastMeasurement, ForecastOutputBinding, ForecastTargetMeaning, ForecastValue,
+    InferenceBackend, ModelBundle, ModelDecision, ModelFeatureValue, ModelFormat, ModelInput,
+    ModelMetadata, ModelOutput, ModelRegistry, TrainingDatasetIdentity, ValidationMetricName,
 };
 use market_squawk_services::{
-    RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolRequest,
-    TypedToolResult,
+    ArtifactError, ArtifactReadContext, ArtifactReference, RequestContext, ServiceDomain,
+    ServiceError, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -179,7 +181,7 @@ impl ModelDomainService {
         } else {
             ToolResultMetadata::complete_not_applicable()
         };
-        let item_count = bundles.len().max(1);
+        let item_count = bundles.len();
         TypedToolResult::try_new(json!({"bundles": bundles}), item_count, metadata, limits)
             .map_err(Into::into)
     }
@@ -251,6 +253,31 @@ impl ModelDomainService {
         }
         one_result(content, request, context)
     }
+
+    async fn select_latest_valid_forecast(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let (instrument_id, as_of) = admitted_forecast_selection(request.arguments())?;
+        let limits = admitted_result_limits(request, context)?;
+        let maximum_artifact_bytes =
+            NonZeroUsize::new(limits.maximum_result_bytes()).ok_or(ServiceError::InvalidRequest)?;
+        ensure_request_live(context, &self.lifecycle)?;
+        let selected = forecast::ForecastEvidenceReader::latest_valid_for_instrument(
+            self,
+            instrument_id,
+            as_of,
+            forecast::ForecastEvidenceReadContext::new(
+                ArtifactReadContext::new(context.cancellation().clone(), context.deadline()),
+                maximum_artifact_bytes,
+            ),
+        )
+        .await
+        .map_err(map_forecast_selection_error)?;
+        ensure_request_live(context, &self.lifecycle)?;
+        one_result(latest_valid_forecast_value(&selected), request, context)
+    }
 }
 
 impl fmt::Debug for ModelDomainService {
@@ -290,6 +317,9 @@ impl ApplicationDomainService for ModelDomainService {
             PREDICT => self.infer(&request, &context, false),
             forecast::GENERATE_FORECAST => self.generate_forecast(&request, &context).await,
             forecast::GET_FORECAST => self.get_forecast(&request, &context).await,
+            forecast::SELECT_LATEST_VALID_FORECAST => {
+                self.select_latest_valid_forecast(&request, &context).await
+            }
             forecast::LIST_FORECASTS => self.list_forecasts(&request, &context).await,
             forecast::GET_FORECAST_OUTCOMES => self.get_forecast_outcomes(&request, &context).await,
             _ => Err(ServiceError::NotFound),
@@ -481,6 +511,26 @@ fn admitted_model_id(arguments: &Map<String, Value>) -> Result<ModelId, ServiceE
         .and_then(|value| ModelId::from_str(value).map_err(|_| ServiceError::InvalidRequest))
 }
 
+fn admitted_forecast_selection(
+    arguments: &Map<String, Value>,
+) -> Result<(InstrumentId, Timestamp), ServiceError> {
+    let instrument_id = arguments
+        .get("instrumentId")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::InvalidRequest)
+        .and_then(|value| {
+            InstrumentId::from_str(value).map_err(|_| ServiceError::InvalidRequest)
+        })?;
+    let as_of = arguments
+        .get("asOf")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .and_then(|value| value.timestamp_nanos_opt())
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(ServiceError::InvalidRequest)?;
+    Ok((instrument_id, as_of))
+}
+
 fn one_result(
     content: Value,
     request: &TypedToolRequest,
@@ -493,6 +543,285 @@ fn one_result(
         admitted_result_limits(request, context)?,
     )
     .map_err(Into::into)
+}
+
+fn latest_valid_forecast_value(selected: &forecast::LatestValidForecast) -> Value {
+    let evidence = match selected.price_evidence() {
+        forecast::ForecastPriceEvidence::Available(price) => json!({
+            "vintageId": digest_value(price.vintage_id()),
+            "instrumentId": price.instrument_id().to_string(),
+            "outputBinding": available_forecast_output_binding_value(price),
+            "model": selected_forecast_model_value(price.model_metadata()),
+            "forecastArtifact": forecast_artifact_value(price.forecast_artifact()),
+            "freshness": forecast_freshness_value(
+                selected.selection_receipt().as_of_unix_nanos(),
+                price.observed_through().unix_nanos(),
+                price.available_at().unix_nanos(),
+                price.created_at().unix_nanos(),
+                price.expires_at().unix_nanos(),
+            ),
+            "points": price
+                .points()
+                .iter()
+                .copied()
+                .map(selected_price_point_value)
+                .collect::<Vec<_>>(),
+            "calibration": price.calibration().map(calibration_evidence_value),
+        }),
+        forecast::ForecastPriceEvidence::Unavailable(unavailable) => json!({
+            "vintageId": digest_value(unavailable.vintage_id()),
+            "instrumentId": unavailable.instrument_id().to_string(),
+            "outputBinding": forecast_output_binding_value(
+                selected.model_metadata().output_binding(),
+                unavailable.output_binding_identity(),
+            ),
+            "model": selected_forecast_model_value(selected.model_metadata()),
+            "forecastArtifact": forecast_artifact_value(selected.forecast_artifact()),
+            "freshness": forecast_freshness_value(
+                selected.selection_receipt().as_of_unix_nanos(),
+                selected.selection_receipt().selected_observed_through_unix_nanos(),
+                selected.selection_receipt().selected_available_at_unix_nanos(),
+                selected.selection_receipt().selected_created_at_unix_nanos(),
+                selected.selection_receipt().selected_expires_at_unix_nanos(),
+            ),
+            "reason": forecast_price_unavailable_reason(unavailable.reason()),
+        }),
+    };
+    json!({
+        "status": match selected.price_evidence() {
+            forecast::ForecastPriceEvidence::Available(_) => "available",
+            forecast::ForecastPriceEvidence::Unavailable(_) => "unavailable",
+        },
+        "evidence": evidence,
+        "selectionReceipt": forecast_selection_receipt_value(selected.selection_receipt()),
+    })
+}
+
+fn available_forecast_output_binding_value(price: &forecast::SelectedPriceForecast) -> Value {
+    json!({
+        "identitySha256": digest_value(price.output_binding_identity()),
+        "measurement": "price",
+        "currency": price.currency().as_str(),
+        "centralStatistic": match price.central_statistic() {
+            ForecastCentralStatistic::ModelEstimatedConditionalMean => "model_estimated_conditional_mean",
+            ForecastCentralStatistic::Unavailable => "unavailable",
+        },
+        "target": "fixed_horizon_terminal",
+        "terminalHorizonNanos": price.terminal_horizon_nanos().get().to_string(),
+    })
+}
+
+fn forecast_output_binding_value(
+    binding: &ForecastOutputBinding,
+    output_binding_identity: Sha256Digest,
+) -> Value {
+    let (measurement, currency) = match binding.measurement() {
+        ForecastMeasurement::Price { currency } => ("price", Some(currency.as_str().to_owned())),
+        ForecastMeasurement::Return => ("return", None),
+        ForecastMeasurement::Probability => ("probability", None),
+        ForecastMeasurement::OtherRegression => ("other_regression", None),
+    };
+    let (target, terminal_horizon_nanos) = match binding.target() {
+        ForecastTargetMeaning::FixedHorizonTerminal { horizon_nanos } => (
+            "fixed_horizon_terminal",
+            Some(horizon_nanos.get().to_string()),
+        ),
+        ForecastTargetMeaning::Unsupported => ("unsupported", None),
+    };
+    json!({
+        "identitySha256": digest_value(output_binding_identity),
+        "measurement": measurement,
+        "currency": currency,
+        "centralStatistic": match binding.central_statistic() {
+            ForecastCentralStatistic::ModelEstimatedConditionalMean => "model_estimated_conditional_mean",
+            ForecastCentralStatistic::Unavailable => "unavailable",
+        },
+        "target": target,
+        "terminalHorizonNanos": terminal_horizon_nanos,
+    })
+}
+
+fn selected_forecast_model_value(metadata: &ModelMetadata) -> Value {
+    json!({
+        "modelId": metadata.model_id().to_string(),
+        "bundleId": metadata.bundle_id().as_str(),
+        "bundleVersion": metadata.bundle_version().get().to_string(),
+        "metadataSha256": digest_value(metadata.metadata_hash()),
+        "modelArtifactSha256": digest_value(metadata.artifact_hash()),
+        "trainingRunSha256": digest_value(metadata.training_run_hash()),
+    })
+}
+
+fn forecast_artifact_value(artifact: &ArtifactReference) -> Value {
+    json!({
+        "artifactId": artifact.id(),
+        "sha256": artifact.sha256(),
+        "byteCount": artifact.byte_count().to_string(),
+        "mediaType": artifact.media_type(),
+    })
+}
+
+fn forecast_freshness_value(
+    as_of_unix_nanos: i64,
+    observed_through_unix_nanos: i64,
+    available_at_unix_nanos: i64,
+    created_at_unix_nanos: i64,
+    expires_at_unix_nanos: i64,
+) -> Value {
+    json!({
+        "asOfUnixNanos": as_of_unix_nanos.to_string(),
+        "observedThroughUnixNanos": observed_through_unix_nanos.to_string(),
+        "availableAtUnixNanos": available_at_unix_nanos.to_string(),
+        "createdAtUnixNanos": created_at_unix_nanos.to_string(),
+        "expiresAtUnixNanos": expires_at_unix_nanos.to_string(),
+        "availableAtOrBeforeAsOf": available_at_unix_nanos <= as_of_unix_nanos,
+        "publishedAtOrBeforeAsOf": created_at_unix_nanos <= as_of_unix_nanos,
+        "unexpiredAtAsOf": as_of_unix_nanos < expires_at_unix_nanos,
+    })
+}
+
+fn selected_price_point_value(point: forecast::SelectedPriceForecastPoint) -> Value {
+    let intervals = point.intervals().map(|intervals| {
+        vec![
+            selected_price_interval_value(5_000, intervals.interval_50()),
+            selected_price_interval_value(8_000, intervals.interval_80()),
+            selected_price_interval_value(9_500, intervals.interval_95()),
+        ]
+    });
+    json!({
+        "targetAtUnixNanos": point.target_at().unix_nanos().to_string(),
+        "central": forecast_value(point.central()),
+        "coverageIntervals": intervals,
+    })
+}
+
+fn selected_price_interval_value(
+    target_coverage_basis_points: u16,
+    interval: forecast::SelectedPriceInterval,
+) -> Value {
+    json!({
+        "targetCoverageBasisPoints": target_coverage_basis_points,
+        "lower": forecast_value(interval.lower()),
+        "upper": forecast_value(interval.upper()),
+        "semantics": "marginal_coverage_interval_not_scenario_probability",
+    })
+}
+
+fn forecast_value(value: ForecastValue) -> Value {
+    json!({
+        "mantissa": value.mantissa().to_string(),
+        "scale": value.scale(),
+    })
+}
+
+fn calibration_evidence_value(calibration: &CalibrationEvidence) -> Value {
+    let window = calibration.window();
+    json!({
+        "identitySha256": digest_value(calibration.identity()),
+        "method": match calibration.method() {
+            CalibrationMethod::MapieEnbpi => "mapie_enbpi",
+            CalibrationMethod::MapieAci => "mapie_aci",
+            CalibrationMethod::ResidualQuantile => "residual_quantile",
+        },
+        "window": {
+            "startUnixNanos": window.start().unix_nanos().to_string(),
+            "endUnixNanos": window.end().unix_nanos().to_string(),
+            "observationCount": window.observations().get().to_string(),
+        },
+        "policyArtifact": {
+            "sha256": digest_value(calibration.policy_hash()),
+            "byteCount": calibration.policy_size_bytes().to_string(),
+        },
+        "residualArtifact": {
+            "sha256": digest_value(calibration.residuals_hash()),
+            "byteCount": calibration.residuals_size_bytes().to_string(),
+        },
+        "coverageBands": calibration
+            .bands()
+            .iter()
+            .map(|band| json!({
+                "targetCoverageBasisPoints": band.coverage().basis_points(),
+                "lowerOffsetIeee754Hex": format!("{:016x}", band.lower_offset().to_bits()),
+                "upperOffsetIeee754Hex": format!("{:016x}", band.upper_offset().to_bits()),
+                "realizedCoveredCount": band.realized().covered().to_string(),
+                "realizedObservationCount": band.realized().total().get().to_string(),
+            }))
+            .collect::<Vec<_>>(),
+        "dependenceAssumptions": calibration.dependence_assumptions(),
+        "semantics": "empirical_marginal_coverage_not_scenario_probability",
+    })
+}
+
+fn forecast_selection_receipt_value(receipt: &forecast::ForecastSelectionReceipt) -> Value {
+    json!({
+        "schema": "market-squawk/forecast-selection-receipt/v1",
+        "policyRevision": receipt.policy_revision(),
+        "selectionOrder": receipt.selection_order().as_str(),
+        "instrumentId": receipt.instrument_id().to_string(),
+        "asOfUnixNanos": receipt.as_of_unix_nanos().to_string(),
+        "consideredVintageCount": receipt.considered_vintage_count(),
+        "retainedVintageHardCeiling": receipt.retained_vintage_hard_ceiling(),
+        "eligibleVintageCount": receipt.eligible_vintage_count(),
+        "competingEligibleVintageCount": receipt.competing_eligible_vintage_count(),
+        "selectionComplete": receipt.selection_complete(),
+        "selectedVintageId": receipt.selected_vintage_id(),
+        "selectedCreatedAtUnixNanos": receipt.selected_created_at_unix_nanos().to_string(),
+        "selectedObservedThroughUnixNanos": receipt
+            .selected_observed_through_unix_nanos()
+            .to_string(),
+        "selectedAvailableAtUnixNanos": receipt.selected_available_at_unix_nanos().to_string(),
+        "selectedExpiresAtUnixNanos": receipt.selected_expires_at_unix_nanos().to_string(),
+        "receiptDigestSha256": encode_hex(receipt.receipt_digest().bytes()),
+    })
+}
+
+const fn forecast_price_unavailable_reason(
+    reason: forecast::ForecastPriceUnavailableReason,
+) -> &'static str {
+    match reason {
+        forecast::ForecastPriceUnavailableReason::ReturnMeasurement => "return_measurement",
+        forecast::ForecastPriceUnavailableReason::ProbabilityMeasurement => {
+            "probability_measurement"
+        }
+        forecast::ForecastPriceUnavailableReason::OtherRegressionMeasurement => {
+            "other_regression_measurement"
+        }
+        forecast::ForecastPriceUnavailableReason::TerminalHorizonUnavailable => {
+            "terminal_horizon_unavailable"
+        }
+        forecast::ForecastPriceUnavailableReason::CentralStatisticUnavailable => {
+            "central_statistic_unavailable"
+        }
+    }
+}
+
+fn map_forecast_selection_error(error: ForecastApplicationError) -> ServiceError {
+    match error {
+        ForecastApplicationError::InvalidLimits | ForecastApplicationError::InvalidRecord => {
+            ServiceError::InvalidRequest
+        }
+        ForecastApplicationError::NotFound => ServiceError::NotFound,
+        ForecastApplicationError::Capacity => ServiceError::ResourceExhausted,
+        ForecastApplicationError::Artifact(ArtifactError::Cancelled) => ServiceError::Cancelled,
+        ForecastApplicationError::Artifact(ArtifactError::DeadlineExceeded) => {
+            ServiceError::DeadlineExceeded
+        }
+        ForecastApplicationError::Artifact(ArtifactError::ReadLimitExceeded) => {
+            ServiceError::ResourceExhausted
+        }
+        ForecastApplicationError::Artifact(ArtifactError::NotFound) => ServiceError::NotFound,
+        ForecastApplicationError::Artifact(ArtifactError::InvalidPublication)
+        | ForecastApplicationError::Artifact(ArtifactError::InvalidReference) => {
+            ServiceError::InvalidResult
+        }
+        ForecastApplicationError::Artifact(ArtifactError::Unavailable)
+        | ForecastApplicationError::State(_)
+        | ForecastApplicationError::Unavailable
+        | ForecastApplicationError::RestoreTargetNotFresh => ServiceError::Unavailable,
+        ForecastApplicationError::Conflict | ForecastApplicationError::CorruptIndex => {
+            ServiceError::Internal
+        }
+    }
 }
 
 fn model_coordinate(metadata: &ModelMetadata) -> (String, String, u64) {

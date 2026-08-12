@@ -165,8 +165,6 @@ pub trait JobRepository: Send + Sync {
         id: JobId,
         generation: JobGeneration,
     ) -> Result<JobSnapshot, JobRepositoryError>;
-    /// Reads the latest durable generation for one stable job identity.
-    async fn get_latest(&self, id: JobId) -> Result<JobSnapshot, JobRepositoryError>;
     /// Lists one latest generation per job through a bounded stable cursor.
     async fn list(
         &self,

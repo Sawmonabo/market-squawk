@@ -20,12 +20,12 @@ use self::io::{
     is_controlled_relative_path, read_exact_bounded, sha256_digest, validate_json_structure,
 };
 use self::validation::{
-    FORECAST_METADATA_SCHEMA_VERSION, FORECAST_POLICY_PATH, FORECAST_RESIDUALS_PATH,
-    ForecastPolicyWire, LEGACY_METADATA_SCHEMA_VERSION, METADATA_SCHEMA_VERSION, MetadataWire,
-    NATIVE_FORMAT_VERSION, NativeArtifactWire, TrainingRunWire, parse_digest, parse_format,
-    validate_artifact, validate_dataset, validate_features, validate_forecast_calibration,
-    validate_label, validate_metrics, validate_output_semantics, validate_prose,
-    validate_thresholds, validate_training_run,
+    FORECAST_POLICY_PATH, FORECAST_RESIDUALS_PATH, ForecastPolicyWire, METADATA_SCHEMA_VERSION,
+    MetadataWire, NATIVE_FORMAT_VERSION, NativeArtifactWire, TrainingRunWire, parse_digest,
+    parse_format, validate_artifact, validate_dataset, validate_features,
+    validate_forecast_calibration, validate_label, validate_metrics, validate_output_measurement,
+    validate_output_semantics, validate_output_statistic, validate_prose, validate_thresholds,
+    validate_training_run,
 };
 use crate::metadata::valid_revision;
 use crate::native::NativeArtifact;
@@ -180,18 +180,8 @@ impl ModelBundle {
             .map_err(|_| BundleError::MetadataStructureLimit)?;
         let wire: MetadataWire =
             serde_json::from_slice(&metadata_bytes).map_err(|_| BundleError::MetadataSyntax)?;
-        if !matches!(
-            wire.schema_version,
-            LEGACY_METADATA_SCHEMA_VERSION
-                | METADATA_SCHEMA_VERSION
-                | FORECAST_METADATA_SCHEMA_VERSION
-        ) {
+        if wire.schema_version != METADATA_SCHEMA_VERSION {
             return Err(BundleError::UnsupportedMetadataVersion);
-        }
-        if (wire.schema_version == FORECAST_METADATA_SCHEMA_VERSION)
-            != wire.forecast_calibration.is_some()
-        {
-            return Err(BundleError::InvalidForecastCalibration);
         }
 
         let model_id =
@@ -208,12 +198,13 @@ impl ModelBundle {
         }
 
         let format = parse_format(&wire.artifact.format)?;
-        let (output_semantics, output_semantics_bound) = validate_output_semantics(
-            wire.schema_version,
-            wire.output_semantics.as_deref(),
+        let output_semantics = validate_output_semantics(
+            &wire.output_semantics,
             format,
             expectations.output_semantics(),
         )?;
+        validate_output_measurement(&wire.output_measurement, expectations)?;
+        validate_output_statistic(&wire.output_statistic, expectations)?;
         if wire.artifact.format_version != NATIVE_FORMAT_VERSION {
             return Err(BundleError::UnsupportedFormatVersion);
         }
@@ -290,14 +281,7 @@ impl ModelBundle {
             .map_err(|_| BundleError::TrainingRunStructureLimit)?;
         let run: TrainingRunWire = serde_json::from_slice(&training_run_bytes)
             .map_err(|_| BundleError::TrainingRunSyntax)?;
-        validate_training_run(
-            &run,
-            &wire,
-            expectations,
-            format,
-            output_semantics,
-            output_semantics_bound,
-        )?;
+        validate_training_run(&run, &wire, expectations, format, output_semantics)?;
 
         let (forecast_calibration, forecast_residuals_bytes, forecast_policy_bytes) =
             match wire.forecast_calibration.as_ref() {
@@ -394,8 +378,6 @@ impl ModelBundle {
             artifact_hash,
             format,
             wire.artifact.format_version,
-            output_semantics,
-            output_semantics_bound,
             features,
             validation_metrics,
             thresholds,
@@ -584,6 +566,8 @@ pub enum BundleError {
     UnsupportedMetadataVersion,
     #[error("model output semantics are invalid or differ from independent authority")]
     InvalidOutputSemantics,
+    #[error("model output measurement is invalid or differs from admitted label rows")]
+    InvalidOutputMeasurement,
     #[error("model artifact schema version is unsupported")]
     UnsupportedArtifactSchemaVersion,
     #[error("model identity differs from independent expectations")]

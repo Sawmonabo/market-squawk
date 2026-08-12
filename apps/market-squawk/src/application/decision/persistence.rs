@@ -9,7 +9,8 @@ use std::{
 };
 
 use market_squawk_decisions::{
-    AppendOutcome, DecisionAuthority, DecisionRepository, DecisionRepositoryLimits,
+    AppendOutcome, DecisionAuthority, DecisionRepository, DecisionRepositoryError,
+    DecisionRepositoryLimits,
 };
 use market_squawk_platform::{
     DecisionDatabaseFileGuard, DecisionDatabaseLocation, DecisionDatabaseWriterGuard,
@@ -23,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 use super::DecisionApplicationError;
 use super::codec::{EncodedRecord, RecoveryContext};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_PAGE_SIZE: i64 = 4_096;
 const SQLITE_MAX_PAGE_COUNT: i64 = 131_072;
@@ -36,19 +37,7 @@ const BACKUP_PAGE_BATCH: i32 = 128;
 const BACKUP_PAGE_PAUSE: Duration = Duration::from_millis(10);
 const EXPECTED_SCHEMA_SQL: &str = "CREATE TABLE decision_records (
                     sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
-                    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 7),
-                    record_key TEXT NOT NULL CHECK (
-                        length(record_key) > 0 AND length(CAST(record_key AS BLOB)) <= 260
-                    ),
-                    payload_json BLOB NOT NULL CHECK (
-                        length(payload_json) > 0 AND length(payload_json) <= 16777216
-                    ),
-                    payload_sha256 BLOB NOT NULL CHECK (length(payload_sha256) = 32),
-                    UNIQUE (kind, record_key)
-                 ) STRICT";
-const LEGACY_SCHEMA_SQL: &str = "CREATE TABLE decision_records (
-                    sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
-                    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 6),
+                    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 8),
                     record_key TEXT NOT NULL CHECK (
                         length(record_key) > 0 AND length(CAST(record_key AS BLOB)) <= 260
                     ),
@@ -97,6 +86,7 @@ pub(super) struct DecisionJournal {
     location: DecisionDatabaseLocation,
     database_file: DecisionDatabaseFileGuard,
     _writer_guard: DecisionDatabaseWriterGuard,
+    maximum_records: usize,
 }
 
 impl fmt::Debug for DecisionJournal {
@@ -108,7 +98,9 @@ impl fmt::Debug for DecisionJournal {
 impl DecisionJournal {
     pub(super) fn open(
         location: DecisionDatabaseLocation,
+        limits: DecisionRepositoryLimits,
     ) -> Result<Self, DecisionApplicationError> {
+        let maximum_records = journal_record_limit(limits)?;
         let database_file = location
             .prepare_database_file()
             .map_err(|_error| DecisionApplicationError::Persistence)?;
@@ -144,6 +136,7 @@ impl DecisionJournal {
             location,
             database_file,
             _writer_guard: writer_guard,
+            maximum_records,
         })
     }
 
@@ -157,6 +150,7 @@ impl DecisionJournal {
         verify_schema(&self.connection)?;
         let semantic = visit_records(
             &self.connection,
+            self.maximum_records,
             |_sequence, kind, key, payload, _digest| context.apply(authority, kind, key, payload),
         )?;
         self.validate_capabilities()?;
@@ -171,7 +165,7 @@ impl DecisionJournal {
         self.validate_capabilities()?;
         verify_integrity(&self.connection)?;
         verify_schema(&self.connection)?;
-        let source_semantic = semantic_digest(&self.connection)?;
+        let source_semantic = semantic_digest(&self.connection, self.maximum_records)?;
         let mut destination =
             Connection::open_in_memory().map_err(|_error| DecisionApplicationError::Persistence)?;
         let backup = rusqlite::backup::Backup::new(&self.connection, &mut destination)
@@ -183,7 +177,7 @@ impl DecisionJournal {
         disable_trusted_schema(&destination)?;
         verify_integrity(&destination)?;
         verify_schema(&destination)?;
-        let destination_semantic = semantic_digest(&destination)?;
+        let destination_semantic = semantic_digest(&destination, self.maximum_records)?;
         if destination_semantic != source_semantic {
             return Err(DecisionApplicationError::InvalidPersistentState);
         }
@@ -214,6 +208,7 @@ impl DecisionJournal {
         limits: DecisionRepositoryLimits,
         bytes: &[u8],
     ) -> Result<[u8; 32], DecisionApplicationError> {
+        let maximum_records = journal_record_limit(limits)?;
         if bytes.is_empty() || bytes.len() > MAX_BACKUP_BYTES {
             return Err(DecisionApplicationError::InvalidPersistentState);
         }
@@ -224,7 +219,7 @@ impl DecisionJournal {
             .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?;
         disable_trusted_schema(&source)?;
         verify_integrity(&source)?;
-        verify_supported_schema(&source)?;
+        verify_schema(&source)?;
         let mut normalized =
             Connection::open_in_memory().map_err(|_error| DecisionApplicationError::Persistence)?;
         let normalization = rusqlite::backup::Backup::new(&source, &mut normalized)
@@ -239,9 +234,10 @@ impl DecisionJournal {
         verify_schema(&normalized)?;
         let repository = DecisionRepository::try_new(limits)?;
         let mut authority = DecisionAuthority::new(repository);
-        let mut recovery = RecoveryContext::try_new()?;
+        let mut recovery = RecoveryContext::try_new(limits.maximum_screen_runs())?;
         let source_semantic = visit_records(
             &normalized,
+            maximum_records,
             |_sequence, kind, key, payload, _payload_sha256| {
                 recovery.apply(&mut authority, kind, key, payload)
             },
@@ -279,7 +275,7 @@ impl DecisionJournal {
         disable_trusted_schema(&destination)?;
         verify_integrity(&destination)?;
         verify_schema(&destination)?;
-        if semantic_digest(&destination)? != source_semantic {
+        if semantic_digest(&destination, maximum_records)? != source_semantic {
             return Err(DecisionApplicationError::InvalidPersistentState);
         }
         destination
@@ -352,7 +348,7 @@ impl DecisionJournal {
             .map_err(|_error| DecisionApplicationError::Persistence)?;
         let record_bytes = i64::try_from(record.payload.len())
             .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?;
-        let maximum_records = i64::try_from(MAX_RECORDS)
+        let maximum_records = i64::try_from(self.maximum_records)
             .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?;
         let maximum_bytes = i64::try_from(MAX_JOURNAL_BYTES)
             .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?;
@@ -511,7 +507,7 @@ fn initialize(connection: &Connection) -> Result<(), DecisionApplicationError> {
                 "BEGIN IMMEDIATE;
                  CREATE TABLE decision_records (
                     sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
-                    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 7),
+                    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 8),
                     record_key TEXT NOT NULL CHECK (
                         length(record_key) > 0 AND length(CAST(record_key AS BLOB)) <= 260
                     ),
@@ -521,34 +517,7 @@ fn initialize(connection: &Connection) -> Result<(), DecisionApplicationError> {
                     payload_sha256 BLOB NOT NULL CHECK (length(payload_sha256) = 32),
                     UNIQUE (kind, record_key)
                  ) STRICT;
-                 PRAGMA user_version = 2;
-                 COMMIT;",
-            )
-            .map_err(|_error| DecisionApplicationError::Persistence)?;
-    } else if version == 1 {
-        verify_schema_version(connection, 1, LEGACY_SCHEMA_SQL)?;
-        connection
-            .execute_batch(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE decision_records RENAME TO decision_records_v1;
-                 CREATE TABLE decision_records (
-                    sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
-                    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 7),
-                    record_key TEXT NOT NULL CHECK (
-                        length(record_key) > 0 AND length(CAST(record_key AS BLOB)) <= 260
-                    ),
-                    payload_json BLOB NOT NULL CHECK (
-                        length(payload_json) > 0 AND length(payload_json) <= 16777216
-                    ),
-                    payload_sha256 BLOB NOT NULL CHECK (length(payload_sha256) = 32),
-                    UNIQUE (kind, record_key)
-                 ) STRICT;
-                 INSERT INTO decision_records
-                    (sequence, kind, record_key, payload_json, payload_sha256)
-                 SELECT sequence, kind, record_key, payload_json, payload_sha256
-                 FROM decision_records_v1 ORDER BY sequence;
-                 DROP TABLE decision_records_v1;
-                 PRAGMA user_version = 2;
+                 PRAGMA user_version = 3;
                  COMMIT;",
             )
             .map_err(|_error| DecisionApplicationError::Persistence)?;
@@ -560,17 +529,6 @@ fn initialize(connection: &Connection) -> Result<(), DecisionApplicationError> {
 
 fn verify_schema(connection: &Connection) -> Result<(), DecisionApplicationError> {
     verify_schema_version(connection, SCHEMA_VERSION, EXPECTED_SCHEMA_SQL)
-}
-
-fn verify_supported_schema(connection: &Connection) -> Result<(), DecisionApplicationError> {
-    let version = connection
-        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-        .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?;
-    match version {
-        1 => verify_schema_version(connection, 1, LEGACY_SCHEMA_SQL),
-        SCHEMA_VERSION => verify_schema(connection),
-        _ => Err(DecisionApplicationError::InvalidPersistentState),
-    }
 }
 
 fn verify_schema_version(
@@ -652,26 +610,53 @@ fn verify_integrity(connection: &Connection) -> Result<(), DecisionApplicationEr
     }
 }
 
+fn journal_record_limit(
+    limits: DecisionRepositoryLimits,
+) -> Result<usize, DecisionApplicationError> {
+    let maximum_records = limits
+        .maximum_records()
+        .checked_add(limits.maximum_screen_runs())
+        .ok_or(DecisionApplicationError::Repository(
+            DecisionRepositoryError::InvalidLimits,
+        ))?;
+    if maximum_records > MAX_RECORDS {
+        return Err(DecisionApplicationError::Repository(
+            DecisionRepositoryError::InvalidLimits,
+        ));
+    }
+    Ok(maximum_records)
+}
+
 const fn valid_kind(kind: i64) -> bool {
-    matches!(kind, 1..=7)
+    matches!(kind, 1..=8)
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-fn semantic_digest(connection: &Connection) -> Result<[u8; 32], DecisionApplicationError> {
-    visit_records(connection, |_sequence, _kind, _key, _payload, _digest| {
-        Ok(())
-    })
+fn semantic_digest(
+    connection: &Connection,
+    maximum_records: usize,
+) -> Result<[u8; 32], DecisionApplicationError> {
+    visit_records(
+        connection,
+        maximum_records,
+        |_sequence, _kind, _key, _payload, _digest| Ok(()),
+    )
 }
 
 fn visit_records(
     connection: &Connection,
+    maximum_records: usize,
     mut visit: impl FnMut(i64, i64, &str, &[u8], &[u8]) -> Result<(), DecisionApplicationError>,
 ) -> Result<[u8; 32], DecisionApplicationError> {
-    let limit = i64::try_from(MAX_RECORDS + 1)
-        .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?;
+    let limit = i64::try_from(
+        maximum_records
+            .checked_add(1)
+            .ok_or(DecisionApplicationError::InvalidPersistentState)?,
+    )
+    .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?;
     let mut statement = connection
         .prepare(
             "SELECT sequence, kind, record_key, payload_json, payload_sha256
@@ -692,7 +677,7 @@ fn visit_records(
         count = count
             .checked_add(1)
             .ok_or(DecisionApplicationError::InvalidPersistentState)?;
-        if count > MAX_RECORDS {
+        if count > maximum_records {
             return Err(DecisionApplicationError::InvalidPersistentState);
         }
         let sequence = row
@@ -738,7 +723,7 @@ fn visit_records(
 
 fn semantic_digest_start() -> Sha256 {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/decision-journal-authority/v2\0");
+    digest.update(b"market-squawk/decision-journal-authority/v3\0");
     digest.update(SCHEMA_VERSION.to_be_bytes());
     digest
 }

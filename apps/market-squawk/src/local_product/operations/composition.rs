@@ -32,6 +32,7 @@ use crate::{
             ManagedBackupOperations, ManagedRecoveryOperations,
             ManagedUpdateOperations as ManagedUpdateOperationsContract, UpdateAvailabilityEvidence,
         },
+        recommendation::RecommendationSetupAuthority,
         workspace::DurableWorkspaceRegistry,
     },
     jobs::{BackupJobRunner, InstalledJobAuthority},
@@ -86,6 +87,7 @@ pub(crate) type InstalledOperationsAuthorityParts = (
 pub(crate) fn try_compose_installed_workspace_backup(
     product: &LocalProduct,
     settings: Arc<ProductionSettingsOperations>,
+    recommendation_setup: Arc<RecommendationSetupAuthority>,
     jobs: &InstalledJobAuthority,
     backup_runner: &BackupJobRunner,
     bundles: Arc<InstalledWorkspaceBackupBundleSource>,
@@ -93,7 +95,10 @@ pub(crate) fn try_compose_installed_workspace_backup(
     active_workspace: WorkspaceId,
 ) -> Result<Arc<InstalledWorkspaceBackupAuthority>, ServiceError> {
     let owners: Vec<Arc<dyn WorkspaceComponentSnapshotAuthority>> = vec![
-        Arc::new(ConfigurationWorkspaceBackupAuthority::try_new(settings)?),
+        Arc::new(ConfigurationWorkspaceBackupAuthority::try_new(
+            settings,
+            recommendation_setup,
+        )?),
         Arc::new(ProviderMetadataWorkspaceBackupAuthority::try_new(
             product.provider_metadata_backup_authority(),
         )?),

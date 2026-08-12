@@ -7,6 +7,7 @@ mod engine;
 mod experiments;
 mod fills;
 mod model_strategy;
+mod recommendation;
 #[cfg(feature = "release-evidence")]
 mod release_evidence;
 mod service;
@@ -41,6 +42,20 @@ pub use fills::{
     ResearchExecutionAssumptionsInput, ResearchFill, ResearchLiquidityPriority,
 };
 pub use model_strategy::{BacktestModelDecisionMapper, BacktestModelStrategy};
+pub use recommendation::{
+    COST_ADJUSTED_TOTAL_RETURN_METRIC, MAXIMUM_DRAWDOWN_METRIC, POSITIVE_FOLD_STABILITY_METRIC,
+    RECOMMENDATION_TARGET_HORIZON_NANOS_V1, RecommendationAggregateEvidenceV1,
+    RecommendationAggregateUnavailableV1, RecommendationAggregateV1, RecommendationBacktestError,
+    RecommendationBacktestEvidenceV1, RecommendationBacktestKernelV1, RecommendationBacktestLimits,
+    RecommendationBacktestLimitsInput, RecommendationBacktestPolicyV1,
+    RecommendationBacktestPolicyV1Input, RecommendationBacktestPublicationV1,
+    RecommendationBenchmarkAggregateV1, RecommendationBenchmarkGapV1,
+    RecommendationBenchmarkPolicyV1, RecommendationEquityPointV1, RecommendationExecutionGapV1,
+    RecommendationOosFoldV1, RecommendationRoundTripOutcomeV1, RecommendationSignalCensorReasonV1,
+    RecommendationSignalDispositionV1, RecommendationSignalInstructionV1,
+    RecommendationSignalPlanCompletenessV1, RecommendationSignalPlanV1,
+    RecommendationSignalResultV1, RecommendationSignalUnavailableReasonV1, RecommendationSignalV1,
+};
 #[cfg(feature = "release-evidence")]
 pub use release_evidence::{
     ReleaseEvidenceBacktestError, ReleaseEvidenceBacktestResult, run_release_evidence_backtest,

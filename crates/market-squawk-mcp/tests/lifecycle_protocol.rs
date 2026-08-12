@@ -15,7 +15,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Method, Request, StatusCode, header},
 };
-use market_squawk_jobs::JobId;
+use market_squawk_jobs::{JobGeneration, JobId};
 use market_squawk_mcp::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
@@ -25,6 +25,7 @@ use market_squawk_mcp::{
     McpRelayExchange, McpRelayResponse, McpRelayTransport, McpRelayTransportError,
     McpResourceDocument, McpResourceError, McpResourceProvider, McpResourceRequest, McpServer,
     McpStdioRelay, MutationAuditBundle, MutationAuditReservation, ServerError, ServerExit,
+    job_resource_uri,
 };
 use market_squawk_runtime::{ClientId, CredentialGeneration, NamedClient, WorkspaceId};
 use market_squawk_services::{
@@ -1417,9 +1418,10 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
         assert!(
             resources["result"]["resourceTemplates"]
                 .as_array()
-                .is_some_and(|templates| templates
-                    .iter()
-                    .any(|template| template["uriTemplate"] == "market-squawk://jobs/{job_id}"))
+                .is_some_and(
+                    |templates| templates.iter().any(|template| template["uriTemplate"]
+                        == "market-squawk://jobs/{job_id}/generations/{generation}")
+                )
         );
         let read = stateless_rpc(
             &http,
@@ -1614,22 +1616,24 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
     );
 
     let job_id: JobId = "00000000-0000-0000-0000-000000000001".parse()?;
+    let job_generation = JobGeneration::try_new(1)?;
+    let job_uri = job_resource_uri(job_id, job_generation);
     let job = response_json(
         http.handle(stateless_request(
             Method::POST,
             Some("beta"),
-            stateless_message(
-                "job",
-                "resources/read",
-                json!({"uri":format!("market-squawk://jobs/{}", job_id.as_uuid())}),
-            ),
+            stateless_message("job", "resources/read", json!({"uri":job_uri})),
         ))
         .await,
     )
     .await?;
     assert_eq!(
         job["result"]["contents"][0]["uri"],
-        format!("market-squawk://jobs/{}", job_id.as_uuid())
+        format!(
+            "market-squawk://jobs/{}/generations/{}",
+            job_id.as_uuid(),
+            job_generation.get()
+        )
     );
     assert_eq!(job["result"]["contents"][0]["mimeType"], "application/json");
     Ok(())

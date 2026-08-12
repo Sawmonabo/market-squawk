@@ -2,10 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Duration;
 
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
-use market_squawk_sources::ExtractionAuthority;
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_platform::RawCaptureRecord;
+use market_squawk_sources::{
+    ExtractionAuthority, MAX_PROVIDER_CAPTURE_BYTES, MAX_PROVIDER_CAPTURE_PAGES,
+    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -16,8 +24,8 @@ use crate::{
     reconcile_submissions, reconcile_submissions_with_cancellation,
 };
 
-const MAX_COMPANION_OBJECTS: u16 = 64;
-const MAX_COMPOSITE_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_COMPANION_OBJECTS: u16 = MAX_PROVIDER_CAPTURE_PAGES as u16 - 1;
+const MAX_COMPOSITE_DECODED_BYTES: u64 = MAX_PROVIDER_CAPTURE_BYTES;
 const MAX_COMPOSITE_MANIFEST_BYTES: usize = 512 * 1024;
 
 /// Hard ceilings for one complete current-plus-historical submissions snapshot.
@@ -32,7 +40,7 @@ impl SecCompositeBounds {
     pub const fn production_defaults() -> Self {
         Self {
             max_companion_objects: MAX_COMPANION_OBJECTS,
-            max_total_decoded_bytes: 128 * 1024 * 1024,
+            max_total_decoded_bytes: MAX_PROVIDER_CAPTURE_BYTES,
         }
     }
 
@@ -161,6 +169,193 @@ impl RetrievedSubmissions {
             components,
         ))
     }
+
+    /// Returns exact body-only capture material for current submissions plus every declared
+    /// companion in provider order.
+    ///
+    /// A direct current-only fetch is a standalone capture. A complete fetch is terminal only
+    /// after every provider-declared companion is present. Offline imports return `None` because
+    /// they have no HTTP receipt and must not be represented as provider responses.
+    pub fn capture_material(&self) -> Result<Option<ProviderCaptureMaterial>, SecClientError> {
+        if self.components().is_empty() {
+            return self.raw().capture_material();
+        }
+        complete_submissions_capture_material(self)
+    }
+}
+
+fn complete_submissions_capture_material(
+    retrieved: &RetrievedSubmissions,
+) -> Result<Option<ProviderCaptureMaterial>, SecClientError> {
+    let expected_count = retrieved
+        .document()
+        .companion_files()
+        .len()
+        .checked_add(1)
+        .ok_or(SecClientError::CompanionObjectLimitExceeded)?;
+    if expected_count != retrieved.components().len() || expected_count > MAX_PROVIDER_CAPTURE_PAGES
+    {
+        return Err(SecClientError::InvalidCaptureMaterial);
+    }
+    let current_locator = SecObjectLocator::submissions(retrieved.document().cik().as_str())?;
+    let mut expected_locators = Vec::new();
+    expected_locators
+        .try_reserve_exact(expected_count)
+        .map_err(|_| SecClientError::AllocationFailed)?;
+    expected_locators.push(current_locator.url().to_owned());
+    for name in retrieved.document().companion_files() {
+        expected_locators.push(SecObjectLocator::companion(name.as_str())?.url().to_owned());
+    }
+
+    let all_offline = retrieved
+        .components()
+        .iter()
+        .all(|component| component.capture_receipt().is_none());
+    if all_offline {
+        return Ok(None);
+    }
+    if retrieved
+        .components()
+        .iter()
+        .any(|component| component.capture_receipt().is_none())
+    {
+        return Err(SecClientError::InvalidCaptureMaterial);
+    }
+
+    let first = retrieved
+        .components()
+        .first()
+        .and_then(RetrievedSecBytes::capture_receipt)
+        .ok_or(SecClientError::InvalidCaptureMaterial)?;
+    let source_id = first.source_id().clone();
+    let metadata_revision = first.metadata_revision().clone();
+    let dataset = SourceIdentifier::try_from(format!(
+        "sec.submissions.cik.{}",
+        retrieved.document().cik()
+    ))?;
+    let mut request_set_hash = Sha256::new();
+    request_set_hash.update(b"market-squawk/sec-complete-submissions-request-set/v1");
+    hash_capture_field(&mut request_set_hash, source_id.as_str().as_bytes());
+    hash_capture_field(
+        &mut request_set_hash,
+        metadata_revision.as_source_identifier().as_str().as_bytes(),
+    );
+    hash_capture_field(&mut request_set_hash, dataset.as_str().as_bytes());
+    request_set_hash.update((expected_count as u64).to_be_bytes());
+
+    let mut pages = Vec::new();
+    pages
+        .try_reserve_exact(expected_count)
+        .map_err(|_| SecClientError::AllocationFailed)?;
+    for (ordinal, (component, expected_locator)) in retrieved
+        .components()
+        .iter()
+        .zip(&expected_locators)
+        .enumerate()
+    {
+        if component.locator() != Some(expected_locator.as_str()) {
+            return Err(SecClientError::InvalidCaptureMaterial);
+        }
+        let capture = component
+            .capture_receipt()
+            .ok_or(SecClientError::InvalidCaptureMaterial)?;
+        let original = capture
+            .pages()
+            .first()
+            .filter(|original| {
+                capture.pages().len() == 1
+                    && capture.source_id() == &source_id
+                    && capture.metadata_revision() == &metadata_revision
+                    && capture.dataset().as_str() == expected_locator
+                    && capture.request_set_identity() == original.request_identity()
+                    && capture.terminal() == ProviderCaptureTerminalDisposition::StandaloneResponse
+            })
+            .ok_or(SecClientError::InvalidCaptureMaterial)?;
+        if original.body_digest() != component.evidence()
+            || original.body_bytes()
+                != u64::try_from(component.bytes().len())
+                    .map_err(|_| SecClientError::CompositeByteLimitExceeded)?
+        {
+            return Err(SecClientError::InvalidCaptureMaterial);
+        }
+        let request_token = ordinal.checked_sub(1).map(|index| {
+            companion_token_digest(
+                retrieved.document().companion_files()[index]
+                    .as_str()
+                    .as_bytes(),
+            )
+        });
+        let response_token = retrieved
+            .document()
+            .companion_files()
+            .get(ordinal)
+            .map(|name| companion_token_digest(name.as_str().as_bytes()));
+        let ordinal =
+            u16::try_from(ordinal).map_err(|_| SecClientError::CompanionObjectLimitExceeded)?;
+        request_set_hash.update(ordinal.to_be_bytes());
+        request_set_hash.update(original.request_identity().bytes());
+        if let Some(token) = response_token {
+            request_set_hash.update(token.bytes());
+        }
+        pages.push(ProviderCapturePageReceipt::try_new(
+            ordinal,
+            original.request_identity(),
+            request_token,
+            response_token,
+            original.http_status(),
+            original.body_bytes(),
+            original.body_digest(),
+            original.received_at(),
+        )?);
+    }
+    let request_set_identity =
+        EvidenceDigest::new(DigestAlgorithm::Sha256, request_set_hash.finalize().into());
+    let receipt = ProviderCaptureSetReceipt::try_new(
+        source_id,
+        metadata_revision,
+        dataset,
+        request_set_identity,
+        ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage,
+        pages,
+    )?;
+    let connection_id = crate::client::deterministic_capture_uuid(b"connection", &receipt, 0);
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(expected_count)
+        .map_err(|_| SecClientError::AllocationFailed)?;
+    for (ordinal, (page, component)) in receipt
+        .pages()
+        .iter()
+        .zip(retrieved.components())
+        .enumerate()
+    {
+        let ordinal =
+            u16::try_from(ordinal).map_err(|_| SecClientError::CompanionObjectLimitExceeded)?;
+        records.push(RawCaptureRecord::try_new_live(
+            crate::client::deterministic_capture_uuid(b"event", &receipt, ordinal),
+            Arc::from(receipt.source_id().as_str()),
+            connection_id,
+            Some(u64::from(ordinal)),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(page.received_at().unix_nanos()),
+            Bytes::clone(component.bytes()),
+        )?);
+    }
+    ProviderCaptureMaterial::try_new(receipt, records)
+        .map(Some)
+        .map_err(Into::into)
+}
+
+fn companion_token_digest(name: &[u8]) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/sec-submissions-companion-token/v1");
+    hash_capture_field(&mut hash, name);
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn hash_capture_field(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
 }
 
 impl SecEdgarSource {
@@ -629,8 +824,52 @@ impl Write for CompositeManifestWriter<'_> {
 #[cfg(test)]
 mod tests {
     use cap_std::{ambient_authority, fs::Dir};
+    use market_squawk_domain::{MetadataRevision, SourceId};
+    use market_squawk_sources::SourceObjectCaptureIdentity;
 
     use super::*;
+
+    fn captured_component(
+        locator: String,
+        bytes: &[u8],
+        received_at: Timestamp,
+    ) -> Result<RetrievedSecBytes, Box<dyn std::error::Error>> {
+        let body_digest =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into());
+        let mut request_hash = Sha256::new();
+        request_hash.update(b"sec-test-request");
+        request_hash.update(locator.as_bytes());
+        let request_identity =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, request_hash.finalize().into());
+        let source_id = SourceId::try_from("sec-test")?;
+        let metadata_revision = MetadataRevision::new(SourceIdentifier::try_from("sec-test-v1")?);
+        let page = ProviderCapturePageReceipt::try_new(
+            0,
+            request_identity,
+            None,
+            None,
+            200,
+            u64::try_from(bytes.len())?,
+            body_digest,
+            received_at,
+        )?;
+        let receipt = ProviderCaptureSetReceipt::try_new(
+            source_id,
+            metadata_revision,
+            SourceIdentifier::try_from(locator.as_str())?,
+            request_identity,
+            ProviderCaptureTerminalDisposition::StandaloneResponse,
+            vec![page],
+        )?;
+        Ok(RetrievedSecBytes::captured_online(
+            bytes.to_vec(),
+            body_digest,
+            received_at,
+            locator,
+            1,
+            receipt,
+        ))
+    }
 
     #[test]
     fn online_composite_restores_every_exact_declared_component()
@@ -677,6 +916,101 @@ mod tests {
         )?;
         assert_eq!(restored.document().filings().len(), 3);
         assert_eq!(restored.components().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn complete_capture_closes_declared_companion_chain_and_rejects_object_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recent_bytes = include_bytes!("../fixtures/submissions-recent.json");
+        let archive_bytes = include_bytes!("../fixtures/submissions-archive.json");
+        let limits = SecParserLimits::production_defaults();
+        let recent = SubmissionsDocument::parse(recent_bytes, limits)?;
+        let archive = SubmissionsDocument::parse_archive(archive_bytes, limits)?;
+        let reconciled = reconcile_submissions(&recent, &[archive], limits)?;
+        let current_locator = SecObjectLocator::submissions(reconciled.cik().as_str())?
+            .url()
+            .to_owned();
+        let companion_locator = SecObjectLocator::companion("CIK0000320193-submissions-001.json")?
+            .url()
+            .to_owned();
+        let current = captured_component(
+            current_locator,
+            recent_bytes,
+            Timestamp::from_unix_nanos(100),
+        )?;
+        let companion = captured_component(
+            companion_locator,
+            archive_bytes,
+            Timestamp::from_unix_nanos(200),
+        )?;
+        let standalone = current
+            .capture_material()?
+            .ok_or(SecClientError::InvalidCaptureMaterial)?;
+        assert!(matches!(
+            SourceObjectCaptureIdentity::try_from_capture(standalone.receipt())?,
+            SourceObjectCaptureIdentity::Paged {
+                page_count,
+                terminal: ProviderCaptureTerminalDisposition::StandaloneResponse,
+                ..
+            } if page_count.get() == 1
+        ));
+        let manifest_bytes = b"local-composite-manifest".to_vec();
+        let manifest_digest = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(&manifest_bytes).into(),
+        );
+        let manifest = RetrievedSecBytes::local_composite(
+            manifest_bytes,
+            manifest_digest,
+            Timestamp::from_unix_nanos(200),
+        );
+        let retrieved = RetrievedSubmissions::new(
+            reconciled.clone(),
+            manifest.clone(),
+            vec![current.clone(), companion],
+        );
+        let capture = retrieved
+            .capture_material()?
+            .ok_or(SecClientError::InvalidCaptureMaterial)?;
+        assert_eq!(
+            capture.receipt().terminal(),
+            ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
+        );
+        assert_eq!(capture.receipt().pages().len(), 2);
+        assert_eq!(capture.records()[0].payload(), recent_bytes);
+        assert_eq!(capture.records()[1].payload(), archive_bytes);
+        assert!(matches!(
+            SourceObjectCaptureIdentity::try_from_capture(capture.receipt())?,
+            SourceObjectCaptureIdentity::Paged {
+                page_count,
+                terminal: ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage,
+                ..
+            } if page_count.get() == 2
+        ));
+        assert_eq!(
+            capture.receipt().pages()[0].response_next_page_token_digest(),
+            capture.receipt().pages()[1].request_page_token_digest()
+        );
+
+        let conflicting = RetrievedSubmissions::new(
+            reconciled,
+            manifest,
+            vec![
+                current,
+                captured_component(
+                    SecObjectLocator::companion("CIK0000320193-submissions-002.json")?
+                        .url()
+                        .to_owned(),
+                    archive_bytes,
+                    Timestamp::from_unix_nanos(200),
+                )?,
+            ],
+        );
+        assert!(matches!(
+            conflicting.capture_material(),
+            Err(SecClientError::InvalidCaptureMaterial)
+        ));
         Ok(())
     }
 }

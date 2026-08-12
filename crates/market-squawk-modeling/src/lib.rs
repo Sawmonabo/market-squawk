@@ -18,6 +18,8 @@ mod native;
 #[cfg(feature = "onnx-tract")]
 mod onnx;
 mod registry;
+#[cfg(test)]
+mod test_contracts;
 mod training_environment;
 mod training_protocol;
 
@@ -39,11 +41,14 @@ pub use bundle::{
     MAX_METADATA_BYTES, MAX_ONNX_ARTIFACT_BYTES, MAX_TRAINING_RUN_BYTES, ModelBundle,
 };
 pub use forecast::{
-    CalibrationBand, CalibrationEvidence, CalibrationMethod, CalibrationWindow, ForecastCoverage,
-    ForecastError, ForecastHorizon, ForecastInterval, ForecastIntervals, ForecastObservedPoint,
-    ForecastOutcome, ForecastOutcomeId, ForecastPath, ForecastPoint, ForecastRequest,
-    ForecastValue, ForecastVintage, ForecastVintageId, MAX_FORECAST_DECIMAL_SCALE,
-    MAX_FORECAST_OBSERVED_POINTS, MAX_FORECAST_POINTS, RealizedCoverage, ResearchForecastBackend,
+    CalibrationBand, CalibrationEvidence, CalibrationMethod, CalibrationWindow,
+    ForecastCentralStatistic, ForecastCoverage, ForecastError, ForecastEstimatorProfile,
+    ForecastHorizon, ForecastInterval, ForecastIntervals, ForecastMeasurement,
+    ForecastObservedPoint, ForecastOutcome, ForecastOutcomeId, ForecastOutputBinding, ForecastPath,
+    ForecastPoint, ForecastRequest, ForecastTargetMeaning, ForecastTrainingObjective,
+    ForecastTransform, ForecastValue, ForecastVintage, ForecastVintageId,
+    MAX_FORECAST_DECIMAL_SCALE, MAX_FORECAST_OBSERVED_POINTS, MAX_FORECAST_POINTS,
+    RealizedCoverage, ResearchForecastBackend, verify_forecast_vintage_identity,
 };
 pub use input::{
     ModelDecision, ModelFeatureValue, ModelInput, ModelInputError, ModelOutput, ModelOutputIdentity,
@@ -277,6 +282,7 @@ const fn bundle_error_code(error: BundleError) -> u16 {
         BundleError::MetadataSyntax => 8,
         BundleError::UnsupportedMetadataVersion => 9,
         BundleError::InvalidOutputSemantics => 48,
+        BundleError::InvalidOutputMeasurement => 55,
         BundleError::ModelIdentityMismatch => 10,
         BundleError::BundleIdentityMismatch => 11,
         BundleError::UnsupportedFormat => 12,

@@ -540,6 +540,8 @@ struct FairValueAmount {
     amount: String,
     currency: String,
     scale: u32,
+    #[serde(rename = "amountBasis")]
+    amount_basis: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -580,6 +582,10 @@ impl FairValueMeasurementOption {
         let prepared_at = timestamp(&record.prepared_at)?;
         if record.prepared_by.is_empty()
             || record.input_count == 0
+            || !matches!(
+                record.amount.amount_basis.as_str(),
+                "per_instrument_unit" | "reporting_entity_total" | "position_total"
+            )
             || !matches!(
                 record.method.as_str(),
                 "quoted_market_price" | "market_approach" | "income_approach" | "cost_approach"
@@ -643,6 +649,7 @@ impl FairValueMeasurementOption {
             amount: self.record.amount.amount.into_boxed_str(),
             currency: self.record.amount.currency.into_boxed_str(),
             scale: self.record.amount.scale,
+            amount_basis: self.record.amount.amount_basis.into_boxed_str(),
             measurement_at: self.measurement_at,
             prepared_at: self.prepared_at,
             method: self.record.method.into_boxed_str(),
@@ -662,6 +669,7 @@ struct FairValueEvidenceOption {
     amount: Box<str>,
     currency: Box<str>,
     scale: u32,
+    amount_basis: Box<str>,
     measurement_at: Timestamp,
     prepared_at: Timestamp,
     method: Box<str>,
@@ -681,6 +689,7 @@ impl FairValueEvidenceOption {
                 "amount": self.amount,
                 "currency": self.currency,
                 "scale": self.scale,
+                "amountBasis": self.amount_basis,
             },
             "measurementAt": self.measurement_at,
             "preparedAt": self.prepared_at,

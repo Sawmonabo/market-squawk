@@ -475,6 +475,7 @@ fn map_modeling_forecast_error(error: ForecastError) -> ServiceError {
         ForecastError::InvalidHorizon
         | ForecastError::InvalidRequest
         | ForecastError::InvalidObservedHistory
+        | ForecastError::InvalidOutputBinding
         | ForecastError::InvalidDecimal
         | ForecastError::InvalidCalibration
         | ForecastError::CalibrationIdentityMismatch

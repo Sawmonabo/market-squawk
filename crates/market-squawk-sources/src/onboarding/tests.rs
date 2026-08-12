@@ -143,6 +143,200 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
             binding.source_id().as_str() == evidence_source && binding.digest() == evidence_digest
         }));
     }
+
+    let alpaca = profiles
+        .get("alpaca.basic-market-data")
+        .ok_or("missing Alpaca Paper Only profile")?;
+    assert_eq!(alpaca.release_state(), ProfileReleaseState::Available);
+    assert_eq!(alpaca.capability().revision().get(), 3);
+    assert_eq!(
+        alpaca.requirements(),
+        (
+            Requirement::RequiredProviderControlled,
+            Requirement::RequiredProviderControlled,
+            Requirement::NotRequired,
+        )
+    );
+    assert!(alpaca.handoff().1.contains("set exactly to paper"));
+    assert_eq!(
+        alpaca
+            .rights()
+            .0
+            .iter()
+            .map(|right| right.admission())
+            .collect::<Vec<_>>(),
+        [
+            OperationAdmission::Admitted,
+            OperationAdmission::Admitted,
+            OperationAdmission::Admitted,
+            OperationAdmission::Admitted,
+            OperationAdmission::Blocked,
+            OperationAdmission::Blocked,
+        ]
+    );
+    assert_eq!(
+        alpaca
+            .persistence_evidence()
+            .map(ProfileEvidence::source_id),
+        Some("MSQ-SELECTED-MARKET-DATA-ARCHITECTURE-2026-08-11")
+    );
+
+    let nasdaq = profiles
+        .get("nasdaq-trader-symbol-directory-reference")
+        .ok_or("missing Nasdaq reference profile")?;
+    assert_eq!(
+        nasdaq.activation_mode(),
+        ProfileActivationMode::NoCredential
+    );
+    assert_eq!(nasdaq.release_state(), ProfileReleaseState::RightsLimited);
+    assert_eq!(nasdaq.capability().revision().get(), 3);
+    assert!(nasdaq.persistence_evidence().is_none());
+    assert!(nasdaq.coverage().0.contains("process-local reference only"));
+    assert_eq!(
+        nasdaq.probe().endpoint(),
+        Some("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt")
+    );
+
+    for (profile_id, activation, setup, credential, coverage_marker, windows) in [
+        (
+            "schwab.trader-api-market-data",
+            ProfileActivationMode::ManualSecretImport,
+            SetupMode::ManualApiKeyImport,
+            CredentialKind::ApiKeyPair,
+            "provider-native read-only REST",
+            &[(1, 60_000_000_000)][..],
+        ),
+        (
+            "yahoo-finance.experimental-enrichment",
+            ProfileActivationMode::NoCredential,
+            SetupMode::NoCredential,
+            CredentialKind::None,
+            "cookie/crumb HTTP",
+            &[(1, 60_000_000_000)][..],
+        ),
+        (
+            "iex.hist-feed-files",
+            ProfileActivationMode::NoCredential,
+            SetupMode::NoCredential,
+            CredentialKind::None,
+            "bounded cold-job",
+            &[(1, 60_000_000_000)][..],
+        ),
+        (
+            "occ.options-reference",
+            ProfileActivationMode::NoCredential,
+            SetupMode::NoCredential,
+            CredentialKind::None,
+            "selected/daily DLP",
+            &[(1, 60_000_000_000)][..],
+        ),
+        (
+            "cboe.options-reference",
+            ProfileActivationMode::NoCredential,
+            SetupMode::NoCredential,
+            CredentialKind::None,
+            "four-file request plans",
+            &[(1, 60_000_000_000)][..],
+        ),
+        (
+            "bea.api-data",
+            ProfileActivationMode::ManualSecretImport,
+            SetupMode::ManualApiKeyImport,
+            CredentialKind::ApiKey,
+            "100 requests, 100 MB, and 30 errors per minute",
+            &[(60, 60_000_000_000)][..],
+        ),
+        (
+            "census.data-api",
+            ProfileActivationMode::ManualSecretImport,
+            SetupMode::ManualApiKeyImport,
+            CredentialKind::ApiKey,
+            "400 requests per day",
+            &[(1, 1_000_000_000), (400, 86_400_000_000_000)][..],
+        ),
+        (
+            "eia.api-v2",
+            ProfileActivationMode::ManualSecretImport,
+            SetupMode::ManualApiKeyImport,
+            CredentialKind::ApiKey,
+            "5,000-row maximum",
+            &[(1, 1_000_000_000)][..],
+        ),
+        (
+            "federal-reserve-board.data-download-program",
+            ProfileActivationMode::NoCredential,
+            SetupMode::NoCredential,
+            CredentialKind::None,
+            "one request per minute",
+            &[(1, 60_000_000_000)][..],
+        ),
+        (
+            "tiingo.starter-eod-nav",
+            ProfileActivationMode::ManualSecretImport,
+            SetupMode::ManualApiKeyImport,
+            CredentialKind::ApiKey,
+            "500 unique symbols/month",
+            &[(40, 3_600_000_000_000), (800, 86_400_000_000_000)][..],
+        ),
+    ] {
+        let profile = profiles
+            .get(profile_id)
+            .ok_or("missing selected pending provider profile")?;
+        assert_eq!(profile.activation_mode(), activation);
+        assert_eq!(
+            profile.release_state(),
+            ProfileReleaseState::RefreshRequired
+        );
+        assert_eq!(profile.capability().revision().get(), 3);
+        assert_eq!(profile.capability().setup_mode(), setup);
+        assert_eq!(profile.capability().credential_kind(), credential);
+        assert_eq!(
+            profile.capability().rights_state(),
+            RightsAdmissionState::AdmittedScoped
+        );
+        assert_eq!(profile.probe().transport(), ProbeTransport::Local);
+        assert!(profile.probe().endpoint().is_none());
+        assert_eq!(
+            profile
+                .persistence_evidence()
+                .map(ProfileEvidence::source_id),
+            Some("MSQ-SELECTED-MARKET-DATA-ARCHITECTURE-2026-08-11")
+        );
+        assert!(profile.coverage().0.contains(coverage_marker));
+        assert!(profile.capability().evidence().iter().any(|binding| {
+            binding.source_id().as_str() == "MSQ-SELECTED-MARKET-DATA-ARCHITECTURE-2026-08-11"
+        }));
+        assert_eq!(
+            profile
+                .rights()
+                .0
+                .iter()
+                .map(|right| right.admission())
+                .collect::<Vec<_>>(),
+            [
+                OperationAdmission::Admitted,
+                OperationAdmission::Admitted,
+                OperationAdmission::Admitted,
+                OperationAdmission::Admitted,
+                OperationAdmission::Blocked,
+                OperationAdmission::Blocked,
+            ]
+        );
+        let budget = profile
+            .capability()
+            .rate_policy()
+            .enforcement_policy()
+            .ok_or("selected pending profile omitted its structural budget")?;
+        assert_eq!(budget.window_count(), windows.len());
+        for (index, expected) in windows.iter().enumerate() {
+            assert_eq!(
+                budget
+                    .window(index)
+                    .map(|window| (window.requests_per_window(), window.window_nanos())),
+                Some(*expected)
+            );
+        }
+    }
     Ok(())
 }
 

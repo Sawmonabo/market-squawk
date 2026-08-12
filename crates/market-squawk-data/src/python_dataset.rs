@@ -5,7 +5,7 @@ mod descriptor;
 #[path = "python_dataset/verify.rs"]
 mod verify;
 
-use std::time::Instant;
+use std::{num::NonZeroU64, time::Instant};
 
 use market_squawk_domain::{Currency, InstrumentId, SourceIdentifier, Timestamp};
 use sha2::{Digest as _, Sha256};
@@ -15,7 +15,8 @@ use uuid::Uuid;
 
 use crate::{
     ArrowConversionError, CatalogEndpointIdentity, CatalogError, DatasetBuildSpecDigest,
-    DatasetManifestRef, DatasetSplitCounts, Sha256Digest, UniverseId,
+    DatasetManifestRef, DatasetSplitCounts, FeatureLabelComponentSpec, FeatureLabelMeasurement,
+    FeatureLabelMeasurementBinding, Sha256Digest, UniverseId,
 };
 
 const MAX_PYTHON_DATASET_ROWS: usize = 100_000;
@@ -114,6 +115,9 @@ pub struct PythonDatasetRow {
     example_id: Box<str>,
     instrument_id: [u8; 16],
     cutoff_at: Timestamp,
+    observed_effective_at: Option<Timestamp>,
+    label_effective_at: Option<Timestamp>,
+    target_coordinate_kind: u8,
     split: u8,
     component_kind: u8,
     component_name: Box<str>,
@@ -134,6 +138,9 @@ impl PythonDatasetRow {
         example_id: &str,
         instrument_id: [u8; 16],
         cutoff_at: Timestamp,
+        observed_effective_at: Option<Timestamp>,
+        label_effective_at: Option<Timestamp>,
+        target_coordinate_kind: u8,
         split: u8,
         component_kind: u8,
         component_name: &str,
@@ -144,8 +151,25 @@ impl PythonDatasetRow {
         lineage: [u8; 32],
     ) -> Result<Self, PythonDatasetCatalogError> {
         let instrument = Uuid::from_bytes(instrument_id);
+        let target_coordinates_valid = match (
+            target_coordinate_kind,
+            observed_effective_at,
+            label_effective_at,
+        ) {
+            (1, Some(observed), Some(target)) => target > observed,
+            (2, None, None) => true,
+            _ => false,
+        };
+        let positive_currency_value = currency.is_none()
+            || match &value {
+                PythonDatasetValue::Float(value) => *value > 0.0,
+                PythonDatasetValue::Decimal { mantissa, .. } => *mantissa > 0,
+                PythonDatasetValue::Missing(_) => false,
+            };
         if !canonical_identifier(example_id, 256)
             || InstrumentId::try_from(instrument).is_err()
+            || !target_coordinates_valid
+            || !positive_currency_value
             || !matches!(split, 1..=3)
             || !matches!(component_kind, 1..=2)
             || !canonical_identifier(component_name, 256)
@@ -165,6 +189,9 @@ impl PythonDatasetRow {
             example_id: example_id.into(),
             instrument_id,
             cutoff_at,
+            observed_effective_at,
+            label_effective_at,
+            target_coordinate_kind,
             split,
             component_kind,
             component_name: component_name.into(),
@@ -174,6 +201,14 @@ impl PythonDatasetRow {
             currency: currency.map(Into::into),
             lineage,
         })
+    }
+
+    fn fixed_horizon_nanos(&self) -> Option<NonZeroU64> {
+        self.observed_effective_at
+            .zip(self.label_effective_at)
+            .and_then(|(observed, target)| target.unix_nanos().checked_sub(observed.unix_nanos()))
+            .and_then(|value| u64::try_from(value).ok())
+            .and_then(NonZeroU64::new)
     }
 }
 
@@ -254,6 +289,7 @@ pub struct PythonDatasetSelection {
     selection_sha256: Sha256Digest,
     selected_rows: usize,
     as_of: Timestamp,
+    label_measurements: Box<[FeatureLabelMeasurementBinding]>,
 }
 
 impl PythonDatasetSelection {
@@ -295,6 +331,31 @@ impl PythonDatasetSelection {
     /// Returns the exact point-in-time cutoff bound into the selection digest.
     pub const fn as_of(&self) -> Timestamp {
         self.as_of
+    }
+
+    /// Returns the row-rederived measurement for one exact label after the descriptor and complete
+    /// object scan agreed.
+    #[must_use]
+    pub fn label_measurement(
+        &self,
+        label: &FeatureLabelComponentSpec,
+    ) -> Option<FeatureLabelMeasurement> {
+        self.label_measurements
+            .iter()
+            .find(|binding| binding.label() == label)
+            .map(FeatureLabelMeasurementBinding::measurement)
+    }
+
+    /// Returns the exact row-rederived positive terminal offset for one admitted label.
+    #[must_use]
+    pub fn label_fixed_horizon_nanos(
+        &self,
+        label: &FeatureLabelComponentSpec,
+    ) -> Option<NonZeroU64> {
+        self.label_measurements
+            .iter()
+            .find(|binding| binding.label() == label)
+            .and_then(FeatureLabelMeasurementBinding::fixed_horizon_nanos)
     }
 
     /// Starts a streaming rehash against this immutable receipt.
@@ -410,7 +471,7 @@ fn selection_hash_prefix(
     as_of: Timestamp,
 ) -> Sha256 {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/python-dataset-selection/v1");
+    hash.update(b"market-squawk/python-dataset-selection/v2");
     hash.update(catalog_identity.bytes());
     hash.update(export_sha256.bytes());
     hash.update(as_of.unix_nanos().to_be_bytes());
@@ -419,10 +480,13 @@ fn selection_hash_prefix(
 
 fn row_digest(row: &PythonDatasetRow) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/python-dataset-row/v1");
+    hash.update(b"market-squawk/python-dataset-row/v2");
     update_bytes(&mut hash, row.example_id.as_bytes());
     hash.update(row.instrument_id);
     hash.update(row.cutoff_at.unix_nanos().to_be_bytes());
+    hash.update([row.target_coordinate_kind]);
+    update_optional_timestamp(&mut hash, row.observed_effective_at);
+    update_optional_timestamp(&mut hash, row.label_effective_at);
     hash.update([row.split, row.component_kind]);
     update_bytes(&mut hash, row.component_name.as_bytes());
     hash.update(row.component_version.to_be_bytes());
@@ -445,6 +509,15 @@ fn row_digest(row: &PythonDatasetRow) -> [u8; 32] {
     update_optional(&mut hash, row.currency.as_deref());
     hash.update(row.lineage);
     hash.finalize().into()
+}
+
+fn update_optional_timestamp(hash: &mut Sha256, value: Option<Timestamp>) {
+    if let Some(value) = value {
+        hash.update([1]);
+        hash.update(value.unix_nanos().to_be_bytes());
+    } else {
+        hash.update([0]);
+    }
 }
 
 fn update_optional(hash: &mut Sha256, value: Option<&str>) {

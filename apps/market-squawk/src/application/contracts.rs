@@ -71,6 +71,12 @@ const PORTFOLIO_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::Required,
     ScopeRequirement::Optional,
 );
+const PORTFOLIO_CANDIDATE_SCOPE: ToolScope = ToolScope::new(
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::Required,
+    ScopeRequirement::NotApplicable,
+);
 
 const NO_ARGUMENTS: &[ArgumentSpec] = &[];
 const LIST_DATASETS_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::optional(
@@ -100,6 +106,8 @@ const MARKET_UNIVERSE_SEARCH_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::optional("query", ArgumentKind::Text)];
 const PROVIDER_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("provider", ArgumentKind::Identifier)];
+const PROVIDER_CREDENTIAL_BUNDLE_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("inputTicketId", ArgumentKind::Uuid)];
 const SOURCE_DISCOVERY_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("provider", ArgumentKind::Identifier),
     ArgumentSpec::required("dataset", ArgumentKind::Identifier),
@@ -185,6 +193,24 @@ const LIST_ACCOUNTS_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::optional(
     "afterAccountId",
     ArgumentKind::Identifier,
 )];
+const RECOMMENDATION_SETUP_PREVIEW_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required(
+        "expectedRevision",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required("accountId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "allocationProfile",
+        ArgumentKind::RecommendationAllocationProfile,
+    ),
+];
+const RECOMMENDATION_SETUP_COMMIT_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("previewId", ArgumentKind::Uuid),
+    ArgumentSpec::required("previewDigest", ArgumentKind::Sha256),
+];
 const LIST_REVISIONS_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("accountId", ArgumentKind::Identifier),
     ArgumentSpec::optional("afterRevisionId", ArgumentKind::Sha256),
@@ -206,8 +232,9 @@ const PORTFOLIO_REBALANCE_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("proposal", ArgumentKind::Object),
 ];
 const PORTFOLIO_CANDIDATE_ARGUMENTS: &[ArgumentSpec] = &[
-    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
-    ArgumentSpec::required("candidate", ArgumentKind::Object),
+    ArgumentSpec::required("instrumentId", ArgumentKind::Identifier),
+    ArgumentSpec::required("proposedQuantity", ArgumentKind::Decimal),
+    ArgumentSpec::required("scenarioShock", ArgumentKind::Decimal),
 ];
 const MODEL_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("modelId", ArgumentKind::Identifier)];
@@ -229,6 +256,10 @@ const MODEL_FORECAST_PREPARED_START_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("receipt", ArgumentKind::Object)];
 const MODEL_FORECAST_ID_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("vintageId", ArgumentKind::Sha256)];
+const MODEL_LATEST_VALID_FORECAST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("instrumentId", ArgumentKind::Uuid),
+    ArgumentSpec::required("asOf", ArgumentKind::Timestamp),
+];
 const DECISION_SAVE_SCREEN_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::optional(
         "expectedRevision",
@@ -325,6 +356,43 @@ const DECISION_TARGET_INDEX_ARGUMENTS: &[ArgumentSpec] = &[
 ];
 const DECISION_TARGET_REVIEW_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("review", ArgumentKind::Object)];
+const DECISION_INVESTMENT_ANALYSIS_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("analysisId", ArgumentKind::Sha256)];
+const DECISION_INVESTMENT_ANALYSIS_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterAnalysisId", ArgumentKind::Sha256),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 1_000,
+        },
+    ),
+];
+const DECISION_RECOMMENDATION_TRACK_RECORD_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("profileId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "profileRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u32::MAX as u64,
+        },
+    ),
+    ArgumentSpec::required("profileDigest", ArgumentKind::Sha256),
+    ArgumentSpec::required(
+        "horizonNanos",
+        ArgumentKind::Signed {
+            minimum: 1,
+            maximum: i64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "evaluatedAtUnixNanos",
+        ArgumentKind::Signed {
+            minimum: i64::MIN,
+            maximum: i64::MAX,
+        },
+    ),
+];
 const OPERATIONS_BACKUP_LIST_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::optional("afterBackupId", ArgumentKind::Sha256),
     ArgumentSpec::required(
@@ -635,7 +703,16 @@ const JOB_LIST_ARGUMENTS: &[ArgumentSpec] = &[
         },
     ),
 ];
-const JOB_ID_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required("jobId", ArgumentKind::Uuid)];
+const JOB_GET_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+];
 const JOB_WATCH_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("jobId", ArgumentKind::Uuid),
     ArgumentSpec::required(
@@ -711,7 +788,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Return one durable sanitized job generation.",
         ServiceDomain::Job,
         JOB_SCOPE,
-        JOB_ID_ARGUMENTS,
+        JOB_GET_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
     read(
@@ -744,6 +821,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Job,
         JOB_SCOPE,
         JOB_MUTATION_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.ImportCredentialBundle",
+        "Claim one native-staged provider credential bundle, transfer enabled secrets into the protected store, and return only secret-free provider dispositions.",
+        ServiceDomain::Source,
+        LOCAL_SCOPE,
+        PROVIDER_CREDENTIAL_BUNDLE_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
     mutation(
@@ -1067,6 +1152,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ToolAuthorization::LocalConfirmation,
     ),
     read(
+        "Portfolio.GetRecommendationSetup",
+        "Return the explicit selected recommendation account and numeric allocation setup.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Portfolio.PreviewRecommendationSetup",
+        "Preview one explicit account selection and same-account numeric allocation profile.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        RECOMMENDATION_SETUP_PREVIEW_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Portfolio.CommitRecommendationSetup",
+        "Commit one exact recommendation-setup preview after local confirmation.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        RECOMMENDATION_SETUP_COMMIT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
         "Portfolio.ListAccounts",
         "List bounded portfolio accounts with their current immutable revisions.",
         ServiceDomain::Portfolio,
@@ -1136,9 +1245,9 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     ),
     read(
         "Portfolio.EvaluateCandidateImpact",
-        "Evaluate a cash-funded candidate's portfolio and scenario impact.",
+        "Evaluate read-only exposure and scenario impact for one candidate against the exact server-selected account and market evidence; analysis only.",
         ServiceDomain::Portfolio,
-        PORTFOLIO_SCOPE,
+        PORTFOLIO_CANDIDATE_SCOPE,
         PORTFOLIO_CANDIDATE_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
@@ -1361,6 +1470,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         SourceEvidencePolicy::NotApplicable,
     ),
     read(
+        "Model.SelectLatestValidForecast",
+        "Select and fully revalidate the newest nonexpired forecast for one exact instrument and point in time.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_LATEST_VALID_FORECAST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
         "Model.ListForecasts",
         "List bounded immutable forecast vintages.",
         ServiceDomain::Model,
@@ -1526,6 +1643,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Decision,
         LOCAL_SCOPE,
         DECISION_TARGET_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.GetInvestmentAnalysis",
+        "Return one exact retained generated, no-action, or unavailable investment analysis.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_INVESTMENT_ANALYSIS_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.ListInvestmentAnalyses",
+        "List bounded retained investment-analysis locators in durable append order.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_INVESTMENT_ANALYSIS_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.GetRecommendationTrackRecord",
+        "Return sample- and coverage-governed realized outcomes grouped by one exact analytical profile, recommendation horizon, and action or no-action control.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_RECOMMENDATION_TRACK_RECORD_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
     read(
@@ -2262,9 +2403,11 @@ enum ArgumentKind {
     FairValueMeasurement,
     ForecastRequest,
     PortfolioImportInterpretations,
+    RecommendationAllocationProfile,
     ResearchFileMapping,
     SettingsChanges,
     Enumeration(&'static [&'static str]),
+    Signed { minimum: i64, maximum: i64 },
     Unsigned { minimum: u64, maximum: u64 },
 }
 
@@ -2421,9 +2564,15 @@ fn argument_schema(kind: ArgumentKind) -> Value {
         ArgumentKind::FairValueMeasurement => fair_value_measurement_schema(),
         ArgumentKind::ForecastRequest => forecast_request_schema(),
         ArgumentKind::PortfolioImportInterpretations => portfolio_import_interpretations_schema(),
+        ArgumentKind::RecommendationAllocationProfile => recommendation_allocation_profile_schema(),
         ArgumentKind::ResearchFileMapping => research_file_mapping_schema(),
         ArgumentKind::SettingsChanges => settings_changes_schema(),
         ArgumentKind::Enumeration(values) => json!({"type": "string", "enum": values}),
+        ArgumentKind::Signed { minimum, maximum } => json!({
+            "type": "integer",
+            "minimum": minimum,
+            "maximum": maximum
+        }),
         ArgumentKind::Unsigned { minimum, maximum } => json!({
             "type": "integer",
             "minimum": minimum,
@@ -2659,11 +2808,19 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
         ArgumentKind::PortfolioImportInterpretations => {
             admit_portfolio_import_interpretations(value)
         }
+        ArgumentKind::RecommendationAllocationProfile => {
+            admit_recommendation_allocation_profile(value)
+        }
         ArgumentKind::ResearchFileMapping => admit_research_file_mapping(value),
         ArgumentKind::SettingsChanges => admit_settings_changes(value),
         ArgumentKind::Enumeration(values) => value
             .as_str()
             .filter(|value| values.contains(value))
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::Signed { minimum, maximum } => value
+            .as_i64()
+            .filter(|value| (*value >= minimum) && (*value <= maximum))
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
         ArgumentKind::Unsigned { minimum, maximum } => value
@@ -2672,6 +2829,121 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
     }
+}
+
+fn recommendation_allocation_profile_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "preferredPositionWeightLowerBps": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10_000,
+            },
+            "preferredPositionWeightUpperBps": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10_000,
+            },
+            "minimumCashReserve": {
+                "type": "object",
+                "properties": {
+                    "amount": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                    },
+                    "currency": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 3,
+                        "pattern": "^[A-Z]{3}$",
+                    },
+                },
+                "required": ["amount", "currency"],
+                "additionalProperties": false,
+            },
+            "maximumDownsideLossBpsOfMarkedEquity": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10_000,
+            },
+            "availableInvestmentHorizonDays": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3_650,
+            },
+        },
+        "required": [
+            "preferredPositionWeightLowerBps",
+            "preferredPositionWeightUpperBps",
+            "minimumCashReserve",
+            "maximumDownsideLossBpsOfMarkedEquity",
+            "availableInvestmentHorizonDays",
+        ],
+        "additionalProperties": false,
+    })
+}
+
+fn admit_recommendation_allocation_profile(value: &Value) -> Result<(), ToolInputError> {
+    const ALLOWED: [&str; 5] = [
+        "preferredPositionWeightLowerBps",
+        "preferredPositionWeightUpperBps",
+        "minimumCashReserve",
+        "maximumDownsideLossBpsOfMarkedEquity",
+        "availableInvestmentHorizonDays",
+    ];
+    let profile = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if profile.len() != ALLOWED.len()
+        || profile.keys().any(|name| !ALLOWED.contains(&name.as_str()))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let lower = bounded_u64(profile, "preferredPositionWeightLowerBps", 1, 10_000)?;
+    let upper = bounded_u64(profile, "preferredPositionWeightUpperBps", 1, 10_000)?;
+    if lower > upper {
+        return Err(ToolInputError::Invalid);
+    }
+    bounded_u64(profile, "maximumDownsideLossBpsOfMarkedEquity", 1, 10_000)?;
+    bounded_u64(profile, "availableInvestmentHorizonDays", 1, 3_650)?;
+    let reserve = profile
+        .get("minimumCashReserve")
+        .and_then(Value::as_object)
+        .ok_or(ToolInputError::Invalid)?;
+    if reserve.len() != 2
+        || reserve
+            .keys()
+            .any(|name| name != "amount" && name != "currency")
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let amount = reserve
+        .get("amount")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .and_then(|value| value.parse::<rust_decimal::Decimal>().ok())
+        .filter(|value| !value.is_sign_negative())
+        .ok_or(ToolInputError::Invalid)?;
+    let _ = amount;
+    reserve
+        .get("currency")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_uppercase()))
+        .map(|_| ())
+        .ok_or(ToolInputError::Invalid)
+}
+
+fn bounded_u64(
+    object: &Map<String, Value>,
+    name: &str,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, ToolInputError> {
+    object
+        .get(name)
+        .and_then(Value::as_u64)
+        .filter(|value| *value >= minimum && *value <= maximum)
+        .ok_or(ToolInputError::Invalid)
 }
 
 fn portfolio_import_interpretations_schema() -> Value {
@@ -3276,6 +3548,14 @@ fn fair_value_measurement_schema() -> Value {
                 "pattern": "^[A-Za-z]{3}$"
             },
             "scale": {"type": "integer", "minimum": 0, "maximum": 28},
+            "amountBasis": {
+                "type": "string",
+                "enum": [
+                    "per_instrument_unit",
+                    "reporting_entity_total",
+                    "position_total"
+                ]
+            },
             "measurementAt": {"type": "string", "format": "date-time"},
             "preparedAt": {"type": "string", "format": "date-time"},
             "preparedBy": {
@@ -3391,6 +3671,7 @@ fn fair_value_measurement_schema() -> Value {
             "amount",
             "currency",
             "scale",
+            "amountBasis",
             "measurementAt",
             "preparedAt",
             "preparedBy",
@@ -3414,12 +3695,13 @@ fn admit_timestamp(value: &Value) -> Result<(), ToolInputError> {
 }
 
 fn admit_fair_value_measurement(value: &Value) -> Result<(), ToolInputError> {
-    const REQUIRED: [&str; 9] = [
+    const REQUIRED: [&str; 10] = [
         "accountId",
         "instrumentId",
         "amount",
         "currency",
         "scale",
+        "amountBasis",
         "measurementAt",
         "preparedAt",
         "preparedBy",
@@ -3437,6 +3719,7 @@ fn admit_fair_value_measurement(value: &Value) -> Result<(), ToolInputError> {
                     | "amount"
                     | "currency"
                     | "scale"
+                    | "amountBasis"
                     | "measurementAt"
                     | "preparedAt"
                     | "preparedBy"
@@ -3474,6 +3757,18 @@ fn admit_fair_value_measurement(value: &Value) -> Result<(), ToolInputError> {
         .get("scale")
         .and_then(Value::as_u64)
         .is_none_or(|scale| scale > 28)
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    if measurement
+        .get("amountBasis")
+        .and_then(Value::as_str)
+        .is_none_or(|basis| {
+            !matches!(
+                basis,
+                "per_instrument_unit" | "reporting_entity_total" | "position_total"
+            )
+        })
     {
         return Err(ToolInputError::Invalid);
     }

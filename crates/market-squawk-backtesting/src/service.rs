@@ -23,6 +23,9 @@ use crate::{
 
 mod artifact;
 
+const COST_ADJUSTED_TOTAL_RETURN_METRIC: &str = "cost-adjusted-total-return";
+const MAXIMUM_DRAWDOWN_METRIC: &str = "maximum-drawdown";
+
 /// Search and selection contract combined with strategy-owned executable identity by the service.
 #[derive(Clone, Debug)]
 pub struct BacktestTrialPlan {
@@ -236,7 +239,7 @@ impl BacktestService {
                 result_digest: run.result_digest(),
                 artifact,
                 metrics,
-                dataset_partition: Some(dataset_partition),
+                dataset_partition,
             },
         ) {
             Ok(completion) => completion,
@@ -281,10 +284,7 @@ impl BacktestService {
             {
                 return Err(BacktestServiceError::InvalidCohort);
             }
-            let candidate_authority = record
-                .spec()
-                .cohort_authority_digest()
-                .ok_or(BacktestServiceError::InvalidCohort)?;
+            let candidate_authority = record.spec().cohort_authority_digest();
             if cohort_authority.is_some_and(|expected| expected != candidate_authority) {
                 return Err(BacktestServiceError::InvalidCohort);
             }
@@ -412,7 +412,7 @@ impl BacktestService {
             evaluator,
             experiment_design_digest: design.ok_or(BacktestServiceError::InvalidCohort)?,
             cohort_universe_digest: plan.universe().digest(),
-            expected_candidate_count: Some(expected_candidates),
+            expected_candidate_count: expected_candidates,
             selection_criterion: plan.selection_criterion().clone(),
             members,
             folds: plan.folds().to_vec(),
@@ -452,7 +452,7 @@ fn run_metrics(
 ) -> Result<Vec<TrialMetric>, BacktestServiceError> {
     let initial = request.portfolio.initial_cash.amount();
     let ending = run.portfolio().marked_equity().amount();
-    let total_return = ending
+    let cost_adjusted_total_return = ending
         .checked_sub(initial)
         .and_then(|value| value.checked_div(initial))
         .and_then(|value| rust_decimal::prelude::ToPrimitive::to_f64(&value))
@@ -468,7 +468,15 @@ fn run_metrics(
             SourceIdentifier::try_from("fill-count")?,
             run.fills().len() as f64,
         )?,
-        TrialMetric::try_new(SourceIdentifier::try_from("total-return")?, total_return)?,
+        TrialMetric::try_new(
+            SourceIdentifier::try_from(COST_ADJUSTED_TOTAL_RETURN_METRIC)?,
+            cost_adjusted_total_return,
+        )?,
+        TrialMetric::try_new(
+            SourceIdentifier::try_from(MAXIMUM_DRAWDOWN_METRIC)?,
+            rust_decimal::prelude::ToPrimitive::to_f64(&performance.maximum_drawdown)
+                .ok_or(BacktestServiceError::MetricEncoding)?,
+        )?,
         TrialMetric::try_new(SourceIdentifier::try_from("sharpe")?, performance.sharpe)?,
         TrialMetric::try_new(
             SourceIdentifier::try_from("return-observations")?,
@@ -518,9 +526,7 @@ fn member_binding(
         id,
         completion.result_digest(),
         record.spec().dataset_identity(),
-        completion
-            .dataset_partition()
-            .ok_or(BacktestServiceError::InvalidCohort)?,
+        completion.dataset_partition(),
         record.spec().parameter_digest()?,
     ))
 }
@@ -551,12 +557,8 @@ fn validate_cohort_folds(
             let TrialStatus::Completed(out_completion) = out_record.status() else {
                 return Err(BacktestServiceError::InvalidCohort);
             };
-            let in_partition = in_completion
-                .dataset_partition()
-                .ok_or(BacktestServiceError::InvalidCohort)?;
-            let out_partition = out_completion
-                .dataset_partition()
-                .ok_or(BacktestServiceError::InvalidCohort)?;
+            let in_partition = in_completion.dataset_partition();
+            let out_partition = out_completion.dataset_partition();
             let parameter_digest = in_record.spec().parameter_digest()?;
             if parameter_digest != out_record.spec().parameter_digest()?
                 || in_record.spec().dataset_identity() == out_record.spec().dataset_identity()
@@ -636,9 +638,7 @@ fn validate_selection_candidates(
         let dataset = (
             record.spec().dataset_identity(),
             record.spec().object_graph_digest(),
-            completion
-                .dataset_partition()
-                .ok_or(BacktestServiceError::InvalidCohort)?,
+            completion.dataset_partition(),
         );
         if expected_dataset.is_some_and(|expected| expected != dataset)
             || !parameter_digests.insert(record.spec().parameter_digest()?.bytes())

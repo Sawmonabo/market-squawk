@@ -7,13 +7,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
+use super::super::{
+    BacktestScope, GovernedBacktestCommand, GovernedBacktestDiscoveryEntry,
+    GovernedBacktestDiscoveryPage, GovernedBacktestDiscoveryQuery, GovernedBacktestRecord,
+};
 use super::{
     GovernedBacktestRepositoryLimits, ProductionGovernedBacktestRepositoryError, strictly_ordered,
 };
-use crate::application::{
-    analysis::{BacktestScope, GovernedBacktestCommand, GovernedBacktestRecord},
-    domain_support::encode_hex,
-};
+use crate::application::domain_support::encode_hex;
 
 const TERMINAL_INDEX_SCHEMA_VERSION: u16 = 1;
 
@@ -138,6 +139,44 @@ impl TerminalIndex {
             .ok()
             .and_then(|position| self.entries.get(position))
             .map(|terminal| &terminal.record)
+    }
+
+    pub(super) fn discover_completed(
+        &self,
+        query: &GovernedBacktestDiscoveryQuery,
+    ) -> Result<GovernedBacktestDiscoveryPage, ServiceError> {
+        let maximum_results = query.maximum_results().get();
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(maximum_results)
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        let mut truncated = false;
+        for terminal in &self.entries {
+            if !terminal.record.is_completed()
+                || terminal
+                    .command
+                    .scope()
+                    .instruments()
+                    .binary_search(&query.instrument_id())
+                    .is_err()
+                || query
+                    .strategy_id()
+                    .is_some_and(|strategy| terminal.command.strategy_id() != strategy)
+            {
+                continue;
+            }
+            if entries.len() == maximum_results {
+                truncated = true;
+                break;
+            }
+            entries.push(GovernedBacktestDiscoveryEntry::new(
+                terminal.command.clone(),
+                &terminal.command_digest,
+                &terminal.record_digest,
+                terminal.record.clone(),
+            ));
+        }
+        GovernedBacktestDiscoveryPage::try_new(query.clone(), entries, truncated)
     }
 }
 

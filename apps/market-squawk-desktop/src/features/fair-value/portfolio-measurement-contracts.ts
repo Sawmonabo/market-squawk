@@ -16,6 +16,11 @@ const exactDecimalSchema = z
   .max(MAXIMUM_DECIMAL_BYTES)
   .regex(/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/)
 const currencySchema = z.string().regex(/^[A-Z]{3}$/)
+const amountBasisSchema = z.enum([
+  "per_instrument_unit",
+  "reporting_entity_total",
+  "position_total",
+])
 const losslessIntegerSchema = z.union([
   z.number().int().safe(),
   z.string().regex(/^-?\d+$/),
@@ -127,6 +132,7 @@ const amountSchema = z
     amount: exactDecimalSchema,
     currency: currencySchema,
     scale: z.number().int().min(0).max(28),
+    amountBasis: amountBasisSchema,
   })
   .strict()
 
@@ -248,6 +254,7 @@ export type PortfolioMeasurementAccount = z.infer<typeof accountSchema>
 export type PortfolioMeasurementHolding = z.infer<typeof holdingSchema>
 export type PortfolioMeasurementPrincipal = z.infer<typeof principalSchema>
 export type PortfolioMeasurementMethod = z.infer<typeof methodSchema>
+export type PortfolioMeasurementAmountBasis = z.infer<typeof amountBasisSchema>
 export type PortfolioMeasurementClassification = z.infer<typeof classificationSchema>
 export type PortfolioMeasurementResult = z.infer<typeof measurementResultSchema>
 
@@ -332,6 +339,7 @@ export function parsePortfolioMeasurementResult(
     amount: string
     currency: string
     scale: number
+    amountBasis: PortfolioMeasurementAmountBasis
     method: PortfolioMeasurementMethod
     preparedBy: string
     at: string
@@ -346,6 +354,7 @@ export function parsePortfolioMeasurementResult(
     measurement.amount.amount !== expected.amount ||
     measurement.amount.currency !== expected.currency ||
     measurement.amount.scale !== expected.scale ||
+    measurement.amount.amountBasis !== expected.amountBasis ||
     measurement.method !== expected.method ||
     measurement.preparedBy !== expected.preparedBy ||
     Date.parse(measurement.measurementAt) !== Date.parse(expected.at) ||
@@ -384,6 +393,7 @@ export function verifyPortfolioMeasurementEvidence(
     input.amount.amount !== expected.portfolioAmount ||
     input.amount.currency !== expected.portfolioCurrency ||
     input.amount.scale !== decimalPlaces(expected.portfolioAmount) ||
+    input.amount.amountBasis !== "position_total" ||
     input.significance !== expected.significance ||
     input.evidence.sourceId !== "market-squawk.portfolio" ||
     input.evidence.payloadDigest.algorithm !== "sha256" ||

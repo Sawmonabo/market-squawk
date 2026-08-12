@@ -27,10 +27,14 @@ use crate::application::market_selection::{
     BudgetAvailability, CandidateAdmissionState, CandidateCapabilities, CandidateHealth,
     CandidateIdentity, CandidateIntegrity, CandidateTimestamps, DowngradeDimension,
     DowngradePolicy, FreshnessBasis, FreshnessRequirement, HealthState, IntegrityState,
-    MarketCoverage, MarketOperation, MarketOperationSet, MarketSelectionError,
-    MarketSelectionPolicy, MarketSelectionReceipt, MarketSelectionRequest, ObservationTiming,
-    ProviderBudgetSnapshot, RequestPriority, RightsAdmission, RightsState, SelectedMarketSource,
-    SelectionClass, SourceCandidate, select_market_source,
+    LiveMarketInvestmentSource, MarketCoverage, MarketFeatureEvidence,
+    MarketFeatureUnavailableReason, MarketInvestmentMarkBasis, MarketInvestmentRead,
+    MarketInvestmentReadError, MarketInvestmentUnavailableReason, MarketOperation,
+    MarketOperationSet, MarketSelectionError, MarketSelectionPolicy, MarketSelectionReceipt,
+    MarketSelectionRequest, ObservationTiming, ProviderBudgetSnapshot, RequestPriority,
+    RightsAdmission, RightsState, SelectedMarketInvestmentSource, SelectedMarketSource,
+    SelectionClass, SourceCandidate, read_market_investment_observation, select_market_source,
+    selected_generation_matches,
 };
 use crate::live_source::display_market::{
     DisplayDecimal, DisplayEffectiveTimeBasis, DisplayMarketAvailability, DisplayMarketPayload,
@@ -750,69 +754,7 @@ fn validate_display_observations(
 fn display_selection_observation(
     snapshot: &DisplayMarketSnapshotLease,
 ) -> Option<&DisplayMarketReadObservation> {
-    let mut selected = None;
-    for candidate in [snapshot.quote(), snapshot.trade()].into_iter().flatten() {
-        if selected.is_none_or(|current| display_observation_is_better(candidate, current)) {
-            selected = Some(candidate);
-        }
-    }
-    selected.or(snapshot.status())
-}
-
-fn display_observation_is_better(
-    candidate: &DisplayMarketReadObservation,
-    current: &DisplayMarketReadObservation,
-) -> bool {
-    let candidate_provenance = candidate.observation().provenance();
-    let current_provenance = current.observation().provenance();
-    display_availability_rank(candidate.availability())
-        .cmp(&display_availability_rank(current.availability()))
-        .then_with(|| {
-            display_depth_rank(candidate_provenance.display_depth())
-                .cmp(&display_depth_rank(current_provenance.display_depth()))
-        })
-        .then_with(|| {
-            display_quality_rank(display_current_quality(candidate))
-                .cmp(&display_quality_rank(display_current_quality(current)))
-        })
-        .then_with(|| {
-            candidate_provenance
-                .received_at()
-                .cmp(&current_provenance.received_at())
-        })
-        .is_gt()
-}
-
-const fn display_availability_rank(availability: DisplayMarketAvailability) -> u8 {
-    match availability {
-        DisplayMarketAvailability::Fresh { .. } => 4,
-        DisplayMarketAvailability::Stale { .. } => 3,
-        DisplayMarketAvailability::Expired { .. } => 2,
-        DisplayMarketAvailability::Quarantined { .. } => 1,
-    }
-}
-
-const fn display_depth_rank(depth: Option<MarketDepth>) -> u8 {
-    match depth {
-        Some(MarketDepth::OrderLevel) => 3,
-        Some(MarketDepth::PriceLevel) => 2,
-        Some(MarketDepth::TopOfBook) => 1,
-        None => 0,
-    }
-}
-
-const fn display_quality_rank(quality: DataQuality) -> u8 {
-    match quality {
-        DataQuality::DirectVerified => 9,
-        DataQuality::DirectUnverified => 8,
-        DataQuality::OfficialDelayed => 7,
-        DataQuality::Aggregated => 6,
-        DataQuality::Indicative => 5,
-        DataQuality::Modeled => 4,
-        DataQuality::Estimated => 3,
-        DataQuality::Stale => 2,
-        DataQuality::Quarantined => 1,
-    }
+    snapshot.selection_observation()
 }
 
 fn exact_order_level_snapshot<'snapshot>(
@@ -1291,6 +1233,36 @@ fn instrument_row(
             exact_selected_view(streams, display_snapshots, kraken_projections, selected)
         })
         .transpose()?;
+    let investment_source = match selected_view {
+        Some(UnifiedSelectedView::Live(view)) => {
+            let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
+            Some(SelectedMarketInvestmentSource::Live(
+                LiveMarketInvestmentSource::new(
+                    view.surface_id,
+                    view.metadata.provider(),
+                    view.stream,
+                    view.route.features(),
+                    executable,
+                    view.shard.published_at(),
+                ),
+            ))
+        }
+        Some(UnifiedSelectedView::Display(snapshot)) => {
+            let market_data = definition.market_data.ok_or(ServiceError::InvalidResult)?;
+            Some(SelectedMarketInvestmentSource::Display {
+                snapshot,
+                definition: market_data,
+            })
+        }
+        Some(UnifiedSelectedView::Kraken(snapshot)) => {
+            Some(SelectedMarketInvestmentSource::Kraken(snapshot))
+        }
+        None => None,
+    };
+    let market_observation = market_investment_value(
+        read_market_investment_observation(receipt, investment_source)
+            .map_err(market_investment_error)?,
+    );
     let symbol = unified_symbol(
         definition,
         selected_view,
@@ -1367,13 +1339,19 @@ fn instrument_row(
         "confidence": selected.map(confidence_label).unwrap_or("No eligible source"),
         "quote": quote,
         "orderBook": order_book,
+        "marketObservation": market_observation,
         "selectedSource": selected_source,
         "alternatives": alternatives,
         "selectionReceipt": {
             "policyRevision": receipt.policy_revision(),
+            "policyCandidateLimit": receipt.policy_candidate_limit(),
             "policyDigest": {
                 "algorithm": receipt.policy_digest().algorithm(),
                 "bytes": encode_hex(receipt.policy_digest().bytes())
+            },
+            "selectionDigest": {
+                "algorithm": receipt.selection_digest().algorithm(),
+                "bytes": encode_hex(receipt.selection_digest().bytes())
             },
             "selectedAt": timestamp_value(receipt.selected_at()),
             "eligibleCount": receipt.eligible().len(),
@@ -1385,6 +1363,110 @@ fn instrument_row(
             "downgradeDimensions": selected_downgrades.iter().map(downgrade_value).collect::<Vec<_>>()
         }
     }))
+}
+
+fn market_investment_value(read: MarketInvestmentRead<'_, '_>) -> Value {
+    match read {
+        MarketInvestmentRead::Unavailable(reason) => json!({
+            "availability": "unavailable",
+            "reason": market_investment_unavailable_reason(reason)
+        }),
+        MarketInvestmentRead::Available(observation) => {
+            let mark = observation.mark();
+            let evidence_identity = mark.evidence_identity();
+            let selection_digest = observation.selection_digest();
+            json!({
+                "availability": "available",
+                "instrumentId": observation.instrument_id().to_string(),
+                "mark": {
+                    "value": mark.value().normalize().to_string(),
+                    "currency": mark.currency().as_str(),
+                    "basis": market_investment_mark_basis(mark.basis()),
+                    "evidenceIdentity": {
+                        "algorithm": evidence_identity.algorithm(),
+                        "bytes": encode_hex(evidence_identity.bytes())
+                    },
+                    "freshUntil": mark.fresh_until().map(timestamp_value)
+                },
+                "selectionDigest": {
+                    "algorithm": selection_digest.algorithm(),
+                    "bytes": encode_hex(selection_digest.bytes())
+                },
+                "selectedAt": timestamp_value(observation.selected_at()),
+                "generation": observation.generation().map(|generation| generation.get().to_string()),
+                "quality": observation.quality(),
+                "depth": observation.depth().map(depth_name),
+                "coverage": coverage_name(observation.coverage()),
+                "integrity": integrity_name(observation.integrity()),
+                "features": market_feature_evidence_value(observation.features())
+            })
+        }
+    }
+}
+
+fn market_feature_evidence_value(features: MarketFeatureEvidence<'_>) -> Value {
+    match features {
+        MarketFeatureEvidence::Available(features) => {
+            let content_digest = features.content_digest();
+            json!({
+                "availability": "available",
+                "sourceId": features.source().as_str(),
+                "venueId": features.venue().as_str(),
+                "instrumentId": features.instrument().to_string(),
+                "generation": features.connection_generation().get().to_string(),
+                "availableAt": timestamp_value(features.available_at()),
+                "contentDigest": {
+                    "algorithm": content_digest.algorithm(),
+                    "bytes": encode_hex(content_digest.bytes())
+                },
+                "valueCount": features.values().len()
+            })
+        }
+        MarketFeatureEvidence::Unavailable(reason) => json!({
+            "availability": "unavailable",
+            "reason": market_feature_unavailable_reason(reason)
+        }),
+    }
+}
+
+const fn market_investment_mark_basis(value: MarketInvestmentMarkBasis) -> &'static str {
+    match value {
+        MarketInvestmentMarkBasis::FreshLastTrade => "fresh_last_trade",
+        MarketInvestmentMarkBasis::FreshBidAskMidpoint => "fresh_bid_ask_midpoint",
+    }
+}
+
+const fn market_investment_unavailable_reason(
+    value: MarketInvestmentUnavailableReason,
+) -> &'static str {
+    match value {
+        MarketInvestmentUnavailableReason::NoEligibleSource => "no_eligible_source",
+        MarketInvestmentUnavailableReason::NoFreshLastTradeOrMidpoint => {
+            "no_fresh_last_trade_or_midpoint"
+        }
+    }
+}
+
+const fn market_feature_unavailable_reason(value: MarketFeatureUnavailableReason) -> &'static str {
+    match value {
+        MarketFeatureUnavailableReason::SourceDoesNotPublishLiveFeatures => {
+            "source_does_not_publish_live_features"
+        }
+        MarketFeatureUnavailableReason::IncompleteSnapshot => "incomplete_snapshot",
+        MarketFeatureUnavailableReason::NoExactSourceGeneration => "no_exact_source_generation",
+        MarketFeatureUnavailableReason::AvailableAfterSelection => "available_after_selection",
+        MarketFeatureUnavailableReason::IncompleteValueSet => "incomplete_value_set",
+    }
+}
+
+const fn market_investment_error(error: MarketInvestmentReadError) -> ServiceError {
+    match error {
+        MarketInvestmentReadError::ExecutionOperationForbidden
+        | MarketInvestmentReadError::SelectedSourceMismatch
+        | MarketInvestmentReadError::InvalidFinancialTerms
+        | MarketInvestmentReadError::AmbiguousFeatureEvidence
+        | MarketInvestmentReadError::EvidenceIdentityEncoding => ServiceError::InvalidResult,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1560,11 +1642,13 @@ fn exact_selected_stream<'snapshot>(
     let identity = selected.candidate().identity();
     let mut matches = streams.iter().copied().filter(|view| {
         view.surface_id == identity.observation_id()
+            && view.metadata.provider() == identity.provider()
             && view.stream.source() == identity.source_id()
             && view.stream.provider_product() == identity.product()
             && view.stream.provider_channel() == identity.feed()
             && Some(view.route.route().venue()) == identity.venue_id()
             && view.route.route().instrument() == identity.instrument_id()
+            && selected_generation_matches(selected, view.stream.connection_generation())
     });
     let selected = matches.next();
     if matches.next().is_some() {
@@ -2006,6 +2090,7 @@ fn order_level_value_with_terms(
         "quality": read.quality(),
         "freshness": freshness,
         "lastMarketAt": last_market_at.map(timestamp_value),
+        "availableAt": timestamp_value(read.available_at()),
         "usableForSelection": order_level_is_usable(snapshot),
         "totalOrderCount": read.total_order_count(),
         "returnedOrderCount": orders.len(),

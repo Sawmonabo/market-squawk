@@ -1,12 +1,12 @@
 //! Account-owned activation for Alpaca Basic IEX and indicative-options data.
 
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use market_squawk_adapter_alpaca::{
-    AlpacaCredentials, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig,
+    AlpacaCredentials, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig, AlpacaTradingApiEnvironment,
 };
 use market_squawk_domain::DataQuality;
-use market_squawk_sources::ProviderRateDeclaration;
+use market_squawk_sources::{ProviderRateAuthority, ProviderRateDeclaration};
 use tokio_util::sync::CancellationToken;
 
 use crate::{ProviderActivationLease, ProviderOnboardingError};
@@ -21,29 +21,42 @@ use super::credentials::{AlpacaCredentialEnvelope, ProviderCredentialError};
 /// Non-clone, account-owned Alpaca Basic runtime admission.
 ///
 /// The owner retains the exclusive account authority and exact onboarding lease while the two
-/// logical source configurations are moved once into central live supervision. Credentials are
-/// shared only between those two bounded provider sources and remain zeroizing and redacted.
+/// logical source configurations are moved once into central live supervision. The already-loaded
+/// credentials are shared only with those bounded live children and the runtime-owned, revocable
+/// historical subordinate; they remain zeroizing and redacted.
 pub struct AlpacaBasicAccountActivation {
-    authority: ProviderAccountRuntimeAuthority,
+    authority: Arc<ProviderAccountRuntimeAuthority>,
     credentials: Arc<AlpacaCredentials>,
+    historical_provider_rate: ProviderRateAuthority,
+    trading_api_environment: AlpacaTradingApiEnvironment,
     iex: Option<AlpacaIexLiveConfig>,
     options: Option<AlpacaOptionsLiveConfig>,
 }
 
 impl AlpacaBasicAccountActivation {
     /// Returns the immutable onboarding lease retained by this runtime owner.
-    pub const fn lease(&self) -> &ProviderActivationLease {
+    pub fn lease(&self) -> &ProviderActivationLease {
         self.authority.lease()
     }
 
     /// Returns the stable, secret-free provider-account binding.
-    pub const fn account_binding(&self) -> &ProviderAccountBinding {
+    pub fn account_binding(&self) -> &ProviderAccountBinding {
         self.authority.binding()
     }
 
-    /// Returns shared zeroizing credentials for construction of the two admitted sources.
+    /// Returns shared zeroizing credentials for construction of admitted runtime children.
     pub fn credentials(&self) -> Arc<AlpacaCredentials> {
         Arc::clone(&self.credentials)
+    }
+
+    /// Delegates the same process-wide provider-rate authority to the historical subordinate.
+    pub(crate) fn historical_provider_rate_authority(&self) -> ProviderRateAuthority {
+        self.historical_provider_rate.clone()
+    }
+
+    /// Returns the explicitly configured Trading API account environment used by calendar calls.
+    pub(crate) const fn trading_api_environment(&self) -> AlpacaTradingApiEnvironment {
+        self.trading_api_environment
     }
 
     /// Moves the exact IEX-only configuration into central supervision once.
@@ -60,6 +73,41 @@ impl AlpacaBasicAccountActivation {
     pub async fn require_current(&self) -> Result<(), ProviderOnboardingError> {
         self.authority.require_current().await
     }
+
+    /// Delegates currentness checks without cloning or extending the account authority lifetime.
+    ///
+    /// The returned validator retains only a weak reference to this activation's sole account
+    /// authority. It neither rereads credentials nor acquires another runtime mutation authority.
+    pub(crate) fn historical_currentness_validator(
+        &self,
+    ) -> impl Fn() -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> + Clone + Send + Sync + 'static
+    {
+        let authority = Arc::downgrade(&self.authority);
+        move || {
+            let authority = authority.upgrade();
+            Box::pin(async move {
+                match authority {
+                    Some(authority) => authority.require_current().await.is_ok(),
+                    None => false,
+                }
+            }) as Pin<Box<dyn Future<Output = bool> + Send + 'static>>
+        }
+    }
+
+    /// Delegates a fail-closed synchronous check for post-extraction analytical callbacks.
+    ///
+    /// The closure retains only a weak reference to the existing account owner. It neither waits
+    /// on onboarding mutation, rereads credentials, nor acquires another account/rate authority.
+    pub(crate) fn historical_currentness_validator_now(
+        &self,
+    ) -> impl Fn() -> bool + Clone + Send + Sync + 'static {
+        let authority = Arc::downgrade(&self.authority);
+        move || {
+            authority
+                .upgrade()
+                .is_some_and(|authority| authority.require_current_now().is_ok())
+        }
+    }
 }
 
 impl std::fmt::Debug for AlpacaBasicAccountActivation {
@@ -68,6 +116,8 @@ impl std::fmt::Debug for AlpacaBasicAccountActivation {
             .debug_struct("AlpacaBasicAccountActivation")
             .field("authority", &self.authority)
             .field("credentials", &"[REDACTED ZEROIZING CREDENTIALS]")
+            .field("historical_provider_rate", &"[SHARED PROCESS AUTHORITY]")
+            .field("trading_api_environment", &self.trading_api_environment)
             .field("iex_config_available", &self.iex.is_some())
             .field("options_config_available", &self.options.is_some())
             .finish()
@@ -107,17 +157,21 @@ impl ProviderAdapterActivation {
         {
             return Err(AlpacaBasicActivationError::SourceBinding);
         }
+        let trading_api_environment = envelope.trading_api_environment();
         let credentials = Arc::new(envelope.into_credentials()?);
-        let authority = ProviderAccountRuntimeAuthority::try_acquire(
+        let provider_rate = self.provider_rate.clone();
+        let authority = Arc::new(ProviderAccountRuntimeAuthority::try_acquire(
             ProviderMarketAccount::AlpacaBasic,
             lease,
             Arc::clone(&self.onboarding),
             &self.app_config,
-            self.provider_rate.clone(),
-        )?;
+            provider_rate.clone(),
+        )?);
         Ok(AlpacaBasicAccountActivation {
             authority,
             credentials,
+            historical_provider_rate: provider_rate,
+            trading_api_environment,
             iex: Some(iex),
             options,
         })

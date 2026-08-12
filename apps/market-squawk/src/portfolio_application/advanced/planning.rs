@@ -1,4 +1,4 @@
-//! Proposal-only rebalance and candidate-impact calculations over pinned source holdings.
+//! Proposal-only rebalance calculations over pinned source holdings.
 
 use std::collections::BTreeSet;
 
@@ -165,106 +165,6 @@ pub(super) fn rebalance(
         "authority".to_owned(),
         json!({
             "proposalOnly": true,
-            "executionAuthority": false,
-            "riskApprovalRequiredBeforeAnyOrder": true,
-        }),
-    );
-    report_result(Value::Object(output), revision, scope, context)
-}
-
-pub(super) fn candidate_impact(
-    revision: &PublishedRevision,
-    scope: &ReadScope,
-    request: &TypedToolRequest,
-    context: &RequestContext,
-) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let candidate = request
-        .arguments()
-        .get("candidate")
-        .and_then(Value::as_object)
-        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
-    let instrument_id = parse_instrument(required_string(candidate, "instrumentId")?)?;
-    if !scope.admits_instrument(instrument_id) {
-        return Err(PortfolioApplicationServiceError::NotFound);
-    }
-    let current = holding_value(revision, instrument_id)?;
-    let proposed = candidate
-        .get("proposedMarketValue")
-        .map(parse_money)
-        .transpose()?
-        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
-    if proposed.currency() != revision.account.currency()
-        || proposed.amount().is_sign_negative()
-        || required_string(candidate, "funding")? != "portfolio_cash"
-    {
-        return Err(PortfolioApplicationServiceError::InvalidRequest);
-    }
-    let shock = parse_decimal(required_string(candidate, "scenarioShock")?)?;
-    if shock < -Decimal::ONE {
-        return Err(PortfolioApplicationServiceError::InvalidRequest);
-    }
-    let delta = checked_sub(proposed.amount(), current.amount())?;
-    let projected_cash = checked_sub(revision.account.cash_balance().amount(), delta)?;
-    if projected_cash.is_sign_negative() {
-        return Err(PortfolioApplicationServiceError::InvalidRequest);
-    }
-    let total = total_value(revision, scope)?;
-    if total.amount() <= Decimal::ZERO {
-        return Err(PortfolioApplicationServiceError::Analytics);
-    }
-    let current_weight = checked_div(current.amount(), total.amount())?;
-    let proposed_weight = checked_div(proposed.amount(), total.amount())?;
-    let current_scenario = checked_mul(current.amount(), shock)?;
-    let proposed_scenario = checked_mul(proposed.amount(), shock)?;
-    let mut output = base_report(revision, "cash_funded_existing_holding_candidate_impact_v1");
-    output.insert(
-        "instrumentId".to_owned(),
-        Value::String(instrument_id.to_string()),
-    );
-    output.insert("currentMarketValue".to_owned(), money_value(current));
-    output.insert("proposedMarketValue".to_owned(), money_value(proposed));
-    output.insert(
-        "projectedCash".to_owned(),
-        money_value(Money::new(projected_cash, revision.account.currency())),
-    );
-    output.insert(
-        "concentration".to_owned(),
-        json!({
-            "current": current_weight.to_string(),
-            "proposed": proposed_weight.to_string(),
-            "change": checked_sub(proposed_weight, current_weight)?.to_string(),
-        }),
-    );
-    output.insert(
-        "scenario".to_owned(),
-        json!({
-            "shock": shock.to_string(),
-            "currentImpact": money_value(Money::new(
-                current_scenario,
-                revision.account.currency()
-            )),
-            "proposedImpact": money_value(Money::new(
-                proposed_scenario,
-                revision.account.currency()
-            )),
-            "marginalImpact": money_value(Money::new(
-                checked_sub(proposed_scenario, current_scenario)?,
-                revision.account.currency()
-            )),
-        }),
-    );
-    output.insert(
-        "unavailable".to_owned(),
-        json!([
-            "new_instrument_without_pinned_mark_evidence",
-            "factor_classification_not_supplied_by_portfolio_source",
-            "liquidity_evidence_not_supplied_by_portfolio_source"
-        ]),
-    );
-    output.insert(
-        "authority".to_owned(),
-        json!({
-            "analysisOnly": true,
             "executionAuthority": false,
             "riskApprovalRequiredBeforeAnyOrder": true,
         }),

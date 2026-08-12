@@ -163,59 +163,9 @@ impl ResearchProviderRuntimeGeneration {
 
     /// Returns a canonical digest of every non-secret exact-generation authority dimension.
     pub fn generation_digest(&self) -> Result<EvidenceDigest, ResearchIngestCompositionError> {
-        let legacy_source_wide_persistence = self.rights.exact_subjects.is_none()
-            && self.rights.permitted_operations.len() == 1
-            && self
-                .rights
-                .permitted_operations
-                .contains(&SourceOperation::Persist)
-            && self.rights.parent_authorization_evidence == self.rights.authorization_evidence;
-        if legacy_source_wide_persistence {
-            #[derive(Serialize)]
-            #[serde(deny_unknown_fields)]
-            struct RuntimeGenerationWireV2<'a> {
-                slot_identity_digest: EvidenceDigest,
-                profile: &'a SourceIdentifier,
-                session_id: Uuid,
-                capability_revision: ProviderCapabilityRevision,
-                capability_digest: EvidenceDigest,
-                credential_generation: Option<SecretGeneration>,
-                secret_reference: Option<&'a SecretRef>,
-                authority_effective_at: Timestamp,
-                metadata: &'a SourceMetadata,
-                rights_source_id: &'a market_squawk_domain::SourceId,
-                rights_basis_reference: &'a str,
-                rights_basis_digest: EvidenceDigest,
-                rights_root_identity_digest: Option<EvidenceDigest>,
-                rights_authorization_evidence: EvidenceDigest,
-                rights_authorization_expires_at: Option<market_squawk_domain::Timestamp>,
-            }
-
-            return digest_runtime_wire(
-                b"market-squawk/research-provider-runtime-generation/v2\0",
-                &RuntimeGenerationWireV2 {
-                    slot_identity_digest: self.slot_identity_digest()?,
-                    profile: &self.profile,
-                    session_id: self.session_id,
-                    capability_revision: self.capability_revision,
-                    capability_digest: self.capability_digest,
-                    credential_generation: self.credential_generation,
-                    secret_reference: self.secret_reference.as_ref(),
-                    authority_effective_at: self.authority_effective_at,
-                    metadata: &self.metadata,
-                    rights_source_id: &self.rights.source_id,
-                    rights_basis_reference: self.rights.basis.reference(),
-                    rights_basis_digest: self.rights.basis.digest(),
-                    rights_root_identity_digest: self.rights.basis.root_identity_digest(),
-                    rights_authorization_evidence: self.rights.authorization_evidence,
-                    rights_authorization_expires_at: self.rights.authorization_expires_at,
-                },
-            );
-        }
-
         #[derive(Serialize)]
         #[serde(deny_unknown_fields)]
-        struct RuntimeGenerationWireV3<'a> {
+        struct RuntimeGenerationWire<'a> {
             slot_identity_digest: EvidenceDigest,
             profile: &'a SourceIdentifier,
             session_id: Uuid,
@@ -237,7 +187,7 @@ impl ResearchProviderRuntimeGeneration {
 
         digest_runtime_wire(
             b"market-squawk/research-provider-runtime-generation/v3\0",
-            &RuntimeGenerationWireV3 {
+            &RuntimeGenerationWire {
                 slot_identity_digest: self.slot_identity_digest()?,
                 profile: &self.profile,
                 session_id: self.session_id,
@@ -257,11 +207,6 @@ impl ResearchProviderRuntimeGeneration {
                 rights_contract_digest: rights_contract_digest(&self.rights),
             },
         )
-    }
-
-    /// Compatibility alias for the exact generation digest.
-    pub fn identity_digest(&self) -> Result<EvidenceDigest, ResearchIngestCompositionError> {
-        self.generation_digest()
     }
 
     fn is_exact_successor_of(

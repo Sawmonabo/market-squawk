@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::io;
 use std::mem::size_of;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +14,7 @@ use arrow::array::{
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     AvailabilityEvidence, CorporateActionObservation, DigestAlgorithm, EvidenceDigest,
-    ResearchObservation, ResearchTemporalCoordinate, SourceIdentifier,
+    ResearchObservation, ResearchTemporalCoordinate, SourceIdentifier, Timestamp,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -22,7 +22,8 @@ use tokio_util::sync::CancellationToken;
 use super::model::{
     ComponentAdjustmentEvidence, ComponentKind, ComponentValue, CorporateActionSensitivity,
     DatasetBuildRequest, DatasetExample, DatasetSplit, DatasetSplitCounts,
-    FeatureLabelComponentInput, FeatureLabelDataset, MissingValuePolicy,
+    FeatureLabelComponentInput, FeatureLabelDataset, FeatureLabelMeasurement,
+    FeatureLabelMeasurementBinding, MissingValuePolicy,
 };
 use super::{
     DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuilderService, admission, canonical,
@@ -103,15 +104,21 @@ pub(super) async fn build(
         .ok_or(DatasetBuildError::DeadlineExceeded)?;
     check_control(&cancellation, deadline)?;
     authorize_research_use(builder, &request, &cancellation)?;
+    let mut budget = BuildRetainedBudget::new(request.limits().max_retained_bytes());
+    budget.charge(request.retained_bytes())?;
+    let label_measurements = derive_label_measurements(&request, &mut budget)?;
     if let Some(existing) = matching_existing(builder, &request)? {
         authorize_existing_output(builder, &request, &existing, &cancellation)?;
         return admit_result(
             builder,
-            result_from_existing(&request, expected_split_counts(&request)?, existing),
+            result_from_existing(
+                &request,
+                expected_split_counts(&request)?,
+                existing,
+                label_measurements,
+            ),
         );
     }
-    let mut budget = BuildRetainedBudget::new(request.limits().max_retained_bytes());
-    budget.charge(request.retained_bytes())?;
     let candidates = read_inputs(builder, &request, &cancellation, deadline, &mut budget).await?;
     let prepared =
         prepare_rows(&request, &candidates, &cancellation, deadline, &mut budget).await?;
@@ -132,7 +139,12 @@ pub(super) async fn build(
         authorize_existing_output(builder, &request, &existing, &cancellation)?;
         return admit_result(
             builder,
-            result_from_existing(&request, prepared.split_counts, existing),
+            result_from_existing(
+                &request,
+                prepared.split_counts,
+                existing,
+                label_measurements,
+            ),
         );
     }
     check_control(&cancellation, deadline)?;
@@ -253,6 +265,7 @@ pub(super) async fn build(
                 .component_specs()
                 .to_vec()
                 .into_boxed_slice(),
+            label_measurements,
         },
     )
 }
@@ -903,6 +916,14 @@ fn feature_label_batch(
     let lineages =
         FixedSizeBinaryArray::try_from_iter(rows.iter().map(|row| row.lineage.bytes().to_vec()))
             .map_err(crate::ArrowConversionError::from)?;
+    let mut target_coordinate_kinds = bounded_output_vec(rows.len())?;
+    for row in rows {
+        target_coordinate_kinds.push(if exact_terminal_coordinates(row.example).is_some() {
+            1
+        } else {
+            2
+        });
+    }
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(fixed_text_array(
             rows.iter().map(|row| Some(row.example.example_id())),
@@ -921,6 +942,23 @@ fn feature_label_batch(
             )
             .with_timezone_utc(),
         ),
+        Arc::new(
+            TimestampNanosecondArray::from_iter(rows.iter().map(|row| {
+                exact_terminal_coordinates(row.example)
+                    .map(|(observed, _target)| observed.unix_nanos())
+            }))
+            .with_timezone_utc(),
+        ),
+        Arc::new(
+            TimestampNanosecondArray::from_iter(rows.iter().map(|row| {
+                exact_terminal_coordinates(row.example)
+                    .map(|(_observed, target)| target.unix_nanos())
+            }))
+            .with_timezone_utc(),
+        ),
+        Arc::new(UInt8Array::from_iter_values(
+            target_coordinate_kinds.iter().copied(),
+        )),
         Arc::new(UInt8Array::from_iter_values(rows.iter().map(
             |row| match row.split {
                 DatasetSplit::Train => 1,
@@ -1124,10 +1162,133 @@ fn expected_split_counts(
     Ok(counts)
 }
 
+fn derive_label_measurements(
+    request: &DatasetBuildRequest,
+    budget: &mut BuildRetainedBudget,
+) -> Result<Box<[FeatureLabelMeasurementBinding]>, DatasetBuildError> {
+    let specs = request.inputs().component_specs();
+    let observed_bytes = size_of::<Option<FeatureLabelMeasurement>>()
+        .checked_add(size_of::<FixedHorizonState>())
+        .and_then(|bytes| bytes.checked_mul(specs.len()))
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+    budget.charge(observed_bytes)?;
+    let mut observed = Vec::new();
+    observed
+        .try_reserve_exact(specs.len())
+        .map_err(|_| DatasetBuildError::LimitExceeded)?;
+    observed.resize(specs.len(), None);
+    let mut horizons = Vec::new();
+    horizons
+        .try_reserve_exact(specs.len())
+        .map_err(|_| DatasetBuildError::LimitExceeded)?;
+    horizons.resize(specs.len(), FixedHorizonState::Unseen);
+    for example in request.inputs().examples() {
+        let has_missing = example
+            .components()
+            .iter()
+            .any(|component| component.value().is_missing());
+        match (request.policy().missing_values(), has_missing) {
+            (MissingValuePolicy::Reject, true) => {
+                return Err(DatasetBuildError::MissingValueRejected);
+            }
+            (MissingValuePolicy::DropExample, true) => continue,
+            (MissingValuePolicy::Reject, false)
+            | (MissingValuePolicy::Preserve, _)
+            | (MissingValuePolicy::DropExample, false) => {}
+        }
+        for (index, component) in example.components().iter().enumerate() {
+            if component.spec().kind() != ComponentKind::Label {
+                continue;
+            }
+            let Some(measurement) = FeatureLabelMeasurement::try_from_value(component.value())?
+            else {
+                continue;
+            };
+            if observed[index].is_some_and(|retained| retained != measurement) {
+                return Err(DatasetBuildError::InvalidRequest);
+            }
+            observed[index] = Some(measurement);
+            horizons[index].observe(example);
+        }
+    }
+    let binding_count = specs
+        .iter()
+        .zip(&observed)
+        .filter(|(spec, measurement)| spec.kind() == ComponentKind::Label && measurement.is_some())
+        .count();
+    let binding_bytes = size_of::<FeatureLabelMeasurementBinding>()
+        .checked_mul(binding_count)
+        .and_then(|bytes| {
+            specs
+                .iter()
+                .zip(&observed)
+                .filter(|(spec, measurement)| {
+                    spec.kind() == ComponentKind::Label && measurement.is_some()
+                })
+                .try_fold(bytes, |total, (spec, _)| {
+                    total.checked_add(spec.name().len())
+                })
+        })
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+    budget.charge(binding_bytes)?;
+    let mut bindings = Vec::new();
+    bindings
+        .try_reserve_exact(binding_count)
+        .map_err(|_| DatasetBuildError::LimitExceeded)?;
+    for ((spec, measurement), horizon) in specs.iter().zip(observed).zip(horizons) {
+        if spec.kind() == ComponentKind::Label {
+            if let Some(measurement) = measurement {
+                bindings.push(FeatureLabelMeasurementBinding::try_new(
+                    spec.clone(),
+                    measurement,
+                    horizon.fixed(),
+                )?);
+            }
+        }
+    }
+    budget.release(observed_bytes)?;
+    Ok(bindings.into_boxed_slice())
+}
+
+#[derive(Clone, Copy)]
+enum FixedHorizonState {
+    Unseen,
+    Fixed(NonZeroU64),
+    Unsupported,
+}
+
+impl FixedHorizonState {
+    fn observe(&mut self, example: &DatasetExample) {
+        let candidate = exact_terminal_coordinates(example)
+            .and_then(|(observed, target)| target.unix_nanos().checked_sub(observed.unix_nanos()))
+            .and_then(|value| u64::try_from(value).ok())
+            .and_then(NonZeroU64::new);
+        *self = match (*self, candidate) {
+            (Self::Unseen, Some(value)) => Self::Fixed(value),
+            (Self::Fixed(expected), Some(value)) if value == expected => Self::Fixed(expected),
+            (Self::Unsupported, _) | (_, None) | (Self::Fixed(_), Some(_)) => Self::Unsupported,
+        };
+    }
+
+    const fn fixed(self) -> Option<NonZeroU64> {
+        match self {
+            Self::Fixed(value) => Some(value),
+            Self::Unseen | Self::Unsupported => None,
+        }
+    }
+}
+
+fn exact_terminal_coordinates(example: &DatasetExample) -> Option<(Timestamp, Timestamp)> {
+    let observed = example.effective_cutoff().exact_timestamp()?;
+    let target = example.label_effective_cutoff().exact_timestamp()?;
+    (target > observed).then_some((observed, target))
+}
+
 fn result_from_existing(
     request: &DatasetBuildRequest,
     split_counts: DatasetSplitCounts,
     pinned: PinnedDataset,
+    label_measurements: Box<[FeatureLabelMeasurementBinding]>,
 ) -> FeatureLabelDataset {
     FeatureLabelDataset {
         pinned,
@@ -1144,6 +1305,7 @@ fn result_from_existing(
             .component_specs()
             .to_vec()
             .into_boxed_slice(),
+        label_measurements,
     }
 }
 
