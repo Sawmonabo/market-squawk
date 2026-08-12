@@ -12,18 +12,16 @@ evidence; it does not replace the README capability truth or the canonical relea
   `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
   release-branch integration is authorized in this execution scope.
 - The latest pushed product-code checkpoint is
-  `215f27582d596707ae6e04a536b5c6e3aac00fc0`, tree
-  `d134d38071f1ee314f9a7b233b5f07723598e74f`. It preserves the bounded Federal Reserve Board H.15
-  dashboard vertical and Desktop service-generation reconnect barrier, then integrates the reviewed
-  phase-one/product-admission split, exact product-contract and catalog-endpoint boundaries,
-  governed sequential recommendation-study evidence, truthful Research/Desktop product status,
-  and the deliberately unavailable recommendation-facing forecast path described below.
+  `f1dafac589cbcf4feb66d478bfdf2fece6ee642c`, tree
+  `ead687bc2e00d1f5a484842f9713b544a36e340f`. It preserves the bounded Federal Reserve Board H.15
+  dashboard vertical, Desktop service-generation reconnect barrier, and reviewed feature-product
+  authority checkpoint, then adds the protected main-window provider-credential import described
+  below.
 - The main checkout owns the feature branch. `.worktrees` is empty and no temporary lane branch
-  exists. The research/data authority slice is integrated and pushed. The only preserved
-  implementation overlay is the disjoint Desktop credential-import slice; it remains outside the
-  product-code checkpoint until its own exact verification and commit. The Python source-closure
-  lock is intentionally not refreshed because that release authority is updated only after the
-  remaining product source changes are final.
+  exists. The research/data authority and Desktop credential-import slices are integrated and
+  pushed; product code was clean and upstream-aligned at `f1dafac5`. This delivery-ledger update is
+  the sole recording overlay. The Python source-closure lock is intentionally not refreshed because
+  that release authority is updated only after the remaining product source changes are final.
 - The approved Markets expansion is now a V1 release blocker in issue
   [#45](https://github.com/Sawmonabo/market-squawk/issues/45), the maintained installed-product
   design/plan, and the
@@ -50,14 +48,15 @@ evidence; it does not replace the README capability truth or the canonical relea
   allowlist, protected token rotation, one multiplexed socket, adaptive capacity, exact
   delay/feed/depth provenance, unlink/revocation handling, and no account/order routes. The exact
   [credential input](../reference/market-squawk-provider-credentials.env.example) and
-  [account setup](../operations/provider-account-setup.md) are documented. The current working
-  candidate implements the strict 32-field `market-squawk-provider-credentials/v1` parser and the
-  one-time installed command
+  [account setup](../operations/provider-account-setup.md) are documented. The pushed candidate
+  implements the strict 32-field `market-squawk-provider-credentials/v1` parser and the one-time
+  installed command
   `market-squawk source import-credentials <absolute-file> --confirm`. It stages bounded bytes to
   the existing onboarding/secret-store service and returns exactly 17 secret-free provider
   dispositions: `disabled`, `credential_stored_unverified`, `probe_required`, or
-  `profile_unavailable`. Import never probes, activates, schedules, publishes, or trades. This is
-  dirty-tree implementation status, not frozen-head acceptance. The former fixed Yahoo 25-symbol
+  `profile_unavailable`, and the Desktop now invokes that same protected operation through a
+  main-window-only native picker and one-shot staged ticket. Import never probes, activates,
+  schedules, publishes, or trades. The former fixed Yahoo 25-symbol
   value had no provider evidence and is removed: one shared runtime lane must measure actual
   attempts and returns, coalesce/cache demand, and stop on its provider-wide 429 circuit. IEX HIST
   enablement authorizes only explicitly selected, byte-admitted feed/date cold jobs and never an
@@ -102,9 +101,8 @@ evidence; it does not replace the README capability truth or the canonical relea
   schema and the owner-local credential file have matching field names; the local file remains
   mode `0600`, and its values are not recorded here. Import produces only Configured,
   Probe-required, Disabled, or Profile-unavailable evidence. Available still requires the complete
-  chain above. The implementation goal remains paused until
-  the owner explicitly resumes it; this entry is the ready-to-resume authority, not an
-  implementation or acceptance claim.
+  chain above. Implementation has resumed; the next serialized vertical is an Alpaca Paper/IEX
+  read-only doctor and durable activation boundary, not an inference from imported credentials.
 - The first dirty-tree integration review found concrete paper/live lifecycle, provider-switch,
   research-file client-isolation/crash-recovery, desktop bootstrap, startup-window, stored-source
   attribution, preview-retention, and development-runtime defects. The code checkpoint closes
@@ -1570,5 +1568,47 @@ move the sole production publisher into the code-owned recipe, publish genuine s
 and Training products, and retain their pairing/derivation receipts. Governed terminal-price
 forecasting, valuation, recommendation/targets, portfolio/risk, Alpaca Paper/IEX doctor and runtime
 activation, and the novice Find → Analyze → forecast/backtest → signal → paper journey remain open
-until those producer authorities exist. `.worktrees` remains empty. The only preserved dirty
-implementation state is the disjoint Desktop credential-import slice awaiting its own checkpoint.
+until those producer authorities exist. `.worktrees` remains empty. The subsequent protected
+Desktop credential-import checkpoint is recorded below.
+
+## 2026-08-12 protected Desktop credential-import checkpoint
+
+Pushed checkpoint `f1dafac589cbcf4feb66d478bfdf2fece6ee642c`, tree
+`ead687bc2e00d1f5a484842f9713b544a36e340f`, closes the installed WebView-to-service credential
+origin boundary without creating provider availability. The main window can select one confirmed
+`.env` file through the native picker; native code opens only a non-empty regular file with
+no-follow semantics, enforces the 64 KiB ceiling, hashes the opened descriptor, stages it under one
+generation/workspace/client-bound opaque ticket, and immediately consumes that ticket through the
+existing private `Source.ImportCredentialBundle` operation. Path, bytes, digest, ticket, service
+envelope, and unexpected fields never cross into the WebView.
+
+Native and TypeScript layers independently require the exact closed schema, all 17 providers in
+code-owned order, the four admitted dispositions, and consistent enabled state. The UI renders only
+redacted setup dispositions and explicitly says that import does not verify, activate, start,
+schedule, publish, or trade. A cancelled picker truthfully leaves setup unchanged. Any non-cancelled
+failure warns that earlier provider entries may already have been stored, invalidates the source
+authority domain, and refreshes status, coverage, health, and retained-manifest evidence before the
+user retries.
+
+Focused checkpoint evidence was intentionally limited to the authority boundary:
+
+- Rust formatting, capability JSON parsing, cached diff integrity, and the locked offline Desktop
+  native check passed;
+- Desktop TypeScript compilation passed;
+- the existing grouped product-navigation journey passed 1/1 with six skipped cases and proves
+  cancel, redacted success, strict rejection of an unexpected secret-like field, truthful warning
+  that earlier entries may have been stored, and a source-status refetch after the failed result;
+  and
+- no broad suite, CI, release build, package matrix, provider network request, or source-lock
+  refresh ran.
+
+The final 13-file candidate was independently accepted at Critical 0, Important 0, Minor 0. Its
+reviewed and committed binary patch SHA-256 is
+`2c646a1a79b430d87aa6cf3acf6dcf74bd32df23a28f7656e91bbbaa15a3d90a`. Product code was clean and
+upstream-aligned at that checkpoint, and the checkout still has one worktree; this ledger update is
+the only subsequent overlay. Import is only Configured or Probe-required evidence. The next barrier
+is a read-only Alpaca doctor that durably binds the exact paper-realm credential generation and
+non-trading account identity to IEX market-data endpoint/feed, batch/cardinality,
+historical-bars/calendar entitlement, and rate-capacity evidence. It must never call or authorize
+account, position, order, or trading routes; only after that evidence is current may the existing
+source-start authority create an IEX market-data runtime.
