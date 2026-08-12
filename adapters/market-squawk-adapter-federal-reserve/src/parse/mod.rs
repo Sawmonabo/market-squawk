@@ -43,6 +43,20 @@ impl Default for BoardParseLimits {
 }
 
 impl BoardParseLimits {
+    /// Returns the closed parser budget for the rolling 100-date H.15 dashboard response.
+    ///
+    /// The observation ceiling is part of the production contract, so a server-side regression
+    /// that ignores `lastobs=100` is rejected while the CSV is still being decoded rather than
+    /// materializing an unbounded full-history batch.
+    pub fn h15_treasury_constant_maturities_rolling_dashboard() -> Self {
+        Self {
+            max_source_bytes: 1024 * 1024,
+            max_series: 11,
+            max_observations: 1_100,
+            ..Self::default()
+        }
+    }
+
     /// Builds explicit nonzero parser limits.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(

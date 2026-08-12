@@ -37,9 +37,11 @@ use crate::transport::{
 #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
 use crate::transport::{BoardScriptedProductionTransport, BoardScriptedTransportFactory};
 use crate::{
-    BoardAdapterError, BoardArtifactKind, BoardDatasetContract, BoardFileFormat, BoardParseLimits,
-    BoardPeriod, BoardPeriodValue, BoardSeries, BoardValue, ParsedBoardDataset, parse_csv,
-    parse_sdmx_xml, parse_sdmx_zip,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT, BoardAdapterError,
+    BoardArtifactKind, BoardDatasetContract, BoardFileFormat, BoardParseLimits, BoardPeriod,
+    BoardPeriodValue, BoardSeries, BoardValue, ParsedBoardDataset, parse_csv, parse_sdmx_xml,
+    parse_sdmx_zip,
 };
 
 const BOARD_PROVIDER_ID: &str = "federal-reserve-board";
@@ -106,6 +108,16 @@ pub struct BoardDatasetProfile {
 }
 
 impl BoardDatasetProfile {
+    /// Builds the closed rolling 100-date H.15 dashboard production profile.
+    pub fn h15_treasury_constant_maturities_rolling_dashboard() -> Result<Self, BoardSourceError> {
+        Self::try_new(
+            BoardDatasetContract::h15_treasury_constant_maturities_rolling_dashboard_csv()
+                .map_err(BoardSourceError::Protocol)?,
+            BoardParseLimits::h15_treasury_constant_maturities_rolling_dashboard(),
+            Vec::new(),
+        )
+    }
+
     /// Builds a source profile. External artifacts are required only for uncompressed SDMX XML;
     /// CSV has none and ZIP must contain its complete closed artifact set.
     pub fn try_new(
@@ -113,6 +125,7 @@ impl BoardDatasetProfile {
         parse_limits: BoardParseLimits,
         structural_artifacts: Vec<BoardStructuralArtifact>,
     ) -> Result<Self, BoardSourceError> {
+        validate_profile_parse_limits(&contract, parse_limits)?;
         validate_structural_artifacts(&contract, parse_limits, &structural_artifacts)?;
         let dataset = SourceIdentifier::try_from(format!(
             "federal-reserve-board:{}:{}:{}",
@@ -159,7 +172,7 @@ impl BoardDatasetProfile {
     }
 
     pub(crate) fn parse(&self, bytes: &[u8]) -> Result<ParsedBoardDataset, BoardAdapterError> {
-        match self.contract.format() {
+        let parsed = match self.contract.format() {
             BoardFileFormat::DdpCsvSeriesColumnV1 => {
                 parse_csv(&self.contract, bytes, self.parse_limits)
             }
@@ -174,7 +187,14 @@ impl BoardDatasetProfile {
                     .collect::<Vec<_>>();
                 parse_sdmx_xml(&self.contract, bytes, &artifacts, self.parse_limits)
             }
+        }?;
+        if self
+            .contract
+            .is_h15_treasury_constant_maturities_rolling_dashboard()
+        {
+            validate_rolling_dashboard_shape(&parsed)?;
         }
+        Ok(parsed)
     }
 }
 
@@ -327,6 +347,7 @@ impl BoardSource {
         metadata: SourceMetadata,
         profile: BoardDatasetProfile,
     ) -> Result<Self, BoardSourceError> {
+        validate_one_batch_source_profile(&profile)?;
         Self::validate_metadata(&metadata, &profile)?;
         let client = BoardHttpClient::try_new(&metadata)?;
         Ok(Self {
@@ -355,6 +376,7 @@ impl BoardSource {
         profile: BoardDatasetProfile,
         transport: Arc<dyn BoardTransport>,
     ) -> Result<Self, BoardSourceError> {
+        validate_one_batch_source_profile(&profile)?;
         Self::validate_metadata(&metadata, &profile)?;
         let client = BoardHttpClient::try_new_with_transport(&metadata, transport)?;
         Ok(Self {
@@ -631,7 +653,7 @@ impl BoardSource {
 impl BoardScriptedTransportFactory {
     /// Constructs the real production source with only its exact HTTP execution scripted.
     ///
-    /// The profile must be the frozen full-history H.15 contract and its metadata must still admit
+    /// The profile must be the frozen rolling H.15 dashboard contract and its metadata must admit
     /// the exact official URL. Discovery, cached extraction, raw-capture material, normalization,
     /// health, and revision behavior remain [`BoardSource`] production behavior.
     pub fn production_source(
@@ -639,8 +661,10 @@ impl BoardScriptedTransportFactory {
         metadata: SourceMetadata,
         profile: BoardDatasetProfile,
     ) -> Result<BoardSource, BoardSourceError> {
-        let expected = BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
-            .map_err(BoardSourceError::Protocol)?;
+        validate_one_batch_source_profile(&profile)?;
+        let expected =
+            BoardDatasetContract::h15_treasury_constant_maturities_rolling_dashboard_csv()
+                .map_err(BoardSourceError::Protocol)?;
         if profile.contract().contract_digest() != expected.contract_digest()
             || profile.contract().url() != expected.url()
         {
@@ -742,6 +766,9 @@ pub enum BoardSourceError {
     /// Dataset profile or structural-artifact binding is invalid.
     #[error("Federal Reserve Board dataset profile is invalid")]
     InvalidProfile,
+    /// The selected full-history file cannot fit the source's indivisible one-batch handoff.
+    #[error("Federal Reserve Board full history requires partitioned extraction")]
+    PartitionedExtractionRequired,
     /// An HTTP validator is malformed, unbounded, or not bound to prior exact bytes.
     #[error("Federal Reserve Board conditional validator is invalid")]
     InvalidValidator,
@@ -1086,6 +1113,47 @@ fn validate_structural_artifacts(
     Ok(())
 }
 
+fn validate_profile_parse_limits(
+    contract: &BoardDatasetContract,
+    limits: BoardParseLimits,
+) -> Result<(), BoardSourceError> {
+    if contract.is_h15_treasury_constant_maturities_rolling_dashboard()
+        && limits != BoardParseLimits::h15_treasury_constant_maturities_rolling_dashboard()
+    {
+        Err(BoardSourceError::InvalidProfile)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_one_batch_source_profile(
+    profile: &BoardDatasetProfile,
+) -> Result<(), BoardSourceError> {
+    if profile
+        .contract()
+        .is_h15_treasury_constant_maturities_full_history()
+    {
+        Err(BoardSourceError::PartitionedExtractionRequired)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_rolling_dashboard_shape(parsed: &ParsedBoardDataset) -> Result<(), BoardAdapterError> {
+    if parsed.series().len() != 11
+        || parsed.observation_count()
+            != BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT
+        || parsed.series().iter().any(|series| {
+            series.observations().len()
+                != BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT
+        })
+    {
+        Err(BoardAdapterError::CsvSchemaDrift)
+    } else {
+        Ok(())
+    }
+}
+
 fn apply_telemetry(health: &mut BoardSourceHealth, telemetry: BoardAttemptTelemetry) {
     health.last_status = telemetry.status;
     health.last_response_bytes = telemetry.body_bytes;
@@ -1111,6 +1179,7 @@ fn map_adapter_error(error: BoardSourceError) -> ExtractionSourceError {
         BoardSourceError::Network | BoardSourceError::BodyTooLarge => SourceError::Network.into(),
         BoardSourceError::InvalidMetadata
         | BoardSourceError::InvalidProfile
+        | BoardSourceError::PartitionedExtractionRequired
         | BoardSourceError::InvalidValidator
         | BoardSourceError::Protocol(_)
         | BoardSourceError::HealthUnavailable

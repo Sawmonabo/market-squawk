@@ -21,12 +21,26 @@ pub const BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL: &str = concat!(
     "lastObs=&layout=seriescolumn&rel=H15&series=bf17364827e38702b42a58cf8eaa3f78&",
     "type=package"
 );
+/// Live-verified rolling H.15 Treasury constant-maturity CSV used by the dashboard source.
+///
+/// This exact request returns the latest 100 dates for all eleven selected maturities. It is a
+/// distinct analytical dataset from the full-history package above: replacement generations
+/// preserve the rolling contract identity while their exact response-body digests change.
+pub const BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_URL: &str = concat!(
+    "https://www.federalreserve.gov/datadownload/Output.aspx?filetype=csv&label=include&",
+    "lastobs=100&layout=seriescolumn&rel=H15&series=bf17364827e38702b42a58cf8eaa3f78&",
+    "type=package"
+);
 /// Live-verified bounded H.15 doctor route returning at most ten recent observations per series.
 pub const BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL: &str = concat!(
     "https://www.federalreserve.gov/datadownload/Output.aspx?filetype=csv&label=include&",
     "lastobs=10&layout=seriescolumn&rel=H15&series=bf17364827e38702b42a58cf8eaa3f78&",
     "type=package"
 );
+/// Exact number of source dates admitted by the rolling dashboard contract.
+pub const BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT: usize = 100;
+/// Exact number of source observations admitted by the rolling dashboard contract.
+pub const BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT: u64 = 1_100;
 
 /// User-facing identity for one series in the selected H.15 Treasury-maturity dashboard.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -857,6 +871,18 @@ impl BoardDatasetContract {
         )
     }
 
+    /// Builds the live-verified rolling 100-date H.15 dashboard CSV contract.
+    ///
+    /// This is the bounded production contract for the current macro dashboard. The separate
+    /// full-history constructor remains available as an explicit research identity, but cannot be
+    /// acquired through the adapter's one-batch source path.
+    pub fn h15_treasury_constant_maturities_rolling_dashboard_csv()
+    -> Result<Self, BoardAdapterError> {
+        Self::h15_treasury_constant_maturities_csv(
+            BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_URL,
+        )
+    }
+
     /// Builds the bounded H.15 route/schema contract used only by provider doctor probes.
     ///
     /// Its URL and contract digest remain distinct from the full-history production dataset, so a
@@ -894,6 +920,20 @@ impl BoardDatasetContract {
             BoardFrequency::BusinessDaily,
             series,
         )
+    }
+
+    /// Returns whether this is the code-owned full-history H.15 package contract.
+    pub fn is_h15_treasury_constant_maturities_full_history(&self) -> bool {
+        self.family == BoardDatasetFamily::H15TreasuryConstantMaturities
+            && self.format == BoardFileFormat::DdpCsvSeriesColumnV1
+            && self.url() == BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL
+    }
+
+    /// Returns whether this is the code-owned rolling 100-date H.15 dashboard contract.
+    pub fn is_h15_treasury_constant_maturities_rolling_dashboard(&self) -> bool {
+        self.family == BoardDatasetFamily::H15TreasuryConstantMaturities
+            && self.format == BoardFileFormat::DdpCsvSeriesColumnV1
+            && self.url() == BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_URL
     }
 
     /// Builds an exact-label, series-in-columns DDP CSV contract for a selected Board family.

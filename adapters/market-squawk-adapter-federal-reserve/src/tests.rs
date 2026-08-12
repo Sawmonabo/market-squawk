@@ -113,16 +113,33 @@ struct BoardSourceHarness {
 fn exact_h15_publication_retains_correction_and_replacement_evidence() -> Result<(), Box<dyn Error>>
 {
     let production = BoardDatasetContract::h15_treasury_constant_maturities_production_csv()?;
+    let rolling = BoardDatasetContract::h15_treasury_constant_maturities_rolling_dashboard_csv()?;
     let doctor = BoardDatasetContract::h15_treasury_constant_maturities_doctor_probe_csv()?;
     assert_eq!(
         production.url(),
         BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL
     );
     assert_eq!(
+        rolling.url(),
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_URL
+    );
+    assert_eq!(
         doctor.url(),
         BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL
     );
+    assert!(production.is_h15_treasury_constant_maturities_full_history());
+    assert!(rolling.is_h15_treasury_constant_maturities_rolling_dashboard());
+    assert_ne!(production.contract_digest(), rolling.contract_digest());
+    assert_ne!(rolling.contract_digest(), doctor.contract_digest());
     assert_ne!(production.contract_digest(), doctor.contract_digest());
+    assert_ne!(
+        production.request().request_digest(),
+        rolling.request().request_digest()
+    );
+    assert_ne!(
+        rolling.request().request_digest(),
+        doctor.request().request_digest()
+    );
     assert_ne!(
         production.request().request_digest(),
         doctor.request().request_digest()
@@ -193,9 +210,21 @@ fn exact_h15_publication_retains_correction_and_replacement_evidence() -> Result
 
     let production_profile =
         BoardDatasetProfile::try_new(production, BoardParseLimits::default(), Vec::new())?;
+    let rolling_profile =
+        BoardDatasetProfile::h15_treasury_constant_maturities_rolling_dashboard()?;
     let doctor_profile =
         BoardDatasetProfile::try_new(doctor, BoardParseLimits::default(), Vec::new())?;
+    assert_ne!(production_profile.dataset(), rolling_profile.dataset());
+    assert_ne!(rolling_profile.dataset(), doctor_profile.dataset());
     assert_ne!(production_profile.dataset(), doctor_profile.dataset());
+    assert_ne!(
+        production_profile.analytical_dataset(),
+        rolling_profile.analytical_dataset()
+    );
+    assert_ne!(
+        rolling_profile.analytical_dataset(),
+        doctor_profile.analytical_dataset()
+    );
     assert_ne!(
         production_profile.analytical_dataset(),
         doctor_profile.analytical_dataset()
@@ -213,6 +242,60 @@ fn exact_h15_publication_retains_correction_and_replacement_evidence() -> Result
             .replace('.', ":"),
         production_profile.dataset().as_str()
     );
+    assert_eq!(
+        rolling_profile
+            .analytical_dataset()
+            .as_str()
+            .replace('.', ":"),
+        rolling_profile.dataset().as_str()
+    );
+    assert_eq!(
+        rolling_profile
+            .parse(h15_dashboard_csv(100).as_bytes())?
+            .observation_count(),
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT
+    );
+    assert!(matches!(
+        rolling_profile.parse(h15_dashboard_csv(99).as_bytes()),
+        Err(BoardAdapterError::CsvSchemaDrift)
+    ));
+    assert!(matches!(
+        BoardDatasetProfile::try_new(
+            BoardDatasetContract::h15_treasury_constant_maturities_rolling_dashboard_csv()?,
+            BoardParseLimits::default(),
+            Vec::new(),
+        ),
+        Err(BoardSourceError::InvalidProfile)
+    ));
+    assert!(matches!(
+        BoardSource::try_new(board_metadata(system_timestamp()?)?, production_profile),
+        Err(BoardSourceError::PartitionedExtractionRequired)
+    ));
+    #[cfg(feature = "scripted-transport-fixture")]
+    {
+        let doctor_response =
+            BoardScriptedCsvResponse::try_new(h15_dashboard_csv(10), Duration::from_millis(1))?;
+        let rolling_response =
+            BoardScriptedCsvResponse::try_new(h15_dashboard_csv(100), Duration::from_millis(1))?;
+        let fixture =
+            BoardScriptedTransportFactory::try_new(doctor_response.clone(), rolling_response)?;
+        assert!(matches!(
+            BoardScriptedTransportFactory::try_new(
+                doctor_response,
+                BoardScriptedCsvResponse::try_new(h15_dashboard_csv(99), Duration::from_millis(1),)?,
+            ),
+            Err(BoardScriptedTransportError::InvalidResponse)
+        ));
+        let full_history_profile = BoardDatasetProfile::try_new(
+            BoardDatasetContract::h15_treasury_constant_maturities_production_csv()?,
+            BoardParseLimits::default(),
+            Vec::new(),
+        )?;
+        assert!(matches!(
+            fixture.production_source(board_metadata(system_timestamp()?)?, full_history_profile,),
+            Err(BoardSourceError::PartitionedExtractionRequired)
+        ));
+    }
 
     let contract = test_h15_one_series_contract(H15_URL)?;
     let first = parse_csv(
@@ -661,6 +744,57 @@ fn h15_csv(first: &str, second: &str) -> String {
     format!(
         "Series Description,\"{DESCRIPTION}\"\nUnit:,Percent:_Per_Year\nMultiplier:,1\nCurrency:,NA\nUnique Identifier: ,H15/H15/RIFLGFCM01_N.B\nTime Period,RIFLGFCM01_N.B\n2026-08-07,{first}\n2026-08-10,{second}\n"
     )
+}
+
+fn h15_dashboard_csv(date_count: usize) -> String {
+    let descriptors = h15_treasury_constant_maturities_dashboard_series();
+    let mut output = String::new();
+    output.push_str("Series Description");
+    for descriptor in descriptors {
+        output.push(',');
+        output.push_str(descriptor.label());
+        output.push_str(" Treasury constant maturity");
+    }
+    output.push('\n');
+    output.push_str("Unit:");
+    for _ in descriptors {
+        output.push_str(",Percent:_Per_Year");
+    }
+    output.push('\n');
+    output.push_str("Multiplier:");
+    for _ in descriptors {
+        output.push_str(",1");
+    }
+    output.push('\n');
+    output.push_str("Currency:");
+    for _ in descriptors {
+        output.push_str(",NA");
+    }
+    output.push('\n');
+    output.push_str("Unique Identifier: ");
+    for descriptor in descriptors {
+        output.push_str(",H15/H15/");
+        output.push_str(descriptor.provider_series_name());
+    }
+    output.push('\n');
+    output.push_str("Time Period");
+    for descriptor in descriptors {
+        output.push(',');
+        output.push_str(descriptor.provider_series_name());
+    }
+    output.push('\n');
+    let start = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).expect("valid fixture start date");
+    for offset in 0..date_count {
+        let date = start
+            .checked_add_days(chrono::Days::new(offset as u64))
+            .expect("bounded fixture date");
+        output.push_str(&date.to_string());
+        for index in 0..descriptors.len() {
+            output.push_str(&format!(",4.{index:03}"));
+        }
+        output.push('\n');
+    }
+    output
 }
 
 fn timing(

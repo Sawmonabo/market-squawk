@@ -31,8 +31,10 @@ use crate::source::{BoardDatasetProfile, BoardSourceError};
 #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
 use crate::{
     BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL,
-    BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL, BoardDatasetContract, BoardParseLimits,
-    parse_csv,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_URL, BoardDatasetContract,
+    BoardParseLimits, parse_csv,
 };
 use crate::{BoardAdapterError, BoardFileFormat, ParsedBoardDataset};
 
@@ -418,7 +420,7 @@ impl BoardScriptedDoctorExecutor {
     }
 }
 
-/// Debug-only closed bundle of disjoint one-shot doctor and production responses.
+/// Debug-only closed bundle of disjoint one-shot doctor and rolling-production responses.
 ///
 /// This fixture never changes an endpoint or network policy. The production arm constructs the
 /// real [`crate::BoardSource`], so discovery caching, rich extraction, exact raw capture material,
@@ -432,7 +434,7 @@ pub struct BoardScriptedTransportFactory {
 
 #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
 impl BoardScriptedTransportFactory {
-    /// Validates and retains one exact doctor and one exact production H.15 CSV response.
+    /// Validates and retains one exact doctor and one exact rolling-production H.15 CSV response.
     pub fn try_new(
         doctor: BoardScriptedCsvResponse,
         production: BoardScriptedCsvResponse,
@@ -478,23 +480,33 @@ fn validate_scripted_h15_response(
     let contract = if doctor {
         BoardDatasetContract::h15_treasury_constant_maturities_doctor_probe_csv()
     } else {
-        BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
+        BoardDatasetContract::h15_treasury_constant_maturities_rolling_dashboard_csv()
     }
     .map_err(|_| BoardScriptedTransportError::InvalidResponse)?;
-    let parsed = parse_csv(&contract, response.body(), BoardParseLimits::default())
+    let limits = if doctor {
+        BoardParseLimits::default()
+    } else {
+        BoardParseLimits::h15_treasury_constant_maturities_rolling_dashboard()
+    };
+    let parsed = parse_csv(&contract, response.body(), limits)
         .map_err(|_| BoardScriptedTransportError::InvalidResponse)?;
-    let exact_series = parsed.series().len() == 11
+    let expected_dates = if doctor {
+        10
+    } else {
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT
+    };
+    let expected_observations = if doctor {
+        110
+    } else {
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT
+    };
+    if parsed.series().len() == 11
+        && parsed.observation_count() == expected_observations
         && parsed
             .series()
             .iter()
-            .all(|series| !series.observations().is_empty());
-    let exact_doctor = !doctor
-        || (parsed.observation_count() == 110
-            && parsed
-                .series()
-                .iter()
-                .all(|series| series.observations().len() == 10));
-    if exact_series && exact_doctor {
+            .all(|series| series.observations().len() == expected_dates)
+    {
         Ok(())
     } else {
         Err(BoardScriptedTransportError::InvalidResponse)
@@ -868,7 +880,7 @@ impl BoardTransport for BoardScriptedProductionTransport {
                 .queue
                 .execute(
                     &scripted,
-                    BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL,
+                    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_URL,
                     self.maximum_response_bytes,
                     self.maximum_deadline_duration,
                     &cancellation,
@@ -1407,6 +1419,7 @@ fn map_source_error(error: BoardSourceError) -> ExtractionSourceError {
         BoardSourceError::Network | BoardSourceError::BodyTooLarge => SourceError::Network.into(),
         BoardSourceError::InvalidMetadata
         | BoardSourceError::InvalidProfile
+        | BoardSourceError::PartitionedExtractionRequired
         | BoardSourceError::InvalidValidator
         | BoardSourceError::Protocol(_)
         | BoardSourceError::HealthUnavailable
