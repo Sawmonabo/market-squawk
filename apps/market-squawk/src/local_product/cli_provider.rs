@@ -18,7 +18,7 @@ use cap_fs_ext::DirExt as _;
 use cap_std::fs::Dir;
 use market_squawk_adapter_bls::{BlsAccessTier, BlsRequestPlan, BlsSeriesMetadata};
 use market_squawk_adapter_federal_reserve::{
-    BoardDatasetContract, BoardDatasetProfile, BoardParseLimits,
+    BOARD_DDP_SOURCE_ID, BoardDatasetContract, BoardDatasetProfile, BoardParseLimits,
 };
 use market_squawk_adapter_files::{ExtractionLimits, ExtractionLimitsInput};
 use market_squawk_adapter_fred::{
@@ -3897,6 +3897,38 @@ fn metadata(
     budget: ProviderBudgetPolicy,
 ) -> Result<SourceMetadata, CliProviderActivationError> {
     let source_id = source_id(source_tag, lease.surface_id())?;
+    metadata_with_source_id(
+        lease,
+        evidence,
+        source_id,
+        provider,
+        source_class,
+        coverage_domain,
+        authorization_mode,
+        historical,
+        effective,
+        network,
+        budget,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every parameter is an independent source-metadata authority dimension"
+)]
+fn metadata_with_source_id(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    source_id: SourceId,
+    provider: &str,
+    source_class: SourceClass,
+    coverage_domain: CoverageDomain,
+    authorization_mode: AuthorizationMode,
+    historical: HistoricalCapability,
+    effective: EffectiveInterval,
+    network: EndpointPolicy,
+    budget: ProviderBudgetPolicy,
+) -> Result<SourceMetadata, CliProviderActivationError> {
     let digest = lower_hex(&evidence.bytes());
     let short = digest
         .get(..24)
@@ -4320,10 +4352,12 @@ fn federal_reserve_board_metadata(
         request_bounds(MAX_PROVIDER_CAPTURE_PAGE_BYTES)?,
     )
     .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
-    metadata(
+    let source_id = SourceId::try_from(BOARD_DDP_SOURCE_ID)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    metadata_with_source_id(
         lease,
         evidence,
-        "federal-reserve-board",
+        source_id,
         "federal-reserve-board",
         SourceClass::OfficialAgency,
         CoverageDomain::Macroeconomic,

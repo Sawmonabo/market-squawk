@@ -72,6 +72,8 @@ use self::provider_activation_state::{
     DurableProviderActivationState, ProviderMetadataBackupAuthority,
 };
 use self::source_lifecycle::ProductionSourceLifecycleAuthority;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use crate::BoardInstalledFixtureBundle;
 use crate::application::analysis::{
     AnalysisCatalog, AnalysisDomainService, GovernedBacktestAuthority,
     GovernedBacktestInputAuthorityLimits, GovernedBacktestInputRegistrar,
@@ -249,6 +251,23 @@ impl LocalProduct {
             selected_workspace.workspace_paths().clone(),
             std::iter::empty::<PrepublishedResearchSourceRegistration>(),
             SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace),
+            #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+            None,
+        )
+    }
+
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    pub(crate) fn try_new_at_selected_workspace_with_board_fixture(
+        config: AppConfig,
+        selected_workspace: &InstalledServiceSelectedWorkspaceGuard,
+        board_fixture: BoardInstalledFixtureBundle,
+    ) -> Result<Self, LocalProductError> {
+        Self::try_new_with_paths_and_prepublished_research_sources(
+            config,
+            selected_workspace.workspace_paths().clone(),
+            std::iter::empty::<PrepublishedResearchSourceRegistration>(),
+            SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace),
+            Some(board_fixture),
         )
     }
 
@@ -274,6 +293,8 @@ impl LocalProduct {
             paths,
             registrations,
             SourceAuthorityStartupPolicy::RejectUncleanPredecessor,
+            #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+            None,
         )
     }
 
@@ -282,6 +303,9 @@ impl LocalProduct {
         paths: LocalPaths,
         registrations: I,
         source_authority_startup_policy: SourceAuthorityStartupPolicy<'_>,
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))] board_fixture: Option<
+            BoardInstalledFixtureBundle,
+        >,
     ) -> Result<Self, LocalProductError>
     where
         I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
@@ -305,6 +329,12 @@ impl LocalProduct {
         let artifacts =
             controlled_artifact_repository(paths.artifacts()?.clone(), maximum_artifact_bytes)?;
         let artifact_repository: Arc<dyn ArtifactRepository> = artifacts.clone();
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        let provider_rate = match &board_fixture {
+            Some(fixture) => fixture.bind_provider_rate(paths.control_root()?.root())?,
+            None => open_provider_rate_authority(paths.control_root()?.root())?,
+        };
+        #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
         let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
 
         // The installation-global guard proves that no predecessor service can still own this
@@ -369,6 +399,23 @@ impl LocalProduct {
         let provider_activation_state =
             DurableProviderActivationState::new(paths.control_root()?.root().to_path_buf());
         let runtime_admissions = provider_activation_state.startup_runtime_admissions()?;
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        let onboarding = Arc::new(match &board_fixture {
+            Some(fixture) => ProviderOnboardingService::try_new_with_provider_rate_runtime_admissions_and_board_fixture(
+                research.onboarding_catalog(),
+                secrets,
+                provider_rate.clone(),
+                runtime_admissions,
+                fixture.doctor_executor(),
+            )?,
+            None => ProviderOnboardingService::try_new_with_provider_rate_and_runtime_admissions(
+                research.onboarding_catalog(),
+                secrets,
+                provider_rate.clone(),
+                runtime_admissions,
+            )?,
+        });
+        #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
         let onboarding = Arc::new(
             ProviderOnboardingService::try_new_with_provider_rate_and_runtime_admissions(
                 research.onboarding_catalog(),
@@ -377,6 +424,25 @@ impl LocalProduct {
                 runtime_admissions,
             )?,
         );
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        let provider_activation = Arc::new(match &board_fixture {
+            Some(fixture) => ProviderAdapterActivation::new_with_board_fixture(
+                Arc::clone(&onboarding),
+                Arc::clone(&research_ingest),
+                provider_runtime_mutation,
+                config.clone(),
+                provider_rate.clone(),
+                fixture.production_source_factory(),
+            ),
+            None => ProviderAdapterActivation::new(
+                Arc::clone(&onboarding),
+                Arc::clone(&research_ingest),
+                provider_runtime_mutation,
+                config.clone(),
+                provider_rate.clone(),
+            ),
+        });
+        #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
         let provider_activation = Arc::new(ProviderAdapterActivation::new(
             Arc::clone(&onboarding),
             Arc::clone(&research_ingest),

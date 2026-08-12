@@ -15,9 +15,14 @@ use market_squawk_adapter_bea::BeaUserId;
 use market_squawk_adapter_census::CensusApiKey;
 use market_squawk_adapter_coinbase::CoinbaseDirectHmacSigner;
 use market_squawk_adapter_eia::EiaApiKey;
+#[cfg(test)]
+use market_squawk_adapter_federal_reserve::BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL;
 use market_squawk_adapter_federal_reserve::{
-    BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL, BoardDatasetContract,
-    BoardParseLimits, parse_csv as parse_board_csv,
+    BoardDatasetContract, BoardParseLimits, parse_csv as parse_board_csv,
+};
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use market_squawk_adapter_federal_reserve::{
+    BoardFileFormat, BoardScriptedDoctorExecutor, BoardScriptedHttpRequest,
 };
 use market_squawk_adapter_fred::{
     FredParseLimits, FredSeriesMetadata, FredTermsDocumentRole, MAX_FRED_SERVICE_PERMISSION_BYTES,
@@ -159,6 +164,8 @@ pub struct ProviderOnboardingService {
     secrets: Arc<dyn SecretStore>,
     client: reqwest::Client,
     probe_rates: ProbeRateAuthority,
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    board_doctor_executor: Option<BoardScriptedDoctorExecutor>,
     activation: AsyncMutex<()>,
     secret_operations: Arc<Semaphore>,
 }
@@ -275,6 +282,8 @@ impl ProviderOnboardingService {
             secrets,
             provider_rate,
             ProviderRuntimeStartupAdmissions::default(),
+            #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+            None,
         )
     }
 
@@ -287,7 +296,34 @@ impl ProviderOnboardingService {
     where
         S: SecretStore + 'static,
     {
-        Self::try_new_inner(catalog, secrets, provider_rate, runtime_admissions)
+        Self::try_new_inner(
+            catalog,
+            secrets,
+            provider_rate,
+            runtime_admissions,
+            #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+            None,
+        )
+    }
+
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    pub(crate) fn try_new_with_provider_rate_runtime_admissions_and_board_fixture<S>(
+        catalog: OnboardingCatalogCapability,
+        secrets: Arc<S>,
+        provider_rate: ProviderRateAuthority,
+        runtime_admissions: ProviderRuntimeStartupAdmissions,
+        board_doctor_executor: BoardScriptedDoctorExecutor,
+    ) -> Result<Self, ProviderOnboardingError>
+    where
+        S: SecretStore + 'static,
+    {
+        Self::try_new_inner(
+            catalog,
+            secrets,
+            provider_rate,
+            runtime_admissions,
+            Some(board_doctor_executor),
+        )
     }
 
     fn try_new_inner<S>(
@@ -295,6 +331,8 @@ impl ProviderOnboardingService {
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
         runtime_admissions: ProviderRuntimeStartupAdmissions,
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        board_doctor_executor: Option<BoardScriptedDoctorExecutor>,
     ) -> Result<Self, ProviderOnboardingError>
     where
         S: SecretStore + 'static,
@@ -326,6 +364,8 @@ impl ProviderOnboardingService {
             secrets,
             client,
             probe_rates,
+            #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+            board_doctor_executor,
             activation: AsyncMutex::new(()),
             secret_operations: Arc::new(Semaphore::new(MAXIMUM_CONCURRENT_SECRET_OPERATIONS)),
         };
@@ -1372,6 +1412,20 @@ impl ProviderOnboardingService {
                 cancellation.clone(),
             )
             .await?;
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        if profile.id() == "federal-reserve-board.data-download-program"
+            && let Some(executor) = &self.board_doctor_executor
+        {
+            let body = self
+                .collect_scripted_board_probe_response(executor, endpoint, policy, cancellation)
+                .await?;
+            validate_probe_semantics(profile.id(), &body)?;
+            rate_permit.record_success()?;
+            return Ok(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(&body).into(),
+            ));
+        }
         let request = match probe.transport() {
             ProbeTransport::HttpGet => self.client.get(endpoint),
             ProbeTransport::HttpPostJson => self
@@ -1399,6 +1453,50 @@ impl ProviderOnboardingService {
             DigestAlgorithm::Sha256,
             Sha256::digest(&body).into(),
         ))
+    }
+
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    async fn collect_scripted_board_probe_response(
+        &self,
+        executor: &BoardScriptedDoctorExecutor,
+        endpoint: &str,
+        policy: &market_squawk_sources::EndpointPolicy,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<u8>, ProviderOnboardingError> {
+        let bounds = policy.request_bounds();
+        let maximum_response_bytes = usize::try_from(bounds.max_response_bytes())
+            .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        let timeout_nanos = i64::try_from(bounds.total_timeout_nanos())
+            .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        let started_at = system_timestamp()?;
+        let deadline = started_at
+            .checked_add_nanos(timeout_nanos)
+            .map_err(|_| ProviderOnboardingError::Clock)?;
+        let request = BoardScriptedHttpRequest::try_new(
+            endpoint,
+            BoardFileFormat::DdpCsvSeriesColumnV1.accept(),
+            "identity",
+            maximum_response_bytes,
+            started_at,
+            deadline,
+        )
+        .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        let response = executor
+            .execute(request, cancellation)
+            .await
+            .map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
+        if response.status() != 200
+            || response.content_type() != "text/csv"
+            || response.content_encoding() != "identity"
+            || response.body_bytes() != response.body().len()
+        {
+            return Err(ProviderOnboardingError::ProbeUnavailable);
+        }
+        policy.validate_response_size(
+            u64::try_from(response.body_bytes())
+                .map_err(|_| ProviderOnboardingError::ProbeUnavailable)?,
+        )?;
+        Ok(response.into_body().to_vec())
     }
 
     async fn run_credential_probe(

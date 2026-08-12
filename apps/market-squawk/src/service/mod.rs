@@ -80,6 +80,8 @@ pub use lifecycle::InstalledServiceRunOutcome;
 pub use logging::{InstalledServiceLogging, InstalledServiceLoggingError, TerminalLogFormat};
 use operations_bootstrap::{PreparedInstalledOperations, ReadyInstalledOperations};
 
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use crate::BoardInstalledFixtureBundle;
 use crate::{AppConfig, LocalProduct, LocalProductError, jobs::InstalledJobAuthority};
 
 use self::portfolio_import::InstalledPortfolioImportOperations;
@@ -392,6 +394,32 @@ impl InstalledService {
         .await
     }
 
+    /// Composes the installed service with one closed debug-only Board transport/rate fixture.
+    ///
+    /// This constructor is absent from release builds and leaves every production constructor
+    /// unchanged. It substitutes only exact Board HTTP execution while retaining ordinary durable
+    /// installed composition and the caller-owned native secret authority.
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    pub async fn start_with_secret_store_and_board_fixture(
+        config: AppConfig,
+        secret_store: Arc<dyn SecretStore>,
+        board_fixture: BoardInstalledFixtureBundle,
+    ) -> Result<Self, InstalledServiceError> {
+        let workspace_paths = LocalPaths::prepare(config.data_dir())?;
+        let installation_paths =
+            LocalPaths::prepare(deterministic_installation_root(&workspace_paths)?)?;
+        let logs = logging::open_log_store(&installation_paths)?;
+        Self::start_prepared_with_board_fixture(
+            config,
+            installation_paths,
+            workspace_paths,
+            secret_store,
+            logs,
+            board_fixture,
+        )
+        .await
+    }
+
     /// Composes a verification-only service whose exact credential generations are retired and
     /// proven absent on every graceful shutdown or startup unwind.
     ///
@@ -421,6 +449,51 @@ impl InstalledService {
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
         ephemeral_verification_credentials: bool,
+    ) -> Result<Self, InstalledServiceError> {
+        Self::start_prepared_inner(
+            config,
+            installation_paths,
+            legacy_workspace_paths,
+            secret_store,
+            logs,
+            ephemeral_verification_credentials,
+            #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    async fn start_prepared_with_board_fixture(
+        config: AppConfig,
+        installation_paths: LocalPaths,
+        legacy_workspace_paths: LocalPaths,
+        secret_store: Arc<dyn SecretStore>,
+        logs: Arc<crate::application::logs::StructuredLogStore>,
+        board_fixture: BoardInstalledFixtureBundle,
+    ) -> Result<Self, InstalledServiceError> {
+        Self::start_prepared_inner(
+            config,
+            installation_paths,
+            legacy_workspace_paths,
+            secret_store,
+            logs,
+            false,
+            Some(board_fixture),
+        )
+        .await
+    }
+
+    async fn start_prepared_inner(
+        config: AppConfig,
+        installation_paths: LocalPaths,
+        legacy_workspace_paths: LocalPaths,
+        secret_store: Arc<dyn SecretStore>,
+        logs: Arc<crate::application::logs::StructuredLogStore>,
+        ephemeral_verification_credentials: bool,
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))] board_fixture: Option<
+            BoardInstalledFixtureBundle,
+        >,
     ) -> Result<Self, InstalledServiceError> {
         let instance_guard = runtime::acquire_instance(&installation_paths)?;
         let installation_id = runtime::installation_id(&installation_paths)?
@@ -483,6 +556,19 @@ impl InstalledService {
                 .map_err(map_workspace_selector_startup)?;
             let workspace_paths = selected_workspace_guard.workspace_paths().clone();
             let config = config.bind_selected_workspace(workspace_paths.root().to_path_buf());
+            #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+            let product = match board_fixture {
+                Some(fixture) => LocalProduct::try_new_at_selected_workspace_with_board_fixture(
+                    config.clone(),
+                    &selected_workspace_guard,
+                    fixture,
+                )?,
+                None => LocalProduct::try_new_at_selected_workspace(
+                    config.clone(),
+                    &selected_workspace_guard,
+                )?,
+            };
+            #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
             let product = LocalProduct::try_new_at_selected_workspace(
                 config.clone(),
                 &selected_workspace_guard,

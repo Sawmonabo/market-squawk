@@ -19,6 +19,8 @@ use std::{
 
 use bytes::Bytes;
 use market_squawk_adapter_bls::{BlsAuthorization, BlsRegistrationKey, BlsSource, BlsSourceConfig};
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use market_squawk_adapter_federal_reserve::BoardScriptedTransportFactory;
 use market_squawk_adapter_federal_reserve::BoardSource;
 use market_squawk_adapter_files::FileExtractionSource;
 use market_squawk_adapter_fred::{FredApiKey, FredOperation, FredRightsPolicy, FredSource};
@@ -125,6 +127,8 @@ pub struct ProviderAdapterActivation {
     research_mutation: ResearchProviderRuntimeMutationAuthority,
     app_config: AppConfig,
     provider_rate: ProviderRateAuthority,
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    board_source_factory: Option<BoardScriptedTransportFactory>,
 }
 
 impl ProviderAdapterActivation {
@@ -143,6 +147,27 @@ impl ProviderAdapterActivation {
             research_mutation,
             app_config,
             provider_rate,
+            #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+            board_source_factory: None,
+        }
+    }
+
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    pub(crate) fn new_with_board_fixture(
+        onboarding: Arc<ProviderOnboardingService>,
+        research: Arc<ProductionResearchIngestCoordinator>,
+        research_mutation: ResearchProviderRuntimeMutationAuthority,
+        app_config: AppConfig,
+        provider_rate: ProviderRateAuthority,
+        board_source_factory: BoardScriptedTransportFactory,
+    ) -> Self {
+        Self {
+            onboarding,
+            research,
+            research_mutation,
+            app_config,
+            provider_rate,
+            board_source_factory: Some(board_source_factory),
         }
     }
 
@@ -995,6 +1020,12 @@ impl ProviderAdapterActivation {
     ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
         require_surface(&lease, FEDERAL_RESERVE_BOARD_SURFACE)?;
         let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        let source = match &self.board_source_factory {
+            Some(factory) => factory.production_source(spec.metadata, spec.profile)?,
+            None => BoardSource::try_new(spec.metadata, spec.profile)?,
+        };
+        #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
         let source = BoardSource::try_new(spec.metadata, spec.profile)?;
         self.register(lease, source, rights)
     }

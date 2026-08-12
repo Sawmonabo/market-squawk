@@ -9,6 +9,8 @@ pub mod application;
 mod artifact_repository;
 pub mod backtest_service;
 pub mod backtest_strategy;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+mod board_installed_fixture;
 pub mod bot;
 pub mod cli;
 pub mod diagnostic_engine;
@@ -45,6 +47,8 @@ pub use backtest_service::{
     BacktestExperimentPlan, PinnedBacktestInput, ProductionBacktestService,
     ProductionBacktestServiceError,
 };
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+pub use board_installed_fixture::BoardInstalledFixtureBundle;
 pub use diagnostic_engine::{
     DiagnosticEngine, DiagnosticEngineSnapshot, DiagnosticProductSnapshot, SharedDiagnosticEngine,
 };

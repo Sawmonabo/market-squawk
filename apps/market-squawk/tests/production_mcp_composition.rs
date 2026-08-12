@@ -11,6 +11,8 @@ use std::{
 
 use anyhow::Context as _;
 use futures_util::FutureExt as _;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use market_squawk::BoardInstalledFixtureBundle;
 use market_squawk::{
     application::application_capabilities,
     service::{
@@ -18,6 +20,13 @@ use market_squawk::{
         InstalledServiceRunOutcome,
     },
 };
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use market_squawk_adapter_federal_reserve::{
+    BoardDatasetContract, BoardScriptedCsvResponse, BoardScriptedTransportCounters,
+    BoardScriptedTransportFactory,
+};
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use market_squawk_domain::Timestamp;
 use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay};
 use market_squawk_platform::{
     AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore, SecretStore, SecretValue,
@@ -41,6 +50,12 @@ const CRASH_RECOVERY_SOURCE_PROFILE: &str = "kraken.spot-public-market-data";
 const INSTALLED_MCP_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 const OWNER_RESEARCH_DATASET: &str = "owner_price_history";
 const OWNER_RESEARCH_CSV: &[u8] = b"row_id,Close Price\nrow-1,12.34\nrow-2,13.05\n";
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+const BOARD_SURFACE: &str = "federal-reserve-board.data-download-program";
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+const BOARD_PROVIDER_DATASET: &str = "federal-reserve-board:h15:h15-treasury-constant-maturities:fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e";
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+const BOARD_ANALYTICAL_DATASET: &str = "federal-reserve-board.h15.h15-treasury-constant-maturities.fe15f60963fd6e7dcb84adee16dbdd45ce6df89220743c7fd32197af71cd085e";
 
 #[test]
 fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() -> TestResult {
@@ -94,12 +109,36 @@ async fn run_installed_service_authority_scenario() -> TestResult {
         temporary.path().join(".market-squawk-installed-service"),
     )
     .context("construct initial installed-service connector")?;
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    let board_fixture = installed_board_fixture().context("construct installed Board fixture")?;
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    let service = InstalledService::start_with_secret_store_and_board_fixture(
+        config.clone(),
+        Arc::clone(&secrets),
+        board_fixture.clone(),
+    )
+    .await
+    .context("start initial installed service with Board fixture")?;
+    #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
     let service = InstalledService::start_with_secret_store(config.clone(), Arc::clone(&secrets))
         .await
         .context("start initial installed service")?;
     let shutdown = CancellationToken::new();
     let service_task = tokio::spawn(service.run(shutdown.clone()));
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    let mut board_evidence = None;
     let initial_phase = AssertUnwindSafe(Box::pin(async {
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        assert!(matches!(
+            InstalledService::start_with_secret_store_and_board_fixture(
+                config.clone(),
+                Arc::clone(&secrets),
+                board_fixture.clone(),
+            )
+            .await,
+            Err(InstalledServiceError::AlreadyRunning)
+        ));
+        #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
         assert!(matches!(
             InstalledService::start_with_secret_store(config.clone(), Arc::clone(&secrets)).await,
             Err(InstalledServiceError::AlreadyRunning)
@@ -167,6 +206,15 @@ async fn run_installed_service_authority_scenario() -> TestResult {
         assert_eq!(jobs.result()["ok"], true);
         assert_eq!(jobs.result()["value"]["data"]["jobs"], json!([]));
 
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        {
+            board_evidence = Some(
+                exercise_installed_board_vertical(&desktop, temporary.path(), &board_fixture)
+                    .await
+                    .context("exercise installed Federal Reserve Board vertical")?,
+            );
+        }
+
         import_owner_research_file(&desktop)
             .await
             .context("import and query one guided owner research file")?;
@@ -231,7 +279,24 @@ async fn run_installed_service_authority_scenario() -> TestResult {
         InstalledServiceRunOutcome::Stopped
     );
     assert!(connector.connect(NamedClient::Cli, None).is_err());
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    board_fixture
+        .synchronize_provider_clock_for_restart()
+        .context("synchronize the retained Board provider clock after clean service shutdown")?;
 
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    let board_evidence = board_evidence.context("installed Board evidence was not retained")?;
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    let board_counters_before_restart = board_fixture.transport_counters();
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    let restarted = InstalledService::start_with_secret_store_and_board_fixture(
+        config.clone(),
+        Arc::clone(&secrets),
+        board_fixture.clone(),
+    )
+    .await
+    .context("restart installed service with durable Board composition")?;
+    #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
     let restarted = InstalledService::start_with_secret_store(config.clone(), Arc::clone(&secrets))
         .await
         .context("restart installed service with durable credentials")?;
@@ -244,6 +309,16 @@ async fn run_installed_service_authority_scenario() -> TestResult {
         assert_owner_research_file_available(&restarted_desktop)
             .await
             .context("query guided owner research file after service restart")?;
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        assert_installed_board_restored(
+            &restarted_desktop,
+            temporary.path(),
+            &board_fixture,
+            board_counters_before_restart,
+            &board_evidence,
+        )
+        .await
+        .context("verify durable Federal Reserve Board state after restart")?;
         exercise_installed_relay(
             NamedClient::ClaudeCode,
             connector
@@ -343,6 +418,722 @@ async fn run_installed_service_authority_scenario() -> TestResult {
     restarted_service
         .stop()
         .context("stop restarted installed-service subprocess")?;
+    Ok(())
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InstalledBoardFileEvidence {
+    relative_path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+#[derive(Debug)]
+struct InstalledBoardEvidence {
+    manifest: Value,
+    history_artifact: Value,
+    dashboard_stable: Value,
+    msj: Vec<InstalledBoardFileEvidence>,
+    parquet: Vec<InstalledBoardFileEvidence>,
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn installed_board_fixture() -> TestResult<BoardInstalledFixtureBundle> {
+    let doctor_dates = [
+        "2026-07-27",
+        "2026-07-28",
+        "2026-07-29",
+        "2026-07-30",
+        "2026-07-31",
+        "2026-08-03",
+        "2026-08-04",
+        "2026-08-05",
+        "2026-08-06",
+        "2026-08-07",
+    ];
+    let production_dates = ["2026-08-07", "2026-08-10"];
+    let doctor = BoardScriptedCsvResponse::try_new(
+        installed_board_csv(&doctor_dates, false)?,
+        Duration::from_millis(1),
+    )
+    .context("construct exact 11-series by 10-row Board doctor response")?;
+    let production = BoardScriptedCsvResponse::try_new(
+        installed_board_csv(&production_dates, true)?,
+        Duration::from_millis(1),
+    )
+    .context("construct exact full-history Board production response")?;
+    let transport = BoardScriptedTransportFactory::try_new(doctor, production)
+        .context("validate separate Board doctor and production responses")?;
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("observe initial Board provider-rate wall clock")?;
+    let unix_nanos = i64::try_from(elapsed.as_nanos())
+        .context("convert initial Board provider-rate wall clock")?;
+    let initial_wall_clock = unix_nanos
+        .checked_sub(60_000_000_000)
+        .context("place the Board provider-rate fixture exactly one minute before real time")?;
+    Ok(BoardInstalledFixtureBundle::new(
+        transport,
+        Timestamp::from_unix_nanos(initial_wall_clock),
+    ))
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn installed_board_csv(dates: &[&str], latest_twenty_year_missing: bool) -> TestResult<String> {
+    let contract = BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
+        .context("construct production Board H.15 contract")?;
+    let series = contract
+        .series_scope()
+        .exact_series()
+        .context("Board H.15 contract did not retain its exact series")?;
+    assert_eq!(series.len(), 11);
+
+    let mut rows = Vec::new();
+    rows.push(
+        std::iter::once("Series Description".to_owned())
+            .chain(series.iter().map(|item| item.series_name().to_owned()))
+            .collect::<Vec<_>>(),
+    );
+    rows.push(
+        std::iter::once("Unit:".to_owned())
+            .chain(series.iter().map(|item| item.unit().to_owned()))
+            .collect::<Vec<_>>(),
+    );
+    rows.push(
+        std::iter::once("Multiplier:".to_owned())
+            .chain(series.iter().map(|item| item.multiplier().to_string()))
+            .collect::<Vec<_>>(),
+    );
+    rows.push(
+        std::iter::once("Currency:".to_owned())
+            .chain(series.iter().map(|item| item.currency().to_owned()))
+            .collect::<Vec<_>>(),
+    );
+    rows.push(
+        std::iter::once("Unique Identifier: ".to_owned())
+            .chain(series.iter().map(|item| item.unique_id().to_owned()))
+            .collect::<Vec<_>>(),
+    );
+    rows.push(
+        std::iter::once("Time Period".to_owned())
+            .chain(series.iter().map(|item| item.series_name().to_owned()))
+            .collect::<Vec<_>>(),
+    );
+    for (date_index, date) in dates.iter().enumerate() {
+        let latest = date_index + 1 == dates.len();
+        let mut row = Vec::with_capacity(series.len() + 1);
+        row.push((*date).to_owned());
+        for series_index in 0..series.len() {
+            let value = if latest_twenty_year_missing && latest && series_index == 9 {
+                "ND".to_owned()
+            } else if latest_twenty_year_missing && !latest && series_index == 9 {
+                "4.60".to_owned()
+            } else {
+                format!("4.{:02}", (series_index + date_index) % 100)
+            };
+            row.push(value);
+        }
+        rows.push(row);
+    }
+    let mut csv = rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|field| format!("\"{}\"", field.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    csv.push('\n');
+    Ok(csv)
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+async fn exercise_installed_board_vertical(
+    client: &LoopbackApplicationClient,
+    installation_root: &Path,
+    fixture: &BoardInstalledFixtureBundle,
+) -> TestResult<InstalledBoardEvidence> {
+    let before_msj = installed_file_evidence(installation_root, "msj")?;
+    let before_parquet = installed_file_evidence(installation_root, "parquet")?;
+    let registered = invoke_installed_board(
+        client,
+        "register",
+        "Source.Register",
+        json!({
+            "provider": BOARD_SURFACE,
+            "sourceCoverage": [BOARD_SURFACE],
+            "confirm": true,
+            "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+        }),
+    )
+    .await?;
+    let profile = &registered["profile"];
+    assert_eq!(profile["id"], BOARD_SURFACE);
+    assert_eq!(profile["capability_revision"], 4);
+    assert_eq!(profile["selected_setup_mode"], "no_credential");
+    assert_eq!(profile["credential_kind"], "none");
+    assert_eq!(profile["release_state"], "available");
+
+    let setup = invoke_installed_board(
+        client,
+        "setup",
+        "Source.Setup",
+        json!({
+            "provider": BOARD_SURFACE,
+            "sourceCoverage": [BOARD_SURFACE],
+            "confirm": true,
+            "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+        }),
+    )
+    .await?;
+    let portal = setup["portal"]["url"]
+        .as_str()
+        .context("Board setup did not return its local portal")?;
+    let http = reqwest::Client::new();
+    let bootstrap_response = http
+        .get(format!("{portal}/api/v1/bootstrap"))
+        .send()
+        .await
+        .context("request Board portal bootstrap")?;
+    let cookie = bootstrap_response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .context("Board portal bootstrap did not issue a session cookie")?
+        .to_str()
+        .context("decode Board portal session cookie")?
+        .split(';')
+        .next()
+        .context("Board portal session cookie was empty")?
+        .to_owned();
+    let bootstrap: Value = bootstrap_response
+        .json()
+        .await
+        .context("decode Board portal bootstrap")?;
+    let csrf = bootstrap["csrf_token"]
+        .as_str()
+        .context("Board portal bootstrap omitted its CSRF token")?;
+    let board_profile = bootstrap["profiles"]
+        .as_array()
+        .and_then(|profiles| profiles.iter().find(|item| item["id"] == BOARD_SURFACE))
+        .context("Board portal bootstrap omitted the rev4 profile")?;
+    assert_eq!(board_profile["capability_revision"], 4);
+    assert_eq!(board_profile["selected_setup_mode"], "no_credential");
+    assert_eq!(board_profile["credential_kind"], "none");
+
+    let started_response = http
+        .post(format!("{portal}/api/v1/sessions"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .header(reqwest::header::ORIGIN, portal)
+        .header("x-csrf-token", csrf)
+        .json(&json!({"surface_id": BOARD_SURFACE}))
+        .send()
+        .await
+        .context("run Board no-key doctor")?;
+    assert_eq!(started_response.status(), reqwest::StatusCode::OK);
+    let started: Value = started_response
+        .json()
+        .await
+        .context("decode Board no-key doctor result")?;
+    let session_id = started["session_id"]
+        .as_str()
+        .context("Board doctor omitted its durable session")?;
+    assert_eq!(started["surface_id"], BOARD_SURFACE);
+    assert_eq!(started["capability_revision"], 4);
+    assert_eq!(started["credential_stored"], false);
+    assert!(started["active_generation"].is_null());
+    assert!(started["candidate_generation"].is_null());
+    assert_eq!(started["generations"], json!([]));
+    assert_eq!(started["public_configuration"], json!({}));
+    assert_installed_board_transport_counts(fixture.transport_counters(), 1, 1, 0, 0);
+
+    let activated_response = http
+        .post(format!("{portal}/api/v1/sessions/{session_id}/activate"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .header(reqwest::header::ORIGIN, portal)
+        .header("x-csrf-token", csrf)
+        .json(&json!({"kind": "federal_reserve_board_h15"}))
+        .send()
+        .await
+        .context("activate Board production source")?;
+    assert_eq!(activated_response.status(), reqwest::StatusCode::OK);
+    let activated: Value = activated_response
+        .json()
+        .await
+        .context("decode Board production activation")?;
+    assert_eq!(activated["profile"], BOARD_SURFACE);
+    assert_eq!(
+        activated["provider_dataset_identifier"],
+        BOARD_PROVIDER_DATASET
+    );
+    assert_eq!(activated["capability_revision"], 4);
+    assert!(activated["credential_generation"].is_null());
+
+    let refused = client
+        .invoke_operation(
+            RequestId::try_string("installed-board-discover-rate-refusal")
+                .context("construct refused Board discovery request ID")?,
+            "Source.Discover",
+            json!({
+                "provider": BOARD_SURFACE,
+                "dataset": BOARD_PROVIDER_DATASET,
+                "sourceCoverage": [BOARD_SURFACE],
+                "confirm": true,
+                "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+            }),
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .context("dispatch refused Board discovery")?;
+    assert_eq!(refused.result()["ok"], false, "{}", refused.result());
+    assert_installed_board_transport_counts(fixture.transport_counters(), 1, 1, 0, 0);
+
+    fixture
+        .advance_provider_clock(Duration::from_secs(60))
+        .context("advance the shared Board provider clock by exactly one minute")?;
+    let discovery_response = client
+        .invoke_operation(
+            RequestId::try_string("installed-board-discover-after-minute")
+                .context("construct admitted Board discovery request ID")?,
+            "Source.Discover",
+            json!({
+                "provider": BOARD_SURFACE,
+                "dataset": BOARD_PROVIDER_DATASET,
+                "sourceCoverage": [BOARD_SURFACE],
+                "confirm": true,
+                "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+            }),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await
+        .context("dispatch admitted Board discovery")?;
+    assert_eq!(
+        discovery_response.result()["ok"],
+        true,
+        "{}; transport={:?}",
+        discovery_response.result(),
+        fixture.transport_counters()
+    );
+    let discovery = discovery_response.result()["value"]["data"].clone();
+    assert_eq!(discovery["profile"], BOARD_SURFACE);
+    assert_eq!(discovery["receipts_survive_restart"], false);
+    let objects = discovery["objects"]
+        .as_array()
+        .context("Board discovery did not return an object array")?;
+    assert_eq!(objects.len(), 1);
+    let object = &objects[0];
+    assert_eq!(object["dataset"], BOARD_PROVIDER_DATASET);
+    assert_installed_board_transport_counts(fixture.transport_counters(), 1, 1, 1, 1);
+
+    let ingest = invoke_installed_board(
+        client,
+        "ingest",
+        "Research.IngestSource",
+        json!({
+            "provider": BOARD_SURFACE,
+            "object": object["object_id"],
+            "dataset": BOARD_PROVIDER_DATASET,
+            "discoveryReceipt": object["discovery_receipt"],
+            "sourceCoverage": [BOARD_SURFACE],
+            "confirm": true,
+            "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+        }),
+    )
+    .await?;
+    assert_eq!(ingest["manifest"]["datasetId"], BOARD_ANALYTICAL_DATASET);
+    assert_eq!(ingest["rowCount"], 22);
+    assert_eq!(ingest["objectCount"], 1);
+    assert!(ingest["totalBytes"].as_u64().is_some_and(|bytes| bytes > 0));
+    assert!(
+        ingest["lineageDigest"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64)
+    );
+    assert_installed_board_transport_counts(fixture.transport_counters(), 1, 1, 1, 1);
+
+    let manifest = invoke_installed_board(
+        client,
+        "manifest",
+        "Research.GetManifest",
+        json!({
+            "dataset": BOARD_ANALYTICAL_DATASET,
+            "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+        }),
+    )
+    .await?;
+    assert_eq!(manifest["manifest"]["datasetId"], BOARD_ANALYTICAL_DATASET);
+    assert_eq!(manifest["rowCount"], 22);
+    assert_eq!(manifest["objectCount"], 1);
+
+    let history = invoke_installed_board(
+        client,
+        "history",
+        "Research.GetHistory",
+        json!({
+            "dataset": BOARD_ANALYTICAL_DATASET,
+            "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+        }),
+    )
+    .await?;
+    assert_eq!(history["manifest"], manifest["manifest"]);
+    let history_artifact = stable_installed_board_history(&history)?;
+
+    let dashboard = installed_board_dashboard(client, "initial").await?;
+    assert_installed_board_dashboard(&dashboard)?;
+    let dashboard_stable = stable_installed_board_dashboard(&dashboard);
+
+    let msj = new_installed_files(
+        &before_msj,
+        installed_file_evidence(installation_root, "msj")?,
+    );
+    let parquet = new_installed_files(
+        &before_parquet,
+        installed_file_evidence(installation_root, "parquet")?,
+    );
+    assert_eq!(msj.len(), 1, "expected one new sealed Board MSJ1 object");
+    assert!(
+        !parquet.is_empty(),
+        "expected durable Board Parquet evidence"
+    );
+    assert_file_magic(installation_root, &msj[0], b"MSJ1", None)?;
+    for file in &parquet {
+        assert_file_magic(installation_root, file, b"PAR1", Some(b"PAR1"))?;
+    }
+
+    Ok(InstalledBoardEvidence {
+        manifest,
+        history_artifact,
+        dashboard_stable,
+        msj,
+        parquet,
+    })
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+async fn assert_installed_board_restored(
+    client: &LoopbackApplicationClient,
+    installation_root: &Path,
+    fixture: &BoardInstalledFixtureBundle,
+    counters_before_restart: BoardScriptedTransportCounters,
+    evidence: &InstalledBoardEvidence,
+) -> TestResult {
+    assert_eq!(fixture.transport_counters(), counters_before_restart);
+    let status = invoke_installed_board(
+        client,
+        "status-after-restart",
+        "Source.GetStatus",
+        json!({
+            "sourceCoverage": [BOARD_SURFACE],
+            "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+        }),
+    )
+    .await?;
+    let rows = status
+        .as_array()
+        .context("restored Board source status was not an array")?;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row["profile"]["id"], BOARD_SURFACE);
+    assert_eq!(row["profile"]["capability_revision"], 4);
+    assert_eq!(row["currentSession"]["state"], "active_scoped");
+    assert_eq!(row["currentSession"]["credential_stored"], false);
+    assert!(row["currentSession"]["active_generation"].is_null());
+    assert!(row["currentSession"]["candidate_generation"].is_null());
+    assert_eq!(row["currentSession"]["generations"], json!([]));
+    assert_eq!(row["providerDatasetIdentifier"], BOARD_PROVIDER_DATASET);
+    assert_eq!(row["lifecycleSupport"], "managed");
+    assert_eq!(row["runtime"]["state"], "not_active");
+
+    let manifest = invoke_installed_board(
+        client,
+        "manifest-after-restart",
+        "Research.GetManifest",
+        json!({
+            "dataset": BOARD_ANALYTICAL_DATASET,
+            "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+        }),
+    )
+    .await?;
+    assert_eq!(manifest, evidence.manifest);
+    let history = invoke_installed_board(
+        client,
+        "history-after-restart",
+        "Research.GetHistory",
+        json!({
+            "dataset": BOARD_ANALYTICAL_DATASET,
+            "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+        }),
+    )
+    .await?;
+    assert_eq!(
+        stable_installed_board_history(&history)?,
+        evidence.history_artifact
+    );
+    let dashboard = installed_board_dashboard(client, "after-restart").await?;
+    assert_installed_board_dashboard(&dashboard)?;
+    assert_eq!(
+        stable_installed_board_dashboard(&dashboard),
+        evidence.dashboard_stable
+    );
+    assert_installed_file_evidence(installation_root, &evidence.msj)?;
+    assert_installed_file_evidence(installation_root, &evidence.parquet)?;
+    assert_eq!(fixture.transport_counters(), counters_before_restart);
+    Ok(())
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+async fn invoke_installed_board(
+    client: &LoopbackApplicationClient,
+    request_suffix: &str,
+    operation: &str,
+    arguments: Value,
+) -> TestResult<Value> {
+    let response = client
+        .invoke_operation(
+            RequestId::try_string(format!("installed-board-{request_suffix}"))
+                .context("construct installed Board request ID")?,
+            operation,
+            arguments,
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await
+        .with_context(|| format!("invoke {operation} for installed Board proof"))?;
+    assert_eq!(
+        response.result()["ok"],
+        true,
+        "{operation} ({request_suffix}) failed: {}",
+        response.result()
+    );
+    Ok(response.result()["value"]["data"].clone())
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+async fn installed_board_dashboard(
+    client: &LoopbackApplicationClient,
+    request_suffix: &str,
+) -> TestResult<Value> {
+    invoke_installed_board(
+        client,
+        &format!("dashboard-{request_suffix}"),
+        "Macro.GetDashboard",
+        json!({
+            "provider": BOARD_SURFACE,
+            "release": "h15",
+            "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+        }),
+    )
+    .await
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn assert_installed_board_dashboard(dashboard: &Value) -> TestResult {
+    assert_eq!(
+        dashboard["schemaIdentity"],
+        "market-squawk-macro-dashboard/v1"
+    );
+    assert_eq!(dashboard["binding"]["surfaceId"], BOARD_SURFACE);
+    assert_eq!(
+        dashboard["binding"]["providerDatasetId"],
+        BOARD_PROVIDER_DATASET
+    );
+    assert_eq!(
+        dashboard["binding"]["analyticalDatasetId"],
+        BOARD_ANALYTICAL_DATASET
+    );
+    assert_eq!(dashboard["release"]["code"], "H15");
+    assert_eq!(dashboard["selection"]["returnedSeries"], 11);
+    assert_eq!(dashboard["selection"]["availableSeries"], 10);
+    assert_eq!(dashboard["selection"]["missingSeries"], 1);
+    assert_eq!(dashboard["selection"]["complete"], true);
+    let observations = dashboard["observations"]
+        .as_array()
+        .context("Board dashboard observations were not an array")?;
+    assert_eq!(
+        observations
+            .iter()
+            .map(|row| row["slot"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        [
+            "1m", "3m", "6m", "1y", "2y", "3y", "5y", "7y", "10y", "20y", "30y"
+        ],
+    );
+    let twenty_year = observations
+        .iter()
+        .find(|row| row["slot"] == "20y")
+        .context("Board dashboard omitted the 20-year slot")?;
+    assert_eq!(twenty_year["effectiveDate"], "2026-08-10");
+    assert_eq!(twenty_year["observation"]["state"], "missing");
+    assert_eq!(twenty_year["observation"]["marker"], "ND");
+    Ok(())
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn assert_installed_board_transport_counts(
+    counters: BoardScriptedTransportCounters,
+    doctor_attempts: u64,
+    doctor_responses: u64,
+    production_attempts: u64,
+    production_responses: u64,
+) {
+    assert_eq!(counters.doctor_attempts(), doctor_attempts);
+    assert_eq!(counters.doctor_responses(), doctor_responses);
+    assert_eq!(counters.production_attempts(), production_attempts);
+    assert_eq!(counters.production_responses(), production_responses);
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn stable_installed_board_dashboard(dashboard: &Value) -> Value {
+    json!({
+        "binding": {
+            "surfaceId": dashboard["binding"]["surfaceId"],
+            "sourceId": dashboard["binding"]["sourceId"],
+            "providerDatasetId": dashboard["binding"]["providerDatasetId"],
+            "analyticalDatasetId": dashboard["binding"]["analyticalDatasetId"],
+            "manifest": dashboard["binding"]["manifest"],
+            "objectGraphDigest": dashboard["binding"]["objectGraphDigest"],
+        },
+        "release": dashboard["release"],
+        "selection": {
+            "policy": dashboard["selection"]["policy"],
+            "returnedSeries": dashboard["selection"]["returnedSeries"],
+            "availableSeries": dashboard["selection"]["availableSeries"],
+            "missingSeries": dashboard["selection"]["missingSeries"],
+            "complete": dashboard["selection"]["complete"],
+        },
+        "observations": dashboard["observations"],
+    })
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn stable_installed_board_history(history: &Value) -> TestResult<Value> {
+    let artifact = history["artifact"]
+        .as_object()
+        .context("Board history did not publish its bounded Parquet artifact")?;
+    assert!(
+        artifact
+            .get("artifactId")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(
+        artifact.get("mediaType"),
+        Some(&json!("application/vnd.apache.parquet"))
+    );
+    assert_eq!(artifact.get("rowCount"), Some(&json!(22)));
+    assert!(
+        artifact
+            .get("byteCount")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0)
+    );
+    assert!(artifact.get("sha256").and_then(Value::as_str).is_some_and(
+        |value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    ));
+    Ok(json!({
+        "manifest": history["manifest"],
+        "artifact": {
+            "sha256": artifact["sha256"],
+            "byteCount": artifact["byteCount"],
+            "mediaType": artifact["mediaType"],
+            "rowCount": artifact["rowCount"],
+        },
+    }))
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn installed_file_evidence(
+    root: &Path,
+    extension: &str,
+) -> TestResult<Vec<InstalledBoardFileEvidence>> {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        extension: &str,
+        files: &mut Vec<InstalledBoardFileEvidence>,
+    ) -> TestResult {
+        for entry in std::fs::read_dir(current)
+            .with_context(|| format!("read installed evidence directory {}", current.display()))?
+        {
+            let entry = entry.context("read installed evidence directory entry")?;
+            let file_type = entry
+                .file_type()
+                .context("inspect installed evidence directory entry")?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                visit(root, &path, extension, files)?;
+            } else if file_type.is_file()
+                && path.extension().and_then(|value| value.to_str()) == Some(extension)
+            {
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("read installed evidence {}", path.display()))?;
+                files.push(InstalledBoardFileEvidence {
+                    relative_path: path
+                        .strip_prefix(root)
+                        .context("installed evidence escaped its scenario root")?
+                        .to_path_buf(),
+                    bytes: u64::try_from(bytes.len())
+                        .context("measure installed evidence bytes")?,
+                    sha256: format!("{:x}", Sha256::digest(&bytes)),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, extension, &mut files)?;
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(files)
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn new_installed_files(
+    before: &[InstalledBoardFileEvidence],
+    after: Vec<InstalledBoardFileEvidence>,
+) -> Vec<InstalledBoardFileEvidence> {
+    after
+        .into_iter()
+        .filter(|candidate| {
+            !before
+                .iter()
+                .any(|existing| existing.relative_path == candidate.relative_path)
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn assert_installed_file_evidence(
+    root: &Path,
+    expected: &[InstalledBoardFileEvidence],
+) -> TestResult {
+    for item in expected {
+        let bytes = std::fs::read(root.join(&item.relative_path)).with_context(|| {
+            format!("reopen installed evidence {}", item.relative_path.display())
+        })?;
+        assert_eq!(u64::try_from(bytes.len())?, item.bytes);
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), item.sha256);
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn assert_file_magic(
+    root: &Path,
+    evidence: &InstalledBoardFileEvidence,
+    prefix: &[u8],
+    suffix: Option<&[u8]>,
+) -> TestResult {
+    let bytes = std::fs::read(root.join(&evidence.relative_path))?;
+    assert!(bytes.starts_with(prefix));
+    if let Some(suffix) = suffix {
+        assert!(bytes.ends_with(suffix));
+    }
     Ok(())
 }
 

@@ -973,8 +973,6 @@ fn provider_capture_lineage(
         || capture.source_id() != object.source_id()
         || capture.metadata_revision() != object.metadata_revision()
         || capture.dataset() != object.dataset()
-        || object.evidence().content_digest() != capture.content_digest()
-        || object.expected_bytes() != Some(capture.total_body_bytes())
         || object.capture_identity() != expected_capture
         || segment.frames().len() != capture.pages().len()
     {

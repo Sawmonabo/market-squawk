@@ -11,6 +11,9 @@ autotests = false
 
 [features]
 default = []
+board-installed-fixture = [
+    "market-squawk-adapter-federal-reserve/scripted-transport-fixture",
+]
 release-evidence = [
     "dep:memory-stats",
     "dep:tempfile",
