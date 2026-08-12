@@ -256,17 +256,21 @@ async fn forward_service_events(
         }
         let empty = values.is_empty();
         cursor = Some(next);
-        let retained = retained_cursor.lock();
-        let Ok(mut retained) = retained else {
+        let cursor_retained = match retained_cursor.lock() {
+            Ok(mut retained) => {
+                *retained = cursor.clone();
+                true
+            }
+            Err(_error) => false,
+        };
+        if !cursor_retained {
             let _ = on_event.send(DesktopEvent::resync_required(
                 runtime,
                 previous_sequence,
                 "service_event_cursor_unavailable",
             ));
             return;
-        };
-        *retained = cursor.clone();
-        drop(retained);
+        }
         if empty {
             tokio::select! {
                 () = cancellation.cancelled() => return,

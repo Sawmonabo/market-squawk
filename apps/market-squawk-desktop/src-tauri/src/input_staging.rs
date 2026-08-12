@@ -13,7 +13,7 @@ use market_squawk_runtime::{ApplicationClient, InputAdmission, InputTicket};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt as _;
 
 use crate::{
@@ -29,8 +29,12 @@ const MAXIMUM_MODEL_AUTHORITY_BYTES: u64 = 4 * 1024 * 1024;
 const MAXIMUM_BACKTEST_REGISTRATION_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_PORTFOLIO_IMPORT_BYTES: u64 = 8 * 1024 * 1024;
 const MAXIMUM_RESEARCH_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAXIMUM_PROVIDER_CREDENTIAL_BUNDLE_BYTES: u64 = 64 * 1024;
 const PORTFOLIO_IMPORT_MEDIA_TYPE: &str = "market-squawk.portfolio-extraction-batch.v1";
 const RESEARCH_FILE_MEDIA_TYPE: &str = "market-squawk.research-source-file.v1";
+const PROVIDER_CREDENTIAL_BUNDLE_MEDIA_TYPE: &str = "market-squawk.provider-credentials.v1";
+const PROVIDER_CREDENTIAL_BUNDLE_SCHEMA: &str = "market-squawk-provider-credentials/v1";
+const IMPORT_PROVIDER_CREDENTIAL_BUNDLE: &str = "Source.ImportCredentialBundle";
 const PREVIEW_PORTFOLIO_IMPORT: &str = "Portfolio.PreviewStagedImport";
 const APPROVE_PORTFOLIO_IMPORT: &str = "Portfolio.ApproveStagedImport";
 const COMMIT_PORTFOLIO_IMPORT: &str = "Portfolio.CommitStagedImport";
@@ -38,6 +42,73 @@ const DISCARD_PORTFOLIO_IMPORT: &str = "Portfolio.DiscardStagedImport";
 const PREVIEW_RESEARCH_FILE: &str = "Research.PreviewStagedFile";
 const COMMIT_RESEARCH_FILE: &str = "Research.CommitStagedFile";
 const DISCARD_RESEARCH_FILE: &str = "Research.DiscardStagedFile";
+
+const PROVIDER_CREDENTIAL_BUNDLE_PROVIDERS: [ProviderCredentialBundleProvider; 17] = [
+    ProviderCredentialBundleProvider::Schwab,
+    ProviderCredentialBundleProvider::Alpaca,
+    ProviderCredentialBundleProvider::YahooFinanceExperimental,
+    ProviderCredentialBundleProvider::NasdaqTraderReference,
+    ProviderCredentialBundleProvider::OccOptionsReference,
+    ProviderCredentialBundleProvider::CboeOptionsReference,
+    ProviderCredentialBundleProvider::IexHist,
+    ProviderCredentialBundleProvider::Bls,
+    ProviderCredentialBundleProvider::Bea,
+    ProviderCredentialBundleProvider::Census,
+    ProviderCredentialBundleProvider::Eia,
+    ProviderCredentialBundleProvider::FredAlfred,
+    ProviderCredentialBundleProvider::Tiingo,
+    ProviderCredentialBundleProvider::Sec,
+    ProviderCredentialBundleProvider::TreasuryFiscalData,
+    ProviderCredentialBundleProvider::TreasuryDailyRates,
+    ProviderCredentialBundleProvider::FederalReserveBoardDirect,
+];
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderCredentialBundleProvider {
+    Schwab,
+    Alpaca,
+    YahooFinanceExperimental,
+    NasdaqTraderReference,
+    OccOptionsReference,
+    CboeOptionsReference,
+    IexHist,
+    Bls,
+    Bea,
+    Census,
+    Eia,
+    FredAlfred,
+    Tiingo,
+    Sec,
+    TreasuryFiscalData,
+    TreasuryDailyRates,
+    FederalReserveBoardDirect,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderCredentialImportDisposition {
+    CredentialStoredUnverified,
+    ProbeRequired,
+    Disabled,
+    ProfileUnavailable,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ProviderCredentialImportProvider {
+    provider: ProviderCredentialBundleProvider,
+    enabled: bool,
+    disposition: ProviderCredentialImportDisposition,
+    onboarding_session_id: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ProviderCredentialImportResult {
+    schema: String,
+    providers: [ProviderCredentialImportProvider; 17],
+}
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,6 +137,72 @@ impl ResearchFileFormat {
             Self::Parquet => &["parquet"],
         }
     }
+}
+
+#[tauri::command]
+pub(crate) async fn import_provider_credential_bundle(
+    confirmed: bool,
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, DesktopState>,
+) -> Result<Option<Value>, DesktopCommandError> {
+    let generation = state.generation()?;
+    require_confirmation(
+        confirmed,
+        "Confirm the protected credential import before selecting its one-time bundle.",
+    )?;
+    if window.label() != "main" {
+        return Err(DesktopCommandError::new(
+            "unauthorized",
+            "Provider credentials can be selected only from the main product window.",
+        ));
+    }
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("Market Squawk provider credentials", &["env"])
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|_error| DesktopCommandError::internal())?;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let path = selected.into_path().map_err(|_error| {
+        DesktopCommandError::invalid_request(
+            "The selected provider credential bundle is not a local file.",
+        )
+    })?;
+    let admitted = tauri::async_runtime::spawn_blocking(move || {
+        open_and_hash_with_extensions(
+            path,
+            MAXIMUM_PROVIDER_CREDENTIAL_BUNDLE_BYTES,
+            &["env"],
+            "Select a filled Market Squawk provider-credentials .env file.",
+        )
+    })
+    .await
+    .map_err(|_error| DesktopCommandError::internal())??;
+    let ticket = stage_admitted_input(
+        admitted,
+        PROVIDER_CREDENTIAL_BUNDLE_MEDIA_TYPE,
+        &state,
+        &generation,
+    )
+    .await?;
+    let arguments = Map::from_iter([(
+        "inputTicketId".to_owned(),
+        Value::String(ticket.id().as_uuid().to_string()),
+    )]);
+    let result = invoke_private_application(
+        IMPORT_PROVIDER_CREDENTIAL_BUNDLE,
+        arguments,
+        &state,
+        &generation,
+        InvocationAuthority::ExactConfirmed(IMPORT_PROVIDER_CREDENTIAL_BUNDLE),
+    )
+    .await?;
+    strictly_redacted_provider_import(result).map(Some)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -527,6 +664,46 @@ async fn stage_admitted_input(
         .map_err(super::bridge::map_application_client_error)?;
     state.admit_current(generation)?;
     Ok(ticket)
+}
+
+fn strictly_redacted_provider_import(result: Value) -> Result<Value, DesktopCommandError> {
+    let data = result
+        .get("data")
+        .cloned()
+        .ok_or_else(DesktopCommandError::internal)?;
+    let redacted = serde_json::from_value::<ProviderCredentialImportResult>(data)
+        .map_err(|_error| DesktopCommandError::internal())?;
+    let exact_provider_order = redacted
+        .providers
+        .iter()
+        .map(|provider| provider.provider)
+        .eq(PROVIDER_CREDENTIAL_BUNDLE_PROVIDERS);
+    let enabled_dispositions_match = redacted.providers.iter().all(|provider| {
+        provider.enabled
+            != matches!(
+                provider.disposition,
+                ProviderCredentialImportDisposition::Disabled
+            )
+    });
+    let returned_items = result
+        .pointer("/metadata/returnedItems")
+        .and_then(Value::as_u64);
+    let available_items = result
+        .pointer("/metadata/availableItems")
+        .and_then(Value::as_u64);
+    if redacted.schema != PROVIDER_CREDENTIAL_BUNDLE_SCHEMA
+        || !exact_provider_order
+        || !enabled_dispositions_match
+        || returned_items != Some(PROVIDER_CREDENTIAL_BUNDLE_PROVIDERS.len() as u64)
+        || available_items != returned_items
+        || result
+            .pointer("/metadata/completeness")
+            .and_then(Value::as_str)
+            != Some("complete")
+    {
+        return Err(DesktopCommandError::internal());
+    }
+    serde_json::to_value(redacted).map_err(|_error| DesktopCommandError::internal())
 }
 
 fn require_confirmation(confirmed: bool, message: &'static str) -> Result<(), DesktopCommandError> {

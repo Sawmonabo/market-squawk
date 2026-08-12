@@ -41,8 +41,8 @@ use contracts::DesktopCommandError;
 use events::{DesktopEventSubscriptions, subscribe_service_events, unsubscribe_service_events};
 use input_staging::{
     commit_portfolio_import, commit_research_file_import, discard_portfolio_import,
-    discard_research_file_import, preview_portfolio_import, preview_research_file_import,
-    stage_training_input, start_backtest_from_file,
+    discard_research_file_import, import_provider_credential_bundle, preview_portfolio_import,
+    preview_research_file_import, stage_training_input, start_backtest_from_file,
 };
 use mcp_clients::{mcp_client_control, mcp_status};
 use service_client::{
@@ -280,6 +280,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             governance_query,
             job_control,
             installation_control,
+            import_provider_credential_bundle,
             mcp_client_control,
             mcp_status,
             model_control,

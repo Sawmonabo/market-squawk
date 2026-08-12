@@ -131,6 +131,7 @@ function transport(
       query({ query: "jobs", limit: "limit" in request ? request.limit : 25 }),
     sourceControl: async (_action, _request) =>
       query({ query: "sourceStatus" }),
+    importProviderCredentialBundle: async () => null,
     operationsControl: async () =>
       query({ query: "operationUpdateStatus" }),
     stageTrainingInput: async () => null,
@@ -1657,6 +1658,54 @@ describe("Market Squawk desktop boundary", () => {
   it("uses grouped product navigation to explore real research and AI connection state", async () => {
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
+    const credentialProviders = [
+      "schwab",
+      "alpaca",
+      "yahoo_finance_experimental",
+      "nasdaq_trader_reference",
+      "occ_options_reference",
+      "cboe_options_reference",
+      "iex_hist",
+      "bls",
+      "bea",
+      "census",
+      "eia",
+      "fred_alfred",
+      "tiingo",
+      "sec",
+      "treasury_fiscal_data",
+      "treasury_daily_rates",
+      "federal_reserve_board_direct",
+    ]
+    const credentialImportResult = {
+      schema: "market-squawk-provider-credentials/v1",
+      providers: credentialProviders.map((provider) => ({
+        provider,
+        enabled: provider === "fred_alfred",
+        disposition:
+          provider === "fred_alfred"
+            ? "credential_stored_unverified"
+            : "disabled",
+        onboardingSessionId:
+          provider === "fred_alfred"
+            ? "d6b1a16d-bdf9-44d9-b10b-6e7558d701cb"
+            : null,
+      })),
+    }
+    const unsafeCredentialImportResult = {
+      ...credentialImportResult,
+      providers: credentialImportResult.providers.map((provider) =>
+        provider.provider === "fred_alfred"
+          ? { ...provider, secret: "should-never-reach-react" }
+          : provider,
+      ),
+    }
+    const credentialImportAttempts: unknown[] = [
+      null,
+      credentialImportResult,
+      unsafeCredentialImportResult,
+    ]
+    let credentialImportAttempt = 0
     const readyBootstrap: DesktopBootstrap = {
       ...blockedBootstrap,
       providerProfiles: [h15ProviderProfile],
@@ -1683,6 +1732,23 @@ describe("Market Squawk desktop boundary", () => {
         ),
         macroDashboardRead(),
         sourceStatusRead(),
+        {
+          name: "Source.ImportCredentialBundle",
+          description: "Import one protected provider credential bundle.",
+          domain: "source",
+          authorization: "local_confirmation",
+          readOnly: false,
+          destructive: false,
+          inputSchema: {
+            type: "object",
+            properties: {
+              inputTicketId: { type: "string", format: "uuid" },
+              confirm: { const: true },
+            },
+            required: ["inputTicketId", "confirm"],
+            additionalProperties: false,
+          },
+        },
         investmentAnalysisListRead(),
         investmentAnalysisRead(),
         recommendationTrackRecordRead(),
@@ -1799,6 +1865,11 @@ describe("Market Squawk desktop boundary", () => {
             }
           },
         }
+      },
+      importProviderCredentialBundle: async () => {
+        const result = credentialImportAttempts[credentialImportAttempt] ?? null
+        credentialImportAttempt += 1
+        return result
       },
     }
     const readCount = (
@@ -2033,6 +2104,40 @@ describe("Market Squawk desktop boundary", () => {
       }),
     )
     expect(await screen.findByRole("heading", { name: "Sources" })).toBeTruthy()
+    const chooseCredentialBundle = screen.getByRole("button", {
+      name: "Choose credential bundle",
+    })
+    await user.click(chooseCredentialBundle)
+    expect(
+      await screen.findByText(
+        "No credential bundle was selected. Provider setup is unchanged.",
+      ),
+    ).toBeTruthy()
+    await user.click(chooseCredentialBundle)
+    expect(await screen.findByText("Credential bundle processed")).toBeTruthy()
+    expect(
+      screen.getByText(
+        "Credential stored; verification and activation are still required.",
+      ),
+    ).toBeTruthy()
+    const sourceReadsBeforeFailedCredentialImport = readCount("sourceStatus")
+    await user.click(
+      screen.getByRole("button", { name: "Select another bundle" }),
+    )
+    expect(
+      await screen.findByText("Credential import needs attention"),
+    ).toBeTruthy()
+    expect(
+      screen.getByText(
+        "Market Squawk could not complete this credential bundle. One or more earlier entries may already have been stored. Source evidence is refreshing; review it before correcting the file or service issue and trying again.",
+      ),
+    ).toBeTruthy()
+    await waitFor(() => {
+      expect(readCount("sourceStatus")).toBeGreaterThan(
+        sourceReadsBeforeFailedCredentialImport,
+      )
+    })
+    expect(screen.queryByText("should-never-reach-react")).toBeNull()
     const boardSourceHeading = await screen.findByRole("heading", {
       name: "Federal Reserve Board Data Download Program",
     })

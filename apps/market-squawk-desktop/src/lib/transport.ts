@@ -356,6 +356,7 @@ export interface ProductTransport {
     request: SourceLifecycleRequest,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
+  importProviderCredentialBundle(): Promise<unknown | null>
   operationsControl(
     request: OperationsControlRequest,
     confirmed?: boolean,

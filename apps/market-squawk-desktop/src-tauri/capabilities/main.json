@@ -19,6 +19,7 @@
     "allow-fair-value-control",
     "allow-governance-control",
     "allow-governance-query",
+    "allow-import-provider-credential-bundle",
     "allow-installation-control",
     "allow-job-control",
     "allow-mcp-client-control",

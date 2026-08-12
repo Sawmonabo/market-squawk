@@ -13,6 +13,7 @@ fn main() {
         "fair_value_control",
         "governance_control",
         "governance_query",
+        "import_provider_credential_bundle",
         "installation_control",
         "job_control",
         "mcp_client_control",

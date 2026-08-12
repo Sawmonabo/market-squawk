@@ -40,6 +40,7 @@ import {
   sourceEvidence,
   sourceNeedsSetup,
 } from "./source-evidence"
+import { ProviderCredentialImport } from "./provider-credential-import"
 
 export function SourcesPage() {
   const product = useProduct()
@@ -172,6 +173,9 @@ function ReadySourcesPage({
     queryClient.invalidateQueries({
       queryKey: productKeys.domain(bootstrap.runtime, "source"),
     })
+  const credentialImportAvailable = bootstrap.operations.some(
+    (operation) => operation.name === "Source.ImportCredentialBundle",
+  )
 
   return (
     <PageFrame
@@ -182,6 +186,14 @@ function ReadySourcesPage({
         </Button>
       }
     >
+      <ProviderCredentialImport
+        available={credentialImportAvailable}
+        transport={transport}
+        onAttempted={() => {
+          void refreshAuthority()
+          refresh()
+        }}
+      />
       {failedReads === totalReads ? (
         <EmptyState
           title="Source evidence could not be read"

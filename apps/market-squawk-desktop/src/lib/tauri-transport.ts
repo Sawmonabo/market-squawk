@@ -178,6 +178,12 @@ class TauriTransport implements ProductTransport {
     return applicationResultSchema.parse(value)
   }
 
+  async importProviderCredentialBundle() {
+    return invoke<unknown | null>("import_provider_credential_bundle", {
+      confirmed: true,
+    })
+  }
+
   async operationsControl(request: OperationsControlRequest, confirmed = false) {
     const value = await invoke("operations_control", { request, confirmed })
     return applicationResultSchema.parse(value)
@@ -377,6 +383,10 @@ class UnavailableBrowserTransport implements ProductTransport {
   }
 
   sourceControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  importProviderCredentialBundle(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
