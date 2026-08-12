@@ -1,18 +1,19 @@
 //! Stable identities for build specifications, selectors, policies, and output rows.
 
 use market_squawk_domain::{
-    AvailabilityEvidence, EvidenceDigest, FundamentalPeriod, ResearchTemporalCoordinate, SourceId,
+    AvailabilityEvidence, EvidenceDigest, FundamentalPeriod, ResearchTemporalCoordinate,
     SourceIdentifier,
 };
 use sha2::{Digest as _, Sha256};
 
 use super::model::{
-    ComponentAdjustmentEvidence, ComponentValue, DatasetBuildInputs, DatasetBuildPolicy,
-    DatasetBuildRequest, DatasetExample, DatasetSplit, FeatureLabelComponentInput,
+    ComponentAdjustmentEvidence, ComponentValue, DatasetBuildInputs, DatasetBuildLimits,
+    DatasetBuildPolicy, DatasetBuildRequest, DatasetExample, DatasetOutputAuthorization,
+    DatasetSplit, FeatureLabelComponentInput,
 };
 use crate::{
     CorporateActionAdjustment, DatasetId, DatasetManifestRef, ObservationFamilyKey, ResearchUse,
-    Sha256Digest, UniverseMembership,
+    ResearchUseLimits, RightsBasis, Sha256Digest, UniverseMembership,
 };
 
 pub(super) fn family_key_digest(family: &ObservationFamilyKey) -> Sha256Digest {
@@ -69,17 +70,21 @@ pub(super) fn build_spec_digest(
     output_dataset: &DatasetId,
     inputs: &DatasetBuildInputs,
     intended_use: ResearchUse,
-    output_source: &SourceId,
+    research_use_limits: ResearchUseLimits,
+    output_authorization: &DatasetOutputAuthorization,
+    limits: DatasetBuildLimits,
     policy_digest: Sha256Digest,
     universe_digest: Sha256Digest,
 ) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/feature-label-build-spec/v3");
+    hash.update(b"market-squawk/feature-label-build-spec/v4");
     put_str(&mut hash, output_dataset.as_str());
-    put_str(&mut hash, output_source.as_str());
     hash.update(policy_digest.bytes());
     hash.update(universe_digest.bytes());
     hash.update([research_use_tag(intended_use)]);
+    encode_research_use_limits(&mut hash, research_use_limits);
+    encode_output_authorization(&mut hash, output_authorization);
+    encode_build_limits(&mut hash, limits);
     put_len(&mut hash, inputs.parents().len());
     for parent in inputs.parents() {
         encode_manifest(&mut hash, parent);
@@ -106,6 +111,85 @@ pub(super) fn build_spec_digest(
         }
     }
     Sha256Digest::new(hash.finalize().into())
+}
+
+fn encode_research_use_limits(hash: &mut Sha256, limits: ResearchUseLimits) {
+    for value in [
+        limits.max_roots(),
+        limits.max_nodes(),
+        limits.max_edges(),
+        limits.max_sources(),
+        limits.max_retained_bytes(),
+    ] {
+        put_len(hash, value);
+    }
+    hash.update(limits.traversal_deadline().as_nanos().to_be_bytes());
+    hash.update(limits.permit_lifetime().as_nanos().to_be_bytes());
+}
+
+fn encode_output_authorization(hash: &mut Sha256, authorization: &DatasetOutputAuthorization) {
+    put_str(hash, authorization.source_id().as_str());
+    let basis = authorization.basis();
+    hash.update([match basis {
+        RightsBasis::ReviewedTerms(_) => 1,
+        RightsBasis::UserOwnedLocal(_) => 2,
+        RightsBasis::ImportedUserInput(_) => 3,
+    }]);
+    put_str(hash, basis.reference());
+    encode_evidence(hash, basis.digest());
+    match basis.root_identity_digest() {
+        Some(digest) => {
+            hash.update([1]);
+            encode_evidence(hash, digest);
+        }
+        None => hash.update([0]),
+    }
+    match basis.imported_user_input_evidence() {
+        Some(evidence) => {
+            hash.update([1]);
+            encode_evidence(hash, evidence.admitted_input_set_digest());
+            encode_evidence(hash, evidence.generated_manifest_digest());
+            encode_evidence(hash, evidence.local_admission_evidence());
+            encode_evidence(hash, evidence.workspace_receipt_evidence());
+            encode_evidence(hash, evidence.import_receipt_evidence());
+            encode_evidence(hash, evidence.binding_digest());
+        }
+        None => hash.update([0]),
+    }
+    encode_evidence(hash, authorization.authorization_evidence());
+    encode_optional_timestamp(hash, authorization.authorization_expires_at());
+}
+
+fn encode_build_limits(hash: &mut Sha256, limits: DatasetBuildLimits) {
+    for value in [
+        limits.max_input_rows(),
+        limits.max_examples(),
+        limits.max_components_per_example(),
+        limits.max_output_rows(),
+        limits.max_retained_bytes(),
+    ] {
+        put_len(hash, value);
+    }
+    hash.update(limits.max_duration().as_nanos().to_be_bytes());
+
+    let point_in_time = limits.point_in_time();
+    for value in [
+        point_in_time.max_candidates(),
+        point_in_time.max_families(),
+        point_in_time.max_conflicts(),
+        point_in_time.max_result_rows(),
+        point_in_time.max_retained_bytes(),
+    ] {
+        put_len(hash, value);
+    }
+
+    let universe = limits.universe();
+    put_len(hash, universe.max_candidates());
+    put_len(hash, universe.max_retained_bytes());
+
+    let corporate_actions = limits.corporate_actions();
+    put_len(hash, corporate_actions.max_actions().get());
+    put_len(hash, corporate_actions.max_retained_bytes().get());
 }
 
 #[allow(

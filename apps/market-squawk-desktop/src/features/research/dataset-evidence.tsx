@@ -174,11 +174,8 @@ export function DatasetEvidence({
               This generation has no retained parent edge.
             </p>
           )}
-          {exact.buildSpecDigest ? (
-            <Digest label="Build specification" value={exact.buildSpecDigest} />
-          ) : null}
-          {exact.pythonExportSha256 ? (
-            <Digest label="Python export" value={exact.pythonExportSha256} />
+          {exact.generationKind === "derived" ? (
+            <DerivedGenerationEvidence generation={exact} />
           ) : null}
         </EvidenceBlock>
 
@@ -409,6 +406,39 @@ function Digest({ label, value }: { label: string; value: string }) {
       <p className="mt-1 break-all font-mono text-[10px] leading-4 text-foreground/80">
         {value}
       </p>
+    </div>
+  )
+}
+
+function DerivedGenerationEvidence({
+  generation,
+}: {
+  generation: Extract<ResearchDataset, { generationKind: "derived" }>
+}) {
+  return (
+    <div className="mt-3 rounded-md border border-border bg-background/45 p-3">
+      <p className="text-[10px] font-medium uppercase tracking-wider text-foreground">
+        {humanize(generation.publicationStage)}
+      </p>
+      <p className="mt-1 text-xs text-muted-foreground">
+        This immutable phase-one generation is retained for inspection. Product admission is not
+        established by this research-generation response; use the receipt-admitted feature-dataset
+        surface for product status.
+      </p>
+      <p className="mt-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+        Product admission evidence · {humanize(generation.productAdmission)}
+      </p>
+      <Digest label="Build specification" value={generation.buildSpecDigest} />
+      {generation.phaseOneDescriptorSha256 ? (
+        <Digest
+          label="Phase-one descriptor"
+          value={generation.phaseOneDescriptorSha256}
+        />
+      ) : (
+        <p className="mt-3 text-xs text-muted-foreground">
+          No phase-one descriptor is present on this generation response.
+        </p>
+      )}
     </div>
   )
 }

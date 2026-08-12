@@ -23,8 +23,14 @@ mod canonical;
 mod export;
 #[path = "dataset_builder/model.rs"]
 mod model;
+#[path = "dataset_builder/production.rs"]
+mod production;
 
-pub use admission::PythonDatasetAdmission;
+pub(crate) use admission::FeatureDatasetProductionReceiptExpectation;
+pub use admission::{
+    FEATURE_DATASET_PRODUCTION_RECEIPT_SCHEMA, FeatureDatasetProductionReceiptV1,
+    MAX_FEATURE_DATASET_PRODUCTION_RECEIPT_BYTES,
+};
 pub use export::{FeatureLabelPythonExport, MAX_FEATURE_LABEL_EXPORT_BYTES};
 
 pub use model::{
@@ -35,6 +41,12 @@ pub use model::{
     FEATURE_LABEL_RETURN_UNIT, FeatureLabelComponentInput, FeatureLabelComponentSpec,
     FeatureLabelDataset, FeatureLabelMeasurement, FeatureLabelMeasurementBinding,
     MissingValuePolicy,
+};
+pub use production::{
+    FeatureDatasetProductContract, FeatureDatasetProductionComposition,
+    FeatureDatasetProductionError, FeatureDatasetProductionProofV1,
+    FeatureDatasetProductionPublication, FeatureDatasetProductionPublicationDisposition,
+    FeatureDatasetProductionPublisher,
 };
 
 /// Process-local authority that must remain live through derived-generation publication.
@@ -117,14 +129,6 @@ impl<'service> DatasetBuilderService<'service> {
             authority,
             operation_gate,
         }
-    }
-
-    /// Re-resolves and returns the immutable catalog admission for one producer-owned result.
-    pub fn python_admission(
-        &self,
-        dataset: &FeatureLabelDataset,
-    ) -> Result<PythonDatasetAdmission, DatasetBuildError> {
-        admission::register(self, dataset)
     }
 
     /// Re-resolves the exact parent graph and validates its current research-use authority.
@@ -299,8 +303,8 @@ pub enum DatasetBuildError {
     /// Research-use traversal or publication authority rejected the build.
     #[error("dataset build research-use authority failed: {0}")]
     ResearchUse(#[from] crate::ResearchUseCatalogError),
-    /// Immutable Python dataset admission failed.
-    #[error("dataset build Python admission failed: {0}")]
+    /// Receipt-required feature-dataset production admission failed.
+    #[error("feature-dataset production admission failed: {0}")]
     PythonDataset(#[from] crate::PythonDatasetCatalogError),
     /// Dataset schema construction or resolution failed.
     #[error("dataset build schema is invalid: {0}")]

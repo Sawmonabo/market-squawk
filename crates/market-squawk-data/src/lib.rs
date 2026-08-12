@@ -116,10 +116,15 @@ pub use dataset_builder::{
     DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildPrecommitAuthority,
     DatasetBuildRequest, DatasetBuilder, DatasetBuilderService, DatasetExample,
     DatasetOutputAuthorization, DatasetResearchUsePreflightReceipt, DatasetSplit,
-    DatasetSplitCounts, FEATURE_LABEL_PROBABILITY_UNIT, FEATURE_LABEL_RETURN_UNIT,
+    DatasetSplitCounts, FEATURE_DATASET_PRODUCTION_RECEIPT_SCHEMA, FEATURE_LABEL_PROBABILITY_UNIT,
+    FEATURE_LABEL_RETURN_UNIT, FeatureDatasetProductContract, FeatureDatasetProductionComposition,
+    FeatureDatasetProductionError, FeatureDatasetProductionProofV1,
+    FeatureDatasetProductionPublication, FeatureDatasetProductionPublicationDisposition,
+    FeatureDatasetProductionPublisher, FeatureDatasetProductionReceiptV1,
     FeatureLabelComponentInput, FeatureLabelComponentSpec, FeatureLabelDataset,
     FeatureLabelMeasurement, FeatureLabelMeasurementBinding, FeatureLabelPythonExport,
-    MAX_FEATURE_LABEL_EXPORT_BYTES, MissingValuePolicy, PythonDatasetAdmission,
+    MAX_FEATURE_DATASET_PRODUCTION_RECEIPT_BYTES, MAX_FEATURE_LABEL_EXPORT_BYTES,
+    MissingValuePolicy,
 };
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
@@ -130,8 +135,8 @@ pub use ingest::{
 pub use manifest::{
     AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
     DerivedGenerationParents, GenerationKind, GenerationParent, GenerationParentRelation,
-    MAX_DERIVED_GENERATION_PARENTS, MAX_RETAINED_PYTHON_DATASET_ADMISSIONS,
-    MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES, ManifestCatalogError, ManifestObject,
+    MAX_DERIVED_GENERATION_PARENTS, MAX_RETAINED_FEATURE_DATASET_PRODUCTION_ADMISSIONS,
+    MAX_RETAINED_FEATURE_DATASET_PRODUCTION_PAYLOAD_BYTES, ManifestCatalogError, ManifestObject,
     ManifestPlan, ManifestPlanError, PinnedDataset, PinnedManifestObject, Sha256Digest,
 };
 #[cfg(feature = "release-evidence")]

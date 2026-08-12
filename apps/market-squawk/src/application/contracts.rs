@@ -1064,7 +1064,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     ),
     mutation(
         "Research.StartDatasetBuild",
-        "Start one durable point-in-time dataset publication from an admitted build registration.",
+        "Start one durable phase-one point-in-time derived generation from an admitted request; the result conveys no product admission.",
         ServiceDomain::Research,
         LOCAL_SCOPE,
         DATASET_BUILD_ARGUMENTS,
@@ -1342,7 +1342,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     ),
     mutation(
         "Analysis.StartFeatureDatasetBuild",
-        "Start one durable point-in-time feature and label dataset publication.",
+        "Start one durable phase-one point-in-time feature and label derived generation; the result conveys no product admission.",
         ServiceDomain::Analysis,
         LOCAL_SCOPE,
         DATASET_BUILD_ARGUMENTS,

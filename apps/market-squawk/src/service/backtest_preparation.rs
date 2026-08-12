@@ -3,7 +3,8 @@
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use market_squawk_data::{
-    AnalyticalReadCapability, AnalyticalReadLimit, DatasetId, ForecastDatasetReadLimits,
+    AnalyticalReadCapability, AnalyticalReadLimit, DatasetId, FeatureDatasetProductContract,
+    ForecastDatasetReadLimits,
 };
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_runtime::RuntimeIdentity;
@@ -140,6 +141,7 @@ impl InstalledBacktestPreparation {
             let page = self
                 .analytical
                 .feature_datasets(
+                    FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
                     after.as_ref(),
                     page_limit,
                     context.deadline(),
@@ -158,6 +160,7 @@ impl InstalledBacktestPreparation {
                 let evidence = self
                     .analytical
                     .forecast_dataset_evidence(
+                        FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
                         generation.manifest(),
                         Timestamp::from_unix_nanos(i64::MAX),
                         evidence_limits,

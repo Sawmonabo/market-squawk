@@ -32,12 +32,9 @@ export const researchManifestSchema = z.strictObject({
   contentHash: digestSchema,
 })
 
-export const researchDatasetSchema = z.strictObject({
+const researchGenerationCommonShape = {
   manifest: researchManifestSchema,
   sourceId: z.string().min(1),
-  generationKind: z.enum(["ingest", "compaction", "derived"]),
-  buildSpecDigest: digestSchema.nullable(),
-  pythonExportSha256: digestSchema.nullable(),
   parents: z.array(
     z.strictObject({
       relation: z.enum([
@@ -52,7 +49,28 @@ export const researchDatasetSchema = z.strictObject({
   totalBytes: z.number().int().nonnegative(),
   lineageDigest: digestSchema,
   objectCount: z.number().int().nonnegative(),
-})
+}
+
+export const researchDatasetSchema = z.discriminatedUnion("generationKind", [
+  z.strictObject({
+    ...researchGenerationCommonShape,
+    generationKind: z.literal("ingest"),
+    buildSpecDigest: z.null(),
+  }),
+  z.strictObject({
+    ...researchGenerationCommonShape,
+    generationKind: z.literal("compaction"),
+    buildSpecDigest: z.null(),
+  }),
+  z.strictObject({
+    ...researchGenerationCommonShape,
+    generationKind: z.literal("derived"),
+    buildSpecDigest: digestSchema,
+    publicationStage: z.literal("phase_one_derived_generation"),
+    phaseOneDescriptorSha256: digestSchema.nullable(),
+    productAdmission: z.literal("not_established_on_this_surface"),
+  }),
+])
 
 const researchDatasetPageSchema = z.strictObject({
   items: z.array(researchDatasetSchema),
@@ -366,7 +384,7 @@ export function parseResearchJobs(result: ApplicationResult): ResearchJob[] {
   return page.data.jobs.filter(
     (job) =>
       job.kind.startsWith("research.") ||
-      job.kind === "analysis.feature-dataset-build.v1",
+      job.kind === "analysis.phase-one-feature-derived-generation-job.v1",
   )
 }
 

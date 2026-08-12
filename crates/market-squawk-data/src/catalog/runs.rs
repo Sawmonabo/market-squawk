@@ -94,20 +94,21 @@ impl CatalogAuthority {
         Ok(result)
     }
 
-    /// Runs one Python-dataset admission mutation in a trusted-time transaction.
-    pub(crate) fn with_python_dataset_transaction<T, F>(
+    /// Runs one receipt-required feature-dataset admission in a trusted-time transaction.
+    pub(crate) fn with_feature_dataset_production_transaction<T, F>(
         &self,
         operation: F,
     ) -> Result<T, PythonDatasetCatalogError>
     where
         F: for<'transaction> FnOnce(
             &Transaction<'transaction>,
+            Uuid,
             Timestamp,
         ) -> Result<T, PythonDatasetCatalogError>,
     {
         let transaction = self.catalog.connection.unchecked_transaction()?;
         let now = trusted_catalog_now(&transaction)?;
-        let result = operation(&transaction, now)?;
+        let result = operation(&transaction, self.catalog.catalog_id, now)?;
         transaction.commit()?;
         Ok(result)
     }

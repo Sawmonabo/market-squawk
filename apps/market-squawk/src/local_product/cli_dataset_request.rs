@@ -1,4 +1,4 @@
-//! Closed JSON DTO conversion into invariant-preserving dataset-build contracts.
+//! Closed JSON DTO conversion into invariant-preserving phase-one generation requests.
 
 use std::{
     num::{NonZeroU16, NonZeroU32, NonZeroUsize},
@@ -31,7 +31,7 @@ use super::CliDatasetError;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct DatasetBuildRequestDto {
+pub(crate) struct PhaseOneDerivedGenerationRequestDto {
     output_dataset: String,
     parents: Vec<ManifestDto>,
     universe: UniverseDto,
@@ -44,7 +44,7 @@ pub(crate) struct DatasetBuildRequestDto {
     limits: BuildLimitsDto,
 }
 
-impl DatasetBuildRequestDto {
+impl PhaseOneDerivedGenerationRequestDto {
     pub(crate) fn into_domain(
         self,
         ownership: Option<UserOwnedInputEvidence>,

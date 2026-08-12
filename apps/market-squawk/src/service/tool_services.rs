@@ -25,6 +25,7 @@ use crate::{
         operations::OperationsApplicationServices, recommendation::RecommendationSetupAuthority,
     },
     jobs::{InstalledJobAuthority, InstalledJobRunners},
+    local_product::cli_dataset::admit_inline_phase_one_derived_generation_request,
 };
 
 use super::{
@@ -310,24 +311,25 @@ impl InstalledToolServices {
                     .get("registration")
                     .and_then(serde_json::Value::as_object)
                     .ok_or(ServiceError::InvalidRequest)?;
-                let build = crate::local_product::cli_dataset::admit_inline_dataset_registration(
-                    registration,
-                )
-                .map_err(map_dataset_admission)?;
+                let build = admit_inline_phase_one_derived_generation_request(registration)
+                    .map_err(map_phase_one_derived_generation_admission)?;
                 if request.name() == START_DATASET {
                     let admission = self
                         .runners
-                        .dataset()
+                        .research_phase_one_derived_generation()
                         .admit(build, captured_at)
                         .map_err(map_research_admission)?;
-                    (admission, JobAdmissionOwner::Dataset)
+                    (admission, JobAdmissionOwner::ResearchPhaseOneGeneration)
                 } else {
                     let admission = self
                         .runners
-                        .feature()
+                        .analysis_phase_one_feature_derived_generation()
                         .admit(build, captured_at)
                         .map_err(map_research_admission)?;
-                    (admission, JobAdmissionOwner::Feature)
+                    (
+                        admission,
+                        JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
+                    )
                 }
             }
             START_PREPARED_FEATURE_DATASET => {
@@ -348,10 +350,13 @@ impl InstalledToolServices {
                     .map_err(ServiceError::from)?;
                 let admission = self
                     .runners
-                    .feature()
+                    .analysis_phase_one_feature_derived_generation()
                     .admit(build, captured_at)
                     .map_err(map_research_admission)?;
-                (admission, JobAdmissionOwner::Feature)
+                (
+                    admission,
+                    JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
+                )
             }
             START_SCENARIO => {
                 let terminal = self.terminal_request(request, "Analysis.GetScenarios")?;
@@ -603,11 +608,17 @@ impl InstalledToolServices {
             JobAdmissionOwner::Export => {
                 let _result = self.runners.export().revoke(admission);
             }
-            JobAdmissionOwner::Dataset => {
-                let _result = self.runners.dataset().revoke(admission);
+            JobAdmissionOwner::ResearchPhaseOneGeneration => {
+                let _result = self
+                    .runners
+                    .research_phase_one_derived_generation()
+                    .revoke(admission);
             }
-            JobAdmissionOwner::Feature => {
-                let _result = self.runners.feature().revoke(admission);
+            JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration => {
+                let _result = self
+                    .runners
+                    .analysis_phase_one_feature_derived_generation()
+                    .revoke(admission);
             }
             JobAdmissionOwner::Scenario => {
                 let _result = self.runners.scenario().revoke(admission);
@@ -720,8 +731,8 @@ fn required_argument<'a>(
 enum JobAdmissionOwner {
     Ingest,
     Export,
-    Dataset,
-    Feature,
+    ResearchPhaseOneGeneration,
+    AnalysisPhaseOneFeatureGeneration,
     Scenario,
     Backtest,
     Training,
@@ -1128,7 +1139,9 @@ fn map_backtest_admission(error: crate::jobs::BacktestJobRunnerError) -> Service
     }
 }
 
-fn map_dataset_admission(error: crate::local_product::CliDatasetError) -> ServiceError {
+fn map_phase_one_derived_generation_admission(
+    error: crate::local_product::CliDatasetError,
+) -> ServiceError {
     match error {
         crate::local_product::CliDatasetError::InvalidRequest
         | crate::local_product::CliDatasetError::RequestJson
@@ -1136,8 +1149,8 @@ fn map_dataset_admission(error: crate::local_product::CliDatasetError) -> Servic
             ServiceError::InvalidRequest
         }
         crate::local_product::CliDatasetError::RequestFile => ServiceError::Unauthorized,
-        crate::local_product::CliDatasetError::Build(_)
-        | crate::local_product::CliDatasetError::PythonExport(_) => ServiceError::Unavailable,
+        crate::local_product::CliDatasetError::PhaseOneDerivedGeneration(_)
+        | crate::local_product::CliDatasetError::PhaseOneDescriptor(_) => ServiceError::Unavailable,
     }
 }
 

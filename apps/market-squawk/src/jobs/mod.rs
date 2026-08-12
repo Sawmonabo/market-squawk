@@ -21,7 +21,8 @@ pub use recovery::{
     RecoveryJobAction, RecoveryJobAuthority, RecoveryJobCommand, RecoveryJobRunner,
 };
 pub use research::{
-    DatasetJobRunner, ResearchExportJobRunner, ResearchJobRunner, ResearchJobRunnerError,
+    PhaseOneDerivedGenerationJobRunner, ResearchExportJobRunner, ResearchJobRunner,
+    ResearchJobRunnerError,
 };
 pub use scenario::ScenarioJobRunner;
 pub use screen::{ScreenJobCommand, ScreenJobRunner, ScreenJobRunnerError};
@@ -56,8 +57,8 @@ const RUNNER_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// Code-owned installed runner set retained for both scheduling and typed admission.
 pub struct InstalledJobRunners {
     ingest: Arc<ResearchJobRunner>,
-    dataset: Arc<DatasetJobRunner>,
-    feature: Arc<DatasetJobRunner>,
+    research_phase_one_derived_generation: Arc<PhaseOneDerivedGenerationJobRunner>,
+    analysis_phase_one_feature_derived_generation: Arc<PhaseOneDerivedGenerationJobRunner>,
     export: Arc<ResearchExportJobRunner>,
     scenario: Arc<ScenarioJobRunner>,
     backtest: Arc<BacktestJobRunner>,
@@ -89,8 +90,8 @@ impl InstalledJobRunners {
             )
             .map_err(|_error| InstalledJobError::RunnerComposition)?,
         );
-        let dataset = Arc::new(
-            DatasetJobRunner::try_new_dataset(
+        let research_phase_one_derived_generation = Arc::new(
+            PhaseOneDerivedGenerationJobRunner::try_new_research_dataset(
                 product.research(),
                 Arc::clone(&artifacts),
                 RUNNER_PENDING_CAPACITY,
@@ -98,8 +99,8 @@ impl InstalledJobRunners {
             )
             .map_err(|_error| InstalledJobError::RunnerComposition)?,
         );
-        let feature = Arc::new(
-            DatasetJobRunner::try_new_feature(
+        let analysis_phase_one_feature_derived_generation = Arc::new(
+            PhaseOneDerivedGenerationJobRunner::try_new_analysis_feature(
                 product.research(),
                 Arc::clone(&artifacts),
                 RUNNER_PENDING_CAPACITY,
@@ -180,8 +181,8 @@ impl InstalledJobRunners {
         );
         Ok(Self {
             ingest,
-            dataset,
-            feature,
+            research_phase_one_derived_generation,
+            analysis_phase_one_feature_derived_generation,
             export,
             scenario,
             backtest,
@@ -199,8 +200,8 @@ impl InstalledJobRunners {
     pub fn registered(&self) -> Vec<JobRunnerRegistration> {
         let mut runners = vec![
             mutation_registration(self.ingest.clone()),
-            mutation_registration(self.dataset.clone()),
-            mutation_registration(self.feature.clone()),
+            mutation_registration(self.research_phase_one_derived_generation.clone()),
+            mutation_registration(self.analysis_phase_one_feature_derived_generation.clone()),
             mutation_registration(self.export.clone()),
             mutation_registration(self.scenario.clone()),
             mutation_registration(self.backtest.clone()),
@@ -224,12 +225,16 @@ impl InstalledJobRunners {
         &self.export
     }
 
-    pub(crate) const fn dataset(&self) -> &Arc<DatasetJobRunner> {
-        &self.dataset
+    pub(crate) const fn research_phase_one_derived_generation(
+        &self,
+    ) -> &Arc<PhaseOneDerivedGenerationJobRunner> {
+        &self.research_phase_one_derived_generation
     }
 
-    pub(crate) const fn feature(&self) -> &Arc<DatasetJobRunner> {
-        &self.feature
+    pub(crate) const fn analysis_phase_one_feature_derived_generation(
+        &self,
+    ) -> &Arc<PhaseOneDerivedGenerationJobRunner> {
+        &self.analysis_phase_one_feature_derived_generation
     }
 
     pub(crate) const fn scenario(&self) -> &Arc<ScenarioJobRunner> {

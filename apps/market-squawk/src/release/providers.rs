@@ -15,9 +15,7 @@ use market_squawk_adapter_fred::FredSource;
 use market_squawk_adapter_treasury::{
     TreasuryDailyRateFamily, TreasuryDailyRateQuery, TreasuryFiscalQuery,
 };
-use market_squawk_data::{
-    CatalogLimit, DatasetId, FeatureLabelDataset, GenerationParentRelation, SourceOperation,
-};
+use market_squawk_data::{CatalogLimit, DatasetId, SourceOperation};
 use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
     FundamentalConsolidation, FundamentalRestatementStatus, PayloadReference, ResearchObservation,
@@ -48,7 +46,6 @@ const REPORT_KIND: &str = "market_squawk.release.providers";
 const EXTERNAL_NETWORK_GATE: &str = "MARKET_SQUAWK_EXTERNAL_NETWORK";
 const PROVIDER_TERMS_GATE: &str = "MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED";
 const MAXIMUM_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
-const MAXIMUM_TRAINING_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAXIMUM_PROVIDER_SESSIONS: usize = 32;
 const REQUEST_MAXIMUM_BYTES: usize = 1024 * 1024;
 const REQUEST_MAXIMUM_ITEMS: usize = 1024;
@@ -173,7 +170,6 @@ struct ResearchRuntimeEvidence {
     runtime_generation_digest: EvidenceDigest,
     authority_effective_at_unix_nanos: i64,
     publications: Vec<ResearchPublicationEvidence>,
-    python_training: Option<PythonTrainingEvidence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -191,7 +187,6 @@ struct ResearchPublicationEvidence {
     total_bytes: u64,
     object_count: u64,
     lineage_digest: String,
-    python_export_sha256: Option<String>,
     observation_query_row_count: u64,
     vintage_query_row_count: Option<u64>,
     series_ids: Vec<String>,
@@ -276,36 +271,6 @@ enum ResearchPublicationTemporalSemantics {
     TreasuryFiscalEffectiveObservations,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PythonTrainingEvidence {
-    request_sha256: String,
-    request_byte_count: u64,
-    dataset_id: String,
-    manifest_version: u64,
-    manifest_content_hash: String,
-    source_surface_id: String,
-    source_parent_dataset_id: String,
-    source_parent_manifest_version: u64,
-    source_parent_content_hash: String,
-    parents: Vec<PythonTrainingParentEvidence>,
-    build_spec_digest: String,
-    policy_digest: String,
-    universe_digest: String,
-    python_export_sha256: String,
-    train_examples: usize,
-    validation_examples: usize,
-    test_examples: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PythonTrainingParentEvidence {
-    dataset_id: String,
-    manifest_version: u64,
-    manifest_content_hash: String,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LiveRuntimeEvidence {
@@ -344,7 +309,7 @@ struct FredAlfredRightsEvidence {
     required: bool,
     selected: bool,
     persistence_admitted: bool,
-    model_training_admitted: bool,
+    model_training_rights_admitted: bool,
     parent_authorization_digest: Option<EvidenceDigest>,
     authorization_digest: Option<EvidenceDigest>,
     authorization_expires_at_unix_nanos: Option<i64>,
@@ -412,7 +377,7 @@ pub(super) async fn run(config: AppConfig, arguments: ReleaseProviderArguments) 
     surfaces.sort_by(|left, right| left.surface_id.cmp(&right.surface_id));
     repository.verify_unchanged()?;
     let payload = ProviderEvidence {
-        schema_version: 5,
+        schema_version: 6,
         repository: repository.clone(),
         executable,
         collected_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -479,7 +444,7 @@ async fn collect_provider_evidence(
     let mut expectations = Vec::new();
     let mut direct_order_count = 0_usize;
     let mut fred_persistence = false;
-    let mut fred_training = false;
+    let mut fred_model_training_rights = false;
     let mut fred_parent_authorization = None;
     let mut fred_authorization = None;
     let mut fred_authorization_expires_at = None;
@@ -503,65 +468,29 @@ async fn collect_provider_evidence(
             let runtime = activation
                 .research_runtime_generation(&profile_id)?
                 .ok_or_else(|| anyhow!("provider research runtime is not active: {surface_id}"))?;
-            let (publications, python_training) = if *surface_id == TREASURY_XML {
+            let publications = if *surface_id == TREASURY_XML {
                 let acceptance_year = product
                     .treasury_daily_rate_release_year()
                     .context("Treasury daily-rate activation does not cover all five families")?;
-                (
-                    exercise_treasury_research(product.application().as_ref(), acceptance_year)
-                        .await?,
-                    None,
-                )
+                exercise_treasury_research(product.application().as_ref(), acceptance_year).await?
             } else if *surface_id == TREASURY_FISCAL {
                 let query = product
                     .treasury_fiscal_release_query()
                     .context("Treasury Fiscal Data activation has no exact admitted query")?;
-                (
-                    exercise_treasury_fiscal_research(product.application().as_ref(), &query)
-                        .await?,
-                    None,
-                )
+                exercise_treasury_fiscal_research(product.application().as_ref(), &query).await?
             } else if *surface_id == SEC_EDGAR {
                 let cik = admit_sec_release_cik(arguments)?;
-                (
-                    exercise_sec_research(product.application().as_ref(), cik).await?,
-                    None,
-                )
+                exercise_sec_research(product.application().as_ref(), cik).await?
             } else if *surface_id == FRED_ALFRED {
-                let (dataset, training_request) = admit_fred_release_inputs(arguments)?;
-                let publications =
-                    exercise_fred_research(product.application().as_ref(), &dataset).await?;
-                let training = exercise_python_training(
-                    product,
-                    FRED_ALFRED,
-                    "FRED/ALFRED",
-                    training_request,
-                    &publications,
-                )
-                .await?;
-                (publications, Some(training))
+                let dataset = admit_fred_release_dataset(arguments)?;
+                exercise_fred_research(product.application().as_ref(), &dataset).await?
             } else if matches!(*surface_id, BLS_PUBLIC | BLS_REGISTERED) {
-                let (dataset, training_request) = admit_bls_release_inputs(arguments, surface_id)?;
-                let publications =
-                    exercise_bls_research(product.application().as_ref(), surface_id, &dataset)
-                        .await?;
-                let training = exercise_python_training(
-                    product,
-                    surface_id,
-                    "BLS",
-                    training_request,
-                    &publications,
-                )
-                .await?;
-                (publications, Some(training))
+                let dataset = admit_bls_release_dataset(arguments, surface_id)?;
+                exercise_bls_research(product.application().as_ref(), surface_id, &dataset).await?
             } else {
-                (Vec::new(), None)
+                Vec::new()
             };
-            Some(research_runtime_evidence(
-                &runtime,
-                publications,
-                python_training,
-            )?)
+            Some(research_runtime_evidence(&runtime, publications)?)
         } else {
             None
         };
@@ -570,7 +499,7 @@ async fn collect_provider_evidence(
                 .as_ref()
                 .ok_or_else(|| anyhow!("FRED/ALFRED research runtime evidence is absent"))?;
             fred_persistence = runtime.rights_operations.contains(&"persist");
-            fred_training = runtime.rights_operations.contains(&"train");
+            fred_model_training_rights = runtime.rights_operations.contains(&"train");
             fred_parent_authorization = Some(runtime.parent_rights_authorization_digest);
             fred_authorization = Some(runtime.rights_authorization_digest);
             fred_authorization_expires_at = runtime.rights_authorization_expires_at_unix_nanos;
@@ -623,7 +552,7 @@ async fn collect_provider_evidence(
         .ok_or_else(|| anyhow!("provider collection time is outside nanosecond range"))?;
     let fred_admitted = fred_selected
         && fred_persistence
-        && fred_training
+        && fred_model_training_rights
         && fred_parent_authorization.is_some_and(|digest| digest.bytes() != [0; 32])
         && fred_authorization.is_some_and(|digest| {
             digest.bytes() != [0; 32] && Some(digest) != fred_parent_authorization
@@ -646,7 +575,7 @@ async fn collect_provider_evidence(
             required: arguments.require_fred_alfred_rights,
             selected: fred_selected,
             persistence_admitted: fred_persistence,
-            model_training_admitted: fred_training,
+            model_training_rights_admitted: fred_model_training_rights,
             parent_authorization_digest: fred_parent_authorization,
             authorization_digest: fred_authorization,
             authorization_expires_at_unix_nanos: fred_authorization_expires_at,
@@ -776,7 +705,6 @@ fn activation_evidence(lease: &ProviderActivationLease) -> ActivationEvidence {
 fn research_runtime_evidence(
     runtime: &ResearchProviderRuntimeGeneration,
     publications: Vec<ResearchPublicationEvidence>,
-    python_training: Option<PythonTrainingEvidence>,
 ) -> Result<ResearchRuntimeEvidence> {
     let rights_operations = [
         SourceOperation::Retrieve,
@@ -812,7 +740,6 @@ fn research_runtime_evidence(
         runtime_generation_digest: runtime.generation_digest()?,
         authority_effective_at_unix_nanos: runtime.authority_effective_at().unix_nanos(),
         publications,
-        python_training,
     })
 }
 
@@ -1343,110 +1270,6 @@ async fn exercise_bls_research(
     Ok(vec![publication])
 }
 
-async fn exercise_python_training(
-    product: &LocalProduct,
-    source_surface_id: &'static str,
-    source_label: &'static str,
-    request: &Path,
-    publications: &[ResearchPublicationEvidence],
-) -> Result<PythonTrainingEvidence> {
-    if publications.is_empty()
-        || publications.iter().any(|publication| {
-            publication.surface_id != source_surface_id
-                || publication.python_export_sha256.is_some()
-        })
-    {
-        bail!("{source_label} publication evidence is invalid for a derived training handoff");
-    }
-    let request_before =
-        hash_stable_file(request, MAXIMUM_TRAINING_REQUEST_BYTES).with_context(|| {
-            format!("{source_label} training request is not a stable bounded regular file")
-        })?;
-    let built =
-        crate::local_product::cli_dataset::build_point_in_time_dataset_from_file(product, request)
-            .await
-            .with_context(|| {
-                format!("{source_label} point-in-time training dataset could not be built")
-            })?;
-    let request_after = hash_stable_file(request, MAXIMUM_TRAINING_REQUEST_BYTES)
-        .with_context(|| format!("{source_label} training request could not be revalidated"))?;
-    if request_before != request_after {
-        bail!("{source_label} training request changed while the dataset was built");
-    }
-    python_training_evidence(
-        &built,
-        source_surface_id,
-        source_label,
-        publications,
-        request_before,
-    )
-}
-
-fn python_training_evidence(
-    built: &FeatureLabelDataset,
-    source_surface_id: &'static str,
-    source_label: &'static str,
-    publications: &[ResearchPublicationEvidence],
-    request: StableFileIdentity,
-) -> Result<PythonTrainingEvidence> {
-    let mut matching_parents = built.pinned().parents().iter().filter(|parent| {
-        parent.relation() == GenerationParentRelation::DerivedInput
-            && publications.iter().any(|publication| {
-                parent.manifest().dataset_id().as_str() == publication.analytical_dataset_id
-                    && parent.manifest().manifest_version() == publication.manifest_version
-                    && lower_hex(parent.manifest().content_hash().bytes())
-                        == publication.manifest_content_hash
-            })
-    });
-    let source_parent = matching_parents.next().ok_or_else(|| {
-        anyhow!("training dataset omitted the exact published {source_label} parent")
-    })?;
-    if matching_parents.next().is_some() {
-        bail!("training dataset contains ambiguous {source_label} parent generations");
-    }
-    let splits = built.split_counts();
-    if splits.train_examples() == 0
-        || splits.validation_examples() == 0
-        || splits.test_examples() == 0
-    {
-        bail!("training dataset must contain nonempty train, validation, and test splits");
-    }
-    let manifest = built.manifest();
-    let parents = built
-        .pinned()
-        .parents()
-        .iter()
-        .map(|parent| PythonTrainingParentEvidence {
-            dataset_id: parent.manifest().dataset_id().as_str().to_owned(),
-            manifest_version: parent.manifest().manifest_version(),
-            manifest_content_hash: lower_hex(parent.manifest().content_hash().bytes()),
-        })
-        .collect();
-    let python_export_sha256 = built
-        .python_export()
-        .context("canonical Python training descriptor could not be reproduced")?
-        .content_hash();
-    Ok(PythonTrainingEvidence {
-        request_sha256: request.sha256,
-        request_byte_count: request.byte_count,
-        dataset_id: manifest.dataset_id().as_str().to_owned(),
-        manifest_version: manifest.manifest_version(),
-        manifest_content_hash: lower_hex(manifest.content_hash().bytes()),
-        source_surface_id: source_surface_id.to_owned(),
-        source_parent_dataset_id: source_parent.manifest().dataset_id().as_str().to_owned(),
-        source_parent_manifest_version: source_parent.manifest().manifest_version(),
-        source_parent_content_hash: lower_hex(source_parent.manifest().content_hash().bytes()),
-        parents,
-        build_spec_digest: lower_hex(built.build_spec_digest().digest().bytes()),
-        policy_digest: lower_hex(built.policy_digest().bytes()),
-        universe_digest: lower_hex(built.universe_digest().bytes()),
-        python_export_sha256: lower_hex(python_export_sha256.bytes()),
-        train_examples: splits.train_examples(),
-        validation_examples: splits.validation_examples(),
-        test_examples: splits.test_examples(),
-    })
-}
-
 fn parse_research_publication(
     surface_id: &str,
     family: &str,
@@ -1478,10 +1301,6 @@ fn parse_research_publication(
     )?;
     let lineage_digest =
         required_sha256(ingestion.get("lineageDigest"), "research lineage digest")?;
-    let python_export_sha256 = optional_sha256(
-        ingestion.get("pythonExportSha256"),
-        "research Python export digest",
-    )?;
     Ok(ResearchPublicationEvidence {
         surface_id: surface_id.to_owned(),
         family: family.to_owned(),
@@ -1495,7 +1314,6 @@ fn parse_research_publication(
         total_bytes,
         object_count,
         lineage_digest,
-        python_export_sha256,
         observation_query_row_count: 0,
         vintage_query_row_count: None,
         series_ids: Vec::new(),
@@ -2697,8 +2515,7 @@ async fn verify_restart_recovery(
                     })?;
                 let mut expected_identity = expected_runtime.clone();
                 expected_identity.publications.clear();
-                expected_identity.python_training = None;
-                if research_runtime_evidence(&runtime, Vec::new(), None)? != expected_identity {
+                if research_runtime_evidence(&runtime, Vec::new())? != expected_identity {
                     bail!("provider research runtime changed during restart: {surface_id}");
                 }
                 for publication in &expected_runtime.publications {
@@ -2792,9 +2609,6 @@ async fn verify_restart_recovery(
                         );
                     }
                 }
-                if let Some(training) = &expected_runtime.python_training {
-                    verify_python_training_recovery(product, training)?;
-                }
             }
             None => {
                 if activation
@@ -2854,57 +2668,6 @@ async fn verify_treasury_fiscal_recovery(
     Ok(observations.row_count)
 }
 
-fn verify_python_training_recovery(
-    product: &LocalProduct,
-    expected: &PythonTrainingEvidence,
-) -> Result<()> {
-    let dataset_id = DatasetId::try_from(expected.dataset_id.as_str())
-        .context("recorded Python training dataset identity is invalid")?;
-    let deadline = Instant::now()
-        .checked_add(APPLICATION_REQUEST_TIMEOUT)
-        .ok_or_else(|| anyhow!("Python training recovery deadline overflow"))?;
-    let cancellation = CancellationToken::new();
-    let recovered = product
-        .research()
-        .analytical_reader()
-        .feature_dataset(&dataset_id, deadline, &cancellation)
-        .context("Python training generation could not be reopened after restart")?
-        .ok_or_else(|| anyhow!("Python training generation is absent after restart"))?;
-    let generation = recovered.generation();
-    let manifest = generation.manifest();
-    let recovered_parents = generation.parents();
-    if manifest.manifest_version() != expected.manifest_version
-        || lower_hex(manifest.content_hash().bytes()) != expected.manifest_content_hash
-        || generation
-            .build_spec_digest()
-            .is_none_or(|digest| lower_hex(digest.digest().bytes()) != expected.build_spec_digest)
-        || lower_hex(recovered.policy_digest().bytes()) != expected.policy_digest
-        || lower_hex(recovered.universe_digest().bytes()) != expected.universe_digest
-        || lower_hex(recovered.python_export_sha256().bytes()) != expected.python_export_sha256
-        || recovered_parents.len() != expected.parents.len()
-        || recovered_parents
-            .iter()
-            .zip(&expected.parents)
-            .any(|(actual, recorded)| {
-                actual.relation() != GenerationParentRelation::DerivedInput
-                    || actual.manifest().dataset_id().as_str() != recorded.dataset_id
-                    || actual.manifest().manifest_version() != recorded.manifest_version
-                    || lower_hex(actual.manifest().content_hash().bytes())
-                        != recorded.manifest_content_hash
-            })
-    {
-        bail!("Python training generation changed during restart");
-    }
-    let splits = recovered.split_counts();
-    if splits.train_examples() != expected.train_examples
-        || splits.validation_examples() != expected.validation_examples
-        || splits.test_examples() != expected.test_examples
-    {
-        bail!("Python training split evidence changed during restart");
-    }
-    Ok(())
-}
-
 async fn shutdown_product(product: &LocalProduct) -> Result<()> {
     let timeout = product.application().shutdown_timeout();
     let deadline = Instant::now()
@@ -2952,9 +2715,9 @@ fn admit_selected_surfaces(arguments: &ReleaseProviderArguments) -> Result<Vec<&
         bail!("FRED and ALFRED rights evidence requires the exact FRED/ALFRED surface");
     }
     if requested.contains(FRED_ALFRED) {
-        admit_fred_release_inputs(arguments)?;
-    } else if arguments.fred_dataset.is_some() || arguments.fred_training_request.is_some() {
-        bail!("FRED/ALFRED release inputs require the selected FRED/ALFRED surface");
+        admit_fred_release_dataset(arguments)?;
+    } else if arguments.fred_dataset.is_some() {
+        bail!("FRED/ALFRED release dataset requires the selected FRED/ALFRED surface");
     }
     if requested.contains(SEC_EDGAR) {
         admit_sec_release_cik(arguments)?;
@@ -2967,12 +2730,12 @@ fn admit_selected_surfaces(arguments: &ReleaseProviderArguments) -> Result<Vec<&
         .collect::<Vec<_>>();
     match selected_bls.as_slice() {
         [] => {
-            if arguments.bls_dataset.is_some() || arguments.bls_training_request.is_some() {
-                bail!("BLS release inputs require one selected BLS surface");
+            if arguments.bls_dataset.is_some() {
+                bail!("BLS release dataset requires one selected BLS surface");
             }
         }
         [surface] => {
-            admit_bls_release_inputs(arguments, surface)?;
+            admit_bls_release_dataset(arguments, surface)?;
         }
         _ => bail!("provider release evidence accepts one BLS access tier per run"),
     }
@@ -2996,9 +2759,7 @@ fn admit_sec_release_cik(arguments: &ReleaseProviderArguments) -> Result<&str> {
         })
 }
 
-fn admit_fred_release_inputs(
-    arguments: &ReleaseProviderArguments,
-) -> Result<(SourceIdentifier, &Path)> {
+fn admit_fred_release_dataset(arguments: &ReleaseProviderArguments) -> Result<SourceIdentifier> {
     let provider_dataset = arguments
         .fred_dataset
         .as_deref()
@@ -3010,17 +2771,13 @@ fn admit_fred_release_inputs(
         .context("FRED/ALFRED provider dataset is not an exact bounded observations request")?;
     DatasetId::try_from(analytical_dataset.as_str())
         .context("FRED/ALFRED analytical dataset identity is invalid")?;
-    let training = arguments
-        .fred_training_request
-        .as_deref()
-        .ok_or_else(|| anyhow!("selected FRED/ALFRED surface requires --fred-training-request"))?;
-    Ok((provider_dataset, training))
+    Ok(provider_dataset)
 }
 
-fn admit_bls_release_inputs<'a>(
-    arguments: &'a ReleaseProviderArguments,
+fn admit_bls_release_dataset(
+    arguments: &ReleaseProviderArguments,
     surface_id: &str,
-) -> Result<(SourceIdentifier, &'a Path)> {
+) -> Result<SourceIdentifier> {
     let provider_dataset = arguments
         .bls_dataset
         .as_deref()
@@ -3040,11 +2797,7 @@ fn admit_bls_release_inputs<'a>(
         .context("BLS provider dataset is not an exact bounded timeseries request")?;
     DatasetId::try_from(analytical_dataset.as_str())
         .context("BLS analytical dataset identity is invalid")?;
-    let training = arguments
-        .bls_training_request
-        .as_deref()
-        .ok_or_else(|| anyhow!("selected BLS surface requires --bls-training-request"))?;
-    Ok((provider_dataset, training))
+    Ok(provider_dataset)
 }
 
 fn is_live_surface(surface_id: &str) -> bool {

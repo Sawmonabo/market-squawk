@@ -24,8 +24,8 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use persistence::{
-    ForecastIndex, ForecastPayloadRecord, OutcomeRecord, VintageRecord, digest_from_hex, hex,
-    validate_digest,
+    ForecastIndex, ForecastIndexSelection, ForecastPayloadRecord, OutcomeRecord, VintageRecord,
+    digest_from_hex, hex, validate_digest,
 };
 
 use super::{
@@ -57,7 +57,7 @@ const FORECAST_PAYLOAD_SCHEMA_VERSION: u32 = 3;
 const MAXIMUM_VINTAGES: usize = 100_000;
 const MAXIMUM_OUTCOMES: usize = 1_000_000;
 const MAXIMUM_DRIFT_OUTCOMES: usize = 4_096;
-const FORECAST_SELECTION_POLICY_REVISION: u32 = 1;
+const FORECAST_SELECTION_POLICY_REVISION: u32 = 2;
 
 /// Stable newest-valid ordering used by the internal investment-workspace read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -87,11 +87,45 @@ impl ForecastSelectionOrder {
     }
 }
 
+/// Exact evidence shape applied before newest-valid ordering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ForecastSelectionQualification {
+    /// Every valid, available, published, and nonexpired vintage is eligible.
+    AnyValid,
+    /// Only complete calibrated conditional-mean terminal-price evidence at one exact horizon.
+    ExactCalibratedConditionalMeanPrice { horizon_nanos: NonZeroU64 },
+}
+
+impl ForecastSelectionQualification {
+    fn update_receipt_digest(self, digest: &mut Sha256) -> Result<(), ForecastApplicationError> {
+        match self {
+            Self::AnyValid => {
+                update_receipt_digest_field(digest, b"qualification", b"any_valid")?;
+            }
+            Self::ExactCalibratedConditionalMeanPrice { horizon_nanos } => {
+                update_receipt_digest_field(
+                    digest,
+                    b"qualification",
+                    b"exact_calibrated_conditional_mean_price",
+                )?;
+                update_receipt_digest_field(
+                    digest,
+                    b"qualification_horizon_nanos",
+                    &horizon_nanos.get().to_be_bytes(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ForecastSelectionReceiptBody {
     policy_revision: u32,
     selection_order: ForecastSelectionOrder,
+    qualification: ForecastSelectionQualification,
     instrument_id: InstrumentId,
     as_of_unix_nanos: i64,
     considered_vintage_count: usize,
@@ -104,6 +138,7 @@ struct ForecastSelectionReceiptBody {
     selected_observed_through_unix_nanos: i64,
     selected_available_at_unix_nanos: i64,
     selected_expires_at_unix_nanos: i64,
+    selected_terminal_target_at_unix_nanos: Option<i64>,
 }
 
 /// Exact, canonically identified proof that the complete retained forecast set was considered.
@@ -134,6 +169,12 @@ impl ForecastSelectionReceipt {
     #[must_use]
     pub(crate) const fn selection_order(&self) -> ForecastSelectionOrder {
         self.body.selection_order
+    }
+
+    /// Exact evidence shape applied before newest-valid ordering.
+    #[must_use]
+    pub(crate) const fn qualification(&self) -> ForecastSelectionQualification {
+        self.body.qualification
     }
 
     /// Exact requested instrument.
@@ -208,6 +249,27 @@ impl ForecastSelectionReceipt {
         self.body.selected_expires_at_unix_nanos
     }
 
+    /// Exact terminal target bound into an exact-horizon receipt, absent for newest-any reads.
+    #[must_use]
+    pub(crate) const fn selected_terminal_target_at_unix_nanos(&self) -> Option<i64> {
+        self.body.selected_terminal_target_at_unix_nanos
+    }
+
+    const fn is_exact_horizon_price_qualified(&self, requested_horizon_nanos: NonZeroU64) -> bool {
+        matches!(
+            self.body.qualification,
+            ForecastSelectionQualification::ExactCalibratedConditionalMeanPrice {
+                horizon_nanos
+            } if horizon_nanos.get() == requested_horizon_nanos.get()
+        )
+    }
+
+    fn binds_live_terminal_target(&self, terminal_target: Timestamp) -> bool {
+        self.body.selected_terminal_target_at_unix_nanos == Some(terminal_target.unix_nanos())
+            && terminal_target.unix_nanos() > self.body.as_of_unix_nanos
+            && self.body.selected_expires_at_unix_nanos <= terminal_target.unix_nanos()
+    }
+
     /// Versioned SHA-256 identity of every canonical receipt field.
     #[must_use]
     pub(crate) const fn receipt_digest(&self) -> EvidenceDigest {
@@ -222,7 +284,7 @@ fn forecast_selection_receipt_digest(
     update_receipt_digest_field(
         &mut digest,
         b"domain",
-        b"market-squawk/forecast-selection-receipt/v1",
+        b"market-squawk/forecast-selection-receipt/v2",
     )?;
     update_receipt_digest_field(
         &mut digest,
@@ -234,6 +296,7 @@ fn forecast_selection_receipt_digest(
         b"selection_order",
         body.selection_order.canonical_bytes(),
     )?;
+    body.qualification.update_receipt_digest(&mut digest)?;
     let instrument_id = body.instrument_id.as_uuid();
     update_receipt_digest_field(&mut digest, b"instrument_id", instrument_id.as_bytes())?;
     update_receipt_digest_field(
@@ -291,6 +354,19 @@ fn forecast_selection_receipt_digest(
         b"selected_expires_at_unix_nanos",
         &body.selected_expires_at_unix_nanos.to_be_bytes(),
     )?;
+    match body.selected_terminal_target_at_unix_nanos {
+        Some(target_at_unix_nanos) => {
+            update_receipt_digest_field(&mut digest, b"selected_terminal_target_present", &[1])?;
+            update_receipt_digest_field(
+                &mut digest,
+                b"selected_terminal_target_at_unix_nanos",
+                &target_at_unix_nanos.to_be_bytes(),
+            )?;
+        }
+        None => {
+            update_receipt_digest_field(&mut digest, b"selected_terminal_target_present", &[0])?
+        }
+    }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
         digest.finalize().into(),
@@ -579,6 +655,8 @@ pub(crate) struct LatestValidForecast {
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExactHorizonPriceForecastUnavailableReason {
+    /// The receipt came from the generic newest-valid research selector.
+    SelectionNotExactHorizonQualified,
     /// The selected model binding is not admitted as conditional-mean terminal-price evidence.
     PriceEvidenceUnavailable(ForecastPriceUnavailableReason),
     /// The admitted model predicts a different exact terminal horizon.
@@ -841,49 +919,54 @@ impl LatestValidForecast {
                 price.instrument_id(),
                 price.output_binding_identity(),
             ),
-            ForecastPriceEvidence::Unavailable(unavailable) => {
-                return Ok(ExactHorizonPriceForecastEvidence::Unavailable(
-                    ExactHorizonPriceForecastUnavailable {
-                        requested_horizon_nanos,
-                        vintage_id: unavailable.vintage_id(),
-                        instrument_id: unavailable.instrument_id(),
-                        output_binding_identity: unavailable.output_binding_identity(),
-                        selection_receipt_digest: self.selection_receipt.receipt_digest(),
-                        reason:
-                            ExactHorizonPriceForecastUnavailableReason::PriceEvidenceUnavailable(
-                                unavailable.reason(),
-                            ),
-                    },
-                ));
-            }
+            ForecastPriceEvidence::Unavailable(unavailable) => (
+                unavailable.vintage_id(),
+                unavailable.instrument_id(),
+                unavailable.output_binding_identity(),
+            ),
         };
+        let unavailable = |reason| {
+            ExactHorizonPriceForecastEvidence::Unavailable(ExactHorizonPriceForecastUnavailable {
+                requested_horizon_nanos,
+                vintage_id,
+                instrument_id,
+                output_binding_identity,
+                selection_receipt_digest: self.selection_receipt.receipt_digest(),
+                reason,
+            })
+        };
+        if !self
+            .selection_receipt
+            .is_exact_horizon_price_qualified(requested_horizon_nanos)
+        {
+            let reason = match self.selection_receipt.qualification() {
+                ForecastSelectionQualification::AnyValid => {
+                    ExactHorizonPriceForecastUnavailableReason::SelectionNotExactHorizonQualified
+                }
+                ForecastSelectionQualification::ExactCalibratedConditionalMeanPrice {
+                    horizon_nanos,
+                } => ExactHorizonPriceForecastUnavailableReason::HorizonMismatch {
+                    selected_horizon_nanos: horizon_nanos,
+                },
+            };
+            return Ok(unavailable(reason));
+        }
         let ForecastPriceEvidence::Available(price) = &self.price_evidence else {
-            return Err(ForecastApplicationError::CorruptIndex);
+            let ForecastPriceEvidence::Unavailable(price) = &self.price_evidence else {
+                return Err(ForecastApplicationError::CorruptIndex);
+            };
+            return Ok(unavailable(
+                ExactHorizonPriceForecastUnavailableReason::PriceEvidenceUnavailable(
+                    price.reason(),
+                ),
+            ));
         };
         if price.terminal_horizon_nanos() != requested_horizon_nanos {
-            return Ok(ExactHorizonPriceForecastEvidence::Unavailable(
-                ExactHorizonPriceForecastUnavailable {
-                    requested_horizon_nanos,
-                    vintage_id,
-                    instrument_id,
-                    output_binding_identity,
-                    selection_receipt_digest: self.selection_receipt.receipt_digest(),
-                    reason: ExactHorizonPriceForecastUnavailableReason::HorizonMismatch {
-                        selected_horizon_nanos: price.terminal_horizon_nanos(),
-                    },
-                },
-            ));
+            return Err(ForecastApplicationError::CorruptIndex);
         }
         let Some(calibration) = price.calibration() else {
-            return Ok(ExactHorizonPriceForecastEvidence::Unavailable(
-                ExactHorizonPriceForecastUnavailable {
-                    requested_horizon_nanos,
-                    vintage_id,
-                    instrument_id,
-                    output_binding_identity,
-                    selection_receipt_digest: self.selection_receipt.receipt_digest(),
-                    reason: ExactHorizonPriceForecastUnavailableReason::CalibrationUnavailable,
-                },
+            return Ok(unavailable(
+                ExactHorizonPriceForecastUnavailableReason::CalibrationUnavailable,
             ));
         };
         let [terminal] = price.points() else {
@@ -920,6 +1003,9 @@ impl LatestValidForecast {
             && intervals.interval_80().upper() <= intervals.interval_95().upper();
         if price.central_statistic() != ForecastCentralStatistic::ModelEstimatedConditionalMean
             || terminal.target_at() != expected_target
+            || !self
+                .selection_receipt
+                .binds_live_terminal_target(terminal.target_at())
             || !nested
             || calibration.identity().bytes() == [0; 32]
             || &revalidated_calibration != calibration
@@ -989,6 +1075,15 @@ pub(crate) trait ForecastEvidenceReader: Send + Sync {
     async fn latest_valid_for_instrument(
         &self,
         instrument_id: InstrumentId,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError>;
+
+    /// Selects the newest exact calibrated conditional-mean terminal-price vintage.
+    async fn latest_valid_exact_horizon_price_for_instrument(
+        &self,
+        instrument_id: InstrumentId,
+        requested_horizon_nanos: NonZeroU64,
         as_of: Timestamp,
         context: ForecastEvidenceReadContext,
     ) -> Result<LatestValidForecast, ForecastApplicationError>;
@@ -1355,35 +1450,72 @@ impl ForecastEvidenceReader for ModelDomainService {
             context.ensure_live()?;
             selected
         };
-        let image = self.read_image.load();
-        let (model_id, bundle_id, bundle_version) = selected.vintage.typed_model_coordinate()?;
-        let bundle = image
-            .registry
-            .get(&bundle_id, bundle_version)
-            .map_err(|_error| ForecastApplicationError::Unavailable)?
-            .ok_or(ForecastApplicationError::Unavailable)?;
-        let metadata = bundle.metadata();
-        if metadata.model_id() != model_id {
-            return Err(ForecastApplicationError::CorruptIndex);
-        }
-        let reference = selected.vintage.artifact_reference()?;
-        let artifact = forecasts
-            .artifacts
-            .read(
-                ArtifactReadRequest::try_new(reference.clone(), context.maximum_artifact_bytes)?,
-                context.artifact.clone(),
-            )
-            .await?;
-        context.ensure_live()?;
-        selected.vintage.verify_artifact_read(&artifact)?;
-        let price_evidence = selected.vintage.revalidated_price_evidence(metadata)?;
-        Ok(LatestValidForecast {
-            price_evidence,
-            selection_receipt: selected.receipt,
-            model_metadata: metadata.clone(),
-            forecast_artifact: reference,
-        })
+        read_forecast_index_selection(self, forecasts, selected, context).await
     }
+
+    async fn latest_valid_exact_horizon_price_for_instrument(
+        &self,
+        _instrument_id: InstrumentId,
+        _requested_horizon_nanos: NonZeroU64,
+        _as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError> {
+        let _forecasts = self
+            .forecasts
+            .as_ref()
+            .ok_or(ForecastApplicationError::Unavailable)?;
+        context.ensure_live()?;
+        // Current vintages carry neither a sealed TrainingV1-to-AnalysisV1 pairing nor an
+        // admitted terminal-price-production receipt. Raw and currently prepared publications
+        // remain research forecasts and cannot mint recommendation-facing price evidence.
+        Err(ForecastApplicationError::Unavailable)
+    }
+}
+
+async fn read_forecast_index_selection(
+    service: &ModelDomainService,
+    forecasts: &ForecastApplicationService,
+    selected: ForecastIndexSelection,
+    context: ForecastEvidenceReadContext,
+) -> Result<LatestValidForecast, ForecastApplicationError> {
+    let image = service.read_image.load();
+    let (model_id, bundle_id, bundle_version) = selected.vintage.typed_model_coordinate()?;
+    let bundle = image
+        .registry
+        .get(&bundle_id, bundle_version)
+        .map_err(|_error| ForecastApplicationError::Unavailable)?
+        .ok_or(ForecastApplicationError::Unavailable)?;
+    let metadata = bundle.metadata();
+    if metadata.model_id() != model_id {
+        return Err(ForecastApplicationError::CorruptIndex);
+    }
+    let reference = selected.vintage.artifact_reference()?;
+    let artifact = forecasts
+        .artifacts
+        .read(
+            ArtifactReadRequest::try_new(reference.clone(), context.maximum_artifact_bytes)?,
+            context.artifact.clone(),
+        )
+        .await?;
+    context.ensure_live()?;
+    selected.vintage.verify_artifact_read(&artifact)?;
+    let price_evidence = selected.vintage.revalidated_price_evidence(metadata)?;
+    let selected = LatestValidForecast {
+        price_evidence,
+        selection_receipt: selected.receipt,
+        model_metadata: metadata.clone(),
+        forecast_artifact: reference,
+    };
+    if let ForecastSelectionQualification::ExactCalibratedConditionalMeanPrice { horizon_nanos } =
+        selected.selection_receipt().qualification()
+        && !matches!(
+            selected.exact_horizon_price_projection(horizon_nanos)?,
+            ExactHorizonPriceForecastEvidence::Available(_)
+        )
+    {
+        return Err(ForecastApplicationError::CorruptIndex);
+    }
+    Ok(selected)
 }
 
 fn drift_monitoring_value(

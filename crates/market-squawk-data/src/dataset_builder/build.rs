@@ -25,9 +25,7 @@ use super::model::{
     FeatureLabelComponentInput, FeatureLabelDataset, FeatureLabelMeasurement,
     FeatureLabelMeasurementBinding, MissingValuePolicy,
 };
-use super::{
-    DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuilderService, admission, canonical,
-};
+use super::{DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuilderService, canonical};
 use crate::schema::{
     FEATURE_LABEL_COMPONENT_NAME_BYTES, FEATURE_LABEL_CURRENCY_BYTES,
     FEATURE_LABEL_EXAMPLE_ID_BYTES, FEATURE_LABEL_MISSING_REASON_BYTES, FEATURE_LABEL_UNIT_BYTES,
@@ -37,8 +35,8 @@ use crate::{
     DatasetArrowBatch, DatasetManifestRecord, DatasetSchemaRegistry, DerivedOutputObjectInput,
     FeatureLabelBatchBindings, GenerationParentRelation, IngestIdentity, ManifestObject,
     ManifestPlan, PinnedDataset, PointInTimeCandidate, PointInTimeRequest, PointInTimeSelection,
-    PointInTimeService, ResearchArrowBatch, ResearchUseRequest, Sha256Digest, SourceOperation,
-    UniverseSnapshot,
+    PointInTimeService, RegisteredRightsGrant, ResearchArrowBatch, ResearchUseRequest,
+    Sha256Digest, SourceOperation, UniverseSnapshot,
 };
 
 #[derive(Debug)]
@@ -108,16 +106,18 @@ pub(super) async fn build(
     budget.charge(request.retained_bytes())?;
     let label_measurements = derive_label_measurements(&request, &mut budget)?;
     if let Some(existing) = matching_existing(builder, &request)? {
-        authorize_existing_output(builder, &request, &existing, &cancellation)?;
-        return admit_result(
+        drop(authorize_existing_output(
             builder,
-            result_from_existing(
-                &request,
-                expected_split_counts(&request)?,
-                existing,
-                label_measurements,
-            ),
-        );
+            &request,
+            &existing,
+            &cancellation,
+        )?);
+        return Ok(result_from_existing(
+            &request,
+            expected_split_counts(&request)?,
+            existing,
+            label_measurements,
+        ));
     }
     let candidates = read_inputs(builder, &request, &cancellation, deadline, &mut budget).await?;
     let prepared =
@@ -136,16 +136,18 @@ pub(super) async fn build(
     check_control(&cancellation, deadline)?;
     let authorization = authorize_research_use(builder, &request, &cancellation)?;
     if let Some(existing) = matching_existing(builder, &request)? {
-        authorize_existing_output(builder, &request, &existing, &cancellation)?;
-        return admit_result(
+        drop(authorize_existing_output(
             builder,
-            result_from_existing(
-                &request,
-                prepared.split_counts,
-                existing,
-                label_measurements,
-            ),
-        );
+            &request,
+            &existing,
+            &cancellation,
+        )?);
+        return Ok(result_from_existing(
+            &request,
+            prepared.split_counts,
+            existing,
+            label_measurements,
+        ));
     }
     check_control(&cancellation, deadline)?;
     let store = builder.service.object_store();
@@ -248,26 +250,23 @@ pub(super) async fn build(
     drop(publication);
     check_control(&cancellation, deadline)?;
     let pinned = builder.service.pinned(derived.manifest())?;
-    admit_result(
-        builder,
-        FeatureLabelDataset {
-            pinned,
-            build_spec_digest: request.build_spec_digest(),
-            policy_digest: request.policy_digest(),
-            universe_digest: request.universe_digest(),
-            split_counts: prepared.split_counts,
-            universe_id: request.inputs().universe_id().clone(),
-            split_policy: request.policy().split(),
-            point_in_time_policy: request.policy().point_in_time(),
-            missing_value_policy: request.policy().missing_values(),
-            component_specs: request
-                .inputs()
-                .component_specs()
-                .to_vec()
-                .into_boxed_slice(),
-            label_measurements,
-        },
-    )
+    Ok(FeatureLabelDataset {
+        pinned,
+        build_spec_digest: request.build_spec_digest(),
+        policy_digest: request.policy_digest(),
+        universe_digest: request.universe_digest(),
+        split_counts: prepared.split_counts,
+        universe_id: request.inputs().universe_id().clone(),
+        split_policy: request.policy().split(),
+        point_in_time_policy: request.policy().point_in_time(),
+        missing_value_policy: request.policy().missing_values(),
+        component_specs: request
+            .inputs()
+            .component_specs()
+            .to_vec()
+            .into_boxed_slice(),
+        label_measurements,
+    })
 }
 
 pub(super) fn validate_request_authority(
@@ -276,14 +275,6 @@ pub(super) fn validate_request_authority(
     cancellation: &CancellationToken,
 ) -> Result<(), DatasetBuildError> {
     authorize_research_use(builder, request, cancellation).map(|_authorization| ())
-}
-
-fn admit_result(
-    builder: &DatasetBuilderService<'_>,
-    dataset: FeatureLabelDataset,
-) -> Result<FeatureLabelDataset, DatasetBuildError> {
-    admission::register(builder, &dataset)?;
-    Ok(dataset)
 }
 
 async fn read_inputs(
@@ -1102,12 +1093,12 @@ fn authorize_research_use(
         .map_err(Into::into)
 }
 
-fn authorize_existing_output(
+pub(super) fn authorize_existing_output(
     builder: &DatasetBuilderService<'_>,
     request: &DatasetBuildRequest,
     existing: &PinnedDataset,
     cancellation: &CancellationToken,
-) -> Result<(), DatasetBuildError> {
+) -> Result<RegisteredRightsGrant, DatasetBuildError> {
     if cancellation.is_cancelled() {
         return Err(DatasetBuildError::Cancelled);
     }
@@ -1118,12 +1109,13 @@ fn authorize_existing_output(
         .authority
         .lock()
         .map_err(|_| DatasetBuildError::AuthorityLockPoisoned)?;
-    authority.admit_source_rights(
-        request
-            .output_authorization()
-            .rights_decision(object.object().content_hash(), current_timestamp()?),
-    )?;
-    Ok(())
+    authority
+        .admit_source_rights(
+            request
+                .output_authorization()
+                .rights_decision(object.object().content_hash(), current_timestamp()?),
+        )
+        .map_err(Into::into)
 }
 
 fn current_timestamp() -> Result<market_squawk_domain::Timestamp, DatasetBuildError> {

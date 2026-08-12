@@ -729,7 +729,12 @@ function humanize(value: string) {
 
 function jobLabel(kind: string) {
   if (kind === "research.ingest-source.v1") return "Ingest research source"
-  if (kind === "research.dataset-build.v1") return "Build point-in-time dataset"
+  if (kind === "research.phase-one-derived-generation-job.v1") {
+    return "Build phase-one derived generation"
+  }
+  if (kind === "analysis.phase-one-feature-derived-generation-job.v1") {
+    return "Build phase-one feature generation"
+  }
   if (kind === "research.dataset-export.v1") return "Export research history"
   return humanize(kind.replace(/^research\./, "").replace(/\.v\d+$/, ""))
 }

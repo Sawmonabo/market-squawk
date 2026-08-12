@@ -15,7 +15,8 @@ use uuid::Uuid;
 
 use crate::{
     ArrowConversionError, CatalogEndpointIdentity, CatalogError, DatasetBuildSpecDigest,
-    DatasetManifestRef, DatasetSplitCounts, FeatureLabelComponentSpec, FeatureLabelMeasurement,
+    DatasetManifestRef, DatasetSplitCounts, FeatureDatasetProductContract,
+    FeatureDatasetProductionReceiptV1, FeatureLabelComponentSpec, FeatureLabelMeasurement,
     FeatureLabelMeasurementBinding, Sha256Digest, UniverseId,
 };
 
@@ -31,6 +32,18 @@ pub enum PythonDatasetCatalogError {
     /// Catalog, descriptor, generation, object, or selected-row identities disagree.
     #[error("Python dataset admission evidence is corrupt")]
     CorruptAdmission,
+    /// Typed producer evidence was empty, repeated, reserved, or outside its closed bound.
+    #[error("feature-dataset production evidence is invalid")]
+    InvalidProductionEvidence,
+    /// A generation was already paired with a different semantic production identity.
+    #[error("feature-dataset production admission conflicts with retained evidence")]
+    ConflictingProductionAdmission,
+    /// Canonical receipt serialization failed or exceeded its fixed byte bound.
+    #[error("feature-dataset production receipt could not be canonically encoded")]
+    ProductionReceiptEncoding,
+    /// Fresh ResearchUse authority expired before the final atomic admission transaction.
+    #[error("feature-dataset production research authority expired before admission")]
+    ResearchAuthorizationExpired,
     /// A caller-selected count, byte, or elapsed-time bound was exceeded.
     #[error("Python dataset verification limit was exceeded")]
     LimitExceeded,
@@ -286,6 +299,8 @@ pub struct PythonDatasetSelection {
     catalog_identity: CatalogEndpointIdentity,
     export_sha256: Sha256Digest,
     descriptor: Box<[u8]>,
+    production_receipt: FeatureDatasetProductionReceiptV1,
+    product_contract: FeatureDatasetProductContract,
     selection_sha256: Sha256Digest,
     selected_rows: usize,
     as_of: Timestamp,
@@ -316,6 +331,16 @@ impl PythonDatasetSelection {
     /// Returns the exact producer-registered descriptor bytes.
     pub fn descriptor(&self) -> &[u8] {
         &self.descriptor
+    }
+
+    /// Returns the immutable receipt required for product/model admission of this dataset.
+    pub const fn production_receipt(&self) -> &FeatureDatasetProductionReceiptV1 {
+        &self.production_receipt
+    }
+
+    /// Returns the exact closed recipe and independently authorized consumer use.
+    pub const fn product_contract(&self) -> FeatureDatasetProductContract {
+        self.product_contract
     }
 
     /// Returns the independently derived canonical selected-row identity.
@@ -409,10 +434,11 @@ impl PythonDatasetSelectionRevalidation {
     }
 }
 
-/// Resolves and verifies one registered Task 11 export from an operator-selected local root.
+/// Resolves and verifies one receipt-admitted export from an operator-selected local root.
 pub fn verify_python_dataset(
     local_root: impl AsRef<std::path::Path>,
     export_sha256: Sha256Digest,
+    expected_contract: FeatureDatasetProductContract,
     as_of: Timestamp,
     limits: PythonDatasetVerificationLimits,
     deadline: Instant,
@@ -421,6 +447,7 @@ pub fn verify_python_dataset(
     verify::verify(
         local_root.as_ref(),
         export_sha256,
+        expected_contract,
         as_of,
         limits,
         deadline,

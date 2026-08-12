@@ -1,4 +1,4 @@
-//! Application-owned composition for local research ingestion and point-in-time datasets.
+//! Application-owned composition for research ingestion and immutable analytical generations.
 
 use std::sync::Arc;
 
@@ -554,8 +554,11 @@ impl ResearchService {
         }
     }
 
-    /// Builds one authorized, point-in-time feature/label generation.
-    pub async fn build_dataset(
+    /// Builds one authorized phase-one, point-in-time derived generation.
+    ///
+    /// The returned generation is immutable and restart-queryable by its exact manifest. It does
+    /// not carry product admission, model admission, or execution authority.
+    pub async fn build_phase_one_derived_generation(
         &self,
         request: DatasetBuildRequest,
         cancellation: CancellationToken,
@@ -567,8 +570,11 @@ impl ResearchService {
             .map_err(Into::into)
     }
 
-    /// Builds while retaining exact caller authority through derived-generation publication.
-    pub async fn build_dataset_with_precommit_authority(
+    /// Builds phase one while retaining exact caller authority through generation publication.
+    ///
+    /// The precommit authority is consumed only for this immutable analytical generation; no
+    /// product receipt or issuer authority is minted by this service boundary.
+    pub async fn build_phase_one_derived_generation_with_precommit_authority(
         &self,
         request: DatasetBuildRequest,
         cancellation: CancellationToken,
@@ -644,7 +650,7 @@ impl ResearchService {
     }
 }
 
-/// Research composition, storage, ingestion, or dataset-construction failure.
+/// Research composition, storage, ingestion, or analytical-generation failure.
 #[derive(Debug, Error)]
 pub enum ResearchServiceError {
     /// Local controlled paths could not be resolved.
@@ -662,8 +668,8 @@ pub enum ResearchServiceError {
     /// Analytical authority composition or ingestion failed.
     #[error("research service ingestion failed: {0}")]
     Ingest(#[from] IngestError),
-    /// Point-in-time dataset construction failed.
-    #[error("research service dataset build failed: {0}")]
+    /// Phase-one point-in-time derived-generation construction failed.
+    #[error("research service phase-one derived-generation build failed: {0}")]
     Dataset(#[from] DatasetBuildError),
     /// The composed source, rights, and exact extraction payload do not agree.
     #[error("research ingest source, rights, and batch evidence do not agree")]

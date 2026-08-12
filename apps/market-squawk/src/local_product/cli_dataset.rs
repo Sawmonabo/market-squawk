@@ -1,4 +1,4 @@
-//! Bounded CLI execution boundary for point-in-time feature-dataset publication.
+//! Bounded CLI boundary for immutable phase-one point-in-time derived generations.
 
 #[path = "cli_dataset_request.rs"]
 mod request_dto;
@@ -11,42 +11,43 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use self::request_dto::DatasetBuildRequestDto;
+use self::request_dto::PhaseOneDerivedGenerationRequestDto;
 use super::LocalProduct;
 use crate::ResearchServiceError;
 
 const MAXIMUM_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Closed request-file, contract-admission, or dataset-publication failure.
+/// Closed request-file, contract-admission, or phase-one generation failure.
 #[derive(Debug, Error)]
 pub enum CliDatasetError {
-    /// Mutating dataset publication was not explicitly confirmed.
-    #[error("dataset build requires explicit confirmation")]
+    /// Mutating phase-one generation publication was not explicitly confirmed.
+    #[error("phase-one derived-generation build requires explicit confirmation")]
     ConfirmationRequired,
     /// The selected request is not a bounded no-follow regular file.
-    #[error("dataset request file is not an admitted bounded regular file")]
+    #[error("phase-one generation request is not an admitted bounded regular file")]
     RequestFile,
-    /// JSON did not match the closed dataset-build schema.
-    #[error("dataset request JSON is malformed or contains unsupported fields")]
+    /// JSON did not match the closed phase-one generation request schema.
+    #[error("phase-one generation request JSON is malformed or contains unsupported fields")]
     RequestJson,
     /// One or more values violated the domain request contract.
-    #[error("dataset request violates point-in-time, rights, or resource invariants")]
+    #[error("phase-one generation request violates point-in-time, rights, or resource invariants")]
     InvalidRequest,
-    /// The production research service rejected or failed publication.
-    #[error("dataset build failed: {0}")]
-    Build(#[from] ResearchServiceError),
-    /// The already admitted dataset could not reproduce its bounded canonical Python descriptor.
-    #[error("dataset Python export could not be reproduced: {0}")]
-    PythonExport(#[from] market_squawk_data::DatasetBuildError),
+    /// The research service rejected or failed the phase-one generation publication.
+    #[error("phase-one derived-generation build failed: {0}")]
+    PhaseOneDerivedGeneration(#[from] ResearchServiceError),
+    /// The immutable generation could not reproduce its bounded canonical phase-one descriptor.
+    #[error("phase-one generation descriptor could not be reproduced: {0}")]
+    PhaseOneDescriptor(#[from] market_squawk_data::DatasetBuildError),
 }
 
-/// Admits caller-materialized feature/label examples and publishes one immutable PIT dataset.
+/// Admits caller-materialized examples and publishes one immutable phase-one PIT generation.
 ///
 /// The data service independently verifies selectors, source generations, universe evidence,
 /// temporal cutoffs, adjustment evidence, rights, and limits. This boundary does not calculate
-/// feature values from canonical observations. The same admitted low-level build contract is
-/// suitable for both `Dataset.Build` and `Feature.Build`.
-pub(super) async fn build_point_in_time_dataset(
+/// feature values from canonical observations. This operation issues no product receipt or
+/// admission; its result records only that operation-scoped disposition. The same low-level
+/// phase-one contract is used by both dataset and feature CLI commands.
+pub(super) async fn build_phase_one_derived_generation(
     product: &LocalProduct,
     request: &Path,
     confirmed: bool,
@@ -54,11 +55,16 @@ pub(super) async fn build_point_in_time_dataset(
     if !confirmed {
         return Err(CliDatasetError::ConfirmationRequired);
     }
-    let built = build_point_in_time_dataset_from_file(product, request).await?;
+    let built = build_phase_one_derived_generation_from_file(product, request).await?;
     let manifest = built.manifest();
     let splits = built.split_counts();
-    let python_export_sha256 = built.python_export()?.content_hash();
+    let phase_one_descriptor_sha256 = built.python_export()?.content_hash();
+    // This returned result records only that this phase-one operation did not issue product
+    // admission before returning. Any receipt-backed product admission is a separate
+    // Analysis.GetFeatureDatasets authority.
     Ok(json!({
+        "publicationStage": "phase_one_derived_generation",
+        "productAdmission": "not_admitted_by_phase_one_operation_at_completion",
         "manifest": {
             "dataset": manifest.dataset_id().as_str(),
             "version": manifest.manifest_version(),
@@ -70,7 +76,7 @@ pub(super) async fn build_point_in_time_dataset(
         "buildSpecSha256": encode_hex(built.build_spec_digest().digest().bytes()),
         "policySha256": encode_hex(built.policy_digest().bytes()),
         "universeSha256": encode_hex(built.universe_digest().bytes()),
-        "pythonExportSha256": encode_hex(python_export_sha256.bytes()),
+        "phaseOneDescriptorSha256": encode_hex(phase_one_descriptor_sha256.bytes()),
         "splitExamples": {
             "train": splits.train_examples(),
             "validation": splits.validation_examples(),
@@ -79,31 +85,34 @@ pub(super) async fn build_point_in_time_dataset(
     }))
 }
 
-/// Admits one bounded request file and publishes its immutable PIT feature/label generation.
+/// Admits one bounded request file and publishes its immutable phase-one PIT generation.
 ///
 /// Callers must establish their own explicit mutation authority before invoking this shared
-/// production path.
-pub(crate) async fn build_point_in_time_dataset_from_file(
+/// path. The returned generation remains queryable by exact manifest after restart but is not a
+/// product admission.
+pub(crate) async fn build_phase_one_derived_generation_from_file(
     product: &LocalProduct,
     request: &Path,
 ) -> Result<FeatureLabelDataset, CliDatasetError> {
     let (bytes, ownership) = read_request(request)?;
-    let request: DatasetBuildRequestDto =
+    let request: PhaseOneDerivedGenerationRequestDto =
         serde_json::from_slice(bytes.as_bytes()).map_err(|_| CliDatasetError::RequestJson)?;
     let admitted = request.into_domain(Some(ownership))?;
     product
         .research()
-        .build_dataset(admitted, CancellationToken::new())
+        .build_phase_one_derived_generation(admitted, CancellationToken::new())
         .await
         .map_err(Into::into)
 }
 
-/// Admits an inline transport registration only when it carries independent reviewed-terms
-/// evidence. Local-file ownership remains available solely through the retained file authority.
-pub(crate) fn admit_inline_dataset_registration(
+/// Admits an inline phase-one request only with independent reviewed-terms evidence.
+///
+/// Local-file ownership remains available solely through the retained file authority. This
+/// conversion creates no product receipt or issuer authority.
+pub(crate) fn admit_inline_phase_one_derived_generation_request(
     registration: &serde_json::Map<String, Value>,
 ) -> Result<market_squawk_data::DatasetBuildRequest, CliDatasetError> {
-    let request: DatasetBuildRequestDto =
+    let request: PhaseOneDerivedGenerationRequestDto =
         serde_json::from_value(Value::Object(registration.clone()))
             .map_err(|_| CliDatasetError::RequestJson)?;
     request.into_domain(None)

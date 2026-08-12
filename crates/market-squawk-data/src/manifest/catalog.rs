@@ -29,7 +29,9 @@ use super::{
 use crate::catalog::exact_catalog_file_binding;
 use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 use crate::{
-    ArtifactRecord, CatalogError, DatasetManifestRecord, IngestRunRecord, SourceOperation,
+    ArtifactRecord, CatalogEndpointIdentity, CatalogError, DatasetManifestRecord,
+    FeatureDatasetProductContract, IngestRunRecord, ResearchUse, ResearchUseDecisionDigest,
+    ResearchUseGraphDigest, SourceOperation,
 };
 
 const REFERENCE_MEMBERSHIP_CHUNK: usize = 128;
@@ -38,11 +40,11 @@ const MAX_FEATURE_DATASET_LEGACY_CANDIDATES: usize = 4_096;
 const MAX_GENERATION_CAPTURE_INPUTS: usize = 4_096;
 const SQLITE_PROGRESS_OPERATIONS: i32 = 1_000;
 
-/// Maximum immutable Python dataset-admission rows retained by one local catalog.
-pub const MAX_RETAINED_PYTHON_DATASET_ADMISSIONS: usize = 4_096;
+/// Maximum immutable feature-dataset production-admission rows retained by one local catalog.
+pub const MAX_RETAINED_FEATURE_DATASET_PRODUCTION_ADMISSIONS: usize = 4_096;
 
-/// Maximum canonical descriptor bytes retained across all Python dataset admissions.
-pub const MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum descriptor-plus-receipt bytes retained across all production admissions.
+pub const MAX_RETAINED_FEATURE_DATASET_PRODUCTION_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 
 /// One manifest-pinned object resolved from immutable catalog metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,6 +140,18 @@ pub(crate) struct CatalogFeatureDataset {
     pub(crate) source_id: SourceId,
     pub(crate) export_sha256: Sha256Digest,
     pub(crate) descriptor: Box<[u8]>,
+    pub(crate) production_identity: Sha256Digest,
+    pub(crate) receipt_sha256: Sha256Digest,
+    pub(crate) receipt_json: Box<[u8]>,
+    pub(crate) catalog_identity: CatalogEndpointIdentity,
+    pub(crate) product_contract: FeatureDatasetProductContract,
+    pub(crate) output_group_id: [u8; 32],
+    pub(crate) final_output_rights_id: [u8; 32],
+    pub(crate) research_decision: ResearchUseDecisionDigest,
+    pub(crate) research_graph: ResearchUseGraphDigest,
+    pub(crate) research_use: ResearchUse,
+    pub(crate) research_use_expires_at: Timestamp,
+    pub(crate) admitted_at: Timestamp,
     pub(crate) source_ids: Box<[SourceId]>,
 }
 
@@ -151,12 +165,35 @@ pub(crate) struct CatalogFeatureDatasetPage {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CatalogFeatureDatasetSelection<'a> {
-    Exact(&'a DatasetId),
+    LatestByDataset(&'a DatasetId),
+    ExactManifest(&'a DatasetManifestRef),
     Page { after: Option<&'a DatasetId> },
 }
 
-type RetainedFeatureDatasetAdmission =
-    (String, i64, String, i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+struct RetainedFeatureDatasetAdmission {
+    dataset: String,
+    version: i64,
+    schema_name: String,
+    schema_version: i64,
+    schema_fingerprint: Vec<u8>,
+    content_hash: Vec<u8>,
+    export_sha256: Vec<u8>,
+    descriptor: Vec<u8>,
+    production_identity: Vec<u8>,
+    receipt_schema: String,
+    receipt_sha256: Vec<u8>,
+    receipt_json: Vec<u8>,
+    catalog_identity: Vec<u8>,
+    product_contract: String,
+    selection_digest_version: i64,
+    output_group_id: Vec<u8>,
+    final_output_rights_id: Vec<u8>,
+    research_decision: Vec<u8>,
+    research_graph: Vec<u8>,
+    research_use: String,
+    research_use_expires_at_ns: i64,
+    admitted_at_ns: i64,
+}
 
 impl fmt::Debug for AnalyticalManifestCatalog {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -215,13 +252,15 @@ impl AnalyticalManifestCatalog {
         }
         let retention_is_consistent: bool = connection.query_row(
             "SELECT retained_rows = (
-                        SELECT COUNT(*) FROM python_dataset_admissions
+                        SELECT COUNT(*) FROM feature_dataset_production_admissions
                     )
-                    AND retained_descriptor_bytes = (
-                        SELECT COALESCE(SUM(length(descriptor_json)), 0)
-                        FROM python_dataset_admissions
+                    AND retained_payload_bytes = (
+                        SELECT COALESCE(
+                            SUM(length(descriptor_json) + length(receipt_json)), 0
+                        )
+                        FROM feature_dataset_production_admissions
                     )
-             FROM python_dataset_admission_retention
+             FROM feature_dataset_production_admission_retention
              WHERE singleton=1",
             [],
             |row| row.get(0),
@@ -902,6 +941,7 @@ impl AnalyticalManifestCatalog {
 
     pub(crate) fn read_feature_dataset_snapshot(
         &self,
+        expected_contract: FeatureDatasetProductContract,
         selection: CatalogFeatureDatasetSelection<'_>,
         legacy_candidates: &[DatasetId],
         limit: usize,
@@ -914,6 +954,8 @@ impl AnalyticalManifestCatalog {
                 max_candidates: MAX_FEATURE_DATASET_LEGACY_CANDIDATES,
             });
         }
+        let live_catalog_identity = CatalogEndpointIdentity::try_from_bytes(self.catalog_binding)
+            .ok_or(ManifestCatalogError::CorruptCatalog)?;
         let mut connection = self.lock()?;
         let token = cancellation.clone();
         connection.progress_handler(
@@ -923,23 +965,39 @@ impl AnalyticalManifestCatalog {
         let operation = (|| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-            let overlapping_legacy_dataset_ids =
-                feature_dataset_overlaps(&transaction, legacy_candidates, deadline, cancellation)?;
-            let (admissions, has_more, available) =
-                feature_dataset_admissions(&transaction, selection, limit, deadline, cancellation)?;
+            let overlapping_legacy_dataset_ids = feature_dataset_overlaps(
+                &transaction,
+                expected_contract,
+                legacy_candidates,
+                deadline,
+                cancellation,
+            )?;
+            let (admissions, has_more, available) = feature_dataset_admissions(
+                &transaction,
+                expected_contract,
+                selection,
+                limit,
+                deadline,
+                cancellation,
+            )?;
             let mut datasets = Vec::new();
             datasets
                 .try_reserve_exact(admissions.len())
                 .map_err(|_| ManifestCatalogError::CountOverflow)?;
             for admission in admissions {
                 check_read_operation(deadline, cancellation)?;
-                datasets.push(load_feature_dataset_admission(
+                let dataset = load_feature_dataset_admission(
                     &transaction,
                     admission,
+                    expected_contract,
                     self.max_objects_per_generation,
                     deadline,
                     cancellation,
-                )?);
+                )?;
+                if dataset.catalog_identity != live_catalog_identity {
+                    return Err(ManifestCatalogError::CorruptCatalog);
+                }
+                datasets.push(dataset);
             }
             check_read_operation(deadline, cancellation)?;
             transaction.commit()?;
@@ -1028,27 +1086,89 @@ impl AnalyticalManifestCatalog {
 
 fn feature_dataset_admissions(
     transaction: &Transaction<'_>,
+    expected_contract: FeatureDatasetProductContract,
     selection: CatalogFeatureDatasetSelection<'_>,
     limit: usize,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<(Vec<RetainedFeatureDatasetAdmission>, bool, usize), ManifestCatalogError> {
     check_read_operation(deadline, cancellation)?;
+    let expected_use = expected_contract.required_use();
     let after = match selection {
-        CatalogFeatureDatasetSelection::Exact(dataset_id) => {
+        CatalogFeatureDatasetSelection::LatestByDataset(dataset_id) => {
             let admission = transaction
                 .query_row(
                     "SELECT generation.dataset_id, generation.manifest_version,
                             generation.schema_name, generation.schema_version,
                             generation.schema_fingerprint, generation.content_hash,
-                            admission.export_sha256, admission.descriptor_json
-                     FROM python_dataset_admissions AS admission
+                            admission.export_sha256, admission.descriptor_json,
+                            admission.production_identity_sha256, admission.receipt_schema,
+                            admission.receipt_sha256, admission.receipt_json,
+                            admission.catalog_identity, admission.product_contract,
+                            admission.selection_digest_version,
+                            admission.output_group_id, admission.final_output_rights_id,
+                            admission.research_decision_id, admission.research_graph_digest,
+                            admission.research_use, admission.research_use_expires_at_ns,
+                            admission.admitted_at_ns
+                     FROM feature_dataset_production_admissions AS admission
                      JOIN analytical_generations AS generation
                        USING (dataset_id, manifest_version)
-                     WHERE generation.dataset_id=?1
+                     WHERE generation.dataset_id=?1 AND admission.product_contract=?2
+                       AND admission.research_use=?3
                      ORDER BY generation.manifest_version DESC
                      LIMIT 1",
-                    [dataset_id.as_str()],
+                    params![
+                        dataset_id.as_str(),
+                        expected_contract.identity(),
+                        expected_use.database_name()
+                    ],
+                    retained_feature_dataset_admission,
+                )
+                .optional()?;
+            let available = usize::from(admission.is_some());
+            let mut admissions = Vec::new();
+            admissions
+                .try_reserve_exact(available)
+                .map_err(|_| ManifestCatalogError::CountOverflow)?;
+            admissions.extend(admission);
+            return Ok((admissions, false, available));
+        }
+        CatalogFeatureDatasetSelection::ExactManifest(manifest) => {
+            let manifest_version = i64::try_from(manifest.manifest_version())
+                .map_err(|_| ManifestCatalogError::CountOverflow)?;
+            let schema_version = i64::from(manifest.schema().version().get());
+            let admission = transaction
+                .query_row(
+                    "SELECT generation.dataset_id, generation.manifest_version,
+                            generation.schema_name, generation.schema_version,
+                            generation.schema_fingerprint, generation.content_hash,
+                            admission.export_sha256, admission.descriptor_json,
+                            admission.production_identity_sha256, admission.receipt_schema,
+                            admission.receipt_sha256, admission.receipt_json,
+                            admission.catalog_identity, admission.product_contract,
+                            admission.selection_digest_version,
+                            admission.output_group_id, admission.final_output_rights_id,
+                            admission.research_decision_id, admission.research_graph_digest,
+                            admission.research_use, admission.research_use_expires_at_ns,
+                            admission.admitted_at_ns
+                     FROM feature_dataset_production_admissions AS admission
+                     JOIN analytical_generations AS generation
+                       USING (dataset_id, manifest_version)
+                     WHERE generation.dataset_id=?1 AND generation.manifest_version=?2
+                       AND generation.schema_name=?3 AND generation.schema_version=?4
+                       AND generation.schema_fingerprint=?5 AND generation.content_hash=?6
+                       AND admission.product_contract=?7 AND admission.research_use=?8
+                     LIMIT 1",
+                    params![
+                        manifest.dataset_id().as_str(),
+                        manifest_version,
+                        manifest.schema().name(),
+                        schema_version,
+                        manifest.schema().fingerprint().as_slice(),
+                        manifest.content_hash().bytes(),
+                        expected_contract.identity(),
+                        expected_use.database_name()
+                    ],
                     retained_feature_dataset_admission,
                 )
                 .optional()?;
@@ -1065,9 +1185,13 @@ fn feature_dataset_admissions(
     let after = after.map(DatasetId::as_str).unwrap_or_default();
     let available_sql: i64 = transaction.query_row(
         "SELECT COUNT(DISTINCT dataset_id)
-         FROM python_dataset_admissions
-         WHERE dataset_id>?1",
-        [after],
+         FROM feature_dataset_production_admissions
+         WHERE dataset_id>?1 AND product_contract=?2 AND research_use=?3",
+        params![
+            after,
+            expected_contract.identity(),
+            expected_use.database_name()
+        ],
         |row| row.get(0),
     )?;
     let available =
@@ -1080,23 +1204,37 @@ fn feature_dataset_admissions(
     let mut statement = transaction.prepare(
         "WITH latest AS (
              SELECT dataset_id, MAX(manifest_version) AS manifest_version
-             FROM python_dataset_admissions
-             WHERE dataset_id>?1
+             FROM feature_dataset_production_admissions
+             WHERE dataset_id>?1 AND product_contract=?2 AND research_use=?3
              GROUP BY dataset_id
              ORDER BY dataset_id
-             LIMIT ?2
+             LIMIT ?4
          )
          SELECT generation.dataset_id, generation.manifest_version,
                 generation.schema_name, generation.schema_version,
                 generation.schema_fingerprint, generation.content_hash,
-                admission.export_sha256, admission.descriptor_json
+                admission.export_sha256, admission.descriptor_json,
+                admission.production_identity_sha256, admission.receipt_schema,
+                admission.receipt_sha256, admission.receipt_json,
+                admission.catalog_identity, admission.product_contract,
+                admission.selection_digest_version,
+                admission.output_group_id, admission.final_output_rights_id,
+                admission.research_decision_id, admission.research_graph_digest,
+                admission.research_use, admission.research_use_expires_at_ns,
+                admission.admitted_at_ns
          FROM latest
          JOIN analytical_generations AS generation USING (dataset_id, manifest_version)
-         JOIN python_dataset_admissions AS admission USING (dataset_id, manifest_version)
+         JOIN feature_dataset_production_admissions AS admission
+           USING (dataset_id, manifest_version)
          ORDER BY generation.dataset_id",
     )?;
     let rows = statement.query_map(
-        params![after, retrieval_limit_sql],
+        params![
+            after,
+            expected_contract.identity(),
+            expected_use.database_name(),
+            retrieval_limit_sql
+        ],
         retained_feature_dataset_admission,
     )?;
     let mut admissions = Vec::new();
@@ -1119,20 +1257,35 @@ fn feature_dataset_admissions(
 fn retained_feature_dataset_admission(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<RetainedFeatureDatasetAdmission> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-    ))
+    Ok(RetainedFeatureDatasetAdmission {
+        dataset: row.get(0)?,
+        version: row.get(1)?,
+        schema_name: row.get(2)?,
+        schema_version: row.get(3)?,
+        schema_fingerprint: row.get(4)?,
+        content_hash: row.get(5)?,
+        export_sha256: row.get(6)?,
+        descriptor: row.get(7)?,
+        production_identity: row.get(8)?,
+        receipt_schema: row.get(9)?,
+        receipt_sha256: row.get(10)?,
+        receipt_json: row.get(11)?,
+        catalog_identity: row.get(12)?,
+        product_contract: row.get(13)?,
+        selection_digest_version: row.get(14)?,
+        output_group_id: row.get(15)?,
+        final_output_rights_id: row.get(16)?,
+        research_decision: row.get(17)?,
+        research_graph: row.get(18)?,
+        research_use: row.get(19)?,
+        research_use_expires_at_ns: row.get(20)?,
+        admitted_at_ns: row.get(21)?,
+    })
 }
 
 fn feature_dataset_overlaps(
     transaction: &Transaction<'_>,
+    expected_contract: FeatureDatasetProductContract,
     legacy_candidates: &[DatasetId],
     deadline: Instant,
     cancellation: &CancellationToken,
@@ -1146,26 +1299,29 @@ fn feature_dataset_overlaps(
         let query_capacity = candidates
             .len()
             .checked_mul(8)
-            .and_then(|value| value.checked_add(192))
+            .and_then(|value| value.checked_add(256))
             .ok_or(ManifestCatalogError::CountOverflow)?;
         let mut query = String::new();
         query
             .try_reserve_exact(query_capacity)
             .map_err(|_| ManifestCatalogError::CountOverflow)?;
         query.push_str(
-            "SELECT DISTINCT dataset_id FROM python_dataset_admissions WHERE dataset_id IN (",
+            "SELECT DISTINCT dataset_id FROM feature_dataset_production_admissions \
+             WHERE product_contract=?1 AND research_use=?2 AND dataset_id IN (",
         );
         for index in 0..candidates.len() {
             if index > 0 {
                 query.push(',');
             }
-            write!(&mut query, "?{}", index + 1)
+            write!(&mut query, "?{}", index + 3)
                 .map_err(|_| ManifestCatalogError::AllocationContract)?;
         }
         query.push_str(") ORDER BY dataset_id");
         let mut statement = transaction.prepare(&query)?;
+        statement.raw_bind_parameter(1, expected_contract.identity())?;
+        statement.raw_bind_parameter(2, expected_contract.required_use().database_name())?;
         for (index, candidate) in candidates.iter().enumerate() {
-            statement.raw_bind_parameter(index + 1, candidate.as_str())?;
+            statement.raw_bind_parameter(index + 3, candidate.as_str())?;
         }
         let mut rows = statement.raw_query();
         while let Some(row) = rows.next()? {
@@ -1206,29 +1362,55 @@ fn classify_sqlite_interrupt(
 fn load_feature_dataset_admission(
     connection: &Connection,
     admission: RetainedFeatureDatasetAdmission,
+    expected_contract: FeatureDatasetProductContract,
     max_objects_per_generation: usize,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<CatalogFeatureDataset, ManifestCatalogError> {
-    let (
-        dataset,
-        version,
-        schema_name,
-        schema_version,
-        schema_fingerprint,
-        content_hash,
-        export_sha256,
-        descriptor,
-    ) = admission;
+    let expected_use = expected_contract.required_use();
     let manifest = DatasetManifestRef::try_new_with_schema(
-        DatasetId::try_from(dataset.as_str())?,
-        from_i64(version)?,
-        parse_schema_identity(&schema_name, schema_version, &schema_fingerprint)?,
-        parse_digest(&content_hash)?,
+        DatasetId::try_from(admission.dataset.as_str())?,
+        from_i64(admission.version)?,
+        parse_schema_identity(
+            &admission.schema_name,
+            admission.schema_version,
+            &admission.schema_fingerprint,
+        )?,
+        parse_digest(&admission.content_hash)?,
     )?;
     let pinned = load_pinned(connection, &manifest, max_objects_per_generation)?;
     let source_id = generation_source(connection, &manifest)?;
-    let export_sha256 = parse_digest(&export_sha256)?;
+    let export_sha256 = parse_digest(&admission.export_sha256)?;
+    let production_identity = parse_digest(&admission.production_identity)?;
+    let receipt_sha256 = parse_digest(&admission.receipt_sha256)?;
+    let catalog_identity =
+        CatalogEndpointIdentity::try_from_bytes(parse_digest(&admission.catalog_identity)?.bytes())
+            .ok_or(ManifestCatalogError::CorruptCatalog)?;
+    let output_group_id = parse_digest(&admission.output_group_id)?.bytes();
+    let final_output_rights_id = parse_digest(&admission.final_output_rights_id)?.bytes();
+    let research_decision = ResearchUseDecisionDigest::try_from_bytes(
+        parse_digest(&admission.research_decision)?.bytes(),
+    )
+    .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    let research_graph =
+        ResearchUseGraphDigest::try_from_bytes(parse_digest(&admission.research_graph)?.bytes())
+            .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    let research_use = match admission.research_use.as_str() {
+        "local_analysis" => ResearchUse::LocalAnalysis,
+        "train" => ResearchUse::Train,
+        _ => return Err(ManifestCatalogError::CorruptCatalog),
+    };
+    let product_contract =
+        FeatureDatasetProductContract::from_identity(&admission.product_contract)
+            .ok_or(ManifestCatalogError::CorruptCatalog)?;
+    if product_contract != expected_contract
+        || research_use != expected_use
+        || admission.receipt_schema != crate::FEATURE_DATASET_PRODUCTION_RECEIPT_SCHEMA
+        || admission.selection_digest_version != 2
+        || admission.admitted_at_ns >= admission.research_use_expires_at_ns
+    {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
     let mut source_ids = Vec::new();
     source_ids
         .try_reserve_exact(pinned.parents().len())
@@ -1246,7 +1428,19 @@ fn load_feature_dataset_admission(
         pinned,
         source_id,
         export_sha256,
-        descriptor: descriptor.into_boxed_slice(),
+        descriptor: admission.descriptor.into_boxed_slice(),
+        production_identity,
+        receipt_sha256,
+        receipt_json: admission.receipt_json.into_boxed_slice(),
+        catalog_identity,
+        product_contract,
+        output_group_id,
+        final_output_rights_id,
+        research_decision,
+        research_graph,
+        research_use,
+        research_use_expires_at: Timestamp::from_unix_nanos(admission.research_use_expires_at_ns),
+        admitted_at: Timestamp::from_unix_nanos(admission.admitted_at_ns),
         source_ids: source_ids.into_boxed_slice(),
     })
 }
@@ -2168,7 +2362,7 @@ fn generation_python_export(
     connection
         .query_row(
             "SELECT export_sha256
-             FROM python_dataset_admissions
+             FROM feature_dataset_production_admissions
              WHERE dataset_id=?1 AND manifest_version=?2",
             params![
                 manifest.dataset_id().as_str(),

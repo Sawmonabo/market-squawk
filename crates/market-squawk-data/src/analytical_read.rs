@@ -33,10 +33,10 @@ use crate::manifest::{
 };
 use crate::{
     AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
-    DatasetSchemaRegistry, DatasetSplitCounts, GenerationKind, GenerationParent,
-    ManifestCatalogError, ParquetObjectStore, PinnedDataset, PinnedFeatureMonetaryValue,
-    PinnedMonetaryValue, PinnedQueryOutput, QueryError, QueryLimits, QueryRequest,
-    ResearchQueryEngine, Sha256Digest, UniverseId,
+    DatasetSchemaRegistry, DatasetSplitCounts, FeatureDatasetProductContract, GenerationKind,
+    GenerationParent, ManifestCatalogError, ParquetObjectStore, PinnedDataset,
+    PinnedFeatureMonetaryValue, PinnedMonetaryValue, PinnedQueryOutput, QueryError, QueryLimits,
+    QueryRequest, ResearchQueryEngine, Sha256Digest, UniverseId,
 };
 use crate::{
     PointInTimeCandidate, PointInTimeLimits, PointInTimePolicy, PointInTimeRequest,
@@ -194,11 +194,13 @@ impl AnalyticalGenerationPage {
     }
 }
 
-/// One durable Python-admitted feature/label generation in the public analytical registry.
+/// One durable receipt-admitted feature/label generation in the public analytical registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyticalFeatureDataset {
     generation: AnalyticalGeneration,
     python_export_sha256: Sha256Digest,
+    production_receipt: crate::FeatureDatasetProductionReceiptV1,
+    product_contract: FeatureDatasetProductContract,
     policy_digest: Sha256Digest,
     universe_digest: Sha256Digest,
     universe_id: UniverseId,
@@ -207,10 +209,41 @@ pub struct AnalyticalFeatureDataset {
 }
 
 impl AnalyticalFeatureDataset {
-    fn from_catalog(dataset: CatalogFeatureDataset) -> Result<Self, AnalyticalReadError> {
+    fn from_catalog(
+        dataset: CatalogFeatureDataset,
+        expected_contract: FeatureDatasetProductContract,
+    ) -> Result<Self, AnalyticalReadError> {
+        if dataset.product_contract != expected_contract
+            || dataset.research_use != expected_contract.required_use()
+        {
+            return Err(ManifestCatalogError::CorruptCatalog.into());
+        }
         let summary = crate::python_dataset::feature_dataset_summary(
             &dataset.descriptor,
             dataset.export_sha256,
+        )
+        .map_err(|_| AnalyticalReadError::Manifest(ManifestCatalogError::CorruptCatalog))?;
+        let production_receipt = crate::FeatureDatasetProductionReceiptV1::decode_and_validate(
+            &dataset.receipt_json,
+            &crate::dataset_builder::FeatureDatasetProductionReceiptExpectation {
+                production_identity: dataset.production_identity,
+                receipt_sha256: dataset.receipt_sha256,
+                catalog_identity: dataset.catalog_identity,
+                product_contract: dataset.product_contract,
+                manifest: dataset.pinned.manifest(),
+                build_spec_digest: summary.identity.build_spec_digest(),
+                policy_digest: summary.identity.policy_digest(),
+                universe_digest: summary.identity.universe_digest(),
+                universe_id: summary.identity.universe_id().as_str(),
+                output_group_id: dataset.output_group_id,
+                final_output_rights_id: dataset.final_output_rights_id,
+                export_sha256: dataset.export_sha256,
+                research_decision: dataset.research_decision,
+                research_graph: dataset.research_graph,
+                research_use: dataset.research_use,
+                research_use_expires_at: dataset.research_use_expires_at,
+                admitted_at: dataset.admitted_at,
+            },
         )
         .map_err(|_| AnalyticalReadError::Manifest(ManifestCatalogError::CorruptCatalog))?;
         let generation = AnalyticalGeneration::from_pinned(
@@ -229,6 +262,8 @@ impl AnalyticalFeatureDataset {
         Ok(Self {
             generation,
             python_export_sha256: dataset.export_sha256,
+            production_receipt,
+            product_contract: dataset.product_contract,
             policy_digest: summary.identity.policy_digest(),
             universe_digest: summary.identity.universe_digest(),
             universe_id: summary.identity.universe_id().clone(),
@@ -245,6 +280,16 @@ impl AnalyticalFeatureDataset {
     /// Returns the exact canonical descriptor digest admitted for native Python verification.
     pub const fn python_export_sha256(&self) -> Sha256Digest {
         self.python_export_sha256
+    }
+
+    /// Returns the required immutable producer receipt admitted with the Python descriptor.
+    pub const fn production_receipt(&self) -> &crate::FeatureDatasetProductionReceiptV1 {
+        &self.production_receipt
+    }
+
+    /// Returns the exact closed recipe and independently authorized consumer use.
+    pub const fn product_contract(&self) -> FeatureDatasetProductContract {
+        self.product_contract
     }
 
     /// Returns the exact point-in-time and transformation-policy identity.
@@ -282,7 +327,7 @@ pub enum AnalyticalFeatureDatasetSelection<'a> {
     Page { after: Option<&'a DatasetId> },
 }
 
-/// One stable bounded page of durable Python-admitted feature datasets.
+/// One stable bounded page of durable receipt-admitted feature datasets.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyticalFeatureDatasetPage {
     datasets: Box<[AnalyticalFeatureDataset]>,
@@ -292,11 +337,14 @@ pub struct AnalyticalFeatureDatasetPage {
 }
 
 impl AnalyticalFeatureDatasetPage {
-    fn from_catalog(page: CatalogFeatureDatasetPage) -> Result<Self, AnalyticalReadError> {
+    fn from_catalog(
+        page: CatalogFeatureDatasetPage,
+        expected_contract: FeatureDatasetProductContract,
+    ) -> Result<Self, AnalyticalReadError> {
         let datasets = page
             .datasets
             .into_iter()
-            .map(AnalyticalFeatureDataset::from_catalog)
+            .map(|dataset| AnalyticalFeatureDataset::from_catalog(dataset, expected_contract))
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
         Ok(Self {
@@ -1386,15 +1434,17 @@ impl AnalyticalReadCapability {
             .map_err(Into::into)
     }
 
-    /// Lists one stable dataset-id page of durable Python-admitted feature generations.
+    /// Lists one stable dataset-id page of durable receipt-admitted feature generations.
     pub fn feature_datasets(
         &self,
+        expected_contract: FeatureDatasetProductContract,
         after: Option<&DatasetId>,
         limit: AnalyticalReadLimit,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<AnalyticalFeatureDatasetPage, AnalyticalReadError> {
         self.feature_dataset_snapshot(
+            expected_contract,
             AnalyticalFeatureDatasetSelection::Page { after },
             &[],
             limit,
@@ -1406,6 +1456,7 @@ impl AnalyticalReadCapability {
     /// Reads one exact or cursor-relative durable page and bounded legacy overlap set atomically.
     pub fn feature_dataset_snapshot(
         &self,
+        expected_contract: FeatureDatasetProductContract,
         selection: AnalyticalFeatureDatasetSelection<'_>,
         legacy_candidates: &[DatasetId],
         limit: AnalyticalReadLimit,
@@ -1414,7 +1465,7 @@ impl AnalyticalReadCapability {
     ) -> Result<AnalyticalFeatureDatasetPage, AnalyticalReadError> {
         let selection = match selection {
             AnalyticalFeatureDatasetSelection::Exact(dataset_id) => {
-                CatalogFeatureDatasetSelection::Exact(dataset_id)
+                CatalogFeatureDatasetSelection::LatestByDataset(dataset_id)
             }
             AnalyticalFeatureDatasetSelection::Page { after } => {
                 CatalogFeatureDatasetSelection::Page { after }
@@ -1422,6 +1473,7 @@ impl AnalyticalReadCapability {
         };
         self.manifests
             .read_feature_dataset_snapshot(
+                expected_contract,
                 selection,
                 legacy_candidates,
                 limit.get(),
@@ -1429,18 +1481,20 @@ impl AnalyticalReadCapability {
                 cancellation,
             )
             .map_err(AnalyticalReadError::from)
-            .and_then(AnalyticalFeatureDatasetPage::from_catalog)
+            .and_then(|page| AnalyticalFeatureDatasetPage::from_catalog(page, expected_contract))
     }
 
-    /// Resolves the latest durable Python admission for one feature-dataset identity.
+    /// Resolves the latest durable receipt admission for one feature-dataset identity.
     pub fn feature_dataset(
         &self,
+        expected_contract: FeatureDatasetProductContract,
         dataset_id: &DatasetId,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<AnalyticalFeatureDataset>, AnalyticalReadError> {
         Ok(self
             .feature_dataset_snapshot(
+                expected_contract,
                 AnalyticalFeatureDatasetSelection::Exact(dataset_id),
                 &[],
                 AnalyticalReadLimit::try_new(1)?,
@@ -1945,7 +1999,7 @@ pub enum AnalyticalReadError {
     /// Fixed observation templates require the canonical research-observation schema.
     #[error("analytical observation schema is invalid")]
     InvalidObservationSchema,
-    /// An exact Python-admitted forecast dataset was not found.
+    /// An exact receipt-admitted forecast dataset was not found.
     #[error("analytical forecast dataset is unavailable")]
     ForecastDatasetUnavailable,
     /// Immutable generation lookup failed.

@@ -901,6 +901,14 @@ impl DatasetBuildLimits {
         self.max_input_rows
     }
 
+    pub(super) const fn max_examples(self) -> usize {
+        self.max_examples
+    }
+
+    pub(super) const fn max_components_per_example(self) -> usize {
+        self.max_components_per_example
+    }
+
     pub(super) const fn max_output_rows(self) -> usize {
         self.max_output_rows
     }
@@ -972,6 +980,18 @@ impl DatasetOutputAuthorization {
 
     pub(super) const fn source_id(&self) -> &SourceId {
         &self.source_id
+    }
+
+    pub(super) const fn basis(&self) -> &RightsBasis {
+        &self.basis
+    }
+
+    pub(super) const fn authorization_evidence(&self) -> EvidenceDigest {
+        self.authorization_evidence
+    }
+
+    pub(super) const fn authorization_expires_at(&self) -> Option<Timestamp> {
+        self.authorization_expires_at
     }
 }
 
@@ -1048,7 +1068,9 @@ impl DatasetBuildRequest {
                 &output_dataset,
                 &inputs,
                 intended_use,
-                output_authorization.source_id(),
+                research_use_limits,
+                &output_authorization,
+                limits,
                 policy_digest,
                 universe_digest,
             )
@@ -1214,7 +1236,10 @@ impl FeatureLabelDataset {
         &self.label_measurements
     }
 
-    /// Produces the bounded canonical Task 11 descriptor consumed by Python research training.
+    /// Produces the bounded canonical phase-one descriptor.
+    ///
+    /// This export proves an immutable analytical generation only; it carries no product/model
+    /// admission or training authority without a matching closed production receipt.
     pub fn python_export(
         &self,
     ) -> Result<super::export::FeatureLabelPythonExport, DatasetBuildError> {

@@ -44,7 +44,8 @@ pub use input_authority::{
     reason = "a generic analysis consumer uses this least-authority seam after composition"
 )]
 pub(crate) use input_authority::{
-    GovernedRecommendationInputMaterializerV1, GovernedRecommendationMaterializedInputV1,
+    GovernedRecommendationBacktestEvidenceV1, GovernedRecommendationInputMaterializerV1,
+    GovernedRecommendationMaterializedInputV1,
 };
 pub use repository::{
     GovernedBacktestInputResolver, GovernedBacktestRepositoryLimits,

@@ -111,32 +111,6 @@ pub(crate) struct ForecastInstrumentAvailability {
 }
 
 impl ForecastInstrumentAvailability {
-    /// Constructs a bounded, ordered point-in-time instrument summary.
-    pub(crate) fn try_new(
-        instrument_id: InstrumentId,
-        observed_from: Timestamp,
-        observed_through: Timestamp,
-        available_at: Timestamp,
-        observed_points: NonZeroUsize,
-        decimal_scale: u8,
-    ) -> Result<Self, ForecastEvidenceReadError> {
-        if observed_from > observed_through
-            || available_at < observed_through
-            || observed_points.get() > market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
-            || decimal_scale > market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE
-        {
-            return Err(ForecastEvidenceReadError::InvalidEvidence);
-        }
-        Ok(Self {
-            instrument_id,
-            observed_from,
-            observed_through,
-            available_at,
-            observed_points,
-            decimal_scale,
-        })
-    }
-
     pub(crate) const fn instrument_id(&self) -> InstrumentId {
         self.instrument_id
     }
@@ -172,28 +146,6 @@ pub(crate) struct ForecastEvidencePolicy {
 }
 
 impl ForecastEvidencePolicy {
-    /// Constructs a policy no broader than the installed forecast contract.
-    pub(crate) fn try_new(
-        maximum_horizon_points: NonZeroU16,
-        horizon_step_nanos: NonZeroU64,
-        maximum_validity_nanos: NonZeroU64,
-        minimum_observed_points: NonZeroUsize,
-    ) -> Result<Self, ForecastEvidenceReadError> {
-        ForecastHorizon::try_new(maximum_horizon_points, horizon_step_nanos)
-            .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
-        if maximum_validity_nanos.get() > MAXIMUM_FORECAST_VALIDITY_NANOS
-            || minimum_observed_points.get() > market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
-        {
-            return Err(ForecastEvidenceReadError::InvalidEvidence);
-        }
-        Ok(Self {
-            maximum_horizon_points,
-            horizon_step_nanos,
-            maximum_validity_nanos,
-            minimum_observed_points,
-        })
-    }
-
     fn admits(self, selection: &ForecastPreparationSelection) -> bool {
         selection.horizon.points().get() <= self.maximum_horizon_points.get()
             && selection.horizon.step_nanos() == self.horizon_step_nanos
@@ -229,43 +181,6 @@ pub(crate) struct ForecastEvidenceDataset {
 }
 
 impl ForecastEvidenceDataset {
-    /// Constructs a canonical nonempty compatibility record.
-    pub(crate) fn try_new(
-        model_id: ModelId,
-        bundle_id: BundleId,
-        bundle_version: NonZeroU64,
-        dataset: TrainingDatasetIdentity,
-        mut instruments: Vec<ForecastInstrumentAvailability>,
-        mut policies: Vec<ForecastEvidencePolicy>,
-    ) -> Result<Self, ForecastEvidenceReadError> {
-        instruments.sort_unstable_by_key(ForecastInstrumentAvailability::instrument_id);
-        policies.sort_unstable_by_key(|policy| {
-            (
-                policy.horizon_step_nanos.get(),
-                policy.maximum_horizon_points.get(),
-                policy.maximum_validity_nanos.get(),
-                policy.minimum_observed_points.get(),
-            )
-        });
-        if instruments.is_empty()
-            || policies.is_empty()
-            || instruments
-                .windows(2)
-                .any(|pair| pair[0].instrument_id == pair[1].instrument_id)
-            || policies.windows(2).any(|pair| pair[0] == pair[1])
-        {
-            return Err(ForecastEvidenceReadError::InvalidEvidence);
-        }
-        Ok(Self {
-            model_id,
-            bundle_id,
-            bundle_version,
-            dataset,
-            instruments: instruments.into_boxed_slice(),
-            policies: policies.into_boxed_slice(),
-        })
-    }
-
     pub(crate) const fn model_id(&self) -> ModelId {
         self.model_id
     }
@@ -304,7 +219,9 @@ impl ForecastEvidenceCatalogSnapshot {
         authority_generation_sha256: Sha256Digest,
         datasets: Vec<ForecastEvidenceDataset>,
     ) -> Result<Self, ForecastEvidenceReadError> {
-        if authority_generation_sha256.bytes() == [0; 32] {
+        // A nonempty serving catalog needs a sealed AnalysisV1 identity and an explicit pairing
+        // receipt to the model's separate TrainingV1 provenance. Neither exists yet.
+        if authority_generation_sha256.bytes() == [0; 32] || !datasets.is_empty() {
             return Err(ForecastEvidenceReadError::InvalidEvidence);
         }
         Ok(Self {
@@ -375,14 +292,6 @@ impl ForecastPreparationSelection {
             validity_nanos,
         })
     }
-
-    pub(crate) const fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
-    }
-
-    pub(crate) const fn horizon(&self) -> ForecastHorizon {
-        self.horizon
-    }
 }
 
 /// Exact materialization request accepted only by the analytical evidence owner.
@@ -391,20 +300,6 @@ pub(crate) struct ForecastEvidenceMaterializationRequest {
     model: ForecastModelRequirement,
     selection: ForecastPreparationSelection,
     authority_generation_sha256: Sha256Digest,
-}
-
-impl ForecastEvidenceMaterializationRequest {
-    pub(crate) const fn model(&self) -> &ForecastModelRequirement {
-        &self.model
-    }
-
-    pub(crate) const fn selection(&self) -> &ForecastPreparationSelection {
-        &self.selection
-    }
-
-    pub(crate) const fn authority_generation_sha256(&self) -> Sha256Digest {
-        self.authority_generation_sha256
-    }
 }
 
 /// Typed history and feature matrix produced only by the injected analytical authority.
@@ -416,60 +311,6 @@ pub(crate) struct PreparedForecastEvidence {
     observed_history: Box<[ForecastObservedPoint]>,
     inputs: Box<[Box<[f64]>]>,
     evidence_sha256: Sha256Digest,
-}
-
-impl PreparedForecastEvidence {
-    /// Validates and binds the exact analytical evidence returned by the data owner.
-    pub(crate) fn try_new(
-        request: ForecastEvidenceMaterializationRequest,
-        observed_cutoff: Timestamp,
-        available_at: Timestamp,
-        decimal_scale: u8,
-        observed_history: Vec<ForecastObservedPoint>,
-        inputs: Vec<Box<[f64]>>,
-    ) -> Result<Self, ForecastEvidenceReadError> {
-        if request.authority_generation_sha256.bytes() == [0; 32]
-            || inputs.len() != usize::from(request.selection.horizon.points().get())
-            || inputs.iter().any(|row| {
-                row.len() != request.model.metadata.features().len()
-                    || row.iter().any(|value| !value.is_finite())
-            })
-        {
-            return Err(ForecastEvidenceReadError::InvalidEvidence);
-        }
-        validate_forecast_shape(
-            request.model.metadata.as_ref(),
-            &request.selection,
-            observed_cutoff,
-            available_at,
-            decimal_scale,
-            &observed_history,
-            &inputs,
-        )
-        .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
-        let evidence_sha256 = evidence_digest(
-            &request,
-            observed_cutoff,
-            available_at,
-            decimal_scale,
-            &observed_history,
-            &inputs,
-        )?;
-        Ok(Self {
-            request,
-            observed_cutoff,
-            available_at,
-            decimal_scale,
-            observed_history: observed_history.into_boxed_slice(),
-            inputs: inputs.into_boxed_slice(),
-            evidence_sha256,
-        })
-    }
-
-    /// Returns the canonical digest over the exact prepared history and feature matrix.
-    pub(crate) const fn evidence_sha256(&self) -> Sha256Digest {
-        self.evidence_sha256
-    }
 }
 
 impl fmt::Debug for PreparedForecastEvidence {
@@ -488,21 +329,8 @@ impl fmt::Debug for PreparedForecastEvidence {
 }
 
 /// Exact data-owner fence revalidated immediately before durable job admission.
-#[derive(Clone, Debug)]
-pub(crate) struct ForecastEvidenceRevalidation {
-    request: ForecastEvidenceMaterializationRequest,
-    evidence_sha256: Sha256Digest,
-}
-
-impl ForecastEvidenceRevalidation {
-    pub(crate) const fn request(&self) -> &ForecastEvidenceMaterializationRequest {
-        &self.request
-    }
-
-    pub(crate) const fn evidence_sha256(&self) -> Sha256Digest {
-        self.evidence_sha256
-    }
-}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForecastEvidenceRevalidation;
 
 /// Narrow analytical authority required by model-owned forecast preparation.
 #[async_trait]
@@ -1008,9 +836,6 @@ impl ForecastPreparationAuthority {
             .find(|candidate| candidate.matches_coordinate(&selection))
             .cloned()
             .ok_or(ForecastPreparationError::ModelUnavailable)?;
-        if model.metadata.dataset().manifest() != &selection.dataset_manifest {
-            return Err(ForecastPreparationError::IncompatibleSelection);
-        }
         let catalog = self
             .evidence
             .catalog(
@@ -1062,10 +887,7 @@ impl ForecastPreparationAuthority {
         let expires_instant = Instant::now()
             .checked_add(self.limits.receipt_lifetime)
             .ok_or(ForecastPreparationError::TimeUnavailable)?;
-        let revalidation = ForecastEvidenceRevalidation {
-            request: materialization,
-            evidence_sha256: evidence.evidence_sha256,
-        };
+        let revalidation = ForecastEvidenceRevalidation;
         let mut receipts = self
             .receipts
             .lock()
@@ -1193,9 +1015,7 @@ fn validate_catalog(
         let Some(model) = model else {
             return Err(ForecastPreparationError::InvalidEvidence);
         };
-        if model.runtime_generation_sha256 != request.runtime_generation_sha256
-            || model.metadata.dataset() != &dataset.dataset
-        {
+        if model.runtime_generation_sha256 != request.runtime_generation_sha256 {
             return Err(ForecastPreparationError::InvalidEvidence);
         }
     }
@@ -1260,7 +1080,6 @@ fn validate_forecast_shape(
     if metadata.model_id() != selection.model_id
         || metadata.bundle_id() != &selection.bundle_id
         || metadata.bundle_version() != selection.bundle_version
-        || metadata.dataset().manifest() != &selection.dataset_manifest
         || inputs.len() != usize::from(selection.horizon.points().get())
     {
         return Err(ForecastPreparationError::InvalidEvidence);
@@ -1551,7 +1370,6 @@ impl From<ForecastEvidenceReadError> for ForecastPreparationError {
         match error {
             ForecastEvidenceReadError::Cancelled => Self::Cancelled,
             ForecastEvidenceReadError::DeadlineExceeded => Self::DeadlineExceeded,
-            ForecastEvidenceReadError::NotFound => Self::IncompatibleSelection,
             ForecastEvidenceReadError::Capacity => Self::Capacity,
             ForecastEvidenceReadError::InvalidEvidence => Self::InvalidEvidence,
             ForecastEvidenceReadError::Unavailable => Self::Unavailable,
@@ -1572,8 +1390,6 @@ pub(crate) enum ForecastEvidenceReadError {
     Cancelled,
     #[error("forecast evidence read deadline elapsed")]
     DeadlineExceeded,
-    #[error("compatible forecast evidence was not found")]
-    NotFound,
     #[error("forecast evidence resource ceiling was exceeded")]
     Capacity,
     #[error("forecast evidence violated its typed contract")]

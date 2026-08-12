@@ -106,8 +106,7 @@ impl InstalledForecastPreparation {
                     .await
                     .map_err(map_preparation)?;
                 let labels = self.labels_for_catalog(&catalog, context)?;
-                let item_count = catalog.models().len();
-                (catalog_value(&catalog, &labels), item_count)
+                catalog_value(&catalog, &labels)
             }
             PREPARE_FORECAST => {
                 let input: ForecastPreparationRequest =
@@ -333,7 +332,7 @@ impl ForecastReceiptWire {
 fn catalog_value(
     catalog: &ForecastPreparationCatalog,
     labels: &BTreeMap<InstrumentId, String>,
-) -> Value {
+) -> (Value, usize) {
     let models = catalog
         .models()
         .iter()
@@ -348,10 +347,14 @@ fn catalog_value(
             (!datasets.is_empty()).then(|| model_value(model, Some(datasets)))
         })
         .collect::<Vec<_>>();
-    json!({
-        "runtimeGenerationSha256": hex(catalog.runtime_generation_sha256()),
-        "models": models,
-    })
+    let item_count = models.len();
+    (
+        json!({
+            "runtimeGenerationSha256": hex(catalog.runtime_generation_sha256()),
+            "models": models,
+        }),
+        item_count,
+    )
 }
 
 fn dataset_matches_model(dataset: &ForecastEvidenceDataset, model: &ForecastModelSummary) -> bool {

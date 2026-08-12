@@ -15,24 +15,27 @@ use arrow::array::{BinaryArray, StringArray};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use market_squawk_data::{
-    AnalyticalDataService, AnalyticalFeatureDatasetSelection, AnalyticalFundNavReadLimit,
-    AnalyticalFundNavReadRequest, AnalyticalMacroLatestKnownRequest,
+    AnalyticalBackupLimits, AnalyticalBackupLocation, AnalyticalDataService,
+    AnalyticalFundNavReadLimit, AnalyticalFundNavReadRequest, AnalyticalMacroLatestKnownRequest,
     AnalyticalMacroSeriesAllowlist, AnalyticalManifestCatalog, AnalyticalMarketBarReadLimit,
     AnalyticalMarketBarReadRequest, AnalyticalObservationReadRequest,
-    AnalyticalObservationTemplate, AnalyticalReadError, AnalyticalReadLimit, CatalogAuthority,
-    CatalogConfig, CatalogError, CatalogLimit, CatalogResultLimits, ChronologicalSplitPolicy,
-    CommittedDataset, CompactionRequest, ComponentAdjustmentEvidence, ComponentKind,
-    ComponentScope, ComponentSelector, ComponentValue, CorporateActionAdjustment,
-    CorporateActionLimits, CorporateActionPolicy, CorporateActionSensitivity, DatasetBuildError,
-    DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildPrecommitAuthority,
-    DatasetBuildRequest, DatasetBuilder, DatasetId, DatasetManifestRef, DatasetOutputAuthorization,
-    DatasetSchemaRegistry, FeatureLabelComponentInput, FeatureLabelComponentSpec, FundNavDateRange,
-    IngestError, IngestIdentity, MAX_RETAINED_PYTHON_DATASET_ADMISSIONS,
-    MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES, ManifestCatalogError, MissingValuePolicy,
-    ObjectStoreConfig, ObservationFamilyKey, OutcomeMarketBarRequest, OutcomeMarketBarSelection,
-    OutcomeMarketBarSeries, OutcomeMarketBarUnavailableReason, ParquetStoreError,
-    PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode, QueryArtifactReservationInput,
-    QueryError, QueryLimits, QueryRequest, QueryResult, ResearchArrowBatch, ResearchIngestService,
+    AnalyticalObservationTemplate, AnalyticalReadError, AnalyticalReadLimit, AnalyticalRestoreMode,
+    AnalyticalRestoreTarget, CatalogAuthority, CatalogConfig, CatalogError, CatalogLimit,
+    CatalogResultLimits, ChronologicalSplitPolicy, CommittedDataset, CompactionRequest,
+    ComponentAdjustmentEvidence, ComponentKind, ComponentScope, ComponentSelector, ComponentValue,
+    CorporateActionAdjustment, CorporateActionLimits, CorporateActionPlan, CorporateActionPolicy,
+    CorporateActionSensitivity, DatasetBuildError, DatasetBuildInputs, DatasetBuildLimits,
+    DatasetBuildPolicy, DatasetBuildPrecommitAuthority, DatasetBuildRequest, DatasetBuilder,
+    DatasetId, DatasetManifestRef, DatasetOutputAuthorization, DatasetSchemaRegistry,
+    FEATURE_LABEL_RETURN_UNIT, FeatureDatasetProductContract, FeatureDatasetProductionError,
+    FeatureDatasetProductionProofV1, FeatureDatasetProductionPublicationDisposition,
+    FeatureDatasetProductionPublisher, FeatureLabelComponentInput, FeatureLabelComponentSpec,
+    FeatureLabelDataset, ForecastDatasetReadLimits, FundNavDateRange, IngestError, IngestIdentity,
+    ManifestCatalogError, MissingValuePolicy, ObjectStoreConfig, ObservationFamilyKey,
+    OutcomeMarketBarRequest, OutcomeMarketBarSelection, OutcomeMarketBarSeries,
+    OutcomeMarketBarUnavailableReason, ParquetStoreError, PointInTimeLimits, PointInTimePolicy,
+    PointInTimeRevisionMode, PythonDatasetCatalogError, QueryArtifactReservationInput, QueryError,
+    QueryLimits, QueryRequest, QueryResult, ResearchArrowBatch, ResearchIngestService,
     ResearchQueryEngine, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseRequest,
     ResearchUseSet, RightsBasis, RightsDecisionInput, Sha256Digest, SourceOperation, UniverseId,
     UniverseLimits, UniverseMembership, extraction_provider_payload_digest,
@@ -969,7 +972,7 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
 
 #[test]
 fn dataset_inputs_reject_a_transaction_from_another_instrument() -> TestResult {
-    let instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
+    let instrument = dataset_membership_instrument()?;
     let other_instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c2")?;
     let parent = DatasetManifestRef::try_new_with_schema(
         DatasetId::try_from("transaction-observations")?,
@@ -1024,15 +1027,16 @@ fn dataset_inputs_reject_a_transaction_from_another_instrument() -> TestResult {
 }
 
 #[tokio::test]
-async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -> TestResult {
+async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_generation()
+-> TestResult {
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
     let location = paths.catalog()?.clone();
-    let catalog_config = test_catalog_config(location)?;
+    let catalog_config = test_catalog_config(location.clone())?;
     let store_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
-    let (service, source) =
-        initialized_service_with_universe(&paths, catalog_config, store_config).await?;
-    let instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
+    let (service, publisher, source, market_bars) =
+        initialized_service_with_universe(&paths, catalog_config.clone(), store_config).await?;
+    let instrument = dataset_membership_instrument()?;
     let research_limits = ResearchUseLimits::try_new(
         8,
         32,
@@ -1258,14 +1262,31 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
     );
     assert_eq!(export_json["split_policy"]["train_end_unix_nanos"], 100);
     assert_eq!(export_json["objects"][0]["row_count"], 2);
-    let replayed = service
-        .dataset_builder()
-        .build(request, CancellationToken::new())
-        .await?;
-    assert_eq!(replayed.manifest(), built.manifest());
     let cancellation = CancellationToken::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     let reader = service.analytical_reader();
+    let phase_one = reader
+        .latest(built.manifest().dataset_id(), deadline, &cancellation)?
+        .ok_or("missing phase-one feature generation")?;
+    assert_eq!(phase_one.python_export_sha256(), None);
+    assert!(
+        reader
+            .feature_dataset(
+                FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+                built.manifest().dataset_id(),
+                deadline,
+                &cancellation,
+            )?
+            .is_none(),
+        "an immutable analytical generation is not a product before receipt admission"
+    );
+
+    let replayed = service
+        .dataset_builder()
+        .build(request.clone(), CancellationToken::new())
+        .await?;
+    assert_eq!(replayed.manifest(), built.manifest());
+
     assert!(matches!(
         AnalyticalObservationReadRequest::try_new(
             source.manifest().clone(),
@@ -1332,192 +1353,195 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
         .ok_or("missing built feature dataset")?;
     assert_eq!(
         listed.python_export_sha256(),
-        Some(export.content_hash()),
-        "the public generation record must expose the exact admitted Python export"
+        None,
+        "a phase-one analytical generation must not claim product admission"
     );
     let feature_page = reader.feature_datasets(
+        FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
         None,
         AnalyticalReadLimit::try_new(8)?,
         deadline,
         &cancellation,
     )?;
     assert!(!feature_page.has_more());
-    let registered = feature_page
-        .datasets()
-        .iter()
-        .find(|dataset| dataset.generation().manifest() == built.manifest())
-        .ok_or("built feature dataset is absent from the public registry")?;
-    assert_eq!(registered.python_export_sha256(), export.content_hash());
-    assert_eq!(registered.policy_digest(), built.policy_digest());
-    assert_eq!(registered.universe_digest(), built.universe_digest());
-    assert_eq!(registered.universe_id().as_str(), "us-equities.historical");
-    assert_eq!(registered.split_counts(), built.split_counts());
-    assert_eq!(
-        registered
-            .source_ids()
-            .iter()
-            .map(SourceId::as_str)
-            .collect::<Vec<_>>(),
-        vec!["fred-local-fixture"]
-    );
-    let overlap_candidate = built.manifest().dataset_id().clone();
-    let legacy_only_candidate = DatasetId::try_from("derived.feature-labels.legacy-only-snapshot")?;
-    let legacy_candidates = [overlap_candidate.clone(), legacy_only_candidate];
-    let snapshot = reader.feature_dataset_snapshot(
-        AnalyticalFeatureDatasetSelection::Page { after: None },
-        &legacy_candidates,
-        AnalyticalReadLimit::try_new(8)?,
-        deadline,
-        &cancellation,
-    )?;
-    assert_eq!(snapshot.available(), 1);
-    assert_eq!(snapshot.datasets().len(), 1);
-    assert_eq!(
-        snapshot.overlapping_legacy_dataset_ids(),
-        std::slice::from_ref(&overlap_candidate)
-    );
-    let exhausted_snapshot = reader.feature_dataset_snapshot(
-        AnalyticalFeatureDatasetSelection::Page {
-            after: Some(&overlap_candidate),
-        },
-        &legacy_candidates,
-        AnalyticalReadLimit::try_new(8)?,
-        deadline,
-        &cancellation,
-    )?;
-    assert_eq!(exhausted_snapshot.available(), 0);
-    assert!(exhausted_snapshot.datasets().is_empty());
-    assert_eq!(
-        exhausted_snapshot.overlapping_legacy_dataset_ids(),
-        std::slice::from_ref(&overlap_candidate)
-    );
-    let exact_snapshot = reader.feature_dataset_snapshot(
-        AnalyticalFeatureDatasetSelection::Exact(&overlap_candidate),
-        std::slice::from_ref(&overlap_candidate),
-        AnalyticalReadLimit::try_new(1)?,
-        deadline,
-        &cancellation,
-    )?;
-    assert_eq!(exact_snapshot.available(), 1);
-    assert_eq!(exact_snapshot.datasets().len(), 1);
-    assert_eq!(
-        exact_snapshot.overlapping_legacy_dataset_ids(),
-        std::slice::from_ref(&overlap_candidate)
-    );
+    assert_eq!(feature_page.available(), 0);
+    assert!(feature_page.datasets().is_empty());
+    assert!(feature_page.overlapping_legacy_dataset_ids().is_empty());
 
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
+    let production_request = closed_price_return_request(
+        source.manifest().clone(),
+        market_bars.manifest().clone(),
+        instrument,
+        research_limits,
+        false,
+    )?;
+    let production_dataset = service
+        .dataset_builder()
+        .build(production_request.clone(), CancellationToken::new())
+        .await?;
+    let production_contract =
+        FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1;
+    assert!(
+        reader
+            .feature_dataset(
+                production_contract,
+                production_dataset.manifest().dataset_id(),
+                deadline,
+                &cancellation,
+            )?
+            .is_none(),
+        "the closed-recipe phase-one generation must remain invisible before publication"
+    );
+    let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    let attested_at = Timestamp::from_unix_nanos(wall_nanos).checked_sub_nanos(1_000_000_000)?;
+    let currentness_expires_at =
+        Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?;
+    let published = publisher.publish(
+        &service,
+        production_contract,
+        &production_request,
+        &production_dataset,
+        closed_price_return_proof(&production_dataset, attested_at, currentness_expires_at, 96)?,
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(
+        published.disposition(),
+        FeatureDatasetProductionPublicationDisposition::Published
+    );
+    assert_eq!(published.contract(), production_contract);
+    let production_identity = published.receipt().production_identity();
+    let receipt_sha256 = published.receipt().receipt_sha256();
+    let retained_receipt = published.receipt().canonical_json().to_vec();
+    let admitted = reader
+        .feature_dataset(
+            production_contract,
+            production_dataset.manifest().dataset_id(),
+            deadline,
+            &cancellation,
+        )?
+        .ok_or("closed price-return product is absent after atomic admission")?;
+    assert_eq!(
+        admitted.generation().manifest(),
+        production_dataset.manifest()
+    );
+    assert_eq!(admitted.product_contract(), production_contract);
+    assert_eq!(
+        admitted.production_receipt().production_identity(),
+        production_identity
+    );
+    assert_eq!(
+        admitted.production_receipt().canonical_json(),
+        retained_receipt
+    );
+    assert!(
+        reader
+            .feature_dataset(
+                FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnTrainingV1,
+                production_dataset.manifest().dataset_id(),
+                deadline,
+                &cancellation,
+            )?
+            .is_none(),
+        "an analysis admission must never authorize training"
+    );
+    let same_session_replay = publisher.publish(
+        &service,
+        production_contract,
+        &production_request,
+        &production_dataset,
+        closed_price_return_proof(&production_dataset, attested_at, currentness_expires_at, 96)?,
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(
+        same_session_replay.disposition(),
+        FeatureDatasetProductionPublicationDisposition::Replay
+    );
+    assert_eq!(
+        same_session_replay.receipt().receipt_sha256(),
+        receipt_sha256
+    );
+    let conflicting = publisher.publish(
+        &service,
+        production_contract,
+        &production_request,
+        &production_dataset,
+        closed_price_return_proof(&production_dataset, attested_at, currentness_expires_at, 97)?,
+        &CancellationToken::new(),
+    );
     assert!(matches!(
-        reader.feature_dataset_snapshot(
-            AnalyticalFeatureDatasetSelection::Page { after: None },
-            &legacy_candidates,
-            AnalyticalReadLimit::try_new(8)?,
-            Instant::now() + Duration::from_secs(30),
-            &cancelled,
-        ),
-        Err(AnalyticalReadError::Manifest(
-            ManifestCatalogError::Cancelled
+        conflicting,
+        Err(FeatureDatasetProductionError::Dataset(
+            DatasetBuildError::PythonDataset(
+                PythonDatasetCatalogError::ConflictingProductionAdmission
+            )
         ))
     ));
-    assert!(matches!(
-        reader.feature_dataset_snapshot(
-            AnalyticalFeatureDatasetSelection::Page { after: None },
-            &legacy_candidates,
-            AnalyticalReadLimit::try_new(8)?,
-            Instant::now(),
+    let successor_request = closed_price_return_request(
+        source.manifest().clone(),
+        market_bars.manifest().clone(),
+        instrument,
+        research_limits,
+        true,
+    )?;
+    let successor_dataset = service
+        .dataset_builder()
+        .build(successor_request.clone(), CancellationToken::new())
+        .await?;
+    assert_eq!(
+        successor_dataset.manifest().manifest_version(),
+        production_dataset
+            .manifest()
+            .manifest_version()
+            .checked_add(1)
+            .ok_or("successor manifest version overflow")?
+    );
+    let successor_publication = publisher.publish(
+        &service,
+        production_contract,
+        &successor_request,
+        &successor_dataset,
+        closed_price_return_proof(&successor_dataset, attested_at, currentness_expires_at, 98)?,
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(
+        successor_publication.disposition(),
+        FeatureDatasetProductionPublicationDisposition::Published
+    );
+    assert_eq!(
+        reader
+            .feature_dataset(
+                production_contract,
+                production_dataset.manifest().dataset_id(),
+                deadline,
+                &cancellation,
+            )?
+            .ok_or("latest product lookup is absent after successor admission")?
+            .generation()
+            .manifest(),
+        successor_dataset.manifest(),
+        "dataset-ID lookup must retain explicit latest-version semantics"
+    );
+    let backup_paths = LocalPaths::prepare(directory.path().join("feature-product-backup"))?;
+    let backup_location = AnalyticalBackupLocation::try_new(
+        backup_paths.catalog()?.clone(),
+        backup_paths.artifacts()?.clone(),
+    )?;
+    let backup_limits =
+        AnalyticalBackupLimits::try_new(64, 256, 64 * 1024 * 1024, 8 * 1024 * 1024, 1024 * 1024)?;
+    let backup_cutoff = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?)
+    .checked_add_nanos(1_000_000_000)?;
+    let verified_backup = service
+        .backup_service()
+        .create(
+            backup_location,
+            backup_cutoff,
+            backup_limits,
             &CancellationToken::new(),
-        ),
-        Err(AnalyticalReadError::Manifest(
-            ManifestCatalogError::DeadlineExceeded
-        ))
-    ));
+        )
+        .await?;
 
-    let bounds_paths = LocalPaths::prepare(directory.path().join("admission-bounds"))?;
-    let bounds_location = bounds_paths.catalog()?.clone();
-    drop(CatalogAuthority::open(test_catalog_config(
-        bounds_location.clone(),
-    )?)?);
-    let bounds = rusqlite::Connection::open(bounds_location.path())?;
-    bounds.pragma_update(None, "foreign_keys", "OFF")?;
-    let retained: (i64, i64) = bounds.query_row(
-        "SELECT retained_rows, retained_descriptor_bytes
-         FROM python_dataset_admission_retention
-         WHERE singleton=1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    assert_eq!(retained, (0, 0));
-    bounds.execute(
-        "INSERT INTO python_dataset_admissions
-         (export_sha256, catalog_identity, dataset_id, manifest_version, descriptor_json,
-          selection_digest_version, registered_at_ns)
-         VALUES (?1, ?2, 'bounds-fixture', 1, ?3, 2, 1)",
-        params![[1_u8; 32], [2_u8; 32], b"{}".as_slice()],
-    )?;
-    assert_eq!(
-        bounds.query_row(
-            "SELECT retained_rows, retained_descriptor_bytes
-             FROM python_dataset_admission_retention
-             WHERE singleton=1",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )?,
-        (1, 2)
-    );
-    bounds.execute(
-        "UPDATE python_dataset_admission_retention
-         SET retained_rows=?1, retained_descriptor_bytes=?2
-         WHERE singleton=1",
-        params![
-            i64::try_from(MAX_RETAINED_PYTHON_DATASET_ADMISSIONS)?,
-            i64::try_from(MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES)?
-        ],
-    )?;
-    assert_eq!(
-        bounds.execute(
-            "INSERT OR IGNORE INTO python_dataset_admissions
-             (export_sha256, catalog_identity, dataset_id, manifest_version, descriptor_json,
-              selection_digest_version, registered_at_ns)
-             VALUES (?1, ?2, 'bounds-fixture', 1, ?3, 2, 1)",
-            params![[1_u8; 32], [2_u8; 32], b"{}".as_slice()],
-        )?,
-        0,
-        "an ignored immutable replay must not consume retained budget"
-    );
-    assert!(
-        bounds
-            .execute(
-                "INSERT INTO python_dataset_admissions
-                 (export_sha256, catalog_identity, dataset_id, manifest_version, descriptor_json,
-                  selection_digest_version, registered_at_ns)
-                 VALUES (?1, ?2, 'bounds-overflow', 1, ?3, 2, 2)",
-                params![[3_u8; 32], [2_u8; 32], b"{}".as_slice()],
-            )
-            .is_err(),
-        "a new retained admission must not cross either immutable ceiling"
-    );
-    assert!(
-        bounds
-            .execute(
-                "UPDATE python_dataset_admission_retention
-                 SET retained_rows=?1
-                 WHERE singleton=1",
-                [i64::try_from(MAX_RETAINED_PYTHON_DATASET_ADMISSIONS)? + 1],
-            )
-            .is_err(),
-        "the schema ceiling itself must reject an over-limit retained count"
-    );
-    assert!(
-        bounds
-            .execute(
-                "UPDATE python_dataset_admission_retention
-                 SET retained_descriptor_bytes=?1
-                 WHERE singleton=1",
-                [i64::try_from(MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES)? + 1],
-            )
-            .is_err(),
-        "the schema ceiling itself must reject over-limit retained descriptor bytes"
-    );
     let query = ResearchQueryEngine::from_pinned_dataset(
         built.pinned().clone(),
         "components",
@@ -1545,6 +1569,158 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
         )
         .await?;
     assert!(matches!(result, QueryResult::Inline { .. }));
+    drop(result);
+    drop(query);
+    drop(admitted);
+    drop(same_session_replay);
+    drop(published);
+    drop(successor_publication);
+    drop(reader);
+    drop(publisher);
+    drop(service);
+
+    let reopened_composition = AnalyticalDataService::open_with_feature_dataset_production(
+        CatalogAuthority::open(catalog_config)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        store_config,
+    )?;
+    let (reopened, reopened_publisher) = reopened_composition.into_parts();
+    let reopened_reader = reopened.analytical_reader();
+    let reopened_phase_one = reopened_reader
+        .latest(
+            built.manifest().dataset_id(),
+            Instant::now() + Duration::from_secs(30),
+            &CancellationToken::new(),
+        )?
+        .ok_or("restarted phase-one feature generation is absent")?;
+    assert_eq!(reopened_phase_one.manifest(), built.manifest());
+    assert_eq!(reopened_phase_one.python_export_sha256(), None);
+    assert!(
+        reopened_reader
+            .feature_dataset(
+                FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+                built.manifest().dataset_id(),
+                Instant::now() + Duration::from_secs(30),
+                &CancellationToken::new(),
+            )?
+            .is_none()
+    );
+    let retention = rusqlite::Connection::open_with_flags(
+        location.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    let retained: (i64, i64) = retention.query_row(
+        "SELECT retained_rows, retained_payload_bytes
+         FROM feature_dataset_production_admission_retention
+         WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(retained.0, 2);
+    assert!(retained.1 > 0);
+    let historical_v1 = reopened_reader
+        .forecast_dataset_evidence(
+            production_contract,
+            production_dataset.manifest(),
+            Timestamp::from_unix_nanos(200),
+            ForecastDatasetReadLimits::try_new(8, 1024 * 1024)?,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        historical_v1.dataset().generation().manifest(),
+        production_dataset.manifest(),
+        "an exact historical manifest must remain selectable after its successor is admitted"
+    );
+    assert_eq!(
+        historical_v1
+            .dataset()
+            .production_receipt()
+            .production_identity(),
+        production_identity
+    );
+    assert_eq!(
+        historical_v1
+            .dataset()
+            .production_receipt()
+            .receipt_sha256(),
+        receipt_sha256
+    );
+    assert_eq!(
+        historical_v1
+            .dataset()
+            .production_receipt()
+            .canonical_json(),
+        retained_receipt
+    );
+    assert_eq!(
+        reopened_reader
+            .feature_dataset(
+                production_contract,
+                production_dataset.manifest().dataset_id(),
+                Instant::now() + Duration::from_secs(30),
+                &CancellationToken::new(),
+            )?
+            .ok_or("latest product lookup is absent after restart")?
+            .generation()
+            .manifest(),
+        successor_dataset.manifest()
+    );
+    let restart_replay = reopened_publisher.publish(
+        &reopened,
+        production_contract,
+        &production_request,
+        &production_dataset,
+        closed_price_return_proof(&production_dataset, attested_at, currentness_expires_at, 96)?,
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(
+        restart_replay.disposition(),
+        FeatureDatasetProductionPublicationDisposition::Replay
+    );
+    assert_eq!(restart_replay.receipt().receipt_sha256(), receipt_sha256);
+    let training_products = reopened_reader.feature_datasets(
+        FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnTrainingV1,
+        None,
+        AnalyticalReadLimit::try_new(1)?,
+        Instant::now() + Duration::from_secs(30),
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(training_products.available(), 0);
+    assert!(training_products.datasets().is_empty());
+    let restored_paths = LocalPaths::prepare(directory.path().join("feature-product-restored"))?;
+    let restored_location = restored_paths.catalog()?.clone();
+    let restored = verified_backup.restore(
+        AnalyticalRestoreTarget::try_new(
+            test_catalog_config(restored_location)?,
+            restored_paths.artifacts()?.clone(),
+            8,
+            store_config,
+            AnalyticalRestoreMode::Fresh,
+        )?,
+        &CancellationToken::new(),
+    )?;
+    let relocated_evidence = restored
+        .analytical_reader()
+        .forecast_dataset_evidence(
+            production_contract,
+            production_dataset.manifest(),
+            Timestamp::from_unix_nanos(200),
+            ForecastDatasetReadLimits::try_new(8, 1024 * 1024)?,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        relocated_evidence,
+        Err(AnalyticalReadError::Manifest(
+            ManifestCatalogError::CorruptCatalog
+        ))
+    ));
     Ok(())
 }
 
@@ -2155,14 +2331,108 @@ async fn initialized_service_with_universe(
     paths: &LocalPaths,
     catalog_config: CatalogConfig,
     store_config: ObjectStoreConfig,
-) -> Result<(AnalyticalDataService, CommittedDataset), Box<dyn Error>> {
-    initialized_service_with_batch(
-        paths,
-        catalog_config,
+) -> Result<
+    (
+        AnalyticalDataService,
+        FeatureDatasetProductionPublisher,
+        CommittedDataset,
+        CommittedDataset,
+    ),
+    Box<dyn Error>,
+> {
+    let location = paths.catalog()?.clone();
+    let authority = CatalogAuthority::open(catalog_config)?;
+    let membership_source = local_source()?;
+    let market_source = market_bar_source()?;
+    authority.register_source(&membership_source, Timestamp::from_unix_nanos(10))?;
+    authority.register_source(&market_source, Timestamp::from_unix_nanos(10))?;
+    authority.register_source(
+        &local_source_for("market-squawk.derived")?,
+        Timestamp::from_unix_nanos(10),
+    )?;
+
+    let membership_batch = dataset_extraction_batch()?;
+    let membership_payload = extraction_provider_payload_digest(&membership_batch);
+    let membership_rights = authority.admit_source_rights(RightsDecisionInput {
+        source_id: membership_source.source_id().clone(),
+        payload_digest: membership_payload,
+        retrieved_at: Timestamp::from_unix_nanos(15),
+        basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
+        authorization_evidence: digest(32),
+        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+        permitted_operations: vec![SourceOperation::Persist],
+    })?;
+    authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+        membership_rights.rights_id(),
+        ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+        digest(33),
+        Some(Timestamp::from_unix_nanos(i64::MAX)),
+    )?)?;
+    let membership_reservation = authority.reserve_ingest(
+        &IngestIdentity::try_new(
+            membership_source.source_id().clone(),
+            membership_payload,
+            SourceOperation::Persist,
+            "fred:gdp:query-fixture:v1",
+        )?,
+        &membership_rights,
+    )?;
+
+    let market_batch = closed_price_return_market_bar_batch()?;
+    let market_payload = extraction_provider_payload_digest(&market_batch);
+    let market_rights = authority.admit_source_rights(RightsDecisionInput {
+        source_id: market_source.source_id().clone(),
+        payload_digest: market_payload,
+        retrieved_at: Timestamp::from_unix_nanos(110),
+        basis: RightsBasis::reviewed_terms("https://example.test/alpaca-terms/v1", digest(51))?,
+        authorization_evidence: digest(52),
+        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+        permitted_operations: vec![SourceOperation::Persist],
+    })?;
+    authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+        market_rights.rights_id(),
+        ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+        digest(53),
+        Some(Timestamp::from_unix_nanos(i64::MAX)),
+    )?)?;
+    let market_reservation = authority.reserve_ingest(
+        &IngestIdentity::try_new(
+            market_source.source_id().clone(),
+            market_payload,
+            SourceOperation::Persist,
+            "alpaca:iex:closed-price-return-fixture:v1",
+        )?,
+        &market_rights,
+    )?;
+
+    let composition = AnalyticalDataService::initialize_with_feature_dataset_production(
+        authority,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
         store_config,
-        dataset_extraction_batch()?,
-    )
-    .await
+    )?;
+    let (service, publisher) = composition.into_parts();
+    let membership_dataset =
+        DatasetId::try_from(membership_batch.request().object().dataset().as_str())?;
+    let membership = service
+        .ingest(
+            membership_reservation,
+            membership_dataset,
+            membership_batch,
+            CancellationToken::new(),
+        )
+        .await?;
+    let market_dataset = DatasetId::try_from(market_batch.request().object().dataset().as_str())?;
+    let market_bars = service
+        .ingest_with_revision_plan(
+            market_reservation,
+            market_dataset,
+            market_batch,
+            closed_price_return_market_bar_revision_plan()?,
+            CancellationToken::new(),
+        )
+        .await?;
+    Ok((service, publisher, membership, market_bars))
 }
 
 async fn initialized_service_with_batch(
@@ -2224,6 +2494,107 @@ async fn initialized_service_with_batch(
 
 fn extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
     extraction_batch_with_membership(false)
+}
+
+fn closed_price_return_market_bar_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
+    let discovery = DiscoveryRequest::try_new(
+        SourceIdentifier::try_from("alpaca-iex-bars-closed-price-return-fixture")?,
+        None,
+        NonZeroU16::MIN,
+        Timestamp::from_unix_nanos(1_000),
+    )?;
+    let object = SourceObject::try_new(
+        SourceId::try_from("alpaca-historical-fixture")?,
+        MetadataRevision::new(SourceIdentifier::try_from("alpaca-revision-1")?),
+        &discovery,
+        SourceIdentifier::try_from("alpaca-iex-bars:closed-price-return-fixture")?,
+        SourceIdentifier::try_from("application-json")?,
+        ExactPayloadEvidence::from_content_digest(digest(54)),
+        EffectiveInterval::new(Timestamp::from_unix_nanos(80), None)?,
+        None,
+        Some(4096),
+    )?;
+    let request = ExtractionRequest::try_new(
+        object,
+        NonZeroU32::new(3).ok_or("nonzero market-bar record limit")?,
+        NonZeroU64::new(1024 * 1024).ok_or("nonzero market-bar byte limit")?,
+        Timestamp::from_unix_nanos(1_000),
+    )?;
+    let instrument = dataset_membership_instrument()?;
+    let mut records = Vec::new();
+    records.try_reserve_exact(3)?;
+    for (effective, available, close_cents, source_record, revision) in [
+        (
+            80_i64,
+            85_i64,
+            10_000_i64,
+            "closed-bar-80",
+            "closed-bar-80-v1",
+        ),
+        (
+            90_i64,
+            95_i64,
+            10_000_i64,
+            "closed-bar-90",
+            "closed-bar-90-v1",
+        ),
+        (
+            100_i64,
+            105_i64,
+            10_000_i64,
+            "closed-bar-100",
+            "closed-bar-100-v1",
+        ),
+    ] {
+        let observation = market_bar_observation(
+            instrument,
+            "AAPL",
+            effective,
+            available,
+            source_record,
+            close_cents,
+        )?;
+        let payload = serde_json::to_vec(&observation)?;
+        records.push(ExtractionRecord::try_new(
+            &request,
+            SourceIdentifier::try_from("market-squawk-research-v3")?,
+            ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(&payload).into(),
+            )),
+            Timestamp::from_unix_nanos(effective),
+            None,
+            SourceAvailabilityEvidence::LocalFirstObserved {
+                observed_at: Timestamp::from_unix_nanos(available),
+            },
+            SourceIdentifier::try_from(revision)?,
+            None,
+            payload.into(),
+        )?);
+    }
+    Ok(ExtractionBatch::try_new(&request, records)?)
+}
+
+fn closed_price_return_market_bar_revision_plan() -> Result<ExtractionRevisionPlan, Box<dyn Error>>
+{
+    let evidence = [
+        ("closed-bar-80-v1", 85_i64),
+        ("closed-bar-90-v1", 95_i64),
+        ("closed-bar-100-v1", 105_i64),
+    ]
+    .into_iter()
+    .map(|(revision, observed_at)| {
+        ExtractionRevisionEvidence::provider_supplied(
+            revision.as_bytes(),
+            ObservedProviderOrder::try_new(
+                ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(observed_at)),
+                revision.as_bytes(),
+            )?,
+        )
+        .map_err(Into::into)
+    })
+    .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok(ExtractionRevisionPlan::try_new(evidence)?)
 }
 
 struct MarketBarCaptureFixture {
@@ -2752,6 +3123,212 @@ fn dataset_extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
     extraction_batch_with_membership(true)
 }
 
+fn closed_price_return_request(
+    membership_parent: DatasetManifestRef,
+    market_bar_parent: DatasetManifestRef,
+    instrument: InstrumentId,
+    research_limits: ResearchUseLimits,
+    include_successor_example: bool,
+) -> Result<DatasetBuildRequest, Box<dyn Error>> {
+    let feature = FeatureLabelComponentSpec::try_new(
+        ComponentKind::Feature,
+        ComponentScope::Instrument,
+        CorporateActionSensitivity::RequiresAdjustment,
+        "research.price-return",
+        NonZeroU32::MIN,
+    )?;
+    let label = FeatureLabelComponentSpec::try_new(
+        ComponentKind::Label,
+        ComponentScope::Instrument,
+        CorporateActionSensitivity::RequiresAdjustment,
+        "research.fixed-horizon-forward-return",
+        NonZeroU32::MIN,
+    )?;
+    let adjustment_policy =
+        CorporateActionPolicy::new(CorporateActionAdjustment::SplitAdjusted, NonZeroU32::MIN);
+    let action_limits = CorporateActionLimits::try_new(
+        NonZeroUsize::new(16).ok_or("nonzero action limit")?,
+        NonZeroUsize::new(1024 * 1024).ok_or("nonzero action byte limit")?,
+    )?;
+    let feature_plan = CorporateActionPlan::try_build(
+        adjustment_policy,
+        Timestamp::from_unix_nanos(95),
+        Timestamp::from_unix_nanos(95),
+        Vec::new(),
+        action_limits,
+    )?;
+    let label_plan = CorporateActionPlan::try_build(
+        adjustment_policy,
+        Timestamp::from_unix_nanos(110),
+        Timestamp::from_unix_nanos(110),
+        Vec::new(),
+        action_limits,
+    )?;
+    let return_unit = Some(SourceIdentifier::try_from(FEATURE_LABEL_RETURN_UNIT)?);
+    let feature_input = FeatureLabelComponentInput::try_new(
+        feature.clone(),
+        ComponentValue::decimal(Decimal::ZERO, return_unit.clone(), None)?,
+        vec![
+            ComponentSelector::new(closed_price_return_market_bar_family(instrument, 80)?),
+            ComponentSelector::new(closed_price_return_market_bar_family(instrument, 90)?),
+        ],
+        ComponentAdjustmentEvidence::try_applied(
+            adjustment_policy,
+            feature_plan.content_hash(),
+            feature_plan.audit_hash(),
+            digest(84),
+        )?,
+    )?;
+    let label_input = FeatureLabelComponentInput::try_new(
+        label.clone(),
+        ComponentValue::decimal(Decimal::ZERO, return_unit, None)?,
+        vec![ComponentSelector::new(
+            closed_price_return_market_bar_family(instrument, 100)?,
+        )],
+        ComponentAdjustmentEvidence::try_applied(
+            adjustment_policy,
+            label_plan.content_hash(),
+            label_plan.audit_hash(),
+            digest(84),
+        )?,
+    )?;
+    let membership_evidence =
+        CanonicalObservationPayload::try_from_observation(&universe_membership_observation()?)?
+            .identity();
+    let mut examples = vec![
+        market_squawk_data::DatasetExample::try_new_with_temporal_cutoffs(
+            "aapl-price-return-example-1",
+            instrument,
+            Timestamp::from_unix_nanos(95),
+            Timestamp::from_unix_nanos(110),
+            ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
+            ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(100)),
+            vec![feature_input.clone(), label_input.clone()],
+        )?,
+    ];
+    if include_successor_example {
+        examples.push(
+            market_squawk_data::DatasetExample::try_new_with_temporal_cutoffs(
+                "aapl-price-return-example-2",
+                instrument,
+                Timestamp::from_unix_nanos(95),
+                Timestamp::from_unix_nanos(110),
+                ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
+                ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(100)),
+                vec![feature_input, label_input],
+            )?,
+        );
+    }
+    let inputs = DatasetBuildInputs::try_new(
+        vec![membership_parent.clone(), market_bar_parent],
+        UniverseId::try_from("us-equities.historical")?,
+        vec![UniverseMembership::new(
+            instrument,
+            EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
+            market_squawk_domain::AvailabilityEvidence::evidenced(
+                Timestamp::from_unix_nanos(1),
+                SourceIdentifier::try_from("constituent-publication")?,
+            ),
+            membership_parent,
+            membership_evidence,
+        )],
+        vec![feature, label],
+        examples,
+    )?;
+    let policy = DatasetBuildPolicy::new(
+        ChronologicalSplitPolicy::try_new(
+            Timestamp::from_unix_nanos(120),
+            Timestamp::from_unix_nanos(200),
+            Timestamp::from_unix_nanos(300),
+        )?,
+        PointInTimePolicy::try_new(NonZeroU32::MIN, PointInTimeRevisionMode::LatestKnown)?,
+        adjustment_policy,
+        MissingValuePolicy::Reject,
+        SourceIdentifier::try_from("price-return-fixed-horizon-forward-return-v1")?,
+    );
+    let limits = DatasetBuildLimits::try_new(
+        128,
+        8,
+        8,
+        64,
+        4 * 1024 * 1024,
+        Duration::from_secs(5),
+        PointInTimeLimits::try_new(128, 128, 8, 128, 1024 * 1024)?,
+        UniverseLimits::try_new(16, 1024 * 1024)?,
+        action_limits,
+    )?;
+    Ok(DatasetBuildRequest::try_new(
+        DatasetId::try_from("derived.feature-labels.price-return-v1")?,
+        inputs,
+        policy,
+        ResearchUse::LocalAnalysis,
+        research_limits,
+        DatasetOutputAuthorization::try_new(
+            SourceId::try_from("market-squawk.derived")?,
+            RightsBasis::reviewed_terms("https://example.test/local-derived/v1", digest(62))?,
+            digest(63),
+            None,
+        )?,
+        limits,
+    )?)
+}
+
+fn closed_price_return_market_bar_family(
+    instrument: InstrumentId,
+    effective: i64,
+) -> Result<ObservationFamilyKey, Box<dyn Error>> {
+    Ok(ObservationFamilyKey::MarketBar {
+        source_id: SourceId::try_from("alpaca-historical-fixture")?,
+        instrument_id: instrument,
+        venue_id: VenueId::try_from("iex")?,
+        provider_instrument_id: ProviderInstrumentId::try_from("AAPL")?,
+        feed: SourceIdentifier::try_from("iex")?,
+        interval: SourceIdentifier::try_from("1Day")?,
+        adjustment: MarketBarAdjustment::Raw,
+        timestamp_basis: BarTimestampBasis::PeriodStart,
+        session: market_bar_session()?,
+        effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(effective)),
+    })
+}
+
+fn closed_price_return_proof(
+    dataset: &FeatureLabelDataset,
+    attested_at: Timestamp,
+    currentness_expires_at: Timestamp,
+    return_kernel_digest_byte: u8,
+) -> Result<FeatureDatasetProductionProofV1, Box<dyn Error>> {
+    let split_counts = dataset.split_counts();
+    let example_count = split_counts
+        .train_examples()
+        .checked_add(split_counts.validation_examples())
+        .and_then(|value| value.checked_add(split_counts.test_examples()))
+        .and_then(|value| u32::try_from(value).ok())
+        .and_then(NonZeroU32::new)
+        .ok_or("nonzero bounded example count")?;
+    Ok(FeatureDatasetProductionProofV1::try_new(
+        dataset.build_spec_digest(),
+        dataset.policy_digest(),
+        dataset.universe_digest(),
+        digest(85),
+        digest(86),
+        digest(87),
+        digest(88),
+        digest(89),
+        digest(90),
+        digest(91),
+        digest(92),
+        digest(93),
+        digest(94),
+        digest(95),
+        digest(return_kernel_digest_byte),
+        NonZeroU64::new(10).ok_or("nonzero return horizon")?,
+        NonZeroU32::MIN,
+        example_count,
+        attested_at,
+        currentness_expires_at,
+    )?)
+}
+
 fn extraction_batch_with_membership(
     include_membership: bool,
 ) -> Result<ExtractionBatch, Box<dyn Error>> {
@@ -3048,7 +3625,7 @@ fn macro_observation() -> Result<ResearchObservation, Box<dyn Error>> {
 }
 
 fn universe_membership_observation() -> Result<ResearchObservation, Box<dyn Error>> {
-    let instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
+    let instrument = dataset_membership_instrument()?;
     let context = ResearchContext::new(
         ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: SourceId::try_from("fred-local-fixture")?,
@@ -3081,6 +3658,12 @@ fn universe_membership_observation() -> Result<ResearchObservation, Box<dyn Erro
             EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
         )?,
     ))
+}
+
+fn dataset_membership_instrument() -> Result<InstrumentId, Box<dyn Error>> {
+    Ok(InstrumentId::from_str(
+        "0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1",
+    )?)
 }
 
 fn local_source() -> Result<SourceMetadata, Box<dyn Error>> {

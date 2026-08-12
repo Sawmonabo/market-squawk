@@ -9,13 +9,14 @@ use std::num::NonZeroU32;
 
 use market_squawk_backtesting::{
     RECOMMENDATION_TARGET_HORIZON_NANOS_V1, RecommendationAggregateEvidenceV1,
-    RecommendationBacktestEvidenceV1,
 };
 use market_squawk_decisions::{
     CostAdjustedPitBacktestEvidence, DecisionContentDigest, ProposalEvidenceWindow,
 };
 use market_squawk_domain::{BasisPoints, DigestAlgorithm, EvidenceDigest};
 use rust_decimal::Decimal;
+
+use crate::application::analysis::GovernedRecommendationBacktestEvidenceV1;
 
 /// Why complete recommendation-backtest evidence could not be admitted into a proposal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,7 +35,7 @@ pub(crate) enum RecommendationBacktestAdapterError {
 /// aggregates or decimal metrics that cannot be represented exactly by the proposal's basis-point
 /// contract.
 pub(crate) fn adapt_recommendation_backtest_v1(
-    evidence: &RecommendationBacktestEvidenceV1,
+    evidence: &GovernedRecommendationBacktestEvidenceV1,
 ) -> Result<CostAdjustedPitBacktestEvidence, RecommendationBacktestAdapterError> {
     let aggregate = match evidence.aggregate() {
         RecommendationAggregateEvidenceV1::Available(value) => value,

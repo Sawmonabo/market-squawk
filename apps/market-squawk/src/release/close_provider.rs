@@ -41,8 +41,6 @@ const DATA_USE_OPERATIONS: [DataUseOperation; 6] = [
     DataUseOperation::Export,
     DataUseOperation::Redistribute,
 ];
-const MAXIMUM_TRAINING_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-const MAXIMUM_TRAINING_PARENTS: usize = 64;
 const BLS_UNEMPLOYMENT_SERIES: &str = "LNS14000000";
 const BLS_PUBLIC_MAXIMUM_ACCEPTANCE_ROWS: u64 = 10 * 13;
 const BLS_REGISTERED_MAXIMUM_ACCEPTANCE_ROWS: u64 = 20 * 13;
@@ -59,7 +57,7 @@ const MAXIMUM_TREASURY_FISCAL_RELEASE_ROW_BYTES: usize = 1024 * 1024;
 const TREASURY_FISCAL_SOURCE_ID: &str = "treasury-treasury.fiscal-data";
 
 pub(super) fn validate_provider_evidence(payload: &Value) -> Result<()> {
-    if payload.pointer("/schema_version").and_then(Value::as_u64) != Some(5)
+    if payload.pointer("/schema_version").and_then(Value::as_u64) != Some(6)
         || payload
             .pointer("/requirements/external_network_authorized")
             .and_then(Value::as_bool)
@@ -191,6 +189,24 @@ fn validate_fred_rights_summary(payload: &Value, surface: &Value) -> Result<()> 
         .pointer("/fred_alfred_rights")
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("FRED/ALFRED rights summary is absent"))?;
+    let expected_summary_fields = [
+        "required",
+        "selected",
+        "persistence_admitted",
+        "model_training_rights_admitted",
+        "parent_authorization_digest",
+        "authorization_digest",
+        "authorization_expires_at_unix_nanos",
+        "exact_series",
+        "admitted",
+    ];
+    if summary.len() != expected_summary_fields.len()
+        || expected_summary_fields
+            .iter()
+            .any(|field| !summary.contains_key(*field))
+    {
+        bail!("FRED/ALFRED rights summary does not match provider schema v6");
+    }
     let runtime_value = surface
         .pointer("/research_runtime")
         .filter(|runtime| !runtime.is_null())
@@ -213,7 +229,7 @@ fn validate_fred_rights_summary(payload: &Value, surface: &Value) -> Result<()> 
         || summary.get("selected").and_then(Value::as_bool) != Some(true)
         || summary.get("persistence_admitted").and_then(Value::as_bool) != Some(true)
         || summary
-            .get("model_training_admitted")
+            .get("model_training_rights_admitted")
             .and_then(Value::as_bool)
             != Some(true)
         || summary.get("admitted").and_then(Value::as_bool) != Some(true)
@@ -351,6 +367,9 @@ fn validate_provider_surface_runtime(surface_id: &str, surface: &Value) -> Resul
                         "durable research-provider evidence omitted its callable runtime"
                     )
                 })?;
+            if runtime.get("python_training").is_some() {
+                bail!("provider schema v6 contains obsolete Python training evidence");
+            }
             if !nonzero_evidence_digest(
                 runtime
                     .pointer("/runtime_generation_digest")
@@ -401,15 +420,6 @@ fn validate_provider_surface_runtime(surface_id: &str, surface: &Value) -> Resul
                 validate_bls_publication(runtime, surface_id)?;
             } else if surface_id == "sec.edgar-public" {
                 validate_sec_publications(runtime)?;
-            } else if runtime
-                .pointer("/publications")
-                .and_then(Value::as_array)
-                .is_none_or(|publications| !publications.is_empty())
-                || !runtime
-                    .pointer("/python_training")
-                    .is_some_and(Value::is_null)
-            {
-                bail!("research runtime contains unexpected publication or training evidence");
             }
         }
         _ => bail!("provider evidence contains an unknown surface"),
@@ -418,12 +428,6 @@ fn validate_provider_surface_runtime(surface_id: &str, surface: &Value) -> Resul
 }
 
 fn validate_treasury_fiscal_publication(runtime: &Value) -> Result<()> {
-    if !runtime
-        .pointer("/python_training")
-        .is_some_and(Value::is_null)
-    {
-        bail!("Treasury Fiscal Data runtime contains unexpected Python training evidence");
-    }
     let publications = runtime
         .pointer("/publications")
         .and_then(Value::as_array)
@@ -856,12 +860,6 @@ fn treasury_fiscal_series_valid(series: &str) -> bool {
 }
 
 fn validate_sec_publications(runtime: &Value) -> Result<()> {
-    if !runtime
-        .pointer("/python_training")
-        .is_some_and(Value::is_null)
-    {
-        bail!("SEC runtime contains unexpected Python training evidence");
-    }
     let publications = runtime
         .pointer("/publications")
         .and_then(Value::as_array)
@@ -1002,12 +1000,6 @@ fn valid_sec_cik(value: &str) -> bool {
 }
 
 fn validate_treasury_publications(runtime: &Value) -> Result<()> {
-    if !runtime
-        .pointer("/python_training")
-        .is_some_and(Value::is_null)
-    {
-        bail!("Treasury runtime contains unexpected Python training evidence");
-    }
     let publications = runtime
         .pointer("/publications")
         .and_then(Value::as_array)
@@ -1195,12 +1187,7 @@ fn validate_fred_publications(runtime: &Value) -> Result<()> {
         bail!("FRED/ALFRED observation and vintage evidence are not the same exact row set");
     }
     validate_research_publication(publication, "fred-alfred.api-v1-v2", true)?;
-    validate_python_training(
-        runtime,
-        publications,
-        "fred-alfred.api-v1-v2",
-        "FRED/ALFRED",
-    )
+    require_feature_product_producer_receipt("FRED/ALFRED")
 }
 
 fn validate_fred_pages(
@@ -1739,118 +1726,13 @@ fn validate_bls_publication(runtime: &Value, surface_id: &str) -> Result<()> {
         bail!("BLS unemployment publication lost direct current-snapshot provenance");
     }
     validate_research_publication(publication, surface_id, false)?;
-    validate_python_training(runtime, publications, surface_id, "BLS")
+    require_feature_product_producer_receipt("BLS")
 }
 
-fn validate_python_training(
-    runtime: &Value,
-    publications: &[Value],
-    source_surface_id: &str,
-    source_label: &str,
-) -> Result<()> {
-    let training = runtime
-        .pointer("/python_training")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("{source_label} Python training evidence is absent"))?;
-    let output_dataset = training
-        .get("dataset_id")
-        .and_then(Value::as_str)
-        .filter(|value| DatasetId::try_from(*value).is_ok())
-        .ok_or_else(|| anyhow::anyhow!("{source_label} Python training dataset is invalid"))?;
-    let source_parent_dataset = training
-        .get("source_parent_dataset_id")
-        .and_then(Value::as_str)
-        .filter(|value| DatasetId::try_from(*value).is_ok())
-        .ok_or_else(|| anyhow::anyhow!("{source_label} Python training parent is invalid"))?;
-    let source_parent_version = training
-        .get("source_parent_manifest_version")
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| anyhow::anyhow!("{source_label} Python training parent is invalid"))?;
-    let source_parent_hash = training
-        .get("source_parent_content_hash")
-        .and_then(Value::as_str)
-        .filter(|value| valid_nonzero_sha256_text(value))
-        .ok_or_else(|| anyhow::anyhow!("{source_label} Python training parent is invalid"))?;
-    let parents = training
-        .get("parents")
-        .and_then(Value::as_array)
-        .filter(|parents| !parents.is_empty() && parents.len() <= MAXIMUM_TRAINING_PARENTS)
-        .ok_or_else(|| anyhow::anyhow!("{source_label} Python training parents are invalid"))?;
-    let mut parent_identities = BTreeSet::new();
-    for parent in parents {
-        let dataset = parent
-            .get("dataset_id")
-            .and_then(Value::as_str)
-            .filter(|value| DatasetId::try_from(*value).is_ok())
-            .ok_or_else(|| anyhow::anyhow!("{source_label} Python training parent is invalid"))?;
-        let version = parent
-            .get("manifest_version")
-            .and_then(Value::as_u64)
-            .filter(|value| *value > 0)
-            .ok_or_else(|| anyhow::anyhow!("{source_label} Python training parent is invalid"))?;
-        let content_hash = parent
-            .get("manifest_content_hash")
-            .and_then(Value::as_str)
-            .filter(|value| valid_nonzero_sha256_text(value))
-            .ok_or_else(|| anyhow::anyhow!("{source_label} Python training parent is invalid"))?;
-        if !parent_identities.insert((dataset, version, content_hash)) {
-            bail!("{source_label} Python training repeats a parent generation");
-        }
-    }
-    let matching_publications = publications
-        .iter()
-        .filter(|publication| {
-            publication
-                .get("analytical_dataset_id")
-                .and_then(Value::as_str)
-                == Some(source_parent_dataset)
-                && publication.get("manifest_version").and_then(Value::as_u64)
-                    == Some(source_parent_version)
-                && publication
-                    .get("manifest_content_hash")
-                    .and_then(Value::as_str)
-                    == Some(source_parent_hash)
-        })
-        .count();
-    if training.get("source_surface_id").and_then(Value::as_str) != Some(source_surface_id)
-        || output_dataset == source_parent_dataset
-        || matching_publications != 1
-        || !parent_identities.contains(&(
-            source_parent_dataset,
-            source_parent_version,
-            source_parent_hash,
-        ))
-        || training
-            .get("request_byte_count")
-            .and_then(Value::as_u64)
-            .is_none_or(|bytes| bytes == 0 || bytes > MAXIMUM_TRAINING_REQUEST_BYTES)
-        || !valid_nonzero_sha256(training.get("request_sha256"))
-        || training
-            .get("manifest_version")
-            .and_then(Value::as_u64)
-            .is_none_or(|value| value == 0)
-        || !valid_nonzero_sha256(training.get("manifest_content_hash"))
-        || !valid_nonzero_sha256(training.get("build_spec_digest"))
-        || !valid_nonzero_sha256(training.get("policy_digest"))
-        || !valid_nonzero_sha256(training.get("universe_digest"))
-        || !valid_nonzero_sha256(training.get("python_export_sha256"))
-        || training
-            .get("train_examples")
-            .and_then(Value::as_u64)
-            .is_none_or(|value| value == 0)
-        || training
-            .get("validation_examples")
-            .and_then(Value::as_u64)
-            .is_none_or(|value| value == 0)
-        || training
-            .get("test_examples")
-            .and_then(Value::as_u64)
-            .is_none_or(|value| value == 0)
-    {
-        bail!("{source_label} Python training evidence is incomplete");
-    }
-    Ok(())
+fn require_feature_product_producer_receipt(source_label: &str) -> Result<()> {
+    bail!(
+        "{source_label} release closure requires an exact feature-product producer receipt; raw provider publication and model-training rights do not prove product production"
+    )
 }
 
 fn validate_research_publication(
@@ -1880,9 +1762,6 @@ fn validate_research_publication(
             .and_then(Value::as_u64)
             .is_none_or(|value| value == 0)
         || !valid_sha256(publication.get("lineage_digest"))
-        || !publication
-            .get("python_export_sha256")
-            .is_some_and(Value::is_null)
         || publication
             .get("observation_query_row_count")
             .and_then(Value::as_u64)
@@ -2096,7 +1975,7 @@ fn nonzero_evidence_digest(value: &Value) -> bool {
 mod tests {
     use serde_json::json;
 
-    use super::validate_provider_surface_runtime;
+    use super::{require_feature_product_producer_receipt, validate_provider_surface_runtime};
 
     #[test]
     fn treasury_fiscal_runtime_requires_durable_publication_evidence() {
@@ -2120,7 +1999,6 @@ mod tests {
                 "runtime_generation_digest": digest,
                 "rights_authorization_digest": digest,
                 "publications": [],
-                "python_training": null,
             },
         });
 
@@ -2133,6 +2011,16 @@ mod tests {
                         .contains("Treasury Fiscal Data publication evidence is absent")
             ),
             "Fiscal Data without a durable publication must fail closed",
+        );
+        assert!(
+            matches!(
+                require_feature_product_producer_receipt("FRED/ALFRED"),
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("exact feature-product producer receipt")
+            ),
+            "raw publication and training rights must not replace a producer receipt",
         );
     }
 }

@@ -3487,32 +3487,52 @@ fn research_file_preview_cell() -> Value {
 }
 
 fn generation() -> Value {
-    closed(
-        vec![
-            ("manifest", manifest()),
-            ("sourceId", text()),
-            ("generationKind", text()),
-            ("buildSpecDigest", nullable(text())),
-            ("pythonExportSha256", nullable(text())),
-            ("parents", array(record())),
-            ("rowCount", unsigned()),
-            ("totalBytes", unsigned()),
-            ("lineageDigest", text()),
-            ("objectCount", unsigned()),
-        ],
-        &[
-            "manifest",
-            "sourceId",
-            "generationKind",
-            "buildSpecDigest",
-            "pythonExportSha256",
-            "parents",
-            "rowCount",
-            "totalBytes",
-            "lineageDigest",
-            "objectCount",
-        ],
-    )
+    one_of(vec![
+        generation_variant("ingest", false),
+        generation_variant("compaction", false),
+        generation_variant("derived", true),
+    ])
+}
+
+fn generation_variant(kind: &'static str, phase_one: bool) -> Value {
+    let mut fields = vec![
+        ("manifest", manifest()),
+        ("sourceId", text()),
+        ("generationKind", constant(kind)),
+        ("buildSpecDigest", if phase_one { sha256() } else { null() }),
+        ("parents", array(record())),
+        ("rowCount", unsigned()),
+        ("totalBytes", unsigned()),
+        ("lineageDigest", text()),
+        ("objectCount", unsigned()),
+    ];
+    let mut required = vec![
+        "manifest",
+        "sourceId",
+        "generationKind",
+        "buildSpecDigest",
+        "parents",
+        "rowCount",
+        "totalBytes",
+        "lineageDigest",
+        "objectCount",
+    ];
+    if phase_one {
+        fields.extend([
+            ("publicationStage", constant("phase_one_derived_generation")),
+            ("phaseOneDescriptorSha256", nullable(lowercase_sha256())),
+            (
+                "productAdmission",
+                constant("not_established_on_this_surface"),
+            ),
+        ]);
+        required.extend([
+            "publicationStage",
+            "phaseOneDescriptorSha256",
+            "productAdmission",
+        ]);
+    }
+    closed(fields, &required)
 }
 
 fn manifest() -> Value {
@@ -4821,17 +4841,40 @@ fn selected_calibration_coverage_band() -> Value {
 }
 
 fn forecast_selection_receipt() -> Value {
+    one_of(vec![
+        forecast_selection_receipt_variant(
+            closed(vec![("kind", constant("any_valid"))], &["kind"]),
+            null(),
+        ),
+        forecast_selection_receipt_variant(
+            closed(
+                vec![
+                    ("kind", constant("exact_calibrated_conditional_mean_price")),
+                    ("horizonNanos", positive_integer_text()),
+                ],
+                &["kind", "horizonNanos"],
+            ),
+            integer_text(),
+        ),
+    ])
+}
+
+fn forecast_selection_receipt_variant(
+    qualification: Value,
+    selected_terminal_target: Value,
+) -> Value {
     closed(
         vec![
             (
                 "schema",
-                constant("market-squawk/forecast-selection-receipt/v1"),
+                constant("market-squawk/forecast-selection-receipt/v2"),
             ),
-            ("policyRevision", constant_unsigned(1)),
+            ("policyRevision", constant_unsigned(2)),
             (
                 "selectionOrder",
                 constant("newest_created_at_observed_through_available_at_then_lowest_vintage_id"),
             ),
+            ("qualification", qualification),
             ("instrumentId", uuid()),
             ("asOfUnixNanos", integer_text()),
             ("consideredVintageCount", bounded_unsigned(100_000)),
@@ -4844,12 +4887,17 @@ fn forecast_selection_receipt() -> Value {
             ("selectedObservedThroughUnixNanos", integer_text()),
             ("selectedAvailableAtUnixNanos", integer_text()),
             ("selectedExpiresAtUnixNanos", integer_text()),
+            (
+                "selectedTerminalTargetAtUnixNanos",
+                selected_terminal_target,
+            ),
             ("receiptDigestSha256", lowercase_sha256()),
         ],
         &[
             "schema",
             "policyRevision",
             "selectionOrder",
+            "qualification",
             "instrumentId",
             "asOfUnixNanos",
             "consideredVintageCount",
@@ -4862,6 +4910,7 @@ fn forecast_selection_receipt() -> Value {
             "selectedObservedThroughUnixNanos",
             "selectedAvailableAtUnixNanos",
             "selectedExpiresAtUnixNanos",
+            "selectedTerminalTargetAtUnixNanos",
             "receiptDigestSha256",
         ],
     )

@@ -28,9 +28,10 @@ use sha2::{Digest as _, Sha256};
 use super::{
     FORECAST_PAYLOAD_SCHEMA_VERSION, FORECAST_SELECTION_POLICY_REVISION, ForecastApplicationError,
     ForecastApplicationLimits, ForecastPriceEvidence, ForecastPriceUnavailableReason,
-    ForecastSelectionOrder, ForecastSelectionReceipt, ForecastSelectionReceiptBody,
-    INDEX_SCHEMA_VERSION, SelectedForecastPriceUnavailable, SelectedPriceForecast,
-    SelectedPriceForecastPoint, SelectedPriceInterval, SelectedPriceIntervals,
+    ForecastSelectionOrder, ForecastSelectionQualification, ForecastSelectionReceipt,
+    ForecastSelectionReceiptBody, INDEX_SCHEMA_VERSION, SelectedForecastPriceUnavailable,
+    SelectedPriceForecast, SelectedPriceForecastPoint, SelectedPriceInterval,
+    SelectedPriceIntervals,
 };
 
 const MAXIMUM_CALIBRATION_ASSUMPTION_BYTES: usize = 512;
@@ -1686,6 +1687,7 @@ impl ForecastIndex {
             policy_revision: FORECAST_SELECTION_POLICY_REVISION,
             selection_order:
                 ForecastSelectionOrder::NewestCreatedAtObservedThroughAvailableAtThenLowestVintageId,
+            qualification: ForecastSelectionQualification::AnyValid,
             instrument_id,
             as_of_unix_nanos: as_of.unix_nanos(),
             considered_vintage_count: self.vintages.len(),
@@ -1698,6 +1700,7 @@ impl ForecastIndex {
             selected_observed_through_unix_nanos: selected.payload.observed_through_unix_nanos,
             selected_available_at_unix_nanos: selected.payload.available_at_unix_nanos,
             selected_expires_at_unix_nanos: selected.payload.expires_at_unix_nanos,
+            selected_terminal_target_at_unix_nanos: None,
         })?;
         Ok(ForecastIndexSelection {
             vintage: selected.clone(),
@@ -1804,7 +1807,10 @@ fn decoded_observed_quality(value: &str) -> Option<DataQuality> {
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroUsize, str::FromStr};
+    use std::{
+        num::{NonZeroU64, NonZeroUsize},
+        str::FromStr,
+    };
 
     use market_squawk_domain::{Currency, InstrumentId, Timestamp};
     use market_squawk_modeling::{ForecastMeasurement, ModelOutputSemantics};
@@ -1817,7 +1823,8 @@ mod tests {
         VintageRecord, hex,
     };
     use crate::application::model::forecast::{
-        FORECAST_PAYLOAD_SCHEMA_VERSION, ForecastApplicationError, INDEX_SCHEMA_VERSION,
+        FORECAST_PAYLOAD_SCHEMA_VERSION, ForecastApplicationError, ForecastSelectionQualification,
+        ForecastSelectionReceipt, INDEX_SCHEMA_VERSION,
     };
 
     #[test]
@@ -1864,6 +1871,48 @@ mod tests {
             assert_eq!(first.receipt.body.retained_vintage_hard_ceiling, 16);
             assert_eq!(first.receipt.body.competing_eligible_vintage_count, 2);
             assert!(first.receipt.body.selection_complete);
+            let exact_horizon = NonZeroU64::new(100).ok_or("nonzero horizon")?;
+            assert_eq!(
+                first.receipt.qualification(),
+                ForecastSelectionQualification::AnyValid
+            );
+            assert_eq!(
+                first.receipt.body.selected_terminal_target_at_unix_nanos,
+                None
+            );
+            assert!(
+                !first
+                    .receipt
+                    .is_exact_horizon_price_qualified(exact_horizon)
+            );
+
+            // No current publication path can construct this receipt. It models the future
+            // sealed-provenance shape solely to pin the temporal boundary used by projection.
+            let mut future_qualified_body = first.receipt.body.clone();
+            future_qualified_body.qualification =
+                ForecastSelectionQualification::ExactCalibratedConditionalMeanPrice {
+                    horizon_nanos: exact_horizon,
+                };
+            future_qualified_body.selected_terminal_target_at_unix_nanos = Some(110);
+            future_qualified_body.selected_expires_at_unix_nanos = 100;
+            let future_qualified =
+                ForecastSelectionReceipt::try_new(future_qualified_body.clone())?;
+            assert!(future_qualified.is_exact_horizon_price_qualified(exact_horizon));
+            assert!(future_qualified.binds_live_terminal_target(Timestamp::from_unix_nanos(110)));
+
+            let mut expires_after_target_body = future_qualified_body.clone();
+            expires_after_target_body.selected_expires_at_unix_nanos = 111;
+            let expires_after_target =
+                ForecastSelectionReceipt::try_new(expires_after_target_body)?;
+            assert!(
+                !expires_after_target.binds_live_terminal_target(Timestamp::from_unix_nanos(110))
+            );
+
+            future_qualified_body.as_of_unix_nanos = 110;
+            let selected_at_target = ForecastSelectionReceipt::try_new(future_qualified_body)?;
+            assert!(
+                !selected_at_target.binds_live_terminal_target(Timestamp::from_unix_nanos(110))
+            );
             assert_eq!(
                 first.vintage.payload.output_binding.decoded_semantics(),
                 Some(ModelOutputSemantics::Regression)

@@ -5,8 +5,9 @@ use std::{collections::BTreeMap, fmt, num::NonZeroU64, time::Instant};
 use market_squawk_analytics::{FeatureRegistry, StatisticalF64};
 use market_squawk_data::{
     AnalyticalReadCapability, CatalogEndpointIdentity, DatasetId, DatasetManifestRef,
-    DatasetSchemaRef, DatasetSchemaRegistry, ForecastDatasetEvidence, ForecastDatasetReadLimits,
-    ForecastFeatureRow, ForecastFeatureValue, Sha256Digest,
+    DatasetSchemaRef, DatasetSchemaRegistry, FeatureDatasetProductContract,
+    ForecastDatasetEvidence, ForecastDatasetReadLimits, ForecastFeatureRow, ForecastFeatureValue,
+    Sha256Digest,
 };
 use market_squawk_decisions::{
     CandidateFlag, CandidateId, CandidateInput, DecisionContentDigest, SavedScreen,
@@ -229,6 +230,7 @@ pub(super) async fn prepare(
     .map_err(|_error| ScreenWorkflowError::Capacity)?;
     let evidence = reader
         .forecast_dataset_evidence(
+            FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
             request.dataset_manifest(),
             request.as_of(),
             limits,

@@ -1,15 +1,16 @@
 # Dataset build and query operations
 
-This runbook covers immutable dataset inspection, point-in-time feature/label publication, bounded
-dataset reads, and the CLI-only read-only SQL surface.
+This runbook covers immutable dataset inspection, phase-one point-in-time feature/label generation,
+receipt-admitted feature-product inspection, bounded dataset reads, and the CLI-only read-only SQL
+surface.
 
 | Field | Value |
 | --- | --- |
 | Document type | Operations runbook |
 | Audience | Local research operators, feature producers, data stewards, and incident responders |
 | Status | Current, with analytical-query overflow limitations called out below |
-| Last substantive review | 2026-07-24 |
-| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Last substantive review | 2026-08-12 |
+| Review basis | Current phase-one generation and receipt-admitted feature-product contracts; not release approval evidence |
 
 ## Contents
 
@@ -18,7 +19,7 @@ dataset reads, and the CLI-only read-only SQL surface.
 - [Preconditions](#preconditions)
 - [Inspect datasets and feature contracts](#inspect-datasets-and-feature-contracts)
 - [Prepare an exact point-in-time build](#prepare-an-exact-point-in-time-build)
-- [Publish the derived dataset](#publish-the-derived-dataset)
+- [Build the phase-one derived generation](#build-the-phase-one-derived-generation)
 - [Read a dataset without SQL](#read-a-dataset-without-sql)
 - [Run bounded read-only SQL](#run-bounded-read-only-sql)
 - [Success evidence](#success-evidence)
@@ -53,11 +54,16 @@ provide arbitrary SQL over the product database, mutate a generation, expose his
 by version through the CLI, or grant order authority. Dataset and query outputs remain research
 data and report `executionEligible: false`.
 
+`dataset build` and `feature build` publish the same kind of immutable phase-one derived
+generation. They return a reproducible phase-one descriptor digest, but they do not issue a product
+receipt, admit a closed feature-dataset product, or create a training-ready Python export. Product
+admission is a separate code-owned operation over an exact closed Analysis or Training contract.
+
 ## Safety and authority boundaries
 
 - `dataset build` and `feature build` are durable mutations and require `--confirm`. They invoke
-  the same point-in-time dataset builder; their success summaries differ, but their request
-  contract and publication behavior do not.
+  the same phase-one point-in-time dataset builder; neither operation issues a product receipt or
+  admission.
 - Use one explicit `--data-dir` throughout a workflow. The default is `.market-squawk`, relative to
   the current working directory, so an omitted root can silently address a different catalog.
 - Build request files are opened as bounded, user-owned, regular files without following symlinks.
@@ -67,6 +73,8 @@ data and report `executionEligible: false`.
   `contentSha256` exactly.
 - The builder checks what was knowable by each example cutoff. Do not replace evidenced
   availability with an earlier timestamp or omit a revision conflict to make a build pass.
+- `intendedUse: "train"` requests and verifies source rights for that use. It does not create the
+  separately required Training product receipt.
 - `query sql` registers exactly one pinned generation as the relation `dataset`. It cannot query
   `catalog.sqlite3`, attach another database, read files, invoke table functions, or mutate state.
 - Generic SQL is deliberately absent from MCP. Remote/agent callers use the typed MCP operations
@@ -136,6 +144,12 @@ Each listed generation includes:
 - exact parent relations and manifests;
 - `rowCount`, `totalBytes`, `lineageDigest`, and `objectCount`.
 
+A derived generation additionally reports `publicationStage: "phase_one_derived_generation"`, a
+nullable `phaseOneDescriptorSha256`, and
+`productAdmission: "not_established_on_this_surface"`. That last field means this generic
+generation read is not product-admission authority; it is not evidence that the same manifest has
+never been admitted through a separate receipt-backed product surface.
+
 There is no public compaction command. A listed `generationKind: "compaction"` is descriptive
 evidence, not permission to invent a manual compaction procedure.
 
@@ -173,10 +187,19 @@ market-squawk --data-dir "$DATA_ROOT" --output json feature list
 ```
 
 Local composition returns the code-owned batch feature catalog followed by durable
-Python-admitted feature/label generations from the analytical catalog. A successful
-`dataset build` or `feature build` is therefore inspectable through `dataset list`,
-`dataset manifest`, query commands, and `feature list`. Each durable feature-dataset entry includes
-its exact manifest, build, policy, universe, split, source, and `pythonExportSha256` identities.
+receipt-admitted Analysis feature datasets from the analytical catalog. A successful generic
+`dataset build` or `feature build` is inspectable through `dataset list`, `dataset manifest`, and
+the query commands; it does not appear in `feature list` merely because its phase-one build
+succeeded. Each receipt-admitted feature-dataset entry includes its exact manifest, build, policy,
+universe, split, source, and `pythonExportSha256` identities.
+
+The installed reader is bounded to the closed Analysis contract
+`market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.analysis/v1`.
+`feature list` is not Training-contract authority. Model training remains unavailable until a
+code-owned producer issues the separate
+`market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.training/v1` receipt for
+the exact generation and export.
+
 When a page reports more entries, continue with the last returned dataset identity:
 
 ```bash
@@ -516,7 +539,7 @@ defaults. The exact nested JSON field names are:
 }
 ```
 
-## Publish the derived dataset
+## Build the phase-one derived generation
 
 Save the complete closed request as a regular file under a user-owned directory, then run one of:
 
@@ -540,6 +563,8 @@ On success, retain the complete result:
 
 ```json
 {
+  "publicationStage": "phase_one_derived_generation",
+  "productAdmission": "not_admitted_by_phase_one_operation_at_completion",
   "manifest": {
     "dataset": "...",
     "version": 1,
@@ -551,7 +576,7 @@ On success, retain the complete result:
   "buildSpecSha256": "...",
   "policySha256": "...",
   "universeSha256": "...",
-  "pythonExportSha256": "...",
+  "phaseOneDescriptorSha256": "...",
   "splitExamples": {
     "train": 6,
     "validation": 2,
@@ -561,14 +586,18 @@ On success, retain the complete result:
 ```
 
 The numbers and digests above illustrate the output shape. Check a real result against the reviewed
-request's expected admitted split counts.
+request's expected phase-one split counts.
 
-The builder publishes an immutable Parquet generation, records exact lineage, registers a canonical
-Python dataset export descriptor in the catalog, and returns that descriptor's exact
-`pythonExportSha256`. Retain it with the complete result; `contentSha256`,
-`buildSpecSha256`, `policySha256`, and `universeSha256` identify different objects and are not
-substitutes. The durable feature registry independently revalidates the descriptor bytes against
-this digest before returning the generation to model consumers.
+The builder publishes an immutable Parquet generation, records exact lineage, and returns the
+digest of its reproducible phase-one descriptor. Retain `phaseOneDescriptorSha256` with the
+complete result; `contentSha256`, `buildSpecSha256`, `policySha256`, and `universeSha256` identify
+different objects and are not substitutes. The phase-one descriptor is not a receipt-admitted
+Python export, and its digest must not be supplied as `exportSha256` to model training.
+
+Only the code-owned feature-dataset producer and non-duplicable publication authority can bind an
+exact closed product contract, rights, point-in-time evidence, and product receipt to a generation.
+Analysis and Training are distinct product contracts. Training remains unavailable until the
+exact Training receipt exists; no command in this generic build procedure promotes the generation.
 
 ## Read a dataset without SQL
 
@@ -661,12 +690,18 @@ A completed build has all of the following:
 
 1. Exit status `0` and a complete JSON result.
 2. A manifest tuple whose dataset identity matches `outputDataset`.
-3. Nonzero `buildSpecSha256`, `policySha256`, `universeSha256`, and `pythonExportSha256`.
-4. Split counts that match the reviewed chronological policy and admitted examples.
-5. A subsequent `dataset manifest <OUTPUT_DATASET>` result with the same manifest values after
+3. `publicationStage: "phase_one_derived_generation"` and
+   `productAdmission: "not_admitted_by_phase_one_operation_at_completion"`.
+4. Nonzero `buildSpecSha256`, `policySha256`, `universeSha256`, and
+   `phaseOneDescriptorSha256`.
+5. Split counts that match the reviewed chronological policy and admitted examples.
+6. A subsequent `dataset manifest <OUTPUT_DATASET>` result with the same manifest values after
    translating the field names shown above.
-6. A bounded `query dataset` or `query sql` result pinned to that exact generation.
-7. The original request, output, source/rights evidence, and operator review retained together.
+7. A bounded `query dataset` or `query sql` result pinned to that exact generation.
+8. The original request, output, source/rights evidence, and operator review retained together.
+
+These checks prove a phase-one generation, not product or training admission. Product evidence is a
+separate receipt-backed feature-dataset read under its exact closed contract.
 
 A completed read has exit status `0`, an exact returned manifest, bounded row counts, complete
 source/result identity, and no execution authority. Empty or truncated-by-policy results are not
@@ -679,6 +714,8 @@ reuses the identical derived generation rather than publishing a mutable replace
 parents, examples, policies, authorization, limits that participate in the build identity, or
 producer revision creates a different build specification and, when admitted, a new immutable
 generation.
+
+Replaying a generic build never promotes that generation into an Analysis or Training product.
 
 There is no CLI delete, de-publish, historical-version selector, manual compaction, or “make latest”
 operation:
@@ -703,14 +740,14 @@ operation:
 
 | Symptom | Meaning | Safe response |
 | --- | --- | --- |
-| `dataset build requires explicit confirmation` | `--confirm` was omitted | Review the exact request, then rerun with confirmation |
+| `phase-one derived-generation build requires explicit confirmation` | `--confirm` was omitted | Review the exact request, then rerun with confirmation |
 | Request file is not admitted | It is too large, not regular, symlinked, escaped, or unreadable | Move a reviewed copy under one user-owned regular directory; do not weaken path checks |
 | Request JSON is malformed or unsupported | Wrong casing, missing field, unknown field, or invalid tagged enum | Compare with the closed decoder and correct the request |
 | Point-in-time, rights, or resource invariant failure | Parent pin, availability, selector, split, authorization, or bound is invalid | Correct the source evidence or lower the requested workload; do not alter timestamps/digests to force admission |
 | Parent or dataset not found | The named/latest generation is absent under this data root | Confirm `--data-dir`, then inspect the exact parent receipt and catalog |
 | Revision/universe/corporate-action conflict | Evidence cannot produce one result under the declared policy or exceeded its conflict budget | Review the competing source records and issue a new truthful policy/request |
 | `hasMore: true` from `dataset list` or `feature list` | More identities exist after this stable page | Continue with `--after-dataset <LAST_DATASET_ID>` from the same operation |
-| Built dataset absent from `feature list` | The generation is not a valid durable Python-admitted feature dataset, the wrong data root is selected, or the page cursor excludes it | Verify the build receipt/data root, request the exact dataset or continue pagination, and preserve any catalog-corruption error |
+| Phase-one generation absent from `feature list` | This is expected until a code-owned producer separately admits the exact Analysis product receipt; a wrong data root or page cursor may also exclude an already admitted product | Inspect the generation through `dataset list` or query; if a product is required, use its code-owned production path and never edit or relabel the phase-one descriptor. Training additionally requires its distinct Training receipt |
 | Query limit/resource exhausted | Row, byte, memory, AST, plan, or deadline ceiling was reached | Narrow the read or SQL; do not increase beyond fixed ceilings |
 | SQL statement/relation/function rejected | It is outside the read-only allowlist | Rewrite it as one bounded query over `dataset` using admitted functions |
 | Dataset or SQL query reports resource exhaustion | The complete-result, row, memory, planning, or deadline ceiling was reached, or terminal publication/readback could not be verified | Reduce projection, predicates, grouping, or rows; never reconstruct a path or weaken artifact verification |
@@ -721,7 +758,7 @@ All paths are relative to the selected data root:
 
 | Path | Purpose | Operator rule |
 | --- | --- | --- |
-| `catalog.sqlite3` and active `catalog.sqlite3-wal`/`catalog.sqlite3-shm` | Manifests, lineage, build admissions, and Python dataset admissions | Treat as one SQLite consistency domain; never edit manually |
+| `catalog.sqlite3` and active `catalog.sqlite3-wal`/`catalog.sqlite3-shm` | Manifests, lineage, phase-one build records, and separately receipt-admitted feature products | Treat as one SQLite consistency domain; never edit manually |
 | `artifacts/objects/sha256/<first-two-hex>/<sha256>.parquet` | Immutable ingested and derived dataset objects | Content addressed; never rename, edit, or delete manually |
 | `artifacts/mcp/v1/parquet/<first-two-hex>/<sha256>.parquet` | Terminal query-overflow objects retrievable by opaque reference | Durable and content addressed; retain and recover with the data root, and never infer this path from the public ID |
 | The retained build request outside the data root | User-owned authority and exact build specification input | Keep with the success receipt and source evidence |

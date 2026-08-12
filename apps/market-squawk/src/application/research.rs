@@ -1287,16 +1287,13 @@ fn parse_timestamp(value: &str) -> Result<Timestamp, ServiceError> {
 }
 
 fn generation_value(generation: &AnalyticalGeneration) -> Value {
-    json!({
+    let mut value = json!({
         "manifest": manifest_value(generation.manifest()),
         "sourceId": generation.source_id(),
         "generationKind": generation_kind(generation.generation_kind()),
         "buildSpecDigest": generation
             .build_spec_digest()
             .map(|digest| encode_hex(digest.digest().bytes())),
-        "pythonExportSha256": generation
-            .python_export_sha256()
-            .map(|digest| encode_hex(digest.bytes())),
         "parents": generation
             .parents()
             .iter()
@@ -1309,7 +1306,29 @@ fn generation_value(generation: &AnalyticalGeneration) -> Value {
         "totalBytes": generation.total_bytes(),
         "lineageDigest": encode_hex(generation.lineage_digest().bytes()),
         "objectCount": generation.object_count(),
-    })
+    });
+    if generation.generation_kind() == GenerationKind::Derived
+        && let Value::Object(fields) = &mut value
+    {
+        fields.insert(
+            "publicationStage".to_owned(),
+            Value::String("phase_one_derived_generation".to_owned()),
+        );
+        fields.insert(
+            "phaseOneDescriptorSha256".to_owned(),
+            generation
+                .python_export_sha256()
+                .map(|digest| Value::String(encode_hex(digest.bytes())))
+                .unwrap_or(Value::Null),
+        );
+        // This analytical-generation projection does not establish product-admission state.
+        // Receipt-backed admission remains available only through Analysis.GetFeatureDatasets.
+        fields.insert(
+            "productAdmission".to_owned(),
+            Value::String("not_established_on_this_surface".to_owned()),
+        );
+    }
+    value
 }
 
 fn manifest_value(manifest: &DatasetManifestRef) -> Value {

@@ -1,10 +1,10 @@
-//! Production dataset-builder and Python-admission release fixture.
+//! Non-product phase-one descriptor and immutable-object storage fixture.
 
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::str::FromStr as _;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
@@ -34,24 +34,22 @@ use crate::{
     DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest, DatasetBuilder, DatasetExample,
     DatasetId, DatasetOutputAuthorization, FeatureLabelComponentInput, FeatureLabelComponentSpec,
     IngestIdentity, MissingValuePolicy, ObjectStoreConfig, ObservationFamilyKey, PointInTimeLimits,
-    PointInTimePolicy, PointInTimeRevisionMode, PythonDatasetVerificationLimits,
-    ResearchIngestService, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet,
-    RightsBasis, RightsDecisionInput, SourceOperation, UniverseId, UniverseLimits,
-    UniverseMembership, extraction_provider_payload_digest, verify_python_dataset,
+    PointInTimePolicy, PointInTimeRevisionMode, ResearchIngestService, ResearchUse,
+    ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet, RightsBasis, RightsDecisionInput,
+    SourceOperation, UniverseId, UniverseLimits, UniverseMembership,
+    extraction_provider_payload_digest,
 };
 
 type FixtureResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const MAX_SELECTED_ROWS: usize = 48_000;
-const AS_OF: Timestamp = Timestamp::from_unix_nanos(100);
-
-pub(super) struct PythonAdmissionMeasurement {
+pub(super) struct PhaseOneStorageMeasurement {
     pub(super) requested_rows: u64,
     pub(super) measured_rows: u64,
-    pub(super) selected_rows_per_verification: u64,
-    pub(super) export_sha256: [u8; 32],
-    pub(super) catalog_identity: [u8; 32],
-    pub(super) selection_sha256: [u8; 32],
+    pub(super) component_rows_per_verification: u64,
+    pub(super) descriptor_sha256: [u8; 32],
+    pub(super) manifest_sha256: [u8; 32],
+    pub(super) object_sha256: [u8; 32],
     pub(super) samples: Vec<u64>,
     pub(super) elapsed_nanos: u64,
 }
@@ -59,7 +57,7 @@ pub(super) struct PythonAdmissionMeasurement {
 pub(super) async fn measure(
     root: &Path,
     requested_rows: u64,
-) -> FixtureResult<PythonAdmissionMeasurement> {
+) -> FixtureResult<PhaseOneStorageMeasurement> {
     let selected_target = usize::try_from(requested_rows.min(MAX_SELECTED_ROWS as u64))?;
     let example_count = selected_target.div_ceil(2).max(1);
     let paths = LocalPaths::prepare(root)?;
@@ -70,7 +68,7 @@ pub(super) async fn measure(
         CatalogLimit::new(64)?,
         CatalogResultLimits::try_new(1024 * 1024, 16 * 1024 * 1024)?,
     )?)?;
-    let source = local_source("release-python-source")?;
+    let source = local_source("release-phase-one-source")?;
     authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
     authority.register_source(
         &local_source("market-squawk.derived")?,
@@ -104,7 +102,7 @@ pub(super) async fn measure(
             source.source_id().clone(),
             payload_digest,
             SourceOperation::Persist,
-            "release-python-source:gdp-and-universe:v1",
+            "release-phase-one-source:gdp-and-universe:v1",
         )?,
         &rights,
     )?;
@@ -134,70 +132,74 @@ pub(super) async fn measure(
     )?;
     let builder = service.dataset_builder();
     let built = builder.build(request, CancellationToken::new()).await?;
-    let admission = builder.python_admission(&built)?;
-    let export_sha256 = admission.export().content_hash();
-    let selected_rows = example_count
+    let export = built.python_export()?;
+    let export_sha256 = export.content_hash();
+    let component_rows = example_count
         .checked_mul(2)
-        .ok_or("selected Python row count overflowed")?;
-    let limits = PythonDatasetVerificationLimits::try_new(selected_rows, 256 * 1024 * 1024)?;
+        .ok_or("phase-one component row count overflowed")?;
     let cancellation = CancellationToken::new();
-    let baseline = verify_python_dataset(
-        paths.root(),
-        export_sha256,
-        AS_OF,
-        limits,
-        Instant::now() + Duration::from_secs(240),
-        &cancellation,
-    )?;
-    if baseline.selected_rows() != selected_rows
-        || baseline.identity().manifest() != built.manifest()
-        || baseline.identity().build_spec_digest() != built.build_spec_digest()
-        || baseline.identity().policy_digest() != built.policy_digest()
-        || baseline.identity().universe_digest() != built.universe_digest()
-        || baseline.catalog_identity() != admission.catalog_identity()
-        || baseline.export_sha256() != export_sha256
+    let summary = crate::python_dataset::feature_dataset_summary(export.bytes(), export_sha256)?;
+    let [object] = built.pinned().objects() else {
+        return Err("phase-one fixture must publish exactly one object".into());
+    };
+    if summary.identity.manifest() != built.manifest()
+        || summary.identity.build_spec_digest() != built.build_spec_digest()
+        || summary.identity.policy_digest() != built.policy_digest()
+        || summary.identity.universe_digest() != built.universe_digest()
+        || built.pinned().plan().row_count() != u64::try_from(component_rows)?
+        || service
+            .analytical_reader()
+            .feature_dataset(
+                crate::FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+                built.manifest().dataset_id(),
+                std::time::Instant::now() + Duration::from_secs(240),
+                &cancellation,
+            )?
+            .is_some()
     {
-        return Err("production Python dataset admission did not reconcile".into());
+        return Err("phase-one descriptor/object storage did not reconcile".into());
     }
-    let selected_rows_u64 = u64::try_from(selected_rows)?;
+    let component_rows_u64 = u64::try_from(component_rows)?;
     let repetitions = requested_rows
-        .checked_add(selected_rows_u64.saturating_sub(1))
-        .and_then(|value| value.checked_div(selected_rows_u64))
-        .ok_or("Python verification repetition count overflowed")?;
+        .checked_add(component_rows_u64.saturating_sub(1))
+        .and_then(|value| value.checked_div(component_rows_u64))
+        .ok_or("phase-one verification repetition count overflowed")?;
     let measured_rows = repetitions
-        .checked_mul(selected_rows_u64)
-        .ok_or("Python verified row count overflowed")?;
+        .checked_mul(component_rows_u64)
+        .ok_or("phase-one verified row count overflowed")?;
     let mut samples = Vec::new();
     samples.try_reserve_exact(usize::try_from(repetitions)?)?;
-    let started_all = Instant::now();
+    let started_all = std::time::Instant::now();
     for _ in 0..repetitions {
-        let started = Instant::now();
-        let selection = verify_python_dataset(
-            paths.root(),
-            export_sha256,
-            AS_OF,
-            limits,
-            Instant::now() + Duration::from_secs(240),
-            &cancellation,
+        let started = std::time::Instant::now();
+        let observed_export = built.python_export()?;
+        let observed_summary = crate::python_dataset::feature_dataset_summary(
+            observed_export.bytes(),
+            observed_export.content_hash(),
         )?;
-        if selection.identity() != baseline.identity()
-            || selection.catalog_identity() != baseline.catalog_identity()
-            || selection.export_sha256() != baseline.export_sha256()
-            || selection.selection_sha256() != baseline.selection_sha256()
-            || selection.selected_rows() != baseline.selected_rows()
-            || selection.as_of() != baseline.as_of()
+        let observed = service.pinned(built.manifest())?;
+        let batches = service
+            .object_store()
+            .read_pinned(&observed, &cancellation)?;
+        let observed_rows = batches
+            .iter()
+            .try_fold(0_usize, |total, batch| total.checked_add(batch.num_rows()));
+        if observed_export != export
+            || observed_summary != summary
+            || &observed != built.pinned()
+            || observed_rows != Some(component_rows)
         {
-            return Err("revalidated Python dataset identity changed".into());
+            return Err("phase-one descriptor/object verification changed".into());
         }
         samples.push(nanos(started.elapsed()));
     }
-    Ok(PythonAdmissionMeasurement {
+    Ok(PhaseOneStorageMeasurement {
         requested_rows,
         measured_rows,
-        selected_rows_per_verification: selected_rows_u64,
-        export_sha256: export_sha256.bytes(),
-        catalog_identity: admission.catalog_identity().bytes(),
-        selection_sha256: baseline.selection_sha256().bytes(),
+        component_rows_per_verification: component_rows_u64,
+        descriptor_sha256: export_sha256.bytes(),
+        manifest_sha256: built.manifest().content_hash().bytes(),
+        object_sha256: object.object().content_hash().bytes(),
         samples,
         elapsed_nanos: nanos(started_all.elapsed()),
     })
@@ -227,7 +229,7 @@ fn build_request(
         feature.clone(),
         ComponentValue::missing(SourceIdentifier::try_from("not-observed")?),
         vec![ComponentSelector::new(ObservationFamilyKey::Macro {
-            source_id: SourceId::try_from("release-python-source")?,
+            source_id: SourceId::try_from("release-phase-one-source")?,
             series: SourceIdentifier::try_from("CPI")?,
             effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
         })],
@@ -241,7 +243,7 @@ fn build_request(
             None,
         )?,
         vec![ComponentSelector::new(ObservationFamilyKey::Macro {
-            source_id: SourceId::try_from("release-python-source")?,
+            source_id: SourceId::try_from("release-phase-one-source")?,
             series: SourceIdentifier::try_from("GDP")?,
             effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
         })],
@@ -289,7 +291,7 @@ fn build_request(
         .checked_mul(2)
         .ok_or("release dataset output row count overflowed")?;
     DatasetBuildRequest::try_new(
-        DatasetId::try_from("release.feature-labels")?,
+        DatasetId::try_from("release.phase-one-feature-labels")?,
         inputs,
         policy,
         ResearchUse::LocalAnalysis,
@@ -337,7 +339,7 @@ fn extraction_batch(membership: ResearchObservation) -> FixtureResult<Extraction
         Timestamp::from_unix_nanos(1_000),
     )?;
     let object = SourceObject::try_new(
-        SourceId::try_from("release-python-source")?,
+        SourceId::try_from("release-phase-one-source")?,
         MetadataRevision::new(SourceIdentifier::try_from("revision-1")?),
         &discovery,
         SourceIdentifier::try_from("release-gdp-and-universe")?,
@@ -444,7 +446,7 @@ fn research_context(
 ) -> FixtureResult<ResearchContext> {
     Ok(ResearchContext::new(
         ResearchProvenance::try_new(ResearchProvenanceInput {
-            source_id: SourceId::try_from("release-python-source")?,
+            source_id: SourceId::try_from("release-phase-one-source")?,
             instrument_id,
             venue_id: None,
             source_identifier: SourceIdentifier::try_from(source_identifier)?,

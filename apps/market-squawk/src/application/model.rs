@@ -754,9 +754,10 @@ fn calibration_evidence_value(calibration: &CalibrationEvidence) -> Value {
 
 fn forecast_selection_receipt_value(receipt: &forecast::ForecastSelectionReceipt) -> Value {
     json!({
-        "schema": "market-squawk/forecast-selection-receipt/v1",
+        "schema": "market-squawk/forecast-selection-receipt/v2",
         "policyRevision": receipt.policy_revision(),
         "selectionOrder": receipt.selection_order().as_str(),
+        "qualification": forecast_selection_qualification_value(receipt.qualification()),
         "instrumentId": receipt.instrument_id().to_string(),
         "asOfUnixNanos": receipt.as_of_unix_nanos().to_string(),
         "consideredVintageCount": receipt.considered_vintage_count(),
@@ -771,8 +772,27 @@ fn forecast_selection_receipt_value(receipt: &forecast::ForecastSelectionReceipt
             .to_string(),
         "selectedAvailableAtUnixNanos": receipt.selected_available_at_unix_nanos().to_string(),
         "selectedExpiresAtUnixNanos": receipt.selected_expires_at_unix_nanos().to_string(),
+        "selectedTerminalTargetAtUnixNanos": receipt
+            .selected_terminal_target_at_unix_nanos()
+            .map(|value| value.to_string()),
         "receiptDigestSha256": encode_hex(receipt.receipt_digest().bytes()),
     })
+}
+
+fn forecast_selection_qualification_value(
+    qualification: forecast::ForecastSelectionQualification,
+) -> Value {
+    match qualification {
+        forecast::ForecastSelectionQualification::AnyValid => json!({
+            "kind": "any_valid",
+        }),
+        forecast::ForecastSelectionQualification::ExactCalibratedConditionalMeanPrice {
+            horizon_nanos,
+        } => json!({
+            "kind": "exact_calibrated_conditional_mean_price",
+            "horizonNanos": horizon_nanos.get().to_string(),
+        }),
+    }
 }
 
 const fn forecast_price_unavailable_reason(

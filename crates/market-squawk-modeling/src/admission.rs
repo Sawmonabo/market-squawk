@@ -11,8 +11,9 @@ use market_squawk_analytics::{
 };
 use market_squawk_data::{
     CatalogEndpointIdentity, ComponentKind, ComponentScope, CorporateActionSensitivity,
-    FeatureLabelComponentSpec, FeatureLabelMeasurement, PythonDatasetCatalogError,
-    PythonDatasetSelection, PythonDatasetVerificationLimits, Sha256Digest, verify_python_dataset,
+    FeatureDatasetProductContract, FeatureLabelComponentSpec, FeatureLabelMeasurement,
+    PythonDatasetCatalogError, PythonDatasetSelection, PythonDatasetVerificationLimits,
+    Sha256Digest, verify_python_dataset,
 };
 use market_squawk_domain::{Currency, ModelId, RoundingPolicy, Timestamp};
 use serde::Deserialize;
@@ -97,6 +98,7 @@ impl PythonDatasetAdmissionAuthority {
         let selection = verify_python_dataset(
             local_root,
             self.export_sha256,
+            FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnTrainingV1,
             self.as_of,
             limits,
             deadline,

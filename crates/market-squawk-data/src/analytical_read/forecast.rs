@@ -16,8 +16,8 @@ use super::{AnalyticalFeatureDataset, AnalyticalReadCapability, AnalyticalReadEr
 use crate::manifest::CatalogFeatureDatasetSelection;
 use crate::python_dataset::{finish_selection_hash, new_selection_hasher, update_selection_hash};
 use crate::{
-    CatalogEndpointIdentity, DatasetManifestRef, PythonDatasetCatalogError, PythonDatasetRow,
-    PythonDatasetValue, Sha256Digest,
+    CatalogEndpointIdentity, DatasetManifestRef, FeatureDatasetProductContract,
+    PythonDatasetCatalogError, PythonDatasetRow, PythonDatasetValue, Sha256Digest,
 };
 
 const MAX_FORECAST_ROWS: usize = 100_000;
@@ -184,6 +184,7 @@ impl AnalyticalReadCapability {
     /// Materializes one exact Python-admitted generation under a point-in-time cutoff.
     pub async fn forecast_dataset_evidence(
         &self,
+        expected_contract: FeatureDatasetProductContract,
         manifest: &DatasetManifestRef,
         as_of: Timestamp,
         limits: ForecastDatasetReadLimits,
@@ -194,7 +195,8 @@ impl AnalyticalReadCapability {
             return Err(AnalyticalReadError::InvalidLimit);
         }
         let page = self.manifests.read_feature_dataset_snapshot(
-            CatalogFeatureDatasetSelection::Exact(manifest.dataset_id()),
+            expected_contract,
+            CatalogFeatureDatasetSelection::ExactManifest(manifest),
             &[],
             1,
             deadline,
@@ -245,7 +247,7 @@ impl AnalyticalReadCapability {
         )
         .ok_or(AnalyticalReadError::InvalidLimit)?;
         let selection_sha256 = finish_selection_hash(hasher, rows.len())?;
-        let dataset = AnalyticalFeatureDataset::from_catalog(retained)?;
+        let dataset = AnalyticalFeatureDataset::from_catalog(retained, expected_contract)?;
         Ok(ForecastDatasetEvidence {
             dataset,
             fence: ForecastDatasetEvidenceFence {
@@ -263,6 +265,7 @@ impl AnalyticalReadCapability {
     /// Re-reads and proves equality with one previously retained exact evidence fence.
     pub async fn revalidate_forecast_dataset_evidence(
         &self,
+        expected_contract: FeatureDatasetProductContract,
         expected: &ForecastDatasetEvidenceFence,
         limits: ForecastDatasetReadLimits,
         deadline: Instant,
@@ -270,6 +273,7 @@ impl AnalyticalReadCapability {
     ) -> Result<(), AnalyticalReadError> {
         let observed = self
             .forecast_dataset_evidence(
+                expected_contract,
                 expected.manifest(),
                 expected.as_of(),
                 limits,

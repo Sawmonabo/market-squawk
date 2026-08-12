@@ -1032,7 +1032,7 @@ fn analysis_catalog() -> Result<AnalysisCatalog, LocalProductError> {
         ),
     )?;
     let features = BatchFeatureCatalog::try_new(config, BATCH_FEATURE_REVISION)?;
-    AnalysisCatalog::try_new(Vec::new(), features, Vec::new()).map_err(Into::into)
+    AnalysisCatalog::try_new(Vec::new(), features).map_err(Into::into)
 }
 
 fn experiment_limits() -> Result<ExperimentLimits, LocalProductError> {

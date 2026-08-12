@@ -84,9 +84,9 @@ pub enum CliProductError {
     /// Opaque analytical result publication or retrieval failed.
     #[error("CLI analytical artifact failed: {0}")]
     Artifact(#[from] ArtifactError),
-    /// A point-in-time dataset build failed admission or publication.
+    /// A phase-one point-in-time derived-generation request failed.
     #[error("{0}")]
-    Dataset(#[from] cli_dataset::CliDatasetError),
+    PhaseOneDerivedGeneration(#[from] cli_dataset::CliDatasetError),
     /// A controlled portfolio manifest import failed.
     #[error("{0}")]
     Portfolio(#[from] cli_portfolio::CliPortfolioImportError),
@@ -488,8 +488,9 @@ async fn dataset(
         DatasetCommand::Build { request, confirm } => match authority {
             CliAuthority::Local(product) => {
                 let value =
-                    cli_dataset::build_point_in_time_dataset(product, &request, confirm).await?;
-                direct_result(value, "point-in-time dataset published")
+                    cli_dataset::build_phase_one_derived_generation(product, &request, confirm)
+                        .await?;
+                direct_result(value, "phase-one derived generation published")
             }
             CliAuthority::Installed(_) => {
                 require_confirmation(confirm)?;
@@ -504,7 +505,7 @@ async fn dataset(
                     "Research.StartDatasetBuild",
                     &mut arguments,
                     Some(1),
-                    "point-in-time dataset build started",
+                    "phase-one derived-generation job started",
                 )
                 .await
             }
@@ -594,8 +595,9 @@ async fn feature(
         FeatureCommand::Build { request, confirm } => match authority {
             CliAuthority::Local(product) => {
                 let value =
-                    cli_dataset::build_point_in_time_dataset(product, &request, confirm).await?;
-                direct_result(value, "point-in-time feature dataset published")
+                    cli_dataset::build_phase_one_derived_generation(product, &request, confirm)
+                        .await?;
+                direct_result(value, "phase-one feature-derived generation published")
             }
             CliAuthority::Installed(_) => {
                 require_confirmation(confirm)?;
@@ -610,7 +612,7 @@ async fn feature(
                     "Analysis.StartFeatureDatasetBuild",
                     &mut arguments,
                     Some(1),
-                    "point-in-time feature dataset build started",
+                    "phase-one feature-derived-generation job started",
                 )
                 .await
             }

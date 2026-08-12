@@ -706,6 +706,22 @@ impl AnalyticalDataService {
         Ok(Self::from_active_parts(authority, manifests, objects))
     }
 
+    /// Initializes one analytical service while consuming the exclusive pre-service catalog
+    /// authority to issue the sole closed feature-dataset production publisher.
+    ///
+    /// The publisher is returned separately and cannot be recovered from the service or its public
+    /// dataset builder. The catalog's process-local single-writer guard makes possession of the
+    /// consumed [`CatalogAuthority`] the one-time composition capability.
+    pub fn initialize_with_feature_dataset_production(
+        authority: CatalogAuthority,
+        manifests: AnalyticalManifestCatalog,
+        artifact_root: market_squawk_platform::ArtifactRoot,
+        object_config: ObjectStoreConfig,
+    ) -> Result<crate::FeatureDatasetProductionComposition, IngestError> {
+        Self::initialize(authority, manifests, artifact_root, object_config)
+            .map(crate::FeatureDatasetProductionComposition::new)
+    }
+
     /// Explicitly verifies and migrates an exact version-3/version-4 catalog and v1 root pair.
     pub fn migrate_legacy(
         authority: CatalogAuthority,
@@ -738,6 +754,20 @@ impl AnalyticalDataService {
         Ok(Self::from_active_parts(authority, manifests, objects))
     }
 
+    /// Opens one bound analytical service and transfers the sole session-bound feature-dataset
+    /// publisher to root composition.
+    ///
+    /// No publisher getter exists after this one-time authority-consuming operation.
+    pub fn open_with_feature_dataset_production(
+        authority: CatalogAuthority,
+        manifests: AnalyticalManifestCatalog,
+        artifact_root: market_squawk_platform::ArtifactRoot,
+        object_config: ObjectStoreConfig,
+    ) -> Result<crate::FeatureDatasetProductionComposition, IngestError> {
+        Self::open(authority, manifests, artifact_root, object_config)
+            .map(crate::FeatureDatasetProductionComposition::new)
+    }
+
     pub(crate) fn from_active_parts(
         authority: CatalogAuthority,
         manifests: AnalyticalManifestCatalog,
@@ -751,6 +781,10 @@ impl AnalyticalDataService {
             objects: Arc::new(objects),
             operation_gate: AnalyticalOperationGate::default(),
         }
+    }
+
+    pub(crate) const fn catalog_session_id(&self) -> uuid::Uuid {
+        self.catalog_id
     }
 
     /// Returns the controlled object capability for manifest-pinned query construction.

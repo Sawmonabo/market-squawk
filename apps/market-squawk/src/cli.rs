@@ -1340,15 +1340,9 @@ pub struct ReleaseProviderArguments {
     /// Exact FRED or ALFRED provider dataset exercised through durable release acceptance.
     #[arg(long, value_name = "PROVIDER_DATASET")]
     pub fred_dataset: Option<String>,
-    /// Bounded typed PIT build request that consumes the exact published FRED generation.
-    #[arg(long, value_name = "REQUEST_FILE")]
-    pub fred_training_request: Option<PathBuf>,
     /// Exact BLS request-plan dataset exercised through durable release acceptance.
     #[arg(long, value_name = "PROVIDER_DATASET")]
     pub bls_dataset: Option<String>,
-    /// Bounded typed PIT build request that consumes the exact published BLS generation.
-    #[arg(long, value_name = "REQUEST_FILE")]
-    pub bls_training_request: Option<PathBuf>,
     /// New empty directory that will own provider evidence.
     #[arg(
         id = "provider_output_directory",

@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use market_squawk_data::{
-    PythonDatasetRow, PythonDatasetSelection, PythonDatasetValue, PythonDatasetVerificationLimits,
-    Sha256Digest, verify_python_dataset,
+    FeatureDatasetProductContract, PythonDatasetRow, PythonDatasetSelection, PythonDatasetValue,
+    PythonDatasetVerificationLimits, Sha256Digest, verify_python_dataset,
 };
 use market_squawk_domain::Timestamp;
 use pyo3::prelude::*;
@@ -107,6 +107,7 @@ fn open_dataset_admission(
         verify_python_dataset(
             &operator_root,
             export_sha256,
+            FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnTrainingV1,
             Timestamp::from_unix_nanos(as_of_unix_nanos),
             limits,
             deadline,

@@ -140,7 +140,7 @@ fn validate_research_kernels(payload: &Value) -> Result<()> {
             .and_then(Value::as_u64)
             != Some(64)
         || payload
-            .pointer("/production_kernels/analytical_storage/python_verified_rows")
+            .pointer("/production_kernels/analytical_storage/phase_one_verified_rows")
             .and_then(Value::as_u64)
             != Some(64)
         || !nonzero_digest_array(
@@ -148,6 +148,15 @@ fn validate_research_kernels(payload: &Value) -> Result<()> {
         )
         || !nonzero_digest_array(
             payload.pointer("/production_kernels/analytical_storage/point_in_time_audit_sha256"),
+        )
+        || !nonzero_digest_array(
+            payload.pointer("/production_kernels/analytical_storage/phase_one_descriptor_sha256"),
+        )
+        || !nonzero_digest_array(
+            payload.pointer("/production_kernels/analytical_storage/phase_one_manifest_sha256"),
+        )
+        || !nonzero_digest_array(
+            payload.pointer("/production_kernels/analytical_storage/phase_one_object_sha256"),
         )
         || payload
             .pointer("/production_kernels/backtest/fill_count")

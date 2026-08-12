@@ -33,11 +33,13 @@ use super::JobTerminalCommitSlot;
 const INGEST_OPERATION: &str = "Research.IngestSource";
 const INGEST_KIND: &str = "research.ingest-source.v1";
 const INGEST_AUTHORITY: &str = "research.dataset-publication.v1";
-const DATASET_KIND: &str = "research.dataset-build.v1";
-const FEATURE_KIND: &str = "analysis.feature-dataset-build.v1";
-const DATASET_INPUT_AUTHORITY: &str = "research.dataset-build-request.v1";
-const DATASET_RESULT_AUTHORITY: &str = "research.dataset-generation.v1";
-const FEATURE_RESULT_AUTHORITY: &str = "analysis.feature-dataset-generation.v1";
+const RESEARCH_PHASE_ONE_KIND: &str = "research.phase-one-derived-generation-job.v1";
+const ANALYSIS_PHASE_ONE_FEATURE_KIND: &str =
+    "analysis.phase-one-feature-derived-generation-job.v1";
+const PHASE_ONE_INPUT_AUTHORITY: &str = "research.phase-one-derived-generation-request.v1";
+const RESEARCH_PHASE_ONE_RESULT_AUTHORITY: &str = "research.phase-one-derived-generation.v1";
+const ANALYSIS_PHASE_ONE_FEATURE_RESULT_AUTHORITY: &str =
+    "analysis.phase-one-feature-derived-generation.v1";
 const EXPORT_OPERATION: &str = "Research.GetHistory";
 const EXPORT_KIND: &str = "research.dataset-export.v1";
 const EXPORT_AUTHORITY: &str = "research.controlled-export.v1";
@@ -77,11 +79,11 @@ impl ResearchIngestCommitAuthority for JobIngestCommitAuthority {
 }
 
 #[derive(Debug)]
-struct JobDatasetCommitAuthority {
+struct JobPhaseOneDerivedGenerationCommitAuthority {
     slot: Arc<JobTerminalCommitSlot>,
 }
 
-impl DatasetBuildPrecommitAuthority for JobDatasetCommitAuthority {
+impl DatasetBuildPrecommitAuthority for JobPhaseOneDerivedGenerationCommitAuthority {
     fn validate_precommit(&self) -> Result<(), DatasetBuildError> {
         self.slot.claim().map_err(|error| match error {
             JobRunError::Cancelled => DatasetBuildError::Cancelled,
@@ -311,30 +313,33 @@ impl ApplicationOperationJobRunner {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DatasetPublicationKind {
-    Dataset,
-    Feature,
+enum PhaseOneDerivedGenerationKind {
+    ResearchDataset,
+    AnalysisFeature,
 }
 
-impl DatasetPublicationKind {
+impl PhaseOneDerivedGenerationKind {
     const fn kind(self) -> &'static str {
         match self {
-            Self::Dataset => DATASET_KIND,
-            Self::Feature => FEATURE_KIND,
+            Self::ResearchDataset => RESEARCH_PHASE_ONE_KIND,
+            Self::AnalysisFeature => ANALYSIS_PHASE_ONE_FEATURE_KIND,
         }
     }
 
     const fn result_authority(self) -> &'static str {
         match self {
-            Self::Dataset => DATASET_RESULT_AUTHORITY,
-            Self::Feature => FEATURE_RESULT_AUTHORITY,
+            Self::ResearchDataset => RESEARCH_PHASE_ONE_RESULT_AUTHORITY,
+            Self::AnalysisFeature => ANALYSIS_PHASE_ONE_FEATURE_RESULT_AUTHORITY,
         }
     }
 }
 
-/// Durable dataset or feature-publication runner over the sole analytical catalog authority.
-pub struct DatasetJobRunner {
-    publication: DatasetPublicationKind,
+/// Durable phase-one derived-generation runner over the sole analytical catalog authority.
+///
+/// Successful jobs publish immutable analytical generations and controlled result artifacts. They
+/// do not mint product receipts, issuer authority, model authority, or execution authority.
+pub struct PhaseOneDerivedGenerationJobRunner {
+    generation_kind: PhaseOneDerivedGenerationKind,
     kind: SourceIdentifier,
     input_authority: SourceIdentifier,
     result_authority: SourceIdentifier,
@@ -346,16 +351,16 @@ pub struct DatasetJobRunner {
     run_timeout: Duration,
 }
 
-impl DatasetJobRunner {
-    /// Creates the runner for `Research.StartDatasetBuild`.
-    pub fn try_new_dataset(
+impl PhaseOneDerivedGenerationJobRunner {
+    /// Creates the phase-one runner currently reached through `Research.StartDatasetBuild`.
+    pub fn try_new_research_dataset(
         research: Arc<ResearchService>,
         artifacts: Arc<dyn ArtifactRepository>,
         maximum_pending: usize,
         run_timeout: Duration,
     ) -> Result<Self, ResearchJobRunnerError> {
         Self::try_new(
-            DatasetPublicationKind::Dataset,
+            PhaseOneDerivedGenerationKind::ResearchDataset,
             research,
             artifacts,
             maximum_pending,
@@ -363,15 +368,15 @@ impl DatasetJobRunner {
         )
     }
 
-    /// Creates the runner for `Analysis.StartFeatureDatasetBuild`.
-    pub fn try_new_feature(
+    /// Creates the phase-one runner currently reached through `Analysis.StartFeatureDatasetBuild`.
+    pub fn try_new_analysis_feature(
         research: Arc<ResearchService>,
         artifacts: Arc<dyn ArtifactRepository>,
         maximum_pending: usize,
         run_timeout: Duration,
     ) -> Result<Self, ResearchJobRunnerError> {
         Self::try_new(
-            DatasetPublicationKind::Feature,
+            PhaseOneDerivedGenerationKind::AnalysisFeature,
             research,
             artifacts,
             maximum_pending,
@@ -380,7 +385,7 @@ impl DatasetJobRunner {
     }
 
     fn try_new(
-        publication: DatasetPublicationKind,
+        generation_kind: PhaseOneDerivedGenerationKind,
         research: Arc<ResearchService>,
         artifacts: Arc<dyn ArtifactRepository>,
         maximum_pending: usize,
@@ -393,12 +398,12 @@ impl DatasetJobRunner {
         {
             return Err(ResearchJobRunnerError::InvalidLimits);
         }
-        let result_authority = identifier(publication.result_authority())?;
+        let result_authority = identifier(generation_kind.result_authority())?;
         Ok(Self {
-            publication,
-            kind: identifier(publication.kind())?,
-            input_authority: identifier(DATASET_INPUT_AUTHORITY)?,
-            authority_digest: namespace_digest(publication.result_authority()),
+            generation_kind,
+            kind: identifier(generation_kind.kind())?,
+            input_authority: identifier(PHASE_ONE_INPUT_AUTHORITY)?,
+            authority_digest: namespace_digest(generation_kind.result_authority()),
             result_authority,
             research,
             artifacts,
@@ -408,7 +413,7 @@ impl DatasetJobRunner {
         })
     }
 
-    /// Registers one fully validated, path-free point-in-time build contract.
+    /// Registers one fully validated, path-free phase-one generation request.
     pub fn admit(
         &self,
         request: DatasetBuildRequest,
@@ -418,7 +423,10 @@ impl DatasetJobRunner {
             DigestAlgorithm::Sha256,
             request.build_spec_digest().digest().bytes(),
         );
-        let identity = identifier(format!("dataset-build-{}", encode_hex(digest.bytes())))?;
+        let identity = identifier(format!(
+            "phase-one-derived-generation-request-{}",
+            encode_hex(digest.bytes())
+        ))?;
         let mut pending = self
             .pending
             .lock()
@@ -437,7 +445,7 @@ impl DatasetJobRunner {
             AdmittedJobInput::new(self.input_authority.clone(), identity, digest),
             JobAuthoritySnapshot::new(
                 self.result_authority.clone(),
-                identifier(self.publication.result_authority())?,
+                identifier(self.generation_kind.result_authority())?,
                 self.authority_digest,
                 captured_at,
             ),
@@ -445,7 +453,7 @@ impl DatasetJobRunner {
         ))
     }
 
-    /// Releases one pending build when durable job creation did not succeed.
+    /// Releases one pending phase-one request when durable job creation did not succeed.
     pub fn revoke(&self, admission: &JobAdmission) -> Result<(), ResearchJobRunnerError> {
         if admission.kind() != &self.kind || admission.input().authority() != &self.input_authority
         {
@@ -485,7 +493,7 @@ impl DatasetJobRunner {
 }
 
 #[async_trait]
-impl JobRunner for DatasetJobRunner {
+impl JobRunner for PhaseOneDerivedGenerationJobRunner {
     fn kind(&self) -> &SourceIdentifier {
         &self.kind
     }
@@ -496,7 +504,8 @@ impl JobRunner for DatasetJobRunner {
         }
         let request = self.take_request(&context)?;
         let progress = JobProgress::try_new(
-            identifier("building-point-in-time-dataset").map_err(|_error| JobRunError::Recovery)?,
+            identifier("building-phase-one-derived-generation")
+                .map_err(|_error| JobRunError::Recovery)?,
             0,
             None,
             context.snapshot().updated_at_timestamp(),
@@ -513,23 +522,27 @@ impl JobRunner for DatasetJobRunner {
         let cancellation = context.cancellation().child_token();
         let slot = Arc::new(JobTerminalCommitSlot::new(&context, progressed.sequence()));
         let precommit: Arc<dyn DatasetBuildPrecommitAuthority> =
-            Arc::new(JobDatasetCommitAuthority {
+            Arc::new(JobPhaseOneDerivedGenerationCommitAuthority {
                 slot: Arc::clone(&slot),
             });
         let dataset = match tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            self.research.build_dataset_with_precommit_authority(
-                request,
-                cancellation.clone(),
-                precommit,
-            ),
+            self.research
+                .build_phase_one_derived_generation_with_precommit_authority(
+                    request,
+                    cancellation.clone(),
+                    precommit,
+                ),
         )
         .await
         {
-            Ok(result) => result.map_err(map_research_service_error)?,
+            Ok(result) => result.map_err(map_phase_one_derived_generation_error)?,
             Err(_elapsed) => {
                 cancellation.cancel();
-                return Err(failed("dataset-deadline-exceeded", true));
+                return Err(failed(
+                    "phase-one-derived-generation-deadline-exceeded",
+                    true,
+                ));
             }
         };
         let published = slot.take_published().or_else(|_error| {
@@ -539,17 +552,22 @@ impl JobRunner for DatasetJobRunner {
         })?;
         let manifest = dataset.manifest();
         let identity = identifier(format!(
-            "dataset-generation-{}",
+            "phase-one-derived-generation-{}",
             encode_hex(manifest.content_hash().bytes())
         ))
         .map_err(|_error| JobRunError::Recovery)?;
         let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, manifest.content_hash().bytes());
         let splits = dataset.split_counts();
-        let python_export_sha256 = dataset
+        let phase_one_descriptor_sha256 = dataset
             .python_export()
-            .map_err(|error| map_research_service_error(error.into()))?
+            .map_err(|error| map_phase_one_derived_generation_error(error.into()))?
             .content_hash();
-        let receipt = serde_json::to_vec(&serde_json::json!({
+        // This immutable result records only that this phase-one operation did not issue product
+        // admission before publishing the result. Any receipt-backed product admission is a
+        // separate Analysis.GetFeatureDatasets authority.
+        let result_bytes = serde_json::to_vec(&serde_json::json!({
+            "publicationStage": "phase_one_derived_generation",
+            "productAdmission": "not_admitted_by_phase_one_operation_at_completion",
             "manifest": {
                 "dataset": manifest.dataset_id().as_str(),
                 "version": manifest.manifest_version(),
@@ -561,18 +579,18 @@ impl JobRunner for DatasetJobRunner {
             "buildSpecSha256": encode_hex(dataset.build_spec_digest().digest().bytes()),
             "policySha256": encode_hex(dataset.policy_digest().bytes()),
             "universeSha256": encode_hex(dataset.universe_digest().bytes()),
-            "pythonExportSha256": encode_hex(python_export_sha256.bytes()),
+            "phaseOneDescriptorSha256": encode_hex(phase_one_descriptor_sha256.bytes()),
             "splitExamples": {
                 "train": splits.train_examples(),
                 "validation": splits.validation_examples(),
                 "test": splits.test_examples(),
             },
         }))
-        .map_err(|_error| failed("dataset-result-invalid", false))?;
+        .map_err(|_error| failed("phase-one-derived-generation-result-invalid", false))?;
         let artifact = self
             .artifacts
             .publish(
-                ArtifactPublication::try_json(receipt).map_err(map_artifact_error)?,
+                ArtifactPublication::try_json(result_bytes).map_err(map_artifact_error)?,
                 ArtifactPublicationContext::new(context.cancellation().clone(), deadline),
             )
             .await
@@ -588,21 +606,21 @@ impl JobRunner for DatasetJobRunner {
     }
 
     fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
-        // Build contracts retain non-cloneable source/output authority. Restart never recreates it
-        // from serialized fields; any already committed generation remains queryable by manifest.
+        // Phase-one requests retain non-cloneable source/output authority. Restart never recreates
+        // it from serialized fields; any committed generation remains queryable by exact manifest.
         JobRecoveryDisposition::MarkInterrupted
     }
 }
 
-impl fmt::Debug for DatasetJobRunner {
+impl fmt::Debug for PhaseOneDerivedGenerationJobRunner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DatasetJobRunner")
-            .field("publication", &self.publication)
+            .debug_struct("PhaseOneDerivedGenerationJobRunner")
+            .field("generation_kind", &self.generation_kind)
             .field("kind", &self.kind)
-            .field("research", &"[ANALYTICAL PUBLICATION AUTHORITY]")
+            .field("research", &"[PHASE-ONE GENERATION AUTHORITY]")
             .field("artifacts", &"[CONTROLLED ARTIFACT AUTHORITY]")
-            .field("pending", &"[BOUNDED BUILD CONTRACTS]")
+            .field("pending", &"[BOUNDED PHASE-ONE REQUESTS]")
             .field("maximum_pending", &self.maximum_pending)
             .field("run_timeout", &self.run_timeout)
             .finish()
@@ -871,21 +889,22 @@ fn map_artifact_error(error: ArtifactError) -> JobRunError {
     }
 }
 
-fn map_research_service_error(error: ResearchServiceError) -> JobRunError {
+fn map_phase_one_derived_generation_error(error: ResearchServiceError) -> JobRunError {
     match error {
         ResearchServiceError::Dataset(DatasetBuildError::Cancelled) => JobRunError::Cancelled,
         ResearchServiceError::Dataset(DatasetBuildError::DeadlineExceeded) => {
-            failed("dataset-deadline-exceeded", true)
+            failed("phase-one-derived-generation-deadline-exceeded", true)
         }
-        ResearchServiceError::Dataset(DatasetBuildError::PublicationAuthorityRevoked) => {
-            failed("dataset-publication-authority-revoked", false)
-        }
+        ResearchServiceError::Dataset(DatasetBuildError::PublicationAuthorityRevoked) => failed(
+            "phase-one-derived-generation-publication-authority-revoked",
+            false,
+        ),
         ResearchServiceError::Dataset(
             DatasetBuildError::InvalidLimits
             | DatasetBuildError::LimitExceeded
             | DatasetBuildError::Arrow(_)
             | DatasetBuildError::Parquet(_),
-        ) => failed("dataset-resource-exhausted", true),
+        ) => failed("phase-one-derived-generation-resource-exhausted", true),
         ResearchServiceError::Dataset(
             DatasetBuildError::InvalidRequest
             | DatasetBuildError::InvalidInputGeneration
@@ -904,7 +923,7 @@ fn map_research_service_error(error: ResearchServiceError) -> JobRunError {
             | DatasetBuildError::ManifestPlan(_)
             | DatasetBuildError::Rights(_)
             | DatasetBuildError::Schema(_),
-        ) => failed("dataset-input-rejected", false),
+        ) => failed("phase-one-derived-generation-input-rejected", false),
         ResearchServiceError::Dataset(
             DatasetBuildError::AuthorityLockPoisoned
             | DatasetBuildError::ManifestCatalog(_)
@@ -920,7 +939,9 @@ fn map_research_service_error(error: ResearchServiceError) -> JobRunError {
         | ResearchServiceError::Ingest(_)
         | ResearchServiceError::IngestAuthorityMismatch
         | ResearchServiceError::Rights(_)
-        | ResearchServiceError::IdentityOverflow => failed("dataset-authority-unavailable", true),
+        | ResearchServiceError::IdentityOverflow => {
+            failed("phase-one-derived-generation-authority-unavailable", true)
+        }
     }
 }
 
