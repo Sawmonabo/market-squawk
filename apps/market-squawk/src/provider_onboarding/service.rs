@@ -12,15 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
 use market_squawk_adapter_alpaca::{
-    AlpacaDoctorBatchObservation as AdapterAlpacaDoctorBatchObservation,
-    AlpacaDoctorCalendarObservation as AdapterAlpacaDoctorCalendarObservation,
-    AlpacaDoctorHistoricalObservation as AdapterAlpacaDoctorHistoricalObservation,
-    AlpacaDoctorHttpEvidence as AdapterAlpacaDoctorHttpEvidence,
-    AlpacaDoctorObservationDisposition, AlpacaDoctorObservationOrigin, AlpacaDoctorObservedField,
-    AlpacaDoctorQuoteObservation as AdapterAlpacaDoctorQuoteObservation,
-    AlpacaDoctorRateEvidence as AdapterAlpacaDoctorRateEvidence, AlpacaDoctorRetryAfter,
-    AlpacaDoctorStreamObservation as AdapterAlpacaDoctorStreamObservation, AlpacaError,
-    AlpacaPaperIexDoctor, AlpacaPaperIexDoctorObservation, AlpacaTransportLimits,
+    AlpacaError, AlpacaPaperIexDoctor, AlpacaPaperIexDoctorObservation, AlpacaTransportLimits,
 };
 use market_squawk_adapter_bea::BeaUserId;
 use market_squawk_adapter_census::CensusApiKey;
@@ -48,9 +40,7 @@ use market_squawk_data::{
     CatalogError, CatalogLimit, OnboardingCatalogCapability, OnboardingReservation,
     OnboardingReservationRequest, ResumedProviderOnboarding,
 };
-use market_squawk_domain::{
-    DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
-};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{
     EncryptedFileFallbackStatus, EncryptedFileUnlockCapability, LocalSecretStoreError,
     SecretCancellation, SecretDeletionDisposition, SecretGeneration, SecretInteractionPolicy,
@@ -58,19 +48,13 @@ use market_squawk_platform::{
     SecretStore, SecretValue,
 };
 use market_squawk_sources::{
-    AlpacaDoctorAdditionalCapability, AlpacaDoctorBatchObservation,
-    AlpacaDoctorCalendarObservation, AlpacaDoctorCapabilityEvidence, AlpacaDoctorCredentialRealm,
-    AlpacaDoctorHistoricalObservation, AlpacaDoctorHistoricalPageEvidence,
-    AlpacaDoctorHttpEvidence, AlpacaDoctorProbeEvidence, AlpacaDoctorQuoteObservation,
-    AlpacaDoctorRateEvidence, AlpacaDoctorStreamObservation, AlpacaPaperIexDoctorReceiptInput,
-    AlpacaPaperIexDoctorReceiptV1, AlpacaRateLimitField, AlpacaRetryAfterEvidence,
-    AuthorityBindings, AuthorityVerification, AuthorityVerificationInput,
-    CapabilityRegistrationOutcome, CredentialGenerationState, OnboardingEvent, OnboardingState,
-    ProbeTransport, ProfileReleaseState, ProviderOnboardingProfile, ProviderProfileError,
-    ProviderProfileRegistry, ProviderPublicConfiguration, ProviderRateAuthority,
-    ProviderRateDeclaration, RuntimeCapabilityDisposition, RuntimeVerificationEvidence,
-    SecretStoreClearOutcome, TREASURY_DAILY_RATES_PROBE_YEAR, built_in_provider_profiles,
-    install_ring_tls_provider,
+    AlpacaPaperIexDoctorReceiptV1, AuthorityBindings, AuthorityVerification,
+    AuthorityVerificationInput, CapabilityRegistrationOutcome, CredentialGenerationState,
+    OnboardingEvent, OnboardingState, ProbeTransport, ProfileReleaseState,
+    ProviderOnboardingProfile, ProviderProfileError, ProviderProfileRegistry,
+    ProviderPublicConfiguration, ProviderRateAuthority, ProviderRateDeclaration,
+    RuntimeVerificationEvidence, SecretStoreClearOutcome, TREASURY_DAILY_RATES_PROBE_YEAR,
+    built_in_provider_profiles, install_ring_tls_provider,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -110,8 +94,6 @@ const COINBASE_DIRECT_VERIFICATION_VALIDITY_NANOS: i64 = 15 * 60 * 1_000_000_000
 const MARKET_DATA_VERIFICATION_VALIDITY_NANOS: i64 = 15 * 60 * 1_000_000_000;
 const ALPACA_DOCTOR_OPERATION_DURATION: Duration = Duration::from_secs(60);
 const ALPACA_DOCTOR_FRAME_BYTES: usize = 1024 * 1024;
-const ALPACA_DOCTOR_ADDITIONAL_CAPABILITY_DOMAIN: &[u8] =
-    b"market-squawk/alpaca-paper-iex-doctor-additional-capability/v1\0";
 const COINBASE_ACCOUNT_BINDING_DOMAIN: &[u8] =
     b"market-squawk/coinbase-exchange-account-binding/v1\0";
 const TRADIER_ACCOUNT_BINDING_DOMAIN: &[u8] = b"market-squawk/tradier-profile-account-binding/v1\0";
@@ -211,23 +193,10 @@ impl RetainedRuntimeVerificationEvidence {
     }
 }
 
-/// One-use application issuance produced only from the adapter's provider-observed doctor type.
-///
-/// This value is deliberately private and non-cloneable. Generic catalog append paths cannot
-/// manufacture it, and consuming it is the only installed route for an activating Alpaca
-/// `RuntimeVerified` event.
+/// One-use application issuance carrying the adapter's provider-observed doctor result.
 struct AlpacaRuntimeVerificationIssuance {
     generation: SecretGeneration,
-    evidence: RuntimeVerificationEvidence,
-}
-
-impl AlpacaRuntimeVerificationIssuance {
-    fn into_event(self) -> OnboardingEvent {
-        OnboardingEvent::RuntimeVerified {
-            generation: Some(self.generation),
-            evidence: self.evidence,
-        }
-    }
+    observation: AlpacaPaperIexDoctorObservation,
 }
 
 /// One exact, bounded FRED terms response acquired from its code-owned official URL.
@@ -402,7 +371,7 @@ impl ProviderOnboardingService {
     ///
     /// Fails closed when profiles, TLS, durable rate admission, or startup reconciliation cannot
     /// be established.
-    pub fn try_new_with_provider_rate<S>(
+    pub(crate) fn try_new_with_provider_rate<S>(
         catalog: OnboardingCatalogCapability,
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
@@ -1292,7 +1261,6 @@ impl ProviderOnboardingService {
                                     &resumed,
                                     profile,
                                     generation,
-                                    None,
                                     cancellation.clone(),
                                 )
                                 .await
@@ -1370,7 +1338,7 @@ impl ProviderOnboardingService {
                 OnboardingState::ActiveScoped | OnboardingState::RenewalRequired
             )
         {
-            if let Some((generation, predecessor, exclusive_expires_at)) = resumed
+            if let Some((generation, exclusive_expires_at)) = resumed
                 .lifecycle()
                 .active_generation()
                 .and_then(|generation| {
@@ -1378,13 +1346,7 @@ impl ProviderOnboardingService {
                         .lifecycle()
                         .generation_runtime_evidence(generation)
                         .and_then(RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
-                        .map(|receipt| {
-                            (
-                                generation,
-                                receipt.receipt_sha256(),
-                                receipt.exclusive_expires_at(),
-                            )
-                        })
+                        .map(|receipt| (generation, receipt.exclusive_expires_at()))
                 })
             {
                 let renewal_required =
@@ -1411,7 +1373,6 @@ impl ProviderOnboardingService {
                         &renewal_required,
                         profile,
                         generation,
-                        Some(predecessor),
                         cancellation,
                     )
                     .await
@@ -1973,7 +1934,6 @@ impl ProviderOnboardingService {
         resumed: &ResumedProviderOnboarding,
         profile: &ProviderOnboardingProfile,
         generation: SecretGeneration,
-        predecessor_digest: Option<EvidenceDigest>,
         cancellation: CancellationToken,
     ) -> Result<AlpacaRuntimeVerificationIssuance, ProviderOnboardingError> {
         if profile.id() != "alpaca.basic-market-data"
@@ -2061,17 +2021,9 @@ impl ProviderOnboardingService {
             .observe(&budget, deadline, &cancellation)
             .await
             .map_err(map_alpaca_doctor_error)?;
-        let receipt = alpaca_doctor_receipt(
-            resumed,
-            profile,
-            generation,
-            principal,
-            &observation,
-            predecessor_digest,
-        )?;
         Ok(AlpacaRuntimeVerificationIssuance {
             generation,
-            evidence: RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(Box::new(receipt)),
+            observation,
         })
     }
 
@@ -2447,15 +2399,11 @@ impl ProviderOnboardingService {
         generation: Option<SecretGeneration>,
         evidence_digest: EvidenceDigest,
     ) -> Result<(), ProviderOnboardingError> {
-        let evidence = RuntimeVerificationEvidence::digest_v1(evidence_digest)
-            .map_err(|_| ProviderOnboardingError::InvalidSessionState)?;
-        self.catalog.append_provider_onboarding_event(
+        self.catalog.append_digest_runtime_verification(
             reservation,
             sequence,
-            OnboardingEvent::RuntimeVerified {
-                generation,
-                evidence,
-            },
+            generation,
+            evidence_digest,
         )?;
         Ok(())
     }
@@ -2466,10 +2414,11 @@ impl ProviderOnboardingService {
         sequence: u64,
         issuance: AlpacaRuntimeVerificationIssuance,
     ) -> Result<(), ProviderOnboardingError> {
-        self.catalog.append_provider_onboarding_event(
+        self.catalog.append_alpaca_paper_iex_doctor_observation(
             reservation,
             sequence,
-            issuance.into_event(),
+            issuance.generation,
+            issuance.observation,
         )?;
         Ok(())
     }
@@ -3261,348 +3210,6 @@ fn event_digest(
         hasher.update(generation.get().to_be_bytes());
     }
     EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
-}
-
-fn alpaca_doctor_receipt(
-    resumed: &ResumedProviderOnboarding,
-    profile: &ProviderOnboardingProfile,
-    generation: SecretGeneration,
-    principal: EvidenceDigest,
-    observation: &AlpacaPaperIexDoctorObservation,
-    predecessor_digest: Option<EvidenceDigest>,
-) -> Result<AlpacaPaperIexDoctorReceiptV1, ProviderOnboardingError> {
-    if observation.origin() != AlpacaDoctorObservationOrigin::ProviderObserved {
-        return Err(ProviderOnboardingError::InvalidSessionState);
-    }
-    let verified_at = observation.completed_at();
-    let exclusive_expires_at = verified_at
-        .unix_nanos()
-        .checked_add(AlpacaPaperIexDoctorReceiptV1::VALIDITY_NANOS)
-        .map(Timestamp::from_unix_nanos)
-        .ok_or(ProviderOnboardingError::Clock)?;
-    let input = AlpacaPaperIexDoctorReceiptInput {
-        provider_observation_origin: AlpacaPaperIexDoctorReceiptV1::provider_observed_origin()
-            .map_err(|_| ProviderOnboardingError::InvalidSessionState)?,
-        provider_observation_sha256: observation.observation_digest(),
-        surface_id: profile.capability().surface_id().clone(),
-        session_identifier: SourceIdentifier::try_from(
-            resumed.reservation().session_id().hyphenated().to_string(),
-        )?,
-        generation,
-        realm: AlpacaDoctorCredentialRealm::Paper,
-        market_data_principal_sha256: principal,
-        capability_revision: profile.capability().revision(),
-        capability_digest: profile.capability().content_digest(),
-        public_configuration_digest: resumed.reservation().public_configuration_digest(),
-        rights_decision_digest: profile.rights_decision_digest(),
-        rate_policy_digest: profile.capability().rate_policy().evidence_digest(),
-        data_quality: DataQuality::DirectUnverified,
-        quote: AlpacaDoctorProbeEvidence {
-            disposition: map_alpaca_doctor_disposition(observation.quote().disposition()),
-            disposition_evidence_digest: observation.quote().semantic_result_digest(),
-            observation: Some(map_alpaca_quote(observation.quote())),
-        },
-        batch: AlpacaDoctorProbeEvidence {
-            disposition: map_alpaca_doctor_disposition(observation.batch().disposition()),
-            disposition_evidence_digest: observation.batch().semantic_result_digest(),
-            observation: Some(map_alpaca_batch(observation.batch())),
-        },
-        stream: AlpacaDoctorProbeEvidence {
-            disposition: map_alpaca_doctor_disposition(observation.stream().disposition()),
-            disposition_evidence_digest: observation.stream().semantic_result_digest(),
-            observation: Some(map_alpaca_stream(observation.stream())),
-        },
-        historical: AlpacaDoctorProbeEvidence {
-            disposition: map_alpaca_doctor_disposition(observation.historical().disposition()),
-            disposition_evidence_digest: observation.historical().semantic_result_digest(),
-            observation: Some(map_alpaca_historical(observation.historical())?),
-        },
-        calendar: AlpacaDoctorProbeEvidence {
-            disposition: map_alpaca_doctor_disposition(observation.calendar().disposition()),
-            disposition_evidence_digest: observation.calendar().semantic_result_digest(),
-            observation: Some(map_alpaca_calendar(observation.calendar())),
-        },
-        additional_capabilities: alpaca_additional_capabilities(observation).into_boxed_slice(),
-        verified_at,
-        exclusive_expires_at,
-        predecessor_digest,
-    };
-    AlpacaPaperIexDoctorReceiptV1::try_new(input)
-        .map_err(|_| ProviderOnboardingError::InvalidSessionState)
-}
-
-fn map_alpaca_quote(
-    observation: &AdapterAlpacaDoctorQuoteObservation,
-) -> AlpacaDoctorQuoteObservation {
-    AlpacaDoctorQuoteObservation {
-        http: map_alpaca_http(observation.http()),
-        semantic_result_digest: observation.semantic_result_digest(),
-        quote_timestamp: observation.quote_timestamp(),
-        bid_price: observation.bid_price(),
-        ask_price: observation.ask_price(),
-        bid_size: observation.bid_size(),
-        ask_size: observation.ask_size(),
-    }
-}
-
-fn map_alpaca_batch(
-    observation: &AdapterAlpacaDoctorBatchObservation,
-) -> AlpacaDoctorBatchObservation {
-    AlpacaDoctorBatchObservation {
-        http: map_alpaca_http(observation.http()),
-        semantic_result_digest: observation.semantic_result_digest(),
-        requested_count: observation.requested_count(),
-        returned_count: observation.returned_count(),
-        missing_count: observation.missing_count(),
-        unexpected_count: observation.unexpected_count(),
-        duplicate_count: observation.duplicate_count(),
-        invalid_count: observation.invalid_count(),
-        effective_cardinality: observation.effective_cardinality(),
-        requested_set_digest: observation.requested_symbols_digest(),
-        returned_set_digest: observation.returned_symbols_digest(),
-        missing_set_digest: observation.missing_symbols_digest(),
-        unexpected_set_digest: observation.unexpected_symbols_digest(),
-    }
-}
-
-fn map_alpaca_stream(
-    observation: &AdapterAlpacaDoctorStreamObservation,
-) -> AlpacaDoctorStreamObservation {
-    AlpacaDoctorStreamObservation {
-        endpoint_contract_digest: observation.endpoint_contract_digest(),
-        request_digest: observation.request_digest(),
-        connected_frame_digest: observation.connected_frame_digest(),
-        authenticated_frame_digest: observation.authenticated_frame_digest(),
-        subscription_frame_digest: observation.subscription_frame_digest(),
-        semantic_result_digest: observation.semantic_result_digest(),
-        handshake_status: observation.handshake_status(),
-        handshake_rate: map_alpaca_rate(observation.handshake_rate()),
-        subscribed_trade_count: observation.subscribed_trade_count(),
-        subscribed_quote_count: observation.subscribed_quote_count(),
-        frames_observed: observation.frames_observed(),
-        bytes_observed: observation.bytes_observed(),
-        authenticated_at: observation.authenticated_at(),
-        subscribed_at: observation.subscribed_at(),
-        close_sent: observation.close_sent(),
-        clean_close_observed: observation.clean_close_observed(),
-        completed_at: observation.completed_at(),
-    }
-}
-
-fn map_alpaca_historical(
-    observation: &AdapterAlpacaDoctorHistoricalObservation,
-) -> Result<AlpacaDoctorHistoricalObservation, ProviderOnboardingError> {
-    let pages = observation
-        .pages()
-        .iter()
-        .map(|page| AlpacaDoctorHistoricalPageEvidence {
-            http: map_alpaca_http(page.http()),
-            request_page_token_digest: page.request_page_token_digest(),
-            response_page_token_digest: page.response_page_token_digest(),
-        })
-        .collect::<Vec<_>>();
-    if pages.len()
-        != usize::try_from(observation.page_count())
-            .map_err(|_| ProviderOnboardingError::InvalidSessionState)?
-    {
-        return Err(ProviderOnboardingError::InvalidSessionState);
-    }
-    Ok(AlpacaDoctorHistoricalObservation {
-        endpoint_contract_digest: observation.endpoint_contract_digest(),
-        request_digest: observation.request_digest(),
-        semantic_result_digest: observation.semantic_result_digest(),
-        start_date: observation.start_date(),
-        end_date: observation.end_date(),
-        page_count: observation.page_count(),
-        returned_bar_count: observation.returned_bar_count(),
-        distinct_date_count: observation.distinct_date_count(),
-        first_bar_timestamp: observation.first_bar_timestamp(),
-        last_bar_timestamp: observation.last_bar_timestamp(),
-        returned_dates_digest: observation.returned_dates_digest(),
-        pagination_graph_digest: observation.pagination_graph_digest(),
-        terminal_page_observed: observation.terminal_page_observed(),
-        pages: pages.into_boxed_slice(),
-    })
-}
-
-fn map_alpaca_calendar(
-    observation: &AdapterAlpacaDoctorCalendarObservation,
-) -> AlpacaDoctorCalendarObservation {
-    AlpacaDoctorCalendarObservation {
-        http: map_alpaca_http(observation.http()),
-        semantic_result_digest: observation.semantic_result_digest(),
-        start_date: observation.start_date(),
-        end_date: observation.end_date(),
-        session_count: observation.session_count(),
-        history_date_count: observation.history_date_count(),
-        matched_count: observation.matched_count(),
-        missing_history_count: observation.missing_history_count(),
-        unexpected_history_count: observation.unexpected_history_count(),
-        session_dates_digest: observation.session_dates_digest(),
-        history_dates_digest: observation.history_dates_digest(),
-        exact_date_reconciliation: observation.exact_date_reconciliation(),
-    }
-}
-
-fn map_alpaca_http(observation: &AdapterAlpacaDoctorHttpEvidence) -> AlpacaDoctorHttpEvidence {
-    AlpacaDoctorHttpEvidence {
-        endpoint_contract_digest: observation.endpoint_contract_digest(),
-        request_digest: observation.request_digest(),
-        status_code: observation.status_code(),
-        body_digest: observation.body_digest(),
-        response_bytes: observation.response_bytes(),
-        received_at: observation.received_at(),
-        latency_nanos: observation.latency_nanos(),
-        rate: map_alpaca_rate(observation.rate()),
-    }
-}
-
-fn map_alpaca_rate(observation: &AdapterAlpacaDoctorRateEvidence) -> AlpacaDoctorRateEvidence {
-    AlpacaDoctorRateEvidence {
-        limit: map_alpaca_observed_field(observation.limit()),
-        remaining: map_alpaca_observed_field(observation.remaining()),
-        reset_unix_seconds: map_alpaca_observed_field(observation.reset_unix_seconds()),
-        retry_after: match observation.retry_after() {
-            AlpacaDoctorObservedField::Observed(AlpacaDoctorRetryAfter::DelaySeconds(value)) => {
-                AlpacaRateLimitField::Observed(AlpacaRetryAfterEvidence::DelaySeconds(*value))
-            }
-            AlpacaDoctorObservedField::Observed(AlpacaDoctorRetryAfter::AtUnixSeconds(value)) => {
-                AlpacaRateLimitField::Observed(AlpacaRetryAfterEvidence::AtUnixSeconds(*value))
-            }
-            AlpacaDoctorObservedField::Missing => AlpacaRateLimitField::Missing,
-        },
-    }
-}
-
-fn map_alpaca_observed_field<T: Copy>(
-    field: &AlpacaDoctorObservedField<T>,
-) -> AlpacaRateLimitField<T> {
-    match field {
-        AlpacaDoctorObservedField::Observed(value) => AlpacaRateLimitField::Observed(*value),
-        AlpacaDoctorObservedField::Missing => AlpacaRateLimitField::Missing,
-    }
-}
-
-fn map_alpaca_doctor_disposition(
-    disposition: AlpacaDoctorObservationDisposition,
-) -> RuntimeCapabilityDisposition {
-    match disposition {
-        AlpacaDoctorObservationDisposition::ObservedAvailable => {
-            RuntimeCapabilityDisposition::Available
-        }
-        AlpacaDoctorObservationDisposition::ObservedDegraded => {
-            RuntimeCapabilityDisposition::Degraded
-        }
-        AlpacaDoctorObservationDisposition::ObservedUnavailable
-        | AlpacaDoctorObservationDisposition::Unsupported => {
-            RuntimeCapabilityDisposition::Unavailable
-        }
-        AlpacaDoctorObservationDisposition::Unprobed => RuntimeCapabilityDisposition::NotProbed,
-    }
-}
-
-fn alpaca_additional_capabilities(
-    observation: &AlpacaPaperIexDoctorObservation,
-) -> Vec<AlpacaDoctorCapabilityEvidence> {
-    [
-        (
-            AlpacaDoctorAdditionalCapability::OptionsRest,
-            observation.indicative_options_rest(),
-        ),
-        (
-            AlpacaDoctorAdditionalCapability::OptionsStream,
-            observation.indicative_options_stream(),
-        ),
-        (
-            AlpacaDoctorAdditionalCapability::FixedIncome,
-            observation.fixed_income(),
-        ),
-        (
-            AlpacaDoctorAdditionalCapability::CorporateActions,
-            observation.corporate_actions(),
-        ),
-        (
-            AlpacaDoctorAdditionalCapability::Sip,
-            observation.consolidated_sip(),
-        ),
-        (AlpacaDoctorAdditionalCapability::Nbbo, observation.nbbo()),
-        (AlpacaDoctorAdditionalCapability::Opra, observation.opra()),
-        (
-            AlpacaDoctorAdditionalCapability::PriceLevelDepth,
-            observation.price_level_depth(),
-        ),
-        (
-            AlpacaDoctorAdditionalCapability::OrderLevelDepth,
-            observation.order_level_depth(),
-        ),
-        (
-            AlpacaDoctorAdditionalCapability::BrokerageAccount,
-            observation.brokerage_account(),
-        ),
-        (
-            AlpacaDoctorAdditionalCapability::Positions,
-            observation.positions(),
-        ),
-        (
-            AlpacaDoctorAdditionalCapability::Orders,
-            observation.orders(),
-        ),
-        (
-            AlpacaDoctorAdditionalCapability::Trading,
-            observation.trading(),
-        ),
-    ]
-    .into_iter()
-    .map(|(capability, observed)| {
-        let disposition = map_alpaca_doctor_disposition(observed);
-        AlpacaDoctorCapabilityEvidence {
-            capability,
-            disposition,
-            disposition_evidence_digest: alpaca_additional_capability_digest(
-                capability,
-                disposition,
-            ),
-        }
-    })
-    .collect()
-}
-
-fn alpaca_additional_capability_digest(
-    capability: AlpacaDoctorAdditionalCapability,
-    disposition: RuntimeCapabilityDisposition,
-) -> EvidenceDigest {
-    let mut hasher = Sha256::new();
-    hasher.update(ALPACA_DOCTOR_ADDITIONAL_CAPABILITY_DOMAIN);
-    hasher.update([alpaca_additional_capability_tag(capability)]);
-    hasher.update([runtime_capability_disposition_tag(disposition)]);
-    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
-}
-
-const fn alpaca_additional_capability_tag(capability: AlpacaDoctorAdditionalCapability) -> u8 {
-    match capability {
-        AlpacaDoctorAdditionalCapability::OptionsRest => 1,
-        AlpacaDoctorAdditionalCapability::OptionsStream => 2,
-        AlpacaDoctorAdditionalCapability::FixedIncome => 3,
-        AlpacaDoctorAdditionalCapability::CorporateActions => 4,
-        AlpacaDoctorAdditionalCapability::Sip => 5,
-        AlpacaDoctorAdditionalCapability::Nbbo => 6,
-        AlpacaDoctorAdditionalCapability::Opra => 7,
-        AlpacaDoctorAdditionalCapability::PriceLevelDepth => 8,
-        AlpacaDoctorAdditionalCapability::OrderLevelDepth => 9,
-        AlpacaDoctorAdditionalCapability::BrokerageAccount => 10,
-        AlpacaDoctorAdditionalCapability::Positions => 11,
-        AlpacaDoctorAdditionalCapability::Orders => 12,
-        AlpacaDoctorAdditionalCapability::Trading => 13,
-    }
-}
-
-const fn runtime_capability_disposition_tag(disposition: RuntimeCapabilityDisposition) -> u8 {
-    match disposition {
-        RuntimeCapabilityDisposition::Available => 1,
-        RuntimeCapabilityDisposition::Degraded => 2,
-        RuntimeCapabilityDisposition::Unavailable => 3,
-        RuntimeCapabilityDisposition::NotProbed => 4,
-    }
 }
 
 fn digest_qualified_subject(

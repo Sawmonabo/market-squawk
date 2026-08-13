@@ -5,6 +5,8 @@ mod configuration;
 mod display;
 mod generation;
 mod group;
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+mod installed_fixture;
 mod kraken;
 
 pub(crate) use alpaca_historical::{
@@ -18,6 +20,10 @@ pub(crate) use configuration::{
 pub(crate) use display::{MarketDisplaySnapshotBatch, MarketDisplaySnapshotLease};
 pub(crate) use generation::MarketRuntimeGroupGeneration;
 pub(crate) use group::MarketProviderGroupLifecycleEvidence;
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+pub(crate) use installed_fixture::{
+    InstalledFixtureDisplayDescriptor, InstalledFixturePresentationLease,
+};
 pub(crate) use kraken::MarketKrakenPriceProjectionLease;
 
 use std::{
@@ -41,6 +47,8 @@ use market_squawk_sources::{ProviderRateAuthority, SourceMetadata};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+use self::installed_fixture::{InstalledFixtureMarketRuntime, map_fixture_runtime_error};
 use self::{
     alpaca_historical::AlpacaHistoricalCapabilityError,
     display::DisplaySourceDescriptor,
@@ -48,6 +56,11 @@ use self::{
     kraken::KrakenSourceDescriptor,
 };
 use super::live_fair_value::{LiveFairValueExportDrains, LiveFairValueObservationBuffer};
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+use crate::{
+    AlpacaInstalledFixtureBundle,
+    live_source::display_market::runtime::InstalledFixtureDisplaySourceRuntime,
+};
 use crate::{
     AppConfig, CoinbaseDirectLiveRuntime, ProductionLiveSourceRuntime, ProductionSourceProvider,
     live_source::display_market::{
@@ -70,6 +83,8 @@ pub(crate) const KRAKEN_PUBLIC_SURFACE_ID: &str = "kraken.spot-public-market-dat
 
 const MAXIMUM_CONCURRENT_MARKET_SURFACES: usize = 16;
 const ACCOUNT_HEALTH_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+const INSTALLED_FIXTURE_SURFACE_ID: &str = "market-squawk.installed-fixture.alpaca-iex-aapl";
 
 /// Exact live evidence returned after one registry-owned source lifecycle operation.
 #[derive(Clone, Debug)]
@@ -216,6 +231,8 @@ pub(crate) struct MarketRuntimeRegistry {
     mutation: Mutex<()>,
     entries: Mutex<Vec<MarketRuntimeEntry>>,
     account_health_drain: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    installed_fixture_drain: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -280,6 +297,8 @@ impl MarketRuntimeRegistry {
             mutation: Mutex::new(()),
             entries: Mutex::new(entries),
             account_health_drain: Mutex::new(None),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            installed_fixture_drain: Mutex::new(None),
         }))
     }
 
@@ -310,7 +329,7 @@ impl MarketRuntimeRegistry {
             .map_err(|_busy| ServiceError::Unavailable)?;
         Ok(entries
             .iter()
-            .filter(|entry| entry.is_published_healthy())
+            .filter(|entry| entry.is_published_healthy() && entry.runtime.is_production_surface())
             .count())
     }
 
@@ -332,6 +351,191 @@ impl MarketRuntimeRegistry {
         let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
         self.start_owned(provider, onboarding_session_id, deadline, cancellation)
             .await
+    }
+
+    /// Starts the isolated installed AAPL-shaped fixture and publishes its read gate only after
+    /// the real capture/decoder/display path has validated the exact subscription acknowledgement
+    /// and produced a current quote.
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    pub(crate) async fn start_installed_fixture(
+        self: &Arc<Self>,
+        bundle: AlpacaInstalledFixtureBundle,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<InstalledFixtureDisplayDescriptor>, ServiceError> {
+        let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        let previous_drain = {
+            let mut drain_slot =
+                bounded_lock(&self.installed_fixture_drain, deadline, cancellation).await?;
+            if drain_slot
+                .as_ref()
+                .is_some_and(|previous| !previous.is_finished())
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            drain_slot.take()
+        };
+        if let Some(previous) = previous_drain {
+            await_before(deadline, cancellation, previous).await?;
+        }
+        let mut drain_slot =
+            bounded_lock(&self.installed_fixture_drain, deadline, cancellation).await?;
+        let surface_id = SourceIdentifier::try_from(INSTALLED_FIXTURE_SURFACE_ID)
+            .map_err(|_error| ServiceError::Unavailable)?;
+        {
+            let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+            if entries.iter().any(|entry| entry.surface_id == surface_id) {
+                return Err(ServiceError::InvalidRequest);
+            }
+        }
+        let config = bundle.config();
+        let definition = bundle.definition();
+        if !definition.matches_config(&config) {
+            return Err(ServiceError::Unavailable);
+        }
+        let runtime_cancellation = self.lifecycle.child_token();
+        let runtime = InstalledFixtureDisplaySourceRuntime::start(
+            self.config.clone(),
+            config.clone(),
+            bundle.transport_factory(),
+            runtime_cancellation.clone(),
+            cancellation,
+            deadline,
+        )
+        .await
+        .map_err(map_fixture_runtime_error);
+        let runtime = match runtime {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                runtime_cancellation.cancel();
+                return Err(error);
+            }
+        };
+        let descriptor =
+            match InstalledFixtureDisplayDescriptor::try_new(Arc::clone(&definition), &runtime) {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    let _cleanup = runtime.shutdown().await;
+                    return Err(error);
+                }
+            };
+        let fixture = InstalledFixtureMarketRuntime::new(Arc::clone(&descriptor), runtime);
+        let monitor_terminal = fixture.terminal_notification();
+        let entry = MarketRuntimeEntry {
+            surface_id,
+            onboarding_session_id: None,
+            metadata: Arc::<[SourceMetadata]>::from([]),
+            cancellation: runtime_cancellation,
+            runtime: MarketRuntime::InstalledFixture(fixture),
+            exports: None,
+            action_hooks_installed: false,
+        };
+        let entry_current = definition_and_entry_are_current(&config, &entry);
+        if ensure_active(&self.accepting, deadline, cancellation).is_err()
+            || !entry_current.as_ref().is_ok_and(|current| *current)
+        {
+            let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
+            return Err(entry_current.err().unwrap_or(ServiceError::Unavailable));
+        }
+        let mut entries = match bounded_lock(&self.entries, deadline, cancellation).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
+                return Err(error);
+            }
+        };
+        let entry_current = definition_and_entry_are_current(&config, &entry);
+        if entries.len() == MAXIMUM_CONCURRENT_MARKET_SURFACES
+            || entries
+                .iter()
+                .any(|current| current.surface_id == entry.surface_id)
+            || ensure_active(&self.accepting, deadline, cancellation).is_err()
+            || !entry_current.as_ref().is_ok_and(|current| *current)
+        {
+            drop(entries);
+            let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
+            return Err(entry_current.err().unwrap_or(ServiceError::Unavailable));
+        }
+        let published_index = entries.len();
+        entries.push(entry);
+        let admitted = match &entries[published_index].runtime {
+            MarketRuntime::InstalledFixture(published) => published.admit_reads(),
+            _ => false,
+        };
+        let publication_current =
+            definition_and_entry_are_current(&config, &entries[published_index]);
+        if !admitted || !publication_current.as_ref().is_ok_and(|current| *current) {
+            let rollback = entries.pop().ok_or(ServiceError::Unavailable)?;
+            drop(entries);
+            let _cleanup = rollback.shutdown(self.config.source_shutdown()).await;
+            return Err(publication_current
+                .err()
+                .unwrap_or(ServiceError::Unavailable));
+        }
+        drop(entries);
+        let monitor_registry = Arc::downgrade(self);
+        let monitor_lifecycle = self.lifecycle.clone();
+        let monitor_generation = expected_generation_from_descriptor(&descriptor);
+        let monitor_expiry = descriptor.exclusive_expires_at();
+        *drain_slot = Some(tokio::spawn(async move {
+            run_installed_fixture_drain(
+                monitor_registry,
+                monitor_lifecycle,
+                monitor_terminal,
+                monitor_generation,
+                monitor_expiry,
+            )
+            .await;
+        }));
+        Ok(descriptor)
+    }
+
+    /// Reads the one isolated fixture presentation without entering production market selection.
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    pub(crate) async fn installed_fixture_presentation(
+        &self,
+        at: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<InstalledFixturePresentationLease, ServiceError> {
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        let (expected_descriptor, expected_generation, authority) = {
+            let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+            let mut fixtures = entries.iter().filter_map(|entry| match &entry.runtime {
+                MarketRuntime::InstalledFixture(runtime) if entry.is_healthy() => Some(runtime),
+                _ => None,
+            });
+            let runtime = fixtures.next().ok_or(ServiceError::NotFound)?;
+            if fixtures.next().is_some() || at >= runtime.descriptor().exclusive_expires_at() {
+                return Err(ServiceError::Unavailable);
+            }
+            let expected_descriptor = Arc::clone(runtime.descriptor());
+            let expected_generation = runtime.generation();
+            let authority = runtime.presentation_authority();
+            (expected_descriptor, expected_generation, authority)
+        };
+        let presentation = authority.presentation(at, cancellation, deadline).await?;
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        if system_timestamp()? >= expected_descriptor.exclusive_expires_at() {
+            return Err(ServiceError::Unavailable);
+        }
+        let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        let current = system_timestamp()? < expected_descriptor.exclusive_expires_at()
+            && entries.iter().any(|entry| match &entry.runtime {
+                MarketRuntime::InstalledFixture(runtime) => {
+                    entry.is_healthy()
+                        && runtime.generation() == expected_generation
+                        && Arc::ptr_eq(runtime.descriptor(), &expected_descriptor)
+                        && Arc::ptr_eq(presentation.descriptor(), &expected_descriptor)
+                }
+                _ => false,
+            });
+        if !current {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(presentation)
     }
 
     /// Starts one exact account-backed provider group and publishes it only after every required
@@ -705,6 +909,8 @@ impl MarketRuntimeRegistry {
             MarketRuntime::Public(_) | MarketRuntime::CoinbaseDirect(_) => {
                 return Err(ServiceError::InvalidRequest);
             }
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            MarketRuntime::InstalledFixture(_) => return Err(ServiceError::InvalidRequest),
         };
         validate_account_evidence(request, group.evidence())?;
         if group.evidence().group_generation() != expected_group_generation {
@@ -1454,6 +1660,32 @@ impl MarketRuntimeRegistry {
                 failure = Some(error);
             }
         }
+        #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+        {
+            let fixture_drain = {
+                let mut drain =
+                    bounded_lock(&self.installed_fixture_drain, deadline, &cleanup).await?;
+                drain.take()
+            };
+            if let Some(mut drain) = fixture_drain {
+                let result = tokio::select! {
+                    biased;
+                    result = &mut drain => result.map_err(|error| {
+                        tracing::error!(%error, "installed fixture drain join failed");
+                        ServiceError::Unavailable
+                    }),
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        drain.abort();
+                        let _aborted = drain.await;
+                        Err(ServiceError::DeadlineExceeded)
+                    }
+                };
+                if let Err(error) = result {
+                    tracing::error!(%error, "installed fixture drain shutdown failed");
+                    failure.get_or_insert(error);
+                }
+            }
+        }
         for entry in &entries {
             entry.begin_shutdown();
         }
@@ -1699,6 +1931,36 @@ impl MarketRuntimeRegistry {
         };
         entry.shutdown(self.config.source_shutdown()).await
     }
+
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    async fn drain_installed_fixture_generation(
+        &self,
+        expected_generation: ConnectionGeneration,
+    ) -> Result<(), ServiceError> {
+        let _mutation = tokio::select! {
+            biased;
+            () = self.lifecycle.cancelled() => return Ok(()),
+            mutation = self.mutation.lock() => mutation,
+        };
+        let entry = {
+            let mut entries = tokio::select! {
+                biased;
+                () = self.lifecycle.cancelled() => return Ok(()),
+                entries = self.entries.lock() => entries,
+            };
+            let Some(index) = entries.iter().position(|entry| match &entry.runtime {
+                MarketRuntime::InstalledFixture(runtime) => {
+                    runtime.generation() == expected_generation
+                }
+                _ => false,
+            }) else {
+                return Ok(());
+            };
+            entries[index].begin_shutdown();
+            entries.swap_remove(index)
+        };
+        entry.shutdown(self.config.source_shutdown()).await
+    }
 }
 
 impl fmt::Debug for MarketRuntimeRegistry {
@@ -1724,6 +1986,74 @@ impl Drop for MarketRuntimeRegistry {
         }
         self.lifecycle.cancel();
     }
+}
+
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+fn definition_and_entry_are_current(
+    config: &market_squawk_adapter_alpaca::AlpacaInstalledFixtureIexConfig,
+    entry: &MarketRuntimeEntry,
+) -> Result<bool, ServiceError> {
+    let runtime = match &entry.runtime {
+        MarketRuntime::InstalledFixture(runtime) => runtime,
+        _ => return Ok(false),
+    };
+    let now = system_timestamp()?;
+    Ok(config.metadata().is_effective_at(now)
+        && now < config.exclusive_expires_at()
+        && runtime.is_healthy()
+        && runtime.generation().get() > 0
+        && runtime.descriptor().definition().matches_config(config)
+        && runtime.descriptor().runtime_generation() == runtime.generation())
+}
+
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+fn system_timestamp() -> Result<Timestamp, ServiceError> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_error| ServiceError::Unavailable)?;
+    let nanos = i64::try_from(elapsed.as_nanos()).map_err(|_error| ServiceError::Unavailable)?;
+    Ok(Timestamp::from_unix_nanos(nanos))
+}
+
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+fn expected_generation_from_descriptor(
+    descriptor: &InstalledFixtureDisplayDescriptor,
+) -> ConnectionGeneration {
+    descriptor.runtime_generation()
+}
+
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+async fn run_installed_fixture_drain(
+    registry: Weak<MarketRuntimeRegistry>,
+    lifecycle: CancellationToken,
+    terminal: CancellationToken,
+    expected_generation: ConnectionGeneration,
+    exclusive_expires_at: Timestamp,
+) {
+    let wait = duration_until_timestamp(exclusive_expires_at).unwrap_or(Duration::ZERO);
+    tokio::select! {
+        biased;
+        () = lifecycle.cancelled() => return,
+        () = terminal.cancelled() => {},
+        () = tokio::time::sleep(wait) => {}
+    }
+    let Some(registry) = registry.upgrade() else {
+        return;
+    };
+    let _ignored = registry
+        .drain_installed_fixture_generation(expected_generation)
+        .await;
+}
+
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+fn duration_until_timestamp(exclusive_expires_at: Timestamp) -> Result<Duration, ServiceError> {
+    let now = system_timestamp()?;
+    let remaining = exclusive_expires_at
+        .unix_nanos()
+        .checked_sub(now.unix_nanos())
+        .ok_or(ServiceError::Unavailable)?;
+    let remaining = u64::try_from(remaining).map_err(|_error| ServiceError::Unavailable)?;
+    Ok(Duration::from_nanos(remaining))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1784,6 +2114,8 @@ impl MarketRuntimeEntry {
             && match &self.runtime {
                 MarketRuntime::Account(group) => group.is_published_healthy(),
                 MarketRuntime::Public(_) | MarketRuntime::CoinbaseDirect(_) => true,
+                #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+                MarketRuntime::InstalledFixture(runtime) => runtime.is_published_healthy(),
             }
     }
 
@@ -1839,25 +2171,45 @@ enum MarketRuntime {
     Public(ProductionLiveSourceRuntime),
     CoinbaseDirect(CoinbaseDirectLiveRuntime),
     Account(AccountMarketRuntimeGroup),
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    InstalledFixture(InstalledFixtureMarketRuntime),
 }
 
 impl MarketRuntime {
+    const fn is_production_surface(&self) -> bool {
+        match self {
+            Self::Public(_) | Self::CoinbaseDirect(_) | Self::Account(_) => true,
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => false,
+        }
+    }
+
     fn is_healthy(&self) -> bool {
         match self {
             Self::Public(runtime) => runtime.is_healthy(),
             Self::CoinbaseDirect(runtime) => runtime.is_healthy(),
             Self::Account(runtime) => runtime.is_healthy(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(runtime) => runtime.is_healthy(),
         }
     }
 
     fn begin_shutdown(&self) {
-        if let Self::Account(runtime) = self {
-            runtime.begin_shutdown();
+        match self {
+            Self::Account(runtime) => runtime.begin_shutdown(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(runtime) => runtime.begin_shutdown(),
+            Self::Public(_) | Self::CoinbaseDirect(_) => {}
         }
     }
 
     const fn has_scalar_snapshots(&self) -> bool {
-        !matches!(self, Self::Account(_))
+        match self {
+            Self::Public(_) | Self::CoinbaseDirect(_) => true,
+            Self::Account(_) => false,
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => false,
+        }
     }
 
     fn scalar_snapshots(&self) -> Result<LiveSnapshotReader, ServiceError> {
@@ -1865,6 +2217,8 @@ impl MarketRuntime {
             Self::Public(runtime) => Ok(runtime.snapshots()),
             Self::CoinbaseDirect(runtime) => Ok(runtime.snapshots()),
             Self::Account(_) => Err(ServiceError::InvalidRequest),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => Err(ServiceError::InvalidRequest),
         }
     }
 
@@ -1872,6 +2226,8 @@ impl MarketRuntime {
         match self {
             Self::Account(runtime) => Some(runtime.evidence()),
             Self::Public(_) | Self::CoinbaseDirect(_) => None,
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => None,
         }
     }
 
@@ -1879,6 +2235,8 @@ impl MarketRuntime {
         match self {
             Self::Account(runtime) => runtime.display_descriptor_count(),
             Self::Public(_) | Self::CoinbaseDirect(_) => 0,
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => 0,
         }
     }
 
@@ -1886,6 +2244,8 @@ impl MarketRuntime {
         match self {
             Self::Account(runtime) => runtime.display_instrument_count(),
             Self::Public(_) | Self::CoinbaseDirect(_) => Some(0),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => Some(0),
         }
     }
 
@@ -1893,6 +2253,8 @@ impl MarketRuntime {
         match self {
             Self::Account(runtime) => runtime.market_instrument_count(),
             Self::Public(_) | Self::CoinbaseDirect(_) => Some(0),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => Some(0),
         }
     }
 
@@ -1900,6 +2262,8 @@ impl MarketRuntime {
         match self {
             Self::Account(runtime) => runtime.owns_display_descriptor(descriptor),
             Self::Public(_) | Self::CoinbaseDirect(_) => false,
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => false,
         }
     }
 
@@ -1922,6 +2286,8 @@ impl MarketRuntime {
         match self {
             Self::Account(runtime) => runtime.kraken_read_authority(instrument_id),
             Self::Public(_) | Self::CoinbaseDirect(_) => None,
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => None,
         }
     }
 
@@ -1929,6 +2295,8 @@ impl MarketRuntime {
         match self {
             Self::Account(runtime) => runtime.owns_kraken_descriptor(descriptor),
             Self::Public(_) | Self::CoinbaseDirect(_) => false,
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => false,
         }
     }
 
@@ -1959,6 +2327,8 @@ impl MarketRuntime {
                     ServiceError::Unavailable
                 }),
             Self::Account(_) => Err(ServiceError::InvalidRequest),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => Err(ServiceError::InvalidRequest),
         }
     }
 
@@ -1986,6 +2356,8 @@ impl MarketRuntime {
                     })
             }
             Self::Account(_) => Err(ServiceError::InvalidRequest),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => Err(ServiceError::InvalidRequest),
         }
     }
 
@@ -2000,6 +2372,10 @@ impl MarketRuntime {
                 await_before(deadline, cancellation, runtime.shutdown()).await
             }
             Self::Account(runtime) => runtime.shutdown_before(deadline, cancellation).await,
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(runtime) => {
+                await_before(deadline, cancellation, runtime.shutdown()).await
+            }
         }
     }
 }

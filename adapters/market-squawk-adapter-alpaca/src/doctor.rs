@@ -596,6 +596,7 @@ impl AlpacaDoctorCalendarObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AlpacaPaperIexDoctorObservationData {
     origin: AlpacaDoctorObservationOrigin,
+    market_data_principal_sha256: EvidenceDigest,
     quote: AlpacaDoctorQuoteObservation,
     batch: AlpacaDoctorBatchObservation,
     stream: AlpacaDoctorStreamObservation,
@@ -609,7 +610,7 @@ struct AlpacaPaperIexDoctorObservationData {
 ///
 /// Only [`AlpacaPaperIexDoctor::observe`] can construct this authority-bearing wrapper. The
 /// installed fixture returns a distinct type with no conversion into this one.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct AlpacaPaperIexDoctorObservation {
     data: AlpacaPaperIexDoctorObservationData,
 }
@@ -630,6 +631,11 @@ macro_rules! impl_observation_accessors {
             /// Returns the digest-bound authority origin of this typed observation.
             pub const fn origin(&self) -> AlpacaDoctorObservationOrigin {
                 self.data.origin
+            }
+
+            /// Returns the digest-only Paper credential principal used by every probe.
+            pub const fn market_data_principal_sha256(&self) -> EvidenceDigest {
+                self.data.market_data_principal_sha256
             }
 
             pub const fn quote(&self) -> &AlpacaDoctorQuoteObservation {
@@ -741,6 +747,7 @@ impl AlpacaPaperIexDoctor {
             .await?;
         let completed_at = system_timestamp()?;
         Ok(complete_provider_observation(
+            self.credentials.paper_market_data_principal_sha256(),
             quote,
             batch,
             stream,
@@ -845,6 +852,7 @@ impl AlpacaPaperIexDoctor {
 }
 
 fn complete_provider_observation(
+    market_data_principal_sha256: EvidenceDigest,
     quote: AlpacaDoctorQuoteObservation,
     batch: AlpacaDoctorBatchObservation,
     stream: AlpacaDoctorStreamObservation,
@@ -855,6 +863,7 @@ fn complete_provider_observation(
     AlpacaPaperIexDoctorObservation {
         data: complete_observation_data(
             AlpacaDoctorObservationOrigin::ProviderObserved,
+            market_data_principal_sha256,
             quote,
             batch,
             stream,
@@ -877,6 +886,7 @@ fn complete_fixture_observation(
     AlpacaPaperIexDoctorFixtureObservation {
         data: complete_observation_data(
             AlpacaDoctorObservationOrigin::InstalledFixture,
+            fixture_market_data_principal_sha256(),
             quote,
             batch,
             stream,
@@ -889,6 +899,7 @@ fn complete_fixture_observation(
 
 fn complete_observation_data(
     origin: AlpacaDoctorObservationOrigin,
+    market_data_principal_sha256: EvidenceDigest,
     quote: AlpacaDoctorQuoteObservation,
     batch: AlpacaDoctorBatchObservation,
     stream: AlpacaDoctorStreamObservation,
@@ -898,6 +909,7 @@ fn complete_observation_data(
 ) -> AlpacaPaperIexDoctorObservationData {
     let observation_digest = doctor_observation_digest(
         origin,
+        market_data_principal_sha256,
         &quote,
         &batch,
         &stream,
@@ -907,6 +919,7 @@ fn complete_observation_data(
     );
     AlpacaPaperIexDoctorObservationData {
         origin,
+        market_data_principal_sha256,
         quote,
         batch,
         stream,
@@ -2997,6 +3010,7 @@ fn pagination_graph_digest(
 
 fn doctor_observation_digest(
     origin: AlpacaDoctorObservationOrigin,
+    market_data_principal_sha256: EvidenceDigest,
     quote: &AlpacaDoctorQuoteObservation,
     batch: &AlpacaDoctorBatchObservation,
     stream: &AlpacaDoctorStreamObservation,
@@ -3005,8 +3019,9 @@ fn doctor_observation_digest(
     completed_at: Timestamp,
 ) -> EvidenceDigest {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/alpaca-paper-iex-doctor-observation/v2\0");
+    digest.update(b"market-squawk/alpaca-paper-iex-doctor-observation/v3\0");
     digest.update([origin_tag(origin)]);
+    hash_evidence(&mut digest, market_data_principal_sha256);
     digest.update([disposition_tag(quote.disposition)]);
     hash_http(&mut digest, &quote.http);
     hash_evidence(&mut digest, quote.semantic_result_digest);
@@ -3096,6 +3111,13 @@ fn doctor_observation_digest(
         digest.update([disposition_tag(disposition)]);
     }
     digest.update(completed_at.unix_nanos().to_be_bytes());
+    evidence(digest.finalize().into())
+}
+
+#[cfg(feature = "scripted-transport-fixture")]
+fn fixture_market_data_principal_sha256() -> EvidenceDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/alpaca-paper-iex-doctor-installed-fixture-principal/v1\0");
     evidence(digest.finalize().into())
 }
 

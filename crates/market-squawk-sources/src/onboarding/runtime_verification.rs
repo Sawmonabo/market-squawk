@@ -20,7 +20,7 @@ pub const ALPACA_PAPER_IEX_DOCTOR_RECEIPT_SCHEMA: &str = "market-squawk.alpaca-p
 pub const MAX_ALPACA_PAPER_IEX_DOCTOR_RECEIPT_BYTES: usize = 16 * 1024;
 
 const ALPACA_PAPER_IEX_DOCTOR_IMPLEMENTATION_REVISION: &str =
-    "market-squawk.alpaca-paper-iex-doctor-implementation.v1";
+    "market-squawk.alpaca-paper-iex-doctor-implementation.v2";
 const ALPACA_PAPER_IEX_DOCTOR_CONTRACT_DOMAIN: &[u8] =
     b"market-squawk/alpaca-paper-iex-doctor-contract/v1\0";
 const ALPACA_PAPER_IEX_PROVIDER_OBSERVATION_ORIGIN: &str =
@@ -1380,8 +1380,9 @@ fn provider_observation_digest(
     let historical = required_observation(&input.historical)?;
     let calendar = required_observation(&input.calendar)?;
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/alpaca-paper-iex-doctor-observation/v2\0");
+    digest.update(b"market-squawk/alpaca-paper-iex-doctor-observation/v3\0");
     digest.update([1]);
+    alpaca_hash_evidence(&mut digest, input.market_data_principal_sha256);
     digest.update([alpaca_disposition_tag(input.quote.disposition)]);
     alpaca_hash_http(&mut digest, &quote.http);
     alpaca_hash_evidence(&mut digest, quote.semantic_result_digest);

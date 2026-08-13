@@ -390,7 +390,7 @@ impl CatalogAuthority {
     }
 
     /// Appends one contiguous event, or confirms an exact prior commit.
-    pub fn append_provider_onboarding_event(
+    pub(crate) fn append_provider_onboarding_event(
         &self,
         reservation: &OnboardingReservation,
         sequence: u64,

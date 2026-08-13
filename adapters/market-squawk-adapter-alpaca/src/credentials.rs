@@ -1,9 +1,13 @@
 use zeroize::Zeroizing;
 
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
+use sha2::{Digest as _, Sha256};
+
 use crate::AlpacaError;
 
 const MIN_CREDENTIAL_BYTES: usize = 8;
 const MAX_CREDENTIAL_BYTES: usize = 256;
+const ALPACA_ACCOUNT_BINDING_DOMAIN: &[u8] = b"market-squawk/alpaca-account-binding/v2\0";
 
 /// User-owned Alpaca Trading API key pair retained in zeroizing memory.
 pub struct AlpacaCredentials {
@@ -37,6 +41,20 @@ impl AlpacaCredentials {
 
     pub(crate) fn secret_key(&self) -> &str {
         self.secret_key.as_str()
+    }
+
+    /// Returns the non-secret Paper-realm principal bound to this key identifier.
+    ///
+    /// The secret key and raw key identifier are never exposed. The provider-observed doctor
+    /// binds this digest into its sealed observation so a result cannot be transplanted between
+    /// credential principals.
+    pub fn paper_market_data_principal_sha256(&self) -> EvidenceDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(ALPACA_ACCOUNT_BINDING_DOMAIN);
+        hasher.update((self.key_id.len() as u64).to_be_bytes());
+        hasher.update(self.key_id.as_bytes());
+        hasher.update([2]);
+        EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
     }
 }
 

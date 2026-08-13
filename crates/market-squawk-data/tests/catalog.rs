@@ -3,13 +3,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_data::{
-    ArtifactRecord, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig, CatalogError,
-    CatalogLimit, CatalogResultLimits, CompanySecurityIdentityDisposition,
-    CompanySecurityIdentityExclusionReason, CompanySecurityIdentityQuery,
-    CompanySecurityIdentityReadCapability, CompanySecurityLinkPublicationCapability,
-    ContractCompletion, DatasetManifestRecord, IngestIdentity, IngestRunState,
-    ListingReferenceError, ListingReferenceExchangeCode, ListingReferenceFileKind,
-    ListingReferenceFinancialStatus, ListingReferenceGenerationInput,
+    AnalyticalDataService, AnalyticalManifestCatalog, ArtifactRecord, BackupReceipt, Catalog,
+    CatalogAuthority, CatalogConfig, CatalogError, CatalogLimit, CatalogResultLimits,
+    CompanySecurityIdentityDisposition, CompanySecurityIdentityExclusionReason,
+    CompanySecurityIdentityQuery, CompanySecurityIdentityReadCapability,
+    CompanySecurityLinkPublicationCapability, ContractCompletion, DatasetManifestRecord,
+    IngestIdentity, IngestRunState, ListingReferenceError, ListingReferenceExchangeCode,
+    ListingReferenceFileKind, ListingReferenceFinancialStatus, ListingReferenceGenerationInput,
     ListingReferenceGenerationSelection, ListingReferenceMarketCategory,
     ListingReferenceMembershipPageState, ListingReferencePublicationCapability,
     ListingReferencePublicationDisposition, ListingReferenceReadCapability,
@@ -18,7 +18,7 @@ use market_squawk_data::{
     MarketDataInstrumentMatchKind, MarketDataInstrumentPopulationDisposition,
     MarketDataInstrumentPopulationExclusionReason, MarketDataInstrumentPopulationQuery,
     MarketDataInstrumentReadCapability, MarketDataInstrumentSynchronization,
-    MarketDataInstrumentSynchronizationCapability, OnboardingAppendOutcome,
+    MarketDataInstrumentSynchronizationCapability, ObjectStoreConfig, OnboardingAppendOutcome,
     OnboardingReservationRequest, RightsBasis, RightsDecisionInput, RightsError, SourceCursor,
     SourceOperation, market_data_instrument_id,
 };
@@ -46,9 +46,9 @@ use market_squawk_sources::{
     CoverageTopology, CredentialKind, EvidenceBinding, FreshnessPolicy, HistoricalCapability,
     HumanBoundary, InstrumentCoverage, LifecycleSupport, NetworkAccessPolicy, OnboardingEvent,
     OnboardingState, ProviderCapability, ProviderCapabilityInput, ProviderCapabilityRevision,
-    ProviderPublicConfiguration, RatePolicyDescriptor, RightsAdmissionState,
-    RuntimeVerificationEvidence, SetupMode, SourceCapabilities, SourceClass, SourceCoverage,
-    SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    ProviderPublicConfiguration, RatePolicyDescriptor, RightsAdmissionState, SetupMode,
+    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
+    SourceProtocolProfile,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest as _, Sha256};
@@ -512,7 +512,13 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
     )?;
     let capability = onboarding_capability()?;
     let requested = AuthoritySet::try_new(vec![SourceIdentifier::try_from("account.read")?])?;
-    let catalog = CatalogAuthority::open(config.clone())?;
+    let object_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
+    let (analytical, catalog) = AnalyticalDataService::initialize_with_provider_onboarding(
+        CatalogAuthority::open(config.clone())?,
+        AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
+        paths.artifacts()?.clone(),
+        object_config,
+    )?;
     assert_eq!(
         catalog.register_provider_capability(&capability)?,
         CapabilityRegistrationOutcome::Inserted
@@ -543,7 +549,7 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
         "locator": "a".repeat(64),
         "generation": generation.get(),
     }))?;
-    let events = [
+    let ordinary_events = [
         OnboardingEvent::CredentialStored {
             reference: reference.clone(),
         },
@@ -573,15 +579,8 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
             generation: Some(generation),
             policy_digest: capability.rate_policy().evidence_digest(),
         },
-        OnboardingEvent::RuntimeVerified {
-            generation: Some(generation),
-            evidence: RuntimeVerificationEvidence::digest_v1(digest(74))?,
-        },
-        OnboardingEvent::Activate {
-            generation: Some(generation),
-        },
     ];
-    for (offset, event) in events.into_iter().enumerate() {
+    for (offset, event) in ordinary_events.into_iter().enumerate() {
         let sequence = u64::try_from(offset)?
             .checked_add(1)
             .ok_or(CatalogError::InvalidRecord)?;
@@ -594,6 +593,35 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
             OnboardingAppendOutcome::Replay
         );
     }
+    assert_eq!(
+        catalog.append_digest_runtime_verification(
+            &reservation,
+            5,
+            Some(generation),
+            digest(74),
+        )?,
+        OnboardingAppendOutcome::Inserted
+    );
+    assert_eq!(
+        catalog.append_digest_runtime_verification(
+            &reservation,
+            5,
+            Some(generation),
+            digest(74),
+        )?,
+        OnboardingAppendOutcome::Replay
+    );
+    let activate = OnboardingEvent::Activate {
+        generation: Some(generation),
+    };
+    assert_eq!(
+        catalog.append_provider_onboarding_event(&reservation, 6, activate.clone())?,
+        OnboardingAppendOutcome::Inserted
+    );
+    assert_eq!(
+        catalog.append_provider_onboarding_event(&reservation, 6, activate)?,
+        OnboardingAppendOutcome::Replay
+    );
     let zero_event_request = OnboardingReservationRequest::try_new(
         &capability,
         ProviderPublicConfiguration::default(),
@@ -633,6 +661,7 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
         OnboardingAppendOutcome::Inserted
     );
     drop(catalog);
+    drop(analytical);
 
     let legacy = Connection::open(&database)?;
     legacy.execute_batch(
@@ -670,7 +699,12 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
     assert_eq!((legacy_sessions, legacy_events), (3, 7));
     drop(legacy);
 
-    let migrated = CatalogAuthority::open(config.clone())?;
+    let (migrated_analytical, migrated) = AnalyticalDataService::open_with_provider_onboarding(
+        CatalogAuthority::open(config.clone())?,
+        AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
+        paths.artifacts()?.clone(),
+        object_config,
+    )?;
     assert_eq!(migrated.health()?.applied_migrations(), 22);
     let resumed = migrated.resume_provider_onboarding(reservation.session_id())?;
     assert_eq!(resumed.lifecycle().state(), OnboardingState::ActiveScoped);
@@ -740,8 +774,14 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
     assert_ne!(zero_event_head.4, vec![0_u8; 32]);
     drop(head_reader);
     drop(migrated);
+    drop(migrated_analytical);
 
-    let reopened = CatalogAuthority::open(config)?;
+    let (_reopened_analytical, reopened) = AnalyticalDataService::open_with_provider_onboarding(
+        CatalogAuthority::open(config)?,
+        AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
+        paths.artifacts()?.clone(),
+        object_config,
+    )?;
     assert_eq!(reopened.health()?.applied_migrations(), 22);
     assert_eq!(
         reopened

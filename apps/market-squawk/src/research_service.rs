@@ -18,15 +18,18 @@ use market_squawk_domain::{
     Timestamp,
 };
 use market_squawk_platform::{
-    LocalPaths, PathError, SealedResearchJournalStore, SealedResearchJournalStoreError,
+    LocalPaths, PathError, SealedResearchJournalStore, SealedResearchJournalStoreError, SecretStore,
 };
 use market_squawk_sources::{
     ExtractionBatch, ExtractionRevisionPlan, ProviderCaptureMaterial,
-    ProviderCaptureMaterialSealError, SourceClass, SourceMetadata, SourceObjectCaptureIdentity,
+    ProviderCaptureMaterialSealError, ProviderRateAuthority, SourceClass, SourceMetadata,
+    SourceObjectCaptureIdentity,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+
+use crate::{ProviderOnboardingError, ProviderOnboardingService};
 
 /// One rights-reserved normalized extraction, with provider revision evidence when required.
 #[derive(Debug)]
@@ -324,12 +327,39 @@ impl ResearchService {
         Self::from_analytical(paths, analytical)
     }
 
-    /// Opens or initializes research while transferring the sole provider-onboarding capability.
+    /// Opens or initializes a safe research and provider-onboarding service composition.
     ///
-    /// This one-time installed-composition boundary returns the non-cloneable capability directly.
-    /// The [`ResearchService`] retains no onboarding writer, and its ordinary constructors cannot
-    /// mint one.
-    pub fn open_or_initialize_with_provider_onboarding(
+    /// The catalog writer is consumed inside this boundary and never returned to the caller.
+    pub fn open_or_initialize_with_provider_onboarding_service<S>(
+        paths: &LocalPaths,
+        catalog: CatalogConfig,
+        max_objects_per_generation: usize,
+        objects: ObjectStoreConfig,
+        secrets: Arc<S>,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<(Self, ProviderOnboardingService), ResearchServiceError>
+    where
+        S: SecretStore + 'static,
+    {
+        let (research, onboarding_catalog) = Self::open_or_initialize_with_provider_onboarding(
+            paths,
+            catalog,
+            max_objects_per_generation,
+            objects,
+        )?;
+        let onboarding = ProviderOnboardingService::try_new_with_provider_rate(
+            onboarding_catalog,
+            secrets,
+            provider_rate,
+        )?;
+        Ok((research, onboarding))
+    }
+
+    /// Internal installed-composition boundary for the restricted onboarding facade.
+    ///
+    /// The [`ResearchService`] retains no onboarding writer, and its ordinary constructors do not
+    /// compose the facade.
+    pub(crate) fn open_or_initialize_with_provider_onboarding(
         paths: &LocalPaths,
         catalog: CatalogConfig,
         max_objects_per_generation: usize,
@@ -735,6 +765,9 @@ pub enum ResearchServiceError {
     /// Analytical authority composition or ingestion failed.
     #[error("research service ingestion failed: {0}")]
     Ingest(#[from] IngestError),
+    /// The fully composed provider-onboarding service could not be constructed.
+    #[error("research provider-onboarding composition failed: {0}")]
+    ProviderOnboarding(#[from] ProviderOnboardingError),
     /// Phase-one point-in-time derived-generation construction failed.
     #[error("research service phase-one derived-generation build failed: {0}")]
     Dataset(#[from] DatasetBuildError),

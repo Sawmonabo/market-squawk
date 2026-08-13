@@ -421,8 +421,18 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
     )?;
     let objects = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
-    let (research, onboarding_catalog) =
-        ResearchService::open_or_initialize_with_provider_onboarding(&paths, catalog, 8, objects)?;
+    let (research, onboarding) =
+        ResearchService::open_or_initialize_with_provider_onboarding_service(
+            &paths,
+            catalog,
+            8,
+            objects,
+            Arc::new(EncryptedFileSecretStore::try_open(
+                directory.path().join("discovery-provider-secrets"),
+                SecretValue::new("discovery test unlock".to_owned())?,
+            )?),
+            provider_rate_authority(&directory.path().join("discovery-provider-rate.sqlite3"))?,
+        )?;
     let research = Arc::new(research);
     let registry = market_squawk_sources::AuthoritativeSourceRegistry::try_new_durable(
         LocalAuthorityStateStore::try_open(
@@ -544,14 +554,7 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         .await,
         Err(ServiceError::NotFound)
     ));
-    let onboarding = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
-        onboarding_catalog,
-        Arc::new(EncryptedFileSecretStore::try_open(
-            directory.path().join("discovery-provider-secrets"),
-            SecretValue::new("discovery test unlock".to_owned())?,
-        )?),
-        provider_rate_authority(&directory.path().join("discovery-provider-rate.sqlite3"))?,
-    )?);
+    let onboarding = Arc::new(onboarding);
     let discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> = Arc::clone(&coordinator) as Arc<_>;
     let source_service = SourceDomainService::try_new(
         onboarding,
@@ -1317,25 +1320,23 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
         CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
     )?;
     let objects = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
-    let (fallback_research, fallback_catalog) =
-        ResearchService::open_or_initialize_with_provider_onboarding(
+    let provider_rate =
+        provider_rate_authority(&directory.path().join("portal-provider-rate.sqlite3"))?;
+    let (fallback_research, fallback_service) =
+        ResearchService::open_or_initialize_with_provider_onboarding_service(
             &paths,
             catalog.clone(),
             8,
             objects,
+            Arc::new(
+                PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
+                    "market-squawk-test",
+                    directory.path().join("preferred-provider-secrets"),
+                )?,
+            ),
+            provider_rate.clone(),
         )?;
-    let provider_rate =
-        provider_rate_authority(&directory.path().join("portal-provider-rate.sqlite3"))?;
-    let fallback_service = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
-        fallback_catalog,
-        Arc::new(
-            PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
-                "market-squawk-test",
-                directory.path().join("preferred-provider-secrets"),
-            )?,
-        ),
-        provider_rate.clone(),
-    )?);
+    let fallback_service = Arc::new(fallback_service);
     assert_eq!(
         fallback_service.encrypted_file_fallback_status()?,
         EncryptedFileFallbackStatus::Locked
@@ -1390,18 +1391,20 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
     drop(fallback_service);
     drop(fallback_research);
 
-    let (_research, onboarding_catalog) =
-        ResearchService::open_or_initialize_with_provider_onboarding(&paths, catalog, 8, objects)?;
-
     let secrets = Arc::new(EncryptedFileSecretStore::try_open(
         directory.path().join("provider-secrets"),
         SecretValue::new("test vault unlock".to_owned())?,
     )?);
-    let service = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
-        onboarding_catalog,
-        secrets,
-        provider_rate,
-    )?);
+    let (_research, service) =
+        ResearchService::open_or_initialize_with_provider_onboarding_service(
+            &paths,
+            catalog,
+            8,
+            objects,
+            secrets,
+            provider_rate,
+        )?;
+    let service = Arc::new(service);
     let registered = service.register_profile("bls.v2-registered")?;
     let replayed = service.register_profile("bls.v2-registered")?;
     let portal = ProviderOnboardingPortal::start(

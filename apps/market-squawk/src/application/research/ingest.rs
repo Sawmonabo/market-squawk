@@ -2046,6 +2046,7 @@ fn map_research_error(error: ResearchServiceError) -> ServiceError {
         | ResearchServiceError::Catalog(_)
         | ResearchServiceError::Manifest(_)
         | ResearchServiceError::ProviderCaptureStore(_)
+        | ResearchServiceError::ProviderOnboarding(_)
         | ResearchServiceError::Dataset(_) => ServiceError::Unavailable,
     }
 }

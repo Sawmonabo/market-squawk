@@ -7,6 +7,11 @@ use market_squawk_adapter_alpaca::{
     AlpacaCredentials, AlpacaIexDecoder, AlpacaIexLiveConfig, AlpacaIexLiveSource,
     AlpacaOptionsDecoder, AlpacaOptionsLiveConfig, AlpacaOptionsLiveSource,
 };
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+use market_squawk_adapter_alpaca::{
+    AlpacaInstalledFixtureIexConfig, AlpacaInstalledFixtureIexLiveSource,
+    AlpacaScriptedTransportFactory,
+};
 use market_squawk_adapter_coinbase::{CoinbaseExchangeDecoder, CoinbaseExchangeSource};
 use market_squawk_adapter_kraken::{KrakenMarketDecoder, KrakenSource};
 use market_squawk_adapter_tradier::{
@@ -30,6 +35,14 @@ use super::{
 
 const AUTHENTICATED_CONTROL_MESSAGE_CAPACITY: usize = 64;
 const AUTHENTICATED_CONTROL_BYTE_CAPACITY: usize = 64 * 1024;
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+const INSTALLED_FIXTURE_CONTROL_MESSAGE_CAPACITY: usize = 8;
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+const INSTALLED_FIXTURE_CONTROL_BYTE_CAPACITY: usize = 32 * 1024;
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+const INSTALLED_FIXTURE_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+pub(super) const INSTALLED_FIXTURE_SOURCE_KEY: &str = "alpaca-installed-fixture-iex";
 
 /// Closed provider set selectable by the production application.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -334,6 +347,102 @@ impl ProductionSourceProfile {
     }
 }
 
+/// Closed local-only connector profile for the installed AAPL-shaped fixture.
+///
+/// This profile cannot hold credentials, an endpoint, an account, or provider-rate authority. It
+/// is deliberately separate from [`ProductionSourceProfile`] so production composition cannot
+/// select or describe it as a provider connector.
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+#[derive(Debug)]
+pub(super) struct InstalledFixtureSourceProfile {
+    config: AlpacaInstalledFixtureIexConfig,
+    transport: AlpacaScriptedTransportFactory,
+}
+
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+impl InstalledFixtureSourceProfile {
+    pub(super) fn try_new(
+        config: AlpacaInstalledFixtureIexConfig,
+        transport: AlpacaScriptedTransportFactory,
+    ) -> Result<Self, ProductionProviderError> {
+        let metadata = config.metadata();
+        let [instrument] = metadata.coverage().instruments().instruments() else {
+            return Err(ProductionProviderError::InstalledFixtureContractMismatch);
+        };
+        let [rule] = metadata
+            .coverage()
+            .live()
+            .ok_or(ProductionProviderError::InstalledFixtureContractMismatch)?
+            .rules()
+        else {
+            return Err(ProductionProviderError::InstalledFixtureContractMismatch);
+        };
+        if metadata.source_id().as_str() != INSTALLED_FIXTURE_SOURCE_KEY
+            || metadata.budget_policy().is_some()
+            || *instrument != config.aapl_route()
+            || rule.event_class() != market_squawk_domain::LiveEventClass::Quote
+            || metadata.coverage().effective_interval().ends_at()
+                != Some(config.exclusive_expires_at())
+        {
+            return Err(ProductionProviderError::InstalledFixtureContractMismatch);
+        }
+        Ok(Self { config, transport })
+    }
+
+    pub(super) const fn metadata(&self) -> &SourceMetadata {
+        self.config.metadata()
+    }
+
+    pub(super) const fn source_key(&self) -> &'static str {
+        INSTALLED_FIXTURE_SOURCE_KEY
+    }
+
+    pub(super) fn subscription_product_snapshot(
+        &self,
+    ) -> Result<Vec<String>, ProductionProviderError> {
+        let mut products = Vec::new();
+        products
+            .try_reserve_exact(1)
+            .map_err(|_error| ProductionProviderError::AllocationFailed)?;
+        let mut symbol = String::new();
+        symbol
+            .try_reserve_exact(4)
+            .map_err(|_error| ProductionProviderError::AllocationFailed)?;
+        symbol.push_str("AAPL");
+        products.push(symbol);
+        Ok(products)
+    }
+
+    pub(super) const fn subscription_ack_timeout(&self) -> Duration {
+        INSTALLED_FIXTURE_ACKNOWLEDGEMENT_TIMEOUT
+    }
+
+    pub(super) const fn control_message_capacity(&self) -> usize {
+        INSTALLED_FIXTURE_CONTROL_MESSAGE_CAPACITY
+    }
+
+    pub(super) const fn control_byte_capacity(&self) -> usize {
+        INSTALLED_FIXTURE_CONTROL_BYTE_CAPACITY
+    }
+
+    pub(super) fn decoder(&self) -> Result<ProductionMarketDecoder, ProductionProviderError> {
+        self.config
+            .decoder()
+            .map(ProductionMarketDecoder::InstalledFixtureAlpacaIex)
+            .map_err(Into::into)
+    }
+
+    pub(super) fn try_source(
+        &self,
+        generation: LiveSourceGeneration,
+    ) -> Result<ProductionLiveSource, ProductionProviderError> {
+        self.transport
+            .live_source(self.config.clone(), generation)
+            .map(ProductionLiveSource::InstalledFixtureAlpacaIex)
+            .map_err(Into::into)
+    }
+}
+
 fn owned_product_names(
     selected: Vec<market_squawk_domain::SourceIdentifier>,
 ) -> Result<Vec<String>, ProductionProviderError> {
@@ -491,6 +600,8 @@ pub(super) enum ProductionMarketDecoder {
     AlpacaIex(AlpacaIexDecoder),
     AlpacaOptions(AlpacaOptionsDecoder),
     Tradier(TradierMarketDecoder),
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    InstalledFixtureAlpacaIex(AlpacaIexDecoder),
 }
 
 impl SourceMetadataProvider for ProductionMarketDecoder {
@@ -501,6 +612,8 @@ impl SourceMetadataProvider for ProductionMarketDecoder {
             Self::AlpacaIex(decoder) => decoder.metadata(),
             Self::AlpacaOptions(decoder) => decoder.metadata(),
             Self::Tradier(decoder) => decoder.metadata(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixtureAlpacaIex(decoder) => decoder.metadata(),
         }
     }
 }
@@ -516,6 +629,8 @@ impl MarketDecoder for ProductionMarketDecoder {
             Self::AlpacaIex(decoder) => decoder.decode(frame),
             Self::AlpacaOptions(decoder) => decoder.decode(frame),
             Self::Tradier(decoder) => decoder.decode(frame),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixtureAlpacaIex(decoder) => decoder.decode(frame),
         }
     }
 }
@@ -528,6 +643,8 @@ pub(super) enum ProductionLiveSource {
     AlpacaIex(AlpacaIexLiveSource),
     AlpacaOptions(AlpacaOptionsLiveSource),
     Tradier(TradierStreamingSource),
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    InstalledFixtureAlpacaIex(AlpacaInstalledFixtureIexLiveSource),
 }
 
 impl ProductionLiveSource {
@@ -542,6 +659,8 @@ impl ProductionLiveSource {
             Self::AlpacaIex(source) => source.run(sink, cancellation),
             Self::AlpacaOptions(source) => source.run(sink, cancellation),
             Self::Tradier(source) => source.run(sink, cancellation),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixtureAlpacaIex(source) => source.run(sink, cancellation),
         }
     }
 }
@@ -565,6 +684,9 @@ pub enum ProductionProviderError {
     TradierProfileMismatch,
     #[error("production provider startup acknowledgement deadline overflowed")]
     StartupAcknowledgementTimeoutOverflow,
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    #[error("installed Alpaca fixture connector does not match its closed local contract")]
+    InstalledFixtureContractMismatch,
     #[error(transparent)]
     Source(#[from] SourceError),
     #[error("production Kraken decoder could not be constructed")]

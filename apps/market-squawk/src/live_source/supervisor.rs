@@ -26,6 +26,8 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+use super::provider::InstalledFixtureSourceProfile;
 use super::{
     composition::{ProductionCoinbaseProfileError, system_timestamp},
     display_market::{
@@ -81,13 +83,161 @@ impl ProductionGenerationOutcome {
 #[derive(Debug)]
 pub(super) struct ProductionSourceSupervisor {
     config: AppConfig,
-    profile: ProductionSourceProfile,
+    profile: SupervisorSourceProfile,
     registry: Option<AuthoritativeSourceRegistry>,
     registered: RegisteredSource,
-    backoff: ProviderBackoffAuthority,
+    refusal: SupervisorRefusalPolicy,
     paths: LocalPaths,
     capture_process: CaptureProcessInfrastructure,
     output: ProductionSupervisorOutput,
+}
+
+#[derive(Debug)]
+enum SupervisorSourceProfile {
+    Production(ProductionSourceProfile),
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    InstalledFixture(InstalledFixtureSourceProfile),
+}
+
+impl SupervisorSourceProfile {
+    fn metadata(&self) -> &market_squawk_sources::SourceMetadata {
+        match self {
+            Self::Production(profile) => profile.metadata(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(profile) => profile.metadata(),
+        }
+    }
+
+    const fn source_key(&self) -> &'static str {
+        match self {
+            Self::Production(profile) => profile.source_key(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(profile) => profile.source_key(),
+        }
+    }
+
+    fn authority_path(&self, paths: &LocalPaths) -> std::path::PathBuf {
+        let base = paths.root().join("authority").join(self.source_key());
+        match self {
+            Self::Production(_) => base,
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(profile) => base.join(
+                profile
+                    .metadata()
+                    .revision()
+                    .as_source_identifier()
+                    .as_str(),
+            ),
+        }
+    }
+
+    fn subscription_product_snapshot(&self) -> Result<Vec<String>, ProductionProviderError> {
+        match self {
+            Self::Production(profile) => profile.subscription_product_snapshot(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(profile) => profile.subscription_product_snapshot(),
+        }
+    }
+
+    const fn subscription_ack_timeout(&self) -> Duration {
+        match self {
+            Self::Production(profile) => profile.subscription_ack_timeout(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(profile) => profile.subscription_ack_timeout(),
+        }
+    }
+
+    const fn control_message_capacity(&self) -> usize {
+        match self {
+            Self::Production(profile) => profile.control_message_capacity(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(profile) => profile.control_message_capacity(),
+        }
+    }
+
+    const fn control_byte_capacity(&self) -> usize {
+        match self {
+            Self::Production(profile) => profile.control_byte_capacity(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(profile) => profile.control_byte_capacity(),
+        }
+    }
+
+    const fn pre_acknowledgement_data_message_capacity(&self) -> usize {
+        match self {
+            Self::Production(profile) => profile.pre_acknowledgement_data_message_capacity(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => 0,
+        }
+    }
+
+    const fn pre_acknowledgement_data_byte_capacity(&self) -> usize {
+        match self {
+            Self::Production(profile) => profile.pre_acknowledgement_data_byte_capacity(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => 0,
+        }
+    }
+
+    const fn subscription_acknowledgement_policy(
+        &self,
+    ) -> super::subscription_state::SubscriptionAcknowledgementPolicy {
+        match self {
+            Self::Production(profile) => profile.subscription_acknowledgement_policy(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => {
+                super::subscription_state::SubscriptionAcknowledgementPolicy::ExplicitProviderFrame
+            }
+        }
+    }
+
+    fn decoder(&self) -> Result<super::provider::ProductionMarketDecoder, ProductionProviderError> {
+        match self {
+            Self::Production(profile) => profile.decoder(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(profile) => profile.decoder(),
+        }
+    }
+
+    fn try_source(
+        &self,
+        generation: market_squawk_sources::LiveSourceGeneration,
+    ) -> Result<ProductionLiveSource, ProductionProviderError> {
+        match self {
+            Self::Production(profile) => profile.try_source(generation),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(profile) => profile.try_source(generation),
+        }
+    }
+
+    const fn supports_display_output(&self) -> bool {
+        match self {
+            Self::Production(profile) => profile.supports_display_output(),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            Self::InstalledFixture(_) => true,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SupervisorRefusalPolicy {
+    Provider(ProviderBackoffAuthority),
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    InstalledFixtureNoRetry,
+}
+
+/// Decoder-validated exact-AAPL subscription and first-quote readiness for one fixture generation.
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct InstalledFixtureSourceReadiness {
+    generation: ConnectionGeneration,
+}
+
+#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+impl InstalledFixtureSourceReadiness {
+    pub(super) const fn generation(self) -> ConnectionGeneration {
+        self.generation
+    }
 }
 
 #[derive(Debug)]
@@ -162,11 +312,11 @@ impl ProductionSourceSupervisor {
         };
         Self::try_new_with_output(
             config,
-            profile,
+            SupervisorSourceProfile::Production(profile),
             paths,
             capture_process,
             output,
-            provider_rate,
+            Some(provider_rate),
         )
     }
 
@@ -204,30 +354,64 @@ impl ProductionSourceSupervisor {
         };
         Self::try_new_with_output(
             config,
-            profile,
+            SupervisorSourceProfile::Production(profile),
             paths,
             capture_process,
             output,
-            provider_rate,
+            Some(provider_rate),
+        )
+    }
+
+    /// Constructs the single local installed-fixture generation without provider budget or
+    /// provider backoff authority.
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the local fixture keeps every bounded capture/display dependency explicit"
+    )]
+    pub(super) fn try_new_installed_fixture_display(
+        config: &AppConfig,
+        profile: InstalledFixtureSourceProfile,
+        paths: LocalPaths,
+        capture_process: CaptureProcessInfrastructure,
+        directory: DisplayMarketDirectory,
+        route: DisplayMarketRouteIdentity,
+        actor_limits: DisplayMarketActorLimits,
+        read_admission: super::display_market::DisplayMarketReadAdmission,
+    ) -> Result<Self, ProductionSupervisorError> {
+        let output = ProductionSupervisorOutput::Display {
+            directory,
+            routes: vec![route],
+            actor_limits,
+            read_admission,
+        };
+        Self::try_new_with_output(
+            config,
+            SupervisorSourceProfile::InstalledFixture(profile),
+            paths,
+            capture_process,
+            output,
+            None,
         )
     }
 
     fn try_new_with_output(
         config: &AppConfig,
-        profile: ProductionSourceProfile,
+        profile: SupervisorSourceProfile,
         paths: LocalPaths,
         capture_process: CaptureProcessInfrastructure,
         output: ProductionSupervisorOutput,
-        provider_rate: ProviderRateAuthority,
+        provider_rate: Option<ProviderRateAuthority>,
     ) -> Result<Self, ProductionSupervisorError> {
         let registered_at = system_timestamp()?;
-        let authority_store = LocalAuthorityStateStore::try_open(
-            paths.root().join("authority").join(profile.source_key()),
-        )?;
-        let mut registry = AuthoritativeSourceRegistry::try_new_durable_with_provider_rate(
-            authority_store,
-            provider_rate,
-        )?;
+        let authority_store = LocalAuthorityStateStore::try_open(profile.authority_path(&paths))?;
+        let mut registry = match provider_rate {
+            Some(provider_rate) => AuthoritativeSourceRegistry::try_new_durable_with_provider_rate(
+                authority_store,
+                provider_rate,
+            )?,
+            None => AuthoritativeSourceRegistry::try_new_durable(authority_store)?,
+        };
         let registered = match registry
             .register_or_resume_exact(profile.metadata().clone(), registered_at)
         {
@@ -241,13 +425,21 @@ impl ProductionSourceSupervisor {
                 };
             }
         };
-        let backoff = registry.provider_backoff_authority(&registered)?;
+        let refusal = match &profile {
+            SupervisorSourceProfile::Production(_) => {
+                SupervisorRefusalPolicy::Provider(registry.provider_backoff_authority(&registered)?)
+            }
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            SupervisorSourceProfile::InstalledFixture(_) => {
+                SupervisorRefusalPolicy::InstalledFixtureNoRetry
+            }
+        };
         Ok(Self {
             config: config.clone(),
             profile,
             registry: Some(registry),
             registered,
-            backoff,
+            refusal,
             paths,
             capture_process,
             output,
@@ -258,6 +450,7 @@ impl ProductionSourceSupervisor {
         &mut self,
         cancellation: CancellationToken,
         startup: &mut Option<oneshot::Sender<()>>,
+        generation_startup: &mut Option<oneshot::Sender<ConnectionGeneration>>,
     ) -> Result<ProductionGenerationOutcome, ProductionSupervisorError> {
         let at = system_timestamp()?;
         let session_id = SessionId::new(SourceIdentifier::try_from(format!(
@@ -283,6 +476,11 @@ impl ProductionSourceSupervisor {
             .ok_or(ProductionSupervisorError::AlreadyShutdown)?;
         let session = registry.begin_next_session(&self.registered, session_id, at)?;
         let generation = session.generation();
+        if let Some(observer) = generation_startup.take() {
+            observer
+                .send(generation)
+                .map_err(|_value| ProductionSupervisorError::InstalledFixtureObserverDropped)?;
+        }
         let startup_required = startup.is_some();
         let route_cancellation = cancellation.child_token();
         let mut capture_control = None;
@@ -551,8 +749,107 @@ impl ProductionSourceSupervisor {
         cancellation: CancellationToken,
         startup: oneshot::Sender<()>,
     ) -> Result<(), ProductionSupervisorError> {
+        #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+        if !matches!(self.refusal, SupervisorRefusalPolicy::Provider(_)) {
+            return Err(ProductionSupervisorError::InstalledFixtureEntryPointRequired);
+        }
         let mut startup = Some(startup);
         let run = self.run_loop(&cancellation, &mut startup).await;
+        let shutdown = self.shutdown();
+        match (run, shutdown) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(source), Ok(())) => Err(source),
+            (Ok(()), Err(shutdown)) => Err(shutdown),
+            (Err(source), Err(shutdown)) => Err(ProductionSupervisorError::RunShutdown {
+                source: Box::new(source),
+                shutdown: Box::new(shutdown),
+            }),
+        }
+    }
+
+    /// Runs exactly one local installed-fixture generation and never enters provider backoff.
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    pub(super) async fn run_installed_fixture(
+        mut self,
+        cancellation: CancellationToken,
+        startup: oneshot::Sender<InstalledFixtureSourceReadiness>,
+    ) -> Result<(), ProductionSupervisorError> {
+        if !matches!(
+            self.refusal,
+            SupervisorRefusalPolicy::InstalledFixtureNoRetry
+        ) {
+            return Err(ProductionSupervisorError::InstalledFixtureEntryPointRequired);
+        }
+        let generation_result = {
+            let generation_cancellation = cancellation.child_token();
+            let (data_ready_sender, data_ready_receiver) = oneshot::channel();
+            let (generation_sender, generation_receiver) = oneshot::channel();
+            let mut data_ready_sender = Some(data_ready_sender);
+            let mut generation_sender = Some(generation_sender);
+            let generation_run = self.run_one_generation(
+                generation_cancellation.clone(),
+                &mut data_ready_sender,
+                &mut generation_sender,
+            );
+            tokio::pin!(generation_run);
+            let readiness = async move {
+                let generation = generation_receiver.await.map_err(|_closed| {
+                    ProductionSupervisorError::InstalledFixtureObserverDropped
+                })?;
+                data_ready_receiver.await.map_err(|_closed| {
+                    ProductionSupervisorError::InstalledFixtureObserverDropped
+                })?;
+                Ok::<_, ProductionSupervisorError>(InstalledFixtureSourceReadiness { generation })
+            };
+            tokio::pin!(readiness);
+
+            let (completed, observer_failure) = tokio::select! {
+                biased;
+                ready = &mut readiness => match ready {
+                    Ok(ready) => {
+                        if startup.send(ready).is_ok() {
+                            (None, None)
+                        } else {
+                            (
+                                None,
+                                Some(ProductionSupervisorError::InstalledFixtureObserverDropped),
+                            )
+                        }
+                    }
+                    Err(error) => (None, Some(error)),
+                },
+                completed = generation_run.as_mut() => (Some(completed), None),
+            };
+            match (completed, observer_failure) {
+                (Some(result), None) => result,
+                (None, Some(error)) => {
+                    generation_cancellation.cancel();
+                    let _cleanup = generation_run.as_mut().await;
+                    Err(error)
+                }
+                (None, None) => generation_run.as_mut().await,
+                (Some(_), Some(_)) => {
+                    Err(ProductionSupervisorError::InstalledFixtureObserverDropped)
+                }
+            }
+        };
+        let run = generation_result.and_then(|outcome| {
+            if outcome.failed_before_startup_readiness() {
+                return match outcome.source_error() {
+                    Some(SourceError::Cancelled) if cancellation.is_cancelled() => Ok(()),
+                    Some(source) => Err(ProductionSupervisorError::SourceFailedBeforeReadiness(
+                        source,
+                    )),
+                    None => Err(ProductionSupervisorError::SourceCompletedBeforeReadiness),
+                };
+            }
+            match outcome.source_error() {
+                Some(SourceError::Cancelled) if cancellation.is_cancelled() => Ok(()),
+                Some(SourceError::SessionNotCurrent) => Ok(()),
+                Some(source) => Err(ProductionSupervisorError::InstalledFixtureRefused(source)),
+                None => Err(ProductionSupervisorError::InstalledFixtureCompleted),
+            }
+        });
         let shutdown = self.shutdown();
         match (run, shutdown) {
             (Ok(()), Ok(())) => Ok(()),
@@ -575,7 +872,7 @@ impl ProductionSourceSupervisor {
                 return Ok(());
             }
             let outcome = self
-                .run_one_generation(cancellation.child_token(), startup)
+                .run_one_generation(cancellation.child_token(), startup, &mut None)
                 .await?;
             if outcome.failed_before_startup_readiness() {
                 return match outcome.source_error() {
@@ -626,7 +923,7 @@ impl ProductionSourceSupervisor {
         cancellation: &CancellationToken,
     ) -> Result<(), ProductionSupervisorError> {
         let decision = self
-            .backoff
+            .provider_backoff()?
             .apply_refusal(BACKOFF_JITTER_SAMPLE_BASIS_POINTS)?;
         match decision {
             ProviderBackoffDecision::WaitUntil(deadline) => {
@@ -643,7 +940,7 @@ impl ProductionSourceSupervisor {
         cancellation: &CancellationToken,
         deadline: market_squawk_sources::MonotonicInstant,
     ) -> Result<(), ProductionSupervisorError> {
-        let wait = self.backoff.remaining_wait(deadline)?;
+        let wait = self.provider_backoff()?.remaining_wait(deadline)?;
         tokio::select! {
             biased;
             () = cancellation.cancelled() => Ok(()),
@@ -656,7 +953,18 @@ impl ProductionSourceSupervisor {
         &mut self,
         cancellation: CancellationToken,
     ) -> Result<ProductionGenerationOutcome, ProductionSupervisorError> {
-        self.run_one_generation(cancellation, &mut None).await
+        self.run_one_generation(cancellation, &mut None, &mut None)
+            .await
+    }
+
+    fn provider_backoff(&self) -> Result<&ProviderBackoffAuthority, ProductionSupervisorError> {
+        match &self.refusal {
+            SupervisorRefusalPolicy::Provider(backoff) => Ok(backoff),
+            #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+            SupervisorRefusalPolicy::InstalledFixtureNoRetry => {
+                Err(ProductionSupervisorError::InstalledFixtureRetryForbidden)
+            }
+        }
     }
 
     pub(super) fn shutdown(mut self) -> Result<(), ProductionSupervisorError> {
@@ -829,6 +1137,21 @@ pub enum ProductionSupervisorError {
     TerminalSource(SourceError),
     #[error("production provider budget is unavailable: {0:?}")]
     BudgetUnavailable(BudgetUnavailableReason),
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    #[error("installed fixture must use its closed one-generation supervisor entry point")]
+    InstalledFixtureEntryPointRequired,
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    #[error("installed fixture retry was refused by the local no-budget policy")]
+    InstalledFixtureRetryForbidden,
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    #[error("installed fixture source failed under the local no-retry policy: {0}")]
+    InstalledFixtureRefused(SourceError),
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    #[error("installed fixture source completed before cancellation or exclusive expiry")]
+    InstalledFixtureCompleted,
+    #[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
+    #[error("installed fixture startup observer was dropped")]
+    InstalledFixtureObserverDropped,
     #[error(transparent)]
     ProviderBackoff(#[from] ProviderBackoffError),
     #[error(transparent)]

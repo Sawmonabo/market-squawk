@@ -4973,6 +4973,7 @@ dependencies = [
  "datafusion",
  "futures-util",
  "libc",
+ "market-squawk-adapter-alpaca",
  "market-squawk-domain",
  "market-squawk-platform",
  "market-squawk-sources",

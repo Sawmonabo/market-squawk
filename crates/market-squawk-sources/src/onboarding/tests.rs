@@ -874,7 +874,7 @@ fn alpaca_doctor_receipt_closes_contract_graph_and_same_generation_renewal() -> 
     ));
     assert_eq!(
         initial_receipt.doctor_revision().as_str(),
-        "market-squawk.alpaca-paper-iex-doctor-implementation.v1"
+        "market-squawk.alpaca-paper-iex-doctor-implementation.v2"
     );
     let mut expected_contract = Sha256::new();
     expected_contract.update(b"market-squawk/alpaca-paper-iex-doctor-contract/v1\0");

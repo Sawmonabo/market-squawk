@@ -706,11 +706,10 @@ impl AnalyticalDataService {
         Ok(Self::from_active_parts(authority, manifests, objects))
     }
 
-    /// Initializes one analytical service and transfers its sole provider-onboarding capability
-    /// to the installed composition.
+    /// Initializes one analytical service with a restricted provider-onboarding facade.
     ///
-    /// The returned capability is non-cloneable and no getter can recreate it from the service.
-    /// Ordinary [`Self::initialize`] therefore cannot mint provider-onboarding append authority.
+    /// Generic transitions cannot carry runtime evidence. Non-Alpaca digest evidence and typed
+    /// Alpaca provider observations are admitted only through their dedicated safe methods.
     pub fn initialize_with_provider_onboarding(
         authority: CatalogAuthority,
         manifests: AnalyticalManifestCatalog,
@@ -770,11 +769,10 @@ impl AnalyticalDataService {
         Ok(Self::from_active_parts(authority, manifests, objects))
     }
 
-    /// Opens one analytical service and transfers its sole provider-onboarding capability to the
-    /// installed composition.
+    /// Opens one analytical service with a restricted provider-onboarding facade.
     ///
-    /// The returned capability is non-cloneable and no getter can recreate it from the service.
-    /// Ordinary [`Self::open`] therefore cannot mint provider-onboarding append authority.
+    /// Generic transitions cannot carry runtime evidence. Non-Alpaca digest evidence and typed
+    /// Alpaca provider observations are admitted only through their dedicated safe methods.
     pub fn open_with_provider_onboarding(
         authority: CatalogAuthority,
         manifests: AnalyticalManifestCatalog,
