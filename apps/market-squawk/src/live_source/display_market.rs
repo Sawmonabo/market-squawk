@@ -12,7 +12,10 @@ pub(crate) mod runtime;
 use std::{
     mem::size_of,
     num::{NonZeroU32, NonZeroUsize},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Instant,
 };
 
@@ -41,6 +44,47 @@ pub(crate) const MAX_DISPLAY_MARKET_ROUTES: usize = 8_192;
 pub(crate) const MAX_DISPLAY_MARKET_INGRESS_COMMANDS: usize = 4_096;
 /// Code-owned ceiling for queued or outstanding snapshot reads per route.
 pub(crate) const MAX_DISPLAY_MARKET_OUTSTANDING_READS: usize = 1_024;
+
+/// Read-admission gate for a staged account-runtime generation.
+///
+/// Startup admits once. Expiry, revocation, or shutdown may close the generation permanently;
+/// the owning runtime must be replaced before reads can resume.
+#[derive(Clone, Debug)]
+pub(crate) struct DisplayMarketReadAdmission(Arc<AtomicU8>);
+
+impl DisplayMarketReadAdmission {
+    const CLOSED: u8 = 0;
+    const ADMITTED: u8 = 1;
+    const REVOKED: u8 = 2;
+
+    pub(crate) fn closed() -> Self {
+        Self(Arc::new(AtomicU8::new(Self::CLOSED)))
+    }
+
+    pub(crate) fn open() -> Self {
+        Self(Arc::new(AtomicU8::new(Self::ADMITTED)))
+    }
+
+    pub(crate) fn admit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::CLOSED,
+                Self::ADMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+            || self.is_admitted()
+    }
+
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::ADMITTED
+    }
+
+    pub(crate) fn revoke(&self) {
+        self.0.store(Self::REVOKED, Ordering::Release);
+    }
+}
 
 /// Exact identity of one display-only source generation.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1078,6 +1122,7 @@ impl DisplayMarketDirectory {
         &self,
         key: DisplayMarketKey,
         limits: DisplayMarketActorLimits,
+        read_admission: DisplayMarketReadAdmission,
         cancellation: &CancellationToken,
         deadline: Instant,
     ) -> Result<DisplayMarketRegistration, DisplayMarketDirectoryError> {
@@ -1145,6 +1190,7 @@ impl DisplayMarketDirectory {
                 cancellation: actor_cancellation.clone(),
                 worker: Some(worker),
                 unregistering: false,
+                read_admission,
             },
         );
         drop(entries);
@@ -1186,7 +1232,9 @@ impl DisplayMarketDirectory {
         };
         let match_count = entries
             .iter()
-            .filter(|entry| entry.key.instrument_id() == instrument_id)
+            .filter(|entry| {
+                entry.read_admission.is_admitted() && entry.key.instrument_id() == instrument_id
+            })
             .count();
         if match_count > maximum_sources.get() {
             return Err(DisplayMarketReadError::SourceLimit {
@@ -1198,10 +1246,9 @@ impl DisplayMarketDirectory {
         clients
             .try_reserve_exact(match_count)
             .map_err(|_error| DisplayMarketReadError::Allocation)?;
-        for entry in entries
-            .iter()
-            .filter(|entry| entry.key.instrument_id() == instrument_id)
-        {
+        for entry in entries.iter().filter(|entry| {
+            entry.read_admission.is_admitted() && entry.key.instrument_id() == instrument_id
+        }) {
             if entry.unregistering {
                 return Err(DisplayMarketReadError::Unregistering);
             }
@@ -1347,6 +1394,7 @@ struct ActorEntry {
     cancellation: CancellationToken,
     worker: Option<JoinHandle<()>>,
     unregistering: bool,
+    read_admission: DisplayMarketReadAdmission,
 }
 
 impl Drop for ActorEntry {

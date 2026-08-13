@@ -13,7 +13,7 @@ use market_squawk_sources::{
     OnboardingState, OperationAdmission, ProfileEvidence, ProfileReleaseState,
     ProviderBudgetPolicy, ProviderCapabilityRevision, ProviderOnboardingProfile,
     ProviderPublicConfiguration, RatePolicyDescriptor, RemoteRevocationOutcome, Requirement,
-    RightsAdmissionState, SetupMode, ZeroFeeStatus,
+    RightsAdmissionState, RuntimeVerificationEvidence, SetupMode, ZeroFeeStatus,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
@@ -497,7 +497,7 @@ pub struct ProviderActivationLease {
     public_configuration: ProviderPublicConfiguration,
     account_digest: Option<EvidenceDigest>,
     verification_evidence_digest: Option<EvidenceDigest>,
-    runtime_evidence_digest: EvidenceDigest,
+    runtime_verification_evidence: RuntimeVerificationEvidence,
     provider_budget_policy: Option<ProviderBudgetPolicy>,
     generation: Option<SecretGeneration>,
     secret_reference: Option<SecretRef>,
@@ -520,7 +520,7 @@ impl ProviderActivationLease {
             public_configuration: input.public_configuration,
             account_digest: input.account_digest,
             verification_evidence_digest: input.verification_evidence_digest,
-            runtime_evidence_digest: input.runtime_evidence_digest,
+            runtime_verification_evidence: input.runtime_verification_evidence,
             provider_budget_policy: input.provider_budget_policy,
             generation: input.generation,
             secret_reference: input.secret_reference,
@@ -528,6 +528,27 @@ impl ProviderActivationLease {
             authority_effective_at: input.authority_effective_at,
             issued_at: input.issued_at,
         }
+    }
+
+    /// Returns whether both leases represent the same exact activation authority.
+    ///
+    /// The trusted-local `issued_at` timestamp is deliberately excluded because recovery may
+    /// remint the same authority at a later issuance instant.
+    pub(crate) fn same_authority_as(&self, other: &Self) -> bool {
+        self.session_id() == other.session_id()
+            && self.surface_id() == other.surface_id()
+            && self.capability_revision() == other.capability_revision()
+            && self.capability_digest() == other.capability_digest()
+            && self.rights_decision_digest() == other.rights_decision_digest()
+            && self.public_configuration_digest() == other.public_configuration_digest()
+            && self.account_digest() == other.account_digest()
+            && self.verification_evidence_digest() == other.verification_evidence_digest()
+            && self.runtime_verification_evidence() == other.runtime_verification_evidence()
+            && self.provider_budget_policy() == other.provider_budget_policy()
+            && self.generation() == other.generation()
+            && self.secret_reference() == other.secret_reference()
+            && self.verification_expires_at() == other.verification_expires_at()
+            && self.authority_effective_at() == other.authority_effective_at()
     }
 
     /// Returns the durable onboarding session bound into this lease.
@@ -588,8 +609,13 @@ impl ProviderActivationLease {
     }
 
     /// Returns the exact successful provider response or local-verifier evidence.
-    pub const fn runtime_evidence_digest(&self) -> EvidenceDigest {
-        self.runtime_evidence_digest
+    pub fn runtime_evidence_digest(&self) -> EvidenceDigest {
+        self.runtime_verification_evidence.evidence_digest()
+    }
+
+    /// Returns the complete retained runtime-verification evidence.
+    pub const fn runtime_verification_evidence(&self) -> &RuntimeVerificationEvidence {
+        &self.runtime_verification_evidence
     }
 
     /// Returns the exact admitted provider budget policy for this capability revision.
@@ -636,7 +662,10 @@ impl std::fmt::Debug for ProviderActivationLease {
                 "verification_evidence_digest",
                 &self.verification_evidence_digest,
             )
-            .field("runtime_evidence_digest", &self.runtime_evidence_digest)
+            .field(
+                "runtime_evidence_digest",
+                &self.runtime_verification_evidence.evidence_digest(),
+            )
             .field("generation", &self.generation)
             .field("secret_reference", &"[OPAQUE]")
             .field("verification_expires_at", &self.verification_expires_at)
@@ -658,7 +687,7 @@ pub(super) struct ProviderActivationLeaseInput {
     pub public_configuration: ProviderPublicConfiguration,
     pub account_digest: Option<EvidenceDigest>,
     pub verification_evidence_digest: Option<EvidenceDigest>,
-    pub runtime_evidence_digest: EvidenceDigest,
+    pub runtime_verification_evidence: RuntimeVerificationEvidence,
     pub provider_budget_policy: Option<ProviderBudgetPolicy>,
     pub generation: Option<SecretGeneration>,
     pub secret_reference: Option<SecretRef>,
@@ -739,6 +768,16 @@ pub(super) fn session_view(
                 OnboardingNextAction::VerifyAndCutover
             }
             OnboardingState::RuntimeVerificationPending => OnboardingNextAction::VerifyAndActivate,
+            OnboardingState::RenewalRequired
+                if lifecycle
+                    .active_generation()
+                    .and_then(|generation| {
+                        lifecycle.generation_alpaca_paper_iex_doctor_receipt(generation)
+                    })
+                    .is_some() =>
+            {
+                OnboardingNextAction::VerifyAndActivate
+            }
             OnboardingState::RenewalRequired => OnboardingNextAction::RenewCredential,
             OnboardingState::RotationPending if credential_stored => {
                 OnboardingNextAction::VerifyAndCutover

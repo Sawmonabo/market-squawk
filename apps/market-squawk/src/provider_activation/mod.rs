@@ -53,6 +53,7 @@ use market_squawk_sources::{
 };
 use specs::BlsAdapterConfiguration;
 
+pub(crate) use account::ProviderAccountRuntimeCurrentness;
 pub use account::{ProviderAccountActivationError, ProviderAccountBinding, ProviderMarketAccount};
 pub use alpaca::{AlpacaBasicAccountActivation, AlpacaBasicActivationError};
 pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
@@ -137,7 +138,42 @@ pub struct ProviderAdapterActivation {
     board_source_factory: Option<BoardScriptedTransportFactory>,
 }
 
+/// Borrowed onboarding mutation authority for final account-market runtime publication.
+///
+/// Construction is private to [`ProviderAdapterActivation`]. Holding this value preserves the
+/// registry-to-onboarding lock order while exposing only exact prepared-activation commit and
+/// active-lease validation; it cannot access broader onboarding mutation operations.
+pub(crate) struct AccountMarketRuntimeMutationAuthority<'a> {
+    onboarding: ProviderOnboardingMutationAuthority<'a>,
+}
+
+impl AccountMarketRuntimeMutationAuthority<'_> {
+    pub(crate) fn commit_prepared_activation(
+        &self,
+        prepared: &ProviderActivationLease,
+    ) -> Result<ProviderActivationLease, ProviderAdapterActivationError> {
+        self.onboarding
+            .commit_prepared_activation(prepared)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn require_active(
+        &self,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderAdapterActivationError> {
+        self.onboarding.require_active(expected).map_err(Into::into)
+    }
+}
+
 impl ProviderAdapterActivation {
+    pub(crate) async fn acquire_account_market_runtime_mutation_authority(
+        &self,
+    ) -> AccountMarketRuntimeMutationAuthority<'_> {
+        AccountMarketRuntimeMutationAuthority {
+            onboarding: self.onboarding.acquire_runtime_mutation_authority().await,
+        }
+    }
+
     /// Binds the sole onboarding authority, research coordinator, and validated live configuration.
     #[must_use]
     pub(crate) fn new(

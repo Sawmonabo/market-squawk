@@ -45,11 +45,12 @@ mod results;
 mod runtime;
 
 pub use lifecycle::{
-    SourceAuthorizationState, SourceAvailabilityState, SourceLifecycleAction,
+    SourceAuthorizationState, SourceAvailabilityState, SourceDoctorEvidence, SourceLifecycleAction,
     SourceLifecycleAuthority, SourceLifecycleBlocker, SourceLifecycleCommand,
     SourceLifecycleCommandInput, SourceLifecycleDisposition, SourceLifecycleError,
     SourceLifecycleReceipt, SourceLifecycleReceiptInput, SourceLifecycleState,
     SourceLifecycleStatus, SourceLifecycleStatusInput, SourceRateBudgetState, SourceRightsEvidence,
+    SourceStartEligibility,
 };
 pub use runtime::{
     SourceRuntimeRequest, SourceRuntimeSnapshot, SourceRuntimeSnapshotBatch,
@@ -1400,6 +1401,9 @@ fn source_lifecycle_value(receipt: &SourceLifecycleReceipt) -> Result<Value, Ser
             .public_configuration_digest
             .map(sha256_value)
             .transpose()?,
+        "configurationSessionId": fields.configuration_session_id.map(|value| value.to_string()),
+        "doctor": fields.doctor.as_ref().map(source_doctor_value).transpose()?,
+        "startEligibility": start_eligibility_name(fields.start_eligibility),
         "observedAt": timestamp_value(fields.observed_at),
     }))
 }
@@ -1417,9 +1421,315 @@ fn source_lifecycle_status_value(status: &SourceLifecycleStatus) -> Result<Value
             .public_configuration_digest
             .map(sha256_value)
             .transpose()?,
+        "doctor": fields.doctor.as_ref().map(source_doctor_value).transpose()?,
+        "startEligibility": start_eligibility_name(fields.start_eligibility),
         "blocker": fields.blocker.map(blocker_name),
         "observedAt": timestamp_value(fields.observed_at),
     }))
+}
+
+fn source_doctor_value(evidence: &SourceDoctorEvidence) -> Result<Value, ServiceError> {
+    let receipt = evidence.receipt();
+    let input = receipt.input();
+    let additional_capabilities = input
+        .additional_capabilities
+        .iter()
+        .map(|item| -> Result<Value, ServiceError> {
+            Ok(json!({
+                "capability": to_json(&item.capability)?,
+                "disposition": doctor_disposition_name(item.disposition),
+                "evidenceSha256": sha256_value(item.disposition_evidence_digest)?,
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "schema": receipt.schema().as_str(),
+        "receiptSha256": sha256_value(receipt.receipt_sha256())?,
+        "surfaceId": receipt.surface_id().as_str(),
+        "onboardingSessionId": receipt.session_identifier().as_str(),
+        "credentialGeneration": receipt.generation().get().to_string(),
+        "realm": "paper",
+        "marketDataPrincipalSha256": sha256_value(receipt.market_data_principal_sha256())?,
+        "principalSemantics": "non_trading_market_data_credential_principal_not_brokerage_account",
+        "capabilityRevision": receipt.capability_revision().get().to_string(),
+        "capabilitySha256": sha256_value(receipt.capability_digest())?,
+        "publicConfigurationSha256": sha256_value(receipt.public_configuration_digest())?,
+        "rightsDecisionSha256": sha256_value(receipt.rights_decision_digest())?,
+        "ratePolicySha256": sha256_value(receipt.rate_policy_digest())?,
+        "doctorRevision": receipt.doctor_revision().as_str(),
+        "doctorContractSha256": sha256_value(receipt.doctor_contract_digest())?,
+        "dataQuality": data_quality_name(input.data_quality),
+        "verifiedAt": timestamp_value(receipt.verified_at()),
+        "exclusiveExpiresAt": timestamp_value(receipt.exclusive_expires_at()),
+        "current": evidence.current(),
+        "capabilities": {
+            "iexLatestQuote": doctor_quote_value(&input.quote)?,
+            "iexSnapshotBatch": doctor_batch_value(&input.batch)?,
+            "iexWebSocket": doctor_stream_value(&input.stream)?,
+            "iexHistoricalBars": doctor_history_value(&input.historical)?,
+            "iexUtcCalendar": doctor_calendar_value(&input.calendar)?,
+            "additional": additional_capabilities,
+        },
+    }))
+}
+
+fn doctor_quote_value(
+    probe: &market_squawk_sources::AlpacaDoctorProbeEvidence<
+        market_squawk_sources::AlpacaDoctorQuoteObservation,
+    >,
+) -> Result<Value, ServiceError> {
+    let observation = probe
+        .observation
+        .as_ref()
+        .map(|value| -> Result<Value, ServiceError> {
+            Ok(json!({
+                "http": source_doctor_http_value(&value.http)?,
+                "semanticResultSha256": sha256_value(value.semantic_result_digest)?,
+                "quoteTimestamp": value.quote_timestamp.map(timestamp_value),
+            }))
+        })
+        .transpose()?;
+    Ok(json!({
+        "disposition": doctor_disposition_name(probe.disposition),
+        "evidenceSha256": sha256_value(probe.disposition_evidence_digest)?,
+        "observation": observation,
+    }))
+}
+
+fn doctor_batch_value(
+    probe: &market_squawk_sources::AlpacaDoctorProbeEvidence<
+        market_squawk_sources::AlpacaDoctorBatchObservation,
+    >,
+) -> Result<Value, ServiceError> {
+    let observation = probe
+        .observation
+        .as_ref()
+        .map(|value| -> Result<Value, ServiceError> {
+            Ok(json!({
+                "http": source_doctor_http_value(&value.http)?,
+                "semanticResultSha256": sha256_value(value.semantic_result_digest)?,
+                "requested": value.requested_count,
+                "returned": value.returned_count,
+                "valid": value.effective_cardinality,
+                "missing": value.missing_count,
+                "unexpected": value.unexpected_count,
+                "duplicate": value.duplicate_count,
+                "invalid": value.invalid_count,
+                "requestedSetSha256": sha256_value(value.requested_set_digest)?,
+                "returnedSetSha256": sha256_value(value.returned_set_digest)?,
+                "missingSetSha256": sha256_value(value.missing_set_digest)?,
+                "unexpectedSetSha256": sha256_value(value.unexpected_set_digest)?,
+            }))
+        })
+        .transpose()?;
+    Ok(json!({
+        "disposition": doctor_disposition_name(probe.disposition),
+        "evidenceSha256": sha256_value(probe.disposition_evidence_digest)?,
+        "observation": observation,
+    }))
+}
+
+fn doctor_stream_value(
+    probe: &market_squawk_sources::AlpacaDoctorProbeEvidence<
+        market_squawk_sources::AlpacaDoctorStreamObservation,
+    >,
+) -> Result<Value, ServiceError> {
+    let observation = probe
+        .observation
+        .as_ref()
+        .map(|value| -> Result<Value, ServiceError> {
+            Ok(json!({
+                "endpointContractSha256": sha256_value(value.endpoint_contract_digest)?,
+                "requestSha256": sha256_value(value.request_digest)?,
+                "connectedFrameSha256": sha256_value(value.connected_frame_digest)?,
+                "authenticatedFrameSha256": sha256_value(value.authenticated_frame_digest)?,
+                "subscriptionFrameSha256": sha256_value(value.subscription_frame_digest)?,
+                "semanticResultSha256": sha256_value(value.semantic_result_digest)?,
+                "handshakeStatus": value.handshake_status,
+                "handshakeRate": source_doctor_rate_value(&value.handshake_rate)?,
+                "subscribedTrades": value.subscribed_trade_count,
+                "subscribedQuotes": value.subscribed_quote_count,
+                "framesObserved": value.frames_observed,
+                "bytesObserved": value.bytes_observed,
+                "authenticatedAt": timestamp_value(value.authenticated_at),
+                "subscribedAt": timestamp_value(value.subscribed_at),
+                "closeSent": value.close_sent,
+                "cleanCloseObserved": value.clean_close_observed,
+                "completedAt": timestamp_value(value.completed_at),
+            }))
+        })
+        .transpose()?;
+    Ok(json!({
+        "disposition": doctor_disposition_name(probe.disposition),
+        "evidenceSha256": sha256_value(probe.disposition_evidence_digest)?,
+        "observation": observation,
+    }))
+}
+
+fn doctor_history_value(
+    probe: &market_squawk_sources::AlpacaDoctorProbeEvidence<
+        market_squawk_sources::AlpacaDoctorHistoricalObservation,
+    >,
+) -> Result<Value, ServiceError> {
+    let observation = probe
+        .observation
+        .as_ref()
+        .map(|value| -> Result<Value, ServiceError> {
+            let pages = value
+                .pages
+                .iter()
+                .map(|page| -> Result<Value, ServiceError> {
+                    Ok(json!({
+                        "http": source_doctor_http_value(&page.http)?,
+                        "requestPageTokenSha256": page
+                            .request_page_token_digest
+                            .map(sha256_value)
+                            .transpose()?,
+                        "responsePageTokenSha256": page
+                            .response_page_token_digest
+                            .map(sha256_value)
+                            .transpose()?,
+                    }))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(json!({
+                "endpointContractSha256": sha256_value(value.endpoint_contract_digest)?,
+                "requestSha256": sha256_value(value.request_digest)?,
+                "semanticResultSha256": sha256_value(value.semantic_result_digest)?,
+                "startDate": to_json(&value.start_date)?,
+                "endDate": to_json(&value.end_date)?,
+                "pages": value.page_count,
+                "bars": value.returned_bar_count,
+                "distinctDates": value.distinct_date_count,
+                "firstBarTimestamp": value.first_bar_timestamp.map(timestamp_value),
+                "lastBarTimestamp": value.last_bar_timestamp.map(timestamp_value),
+                "returnedDatesSha256": sha256_value(value.returned_dates_digest)?,
+                "paginationGraphSha256": sha256_value(value.pagination_graph_digest)?,
+                "terminalPagination": value.terminal_page_observed,
+                "pageEvidence": pages,
+            }))
+        })
+        .transpose()?;
+    Ok(json!({
+        "disposition": doctor_disposition_name(probe.disposition),
+        "evidenceSha256": sha256_value(probe.disposition_evidence_digest)?,
+        "observation": observation,
+    }))
+}
+
+fn doctor_calendar_value(
+    probe: &market_squawk_sources::AlpacaDoctorProbeEvidence<
+        market_squawk_sources::AlpacaDoctorCalendarObservation,
+    >,
+) -> Result<Value, ServiceError> {
+    let observation = probe
+        .observation
+        .as_ref()
+        .map(|value| -> Result<Value, ServiceError> {
+            Ok(json!({
+                "http": source_doctor_http_value(&value.http)?,
+                "semanticResultSha256": sha256_value(value.semantic_result_digest)?,
+                "startDate": to_json(&value.start_date)?,
+                "endDate": to_json(&value.end_date)?,
+                "sessions": value.session_count,
+                "historyDates": value.history_date_count,
+                "matchedDates": value.matched_count,
+                "missingHistoryDates": value.missing_history_count,
+                "unexpectedHistoryDates": value.unexpected_history_count,
+                "sessionDatesSha256": sha256_value(value.session_dates_digest)?,
+                "historyDatesSha256": sha256_value(value.history_dates_digest)?,
+                "exactDateReconciliation": value.exact_date_reconciliation,
+            }))
+        })
+        .transpose()?;
+    Ok(json!({
+        "disposition": doctor_disposition_name(probe.disposition),
+        "evidenceSha256": sha256_value(probe.disposition_evidence_digest)?,
+        "observation": observation,
+    }))
+}
+
+fn source_doctor_http_value(
+    http: &market_squawk_sources::AlpacaDoctorHttpEvidence,
+) -> Result<Value, ServiceError> {
+    Ok(json!({
+        "endpointContractSha256": sha256_value(http.endpoint_contract_digest)?,
+        "requestSha256": sha256_value(http.request_digest)?,
+        "status": http.status_code,
+        "bodySha256": sha256_value(http.body_digest)?,
+        "bytes": http.response_bytes,
+        "receivedAt": timestamp_value(http.received_at),
+        "latencyNanos": http.latency_nanos.to_string(),
+        "rate": source_doctor_rate_value(&http.rate)?,
+    }))
+}
+
+fn source_doctor_rate_value(
+    rate: &market_squawk_sources::AlpacaDoctorRateEvidence,
+) -> Result<Value, ServiceError> {
+    use market_squawk_sources::{AlpacaRateLimitField, AlpacaRetryAfterEvidence};
+
+    let observed_unsigned = |field: AlpacaRateLimitField<u32>| match field {
+        AlpacaRateLimitField::Observed(value) => json!({
+            "state": "observed",
+            "value": value,
+        }),
+        AlpacaRateLimitField::Missing => json!({"state": "missing"}),
+    };
+    let reset = match rate.reset_unix_seconds {
+        AlpacaRateLimitField::Observed(value) => json!({
+            "state": "observed",
+            "value": value.to_string(),
+        }),
+        AlpacaRateLimitField::Missing => json!({"state": "missing"}),
+    };
+    let retry_after = match rate.retry_after {
+        AlpacaRateLimitField::Observed(AlpacaRetryAfterEvidence::DelaySeconds(value)) => json!({
+            "state": "observed",
+            "value": {
+                "kind": "delay_seconds",
+                "value": value.to_string(),
+            },
+        }),
+        AlpacaRateLimitField::Observed(AlpacaRetryAfterEvidence::AtUnixSeconds(value)) => json!({
+            "state": "observed",
+            "value": {
+                "kind": "at_unix_seconds",
+                "value": value.to_string(),
+            },
+        }),
+        AlpacaRateLimitField::Missing => json!({"state": "missing"}),
+    };
+    Ok(json!({
+        "limit": observed_unsigned(rate.limit),
+        "remaining": observed_unsigned(rate.remaining),
+        "reset_unix_seconds": reset,
+        "retry_after": retry_after,
+    }))
+}
+
+const fn doctor_disposition_name(
+    disposition: market_squawk_sources::RuntimeCapabilityDisposition,
+) -> &'static str {
+    match disposition {
+        market_squawk_sources::RuntimeCapabilityDisposition::Available => "available",
+        market_squawk_sources::RuntimeCapabilityDisposition::Degraded => "degraded",
+        market_squawk_sources::RuntimeCapabilityDisposition::Unavailable => "unavailable",
+        market_squawk_sources::RuntimeCapabilityDisposition::NotProbed => "not_probed",
+    }
+}
+
+const fn start_eligibility_name(eligibility: SourceStartEligibility) -> &'static str {
+    match eligibility {
+        SourceStartEligibility::Eligible => "eligible",
+        SourceStartEligibility::AlreadyActive => "already_active",
+        SourceStartEligibility::DoctorRequired => "doctor_required",
+        SourceStartEligibility::DoctorExpired => "doctor_expired",
+        SourceStartEligibility::CredentialStale => "credential_stale",
+        SourceStartEligibility::ReconciliationRequired => "reconciliation_required",
+        SourceStartEligibility::ProviderUnavailable => "provider_unavailable",
+        SourceStartEligibility::NotApplicable => "not_applicable",
+    }
 }
 
 fn attach_lifecycle_status(

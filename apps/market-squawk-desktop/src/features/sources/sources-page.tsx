@@ -32,6 +32,7 @@ import {
 } from "@/features/research/research-contracts"
 
 import {
+  type DoctorRateEvidence,
   type LifecycleControl,
   type SourceEvidence,
   type StoredDataEvidence,
@@ -319,6 +320,14 @@ function SourceCard({
               : "No historical setup action is recorded."
           }
         />
+        {source.lifecycle?.startEligibility !== "not_applicable" ? (
+          <EvidencePanel
+            title="Doctor / start gate"
+            icon={ShieldCheck}
+            headline={startEligibilityLabel(source.lifecycle?.startEligibility ?? null)}
+            detail={doctorGateDetail(source)}
+          />
+        ) : null}
         <EvidencePanel
           title="Stored data"
           icon={DatabaseZap}
@@ -341,6 +350,10 @@ function SourceCard({
         />
       </div>
 
+      {source.lifecycle?.doctor ? (
+        <DoctorEvidence evidence={source.lifecycle.doctor} />
+      ) : null}
+
       <dl className="mt-5 grid gap-x-4 gap-y-3 border-t border-border/70 pt-4 sm:grid-cols-2">
         <Fact label="Runtime source" value={source.sourceId ?? "Not reported"} />
         <Fact label="Venue" value={source.venueId ?? "Not reported"} />
@@ -354,6 +367,10 @@ function SourceCard({
         <Fact
           label="Provider dataset"
           value={source.providerDatasetIdentifier ?? "None published"}
+        />
+        <Fact
+          label="Runtime generation SHA-256"
+          value={source.lifecycle?.runtimeGenerationSha256 ?? "Not reported"}
         />
         <Fact
           label="Lifecycle observed"
@@ -414,9 +431,13 @@ function SourceCard({
           <DialogHeader>
             <DialogTitle>{confirming?.label ?? "Change source state"}?</DialogTitle>
             <DialogDescription>
-              This changes the runtime state for {source.name} using lifecycle revision{" "}
-              {source.lifecycle?.stateRevision}. Market Squawk will reject the request if that
-              source state has changed since this evidence was loaded.
+              {confirming?.action === "verify" &&
+              source.id === "alpaca.basic-market-data" &&
+              (source.lifecycle?.state === "active" || source.lifecycle?.state === "blocked")
+                ? "Running or renewing the Paper/IEX doctor stops any retained source runtime, including one currently reported as blocked. Starting it again remains a separate explicit action. "
+                : "This changes the runtime state for this source. "}
+              Market Squawk will use lifecycle revision {source.lifecycle?.stateRevision} and
+              reject the request if that source state has changed since this evidence was loaded.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -436,6 +457,150 @@ function SourceCard({
       </Dialog>
     </article>
   )
+}
+
+function doctorGateDetail(source: SourceEvidence) {
+  const lifecycle = source.lifecycle
+  if (!lifecycle) return "No server-owned start conclusion is available."
+  switch (lifecycle.startEligibility) {
+    case "eligible":
+      return "The exact Paper/IEX receipt is current. Starting remains a separate explicit operation."
+    case "already_active":
+      return "The exact Paper/IEX receipt already owns the active runtime; another Start is not applicable."
+    case "doctor_required":
+      return "Run the code-owned doctor before this stopped configuration can start."
+    case "doctor_expired":
+      return "The retained receipt is historical evidence only; renew the doctor before starting."
+    case "credential_stale":
+      return "Credential generation or immutable configuration no longer matches the retained receipt."
+    case "reconciliation_required":
+      return "Durable lifecycle state must be reconciled before another doctor or start."
+    case "provider_unavailable":
+      return "The doctor retained a bounded unavailable or degraded capability result; it did not admit Start."
+    case "not_applicable":
+      return "This source does not use the Paper/IEX doctor contract."
+  }
+}
+
+function startEligibilityLabel(
+  eligibility: NonNullable<SourceEvidence["lifecycle"]>["startEligibility"] | null,
+) {
+  switch (eligibility) {
+    case "eligible":
+      return "Ready to start"
+    case "already_active":
+      return "Already active"
+    case "doctor_required":
+      return "Doctor required"
+    case "doctor_expired":
+      return "Doctor expired"
+    case "credential_stale":
+      return "Credential stale"
+    case "reconciliation_required":
+      return "Reconciliation required"
+    case "provider_unavailable":
+      return "Provider unavailable"
+    case "not_applicable":
+      return "Not applicable"
+    default:
+      return "Not established"
+  }
+}
+
+function DoctorEvidence({
+  evidence,
+}: {
+  evidence: NonNullable<SourceEvidence["lifecycle"]>["doctor"]
+}) {
+  if (!evidence) return null
+  const capabilities = evidence.capabilities
+  return (
+    <section className="mt-5 rounded-lg border border-border bg-background/35 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            Alpaca Paper / IEX doctor evidence
+          </p>
+          <p className="mt-1 text-sm font-medium">
+            {evidence.current ? "Current receipt" : "Expired retained receipt"}
+          </p>
+        </div>
+        <StateBadge label="Direct unverified" active={false} />
+      </div>
+      <dl className="mt-4 grid gap-x-4 gap-y-3 sm:grid-cols-2">
+        <Fact label="Realm" value="Paper" />
+        <Fact label="Credential generation" value={String(evidence.credentialGeneration)} />
+        <Fact label="Verified" value={dateTime(evidence.verifiedAt)} />
+        <Fact label="Exclusive expiry" value={dateTime(evidence.exclusiveExpiresAt)} />
+        <Fact label="Receipt SHA-256" value={evidence.receiptSha256} />
+        <Fact label="Market-data principal SHA-256" value={evidence.marketDataPrincipalSha256} />
+        <Fact
+          label="Latest AAPL/IEX quote"
+          value={runtimeName(capabilities.iexLatestQuote.disposition)}
+        />
+        <Fact
+          label="IEX snapshot batch"
+          value={`${runtimeName(capabilities.iexSnapshotBatch.disposition)} · ${capabilities.iexSnapshotBatch.valid ?? 0}/${capabilities.iexSnapshotBatch.requested ?? 0} valid · ${capabilities.iexSnapshotBatch.missing ?? 0} missing`}
+        />
+        <Fact
+          label="Snapshot rate evidence"
+          value={doctorRateSummary(capabilities.iexSnapshotBatch.rate)}
+        />
+        <Fact
+          label="IEX WebSocket auth + subscription"
+          value={runtimeName(capabilities.iexWebSocket.disposition)}
+        />
+        <Fact
+          label="WebSocket handshake rate evidence"
+          value={doctorRateSummary(capabilities.iexWebSocket.rate)}
+        />
+        <Fact
+          label="Historical bars"
+          value={`${runtimeName(capabilities.iexHistoricalBars.disposition)} · ${capabilities.iexHistoricalBars.bars ?? 0} bars · terminal ${capabilities.iexHistoricalBars.terminalPagination === true ? "yes" : "no"}`}
+        />
+        <Fact
+          label="IEX / UTC calendar"
+          value={`${runtimeName(capabilities.iexUtcCalendar.disposition)} · ${capabilities.iexUtcCalendar.matchedDates ?? 0}/${capabilities.iexUtcCalendar.sessions ?? 0} dates matched`}
+        />
+        <Fact
+          label="Authority boundary"
+          value="Market-data credential principal only; no brokerage account, positions, orders, execution, or trading authority."
+        />
+      </dl>
+      <details className="mt-4 rounded-md border border-border bg-card/35 p-3">
+        <summary className="cursor-pointer text-[10px] uppercase tracking-wider text-muted-foreground">
+          Exact authority evidence
+        </summary>
+        <dl className="mt-3 grid gap-x-4 gap-y-3 sm:grid-cols-2">
+          <Fact label="Doctor revision" value={evidence.doctorRevision} />
+          <Fact label="Doctor contract SHA-256" value={evidence.doctorContractSha256} />
+          <Fact label="Capability revision" value={evidence.capabilityRevision} />
+          <Fact label="Capability SHA-256" value={evidence.capabilitySha256} />
+          <Fact
+            label="Public configuration SHA-256"
+            value={evidence.publicConfigurationSha256}
+          />
+          <Fact label="Rights decision SHA-256" value={evidence.rightsDecisionSha256} />
+          <Fact label="Rate policy SHA-256" value={evidence.ratePolicySha256} />
+        </dl>
+      </details>
+    </section>
+  )
+}
+
+function doctorRateSummary(rate: DoctorRateEvidence | null): string {
+  if (!rate) return "No response rate evidence retained"
+  const limit = rate.limit.state === "observed" ? String(rate.limit.value) : "missing"
+  const remaining = rate.remaining.state === "observed"
+    ? String(rate.remaining.value)
+    : "missing"
+  const reset = rate.resetUnixSeconds.state === "observed"
+    ? rate.resetUnixSeconds.value
+    : "missing"
+  const retry = rate.retryAfter.state === "observed"
+    ? `${humanize(rate.retryAfter.value.kind)} ${rate.retryAfter.value.value}`
+    : "missing"
+  return `Provider headers: limit ${limit} · remaining ${remaining} · reset ${reset} · retry-after ${retry}`
 }
 
 function storedDataEvidence(dataset: ResearchDataset): StoredDataEvidence {
@@ -464,7 +629,7 @@ function operationalDetail(source: SourceEvidence): string {
     return `Verified live generation ${source.lifecycle.currentGeneration}.`
   }
   if (source.lifecycle.runtimeGenerationSha256) {
-    return "A callable research runtime generation is verified."
+    return "A callable source runtime generation is verified."
   }
   return `Lifecycle revision ${source.lifecycle.stateRevision} is authoritative.`
 }

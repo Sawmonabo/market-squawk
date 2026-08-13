@@ -23,7 +23,7 @@ use crate::{ProviderActivationLease, ProviderOnboardingError};
 use super::ProviderAdapterActivation;
 use super::account::{
     ProviderAccountActivationError, ProviderAccountBinding, ProviderAccountRuntimeAuthority,
-    ProviderMarketAccount,
+    ProviderAccountRuntimeCurrentness, ProviderMarketAccount,
 };
 use super::credentials::{KrakenL3CredentialSigner, ProviderCredentialError, next_kraken_nonce};
 
@@ -33,7 +33,7 @@ const MAX_TOKEN_VALIDITY_SECONDS: u64 = 15 * 60;
 
 /// Non-clone owner of one verified Kraken key and order-level source configuration.
 pub struct KrakenL3AccountActivation {
-    authority: ProviderAccountRuntimeAuthority,
+    authority: Arc<ProviderAccountRuntimeAuthority>,
     signer: KrakenL3CredentialSigner,
     client: reqwest::Client,
     budget: SharedProviderBudget,
@@ -42,13 +42,18 @@ pub struct KrakenL3AccountActivation {
 
 impl KrakenL3AccountActivation {
     /// Returns the immutable onboarding lease retained by this runtime owner.
-    pub const fn lease(&self) -> &ProviderActivationLease {
+    pub fn lease(&self) -> &ProviderActivationLease {
         self.authority.lease()
     }
 
     /// Returns the stable, secret-free provider-account binding.
-    pub const fn account_binding(&self) -> &ProviderAccountBinding {
+    pub fn account_binding(&self) -> &ProviderAccountBinding {
         self.authority.binding()
+    }
+
+    /// Returns a weak-only view for the common account-runtime currentness monitor.
+    pub(crate) fn currentness(&self) -> ProviderAccountRuntimeCurrentness {
+        self.authority.currentness()
     }
 
     /// Moves the exact order-level configuration into central supervision once.
@@ -256,13 +261,13 @@ impl ProviderAdapterActivation {
             ))
             .build()
             .map_err(|_error| KrakenL3ActivationError::Client)?;
-        let authority = ProviderAccountRuntimeAuthority::try_acquire(
+        let authority = Arc::new(ProviderAccountRuntimeAuthority::try_acquire(
             ProviderMarketAccount::KrakenLevel3,
             lease,
             Arc::clone(&self.onboarding),
             &self.app_config,
             self.provider_rate.clone(),
-        )?;
+        )?);
         Ok(KrakenL3AccountActivation {
             authority,
             signer,

@@ -7,9 +7,12 @@ use market_squawk_domain::{
     ConnectionGeneration, CoverageStatus, DataQuality, DigestAlgorithm, EvidenceDigest,
     SourceIdentifier, StreamIntegrityState, Timestamp,
 };
+use market_squawk_sources::AlpacaPaperIexDoctorReceiptV1;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+const ALPACA_BASIC_MARKET_DATA_SURFACE: &str = "alpaca.basic-market-data";
 
 /// Closed source lifecycle action implemented by the sole runtime/onboarding owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,7 +104,8 @@ impl SourceLifecycleCommand {
             SourceLifecycleAction::Start | SourceLifecycleAction::Verify => {
                 input.expected_generation.is_none()
                     && input.expected_runtime_generation_digest.is_none()
-                    && input.public_configuration_digest.is_none()
+                    && (input.onboarding_session_id.is_some()
+                        == input.public_configuration_digest.is_some())
                     && input.reason.is_none()
             }
             SourceLifecycleAction::Reconfigure => {
@@ -322,6 +326,56 @@ pub enum SourceLifecycleBlocker {
     StalePrecondition,
 }
 
+/// Server-owned conclusion for the next account-source start operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceStartEligibility {
+    /// The exact retained doctor receipt is current and can stage one runtime generation.
+    Eligible,
+    /// The exact retained doctor receipt already owns the active runtime generation.
+    AlreadyActive,
+    /// No complete typed doctor receipt is retained for the exact configuration.
+    DoctorRequired,
+    /// The exact retained doctor receipt reached its exclusive expiry.
+    DoctorExpired,
+    /// Credential generation or immutable configuration no longer matches the receipt.
+    CredentialStale,
+    /// Durable state must be reconciled before another runtime can start.
+    ReconciliationRequired,
+    /// Provider or shared rate evidence currently blocks another attempt.
+    ProviderUnavailable,
+    /// This source does not use the typed doctor contract.
+    NotApplicable,
+}
+
+/// Exact secret-free doctor evidence retained by one lifecycle response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceDoctorEvidence {
+    receipt: AlpacaPaperIexDoctorReceiptV1,
+    current: bool,
+}
+
+impl SourceDoctorEvidence {
+    /// Retains a validated receipt and the server's trusted-time currentness conclusion.
+    pub fn try_new(
+        receipt: AlpacaPaperIexDoctorReceiptV1,
+        observed_at: Timestamp,
+    ) -> Result<Self, SourceLifecycleError> {
+        if !valid_sha256(receipt.receipt_sha256()) {
+            return Err(SourceLifecycleError::InvalidResult);
+        }
+        let current = receipt.is_current_at(observed_at);
+        Ok(Self { receipt, current })
+    }
+
+    pub const fn receipt(&self) -> &AlpacaPaperIexDoctorReceiptV1 {
+        &self.receipt
+    }
+
+    pub const fn current(&self) -> bool {
+        self.current
+    }
+}
+
 /// Immutable rights/availability evidence identity carried by a lifecycle receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceRightsEvidence {
@@ -410,6 +464,12 @@ pub struct SourceLifecycleReceiptInput {
     pub blocker: Option<SourceLifecycleBlocker>,
     /// Public configuration digest after start/reconfigure when applicable.
     pub public_configuration_digest: Option<EvidenceDigest>,
+    /// Onboarding session that owns the retained public configuration, when one exists.
+    pub configuration_session_id: Option<Uuid>,
+    /// Exact typed doctor evidence when this surface uses server-owned doctor admission.
+    pub doctor: Option<SourceDoctorEvidence>,
+    /// Server-owned next-start conclusion; clients must not recompute it.
+    pub start_eligibility: SourceStartEligibility,
     /// Trusted observation time of the result.
     pub observed_at: Timestamp,
 }
@@ -473,6 +533,42 @@ impl SourceLifecycleReceipt {
         {
             return Err(SourceLifecycleError::InvalidResult);
         }
+        if input.configuration_session_id.is_some() != input.public_configuration_digest.is_some()
+            || !doctor_binding_is_exact(
+                &input.provider,
+                input.configuration_session_id,
+                input.public_configuration_digest,
+                input.doctor.as_ref(),
+            )
+        {
+            return Err(SourceLifecycleError::InvalidResult);
+        }
+        if matches!(
+            input.start_eligibility,
+            SourceStartEligibility::NotApplicable
+        ) && input.doctor.is_some()
+        {
+            return Err(SourceLifecycleError::InvalidResult);
+        }
+        if !start_eligibility_is_exact(
+            &input.provider,
+            input.state,
+            input.doctor.as_ref(),
+            input.start_eligibility,
+        ) || matches!(
+            input.start_eligibility,
+            SourceStartEligibility::Eligible | SourceStartEligibility::AlreadyActive
+        ) && (input.authorization != SourceAuthorizationState::Admitted
+            || input.rights_evidence.as_ref().is_none_or(|rights| {
+                input.doctor.as_ref().is_none_or(|doctor| {
+                    rights.digest() != doctor.receipt().rights_decision_digest()
+                })
+            }))
+            || input.start_eligibility == SourceStartEligibility::AlreadyActive
+                && input.availability != SourceAvailabilityState::Available
+        {
+            return Err(SourceLifecycleError::InvalidResult);
+        }
         Ok(Self(input))
     }
 
@@ -499,6 +595,10 @@ pub struct SourceLifecycleStatusInput {
     pub runtime_generation_digest: Option<EvidenceDigest>,
     /// Current public configuration identity when retained.
     pub public_configuration_digest: Option<EvidenceDigest>,
+    /// Exact typed doctor evidence when this surface uses server-owned doctor admission.
+    pub doctor: Option<SourceDoctorEvidence>,
+    /// Server-owned next-start conclusion; clients must not recompute it.
+    pub start_eligibility: SourceStartEligibility,
     /// Current fail-closed blocker when one exists.
     pub blocker: Option<SourceLifecycleBlocker>,
     /// Trusted observation time.
@@ -534,12 +634,79 @@ impl SourceLifecycleStatus {
         {
             return Err(SourceLifecycleError::InvalidResult);
         }
+        if input.configuration_session_id.is_some() != input.public_configuration_digest.is_some()
+            || !doctor_binding_is_exact(
+                &input.provider,
+                input.configuration_session_id,
+                input.public_configuration_digest,
+                input.doctor.as_ref(),
+            )
+        {
+            return Err(SourceLifecycleError::InvalidResult);
+        }
+        if matches!(
+            input.start_eligibility,
+            SourceStartEligibility::NotApplicable
+        ) && input.doctor.is_some()
+        {
+            return Err(SourceLifecycleError::InvalidResult);
+        }
+        if !start_eligibility_is_exact(
+            &input.provider,
+            input.state,
+            input.doctor.as_ref(),
+            input.start_eligibility,
+        ) {
+            return Err(SourceLifecycleError::InvalidResult);
+        }
         Ok(Self(input))
     }
 
     /// Returns complete safe fields for integration-owned projection.
     pub const fn fields(&self) -> &SourceLifecycleStatusInput {
         &self.0
+    }
+}
+
+fn doctor_binding_is_exact(
+    provider: &SourceIdentifier,
+    configuration_session_id: Option<Uuid>,
+    public_configuration_digest: Option<EvidenceDigest>,
+    doctor: Option<&SourceDoctorEvidence>,
+) -> bool {
+    let Some(doctor) = doctor else {
+        return true;
+    };
+    let receipt = doctor.receipt();
+    receipt.surface_id() == provider
+        && configuration_session_id.is_some_and(|session_id| {
+            receipt.session_identifier().as_str() == session_id.hyphenated().to_string()
+        })
+        && Some(receipt.public_configuration_digest()) == public_configuration_digest
+}
+
+fn start_eligibility_is_exact(
+    provider: &SourceIdentifier,
+    state: SourceLifecycleState,
+    doctor: Option<&SourceDoctorEvidence>,
+    eligibility: SourceStartEligibility,
+) -> bool {
+    let is_alpaca = provider.as_str() == ALPACA_BASIC_MARKET_DATA_SURFACE;
+    let doctor_admits_start = doctor
+        .is_some_and(|evidence| evidence.current() && evidence.receipt().admits_source_start());
+    match eligibility {
+        SourceStartEligibility::Eligible => {
+            is_alpaca && state == SourceLifecycleState::Stopped && doctor_admits_start
+        }
+        SourceStartEligibility::AlreadyActive => {
+            is_alpaca && state == SourceLifecycleState::Active && doctor_admits_start
+        }
+        SourceStartEligibility::NotApplicable => !is_alpaca && doctor.is_none(),
+        SourceStartEligibility::DoctorRequired
+        | SourceStartEligibility::DoctorExpired
+        | SourceStartEligibility::CredentialStale
+        | SourceStartEligibility::ReconciliationRequired
+        | SourceStartEligibility::ProviderUnavailable => is_alpaca,
     }
 }
 
@@ -561,6 +728,8 @@ impl fmt::Debug for SourceLifecycleStatusInput {
                 &self.public_configuration_digest.is_some(),
             )
             .field("blocker", &self.blocker)
+            .field("doctor", &self.doctor)
+            .field("start_eligibility", &self.start_eligibility)
             .field("observed_at", &self.observed_at)
             .finish()
     }
@@ -594,6 +763,8 @@ impl fmt::Debug for SourceLifecycleReceiptInput {
                 "has_public_configuration_digest",
                 &self.public_configuration_digest.is_some(),
             )
+            .field("doctor", &self.doctor)
+            .field("start_eligibility", &self.start_eligibility)
             .field("observed_at", &self.observed_at)
             .finish()
     }

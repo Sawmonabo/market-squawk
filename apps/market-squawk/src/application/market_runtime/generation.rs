@@ -41,6 +41,11 @@ impl MarketRuntimeGroupGeneration {
         update_text(&mut hasher, request.surface().surface_id())?;
         hasher.update(request.onboarding_session_id().as_bytes());
         update_evidence(&mut hasher, request.expected_public_configuration_digest());
+        update_evidence(
+            &mut hasher,
+            request.expected_runtime_verification_receipt_digest(),
+        );
+        hasher.update(request.expected_credential_generation().get().to_be_bytes());
         let lease = match prepared {
             PreparedMarketProviderConfiguration::AlpacaBasic(value) => value.lease(),
             PreparedMarketProviderConfiguration::Tradier(value) => value.lease(),

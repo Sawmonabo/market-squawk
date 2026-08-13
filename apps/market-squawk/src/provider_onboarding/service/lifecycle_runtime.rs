@@ -161,8 +161,14 @@ impl ProviderOnboardingService {
             && let Some(generation) = resumed.lifecycle().active_generation()
             && let Some(expires_at) = resumed
                 .lifecycle()
-                .generation_verification(generation)
-                .and_then(AuthorityVerification::expires_at)
+                .generation_alpaca_paper_iex_doctor_receipt(generation)
+                .map(|receipt| receipt.exclusive_expires_at())
+                .or_else(|| {
+                    resumed
+                        .lifecycle()
+                        .generation_verification(generation)
+                        .and_then(AuthorityVerification::expires_at)
+                })
             && expires_at <= observed_at
         {
             self.append(

@@ -23,18 +23,19 @@ pub(crate) use kraken::MarketKrakenPriceProjectionLease;
 use std::{
     fmt,
     num::{NonZeroU64, NonZeroUsize},
-    sync::Arc,
-    time::Instant,
+    sync::{Arc, Weak},
+    time::{Duration, Instant},
 };
 
 use market_squawk_domain::{
-    ConnectionGeneration, CoverageStatus, DataQuality, InstrumentId, SourceId, SourceIdentifier,
-    StreamIntegrityState, Timestamp, VenueId,
+    ConnectionGeneration, CoverageStatus, DataQuality, EvidenceDigest, InstrumentId, SourceId,
+    SourceIdentifier, StreamIntegrityState, Timestamp, VenueId,
 };
 use market_squawk_live::{
     LiveActionHookGeneration, LiveActionHookReapReceipt, LiveRuntimeSnapshotLease,
     LiveSnapshotReader, PreparedLiveActionHookGroup, RouteActionHook,
 };
+use market_squawk_platform::SecretGeneration;
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{ProviderRateAuthority, SourceMetadata};
 use tokio::sync::Mutex;
@@ -60,7 +61,7 @@ use crate::{
     paper_bot::{
         local_coinbase_direct_live_market_with_activation, local_live_market_with_provider_rate,
     },
-    provider_activation::ProviderAdapterActivation,
+    provider_activation::{AccountMarketRuntimeMutationAuthority, ProviderAdapterActivation},
 };
 
 pub(crate) const COINBASE_PUBLIC_SURFACE_ID: &str = "coinbase.public-market-data";
@@ -68,6 +69,7 @@ pub(crate) const COINBASE_DIRECT_SURFACE_ID: &str = "coinbase.exchange-direct-ma
 pub(crate) const KRAKEN_PUBLIC_SURFACE_ID: &str = "kraken.spot-public-market-data";
 
 const MAXIMUM_CONCURRENT_MARKET_SURFACES: usize = 16;
+const ACCOUNT_HEALTH_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Exact live evidence returned after one registry-owned source lifecycle operation.
 #[derive(Clone, Debug)]
@@ -213,6 +215,13 @@ pub(crate) struct MarketRuntimeRegistry {
     shutdown: Mutex<Option<Result<(), ServiceError>>>,
     mutation: Mutex<()>,
     entries: Mutex<Vec<MarketRuntimeEntry>>,
+    account_health_drain: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AccountMarketRuntimeHealthSnapshot {
+    surface_id: SourceIdentifier,
+    group_generation: MarketRuntimeGroupGeneration,
 }
 
 impl MarketRuntimeRegistry {
@@ -270,7 +279,28 @@ impl MarketRuntimeRegistry {
             shutdown: Mutex::new(None),
             mutation: Mutex::new(()),
             entries: Mutex::new(entries),
+            account_health_drain: Mutex::new(None),
         }))
+    }
+
+    async fn ensure_account_health_drain_started(
+        self: &Arc<Self>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        let mut drain = bounded_lock(&self.account_health_drain, deadline, cancellation).await?;
+        if let Some(running) = drain.as_ref() {
+            return if running.is_finished() {
+                Err(ServiceError::Unavailable)
+            } else {
+                Ok(())
+            };
+        }
+        *drain = Some(tokio::spawn(run_account_health_drain(
+            Arc::downgrade(self),
+            self.lifecycle.clone(),
+        )));
+        Ok(())
     }
 
     pub(crate) fn active_source_count(&self) -> Result<usize, ServiceError> {
@@ -278,7 +308,10 @@ impl MarketRuntimeRegistry {
             .entries
             .try_lock()
             .map_err(|_busy| ServiceError::Unavailable)?;
-        Ok(entries.iter().filter(|entry| entry.is_healthy()).count())
+        Ok(entries
+            .iter()
+            .filter(|entry| entry.is_published_healthy())
+            .count())
     }
 
     pub(crate) fn is_account_free_source_configured(&self, provider: &SourceIdentifier) -> bool {
@@ -305,11 +338,13 @@ impl MarketRuntimeRegistry {
     /// child reports ready. Optional children are included only when the prepared configuration
     /// explicitly contains them.
     pub(crate) async fn start_account_group(
-        &self,
+        self: &Arc<Self>,
         request: PreparedMarketProviderConfigurationRequest,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<MarketProviderGroupLifecycleEvidence, ServiceError> {
+        self.ensure_account_health_drain_started(deadline, cancellation)
+            .await?;
         let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
         self.start_account_group_owned(request, deadline, cancellation)
             .await
@@ -359,6 +394,11 @@ impl MarketRuntimeRegistry {
             cancellation,
         )
         .await?;
+        let account_lease = group.activation_lease().clone();
+        if let Err(error) = validate_account_lease(request, &account_lease) {
+            let _cleanup = group.shutdown_before(deadline, cancellation).await;
+            return Err(error);
+        }
         let evidence = group.evidence().clone();
         let entry = MarketRuntimeEntry {
             surface_id,
@@ -373,10 +413,21 @@ impl MarketRuntimeRegistry {
             let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
             return Err(error);
         }
+        let publication_authority = match self
+            .account_market_mutation_authority_before(deadline, cancellation)
+            .await
+        {
+            Ok(authority) => authority,
+            Err(error) => {
+                let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
+                return Err(error);
+            }
+        };
         let entries = bounded_lock(&self.entries, deadline, cancellation).await;
         let mut entries = match entries {
             Ok(entries) => entries,
             Err(error) => {
+                drop(publication_authority);
                 let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
                 return Err(error);
             }
@@ -387,10 +438,55 @@ impl MarketRuntimeRegistry {
                 .any(|current| current.surface_id == entry.surface_id)
         {
             drop(entries);
+            drop(publication_authority);
             entry.shutdown(self.config.source_shutdown()).await?;
             return Err(ServiceError::ResourceExhausted);
         }
+        if let Err(error) = ensure_active(&self.accepting, deadline, cancellation) {
+            drop(entries);
+            drop(publication_authority);
+            let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
+            return Err(error);
+        }
+        if !entry.is_healthy() {
+            drop(entries);
+            drop(publication_authority);
+            let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
+            return Err(ServiceError::Unavailable);
+        }
+        let active_lease = if request.surface() == AccountMarketSurface::AlpacaBasic {
+            match publication_authority.commit_prepared_activation(&account_lease) {
+                Ok(active) => active,
+                Err(error) => {
+                    tracing::error!(%error, "account-market activation commit failed");
+                    drop(entries);
+                    drop(publication_authority);
+                    let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
+                    return Err(ServiceError::Unauthorized);
+                }
+            }
+        } else {
+            account_lease
+        };
+        let publication = publication_authority
+            .require_active(&active_lease)
+            .map_err(|error| {
+                tracing::error!(%error, "account-market active-lease validation failed");
+                ServiceError::Unauthorized
+            })
+            .and_then(|()| validate_account_lease(request, &active_lease));
+        if let Err(error) = publication {
+            tracing::error!(%error, "account-market registry publication authority failed");
+            drop(entries);
+            drop(publication_authority);
+            let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
+            return Err(ServiceError::Unauthorized);
+        }
+        // Durable Active and the exact runtime remain serialized by one onboarding mutation
+        // authority until this infallible registry insertion completes.
         entries.push(entry);
+        drop(entries);
+        drop(publication_authority);
         Ok(evidence)
     }
 
@@ -579,6 +675,48 @@ impl MarketRuntimeRegistry {
         ensure_before(deadline, cancellation)?;
         self.verify_account_group_owned(request, deadline, cancellation)
             .await
+    }
+
+    /// Opens the one-way read gate for the exact registry generation after its durable source
+    /// lifecycle record has committed Active.
+    pub(crate) async fn admit_account_group_reads(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        expected_group_generation: MarketRuntimeGroupGeneration,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        let admission_authority = self
+            .account_market_mutation_authority_before(deadline, cancellation)
+            .await?;
+        let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+        let surface_id = try_surface_identifier(request.surface())?;
+        let entry = entries
+            .iter()
+            .find(|entry| entry.surface_id == surface_id)
+            .ok_or(ServiceError::NotFound)?;
+        if entry.onboarding_session_id != Some(request.onboarding_session_id()) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let group = match &entry.runtime {
+            MarketRuntime::Account(group) => group,
+            MarketRuntime::Public(_) | MarketRuntime::CoinbaseDirect(_) => {
+                return Err(ServiceError::InvalidRequest);
+            }
+        };
+        validate_account_evidence(request, group.evidence())?;
+        if group.evidence().group_generation() != expected_group_generation {
+            return Err(ServiceError::InvalidRequest);
+        }
+        validate_account_lease(request, group.activation_lease())?;
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        admission_authority
+            .require_active(group.activation_lease())
+            .map_err(|_error| ServiceError::Unauthorized)?;
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        group.admit_reads()
     }
 
     async fn verify_account_group_owned(
@@ -1077,9 +1215,13 @@ impl MarketRuntimeRegistry {
         Ok(Some(snapshot))
     }
 
-    /// Reads a bounded individual-order sample only from the exact retained source generation.
-    pub(crate) async fn order_level_snapshot(
+    /// Reads a bounded individual-order sample for one exact non-account scalar runtime.
+    ///
+    /// Account-backed order-level groups are deliberately excluded from this raw-key path. Their
+    /// reads require the non-forgeable projection lease returned by [`Self::kraken_price_projection`].
+    pub(crate) async fn scalar_order_level_snapshot(
         &self,
+        surface_id: &SourceIdentifier,
         source_id: &SourceId,
         venue_id: &VenueId,
         instrument_id: InstrumentId,
@@ -1089,30 +1231,86 @@ impl MarketRuntimeRegistry {
         cancellation: &CancellationToken,
     ) -> Result<Option<MarketOrderLevelSnapshot>, ServiceError> {
         ensure_active(&self.accepting, deadline, cancellation)?;
+        {
+            let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+            require_scalar_order_read_authority(&entries, surface_id, source_id)?;
+        }
         let key =
             OrderLevelBookKey::try_from_snapshot(source_id, venue_id, instrument_id, generation)
                 .map_err(map_order_level_key_error)?;
-        let orders = match self
+        let Some(orders) = self
+            .read_order_level_orders(&key, maximum_orders, deadline, cancellation)
+            .await?
+        else {
+            return Ok(None);
+        };
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        {
+            let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+            require_scalar_order_read_authority(&entries, surface_id, source_id)?;
+        }
+        Ok(Some(MarketOrderLevelSnapshot { key, orders }))
+    }
+
+    /// Reads a bounded individual-order sample from one exact admitted Kraken account group.
+    ///
+    /// The projection lease is minted only after the registry validates the group, read gate,
+    /// descriptor, and current actor key. Those same coordinates are revalidated both before and
+    /// after the awaited actor read so a stopped, replaced, or revoked group cannot publish the
+    /// retained result.
+    pub(crate) async fn kraken_order_level_snapshot(
+        &self,
+        projection: &MarketKrakenPriceProjectionLease,
+        maximum_orders: NonZeroUsize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<MarketOrderLevelSnapshot>, ServiceError> {
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        {
+            let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+            require_kraken_order_read_authority(&entries, projection)?;
+        }
+        let key = projection.key().clone();
+        let Some(orders) = self
+            .read_order_level_orders(&key, maximum_orders, deadline, cancellation)
+            .await?
+        else {
+            return Ok(None);
+        };
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        {
+            let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+            require_kraken_order_read_authority(&entries, projection)?;
+        }
+        Ok(Some(MarketOrderLevelSnapshot { key, orders }))
+    }
+
+    async fn read_order_level_orders(
+        &self,
+        key: &OrderLevelBookKey,
+        maximum_orders: NonZeroUsize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<OrderLevelOrdersRead>, ServiceError> {
+        match self
             .order_level
-            .read_orders(&key, maximum_orders, cancellation, deadline)
+            .read_orders(key, maximum_orders, cancellation, deadline)
             .await
         {
-            Ok(orders) => orders,
+            Ok(orders) => Ok(Some(orders)),
             Err(
                 OrderLevelReadError::Unavailable
                 | OrderLevelReadError::NotRegistered
                 | OrderLevelReadError::Unregistering
                 | OrderLevelReadError::WorkerClosed,
-            ) => return Ok(None),
-            Err(OrderLevelReadError::Cancelled) => return Err(ServiceError::Cancelled),
-            Err(OrderLevelReadError::Deadline) => return Err(ServiceError::DeadlineExceeded),
+            ) => Ok(None),
+            Err(OrderLevelReadError::Cancelled) => Err(ServiceError::Cancelled),
+            Err(OrderLevelReadError::Deadline) => Err(ServiceError::DeadlineExceeded),
             Err(error) => {
                 tracing::error!(%error, "bounded order-level market read failed");
-                return Err(ServiceError::Unavailable);
+                Err(ServiceError::Unavailable)
             }
-        };
-        ensure_active(&self.accepting, deadline, cancellation)?;
-        Ok(Some(MarketOrderLevelSnapshot { key, orders }))
+        }
     }
 
     /// Returns immutable snapshot access for one exact active source/session.
@@ -1232,10 +1430,33 @@ impl MarketRuntimeRegistry {
             };
             std::mem::take(&mut *entries)
         };
+        let mut failure = None;
+        self.lifecycle.cancel();
+        let account_health_drain = {
+            let mut drain = bounded_lock(&self.account_health_drain, deadline, &cleanup).await?;
+            drain.take()
+        };
+        if let Some(mut drain) = account_health_drain {
+            let result = tokio::select! {
+                biased;
+                result = &mut drain => result.map_err(|error| {
+                    tracing::error!(%error, "account-market health drain join failed");
+                    ServiceError::Unavailable
+                }),
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    drain.abort();
+                    let _aborted = drain.await;
+                    Err(ServiceError::DeadlineExceeded)
+                }
+            };
+            if let Err(error) = result {
+                tracing::error!(%error, "account-market health drain shutdown failed");
+                failure = Some(error);
+            }
+        }
         for entry in &entries {
             entry.begin_shutdown();
         }
-        let mut failure = None;
         for entry in entries {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1259,8 +1480,6 @@ impl MarketRuntimeRegistry {
         );
         let (display_result, order_level_result, resolver_result) =
             tokio::join!(display_shutdown, order_level_shutdown, resolver_shutdown);
-        self.lifecycle.cancel();
-
         match display_result {
             Ok(report) if report.is_complete() => {}
             Ok(_report) => {
@@ -1409,10 +1628,76 @@ impl MarketRuntimeRegistry {
             .map(|index| entries.swap_remove(index)))
     }
 
-    fn cleanup_deadline(&self) -> Result<Instant, ServiceError> {
+    pub(crate) fn cleanup_deadline(&self) -> Result<Instant, ServiceError> {
         Instant::now()
             .checked_add(self.config.source_shutdown())
             .ok_or(ServiceError::Unavailable)
+    }
+
+    async fn account_market_mutation_authority_before(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<AccountMarketRuntimeMutationAuthority<'_>, ServiceError> {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ServiceError::Cancelled),
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                Err(ServiceError::DeadlineExceeded)
+            }
+            authority = self.provider_activation.acquire_account_market_runtime_mutation_authority() => {
+                Ok(authority)
+            }
+        }
+    }
+
+    async fn first_unhealthy_account_group(&self) -> Option<AccountMarketRuntimeHealthSnapshot> {
+        let entries = self.entries.try_lock().ok()?;
+        entries.iter().find_map(|entry| {
+            if entry.is_healthy() {
+                return None;
+            }
+            let evidence = entry.runtime.account_evidence()?;
+            Some(AccountMarketRuntimeHealthSnapshot {
+                surface_id: entry.surface_id.clone(),
+                group_generation: evidence.group_generation(),
+            })
+        })
+    }
+
+    async fn drain_account_group_generation(
+        &self,
+        snapshot: &AccountMarketRuntimeHealthSnapshot,
+    ) -> Result<(), ServiceError> {
+        let _mutation = tokio::select! {
+            biased;
+            () = self.lifecycle.cancelled() => return Ok(()),
+            mutation = self.mutation.lock() => mutation,
+        };
+        let entry = {
+            let mut entries = tokio::select! {
+                biased;
+                () = self.lifecycle.cancelled() => return Ok(()),
+                entries = self.entries.lock() => entries,
+            };
+            let Some(index) = entries.iter().position(|entry| {
+                matches_unhealthy_account_generation(
+                    &snapshot.surface_id,
+                    snapshot.group_generation.digest(),
+                    &entry.surface_id,
+                    entry
+                        .runtime
+                        .account_evidence()
+                        .map(|evidence| evidence.group_generation().digest()),
+                    entry.is_healthy(),
+                )
+            }) else {
+                return Ok(());
+            };
+            entries[index].begin_shutdown();
+            entries.swap_remove(index)
+        };
+        entry.shutdown(self.config.source_shutdown()).await
     }
 }
 
@@ -1494,6 +1779,14 @@ impl MarketRuntimeEntry {
                 .is_none_or(LiveFairValueExportDrains::is_healthy)
     }
 
+    fn is_published_healthy(&self) -> bool {
+        self.is_healthy()
+            && match &self.runtime {
+                MarketRuntime::Account(group) => group.is_published_healthy(),
+                MarketRuntime::Public(_) | MarketRuntime::CoinbaseDirect(_) => true,
+            }
+    }
+
     fn begin_shutdown(&self) {
         if let Some(exports) = self.exports.as_ref() {
             exports.begin_shutdown();
@@ -1512,7 +1805,7 @@ impl MarketRuntimeEntry {
             .ok_or(ServiceError::Unavailable)?;
         let cleanup = CancellationToken::new();
         self.begin_shutdown();
-        let runtime_result = self.runtime.shutdown().await;
+        let runtime_result = self.runtime.shutdown_before(deadline, &cleanup).await;
         let export_result = match self.exports.take() {
             Some(exports) => exports
                 .finish_before(deadline, &cleanup)
@@ -1696,17 +1989,17 @@ impl MarketRuntime {
         }
     }
 
-    async fn shutdown(self) -> Result<(), ServiceError> {
+    async fn shutdown_before(
+        self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
         match self {
-            Self::Public(runtime) => runtime.shutdown().await.map_err(|error| {
-                tracing::error!(%error, "public market source shutdown failed");
-                ServiceError::Unavailable
-            }),
-            Self::CoinbaseDirect(runtime) => runtime.shutdown().await.map_err(|error| {
-                tracing::error!(%error, "Coinbase Direct market source shutdown failed");
-                ServiceError::Unavailable
-            }),
-            Self::Account(runtime) => runtime.shutdown().await,
+            Self::Public(runtime) => await_before(deadline, cancellation, runtime.shutdown()).await,
+            Self::CoinbaseDirect(runtime) => {
+                await_before(deadline, cancellation, runtime.shutdown()).await
+            }
+            Self::Account(runtime) => runtime.shutdown_before(deadline, cancellation).await,
         }
     }
 }
@@ -1823,23 +2116,102 @@ fn validate_alpaca_historical_entry(
     entry: &MarketRuntimeEntry,
     request: PreparedMarketProviderConfigurationRequest,
 ) -> Result<(), AlpacaHistoricalLookupError> {
-    if entry.onboarding_session_id != Some(request.onboarding_session_id()) {
-        return Err(AlpacaHistoricalLookupError::Stale);
-    }
     let evidence = entry
         .runtime
         .account_evidence()
         .ok_or(AlpacaHistoricalLookupError::Stale)?;
-    if evidence.public_configuration_digest() != request.expected_public_configuration_digest()
-        || evidence.surface_id().as_str() != AccountMarketSurface::AlpacaBasic.surface_id()
-        || evidence.onboarding_session_id() != request.onboarding_session_id()
-    {
-        return Err(AlpacaHistoricalLookupError::Stale);
-    }
+    validate_alpaca_historical_coordinates(
+        request,
+        entry.onboarding_session_id,
+        AccountRuntimeEvidenceCoordinates::from(evidence),
+    )?;
     if !entry.is_healthy() {
         return Err(AlpacaHistoricalLookupError::Inactive);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct AccountRuntimeEvidenceCoordinates<'a> {
+    surface_id: &'a str,
+    onboarding_session_id: uuid::Uuid,
+    public_configuration_digest: EvidenceDigest,
+    runtime_verification_receipt_digest: EvidenceDigest,
+    credential_generation: SecretGeneration,
+}
+
+impl<'a> From<&'a MarketProviderGroupLifecycleEvidence> for AccountRuntimeEvidenceCoordinates<'a> {
+    fn from(evidence: &'a MarketProviderGroupLifecycleEvidence) -> Self {
+        Self {
+            surface_id: evidence.surface_id().as_str(),
+            onboarding_session_id: evidence.onboarding_session_id(),
+            public_configuration_digest: evidence.public_configuration_digest(),
+            runtime_verification_receipt_digest: evidence.runtime_verification_receipt_digest(),
+            credential_generation: evidence.credential_generation(),
+        }
+    }
+}
+
+fn validate_alpaca_historical_coordinates(
+    request: PreparedMarketProviderConfigurationRequest,
+    entry_onboarding_session_id: Option<uuid::Uuid>,
+    actual: AccountRuntimeEvidenceCoordinates<'_>,
+) -> Result<(), AlpacaHistoricalLookupError> {
+    if entry_onboarding_session_id != Some(request.onboarding_session_id())
+        || actual.surface_id != request.surface().surface_id()
+        || actual.onboarding_session_id != request.onboarding_session_id()
+        || actual.public_configuration_digest != request.expected_public_configuration_digest()
+        || actual.runtime_verification_receipt_digest
+            != request.expected_runtime_verification_receipt_digest()
+        || actual.credential_generation != request.expected_credential_generation()
+    {
+        Err(AlpacaHistoricalLookupError::Stale)
+    } else {
+        Ok(())
+    }
+}
+
+fn matches_unhealthy_account_generation(
+    snapshot_surface_id: &SourceIdentifier,
+    snapshot_generation: EvidenceDigest,
+    entry_surface_id: &SourceIdentifier,
+    entry_generation: Option<EvidenceDigest>,
+    entry_is_healthy: bool,
+) -> bool {
+    !entry_is_healthy
+        && entry_surface_id == snapshot_surface_id
+        && entry_generation == Some(snapshot_generation)
+}
+
+async fn run_account_health_drain(
+    registry: Weak<MarketRuntimeRegistry>,
+    lifecycle: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(ACCOUNT_HEALTH_SCAN_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = lifecycle.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+        let Some(registry) = registry.upgrade() else {
+            break;
+        };
+        let Some(snapshot) = registry.first_unhealthy_account_group().await else {
+            continue;
+        };
+        if let Err(error) = registry.drain_account_group_generation(&snapshot).await
+            && !lifecycle.is_cancelled()
+        {
+            tracing::error!(
+                %error,
+                surface = %snapshot.surface_id.as_str(),
+                generation = ?snapshot.group_generation.digest(),
+                "account-market stale generation drain failed"
+            );
+        }
+    }
 }
 
 const fn map_alpaca_historical_capability_error(
@@ -1862,10 +2234,93 @@ fn validate_account_evidence(
     if evidence.public_configuration_digest() != request.expected_public_configuration_digest()
         || evidence.surface_id().as_str() != request.surface().surface_id()
         || evidence.onboarding_session_id() != request.onboarding_session_id()
+        || evidence.runtime_verification_receipt_digest()
+            != request.expected_runtime_verification_receipt_digest()
+        || evidence.credential_generation() != request.expected_credential_generation()
     {
         Err(ServiceError::InvalidRequest)
     } else {
         Ok(())
+    }
+}
+
+fn validate_account_lease(
+    request: PreparedMarketProviderConfigurationRequest,
+    lease: &crate::ProviderActivationLease,
+) -> Result<(), ServiceError> {
+    if lease.surface_id().as_str() != request.surface().surface_id()
+        || lease.session_id() != request.onboarding_session_id()
+        || lease.public_configuration_digest() != request.expected_public_configuration_digest()
+        || lease.runtime_evidence_digest() != request.expected_runtime_verification_receipt_digest()
+        || lease.generation() != Some(request.expected_credential_generation())
+    {
+        Err(ServiceError::InvalidRequest)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_scalar_order_read_authority(
+    entries: &[MarketRuntimeEntry],
+    surface_id: &SourceIdentifier,
+    source_id: &SourceId,
+) -> Result<(), ServiceError> {
+    let mut found = false;
+    for entry in entries {
+        if !entry.is_published_healthy()
+            || !entry.runtime.has_scalar_snapshots()
+            || &entry.surface_id != surface_id
+            || !entry
+                .metadata
+                .iter()
+                .any(|metadata| metadata.source_id() == source_id)
+        {
+            continue;
+        }
+        if found {
+            return Err(ServiceError::Unavailable);
+        }
+        found = true;
+    }
+    if found {
+        Ok(())
+    } else {
+        Err(ServiceError::Unavailable)
+    }
+}
+
+fn require_kraken_order_read_authority(
+    entries: &[MarketRuntimeEntry],
+    projection: &MarketKrakenPriceProjectionLease,
+) -> Result<(), ServiceError> {
+    let mut found = false;
+    for entry in entries {
+        if !entry.is_published_healthy() || &entry.surface_id != projection.surface_id() {
+            continue;
+        }
+        let Some((descriptor, key)) = entry
+            .runtime
+            .kraken_read_authority(projection.key().instrument_id())
+        else {
+            continue;
+        };
+        if !entry
+            .runtime
+            .owns_kraken_descriptor(projection.descriptor())
+            || !Arc::ptr_eq(&descriptor, projection.descriptor())
+            || &key != projection.key()
+        {
+            continue;
+        }
+        if found {
+            return Err(ServiceError::Unavailable);
+        }
+        found = true;
+    }
+    if found {
+        Ok(())
+    } else {
+        Err(ServiceError::Unavailable)
     }
 }
 
@@ -2075,5 +2530,101 @@ impl Drop for StartupCancellation {
         if self.armed {
             self.cancellation.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use market_squawk_domain::DigestAlgorithm;
+
+    #[test]
+    fn historical_lookup_rejects_receipt_and_credential_generation_mismatch() {
+        let session_id = uuid::Uuid::new_v4();
+        let public_configuration_digest = digest(1);
+        let runtime_receipt_digest = digest(2);
+        let credential_generation = SecretGeneration::new(3).expect("nonzero generation");
+        let request = PreparedMarketProviderConfigurationRequest::try_new(
+            AccountMarketSurface::AlpacaBasic,
+            session_id,
+            public_configuration_digest,
+            runtime_receipt_digest,
+            credential_generation,
+        )
+        .expect("exact request");
+        let exact = AccountRuntimeEvidenceCoordinates {
+            surface_id: AccountMarketSurface::AlpacaBasic.surface_id(),
+            onboarding_session_id: session_id,
+            public_configuration_digest,
+            runtime_verification_receipt_digest: runtime_receipt_digest,
+            credential_generation,
+        };
+        assert_eq!(
+            validate_alpaca_historical_coordinates(request, Some(session_id), exact),
+            Ok(())
+        );
+        assert_eq!(
+            validate_alpaca_historical_coordinates(
+                request,
+                Some(session_id),
+                AccountRuntimeEvidenceCoordinates {
+                    runtime_verification_receipt_digest: digest(4),
+                    ..exact
+                },
+            ),
+            Err(AlpacaHistoricalLookupError::Stale)
+        );
+        assert_eq!(
+            validate_alpaca_historical_coordinates(
+                request,
+                Some(session_id),
+                AccountRuntimeEvidenceCoordinates {
+                    credential_generation: SecretGeneration::new(5).expect("nonzero generation"),
+                    ..exact
+                },
+            ),
+            Err(AlpacaHistoricalLookupError::Stale)
+        );
+    }
+
+    #[test]
+    fn health_drain_cas_rejects_healthy_and_successor_coordinates() {
+        let surface = SourceIdentifier::try_from(AccountMarketSurface::AlpacaBasic.surface_id())
+            .expect("fixed surface");
+        let other = SourceIdentifier::try_from(AccountMarketSurface::Tradier.surface_id())
+            .expect("fixed surface");
+        let generation = digest(6);
+        assert!(matches_unhealthy_account_generation(
+            &surface,
+            generation,
+            &surface,
+            Some(generation),
+            false,
+        ));
+        assert!(!matches_unhealthy_account_generation(
+            &surface,
+            generation,
+            &surface,
+            Some(generation),
+            true,
+        ));
+        assert!(!matches_unhealthy_account_generation(
+            &surface,
+            generation,
+            &surface,
+            Some(digest(7)),
+            false,
+        ));
+        assert!(!matches_unhealthy_account_generation(
+            &surface,
+            generation,
+            &other,
+            Some(generation),
+            false,
+        ));
+    }
+
+    const fn digest(byte: u8) -> EvidenceDigest {
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32])
     }
 }

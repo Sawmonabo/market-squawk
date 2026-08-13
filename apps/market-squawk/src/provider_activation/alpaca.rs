@@ -14,7 +14,7 @@ use crate::{ProviderActivationLease, ProviderOnboardingError};
 use super::ProviderAdapterActivation;
 use super::account::{
     ProviderAccountActivationError, ProviderAccountBinding, ProviderAccountRuntimeAuthority,
-    ProviderMarketAccount,
+    ProviderAccountRuntimeCurrentness, ProviderMarketAccount,
 };
 use super::credentials::{AlpacaCredentialEnvelope, ProviderCredentialError};
 
@@ -74,6 +74,15 @@ impl AlpacaBasicAccountActivation {
         self.authority.require_current().await
     }
 
+    pub(crate) async fn require_prepared_or_active(&self) -> Result<(), ProviderOnboardingError> {
+        self.authority.require_prepared_or_active().await
+    }
+
+    /// Returns a weak-only view for the common account-runtime currentness monitor.
+    pub(crate) fn currentness(&self) -> ProviderAccountRuntimeCurrentness {
+        self.authority.currentness()
+    }
+
     /// Delegates currentness checks without cloning or extending the account authority lifetime.
     ///
     /// The returned validator retains only a weak reference to this activation's sole account
@@ -82,15 +91,11 @@ impl AlpacaBasicAccountActivation {
         &self,
     ) -> impl Fn() -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> + Clone + Send + Sync + 'static
     {
-        let authority = Arc::downgrade(&self.authority);
+        let currentness = self.currentness();
         move || {
-            let authority = authority.upgrade();
-            Box::pin(async move {
-                match authority {
-                    Some(authority) => authority.require_current().await.is_ok(),
-                    None => false,
-                }
-            }) as Pin<Box<dyn Future<Output = bool> + Send + 'static>>
+            let currentness = currentness.clone();
+            Box::pin(async move { currentness.is_active().await })
+                as Pin<Box<dyn Future<Output = bool> + Send + 'static>>
         }
     }
 
@@ -101,12 +106,8 @@ impl AlpacaBasicAccountActivation {
     pub(crate) fn historical_currentness_validator_now(
         &self,
     ) -> impl Fn() -> bool + Clone + Send + Sync + 'static {
-        let authority = Arc::downgrade(&self.authority);
-        move || {
-            authority
-                .upgrade()
-                .is_some_and(|authority| authority.require_current_now().is_ok())
-        }
+        let currentness = self.currentness();
+        move || currentness.is_active_now()
     }
 }
 
@@ -160,13 +161,15 @@ impl ProviderAdapterActivation {
         let trading_api_environment = envelope.trading_api_environment();
         let credentials = Arc::new(envelope.into_credentials()?);
         let provider_rate = self.provider_rate.clone();
-        let authority = Arc::new(ProviderAccountRuntimeAuthority::try_acquire(
-            ProviderMarketAccount::AlpacaBasic,
-            lease,
-            Arc::clone(&self.onboarding),
-            &self.app_config,
-            provider_rate.clone(),
-        )?);
+        let authority = Arc::new(
+            ProviderAccountRuntimeAuthority::try_acquire_prepared_or_active(
+                ProviderMarketAccount::AlpacaBasic,
+                lease,
+                Arc::clone(&self.onboarding),
+                &self.app_config,
+                provider_rate.clone(),
+            )?,
+        );
         Ok(AlpacaBasicAccountActivation {
             authority,
             credentials,

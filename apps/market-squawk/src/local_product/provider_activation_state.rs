@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
-use market_squawk_platform::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
+use market_squawk_platform::{
+    LocalAuthorityStateStore, LocalAuthorityStateStoreError, SecretGeneration,
+};
 use market_squawk_sources::{AuthoritativeSourceRegistry, RegistryError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -31,7 +33,7 @@ const QUARANTINE_SCHEMA_VERSION: u16 = 2;
 const QUARANTINE_RECORD_KIND: &str = "provider_activation_quarantine";
 const MAXIMUM_RECIPE_EVIDENCE_OBJECTS: usize = 1_024;
 const ACTIVATION_STATE_DIRECTORY: &str = "sources/provider-activation-v1";
-const SOURCE_LIFECYCLE_SCHEMA_VERSION: u16 = 1;
+const SOURCE_LIFECYCLE_SCHEMA_VERSION: u16 = 2;
 const LEGACY_PROVIDER_METADATA_BACKUP_SCHEMA_VERSION: u16 = 1;
 const PROVIDER_METADATA_BACKUP_SCHEMA_VERSION: u16 = 2;
 const LEGACY_PROVIDER_METADATA_LIFECYCLE_SURFACE_COUNT: usize = 11;
@@ -335,6 +337,8 @@ pub(super) struct DurableSourceLifecycleRecord {
     transition_digest: Option<EvidenceDigest>,
     session_id: Option<Uuid>,
     public_configuration_digest: Option<EvidenceDigest>,
+    runtime_verification_receipt_digest: Option<EvidenceDigest>,
+    credential_generation: Option<SecretGeneration>,
 }
 
 impl DurableSourceLifecycleRecord {
@@ -356,6 +360,14 @@ impl DurableSourceLifecycleRecord {
 
     pub(super) const fn public_configuration_digest(&self) -> Option<EvidenceDigest> {
         self.public_configuration_digest
+    }
+
+    pub(super) const fn runtime_verification_receipt_digest(&self) -> Option<EvidenceDigest> {
+        self.runtime_verification_receipt_digest
+    }
+
+    pub(super) const fn credential_generation(&self) -> Option<SecretGeneration> {
+        self.credential_generation
     }
 }
 
@@ -396,6 +408,8 @@ struct SourceLifecycleWire {
     transition_sha256: Option<String>,
     session_id: Option<Uuid>,
     public_configuration_sha256: Option<String>,
+    runtime_verification_receipt_sha256: Option<String>,
+    credential_generation: Option<u64>,
 }
 
 /// Secret-free evidence for one disabled activation recipe.
@@ -566,6 +580,8 @@ impl DurableProviderActivationState {
                 transition_digest: None,
                 session_id,
                 public_configuration_digest: None,
+                runtime_verification_receipt_digest: None,
+                credential_generation: None,
             });
         };
         decode_source_lifecycle(surface_id, &encoded)
@@ -579,6 +595,8 @@ impl DurableProviderActivationState {
         operation_id: SourceIdentifier,
         command_digest: EvidenceDigest,
         allow_reconciliation: bool,
+        target_session_id: Option<Uuid>,
+        target_public_configuration_digest: Option<EvidenceDigest>,
     ) -> Result<DurableSourceLifecycleTransition, DurableProviderActivationStateError> {
         if command_digest.bytes() == [0; 32] {
             return Err(DurableProviderActivationStateError::InvalidLifecycle);
@@ -626,8 +644,11 @@ impl DurableProviderActivationState {
             operation_id: Some(operation_id),
             command_digest: Some(command_digest),
             transition_digest: Some(transition_digest),
-            session_id: current.session_id,
-            public_configuration_digest: current.public_configuration_digest,
+            session_id: target_session_id.or(current.session_id),
+            public_configuration_digest: target_public_configuration_digest
+                .or(current.public_configuration_digest),
+            runtime_verification_receipt_digest: current.runtime_verification_receipt_digest,
+            credential_generation: current.credential_generation,
         };
         self.store_source_lifecycle(surface_id, &applying)?;
         Ok(DurableSourceLifecycleTransition::Apply(applying))
@@ -641,6 +662,8 @@ impl DurableProviderActivationState {
         phase: DurableSourceLifecyclePhase,
         session_id: Option<Uuid>,
         public_configuration_digest: Option<EvidenceDigest>,
+        runtime_verification_receipt_digest: Option<EvidenceDigest>,
+        credential_generation: Option<SecretGeneration>,
     ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
         if matches!(
             phase,
@@ -659,6 +682,42 @@ impl DurableProviderActivationState {
             phase,
             session_id,
             public_configuration_digest,
+            runtime_verification_receipt_digest,
+            credential_generation,
+            ..current
+        };
+        self.store_source_lifecycle(surface_id, &completed)?;
+        Ok(completed)
+    }
+
+    /// Completes a doctor attempt that had no onboarding mutation, restoring the exact prior
+    /// lifecycle phase and bindings while retaining the attempt's revision/audit identity.
+    pub(super) fn complete_source_lifecycle_no_effect(
+        &self,
+        surface_id: &str,
+        expected_transition: EvidenceDigest,
+        prior: &DurableSourceLifecycleRecord,
+    ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
+        if matches!(
+            prior.phase,
+            DurableSourceLifecyclePhase::Applying
+                | DurableSourceLifecyclePhase::ReconciliationRequired
+                | DurableSourceLifecyclePhase::Removed
+        ) {
+            return Err(DurableProviderActivationStateError::InvalidLifecycle);
+        }
+        let current = self.source_lifecycle_record(surface_id)?;
+        if current.phase != DurableSourceLifecyclePhase::Applying
+            || current.transition_digest != Some(expected_transition)
+        {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        let completed = DurableSourceLifecycleRecord {
+            phase: prior.phase,
+            session_id: prior.session_id,
+            public_configuration_digest: prior.public_configuration_digest,
+            runtime_verification_receipt_digest: prior.runtime_verification_receipt_digest,
+            credential_generation: prior.credential_generation,
             ..current
         };
         self.store_source_lifecycle(surface_id, &completed)?;
@@ -674,6 +733,31 @@ impl DurableProviderActivationState {
         let current = self.source_lifecycle_record(surface_id)?;
         if current.phase != DurableSourceLifecyclePhase::Applying
             || current.transition_digest != Some(expected_transition)
+        {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        let blocked = DurableSourceLifecycleRecord {
+            phase: DurableSourceLifecyclePhase::ReconciliationRequired,
+            ..current
+        };
+        self.store_source_lifecycle(surface_id, &blocked)?;
+        Ok(blocked)
+    }
+
+    /// Converts an exact just-completed lifecycle mutation into a recovery barrier when the
+    /// corresponding runtime publication step fails after the durable final-state write.
+    pub(super) fn require_completed_source_lifecycle_reconciliation(
+        &self,
+        surface_id: &str,
+        expected_transition: EvidenceDigest,
+    ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
+        let current = self.source_lifecycle_record(surface_id)?;
+        if matches!(
+            current.phase,
+            DurableSourceLifecyclePhase::Applying
+                | DurableSourceLifecyclePhase::ReconciliationRequired
+                | DurableSourceLifecyclePhase::Removed
+        ) || current.transition_digest != Some(expected_transition)
         {
             return Err(DurableProviderActivationStateError::StaleState);
         }
@@ -1397,6 +1481,8 @@ fn validate_provider_metadata_backup(
                 transition_digest: None,
                 session_id: None,
                 public_configuration_digest: None,
+                runtime_verification_receipt_digest: None,
+                credential_generation: None,
             };
             lifecycle_records.push((
                 (*surface_id).to_owned(),
@@ -1520,6 +1606,10 @@ fn encode_source_lifecycle(
         public_configuration_sha256: record
             .public_configuration_digest
             .map(|value| lower_hex(&value.bytes())),
+        runtime_verification_receipt_sha256: record
+            .runtime_verification_receipt_digest
+            .map(|value| lower_hex(&value.bytes())),
+        credential_generation: record.credential_generation.map(SecretGeneration::get),
     };
     serde_json::to_vec(&wire).map_err(|_| DurableProviderActivationStateError::InvalidLifecycle)
 }
@@ -1555,10 +1645,30 @@ fn decode_source_lifecycle(
         .as_deref()
         .map(digest_from_lower_hex)
         .transpose()?;
+    let runtime_verification_receipt_digest = wire
+        .runtime_verification_receipt_sha256
+        .as_deref()
+        .map(digest_from_lower_hex)
+        .transpose()?;
+    let credential_generation = wire
+        .credential_generation
+        .map(SecretGeneration::new)
+        .transpose()
+        .map_err(|_| DurableProviderActivationStateError::InvalidLifecycle)?;
     let command_identity_valid = operation_id.is_some() == command_digest.is_some()
         && command_digest.is_some() == transition_digest.is_some();
+    let runtime_binding_valid = runtime_verification_receipt_digest.is_some()
+        == credential_generation.is_some()
+        && (runtime_verification_receipt_digest.is_none()
+            || (wire.session_id.is_some() && public_configuration_digest.is_some()));
     if !command_identity_valid
         || (wire.phase == DurableSourceLifecyclePhase::Applying && transition_digest.is_none())
+        || !runtime_binding_valid
+        || (wire.phase == DurableSourceLifecyclePhase::Removed
+            && (wire.session_id.is_some()
+                || public_configuration_digest.is_some()
+                || runtime_verification_receipt_digest.is_some()
+                || credential_generation.is_some()))
     {
         return Err(DurableProviderActivationStateError::InvalidLifecycle);
     }
@@ -1570,6 +1680,8 @@ fn decode_source_lifecycle(
         transition_digest,
         session_id: wire.session_id,
         public_configuration_digest,
+        runtime_verification_receipt_digest,
+        credential_generation,
     })
 }
 
@@ -2384,6 +2496,8 @@ mod tests {
             operation_id.clone(),
             command_digest,
             false,
+            None,
+            None,
         )?;
         assert_eq!(
             transition.record().revision(),
@@ -2400,6 +2514,8 @@ mod tests {
             DurableSourceLifecyclePhase::Stopped,
             None,
             None,
+            None,
+            None,
         )?;
         assert_eq!(completed.revision(), NonZeroU64::new(2).ok_or("revision")?);
         assert_eq!(completed.phase(), DurableSourceLifecyclePhase::Stopped);
@@ -2410,6 +2526,8 @@ mod tests {
                 operation_id,
                 command_digest,
                 false,
+                None,
+                None,
             )?,
             DurableSourceLifecycleTransition::Replay(_)
         ));
@@ -2420,6 +2538,8 @@ mod tests {
                 SourceIdentifier::try_from("different-stop-operation")?,
                 generation_digest(8),
                 false,
+                None,
+                None,
             ),
             Err(DurableProviderActivationStateError::StaleState)
         ));
@@ -2430,6 +2550,8 @@ mod tests {
             SourceIdentifier::try_from("interrupted-operation")?,
             generation_digest(9),
             false,
+            None,
+            None,
         )?;
         let blocked = state
             .require_source_lifecycle_reconciliation(surface_id, interrupted.transition_digest())?;
@@ -2439,6 +2561,8 @@ mod tests {
             SourceIdentifier::try_from("recovery-operation")?,
             generation_digest(10),
             true,
+            None,
+            None,
         )?;
         assert_eq!(
             recovery.record().revision().get(),

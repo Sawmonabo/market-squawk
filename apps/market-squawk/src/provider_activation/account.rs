@@ -1,6 +1,6 @@
 //! Shared account identity, budget, and lifetime authority for market-data providers.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 use market_squawk_platform::{AppConfig, LocalAuthorityStateStore, LocalPaths};
@@ -55,7 +55,7 @@ impl ProviderMarketAccount {
 
     const fn subject_prefix(self) -> &'static str {
         match self {
-            Self::AlpacaBasic => "alpaca-account-",
+            Self::AlpacaBasic => "alpaca-market-data-principal-",
             Self::TradierBrokerage => "tradier-account-",
             Self::KrakenLevel3 => "kraken-l3-account-",
         }
@@ -70,7 +70,7 @@ impl ProviderMarketAccount {
     }
 }
 
-/// Secret-free account identity derived only from one verified onboarding lease.
+/// Secret-free provider collision identity derived only from one verified onboarding lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderAccountBinding {
     account: ProviderMarketAccount,
@@ -79,7 +79,7 @@ pub struct ProviderAccountBinding {
 }
 
 impl ProviderAccountBinding {
-    /// Derives the stable provider-rate and metadata subject for one exact account lease.
+    /// Derives the stable provider-rate and metadata subject for one exact credential lease.
     ///
     /// # Errors
     ///
@@ -104,12 +104,25 @@ impl ProviderAccountBinding {
         if digest.algorithm() != DigestAlgorithm::Sha256
             || lease.generation().is_none()
             || lease.secret_reference().is_none()
-            || lease.verification_expires_at().is_none()
             || !lease.admits(DataUseOperation::Retrieve)
             || !lease.admits(DataUseOperation::Display)
             || budget.scope().as_source_identifier().as_str() != account.provider()
             || budget.scope().authorization_account().is_none()
         {
+            return Err(ProviderAccountActivationError::SourceBinding);
+        }
+        if account == ProviderMarketAccount::AlpacaBasic {
+            let receipt = lease
+                .runtime_verification_evidence()
+                .alpaca_paper_iex_receipt()
+                .ok_or(ProviderAccountActivationError::SourceBinding)?;
+            if receipt.market_data_principal_sha256() != digest
+                || !receipt.admits_source_start()
+                || lease.verification_expires_at() != Some(receipt.exclusive_expires_at())
+            {
+                return Err(ProviderAccountActivationError::SourceBinding);
+            }
+        } else if lease.verification_expires_at().is_none() {
             return Err(ProviderAccountActivationError::SourceBinding);
         }
         let subject = digest_subject(account.subject_prefix(), digest)?;
@@ -151,6 +164,43 @@ pub(super) struct ProviderAccountRuntimeAuthority {
     _account_authority: LocalAuthorityStateStore,
 }
 
+/// Weak-only currentness view of one provider-account runtime owner.
+///
+/// This handle cannot prolong the account authority lifetime or expose its lease, binding,
+/// provider-rate authority, onboarding service, or local account capability. Once the sole strong
+/// runtime owner is dropped, every check fails closed.
+#[derive(Clone)]
+pub(crate) struct ProviderAccountRuntimeCurrentness {
+    authority: Weak<ProviderAccountRuntimeAuthority>,
+}
+
+impl ProviderAccountRuntimeCurrentness {
+    /// Returns whether the exact retained account lease is still active.
+    pub(crate) async fn is_active(&self) -> bool {
+        let Some(authority) = self.authority.upgrade() else {
+            return false;
+        };
+        authority.require_current().await.is_ok()
+    }
+
+    /// Returns whether the exact retained account lease is staged or active.
+    ///
+    /// This narrower startup allowance exists only for the Alpaca staged-publication interval.
+    pub(crate) async fn is_prepared_or_active(&self) -> bool {
+        let Some(authority) = self.authority.upgrade() else {
+            return false;
+        };
+        authority.require_prepared_or_active().await.is_ok()
+    }
+
+    /// Performs the active-lease check without waiting for onboarding mutation ownership.
+    pub(crate) fn is_active_now(&self) -> bool {
+        self.authority
+            .upgrade()
+            .is_some_and(|authority| authority.require_current_now().is_ok())
+    }
+}
+
 impl ProviderAccountRuntimeAuthority {
     pub(super) fn try_acquire(
         account: ProviderMarketAccount,
@@ -185,6 +235,39 @@ impl ProviderAccountRuntimeAuthority {
         })
     }
 
+    pub(super) fn try_acquire_prepared_or_active(
+        account: ProviderMarketAccount,
+        lease: ProviderActivationLease,
+        onboarding: Arc<ProviderOnboardingService>,
+        app_config: &AppConfig,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<Self, ProviderAccountActivationError> {
+        let binding = ProviderAccountBinding::try_from_lease(account, &lease)?;
+        let onboarding_authority = onboarding.try_acquire_runtime_mutation_authority()?;
+        onboarding_authority.require_prepared_or_active(&lease)?;
+        provider_rate.bind_authorization_subject(
+            AuthorizationMode::UserAuthorized,
+            binding.verification_evidence(),
+            binding.subject(),
+        )?;
+        let paths = LocalPaths::prepare(app_config.data_dir())?;
+        let authority_root = paths
+            .control_root()?
+            .root()
+            .join(account.authority_root())
+            .join(binding.subject().as_str());
+        let account_authority = LocalAuthorityStateStore::try_open(authority_root)?;
+        onboarding_authority.require_prepared_or_active(&lease)?;
+        drop(onboarding_authority);
+        Ok(Self {
+            binding,
+            lease,
+            onboarding,
+            _provider_rate: provider_rate,
+            _account_authority: account_authority,
+        })
+    }
+
     pub(super) const fn lease(&self) -> &ProviderActivationLease {
         &self.lease
     }
@@ -193,11 +276,26 @@ impl ProviderAccountRuntimeAuthority {
         &self.binding
     }
 
+    pub(super) fn currentness(self: &Arc<Self>) -> ProviderAccountRuntimeCurrentness {
+        ProviderAccountRuntimeCurrentness {
+            authority: Arc::downgrade(self),
+        }
+    }
+
     pub(super) async fn require_current(&self) -> Result<(), crate::ProviderOnboardingError> {
         self.onboarding
             .acquire_runtime_mutation_authority()
             .await
             .require_active(&self.lease)
+    }
+
+    pub(super) async fn require_prepared_or_active(
+        &self,
+    ) -> Result<(), crate::ProviderOnboardingError> {
+        self.onboarding
+            .acquire_runtime_mutation_authority()
+            .await
+            .require_prepared_or_active(&self.lease)
     }
 
     /// Revalidates this exact active account lease without waiting for the onboarding mutation

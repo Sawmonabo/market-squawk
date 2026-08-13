@@ -1353,13 +1353,7 @@ fn require_same_activation_lease(
     current: &ProviderActivationLease,
     expected: &ProviderActivationLease,
 ) -> Result<(), CliProviderActivationError> {
-    if current.session_id() == expected.session_id()
-        && current.surface_id() == expected.surface_id()
-        && current.capability_digest() == expected.capability_digest()
-        && current.rights_decision_digest() == expected.rights_decision_digest()
-        && current.generation() == expected.generation()
-        && current.secret_reference() == expected.secret_reference()
-    {
+    if current.same_authority_as(expected) {
         Ok(())
     } else {
         Err(CliProviderActivationError::ProviderConfiguration)
@@ -5522,7 +5516,9 @@ mod tests {
             },
             OnboardingEvent::RuntimeVerified {
                 generation: None,
-                evidence_digest: profile.rights_decision_digest(),
+                evidence: market_squawk_sources::RuntimeVerificationEvidence::digest_v1(
+                    profile.rights_decision_digest(),
+                )?,
             },
         ]) {
             catalog.append_provider_onboarding_event(&reservation, sequence, event)?;

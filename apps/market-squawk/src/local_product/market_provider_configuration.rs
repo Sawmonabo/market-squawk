@@ -219,7 +219,7 @@ impl ProductionMarketProviderConfigurationResolver {
                 })?,
             });
         self.provider_activation
-            .try_construct_market_provider_configuration(lease, request)
+            .try_construct_staged_market_provider_configuration(lease, request)
             .map_err(|error| {
                 tracing::warn!(%error, "Alpaca market configuration resolution failed");
                 request_state_error(deadline, cancellation)
@@ -247,7 +247,7 @@ impl ProductionMarketProviderConfigurationResolver {
                 transport_limits: tradier_transport_limits()?,
             });
         self.provider_activation
-            .try_construct_market_provider_configuration(lease, request)
+            .try_construct_staged_market_provider_configuration(lease, request)
             .map_err(|error| {
                 tracing::warn!(%error, "Tradier market configuration resolution failed");
                 request_state_error(deadline, cancellation)
@@ -289,7 +289,7 @@ impl ProductionMarketProviderConfigurationResolver {
                     .ok_or(ServiceError::Internal)?,
             });
         self.provider_activation
-            .try_construct_market_provider_configuration(lease, request)
+            .try_construct_staged_market_provider_configuration(lease, request)
             .map_err(|error| {
                 tracing::warn!(%error, "Kraken level-3 configuration resolution failed");
                 request_state_error(deadline, cancellation)
@@ -309,12 +309,19 @@ impl PreparedMarketProviderConfigurationResolver for ProductionMarketProviderCon
         let lease = self
             .onboarding
             .activation_lease(request.onboarding_session_id())
+            .or_else(|_| {
+                self.onboarding
+                    .prepared_activation_lease(request.onboarding_session_id())
+            })
             .map_err(|error| {
                 tracing::warn!(%error, "account-market activation lease is unavailable");
                 ServiceError::Unauthorized
             })?;
         if lease.surface_id().as_str() != request.surface().surface_id()
             || lease.public_configuration_digest() != request.expected_public_configuration_digest()
+            || lease.runtime_evidence_digest()
+                != request.expected_runtime_verification_receipt_digest()
+            || lease.generation() != Some(request.expected_credential_generation())
         {
             return Err(ServiceError::InvalidRequest);
         }

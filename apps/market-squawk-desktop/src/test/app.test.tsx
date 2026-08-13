@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react"
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest"
 import { App } from "@/app/app"
 import marketSquawkMarkSvg from "@/assets/market-squawk-mark.svg?raw"
 import { CredentialField } from "@/components/setup/credential-field"
+import { ProviderStep } from "@/components/setup/provider-step"
 import type { AnalyticalControllerStatus } from "@/features/advanced/analytical-profile-contracts"
 import { lookupRoute } from "@/features/lookup/lookup-surface"
 import type {
@@ -18,6 +19,7 @@ import type {
   ApplicationResult,
   DesktopBootstrap,
   DesktopEvent,
+  ProviderSession,
 } from "@/lib/schemas"
 import type {
   DesktopEventSubscriptionRequest,
@@ -586,6 +588,307 @@ const h15ProviderProfile: DesktopBootstrap["providerProfiles"][number] = {
   quality_ceiling: "official_delayed",
 }
 
+const alpacaProviderProfile: DesktopBootstrap["providerProfiles"][number] = {
+  id: "alpaca.basic-market-data",
+  display_name: "Alpaca Basic Market Data",
+  official_handoff_url: "https://alpaca.markets/",
+  handoff_instruction: "Use a Paper-only market-data credential.",
+  zero_fee: "Basic IEX market data",
+  account_requirement: "Paper credential realm",
+  credential_requirement: "Paper API key and secret",
+  release_state: "selected",
+  coverage: "Alpaca Basic IEX market data",
+  quality_ceiling: "direct_unverified",
+}
+
+const alpacaOnboardingSessionId = "3f99c998-b834-4d34-a759-66fbf3d8ab3a"
+const alpacaPublicConfigurationSha256 = "c".repeat(64)
+const initialAlpacaDoctorReceiptSha256 = "1a".repeat(32)
+const renewedAlpacaDoctorReceiptSha256 = "2b".repeat(32)
+const alpacaDoctorPredecessors = new Map([
+  [renewedAlpacaDoctorReceiptSha256, initialAlpacaDoctorReceiptSha256],
+])
+const initialAlpacaRuntimeGenerationSha256 = "8".repeat(64)
+const resynchronizedAlpacaRuntimeGenerationSha256 = "9".repeat(64)
+const reactivatedAlpacaRuntimeGenerationSha256 = "a".repeat(64)
+
+function alpacaDoctorRate(observed: boolean) {
+  return observed
+    ? {
+        limit: { state: "observed", value: 200 },
+        remaining: { state: "observed", value: 195 },
+        reset_unix_seconds: { state: "observed", value: "1786567800" },
+        retry_after: { state: "missing" },
+      }
+    : {
+        limit: { state: "missing" },
+        remaining: { state: "missing" },
+        reset_unix_seconds: { state: "missing" },
+        retry_after: { state: "missing" },
+      }
+}
+
+function alpacaDoctorHttp(identity: string, observedRate = true) {
+  return {
+    endpointContractSha256: identity.repeat(64),
+    requestSha256: "2".repeat(64),
+    status: 200,
+    bodySha256: "3".repeat(64),
+    bytes: 512,
+    receivedAt: "2026-08-12T20:00:05.000000000Z",
+    latencyNanos: "125000000",
+    rate: alpacaDoctorRate(observedRate),
+  }
+}
+
+const alpacaDoctorAdditional = [
+  ["options_rest", "not_probed"],
+  ["options_stream", "not_probed"],
+  ["fixed_income", "not_probed"],
+  ["corporate_actions", "not_probed"],
+  ["sip", "unavailable"],
+  ["nbbo", "unavailable"],
+  ["opra", "unavailable"],
+  ["price_level_depth", "unavailable"],
+  ["order_level_depth", "unavailable"],
+  ["brokerage_account", "unavailable"],
+  ["positions", "unavailable"],
+  ["orders", "unavailable"],
+  ["trading", "unavailable"],
+].map(([capability, disposition], index) => ({
+  capability,
+  disposition,
+  evidenceSha256: String((index % 9) + 1).repeat(64),
+}))
+
+function alpacaDoctorEvidence({
+  receiptSha256,
+  verifiedAt,
+  exclusiveExpiresAt,
+}: {
+  receiptSha256: string
+  verifiedAt: string
+  exclusiveExpiresAt: string
+}) {
+  return {
+    schema: "market-squawk.alpaca-paper-iex-doctor/v1",
+    receiptSha256,
+    surfaceId: "alpaca.basic-market-data",
+    onboardingSessionId: alpacaOnboardingSessionId,
+    credentialGeneration: "7",
+    realm: "paper",
+    marketDataPrincipalSha256: "b".repeat(64),
+    principalSemantics:
+      "non_trading_market_data_credential_principal_not_brokerage_account",
+    capabilityRevision: "4",
+    capabilitySha256: "d".repeat(64),
+    publicConfigurationSha256: alpacaPublicConfigurationSha256,
+    rightsDecisionSha256: "e".repeat(64),
+    ratePolicySha256: "f".repeat(64),
+    doctorRevision: "market-squawk.alpaca-paper-iex-doctor-implementation.v1",
+    doctorContractSha256: "ed8ab1614fc4cee29b213b7eed8ce59033e0041378039f51368ad872bfe3a911",
+    dataQuality: "direct_unverified",
+    verifiedAt,
+    exclusiveExpiresAt,
+    current: true,
+    capabilities: {
+    iexLatestQuote: {
+      disposition: "available",
+      evidenceSha256: "2".repeat(64),
+      observation: {
+        http: alpacaDoctorHttp("4"),
+        semanticResultSha256: "5".repeat(64),
+        quoteTimestamp: "2026-08-12T20:00:04.000000000Z",
+      },
+    },
+    iexSnapshotBatch: {
+      disposition: "available",
+      evidenceSha256: "3".repeat(64),
+      observation: {
+        http: alpacaDoctorHttp("5"),
+        semanticResultSha256: "6".repeat(64),
+        requested: 50,
+        returned: 50,
+        valid: 50,
+        missing: 0,
+        unexpected: 0,
+        duplicate: 0,
+        invalid: 0,
+        requestedSetSha256: "7".repeat(64),
+        returnedSetSha256: "8".repeat(64),
+        missingSetSha256: "9".repeat(64),
+        unexpectedSetSha256: "a".repeat(64),
+      },
+    },
+    iexWebSocket: {
+      disposition: "available",
+      evidenceSha256: "4".repeat(64),
+      observation: {
+        endpointContractSha256: "5".repeat(64),
+        requestSha256: "6".repeat(64),
+        connectedFrameSha256: "7".repeat(64),
+        authenticatedFrameSha256: "8".repeat(64),
+        subscriptionFrameSha256: "9".repeat(64),
+        semanticResultSha256: "a".repeat(64),
+        handshakeStatus: 101,
+        handshakeRate: alpacaDoctorRate(false),
+        subscribedTrades: 1,
+        subscribedQuotes: 1,
+        framesObserved: 3,
+        bytesObserved: 384,
+        authenticatedAt: "2026-08-12T20:00:01.000000000Z",
+        subscribedAt: "2026-08-12T20:00:02.000000000Z",
+        closeSent: true,
+        cleanCloseObserved: true,
+        completedAt: "2026-08-12T20:00:03.000000000Z",
+      },
+    },
+    iexHistoricalBars: {
+      disposition: "available",
+      evidenceSha256: "5".repeat(64),
+      observation: {
+        endpointContractSha256: "6".repeat(64),
+        requestSha256: "7".repeat(64),
+        semanticResultSha256: "8".repeat(64),
+        startDate: { year: 2026, month: 8, day: 10 },
+        endDate: { year: 2026, month: 8, day: 11 },
+        pages: 2,
+        bars: 2,
+        distinctDates: 2,
+        firstBarTimestamp: "2026-08-10T20:00:00.000000000Z",
+        lastBarTimestamp: "2026-08-11T20:00:00.000000000Z",
+        returnedDatesSha256: "9".repeat(64),
+        paginationGraphSha256: "a".repeat(64),
+        terminalPagination: true,
+        pageEvidence: [
+          {
+            http: alpacaDoctorHttp("b"),
+            requestPageTokenSha256: null,
+            responsePageTokenSha256: "4c".repeat(32),
+          },
+          {
+            http: alpacaDoctorHttp("c"),
+            requestPageTokenSha256: "4c".repeat(32),
+            responsePageTokenSha256: null,
+          },
+        ],
+      },
+    },
+    iexUtcCalendar: {
+      disposition: "available",
+      evidenceSha256: "6".repeat(64),
+      observation: {
+        http: alpacaDoctorHttp("c"),
+        semanticResultSha256: "d".repeat(64),
+        startDate: { year: 2026, month: 8, day: 10 },
+        endDate: { year: 2026, month: 8, day: 11 },
+        sessions: 2,
+        historyDates: 2,
+        matchedDates: 2,
+        missingHistoryDates: 0,
+        unexpectedHistoryDates: 0,
+        sessionDatesSha256: "9".repeat(64),
+        historyDatesSha256: "9".repeat(64),
+        exactDateReconciliation: true,
+      },
+    },
+    additional: alpacaDoctorAdditional,
+    },
+  }
+}
+
+const initialAlpacaDoctorEvidence = alpacaDoctorEvidence({
+  receiptSha256: initialAlpacaDoctorReceiptSha256,
+  verifiedAt: "2026-08-12T20:00:06.000000000Z",
+  exclusiveExpiresAt: "2026-08-12T20:15:06.000000000Z",
+})
+
+const renewedAlpacaDoctorEvidence = alpacaDoctorEvidence({
+  receiptSha256: renewedAlpacaDoctorReceiptSha256,
+  verifiedAt: "2026-08-12T20:05:06.000000000Z",
+  exclusiveExpiresAt: "2026-08-12T20:20:06.000000000Z",
+})
+
+type AlpacaSourceStage =
+  | "unconfigured"
+  | "doctor_required"
+  | "eligible"
+  | "active"
+  | "resynchronized"
+  | "renewed"
+  | "reactivated"
+
+function alpacaSourceStatus(stage: AlpacaSourceStage): ApplicationResult {
+  const configured = stage !== "unconfigured"
+  const admitted = configured && stage !== "doctor_required"
+  const active = stage === "active" || stage === "resynchronized" ||
+    stage === "reactivated"
+  const stateRevision = stage === "unconfigured"
+    ? 7
+    : stage === "doctor_required"
+      ? 8
+    : stage === "eligible"
+      ? 9
+      : stage === "active"
+        ? 10
+        : stage === "resynchronized"
+          ? 11
+          : stage === "renewed"
+            ? 12
+            : 13
+  const runtimeGenerationSha256 = stage === "active"
+    ? initialAlpacaRuntimeGenerationSha256
+    : stage === "resynchronized"
+      ? resynchronizedAlpacaRuntimeGenerationSha256
+      : stage === "reactivated"
+        ? reactivatedAlpacaRuntimeGenerationSha256
+        : null
+  const doctor = admitted
+    ? stage === "renewed" || stage === "reactivated"
+      ? renewedAlpacaDoctorEvidence
+      : initialAlpacaDoctorEvidence
+    : null
+  const observedAt = stage === "renewed" || stage === "reactivated"
+    ? "2026-08-12T20:05:07.000000000Z"
+    : "2026-08-12T20:00:07.000000000Z"
+  return {
+    data: [{
+      profile: {
+        id: "alpaca.basic-market-data",
+        display_name: "Alpaca Basic Market Data",
+      },
+      currentSession: null,
+      providerDatasetIdentifier: null,
+      lifecycleSupport: "managed",
+      lifecycle: {
+        provider: "alpaca.basic-market-data",
+        state: active ? "active" : "stopped",
+        stateRevision,
+        configurationSessionId: configured ? alpacaOnboardingSessionId : null,
+        currentGeneration: null,
+        runtimeGenerationSha256,
+        publicConfigurationSha256: configured ? alpacaPublicConfigurationSha256 : null,
+        doctor,
+        startEligibility: stage === "unconfigured" || stage === "doctor_required"
+          ? "doctor_required"
+          : active
+              ? "already_active"
+              : "eligible",
+        blocker: null,
+        observedAt,
+      },
+      runtime: active ? { state: "active" } : {},
+    }],
+    metadata: {
+      completeness: "complete",
+      returnedItems: 1,
+      availableItems: 1,
+      sourceCoverage: { status: "complete", providers: ["alpaca.basic-market-data"] },
+      dataQuality: { status: admitted ? "direct_unverified" : "not_applicable" },
+    },
+  }
+}
+
 const h15DashboardResult: ApplicationResult = {
   data: h15DashboardData,
   metadata: {
@@ -649,8 +952,13 @@ const inactiveH15SourceStatus: ApplicationResult = {
         state: "stopped",
         stateRevision: 7,
         configurationSessionId: null,
+        currentGeneration: null,
+        runtimeGenerationSha256: null,
+        publicConfigurationSha256: null,
+        doctor: null,
+        startEligibility: "not_applicable",
         blocker: null,
-        observedAt: "2026-08-11T20:31:00Z",
+        observedAt: "2026-08-11T20:31:00.000000000Z",
       },
       runtime: {},
     },
@@ -1658,6 +1966,7 @@ describe("Market Squawk desktop boundary", () => {
   it("uses grouped product navigation to explore real research and AI connection state", async () => {
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
+    let alpacaStage: AlpacaSourceStage = "unconfigured"
     const credentialProviders = [
       "schwab",
       "alpaca",
@@ -1681,21 +1990,21 @@ describe("Market Squawk desktop boundary", () => {
       schema: "market-squawk-provider-credentials/v1",
       providers: credentialProviders.map((provider) => ({
         provider,
-        enabled: provider === "fred_alfred",
+        enabled: provider === "alpaca",
         disposition:
-          provider === "fred_alfred"
+          provider === "alpaca"
             ? "credential_stored_unverified"
             : "disabled",
         onboardingSessionId:
-          provider === "fred_alfred"
-            ? "d6b1a16d-bdf9-44d9-b10b-6e7558d701cb"
+          provider === "alpaca"
+            ? alpacaOnboardingSessionId
             : null,
       })),
     }
     const unsafeCredentialImportResult = {
       ...credentialImportResult,
       providers: credentialImportResult.providers.map((provider) =>
-        provider.provider === "fred_alfred"
+        provider.provider === "alpaca"
           ? { ...provider, secret: "should-never-reach-react" }
           : provider,
       ),
@@ -1708,7 +2017,7 @@ describe("Market Squawk desktop boundary", () => {
     let credentialImportAttempt = 0
     const readyBootstrap: DesktopBootstrap = {
       ...blockedBootstrap,
-      providerProfiles: [h15ProviderProfile],
+      providerProfiles: [h15ProviderProfile, alpacaProviderProfile],
       operations: [
         datasetRead(
           "Research.ListDatasets",
@@ -1780,6 +2089,10 @@ describe("Market Squawk desktop boundary", () => {
     } = { listener: null, protocolError: null }
     const eventSubscriptions: DesktopEventSubscriptionRequest[] = []
     const releasedEventSequences: string[] = []
+    const sourceControls: Array<{
+      action: Parameters<ProductTransport["sourceControl"]>[0]
+      request: Parameters<ProductTransport["sourceControl"]>[1]
+    }> = []
     let admitInitialEventSubscription!: () => void
     const initialEventSubscriptionAdmission = new Promise<void>((resolve) => {
       admitInitialEventSubscription = resolve
@@ -1796,7 +2109,11 @@ describe("Market Squawk desktop boundary", () => {
             ? refreshedH15DashboardResult
             : h15DashboardResult
         }
-        if (request.query === "sourceStatus") return inactiveH15SourceStatus
+        if (request.query === "sourceStatus") {
+          return request.sourceIds?.includes("alpaca.basic-market-data") === true
+            ? alpacaSourceStatus(alpacaStage)
+            : inactiveH15SourceStatus
+        }
         if (request.query === "paperStatus") return stoppedPaperStatus
         if (
           request.query === "paperOrders" ||
@@ -1867,9 +2184,32 @@ describe("Market Squawk desktop boundary", () => {
         }
       },
       importProviderCredentialBundle: async () => {
-        const result = credentialImportAttempts[credentialImportAttempt] ?? null
+        const attempt = credentialImportAttempt
+        const result = credentialImportAttempts[attempt] ?? null
         credentialImportAttempt += 1
+        if (attempt === 1) alpacaStage = "doctor_required"
         return result
+      },
+      sourceControl: async (action, request) => {
+        sourceControls.push({ action, request })
+        if (request.provider === "alpaca.basic-market-data") {
+          if (action === "verify") {
+            const renewing = alpacaStage === "active" ||
+              alpacaStage === "resynchronized" ||
+              alpacaStage === "reactivated"
+            if (renewing && alpacaDoctorPredecessors.get(
+              renewedAlpacaDoctorEvidence.receiptSha256,
+            ) !== initialAlpacaDoctorEvidence.receiptSha256) {
+              throw new Error("The renewed doctor fixture lost its exact predecessor.")
+            }
+            alpacaStage = renewing ? "renewed" : "eligible"
+          }
+          if (action === "resynchronize") alpacaStage = "resynchronized"
+          if (action === "start") {
+            alpacaStage = alpacaStage === "renewed" ? "reactivated" : "active"
+          }
+        }
+        return alpacaSourceStatus(alpacaStage)
       },
     }
     const readCount = (
@@ -1983,7 +2323,7 @@ describe("Market Squawk desktop boundary", () => {
       within(h15Section).getByText("Source lifecycle observed"),
     ).toBeTruthy()
     expect(
-      within(h15Section).getByText("2026-08-11T20:31:00Z"),
+      within(h15Section).getByText("2026-08-11T20:31:00.000000000Z"),
     ).toBeTruthy()
     expect(
       within(h15Section).getByText("Source runtime observed"),
@@ -2098,12 +2438,22 @@ describe("Market Squawk desktop boundary", () => {
     if (!(refreshedNavigation instanceof HTMLElement)) {
       throw new Error("The refreshed Market Squawk navigation is absent")
     }
-    await user.click(
+    fireEvent.click(
       within(refreshedNavigation).getByRole("link", {
         name: "Connections & Sources",
       }),
     )
     expect(await screen.findByRole("heading", { name: "Sources" })).toBeTruthy()
+    const alpacaSourceHeading = await screen.findByRole("heading", {
+      name: "Alpaca Basic Market Data",
+    })
+    const alpacaSource = alpacaSourceHeading.closest("article")
+    expect(alpacaSource).toBeInstanceOf(HTMLElement)
+    if (!(alpacaSource instanceof HTMLElement)) {
+      throw new Error("The Alpaca source evidence is absent")
+    }
+    expect(within(alpacaSource).getByRole("link", { name: "Set up again" })).toBeTruthy()
+    expect(within(alpacaSource).queryByRole("button", { name: "Run doctor" })).toBeNull()
     const chooseCredentialBundle = screen.getByRole("button", {
       name: "Choose credential bundle",
     })
@@ -2113,6 +2463,7 @@ describe("Market Squawk desktop boundary", () => {
         "No credential bundle was selected. Provider setup is unchanged.",
       ),
     ).toBeTruthy()
+    const sourceReadsBeforeCredentialImport = readCount("sourceStatus")
     await user.click(chooseCredentialBundle)
     expect(await screen.findByText("Credential bundle processed")).toBeTruthy()
     expect(
@@ -2120,6 +2471,11 @@ describe("Market Squawk desktop boundary", () => {
         "Credential stored; verification and activation are still required.",
       ),
     ).toBeTruthy()
+    await waitFor(() => {
+      expect(readCount("sourceStatus")).toBeGreaterThan(sourceReadsBeforeCredentialImport)
+      expect(within(alpacaSource).getByRole("button", { name: "Run doctor" })).toBeTruthy()
+    })
+    expect(within(alpacaSource).queryByRole("link", { name: "Set up again" })).toBeNull()
     const sourceReadsBeforeFailedCredentialImport = readCount("sourceStatus")
     await user.click(
       screen.getByRole("button", { name: "Select another bundle" }),
@@ -2156,6 +2512,155 @@ describe("Market Squawk desktop boundary", () => {
       new Date("2026-08-11T20:31:00Z").toLocaleString(),
     )
     expect(runtimeObserved?.querySelector("dd")?.textContent).toBe("Not reported")
+
+    expect(within(alpacaSource).getByText("Doctor required")).toBeTruthy()
+    expect(within(alpacaSource).queryByText("Alpaca Paper / IEX doctor evidence")).toBeNull()
+    await user.click(within(alpacaSource).getByRole("button", { name: "Run doctor" }))
+    expect(await within(alpacaSource).findByText("Ready to start")).toBeTruthy()
+    expect(
+      within(alpacaSource).getByText("Alpaca Paper / IEX doctor evidence"),
+    ).toBeTruthy()
+    expect(within(alpacaSource).getByText("Current receipt")).toBeTruthy()
+    expect(within(alpacaSource).getByText(initialAlpacaDoctorReceiptSha256)).toBeTruthy()
+    await user.click(within(alpacaSource).getByText("Exact authority evidence"))
+    expect(
+      within(alpacaSource).getByText(
+        "market-squawk.alpaca-paper-iex-doctor-implementation.v1",
+      ),
+    ).toBeTruthy()
+    expect(
+      within(alpacaSource).getByText(
+        "ed8ab1614fc4cee29b213b7eed8ce59033e0041378039f51368ad872bfe3a911",
+      ),
+    ).toBeTruthy()
+    expect(
+      within(alpacaSource).getByText("50/50 valid · 0 missing", { exact: false }),
+    ).toBeTruthy()
+    expect(
+      within(alpacaSource).getByText(
+        "Provider headers: limit 200 · remaining 195 · reset 1786567800 · retry-after missing",
+      ),
+    ).toBeTruthy()
+    expect(
+      within(alpacaSource).getByText(
+        "Provider headers: limit missing · remaining missing · reset missing · retry-after missing",
+      ),
+    ).toBeTruthy()
+    expect(
+      within(alpacaSource).getByText(
+        "Market-data credential principal only; no brokerage account, positions, orders, execution, or trading authority.",
+      ),
+    ).toBeTruthy()
+    expect(sourceControls[0]).toEqual({
+      action: "verify",
+      request: {
+        provider: "alpaca.basic-market-data",
+        expectedStateRevision: 8,
+        onboardingSessionId: alpacaOnboardingSessionId,
+        publicConfigurationSha256: alpacaPublicConfigurationSha256,
+      },
+    })
+    await user.click(within(alpacaSource).getByRole("button", { name: "Start" }))
+    await waitFor(() => {
+      expect(within(alpacaSource).getAllByText("Active", { selector: "p" })).toHaveLength(2)
+    })
+    expect(within(alpacaSource).getByText("Already active")).toBeTruthy()
+    expect(within(alpacaSource).queryByRole("button", { name: "Start" })).toBeNull()
+    expect(sourceControls[1]).toEqual({
+      action: "start",
+      request: {
+        provider: "alpaca.basic-market-data",
+        expectedStateRevision: 9,
+        onboardingSessionId: alpacaOnboardingSessionId,
+        publicConfigurationSha256: alpacaPublicConfigurationSha256,
+      },
+    })
+    const initialRuntimeGeneration = within(alpacaSource)
+      .getByText("Runtime generation SHA-256")
+      .closest("div")
+    expect(initialRuntimeGeneration?.querySelector("dd")?.textContent).toBe(
+      initialAlpacaRuntimeGenerationSha256,
+    )
+    await user.click(within(alpacaSource).getByRole("button", { name: "Resynchronize" }))
+    expect(sourceControls[2]).toEqual({
+      action: "resynchronize",
+      request: {
+        provider: "alpaca.basic-market-data",
+        expectedStateRevision: 10,
+        expectedRuntimeGenerationSha256: initialAlpacaRuntimeGenerationSha256,
+        reason: "desktop-user-request",
+      },
+    })
+    await waitFor(() => {
+      const generation = within(alpacaSource)
+        .getByText("Runtime generation SHA-256")
+        .closest("div")
+      expect(generation?.querySelector("dd")?.textContent).toBe(
+        resynchronizedAlpacaRuntimeGenerationSha256,
+      )
+    })
+    const alpacaSourceReadsBeforeDoctorRenewal = issuedQueries.filter(
+      (request) => request.query === "sourceStatus" &&
+        request.sourceIds?.includes("alpaca.basic-market-data") === true,
+    ).length
+    const sourceReadsBeforeDoctorRenewal = readCount("sourceStatus")
+    await user.click(
+      within(alpacaSource).getByRole("button", { name: "Renew doctor and stop source" }),
+    )
+    expect(
+      await screen.findByText(
+        "Running or renewing the Paper/IEX doctor stops any retained source runtime, including one currently reported as blocked. Starting it again remains a separate explicit action.",
+        { exact: false },
+      ),
+    ).toBeTruthy()
+    await user.click(screen.getByRole("button", { name: "Confirm change" }))
+    await waitFor(() => {
+      expect(
+        issuedQueries.filter((request) => request.query === "sourceStatus" &&
+          request.sourceIds?.includes("alpaca.basic-market-data") === true).length,
+      ).toBeGreaterThan(alpacaSourceReadsBeforeDoctorRenewal)
+    })
+    expect(readCount("sourceStatus")).toBeGreaterThan(sourceReadsBeforeDoctorRenewal)
+    expect(within(alpacaSource).getByText("Ready to start")).toBeTruthy()
+    expect(within(alpacaSource).getByRole("button", { name: "Start" })).toBeTruthy()
+    expect(within(alpacaSource).getByText(renewedAlpacaDoctorReceiptSha256)).toBeTruthy()
+    expect(within(alpacaSource).queryByText(initialAlpacaDoctorReceiptSha256)).toBeNull()
+    const stoppedRuntimeGeneration = within(alpacaSource)
+      .getByText("Runtime generation SHA-256")
+      .closest("div")
+    expect(stoppedRuntimeGeneration?.querySelector("dd")?.textContent).toBe("Not reported")
+    expect(sourceControls[3]).toEqual({
+      action: "verify",
+      request: {
+        provider: "alpaca.basic-market-data",
+        expectedStateRevision: 11,
+        onboardingSessionId: alpacaOnboardingSessionId,
+        publicConfigurationSha256: alpacaPublicConfigurationSha256,
+      },
+    })
+    await user.click(within(alpacaSource).getByRole("button", { name: "Start" }))
+    await waitFor(() => {
+      expect(within(alpacaSource).getAllByText("Active", { selector: "p" })).toHaveLength(2)
+    })
+    expect(within(alpacaSource).getByText("Already active")).toBeTruthy()
+    expect(sourceControls[4]).toEqual({
+      action: "start",
+      request: {
+        provider: "alpaca.basic-market-data",
+        expectedStateRevision: 12,
+        onboardingSessionId: alpacaOnboardingSessionId,
+        publicConfigurationSha256: alpacaPublicConfigurationSha256,
+      },
+    })
+    const reactivatedRuntimeGeneration = within(alpacaSource)
+      .getByText("Runtime generation SHA-256")
+      .closest("div")
+    expect(reactivatedRuntimeGeneration?.querySelector("dd")?.textContent).toBe(
+      reactivatedAlpacaRuntimeGenerationSha256,
+    )
+    expect(reactivatedRuntimeGeneration?.querySelector("dd")?.textContent).not.toBe(
+      resynchronizedAlpacaRuntimeGenerationSha256,
+    )
 
     await waitFor(() => {
       expect(readCount("sourceCoverage")).toBeGreaterThan(0)
@@ -2416,7 +2921,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(screen.getByText("stateless request sessions", { exact: false })).toBeTruthy()
 
     mcpRendered.unmount()
-    render(
+    const updatesRendered = render(
       <MemoryRouter initialEntries={["/system/updates-repair"]}>
         <App transport={transport(readyBootstrap)} />
       </MemoryRouter>,
@@ -2424,6 +2929,75 @@ describe("Market Squawk desktop boundary", () => {
     expect(
       await screen.findByRole("heading", { name: "Updates & program recovery" }),
     ).toBeTruthy()
+
+    updatesRendered.unmount()
+    const setupSessionId = "8fdbfe5d-aee2-4a42-8573-dafdf582cab1"
+    const needsCredential: ProviderSession = {
+      session_id: setupSessionId,
+      surface_id: alpacaProviderProfile.id,
+      state: "user_action_required",
+      next_action: "import_secret",
+      credential_stored: false,
+    }
+    const readyToActivate: ProviderSession = {
+      ...needsCredential,
+      state: "stored_unverified",
+      next_action: "verify_and_activate",
+      credential_stored: true,
+    }
+    const authoritativeActive: ProviderSession = {
+      ...readyToActivate,
+      state: "active_scoped",
+      next_action: "active",
+    }
+    const onboardingRequests: Parameters<ProductTransport["onboard"]>[0][] = []
+    let setupRefreshes = 0
+    const setupTransport = transport(
+      blockedBootstrap,
+      (async (request) => {
+        onboardingRequests.push(request)
+        if (request.action === "submitSecret") return readyToActivate
+        if (request.action === "activate") {
+          return {
+            profile: alpacaProviderProfile.id,
+            session_id: setupSessionId,
+            capability_revision: 4,
+          }
+        }
+        throw new Error("Unexpected setup action")
+      }) as ProductTransport["onboard"],
+    )
+    const providerSetup = render(
+      <ProviderStep
+        profiles={[alpacaProviderProfile]}
+        sessions={[needsCredential]}
+        transport={setupTransport}
+        onChanged={() => {
+          setupRefreshes += 1
+        }}
+      />,
+    )
+    await user.type(screen.getByLabelText("Provider API key"), "paper-fixture-key")
+    await user.click(screen.getByRole("button", { name: "Save and verify" }))
+    expect(await screen.findByText("Credentials stored")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Verify and activate" })).toBeNull()
+    expect(setupRefreshes).toBe(1)
+    providerSetup.rerender(
+      <ProviderStep
+        profiles={[alpacaProviderProfile]}
+        sessions={[authoritativeActive]}
+        transport={setupTransport}
+        onChanged={() => {
+          setupRefreshes += 1
+        }}
+      />,
+    )
+    expect(screen.getByText("Credentials stored")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Verify and activate" })).toBeNull()
+    expect(onboardingRequests.map((request) => request.action)).toEqual([
+      "submitSecret",
+      "activate",
+    ])
   })
 
   it("never promotes an unverified backend state to installation readiness", async () => {

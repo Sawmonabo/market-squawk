@@ -683,7 +683,8 @@ async fn load_order_level_snapshots(
             continue;
         }
         if let Some(snapshot) = registry
-            .order_level_snapshot(
+            .scalar_order_level_snapshot(
+                view.surface_id,
                 view.stream.source(),
                 view.route.route().venue(),
                 view.route.route().instrument(),
@@ -709,11 +710,8 @@ async fn load_order_level_snapshots(
             continue;
         }
         if let Some(snapshot) = registry
-            .order_level_snapshot(
-                key.source_id(),
-                key.venue_id(),
-                key.instrument_id(),
-                key.generation(),
+            .kraken_order_level_snapshot(
+                projection,
                 maximum_orders,
                 context.deadline(),
                 context.cancellation(),

@@ -10,6 +10,10 @@ readme = "../../README.md"
 keywords = ["finance", "market-data", "alpaca", "websocket"]
 categories = ["finance", "network-programming"]
 
+[features]
+default = []
+scripted-transport-fixture = []
+
 [dependencies]
 base64.workspace = true
 bytes.workspace = true

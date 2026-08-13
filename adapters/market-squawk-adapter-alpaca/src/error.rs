@@ -27,8 +27,10 @@ pub enum AlpacaError {
     /// Transport byte or deadline limits were invalid.
     #[error("Alpaca transport limits are invalid")]
     InvalidTransportLimits,
-    /// Shared budget metadata does not retain the documented Basic historical ceiling.
-    #[error("Alpaca shared provider budget does not enforce 200 historical requests per minute")]
+    /// Shared budget metadata does not retain Market Squawk's conservative application ceiling.
+    #[error(
+        "Alpaca shared provider budget does not enforce the 150-request/minute application ceiling"
+    )]
     InvalidBudget,
     /// Historical dates, timeframe, adjustment, or page size were invalid.
     #[error("Alpaca historical request plan is invalid")]

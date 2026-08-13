@@ -30,6 +30,16 @@ pub const ALPACA_BASIC_EQUITY_SYMBOL_LIMIT: usize = 30;
 pub const ALPACA_BASIC_OPTION_SYMBOL_LIMIT: usize = 200;
 /// Alpaca Basic historical request ceiling.
 pub const ALPACA_BASIC_HISTORICAL_REQUESTS_PER_MINUTE: u32 = 200;
+/// Market Squawk hard application ceiling for recurring Alpaca REST work.
+///
+/// This is an application policy, not a provider-published limit. Runtime-observed headers may
+/// reduce admission but never raise this ceiling.
+pub const ALPACA_APPLICATION_MAX_REQUESTS_PER_MINUTE: u32 = 150;
+/// Market Squawk recurring Alpaca REST scheduling target.
+///
+/// The remaining application capacity is reserved for interactive requests, retries, pagination,
+/// gap repair, and provider-health work.
+pub const ALPACA_RECURRING_TARGET_REQUESTS_PER_MINUTE: u32 = 120;
 /// Alpaca Basic historical exclusion window, in nanoseconds.
 pub const ALPACA_HISTORICAL_EXCLUSION_NANOS: u64 = 900_000_000_000;
 /// Minimum contiguous lookback admitted for one historical analysis plan.
@@ -1312,13 +1322,13 @@ fn validate_authorization_and_budget(
     if authorization.mode() != AuthorizationMode::UserAuthorized {
         return Err(AlpacaError::InvalidAuthorization);
     }
-    let retains_basic_window = (0..budget.window_count()).any(|index| {
+    let retains_application_window = (0..budget.window_count()).any(|index| {
         budget.window(index).is_some_and(|window| {
-            window.requests_per_window() == ALPACA_BASIC_HISTORICAL_REQUESTS_PER_MINUTE
+            window.requests_per_window() == ALPACA_APPLICATION_MAX_REQUESTS_PER_MINUTE
                 && window.window_nanos() == NANOS_PER_MINUTE
         })
     });
-    if !retains_basic_window {
+    if !retains_application_window {
         return Err(AlpacaError::InvalidBudget);
     }
     Ok(())

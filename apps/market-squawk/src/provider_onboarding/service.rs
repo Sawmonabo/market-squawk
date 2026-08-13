@@ -11,6 +11,17 @@ use std::thread::JoinHandle as ThreadJoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
+use market_squawk_adapter_alpaca::{
+    AlpacaDoctorBatchObservation as AdapterAlpacaDoctorBatchObservation,
+    AlpacaDoctorCalendarObservation as AdapterAlpacaDoctorCalendarObservation,
+    AlpacaDoctorHistoricalObservation as AdapterAlpacaDoctorHistoricalObservation,
+    AlpacaDoctorHttpEvidence as AdapterAlpacaDoctorHttpEvidence,
+    AlpacaDoctorObservationDisposition, AlpacaDoctorObservationOrigin, AlpacaDoctorObservedField,
+    AlpacaDoctorQuoteObservation as AdapterAlpacaDoctorQuoteObservation,
+    AlpacaDoctorRateEvidence as AdapterAlpacaDoctorRateEvidence, AlpacaDoctorRetryAfter,
+    AlpacaDoctorStreamObservation as AdapterAlpacaDoctorStreamObservation, AlpacaError,
+    AlpacaPaperIexDoctor, AlpacaPaperIexDoctorObservation, AlpacaTransportLimits,
+};
 use market_squawk_adapter_bea::BeaUserId;
 use market_squawk_adapter_census::CensusApiKey;
 use market_squawk_adapter_coinbase::CoinbaseDirectHmacSigner;
@@ -37,7 +48,9 @@ use market_squawk_data::{
     CatalogError, CatalogLimit, OnboardingCatalogCapability, OnboardingReservation,
     OnboardingReservationRequest, ResumedProviderOnboarding,
 };
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
+};
 use market_squawk_platform::{
     EncryptedFileFallbackStatus, EncryptedFileUnlockCapability, LocalSecretStoreError,
     SecretCancellation, SecretDeletionDisposition, SecretGeneration, SecretInteractionPolicy,
@@ -45,12 +58,19 @@ use market_squawk_platform::{
     SecretStore, SecretValue,
 };
 use market_squawk_sources::{
+    AlpacaDoctorAdditionalCapability, AlpacaDoctorBatchObservation,
+    AlpacaDoctorCalendarObservation, AlpacaDoctorCapabilityEvidence, AlpacaDoctorCredentialRealm,
+    AlpacaDoctorHistoricalObservation, AlpacaDoctorHistoricalPageEvidence,
+    AlpacaDoctorHttpEvidence, AlpacaDoctorProbeEvidence, AlpacaDoctorQuoteObservation,
+    AlpacaDoctorRateEvidence, AlpacaDoctorStreamObservation, AlpacaPaperIexDoctorReceiptInput,
+    AlpacaPaperIexDoctorReceiptV1, AlpacaRateLimitField, AlpacaRetryAfterEvidence,
     AuthorityBindings, AuthorityVerification, AuthorityVerificationInput,
     CapabilityRegistrationOutcome, CredentialGenerationState, OnboardingEvent, OnboardingState,
     ProbeTransport, ProfileReleaseState, ProviderOnboardingProfile, ProviderProfileError,
     ProviderProfileRegistry, ProviderPublicConfiguration, ProviderRateAuthority,
-    ProviderRateDeclaration, SecretStoreClearOutcome, TREASURY_DAILY_RATES_PROBE_YEAR,
-    built_in_provider_profiles, install_ring_tls_provider,
+    ProviderRateDeclaration, RuntimeCapabilityDisposition, RuntimeVerificationEvidence,
+    SecretStoreClearOutcome, TREASURY_DAILY_RATES_PROBE_YEAR, built_in_provider_profiles,
+    install_ring_tls_provider,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -88,6 +108,10 @@ const FRED_PERMISSION_MEDIA_TYPES: [&str; 5] = [
 const BLS_REGISTRATION_VALIDITY_NANOS: i64 = 365 * 86_400 * 1_000_000_000;
 const COINBASE_DIRECT_VERIFICATION_VALIDITY_NANOS: i64 = 15 * 60 * 1_000_000_000;
 const MARKET_DATA_VERIFICATION_VALIDITY_NANOS: i64 = 15 * 60 * 1_000_000_000;
+const ALPACA_DOCTOR_OPERATION_DURATION: Duration = Duration::from_secs(60);
+const ALPACA_DOCTOR_FRAME_BYTES: usize = 1024 * 1024;
+const ALPACA_DOCTOR_ADDITIONAL_CAPABILITY_DOMAIN: &[u8] =
+    b"market-squawk/alpaca-paper-iex-doctor-additional-capability/v1\0";
 const COINBASE_ACCOUNT_BINDING_DOMAIN: &[u8] =
     b"market-squawk/coinbase-exchange-account-binding/v1\0";
 const TRADIER_ACCOUNT_BINDING_DOMAIN: &[u8] = b"market-squawk/tradier-profile-account-binding/v1\0";
@@ -160,14 +184,50 @@ impl StartOnboardingRequest {
 /// Provider onboarding composition over catalog and exact-generation secret authority.
 pub struct ProviderOnboardingService {
     profiles: ProviderProfileRegistry,
-    catalog: OnboardingCatalogCapability,
+    catalog: Arc<OnboardingCatalogCapability>,
     secrets: Arc<dyn SecretStore>,
     client: reqwest::Client,
+    provider_rate: ProviderRateAuthority,
     probe_rates: ProbeRateAuthority,
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
     board_doctor_executor: Option<BoardScriptedDoctorExecutor>,
     activation: AsyncMutex<()>,
     secret_operations: Arc<Semaphore>,
+}
+
+/// Read-only retained evidence plus the exact durable onboarding state that fences currentness.
+pub(crate) struct RetainedRuntimeVerificationEvidence {
+    evidence: RuntimeVerificationEvidence,
+    onboarding_state: OnboardingState,
+}
+
+impl RetainedRuntimeVerificationEvidence {
+    pub(crate) const fn evidence(&self) -> &RuntimeVerificationEvidence {
+        &self.evidence
+    }
+
+    pub(crate) const fn onboarding_state(&self) -> OnboardingState {
+        self.onboarding_state
+    }
+}
+
+/// One-use application issuance produced only from the adapter's provider-observed doctor type.
+///
+/// This value is deliberately private and non-cloneable. Generic catalog append paths cannot
+/// manufacture it, and consuming it is the only installed route for an activating Alpaca
+/// `RuntimeVerified` event.
+struct AlpacaRuntimeVerificationIssuance {
+    generation: SecretGeneration,
+    evidence: RuntimeVerificationEvidence,
+}
+
+impl AlpacaRuntimeVerificationIssuance {
+    fn into_event(self) -> OnboardingEvent {
+        OnboardingEvent::RuntimeVerified {
+            generation: Some(self.generation),
+            evidence: self.evidence,
+        }
+    }
 }
 
 /// One exact, bounded FRED terms response acquired from its code-owned official URL.
@@ -254,6 +314,79 @@ impl ProviderOnboardingService {
         self.prepared_lease_from_resumed(&resumed, profile)
     }
 
+    pub(crate) fn runtime_activation_target_public_configuration(
+        &self,
+        session_id: Uuid,
+        expected_surface: &SourceIdentifier,
+    ) -> Result<EvidenceDigest, ProviderOnboardingError> {
+        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        let profile = self.current_profile_for(&resumed)?;
+        if profile.capability().surface_id() != expected_surface
+            || resumed.lifecycle().surface_id() != expected_surface
+        {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        Ok(resumed.reservation().public_configuration_digest())
+    }
+
+    /// Returns the newest exact onboarding target for a surface without granting activation.
+    pub(crate) fn current_runtime_activation_target(
+        &self,
+        expected_surface: &SourceIdentifier,
+    ) -> Result<Option<(Uuid, EvidenceDigest)>, ProviderOnboardingError> {
+        let sessions = self
+            .catalog
+            .current_provider_onboarding_sessions(CatalogLimit::new(32)?)?;
+        let selected = sessions
+            .into_iter()
+            .find(|session| session.lifecycle().surface_id() == expected_surface);
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        let profile = self.current_profile_for(&selected)?;
+        if profile.capability().surface_id() != expected_surface {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        Ok(Some((
+            selected.reservation().session_id(),
+            selected.reservation().public_configuration_digest(),
+        )))
+    }
+
+    /// Reopens retained runtime-verification evidence without treating it as current authority.
+    ///
+    /// This is the read-only status seam for an expired doctor receipt. Start and restart paths
+    /// must continue to use a prepared or active lease, whose construction independently enforces
+    /// the receipt's exclusive currentness deadline.
+    pub(crate) fn retained_runtime_verification_evidence(
+        &self,
+        session_id: Uuid,
+        expected_surface: &SourceIdentifier,
+        expected_public_configuration_digest: EvidenceDigest,
+        expected_generation: SecretGeneration,
+    ) -> Result<RetainedRuntimeVerificationEvidence, ProviderOnboardingError> {
+        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        let profile = self.current_profile_for(&resumed)?;
+        let lifecycle = resumed.lifecycle();
+        if profile.capability().surface_id() != expected_surface
+            || lifecycle.surface_id() != expected_surface
+            || resumed.reservation().public_configuration_digest()
+                != expected_public_configuration_digest
+            || lifecycle.active_generation() != Some(expected_generation)
+                && lifecycle.candidate_generation() != Some(expected_generation)
+        {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        let evidence = lifecycle
+            .generation_runtime_evidence(expected_generation)
+            .cloned()
+            .ok_or(ProviderOnboardingError::ActivationUnavailable)?;
+        Ok(RetainedRuntimeVerificationEvidence {
+            evidence,
+            onboarding_state: lifecycle.state(),
+        })
+    }
+
     pub(crate) fn discard_prepared_activation_at_startup(
         &self,
         prepared: &ProviderActivationLease,
@@ -270,7 +403,7 @@ impl ProviderOnboardingService {
     /// Fails closed when profiles, TLS, durable rate admission, or startup reconciliation cannot
     /// be established.
     pub fn try_new_with_provider_rate<S>(
-        catalog: OnboardingCatalogCapability,
+        catalog: Arc<OnboardingCatalogCapability>,
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
     ) -> Result<Self, ProviderOnboardingError>
@@ -288,7 +421,7 @@ impl ProviderOnboardingService {
     }
 
     pub(crate) fn try_new_with_provider_rate_and_runtime_admissions<S>(
-        catalog: OnboardingCatalogCapability,
+        catalog: Arc<OnboardingCatalogCapability>,
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
         runtime_admissions: ProviderRuntimeStartupAdmissions,
@@ -308,7 +441,7 @@ impl ProviderOnboardingService {
 
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
     pub(crate) fn try_new_with_provider_rate_runtime_admissions_and_board_fixture<S>(
-        catalog: OnboardingCatalogCapability,
+        catalog: Arc<OnboardingCatalogCapability>,
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
         runtime_admissions: ProviderRuntimeStartupAdmissions,
@@ -327,7 +460,7 @@ impl ProviderOnboardingService {
     }
 
     fn try_new_inner<S>(
-        catalog: OnboardingCatalogCapability,
+        catalog: Arc<OnboardingCatalogCapability>,
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
         runtime_admissions: ProviderRuntimeStartupAdmissions,
@@ -357,12 +490,14 @@ impl ProviderOnboardingService {
             .build()
             .map_err(|_| ProviderOnboardingError::ClientConfiguration)?;
         let profiles = built_in_provider_profiles()?;
-        let probe_rates = ProbeRateAuthority::try_new_with_provider_rate(&profiles, provider_rate)?;
+        let probe_rates =
+            ProbeRateAuthority::try_new_with_provider_rate(&profiles, provider_rate.clone())?;
         let service = Self {
             profiles,
             catalog,
             secrets,
             client,
+            provider_rate,
             probe_rates,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             board_doctor_executor,
@@ -998,20 +1133,23 @@ impl ProviderOnboardingService {
                         },
                     )
                     .await?;
-                    let probe_evidence = self
-                        .run_credential_probe(profile, &secret, cancellation.clone())
-                        .await?;
+                    let probe_evidence = if profile.id() == "alpaca.basic-market-data" {
+                        alpaca_credential_shape_evidence(&resumed, profile, generation, &secret)?
+                    } else {
+                        self.run_credential_probe(profile, &secret, cancellation.clone())
+                            .await?
+                    };
                     let verified_at = system_timestamp()?;
                     let verification_validity_nanos = match profile.id() {
                         "bls.v2-registered" => Some(BLS_REGISTRATION_VALIDITY_NANOS),
                         "coinbase.exchange-direct-market-data" => {
                             Some(COINBASE_DIRECT_VERIFICATION_VALIDITY_NANOS)
                         }
-                        "alpaca.basic-market-data"
-                        | "tradier.brokerage-market-data"
+                        "tradier.brokerage-market-data"
                         | "kraken.spot-authenticated-level3-market-data" => {
                             Some(MARKET_DATA_VERIFICATION_VALIDITY_NANOS)
                         }
+                        "alpaca.basic-market-data" => None,
                         _ => None,
                     };
                     let verification_expires_at = verification_validity_nanos
@@ -1090,19 +1228,52 @@ impl ProviderOnboardingService {
                         .generation_runtime_digest(generation)
                         .is_none()
                     {
-                        self.append(
-                            resumed.reservation(),
-                            resumed.next_sequence(),
-                            OnboardingEvent::RuntimeVerified {
-                                generation: Some(generation),
-                                evidence_digest: derived_evidence_digest(
+                        if profile.id() == "alpaca.basic-market-data" {
+                            let issuance = match self
+                                .run_alpaca_paper_iex_doctor(
+                                    &resumed,
+                                    profile,
+                                    generation,
+                                    None,
+                                    cancellation.clone(),
+                                )
+                                .await
+                            {
+                                Ok(issuance) => issuance,
+                                Err(error @ ProviderOnboardingError::CredentialRejected) => {
+                                    self.append(
+                                        resumed.reservation(),
+                                        resumed.next_sequence(),
+                                        OnboardingEvent::RefreshRequired {
+                                            evidence_digest: event_digest(
+                                                b"alpaca-doctor-credential-rejected",
+                                                session_id,
+                                                Some(generation),
+                                            ),
+                                        },
+                                    )?;
+                                    return Err(error);
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            self.append_alpaca_runtime_verification(
+                                resumed.reservation(),
+                                resumed.next_sequence(),
+                                issuance,
+                            )?;
+                        } else {
+                            self.append_digest_runtime_verification(
+                                resumed.reservation(),
+                                resumed.next_sequence(),
+                                Some(generation),
+                                derived_evidence_digest(
                                     b"credential-runtime",
                                     session_id,
                                     generation,
                                     verification.evidence_digest(),
                                 ),
-                            },
-                        )?;
+                            )?;
+                        }
                     } else {
                         return self.prepared_lease_from_resumed(&resumed, profile);
                     }
@@ -1121,6 +1292,104 @@ impl ProviderOnboardingService {
                 | None => return Err(ProviderOnboardingError::ActivationUnavailable),
             }
         }
+    }
+
+    /// Performs or renews one exact provider doctor while leaving runtime activation pending.
+    pub(crate) async fn verify_runtime_activation_target(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
+        let activation = self.activation.lock().await;
+        if cancellation.is_cancelled() {
+            return Err(ProviderOnboardingError::OperationCancelled);
+        }
+        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        let profile = self.current_profile_for(&resumed)?;
+        if profile.id() == "alpaca.basic-market-data"
+            && matches!(
+                resumed.lifecycle().state(),
+                OnboardingState::ActiveScoped | OnboardingState::RenewalRequired
+            )
+        {
+            if let Some((generation, predecessor, exclusive_expires_at)) = resumed
+                .lifecycle()
+                .active_generation()
+                .and_then(|generation| {
+                    resumed
+                        .lifecycle()
+                        .generation_runtime_evidence(generation)
+                        .and_then(RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
+                        .map(|receipt| {
+                            (
+                                generation,
+                                receipt.receipt_sha256(),
+                                receipt.exclusive_expires_at(),
+                            )
+                        })
+                })
+            {
+                let renewal_required =
+                    if resumed.lifecycle().state() == OnboardingState::ActiveScoped {
+                        self.append(
+                            resumed.reservation(),
+                            resumed.next_sequence(),
+                            OnboardingEvent::RenewalRequired {
+                                generation,
+                                expires_at: exclusive_expires_at,
+                                evidence_digest: event_digest(
+                                    b"alpaca-doctor-renewal-required",
+                                    session_id,
+                                    Some(generation),
+                                ),
+                            },
+                        )?;
+                        self.catalog.resume_provider_onboarding(session_id)?
+                    } else {
+                        resumed
+                    };
+                let issuance = match self
+                    .run_alpaca_paper_iex_doctor(
+                        &renewal_required,
+                        profile,
+                        generation,
+                        Some(predecessor),
+                        cancellation,
+                    )
+                    .await
+                {
+                    Ok(issuance) => issuance,
+                    Err(error @ ProviderOnboardingError::CredentialRejected) => {
+                        self.append(
+                            renewal_required.reservation(),
+                            renewal_required.next_sequence(),
+                            OnboardingEvent::RefreshRequired {
+                                evidence_digest: event_digest(
+                                    b"alpaca-doctor-credential-rejected",
+                                    session_id,
+                                    Some(generation),
+                                ),
+                            },
+                        )?;
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.append_alpaca_runtime_verification(
+                    renewal_required.reservation(),
+                    renewal_required.next_sequence(),
+                    issuance,
+                )?;
+                let renewed = self.catalog.resume_provider_onboarding(session_id)?;
+                let profile = self.current_profile_for(&renewed)?;
+                return self
+                    .lease_from_resumed(&renewed, profile)
+                    .or_else(|_| self.prepared_lease_from_resumed(&renewed, profile));
+            }
+        }
+        drop(activation);
+        self.prepare_runtime_activation_target(session_id, cancellation)
+            .await
     }
 
     /// Commits only the exact prepared lease after application-owned runtime staging succeeds.
@@ -1353,14 +1622,9 @@ impl ProviderOnboardingService {
             .run_probe(profile, declared_user_agent, cancellation)
             .await
         {
-            Ok(evidence_digest) => self.append(
-                reservation,
-                3,
-                OnboardingEvent::RuntimeVerified {
-                    generation: None,
-                    evidence_digest,
-                },
-            ),
+            Ok(evidence_digest) => {
+                self.append_digest_runtime_verification(reservation, 3, None, evidence_digest)
+            }
             Err(ProviderOnboardingError::OperationCancelled) => self.append(
                 reservation,
                 3,
@@ -1511,7 +1775,6 @@ impl ProviderOnboardingService {
             }
             "coinbase.exchange-direct-market-data"
             | "fred-alfred.api-v1-v2"
-            | "alpaca.basic-market-data"
             | "tradier.brokerage-market-data" => ProbeTransport::HttpGet,
             _ => return Err(ProviderOnboardingError::InvalidProfile),
         };
@@ -1583,14 +1846,6 @@ impl ProviderOnboardingService {
                     .verification_request(&self.client, unix_seconds_now()?)
                     .map_err(|_error| ProviderOnboardingError::InvalidSecretShape)?
             }
-            "alpaca.basic-market-data" => {
-                let credentials = AlpacaCredentialEnvelope::try_parse(secret.expose_secret())
-                    .map_err(|_error| ProviderOnboardingError::InvalidSecretShape)?;
-                expected_account_digest = Some(credentials.account_digest());
-                credentials
-                    .verification_request(&self.client)
-                    .map_err(|_error| ProviderOnboardingError::InvalidSecretShape)?
-            }
             "tradier.brokerage-market-data" => {
                 tradier_verification_request(&self.client, secret.expose_secret())
                     .map_err(|_error| ProviderOnboardingError::InvalidSecretShape)?
@@ -1635,7 +1890,6 @@ impl ProviderOnboardingService {
         validate_probe_semantics(profile.id(), &response)?;
         let account_digest = match profile.id() {
             "coinbase.exchange-direct-market-data" => Some(coinbase_account_digest(&response)?),
-            "alpaca.basic-market-data" => expected_account_digest,
             "tradier.brokerage-market-data" => Some(tradier_account_digest(&response)?),
             "kraken.spot-authenticated-level3-market-data" => {
                 let observed = kraken_account_digest(&response)?;
@@ -1653,6 +1907,113 @@ impl ProviderOnboardingService {
                 Sha256::digest(&response).into(),
             ),
             account_digest,
+        })
+    }
+
+    async fn run_alpaca_paper_iex_doctor(
+        &self,
+        resumed: &ResumedProviderOnboarding,
+        profile: &ProviderOnboardingProfile,
+        generation: SecretGeneration,
+        predecessor_digest: Option<EvidenceDigest>,
+        cancellation: CancellationToken,
+    ) -> Result<AlpacaRuntimeVerificationIssuance, ProviderOnboardingError> {
+        if profile.id() != "alpaca.basic-market-data"
+            || (resumed.lifecycle().candidate_generation() != Some(generation)
+                && resumed.lifecycle().active_generation() != Some(generation))
+        {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        let reference = resumed
+            .lifecycle()
+            .generation_reference(generation)
+            .cloned()
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let session_id = resumed.reservation().session_id();
+        let secrets = Arc::clone(&self.secrets);
+        let secret = await_blocking_secret_operation(
+            Arc::clone(&self.secret_operations),
+            cancellation.clone(),
+            move |operation| {
+                read_secret_reference(
+                    secrets.as_ref(),
+                    session_id,
+                    &reference,
+                    operation,
+                    SecretInteractionPolicy::AllowPlatformPrompt,
+                )
+            },
+        )
+        .await?;
+        let envelope = AlpacaCredentialEnvelope::try_parse(secret.expose_secret())
+            .map_err(|_| ProviderOnboardingError::InvalidSecretShape)?;
+        let principal = envelope.account_digest();
+        let verification = resumed
+            .lifecycle()
+            .generation_verification(generation)
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        if verification.bindings().account_digest() != Some(principal)
+            || verification.expires_at().is_some()
+            || resumed.lifecycle().generation_rights_digest(generation)
+                != Some(profile.rights_decision_digest())
+            || resumed
+                .lifecycle()
+                .generation_rate_policy_digest(generation)
+                != Some(profile.capability().rate_policy().evidence_digest())
+        {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        let subject = digest_qualified_subject("alpaca-market-data-principal-", principal)?;
+        self.provider_rate
+            .bind_authorization_subject(
+                market_squawk_sources::AuthorizationMode::UserAuthorized,
+                verification.evidence_digest(),
+                &subject,
+            )
+            .map_err(|_| ProviderOnboardingError::ProbeRateLimited)?;
+        let policy = profile
+            .capability()
+            .rate_policy()
+            .enforcement_policy()
+            .cloned()
+            .ok_or(ProviderOnboardingError::InvalidProfile)?;
+        let declaration = ProviderRateDeclaration::try_for_authorization_subject(policy, &subject)
+            .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        let budget = self
+            .provider_rate
+            .register_budget(declaration)
+            .map_err(|_| ProviderOnboardingError::ProbeRateLimited)?;
+        let credentials = Arc::new(
+            envelope
+                .into_credentials()
+                .map_err(|_| ProviderOnboardingError::InvalidSecretShape)?,
+        );
+        let limits = AlpacaTransportLimits::try_new(
+            ALPACA_DOCTOR_FRAME_BYTES,
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        )
+        .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        let doctor = AlpacaPaperIexDoctor::try_new(credentials, limits)
+            .map_err(|_| ProviderOnboardingError::ClientConfiguration)?;
+        let deadline = Instant::now()
+            .checked_add(ALPACA_DOCTOR_OPERATION_DURATION)
+            .ok_or(ProviderOnboardingError::Clock)?;
+        let observation = doctor
+            .observe(&budget, deadline, &cancellation)
+            .await
+            .map_err(map_alpaca_doctor_error)?;
+        let receipt = alpaca_doctor_receipt(
+            resumed,
+            profile,
+            generation,
+            principal,
+            &observation,
+            predecessor_digest,
+        )?;
+        Ok(AlpacaRuntimeVerificationIssuance {
+            generation,
+            evidence: RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(Box::new(receipt)),
         })
     }
 
@@ -1802,7 +2163,7 @@ impl ProviderOnboardingService {
         let rights_decision_digest = profile.rights_decision_digest();
         let rate_policy_digest = profile.capability().rate_policy().evidence_digest();
         let issued_at = system_timestamp()?;
-        let (generation, secret_reference, verification_expires_at, authority_effective_at) =
+        let (generation, secret_reference, credential_expires_at, credential_effective_at) =
             if let Some(generation) = lifecycle.candidate_generation() {
                 if lifecycle.generation_state(generation)
                     != Some(CredentialGenerationState::VerifiedLeastPrivilege)
@@ -1845,6 +2206,23 @@ impl ProviderOnboardingService {
                 }
                 (None, None, None, resumed.reservation().created_at())
             };
+        let runtime_verification_evidence = generation
+            .and_then(|generation| lifecycle.generation_runtime_evidence(generation))
+            .or_else(|| lifecycle.anonymous_runtime_evidence())
+            .cloned()
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        if !runtime_verification_evidence.admits_activation_at(issued_at) {
+            return Err(ProviderOnboardingError::ActivationExpired);
+        }
+        let doctor_receipt = runtime_verification_evidence.alpaca_paper_iex_receipt();
+        let verification_expires_at = doctor_receipt
+            .map(AlpacaPaperIexDoctorReceiptV1::exclusive_expires_at)
+            .or(credential_expires_at);
+        let authority_effective_at = doctor_receipt
+            .map(AlpacaPaperIexDoctorReceiptV1::verified_at)
+            .map_or(credential_effective_at, |verified_at| {
+                verified_at.max(credential_effective_at)
+            });
         if authority_effective_at > issued_at {
             return Err(ProviderOnboardingError::InvalidSessionState);
         }
@@ -1864,10 +2242,7 @@ impl ProviderOnboardingService {
             verification_evidence_digest: generation
                 .and_then(|generation| lifecycle.generation_verification(generation))
                 .map(AuthorityVerification::evidence_digest),
-            runtime_evidence_digest: generation
-                .and_then(|generation| lifecycle.generation_runtime_digest(generation))
-                .or_else(|| lifecycle.anonymous_runtime_digest())
-                .ok_or(ProviderOnboardingError::InvalidSessionState)?,
+            runtime_verification_evidence,
             provider_budget_policy: profile
                 .capability()
                 .rate_policy()
@@ -1910,7 +2285,7 @@ impl ProviderOnboardingService {
             return Err(ProviderOnboardingError::InvalidSessionState);
         }
         let issued_at = system_timestamp()?;
-        let (generation, secret_reference, verification_expires_at, authority_effective_at) =
+        let (generation, secret_reference, credential_expires_at, credential_effective_at) =
             if let Some(generation) = lifecycle.active_generation() {
                 if !lifecycle.generation_is_active_scoped(generation) {
                     return Err(ProviderOnboardingError::InvalidSessionState);
@@ -1938,6 +2313,28 @@ impl ProviderOnboardingService {
             } else {
                 (None, None, None, resumed.reservation().created_at())
             };
+        let runtime_verification_evidence = generation
+            .and_then(|generation| lifecycle.generation_runtime_evidence(generation))
+            .or_else(|| lifecycle.anonymous_runtime_evidence())
+            .cloned()
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        if !runtime_verification_evidence.admits_activation_at(issued_at)
+            || generation.is_some()
+                && !lifecycle
+                    .active_generation_is_fully_admitted(profile.capability(), issued_at)
+                    .map_err(|_| ProviderOnboardingError::InvalidSessionState)?
+        {
+            return Err(ProviderOnboardingError::ActivationExpired);
+        }
+        let doctor_receipt = runtime_verification_evidence.alpaca_paper_iex_receipt();
+        let verification_expires_at = doctor_receipt
+            .map(AlpacaPaperIexDoctorReceiptV1::exclusive_expires_at)
+            .or(credential_expires_at);
+        let authority_effective_at = doctor_receipt
+            .map(AlpacaPaperIexDoctorReceiptV1::verified_at)
+            .map_or(credential_effective_at, |verified_at| {
+                verified_at.max(credential_effective_at)
+            });
         if authority_effective_at > issued_at {
             return Err(ProviderOnboardingError::InvalidSessionState);
         }
@@ -1957,10 +2354,7 @@ impl ProviderOnboardingService {
             verification_evidence_digest: generation
                 .and_then(|generation| lifecycle.generation_verification(generation))
                 .map(AuthorityVerification::evidence_digest),
-            runtime_evidence_digest: generation
-                .and_then(|generation| lifecycle.generation_runtime_digest(generation))
-                .or_else(|| lifecycle.anonymous_runtime_digest())
-                .ok_or(ProviderOnboardingError::InvalidSessionState)?,
+            runtime_verification_evidence,
             provider_budget_policy: profile
                 .capability()
                 .rate_policy()
@@ -1980,8 +2374,45 @@ impl ProviderOnboardingService {
         sequence: u64,
         event: OnboardingEvent,
     ) -> Result<(), ProviderOnboardingError> {
+        if matches!(&event, OnboardingEvent::RuntimeVerified { .. }) {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
         self.catalog
             .append_provider_onboarding_event(reservation, sequence, event)?;
+        Ok(())
+    }
+
+    fn append_digest_runtime_verification(
+        &self,
+        reservation: &OnboardingReservation,
+        sequence: u64,
+        generation: Option<SecretGeneration>,
+        evidence_digest: EvidenceDigest,
+    ) -> Result<(), ProviderOnboardingError> {
+        let evidence = RuntimeVerificationEvidence::digest_v1(evidence_digest)
+            .map_err(|_| ProviderOnboardingError::InvalidSessionState)?;
+        self.catalog.append_provider_onboarding_event(
+            reservation,
+            sequence,
+            OnboardingEvent::RuntimeVerified {
+                generation,
+                evidence,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn append_alpaca_runtime_verification(
+        &self,
+        reservation: &OnboardingReservation,
+        sequence: u64,
+        issuance: AlpacaRuntimeVerificationIssuance,
+    ) -> Result<(), ProviderOnboardingError> {
+        self.catalog.append_provider_onboarding_event(
+            reservation,
+            sequence,
+            issuance.into_event(),
+        )?;
         Ok(())
     }
 
@@ -2406,18 +2837,7 @@ fn require_same_active_lease(
     current: &ProviderActivationLease,
     expected: &ProviderActivationLease,
 ) -> Result<(), ProviderOnboardingError> {
-    if current.session_id() == expected.session_id()
-        && current.surface_id() == expected.surface_id()
-        && current.capability_revision() == expected.capability_revision()
-        && current.capability_digest() == expected.capability_digest()
-        && current.rights_decision_digest() == expected.rights_decision_digest()
-        && current.public_configuration_digest() == expected.public_configuration_digest()
-        && current.account_digest() == expected.account_digest()
-        && current.verification_evidence_digest() == expected.verification_evidence_digest()
-        && current.provider_budget_policy() == expected.provider_budget_policy()
-        && current.generation() == expected.generation()
-        && current.secret_reference() == expected.secret_reference()
-    {
+    if current.same_authority_as(expected) {
         Ok(())
     } else {
         Err(ProviderOnboardingError::InvalidSessionState)
@@ -2618,7 +3038,6 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
     let valid = match profile_id {
         "coinbase.public-market-data" => value.get("product_id").is_some(),
         "coinbase.exchange-direct-market-data" => coinbase_account_id(&value).is_some(),
-        "alpaca.basic-market-data" => alpaca_probe_is_valid(&value),
         "tradier.brokerage-market-data" => tradier_profile_id(&value).is_some(),
         "kraken.spot-public-market-data" => {
             value
@@ -2647,23 +3066,6 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
     } else {
         Err(ProviderOnboardingError::ProbeUnavailable)
     }
-}
-
-fn alpaca_probe_is_valid(value: &serde_json::Value) -> bool {
-    let Some(quote) = value.get("quote").and_then(serde_json::Value::as_object) else {
-        return false;
-    };
-    quote
-        .get("t")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|timestamp| {
-            !timestamp.is_empty()
-                && timestamp.len() <= 64
-                && timestamp.is_ascii()
-                && !timestamp.bytes().any(|byte| byte.is_ascii_control())
-        })
-        && quote.get("ap").is_some_and(serde_json::Value::is_number)
-        && quote.get("bp").is_some_and(serde_json::Value::is_number)
 }
 
 fn tradier_profile_id(value: &serde_json::Value) -> Option<&str> {
@@ -2699,6 +3101,34 @@ fn kraken_key_info_is_least_authority(value: &serde_json::Value) -> bool {
 struct CredentialProbeEvidence {
     response_digest: EvidenceDigest,
     account_digest: Option<EvidenceDigest>,
+}
+
+fn alpaca_credential_shape_evidence(
+    resumed: &ResumedProviderOnboarding,
+    profile: &ProviderOnboardingProfile,
+    generation: SecretGeneration,
+    secret: &SecretValue,
+) -> Result<CredentialProbeEvidence, ProviderOnboardingError> {
+    if profile.id() != "alpaca.basic-market-data"
+        || resumed.lifecycle().candidate_generation() != Some(generation)
+    {
+        return Err(ProviderOnboardingError::InvalidSessionState);
+    }
+    let envelope = AlpacaCredentialEnvelope::try_parse(secret.expose_secret())
+        .map_err(|_| ProviderOnboardingError::InvalidSecretShape)?;
+    let principal = envelope.account_digest();
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/alpaca-paper-market-data-credential-shape/v1\0");
+    hasher.update(resumed.reservation().session_id().as_bytes());
+    hasher.update(generation.get().to_be_bytes());
+    hasher.update(principal.bytes());
+    hasher.update(profile.capability().content_digest().bytes());
+    hasher.update(resumed.reservation().public_configuration_digest().bytes());
+    hasher.update(profile.rights_decision_digest().bytes());
+    Ok(CredentialProbeEvidence {
+        response_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into()),
+        account_digest: Some(principal),
+    })
 }
 
 fn coinbase_account_digest(body: &[u8]) -> Result<EvidenceDigest, ProviderOnboardingError> {
@@ -2775,6 +3205,386 @@ fn event_digest(
     EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
 }
 
+fn alpaca_doctor_receipt(
+    resumed: &ResumedProviderOnboarding,
+    profile: &ProviderOnboardingProfile,
+    generation: SecretGeneration,
+    principal: EvidenceDigest,
+    observation: &AlpacaPaperIexDoctorObservation,
+    predecessor_digest: Option<EvidenceDigest>,
+) -> Result<AlpacaPaperIexDoctorReceiptV1, ProviderOnboardingError> {
+    if observation.origin() != AlpacaDoctorObservationOrigin::ProviderObserved {
+        return Err(ProviderOnboardingError::InvalidSessionState);
+    }
+    let verified_at = observation.completed_at();
+    let exclusive_expires_at = verified_at
+        .unix_nanos()
+        .checked_add(AlpacaPaperIexDoctorReceiptV1::VALIDITY_NANOS)
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(ProviderOnboardingError::Clock)?;
+    let input = AlpacaPaperIexDoctorReceiptInput {
+        provider_observation_origin: AlpacaPaperIexDoctorReceiptV1::provider_observed_origin()
+            .map_err(|_| ProviderOnboardingError::InvalidSessionState)?,
+        provider_observation_sha256: observation.observation_digest(),
+        surface_id: profile.capability().surface_id().clone(),
+        session_identifier: SourceIdentifier::try_from(
+            resumed.reservation().session_id().hyphenated().to_string(),
+        )?,
+        generation,
+        realm: AlpacaDoctorCredentialRealm::Paper,
+        market_data_principal_sha256: principal,
+        capability_revision: profile.capability().revision(),
+        capability_digest: profile.capability().content_digest(),
+        public_configuration_digest: resumed.reservation().public_configuration_digest(),
+        rights_decision_digest: profile.rights_decision_digest(),
+        rate_policy_digest: profile.capability().rate_policy().evidence_digest(),
+        data_quality: DataQuality::DirectUnverified,
+        quote: AlpacaDoctorProbeEvidence {
+            disposition: map_alpaca_doctor_disposition(observation.quote().disposition()),
+            disposition_evidence_digest: observation.quote().semantic_result_digest(),
+            observation: Some(map_alpaca_quote(observation.quote())),
+        },
+        batch: AlpacaDoctorProbeEvidence {
+            disposition: map_alpaca_doctor_disposition(observation.batch().disposition()),
+            disposition_evidence_digest: observation.batch().semantic_result_digest(),
+            observation: Some(map_alpaca_batch(observation.batch())),
+        },
+        stream: AlpacaDoctorProbeEvidence {
+            disposition: map_alpaca_doctor_disposition(observation.stream().disposition()),
+            disposition_evidence_digest: observation.stream().semantic_result_digest(),
+            observation: Some(map_alpaca_stream(observation.stream())),
+        },
+        historical: AlpacaDoctorProbeEvidence {
+            disposition: map_alpaca_doctor_disposition(observation.historical().disposition()),
+            disposition_evidence_digest: observation.historical().semantic_result_digest(),
+            observation: Some(map_alpaca_historical(observation.historical())?),
+        },
+        calendar: AlpacaDoctorProbeEvidence {
+            disposition: map_alpaca_doctor_disposition(observation.calendar().disposition()),
+            disposition_evidence_digest: observation.calendar().semantic_result_digest(),
+            observation: Some(map_alpaca_calendar(observation.calendar())),
+        },
+        additional_capabilities: alpaca_additional_capabilities(observation).into_boxed_slice(),
+        verified_at,
+        exclusive_expires_at,
+        predecessor_digest,
+    };
+    AlpacaPaperIexDoctorReceiptV1::try_new(input)
+        .map_err(|_| ProviderOnboardingError::InvalidSessionState)
+}
+
+fn map_alpaca_quote(
+    observation: &AdapterAlpacaDoctorQuoteObservation,
+) -> AlpacaDoctorQuoteObservation {
+    AlpacaDoctorQuoteObservation {
+        http: map_alpaca_http(observation.http()),
+        semantic_result_digest: observation.semantic_result_digest(),
+        quote_timestamp: observation.quote_timestamp(),
+        bid_price: observation.bid_price(),
+        ask_price: observation.ask_price(),
+        bid_size: observation.bid_size(),
+        ask_size: observation.ask_size(),
+    }
+}
+
+fn map_alpaca_batch(
+    observation: &AdapterAlpacaDoctorBatchObservation,
+) -> AlpacaDoctorBatchObservation {
+    AlpacaDoctorBatchObservation {
+        http: map_alpaca_http(observation.http()),
+        semantic_result_digest: observation.semantic_result_digest(),
+        requested_count: observation.requested_count(),
+        returned_count: observation.returned_count(),
+        missing_count: observation.missing_count(),
+        unexpected_count: observation.unexpected_count(),
+        duplicate_count: observation.duplicate_count(),
+        invalid_count: observation.invalid_count(),
+        effective_cardinality: observation.effective_cardinality(),
+        requested_set_digest: observation.requested_symbols_digest(),
+        returned_set_digest: observation.returned_symbols_digest(),
+        missing_set_digest: observation.missing_symbols_digest(),
+        unexpected_set_digest: observation.unexpected_symbols_digest(),
+    }
+}
+
+fn map_alpaca_stream(
+    observation: &AdapterAlpacaDoctorStreamObservation,
+) -> AlpacaDoctorStreamObservation {
+    AlpacaDoctorStreamObservation {
+        endpoint_contract_digest: observation.endpoint_contract_digest(),
+        request_digest: observation.request_digest(),
+        connected_frame_digest: observation.connected_frame_digest(),
+        authenticated_frame_digest: observation.authenticated_frame_digest(),
+        subscription_frame_digest: observation.subscription_frame_digest(),
+        semantic_result_digest: observation.semantic_result_digest(),
+        handshake_status: observation.handshake_status(),
+        handshake_rate: map_alpaca_rate(observation.handshake_rate()),
+        subscribed_trade_count: observation.subscribed_trade_count(),
+        subscribed_quote_count: observation.subscribed_quote_count(),
+        frames_observed: observation.frames_observed(),
+        bytes_observed: observation.bytes_observed(),
+        authenticated_at: observation.authenticated_at(),
+        subscribed_at: observation.subscribed_at(),
+        close_sent: observation.close_sent(),
+        clean_close_observed: observation.clean_close_observed(),
+        completed_at: observation.completed_at(),
+    }
+}
+
+fn map_alpaca_historical(
+    observation: &AdapterAlpacaDoctorHistoricalObservation,
+) -> Result<AlpacaDoctorHistoricalObservation, ProviderOnboardingError> {
+    let pages = observation
+        .pages()
+        .iter()
+        .map(|page| AlpacaDoctorHistoricalPageEvidence {
+            http: map_alpaca_http(page.http()),
+            request_page_token_digest: page.request_page_token_digest(),
+            response_page_token_digest: page.response_page_token_digest(),
+        })
+        .collect::<Vec<_>>();
+    if pages.len()
+        != usize::try_from(observation.page_count())
+            .map_err(|_| ProviderOnboardingError::InvalidSessionState)?
+    {
+        return Err(ProviderOnboardingError::InvalidSessionState);
+    }
+    Ok(AlpacaDoctorHistoricalObservation {
+        endpoint_contract_digest: observation.endpoint_contract_digest(),
+        request_digest: observation.request_digest(),
+        semantic_result_digest: observation.semantic_result_digest(),
+        start_date: observation.start_date(),
+        end_date: observation.end_date(),
+        page_count: observation.page_count(),
+        returned_bar_count: observation.returned_bar_count(),
+        distinct_date_count: observation.distinct_date_count(),
+        first_bar_timestamp: observation.first_bar_timestamp(),
+        last_bar_timestamp: observation.last_bar_timestamp(),
+        returned_dates_digest: observation.returned_dates_digest(),
+        pagination_graph_digest: observation.pagination_graph_digest(),
+        terminal_page_observed: observation.terminal_page_observed(),
+        pages: pages.into_boxed_slice(),
+    })
+}
+
+fn map_alpaca_calendar(
+    observation: &AdapterAlpacaDoctorCalendarObservation,
+) -> AlpacaDoctorCalendarObservation {
+    AlpacaDoctorCalendarObservation {
+        http: map_alpaca_http(observation.http()),
+        semantic_result_digest: observation.semantic_result_digest(),
+        start_date: observation.start_date(),
+        end_date: observation.end_date(),
+        session_count: observation.session_count(),
+        history_date_count: observation.history_date_count(),
+        matched_count: observation.matched_count(),
+        missing_history_count: observation.missing_history_count(),
+        unexpected_history_count: observation.unexpected_history_count(),
+        session_dates_digest: observation.session_dates_digest(),
+        history_dates_digest: observation.history_dates_digest(),
+        exact_date_reconciliation: observation.exact_date_reconciliation(),
+    }
+}
+
+fn map_alpaca_http(observation: &AdapterAlpacaDoctorHttpEvidence) -> AlpacaDoctorHttpEvidence {
+    AlpacaDoctorHttpEvidence {
+        endpoint_contract_digest: observation.endpoint_contract_digest(),
+        request_digest: observation.request_digest(),
+        status_code: observation.status_code(),
+        body_digest: observation.body_digest(),
+        response_bytes: observation.response_bytes(),
+        received_at: observation.received_at(),
+        latency_nanos: observation.latency_nanos(),
+        rate: map_alpaca_rate(observation.rate()),
+    }
+}
+
+fn map_alpaca_rate(observation: &AdapterAlpacaDoctorRateEvidence) -> AlpacaDoctorRateEvidence {
+    AlpacaDoctorRateEvidence {
+        limit: map_alpaca_observed_field(observation.limit()),
+        remaining: map_alpaca_observed_field(observation.remaining()),
+        reset_unix_seconds: map_alpaca_observed_field(observation.reset_unix_seconds()),
+        retry_after: match observation.retry_after() {
+            AlpacaDoctorObservedField::Observed(AlpacaDoctorRetryAfter::DelaySeconds(value)) => {
+                AlpacaRateLimitField::Observed(AlpacaRetryAfterEvidence::DelaySeconds(*value))
+            }
+            AlpacaDoctorObservedField::Observed(AlpacaDoctorRetryAfter::AtUnixSeconds(value)) => {
+                AlpacaRateLimitField::Observed(AlpacaRetryAfterEvidence::AtUnixSeconds(*value))
+            }
+            AlpacaDoctorObservedField::Missing => AlpacaRateLimitField::Missing,
+        },
+    }
+}
+
+fn map_alpaca_observed_field<T: Copy>(
+    field: &AlpacaDoctorObservedField<T>,
+) -> AlpacaRateLimitField<T> {
+    match field {
+        AlpacaDoctorObservedField::Observed(value) => AlpacaRateLimitField::Observed(*value),
+        AlpacaDoctorObservedField::Missing => AlpacaRateLimitField::Missing,
+    }
+}
+
+fn map_alpaca_doctor_disposition(
+    disposition: AlpacaDoctorObservationDisposition,
+) -> RuntimeCapabilityDisposition {
+    match disposition {
+        AlpacaDoctorObservationDisposition::ObservedAvailable => {
+            RuntimeCapabilityDisposition::Available
+        }
+        AlpacaDoctorObservationDisposition::ObservedDegraded => {
+            RuntimeCapabilityDisposition::Degraded
+        }
+        AlpacaDoctorObservationDisposition::ObservedUnavailable
+        | AlpacaDoctorObservationDisposition::Unsupported => {
+            RuntimeCapabilityDisposition::Unavailable
+        }
+        AlpacaDoctorObservationDisposition::Unprobed => RuntimeCapabilityDisposition::NotProbed,
+    }
+}
+
+fn alpaca_additional_capabilities(
+    observation: &AlpacaPaperIexDoctorObservation,
+) -> Vec<AlpacaDoctorCapabilityEvidence> {
+    [
+        (
+            AlpacaDoctorAdditionalCapability::OptionsRest,
+            observation.indicative_options_rest(),
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::OptionsStream,
+            observation.indicative_options_stream(),
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::FixedIncome,
+            observation.fixed_income(),
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::CorporateActions,
+            observation.corporate_actions(),
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::Sip,
+            observation.consolidated_sip(),
+        ),
+        (AlpacaDoctorAdditionalCapability::Nbbo, observation.nbbo()),
+        (AlpacaDoctorAdditionalCapability::Opra, observation.opra()),
+        (
+            AlpacaDoctorAdditionalCapability::PriceLevelDepth,
+            observation.price_level_depth(),
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::OrderLevelDepth,
+            observation.order_level_depth(),
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::BrokerageAccount,
+            observation.brokerage_account(),
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::Positions,
+            observation.positions(),
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::Orders,
+            observation.orders(),
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::Trading,
+            observation.trading(),
+        ),
+    ]
+    .into_iter()
+    .map(|(capability, observed)| {
+        let disposition = map_alpaca_doctor_disposition(observed);
+        AlpacaDoctorCapabilityEvidence {
+            capability,
+            disposition,
+            disposition_evidence_digest: alpaca_additional_capability_digest(
+                capability,
+                disposition,
+            ),
+        }
+    })
+    .collect()
+}
+
+fn alpaca_additional_capability_digest(
+    capability: AlpacaDoctorAdditionalCapability,
+    disposition: RuntimeCapabilityDisposition,
+) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(ALPACA_DOCTOR_ADDITIONAL_CAPABILITY_DOMAIN);
+    hasher.update([alpaca_additional_capability_tag(capability)]);
+    hasher.update([runtime_capability_disposition_tag(disposition)]);
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
+}
+
+const fn alpaca_additional_capability_tag(capability: AlpacaDoctorAdditionalCapability) -> u8 {
+    match capability {
+        AlpacaDoctorAdditionalCapability::OptionsRest => 1,
+        AlpacaDoctorAdditionalCapability::OptionsStream => 2,
+        AlpacaDoctorAdditionalCapability::FixedIncome => 3,
+        AlpacaDoctorAdditionalCapability::CorporateActions => 4,
+        AlpacaDoctorAdditionalCapability::Sip => 5,
+        AlpacaDoctorAdditionalCapability::Nbbo => 6,
+        AlpacaDoctorAdditionalCapability::Opra => 7,
+        AlpacaDoctorAdditionalCapability::PriceLevelDepth => 8,
+        AlpacaDoctorAdditionalCapability::OrderLevelDepth => 9,
+        AlpacaDoctorAdditionalCapability::BrokerageAccount => 10,
+        AlpacaDoctorAdditionalCapability::Positions => 11,
+        AlpacaDoctorAdditionalCapability::Orders => 12,
+        AlpacaDoctorAdditionalCapability::Trading => 13,
+    }
+}
+
+const fn runtime_capability_disposition_tag(disposition: RuntimeCapabilityDisposition) -> u8 {
+    match disposition {
+        RuntimeCapabilityDisposition::Available => 1,
+        RuntimeCapabilityDisposition::Degraded => 2,
+        RuntimeCapabilityDisposition::Unavailable => 3,
+        RuntimeCapabilityDisposition::NotProbed => 4,
+    }
+}
+
+fn digest_qualified_subject(
+    prefix: &str,
+    digest: EvidenceDigest,
+) -> Result<SourceIdentifier, ProviderOnboardingError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = digest.bytes();
+    let mut subject = String::with_capacity(prefix.len().saturating_add(bytes.len() * 2));
+    subject.push_str(prefix);
+    for byte in bytes {
+        subject.push(char::from(HEX[usize::from(byte >> 4)]));
+        subject.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    SourceIdentifier::try_from(subject).map_err(Into::into)
+}
+
+const fn map_alpaca_doctor_error(error: AlpacaError) -> ProviderOnboardingError {
+    match error {
+        AlpacaError::Cancelled => ProviderOnboardingError::OperationCancelled,
+        AlpacaError::DeadlineExceeded => ProviderOnboardingError::ProbeDeadlineExceeded,
+        AlpacaError::InvalidAuthorization => ProviderOnboardingError::CredentialRejected,
+        AlpacaError::InvalidBudget => ProviderOnboardingError::ProbeRateLimited,
+        AlpacaError::InvalidCredentials => ProviderOnboardingError::InvalidSecretShape,
+        AlpacaError::Identity(_)
+        | AlpacaError::Metadata(_)
+        | AlpacaError::NetworkPolicy(_)
+        | AlpacaError::InvalidCoverage
+        | AlpacaError::SubscriptionLimit
+        | AlpacaError::InvalidTransportLimits
+        | AlpacaError::InvalidHistoricalPlan => ProviderOnboardingError::InvalidProfile,
+        AlpacaError::Serialization
+        | AlpacaError::Protocol
+        | AlpacaError::CaptureMaterial
+        | AlpacaError::Allocation
+        | AlpacaError::Network
+        | AlpacaError::BodyTooLarge => ProviderOnboardingError::ProbeUnavailable,
+    }
+}
+
 fn derived_evidence_digest(
     domain: &[u8],
     session_id: Uuid,
@@ -2801,10 +3611,10 @@ fn credential_assurance(
             "coinbase-exchange-view-key-verified-live-entitlement-pending",
         )
         .map_err(Into::into),
-        "alpaca.basic-market-data" => {
-            SourceIdentifier::try_from("alpaca-basic-iex-and-indicative-market-data-key-verified")
-                .map_err(Into::into)
-        }
+        "alpaca.basic-market-data" => SourceIdentifier::try_from(
+            "alpaca-paper-market-data-credential-principal-shape-verified",
+        )
+        .map_err(Into::into),
         "tradier.brokerage-market-data" => SourceIdentifier::try_from(
             "tradier-production-profile-read-and-market-data-token-verified",
         )

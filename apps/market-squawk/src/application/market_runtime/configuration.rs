@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
+use market_squawk_platform::SecretGeneration;
 use market_squawk_services::ServiceError;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -50,6 +51,8 @@ pub(crate) struct PreparedMarketProviderConfigurationRequest {
     surface: AccountMarketSurface,
     onboarding_session_id: Uuid,
     expected_public_configuration_digest: EvidenceDigest,
+    expected_runtime_verification_receipt_digest: EvidenceDigest,
+    expected_credential_generation: SecretGeneration,
 }
 
 impl PreparedMarketProviderConfigurationRequest {
@@ -58,10 +61,14 @@ impl PreparedMarketProviderConfigurationRequest {
         surface: AccountMarketSurface,
         onboarding_session_id: Uuid,
         expected_public_configuration_digest: EvidenceDigest,
+        expected_runtime_verification_receipt_digest: EvidenceDigest,
+        expected_credential_generation: SecretGeneration,
     ) -> Result<Self, ServiceError> {
         if onboarding_session_id.is_nil()
             || expected_public_configuration_digest.algorithm() != DigestAlgorithm::Sha256
             || expected_public_configuration_digest.bytes() == [0; 32]
+            || expected_runtime_verification_receipt_digest.algorithm() != DigestAlgorithm::Sha256
+            || expected_runtime_verification_receipt_digest.bytes() == [0; 32]
         {
             return Err(ServiceError::InvalidRequest);
         }
@@ -69,6 +76,8 @@ impl PreparedMarketProviderConfigurationRequest {
             surface,
             onboarding_session_id,
             expected_public_configuration_digest,
+            expected_runtime_verification_receipt_digest,
+            expected_credential_generation,
         })
     }
 
@@ -82,6 +91,14 @@ impl PreparedMarketProviderConfigurationRequest {
 
     pub(crate) const fn expected_public_configuration_digest(self) -> EvidenceDigest {
         self.expected_public_configuration_digest
+    }
+
+    pub(crate) const fn expected_runtime_verification_receipt_digest(self) -> EvidenceDigest {
+        self.expected_runtime_verification_receipt_digest
+    }
+
+    pub(crate) const fn expected_credential_generation(self) -> SecretGeneration {
+        self.expected_credential_generation
     }
 }
 
@@ -128,6 +145,8 @@ pub(super) fn validate_resolved_configuration(
         || lease.surface_id().as_str() != request.surface().surface_id()
         || lease.session_id() != request.onboarding_session_id()
         || lease.public_configuration_digest() != request.expected_public_configuration_digest()
+        || lease.runtime_evidence_digest() != request.expected_runtime_verification_receipt_digest()
+        || lease.generation() != Some(request.expected_credential_generation())
     {
         return Err(ServiceError::InvalidRequest);
     }

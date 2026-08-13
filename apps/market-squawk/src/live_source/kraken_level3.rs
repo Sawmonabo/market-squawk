@@ -468,7 +468,6 @@ async fn run_generation(
             .as_mut()
             .ok_or(KrakenLevel3RuntimeError::ActorTopology)?;
         let socket_result = run_socket(
-            activation,
             config,
             specs,
             &profile,
@@ -582,7 +581,6 @@ impl IntegrityProfile {
     reason = "the established socket loop retains every generation-bound capability"
 )]
 async fn run_socket<S>(
-    activation: &KrakenL3AccountActivation,
     config: &KrakenL3Config,
     specs: &[InstrumentSpec],
     profile: &IntegrityProfile,
@@ -637,7 +635,6 @@ where
                 };
             }
             _ = currentness.tick() => {
-                activation.require_current().await?;
                 source.validate_current()?;
             }
             () = tokio::time::sleep_until(idle_deadline) => {

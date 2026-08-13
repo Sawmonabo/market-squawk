@@ -8,6 +8,7 @@ mod capability;
 mod lifecycle;
 mod profile;
 mod public_configuration;
+mod runtime_verification;
 
 pub use built_in_profiles::{TREASURY_DAILY_RATES_PROBE_YEAR, built_in_provider_profiles};
 pub use capability::{
@@ -30,6 +31,18 @@ pub use profile::{
 pub use public_configuration::{
     MAX_PROVIDER_PUBLIC_CONFIGURATION_BYTES, MAX_PROVIDER_PUBLIC_CONFIGURATION_FIELDS,
     ProviderPublicConfiguration, PublicConfigurationError,
+};
+pub use runtime_verification::{
+    ALPACA_BASIC_MARKET_DATA_SURFACE_ID, ALPACA_PAPER_IEX_DOCTOR_RECEIPT_SCHEMA,
+    AlpacaDoctorAdditionalCapability, AlpacaDoctorBatchObservation,
+    AlpacaDoctorCalendarObservation, AlpacaDoctorCapabilityEvidence, AlpacaDoctorCredentialRealm,
+    AlpacaDoctorHistoricalObservation, AlpacaDoctorHistoricalPageEvidence,
+    AlpacaDoctorHttpEvidence, AlpacaDoctorProbeEvidence, AlpacaDoctorQuoteObservation,
+    AlpacaDoctorRateEvidence, AlpacaDoctorStreamObservation, AlpacaPaperIexDoctorReceiptInput,
+    AlpacaPaperIexDoctorReceiptV1, AlpacaRateLimitField, AlpacaRetryAfterEvidence,
+    MAX_ALPACA_PAPER_IEX_DOCTOR_RECEIPT_BYTES, RuntimeCapabilityDisposition,
+    RuntimeVerificationContext, RuntimeVerificationDigestV1, RuntimeVerificationEvidence,
+    RuntimeVerificationEvidenceError,
 };
 
 #[cfg(test)]

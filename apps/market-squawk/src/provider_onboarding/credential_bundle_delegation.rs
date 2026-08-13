@@ -20,7 +20,7 @@ const PROVIDER_COUNT: usize = 17;
 
 const ALPACA_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "alpaca.basic-market-data",
-    capability_revision: 3,
+    capability_revision: 4,
     release_state: ProfileReleaseState::Available,
 };
 const SCHWAB_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {

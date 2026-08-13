@@ -18,13 +18,13 @@ use crate::{ProviderActivationLease, ProviderOnboardingError};
 use super::ProviderAdapterActivation;
 use super::account::{
     ProviderAccountActivationError, ProviderAccountBinding, ProviderAccountRuntimeAuthority,
-    ProviderMarketAccount,
+    ProviderAccountRuntimeCurrentness, ProviderMarketAccount,
 };
 use super::credentials::{ProviderCredentialError, tradier_access_token};
 
 /// Non-clone owner of one Tradier account and all admitted logical market-data configurations.
 pub struct TradierMarketDataAccountActivation {
-    authority: ProviderAccountRuntimeAuthority,
+    authority: Arc<ProviderAccountRuntimeAuthority>,
     account: Arc<TradierAccountMarketData>,
     consolidated_stream: Option<TradierSourceConfig>,
     subscriptions: TradierSubscriptionAuthority,
@@ -34,13 +34,18 @@ pub struct TradierMarketDataAccountActivation {
 
 impl TradierMarketDataAccountActivation {
     /// Returns the immutable onboarding lease retained by this runtime owner.
-    pub const fn lease(&self) -> &ProviderActivationLease {
+    pub fn lease(&self) -> &ProviderActivationLease {
         self.authority.lease()
     }
 
     /// Returns the stable, secret-free provider-account binding.
-    pub const fn account_binding(&self) -> &ProviderAccountBinding {
+    pub fn account_binding(&self) -> &ProviderAccountBinding {
         self.authority.binding()
+    }
+
+    /// Returns a weak-only view for the common account-runtime currentness monitor.
+    pub(crate) fn currentness(&self) -> ProviderAccountRuntimeCurrentness {
+        self.authority.currentness()
     }
 
     /// Transfers the generation-neutral stream plan into central supervision once.
@@ -183,13 +188,13 @@ impl ProviderAdapterActivation {
         )?);
         let subscriptions =
             account.subscription_authority(&consolidated_stream, initial_stream_symbols)?;
-        let authority = ProviderAccountRuntimeAuthority::try_acquire(
+        let authority = Arc::new(ProviderAccountRuntimeAuthority::try_acquire(
             ProviderMarketAccount::TradierBrokerage,
             lease,
             Arc::clone(&self.onboarding),
             &self.app_config,
             self.provider_rate.clone(),
-        )?;
+        )?);
         Ok(TradierMarketDataAccountActivation {
             authority,
             account,

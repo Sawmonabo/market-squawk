@@ -101,6 +101,7 @@ enum ProductionSupervisorOutput {
         directory: DisplayMarketDirectory,
         routes: Vec<DisplayMarketRouteIdentity>,
         actor_limits: DisplayMarketActorLimits,
+        read_admission: super::display_market::DisplayMarketReadAdmission,
     },
 }
 
@@ -181,6 +182,7 @@ impl ProductionSourceSupervisor {
         directory: DisplayMarketDirectory,
         routes: Vec<DisplayMarketRouteIdentity>,
         actor_limits: DisplayMarketActorLimits,
+        read_admission: super::display_market::DisplayMarketReadAdmission,
         provider_rate: ProviderRateAuthority,
     ) -> Result<Self, ProductionSupervisorError> {
         if !profile.supports_display_output() {
@@ -198,6 +200,7 @@ impl ProductionSourceSupervisor {
             directory,
             routes,
             actor_limits,
+            read_admission,
         };
         Self::try_new_with_output(
             config,
@@ -340,6 +343,7 @@ impl ProductionSourceSupervisor {
                     directory,
                     routes,
                     actor_limits,
+                    read_admission,
                 } => {
                     let registration_deadline = Instant::now()
                         .checked_add(self.config.source_shutdown())
@@ -360,7 +364,13 @@ impl ProductionSourceSupervisor {
                             ProductionSupervisorError::DisplayDirectory
                         })?;
                         let registration = directory
-                            .register(key, *actor_limits, &cancellation, registration_deadline)
+                            .register(
+                                key,
+                                *actor_limits,
+                                read_admission.clone(),
+                                &cancellation,
+                                registration_deadline,
+                            )
                             .await
                             .map_err(|error| {
                                 tracing::error!(%error, "display-market registration failed");

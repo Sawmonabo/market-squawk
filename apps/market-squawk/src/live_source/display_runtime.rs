@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     DisplayMarketActorLimits, DisplayMarketDirectory, DisplayMarketDirectoryError,
-    DisplayMarketRouteIdentity,
+    DisplayMarketReadAdmission, DisplayMarketRouteIdentity,
 };
 use crate::live_source::{
     provider::{ProductionProviderError, ProductionSourceProfile},
@@ -48,6 +48,7 @@ impl ProductionDisplaySourceRuntime {
         source: AlpacaIexLiveConfig,
         credentials: Arc<AlpacaCredentials>,
         actor_limits: DisplayMarketActorLimits,
+        read_admission: DisplayMarketReadAdmission,
         provider_rate: ProviderRateAuthority,
         cancellation: CancellationToken,
     ) -> Result<Self, ProductionDisplaySourceRuntimeError> {
@@ -63,6 +64,7 @@ impl ProductionDisplaySourceRuntime {
             profile,
             routes,
             actor_limits,
+            read_admission,
             provider_rate,
             cancellation,
         )
@@ -80,6 +82,7 @@ impl ProductionDisplaySourceRuntime {
         source: AlpacaOptionsLiveConfig,
         credentials: Arc<AlpacaCredentials>,
         actor_limits: DisplayMarketActorLimits,
+        read_admission: DisplayMarketReadAdmission,
         provider_rate: ProviderRateAuthority,
         cancellation: CancellationToken,
     ) -> Result<Self, ProductionDisplaySourceRuntimeError> {
@@ -95,6 +98,7 @@ impl ProductionDisplaySourceRuntime {
             profile,
             routes,
             actor_limits,
+            read_admission,
             provider_rate,
             cancellation,
         )
@@ -113,6 +117,7 @@ impl ProductionDisplaySourceRuntime {
         account: Arc<TradierAccountMarketData>,
         subscriptions: TradierSubscriptionAuthority,
         actor_limits: DisplayMarketActorLimits,
+        read_admission: DisplayMarketReadAdmission,
         provider_rate: ProviderRateAuthority,
         cancellation: CancellationToken,
     ) -> Result<Self, ProductionDisplaySourceRuntimeError> {
@@ -128,6 +133,7 @@ impl ProductionDisplaySourceRuntime {
             profile,
             routes,
             actor_limits,
+            read_admission,
             provider_rate,
             cancellation,
         )
@@ -140,6 +146,7 @@ impl ProductionDisplaySourceRuntime {
         profile: ProductionSourceProfile,
         routes: Vec<DisplayMarketRouteIdentity>,
         actor_limits: DisplayMarketActorLimits,
+        read_admission: DisplayMarketReadAdmission,
         provider_rate: ProviderRateAuthority,
         cancellation: CancellationToken,
     ) -> Result<Self, ProductionDisplaySourceRuntimeError> {
@@ -156,6 +163,7 @@ impl ProductionDisplaySourceRuntime {
             directory.clone(),
             routes,
             actor_limits,
+            read_admission,
             provider_rate,
         )?;
         let source_shutdown = app_config.source_shutdown();

@@ -1,5 +1,9 @@
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
+};
 use market_squawk_platform::{SecretGeneration, SecretRef};
+use rust_decimal::Decimal;
+use sha2::{Digest as _, Sha256};
 
 use super::*;
 
@@ -148,7 +152,18 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         .get("alpaca.basic-market-data")
         .ok_or("missing Alpaca Paper Only profile")?;
     assert_eq!(alpaca.release_state(), ProfileReleaseState::Available);
-    assert_eq!(alpaca.capability().revision().get(), 3);
+    assert_eq!(alpaca.capability().revision().get(), 4);
+    assert_eq!(
+        alpaca.capability().maximum_authority().as_slice(),
+        &[SourceIdentifier::try_from("alpaca.market-data.read")?]
+    );
+    assert_eq!(
+        alpaca
+            .capability_history()
+            .map(|capability| capability.revision().get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
     assert_eq!(
         alpaca.requirements(),
         (
@@ -599,7 +614,7 @@ fn provider_onboarding_authority_lifecycle_requires_exact_generation_and_renewal
         &capability_v1,
         OnboardingEvent::RuntimeVerified {
             generation: Some(generation_one),
-            evidence_digest: digest(42),
+            evidence: RuntimeVerificationEvidence::digest_v1(digest(42))?,
         },
         observed_at,
     )?;
@@ -674,7 +689,7 @@ fn provider_onboarding_authority_lifecycle_requires_exact_generation_and_renewal
         },
         OnboardingEvent::RuntimeVerified {
             generation: Some(generation_two),
-            evidence_digest: digest(44),
+            evidence: RuntimeVerificationEvidence::digest_v1(digest(44))?,
         },
     ] {
         lifecycle.apply(&capability_v1, event, rotation_at)?;
@@ -756,6 +771,340 @@ fn provider_onboarding_authority_lifecycle_requires_exact_generation_and_renewal
         lifecycle.generation_reference(generation_two),
         Some(&active_reference)
     );
+    Ok(())
+}
+
+#[test]
+fn alpaca_doctor_receipt_closes_contract_graph_and_same_generation_renewal() -> TestResult {
+    let profiles = built_in_provider_profiles()?;
+    let profile = profiles
+        .get(ALPACA_BASIC_MARKET_DATA_SURFACE_ID)
+        .ok_or("missing Alpaca Paper/IEX profile")?;
+    let capability = profile.capability();
+    let requested_authority = capability.maximum_authority().clone();
+    assert_eq!(
+        requested_authority.as_slice(),
+        &[SourceIdentifier::try_from("alpaca.market-data.read")?]
+    );
+
+    let session_identifier = SourceIdentifier::try_from("018f76a0-3d3b-7d62-a60b-0242ac120002")?;
+    let public_configuration_digest = digest(70);
+    let principal_digest = digest(71);
+    let generation = SecretGeneration::new(1)?;
+    let mut lifecycle = OnboardingLifecycle::reserve_with_runtime_verification_context(
+        capability,
+        requested_authority.clone(),
+        RuntimeVerificationContext::try_new(
+            session_identifier.clone(),
+            public_configuration_digest,
+        )?,
+    )?;
+    assert_eq!(lifecycle.requested_authority(), &requested_authority);
+    lifecycle.apply(
+        capability,
+        OnboardingEvent::CredentialStored {
+            reference: secret_ref(1, 'c')?,
+        },
+        Timestamp::from_unix_nanos(100),
+    )?;
+    lifecycle.apply(
+        capability,
+        OnboardingEvent::AuthorityVerified {
+            verification: Box::new(AuthorityVerification::try_new(
+                capability,
+                AuthorityVerificationInput {
+                    requested: requested_authority.clone(),
+                    observed: requested_authority,
+                    restrictions_digest: digest(72),
+                    bindings: AuthorityBindings::new(None, None, None, Some(principal_digest)),
+                    verified_at: Timestamp::from_unix_nanos(100),
+                    expires_at: None,
+                    verifier_revision: capability.verifier_revision().clone(),
+                    assurance_limitation: SourceIdentifier::try_from(
+                        "alpaca-paper-iex-market-data-only",
+                    )?,
+                    evidence_digest: digest(73),
+                },
+            )?),
+        },
+        Timestamp::from_unix_nanos(100),
+    )?;
+    for event in [
+        OnboardingEvent::RightsAdmitted {
+            generation: Some(generation),
+            decision_digest: profile.rights_decision_digest(),
+        },
+        OnboardingEvent::RatePolicyAdmitted {
+            generation: Some(generation),
+            policy_digest: capability.rate_policy().evidence_digest(),
+        },
+    ] {
+        lifecycle.apply(capability, event, Timestamp::from_unix_nanos(100))?;
+    }
+
+    let initial_input = alpaca_doctor_input(
+        profile,
+        &session_identifier,
+        public_configuration_digest,
+        generation,
+        principal_digest,
+        Timestamp::from_unix_nanos(1_000),
+        Timestamp::from_unix_nanos(2_000),
+        None,
+    )?;
+    let initial_receipt = AlpacaPaperIexDoctorReceiptV1::try_new(initial_input.clone())?;
+    let initial_expires_at = initial_receipt.exclusive_expires_at();
+    assert_eq!(
+        initial_receipt.provider_observation_sha256(),
+        initial_input.provider_observation_sha256
+    );
+    let mut forged_provider_observation = initial_input.clone();
+    forged_provider_observation.provider_observation_sha256 = digest(79);
+    assert!(matches!(
+        AlpacaPaperIexDoctorReceiptV1::try_new(forged_provider_observation),
+        Err(RuntimeVerificationEvidenceError::InvalidEvidence)
+    ));
+    let mut caller_selected_expiry = initial_input.clone();
+    caller_selected_expiry.exclusive_expires_at = caller_selected_expiry
+        .exclusive_expires_at
+        .checked_add_nanos(1)?;
+    assert!(matches!(
+        AlpacaPaperIexDoctorReceiptV1::try_new(caller_selected_expiry),
+        Err(RuntimeVerificationEvidenceError::InvalidEvidence)
+    ));
+    assert_eq!(
+        initial_receipt.doctor_revision().as_str(),
+        "market-squawk.alpaca-paper-iex-doctor-implementation.v1"
+    );
+    let mut expected_contract = Sha256::new();
+    expected_contract.update(b"market-squawk/alpaca-paper-iex-doctor-contract/v1\0");
+    expected_contract.update(capability.revision().get().to_be_bytes());
+    expected_contract.update(capability.content_digest().bytes());
+    expected_contract.update(initial_receipt.doctor_revision().as_str().as_bytes());
+    assert_eq!(
+        initial_receipt.doctor_contract_digest(),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, expected_contract.finalize().into())
+    );
+    let mut serialized_receipt = serde_json::to_value(&initial_receipt)?;
+    assert!(serialized_receipt["input"].get("doctor_revision").is_none());
+    assert!(
+        serialized_receipt["input"]
+            .get("doctor_contract_digest")
+            .is_none()
+    );
+    serialized_receipt["doctor_contract_digest"] = serde_json::to_value(digest(74))?;
+    assert!(serde_json::from_value::<AlpacaPaperIexDoctorReceiptV1>(serialized_receipt).is_err());
+
+    let mut disconnected_history = initial_input.clone();
+    disconnected_history
+        .historical
+        .observation
+        .as_mut()
+        .ok_or("history observation omitted")?
+        .pages[1]
+        .request_page_token_digest = None;
+    assert!(matches!(
+        AlpacaPaperIexDoctorReceiptV1::try_new(disconnected_history),
+        Err(RuntimeVerificationEvidenceError::InvalidEvidence)
+    ));
+
+    let mut mismatched_range = initial_input.clone();
+    mismatched_range
+        .calendar
+        .observation
+        .as_mut()
+        .ok_or("calendar observation omitted")?
+        .start_date = CalendarDate::new(2026, 8, 12)?;
+    assert!(matches!(
+        AlpacaPaperIexDoctorReceiptV1::try_new(mismatched_range),
+        Err(RuntimeVerificationEvidenceError::InvalidEvidence)
+    ));
+
+    let mut mismatched_count = initial_input.clone();
+    let calendar = mismatched_count
+        .calendar
+        .observation
+        .as_mut()
+        .ok_or("calendar observation omitted")?;
+    calendar.session_count = 1;
+    calendar.history_date_count = 1;
+    calendar.matched_count = 1;
+    assert!(matches!(
+        AlpacaPaperIexDoctorReceiptV1::try_new(mismatched_count),
+        Err(RuntimeVerificationEvidenceError::InvalidEvidence)
+    ));
+
+    let mut mismatched_dates = initial_input.clone();
+    let calendar = mismatched_dates
+        .calendar
+        .observation
+        .as_mut()
+        .ok_or("calendar observation omitted")?;
+    calendar.session_dates_digest = digest(75);
+    calendar.history_dates_digest = digest(75);
+    assert!(matches!(
+        AlpacaPaperIexDoctorReceiptV1::try_new(mismatched_dates),
+        Err(RuntimeVerificationEvidenceError::InvalidEvidence)
+    ));
+
+    let initial_digest = initial_receipt.receipt_sha256();
+    lifecycle.apply(
+        capability,
+        OnboardingEvent::RuntimeVerified {
+            generation: Some(generation),
+            evidence: alpaca_runtime_evidence(initial_receipt),
+        },
+        Timestamp::from_unix_nanos(1_100),
+    )?;
+    let pending_successor = AlpacaPaperIexDoctorReceiptV1::try_new(alpaca_doctor_input(
+        profile,
+        &session_identifier,
+        public_configuration_digest,
+        generation,
+        principal_digest,
+        Timestamp::from_unix_nanos(1_200),
+        Timestamp::from_unix_nanos(2_200),
+        Some(initial_digest),
+    )?)?;
+    assert!(matches!(
+        lifecycle.apply(
+            capability,
+            OnboardingEvent::RuntimeVerified {
+                generation: Some(generation),
+                evidence: alpaca_runtime_evidence(pending_successor),
+            },
+            Timestamp::from_unix_nanos(1_300),
+        ),
+        Err(OnboardingStateError::InvalidEvidence)
+    ));
+    assert_eq!(
+        lifecycle.generation_runtime_digest(generation),
+        Some(initial_digest)
+    );
+    lifecycle.apply(
+        capability,
+        OnboardingEvent::Activate {
+            generation: Some(generation),
+        },
+        Timestamp::from_unix_nanos(1_300),
+    )?;
+    assert_eq!(lifecycle.state(), OnboardingState::ActiveScoped);
+
+    let successor = AlpacaPaperIexDoctorReceiptV1::try_new(alpaca_doctor_input(
+        profile,
+        &session_identifier,
+        public_configuration_digest,
+        generation,
+        principal_digest,
+        Timestamp::from_unix_nanos(1_500),
+        Timestamp::from_unix_nanos(2_500),
+        Some(initial_digest),
+    )?)?;
+    assert!(matches!(
+        lifecycle.apply(
+            capability,
+            OnboardingEvent::RuntimeVerified {
+                generation: Some(generation),
+                evidence: alpaca_runtime_evidence(successor.clone()),
+            },
+            Timestamp::from_unix_nanos(1_600),
+        ),
+        Err(OnboardingStateError::InvalidTransition)
+    ));
+    assert_eq!(lifecycle.state(), OnboardingState::ActiveScoped);
+
+    lifecycle.apply(
+        capability,
+        OnboardingEvent::RenewalRequired {
+            generation,
+            expires_at: initial_expires_at,
+            evidence_digest: digest(76),
+        },
+        initial_expires_at,
+    )?;
+    assert_eq!(lifecycle.state(), OnboardingState::RenewalRequired);
+    let renewal_observed_at = initial_expires_at.checked_add_nanos(100)?;
+
+    for rejected_input in [
+        alpaca_doctor_input(
+            profile,
+            &session_identifier,
+            public_configuration_digest,
+            generation,
+            principal_digest,
+            Timestamp::from_unix_nanos(1_500),
+            Timestamp::from_unix_nanos(2_500),
+            Some(digest(77)),
+        )?,
+        alpaca_doctor_input(
+            profile,
+            &session_identifier,
+            public_configuration_digest,
+            generation,
+            principal_digest,
+            Timestamp::from_unix_nanos(1_000),
+            Timestamp::from_unix_nanos(2_500),
+            Some(initial_digest),
+        )?,
+        alpaca_doctor_input(
+            profile,
+            &session_identifier,
+            public_configuration_digest,
+            SecretGeneration::new(2)?,
+            principal_digest,
+            Timestamp::from_unix_nanos(1_500),
+            Timestamp::from_unix_nanos(2_500),
+            Some(initial_digest),
+        )?,
+        alpaca_doctor_input(
+            profile,
+            &session_identifier,
+            public_configuration_digest,
+            generation,
+            digest(78),
+            Timestamp::from_unix_nanos(1_500),
+            Timestamp::from_unix_nanos(2_500),
+            Some(initial_digest),
+        )?,
+    ] {
+        let rejected = AlpacaPaperIexDoctorReceiptV1::try_new(rejected_input)?;
+        assert!(
+            lifecycle
+                .apply(
+                    capability,
+                    OnboardingEvent::RuntimeVerified {
+                        generation: Some(generation),
+                        evidence: alpaca_runtime_evidence(rejected),
+                    },
+                    renewal_observed_at,
+                )
+                .is_err()
+        );
+        assert_eq!(lifecycle.state(), OnboardingState::RenewalRequired);
+        assert_eq!(
+            lifecycle.generation_runtime_digest(generation),
+            Some(initial_digest)
+        );
+    }
+
+    let successor_digest = successor.receipt_sha256();
+    assert_eq!(
+        lifecycle.apply(
+            capability,
+            OnboardingEvent::RuntimeVerified {
+                generation: Some(generation),
+                evidence: alpaca_runtime_evidence(successor),
+            },
+            renewal_observed_at,
+        )?,
+        OnboardingState::ActiveScoped
+    );
+    assert_eq!(lifecycle.active_generation(), Some(generation));
+    assert_eq!(
+        lifecycle.generation_runtime_digest(generation),
+        Some(successor_digest)
+    );
+    assert!(lifecycle.active_generation_is_fully_admitted(capability, renewal_observed_at)?);
     Ok(())
 }
 
@@ -1019,6 +1368,254 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
         Some((8, 1_000_000_000))
     );
     Ok(())
+}
+
+fn alpaca_doctor_input(
+    profile: &ProviderOnboardingProfile,
+    session_identifier: &SourceIdentifier,
+    public_configuration_digest: EvidenceDigest,
+    generation: SecretGeneration,
+    principal_digest: EvidenceDigest,
+    verified_at: Timestamp,
+    exclusive_expires_at: Timestamp,
+    predecessor_digest: Option<EvidenceDigest>,
+) -> TestResult<AlpacaPaperIexDoctorReceiptInput> {
+    let capability = profile.capability();
+    let received_at = |offset: i64| {
+        Timestamp::from_unix_nanos(
+            verified_at
+                .unix_nanos()
+                .checked_sub(offset)
+                .expect("test doctor timestamp underflow"),
+        )
+    };
+    let history_dates_digest = digest(140);
+    let continuation_digest = digest(141);
+    let start_date = CalendarDate::new(2026, 8, 11)?;
+    let end_date = CalendarDate::new(2026, 8, 12)?;
+    let additional_capabilities = [
+        (
+            AlpacaDoctorAdditionalCapability::OptionsRest,
+            RuntimeCapabilityDisposition::NotProbed,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::OptionsStream,
+            RuntimeCapabilityDisposition::NotProbed,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::FixedIncome,
+            RuntimeCapabilityDisposition::NotProbed,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::CorporateActions,
+            RuntimeCapabilityDisposition::NotProbed,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::Sip,
+            RuntimeCapabilityDisposition::Unavailable,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::Nbbo,
+            RuntimeCapabilityDisposition::Unavailable,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::Opra,
+            RuntimeCapabilityDisposition::Unavailable,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::PriceLevelDepth,
+            RuntimeCapabilityDisposition::Unavailable,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::OrderLevelDepth,
+            RuntimeCapabilityDisposition::Unavailable,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::BrokerageAccount,
+            RuntimeCapabilityDisposition::Unavailable,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::Positions,
+            RuntimeCapabilityDisposition::Unavailable,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::Orders,
+            RuntimeCapabilityDisposition::Unavailable,
+        ),
+        (
+            AlpacaDoctorAdditionalCapability::Trading,
+            RuntimeCapabilityDisposition::Unavailable,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(
+        |(index, (capability, disposition))| AlpacaDoctorCapabilityEvidence {
+            capability,
+            disposition,
+            disposition_evidence_digest: digest(
+                u8::try_from(180 + index).expect("test capability digest index overflow"),
+            ),
+        },
+    )
+    .collect::<Vec<_>>()
+    .into_boxed_slice();
+
+    let mut input = AlpacaPaperIexDoctorReceiptInput {
+        provider_observation_origin: AlpacaPaperIexDoctorReceiptV1::provider_observed_origin()?,
+        provider_observation_sha256: digest(79),
+        surface_id: capability.surface_id().clone(),
+        session_identifier: session_identifier.clone(),
+        generation,
+        realm: AlpacaDoctorCredentialRealm::Paper,
+        market_data_principal_sha256: principal_digest,
+        capability_revision: capability.revision(),
+        capability_digest: capability.content_digest(),
+        public_configuration_digest,
+        rights_decision_digest: profile.rights_decision_digest(),
+        rate_policy_digest: capability.rate_policy().evidence_digest(),
+        data_quality: DataQuality::DirectUnverified,
+        quote: available_probe(
+            AlpacaDoctorQuoteObservation {
+                http: alpaca_http_evidence(80, received_at(50)),
+                semantic_result_digest: digest(83),
+                quote_timestamp: Some(received_at(51)),
+                bid_price: Some(Decimal::new(10_000, 2)),
+                ask_price: Some(Decimal::new(10_001, 2)),
+                bid_size: Some(10),
+                ask_size: Some(11),
+            },
+            84,
+        ),
+        batch: available_probe(
+            AlpacaDoctorBatchObservation {
+                http: alpaca_http_evidence(85, received_at(40)),
+                semantic_result_digest: digest(88),
+                requested_count: 50,
+                returned_count: 50,
+                missing_count: 0,
+                unexpected_count: 0,
+                duplicate_count: 0,
+                invalid_count: 0,
+                effective_cardinality: 50,
+                requested_set_digest: digest(89),
+                returned_set_digest: digest(90),
+                missing_set_digest: digest(91),
+                unexpected_set_digest: digest(92),
+            },
+            93,
+        ),
+        stream: available_probe(
+            AlpacaDoctorStreamObservation {
+                endpoint_contract_digest: digest(94),
+                request_digest: digest(95),
+                connected_frame_digest: digest(96),
+                authenticated_frame_digest: digest(97),
+                subscription_frame_digest: digest(98),
+                semantic_result_digest: digest(99),
+                handshake_status: 101,
+                handshake_rate: alpaca_rate_evidence(),
+                subscribed_trade_count: 1,
+                subscribed_quote_count: 1,
+                frames_observed: 3,
+                bytes_observed: 512,
+                authenticated_at: received_at(35),
+                subscribed_at: received_at(34),
+                close_sent: true,
+                clean_close_observed: true,
+                completed_at: received_at(30),
+            },
+            100,
+        ),
+        historical: available_probe(
+            AlpacaDoctorHistoricalObservation {
+                endpoint_contract_digest: digest(101),
+                request_digest: digest(102),
+                semantic_result_digest: digest(103),
+                start_date,
+                end_date,
+                page_count: 2,
+                returned_bar_count: 2,
+                distinct_date_count: 2,
+                first_bar_timestamp: Some(received_at(100)),
+                last_bar_timestamp: Some(received_at(90)),
+                returned_dates_digest: history_dates_digest,
+                pagination_graph_digest: digest(104),
+                terminal_page_observed: true,
+                pages: vec![
+                    AlpacaDoctorHistoricalPageEvidence {
+                        http: alpaca_http_evidence(105, received_at(25)),
+                        request_page_token_digest: None,
+                        response_page_token_digest: Some(continuation_digest),
+                    },
+                    AlpacaDoctorHistoricalPageEvidence {
+                        http: alpaca_http_evidence(108, received_at(20)),
+                        request_page_token_digest: Some(continuation_digest),
+                        response_page_token_digest: None,
+                    },
+                ]
+                .into_boxed_slice(),
+            },
+            111,
+        ),
+        calendar: available_probe(
+            AlpacaDoctorCalendarObservation {
+                http: alpaca_http_evidence(112, received_at(10)),
+                semantic_result_digest: digest(115),
+                start_date,
+                end_date,
+                session_count: 2,
+                history_date_count: 2,
+                matched_count: 2,
+                missing_history_count: 0,
+                unexpected_history_count: 0,
+                session_dates_digest: history_dates_digest,
+                history_dates_digest,
+                exact_date_reconciliation: true,
+            },
+            117,
+        ),
+        additional_capabilities,
+        verified_at,
+        exclusive_expires_at,
+        predecessor_digest,
+    };
+    super::runtime_verification::seal_test_alpaca_provider_observation(&mut input)?;
+    Ok(input)
+}
+
+fn alpaca_runtime_evidence(receipt: AlpacaPaperIexDoctorReceiptV1) -> RuntimeVerificationEvidence {
+    RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(Box::new(receipt))
+}
+
+fn available_probe<T>(observation: T, digest_byte: u8) -> AlpacaDoctorProbeEvidence<T> {
+    AlpacaDoctorProbeEvidence {
+        disposition: RuntimeCapabilityDisposition::Available,
+        disposition_evidence_digest: digest(digest_byte),
+        observation: Some(observation),
+    }
+}
+
+fn alpaca_http_evidence(digest_byte: u8, received_at: Timestamp) -> AlpacaDoctorHttpEvidence {
+    AlpacaDoctorHttpEvidence {
+        endpoint_contract_digest: digest(digest_byte),
+        request_digest: digest(digest_byte + 1),
+        status_code: 200,
+        body_digest: digest(digest_byte + 2),
+        response_bytes: 512,
+        received_at,
+        latency_nanos: 1,
+        rate: alpaca_rate_evidence(),
+    }
+}
+
+const fn alpaca_rate_evidence() -> AlpacaDoctorRateEvidence {
+    AlpacaDoctorRateEvidence {
+        limit: AlpacaRateLimitField::Observed(200),
+        remaining: AlpacaRateLimitField::Observed(199),
+        reset_unix_seconds: AlpacaRateLimitField::Observed(1_800_000_000),
+        retry_after: AlpacaRateLimitField::Missing,
+    }
 }
 
 fn capability(revision: u64) -> TestResult<ProviderCapability> {

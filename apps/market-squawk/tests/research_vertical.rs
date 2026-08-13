@@ -421,7 +421,9 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
     )?;
     let objects = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
-    let research = Arc::new(ResearchService::initialize(&paths, catalog, 8, objects)?);
+    let (research, onboarding_catalog) =
+        ResearchService::initialize_with_provider_onboarding(&paths, catalog, 8, objects)?;
+    let research = Arc::new(research);
     let registry = market_squawk_sources::AuthoritativeSourceRegistry::try_new_durable(
         LocalAuthorityStateStore::try_open(
             paths
@@ -543,7 +545,7 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         Err(ServiceError::NotFound)
     ));
     let onboarding = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
-        research.onboarding_catalog(),
+        onboarding_catalog,
         Arc::new(EncryptedFileSecretStore::try_open(
             directory.path().join("discovery-provider-secrets"),
             SecretValue::new("discovery test unlock".to_owned())?,
@@ -1315,11 +1317,12 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
         CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
     )?;
     let objects = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
-    let research = ResearchService::initialize(&paths, catalog, 8, objects)?;
+    let (_research, onboarding_catalog) =
+        ResearchService::initialize_with_provider_onboarding(&paths, catalog, 8, objects)?;
     let provider_rate =
         provider_rate_authority(&directory.path().join("portal-provider-rate.sqlite3"))?;
     let fallback_service = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
-        research.onboarding_catalog(),
+        Arc::clone(&onboarding_catalog),
         Arc::new(
             PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
                 "market-squawk-test",
@@ -1385,7 +1388,7 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
         SecretValue::new("test vault unlock".to_owned())?,
     )?);
     let service = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
-        research.onboarding_catalog(),
+        onboarding_catalog,
         secrets,
         provider_rate,
     )?);

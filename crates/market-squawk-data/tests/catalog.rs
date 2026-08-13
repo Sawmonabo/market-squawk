@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_data::{
     ArtifactRecord, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig, CatalogError,
@@ -46,9 +46,9 @@ use market_squawk_sources::{
     CoverageTopology, CredentialKind, EvidenceBinding, FreshnessPolicy, HistoricalCapability,
     HumanBoundary, InstrumentCoverage, LifecycleSupport, NetworkAccessPolicy, OnboardingEvent,
     OnboardingState, ProviderCapability, ProviderCapabilityInput, ProviderCapabilityRevision,
-    ProviderPublicConfiguration, RatePolicyDescriptor, RightsAdmissionState, SetupMode,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
-    SourceProtocolProfile,
+    ProviderPublicConfiguration, RatePolicyDescriptor, RightsAdmissionState,
+    RuntimeVerificationEvidence, SetupMode, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest as _, Sha256};
@@ -94,7 +94,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
     assert!(!health.trusted_schema());
     assert_eq!(health.synchronous(), 2);
     assert_eq!(health.busy_timeout(), Duration::from_millis(750));
-    assert_eq!(health.applied_migrations(), 21);
+    assert_eq!(health.applied_migrations(), 22);
     assert!(matches!(
         CatalogAuthority::open(config.clone()),
         Err(CatalogError::WriterAlreadyOpen)
@@ -113,7 +113,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         CatalogAuthority::open(alias_config),
         Err(CatalogError::UnsafePath)
     ));
-    assert_eq!(catalog.health()?.applied_migrations(), 21);
+    assert_eq!(catalog.health()?.applied_migrations(), 22);
     drop(catalog);
     std::fs::remove_file(alias_location.path())?;
     let catalog = CatalogAuthority::open(config.clone())?;
@@ -503,6 +503,7 @@ fn catalog_rejects_tampered_migration_identity() -> TestResult {
 fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestResult {
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("onboarding"))?;
+    let database = paths.catalog()?.path().to_path_buf();
     let config = CatalogConfig::try_new(
         paths.catalog()?.clone(),
         Duration::from_millis(250),
@@ -551,7 +552,7 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
                 &capability,
                 AuthorityVerificationInput {
                     requested: requested.clone(),
-                    observed: requested,
+                    observed: requested.clone(),
                     restrictions_digest: digest(70),
                     bindings: AuthorityBindings::new(None, None, None, Some(digest(71))),
                     verified_at: Timestamp::from_unix_nanos(10),
@@ -574,7 +575,7 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
         },
         OnboardingEvent::RuntimeVerified {
             generation: Some(generation),
-            evidence_digest: digest(74),
+            evidence: RuntimeVerificationEvidence::digest_v1(digest(74))?,
         },
         OnboardingEvent::Activate {
             generation: Some(generation),
@@ -593,10 +594,85 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
             OnboardingAppendOutcome::Replay
         );
     }
+    let zero_event_request = OnboardingReservationRequest::try_new(
+        &capability,
+        ProviderPublicConfiguration::default(),
+        requested.clone(),
+        SourceIdentifier::try_from("local-user")?,
+        SourceIdentifier::try_from("reserved-without-events")?,
+        Timestamp::from_unix_nanos(i64::MAX),
+        1,
+    )?;
+    let zero_event_reservation = catalog.reserve_provider_onboarding(&zero_event_request)?;
+    let zero_event_session_id = zero_event_reservation.session_id();
+    assert_eq!(
+        zero_event_reservation.initial_state(),
+        OnboardingState::UserActionRequired
+    );
+    let wall_now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let late_deadline = wall_now
+        .checked_add(Duration::from_secs(1))
+        .and_then(|value| i64::try_from(value.as_nanos()).ok())
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(CatalogError::InvalidRecord)?;
+    let late_request = OnboardingReservationRequest::try_new(
+        &capability,
+        ProviderPublicConfiguration::default(),
+        requested,
+        SourceIdentifier::try_from("local-user")?,
+        SourceIdentifier::try_from("late-replay-session")?,
+        late_deadline,
+        1,
+    )?;
+    let late_reservation = catalog.reserve_provider_onboarding(&late_request)?;
+    let late_event = OnboardingEvent::CredentialStored {
+        reference: reference.clone(),
+    };
+    assert_eq!(
+        catalog.append_provider_onboarding_event(&late_reservation, 1, late_event.clone())?,
+        OnboardingAppendOutcome::Inserted
+    );
     drop(catalog);
 
-    let reopened = CatalogAuthority::open(config)?;
-    let resumed = reopened.resume_provider_onboarding(reservation.session_id())?;
+    let legacy = Connection::open(&database)?;
+    legacy.execute_batch(
+        "BEGIN IMMEDIATE;
+         DROP TRIGGER provider_onboarding_stream_heads_checked_update;
+         DROP TRIGGER provider_onboarding_stream_heads_immutable_delete;
+         DROP TABLE provider_onboarding_stream_heads;
+         DELETE FROM schema_migrations WHERE version=22;
+         COMMIT;",
+    )?;
+    let legacy_migration_count: i64 =
+        legacy.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })?;
+    let legacy_head_table: bool = legacy.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_schema
+             WHERE type='table' AND name='provider_onboarding_stream_heads'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let legacy_sessions: i64 = legacy.query_row(
+        "SELECT COUNT(*) FROM provider_onboarding_sessions",
+        [],
+        |row| row.get(0),
+    )?;
+    let legacy_events: i64 = legacy.query_row(
+        "SELECT COUNT(*) FROM provider_onboarding_events",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(legacy_migration_count, 21);
+    assert!(!legacy_head_table);
+    assert_eq!((legacy_sessions, legacy_events), (3, 7));
+    drop(legacy);
+
+    let migrated = CatalogAuthority::open(config.clone())?;
+    assert_eq!(migrated.health()?.applied_migrations(), 22);
+    let resumed = migrated.resume_provider_onboarding(reservation.session_id())?;
     assert_eq!(resumed.lifecycle().state(), OnboardingState::ActiveScoped);
     assert!(resumed.lifecycle().generation_is_active_scoped(generation));
     assert_eq!(
@@ -604,6 +680,96 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
         Some(&reference)
     );
     assert_eq!(resumed.next_sequence(), 7);
+    let late_resumed = migrated.resume_provider_onboarding(late_reservation.session_id())?;
+    assert_eq!(late_resumed.next_sequence(), 2);
+    let zero_event_resumed = migrated.resume_provider_onboarding(zero_event_session_id)?;
+    assert_eq!(
+        zero_event_resumed.lifecycle().state(),
+        OnboardingState::UserActionRequired
+    );
+    assert_eq!(zero_event_resumed.next_sequence(), 1);
+
+    let head_reader = Connection::open(&database)?;
+    let head_count: i64 = head_reader.query_row(
+        "SELECT COUNT(*) FROM provider_onboarding_stream_heads",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(head_count, 3);
+    let successful_head: (i64, i64, Option<i64>, Option<i64>, Vec<u8>) = head_reader.query_row(
+        "SELECT stream_version, event_count, last_event_sequence, last_audit_sequence,
+                cumulative_sha256
+         FROM provider_onboarding_stream_heads WHERE session_id=?1",
+        [reservation.session_id().to_string()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    assert_eq!(successful_head.0, 1);
+    assert_eq!(successful_head.1, 6);
+    assert_eq!(successful_head.2, Some(6));
+    assert!(successful_head.3.is_some());
+    assert_eq!(successful_head.4.len(), 32);
+    assert_ne!(successful_head.4, vec![0_u8; 32]);
+    let zero_event_head: (i64, i64, Option<i64>, Option<i64>, Vec<u8>) = head_reader.query_row(
+        "SELECT stream_version, event_count, last_event_sequence, last_audit_sequence,
+                cumulative_sha256
+         FROM provider_onboarding_stream_heads WHERE session_id=?1",
+        [zero_event_session_id.to_string()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    assert_eq!(zero_event_head.0, 1);
+    assert_eq!(zero_event_head.1, 0);
+    assert_eq!(zero_event_head.2, None);
+    assert_eq!(zero_event_head.3, None);
+    assert_eq!(zero_event_head.4.len(), 32);
+    assert_ne!(zero_event_head.4, vec![0_u8; 32]);
+    drop(head_reader);
+    drop(migrated);
+
+    let reopened = CatalogAuthority::open(config)?;
+    assert_eq!(reopened.health()?.applied_migrations(), 22);
+    assert_eq!(
+        reopened
+            .resume_provider_onboarding(reservation.session_id())?
+            .next_sequence(),
+        7
+    );
+    let reopened_zero_event = reopened.resume_provider_onboarding(zero_event_session_id)?;
+    assert_eq!(
+        reopened_zero_event.lifecycle().state(),
+        OnboardingState::UserActionRequired
+    );
+    assert_eq!(reopened_zero_event.next_sequence(), 1);
+    let late_resumed = reopened.resume_provider_onboarding(late_reservation.session_id())?;
+    let wall_now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let wall_now = i64::try_from(wall_now.as_nanos())?;
+    if let Some(remaining) = late_deadline.unix_nanos().checked_sub(wall_now)
+        && remaining >= 0
+    {
+        let wait_nanos = u64::try_from(remaining)?
+            .checked_add(1_000_000)
+            .ok_or(CatalogError::InvalidRecord)?;
+        std::thread::sleep(Duration::from_nanos(wait_nanos));
+    }
+    assert!(matches!(
+        reopened.append_provider_onboarding_event(late_resumed.reservation(), 1, late_event,),
+        Err(CatalogError::OnboardingDeadlineExceeded)
+    ));
     Ok(())
 }
 

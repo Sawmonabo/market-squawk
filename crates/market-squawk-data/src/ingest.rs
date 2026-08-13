@@ -706,6 +706,22 @@ impl AnalyticalDataService {
         Ok(Self::from_active_parts(authority, manifests, objects))
     }
 
+    /// Initializes one analytical service and transfers its sole provider-onboarding capability
+    /// to the installed composition.
+    ///
+    /// The returned capability is non-cloneable and no getter can recreate it from the service.
+    /// Ordinary [`Self::initialize`] therefore cannot mint provider-onboarding append authority.
+    pub fn initialize_with_provider_onboarding(
+        authority: CatalogAuthority,
+        manifests: AnalyticalManifestCatalog,
+        artifact_root: market_squawk_platform::ArtifactRoot,
+        object_config: ObjectStoreConfig,
+    ) -> Result<(Self, crate::OnboardingCatalogCapability), IngestError> {
+        let service = Self::initialize(authority, manifests, artifact_root, object_config)?;
+        let capability = crate::OnboardingCatalogCapability::new(Arc::clone(&service.authority));
+        Ok((service, capability))
+    }
+
     /// Initializes one analytical service while consuming the exclusive pre-service catalog
     /// authority to issue the sole closed feature-dataset production publisher.
     ///
@@ -752,6 +768,22 @@ impl AnalyticalDataService {
             AuthorityTransitionService::open_bound(authority, artifact_root, object_config)
                 .map_err(map_authority_transition_error)?;
         Ok(Self::from_active_parts(authority, manifests, objects))
+    }
+
+    /// Opens one analytical service and transfers its sole provider-onboarding capability to the
+    /// installed composition.
+    ///
+    /// The returned capability is non-cloneable and no getter can recreate it from the service.
+    /// Ordinary [`Self::open`] therefore cannot mint provider-onboarding append authority.
+    pub fn open_with_provider_onboarding(
+        authority: CatalogAuthority,
+        manifests: AnalyticalManifestCatalog,
+        artifact_root: market_squawk_platform::ArtifactRoot,
+        object_config: ObjectStoreConfig,
+    ) -> Result<(Self, crate::OnboardingCatalogCapability), IngestError> {
+        let service = Self::open(authority, manifests, artifact_root, object_config)?;
+        let capability = crate::OnboardingCatalogCapability::new(Arc::clone(&service.authority));
+        Ok((service, capability))
     }
 
     /// Opens one bound analytical service and transfers the sole session-bound feature-dataset
@@ -866,11 +898,6 @@ impl AnalyticalDataService {
     /// Returns fair-value persistence authority over this service's sole catalog writer.
     pub fn fair_value_catalog(&self) -> crate::FairValueCatalogCapability {
         crate::FairValueCatalogCapability::new(Arc::clone(&self.authority))
-    }
-
-    /// Returns provider-onboarding authority over this service's sole catalog writer.
-    pub fn onboarding_catalog(&self) -> crate::OnboardingCatalogCapability {
-        crate::OnboardingCatalogCapability::new(Arc::clone(&self.authority))
     }
 
     /// Returns bounded point-in-time definition reads over this service's sole catalog session.

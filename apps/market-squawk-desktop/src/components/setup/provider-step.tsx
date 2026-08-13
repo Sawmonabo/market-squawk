@@ -50,9 +50,34 @@ export function ProviderStep({
     (profile) => !profile.id.startsWith("local."),
   )
 
-  const sessionFor = (profile: ProviderProfile) =>
-    localSessions[profile.id] ??
-    sessions.find((candidate) => candidate.surface_id === profile.id)
+  React.useEffect(() => {
+    setLocalSessions((current) => {
+      const retained = Object.entries(current).filter(([surfaceId, local]) => {
+        const authoritative = sessions.find(
+          (candidate) => candidate.surface_id === surfaceId,
+        )
+        if (!authoritative) return true
+        const parentCaughtUp =
+          authoritative.session_id === local.session_id &&
+          authoritative.state === local.state &&
+          authoritative.next_action === local.next_action &&
+          authoritative.credential_stored === local.credential_stored
+        return !parentCaughtUp && authoritative.next_action !== "active"
+      })
+      return retained.length === Object.keys(current).length
+        ? current
+        : Object.fromEntries(retained)
+    })
+  }, [sessions])
+
+  const sessionFor = (profile: ProviderProfile) => {
+    const authoritative = sessions.find(
+      (candidate) => candidate.surface_id === profile.id,
+    )
+    const local = localSessions[profile.id]
+    if (authoritative?.next_action === "active") return authoritative
+    return local ?? authoritative
+  }
 
   const remember = (session: ProviderSession) => {
     setLocalSessions((current) => ({
@@ -71,10 +96,21 @@ export function ProviderStep({
     setPending(profile.id)
     setError(null)
     try {
-      await transport.onboard({
+      const activation = await transport.onboard({
         action: "activate",
         sessionId: session.session_id,
         request: { kind: "source" },
+      })
+      if (
+        activation.profile !== profile.id ||
+        activation.session_id !== session.session_id
+      ) {
+        throw new Error("Provider activation returned a different setup identity.")
+      }
+      remember({
+        ...session,
+        state: "active_scoped",
+        next_action: "active",
       })
       onChanged()
     } catch (requestError) {
@@ -173,7 +209,7 @@ export function ProviderStep({
                 {setupReady ? (
                   <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-400">
                     <CircleCheck className="size-3.5" aria-hidden="true" />
-                    Setup ready
+                    {session?.credential_stored ? "Credentials stored" : "Setup verified"}
                   </span>
                 ) : null}
               </div>
@@ -184,6 +220,13 @@ export function ProviderStep({
                 <ProviderFact label="Cost" value={profile.zero_fee} />
                 <ProviderFact label="Quality ceiling" value={profile.quality_ceiling} />
               </dl>
+
+              {setupReady ? (
+                <p className="mt-3 text-[10px] leading-relaxed text-muted-foreground">
+                  Completed setup does not start a source or authorize trading. Sources shows any
+                  server-owned checks required before an explicit Start.
+                </p>
+              ) : null}
 
               {!setupReady ? (
                 <div className="mt-4 flex flex-wrap gap-2">

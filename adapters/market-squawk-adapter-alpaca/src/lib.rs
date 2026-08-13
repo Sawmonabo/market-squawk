@@ -8,22 +8,37 @@
 mod config;
 mod credentials;
 mod decoder;
+mod doctor;
 mod error;
 mod historical;
 mod historical_calendar;
 mod live;
+#[cfg(feature = "scripted-transport-fixture")]
+mod scripted;
 
 pub use config::{
-    ALPACA_BASIC_EQUITY_SYMBOL_LIMIT, ALPACA_BASIC_HISTORICAL_REQUESTS_PER_MINUTE,
-    ALPACA_BASIC_OPTION_SYMBOL_LIMIT, ALPACA_HISTORICAL_EXCLUSION_NANOS,
-    ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS, ALPACA_HISTORICAL_MIN_LOOKBACK_DAYS, AlpacaAdjustment,
-    AlpacaHistoricalEquityConfig, AlpacaHistoricalEquityDataset, AlpacaHistoricalEquityDatasetPlan,
-    AlpacaHistoricalEquityPreflightPlan, AlpacaHistoricalLookback, AlpacaHistoricalSeriesSemantics,
-    AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsLiveConfig,
-    AlpacaTimeframe, AlpacaTransportLimits,
+    ALPACA_APPLICATION_MAX_REQUESTS_PER_MINUTE, ALPACA_BASIC_EQUITY_SYMBOL_LIMIT,
+    ALPACA_BASIC_HISTORICAL_REQUESTS_PER_MINUTE, ALPACA_BASIC_OPTION_SYMBOL_LIMIT,
+    ALPACA_HISTORICAL_EXCLUSION_NANOS, ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS,
+    ALPACA_HISTORICAL_MIN_LOOKBACK_DAYS, ALPACA_RECURRING_TARGET_REQUESTS_PER_MINUTE,
+    AlpacaAdjustment, AlpacaHistoricalEquityConfig, AlpacaHistoricalEquityDataset,
+    AlpacaHistoricalEquityDatasetPlan, AlpacaHistoricalEquityPreflightPlan,
+    AlpacaHistoricalLookback, AlpacaHistoricalSeriesSemantics, AlpacaIexLiveConfig,
+    AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsLiveConfig, AlpacaTimeframe,
+    AlpacaTransportLimits,
 };
 pub use credentials::AlpacaCredentials;
 pub use decoder::{AlpacaIexDecoder, AlpacaOptionsDecoder};
+#[cfg(feature = "scripted-transport-fixture")]
+pub use doctor::AlpacaPaperIexDoctorFixtureObservation;
+pub use doctor::{
+    ALPACA_PAPER_IEX_DOCTOR_BATCH_SYMBOL_COUNT, AlpacaDoctorBatchObservation,
+    AlpacaDoctorCalendarObservation, AlpacaDoctorHistoricalObservation, AlpacaDoctorHttpEvidence,
+    AlpacaDoctorHttpPageEvidence, AlpacaDoctorObservationDisposition,
+    AlpacaDoctorObservationOrigin, AlpacaDoctorObservedField, AlpacaDoctorQuoteObservation,
+    AlpacaDoctorRateEvidence, AlpacaDoctorRetryAfter, AlpacaDoctorStreamObservation,
+    AlpacaPaperIexDoctor, AlpacaPaperIexDoctorObservation,
+};
 pub use error::AlpacaError;
 pub use historical::{
     AlpacaHistoricalBarTimeAuthority, AlpacaHistoricalBarTimeRequest,
@@ -37,6 +52,12 @@ pub use historical_calendar::{
     AlpacaTradingApiEnvironment,
 };
 pub use live::{AlpacaIexLiveSource, AlpacaOptionsLiveSource};
+#[cfg(feature = "scripted-transport-fixture")]
+pub use scripted::{
+    ALPACA_SCRIPTED_FIXTURE_SOURCE_ID, AlpacaScriptedDoctorExecutor, AlpacaScriptedIexLiveSource,
+    AlpacaScriptedTransportEvent, AlpacaScriptedTransportEventKind, AlpacaScriptedTransportFactory,
+    AlpacaScriptedTransportTranscript,
+};
 
 #[cfg(test)]
 mod tests;

@@ -304,8 +304,11 @@ impl FairValueCatalogCapability {
     }
 }
 
-/// Cloneable provider-onboarding authority without general catalog or SQLite access.
-#[derive(Clone)]
+/// Provider-onboarding authority without general catalog or SQLite access.
+///
+/// The installed application receives this non-cloneable capability exactly once while the
+/// analytical service is composed. Sharing inside that application remains an application-owned
+/// `Arc`; an ordinary analytical reader cannot recover another writer.
 pub struct OnboardingCatalogCapability {
     authority: Arc<Mutex<CatalogAuthority>>,
 }

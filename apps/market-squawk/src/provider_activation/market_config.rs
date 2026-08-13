@@ -960,6 +960,29 @@ impl ProviderAdapterActivation {
         authority.require_active(&lease)?;
         Ok(configured)
     }
+
+    /// Constructs a configuration for one private, unpublished prepared-runtime stage.
+    pub(crate) fn try_construct_staged_market_provider_configuration(
+        &self,
+        lease: ProviderActivationLease,
+        request: ProviderMarketConfigurationRequest,
+    ) -> Result<PreparedMarketProviderConfiguration, MarketProviderConfigurationError> {
+        let authority = self.onboarding.try_acquire_runtime_mutation_authority()?;
+        authority.require_prepared_or_active(&lease)?;
+        let configured = match request {
+            ProviderMarketConfigurationRequest::AlpacaBasic(input) => {
+                PreparedMarketProviderConfiguration::AlpacaBasic(prepare_alpaca(&lease, input)?)
+            }
+            ProviderMarketConfigurationRequest::Tradier(input) => {
+                PreparedMarketProviderConfiguration::Tradier(prepare_tradier(&lease, input)?)
+            }
+            ProviderMarketConfigurationRequest::KrakenLevel3(input) => {
+                PreparedMarketProviderConfiguration::KrakenLevel3(prepare_kraken_l3(&lease, input)?)
+            }
+        };
+        authority.require_prepared_or_active(&lease)?;
+        Ok(configured)
+    }
 }
 
 fn prepare_alpaca(

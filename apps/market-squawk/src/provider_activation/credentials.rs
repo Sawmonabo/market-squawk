@@ -14,8 +14,6 @@ use serde::{Deserialize, Deserializer};
 use sha2::{Digest as _, Sha256, Sha512};
 use zeroize::Zeroizing;
 
-const ALPACA_PROBE_ENDPOINT: &str =
-    "https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest?feed=iex";
 const KRAKEN_API_KEY_INFO_ENDPOINT: &str = "https://api.kraken.com/0/private/GetApiKeyInfo";
 const KRAKEN_API_KEY_INFO_PATH: &str = "/0/private/GetApiKeyInfo";
 const KRAKEN_GET_TOKEN_PATH: &str = "/0/private/GetWebSocketsToken";
@@ -59,19 +57,6 @@ impl AlpacaCredentialEnvelope {
             secret_key,
             trading_api_environment,
         })
-    }
-
-    pub(crate) fn verification_request(
-        &self,
-        client: &reqwest::Client,
-    ) -> Result<reqwest::RequestBuilder, ProviderCredentialError> {
-        let key_id = sensitive_header(self.key_id.as_str())?;
-        let secret_key = sensitive_header(self.secret_key.as_str())?;
-        Ok(client
-            .get(ALPACA_PROBE_ENDPOINT)
-            .header("APCA-API-KEY-ID", key_id)
-            .header("APCA-API-SECRET-KEY", secret_key)
-            .header(ACCEPT, "application/json"))
     }
 
     pub(crate) fn account_digest(&self) -> EvidenceDigest {

@@ -1190,6 +1190,44 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             vec![legacy_capability, revision_two, revision_three],
             current,
         )
+    } else if spec.id == ALPACA_BASIC_PROFILE {
+        // Preserve the exact revision-three provider-fact budget. Revision four separates that
+        // 200/min historical fact from Market Squawk's 150/min application ceiling and requires
+        // the closed Paper/IEX doctor rather than treating one quote as complete readiness.
+        let revision_three = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(3)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(spec.rate_policy)?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(2)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, false)?,
+                true,
+            )?,
+        )?;
+        let current = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(4)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(3)?,
+                SourceIdentifier::try_from("alpaca.basic-market-data.paper-iex-doctor.v1")?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, true)?,
+                true,
+            )?,
+        )?;
+        (
+            vec![legacy_capability, revision_two, revision_three],
+            current,
+        )
     } else if has_provider_release_revision(spec.id) {
         let current = build_capability(
             &spec,
@@ -1291,6 +1329,7 @@ fn build_capability_with_rights_state(
             if (spec.id == TREASURY_DAILY_RATES_PROFILE && revision.get() >= 3)
                 || (spec.id == TREASURY_FISCAL_PROFILE && revision.get() >= 4)
                 || (spec.id == FEDERAL_RESERVE_BOARD_PROFILE && revision.get() >= 4)
+                || (spec.id == ALPACA_BASIC_PROFILE && revision.get() >= 4)
             {
                 2
             } else {
@@ -1439,6 +1478,8 @@ fn is_selected_architecture_profile(profile_id: &str) -> bool {
 fn current_rate_policy(spec: &BuiltInSpec) -> &'static str {
     if spec.id == "fred-alfred.api-v1-v2" {
         "fred-alfred.api-v1-v2.rate-policy.v2"
+    } else if spec.id == ALPACA_BASIC_PROFILE {
+        "alpaca.basic-market-data.account-rate-policy.v2"
     } else if spec.id == FEDERAL_RESERVE_BOARD_PROFILE {
         "federal-reserve-board.data-download-program.rate-policy.v1"
     } else {
@@ -1489,7 +1530,7 @@ fn built_in_budget(
         ALPACA_BASIC_PROFILE => simple_budget(
             "alpaca-market-data",
             Some("alpaca.basic.account-template"),
-            200,
+            if current_revision { 150 } else { 200 },
             MINUTE_NANOS,
             1,
             backoff,
@@ -1800,7 +1841,7 @@ fn alpaca_basic() -> Result<BuiltInSpec, ProviderProfileError> {
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("alpaca.market-data.read"),
         permissions: &["market-data.read"],
-        coverage: "One Alpaca Paper Only key generation in the paper realm: Basic real-time US equities and ETFs from IEX only with an official 30-symbol WebSocket ceiling at DirectUnverified quality; indicative US options with an official 200-quote WebSocket ceiling at Indicative quality; IEX stock history since 2016 with the Basic latest-15-minute restriction and an official 200 historical-calls/minute ceiling; top-of-book only and never consolidated SIP, NBBO, OPRA, Level II, or execution coverage",
+        coverage: "One Alpaca Paper Only key generation in the paper realm: Basic real-time US equities and ETFs from IEX only with an official 30-symbol WebSocket ceiling at DirectUnverified quality; code-owned quote, 50-symbol snapshot sentinel, WebSocket control acknowledgement, raw daily history, and exact IEX/UTC calendar reconciliation require runtime doctor proof; indicative options, fixed income, and corporate actions remain unprobed by this capability; IEX stock history retains the Basic latest-15-minute restriction and provider-published 200 historical-calls/minute fact; top-of-book only and never consolidated SIP, NBBO, OPRA, Level II/III, account, position, order, trading, or execution coverage",
         quality: DataQuality::DirectUnverified,
         probe: VerificationProbe::network_exact_public_query(
             ProbeTransport::HttpGet,
@@ -1812,8 +1853,10 @@ fn alpaca_basic() -> Result<BuiltInSpec, ProviderProfileError> {
         duties: &[
             "retain the exact IEX-only or indicative-options provider and feed label on every raw, canonical, and derived observation",
             "admit persistence and model use only inside owner-local personal research datasets",
-            "enforce one shared Paper account budget plus the official Basic ceilings of 200 historical calls per minute, 30 equity stream symbols, and 200 option quote subscriptions",
-            "use this credential only with code-owned data.alpaca.markets and market-data WebSocket endpoints and never with account, position, order, or trading endpoints",
+            "retain the provider-published Basic facts of 200 historical calls per minute, 30 equity stream symbols, and 200 option quote subscriptions without treating response headers as permission to expand",
+            "enforce one shared Paper account application ceiling of 150 REST requests per minute, target at most 120 recurring requests per minute, and lower admission from runtime headers, 429, Retry-After, partial returns, latency, and pressure",
+            "treat the fixed AAPL latest-quote probe as legacy portal bootstrap evidence only; current revision-four runtime verification requires the closed Paper/IEX quote, 50-symbol snapshot, WebSocket acknowledgement, raw-history, and calendar receipt",
+            "use this credential only with code-owned data.alpaca.markets routes, the IEX market-data WebSocket, and GET https://paper-api.alpaca.markets/v3/calendar/IEX with bounded start, end, and timezone=UTC query coordinates; every other paper-api origin route and all account, position, order, trading, or execution endpoints remain forbidden",
             "keep source-data export and redistribution closed",
         ],
         persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),

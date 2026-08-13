@@ -4035,6 +4035,9 @@ fn source_lifecycle_receipt() -> Value {
         ("rightsEvidence", nullable(record())),
         ("blocker", nullable(text())),
         ("publicConfigurationSha256", nullable(text())),
+        ("configurationSessionId", nullable(uuid())),
+        ("doctor", nullable(source_doctor_evidence())),
+        ("startEligibility", source_start_eligibility()),
         ("observedAt", timestamp()),
     ])
 }
@@ -4059,6 +4062,8 @@ fn source_lifecycle_status() -> Value {
             ("currentGeneration", nullable(unsigned())),
             ("runtimeGenerationSha256", nullable(text())),
             ("publicConfigurationSha256", nullable(text())),
+            ("doctor", nullable(source_doctor_evidence())),
+            ("startEligibility", source_start_eligibility()),
             (
                 "blocker",
                 nullable(enumeration(&[
@@ -4081,9 +4086,455 @@ fn source_lifecycle_status() -> Value {
             "currentGeneration",
             "runtimeGenerationSha256",
             "publicConfigurationSha256",
+            "doctor",
+            "startEligibility",
             "blocker",
             "observedAt",
         ],
+    )
+}
+
+fn source_start_eligibility() -> Value {
+    enumeration(&[
+        "eligible",
+        "already_active",
+        "doctor_required",
+        "doctor_expired",
+        "credential_stale",
+        "reconciliation_required",
+        "provider_unavailable",
+        "not_applicable",
+    ])
+}
+
+fn source_doctor_evidence() -> Value {
+    closed(
+        vec![
+            (
+                "schema",
+                constant("market-squawk.alpaca-paper-iex-doctor/v1"),
+            ),
+            ("receiptSha256", sha256()),
+            ("surfaceId", constant("alpaca.basic-market-data")),
+            ("onboardingSessionId", uuid()),
+            ("credentialGeneration", positive_integer_text()),
+            ("realm", constant("paper")),
+            ("marketDataPrincipalSha256", sha256()),
+            (
+                "principalSemantics",
+                constant("non_trading_market_data_credential_principal_not_brokerage_account"),
+            ),
+            ("capabilityRevision", positive_integer_text()),
+            ("capabilitySha256", sha256()),
+            ("publicConfigurationSha256", sha256()),
+            ("rightsDecisionSha256", sha256()),
+            ("ratePolicySha256", sha256()),
+            ("doctorRevision", bounded_text(128)),
+            ("doctorContractSha256", sha256()),
+            ("dataQuality", constant("direct_unverified")),
+            ("verifiedAt", timestamp()),
+            ("exclusiveExpiresAt", timestamp()),
+            ("current", boolean()),
+            ("capabilities", source_doctor_capabilities()),
+        ],
+        &[
+            "schema",
+            "receiptSha256",
+            "surfaceId",
+            "onboardingSessionId",
+            "credentialGeneration",
+            "realm",
+            "marketDataPrincipalSha256",
+            "principalSemantics",
+            "capabilityRevision",
+            "capabilitySha256",
+            "publicConfigurationSha256",
+            "rightsDecisionSha256",
+            "ratePolicySha256",
+            "doctorRevision",
+            "doctorContractSha256",
+            "dataQuality",
+            "verifiedAt",
+            "exclusiveExpiresAt",
+            "current",
+            "capabilities",
+        ],
+    )
+}
+
+fn source_doctor_capabilities() -> Value {
+    closed(
+        vec![
+            (
+                "iexLatestQuote",
+                source_doctor_probe(source_doctor_quote_observation()),
+            ),
+            (
+                "iexSnapshotBatch",
+                source_doctor_probe(source_doctor_batch_observation()),
+            ),
+            (
+                "iexWebSocket",
+                source_doctor_probe(source_doctor_stream_observation()),
+            ),
+            (
+                "iexHistoricalBars",
+                source_doctor_probe(source_doctor_history_observation()),
+            ),
+            (
+                "iexUtcCalendar",
+                source_doctor_probe(source_doctor_calendar_observation()),
+            ),
+            (
+                "additional",
+                fixed_array(source_doctor_additional_capability(), 13),
+            ),
+        ],
+        &[
+            "iexLatestQuote",
+            "iexSnapshotBatch",
+            "iexWebSocket",
+            "iexHistoricalBars",
+            "iexUtcCalendar",
+            "additional",
+        ],
+    )
+}
+
+fn source_doctor_probe(observation: Value) -> Value {
+    one_of(vec![
+        closed(
+            vec![
+                ("disposition", constant("available")),
+                ("evidenceSha256", sha256()),
+                ("observation", observation.clone()),
+            ],
+            &["disposition", "evidenceSha256", "observation"],
+        ),
+        closed(
+            vec![
+                ("disposition", constant("degraded")),
+                ("evidenceSha256", sha256()),
+                ("observation", observation.clone()),
+            ],
+            &["disposition", "evidenceSha256", "observation"],
+        ),
+        closed(
+            vec![
+                ("disposition", constant("unavailable")),
+                ("evidenceSha256", sha256()),
+                ("observation", nullable(observation)),
+            ],
+            &["disposition", "evidenceSha256", "observation"],
+        ),
+        closed(
+            vec![
+                ("disposition", constant("not_probed")),
+                ("evidenceSha256", sha256()),
+                ("observation", null()),
+            ],
+            &["disposition", "evidenceSha256", "observation"],
+        ),
+    ])
+}
+
+fn source_doctor_quote_observation() -> Value {
+    closed(
+        vec![
+            ("http", source_doctor_http_evidence()),
+            ("semanticResultSha256", sha256()),
+            ("quoteTimestamp", nullable(timestamp())),
+        ],
+        &["http", "semanticResultSha256", "quoteTimestamp"],
+    )
+}
+
+fn source_doctor_batch_observation() -> Value {
+    closed(
+        vec![
+            ("http", source_doctor_http_evidence()),
+            ("semanticResultSha256", sha256()),
+            ("requested", bounded_unsigned(101)),
+            ("returned", bounded_unsigned(101)),
+            ("valid", bounded_unsigned(101)),
+            ("missing", bounded_unsigned(101)),
+            ("unexpected", bounded_unsigned(101)),
+            ("duplicate", bounded_unsigned(101)),
+            ("invalid", bounded_unsigned(101)),
+            ("requestedSetSha256", sha256()),
+            ("returnedSetSha256", sha256()),
+            ("missingSetSha256", sha256()),
+            ("unexpectedSetSha256", sha256()),
+        ],
+        &[
+            "http",
+            "semanticResultSha256",
+            "requested",
+            "returned",
+            "valid",
+            "missing",
+            "unexpected",
+            "duplicate",
+            "invalid",
+            "requestedSetSha256",
+            "returnedSetSha256",
+            "missingSetSha256",
+            "unexpectedSetSha256",
+        ],
+    )
+}
+
+fn source_doctor_stream_observation() -> Value {
+    closed(
+        vec![
+            ("endpointContractSha256", sha256()),
+            ("requestSha256", sha256()),
+            ("connectedFrameSha256", sha256()),
+            ("authenticatedFrameSha256", sha256()),
+            ("subscriptionFrameSha256", sha256()),
+            ("semanticResultSha256", sha256()),
+            ("handshakeStatus", bounded_unsigned_range(100, 599)),
+            ("handshakeRate", source_doctor_rate_evidence()),
+            ("subscribedTrades", bounded_unsigned(26)),
+            ("subscribedQuotes", bounded_unsigned(26)),
+            ("framesObserved", bounded_unsigned(26)),
+            ("bytesObserved", bounded_unsigned(26 * 16 * 1024 * 1024)),
+            ("authenticatedAt", timestamp()),
+            ("subscribedAt", timestamp()),
+            ("closeSent", boolean()),
+            ("cleanCloseObserved", boolean()),
+            ("completedAt", timestamp()),
+        ],
+        &[
+            "endpointContractSha256",
+            "requestSha256",
+            "connectedFrameSha256",
+            "authenticatedFrameSha256",
+            "subscriptionFrameSha256",
+            "semanticResultSha256",
+            "handshakeStatus",
+            "handshakeRate",
+            "subscribedTrades",
+            "subscribedQuotes",
+            "framesObserved",
+            "bytesObserved",
+            "authenticatedAt",
+            "subscribedAt",
+            "closeSent",
+            "cleanCloseObserved",
+            "completedAt",
+        ],
+    )
+}
+
+fn source_doctor_history_observation() -> Value {
+    closed(
+        vec![
+            ("endpointContractSha256", sha256()),
+            ("requestSha256", sha256()),
+            ("semanticResultSha256", sha256()),
+            ("startDate", calendar_date()),
+            ("endDate", calendar_date()),
+            ("pages", bounded_unsigned(8)),
+            ("bars", unsigned()),
+            ("distinctDates", unsigned()),
+            ("firstBarTimestamp", nullable(timestamp())),
+            ("lastBarTimestamp", nullable(timestamp())),
+            ("returnedDatesSha256", sha256()),
+            ("paginationGraphSha256", sha256()),
+            ("terminalPagination", boolean()),
+            (
+                "pageEvidence",
+                bounded_array(source_doctor_history_page(), 8),
+            ),
+        ],
+        &[
+            "endpointContractSha256",
+            "requestSha256",
+            "semanticResultSha256",
+            "startDate",
+            "endDate",
+            "pages",
+            "bars",
+            "distinctDates",
+            "firstBarTimestamp",
+            "lastBarTimestamp",
+            "returnedDatesSha256",
+            "paginationGraphSha256",
+            "terminalPagination",
+            "pageEvidence",
+        ],
+    )
+}
+
+fn source_doctor_history_page() -> Value {
+    closed(
+        vec![
+            ("http", source_doctor_http_evidence()),
+            ("requestPageTokenSha256", nullable(sha256())),
+            ("responsePageTokenSha256", nullable(sha256())),
+        ],
+        &["http", "requestPageTokenSha256", "responsePageTokenSha256"],
+    )
+}
+
+fn source_doctor_calendar_observation() -> Value {
+    closed(
+        vec![
+            ("http", source_doctor_http_evidence()),
+            ("semanticResultSha256", sha256()),
+            ("startDate", calendar_date()),
+            ("endDate", calendar_date()),
+            ("sessions", unsigned()),
+            ("historyDates", unsigned()),
+            ("matchedDates", unsigned()),
+            ("missingHistoryDates", unsigned()),
+            ("unexpectedHistoryDates", unsigned()),
+            ("sessionDatesSha256", sha256()),
+            ("historyDatesSha256", sha256()),
+            ("exactDateReconciliation", boolean()),
+        ],
+        &[
+            "http",
+            "semanticResultSha256",
+            "startDate",
+            "endDate",
+            "sessions",
+            "historyDates",
+            "matchedDates",
+            "missingHistoryDates",
+            "unexpectedHistoryDates",
+            "sessionDatesSha256",
+            "historyDatesSha256",
+            "exactDateReconciliation",
+        ],
+    )
+}
+
+fn source_doctor_http_evidence() -> Value {
+    closed(
+        vec![
+            ("endpointContractSha256", sha256()),
+            ("requestSha256", sha256()),
+            ("status", bounded_unsigned_range(100, 599)),
+            ("bodySha256", sha256()),
+            ("bytes", bounded_unsigned(8 * 1024 * 1024)),
+            ("receivedAt", timestamp()),
+            ("latencyNanos", unsigned_integer_text()),
+            ("rate", source_doctor_rate_evidence()),
+        ],
+        &[
+            "endpointContractSha256",
+            "requestSha256",
+            "status",
+            "bodySha256",
+            "bytes",
+            "receivedAt",
+            "latencyNanos",
+            "rate",
+        ],
+    )
+}
+
+fn source_doctor_rate_evidence() -> Value {
+    closed(
+        vec![
+            ("limit", source_doctor_observed_unsigned()),
+            ("remaining", source_doctor_observed_unsigned()),
+            ("reset_unix_seconds", source_doctor_observed_integer()),
+            ("retry_after", source_doctor_observed_retry_after()),
+        ],
+        &["limit", "remaining", "reset_unix_seconds", "retry_after"],
+    )
+}
+
+fn source_doctor_observed_unsigned() -> Value {
+    one_of(vec![
+        closed(vec![("state", constant("missing"))], &["state"]),
+        closed(
+            vec![("state", constant("observed")), ("value", unsigned())],
+            &["state", "value"],
+        ),
+    ])
+}
+
+fn source_doctor_observed_integer() -> Value {
+    one_of(vec![
+        closed(vec![("state", constant("missing"))], &["state"]),
+        closed(
+            vec![("state", constant("observed")), ("value", integer_text())],
+            &["state", "value"],
+        ),
+    ])
+}
+
+fn source_doctor_observed_retry_after() -> Value {
+    one_of(vec![
+        closed(vec![("state", constant("missing"))], &["state"]),
+        closed(
+            vec![
+                ("state", constant("observed")),
+                (
+                    "value",
+                    one_of(vec![
+                        closed(
+                            vec![
+                                ("kind", constant("delay_seconds")),
+                                ("value", unsigned_integer_text()),
+                            ],
+                            &["kind", "value"],
+                        ),
+                        closed(
+                            vec![
+                                ("kind", constant("at_unix_seconds")),
+                                ("value", integer_text()),
+                            ],
+                            &["kind", "value"],
+                        ),
+                    ]),
+                ),
+            ],
+            &["state", "value"],
+        ),
+    ])
+}
+
+fn source_doctor_additional_capability() -> Value {
+    closed(
+        vec![
+            (
+                "capability",
+                enumeration(&[
+                    "options_rest",
+                    "options_stream",
+                    "fixed_income",
+                    "corporate_actions",
+                    "sip",
+                    "nbbo",
+                    "opra",
+                    "price_level_depth",
+                    "order_level_depth",
+                    "brokerage_account",
+                    "positions",
+                    "orders",
+                    "trading",
+                ]),
+            ),
+            ("disposition", enumeration(&["not_probed", "unavailable"])),
+            ("evidenceSha256", sha256()),
+        ],
+        &["capability", "disposition", "evidenceSha256"],
+    )
+}
+
+fn calendar_date() -> Value {
+    closed(
+        vec![
+            ("year", bounded_unsigned_range(1, u16::MAX as u64)),
+            ("month", bounded_unsigned_range(1, 12)),
+            ("day", bounded_unsigned_range(1, 31)),
+        ],
+        &["year", "month", "day"],
     )
 }
 
