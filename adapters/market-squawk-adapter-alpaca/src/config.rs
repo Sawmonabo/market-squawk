@@ -10,6 +10,8 @@ use market_squawk_domain::{
     SchemaVersion, SequenceCapability, SnapshotApplicability, SourceId, SourceIdentifier,
     Timestamp, VenueId,
 };
+#[cfg(feature = "scripted-transport-fixture")]
+use market_squawk_domain::{AuthorizationBasis, MetadataRevision};
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, ChecksumValidationProfile,
     CoverageDomain, CoverageTopology, FreshnessPolicy, HistoricalCapability, HttpRequestBounds,
@@ -54,6 +56,25 @@ pub(crate) const ALPACA_OPTIONS_ENDPOINT: &str =
 pub(crate) const ALPACA_STOCKS_BASE_ENDPOINT: &str = "https://data.alpaca.markets/v2/stocks";
 pub(crate) const IEX_VENUE: &str = "iex";
 pub(crate) const INDICATIVE_OPTIONS_VENUE: &str = "alpaca-indicative-options";
+
+/// Exact local source identity of the installed AAPL/IEX fixture.
+#[cfg(feature = "scripted-transport-fixture")]
+pub const ALPACA_INSTALLED_FIXTURE_IEX_SOURCE_ID: &str = "alpaca-installed-fixture-iex";
+/// Finite lifetime of one installed AAPL/IEX fixture configuration.
+#[cfg(feature = "scripted-transport-fixture")]
+pub const ALPACA_INSTALLED_FIXTURE_IEX_VALIDITY_NANOS: i64 = 15 * 60 * 1_000_000_000;
+
+#[cfg(feature = "scripted-transport-fixture")]
+const ALPACA_INSTALLED_FIXTURE_PROVIDER: &str = "market-squawk-installed-fixture";
+#[cfg(feature = "scripted-transport-fixture")]
+const ALPACA_INSTALLED_FIXTURE_AAPL_ROUTE_UUID: uuid::Uuid =
+    uuid::Uuid::from_u128(0x71cd_3d9c_a69e_5e2e_9f03_66a9_cf2f_68c1);
+#[cfg(feature = "scripted-transport-fixture")]
+const ALPACA_INSTALLED_FIXTURE_MAX_FRAME_BYTES: usize = 64 * 1024;
+#[cfg(feature = "scripted-transport-fixture")]
+const ALPACA_INSTALLED_FIXTURE_OPERATION_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(feature = "scripted-transport-fixture")]
+const ALPACA_INSTALLED_FIXTURE_FRESHNESS_NANOS: u64 = 2_000_000_000;
 
 const MAX_SYMBOL_BYTES: usize = 32;
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -265,6 +286,98 @@ impl AlpacaIexLiveConfig {
 
     pub(crate) fn subscription(&self) -> &str {
         &self.subscription
+    }
+}
+
+/// Closed local AAPL/IEX fixture configuration for installed-product journeys.
+///
+/// This type cannot carry broker, credential, remote-network, or provider-budget authority. Its
+/// private production-compatible decoder input is built only from code-owned local-fixture
+/// metadata and is never exposed for use by the authenticated Alpaca transport.
+#[cfg(feature = "scripted-transport-fixture")]
+#[derive(Clone, Debug)]
+pub struct AlpacaInstalledFixtureIexConfig {
+    decoder_config: AlpacaIexLiveConfig,
+    aapl_route: InstrumentId,
+    exclusive_expires_at: Timestamp,
+}
+
+#[cfg(feature = "scripted-transport-fixture")]
+impl AlpacaInstalledFixtureIexConfig {
+    /// Constructs one short-lived fixture instance with a code-owned AAPL route coordinate.
+    ///
+    /// All source, provider, authorization, coverage, protocol, freshness, transport, and
+    /// lifetime values are fixed by this constructor. The resulting metadata is local-only,
+    /// network-denied, budget-free, and capped at `DirectUnverified`.
+    pub fn try_new(starts_at: Timestamp) -> Result<Self, AlpacaError> {
+        let aapl_route = InstrumentId::try_from(ALPACA_INSTALLED_FIXTURE_AAPL_ROUTE_UUID)?;
+        let exclusive_expires_at = starts_at
+            .checked_add_nanos(ALPACA_INSTALLED_FIXTURE_IEX_VALIDITY_NANOS)
+            .map_err(|_| AlpacaError::InvalidCoverage)?;
+        let effective = EffectiveInterval::new(starts_at, Some(exclusive_expires_at))
+            .map_err(|_| AlpacaError::InvalidCoverage)?;
+        let mapping =
+            AlpacaInstrumentMapping::try_new("AAPL".to_owned(), aapl_route, AssetClass::Equity)?;
+        let mappings = vec![mapping];
+        let metadata = installed_fixture_iex_metadata(aapl_route, effective)?;
+        let limits = AlpacaTransportLimits::try_new(
+            ALPACA_INSTALLED_FIXTURE_MAX_FRAME_BYTES,
+            ALPACA_INSTALLED_FIXTURE_OPERATION_TIMEOUT,
+            ALPACA_INSTALLED_FIXTURE_OPERATION_TIMEOUT,
+        )?;
+        let subscription = json_subscription(&mappings)?;
+        let decoder_config = AlpacaIexLiveConfig {
+            metadata,
+            mappings: mappings.into_boxed_slice(),
+            limits,
+            subscription,
+        };
+        Ok(Self {
+            decoder_config,
+            aapl_route,
+            exclusive_expires_at,
+        })
+    }
+
+    /// Returns immutable local installed-fixture metadata.
+    pub const fn metadata(&self) -> &SourceMetadata {
+        self.decoder_config.metadata()
+    }
+
+    /// Returns the fixture-only route coordinate used for decoded AAPL observations.
+    ///
+    /// This value is not instrument-definition or provider-symbol authority. Installed
+    /// composition must bind it only to a sealed installed-fixture definition that it owns; it
+    /// must never bind this coordinate to a `MarketDataInstrumentDefinition`.
+    pub const fn aapl_route(&self) -> InstrumentId {
+        self.aapl_route
+    }
+
+    pub(crate) fn has_exact_aapl_equity_mapping(&self) -> bool {
+        let [mapping] = self.decoder_config.mappings() else {
+            return false;
+        };
+        mapping.symbol() == "AAPL"
+            && mapping.instrument() == self.aapl_route
+            && mapping.asset_class() == AssetClass::Equity
+    }
+
+    /// Returns the exclusive end of this fixture authority.
+    pub const fn exclusive_expires_at(&self) -> Timestamp {
+        self.exclusive_expires_at
+    }
+
+    /// Constructs the real Alpaca IEX decoder over the closed local-fixture metadata.
+    pub fn decoder(&self) -> Result<crate::decoder::AlpacaIexDecoder, AlpacaError> {
+        crate::decoder::AlpacaIexDecoder::try_new(&self.decoder_config)
+    }
+
+    pub(crate) const fn max_frame_bytes(&self) -> usize {
+        self.decoder_config.transport_limits().max_frame_bytes()
+    }
+
+    pub(crate) fn is_current_at(&self, observed_at: Timestamp) -> bool {
+        self.metadata().is_effective_at(observed_at) && observed_at < self.exclusive_expires_at
     }
 }
 
@@ -1303,6 +1416,124 @@ fn live_metadata(
             ProviderNumericPolicy::ExactDecimalLexeme,
         ))),
     ))?)
+}
+
+#[cfg(feature = "scripted-transport-fixture")]
+fn installed_fixture_iex_metadata(
+    aapl_route: InstrumentId,
+    effective: EffectiveInterval,
+) -> Result<SourceMetadata, AlpacaError> {
+    let snapshot_rule = rule("alpaca-installed-fixture-non-book-snapshot-not-applicable-v1")?;
+    let coverage_rules = [LiveEventClass::Quote]
+        .into_iter()
+        .map(|event| {
+            LiveCoverageRule::try_new(
+                event,
+                None,
+                SnapshotApplicability::NotApplicable {
+                    metadata_rule: snapshot_rule.clone(),
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let live = LiveCoverageDeclaration::try_new(
+        ProviderProduct::new(SourceIdentifier::try_from(
+            "market-squawk-installed-aapl-iex-fixture-v1",
+        )?),
+        ProviderChannel::new(SourceIdentifier::try_from(
+            "local-alpaca-iex-json-compatible-script-v1",
+        )?),
+        coverage_rules,
+    )?;
+    let authorization = AuthorizationGrant::new(
+        AuthorizationMode::UserOwnedLocal,
+        AuthorizationBasis::new(SourceIdentifier::try_from(
+            "market-squawk-installed-fixture-local-use-v1",
+        )?),
+        installed_fixture_evidence(b"local-use", aapl_route, effective),
+        effective,
+    );
+    let revision_payload = installed_fixture_evidence(b"metadata-revision", aapl_route, effective);
+    let revision_evidence = RevisionBoundPayloadEvidence::new(
+        MetadataRevision::new(SourceIdentifier::try_from(format!(
+            "alpaca-installed-fixture-iex-metadata-v1.{}",
+            encode_lower_hex(revision_payload.content_digest().bytes())
+        ))?),
+        revision_payload,
+    );
+    let freshness = FreshnessPolicy::try_new(
+        ALPACA_INSTALLED_FIXTURE_FRESHNESS_NANOS,
+        ALPACA_INSTALLED_FIXTURE_FRESHNESS_NANOS,
+        ALPACA_INSTALLED_FIXTURE_FRESHNESS_NANOS,
+        ALPACA_INSTALLED_FIXTURE_FRESHNESS_NANOS,
+        ALPACA_INSTALLED_FIXTURE_FRESHNESS_NANOS,
+    )?;
+    Ok(SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        SourceId::try_from(ALPACA_INSTALLED_FIXTURE_IEX_SOURCE_ID)?,
+        revision_evidence,
+        SourceClass::LocalFile,
+        SourceIdentifier::try_from(ALPACA_INSTALLED_FIXTURE_PROVIDER)?,
+        authorization,
+        SourceCoverage::try_instrument(
+            installed_fixture_evidence(b"aapl-iex-coverage", aapl_route, effective),
+            effective,
+            vec![AssetClass::Equity],
+            CoverageTopology::partial_venues(vec![VenueId::try_from(IEX_VENUE)?])?,
+            InstrumentCoverage::enumerated(vec![aapl_route])?,
+            Some(live),
+            CoverageDelay::RealTime,
+            DeliveryEvidence::Unknown,
+        )?,
+        DataQuality::DirectUnverified,
+        NetworkAccessPolicy::Denied,
+        freshness,
+        None,
+        SourceCapabilities::new(
+            true,
+            false,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            HistoricalCapability::None,
+            true,
+        ),
+        SourceProtocolProfile::Live(Box::new(LiveProtocolProfile::new(
+            rule("alpaca-iex-json-v2-decoder")?,
+            SemanticInterpretationProfile::new(
+                rule("alpaca-installed-fixture-trade-aggressor-unavailable-v1")?,
+                rule("alpaca-installed-fixture-auction-unused-v1")?,
+                rule("alpaca-installed-fixture-trading-status-codes-v1")?,
+                rule("alpaca-installed-fixture-corporate-action-unused-v1")?,
+            ),
+            rule("alpaca-installed-fixture-rfc3339-nanosecond-timestamp-v1")?,
+            SequenceValidationProfile::Unsupported {
+                rule: rule("alpaca-installed-fixture-sequence-unsupported-v1")?,
+            },
+            ChecksumValidationProfile::Unsupported {
+                rule: rule("alpaca-installed-fixture-checksum-unsupported-v1")?,
+            },
+            true,
+            ProviderNumericPolicy::ExactDecimalLexeme,
+        ))),
+    ))?)
+}
+
+#[cfg(feature = "scripted-transport-fixture")]
+fn installed_fixture_evidence(
+    kind: &[u8],
+    aapl_route: InstrumentId,
+    effective: EffectiveInterval,
+) -> ExactPayloadEvidence {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/alpaca-installed-fixture-evidence/v1\0");
+    digest.update(kind);
+    digest.update([0]);
+    digest.update(aapl_route.as_uuid().as_bytes());
+    hash_effective_interval(&mut digest, effective);
+    ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
 }
 
 fn distinct_assets(mappings: &[AlpacaInstrumentMapping]) -> Vec<AssetClass> {

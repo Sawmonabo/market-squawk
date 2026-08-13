@@ -27,6 +27,11 @@ pub use config::{
     AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsLiveConfig, AlpacaTimeframe,
     AlpacaTransportLimits,
 };
+#[cfg(feature = "scripted-transport-fixture")]
+pub use config::{
+    ALPACA_INSTALLED_FIXTURE_IEX_SOURCE_ID, ALPACA_INSTALLED_FIXTURE_IEX_VALIDITY_NANOS,
+    AlpacaInstalledFixtureIexConfig,
+};
 pub use credentials::AlpacaCredentials;
 pub use decoder::{AlpacaIexDecoder, AlpacaOptionsDecoder};
 #[cfg(feature = "scripted-transport-fixture")]
@@ -54,7 +59,7 @@ pub use historical_calendar::{
 pub use live::{AlpacaIexLiveSource, AlpacaOptionsLiveSource};
 #[cfg(feature = "scripted-transport-fixture")]
 pub use scripted::{
-    ALPACA_SCRIPTED_FIXTURE_SOURCE_ID, AlpacaScriptedDoctorExecutor, AlpacaScriptedIexLiveSource,
+    AlpacaInstalledFixtureIexLiveSource, AlpacaScriptedDoctorExecutor,
     AlpacaScriptedTransportEvent, AlpacaScriptedTransportEventKind, AlpacaScriptedTransportFactory,
     AlpacaScriptedTransportTranscript,
 };

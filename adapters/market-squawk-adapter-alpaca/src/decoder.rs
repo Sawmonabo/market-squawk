@@ -157,12 +157,14 @@ impl AlpacaDecoder {
                 return Err(AlpacaError::Protocol);
             }
         };
+        let snapshot_event = match surface {
+            DecoderSurface::Iex => market_squawk_domain::LiveEventClass::Quote,
+            DecoderSurface::IndicativeOptions => market_squawk_domain::LiveEventClass::Trade,
+        };
         let snapshot_rule = metadata
             .coverage()
             .live()
-            .and_then(|coverage| {
-                coverage.rule_for(market_squawk_domain::LiveEventClass::Trade, None)
-            })
+            .and_then(|coverage| coverage.rule_for(snapshot_event, None))
             .and_then(|coverage| match coverage.snapshot_applicability() {
                 market_squawk_domain::SnapshotApplicability::NotApplicable { metadata_rule } => {
                     Some(metadata_rule.clone())

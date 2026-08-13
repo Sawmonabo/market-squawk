@@ -8,19 +8,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::{FutureExt as _, future::BoxFuture};
-use market_squawk_domain::{AssetClass, DigestAlgorithm, EvidenceDigest, SourceId, Timestamp};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, LiveMarketSource, LiveSourceGeneration, RawMarketSink, SourceError,
-    SourceMetadata, SourceMetadataProvider, TransportFrameKind,
+    ActiveLiveSourceGeneration, AuthorizationMode, LiveMarketSource, LiveSourceGeneration,
+    NetworkAccessPolicy, RawMarketSink, SourceClass, SourceError, SourceMetadata,
+    SourceMetadataProvider, TransportFrameKind,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::doctor::installed_fixture_observation;
-use crate::{AlpacaError, AlpacaIexLiveConfig, AlpacaPaperIexDoctorFixtureObservation};
+use crate::{
+    ALPACA_INSTALLED_FIXTURE_IEX_SOURCE_ID, AlpacaError, AlpacaInstalledFixtureIexConfig,
+    AlpacaPaperIexDoctorFixtureObservation,
+};
 
-/// Exact source identity required by the scripted IEX live fixture.
-pub const ALPACA_SCRIPTED_FIXTURE_SOURCE_ID: &str = "alpaca-installed-fixture-iex";
+const FIXTURE_CONNECTED_FRAME: &[u8] = br#"[{"T":"success","msg":"connected"}]"#;
+const FIXTURE_AUTHENTICATED_FRAME: &[u8] = br#"[{"T":"success","msg":"authenticated"}]"#;
+const FIXTURE_SUBSCRIBED_FRAME: &[u8] =
+    br#"[{"T":"subscription","trades":["AAPL"],"quotes":["AAPL"],"statuses":["AAPL"]}]"#;
 
 const DOCTOR_EVENT_COUNT: usize = 6;
 const MAX_TRANSCRIPT_EVENTS: usize = 4_096;
@@ -37,7 +43,12 @@ pub enum AlpacaScriptedTransportEventKind {
     DoctorHistoricalPage,
     DoctorCalendar,
     DoctorCompleted,
-    FixtureLiveStarted,
+    /// Local decoder-state fixture bytes; never provider authentication or entitlement evidence.
+    FixtureDecoderConnected,
+    /// Local decoder-state fixture bytes; never provider authentication or entitlement evidence.
+    FixtureDecoderAuthenticated,
+    /// Local decoder-state fixture bytes; never provider subscription or entitlement evidence.
+    FixtureDecoderSubscribed,
     FixtureLiveQuote,
 }
 
@@ -141,18 +152,13 @@ impl AlpacaScriptedTransportFactory {
             .map_err(|()| AlpacaError::Allocation)
     }
 
-    /// Constructs a fixture-only AAPL source without accepting credentials.
-    ///
-    /// The explicit source identity, metadata identity, and sole mapping must all match the closed
-    /// installed-fixture contract.
+    /// Constructs a fixture-only AAPL source without accepting credentials or caller metadata.
     pub fn live_source(
         &self,
-        fixture_source_id: SourceId,
-        config: AlpacaIexLiveConfig,
+        config: AlpacaInstalledFixtureIexConfig,
         generation: LiveSourceGeneration,
-    ) -> Result<AlpacaScriptedIexLiveSource, SourceError> {
-        AlpacaScriptedIexLiveSource::try_new(
-            fixture_source_id,
+    ) -> Result<AlpacaInstalledFixtureIexLiveSource, SourceError> {
+        AlpacaInstalledFixtureIexLiveSource::try_new(
             config,
             generation,
             Arc::clone(&self.transcript),
@@ -226,31 +232,34 @@ impl AlpacaScriptedDoctorExecutor {
     }
 }
 
-/// Fixture-identified IEX source that emits only raw AAPL quote frames into the real sink.
+/// Fixture-identified IEX source that emits local decoder-state frames and raw AAPL quotes.
 #[derive(Debug)]
-pub struct AlpacaScriptedIexLiveSource {
-    config: AlpacaIexLiveConfig,
+pub struct AlpacaInstalledFixtureIexLiveSource {
+    config: AlpacaInstalledFixtureIexConfig,
     authority: ActiveLiveSourceGeneration,
     transcript: Arc<SharedTranscript>,
     generation_started: bool,
 }
 
-impl AlpacaScriptedIexLiveSource {
+impl AlpacaInstalledFixtureIexLiveSource {
     fn try_new(
-        fixture_source_id: SourceId,
-        config: AlpacaIexLiveConfig,
+        config: AlpacaInstalledFixtureIexConfig,
         generation: LiveSourceGeneration,
         transcript: Arc<SharedTranscript>,
     ) -> Result<Self, SourceError> {
-        if fixture_source_id.as_str() != ALPACA_SCRIPTED_FIXTURE_SOURCE_ID
-            || config.metadata().source_id() != &fixture_source_id
-            || config.mappings().len() != 1
-            || config.mappings()[0].symbol() != "AAPL"
-            || config.mappings()[0].asset_class() != AssetClass::Equity
+        let metadata = config.metadata();
+        if metadata.source_id().as_str() != ALPACA_INSTALLED_FIXTURE_IEX_SOURCE_ID
+            || metadata.source_class() != SourceClass::LocalFile
+            || metadata.authorization().mode() != AuthorizationMode::UserOwnedLocal
+            || !matches!(metadata.network_policy(), NetworkAccessPolicy::Denied)
+            || metadata.budget_policy().is_some()
+            || metadata.quality_ceiling() != market_squawk_domain::DataQuality::DirectUnverified
+            || !config.has_exact_aapl_equity_mapping()
+            || !config.is_current_at(system_timestamp()?)
         {
             return Err(SourceError::GenerationAuthorityMismatch);
         }
-        let authority = generation.try_start(config.metadata())?;
+        let authority = generation.try_start(metadata)?;
         Ok(Self {
             config,
             authority,
@@ -272,35 +281,65 @@ impl AlpacaScriptedIexLiveSource {
         }
         self.generation_started = true;
         self.authority.validate_current()?;
+        self.ensure_fixture_current()?;
+        let expiry = tokio::time::sleep_until(tokio::time::Instant::from_std(
+            self.fixture_expiry_deadline()?,
+        ));
+        tokio::pin!(expiry);
+        self.publish_fixture_decoder_frame(
+            sink,
+            FIXTURE_CONNECTED_FRAME,
+            AlpacaScriptedTransportEventKind::FixtureDecoderConnected,
+        )?;
+        if cancellation.is_cancelled() {
+            return Err(SourceError::Cancelled);
+        }
+        self.publish_fixture_decoder_frame(
+            sink,
+            FIXTURE_AUTHENTICATED_FRAME,
+            AlpacaScriptedTransportEventKind::FixtureDecoderAuthenticated,
+        )?;
+        if cancellation.is_cancelled() {
+            return Err(SourceError::Cancelled);
+        }
+        self.publish_fixture_decoder_frame(
+            sink,
+            FIXTURE_SUBSCRIBED_FRAME,
+            AlpacaScriptedTransportEventKind::FixtureDecoderSubscribed,
+        )?;
+        if cancellation.is_cancelled() {
+            return Err(SourceError::Cancelled);
+        }
         let first_digest = self.publish_quote(sink)?;
         self.transcript
-            .append(&[
-                event(
-                    AlpacaScriptedTransportEventKind::FixtureLiveStarted,
-                    None,
-                    [Some(fixture_identity_digest()), None, None],
-                ),
-                event(
-                    AlpacaScriptedTransportEventKind::FixtureLiveQuote,
-                    None,
-                    [Some(first_digest), None, None],
-                ),
-            ])
+            .append(&[event(
+                AlpacaScriptedTransportEventKind::FixtureLiveQuote,
+                None,
+                [Some(first_digest), Some(fixture_identity_digest()), None],
+            )])
             .map_err(|()| SourceError::InvalidProtocolState)?;
 
-        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        let quote_interval = Duration::from_millis(250);
+        let first_tick = tokio::time::Instant::now()
+            .checked_add(quote_interval)
+            .ok_or(SourceError::TrustedTimeDiscontinuity)?;
+        let mut interval = tokio::time::interval_at(first_tick, quote_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await;
         loop {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return Err(SourceError::Cancelled),
+                () = &mut expiry => {
+                    expiry.as_mut().reset(tokio::time::Instant::from_std(
+                        self.fixture_expiry_deadline()?,
+                    ));
+                }
                 _ = interval.tick() => {
                     let digest = self.publish_quote(sink)?;
                     self.transcript.append(&[event(
                         AlpacaScriptedTransportEventKind::FixtureLiveQuote,
                         None,
-                        [Some(digest), None, None],
+                        [Some(digest), Some(fixture_identity_digest()), None],
                     )]).map_err(|()| SourceError::InvalidProtocolState)?;
                 }
             }
@@ -311,6 +350,7 @@ impl AlpacaScriptedIexLiveSource {
         &mut self,
         sink: &mut dyn RawMarketSink,
     ) -> Result<EvidenceDigest, SourceError> {
+        self.ensure_fixture_current()?;
         let timestamp = system_timestamp()?;
         let payload = serde_json::to_vec(&serde_json::json!([{
             "T": "q",
@@ -324,28 +364,92 @@ impl AlpacaScriptedIexLiveSource {
             "t": rfc3339(timestamp)?
         }]))
         .map_err(|_| SourceError::InvalidProtocolState)?;
-        if payload.len() > self.config.transport_limits().max_frame_bytes() {
+        if payload.len() > self.config.max_frame_bytes() {
             return Err(SourceError::FrameTooLarge {
-                max: self.config.transport_limits().max_frame_bytes(),
+                max: self.config.max_frame_bytes(),
             });
         }
         let digest = sha256(&payload);
+        self.ensure_fixture_current()?;
         let frame = self
             .authority
             .frames_mut()?
             .try_frame(TransportFrameKind::Text, Bytes::from(payload))?;
+        self.ensure_fixture_current()?;
+        if frame.received_at() >= self.config.exclusive_expires_at() {
+            return Err(SourceError::SessionNotCurrent);
+        }
         sink.try_publish(frame)?;
         Ok(digest)
     }
+
+    fn publish_fixture_decoder_frame(
+        &mut self,
+        sink: &mut dyn RawMarketSink,
+        payload: &'static [u8],
+        kind: AlpacaScriptedTransportEventKind,
+    ) -> Result<(), SourceError> {
+        self.ensure_fixture_current()?;
+        if payload.len() > self.config.max_frame_bytes() {
+            return Err(SourceError::FrameTooLarge {
+                max: self.config.max_frame_bytes(),
+            });
+        }
+        let payload_digest = sha256(payload);
+        self.ensure_fixture_current()?;
+        let frame = self
+            .authority
+            .frames_mut()?
+            .try_frame(TransportFrameKind::Text, Bytes::from_static(payload))?;
+        self.ensure_fixture_current()?;
+        if frame.received_at() >= self.config.exclusive_expires_at() {
+            return Err(SourceError::SessionNotCurrent);
+        }
+        sink.try_publish(frame)?;
+        self.transcript
+            .append(&[event(
+                kind,
+                None,
+                [Some(payload_digest), Some(fixture_identity_digest()), None],
+            )])
+            .map_err(|()| SourceError::InvalidProtocolState)
+    }
+
+    fn ensure_fixture_current(&self) -> Result<(), SourceError> {
+        if self.config.is_current_at(system_timestamp()?) {
+            Ok(())
+        } else {
+            Err(SourceError::SessionNotCurrent)
+        }
+    }
+
+    fn fixture_expiry_deadline(&self) -> Result<Instant, SourceError> {
+        let monotonic_now = Instant::now();
+        let wall_now = system_timestamp()?;
+        let remaining_nanos = self
+            .config
+            .exclusive_expires_at()
+            .unix_nanos()
+            .checked_sub(wall_now.unix_nanos())
+            .ok_or(SourceError::TrustedTimeDiscontinuity)?;
+        let remaining_nanos =
+            u64::try_from(remaining_nanos).map_err(|_| SourceError::SessionNotCurrent)?;
+        if remaining_nanos == 0 {
+            return Err(SourceError::SessionNotCurrent);
+        }
+        monotonic_now
+            .checked_add(Duration::from_nanos(remaining_nanos))
+            .ok_or(SourceError::TrustedTimeDiscontinuity)
+    }
 }
 
-impl SourceMetadataProvider for AlpacaScriptedIexLiveSource {
+impl SourceMetadataProvider for AlpacaInstalledFixtureIexLiveSource {
     fn metadata(&self) -> &SourceMetadata {
         self.config.metadata()
     }
 }
 
-impl LiveMarketSource for AlpacaScriptedIexLiveSource {
+impl LiveMarketSource for AlpacaInstalledFixtureIexLiveSource {
     fn run<'a>(
         &'a mut self,
         sink: &'a mut dyn RawMarketSink,
@@ -384,7 +488,7 @@ fn rfc3339(timestamp: Timestamp) -> Result<String, SourceError> {
 }
 
 fn fixture_identity_digest() -> EvidenceDigest {
-    sha256(ALPACA_SCRIPTED_FIXTURE_SOURCE_ID.as_bytes())
+    sha256(ALPACA_INSTALLED_FIXTURE_IEX_SOURCE_ID.as_bytes())
 }
 
 fn sha256(value: &[u8]) -> EvidenceDigest {
