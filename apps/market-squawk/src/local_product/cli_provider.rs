@@ -4641,11 +4641,8 @@ mod tests {
     use std::ffi::OsString;
     use std::time::{Duration, Instant};
 
-    use market_squawk_data::OnboardingReservationRequest;
     use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
-    use market_squawk_sources::{
-        OnboardingEvent, OnboardingState, ProviderPublicConfiguration, built_in_provider_profiles,
-    };
+    use market_squawk_sources::{OnboardingState, ProviderPublicConfiguration};
 
     use super::*;
 
@@ -5489,43 +5486,9 @@ mod tests {
         operation: &str,
         public_configuration: ProviderPublicConfiguration,
     ) -> Result<ProviderActivationLease, Box<dyn std::error::Error>> {
-        let profiles = built_in_provider_profiles()?;
-        let profile = profiles
-            .get(surface_id)
-            .ok_or("onboarding profile is missing")?;
-        let catalog = product.research().onboarding_catalog();
-        catalog.register_provider_capability(profile.capability())?;
-        let request = OnboardingReservationRequest::try_new(
-            profile.capability(),
-            public_configuration,
-            profile.capability().maximum_authority().clone(),
-            SourceIdentifier::try_from("provider-replacement-regression")?,
-            SourceIdentifier::try_from(operation)?,
-            Timestamp::from_unix_nanos(i64::MAX),
-            0,
-        )?;
-        let reservation = catalog.reserve_provider_onboarding(&request)?;
-        for (sequence, event) in [1_u64, 2, 3].into_iter().zip([
-            OnboardingEvent::RightsAdmitted {
-                generation: None,
-                decision_digest: profile.rights_decision_digest(),
-            },
-            OnboardingEvent::RatePolicyAdmitted {
-                generation: None,
-                policy_digest: profile.capability().rate_policy().evidence_digest(),
-            },
-            OnboardingEvent::RuntimeVerified {
-                generation: None,
-                evidence: market_squawk_sources::RuntimeVerificationEvidence::digest_v1(
-                    profile.rights_decision_digest(),
-                )?,
-            },
-        ]) {
-            catalog.append_provider_onboarding_event(&reservation, sequence, event)?;
-        }
         Ok(product
             .provider_onboarding()
-            .prepare_runtime_activation_target(reservation.session_id(), CancellationToken::new())
+            .prepare_noncredential_test_activation(surface_id, public_configuration, operation)
             .await?)
     }
 

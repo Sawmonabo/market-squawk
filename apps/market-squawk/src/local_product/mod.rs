@@ -311,7 +311,8 @@ impl LocalProduct {
     where
         I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
     {
-        let research = Arc::new(open_research(&paths)?);
+        let (research, onboarding_catalog) = open_research(&paths)?;
+        let research = Arc::new(research);
         let company_security_resolution = Arc::new(CompanySecurityResolutionAuthority::new(
             research.company_identities(),
             research.market_data_instruments(),
@@ -403,14 +404,14 @@ impl LocalProduct {
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
         let onboarding = Arc::new(match &board_fixture {
             Some(fixture) => ProviderOnboardingService::try_new_with_provider_rate_runtime_admissions_and_board_fixture(
-                research.onboarding_catalog(),
+                onboarding_catalog,
                 secrets,
                 provider_rate.clone(),
                 runtime_admissions,
                 fixture.doctor_executor(),
             )?,
             None => ProviderOnboardingService::try_new_with_provider_rate_and_runtime_admissions(
-                research.onboarding_catalog(),
+                onboarding_catalog,
                 secrets,
                 provider_rate.clone(),
                 runtime_admissions,
@@ -419,7 +420,7 @@ impl LocalProduct {
         #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
         let onboarding = Arc::new(
             ProviderOnboardingService::try_new_with_provider_rate_and_runtime_admissions(
-                research.onboarding_catalog(),
+                onboarding_catalog,
                 secrets,
                 provider_rate.clone(),
                 runtime_admissions,
@@ -938,11 +939,19 @@ impl std::fmt::Debug for LocalProduct {
     }
 }
 
-fn open_research(paths: &LocalPaths) -> Result<ResearchService, LocalProductError> {
+fn open_research(
+    paths: &LocalPaths,
+) -> Result<
+    (
+        ResearchService,
+        market_squawk_data::OnboardingCatalogCapability,
+    ),
+    LocalProductError,
+> {
     let catalog = local_catalog_config(paths)?;
     let objects =
         ObjectStoreConfig::try_new(MAXIMUM_STAGING_BYTES, MAXIMUM_ROW_GROUP_ROWS, ORPHAN_GRACE)?;
-    ResearchService::open_or_initialize(
+    ResearchService::open_or_initialize_with_provider_onboarding(
         paths,
         catalog,
         MAXIMUM_OBJECTS_PER_DATASET_GENERATION,

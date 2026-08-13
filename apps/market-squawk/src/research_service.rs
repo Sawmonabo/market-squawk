@@ -281,7 +281,6 @@ fn encode_lower_hex(bytes: [u8; 32]) -> String {
 #[derive(Debug)]
 pub struct ResearchService {
     analytical: AnalyticalDataService,
-    onboarding_catalog: Arc<OnboardingCatalogCapability>,
     provider_captures: Arc<SealedResearchJournalStore>,
 }
 
@@ -313,25 +312,54 @@ impl ResearchService {
         max_objects_per_generation: usize,
         objects: ObjectStoreConfig,
     ) -> Result<Self, ResearchServiceError> {
-        Self::initialize_with_provider_onboarding(
-            paths,
-            catalog,
-            max_objects_per_generation,
+        let authority = CatalogAuthority::open(catalog)?;
+        let manifests =
+            AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
+        let analytical = AnalyticalDataService::initialize(
+            authority,
+            manifests,
+            paths.artifacts()?.clone(),
             objects,
-        )
-        .map(|(service, _onboarding_catalog)| service)
+        )?;
+        Self::from_analytical(paths, analytical)
     }
 
-    /// Creates a fresh research service while transferring its sole provider-onboarding
-    /// capability to root composition.
+    /// Opens or initializes research while transferring the sole provider-onboarding capability.
     ///
-    /// The capability is returned only during construction; no getter can recreate it later.
-    pub fn initialize_with_provider_onboarding(
+    /// This one-time installed-composition boundary returns the non-cloneable capability directly.
+    /// The [`ResearchService`] retains no onboarding writer, and its ordinary constructors cannot
+    /// mint one.
+    pub fn open_or_initialize_with_provider_onboarding(
         paths: &LocalPaths,
         catalog: CatalogConfig,
         max_objects_per_generation: usize,
         objects: ObjectStoreConfig,
-    ) -> Result<(Self, Arc<OnboardingCatalogCapability>), ResearchServiceError> {
+    ) -> Result<(Self, OnboardingCatalogCapability), ResearchServiceError> {
+        match Self::open_provider_onboarding_composition(
+            paths,
+            catalog.clone(),
+            max_objects_per_generation,
+            objects,
+        ) {
+            Ok(composition) => Ok(composition),
+            Err(ResearchServiceError::Ingest(IngestError::Catalog(
+                market_squawk_data::CatalogError::ArtifactRootAuthorityInitializationRequired,
+            ))) => Self::initialize_provider_onboarding_composition(
+                paths,
+                catalog,
+                max_objects_per_generation,
+                objects,
+            ),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn initialize_provider_onboarding_composition(
+        paths: &LocalPaths,
+        catalog: CatalogConfig,
+        max_objects_per_generation: usize,
+        objects: ObjectStoreConfig,
+    ) -> Result<(Self, OnboardingCatalogCapability), ResearchServiceError> {
         let authority = CatalogAuthority::open(catalog)?;
         let manifests =
             AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
@@ -342,13 +370,7 @@ impl ResearchService {
                 paths.artifacts()?.clone(),
                 objects,
             )?;
-        let provider_captures = Arc::new(paths.sealed_research_journal_store()?);
-        let onboarding_catalog = Arc::new(onboarding_catalog);
-        let service = Self {
-            analytical,
-            onboarding_catalog: Arc::clone(&onboarding_catalog),
-            provider_captures,
-        };
+        let service = Self::from_analytical(paths, analytical)?;
         Ok((service, onboarding_catalog))
     }
 
@@ -359,20 +381,20 @@ impl ResearchService {
         max_objects_per_generation: usize,
         objects: ObjectStoreConfig,
     ) -> Result<Self, ResearchServiceError> {
-        Self::open_with_provider_onboarding(paths, catalog, max_objects_per_generation, objects)
-            .map(|(service, _onboarding_catalog)| service)
+        let authority = CatalogAuthority::open(catalog)?;
+        let manifests =
+            AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
+        let analytical =
+            AnalyticalDataService::open(authority, manifests, paths.artifacts()?.clone(), objects)?;
+        Self::from_analytical(paths, analytical)
     }
 
-    /// Opens a bound research service while transferring its sole provider-onboarding capability
-    /// to root composition.
-    ///
-    /// The capability is returned only during construction; no getter can recreate it later.
-    pub fn open_with_provider_onboarding(
+    fn open_provider_onboarding_composition(
         paths: &LocalPaths,
         catalog: CatalogConfig,
         max_objects_per_generation: usize,
         objects: ObjectStoreConfig,
-    ) -> Result<(Self, Arc<OnboardingCatalogCapability>), ResearchServiceError> {
+    ) -> Result<(Self, OnboardingCatalogCapability), ResearchServiceError> {
         let authority = CatalogAuthority::open(catalog)?;
         let manifests =
             AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
@@ -383,14 +405,18 @@ impl ResearchService {
                 paths.artifacts()?.clone(),
                 objects,
             )?;
-        let provider_captures = Arc::new(paths.sealed_research_journal_store()?);
-        let onboarding_catalog = Arc::new(onboarding_catalog);
-        let service = Self {
-            analytical,
-            onboarding_catalog: Arc::clone(&onboarding_catalog),
-            provider_captures,
-        };
+        let service = Self::from_analytical(paths, analytical)?;
         Ok((service, onboarding_catalog))
+    }
+
+    fn from_analytical(
+        paths: &LocalPaths,
+        analytical: AnalyticalDataService,
+    ) -> Result<Self, ResearchServiceError> {
+        Ok(Self {
+            analytical,
+            provider_captures: Arc::new(paths.sealed_research_journal_store()?),
+        })
     }
 
     /// Verifies every catalog-retained provider capture before a provider runtime is published.
@@ -646,11 +672,6 @@ impl ResearchService {
     /// Returns fair-value persistence authority over this service's sole catalog writer.
     pub fn fair_value_catalog(&self) -> FairValueCatalogCapability {
         self.analytical.fair_value_catalog()
-    }
-
-    /// Returns the installed application-owned provider-onboarding authority.
-    pub(crate) fn onboarding_catalog(&self) -> Arc<OnboardingCatalogCapability> {
-        Arc::clone(&self.onboarding_catalog)
     }
 
     /// Returns bounded point-in-time definition reads over this service's sole catalog session.

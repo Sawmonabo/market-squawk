@@ -184,7 +184,7 @@ impl StartOnboardingRequest {
 /// Provider onboarding composition over catalog and exact-generation secret authority.
 pub struct ProviderOnboardingService {
     profiles: ProviderProfileRegistry,
-    catalog: Arc<OnboardingCatalogCapability>,
+    catalog: OnboardingCatalogCapability,
     secrets: Arc<dyn SecretStore>,
     client: reqwest::Client,
     provider_rate: ProviderRateAuthority,
@@ -403,7 +403,7 @@ impl ProviderOnboardingService {
     /// Fails closed when profiles, TLS, durable rate admission, or startup reconciliation cannot
     /// be established.
     pub fn try_new_with_provider_rate<S>(
-        catalog: Arc<OnboardingCatalogCapability>,
+        catalog: OnboardingCatalogCapability,
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
     ) -> Result<Self, ProviderOnboardingError>
@@ -421,7 +421,7 @@ impl ProviderOnboardingService {
     }
 
     pub(crate) fn try_new_with_provider_rate_and_runtime_admissions<S>(
-        catalog: Arc<OnboardingCatalogCapability>,
+        catalog: OnboardingCatalogCapability,
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
         runtime_admissions: ProviderRuntimeStartupAdmissions,
@@ -441,7 +441,7 @@ impl ProviderOnboardingService {
 
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
     pub(crate) fn try_new_with_provider_rate_runtime_admissions_and_board_fixture<S>(
-        catalog: Arc<OnboardingCatalogCapability>,
+        catalog: OnboardingCatalogCapability,
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
         runtime_admissions: ProviderRuntimeStartupAdmissions,
@@ -459,8 +459,66 @@ impl ProviderOnboardingService {
         )
     }
 
+    /// Prepares one no-credential test session without granting access to the catalog writer.
+    ///
+    /// This helper is deliberately unavailable to production code and rejects every credentialed
+    /// profile, including Alpaca. Alpaca activation remains reachable only through the
+    /// provider-observed doctor issuance consumed by [`Self::append_alpaca_runtime_verification`].
+    #[cfg(test)]
+    pub(crate) async fn prepare_noncredential_test_activation(
+        &self,
+        surface_id: &str,
+        public_configuration: ProviderPublicConfiguration,
+        operation: &str,
+    ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
+        let profile = self
+            .profiles
+            .get(surface_id)
+            .ok_or(ProviderOnboardingError::UnknownProfile)?;
+        if profile.capability().credential_kind() != market_squawk_sources::CredentialKind::None
+            || profile.capability().setup_mode() != market_squawk_sources::SetupMode::NoCredential
+        {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        self.register_profile_capabilities(profile)?;
+        let request = OnboardingReservationRequest::try_new(
+            profile.capability(),
+            public_configuration,
+            profile.capability().maximum_authority().clone(),
+            SourceIdentifier::try_from("provider-replacement-regression")?,
+            SourceIdentifier::try_from(operation)?,
+            Timestamp::from_unix_nanos(i64::MAX),
+            0,
+        )?;
+        let reservation = self.catalog.reserve_provider_onboarding(&request)?;
+        self.append(
+            &reservation,
+            1,
+            OnboardingEvent::RightsAdmitted {
+                generation: None,
+                decision_digest: profile.rights_decision_digest(),
+            },
+        )?;
+        self.append(
+            &reservation,
+            2,
+            OnboardingEvent::RatePolicyAdmitted {
+                generation: None,
+                policy_digest: profile.capability().rate_policy().evidence_digest(),
+            },
+        )?;
+        self.append_digest_runtime_verification(
+            &reservation,
+            3,
+            None,
+            profile.rights_decision_digest(),
+        )?;
+        self.prepare_runtime_activation_target(reservation.session_id(), CancellationToken::new())
+            .await
+    }
+
     fn try_new_inner<S>(
-        catalog: Arc<OnboardingCatalogCapability>,
+        catalog: OnboardingCatalogCapability,
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
         runtime_admissions: ProviderRuntimeStartupAdmissions,
@@ -3971,7 +4029,7 @@ mod tests {
     fn startup_reconciles_every_page_of_recognized_historical_sessions() -> TestResult {
         let directory = tempfile::tempdir()?;
         let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
-        let research = ResearchService::initialize(
+        let (_research, catalog) = ResearchService::open_or_initialize_with_provider_onboarding(
             &paths,
             CatalogConfig::try_new(
                 paths.catalog()?.clone(),
@@ -3982,7 +4040,6 @@ mod tests {
             8,
             ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
         )?;
-        let catalog = research.onboarding_catalog();
         let profiles = built_in_provider_profiles()?;
         let sec = profiles
             .get("sec.edgar-public")

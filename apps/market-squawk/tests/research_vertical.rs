@@ -422,7 +422,7 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
     )?;
     let objects = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
     let (research, onboarding_catalog) =
-        ResearchService::initialize_with_provider_onboarding(&paths, catalog, 8, objects)?;
+        ResearchService::open_or_initialize_with_provider_onboarding(&paths, catalog, 8, objects)?;
     let research = Arc::new(research);
     let registry = market_squawk_sources::AuthoritativeSourceRegistry::try_new_durable(
         LocalAuthorityStateStore::try_open(
@@ -1317,12 +1317,17 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
         CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
     )?;
     let objects = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
-    let (_research, onboarding_catalog) =
-        ResearchService::initialize_with_provider_onboarding(&paths, catalog, 8, objects)?;
+    let (fallback_research, fallback_catalog) =
+        ResearchService::open_or_initialize_with_provider_onboarding(
+            &paths,
+            catalog.clone(),
+            8,
+            objects,
+        )?;
     let provider_rate =
         provider_rate_authority(&directory.path().join("portal-provider-rate.sqlite3"))?;
     let fallback_service = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
-        Arc::clone(&onboarding_catalog),
+        fallback_catalog,
         Arc::new(
             PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
                 "market-squawk-test",
@@ -1382,6 +1387,11 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
                 == "ready"
     );
     fallback_portal.shutdown().await?;
+    drop(fallback_service);
+    drop(fallback_research);
+
+    let (_research, onboarding_catalog) =
+        ResearchService::open_or_initialize_with_provider_onboarding(&paths, catalog, 8, objects)?;
 
     let secrets = Arc::new(EncryptedFileSecretStore::try_open(
         directory.path().join("provider-secrets"),
