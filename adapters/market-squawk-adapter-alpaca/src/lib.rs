@@ -13,8 +13,6 @@ mod error;
 mod historical;
 mod historical_calendar;
 mod live;
-#[cfg(feature = "scripted-transport-fixture")]
-mod scripted;
 
 pub use config::{
     ALPACA_APPLICATION_MAX_REQUESTS_PER_MINUTE, ALPACA_BASIC_EQUITY_SYMBOL_LIMIT,
@@ -27,15 +25,8 @@ pub use config::{
     AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsLiveConfig, AlpacaTimeframe,
     AlpacaTransportLimits,
 };
-#[cfg(feature = "scripted-transport-fixture")]
-pub use config::{
-    ALPACA_INSTALLED_FIXTURE_IEX_SOURCE_ID, ALPACA_INSTALLED_FIXTURE_IEX_VALIDITY_NANOS,
-    AlpacaInstalledFixtureIexConfig,
-};
 pub use credentials::AlpacaCredentials;
 pub use decoder::{AlpacaIexDecoder, AlpacaOptionsDecoder};
-#[cfg(feature = "scripted-transport-fixture")]
-pub use doctor::AlpacaPaperIexDoctorFixtureObservation;
 pub use doctor::{
     ALPACA_PAPER_IEX_DOCTOR_BATCH_SYMBOL_COUNT, AlpacaDoctorBatchObservation,
     AlpacaDoctorCalendarObservation, AlpacaDoctorHistoricalObservation, AlpacaDoctorHttpEvidence,
@@ -57,12 +48,6 @@ pub use historical_calendar::{
     AlpacaTradingApiEnvironment,
 };
 pub use live::{AlpacaIexLiveSource, AlpacaOptionsLiveSource};
-#[cfg(feature = "scripted-transport-fixture")]
-pub use scripted::{
-    AlpacaInstalledFixtureIexLiveSource, AlpacaScriptedDoctorExecutor,
-    AlpacaScriptedTransportEvent, AlpacaScriptedTransportEventKind, AlpacaScriptedTransportFactory,
-    AlpacaScriptedTransportTranscript,
-};
 
 #[cfg(test)]
 mod tests;

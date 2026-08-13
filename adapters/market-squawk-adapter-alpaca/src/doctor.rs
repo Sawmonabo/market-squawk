@@ -96,15 +96,12 @@ pub enum AlpacaDoctorObservationDisposition {
 
 /// Authority origin of one complete doctor observation.
 ///
-/// Provider observations and installed-fixture observations intentionally occupy distinct digest
-/// domains. A fixture result can exercise composition and persistence, but can never be presented
-/// as evidence that Alpaca authenticated or served the requests.
+/// The origin is retained in the observation digest so downstream admission can require the
+/// credential-bearing provider transport explicitly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AlpacaDoctorObservationOrigin {
     /// The credential-bearing production transport observed Alpaca's responses.
     ProviderObserved,
-    /// The closed nondefault installed fixture replayed code-owned raw protocol bytes.
-    InstalledFixture,
 }
 
 /// An exact provider header was either observed once or absent.
@@ -608,20 +605,9 @@ struct AlpacaPaperIexDoctorObservationData {
 
 /// Provider-observed secret-free output from the credential-bearing Paper/IEX doctor.
 ///
-/// Only [`AlpacaPaperIexDoctor::observe`] can construct this authority-bearing wrapper. The
-/// installed fixture returns a distinct type with no conversion into this one.
+/// Only [`AlpacaPaperIexDoctor::observe`] can construct this authority-bearing wrapper.
 #[derive(Debug, Eq, PartialEq)]
 pub struct AlpacaPaperIexDoctorObservation {
-    data: AlpacaPaperIexDoctorObservationData,
-}
-
-/// Installed-fixture output from the closed raw Paper/IEX protocol transcript.
-///
-/// This type cannot be converted into [`AlpacaPaperIexDoctorObservation`] and therefore cannot
-/// satisfy an application seam that requires provider-observed evidence.
-#[cfg(feature = "scripted-transport-fixture")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AlpacaPaperIexDoctorFixtureObservation {
     data: AlpacaPaperIexDoctorObservationData,
 }
 
@@ -704,8 +690,6 @@ macro_rules! impl_observation_accessors {
 }
 
 impl_observation_accessors!(AlpacaPaperIexDoctorObservation);
-#[cfg(feature = "scripted-transport-fixture")]
-impl_observation_accessors!(AlpacaPaperIexDoctorFixtureObservation);
 
 /// Credential-bearing fixed-route doctor. It is not an account or execution client.
 pub struct AlpacaPaperIexDoctor {
@@ -874,29 +858,6 @@ fn complete_provider_observation(
     }
 }
 
-#[cfg(feature = "scripted-transport-fixture")]
-fn complete_fixture_observation(
-    quote: AlpacaDoctorQuoteObservation,
-    batch: AlpacaDoctorBatchObservation,
-    stream: AlpacaDoctorStreamObservation,
-    historical: AlpacaDoctorHistoricalObservation,
-    calendar: AlpacaDoctorCalendarObservation,
-    completed_at: Timestamp,
-) -> AlpacaPaperIexDoctorFixtureObservation {
-    AlpacaPaperIexDoctorFixtureObservation {
-        data: complete_observation_data(
-            AlpacaDoctorObservationOrigin::InstalledFixture,
-            fixture_market_data_principal_sha256(),
-            quote,
-            batch,
-            stream,
-            historical,
-            calendar,
-            completed_at,
-        ),
-    }
-}
-
 fn complete_observation_data(
     origin: AlpacaDoctorObservationOrigin,
     market_data_principal_sha256: EvidenceDigest,
@@ -927,312 +888,6 @@ fn complete_observation_data(
         calendar,
         completed_at,
         observation_digest,
-    }
-}
-
-/// Replays one closed raw Paper/IEX transcript through the production parsers.
-///
-/// The fixture has no credential, network, provider-budget, or caller-selected request surface.
-#[cfg(feature = "scripted-transport-fixture")]
-pub(crate) fn installed_fixture_observation(
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<AlpacaPaperIexDoctorFixtureObservation, AlpacaError> {
-    ensure_before(deadline, cancellation)?;
-    let completed_at = system_timestamp()?;
-    let quote_timestamp = completed_at
-        .checked_sub_nanos(10_000_000)
-        .map_err(|_| AlpacaError::Protocol)?;
-    let quote_timestamp_text = fixture_rfc3339(quote_timestamp)?;
-
-    let quote_body = serde_json::to_vec(&serde_json::json!({
-        "quote": {
-            "t": quote_timestamp_text,
-            "bp": 100.00,
-            "ap": 100.01,
-            "bs": 100,
-            "as": 100
-        },
-        "symbol": DOCTOR_SYMBOL
-    }))
-    .map_err(|_| AlpacaError::Serialization)?;
-    let quote = quote_observation(fixture_http_response(
-        DoctorEndpointContract::Quote,
-        exact_url(QUOTE_ENDPOINT)?,
-        quote_body,
-        completed_at
-            .checked_sub_nanos(9_000_000)
-            .map_err(|_| AlpacaError::Protocol)?,
-        MAX_QUOTE_RESPONSE_BYTES,
-    )?)?;
-
-    let snapshot_quote = serde_json::json!({
-        "t": quote_timestamp_text,
-        "bp": 100.00,
-        "ap": 100.01,
-        "bs": 100,
-        "as": 100
-    });
-    let mut snapshots = serde_json::Map::new();
-    for symbol in BATCH_SYMBOLS {
-        snapshots.insert(
-            symbol.to_owned(),
-            serde_json::json!({"latestQuote": snapshot_quote.clone()}),
-        );
-    }
-    let batch_body = serde_json::to_vec(&snapshots).map_err(|_| AlpacaError::Serialization)?;
-    let batch = batch_observation(fixture_http_response(
-        DoctorEndpointContract::Batch,
-        batch_url()?,
-        batch_body,
-        completed_at
-            .checked_sub_nanos(8_000_000)
-            .map_err(|_| AlpacaError::Protocol)?,
-        MAX_BATCH_RESPONSE_BYTES,
-    )?)?;
-
-    let stream = fixture_stream_observation(completed_at)?;
-    let (start_date, end_date) = doctor_date_range()?;
-    let bar_timestamp = fixture_midnight_timestamp(end_date)?;
-    let historical_body = serde_json::to_vec(&serde_json::json!({
-        "bars": [{
-            "t": fixture_rfc3339(bar_timestamp)?,
-            "o": 100.00,
-            "h": 101.00,
-            "l": 99.00,
-            "c": 100.50,
-            "v": 1_000,
-            "n": 100,
-            "vw": 100.25
-        }],
-        "symbol": DOCTOR_SYMBOL,
-        "next_page_token": null
-    }))
-    .map_err(|_| AlpacaError::Serialization)?;
-    let history_url = historical_url(start_date, end_date, None)?;
-    let history_response = fixture_http_response(
-        DoctorEndpointContract::Historical,
-        history_url,
-        historical_body,
-        completed_at
-            .checked_sub_nanos(5_000_000)
-            .map_err(|_| AlpacaError::Protocol)?,
-        MAX_HISTORICAL_PAGE_BYTES,
-    )?;
-    let parsed_history = parse_historical_page(&history_response.body, start_date, end_date)?;
-    if parsed_history.next_page_token.is_some() {
-        return Err(AlpacaError::Protocol);
-    }
-    let mut returned_dates = BTreeSet::new();
-    let mut first_bar_timestamp = None;
-    let mut last_bar_timestamp = None;
-    for (date, timestamp) in parsed_history.bars.iter().copied() {
-        if last_bar_timestamp.is_some_and(|prior| prior >= timestamp)
-            || !returned_dates.insert(date)
-        {
-            return Err(AlpacaError::Protocol);
-        }
-        first_bar_timestamp.get_or_insert(timestamp);
-        last_bar_timestamp = Some(timestamp);
-    }
-    let returned_bar_count = parsed_history.bars.len();
-    let historical = historical_observation(
-        AlpacaDoctorObservationDisposition::ObservedAvailable,
-        start_date,
-        end_date,
-        vec![AlpacaDoctorHttpPageEvidence {
-            http: history_response.evidence,
-            request_page_token_digest: None,
-            response_page_token_digest: None,
-        }],
-        returned_dates,
-        returned_bar_count,
-        first_bar_timestamp,
-        last_bar_timestamp,
-        true,
-    )?;
-
-    let calendar_request = AlpacaAuthenticatedCalendarRequest::try_new(
-        AlpacaTradingApiEnvironment::Paper,
-        start_date,
-        end_date,
-    )?;
-    let calendar_url = exact_url(&format!(
-        "{}{}",
-        calendar_request.origin(),
-        calendar_request.path_and_query()
-    ))?;
-    let calendar_body = serde_json::to_vec(&serde_json::json!({
-        "market": {"acronym": DOCTOR_MARKET, "timezone": DOCTOR_TIMEZONE},
-        "calendar": [{"date": end_date.to_string()}]
-    }))
-    .map_err(|_| AlpacaError::Serialization)?;
-    let calendar = calendar_observation(
-        fixture_http_response(
-            DoctorEndpointContract::Calendar,
-            calendar_url,
-            calendar_body,
-            completed_at
-                .checked_sub_nanos(2_000_000)
-                .map_err(|_| AlpacaError::Protocol)?,
-            ALPACA_HISTORICAL_CALENDAR_MAX_RESPONSE_BYTES,
-        )?,
-        &historical,
-    )?;
-
-    ensure_before(deadline, cancellation)?;
-    Ok(complete_fixture_observation(
-        quote,
-        batch,
-        stream,
-        historical,
-        calendar,
-        completed_at,
-    ))
-}
-
-#[cfg(feature = "scripted-transport-fixture")]
-fn fixture_http_response(
-    contract: DoctorEndpointContract,
-    url: Url,
-    body: Vec<u8>,
-    received_at: Timestamp,
-    maximum_bytes: usize,
-) -> Result<HttpProbeResponse, AlpacaError> {
-    if body.len() > maximum_bytes {
-        return Err(AlpacaError::BodyTooLarge);
-    }
-    let response_bytes = u64::try_from(body.len()).map_err(|_| AlpacaError::BodyTooLarge)?;
-    Ok(HttpProbeResponse {
-        evidence: AlpacaDoctorHttpEvidence {
-            endpoint_contract_digest: endpoint_contract_digest(contract)?,
-            request_digest: request_digest("GET", url.as_str())?,
-            status_code: 200,
-            body_digest: sha256(&body),
-            response_bytes,
-            received_at,
-            latency_nanos: 1_000_000,
-            rate: missing_rate_evidence(),
-        },
-        body: body.into_boxed_slice(),
-    })
-}
-
-#[cfg(feature = "scripted-transport-fixture")]
-fn fixture_stream_observation(
-    completed_at: Timestamp,
-) -> Result<AlpacaDoctorStreamObservation, AlpacaError> {
-    const CONNECTED: &[u8] = br#"[{"T":"success","msg":"connected"}]"#;
-    const AUTHENTICATED: &[u8] = br#"[{"T":"success","msg":"authenticated"}]"#;
-    const SUBSCRIBED: &[u8] = br#"[{"T":"subscription","trades":["AAPL"],"quotes":["AAPL"],"bars":[],"updatedBars":[],"dailyBars":[],"statuses":[],"lulds":[],"corrections":[],"cancelErrors":[]}]"#;
-    let connected = parse_control_frame(CONNECTED)?;
-    let authenticated = parse_control_frame(AUTHENTICATED)?;
-    let subscribed = parse_control_frame(SUBSCRIBED)?;
-    if !connected.connected
-        || connected.authenticated
-        || connected.subscription.is_some()
-        || !authenticated.authenticated
-        || authenticated.connected
-        || authenticated.subscription.is_some()
-        || subscribed.subscription != Some((1, 1))
-        || subscribed.connected
-        || subscribed.authenticated
-        || connected.error_code.is_some()
-        || authenticated.error_code.is_some()
-        || subscribed.error_code.is_some()
-    {
-        return Err(AlpacaError::Protocol);
-    }
-    let authenticated_at = completed_at
-        .checked_sub_nanos(7_000_000)
-        .map_err(|_| AlpacaError::Protocol)?;
-    let subscribed_at = completed_at
-        .checked_sub_nanos(6_000_000)
-        .map_err(|_| AlpacaError::Protocol)?;
-    let stream_completed_at = completed_at
-        .checked_sub_nanos(5_500_000)
-        .map_err(|_| AlpacaError::Protocol)?;
-    let frames_observed = 3;
-    let bytes_observed = [CONNECTED, AUTHENTICATED, SUBSCRIBED]
-        .into_iter()
-        .try_fold(0_u64, |total, payload| {
-            total.checked_add(u64::try_from(payload.len()).ok()?)
-        })
-        .ok_or(AlpacaError::Protocol)?;
-    let connected_frame_digest = sha256(CONNECTED);
-    let authenticated_frame_digest = sha256(AUTHENTICATED);
-    let subscription_frame_digest = sha256(SUBSCRIBED);
-    let handshake_rate = missing_rate_evidence();
-    let disposition = AlpacaDoctorObservationDisposition::ObservedAvailable;
-    let semantic_result_digest = stream_semantic_digest(
-        disposition,
-        101,
-        &handshake_rate,
-        connected_frame_digest,
-        authenticated_frame_digest,
-        subscription_frame_digest,
-        1,
-        1,
-        frames_observed,
-        bytes_observed,
-        authenticated_at,
-        subscribed_at,
-        true,
-        true,
-        stream_completed_at,
-    );
-    Ok(AlpacaDoctorStreamObservation {
-        disposition,
-        endpoint_contract_digest: endpoint_contract_digest(DoctorEndpointContract::Stream)?,
-        request_digest: stream_request_digest()?,
-        handshake_status: 101,
-        handshake_rate,
-        connected_frame_digest,
-        authenticated_frame_digest,
-        subscription_frame_digest,
-        semantic_result_digest,
-        subscribed_trade_count: 1,
-        subscribed_quote_count: 1,
-        frames_observed,
-        bytes_observed,
-        authenticated_at,
-        subscribed_at,
-        close_sent: true,
-        clean_close_observed: true,
-        completed_at: stream_completed_at,
-    })
-}
-
-#[cfg(feature = "scripted-transport-fixture")]
-fn fixture_midnight_timestamp(date: CalendarDate) -> Result<Timestamp, AlpacaError> {
-    let date = NaiveDate::from_ymd_opt(
-        i32::from(date.year()),
-        u32::from(date.month()),
-        u32::from(date.day()),
-    )
-    .ok_or(AlpacaError::Protocol)?;
-    let value = date.and_hms_opt(0, 0, 0).ok_or(AlpacaError::Protocol)?;
-    DateTime::<Utc>::from_naive_utc_and_offset(value, Utc)
-        .timestamp_nanos_opt()
-        .map(Timestamp::from_unix_nanos)
-        .ok_or(AlpacaError::Protocol)
-}
-
-#[cfg(feature = "scripted-transport-fixture")]
-fn fixture_rfc3339(timestamp: Timestamp) -> Result<String, AlpacaError> {
-    DateTime::<Utc>::from_timestamp_nanos(timestamp.unix_nanos())
-        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
-        .parse()
-        .map_err(|_| AlpacaError::Protocol)
-}
-
-#[cfg(feature = "scripted-transport-fixture")]
-const fn missing_rate_evidence() -> AlpacaDoctorRateEvidence {
-    AlpacaDoctorRateEvidence {
-        limit: AlpacaDoctorObservedField::Missing,
-        remaining: AlpacaDoctorObservedField::Missing,
-        reset_unix_seconds: AlpacaDoctorObservedField::Missing,
-        retry_after: AlpacaDoctorObservedField::Missing,
     }
 }
 
@@ -3114,13 +2769,6 @@ fn doctor_observation_digest(
     evidence(digest.finalize().into())
 }
 
-#[cfg(feature = "scripted-transport-fixture")]
-fn fixture_market_data_principal_sha256() -> EvidenceDigest {
-    let mut digest = Sha256::new();
-    digest.update(b"market-squawk/alpaca-paper-iex-doctor-installed-fixture-principal/v1\0");
-    evidence(digest.finalize().into())
-}
-
 fn hash_http(digest: &mut Sha256, value: &AlpacaDoctorHttpEvidence) {
     hash_evidence(digest, value.endpoint_contract_digest);
     hash_evidence(digest, value.request_digest);
@@ -3254,6 +2902,5 @@ const fn disposition_tag(value: AlpacaDoctorObservationDisposition) -> u8 {
 const fn origin_tag(value: AlpacaDoctorObservationOrigin) -> u8 {
     match value {
         AlpacaDoctorObservationOrigin::ProviderObserved => 1,
-        AlpacaDoctorObservationOrigin::InstalledFixture => 2,
     }
 }

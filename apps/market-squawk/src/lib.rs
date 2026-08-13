@@ -5,8 +5,6 @@
 //! Production live batches enter only [`live_runtime::LiveRuntimeComposition`]. The legacy local
 //! event model is explicitly diagnostic and remains isolated from current execution authority.
 
-#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
-mod alpaca_installed_fixture;
 pub mod application;
 mod artifact_repository;
 pub mod backtest_service;
@@ -45,8 +43,6 @@ pub mod journal {
     pub use market_squawk_platform::{JournalError, JournalReader, JournalWriter};
 }
 
-#[cfg(all(feature = "alpaca-installed-fixture", debug_assertions))]
-pub use alpaca_installed_fixture::{AlpacaInstalledFixtureBundle, AlpacaInstalledFixtureError};
 pub use backtest_service::{
     BacktestExperimentPlan, PinnedBacktestInput, ProductionBacktestService,
     ProductionBacktestServiceError,

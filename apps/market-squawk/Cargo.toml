@@ -11,9 +11,6 @@ autotests = false
 
 [features]
 default = []
-alpaca-installed-fixture = [
-    "market-squawk-adapter-alpaca/scripted-transport-fixture",
-]
 board-installed-fixture = [
     "market-squawk-adapter-federal-reserve/scripted-transport-fixture",
 ]
