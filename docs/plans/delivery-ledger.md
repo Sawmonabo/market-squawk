@@ -1612,3 +1612,64 @@ non-trading account identity to IEX market-data endpoint/feed, batch/cardinality
 historical-bars/calendar entitlement, and rate-capacity evidence. It must never call or authorize
 account, position, order, or trading routes; only after that evidence is current may the existing
 source-start authority create an IEX market-data runtime.
+
+## 2026-08-13 Alpaca Paper/IEX doctor and source-runtime checkpoint
+
+Pushed checkpoint `9c1be5fded3b87b055cdaa50297bb80617046b4c`, tree
+`506581da9603877ef88515475fcb5ef62541f6f2`, closes the first selected-market-data authority
+barrier without claiming a live external-provider result. The installed product now owns a closed
+five-probe Alpaca Paper/IEX doctor covering the fixed quote, exact 50-symbol snapshot batch, IEX
+WebSocket authentication/subscription acknowledgement, terminal raw-history pagination, and exact
+Paper IEX/UTC calendar reconciliation. Its provider-observed result is nonconvertible from the
+installed scripted fixture. The durable receipt binds the exact credential generation, non-trading
+market-data principal, profile/configuration/rights/rate identities, complete observation digest,
+fifteen-minute exclusive validity, and same-generation renewal predecessor.
+
+`Source.Verify`, `Source.Start`, restart restoration, expiry, renewal, resynchronization, and
+shutdown now retain exact receipt/configuration/generation authority. Alpaca, Tradier, and Kraken
+account runtimes begin with display reads closed; final publication and read admission occur while
+the registry, onboarding mutation guard, and entry authority remain coherently held. Weak-only
+currentness monitors revoke reads before cancellation, generation-CAS health drains remove and join
+only the stale generation, every shutdown has a finite code-owned deadline, and historical Alpaca
+capabilities require the exact runtime receipt plus credential generation. A same-generation
+renewal accepts an already-drained prior runtime as idempotently stopped, while every present entry
+still receives complete request validation. Failed or expired post-start transitions clean the
+exact runtime under a fresh product-owned deadline before durable reconciliation.
+
+Catalog migration 0016 remains immutable. Forward migration 0022 adds exact per-session onboarding
+stream heads and performs a bounded Rust backfill inside the migration transaction, including
+zero-event retained sessions. Replay validates canonical reservation, audit, event, deadline,
+lifecycle, and cumulative-chain evidence and applies trusted current-time deadline semantics before
+returning an exact replay. Desktop Sources strictly renders the server-owned doctor evidence and
+closed Verify/Start/Resynchronize/renewal controls; setup copy states that doctor success neither
+starts a source nor grants trading authority.
+
+Focused checkpoint evidence remained deliberately thin:
+
+- the locked offline application compile passed on the frozen source candidate;
+- the existing exact source receipt/renewal test passed;
+- the three existing application tests for cancellable monitor join, exact historical
+  receipt/generation mismatch, and stale-generation drain CAS each passed;
+- the existing catalog replay/migration test passed, including the retained zero-event stream;
+- Desktop TypeScript compilation and the existing grouped product-navigation journey passed; and
+- no broad workspace suite, CI/CD, release build, native package matrix, provider network request,
+  or source-lock refresh ran.
+
+The closing grouped remediation review accepted the frozen working source at Critical 0,
+Important 0, Minor 0; its 28-file reviewed aggregate SHA-256 was
+`d37cb8a4858ba8139e2c5d827a73035038f2ea91c0751ed86d25c678a988cb89`.
+That is focused checkpoint evidence, not clean exact-head release approval. The branch and upstream
+matched at the pushed commit, the sole worktree was clean, no completed worktree or lane branch
+remained to remove, and generated `target/` state was approximately 13 GiB under the 20 GiB ceiling.
+
+The active barrier is the first honest installed Markets producer-to-Desktop vertical: a
+credential-free, network-denied AAPL/IEX fixture must traverse the real Alpaca decoder, bounded
+live-source supervisor, display directory, `Market.GetUnifiedFeed`, and existing Markets UI while
+remaining visibly `InstalledFixture` and `DirectUnverified`. The fixture cannot infer a canonical
+instrument from `AAPL`, fabricate Nasdaq/OpenFIGI/FIGI evidence, reuse a production doctor receipt,
+or obtain account, historical-provider, order, or trading authority. The next integration event is
+an exact retained AAPL reference definition plus the sealed fixture runtime and one existing Rust
+installed-service journey and grouped Desktop journey proving the real read path. Live Alpaca
+entitlement remains a later separately authorized provider smoke; historical/PIT product
+publication, models, forecasting, valuation, recommendation, backtesting, portfolio/risk, and the
+complete novice decision journey remain release blockers after this current-market slice.
