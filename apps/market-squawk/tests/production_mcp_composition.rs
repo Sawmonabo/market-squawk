@@ -43,6 +43,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 type TestResult<T = ()> = anyhow::Result<T>;
 
@@ -52,6 +53,13 @@ const INSTALLED_SERVICE_TEST_UNLOCK: &str = "installed-service-test-unlock";
 const INSTALLED_SERVICE_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
 const CRASH_RECOVERY_SOURCE_PROFILE: &str = "kraken.spot-public-market-data";
 const INSTALLED_MCP_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
+const REAL_ALPACA_BUNDLE_PATH_ENV: &str = "MARKET_SQUAWK_TEST_REAL_ALPACA_BUNDLE_PATH";
+const REAL_ALPACA_SURFACE: &str = "alpaca.basic-market-data";
+const REAL_ALPACA_CREDENTIAL_MEDIA_TYPE: &str = "market-squawk.provider-credentials.v1";
+const REAL_ALPACA_CREDENTIAL_SCHEMA: &str = "market-squawk-provider-credentials/v1";
+const REAL_ALPACA_CREDENTIAL_MAXIMUM_BYTES: u64 = 64 * 1024;
+const REAL_ALPACA_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(120);
+const REAL_ALPACA_MARKET_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const OWNER_RESEARCH_DATASET: &str = "owner_price_history";
 const OWNER_RESEARCH_CSV: &[u8] = b"row_id,Close Price\nrow-1,12.34\nrow-2,13.05\n";
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -85,6 +93,7 @@ async fn run_installed_service_authority_scenario() -> TestResult {
             .context("resolve installed-service subprocess root")?;
         return run_installed_service_process_role(&role, root).await;
     }
+    let real_alpaca_bundle_path = protected_real_alpaca_bundle_path()?;
     let temporary = tempfile::tempdir().context("create installed-service scenario root")?;
     let environment = BTreeMap::<OsString, OsString>::new();
     let config = AppConfig::load(ConfigSources::new(
@@ -129,6 +138,7 @@ async fn run_installed_service_authority_scenario() -> TestResult {
     let service_task = tokio::spawn(service.run(shutdown.clone()));
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
     let mut board_evidence = None;
+    let mut real_alpaca_evidence = None;
     let initial_phase = AssertUnwindSafe(Box::pin(async {
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
         assert!(matches!(
@@ -246,11 +256,20 @@ async fn run_installed_service_authority_scenario() -> TestResult {
             .context("revoke Codex credential through desktop authority")?;
         assert_eq!(revoked.result()["value"]["accessRevoked"], true);
 
-        exercise_installed_relay(
+        if let Some(path) = real_alpaca_bundle_path.as_deref() {
+            real_alpaca_evidence = Some(
+                exercise_real_alpaca_vertical(&desktop, path)
+                    .await
+                    .context("exercise opt-in real Alpaca production vertical")?,
+            );
+        }
+
+        exercise_installed_relay_with_market(
             NamedClient::ClaudeCode,
             connector
                 .connect_mcp_relay(NamedClient::ClaudeCode)
                 .context("admit rotated Claude relay")?,
+            real_alpaca_evidence.as_ref(),
         )
         .await
         .context("exercise rotated Claude relay")?;
@@ -281,6 +300,10 @@ async fn run_installed_service_authority_scenario() -> TestResult {
         InstalledServiceRunOutcome::Stopped
     );
     assert!(connector.connect(NamedClient::Cli, None).is_err());
+    let real_alpaca_evidence = match real_alpaca_bundle_path {
+        Some(_) => Some(real_alpaca_evidence.context("real Alpaca evidence was not retained")?),
+        None => None,
+    };
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
     board_fixture
         .synchronize_provider_clock_for_restart()
@@ -321,11 +344,20 @@ async fn run_installed_service_authority_scenario() -> TestResult {
         )
         .await
         .context("verify durable Federal Reserve Board state after restart")?;
-        exercise_installed_relay(
+        let restarted_real_alpaca_evidence = match real_alpaca_evidence.as_ref() {
+            Some(initial) => Some(
+                assert_real_alpaca_restored(&restarted_desktop, initial)
+                    .await
+                    .context("verify real Alpaca production state after restart")?,
+            ),
+            None => None,
+        };
+        exercise_installed_relay_with_market(
             NamedClient::ClaudeCode,
             connector
                 .connect_mcp_relay(NamedClient::ClaudeCode)
                 .context("admit persisted Claude relay after restart")?,
+            restarted_real_alpaca_evidence.as_ref(),
         )
         .await
         .context("exercise persisted Claude relay after restart")?;
@@ -421,6 +453,787 @@ async fn run_installed_service_authority_scenario() -> TestResult {
         .stop()
         .context("stop restarted installed-service subprocess")?;
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RealAlpacaCredentialAuthority {
+    onboarding_session_id: String,
+    public_configuration_sha256: String,
+    doctor_credential_generation: u64,
+    doctor: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RealAlpacaAuthority {
+    credential: RealAlpacaCredentialAuthority,
+    lifecycle_state_revision: u64,
+    runtime_generation_sha256: String,
+}
+
+#[derive(Debug)]
+struct ActiveRealAlpacaRuntime {
+    source_id: String,
+    instrument_id: String,
+    connection_generation: u64,
+}
+
+#[derive(Debug)]
+struct ActiveRealAlpacaStatus {
+    authority: RealAlpacaAuthority,
+    runtimes: Vec<ActiveRealAlpacaRuntime>,
+}
+
+#[derive(Debug)]
+struct RealAlpacaEvidence {
+    authority: RealAlpacaAuthority,
+    source_id: String,
+    instrument_id: String,
+    connection_generation: u64,
+    stable_market_identity: Value,
+}
+
+#[derive(Debug)]
+struct RealAlpacaMarketObservation {
+    source_id: String,
+    instrument_id: String,
+    connection_generation: u64,
+    stable_identity: Value,
+}
+
+fn protected_real_alpaca_bundle_path() -> TestResult<Option<PathBuf>> {
+    let Some(raw) = std::env::var_os(REAL_ALPACA_BUNDLE_PATH_ENV) else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        anyhow::bail!("real Alpaca credential-bundle path is empty");
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        anyhow::bail!("real Alpaca credential-bundle path is not absolute");
+    }
+    let metadata = std::fs::symlink_metadata(&path)
+        .context("inspect protected real Alpaca credential bundle")?;
+    validate_real_alpaca_bundle_metadata(&metadata)?;
+    Ok(Some(path))
+}
+
+#[cfg(unix)]
+fn validate_real_alpaca_bundle_metadata(metadata: &std::fs::Metadata) -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        anyhow::bail!("real Alpaca credential bundle is not a regular non-symlink file");
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        anyhow::bail!("real Alpaca credential bundle is not mode-private");
+    }
+    if metadata.len() == 0 || metadata.len() > REAL_ALPACA_CREDENTIAL_MAXIMUM_BYTES {
+        anyhow::bail!("real Alpaca credential bundle violates its byte bound");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_real_alpaca_bundle_metadata(_metadata: &std::fs::Metadata) -> TestResult {
+    anyhow::bail!("real Alpaca credential-bundle gate requires Unix mode protections")
+}
+
+#[cfg(unix)]
+fn read_real_alpaca_bundle(path: &Path) -> TestResult<Zeroizing<Vec<u8>>> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let named = std::fs::symlink_metadata(path)
+        .context("reinspect protected real Alpaca credential bundle")?;
+    validate_real_alpaca_bundle_metadata(&named)?;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .context("open protected real Alpaca credential bundle")?;
+    let opened = file
+        .metadata()
+        .context("inspect opened real Alpaca credential bundle")?;
+    validate_real_alpaca_bundle_metadata(&opened)?;
+    if named.dev() != opened.dev() || named.ino() != opened.ino() || named.len() != opened.len() {
+        anyhow::bail!("real Alpaca credential bundle changed during protected open");
+    }
+
+    let capacity = usize::try_from(opened.len()).context("size real Alpaca credential bundle")?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    bytes
+        .try_reserve_exact(capacity)
+        .context("reserve bounded real Alpaca credential bundle")?;
+    file.take(REAL_ALPACA_CREDENTIAL_MAXIMUM_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read protected real Alpaca credential bundle")?;
+    if u64::try_from(bytes.len()).ok() != Some(opened.len()) {
+        anyhow::bail!("real Alpaca credential bundle changed during bounded read");
+    }
+    let after = std::fs::symlink_metadata(path)
+        .context("finalize protected real Alpaca credential-bundle read")?;
+    validate_real_alpaca_bundle_metadata(&after)?;
+    if opened.dev() != after.dev() || opened.ino() != after.ino() || opened.len() != after.len() {
+        anyhow::bail!("real Alpaca credential bundle changed during bounded read");
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_real_alpaca_bundle(_path: &Path) -> TestResult<Zeroizing<Vec<u8>>> {
+    anyhow::bail!("real Alpaca credential-bundle gate requires Unix mode protections")
+}
+
+async fn exercise_real_alpaca_vertical(
+    client: &LoopbackApplicationClient,
+    bundle_path: &Path,
+) -> TestResult<RealAlpacaEvidence> {
+    let bytes = read_real_alpaca_bundle(bundle_path)?;
+    let admission = InputAdmission::try_sha256(
+        REAL_ALPACA_CREDENTIAL_MEDIA_TYPE,
+        u64::try_from(bytes.len()).context("measure real Alpaca credential bundle")?,
+        Sha256::digest(bytes.as_slice()).into(),
+    )
+    .context("admit bounded real Alpaca credential bundle")?;
+    let ticket = {
+        let mut reader = bytes.as_slice();
+        client
+            .stage_input(admission, &mut reader, CancellationToken::new())
+            .await
+            .context("stage real Alpaca credential bundle through desktop authority")?
+    };
+    drop(bytes);
+
+    let imported = invoke_real_alpaca(
+        client,
+        "import",
+        0,
+        "Source.ImportCredentialBundle",
+        json!({
+            "inputTicketId": ticket.id(),
+            "confirm": true,
+            "resultLimits": {"maximumItems": 32, "maximumBytes": 1_048_576},
+        }),
+        REAL_ALPACA_LIFECYCLE_TIMEOUT,
+    )
+    .await?;
+    assert_eq!(imported["schema"], REAL_ALPACA_CREDENTIAL_SCHEMA);
+    let providers = imported["providers"]
+        .as_array()
+        .context("real credential import omitted provider dispositions")?;
+    let alpaca = exactly_one_value(providers, |provider| provider["provider"] == "alpaca")
+        .context("real credential import omitted exact Alpaca disposition")?;
+    assert_eq!(alpaca["enabled"], true);
+    assert_eq!(alpaca["disposition"], "credential_stored_unverified");
+    for provider in providers
+        .iter()
+        .filter(|provider| provider["provider"] != "alpaca")
+    {
+        assert_eq!(provider["enabled"], false);
+        assert_eq!(provider["disposition"], "disabled");
+        assert!(provider["onboardingSessionId"].is_null());
+    }
+    let onboarding_session_id = required_uuid_string(
+        &alpaca["onboardingSessionId"],
+        "imported Alpaca onboarding session",
+    )?;
+
+    let status = invoke_real_alpaca(
+        client,
+        "status-after-import",
+        0,
+        "Source.GetStatus",
+        real_alpaca_source_status_arguments(),
+        INSTALLED_MCP_SERVICE_TIMEOUT,
+    )
+    .await?;
+    let (import_revision, public_configuration_sha256) =
+        assert_real_alpaca_stopped_status(&status, &onboarding_session_id)?;
+
+    let verified = invoke_real_alpaca(
+        client,
+        "verify",
+        0,
+        "Source.Verify",
+        real_alpaca_lifecycle_arguments(
+            import_revision,
+            &onboarding_session_id,
+            &public_configuration_sha256,
+        ),
+        REAL_ALPACA_LIFECYCLE_TIMEOUT,
+    )
+    .await?;
+    assert_eq!(verified["provider"], REAL_ALPACA_SURFACE);
+    assert_eq!(verified["action"], "verify");
+    assert_eq!(verified["disposition"], "applied");
+    assert_eq!(verified["state"], "stopped");
+    assert!(verified["previousGeneration"].is_null());
+    assert!(verified["currentGeneration"].is_null());
+    assert!(verified["runtimeGenerationSha256"].is_null());
+    assert_eq!(verified["configurationSessionId"], onboarding_session_id);
+    assert_eq!(
+        verified["publicConfigurationSha256"],
+        public_configuration_sha256
+    );
+    assert_eq!(verified["startEligibility"], "eligible");
+    assert!(verified["blocker"].is_null());
+    let verify_revision = canonical_positive_u64(
+        &verified["stateRevision"],
+        "verified Alpaca lifecycle revision",
+    )?;
+    assert!(verify_revision > import_revision);
+    let doctor_credential_generation = assert_real_alpaca_doctor(
+        &verified["doctor"],
+        &onboarding_session_id,
+        &public_configuration_sha256,
+    )?;
+
+    let started = invoke_real_alpaca(
+        client,
+        "start",
+        0,
+        "Source.Start",
+        real_alpaca_lifecycle_arguments(
+            verify_revision,
+            &onboarding_session_id,
+            &public_configuration_sha256,
+        ),
+        REAL_ALPACA_LIFECYCLE_TIMEOUT,
+    )
+    .await?;
+    assert_eq!(started["provider"], REAL_ALPACA_SURFACE);
+    assert_eq!(started["action"], "start");
+    assert_eq!(started["disposition"], "applied");
+    assert_eq!(started["state"], "active");
+    assert!(started["previousGeneration"].is_null());
+    assert!(started["currentGeneration"].is_null());
+    assert_eq!(started["configurationSessionId"], onboarding_session_id);
+    assert_eq!(
+        started["publicConfigurationSha256"],
+        public_configuration_sha256
+    );
+    assert_eq!(started["doctor"], verified["doctor"]);
+    assert_eq!(started["startEligibility"], "already_active");
+    assert!(started["blocker"].is_null());
+    let lifecycle_state_revision = canonical_positive_u64(
+        &started["stateRevision"],
+        "started Alpaca lifecycle revision",
+    )?;
+    assert!(lifecycle_state_revision > verify_revision);
+    let runtime_generation_sha256 = required_sha256(
+        &started["runtimeGenerationSha256"],
+        "started Alpaca runtime generation",
+    )?;
+    let expected = RealAlpacaAuthority {
+        credential: RealAlpacaCredentialAuthority {
+            onboarding_session_id,
+            public_configuration_sha256,
+            doctor_credential_generation,
+            doctor: verified["doctor"].clone(),
+        },
+        lifecycle_state_revision,
+        runtime_generation_sha256,
+    };
+    await_real_alpaca_market(client, &expected, false).await
+}
+
+async fn assert_real_alpaca_restored(
+    client: &LoopbackApplicationClient,
+    initial: &RealAlpacaEvidence,
+) -> TestResult<RealAlpacaEvidence> {
+    let restored = await_real_alpaca_market(client, &initial.authority, true).await?;
+    assert_eq!(restored.source_id, initial.source_id);
+    assert_eq!(restored.instrument_id, initial.instrument_id);
+    assert!(restored.connection_generation > initial.connection_generation);
+    assert_eq!(
+        restored.stable_market_identity,
+        initial.stable_market_identity
+    );
+    Ok(restored)
+}
+
+async fn await_real_alpaca_market(
+    client: &LoopbackApplicationClient,
+    expected: &RealAlpacaAuthority,
+    require_new_runtime_generation: bool,
+) -> TestResult<RealAlpacaEvidence> {
+    let deadline = Instant::now()
+        .checked_add(REAL_ALPACA_MARKET_READY_TIMEOUT)
+        .context("compute real Alpaca market-readiness deadline")?;
+    let mut attempt = 0_u64;
+    loop {
+        attempt = attempt
+            .checked_add(1)
+            .context("advance real Alpaca market-readiness attempt")?;
+        let result = async {
+            let status = invoke_real_alpaca(
+                client,
+                "status-live",
+                attempt,
+                "Source.GetStatus",
+                real_alpaca_source_status_arguments(),
+                real_alpaca_remaining_timeout(deadline)?,
+            )
+            .await?;
+            let status = active_real_alpaca_status(&status)?;
+            assert_real_alpaca_authority(
+                &status.authority,
+                expected,
+                require_new_runtime_generation,
+            )?;
+            let instrument_ids = status
+                .runtimes
+                .iter()
+                .map(|runtime| runtime.instrument_id.clone())
+                .collect::<Vec<_>>();
+            let market = invoke_real_alpaca(
+                client,
+                "market-native",
+                attempt,
+                "Market.GetUnifiedFeed",
+                real_alpaca_market_arguments(&instrument_ids),
+                real_alpaca_remaining_timeout(deadline)?,
+            )
+            .await?;
+            let market = real_alpaca_market_observation(&market)?;
+            let runtime = status
+                .runtimes
+                .iter()
+                .find(|runtime| {
+                    runtime.source_id == market.source_id
+                        && runtime.instrument_id == market.instrument_id
+                        && runtime.connection_generation == market.connection_generation
+                })
+                .context("native AAPL market evidence did not match current Source authority")?;
+            Ok::<_, anyhow::Error>(RealAlpacaEvidence {
+                authority: status.authority,
+                source_id: runtime.source_id.clone(),
+                instrument_id: runtime.instrument_id.clone(),
+                connection_generation: runtime.connection_generation,
+                stable_market_identity: market.stable_identity,
+            })
+        }
+        .await;
+        match result {
+            Ok(evidence) => return Ok(evidence),
+            Err(error) if Instant::now() >= deadline => {
+                anyhow::bail!("real Alpaca market readiness missed its deadline: {error:#}");
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
+    }
+}
+
+fn real_alpaca_remaining_timeout(deadline: Instant) -> TestResult<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("real Alpaca market-readiness deadline elapsed");
+    }
+    Ok(remaining.min(INSTALLED_MCP_SERVICE_TIMEOUT))
+}
+
+async fn invoke_real_alpaca(
+    client: &LoopbackApplicationClient,
+    phase: &str,
+    attempt: u64,
+    operation: &'static str,
+    arguments: Value,
+    timeout: Duration,
+) -> TestResult<Value> {
+    let response = client
+        .invoke_operation(
+            RequestId::try_string(format!("real-alpaca-{phase}-{attempt}"))
+                .context("construct real Alpaca request ID")?,
+            operation,
+            arguments,
+            timeout,
+            CancellationToken::new(),
+        )
+        .await
+        .with_context(|| format!("invoke {operation} for real Alpaca production evidence"))?;
+    if response.result()["ok"] != true {
+        anyhow::bail!(
+            "{operation} rejected the real Alpaca production request: {}",
+            response.result()
+        );
+    }
+    Ok(response.result()["value"]["data"].clone())
+}
+
+fn real_alpaca_source_status_arguments() -> Value {
+    json!({
+        "sourceCoverage": [REAL_ALPACA_SURFACE],
+        "resultLimits": {"maximumItems": 32, "maximumBytes": 1_048_576},
+    })
+}
+
+fn real_alpaca_lifecycle_arguments(
+    expected_state_revision: u64,
+    onboarding_session_id: &str,
+    public_configuration_sha256: &str,
+) -> Value {
+    json!({
+        "provider": REAL_ALPACA_SURFACE,
+        "expectedStateRevision": expected_state_revision.to_string(),
+        "onboardingSessionId": onboarding_session_id,
+        "publicConfigurationSha256": public_configuration_sha256,
+        "sourceCoverage": [REAL_ALPACA_SURFACE],
+        "confirm": true,
+        "resultLimits": {"maximumItems": 32, "maximumBytes": 1_048_576},
+    })
+}
+
+fn real_alpaca_market_arguments(instrument_ids: &[String]) -> Value {
+    json!({
+        "instrumentIds": instrument_ids,
+        "sourceCoverage": [REAL_ALPACA_SURFACE],
+        "resultLimits": {"maximumItems": 32, "maximumBytes": 1_048_576},
+    })
+}
+
+fn assert_real_alpaca_stopped_status(
+    data: &Value,
+    onboarding_session_id: &str,
+) -> TestResult<(u64, String)> {
+    let rows = data
+        .as_array()
+        .context("real Alpaca status after import was not an array")?;
+    if rows.len() != 1 {
+        anyhow::bail!("real Alpaca status after import was not exact-scoped");
+    }
+    let row = &rows[0];
+    assert_eq!(row["profile"]["id"], REAL_ALPACA_SURFACE);
+    assert_eq!(row["currentSession"]["session_id"], onboarding_session_id);
+    assert_eq!(row["currentSession"]["credential_stored"], true);
+    assert_eq!(row["currentSession"]["state"], "stored_unverified");
+    assert_eq!(row["lifecycleSupport"], "managed");
+    assert_eq!(row["runtime"]["state"], "not_active");
+    let lifecycle = &row["lifecycle"];
+    assert_eq!(lifecycle["provider"], REAL_ALPACA_SURFACE);
+    assert_eq!(lifecycle["state"], "stopped");
+    assert_eq!(lifecycle["configurationSessionId"], onboarding_session_id);
+    assert!(lifecycle["currentGeneration"].is_null());
+    assert!(lifecycle["runtimeGenerationSha256"].is_null());
+    assert!(lifecycle["doctor"].is_null());
+    assert_eq!(lifecycle["startEligibility"], "doctor_required");
+    assert!(lifecycle["blocker"].is_null());
+    Ok((
+        canonical_positive_u64(
+            &lifecycle["stateRevision"],
+            "imported Alpaca lifecycle revision",
+        )?,
+        required_sha256(
+            &lifecycle["publicConfigurationSha256"],
+            "imported Alpaca public configuration",
+        )?,
+    ))
+}
+
+fn active_real_alpaca_status(data: &Value) -> TestResult<ActiveRealAlpacaStatus> {
+    let rows = data
+        .as_array()
+        .context("active real Alpaca status was not an array")?;
+    if rows.is_empty() {
+        anyhow::bail!("active real Alpaca status omitted its IEX runtimes");
+    }
+    let mut authority = None;
+    let mut runtimes = Vec::new();
+    runtimes
+        .try_reserve_exact(rows.len())
+        .context("reserve active real Alpaca runtime evidence")?;
+    for row in rows {
+        assert_eq!(row["profile"]["id"], REAL_ALPACA_SURFACE);
+        assert_eq!(row["lifecycleSupport"], "managed");
+        let lifecycle = &row["lifecycle"];
+        assert_eq!(lifecycle["provider"], REAL_ALPACA_SURFACE);
+        assert_eq!(lifecycle["state"], "active");
+        assert!(lifecycle["currentGeneration"].is_null());
+        assert_eq!(lifecycle["startEligibility"], "already_active");
+        assert!(lifecycle["blocker"].is_null());
+        let onboarding_session_id = required_uuid_string(
+            &lifecycle["configurationSessionId"],
+            "active Alpaca configuration session",
+        )?;
+        let public_configuration_sha256 = required_sha256(
+            &lifecycle["publicConfigurationSha256"],
+            "active Alpaca public configuration",
+        )?;
+        let doctor_credential_generation = assert_real_alpaca_doctor(
+            &lifecycle["doctor"],
+            &onboarding_session_id,
+            &public_configuration_sha256,
+        )?;
+        let candidate = RealAlpacaAuthority {
+            credential: RealAlpacaCredentialAuthority {
+                onboarding_session_id,
+                public_configuration_sha256,
+                doctor_credential_generation,
+                doctor: lifecycle["doctor"].clone(),
+            },
+            lifecycle_state_revision: canonical_positive_u64(
+                &lifecycle["stateRevision"],
+                "active Alpaca lifecycle revision",
+            )?,
+            runtime_generation_sha256: required_sha256(
+                &lifecycle["runtimeGenerationSha256"],
+                "active Alpaca runtime generation",
+            )?,
+        };
+        if let Some(authority) = authority.as_ref() {
+            if authority != &candidate {
+                anyhow::bail!("active Alpaca child runtimes disagreed on account authority");
+            }
+        } else {
+            authority = Some(candidate);
+        }
+        assert_eq!(
+            row["currentSession"]["session_id"],
+            lifecycle["configurationSessionId"]
+        );
+        assert_eq!(row["currentSession"]["state"], "active_scoped");
+        assert_eq!(row["currentSession"]["credential_stored"], true);
+        assert_eq!(
+            row["currentSession"]["active_generation"],
+            doctor_credential_generation
+        );
+        let runtime = &row["runtime"];
+        assert_eq!(runtime["state"], "active");
+        assert_eq!(runtime["venueId"], "iex");
+        let source_id = required_nonempty_string(&runtime["sourceId"], "Alpaca source ID")?;
+        let instrument_id = required_uuid_string(&runtime["instrumentId"], "Alpaca instrument ID")?;
+        let connection_generation = canonical_positive_u64(
+            &runtime["connectionGeneration"],
+            "Alpaca connection generation",
+        )?;
+        required_sha256(&runtime["bindingDigest"], "Alpaca runtime binding")?;
+        if runtimes.iter().any(|prior: &ActiveRealAlpacaRuntime| {
+            prior.source_id == source_id && prior.instrument_id == instrument_id
+        }) {
+            anyhow::bail!("active Alpaca status duplicated one source instrument");
+        }
+        runtimes.push(ActiveRealAlpacaRuntime {
+            source_id,
+            instrument_id,
+            connection_generation,
+        });
+    }
+    Ok(ActiveRealAlpacaStatus {
+        authority: authority.context("active Alpaca status omitted account authority")?,
+        runtimes,
+    })
+}
+
+fn assert_real_alpaca_authority(
+    actual: &RealAlpacaAuthority,
+    expected: &RealAlpacaAuthority,
+    require_new_runtime_generation: bool,
+) -> TestResult {
+    if actual.credential != expected.credential
+        || actual.lifecycle_state_revision != expected.lifecycle_state_revision
+    {
+        anyhow::bail!("restored Alpaca credential or durable lifecycle authority changed");
+    }
+    if require_new_runtime_generation {
+        if actual.runtime_generation_sha256 == expected.runtime_generation_sha256 {
+            anyhow::bail!("restored Alpaca runtime did not mint a new group generation");
+        }
+    } else if actual.runtime_generation_sha256 != expected.runtime_generation_sha256 {
+        anyhow::bail!("started Alpaca runtime disagreed with its lifecycle receipt");
+    }
+    Ok(())
+}
+
+fn assert_real_alpaca_doctor(
+    doctor: &Value,
+    onboarding_session_id: &str,
+    public_configuration_sha256: &str,
+) -> TestResult<u64> {
+    assert_eq!(doctor["schema"], "market-squawk.alpaca-paper-iex-doctor/v1");
+    assert_eq!(doctor["surfaceId"], REAL_ALPACA_SURFACE);
+    assert_eq!(doctor["onboardingSessionId"], onboarding_session_id);
+    assert_eq!(doctor["realm"], "paper");
+    assert_eq!(
+        doctor["publicConfigurationSha256"],
+        public_configuration_sha256
+    );
+    assert_eq!(doctor["dataQuality"], "direct_unverified");
+    assert_eq!(doctor["current"], true);
+    required_sha256(&doctor["receiptSha256"], "Alpaca doctor receipt")?;
+    let generation = canonical_positive_u64(
+        &doctor["credentialGeneration"],
+        "Alpaca doctor credential generation",
+    )?;
+    for capability in [
+        "iexLatestQuote",
+        "iexSnapshotBatch",
+        "iexWebSocket",
+        "iexHistoricalBars",
+        "iexUtcCalendar",
+    ] {
+        let probe = &doctor["capabilities"][capability];
+        if !matches!(
+            probe["disposition"].as_str(),
+            Some("available" | "degraded")
+        ) {
+            anyhow::bail!("Alpaca doctor did not complete the {capability} production probe");
+        }
+        required_sha256(
+            &probe["evidenceSha256"],
+            "Alpaca doctor capability evidence",
+        )?;
+        if !probe["observation"].is_object() {
+            anyhow::bail!("Alpaca doctor omitted the {capability} production observation");
+        }
+    }
+    Ok(generation)
+}
+
+fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketObservation> {
+    let rows = data
+        .as_array()
+        .context("real Alpaca unified Market result was not an array")?;
+    let row = exactly_one_value(rows, |row| {
+        row["symbol"] == "AAPL" && row["selectedSource"]["surfaceId"] == REAL_ALPACA_SURFACE
+    })
+    .context("real Alpaca unified Market result omitted exact live AAPL evidence")?;
+    assert_eq!(row["symbolKind"], "provider_subscription_symbol");
+    assert_eq!(row["symbolVenueId"], "iex");
+    assert_eq!(row["assetClass"], "equity");
+    assert_eq!(row["quoteCurrency"], "USD");
+    assert_eq!(row["definitionKind"], "market_data");
+    assert_eq!(row["executionTermsAvailable"], false);
+    assert!(row["orderBook"].is_null());
+    assert_eq!(row["availability"], "Live");
+    assert_eq!(row["confidence"], "Direct, unverified");
+    required_nonempty_string(&row["permanentFigi"], "AAPL permanent FIGI")?;
+    for field in ["bidPrice", "askPrice", "midPrice"] {
+        required_nonempty_string(&row["quote"][field], "AAPL live quote value")?;
+    }
+    assert_eq!(
+        row["quote"]["midPriceBasis"],
+        "calculated_from_selected_bid_and_ask"
+    );
+    if !row["quote"]["quoteEvidence"].is_object() {
+        anyhow::bail!("real Alpaca AAPL quote omitted provider receipt evidence");
+    }
+    let selected = &row["selectedSource"];
+    assert_eq!(selected["providerId"], "alpaca");
+    assert_eq!(selected["providerSymbol"], "AAPL");
+    assert_eq!(selected["venueId"], "iex");
+    assert_eq!(selected["quality"], "direct_unverified");
+    assert_eq!(selected["health"], "healthy");
+    assert_eq!(selected["rights"]["state"], "admitted");
+    assert_eq!(selected["rights"]["snapshotDisplayPermitted"], true);
+    assert_eq!(selected["freshness"]["freshAtSelection"], true);
+    let connection_generation = canonical_positive_u64(
+        &selected["integrity"]["connectionGeneration"],
+        "selected AAPL connection generation",
+    )?;
+    let instrument_id = required_uuid_string(&row["instrumentId"], "selected AAPL instrument")?;
+    let source_id = required_nonempty_string(&selected["sourceId"], "selected AAPL source")?;
+    let observation = &row["marketObservation"];
+    assert_eq!(observation["availability"], "available");
+    assert_eq!(observation["instrumentId"], instrument_id);
+    assert_eq!(observation["mark"]["basis"], "fresh_bid_ask_midpoint");
+    assert_eq!(observation["mark"]["value"], row["quote"]["midPrice"]);
+    assert_eq!(
+        canonical_positive_u64(
+            &observation["generation"],
+            "AAPL investment observation generation",
+        )?,
+        connection_generation
+    );
+    Ok(RealAlpacaMarketObservation {
+        source_id,
+        instrument_id,
+        connection_generation,
+        stable_identity: json!({
+            "instrumentId": row["instrumentId"],
+            "symbol": row["symbol"],
+            "symbolKind": row["symbolKind"],
+            "symbolVenueId": row["symbolVenueId"],
+            "assetClass": row["assetClass"],
+            "quoteCurrency": row["quoteCurrency"],
+            "definitionKind": row["definitionKind"],
+            "permanentFigi": row["permanentFigi"],
+            "surfaceId": selected["surfaceId"],
+            "providerId": selected["providerId"],
+            "providerSymbol": selected["providerSymbol"],
+            "sourceId": selected["sourceId"],
+            "venueId": selected["venueId"],
+            "providerProduct": selected["providerProduct"],
+            "providerChannel": selected["providerChannel"],
+        }),
+    })
+}
+
+fn assert_real_alpaca_mcp_market(data: &Value, expected: &RealAlpacaEvidence) -> TestResult {
+    let observed = real_alpaca_market_observation(data)?;
+    assert_eq!(observed.source_id, expected.source_id);
+    assert_eq!(observed.instrument_id, expected.instrument_id);
+    assert!(observed.connection_generation >= expected.connection_generation);
+    assert_eq!(observed.stable_identity, expected.stable_market_identity);
+    Ok(())
+}
+
+fn exactly_one_value<'a>(
+    values: &'a [Value],
+    predicate: impl Fn(&Value) -> bool,
+) -> Option<&'a Value> {
+    let mut matches = values.iter().filter(|value| predicate(value));
+    let selected = matches.next()?;
+    matches.next().is_none().then_some(selected)
+}
+
+fn required_nonempty_string(value: &Value, label: &str) -> TestResult<String> {
+    value
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .with_context(|| format!("{label} was not a nonempty string"))
+}
+
+fn required_uuid_string(value: &Value, label: &str) -> TestResult<String> {
+    let value = required_nonempty_string(value, label)?;
+    uuid::Uuid::parse_str(&value).with_context(|| format!("{label} was not a UUID"))?;
+    Ok(value)
+}
+
+fn canonical_positive_u64(value: &Value, label: &str) -> TestResult<u64> {
+    let value = value
+        .as_str()
+        .with_context(|| format!("{label} was not a decimal string"))?;
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        anyhow::bail!("{label} was not a canonical positive decimal string");
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .with_context(|| format!("{label} was outside the positive u64 range"))
+}
+
+fn required_sha256(value: &Value, label: &str) -> TestResult<String> {
+    let value = value
+        .as_str()
+        .with_context(|| format!("{label} was not a SHA-256 string"))?;
+    if value.len() != 64
+        || value.bytes().all(|byte| byte == b'0')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        anyhow::bail!("{label} was not a canonical nonzero SHA-256 string");
+    }
+    Ok(value.to_owned())
 }
 
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -1659,7 +2472,15 @@ async fn exercise_installed_relay(
     client: NamedClient,
     transport: Arc<dyn market_squawk_mcp::McpRelayTransport>,
 ) -> TestResult {
-    exercise_installed_relay_with_gate(client, transport, None).await
+    exercise_installed_relay_with_gate(client, transport, None, None).await
+}
+
+async fn exercise_installed_relay_with_market(
+    client: NamedClient,
+    transport: Arc<dyn market_squawk_mcp::McpRelayTransport>,
+    real_alpaca: Option<&RealAlpacaEvidence>,
+) -> TestResult {
+    exercise_installed_relay_with_gate(client, transport, None, real_alpaca).await
 }
 
 struct ConcurrentRelayGate {
@@ -1688,6 +2509,7 @@ async fn exercise_concurrent_installed_relays(
             .connect_mcp_relay(NamedClient::ClaudeCode)
             .context("admit concurrent Claude Code relay")?,
         Some(claude_gate),
+        None,
     );
     let codex = exercise_installed_relay_with_gate(
         NamedClient::Codex,
@@ -1695,6 +2517,7 @@ async fn exercise_concurrent_installed_relays(
             .connect_mcp_relay(NamedClient::Codex)
             .context("admit concurrent Codex relay")?,
         Some(codex_gate),
+        None,
     );
     let collect_evidence = async {
         evidence_gate.initialized.wait().await;
@@ -1784,6 +2607,7 @@ async fn exercise_installed_relay_with_gate(
     client: NamedClient,
     transport: Arc<dyn market_squawk_mcp::McpRelayTransport>,
     concurrent_gate: Option<Arc<ConcurrentRelayGate>>,
+    real_alpaca: Option<&RealAlpacaEvidence>,
 ) -> TestResult {
     let relay = McpStdioRelay::try_new(
         client,
@@ -1870,6 +2694,27 @@ async fn exercise_installed_relay_with_gate(
             .is_some(),
         "installed MCP did not dispatch the non-core Job.List authority: {jobs}"
     );
+    if let Some(real_alpaca) = real_alpaca {
+        write_message(
+            &mut peer_writer,
+            json!({
+                "jsonrpc":"2.0","id":"installed-real-alpaca-market","method":"tools/call",
+                "params":{
+                    "name":"Market.GetUnifiedFeed",
+                    "arguments":real_alpaca_market_arguments(std::slice::from_ref(
+                        &real_alpaca.instrument_id,
+                    ))
+                }
+            }),
+        )
+        .await
+        .context("write installed relay real Alpaca Market request")?;
+        let market = read_message(&mut peer_reader)
+            .await
+            .context("read installed relay real Alpaca Market response")?;
+        assert_real_alpaca_mcp_market(&market["result"]["structuredContent"]["data"], real_alpaca)
+            .context("verify installed MCP real Alpaca Market evidence")?;
+    }
     write_message(
         &mut peer_writer,
         json!({"jsonrpc":"2.0","id":"installed-resources","method":"resources/list"}),

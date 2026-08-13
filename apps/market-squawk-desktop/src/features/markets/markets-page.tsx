@@ -34,6 +34,8 @@ import {
 } from "./reference-market"
 import { type UnifiedMarketRow, unifiedMarketRows } from "./unified-market"
 
+const UNIFIED_FEED_POLL_INTERVAL_MS = 5_000
+
 export function MarketsPage() {
   const product = useProduct()
 
@@ -71,15 +73,19 @@ function ReadyMarketsPage({
     bootstrap.operations.map((operation) => operation.name),
   )
   const feedAvailable = operationNames.has("Market.GetUnifiedFeed")
+  const pageVisible = usePageVisibility()
   const feed = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Market",
+      "market",
       "Market.GetUnifiedFeed",
       {},
     ),
     enabled: feedAvailable,
     queryFn: () => transport.query({ query: "marketUnifiedFeed" }),
+    refetchInterval:
+      feedAvailable && pageVisible ? UNIFIED_FEED_POLL_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
   })
   const feedRead = parseRead(() => unifiedMarketRows(feed.data))
   const rows = feedRead.value ?? []
@@ -93,7 +99,7 @@ function ReadyMarketsPage({
   const universe = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Market",
+      "market",
       "Market.SearchUniverse",
       { query: referenceQuery },
     ),
@@ -163,7 +169,7 @@ function ReadyMarketsPage({
   const trades = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Market",
+      "market",
       "Market.GetTrades",
       { instrumentId: selectedInstrument },
     ),
@@ -177,7 +183,7 @@ function ReadyMarketsPage({
   const quotes = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Market",
+      "market",
       "Market.GetQuotes",
       { instrumentId: selectedInstrument },
     ),
@@ -191,7 +197,7 @@ function ReadyMarketsPage({
   const books = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Market",
+      "market",
       "Market.GetBooks",
       { instrumentId: selectedInstrument },
     ),
@@ -205,7 +211,7 @@ function ReadyMarketsPage({
   const comparisons = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
-      "Market",
+      "market",
       "Market.GetComparisons",
       { instrumentId: selectedInstrument },
     ),
@@ -223,8 +229,12 @@ function ReadyMarketsPage({
     quotes.isFetching ||
     books.isFetching ||
     comparisons.isFetching
-  const feedFailed = feedRead.error !== null || feed.isError
-  const universeFailed = universeRead.error !== null || universe.isError
+  const feedError =
+    feedRead.error ?? (feed.isError ? messageFrom(feed.error) : null)
+  const universeError =
+    universeRead.error ?? (universe.isError ? messageFrom(universe.error) : null)
+  const feedFailed = feedError !== null
+  const universeFailed = universeError !== null
   const live = rows.filter((row) => row.availability === "Live").length
   const verified = rows.filter((row) => row.confidence === "Verified").length
 
@@ -270,14 +280,22 @@ function ReadyMarketsPage({
       ) : feedFailed && universeFailed ? (
         <EmptyState
           title="Market data is temporarily unavailable"
-          detail={
-            universeRead.error ??
-            feedRead.error ??
-            messageFrom(universe.error ?? feed.error)
-          }
+          detail={feedError ?? universeError ?? "Market data could not be read."}
         />
-      ) : rows.length === 0 && referenceRows.length === 0 && (feed.isLoading || universe.isLoading) ? (
+      ) : rows.length === 0 &&
+        referenceRows.length === 0 &&
+        (feed.isLoading || universe.isLoading) ? (
         <MarketGridLoading />
+      ) : rows.length === 0 && referenceRows.length === 0 && feedFailed ? (
+        <EmptyState
+          title="Live market observations are unavailable"
+          detail={feedError ?? "Live market observations could not be read."}
+        />
+      ) : rows.length === 0 && referenceRows.length === 0 && universeFailed ? (
+        <EmptyState
+          title="U.S. listing search is unavailable"
+          detail={universeError ?? "U.S. listing search could not be read."}
+        />
       ) : rows.length === 0 && referenceRows.length === 0 ? (
         <EmptyState
           title="No markets are available yet"
@@ -286,13 +304,21 @@ function ReadyMarketsPage({
       ) : (
         <>
           {feedFailed ? (
-            <Notice text={`Live observations are unavailable. Official listing search remains usable. ${feedRead.error ?? messageFrom(feed.error)}`} />
+            <Notice
+              text={`Live observations are unavailable. Official listing search remains usable. ${feedError}`}
+            />
           ) : null}
           {universeFailed ? (
-            <Notice text={`U.S. listing search is unavailable. Active live markets remain usable. ${universeRead.error ?? messageFrom(universe.error)}`} />
+            <Notice
+              text={`U.S. listing search is unavailable. Active live markets remain usable. ${universeError}`}
+            />
           ) : null}
           <div className="grid gap-3 sm:grid-cols-3">
-            <Summary label="Markets in view" value={rows.length + referenceRows.length} icon={Activity} />
+            <Summary
+              label="Markets in view"
+              value={rows.length + referenceRows.length}
+              icon={Activity}
+            />
             <Summary label="Live now" value={live} icon={Clock3} />
             <Summary label="High confidence" value={verified} icon={ShieldCheck} />
           </div>
@@ -338,8 +364,7 @@ function ReadyMarketsPage({
             </div>
           )}
           {selectedInstrument && !selectedRow ? (
-            <Notice text="The selected instrument has no active unified market observation."
-            />
+            <Notice text="The selected instrument has no active unified market observation." />
           ) : null}
           {selectedInstrument ? (
             <details className="mt-5 rounded-xl border border-border bg-card/30 p-4">
@@ -362,7 +387,9 @@ function ReadyMarketsPage({
           {selectedReference ? (
             <ReferenceWorkspace row={selectedReference} />
           ) : selectedReferenceId ? (
-            <Notice text="That reference listing is no longer present in the current search result." />
+            <Notice
+              text="That reference listing is no longer present in the current search result."
+            />
           ) : null}
           <UnifiedResultBoundary feed={resultState(feed.data)} />
         </>
@@ -447,9 +474,9 @@ function ReferenceWorkspace({ row }: { row: ReferenceMarketRow }) {
           </h2>
           <p className="mt-2 max-w-2xl text-xs leading-5 text-muted-foreground">
             Market Squawk found this U.S. listing without inventing a price. The supported no-cost
-            U.S. IEX option still requires an Alpaca account and API credentials. Connect it to add
-            current quotes, charts, signals, forecasts, backtests, and portfolio impact to this
-            same workspace.
+            U.S. IEX option still requires an Alpaca Paper account and API credentials. When an
+            admitted runtime is available, this workspace can show its current source-bound market
+            observation.
           </p>
         </div>
         <EvidenceBadge label="Provider account required for prices" tone="neutral" />
@@ -599,15 +626,6 @@ function InstrumentWorkspace({
           <h2 id="instrument-workspace-title" className="mt-1 text-lg font-semibold">
             Trades, quotes, book, and cross-source comparison
           </h2>
-        </div>
-        <div className="max-w-xs">
-          <Button type="button" size="sm" disabled aria-describedby="analyze-readiness">
-            Analyze this investment
-          </Button>
-          <p id="analyze-readiness" className="mt-2 text-[10px] leading-4 text-muted-foreground">
-            The selected identity is exact, but canonical analysis inputs and the restart-proven
-            Desktop workflow are not composed yet. This control starts no work.
-          </p>
         </div>
       </div>
       {market ? <SelectedSourceSummary row={market} /> : null}
@@ -1274,4 +1292,16 @@ function parseRead<T>(read: () => T): { value: T | null; error: string | null } 
   } catch (error) {
     return { value: null, error: messageFrom(error) }
   }
+}
+
+function usePageVisibility(): boolean {
+  const [visible, setVisible] = React.useState(
+    () => document.visibilityState === "visible",
+  )
+  React.useEffect(() => {
+    const update = () => setVisible(document.visibilityState === "visible")
+    document.addEventListener("visibilitychange", update)
+    return () => document.removeEventListener("visibilitychange", update)
+  }, [])
+  return visible
 }

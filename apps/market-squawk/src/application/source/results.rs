@@ -5,6 +5,7 @@ use market_squawk_domain::{DataQuality, SourceIdentifier, Timestamp};
 use market_squawk_services::{
     ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
+use market_squawk_sources::ConnectionLiveness;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -106,20 +107,35 @@ fn runtime_status_value(runtime: &SourceRuntimeSnapshot) -> Result<Value, Servic
             .provider_channel()
             .as_source_identifier()
             .as_str(),
-        "connectionGeneration": runtime.connection_generation.get(),
+        "connectionGeneration": runtime.connection_generation.get().to_string(),
         "sessionId": runtime.session_id.as_str(),
-        "healthEpoch": runtime.health_epoch,
-        "stateRevision": runtime.state_revision,
+        "healthEpoch": runtime.health_epoch.to_string(),
+        "stateRevision": runtime.state_revision.to_string(),
         "assessmentId": runtime.assessment_id.as_str(),
         "bindingDigest": encode_hex(runtime.binding_digest),
-        "connection": to_json(&runtime.connection)?,
+        "connection": connection_liveness_value(runtime.connection),
         "integrity": to_json(&runtime.stream_integrity)?,
         "quality": to_json(&runtime.quality)?,
-        "observedAtUnixNanos": runtime.observed_at.unix_nanos(),
+        "observedAtUnixNanos": runtime.observed_at.unix_nanos().to_string(),
         "qualificationEvaluatedAtUnixNanos":
-            runtime.qualification_evaluated_at.unix_nanos(),
-        "qualificationValidUntilUnixNanos": runtime.qualification_valid_until.unix_nanos(),
+            runtime.qualification_evaluated_at.unix_nanos().to_string(),
+        "qualificationValidUntilUnixNanos": runtime.qualification_valid_until.unix_nanos().to_string(),
     }))
+}
+
+fn connection_liveness_value(value: ConnectionLiveness) -> Value {
+    match value {
+        ConnectionLiveness::Connecting => json!("connecting"),
+        ConnectionLiveness::Live { last_activity_at } => {
+            json!({"live": {"last_activity_at": last_activity_at.unix_nanos().to_string()}})
+        }
+        ConnectionLiveness::Stale { last_activity_at } => {
+            json!({"stale": {"last_activity_at": last_activity_at.unix_nanos().to_string()}})
+        }
+        ConnectionLiveness::Disconnected { disconnected_at } => {
+            json!({"disconnected": {"disconnected_at": disconnected_at.unix_nanos().to_string()}})
+        }
+    }
 }
 
 fn runtime_coverage_value(runtime: &SourceRuntimeSnapshot) -> Result<Value, ServiceError> {

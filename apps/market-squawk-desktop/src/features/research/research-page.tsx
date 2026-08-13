@@ -29,6 +29,7 @@ import {
   type MacroDashboardSourceReadiness,
 } from "@/features/macro"
 import {
+  parseSourceStatusResult,
   sourceEvidence,
   type SourceEvidence,
 } from "@/features/sources/source-evidence"
@@ -159,11 +160,14 @@ function ResearchWorkspace({
   const h15Source = useQuery({
     queryKey: h15SourceKey,
     enabled: macroDashboardAvailable && sourceStatusAvailable,
-    queryFn: () =>
-      transport.query({
-        query: "sourceStatus",
-        sourceIds: [H15_SURFACE_ID],
-      }),
+    queryFn: async () =>
+      parseSourceStatusResult(
+        await transport.query({
+          query: "sourceStatus",
+          sourceIds: [H15_SURFACE_ID],
+        }),
+        [H15_SURFACE_ID],
+      ),
   })
   const jobMutation = useMutation({
     mutationFn: ({ request }: { request: ResearchJobMutationRequest }) =>
@@ -210,7 +214,7 @@ function ResearchWorkspace({
       ? sourceEvidence(
           bootstrap.providerProfiles,
           bootstrap.providerSessions,
-          [h15Source.data],
+          h15Source.data,
           undefined,
           undefined,
         ).find((source) => source.id === H15_SURFACE_ID)

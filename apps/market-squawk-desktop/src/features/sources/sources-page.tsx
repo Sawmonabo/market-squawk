@@ -38,6 +38,8 @@ import {
   type StoredDataEvidence,
   attachStoredData,
   lifecycleControls,
+  parseSourceLifecycleReceipt,
+  parseSourceStatusResult,
   sourceEvidence,
   sourceNeedsSetup,
 } from "./source-evidence"
@@ -77,8 +79,11 @@ function ReadySourcesPage({
         "Source.GetStatus",
         { sourceIds: [profile.id] },
       ),
-      queryFn: () =>
-        transport.query({ query: "sourceStatus", sourceIds: [profile.id] }),
+      queryFn: async () =>
+        parseSourceStatusResult(
+          await transport.query({ query: "sourceStatus", sourceIds: [profile.id] }),
+          [profile.id],
+        ),
     })),
   })
   const coverage = useQuery({
@@ -102,7 +107,7 @@ function ReadySourcesPage({
   const sourceRows = sourceEvidence(
     bootstrap.providerProfiles,
     bootstrap.providerSessions,
-    statusReads.flatMap((query) => (query.data ? [query.data] : [])),
+    statusReads.flatMap((query) => query.data ?? []),
     coverage.data,
     health.data,
   )
@@ -174,6 +179,15 @@ function ReadySourcesPage({
     queryClient.invalidateQueries({
       queryKey: productKeys.domain(bootstrap.runtime, "source"),
     })
+  const refreshLifecycleAuthorities = () =>
+    Promise.all([
+      queryClient.invalidateQueries({
+        queryKey: productKeys.domain(bootstrap.runtime, "source"),
+      }),
+      queryClient.invalidateQueries({
+        queryKey: productKeys.domain(bootstrap.runtime, "market"),
+      }),
+    ]).then(() => undefined)
   const credentialImportAvailable = bootstrap.operations.some(
     (operation) => operation.name === "Source.ImportCredentialBundle",
   )
@@ -234,7 +248,7 @@ function ReadySourcesPage({
                 key={source.id}
                 source={source}
                 transport={transport}
-                onChanged={refreshAuthority}
+                onChanged={refreshLifecycleAuthorities}
               />
             ))}
           </div>
@@ -265,18 +279,26 @@ function SourceCard({
     setConfirming(null)
     setPending(control.action)
     setError(null)
+    let requestError: unknown | null = null
     try {
-      await transport.sourceControl(
+      const result = await transport.sourceControl(
         control.action,
         control.request,
         true,
       )
-      await onChanged()
-    } catch (requestError) {
-      setError(messageFrom(requestError))
-    } finally {
-      setPending(null)
+      parseSourceLifecycleReceipt(result, control.action, control.request)
+    } catch (error) {
+      requestError = error
     }
+    let refreshError: unknown | null = null
+    try {
+      await onChanged()
+    } catch (error) {
+      refreshError = error
+    }
+    const error = requestError ?? refreshError
+    setError(error === null ? null : messageFrom(error))
+    setPending(null)
   }
 
   return (

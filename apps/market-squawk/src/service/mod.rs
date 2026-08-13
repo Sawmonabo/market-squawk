@@ -232,7 +232,7 @@ impl InstalledServiceConnector {
         if timeout.is_zero() || timeout > MAXIMUM_CLIENT_TIMEOUT {
             return Err(InstalledServiceError::InvalidComposition);
         }
-        let structure = JsonStructureLimits::try_new(32, 64 * 1024, 10_000, 2_000)
+        let structure = JsonStructureLimits::try_new(64, 64 * 1024, 10_000, 2_000)
             .map_err(|_error| InstalledServiceError::InvalidComposition)?;
         let admitted = ready_admission::request(&self.paths, client, timeout)?;
         runtime::connect_admitted_client(admitted, origin, structure, RESPONSE_BODY_BYTES, timeout)
@@ -960,7 +960,7 @@ async fn compose_transport(
         workspace_selector,
         workspace_placement,
     } = composition;
-    let structure = JsonStructureLimits::try_new(32, 64 * 1024, 10_000, 2_000)
+    let structure = JsonStructureLimits::try_new(64, 64 * 1024, 10_000, 2_000)
         .map_err(|_error| InstalledServiceError::InvalidComposition)?;
     let service_limits =
         ServiceLimits::try_new(64 * 1024, 1_000, RESPONSE_BODY_BYTES, 1_000_000, structure)

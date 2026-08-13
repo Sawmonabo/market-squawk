@@ -2,6 +2,16 @@ import type { DesktopEvent } from "@/lib/schemas"
 
 import type { ProductScope } from "./query-client"
 
+const SOURCE_MARKET_AUTHORITY_OPERATIONS = new Set([
+  "Source.Start",
+  "Source.Stop",
+  "Source.Retry",
+  "Source.Resynchronize",
+  "Source.Verify",
+  "Source.Reconfigure",
+  "Source.Remove",
+])
+
 export function sameRuntime(
   left: ProductScope,
   right: ProductScope,
@@ -26,8 +36,15 @@ export function requiresResync(
     : BigInt(event.sequence) !== BigInt(previousSequence) + 1n
 }
 
-export function affectedDomain(event: DesktopEvent): string | null {
-  return event.body.type === "authority_changed" ? event.body.domain : null
+export function affectedDomains(event: DesktopEvent): readonly string[] {
+  if (event.body.type !== "authority_changed") return []
+  if (
+    event.body.domain === "source" &&
+    SOURCE_MARKET_AUTHORITY_OPERATIONS.has(event.body.operation)
+  ) {
+    return ["source", "market"]
+  }
+  return [event.body.domain]
 }
 
 export function isRetryableDisconnect(event: DesktopEvent): boolean {

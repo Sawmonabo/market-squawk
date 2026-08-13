@@ -140,20 +140,8 @@ const SOURCE_INSPECTION_ARGUMENTS: &[ArgumentSpec] = &[
 ];
 const SOURCE_LIFECYCLE_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("provider", ArgumentKind::Identifier),
-    ArgumentSpec::required(
-        "expectedStateRevision",
-        ArgumentKind::Unsigned {
-            minimum: 1,
-            maximum: u64::MAX,
-        },
-    ),
-    ArgumentSpec::optional(
-        "expectedGeneration",
-        ArgumentKind::Unsigned {
-            minimum: 1,
-            maximum: u64::MAX,
-        },
-    ),
+    ArgumentSpec::required("expectedStateRevision", ArgumentKind::PositiveUnsignedText),
+    ArgumentSpec::optional("expectedGeneration", ArgumentKind::PositiveUnsignedText),
     ArgumentSpec::optional("expectedRuntimeGenerationSha256", ArgumentKind::Sha256),
     ArgumentSpec::optional("onboardingSessionId", ArgumentKind::Uuid),
     ArgumentSpec::optional("publicConfigurationSha256", ArgumentKind::Sha256),
@@ -2417,6 +2405,7 @@ enum ArgumentKind {
     Text,
     Decimal,
     PositiveLotQuantity,
+    PositiveUnsignedText,
     Object,
     Array,
     Timestamp,
@@ -2577,6 +2566,12 @@ fn argument_schema(kind: ArgumentKind) -> Value {
             "minLength": 1,
             "maxLength": 19,
             "pattern": "^[1-9][0-9]{0,18}$"
+        }),
+        ArgumentKind::PositiveUnsignedText => json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 20,
+            "pattern": "^[1-9][0-9]{0,19}$"
         }),
         ArgumentKind::Object => json!({"type": "object", "minProperties": 1}),
         ArgumentKind::Array => json!({"type": "array", "minItems": 1}),
@@ -2809,6 +2804,18 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
                     && !value.starts_with('0')
             })
             .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::PositiveUnsignedText => value
+            .as_str()
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 20
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && !value.starts_with('0')
+            })
+            .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),

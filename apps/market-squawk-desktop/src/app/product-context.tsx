@@ -9,7 +9,7 @@ import type {
 import type { DesktopEventSubscription, ProductTransport } from "@/lib/transport"
 
 import {
-  affectedDomain,
+  affectedDomains,
   isRetryableDisconnect,
   requiresResync,
   sameRuntime,
@@ -251,12 +251,13 @@ export function ProductProvider({
             }
             previousSequence = event.sequence
             eventCursor.current = { runtime: scope, sequence: previousSequence }
-            const domain = affectedDomain(event)
-            void queryClient.invalidateQueries({
-              queryKey: domain
-                ? productKeys.domain(scope, domain)
-                : productKeys.root(scope),
-            })
+            void Promise.all(
+              affectedDomains(event).map((domain) =>
+                queryClient.invalidateQueries({
+                  queryKey: productKeys.domain(scope, domain),
+                }),
+              ),
+            )
           },
           () => {
             if (active && epoch === connectionEpoch) resync()

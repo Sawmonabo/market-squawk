@@ -17,7 +17,10 @@ import {
 } from "@/features/portfolio/portfolio-contracts"
 import { parseResearchDatasetPage } from "@/features/research/research-contracts"
 import { parseSettingsSnapshot } from "@/features/settings/contracts"
-import { sourceEvidence } from "@/features/sources/source-evidence"
+import {
+  parseSourceStatusResult,
+  sourceEvidence,
+} from "@/features/sources/source-evidence"
 import type {
   ApplicationResult,
   DesktopBootstrap,
@@ -59,7 +62,11 @@ export function useOwnerEvidence(
 
     const sourceStatusReadsPromise = Promise.all(
       bootstrap.providerProfiles.map((profile) =>
-        settle(transport.query({ query: "sourceStatus", sourceIds: [profile.id] })),
+        settle(
+          transport
+            .query({ query: "sourceStatus", sourceIds: [profile.id] })
+            .then((result) => parseSourceStatusResult(result, [profile.id])),
+        ),
       ),
     )
     const [
@@ -119,7 +126,7 @@ export function useOwnerEvidence(
     if (activeRequest !== requestId.current) return
 
     const successfulStatuses = sourceStatusReads.flatMap((read) =>
-      read.ok ? [read.value] : [],
+      read.ok ? read.value : [],
     )
     const sources = sourceEvidence(
       bootstrap.providerProfiles,

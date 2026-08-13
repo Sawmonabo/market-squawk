@@ -12,7 +12,10 @@ use market_squawk_live::{
     OrderLevelQuarantineReason, StreamPhaseSnapshot, StreamSnapshot,
 };
 use market_squawk_services::{RequestContext, ServiceError, ServiceLimits, TypedToolResult};
-use market_squawk_sources::{InstrumentCoverageMembership, MarketFreshness, SourceMetadata};
+use market_squawk_sources::{
+    ConnectionLiveness, InstrumentCoverageMembership, MarketFreshness, SourceMetadata,
+    SourceTimestampFreshness, TransportFreshness,
+};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
@@ -1311,7 +1314,7 @@ fn instrument_row(
         "assetClass": definition.asset_class(),
         "quoteCurrency": definition.quote_currency().as_str(),
         "definitionKind": definition_kind(definition),
-        "definitionRevision": definition.executable.map(|value| value.definition_revision().get()),
+        "definitionRevision": definition.executable.map(|value| value.definition_revision().get().to_string()),
         "referenceRevision": definition.market_data.map(|value| value.reference_revision().as_source_identifier().as_str()),
         "permanentFigi": definition.market_data.map(|value| value.permanent_figi().as_str()),
         "displayName": definition.market_data.and_then(MarketDataInstrumentDefinition::display_name).map(|value| value.as_str()),
@@ -1855,7 +1858,7 @@ fn kraken_quote_value(
         "lastAvailableAt": Value::Null,
         "lastQuality": Value::Null,
         "lastFreshAtSelection": Value::Null,
-        "quoteEvidence": kraken_projection_evidence(snapshot),
+        "quoteEvidence": kraken_projection_evidence(snapshot)?,
         "tradeEvidence": Value::Null
     }))
 }
@@ -1878,9 +1881,9 @@ fn display_observation_evidence(observation: &DisplayMarketReadObservation) -> V
         "recordedQuality": provenance.quality(),
         "currentDisplayQuality": display_current_quality(observation),
         "displayDepth": provenance.display_depth().map(depth_name),
-        "connectionGeneration": provenance.generation().get(),
+        "connectionGeneration": provenance.generation().get().to_string(),
         "sessionId": provenance.session_id().as_str(),
-        "frameId": provenance.frame_id().get(),
+        "frameId": provenance.frame_id().get().to_string(),
         "payloadDigest": {
             "algorithm": provenance.payload_digest().algorithm(),
             "bytes": encode_hex(provenance.payload_digest().bytes())
@@ -1896,7 +1899,7 @@ fn display_observation_evidence(observation: &DisplayMarketReadObservation) -> V
             "providerChannel": coverage.provider_channel().as_str(),
             "eventClass": coverage.event_class(),
             "declaredDepth": coverage.declared_depth().map(depth_name),
-            "delay": coverage.delay(),
+            "delay": coverage_delay_value(coverage.delay()),
             "consolidation": coverage.consolidation(),
             "delivery": coverage.delivery(),
             "status": coverage.status(),
@@ -1914,12 +1917,14 @@ fn display_observation_evidence(observation: &DisplayMarketReadObservation) -> V
     })
 }
 
-fn kraken_projection_evidence(snapshot: &MarketKrakenPriceProjectionLease) -> Value {
+fn kraken_projection_evidence(
+    snapshot: &MarketKrakenPriceProjectionLease,
+) -> Result<Value, ServiceError> {
     let execution_terms = snapshot.execution_terms();
     let projection = snapshot.projection();
     let route = projection.route();
     let (freshness, last_market_at) = market_freshness(projection.freshness());
-    json!({
+    Ok(json!({
         "surfaceId": snapshot.surface_id().as_str(),
         "providerId": snapshot.metadata().provider().as_str(),
         "providerSymbol": snapshot.provider_symbol().as_str(),
@@ -1927,7 +1932,7 @@ fn kraken_projection_evidence(snapshot: &MarketKrakenPriceProjectionLease) -> Va
         "venueId": route.venue_id().as_str(),
         "instrumentId": route.instrument_id().to_string(),
         "providerInstrument": route.provider_instrument().as_str(),
-        "connectionGeneration": route.generation().get(),
+        "connectionGeneration": route.generation().get().to_string(),
         "batchIdentifier": projection.batch_identifier().as_str(),
         "revision": projection.revision().to_string(),
         "phase": order_level_phase(projection.phase()),
@@ -1937,7 +1942,7 @@ fn kraken_projection_evidence(snapshot: &MarketKrakenPriceProjectionLease) -> Va
         "projectionDepth": depth_name(projection.market_depth()),
         "executionTerms": {
             "instrumentId": execution_terms.instrument_id().to_string(),
-            "definitionRevision": execution_terms.definition_revision().get(),
+            "definitionRevision": execution_terms.definition_revision().get().to_string(),
             "priceTick": execution_terms.price_tick().as_decimal().normalize().to_string(),
             "lotSize": execution_terms.lot_size().as_decimal().normalize().to_string(),
             "quoteCurrency": execution_terms.quote_currency().as_str(),
@@ -1949,13 +1954,66 @@ fn kraken_projection_evidence(snapshot: &MarketKrakenPriceProjectionLease) -> Va
         "sourceTimestamp": timestamp_value(projection.source_timestamp()),
         "receivedAt": timestamp_value(projection.received_at()),
         "availableAt": timestamp_value(projection.available_at()),
-        "providerSequence": projection.provider_sequence().map(|sequence| sequence.get()),
+        "providerSequence": projection.provider_sequence().map(|sequence| sequence.get().to_string()),
         "diagnosticOrdinal": projection.diagnostic_ordinal().map(|ordinal| ordinal.to_string()),
-        "sequenceEvidence": projection.sequence_evidence(),
-        "checksumEvidence": projection.checksum_evidence(),
+        "sequenceEvidence": sequence_evidence_value(projection.sequence_evidence())?,
+        "checksumEvidence": checksum_evidence_value(projection.checksum_evidence())?,
         "bidLevelCount": projection.bids().len(),
         "askLevelCount": projection.asks().len()
-    })
+    }))
+}
+
+fn sequence_evidence_value(
+    evidence: &market_squawk_domain::SequenceEvidence,
+) -> Result<Value, ServiceError> {
+    let mut value = serde_json::to_value(evidence).map_err(|_error| ServiceError::InvalidResult)?;
+    let fields = value.as_object_mut().ok_or(ServiceError::InvalidResult)?;
+    stringify_u64_field(fields, "connection_generation", false)?;
+    stringify_u64_field(fields, "snapshot_sequence", true)?;
+    stringify_u64_field(fields, "previous_sequence", true)?;
+    stringify_u64_field(fields, "observed_sequence", true)?;
+    Ok(value)
+}
+
+fn checksum_evidence_value(
+    evidence: &market_squawk_domain::ChecksumEvidence,
+) -> Result<Value, ServiceError> {
+    let mut value = serde_json::to_value(evidence).map_err(|_error| ServiceError::InvalidResult)?;
+    let fields = value.as_object_mut().ok_or(ServiceError::InvalidResult)?;
+    stringify_u64_field(fields, "connection_generation", false)?;
+    stringify_u64_field(fields, "expected", true)?;
+    stringify_u64_field(fields, "computed", true)?;
+    Ok(value)
+}
+
+fn stringify_u64_field(
+    fields: &mut serde_json::Map<String, Value>,
+    field: &str,
+    nullable: bool,
+) -> Result<(), ServiceError> {
+    let replacement = match fields.get(field).ok_or(ServiceError::InvalidResult)? {
+        Value::Number(number) => Value::String(
+            number
+                .as_u64()
+                .ok_or(ServiceError::InvalidResult)?
+                .to_string(),
+        ),
+        Value::Null if nullable => return Ok(()),
+        Value::Null | Value::Bool(_) | Value::String(_) | Value::Array(_) | Value::Object(_) => {
+            return Err(ServiceError::InvalidResult);
+        }
+    };
+    fields.insert(field.to_owned(), replacement);
+    Ok(())
+}
+
+fn coverage_delay_value(value: CoverageDelay) -> Value {
+    match value {
+        CoverageDelay::RealTime => json!({"kind": "real_time"}),
+        CoverageDelay::Delayed(nanos) => {
+            json!({"kind": "delayed", "value": nanos.to_string()})
+        }
+    }
 }
 
 const fn display_effective_time_basis(value: DisplayEffectiveTimeBasis) -> &'static str {
@@ -2233,9 +2291,9 @@ fn selected_source_value(
         "coverage": coverage_name(capabilities.coverage()),
         "health": health_name(admission.health().state()),
         "healthObservedAt": timestamp_value(admission.health().observed_at()),
-        "stateRevision": view.stream.state_revision(),
+        "stateRevision": view.stream.state_revision().to_string(),
         "shardId": view.shard.shard_id().to_string(),
-        "shardSnapshotRevision": view.shard.snapshot_revision().get(),
+        "shardSnapshotRevision": view.shard.snapshot_revision().get().to_string(),
         "snapshotPublishedAt": timestamp_value(view.shard.published_at()),
         "providerBudget": {
             "availability": budget_name(admission.budget().availability()),
@@ -2250,7 +2308,7 @@ fn selected_source_value(
             "snapshotDisplayPermitted": rights.permitted_operations().contains(MarketOperation::SnapshotDisplay)
         },
         "freshness": {
-            "ageNanos": selected.freshness_age_nanos(),
+            "ageNanos": selected.freshness_age_nanos().to_string(),
             "sourceTimestamp": timestamps.source_timestamp().map(timestamp_value),
             "receivedAt": timestamp_value(timestamps.received_at()),
             "availableAt": timestamp_value(timestamps.available_at()),
@@ -2261,11 +2319,11 @@ fn selected_source_value(
         "integrity": {
             "state": integrity_name(integrity.state()),
             "assessedAt": timestamp_value(integrity.assessed_at()),
-            "connectionGeneration": integrity.generation().map(|generation| generation.get()),
+            "connectionGeneration": integrity.generation().map(|generation| generation.get().to_string()),
             "phase": view.stream.phase(),
             "generationCurrent": view.stream.generation_current(),
             "snapshotInitialized": view.stream.snapshot_initialized(),
-            "lastSequence": view.stream.last_sequence().map(|sequence| sequence.get()),
+            "lastSequence": view.stream.last_sequence().map(|sequence| sequence.get().to_string()),
             "runtimeEvidence": runtime_evidence_value(view.stream)
         }
     })
@@ -2302,7 +2360,7 @@ fn display_selected_source_value(
         "coverageStatus": coverage.status(),
         "health": health_name(admission.health().state()),
         "healthObservedAt": timestamp_value(admission.health().observed_at()),
-        "stateRevision": actor.revision(),
+        "stateRevision": actor.revision().to_string(),
         "snapshotPublishedAt": timestamp_value(provenance.available_at()),
         "providerBudget": {
             "availability": budget_name(admission.budget().availability()),
@@ -2317,7 +2375,7 @@ fn display_selected_source_value(
             "snapshotDisplayPermitted": rights.permitted_operations().contains(MarketOperation::SnapshotDisplay)
         },
         "freshness": {
-            "ageNanos": selected.freshness_age_nanos(),
+            "ageNanos": selected.freshness_age_nanos().to_string(),
             "sourceTimestamp": provenance.source_at().map(timestamp_value),
             "effectiveAt": timestamp_value(provenance.effective_at()),
             "receivedAt": timestamp_value(provenance.received_at()),
@@ -2331,7 +2389,7 @@ fn display_selected_source_value(
         "integrity": {
             "state": integrity_name(integrity.state()),
             "assessedAt": timestamp_value(integrity.assessed_at()),
-            "connectionGeneration": actor.key().generation().get(),
+            "connectionGeneration": actor.key().generation().get().to_string(),
             "phase": display_phase(observation.availability()),
             "generationCurrent": Value::Null,
             "snapshotInitialized": actor.trade().is_some() || actor.quote().is_some() || actor.status().is_some(),
@@ -2378,7 +2436,7 @@ fn kraken_selected_source_value(
         "coverage": coverage_name(capabilities.coverage()),
         "health": health_name(admission.health().state()),
         "healthObservedAt": timestamp_value(admission.health().observed_at()),
-        "stateRevision": projection.revision(),
+        "stateRevision": projection.revision().to_string(),
         "snapshotPublishedAt": timestamp_value(projection.available_at()),
         "executionEligible": false,
         "providerBudget": {
@@ -2394,7 +2452,7 @@ fn kraken_selected_source_value(
             "snapshotDisplayPermitted": rights.permitted_operations().contains(MarketOperation::SnapshotDisplay)
         },
         "freshness": {
-            "ageNanos": selected.freshness_age_nanos(),
+            "ageNanos": selected.freshness_age_nanos().to_string(),
             "state": freshness,
             "lastMarketAt": last_market_at.map(timestamp_value),
             "sourceTimestamp": timestamp_value(projection.source_timestamp()),
@@ -2409,12 +2467,12 @@ fn kraken_selected_source_value(
         "integrity": {
             "state": integrity_name(integrity.state()),
             "assessedAt": timestamp_value(integrity.assessed_at()),
-            "connectionGeneration": snapshot.key().generation().get(),
+            "connectionGeneration": snapshot.key().generation().get().to_string(),
             "phase": order_level_phase(projection.phase()),
             "generationCurrent": true,
             "snapshotInitialized": projection.phase() != OrderLevelPhase::AwaitingSnapshot,
-            "lastSequence": projection.provider_sequence().map(|sequence| sequence.get()),
-            "runtimeEvidence": kraken_projection_evidence(snapshot)
+            "lastSequence": projection.provider_sequence().map(|sequence| sequence.get().to_string()),
+            "runtimeEvidence": kraken_projection_evidence(snapshot)?
         },
         "sourceMetadataEvidence": source_metadata_evidence(snapshot.metadata())
     }))
@@ -2451,7 +2509,7 @@ fn source_metadata_evidence(metadata: &SourceMetadata) -> Value {
             "topology": coverage.topology(),
             "instruments": coverage.instruments(),
             "live": coverage.live(),
-            "delay": coverage.delay(),
+            "delay": coverage_delay_value(coverage.delay()),
             "delivery": coverage.delivery()
         }
     })
@@ -2520,10 +2578,10 @@ fn runtime_evidence_value(stream: &StreamSnapshot) -> Value {
                 "sessionId": evidence.session_id().as_str(),
                 "assessmentId": evidence.assessment_id().as_source_identifier().as_str(),
                 "bindingDigest": encode_hex(evidence.binding_digest()),
-                "connection": evidence.connection(),
-                "transportFreshness": evidence.transport_freshness(),
-                "marketFreshness": evidence.market_freshness(),
-                "sourceFreshness": evidence.source_freshness(),
+                "connection": connection_liveness_value(evidence.connection()),
+                "transportFreshness": transport_freshness_value(evidence.transport_freshness()),
+                "marketFreshness": market_freshness_value(evidence.market_freshness()),
+                "sourceFreshness": source_timestamp_freshness_value(evidence.source_freshness()),
                 "streamIntegrity": evidence.stream_integrity(),
                 "captureIntegrity": evidence.capture_integrity(),
                 "coverageStatus": evidence.coverage_status(),
@@ -2533,6 +2591,57 @@ fn runtime_evidence_value(stream: &StreamSnapshot) -> Value {
             })
         })
         .unwrap_or(Value::Null)
+}
+
+fn connection_liveness_value(value: ConnectionLiveness) -> Value {
+    match value {
+        ConnectionLiveness::Connecting => json!("connecting"),
+        ConnectionLiveness::Live { last_activity_at } => {
+            json!({"live": {"last_activity_at": last_activity_at.unix_nanos().to_string()}})
+        }
+        ConnectionLiveness::Stale { last_activity_at } => {
+            json!({"stale": {"last_activity_at": last_activity_at.unix_nanos().to_string()}})
+        }
+        ConnectionLiveness::Disconnected { disconnected_at } => {
+            json!({"disconnected": {"disconnected_at": disconnected_at.unix_nanos().to_string()}})
+        }
+    }
+}
+
+fn transport_freshness_value(value: TransportFreshness) -> Value {
+    match value {
+        TransportFreshness::Uninitialized => json!("uninitialized"),
+        TransportFreshness::Fresh { last_transport_at } => {
+            json!({"fresh": {"last_transport_at": last_transport_at.unix_nanos().to_string()}})
+        }
+        TransportFreshness::Stale { last_transport_at } => {
+            json!({"stale": {"last_transport_at": last_transport_at.unix_nanos().to_string()}})
+        }
+    }
+}
+
+fn market_freshness_value(value: MarketFreshness) -> Value {
+    match value {
+        MarketFreshness::Uninitialized => json!("uninitialized"),
+        MarketFreshness::Fresh { last_market_at } => {
+            json!({"fresh": {"last_market_at": last_market_at.unix_nanos().to_string()}})
+        }
+        MarketFreshness::Stale { last_market_at } => {
+            json!({"stale": {"last_market_at": last_market_at.unix_nanos().to_string()}})
+        }
+    }
+}
+
+fn source_timestamp_freshness_value(value: SourceTimestampFreshness) -> Value {
+    match value {
+        SourceTimestampFreshness::Uninitialized => json!("uninitialized"),
+        SourceTimestampFreshness::Fresh { last_source_at } => {
+            json!({"fresh": {"last_source_at": last_source_at.unix_nanos().to_string()}})
+        }
+        SourceTimestampFreshness::Stale { last_source_at } => {
+            json!({"stale": {"last_source_at": last_source_at.unix_nanos().to_string()}})
+        }
+    }
 }
 
 fn source_summary(
@@ -2552,7 +2661,7 @@ fn source_summary(
         "depth": capabilities.depth().map(depth_name),
         "quality": capabilities.quality(),
         "coverage": coverage_name(capabilities.coverage()),
-        "freshnessAgeNanos": freshness_age_nanos,
+        "freshnessAgeNanos": freshness_age_nanos.to_string(),
         "downgradeDimensions": downgrade
             .map(|value| value.dimensions())
             .unwrap_or(&[])
@@ -2589,8 +2698,8 @@ fn downgrade_value(downgrade: &DowngradeDimension) -> Value {
             selected_age_nanos,
         } => json!({
             "dimension": "freshness",
-            "maximumAgeNanos": maximum_age_nanos,
-            "selectedAgeNanos": selected_age_nanos
+            "maximumAgeNanos": maximum_age_nanos.to_string(),
+            "selectedAgeNanos": selected_age_nanos.to_string()
         }),
     }
 }

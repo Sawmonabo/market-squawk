@@ -408,6 +408,9 @@ struct PaperController {
     // Serializes every mutation that can replace the sole live/paper runtime owner.
     owner_gate: Mutex<()>,
     state: Mutex<PaperState>,
+    // Bot and Execution are separate facades over this shared controller. Retain one terminal
+    // shutdown result so the second facade cannot repeat destruction of the same runtime owner.
+    shutdown: Mutex<Option<Result<(), ServiceError>>>,
 }
 
 impl PaperController {
@@ -426,6 +429,7 @@ impl PaperController {
             state: Mutex::new(PaperState::Stopped {
                 last_complete: None,
             }),
+            shutdown: Mutex::new(None),
         }
     }
 
@@ -1193,15 +1197,21 @@ impl PaperController {
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
         let cleanup = CancellationToken::new();
+        let mut shutdown = bounded_lock(&self.shutdown, deadline, &cleanup).await?;
+        if let Some(result) = *shutdown {
+            return result;
+        }
         let _owner = bounded_lock(&self.owner_gate, deadline, &cleanup).await?;
         let paper = self.stop_paper_before_owned(deadline, &cleanup).await;
         let sources = self.market_runtime.finish_shutdown(deadline).await;
-        match (paper, sources) {
+        let result = match (paper, sources) {
             (Ok(true), Ok(())) => Ok(()),
             (Ok(false), Ok(())) => Err(ServiceError::Unavailable),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
             (Err(_paper), Err(_sources)) => Err(ServiceError::Unavailable),
-        }
+        };
+        *shutdown = Some(result);
+        result
     }
 
     async fn set_cleanup_required(

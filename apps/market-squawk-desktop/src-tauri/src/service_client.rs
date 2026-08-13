@@ -1279,15 +1279,24 @@ pub(crate) async fn source_control(
     let mut arguments = Map::new();
     arguments.insert("provider".to_owned(), json!(&request.provider));
     arguments.insert("sourceCoverage".to_owned(), json!([&request.provider]));
+    let expected_state_revision = parse_positive_u64(
+        request.expected_state_revision,
+        "The source state revision must be a positive canonical unsigned decimal.",
+    )?;
     arguments.insert(
         "expectedStateRevision".to_owned(),
-        json!(request.expected_state_revision),
+        json!(expected_state_revision.to_string()),
     );
-    insert_optional(
-        &mut arguments,
-        "expectedGeneration",
-        request.expected_generation,
-    );
+    if let Some(expected_generation) = request.expected_generation {
+        let expected_generation = parse_positive_u64(
+            expected_generation,
+            "The source generation must be a positive canonical unsigned decimal.",
+        )?;
+        arguments.insert(
+            "expectedGeneration".to_owned(),
+            Value::String(expected_generation.to_string()),
+        );
+    }
     insert_optional(
         &mut arguments,
         "expectedRuntimeGenerationSha256",
@@ -1517,6 +1526,12 @@ fn parse_canonical_u64(value: &str) -> Option<u64> {
         return None;
     }
     value.parse::<u64>().ok()
+}
+
+fn parse_positive_u64(value: String, message: &'static str) -> Result<u64, DesktopCommandError> {
+    parse_canonical_u64(&value)
+        .filter(|parsed| *parsed > 0)
+        .ok_or_else(|| DesktopCommandError::invalid_request(message))
 }
 
 fn parse_unsigned_decimal(

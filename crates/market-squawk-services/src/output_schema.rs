@@ -12,8 +12,8 @@ const NANOSECOND_UTC_TIMESTAMP_PATTERN: &str =
     "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{9}Z$";
 const CANONICAL_DECIMAL_PATTERN: &str = "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]*[1-9])?$";
 const POSITIVE_INTEGER_PATTERN: &str = "^[1-9][0-9]*$";
-const UNSIGNED_INTEGER_PATTERN: &str = "^[0-9]+$";
-const INTEGER_PATTERN: &str = "^-?[0-9]+$";
+const UNSIGNED_INTEGER_PATTERN: &str = "^(?:0|[1-9][0-9]*)$";
+const INTEGER_PATTERN: &str = "^(?:0|-?[1-9][0-9]*)$";
 const MEDIA_TYPE_PATTERN: &str = "^[A-Za-z0-9/.+\\-]+$";
 
 pub(crate) fn validate_data_schema(schema: &Value) -> bool {
@@ -348,9 +348,7 @@ fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {
         Some(NANOSECOND_UTC_TIMESTAMP_PATTERN) => nanosecond_utc_timestamp_matches(value),
         Some(CANONICAL_DECIMAL_PATTERN) => canonical_decimal_matches(value),
         Some(POSITIVE_INTEGER_PATTERN) => positive_integer_matches(value),
-        Some(UNSIGNED_INTEGER_PATTERN) => {
-            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-        }
+        Some(UNSIGNED_INTEGER_PATTERN) => value == "0" || positive_integer_matches(value),
         Some(INTEGER_PATTERN) => integer_matches(value),
         Some(MEDIA_TYPE_PATTERN) => {
             !value.is_empty()
@@ -411,8 +409,7 @@ fn positive_integer_matches(value: &str) -> bool {
 }
 
 fn integer_matches(value: &str) -> bool {
-    let unsigned = value.strip_prefix('-').unwrap_or(value);
-    !unsigned.is_empty() && unsigned.bytes().all(|byte| byte.is_ascii_digit())
+    value == "0" || positive_integer_matches(value.strip_prefix('-').unwrap_or(value))
 }
 
 fn string_format_matches(format: Option<&Value>, value: &str) -> bool {
@@ -482,7 +479,8 @@ fn bounded_number(value: &Value, minimum: Option<&Value>, maximum: Option<&Value
 #[cfg(test)]
 mod tests {
     use super::{
-        CANONICAL_DECIMAL_PATTERN, LOWERCASE_SHA256_PATTERN, validate_data, validate_data_schema,
+        CANONICAL_DECIMAL_PATTERN, INTEGER_PATTERN, LOWERCASE_SHA256_PATTERN,
+        UNSIGNED_INTEGER_PATTERN, validate_data, validate_data_schema,
     };
     use serde_json::json;
 
@@ -539,6 +537,20 @@ mod tests {
         assert!(validate_data_schema(&decimal_schema));
         assert!(validate_data(&decimal_schema, &json!("-12.34")));
         assert!(!validate_data(&decimal_schema, &json!("01.0")));
+
+        let unsigned_schema = json!({"type": "string", "pattern": UNSIGNED_INTEGER_PATTERN});
+        assert!(validate_data_schema(&unsigned_schema));
+        assert!(validate_data(&unsigned_schema, &json!("0")));
+        assert!(validate_data(&unsigned_schema, &json!("12")));
+        assert!(!validate_data(&unsigned_schema, &json!("00")));
+        assert!(!validate_data(&unsigned_schema, &json!("012")));
+
+        let integer_schema = json!({"type": "string", "pattern": INTEGER_PATTERN});
+        assert!(validate_data_schema(&integer_schema));
+        assert!(validate_data(&integer_schema, &json!("0")));
+        assert!(validate_data(&integer_schema, &json!("-12")));
+        assert!(!validate_data(&integer_schema, &json!("-0")));
+        assert!(!validate_data(&integer_schema, &json!("-012")));
         assert!(!validate_data_schema(
             &json!({"type": "string", "pattern": "^.*$"})
         ));

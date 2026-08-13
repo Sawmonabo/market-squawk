@@ -18,8 +18,10 @@ const MAXIMUM_TOOL_NAME_BYTES: usize = 128;
 const MAXIMUM_TOOL_VERSION_BYTES: usize = 64;
 const MAXIMUM_TOOL_DESCRIPTION_BYTES: usize = 1024;
 const MAXIMUM_TOOLS: usize = 256;
-const MAXIMUM_DESCRIPTOR_SCHEMA_BYTES: usize = 64 * 1024;
-const MAXIMUM_DESCRIPTOR_SCHEMA_DEPTH: usize = 32;
+// Closed production contracts are intentionally detailed; these bounds still cap every retained
+// descriptor independently while allowing the complete Source and Market schema graphs.
+const MAXIMUM_DESCRIPTOR_SCHEMA_BYTES: usize = 256 * 1024;
+const MAXIMUM_DESCRIPTOR_SCHEMA_DEPTH: usize = 64;
 const MAXIMUM_DESCRIPTOR_METADATA_BYTES: usize = 8 * 1024;
 const MAXIMUM_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 

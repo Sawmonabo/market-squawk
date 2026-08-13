@@ -10,6 +10,11 @@ import { CredentialField } from "@/components/setup/credential-field"
 import { ProviderStep } from "@/components/setup/provider-step"
 import type { AnalyticalControllerStatus } from "@/features/advanced/analytical-profile-contracts"
 import { lookupRoute } from "@/features/lookup/lookup-surface"
+import { parseUnifiedMarketResult } from "@/features/markets/unified-market"
+import {
+  parseSourceLifecycleReceipt,
+  parseSourceStatusResult,
+} from "@/features/sources/source-evidence"
 import type {
   PortfolioAccount,
   PortfolioHolding,
@@ -24,6 +29,8 @@ import type {
 import type {
   DesktopEventSubscriptionRequest,
   ProductTransport,
+  SourceLifecycleAction,
+  SourceLifecycleRequest,
 } from "@/lib/transport"
 
 const blockedBootstrap: DesktopBootstrap = {
@@ -611,6 +618,8 @@ const alpacaDoctorPredecessors = new Map([
 const initialAlpacaRuntimeGenerationSha256 = "8".repeat(64)
 const resynchronizedAlpacaRuntimeGenerationSha256 = "9".repeat(64)
 const reactivatedAlpacaRuntimeGenerationSha256 = "a".repeat(64)
+const alpacaRuntimeSourceId = "alpaca-paper-iex-live"
+const alpacaRuntimeInstrumentId = "6d6cead8-bf3a-5f46-a17d-34754eb67768"
 
 function alpacaDoctorRate(observed: boolean) {
   return observed
@@ -634,7 +643,7 @@ function alpacaDoctorHttp(identity: string, observedRate = true) {
     requestSha256: "2".repeat(64),
     status: 200,
     bodySha256: "3".repeat(64),
-    bytes: 512,
+    bytes: "512",
     receivedAt: "2026-08-12T20:00:05.000000000Z",
     latencyNanos: "125000000",
     rate: alpacaDoctorRate(observedRate),
@@ -685,7 +694,7 @@ function alpacaDoctorEvidence({
     publicConfigurationSha256: alpacaPublicConfigurationSha256,
     rightsDecisionSha256: "e".repeat(64),
     ratePolicySha256: "f".repeat(64),
-    doctorRevision: "market-squawk.alpaca-paper-iex-doctor-implementation.v1",
+    doctorRevision: "market-squawk.alpaca-paper-iex-doctor-implementation.v2",
     doctorContractSha256: "ed8ab1614fc4cee29b213b7eed8ce59033e0041378039f51368ad872bfe3a911",
     dataQuality: "direct_unverified",
     verifiedAt,
@@ -735,7 +744,7 @@ function alpacaDoctorEvidence({
         subscribedTrades: 1,
         subscribedQuotes: 1,
         framesObserved: 3,
-        bytesObserved: 384,
+        bytesObserved: "384",
         authenticatedAt: "2026-08-12T20:00:01.000000000Z",
         subscribedAt: "2026-08-12T20:00:02.000000000Z",
         closeSent: true,
@@ -824,18 +833,18 @@ function alpacaSourceStatus(stage: AlpacaSourceStage): ApplicationResult {
   const active = stage === "active" || stage === "resynchronized" ||
     stage === "reactivated"
   const stateRevision = stage === "unconfigured"
-    ? 7
+    ? "7"
     : stage === "doctor_required"
-      ? 8
+      ? "8"
     : stage === "eligible"
-      ? 9
+      ? "9"
       : stage === "active"
-        ? 10
+        ? "10"
         : stage === "resynchronized"
-          ? 11
+          ? "11"
           : stage === "renewed"
-            ? 12
-            : 13
+            ? "12"
+            : "13"
   const runtimeGenerationSha256 = stage === "active"
     ? initialAlpacaRuntimeGenerationSha256
     : stage === "resynchronized"
@@ -851,13 +860,44 @@ function alpacaSourceStatus(stage: AlpacaSourceStage): ApplicationResult {
   const observedAt = stage === "renewed" || stage === "reactivated"
     ? "2026-08-12T20:05:07.000000000Z"
     : "2026-08-12T20:00:07.000000000Z"
-  return {
+  const runtime = active
+    ? {
+        state: "active",
+        sourceId: alpacaRuntimeSourceId,
+        venueId: "iex",
+        instrumentId: alpacaRuntimeInstrumentId,
+        providerProduct: "stocks",
+        providerChannel: "iex",
+        connectionGeneration: stage === "reactivated" ? "3" : stage === "resynchronized" ? "2" : "1",
+        sessionId: `alpaca-${stage}-session`,
+        healthEpoch: "1",
+        stateRevision,
+        assessmentId: `alpaca-${stage}-assessment`,
+        bindingDigest: runtimeGenerationSha256,
+        connection: { live: { last_activity_at: "1786565107000000000" } },
+        integrity: "healthy",
+        quality: "direct_unverified",
+        observedAtUnixNanos: "1786565107000000000",
+        qualificationEvaluatedAtUnixNanos: "1786565107000000000",
+        qualificationValidUntilUnixNanos: "1786565167000000000",
+      }
+    : { state: "not_active" }
+  const currentSession = configured
+    ? {
+        session_id: alpacaOnboardingSessionId,
+        surface_id: "alpaca.basic-market-data",
+        state: active ? "active_scoped" : stage === "doctor_required" ? "stored_unverified" : "runtime_verification_pending",
+        next_action: active ? "active" : "verify_and_activate",
+        credential_stored: true,
+      }
+    : null
+  const result = {
     data: [{
       profile: {
         id: "alpaca.basic-market-data",
         display_name: "Alpaca Basic Market Data",
       },
-      currentSession: null,
+      currentSession,
       providerDatasetIdentifier: null,
       lifecycleSupport: "managed",
       lifecycle: {
@@ -877,16 +917,84 @@ function alpacaSourceStatus(stage: AlpacaSourceStage): ApplicationResult {
         blocker: null,
         observedAt,
       },
-      runtime: active ? { state: "active" } : {},
+      runtime,
     }],
     metadata: {
       completeness: "complete",
       returnedItems: 1,
       availableItems: 1,
-      sourceCoverage: { status: "complete", providers: ["alpaca.basic-market-data"] },
-      dataQuality: { status: admitted ? "direct_unverified" : "not_applicable" },
+      sourceCoverage: {
+        authority: "code_owned_profiles_and_current_runtime_evidence",
+        requestedSources: ["alpaca.basic-market-data"],
+        profileCount: 1,
+        runtimeRecordCount: active ? 1 : 0,
+        runtimeAbsence: "not_established",
+      },
+      dataQuality: {
+        authority: "profile_ceiling_and_runtime_qualification",
+        runtimeClasses: active ? ["direct_unverified"] : [],
+        runtimeAbsence: "not_active",
+        executionEligibilityUnchanged: true,
+      },
     },
   }
+  parseSourceStatusResult(result, ["alpaca.basic-market-data"])
+  return result
+}
+
+function alpacaLifecycleResult(
+  action: SourceLifecycleAction,
+  request: SourceLifecycleRequest,
+  stage: AlpacaSourceStage,
+): ApplicationResult {
+  const status = alpacaSourceStatus(stage)
+  const statusRow = Array.isArray(status.data) ? status.data[0] : null
+  if (!statusRow || typeof statusRow !== "object" || !("lifecycle" in statusRow)) {
+    throw new Error("The Alpaca lifecycle status fixture is unavailable.")
+  }
+  const lifecycle = statusRow.lifecycle as Record<string, unknown>
+  const active = lifecycle.state === "active"
+  const doctor = lifecycle.doctor as ReturnType<typeof alpacaDoctorEvidence> | null
+  const result: ApplicationResult = {
+    data: {
+      operationId: `desktop-alpaca-${action}-${String(lifecycle.stateRevision)}`,
+      provider: "alpaca.basic-market-data",
+      action,
+      disposition: "applied",
+      state: lifecycle.state,
+      stateRevision: lifecycle.stateRevision,
+      previousGeneration: null,
+      currentGeneration: null,
+      runtimeGenerationSha256: lifecycle.runtimeGenerationSha256,
+      coverage: null,
+      integrity: null,
+      quality: null,
+      rateBudget: { state: "indeterminate" },
+      authorization: "admitted",
+      availability: active ? "available" : "indeterminate",
+      rightsEvidence: {
+        id: "alpaca-paper-iex-rights",
+        sha256: doctor?.rightsDecisionSha256,
+        effectiveAt: "2026-08-12T19:59:00.000000000Z",
+        expiresAt: null,
+      },
+      blocker: null,
+      publicConfigurationSha256: lifecycle.publicConfigurationSha256,
+      configurationSessionId: lifecycle.configurationSessionId,
+      doctor,
+      startEligibility: lifecycle.startEligibility,
+      observedAt: lifecycle.observedAt,
+    },
+    metadata: {
+      completeness: "complete",
+      returnedItems: 1,
+      availableItems: 1,
+      sourceCoverage: { status: "not_applicable" },
+      dataQuality: { status: "not_applicable" },
+    },
+  }
+  parseSourceLifecycleReceipt(result, action, request)
+  return result
 }
 
 const h15DashboardResult: ApplicationResult = {
@@ -950,7 +1058,7 @@ const inactiveH15SourceStatus: ApplicationResult = {
       lifecycle: {
         provider: "federal-reserve-board.data-download-program",
         state: "stopped",
-        stateRevision: 7,
+        stateRevision: "7",
         configurationSessionId: null,
         currentGeneration: null,
         runtimeGenerationSha256: null,
@@ -960,7 +1068,7 @@ const inactiveH15SourceStatus: ApplicationResult = {
         blocker: null,
         observedAt: "2026-08-11T20:31:00.000000000Z",
       },
-      runtime: {},
+      runtime: { state: "not_active" },
     },
   ],
   metadata: {
@@ -968,12 +1076,25 @@ const inactiveH15SourceStatus: ApplicationResult = {
     returnedItems: 1,
     availableItems: 1,
     sourceCoverage: {
-      status: "complete",
-      providers: ["federal-reserve-board.data-download-program"],
+      authority: "code_owned_profiles_and_current_runtime_evidence",
+      requestedSources: ["federal-reserve-board.data-download-program"],
+      profileCount: 1,
+      runtimeRecordCount: 0,
+      runtimeAbsence: "not_established",
     },
-    dataQuality: { status: "not_applicable" },
+    dataQuality: {
+      authority: "profile_ceiling_and_runtime_qualification",
+      runtimeClasses: [],
+      runtimeAbsence: "not_active",
+      executionEligibilityUnchanged: true,
+    },
   },
 }
+
+parseSourceStatusResult(
+  inactiveH15SourceStatus,
+  ["federal-reserve-board.data-download-program"],
+)
 
 const stoppedPaperStatus: ApplicationResult = {
   data: { state: "stopped", lastShutdownComplete: true },
@@ -1427,17 +1548,126 @@ function retainedTrackRecord(request: TrackRecordQuery): ApplicationResult {
   }
 }
 
+const krakenInstrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
+const krakenSourceAt = "2026-08-09T14:30:00.000000000Z"
+const krakenReceivedAt = "2026-08-09T14:30:00.010000000Z"
+const krakenAvailableAt = "2026-08-09T14:30:00.011000000Z"
+
+function krakenProjectionEvidence() {
+  return {
+    surfaceId: "kraken-l3",
+    providerId: "kraken",
+    providerSymbol: "BTC/USD",
+    sourceId: "kraken-l3-account",
+    venueId: "kraken",
+    instrumentId: krakenInstrumentId,
+    providerInstrument: "BTC/USD",
+    connectionGeneration: "1",
+    batchIdentifier: "kraken-l3-g1-f42-snapshot",
+    revision: "17",
+    phase: "healthy",
+    quarantineReason: null,
+    quality: "direct_unverified",
+    sourceDepth: "order_level",
+    projectionDepth: "price_level",
+    executionTerms: {
+      instrumentId: krakenInstrumentId,
+      definitionRevision: "3",
+      priceTick: "0.1",
+      lotSize: "0.00000001",
+      quoteCurrency: "USD",
+      settlementDenomination: { kind: "currency", value: "USD" },
+      contractMultiplier: "1",
+    },
+    freshness: "fresh",
+    lastMarketAt: krakenSourceAt,
+    sourceTimestamp: krakenSourceAt,
+    receivedAt: krakenReceivedAt,
+    availableAt: krakenAvailableAt,
+    providerSequence: "42",
+    diagnosticOrdinal: "1",
+    sequenceEvidence: {
+      capability: "provided",
+      rule: { provider_rule: "kraken-v2-sequence", version: 1 },
+      validation_rule: "consecutive",
+      connection_generation: "1",
+      snapshot_sequence: "41",
+      previous_sequence: "41",
+      observed_sequence: "42",
+      integrity: "valid",
+    },
+    checksumEvidence: {
+      capability: "provided",
+      rule: { provider_rule: "kraken-v2-book-checksum", version: 1 },
+      connection_generation: "1",
+      target: {
+        kind: "book",
+        scope: {
+          depth: "order_level",
+          level_count: 2,
+          provider_scope: "kraken-l3-btc-usd",
+        },
+      },
+      expected: "123456",
+      computed: "123456",
+      integrity: "valid",
+    },
+    bidLevelCount: 1,
+    askLevelCount: 1,
+  }
+}
+
+function krakenSourceMetadataEvidence() {
+  return {
+    schemaVersion: 1,
+    sourceId: "kraken-l3-account",
+    providerId: "kraken",
+    sourceClass: "exchange",
+    metadataRevision: "kraken-l3-metadata-v1",
+    metadataPayloadDigest: { algorithm: "sha256", bytes: "44".repeat(32) },
+    metadataPayloadLocator: null,
+    qualityCeiling: "direct_unverified",
+    coverage: {
+      payloadDigest: { algorithm: "sha256", bytes: "55".repeat(32) },
+      payloadLocator: null,
+      effectiveFrom: "2026-08-09T00:00:00.000000000Z",
+      effectiveUntil: null,
+      assetClasses: ["crypto"],
+      topology: { kind: "single_venue", venues: ["kraken"] },
+      instruments: { kind: "enumerated", instruments: [krakenInstrumentId] },
+      live: {
+        provider_product: "websocket-v2",
+        provider_channel: "level3",
+        rules: [
+          {
+            event_class: "book_snapshot",
+            depth: "order_level",
+            snapshot_applicability: { kind: "required" },
+          },
+          {
+            event_class: "book_delta",
+            depth: "order_level",
+            snapshot_applicability: { kind: "required" },
+          },
+        ],
+      },
+      delay: { kind: "real_time" },
+      delivery: "direct_venue",
+    },
+  }
+}
+
 const unifiedKrakenMarket: ApplicationResult = {
   data: [
     {
-      instrumentId: "7e8299e7-9757-4441-926f-d0b22c767a65",
+      instrumentId: krakenInstrumentId,
       symbol: "BTC/USD",
-      symbolKind: "provider_subscription",
+      symbolKind: "provider_subscription_symbol",
       symbolVenueId: "kraken",
       assetClass: "crypto",
       quoteCurrency: "USD",
-      definitionKind: "execution_capable",
-      definitionRevision: 3,
+      definitionKind: "execution",
+      definitionRevision: "3",
       referenceRevision: null,
       permanentFigi: null,
       displayName: "Bitcoin",
@@ -1446,28 +1676,28 @@ const unifiedKrakenMarket: ApplicationResult = {
       executionTermsAvailable: true,
       referenceEvidence: null,
       availability: "Live",
-      confidence: "Direct unverified",
+      confidence: "Direct, unverified",
       quote: {
         bidPrice: "68000.1",
-        bidPriceProviderLexeme: "68000.1",
+        bidPriceProviderLexeme: null,
         bidSize: "0.25",
-        bidSizeProviderLexeme: "0.25000000",
+        bidSizeProviderLexeme: null,
         askPrice: "68000.2",
-        askPriceProviderLexeme: "68000.2",
+        askPriceProviderLexeme: null,
         askSize: "0.3",
-        askSizeProviderLexeme: "0.30000000",
+        askSizeProviderLexeme: null,
         midPrice: "68000.15",
-        midPriceBasis: "best_bid_ask",
-        lastPrice: "68000.2",
-        lastPriceProviderLexeme: "68000.2",
-        lastSize: "0.02",
-        lastSizeProviderLexeme: "0.02000000",
-        lastSourceTimestamp: "2026-08-09T14:30:00Z",
-        lastReceivedAt: "2026-08-09T14:30:00.010Z",
-        lastAvailableAt: "2026-08-09T14:30:00.011Z",
-        lastQuality: "direct_unverified",
-        lastFreshAtSelection: true,
-        quoteEvidence: { surfaceId: "kraken-l3" },
+        midPriceBasis: "calculated_from_selected_bid_and_ask",
+        lastPrice: null,
+        lastPriceProviderLexeme: null,
+        lastSize: null,
+        lastSizeProviderLexeme: null,
+        lastSourceTimestamp: null,
+        lastReceivedAt: null,
+        lastAvailableAt: null,
+        lastQuality: null,
+        lastFreshAtSelection: null,
+        quoteEvidence: krakenProjectionEvidence(),
         tradeEvidence: null,
       },
       orderBook: {
@@ -1477,8 +1707,8 @@ const unifiedKrakenMarket: ApplicationResult = {
         quarantineReason: null,
         quality: "direct_unverified",
         freshness: "fresh",
-        lastMarketAt: "2026-08-09T14:30:00Z",
-        availableAt: "2026-08-09T14:30:00.011000000Z",
+        lastMarketAt: krakenSourceAt,
+        availableAt: krakenAvailableAt,
         usableForSelection: true,
         totalOrderCount: 2,
         returnedOrderCount: 2,
@@ -1492,12 +1722,12 @@ const unifiedKrakenMarket: ApplicationResult = {
             priceTicks: "680001",
             quantity: "0.25",
             quantityLots: "25000000",
-            providerOrderTimestamp: "2026-08-09T14:30:00Z",
+            providerOrderTimestamp: krakenSourceAt,
             providerPriority: null,
             firstSeenIn: "snapshot",
             lastUpdatedIn: "snapshot",
-            lastSourceTimestamp: "2026-08-09T14:30:00Z",
-            lastReceivedAt: "2026-08-09T14:30:00.010Z",
+            lastSourceTimestamp: krakenSourceAt,
+            lastReceivedAt: krakenReceivedAt,
             arrivalOrdinal: "1",
           },
           {
@@ -1507,37 +1737,37 @@ const unifiedKrakenMarket: ApplicationResult = {
             priceTicks: "680002",
             quantity: "0.3",
             quantityLots: "30000000",
-            providerOrderTimestamp: "2026-08-09T14:30:00Z",
+            providerOrderTimestamp: krakenSourceAt,
             providerPriority: null,
             firstSeenIn: "snapshot",
             lastUpdatedIn: "snapshot",
-            lastSourceTimestamp: "2026-08-09T14:30:00Z",
-            lastReceivedAt: "2026-08-09T14:30:00.010Z",
+            lastSourceTimestamp: krakenSourceAt,
+            lastReceivedAt: krakenReceivedAt,
             arrivalOrdinal: "2",
           },
         ],
       },
       marketObservation: {
         availability: "available",
-        instrumentId: "7e8299e7-9757-4441-926f-d0b22c767a65",
+        instrumentId: krakenInstrumentId,
         mark: {
-          value: "68000.2",
+          value: "68000.15",
           currency: "USD",
-          basis: "fresh_last_trade",
+          basis: "fresh_bid_ask_midpoint",
           evidenceIdentity: {
             algorithm: "sha256",
             bytes: "11".repeat(32),
           },
-          freshUntil: "2026-08-09T14:30:05.000000000Z",
+          freshUntil: null,
         },
         selectionDigest: {
           algorithm: "sha256",
           bytes: "22".repeat(32),
         },
-        selectedAt: "2026-08-09T14:30:00.011000000Z",
+        selectedAt: krakenAvailableAt,
         generation: "1",
         quality: "direct_unverified",
-        depth: "order_level",
+        depth: "price_level",
         coverage: "single_venue",
         integrity: "verified",
         features: {
@@ -1553,28 +1783,59 @@ const unifiedKrakenMarket: ApplicationResult = {
         venueId: "kraken",
         providerProduct: "websocket-v2",
         providerChannel: "level3",
-        timing: "live",
-        depth: "order_level",
-        depthLabel: "Order-level book",
+        timing: "real_time",
+        depth: "price_level",
+        depthLabel: "Price-level book",
+        sourceDepth: "order_level",
+        projectionDepth: "price_level",
         quality: "direct_unverified",
+        qualityCeiling: "direct_unverified",
         coverage: "single_venue",
         health: "healthy",
+        healthObservedAt: krakenAvailableAt,
+        stateRevision: "17",
+        snapshotPublishedAt: krakenAvailableAt,
+        executionEligible: false,
+        providerBudget: {
+          availability: "not_required",
+          observedAt: krakenAvailableAt,
+        },
+        rights: {
+          decisionId: "kraken-snapshot-display-v1",
+          state: "admitted",
+          decidedAt: krakenAvailableAt,
+          effectiveFrom: "2026-08-09T00:00:00.000000000Z",
+          effectiveUntil: null,
+          snapshotDisplayPermitted: true,
+        },
         freshness: {
-          receivedAt: "2026-08-09T14:30:00.010Z",
-          availableAt: "2026-08-09T14:30:00.011Z",
-          sourceValidUntil: "2026-08-09T14:30:05Z",
+          ageNanos: "0",
+          state: "fresh",
+          lastMarketAt: krakenSourceAt,
+          sourceTimestamp: krakenSourceAt,
+          effectiveAt: krakenSourceAt,
+          receivedAt: krakenReceivedAt,
+          availableAt: krakenAvailableAt,
+          ingestedAt: krakenAvailableAt,
+          sourceValidUntil: null,
           freshAtSelection: true,
+          selectedAt: krakenAvailableAt,
         },
         integrity: {
-          state: "checksum_valid",
+          state: "verified",
+          assessedAt: krakenAvailableAt,
+          connectionGeneration: "1",
           phase: "healthy",
           generationCurrent: true,
           snapshotInitialized: true,
+          lastSequence: "42",
+          runtimeEvidence: krakenProjectionEvidence(),
         },
+        sourceMetadataEvidence: krakenSourceMetadataEvidence(),
       },
       alternatives: [],
       selectionReceipt: {
-        policyRevision: 1,
+        policyRevision: 2,
         policyCandidateLimit: 256,
         policyDigest: {
           algorithm: "sha256",
@@ -1584,7 +1845,7 @@ const unifiedKrakenMarket: ApplicationResult = {
           algorithm: "sha256",
           bytes: "22".repeat(32),
         },
-        selectedAt: "2026-08-09T14:30:00.011000000Z",
+        selectedAt: krakenAvailableAt,
         eligibleCount: 1,
         rejectedCount: 0,
         availableAlternativeCount: 0,
@@ -1599,10 +1860,47 @@ const unifiedKrakenMarket: ApplicationResult = {
     completeness: "complete",
     returnedItems: 1,
     availableItems: 1,
-    sourceCoverage: { status: "complete", providers: ["kraken"] },
-    dataQuality: { status: "direct_unverified" },
+    sourceCoverage: {
+      mode: "unified_current_market_runtime",
+      consistency: "per_shard_current_non_atomic",
+      historicalDataset: null,
+      requestedSourceCount: 0,
+      listedRequestedSources: [],
+      listedRequestedSourcesComplete: true,
+      observedSourceCount: 1,
+      listedSources: ["kraken-l3-account"],
+      listedSourcesComplete: true,
+      observedVenueCount: 1,
+      listedVenues: ["kraken"],
+      listedVenuesComplete: true,
+      failedSourceCount: 0,
+      failedSources: [],
+      listedFailedSourcesComplete: true,
+      streamIdentityScope: "complete",
+      bookDepthScope: "per_record_explicit",
+      displayObservationCount: 0,
+      krakenOrderLevelProjectionCount: 1,
+      availability: "current",
+    },
+    dataQuality: {
+      referenceAt: krakenAvailableAt,
+      recordedClassifications: [],
+      currentDisplayClassifications: [],
+      freshObservations: 0,
+      staleObservations: 0,
+      authority: "not_exposed",
+      summaryScope: "live_price_level_streams",
+      summarizedObservationCount: 0,
+      displayObservationCount: 0,
+      krakenOrderLevelProjectionCount: 1,
+    },
   },
 }
+
+// Keep this production-shaped evidence fixture at the strict Rust/Desktop wire boundary.
+// Parsing here makes a schema drift failure point at the fixture instead of disappearing
+// behind the Markets page's deliberately user-facing unavailable state.
+parseUnifiedMarketResult(unifiedKrakenMarket)
 
 const portfolioAccountId = "55e7626c-81c8-4e78-8aa6-45a1d9c2949a"
 const heldInstrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
@@ -1840,18 +2138,18 @@ describe("Market Squawk desktop boundary", () => {
     }
     expect(within(marketCard).getByText("Bitcoin")).toBeTruthy()
     expect(within(marketCard).getByText("Live")).toBeTruthy()
-    expect(within(marketCard).getByText("Order-level book")).toBeTruthy()
+    expect(within(marketCard).getByText("Price-level book")).toBeTruthy()
     expect(within(marketCard).getByText("2 of 2")).toBeTruthy()
     expect(screen.queryByRole("combobox", { name: /provider/i })).toBeNull()
 
     await user.click(
       screen.getByText("Show detailed trades, quotes, order book, and source comparison"),
     )
-    expect(await screen.findByText("Chosen automatically")).toBeTruthy()
+    expect(await screen.findByText("Selected market evidence")).toBeTruthy()
     expect(screen.getByText("Orders behind the visible market")).toBeTruthy()
-    await user.click(screen.getByText("Data confidence"))
+    await user.click(screen.getByText("Source, quality, and evidence details"))
     expect(screen.getAllByText("kraken").length).toBeGreaterThan(0)
-    expect(screen.getByText("Checksum valid")).toBeTruthy()
+    expect(screen.getByText("Verified")).toBeTruthy()
   })
 
   it("keeps candidate impact server-resolved and visibly analysis-only", async () => {
@@ -2209,7 +2507,7 @@ describe("Market Squawk desktop boundary", () => {
             alpacaStage = alpacaStage === "renewed" ? "reactivated" : "active"
           }
         }
-        return alpacaSourceStatus(alpacaStage)
+        return alpacaLifecycleResult(action, request, alpacaStage)
       },
     }
     const readCount = (
@@ -2323,12 +2621,9 @@ describe("Market Squawk desktop boundary", () => {
       within(h15Section).getByText("Source lifecycle observed"),
     ).toBeTruthy()
     expect(
-      within(h15Section).getByText("2026-08-11T20:31:00.000000000Z"),
-    ).toBeTruthy()
-    expect(
       within(h15Section).getByText("Source runtime observed"),
     ).toBeTruthy()
-    expect(within(h15Section).getByText("Not reported")).toBeTruthy()
+    expect(within(h15Section).getAllByText("Not reported").length).toBeGreaterThan(0)
     expect(within(h15Section).getByText("4.25%")).toBeTruthy()
     expect(
       within(h15Section).getByText("Pinned query result digest"),
@@ -2525,7 +2820,7 @@ describe("Market Squawk desktop boundary", () => {
     await user.click(within(alpacaSource).getByText("Exact authority evidence"))
     expect(
       within(alpacaSource).getByText(
-        "market-squawk.alpaca-paper-iex-doctor-implementation.v1",
+        "market-squawk.alpaca-paper-iex-doctor-implementation.v2",
       ),
     ).toBeTruthy()
     expect(
@@ -2555,7 +2850,7 @@ describe("Market Squawk desktop boundary", () => {
       action: "verify",
       request: {
         provider: "alpaca.basic-market-data",
-        expectedStateRevision: 8,
+        expectedStateRevision: "8",
         onboardingSessionId: alpacaOnboardingSessionId,
         publicConfigurationSha256: alpacaPublicConfigurationSha256,
       },
@@ -2570,7 +2865,7 @@ describe("Market Squawk desktop boundary", () => {
       action: "start",
       request: {
         provider: "alpaca.basic-market-data",
-        expectedStateRevision: 9,
+        expectedStateRevision: "9",
         onboardingSessionId: alpacaOnboardingSessionId,
         publicConfigurationSha256: alpacaPublicConfigurationSha256,
       },
@@ -2586,7 +2881,7 @@ describe("Market Squawk desktop boundary", () => {
       action: "resynchronize",
       request: {
         provider: "alpaca.basic-market-data",
-        expectedStateRevision: 10,
+        expectedStateRevision: "10",
         expectedRuntimeGenerationSha256: initialAlpacaRuntimeGenerationSha256,
         reason: "desktop-user-request",
       },
@@ -2633,7 +2928,7 @@ describe("Market Squawk desktop boundary", () => {
       action: "verify",
       request: {
         provider: "alpaca.basic-market-data",
-        expectedStateRevision: 11,
+        expectedStateRevision: "11",
         onboardingSessionId: alpacaOnboardingSessionId,
         publicConfigurationSha256: alpacaPublicConfigurationSha256,
       },
@@ -2647,7 +2942,7 @@ describe("Market Squawk desktop boundary", () => {
       action: "start",
       request: {
         provider: "alpaca.basic-market-data",
-        expectedStateRevision: 12,
+        expectedStateRevision: "12",
         onboardingSessionId: alpacaOnboardingSessionId,
         publicConfigurationSha256: alpacaPublicConfigurationSha256,
       },

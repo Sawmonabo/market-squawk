@@ -1304,20 +1304,8 @@ impl DisplayMarketDirectory {
         cancellation: &CancellationToken,
         deadline: Instant,
     ) -> Result<DisplayMarketDirectoryShutdown, DisplayMarketDirectoryError> {
-        let _lifecycle = lock_directory(
-            &self.inner.lifecycle,
-            &self.inner.cancellation,
-            cancellation,
-            deadline,
-        )
-        .await?;
-        let mut entries = lock_directory(
-            &self.inner.entries,
-            &self.inner.cancellation,
-            cancellation,
-            deadline,
-        )
-        .await?;
+        let _lifecycle = lock_for_shutdown(&self.inner.lifecycle, cancellation, deadline).await?;
+        let mut entries = lock_for_shutdown(&self.inner.entries, cancellation, deadline).await?;
         let owned_entries = std::mem::take(&mut *entries);
         drop(entries);
         self.inner.cancellation.cancel();
@@ -2305,6 +2293,29 @@ async fn lock_directory<'a, T>(
         biased;
         () = cancellation.cancelled() => Err(DisplayMarketDirectoryError::Cancelled),
         () = directory_cancellation.cancelled() => Err(DisplayMarketDirectoryError::Closed),
+        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            Err(DisplayMarketDirectoryError::Deadline)
+        }
+        guard = mutex.lock() => Ok(guard),
+    }
+}
+
+async fn lock_for_shutdown<'a, T>(
+    mutex: &'a Mutex<T>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<tokio::sync::MutexGuard<'a, T>, DisplayMarketDirectoryError> {
+    // Directory lifecycle cancellation begins shutdown. Terminal ownership must therefore remain
+    // acquirable after that signal while the caller's independent deadline/cancellation stay live.
+    if cancellation.is_cancelled() {
+        return Err(DisplayMarketDirectoryError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(DisplayMarketDirectoryError::Deadline);
+    }
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(DisplayMarketDirectoryError::Cancelled),
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
             Err(DisplayMarketDirectoryError::Deadline)
         }

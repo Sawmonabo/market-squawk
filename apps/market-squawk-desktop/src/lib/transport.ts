@@ -671,8 +671,8 @@ export type SourceLifecycleAction =
 
 export interface SourceLifecycleRequest {
   provider: string
-  expectedStateRevision: number
-  expectedGeneration?: number
+  expectedStateRevision: string
+  expectedGeneration?: string
   expectedRuntimeGenerationSha256?: string
   onboardingSessionId?: string
   publicConfigurationSha256?: string

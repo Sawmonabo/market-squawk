@@ -441,7 +441,8 @@ impl SourceController {
         let expected_state_revision = request
             .arguments()
             .get("expectedStateRevision")
-            .and_then(Value::as_u64)
+            .and_then(Value::as_str)
+            .and_then(parse_canonical_positive_u64)
             .and_then(NonZeroU64::new)
             .ok_or(ServiceError::InvalidRequest)?;
         let expected_generation = optional_nonzero_u64(request, "expectedGeneration")?
@@ -1319,11 +1320,22 @@ fn optional_nonzero_u64(
         .get(field)
         .map(|value| {
             value
-                .as_u64()
+                .as_str()
+                .and_then(parse_canonical_positive_u64)
                 .and_then(NonZeroU64::new)
                 .ok_or(ServiceError::InvalidRequest)
         })
         .transpose()
+}
+
+fn parse_canonical_positive_u64(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse::<u64>().ok().filter(|value| *value > 0)
 }
 
 fn optional_uuid(request: &TypedToolRequest, field: &str) -> Result<Option<Uuid>, ServiceError> {
@@ -1385,9 +1397,9 @@ fn source_lifecycle_value(receipt: &SourceLifecycleReceipt) -> Result<Value, Ser
         "action": lifecycle_action_name(fields.action),
         "disposition": lifecycle_disposition_name(fields.disposition),
         "state": lifecycle_state_name(fields.state),
-        "stateRevision": fields.state_revision.get(),
-        "previousGeneration": fields.previous_generation.map(ConnectionGeneration::get),
-        "currentGeneration": fields.current_generation.map(ConnectionGeneration::get),
+        "stateRevision": fields.state_revision.get().to_string(),
+        "previousGeneration": fields.previous_generation.map(|value| value.get().to_string()),
+        "currentGeneration": fields.current_generation.map(|value| value.get().to_string()),
         "runtimeGenerationSha256": fields.runtime_generation_digest.map(sha256_value).transpose()?,
         "coverage": fields.coverage.map(|value| to_json(&value)).transpose()?,
         "integrity": fields.integrity.map(|value| to_json(&value)).transpose()?,
@@ -1412,10 +1424,10 @@ fn source_lifecycle_status_value(status: &SourceLifecycleStatus) -> Result<Value
     let fields = status.fields();
     Ok(json!({
         "provider": fields.provider.as_str(),
-        "stateRevision": fields.state_revision.get(),
+        "stateRevision": fields.state_revision.get().to_string(),
         "state": lifecycle_state_name(fields.state),
         "configurationSessionId": fields.configuration_session_id.map(|value| value.to_string()),
-        "currentGeneration": fields.current_generation.map(ConnectionGeneration::get),
+        "currentGeneration": fields.current_generation.map(|value| value.get().to_string()),
         "runtimeGenerationSha256": fields.runtime_generation_digest.map(sha256_value).transpose()?,
         "publicConfigurationSha256": fields
             .public_configuration_digest
@@ -1550,7 +1562,7 @@ fn doctor_stream_value(
                 "subscribedTrades": value.subscribed_trade_count,
                 "subscribedQuotes": value.subscribed_quote_count,
                 "framesObserved": value.frames_observed,
-                "bytesObserved": value.bytes_observed,
+                "bytesObserved": value.bytes_observed.to_string(),
                 "authenticatedAt": timestamp_value(value.authenticated_at),
                 "subscribedAt": timestamp_value(value.subscribed_at),
                 "closeSent": value.close_sent,
@@ -1657,7 +1669,7 @@ fn source_doctor_http_value(
         "requestSha256": sha256_value(http.request_digest)?,
         "status": http.status_code,
         "bodySha256": sha256_value(http.body_digest)?,
-        "bytes": http.response_bytes,
+        "bytes": http.response_bytes.to_string(),
         "receivedAt": timestamp_value(http.received_at),
         "latencyNanos": http.latency_nanos.to_string(),
         "rate": source_doctor_rate_value(&http.rate)?,
