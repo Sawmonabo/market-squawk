@@ -1189,7 +1189,33 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
     })
 }
 
-fn assert_real_alpaca_mcp_market(data: &Value, expected: &RealAlpacaEvidence) -> TestResult {
+fn assert_real_alpaca_mcp_market(result: &Value, expected: &RealAlpacaEvidence) -> TestResult {
+    let data = &result["data"];
+    if data.is_null() {
+        let metadata = &result["metadata"];
+        assert_eq!(metadata["completeness"], "complete");
+        assert_eq!(metadata["returnedItems"], 0);
+        assert_eq!(metadata["availableItems"], 0);
+        assert_eq!(
+            metadata["sourceCoverage"]["listedRequestedSources"],
+            json!([REAL_ALPACA_SURFACE])
+        );
+        assert_eq!(
+            metadata["sourceCoverage"]["listedRequestedSourcesComplete"],
+            true
+        );
+        assert_eq!(
+            metadata["sourceCoverage"]["availability"],
+            "no_current_observation"
+        );
+        assert_eq!(metadata["dataQuality"]["summarizedObservationCount"], 0);
+        assert_eq!(metadata["dataQuality"]["displayObservationCount"], 0);
+        assert_eq!(
+            metadata["dataQuality"]["krakenOrderLevelProjectionCount"],
+            0
+        );
+        return Ok(());
+    }
     let observed = real_alpaca_market_observation(data)?;
     assert_eq!(observed.instrument_id, expected.instrument_id);
     if observed.available && expected.market_available {
@@ -2738,7 +2764,7 @@ async fn exercise_installed_relay_with_gate(
         let market = read_message(&mut peer_reader)
             .await
             .context("read installed relay real Alpaca Market response")?;
-        assert_real_alpaca_mcp_market(&market["result"]["structuredContent"]["data"], real_alpaca)
+        assert_real_alpaca_mcp_market(&market["result"]["structuredContent"], real_alpaca)
             .context("verify installed MCP real Alpaca Market evidence")?;
     }
     write_message(

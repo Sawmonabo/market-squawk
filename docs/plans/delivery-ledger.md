@@ -1682,9 +1682,10 @@ it does not rewrite that historical checkpoint. Work began from frozen pushed ba
 working-tree candidate layered on that base and is therefore focused dirty-candidate evidence, not
 clean exact-head approval.
 
-**Integrated code commit: `f2d6f3b7` (`feat: wire real Alpaca market dashboard`).** The following
-ledger-only commit records that code checkpoint; any approval claim must use the final clean,
-unchanged ledger head rather than infer authority from the earlier working tree.
+**Integrated implementation commit: `f2d6f3b7` (`feat: wire real Alpaca market dashboard`).** The
+checkpoint history that follows records that code commit and the later protected-currentness
+assertion remediation; any approval claim must use the final clean, unchanged head rather than
+infer authority from the earlier working tree.
 
 The current candidate replaces the proposed scripted-fixture barrier with the protected production
 Alpaca Paper/IEX path. The application performs the bounded real REST boot snapshot before its real
@@ -1722,7 +1723,9 @@ Focused working-candidate gates completed:
 - The existing exact Alpaca doctor-receipt/current-generation renewal case passed 1/1.
 - The existing protected production journey passed 1/1 with 31 filtered cases: protected import,
   five real probes, `Source.Start`, native Market read, MCP Market read, shutdown/restart, and both
-  reads again.
+  reads again. A later MCP read may truthfully transition to the strict zero-row result only when
+  its metadata is complete, exact-scoped to the requested Alpaca surface, and reports zero current
+  observations; the journey does not freeze a stale row across non-atomic reads.
 - Desktop TypeScript compilation passed, and the narrow existing grouped selector passed 2 cases
   with 5 skipped.
 
