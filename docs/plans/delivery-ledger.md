@@ -1741,3 +1741,43 @@ generation. The following dependency is a separately sealed forward live-event a
 publication-time evidence accumulated by those durable paths may unlock genuine point-in-time
 features, backtests, forecasts, recommendations and track records; first-observed-now history can
 support current charts and research but cannot be presented as retrospective PIT evidence.
+
+### 2026-08-14 exact-definition and canonical-market remediation
+
+Exact code checkpoint `5133f338279dffa17fe3e72b447cac503239fa60`, tree
+`c423a5c65c7ff2599e70c9aeb79f523e892f47c9`, closes the grouped I1–I4 remediation on the real
+Alpaca/Markets vertical. `Market.GetUnifiedFeed` now selects an immutable market-data definition
+that was both knowable and effective at the operation's exact reference time, rejects expired or
+future-published definitions, and binds the nonzero whole-definition SHA-256 through every
+candidate, the selection request and digest, the row, the receipt, MCP, and the strict Desktop
+parser. Desktop independently requires the same end-exclusive effective interval and exact
+row-to-receipt digest equality.
+
+The operation is deliberately a hot current-display operation: it may show a fresh selected-source
+trade or bid/ask midpoint, but its closed Rust and Desktop contracts always report
+`runtime_display_only`, `executionEligible: false`, and no durable analytical observation. The UI
+states only that this live-feed response is not PIT evidence; it does not claim that a separate
+archive is absent. A canonical instrument row may transition between live and unavailable across
+non-atomic reads, but it may no longer disappear from MCP after the native read has established the
+configured topology. Stable identity, including the exact definition digest, survives that
+transition and restart.
+
+Focused clean, unchanged, exact-head evidence on `5133f338` passed:
+
+- Rust formatting and diff integrity;
+- the bounded output-schema validator's single nonzero-SHA-256 proof;
+- the existing market-selection determinism/downgrade/execution case, including definition-revision
+  mismatch and digest-change proof;
+- Desktop TypeScript compilation and the existing unified-market journey (1 passed, 6 skipped);
+  and
+- the protected real Alpaca installed-service journey (1 passed, 31 filtered): credential import,
+  five real probes, start, native and MCP reads, clean shutdown, same-root restart, and both reads
+  again.
+
+The frozen 15-file remediation was independently reviewed at Critical 0, Important 0, Minor 0;
+its pre-commit aggregate patch SHA-256 was
+`a3a1ea38a2e31bb34e5ba49782730ead2c7a9839e923a85c4a53c3d738597b84`. No broad suite, CI/CD,
+release build, package matrix, or release-branch merge ran. This is an exact product checkpoint,
+not complete V1 or release approval. The active barrier remains complete Alpaca daily-history and
+calendar publication, manifest-pinned `Market.GetHistory`, Desktop charts, and then the separately
+sealed forward live-event archive needed before genuine PIT analytics can become available.
