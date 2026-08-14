@@ -30,7 +30,7 @@ const AUTHENTICATED_CONTROL_BYTE_CAPACITY: usize = 64 * 1024;
 pub enum ProductionSourceProvider {
     /// Coinbase Exchange WebSocket feed.
     Coinbase,
-    /// Kraken Spot WebSocket v2 book feed.
+    /// Kraken Spot WebSocket v2 book-and-trade feed set.
     Kraken,
 }
 
@@ -351,7 +351,7 @@ impl ProductionConnectorProfile {
     const fn source_key(&self) -> &'static str {
         match self {
             Self::Coinbase(_) => "coinbase-exchange-public",
-            Self::Kraken(_) => "kraken-public-book-v2",
+            Self::Kraken(profile) => profile.source_key(),
             Self::AlpacaIex { .. } => "alpaca-basic-iex-live",
             Self::AlpacaOptions { .. } => "alpaca-basic-indicative-options-live",
         }

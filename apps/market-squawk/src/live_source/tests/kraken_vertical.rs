@@ -15,10 +15,10 @@ use std::{
 use chrono::{SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
 use market_squawk_domain::{
-    AccountId, BasisPoints, ClientOrderId, ConnectionGeneration, Currency, DataQuality,
-    InstrumentExecutionTerms, InstrumentId, Money, OrderId, OrderReasonCode, OrderSide, OrderType,
-    PriceTicks, QuantityLots, RuleVersion, SourceId, SourceIdentifier, StrategyId, TimeInForce,
-    Timestamp, TradingStatus,
+    AccountId, AggressorSide, BasisPoints, ChecksumCapability, ClientOrderId, ConnectionGeneration,
+    Currency, DataQuality, InstrumentExecutionTerms, InstrumentId, Money, OrderId, OrderReasonCode,
+    OrderSide, OrderType, PriceTicks, QuantityLots, RuleVersion, SourceId, SourceIdentifier,
+    StrategyId, TimeInForce, Timestamp, TradingStatus,
 };
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
@@ -33,6 +33,7 @@ use market_squawk_platform::{
 };
 use rust_decimal::Decimal;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
@@ -66,20 +67,56 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     let temporary = tempfile::tempdir()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}/", listener.local_addr()?);
-    let (acknowledgement, snapshot) = current_kraken_frames()?;
-    let expected_acknowledgement = acknowledgement.clone();
-    let expected_snapshot = snapshot.clone();
+    let frames = current_kraken_frames()?;
+    let expected_book_acknowledgement = frames.book_acknowledgement.clone();
+    let expected_book_snapshot = frames.book_snapshot.clone();
+    let expected_trade_acknowledgement = frames.trade_acknowledgement.clone();
+    let expected_trade_snapshot = frames.trade_snapshot.clone();
+    let (resync_trigger, resync_requested) = oneshot::channel();
+    let (resync_sent, resync_observed) = oneshot::channel();
+    let (recovery_trigger, recovery_requested) = oneshot::channel();
     let server = tokio::spawn(serve_resynchronizing_kraken_sessions(
         listener,
-        acknowledgement,
-        snapshot,
+        frames,
+        resync_requested,
+        resync_sent,
+        recovery_requested,
     ));
 
     let config = kraken_config(temporary.path())?;
     let source_config = config.kraken().ok_or("Kraken source profile missing")?;
-    let metadata = super::super::kraken::ProductionKrakenProfile::try_from(source_config)?
-        .metadata()
-        .clone();
+    let profiles =
+        super::super::kraken::ProductionKrakenProfileSet::try_from_config(source_config)?;
+    let book_metadata = profiles.book().metadata().clone();
+    let trade_metadata = profiles.trades().metadata().clone();
+    assert_eq!(
+        book_metadata.capabilities().checksum(),
+        ChecksumCapability::Provided
+    );
+    assert_eq!(
+        trade_metadata.capabilities().checksum(),
+        ChecksumCapability::Unsupported
+    );
+    assert_eq!(
+        book_metadata
+            .coverage()
+            .live()
+            .ok_or("Kraken book coverage missing")?
+            .provider_channel()
+            .as_source_identifier()
+            .as_str(),
+        "book-v2"
+    );
+    assert_eq!(
+        trade_metadata
+            .coverage()
+            .live()
+            .ok_or("Kraken trade coverage missing")?
+            .provider_channel()
+            .as_source_identifier()
+            .as_str(),
+        "trade-v2"
+    );
     let definition = source_config.definition().clone();
     let invocations = Arc::new(AtomicUsize::new(0));
     let composition = local_kraken_paper_bot_with_strategy_for_test(
@@ -94,9 +131,43 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     let cancellation = CancellationToken::new();
     let runtime = composition.start(cancellation.clone()).await?;
 
-    let observed = wait_for_kraken_snapshot(runtime.snapshots(), metadata.source_id()).await?;
-    assert_eq!(metadata.quality_ceiling(), DataQuality::DirectUnverified);
-    assert_eq!(observed.source, *metadata.source_id());
+    let initial = wait_for_kraken_snapshot(
+        runtime.snapshots(),
+        book_metadata.source_id(),
+        trade_metadata.source_id(),
+    )
+    .await?;
+    assert_eq!(initial.connection_generation, ConnectionGeneration::new(1)?);
+    assert_eq!(initial.trade_generation, ConnectionGeneration::new(1)?);
+    assert!(runtime.source_is_healthy());
+
+    resync_trigger
+        .send(())
+        .map_err(|_| "Kraken resynchronization trigger receiver closed")?;
+    tokio::time::timeout(LOCAL_SUBSCRIPTION_BOUND, resync_observed)
+        .await?
+        .map_err(|_| "Kraken resynchronization evidence sender closed")?;
+    wait_for_source_health(&runtime, false).await?;
+    recovery_trigger
+        .send(())
+        .map_err(|_| "Kraken recovery trigger receiver closed")?;
+    let observed = wait_for_kraken_snapshot(
+        runtime.snapshots(),
+        book_metadata.source_id(),
+        trade_metadata.source_id(),
+    )
+    .await?;
+    assert!(runtime.source_is_healthy());
+    assert_eq!(
+        book_metadata.quality_ceiling(),
+        DataQuality::DirectUnverified
+    );
+    assert_eq!(
+        trade_metadata.quality_ceiling(),
+        DataQuality::DirectUnverified
+    );
+    assert_eq!(observed.source, *book_metadata.source_id());
+    assert_eq!(observed.trade_source, *trade_metadata.source_id());
     assert_eq!(observed.instrument, definition.instrument_id());
     assert_eq!(
         observed.connection_generation,
@@ -106,6 +177,11 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     assert_eq!(observed.phase, StreamPhaseSnapshot::Healthy);
     assert!(observed.snapshot_initialized);
     assert_eq!(observed.trading_status, Some(TradingStatus::Active));
+    assert_eq!(observed.trade_generation, ConnectionGeneration::new(1)?);
+    assert!(observed.trade_generation_current);
+    assert_eq!(observed.trade_phase, StreamPhaseSnapshot::Healthy);
+    assert_eq!(observed.trade_id.as_str(), "1001");
+    assert_eq!(observed.trade_aggressor, AggressorSide::Buy);
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
 
     let rejection = defense_in_depth_risk_probe(&definition.execution_terms(), observed)?;
@@ -161,20 +237,36 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     server.await??;
     let paths = LocalPaths::prepare(temporary.path())?;
     let records = JournalReader::open(paths.journal_write_file("kraken-public-book-v2")?)?
-        .read_all_bounded(4, 4 * 1024 * 1024)?;
-    assert_eq!(records.len(), 4);
-    assert_eq!(records[0].payload(), expected_acknowledgement.as_bytes());
-    assert_eq!(records[1].payload(), UPDATE_BEFORE_SNAPSHOT.as_bytes());
-    assert_eq!(records[2].payload(), expected_acknowledgement.as_bytes());
-    assert_eq!(records[3].payload(), expected_snapshot.as_bytes());
+        .read_all_bounded(5, 4 * 1024 * 1024)?;
+    assert_eq!(records.len(), 5);
+    assert_eq!(
+        records[0].payload(),
+        expected_book_acknowledgement.as_bytes()
+    );
+    assert_eq!(records[1].payload(), expected_book_snapshot.as_bytes());
+    assert_eq!(records[2].payload(), UPDATE_BEFORE_SNAPSHOT.as_bytes());
+    assert_eq!(
+        records[3].payload(),
+        expected_book_acknowledgement.as_bytes()
+    );
+    assert_eq!(records[4].payload(), expected_book_snapshot.as_bytes());
+    let trade_records = JournalReader::open(paths.journal_write_file("kraken-public-trades-v2")?)?
+        .read_all_bounded(2, 4 * 1024 * 1024)?;
+    assert_eq!(trade_records.len(), 2);
+    assert_eq!(
+        trade_records[0].payload(),
+        expected_trade_acknowledgement.as_bytes()
+    );
+    assert_eq!(
+        trade_records[1].payload(),
+        expected_trade_snapshot.as_bytes()
+    );
 
     let restart_listener = TcpListener::bind("127.0.0.1:0").await?;
     let restart_endpoint = format!("ws://{}/", restart_listener.local_addr()?);
-    let (restart_acknowledgement, restart_snapshot) = current_kraken_frames()?;
     let restart_server = tokio::spawn(serve_one_kraken_session(
         restart_listener,
-        restart_acknowledgement,
-        restart_snapshot,
+        current_kraken_frames()?,
     ));
     let restart_composition = local_kraken_paper_bot_with_strategy_for_test(
         kraken_config(temporary.path())?,
@@ -189,8 +281,20 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     let restarted = restart_composition
         .start(restart_cancellation.clone())
         .await?;
-    let _restart_observed =
-        wait_for_kraken_snapshot(restarted.snapshots(), metadata.source_id()).await?;
+    let restart_observed = wait_for_kraken_snapshot(
+        restarted.snapshots(),
+        book_metadata.source_id(),
+        trade_metadata.source_id(),
+    )
+    .await?;
+    assert_eq!(
+        restart_observed.connection_generation,
+        ConnectionGeneration::new(3)?
+    );
+    assert_eq!(
+        restart_observed.trade_generation,
+        ConnectionGeneration::new(2)?
+    );
     assert!(restarted.financial_reconciliation_current());
     restart_cancellation.cancel();
     let restart_shutdown =
@@ -218,7 +322,10 @@ async fn silent_peer_is_replaced_at_the_ack_deadline_before_transport_idle() -> 
     let temporary = tempfile::tempdir()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}/", listener.local_addr()?);
-    let mut server = tokio::spawn(observe_silent_generation_rotation(listener));
+    let server = tokio::spawn(observe_silent_generation_rotation(
+        listener,
+        current_kraken_frames()?,
+    ));
     let config = kraken_config_with_ack_timeout(temporary.path(), 100)?;
     let invocations = Arc::new(AtomicUsize::new(0));
     let composition = local_kraken_paper_bot_with_strategy_for_test(
@@ -231,21 +338,24 @@ async fn silent_peer_is_replaced_at_the_ack_deadline_before_transport_idle() -> 
     )?
     .with_local_kraken_endpoint_for_test(&endpoint)?;
     let cancellation = CancellationToken::new();
-    let runtime = composition.start(cancellation.clone()).await?;
-
-    let rotation = tokio::time::timeout(ROTATION_BOUND, &mut server).await;
+    let runtime =
+        match tokio::time::timeout(ROTATION_BOUND, composition.start(cancellation.clone())).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                cancellation.cancel();
+                server.abort();
+                let _aborted = server.await;
+                return Err(
+                    "silent Kraken generation outlived its acknowledgement deadline".into(),
+                );
+            }
+        };
+    assert!(runtime.source_is_healthy());
     cancellation.cancel();
     let shutdown = tokio::time::timeout(Duration::from_secs(30), runtime.shutdown()).await?;
     assert!(shutdown.is_complete(), "{shutdown:#?}");
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
-    match rotation {
-        Ok(result) => result??,
-        Err(_elapsed) => {
-            server.abort();
-            let _aborted = server.await;
-            return Err("silent Kraken generation outlived its acknowledgement deadline".into());
-        }
-    }
+    server.await??;
     Ok(())
 }
 
@@ -272,6 +382,7 @@ impl Strategy for InvocationProbeStrategy {
 #[derive(Clone, Debug)]
 struct ObservedKrakenSession {
     source: SourceId,
+    trade_source: SourceId,
     instrument: InstrumentId,
     connection_generation: ConnectionGeneration,
     generation_current: bool,
@@ -281,11 +392,17 @@ struct ObservedKrakenSession {
     observed_at: Timestamp,
     valid_until: Timestamp,
     best_ask: PriceTicks,
+    trade_generation: ConnectionGeneration,
+    trade_generation_current: bool,
+    trade_phase: StreamPhaseSnapshot,
+    trade_id: SourceIdentifier,
+    trade_aggressor: AggressorSide,
 }
 
 async fn wait_for_kraken_snapshot(
     snapshots: market_squawk_live::LiveSnapshotReader,
-    source: &SourceId,
+    book_source: &SourceId,
+    trade_source: &SourceId,
 ) -> TestResult<ObservedKrakenSession> {
     // The vertical's acknowledgement and freshness windows are deliberately noncompeting here;
     // the separate silent-peer case below owns acknowledgement-expiry behavior.
@@ -294,9 +411,12 @@ async fn wait_for_kraken_snapshot(
             if let Ok(lease) = snapshots.try_load_all() {
                 for shard in lease.snapshots() {
                     for route in shard.routes() {
+                        let mut book = None;
+                        let mut trade = None;
                         for stream in route.streams() {
-                            if stream.source() == source
+                            if stream.source() == book_source
                                 && stream.phase() == StreamPhaseSnapshot::Healthy
+                                && stream.generation_current()
                                 && stream.snapshot_initialized()
                             {
                                 let best_ask = stream
@@ -304,19 +424,52 @@ async fn wait_for_kraken_snapshot(
                                     .first()
                                     .ok_or("Kraken snapshot contains no ask")?
                                     .price();
-                                return TestResult::Ok(ObservedKrakenSession {
-                                    source: stream.source().clone(),
-                                    instrument: stream.instrument(),
-                                    connection_generation: stream.connection_generation(),
-                                    generation_current: stream.generation_current(),
-                                    phase: stream.phase(),
-                                    snapshot_initialized: stream.snapshot_initialized(),
-                                    trading_status: stream.trading_status(),
-                                    observed_at: stream.received_at(),
-                                    valid_until: stream.source_valid_until(),
+                                book = Some((
+                                    stream.source().clone(),
+                                    stream.instrument(),
+                                    stream.connection_generation(),
+                                    stream.generation_current(),
+                                    stream.phase(),
+                                    stream.snapshot_initialized(),
+                                    stream.trading_status(),
+                                    stream.received_at(),
+                                    stream.source_valid_until(),
                                     best_ask,
-                                });
+                                ));
+                            } else if stream.source() == trade_source
+                                && stream.phase() == StreamPhaseSnapshot::Healthy
+                                && stream.generation_current()
+                                && let Some(last_trade) = stream.last_trade()
+                            {
+                                trade = Some((
+                                    stream.source().clone(),
+                                    stream.connection_generation(),
+                                    stream.generation_current(),
+                                    stream.phase(),
+                                    last_trade.stable_trade_id().clone(),
+                                    last_trade.aggressor_side(),
+                                ));
                             }
+                        }
+                        if let (Some(book), Some(trade)) = (book, trade) {
+                            return TestResult::Ok(ObservedKrakenSession {
+                                source: book.0,
+                                trade_source: trade.0,
+                                instrument: book.1,
+                                connection_generation: book.2,
+                                generation_current: book.3,
+                                phase: book.4,
+                                snapshot_initialized: book.5,
+                                trading_status: book.6,
+                                observed_at: book.7,
+                                valid_until: book.8,
+                                best_ask: book.9,
+                                trade_generation: trade.1,
+                                trade_generation_current: trade.2,
+                                trade_phase: trade.3,
+                                trade_id: trade.4,
+                                trade_aggressor: trade.5,
+                            });
                         }
                     }
                 }
@@ -325,6 +478,22 @@ async fn wait_for_kraken_snapshot(
         }
     })
     .await?
+}
+
+async fn wait_for_source_health(
+    runtime: &crate::paper_bot::ProductionPaperBotRuntime,
+    expected: bool,
+) -> TestResult {
+    tokio::time::timeout(LOCAL_SNAPSHOT_BOUND, async {
+        loop {
+            if runtime.source_is_healthy() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_elapsed| format!("Kraken composite source health did not become {expected}").into())
 }
 
 fn defense_in_depth_risk_probe(
@@ -429,93 +598,250 @@ fn defense_in_depth_risk_probe(
 
 async fn serve_resynchronizing_kraken_sessions(
     listener: TcpListener,
+    frames: KrakenTestFrames,
+    resync_requested: oneshot::Receiver<()>,
+    resync_sent: oneshot::Sender<()>,
+    recovery_requested: oneshot::Receiver<()>,
+) -> TestResult {
+    let mut workers = tokio::task::JoinSet::new();
+    let mut book_seen = false;
+    let mut trades_seen = false;
+    let mut resync_requested = Some(resync_requested);
+    let mut resync_sent = Some(resync_sent);
+    while !book_seen || !trades_seen {
+        let (socket, channel) = accept_kraken_subscription(&listener).await?;
+        match channel {
+            KrakenTestChannel::Book if !book_seen => {
+                book_seen = true;
+                let _worker = workers.spawn(serve_book_until_resynchronization(
+                    socket,
+                    frames.book_acknowledgement.clone(),
+                    frames.book_snapshot.clone(),
+                    resync_requested
+                        .take()
+                        .ok_or("Kraken resynchronization trigger was already consumed")?,
+                    resync_sent
+                        .take()
+                        .ok_or("Kraken resynchronization sender was already consumed")?,
+                ));
+            }
+            KrakenTestChannel::Trades if !trades_seen => {
+                trades_seen = true;
+                let _worker = workers.spawn(serve_kraken_frames_until_close(
+                    socket,
+                    vec![
+                        frames.trade_acknowledgement.clone(),
+                        frames.trade_snapshot.clone(),
+                    ],
+                ));
+            }
+            _ => return Err("Kraken source opened an unexpected duplicate channel".into()),
+        }
+    }
+    let (replacement, channel) = accept_kraken_subscription(&listener).await?;
+    if channel != KrakenTestChannel::Book {
+        return Err("Kraken source rotated the healthy trade channel during book resync".into());
+    }
+    let _replacement = workers.spawn(serve_kraken_frames_after_barrier(
+        replacement,
+        recovery_requested,
+        vec![frames.book_acknowledgement, frames.book_snapshot],
+    ));
+    while let Some(result) = workers.join_next().await {
+        result??;
+    }
+    Ok(())
+}
+
+async fn serve_book_until_resynchronization(
+    mut socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     acknowledgement: String,
     snapshot: String,
+    mut resync_requested: oneshot::Receiver<()>,
+    resync_sent: oneshot::Sender<()>,
 ) -> TestResult {
-    let mut first = accept_kraken_subscription(&listener).await?;
-    first
-        .send(Message::Text(acknowledgement.clone().into()))
-        .await?;
-    first
+    socket.send(Message::Text(acknowledgement.into())).await?;
+    socket.send(Message::Text(snapshot.into())).await?;
+    socket
         .send(Message::Ping(FIRST_GENERATION_READY.into()))
         .await?;
     tokio::time::timeout(LOCAL_SUBSCRIPTION_BOUND, async {
+        let mut snapshot_observed = false;
         loop {
-            match first.next().await {
-                Some(Ok(Message::Pong(payload))) if payload.as_ref() == FIRST_GENERATION_READY => {
+            tokio::select! {
+                biased;
+                requested = &mut resync_requested, if snapshot_observed => {
+                    requested.map_err(|_| "Kraken resynchronization trigger sender closed")?;
                     return TestResult::Ok(());
                 }
-                Some(Ok(Message::Ping(payload))) => {
-                    first.send(Message::Pong(payload)).await?;
+                message = socket.next() => match message {
+                    Some(Ok(Message::Pong(payload)))
+                        if payload.as_ref() == FIRST_GENERATION_READY =>
+                    {
+                        snapshot_observed = true;
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        socket.send(Message::Pong(payload)).await?;
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                        return Err(
+                            "Kraken source closed before the controlled resynchronization".into(),
+                        );
+                    }
+                    Some(Ok(_)) => {}
                 }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                    return Err(
-                        "Kraken source closed before the first-generation acknowledgement barrier"
-                            .into(),
-                    );
-                }
-                Some(Ok(_)) => {}
             }
         }
     })
     .await??;
-    first
+    socket
         .send(Message::Text(UPDATE_BEFORE_SNAPSHOT.into()))
         .await?;
-    while let Some(message) = first.next().await {
+    resync_sent
+        .send(())
+        .map_err(|_| "Kraken resynchronization evidence receiver closed")?;
+    while let Some(message) = socket.next().await {
         match message {
             Ok(Message::Close(_)) | Err(_) => break,
-            Ok(Message::Ping(payload)) => first.send(Message::Pong(payload)).await?,
+            Ok(Message::Ping(payload)) => socket.send(Message::Pong(payload)).await?,
             Ok(_) => {}
-        }
-    }
-
-    let mut socket = accept_kraken_subscription(&listener).await?;
-    socket.send(Message::Text(acknowledgement.into())).await?;
-    socket.send(Message::Text(snapshot.into())).await?;
-    while let Some(message) = socket.next().await {
-        match message? {
-            Message::Close(_) => return Ok(()),
-            Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
-            _ => {}
         }
     }
     Ok(())
 }
 
-async fn serve_one_kraken_session(
-    listener: TcpListener,
-    acknowledgement: String,
-    snapshot: String,
+async fn serve_kraken_frames_after_barrier(
+    mut socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    mut barrier: oneshot::Receiver<()>,
+    frames: Vec<String>,
 ) -> TestResult {
-    let mut socket = accept_kraken_subscription(&listener).await?;
-    socket.send(Message::Text(acknowledgement.into())).await?;
-    socket.send(Message::Text(snapshot.into())).await?;
+    tokio::time::timeout(LOCAL_SUBSCRIPTION_BOUND, async {
+        loop {
+            tokio::select! {
+                biased;
+                released = &mut barrier => {
+                    released.map_err(|_| "Kraken recovery trigger sender closed")?;
+                    return TestResult::Ok(());
+                }
+                message = socket.next() => match message {
+                    Some(Ok(Message::Ping(payload))) => {
+                        socket.send(Message::Pong(payload)).await?;
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                        return Err("Kraken replacement closed before recovery release".into());
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+    })
+    .await??;
+    serve_kraken_frames_until_close(socket, frames).await
+}
+
+async fn serve_one_kraken_session(listener: TcpListener, frames: KrakenTestFrames) -> TestResult {
+    let mut workers = tokio::task::JoinSet::new();
+    let mut book_seen = false;
+    let mut trades_seen = false;
+    while !book_seen || !trades_seen {
+        let (socket, channel) = accept_kraken_subscription(&listener).await?;
+        let channel_frames = match channel {
+            KrakenTestChannel::Book if !book_seen => {
+                book_seen = true;
+                vec![
+                    frames.book_acknowledgement.clone(),
+                    frames.book_snapshot.clone(),
+                ]
+            }
+            KrakenTestChannel::Trades if !trades_seen => {
+                trades_seen = true;
+                vec![
+                    frames.trade_acknowledgement.clone(),
+                    frames.trade_snapshot.clone(),
+                ]
+            }
+            _ => return Err("Kraken source opened an unexpected duplicate channel".into()),
+        };
+        let _worker = workers.spawn(serve_kraken_frames_until_close(socket, channel_frames));
+    }
+    while let Some(result) = workers.join_next().await {
+        result??;
+    }
+    Ok(())
+}
+
+async fn serve_kraken_frames_until_close(
+    mut socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    frames: Vec<String>,
+) -> TestResult {
+    for frame in frames {
+        socket.send(Message::Text(frame.into())).await?;
+    }
     while let Some(message) = socket.next().await {
-        match message? {
-            Message::Close(_) => return Ok(()),
-            Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
-            _ => {}
+        match message {
+            Ok(Message::Close(_)) | Err(_) => return Ok(()),
+            Ok(Message::Ping(payload)) => socket.send(Message::Pong(payload)).await?,
+            Ok(_) => {}
         }
     }
     Ok(())
 }
 
-async fn observe_silent_generation_rotation(listener: TcpListener) -> TestResult {
-    let mut first = accept_kraken_subscription(&listener).await?;
-    while let Some(message) = first.next().await {
-        match message {
-            Ok(Message::Close(_)) | Err(_) => break,
-            Ok(_) => {}
+async fn observe_silent_generation_rotation(
+    listener: TcpListener,
+    frames: KrakenTestFrames,
+) -> TestResult {
+    let mut workers = tokio::task::JoinSet::new();
+    let mut book_connections = 0_usize;
+    let mut trades_seen = false;
+    while book_connections < 2 || !trades_seen {
+        let (socket, channel) = accept_kraken_subscription(&listener).await?;
+        match channel {
+            KrakenTestChannel::Book if book_connections == 0 => {
+                book_connections += 1;
+                let _worker = workers.spawn(serve_kraken_frames_until_close(socket, Vec::new()));
+            }
+            KrakenTestChannel::Book if book_connections == 1 => {
+                book_connections += 1;
+                let _worker = workers.spawn(serve_kraken_frames_until_close(
+                    socket,
+                    vec![
+                        frames.book_acknowledgement.clone(),
+                        frames.book_snapshot.clone(),
+                    ],
+                ));
+            }
+            KrakenTestChannel::Trades if !trades_seen => {
+                trades_seen = true;
+                let _worker = workers.spawn(serve_kraken_frames_until_close(
+                    socket,
+                    vec![
+                        frames.trade_acknowledgement.clone(),
+                        frames.trade_snapshot.clone(),
+                    ],
+                ));
+            }
+            _ => return Err("Kraken source opened an unexpected duplicate channel".into()),
         }
     }
-    let _successor = accept_kraken_subscription(&listener).await?;
+    while let Some(result) = workers.join_next().await {
+        result??;
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KrakenTestChannel {
+    Book,
+    Trades,
 }
 
 async fn accept_kraken_subscription(
     listener: &TcpListener,
-) -> TestResult<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>> {
+) -> TestResult<(
+    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    KrakenTestChannel,
+)> {
     let (stream, _) = listener.accept().await?;
     let mut socket = tokio_tungstenite::accept_async(stream).await?;
     let Some(Ok(Message::Text(subscription))) =
@@ -524,20 +850,36 @@ async fn accept_kraken_subscription(
         return Err("Kraken source did not send a text subscription".into());
     };
     let request: serde_json::Value = serde_json::from_str(&subscription)?;
+    let params = request["params"]
+        .as_object()
+        .ok_or("Kraken subscription params are not an object")?;
+    let channel = match params.get("channel").and_then(serde_json::Value::as_str) {
+        Some("book") if params.get("depth") == Some(&serde_json::json!(10)) => {
+            KrakenTestChannel::Book
+        }
+        Some("trade") if !params.contains_key("depth") => KrakenTestChannel::Trades,
+        _ => return Err("Kraken source sent an unsupported channel subscription".into()),
+    };
     if request["method"] != "subscribe"
-        || request["params"]["channel"] != "book"
-        || request["params"]["depth"] != 10
-        || request["params"]["snapshot"] != true
-        || request["params"]["symbol"] != serde_json::json!(["BTC/USD"])
+        || params.get("snapshot") != Some(&serde_json::Value::Bool(true))
+        || params.get("symbol") != Some(&serde_json::json!(["BTC/USD"]))
     {
         return Err("Kraken source sent a mismatched production subscription".into());
     }
-    Ok(socket)
+    Ok((socket, channel))
 }
 
-fn current_kraken_frames() -> TestResult<(String, String)> {
+#[derive(Clone, Debug)]
+struct KrakenTestFrames {
+    book_acknowledgement: String,
+    book_snapshot: String,
+    trade_acknowledgement: String,
+    trade_snapshot: String,
+}
+
+fn current_kraken_frames() -> TestResult<KrakenTestFrames> {
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
-    let acknowledgement = serde_json::json!({
+    let book_acknowledgement = serde_json::json!({
         "method": "subscribe",
         "result": {
             "channel": "book",
@@ -554,8 +896,40 @@ fn current_kraken_frames() -> TestResult<(String, String)> {
     let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../../adapters/market-squawk-adapter-kraken/fixtures/official_book_checksum.json"
     ))?;
-    snapshot["data"][0]["timestamp"] = serde_json::Value::String(now);
-    Ok((acknowledgement, snapshot.to_string()))
+    snapshot["data"][0]["timestamp"] = serde_json::Value::String(now.clone());
+    let trade_acknowledgement = serde_json::json!({
+        "method": "subscribe",
+        "result": {
+            "channel": "trade",
+            "snapshot": true,
+            "symbol": "BTC/USD",
+            "warnings": []
+        },
+        "success": true,
+        "time_in": now.clone(),
+        "time_out": now.clone()
+    })
+    .to_string();
+    let trade_snapshot = serde_json::json!({
+        "channel": "trade",
+        "type": "snapshot",
+        "data": [{
+            "symbol": "BTC/USD",
+            "side": "buy",
+            "price": "45283.5",
+            "qty": "0.001",
+            "ord_type": "market",
+            "trade_id": 1001,
+            "timestamp": now
+        }]
+    })
+    .to_string();
+    Ok(KrakenTestFrames {
+        book_acknowledgement,
+        book_snapshot: snapshot.to_string(),
+        trade_acknowledgement,
+        trade_snapshot,
+    })
 }
 
 fn kraken_config(data_dir: &std::path::Path) -> TestResult<AppConfig> {
