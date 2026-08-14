@@ -104,6 +104,10 @@ pub enum CapacityUnit {
     Requests,
     /// Provider symbols.
     Symbols,
+    /// Requested market-session segments.
+    MarketSegments,
+    /// Instrument/reference lookup keys.
+    LookupKeys,
     /// Option contracts.
     OptionContracts,
     /// Historical candles.

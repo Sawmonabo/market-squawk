@@ -7,16 +7,39 @@
 
 #![forbid(unsafe_code)]
 
+mod authority;
 mod bounds;
+mod callback;
+mod canonical;
 mod error;
 mod oauth;
 mod rest;
 mod streamer;
 mod transport;
+mod vertical;
 
+pub use authority::{
+    ProtectedSchwabOAuthAuthority, ReqwestSchwabOAuthWire, SchwabOAuthAuthorityConfiguration,
+    SchwabOAuthAuthorityError, SchwabOAuthAuthorityReceipt, SchwabOAuthAuthorityStatus,
+    SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire, SchwabOAuthWireBounds,
+    SchwabOAuthWireError, SchwabOAuthWireRequest, SchwabOAuthWireResponse,
+};
 pub use bounds::{
     AdaptiveAssessment, CapacityCounters, CapacityObservation, CapacityUnit, ParseBounds,
     RequestAdmission,
+};
+pub use callback::{
+    OAuthLoopbackBounds, OAuthLoopbackError, OAuthLoopbackReceiver, OAuthLoopbackTlsAcceptError,
+    OAuthLoopbackTlsAcceptFuture, OAuthLoopbackTlsAcceptor, OAuthLoopbackTlsStream,
+};
+pub use canonical::{
+    SchwabCanonicalError, SchwabCanonicalField, SchwabCanonicalStreamerField,
+    SchwabCanonicalStreamerRecord, SchwabHistoricalBarContext, SchwabInstrumentCandidate,
+    SchwabOptionCandidateAbstention, SchwabOptionCandidateOutcome, SchwabOptionSnapshotCandidate,
+    SchwabQuoteAbstention, SchwabQuoteCanonicalOutcome, SchwabResolvedProviderIdentity,
+    SchwabStreamerFieldDictionary, SchwabStreamerSemanticField, canonicalize_instrument_candidates,
+    canonicalize_option_chain, canonicalize_price_history, canonicalize_quote,
+    canonicalize_streamer_batch, canonicalize_streamer_quote_record,
 };
 pub use error::SchwabAdapterError;
 pub use oauth::{
@@ -59,6 +82,12 @@ pub use transport::{
     SchwabTransportTelemetrySnapshot, StreamerCaptureSink, StreamerCaptureSinkError,
     StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit, StreamerTransportBounds,
     TokenAuthorityError, TransientAccessToken,
+};
+pub use vertical::{
+    SchwabActivationLease, SchwabDataUsePurpose, SchwabDoctorDisposition, SchwabDoctorObservation,
+    SchwabOwnerUseAuthorization, SchwabProviderCurrentness, SchwabProviderPublication,
+    SchwabProviderQuery, SchwabPublicationFamily, SchwabPublishedRecord,
+    SchwabRestCapacityEvidence, SchwabVerticalError,
 };
 
 /// Exact Schwab OAuth authorization endpoint.

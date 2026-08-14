@@ -4,6 +4,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
+use sha2::{Digest as _, Sha256};
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -14,6 +15,8 @@ use crate::rest::{
 use crate::{ParseBounds, RequestAdmission, SchwabAdapterError};
 
 const MAX_BOOTSTRAP_VALUE_BYTES: usize = 4 * 1024;
+const MARKET_DATA_PRINCIPAL_DIGEST_DOMAIN: &[u8] =
+    b"market-squawk/schwab-market-data-principal/v1\0";
 
 /// Runtime admission for one Streamer generation.
 ///
@@ -52,6 +55,7 @@ impl StreamerAdmission {
 /// Minimum read-only Streamer connection coordinates.
 pub struct StreamerBootstrap {
     socket_url: Box<str>,
+    market_data_principal_sha256: [u8; 32],
     customer_id: Zeroizing<String>,
     correlation_id: Zeroizing<String>,
     channel: Zeroizing<String>,
@@ -63,6 +67,14 @@ pub struct StreamerBootstrap {
 impl StreamerBootstrap {
     pub fn socket_url(&self) -> &str {
         &self.socket_url
+    }
+    /// Stable, one-way binding for the Schwab market-data principal selected by OAuth.
+    ///
+    /// The provider customer identifier itself remains zeroizing and unobservable. This digest is
+    /// suitable for collision/currentness evidence; it grants no account, order, or trading
+    /// authority.
+    pub const fn market_data_principal_sha256(&self) -> [u8; 32] {
+        self.market_data_principal_sha256
     }
     pub fn market_data_permission(&self) -> Option<&str> {
         self.market_data_permission.as_deref()
@@ -116,6 +128,7 @@ pub fn parse_user_preference(
     validate_bootstrap_value(&correlation_id)?;
     validate_bootstrap_value(&channel)?;
     validate_bootstrap_value(&function_id)?;
+    let market_data_principal_sha256 = market_data_principal_digest(&customer_id);
     record_remaining(&info, "$.streamerInfo[0]", &mut context)?;
 
     let mut market_data_permission = None;
@@ -141,6 +154,7 @@ pub fn parse_user_preference(
         context.finish(),
         StreamerBootstrap {
             socket_url: socket_url.into_boxed_str(),
+            market_data_principal_sha256,
             customer_id: Zeroizing::new(customer_id),
             correlation_id: Zeroizing::new(correlation_id),
             channel: Zeroizing::new(channel),
@@ -149,6 +163,14 @@ pub fn parse_user_preference(
             level_two_permission,
         },
     ))
+}
+
+fn market_data_principal_digest(customer_id: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(MARKET_DATA_PRINCIPAL_DIGEST_DOMAIN);
+    hasher.update((customer_id.len() as u64).to_be_bytes());
+    hasher.update(customer_id.as_bytes());
+    hasher.finalize().into()
 }
 
 /// Selected market-data-only Streamer services. `ACCOUNT_ACTIVITY` is unrepresentable.
@@ -375,11 +397,11 @@ impl DesiredStateController {
         &mut self,
         addition: StreamerSubscription,
     ) -> Result<Option<TransientStreamerRequest>, SchwabAdapterError> {
-        let request = if matches!(self.state, ConnectionState::Active(_)) {
-            Some(self.subscription_request(&addition, StreamerCommand::Add)?)
-        } else {
-            None
-        };
+        if !self.desired.contains_key(&addition.service)
+            && self.desired.len() >= self.admission.max_services()
+        {
+            return Err(SchwabAdapterError::RequestNotAdmitted);
+        }
         let combined = match self.desired.get(&addition.service) {
             Some(existing) => {
                 let mut keys = existing.keys.clone();
@@ -393,7 +415,12 @@ impl DesiredStateController {
                     self.admission,
                 )?
             }
-            None => addition,
+            None => addition.clone(),
+        };
+        let request = if matches!(self.state, ConnectionState::Active(_)) {
+            Some(self.subscription_request(&addition, StreamerCommand::Add)?)
+        } else {
+            None
         };
         self.desired.insert(combined.service, combined);
         Ok(request)

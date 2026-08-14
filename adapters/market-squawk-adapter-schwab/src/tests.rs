@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use market_squawk_domain::{MetadataRevision, SourceId, SourceIdentifier};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -17,13 +19,16 @@ use crate::{
     HttpMethod, InboundStreamerFrame, MarketDataService, OAuthCallback, ParseBounds,
     ProviderIdentifier, QuoteRequest, ReadOnlyRoute, RefreshTokenGeneration, RequestAdmission,
     ResponseHeaderEvidence, RestExecutionOutcome, RestTransportBounds, SchwabAccessTokenSource,
-    SchwabAdapterError, SchwabCaptureCoordinates, SchwabHttpWire, SchwabHttpWireRequest,
-    SchwabHttpWireResponse, SchwabRestExecutor, SchwabStreamerConnection, SchwabStreamerConnector,
-    SchwabStreamerExecutor, SchwabTransportError, SchwabTransportTelemetry, StreamerAdmission,
+    SchwabAdapterError, SchwabCanonicalError, SchwabCaptureCoordinates, SchwabDataUsePurpose,
+    SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse, SchwabOptionCandidateOutcome,
+    SchwabOwnerUseAuthorization, SchwabRestExecutor, SchwabStreamerConnection,
+    SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFieldDictionary,
+    SchwabStreamerSemanticField, SchwabTransportError, SchwabTransportTelemetry, StreamerAdmission,
     StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerResponseCode,
     StreamerSubscription, StreamerTransportBounds, TokenAuthorityError, TokenDecision,
-    TransientAccessToken, parse_option_chain_response, parse_quote_response, parse_streamer_frame,
-    parse_token_response, parse_user_preference,
+    TransientAccessToken, canonicalize_option_chain, canonicalize_streamer_batch,
+    parse_option_chain_response, parse_quote_response, parse_streamer_frame, parse_token_response,
+    parse_user_preference,
 };
 
 fn nonzero(value: usize) -> NonZeroUsize {
@@ -64,6 +69,14 @@ fn oauth_lifecycle_and_read_only_route_allowlist_fail_closed() {
     assert!(matches!(
         OAuthCallback::parse(
             "https://localhost:8182/?code=one-time&state=correlation",
+            "correlation",
+            admission(),
+        ),
+        Err(SchwabAdapterError::InvalidCallback)
+    ));
+    assert!(matches!(
+        OAuthCallback::parse(
+            "https://127.0.0.1:8182/?code=one-time&state=correlation&error_description=mixed",
             "correlation",
             admission(),
         ),
@@ -120,6 +133,23 @@ fn oauth_lifecycle_and_read_only_route_allowlist_fail_closed() {
         ReadOnlyRoute::classify(HttpMethod::Post, quote.request().url()),
         Err(SchwabAdapterError::RouteNotAllowed)
     );
+    for forbidden in [
+        "https://api.schwabapi.com/trader/v1/accounts/1/positions",
+        "https://api.schwabapi.com/trader/v1/accounts/1/transactions",
+        "https://api.schwabapi.com/trader/v1/accounts/1/orders/preview",
+        "https://api.schwabapi.com/trader/v1/accounts/1/orders/replace",
+        "https://api.schwabapi.com/trader/v1/accounts/1/orders/cancel",
+        "https://api.schwabapi.com/trader/v1/accounts/1/money-movements",
+    ] {
+        assert_eq!(
+            ReadOnlyRoute::classify(HttpMethod::Get, forbidden),
+            Err(SchwabAdapterError::RouteNotAllowed)
+        );
+        assert_eq!(
+            ReadOnlyRoute::classify(HttpMethod::Post, forbidden),
+            Err(SchwabAdapterError::RouteNotAllowed)
+        );
+    }
     let chain = ChainRequest::new(
         ProviderIdentifier::try_new("SPY").unwrap_or_else(|error| panic!("symbol: {error}")),
     )
@@ -156,6 +186,17 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
     let parsed_chain = parse_option_chain_response(chain, bounds())
         .unwrap_or_else(|error| panic!("chain payload: {error}"));
     assert_eq!(parsed_chain.value().contracts().len(), 2);
+    let option_candidates = canonicalize_option_chain(
+        &parsed_chain,
+        Timestamp::from_unix_nanos(1_710_000_000_000_000_000),
+    )
+    .unwrap_or_else(|error| panic!("option canonicalization: {error}"));
+    assert_eq!(option_candidates.len(), 2);
+    assert!(
+        option_candidates
+            .iter()
+            .all(|value| matches!(value, SchwabOptionCandidateOutcome::Mapped(_)))
+    );
 
     let preference = br#"{
       "accounts":[{"accountNumber":"must-not-escape"}],
@@ -169,6 +210,7 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
         "wss://streamer.example.test/ws"
     );
     assert_eq!(bootstrap.value().market_data_permission(), Some("NP"));
+    assert_ne!(bootstrap.value().market_data_principal_sha256(), [0; 32]);
     assert!(bootstrap.unknown_fields().field_count() >= 2);
 
     let stream = br#"{
@@ -182,6 +224,33 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
         StreamerResponseCode::Success
     );
     assert_eq!(frame.value().data[0].content[0].fields.len(), 2);
+    let dictionary = SchwabStreamerFieldDictionary::try_new(
+        MarketDataService::LevelOneEquities,
+        SourceIdentifier::try_from("schwab-streamer-test-fixture-v1")
+            .unwrap_or_else(|error| panic!("dictionary version: {error}")),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [7; 32]),
+        vec![
+            (1, SchwabStreamerSemanticField::BidPrice),
+            (2, SchwabStreamerSemanticField::AskPrice),
+        ],
+    )
+    .unwrap_or_else(|error| panic!("dictionary: {error}"));
+    let mapped = canonicalize_streamer_batch(&frame.value().data[0], &dictionary)
+        .unwrap_or_else(|error| panic!("stream canonicalization: {error}"));
+    assert_eq!(mapped.len(), 1);
+    assert_eq!(mapped[0].fields.len(), 2);
+    let incomplete_dictionary = SchwabStreamerFieldDictionary::try_new(
+        MarketDataService::LevelOneEquities,
+        SourceIdentifier::try_from("schwab-streamer-test-fixture-v2")
+            .unwrap_or_else(|error| panic!("dictionary version: {error}")),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [8; 32]),
+        vec![(1, SchwabStreamerSemanticField::BidPrice)],
+    )
+    .unwrap_or_else(|error| panic!("dictionary: {error}"));
+    assert_eq!(
+        canonicalize_streamer_batch(&frame.value().data[0], &incomplete_dictionary),
+        Err(SchwabCanonicalError::UnknownStreamerField { field_id: 2 })
+    );
 
     let stream_admission = StreamerAdmission::new(admission(), nonzero(4), nonzero(16));
     let subscription = StreamerSubscription::try_new(
@@ -211,6 +280,50 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].command(), "SUBS");
     assert!(!String::from_utf8_lossy(requests[0].expose_body()).contains("ACCOUNT_ACTIVITY"));
+
+    let one_service_admission = StreamerAdmission::new(admission(), nonzero(1), nonzero(16));
+    let mut bounded = DesiredStateController::new(one_service_admission);
+    bounded
+        .add_desired(
+            StreamerSubscription::try_new(
+                MarketDataService::LevelOneEquities,
+                vec![
+                    ProviderIdentifier::try_new("AAPL")
+                        .unwrap_or_else(|error| panic!("symbol: {error}")),
+                ],
+                vec![1],
+                one_service_admission,
+            )
+            .unwrap_or_else(|error| panic!("subscription: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("first service: {error}"));
+    assert!(matches!(
+        bounded.add_desired(
+            StreamerSubscription::try_new(
+                MarketDataService::LevelOneOptions,
+                vec![
+                    ProviderIdentifier::try_new("SPY  260821C00500000")
+                        .unwrap_or_else(|error| panic!("option symbol: {error}"))
+                ],
+                vec![1],
+                one_service_admission,
+            )
+            .unwrap_or_else(|error| panic!("subscription: {error}")),
+        ),
+        Err(SchwabAdapterError::RequestNotAdmitted)
+    ));
+
+    let use_authorization = SchwabOwnerUseAuthorization::OWNER_PRIVATE_RESEARCH;
+    assert!(use_authorization.private_retrieval());
+    assert!(use_authorization.persistence());
+    assert!(use_authorization.backtesting());
+    assert!(use_authorization.forecasting());
+    assert!(use_authorization.model_training_and_operation());
+    assert!(!use_authorization.sale());
+    assert!(!use_authorization.redistribution());
+    assert!(use_authorization.allows(SchwabDataUsePurpose::Backtesting));
+    assert!(!use_authorization.allows(SchwabDataUsePurpose::Sale));
+    assert!(!use_authorization.allows(SchwabDataUsePurpose::Redistribution));
 }
 
 #[tokio::test]

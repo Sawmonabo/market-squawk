@@ -217,9 +217,9 @@ impl OAuthCallback {
         if !constant_time_equal(returned_state.as_bytes(), expected_state.as_bytes()) {
             return Err(SchwabAdapterError::InvalidCallback);
         }
-        match (code, error) {
-            (Some(code), None) => Ok(CallbackOutcome::Authorized(Self { code, session })),
-            (None, Some(error)) if session.is_none() => Ok(CallbackOutcome::Denied {
+        match (code, error, description) {
+            (Some(code), None, None) => Ok(CallbackOutcome::Authorized(Self { code, session })),
+            (None, Some(error), description) if session.is_none() => Ok(CallbackOutcome::Denied {
                 error: error.into_boxed_str(),
                 description: description.map(String::into_boxed_str),
             }),
