@@ -1,8 +1,8 @@
 use market_squawk_domain::{
-    AssetClass, ConnectionGeneration, Currency, DataQuality, ExecutionEligibility, InstrumentId,
-    MarketDepth, ProviderChannel, ProviderProduct, SourceId, SourceIdentifier, Timestamp, VenueId,
+    AssetClass, ConnectionGeneration, DataQuality, DigestAlgorithm, EvidenceDigest,
+    ExecutionEligibility, InstrumentId, MarketDepth, ProviderChannel, ProviderProduct, SourceId,
+    SourceIdentifier, Timestamp, VenueId,
 };
-use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use super::receipt::CandidateRejectionReason;
@@ -20,6 +20,26 @@ fn candidate(
     coverage: MarketCoverage,
     execution_eligibility: ExecutionEligibility,
 ) -> Result<SourceCandidate, Box<dyn std::error::Error>> {
+    candidate_for_definition(
+        provider,
+        observation,
+        timing,
+        quality,
+        coverage,
+        execution_eligibility,
+        Some(definition_revision_digest(0x11)),
+    )
+}
+
+fn candidate_for_definition(
+    provider: &str,
+    observation: &str,
+    timing: ObservationTiming,
+    quality: DataQuality,
+    coverage: MarketCoverage,
+    execution_eligibility: ExecutionEligibility,
+    definition_revision_digest: Option<EvidenceDigest>,
+) -> Result<SourceCandidate, Box<dyn std::error::Error>> {
     let operations = MarketOperationSet::try_new(&[
         MarketOperation::SnapshotDisplay,
         MarketOperation::AutomatedExecution,
@@ -32,6 +52,7 @@ fn candidate(
         Some(VenueId::try_from("venue")?),
         InstrumentId::try_from(Uuid::from_u128(1))?,
         source_identifier(observation)?,
+        definition_revision_digest,
     );
     let capabilities = CandidateCapabilities::try_new(
         AssetClass::Equity,
@@ -87,6 +108,13 @@ fn candidate(
 fn display_request(
     downgrade: DowngradePolicy,
 ) -> Result<MarketSelectionRequest, Box<dyn std::error::Error>> {
+    display_request_for_definition(downgrade, Some(definition_revision_digest(0x11)))
+}
+
+fn display_request_for_definition(
+    downgrade: DowngradePolicy,
+    definition_revision_digest: Option<EvidenceDigest>,
+) -> Result<MarketSelectionRequest, Box<dyn std::error::Error>> {
     Ok(MarketSelectionRequest::try_new(
         AssetClass::Equity,
         MarketOperation::SnapshotDisplay,
@@ -97,7 +125,12 @@ fn display_request(
         FreshnessRequirement::try_new(Timestamp::from_unix_nanos(100), FreshnessBasis::Source, 20)?,
         RequestPriority::Interactive,
         downgrade,
+        definition_revision_digest,
     )?)
+}
+
+const fn definition_revision_digest(byte: u8) -> EvidenceDigest {
+    EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32])
 }
 
 #[test]
@@ -161,6 +194,68 @@ fn selection_is_deterministic_downgrade_is_explicit_and_execution_fails_closed()
         ],
     )?;
     assert_eq!(repeated.selection_digest(), selection_digest);
+    assert_eq!(
+        repeated.definition_revision_digest(),
+        Some(definition_revision_digest(0x11))
+    );
+    let revised = select_market_source(
+        policy,
+        display_request_for_definition(
+            DowngradePolicy::deny(),
+            Some(definition_revision_digest(0x22)),
+        )?,
+        vec![
+            candidate_for_definition(
+                "alpha",
+                "observation-alpha",
+                ObservationTiming::RealTime,
+                DataQuality::DirectVerified,
+                MarketCoverage::Consolidated,
+                ExecutionEligibility::Eligible,
+                Some(definition_revision_digest(0x22)),
+            )?,
+            candidate_for_definition(
+                "beta",
+                "observation-beta",
+                ObservationTiming::RealTime,
+                DataQuality::DirectVerified,
+                MarketCoverage::Consolidated,
+                ExecutionEligibility::Eligible,
+                Some(definition_revision_digest(0x22)),
+            )?,
+        ],
+    )?;
+    assert_ne!(revised.selection_digest(), selection_digest);
+    assert!(matches!(
+        select_market_source(
+            policy,
+            display_request(DowngradePolicy::deny())?,
+            vec![candidate_for_definition(
+                "alpha",
+                "observation-alpha",
+                ObservationTiming::RealTime,
+                DataQuality::DirectVerified,
+                MarketCoverage::Consolidated,
+                ExecutionEligibility::Eligible,
+                Some(definition_revision_digest(0x22)),
+            )?],
+        ),
+        Err(MarketSelectionError::DefinitionRevisionMismatch)
+    ));
+    let unbound = select_market_source(
+        policy,
+        display_request_for_definition(DowngradePolicy::deny(), None)?,
+        vec![candidate_for_definition(
+            "alpha",
+            "observation-alpha",
+            ObservationTiming::RealTime,
+            DataQuality::DirectVerified,
+            MarketCoverage::Consolidated,
+            ExecutionEligibility::Eligible,
+            None,
+        )?],
+    )?;
+    assert_eq!(unbound.definition_revision_digest(), None);
     let tampered = select_market_source(
         policy,
         display_request(DowngradePolicy::deny())?,
@@ -193,52 +288,6 @@ fn selection_is_deterministic_downgrade_is_explicit_and_execution_fails_closed()
         selected_source,
         ConnectionGeneration::new(2)?
     ));
-    let usd = Currency::try_from("USD")?;
-    let mark_identity = |value, fresh_until, evidence_revision| {
-        super::investment::synthetic_mark_evidence_identity(
-            selected_source,
-            selection_digest,
-            selected.selected_at(),
-            value,
-            usd,
-            MarketInvestmentMarkBasis::FreshBidAskMidpoint,
-            fresh_until,
-            evidence_revision,
-        )
-    };
-    let exact_mark_identity = mark_identity(
-        Decimal::new(12_345, 2),
-        Some(Timestamp::from_unix_nanos(120)),
-        7,
-    )?;
-    assert_eq!(
-        mark_identity(
-            Decimal::new(123_450, 3),
-            Some(Timestamp::from_unix_nanos(120)),
-            7,
-        )?,
-        exact_mark_identity
-    );
-    assert_ne!(
-        mark_identity(
-            Decimal::new(12_345, 2),
-            Some(Timestamp::from_unix_nanos(120)),
-            8,
-        )?,
-        exact_mark_identity
-    );
-    assert_ne!(
-        mark_identity(
-            Decimal::new(12_345, 2),
-            Some(Timestamp::from_unix_nanos(121)),
-            7,
-        )?,
-        exact_mark_identity
-    );
-    assert_ne!(
-        mark_identity(Decimal::new(12_345, 2), None, 7)?,
-        exact_mark_identity
-    );
 
     let downgrade_policy = DowngradePolicy::try_new(
         &[ObservationTiming::Delayed],
@@ -295,6 +344,7 @@ fn selection_is_deterministic_downgrade_is_explicit_and_execution_fails_closed()
         FreshnessRequirement::try_new(Timestamp::from_unix_nanos(100), FreshnessBasis::Source, 20)?,
         RequestPriority::Foreground,
         unsafe_execution_downgrade,
+        Some(definition_revision_digest(0x11)),
     );
     assert_eq!(
         unsafe_execution,
@@ -311,6 +361,7 @@ fn selection_is_deterministic_downgrade_is_explicit_and_execution_fails_closed()
         FreshnessRequirement::try_new(Timestamp::from_unix_nanos(100), FreshnessBasis::Source, 20)?,
         RequestPriority::Foreground,
         DowngradePolicy::deny(),
+        Some(definition_revision_digest(0x11)),
     )?;
     let execution_denied = candidate(
         "execution-denied",

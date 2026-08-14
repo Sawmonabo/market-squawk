@@ -3039,6 +3039,10 @@ fn unified_market_rows() -> Value {
             ("lotSize", nullable(canonical_decimal_text())),
             ("executionTermsAvailable", boolean()),
             ("executionEligible", constant_bool(false)),
+            (
+                "definitionRevisionDigest",
+                nullable(nonzero_sha256_evidence_digest()),
+            ),
             ("referenceEvidence", nullable(market_reference_evidence())),
             (
                 "availability",
@@ -3068,11 +3072,8 @@ fn unified_market_rows() -> Value {
             ),
             ("quote", unified_market_quote()),
             ("orderBook", nullable(order_level_book())),
-            (
-                "analyticalReadiness",
-                enumeration(&["runtime_display_only", "durable_pit_available"]),
-            ),
-            ("marketObservation", market_investment_observation()),
+            ("analyticalReadiness", constant("runtime_display_only")),
+            ("marketObservation", unified_market_observation()),
             ("selectedSource", nullable(unified_selected_market_source())),
             (
                 "alternatives",
@@ -3096,6 +3097,7 @@ fn unified_market_rows() -> Value {
             "lotSize",
             "executionTermsAvailable",
             "executionEligible",
+            "definitionRevisionDigest",
             "referenceEvidence",
             "availability",
             "confidence",
@@ -4466,119 +4468,17 @@ fn order_level_order() -> Value {
     )
 }
 
-fn market_investment_observation() -> Value {
-    one_of(vec![
-        closed(
-            vec![
-                ("availability", constant("available")),
-                ("instrumentId", uuid()),
-                ("mark", market_investment_mark()),
-                ("selectionDigest", sha256_evidence_digest()),
-                ("selectedAt", canonical_market_timestamp()),
-                ("generation", nullable(positive_integer_text())),
-                ("quality", market_quality()),
-                ("depth", nullable(market_depth())),
-                ("coverage", market_coverage()),
-                ("integrity", market_integrity()),
-                ("features", market_feature_availability()),
-            ],
-            &[
-                "availability",
-                "instrumentId",
-                "mark",
-                "selectionDigest",
-                "selectedAt",
-                "generation",
-                "quality",
-                "depth",
-                "coverage",
-                "integrity",
-                "features",
-            ],
-        ),
-        closed(
-            vec![
-                ("availability", constant("unavailable")),
-                (
-                    "reason",
-                    enumeration(&[
-                        "no_eligible_source",
-                        "no_fresh_last_trade_or_midpoint",
-                        "durable_pit_evidence_not_established",
-                    ]),
-                ),
-            ],
-            &["availability", "reason"],
-        ),
-    ])
-}
-
-fn market_investment_mark() -> Value {
+fn unified_market_observation() -> Value {
     closed(
         vec![
-            ("value", canonical_decimal_text()),
+            ("availability", constant("unavailable")),
             (
-                "currency",
-                json!({"type": "string", "pattern": "^[A-Z]{3}$"}),
+                "reason",
+                enumeration(&["no_eligible_source", "durable_pit_evidence_not_established"]),
             ),
-            (
-                "basis",
-                enumeration(&["fresh_last_trade", "fresh_bid_ask_midpoint"]),
-            ),
-            ("evidenceIdentity", sha256_evidence_digest()),
-            ("freshUntil", nullable(canonical_market_timestamp())),
         ],
-        &[
-            "value",
-            "currency",
-            "basis",
-            "evidenceIdentity",
-            "freshUntil",
-        ],
+        &["availability", "reason"],
     )
-}
-
-fn market_feature_availability() -> Value {
-    one_of(vec![
-        closed(
-            vec![
-                ("availability", constant("available")),
-                ("sourceId", bounded_text(128)),
-                ("venueId", bounded_text(64)),
-                ("instrumentId", uuid()),
-                ("generation", positive_integer_text()),
-                ("availableAt", canonical_market_timestamp()),
-                ("contentDigest", evidence_digest()),
-                ("valueCount", bounded_unsigned(15)),
-            ],
-            &[
-                "availability",
-                "sourceId",
-                "venueId",
-                "instrumentId",
-                "generation",
-                "availableAt",
-                "contentDigest",
-                "valueCount",
-            ],
-        ),
-        closed(
-            vec![
-                ("availability", constant("unavailable")),
-                (
-                    "reason",
-                    enumeration(&[
-                        "source_does_not_publish_live_features",
-                        "incomplete_snapshot",
-                        "no_exact_source_generation",
-                        "available_after_selection",
-                        "incomplete_value_set",
-                    ]),
-                ),
-            ],
-            &["availability", "reason"],
-        ),
-    ])
 }
 
 fn market_selection_receipt() -> Value {
@@ -4588,6 +4488,10 @@ fn market_selection_receipt() -> Value {
             ("policyCandidateLimit", bounded_unsigned_range(1, 4_096)),
             ("policyDigest", sha256_evidence_digest()),
             ("selectionDigest", sha256_evidence_digest()),
+            (
+                "definitionRevisionDigest",
+                nullable(nonzero_sha256_evidence_digest()),
+            ),
             ("selectedAt", canonical_market_timestamp()),
             ("eligibleCount", bounded_unsigned(4_096)),
             ("rejectedCount", bounded_unsigned(4_096)),
@@ -4608,6 +4512,7 @@ fn market_selection_receipt() -> Value {
             "policyCandidateLimit",
             "policyDigest",
             "selectionDigest",
+            "definitionRevisionDigest",
             "selectedAt",
             "eligibleCount",
             "rejectedCount",
@@ -4685,6 +4590,26 @@ fn sha256_evidence_digest() -> Value {
             (
                 "bytes",
                 json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
+            ),
+        ],
+        &["algorithm", "bytes"],
+    )
+}
+
+fn nonzero_sha256_evidence_digest() -> Value {
+    closed(
+        vec![
+            ("algorithm", constant("sha256")),
+            (
+                "bytes",
+                json!({
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                    "not": {
+                        "type": "string",
+                        "const": "0000000000000000000000000000000000000000000000000000000000000000"
+                    }
+                }),
             ),
         ],
         &["algorithm", "bytes"],
@@ -4975,7 +4900,7 @@ fn market_field(name: &str) -> Value {
         | "matchKind"
         | "quoteAvailability" => text(),
         "book" | "quote" => record(),
-        "marketObservation" => market_investment_observation(),
+        "marketObservation" => unified_market_observation(),
         "selectionReceipt" => market_selection_receipt(),
         "bid" | "ask" | "selectedSource" | "orderBook" => nullable(record()),
         "observations" | "alternatives" => array(record()),

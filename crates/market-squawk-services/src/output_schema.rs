@@ -174,6 +174,7 @@ fn schema_definition_is_supported(schema: &Value, root: bool) -> bool {
                 | "maxProperties"
                 | "format"
                 | "pattern"
+                | "not"
                 | "description"
         )
     }) {
@@ -202,6 +203,9 @@ fn schema_definition_is_supported(schema: &Value, root: bool) -> bool {
         && schema
             .get("enum")
             .is_none_or(|values| values.as_array().is_some_and(|values| !values.is_empty()))
+        && schema
+            .get("not")
+            .is_none_or(|negated| schema_definition_is_supported(negated, false))
 }
 
 fn string_pattern_is_supported(schema: &Map<String, Value>, schema_type: &str) -> bool {
@@ -300,6 +304,12 @@ fn validate_instance(schema: &Value, value: &Value) -> bool {
             .get("enum")
             .and_then(Value::as_array)
             .is_some_and(|values| !values.contains(value))
+    {
+        return false;
+    }
+    if schema
+        .get("not")
+        .is_some_and(|negated| validate_instance(negated, value))
     {
         return false;
     }
@@ -531,6 +541,24 @@ mod tests {
         assert!(!validate_data(
             &sha256_schema,
             &json!("0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF")
+        ));
+
+        let nonzero_sha256_schema = json!({
+            "type": "string",
+            "pattern": LOWERCASE_SHA256_PATTERN,
+            "not": {
+                "type": "string",
+                "const": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+        });
+        assert!(validate_data_schema(&nonzero_sha256_schema));
+        assert!(validate_data(
+            &nonzero_sha256_schema,
+            &json!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        ));
+        assert!(!validate_data(
+            &nonzero_sha256_schema,
+            &json!("0000000000000000000000000000000000000000000000000000000000000000")
         ));
 
         let decimal_schema = json!({"type": "string", "pattern": CANONICAL_DECIMAL_PATTERN});

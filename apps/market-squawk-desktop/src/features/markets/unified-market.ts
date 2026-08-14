@@ -41,6 +41,11 @@ const sha256EvidenceDigestSchema = z
   })
   .strict()
 
+const definitionRevisionDigestSchema = sha256EvidenceDigestSchema.refine(
+  (digest) => digest.bytes !== "0".repeat(64),
+  { message: "definition revision digest must be nonzero" },
+)
+
 const marketTimingSchema = z.enum([
   "real_time",
   "delayed",
@@ -118,68 +123,15 @@ const referenceEvidenceSchema = z
     }
   })
 
-const marketFeatureAvailabilitySchema = z.discriminatedUnion("availability", [
-  z
-    .object({
-      availability: z.literal("available"),
-      sourceId: sourceIdSchema,
-      venueId: venueIdSchema,
-      instrumentId: z.string().uuid(),
-      generation: positiveIntegerTextSchema,
-      availableAt: timestampSchema,
-      contentDigest: evidenceDigestSchema,
-      valueCount: z.number().int().min(0).max(15),
-    })
-    .strict(),
-  z
-    .object({
-      availability: z.literal("unavailable"),
-      reason: z.enum([
-        "source_does_not_publish_live_features",
-        "incomplete_snapshot",
-        "no_exact_source_generation",
-        "available_after_selection",
-        "incomplete_value_set",
-      ]),
-    })
-    .strict(),
-])
-
-const marketInvestmentObservationSchema = z.discriminatedUnion("availability", [
-  z
-    .object({
-      availability: z.literal("available"),
-      instrumentId: z.string().uuid(),
-      mark: z
-        .object({
-          value: canonicalDecimalSchema,
-          currency: z.string().regex(/^[A-Z]{3}$/),
-          basis: z.enum(["fresh_last_trade", "fresh_bid_ask_midpoint"]),
-          evidenceIdentity: sha256EvidenceDigestSchema,
-          freshUntil: timestampSchema.nullable(),
-        })
-        .strict(),
-      selectionDigest: sha256EvidenceDigestSchema,
-      selectedAt: timestampSchema,
-      generation: positiveIntegerTextSchema.nullable(),
-      quality: marketQualitySchema,
-      depth: marketDepthSchema.nullable(),
-      coverage: marketCoverageSchema,
-      integrity: marketIntegritySchema,
-      features: marketFeatureAvailabilitySchema,
-    })
-    .strict(),
-  z
-    .object({
-      availability: z.literal("unavailable"),
-      reason: z.enum([
-        "no_eligible_source",
-        "no_fresh_last_trade_or_midpoint",
-        "durable_pit_evidence_not_established",
-      ]),
-    })
-    .strict(),
-])
+const unifiedMarketObservationSchema = z
+  .object({
+    availability: z.literal("unavailable"),
+    reason: z.enum([
+      "no_eligible_source",
+      "durable_pit_evidence_not_established",
+    ]),
+  })
+  .strict()
 
 const marketDowngradeDimensionSchema = z.discriminatedUnion("dimension", [
   z
@@ -234,6 +186,7 @@ const marketSelectionReceiptSchema = z
     policyCandidateLimit: z.number().int().min(1).max(4_096),
     policyDigest: sha256EvidenceDigestSchema,
     selectionDigest: sha256EvidenceDigestSchema,
+    definitionRevisionDigest: definitionRevisionDigestSchema.nullable(),
     selectedAt: timestampSchema,
     eligibleCount: z.number().int().min(0).max(4_096),
     rejectedCount: z.number().int().min(0).max(4_096),
@@ -1058,6 +1011,7 @@ export const unifiedMarketRowSchema = z
     lotSize: canonicalDecimalSchema.nullable(),
     executionTermsAvailable: z.boolean(),
     executionEligible: z.literal(false),
+    definitionRevisionDigest: definitionRevisionDigestSchema.nullable(),
     referenceEvidence: referenceEvidenceSchema.nullable(),
     availability: z.enum(["Live", "Delayed", "End of day", "Stored data", "Stale", "Unavailable"]),
     confidence: z.enum([
@@ -1074,11 +1028,8 @@ export const unifiedMarketRowSchema = z
     ]),
     quote: quoteSchema,
     orderBook: orderBookSchema.nullable(),
-    analyticalReadiness: z.enum([
-      "runtime_display_only",
-      "durable_pit_available",
-    ]),
-    marketObservation: marketInvestmentObservationSchema,
+    analyticalReadiness: z.literal("runtime_display_only"),
+    marketObservation: unifiedMarketObservationSchema,
     selectedSource: selectedSourceSchema.nullable(),
     alternatives: z.array(marketAlternativeSchema).max(8),
     selectionReceipt: marketSelectionReceiptSchema,
@@ -1341,12 +1292,36 @@ function crossBindDefinition(
   ) {
     context.addIssue({ code: "custom", message: "market-data definition binding mismatch" })
   }
+  const rowDefinitionDigest = row.definitionRevisionDigest
+  const receiptDefinitionDigest = row.selectionReceipt.definitionRevisionDigest
+  if (
+    (rowDefinitionDigest !== null) !== hasReference ||
+    (rowDefinitionDigest === null) !== (receiptDefinitionDigest === null) ||
+    rowDefinitionDigest?.algorithm !== receiptDefinitionDigest?.algorithm ||
+    rowDefinitionDigest?.bytes !== receiptDefinitionDigest?.bytes
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "definition revision digest binding mismatch",
+    })
+  }
   if (
     row.referenceEvidence &&
     (row.referenceEvidence.referenceRevision !== row.referenceRevision ||
       row.referenceEvidence.permanentFigi !== row.permanentFigi)
   ) {
     context.addIssue({ code: "custom", message: "reference evidence identity mismatch" })
+  }
+  if (
+    row.referenceEvidence &&
+    (row.referenceEvidence.effectiveFrom > row.selectionReceipt.selectedAt ||
+      (row.referenceEvidence.effectiveUntil !== null &&
+        row.selectionReceipt.selectedAt >= row.referenceEvidence.effectiveUntil))
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "market-data definition is not effective at selection time",
+    })
   }
   if (row.symbolKind === "permanent_figi" && row.symbol !== row.permanentFigi) {
     context.addIssue({ code: "custom", message: "permanent FIGI symbol mismatch" })
@@ -1363,23 +1338,13 @@ function crossBindSelection(
   const receipt = row.selectionReceipt
   const selected = row.selectedSource
   const observation = row.marketObservation
-  if (row.analyticalReadiness === "runtime_display_only") {
-    const expectedReason = selected
-      ? "durable_pit_evidence_not_established"
-      : "no_eligible_source"
-    if (
-      observation.availability !== "unavailable" ||
-      observation.reason !== expectedReason
-    ) {
-      context.addIssue({
-        code: "custom",
-        message: "runtime display analytical authority mismatch",
-      })
-    }
-  } else if (observation.availability !== "available" || !selected) {
+  const expectedObservationReason = selected
+    ? "durable_pit_evidence_not_established"
+    : "no_eligible_source"
+  if (observation.reason !== expectedObservationReason) {
     context.addIssue({
       code: "custom",
-      message: "durable point-in-time analytical authority mismatch",
+      message: "runtime display analytical authority mismatch",
     })
   }
   if (receipt.returnedAlternativeCount !== row.alternatives.length) {
@@ -1428,11 +1393,7 @@ function crossBindSelection(
   if (
     receipt.eligibleCount === 0 ||
     receipt.selectionClass === null ||
-    selected.integrity.connectionGeneration === null ||
-    receipt.selectionDigest.bytes !==
-      (row.marketObservation.availability === "available"
-        ? row.marketObservation.selectionDigest.bytes
-        : receipt.selectionDigest.bytes)
+    selected.integrity.connectionGeneration === null
   ) {
     context.addIssue({ code: "custom", message: "selected receipt binding mismatch" })
   }
@@ -1458,40 +1419,6 @@ function crossBindSelection(
   if ("selectedAt" in selected.freshness && selected.freshness.selectedAt !== receipt.selectedAt) {
     context.addIssue({ code: "custom", message: "selected timestamp mismatch" })
   }
-  if (row.marketObservation.availability === "available") {
-    const observation = row.marketObservation
-    const expectedMarkValue = observation.mark.basis === "fresh_last_trade"
-      ? row.quote.lastPrice
-      : row.quote.midPrice
-    if (
-      observation.instrumentId !== row.instrumentId ||
-      observation.mark.currency !== row.quoteCurrency ||
-      observation.mark.value !== expectedMarkValue ||
-      (observation.mark.basis === "fresh_last_trade" &&
-        row.quote.lastFreshAtSelection !== true) ||
-      (observation.mark.basis === "fresh_bid_ask_midpoint" &&
-        !selected.freshness.freshAtSelection) ||
-      observation.selectionDigest.bytes !== receipt.selectionDigest.bytes ||
-      observation.selectedAt !== receipt.selectedAt ||
-      observation.quality !== selected.quality ||
-      observation.depth !== selected.depth ||
-      observation.coverage !== selected.coverage ||
-      observation.integrity !== selected.integrity.state ||
-      observation.generation !== selected.integrity.connectionGeneration
-    ) {
-      context.addIssue({ code: "custom", message: "market observation binding mismatch" })
-    }
-    if (
-      observation.features.availability === "available" &&
-      (observation.features.instrumentId !== row.instrumentId ||
-        observation.features.sourceId !== selected.sourceId ||
-        observation.features.venueId !== selected.venueId ||
-        observation.features.generation !== selected.integrity.connectionGeneration)
-    ) {
-      context.addIssue({ code: "custom", message: "market feature identity mismatch" })
-    }
-  }
-
   if ("shardId" in selected) {
     if (
       row.quote.quoteEvidence !== null ||

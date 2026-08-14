@@ -1113,6 +1113,16 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
     assert_eq!(row["analyticalReadiness"], "runtime_display_only");
     assert!(row["orderBook"].is_null());
     required_nonempty_string(&row["permanentFigi"], "Alpaca overview permanent FIGI")?;
+    let definition_revision_digest = &row["definitionRevisionDigest"];
+    assert_eq!(definition_revision_digest["algorithm"], "sha256");
+    required_sha256(
+        &definition_revision_digest["bytes"],
+        "Alpaca overview definition revision digest",
+    )?;
+    assert_eq!(
+        &row["selectionReceipt"]["definitionRevisionDigest"],
+        definition_revision_digest
+    );
     let instrument_id =
         required_uuid_string(&row["instrumentId"], "selected Alpaca overview instrument")?;
     let stable_identity = json!({
@@ -1121,6 +1131,7 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
         "assetClass": row["assetClass"],
         "quoteCurrency": row["quoteCurrency"],
         "definitionKind": row["definitionKind"],
+        "definitionRevisionDigest": definition_revision_digest,
         "referenceRevision": row["referenceRevision"],
         "permanentFigi": row["permanentFigi"],
         "executionEligible": row["executionEligible"],
@@ -1191,30 +1202,15 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
 
 fn assert_real_alpaca_mcp_market(result: &Value, expected: &RealAlpacaEvidence) -> TestResult {
     let data = &result["data"];
-    if data.is_null() {
-        let metadata = &result["metadata"];
-        assert_eq!(metadata["completeness"], "complete");
-        assert_eq!(metadata["returnedItems"], 0);
-        assert_eq!(metadata["availableItems"], 0);
-        assert_eq!(
-            metadata["sourceCoverage"]["listedRequestedSources"],
-            json!([REAL_ALPACA_SURFACE])
+    let rows = data
+        .as_array()
+        .context("MCP Alpaca Market read omitted the canonical row proven by the native read")?;
+    if rows.len() != 1 {
+        anyhow::bail!(
+            "MCP Alpaca Market exact-instrument read returned {} rows instead of the canonical {} row",
+            rows.len(),
+            REAL_ALPACA_OVERVIEW_SYMBOL,
         );
-        assert_eq!(
-            metadata["sourceCoverage"]["listedRequestedSourcesComplete"],
-            true
-        );
-        assert_eq!(
-            metadata["sourceCoverage"]["availability"],
-            "no_current_observation"
-        );
-        assert_eq!(metadata["dataQuality"]["summarizedObservationCount"], 0);
-        assert_eq!(metadata["dataQuality"]["displayObservationCount"], 0);
-        assert_eq!(
-            metadata["dataQuality"]["krakenOrderLevelProjectionCount"],
-            0
-        );
-        return Ok(());
     }
     let observed = real_alpaca_market_observation(data)?;
     assert_eq!(observed.instrument_id, expected.instrument_id);

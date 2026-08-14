@@ -31,6 +31,11 @@ pub(crate) fn select_market_source(
             actual: candidates.len(),
         });
     }
+    if candidates.iter().any(|candidate| {
+        candidate.identity().definition_revision_digest() != request.definition_revision_digest()
+    }) {
+        return Err(MarketSelectionError::DefinitionRevisionMismatch);
+    }
 
     candidates.sort_unstable_by(|left, right| left.identity().stable_cmp(right.identity()));
     if candidates

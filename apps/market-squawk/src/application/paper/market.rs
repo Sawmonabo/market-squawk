@@ -9,11 +9,14 @@ use std::{cmp::Ordering, fmt, num::NonZeroUsize, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use market_squawk_data::{InstrumentDefinitionReadCapability, MarketDataInstrumentReadCapability};
+use market_squawk_data::{
+    InstrumentDefinitionReadCapability, MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS,
+    MarketDataInstrumentPopulationDisposition, MarketDataInstrumentPopulationQuery,
+    MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
+};
 use market_squawk_domain::{
-    AssetClass, CoverageDelay, DataQuality, EvidenceDigest, InstrumentDefinition, InstrumentId,
-    LiveEventClass, MarketDataInstrumentDefinition, MarketDepth, SourceId, SourceIdentifier,
-    Timestamp, VenueId,
+    AssetClass, CoverageDelay, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentDefinition,
+    InstrumentId, LiveEventClass, MarketDepth, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_live::{
     RouteSnapshot, ShardSnapshot, SnapshotCompleteness, SnapshotDimension, StreamSnapshot,
@@ -348,10 +351,11 @@ impl ApplicationDomainService for MarketDomainService {
                     &kraken_price_projections,
                     &context,
                 )?;
-                let market_data_definitions = load_market_data_instrument_definitions(
+                let market_data_records = load_market_data_instrument_records(
                     &self.market_data_instruments,
                     &display_instrument_ids,
                     &display_batches,
+                    reference_at,
                     &context,
                 )?;
                 let order_level = load_order_level_snapshots(
@@ -379,7 +383,7 @@ impl ApplicationDomainService for MarketDomainService {
                     &streams,
                     &filters,
                     &definitions,
-                    &market_data_definitions,
+                    &market_data_records,
                     &display_snapshots,
                     &kraken_projection_refs,
                     &surface_policies,
@@ -605,48 +609,92 @@ fn kraken_projection_refs(
     Ok(references)
 }
 
-fn load_market_data_instrument_definitions(
+fn load_market_data_instrument_records(
     reader: &MarketDataInstrumentReadCapability,
     instrument_ids: &[InstrumentId],
     display_batches: &[MarketDisplaySnapshotBatch],
+    reference_at: Timestamp,
     context: &RequestContext,
-) -> Result<Vec<MarketDataInstrumentDefinition>, ServiceError> {
+) -> Result<Vec<MarketDataInstrumentRecord>, ServiceError> {
     if display_batches.len() != instrument_ids.len() {
         return Err(ServiceError::Unavailable);
     }
-    let mut definitions = Vec::new();
-    definitions
+    if instrument_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(ServiceError::InvalidResult);
+    }
+    let mut records = Vec::new();
+    records
         .try_reserve_exact(instrument_ids.len())
         .map_err(|_error| ServiceError::ResourceExhausted)?;
-    for (index, instrument_id) in instrument_ids.iter().enumerate() {
+    for instrument_chunk in instrument_ids.chunks(MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS) {
         ensure_live(context)?;
-        let record = reader
-            .latest(*instrument_id, context.deadline(), context.cancellation())
+        let mut query_instrument_ids = Vec::new();
+        query_instrument_ids
+            .try_reserve_exact(instrument_chunk.len())
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        query_instrument_ids.extend_from_slice(instrument_chunk);
+        let query = MarketDataInstrumentPopulationQuery::try_new(
+            query_instrument_ids,
+            reference_at,
+            reference_at,
+        )
+        .map_err(|error| {
+            tracing::error!(%error, "unified Markets market-data definition query failed");
+            ServiceError::InvalidResult
+        })?;
+        let selection = reader
+            .pin_population_as_of(query, context.deadline(), context.cancellation())
             .map_err(|error| {
-                tracing::error!(%error, "unified Markets market-data definition read failed");
+                tracing::error!(%error, "unified Markets market-data definition PIT read failed");
                 ServiceError::Unavailable
-            })?
-            .ok_or(ServiceError::Unavailable)?;
+            })?;
+        if selection.disposition() != MarketDataInstrumentPopulationDisposition::Complete {
+            return Err(ServiceError::Unavailable);
+        }
+        if selection.query().knowledge_at() != reference_at
+            || selection.query().effective_at() != reference_at
+            || selection.query().instrument_ids() != instrument_chunk
+            || !selection.exclusions().is_empty()
+            || selection.records().len() != instrument_chunk.len()
+            || selection
+                .records()
+                .iter()
+                .zip(instrument_chunk)
+                .any(|(record, expected)| record.definition().instrument_id() != *expected)
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        records.extend(selection.records().iter().cloned());
+    }
+    if records.len() != instrument_ids.len() {
+        return Err(ServiceError::InvalidResult);
+    }
+    for (index, (record, instrument_id)) in records.iter().zip(instrument_ids).enumerate() {
+        ensure_live(context)?;
+        let definition = record.definition();
+        let interval = definition.effective_interval();
+        if definition.instrument_id() != *instrument_id
+            || record.published_at() > reference_at
+            || interval.starts_at() > reference_at
+            || interval.ends_at().is_some_and(|end| reference_at >= end)
+            || record.revision_digest().algorithm() != DigestAlgorithm::Sha256
+            || record.revision_digest().bytes() == [0; 32]
+        {
+            return Err(ServiceError::Unavailable);
+        }
         let batch = display_batches
             .get(index)
             .ok_or(ServiceError::Unavailable)?;
         if batch.snapshots().is_empty()
             || batch.snapshots().iter().any(|snapshot| {
                 snapshot.lease().key().instrument_id() != *instrument_id
-                    || !snapshot.matches_definition_record(&record)
+                    || !snapshot.matches_definition_record(record)
             })
         {
             return Err(ServiceError::Unavailable);
         }
-        definitions.push(record.definition().clone());
     }
-    if definitions
-        .windows(2)
-        .any(|pair| pair[0].instrument_id() >= pair[1].instrument_id())
-    {
-        return Err(ServiceError::InvalidResult);
-    }
-    Ok(definitions)
+    Ok(records)
 }
 
 async fn load_kraken_price_projections(
