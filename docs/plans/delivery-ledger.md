@@ -1673,3 +1673,68 @@ installed-service journey and grouped Desktop journey proving the real read path
 entitlement remains a later separately authorized provider smoke; historical/PIT product
 publication, models, forecasting, valuation, recommendation, backtesting, portfolio/risk, and the
 complete novice decision journey remain release blockers after this current-market slice.
+
+## 2026-08-14 real Alpaca and strict Markets working-candidate checkpoint
+
+This entry supersedes only the stale *next-barrier* statement at the end of the 2026-08-13 entry;
+it does not rewrite that historical checkpoint. Work began from frozen pushed base
+`ca0601a5969b0e23bdc99c870b2cb4b8dc879ab9`. The evidence below was produced from the current
+working-tree candidate layered on that base and is therefore focused dirty-candidate evidence, not
+clean exact-head approval.
+
+**Integrated code commit: `f2d6f3b7` (`feat: wire real Alpaca market dashboard`).** The following
+ledger-only commit records that code checkpoint; any approval claim must use the final clean,
+unchanged ledger head rather than infer authority from the earlier working tree.
+
+The current candidate replaces the proposed scripted-fixture barrier with the protected production
+Alpaca Paper/IEX path. The application performs the bounded real REST boot snapshot before its real
+WebSocket session, requires the exact IEX subscription acknowledgement, retains raw capture and
+freshness/currentness authority, projects the active account group through the Source lifecycle,
+and preserves a canonical unavailable Market row when after-hours data is not current. The
+protected journey imported the configured credential bundle, ran all five real doctor probes,
+started the source, queried the same Market authority through native and MCP clients, shut down,
+reopened the same root, and queried native and MCP again. The after-hours execution observed the
+truthful unavailable branch; it did not substitute a fixture, stub, fake provider, or scripted
+market response.
+
+The Desktop and Rust wires now use closed schemas for the unified feed, secondary trade/quote/book/
+comparison detail, and Source status/coverage/health. Source lifecycle status is the sole
+operational authority, while coverage and health can enrich only exact matching status rows. Live
+quotes and books remain visible, but current hot rows are explicitly
+`runtime_display_only`, `executionEligible: false`, and unavailable for investment analysis until
+durable point-in-time evidence exists. Exact instrument-definition evidence, reference identity,
+effective interval, revision, and definition digest stay bound through selection. A live hot source
+cannot mint durable investment, feature, portfolio-mark, recommendation, backtest, forecast, or
+execution authority.
+
+Tradier is unselected and removed from shipped application discovery, credential import,
+onboarding, activation, configuration, runtime, display, lifecycle, restore, and Desktop controls.
+The public Coinbase Advanced Trade and public Kraken Spot sources remain selected no-key crypto-only
+specialists; optional authenticated Coinbase Direct remains a separate crypto complement. None of
+those crypto sources is represented as stock, ETF, index, bond, mutual-fund, or REIT breadth, and
+this focused Alpaca journey is not fresh release proof for them.
+
+Focused working-candidate gates completed:
+
+- `CARGO_INCREMENTAL=0 cargo +1.97.1 check --locked -p market-squawk --lib` passed; only the
+  existing warning backlog remained.
+- `cargo +1.97.1 fmt --all -- --check` and `git diff --check` passed.
+- The existing exact Alpaca doctor-receipt/current-generation renewal case passed 1/1.
+- The existing protected production journey passed 1/1 with 31 filtered cases: protected import,
+  five real probes, `Source.Start`, native Market read, MCP Market read, shutdown/restart, and both
+  reads again.
+- Desktop TypeScript compilation passed, and the narrow existing grouped selector passed 2 cases
+  with 5 skipped.
+
+No broad workspace suite, CI/CD workflow, release build, package matrix, source-lock refresh,
+Quarter 4 review, or clean exact-head release gate ran. These focused results prove only the current
+Alpaca/display slice. Final checkpoint authority remains pending the root-filled commit, unchanged-
+head verification, and the applicable grouped review.
+
+The next barrier is not a fixture. It is application-owned durable Alpaca daily-history and market-
+calendar publication through the existing capture/catalog/storage authorities, followed by a
+manifest-pinned `Market.GetHistory` read and the Desktop chart composition over that exact immutable
+generation. The following dependency is a separately sealed forward live-event archive. Only real
+publication-time evidence accumulated by those durable paths may unlock genuine point-in-time
+features, backtests, forecasts, recommendations and track records; first-observed-now history can
+support current charts and research but cannot be presented as retrospective PIT evidence.
