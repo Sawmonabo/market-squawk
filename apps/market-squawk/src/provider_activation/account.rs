@@ -15,25 +15,18 @@ use crate::{ProviderActivationLease, ProviderOnboardingService};
 pub enum ProviderMarketAccount {
     /// Alpaca Trading API Basic market-data account.
     AlpacaBasic,
-    /// Tradier production Brokerage market-data account.
-    TradierBrokerage,
     /// Kraken Spot API key admitted only for authenticated level-3 market data.
     KrakenLevel3,
 }
 
 impl ProviderMarketAccount {
     /// Every closed account-market group admitted by the installed product.
-    pub(crate) const ALL: [Self; 3] = [
-        Self::AlpacaBasic,
-        Self::TradierBrokerage,
-        Self::KrakenLevel3,
-    ];
+    pub(crate) const ALL: [Self; 2] = [Self::AlpacaBasic, Self::KrakenLevel3];
 
     /// Returns the canonical lifecycle surface owned by this account group.
     pub(crate) const fn surface_id(self) -> &'static str {
         match self {
             Self::AlpacaBasic => "alpaca.basic-market-data",
-            Self::TradierBrokerage => "tradier.brokerage-market-data",
             Self::KrakenLevel3 => "kraken.spot-authenticated-level3-market-data",
         }
     }
@@ -48,7 +41,6 @@ impl ProviderMarketAccount {
     const fn provider(self) -> &'static str {
         match self {
             Self::AlpacaBasic => "alpaca-market-data",
-            Self::TradierBrokerage => "tradier-brokerage",
             Self::KrakenLevel3 => "kraken",
         }
     }
@@ -56,7 +48,6 @@ impl ProviderMarketAccount {
     const fn subject_prefix(self) -> &'static str {
         match self {
             Self::AlpacaBasic => "alpaca-market-data-principal-",
-            Self::TradierBrokerage => "tradier-account-",
             Self::KrakenLevel3 => "kraken-l3-account-",
         }
     }
@@ -64,7 +55,6 @@ impl ProviderMarketAccount {
     const fn authority_root(self) -> &'static str {
         match self {
             Self::AlpacaBasic => "alpaca-market-data-account-authority",
-            Self::TradierBrokerage => "tradier-market-data-account-authority",
             Self::KrakenLevel3 => "kraken-level3-account-authority",
         }
     }

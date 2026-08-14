@@ -10,7 +10,6 @@ pub(crate) mod nasdaq_reference;
 pub(crate) mod openfigi_identity;
 mod reference_identity;
 mod specs;
-mod tradier;
 
 use std::{
     fmt,
@@ -67,8 +66,7 @@ pub use market_config::{
     MarketInstrumentReferenceBinding, MarketProviderConfigurationError, MarketSourceEvidence,
     MarketSubscriptionPriority, PreparedAlpacaBasicMarketConfiguration,
     PreparedKrakenL3MarketConfiguration, PreparedMarketProviderConfiguration,
-    PreparedTradierMarketConfiguration, ProviderMarketConfigurationRequest,
-    TradierMarketConfigurationInput,
+    ProviderMarketConfigurationRequest,
 };
 pub(crate) use reference_identity::{
     MarketReferenceIdentityApprovalV1, MarketReferenceIdentityAuthority,
@@ -81,10 +79,6 @@ pub use specs::{
     CoinbaseDirectProductActivation, ControlledLocalFileAdapterActivation, FredAdapterActivation,
     LocalFileAdapterActivation, PortfolioAdapterActivation, ProviderAdapterActivationError,
     ProviderAdapterActivationRequest, SecAdapterActivation, TreasuryAdapterActivation,
-};
-pub use tradier::{
-    TradierMarketDataAccountActivation, TradierMarketDataActivationError,
-    TradierStreamingActivation,
 };
 
 const COINBASE_SURFACE: &str = "coinbase.public-market-data";

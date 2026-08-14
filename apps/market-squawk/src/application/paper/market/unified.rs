@@ -30,14 +30,10 @@ use crate::application::market_selection::{
     BudgetAvailability, CandidateAdmissionState, CandidateCapabilities, CandidateHealth,
     CandidateIdentity, CandidateIntegrity, CandidateTimestamps, DowngradeDimension,
     DowngradePolicy, FreshnessBasis, FreshnessRequirement, HealthState, IntegrityState,
-    LiveMarketInvestmentSource, MarketCoverage, MarketFeatureEvidence,
-    MarketFeatureUnavailableReason, MarketInvestmentMarkBasis, MarketInvestmentRead,
-    MarketInvestmentReadError, MarketInvestmentUnavailableReason, MarketOperation,
-    MarketOperationSet, MarketSelectionError, MarketSelectionPolicy, MarketSelectionReceipt,
-    MarketSelectionRequest, ObservationTiming, ProviderBudgetSnapshot, RequestPriority,
-    RightsAdmission, RightsState, SelectedMarketInvestmentSource, SelectedMarketSource,
-    SelectionClass, SourceCandidate, read_market_investment_observation, select_market_source,
-    selected_generation_matches,
+    MarketCoverage, MarketOperation, MarketOperationSet, MarketSelectionError,
+    MarketSelectionPolicy, MarketSelectionReceipt, MarketSelectionRequest, ObservationTiming,
+    ProviderBudgetSnapshot, RequestPriority, RightsAdmission, RightsState, SelectedMarketSource,
+    SelectionClass, SourceCandidate, select_market_source, selected_generation_matches,
 };
 use crate::live_source::display_market::{
     DisplayDecimal, DisplayEffectiveTimeBasis, DisplayMarketAvailability, DisplayMarketPayload,
@@ -47,6 +43,8 @@ use crate::live_source::display_market::{
 
 const MAXIMUM_CANDIDATES_PER_INSTRUMENT: usize = 256;
 const MAXIMUM_ALTERNATIVES_PER_INSTRUMENT: usize = 8;
+const RUNTIME_DISPLAY_ONLY: &str = "runtime_display_only";
+const DURABLE_PIT_EVIDENCE_NOT_ESTABLISHED: &str = "durable_pit_evidence_not_established";
 
 /// Exact operation-rights decision attached to one provider surface and asset class.
 #[derive(Clone, Debug)]
@@ -313,13 +311,17 @@ pub(super) fn build_unified_market_result(
         let instrument_display = display_snapshots
             .iter()
             .copied()
-            .filter(|snapshot| {
-                snapshot.lease().key().instrument_id() == instrument_id
-                    && display_selection_observation(snapshot.lease()).is_some_and(|observation| {
-                        filters.matches_time(observation.observation().provenance().received_at())
-                    })
-            })
+            .filter(|snapshot| snapshot.lease().key().instrument_id() == instrument_id)
             .collect::<Vec<_>>();
+        let mut candidate_display = Vec::new();
+        candidate_display
+            .try_reserve_exact(instrument_display.len())
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        candidate_display.extend(instrument_display.iter().copied().filter(|snapshot| {
+            display_selection_observation(snapshot.lease()).is_some_and(|observation| {
+                filters.matches_time(observation.observation().provenance().received_at())
+            })
+        }));
         let instrument_kraken = kraken_projections
             .iter()
             .copied()
@@ -331,7 +333,7 @@ pub(super) fn build_unified_market_result(
         let candidates = build_candidates(
             &instrument_streams,
             definition,
-            &instrument_display,
+            &candidate_display,
             &instrument_kraken,
             surface_policies,
             order_level,
@@ -444,7 +446,7 @@ pub(super) fn validate_inputs(
             .and_then(|index| market_data_definitions.get(index))
             .ok_or(ServiceError::Unavailable)?;
         if snapshot.metadata().source_id() != key.source_id()
-            || definition.instrument_id() != key.instrument_id()
+            || !snapshot.matches_definition(definition)
             || snapshot.provider_symbol().as_str().is_empty()
         {
             return Err(ServiceError::InvalidResult);
@@ -1243,13 +1245,14 @@ fn instrument_row(
             exact_selected_view(streams, display_snapshots, kraken_projections, selected)
         })
         .transpose()?;
-    let market_observation = market_investment_value(read_selected_market_investment(
-        definition,
-        streams,
-        display_snapshots,
-        kraken_projections,
-        receipt,
-    )?);
+    let market_observation = json!({
+        "availability": "unavailable",
+        "reason": if selected.is_some() {
+            DURABLE_PIT_EVIDENCE_NOT_ESTABLISHED
+        } else {
+            "no_eligible_source"
+        }
+    });
     let symbol = unified_symbol(
         definition,
         selected_view,
@@ -1321,9 +1324,11 @@ fn instrument_row(
         "tickSize": definition.executable.map(|value| value.tick_size().as_decimal().normalize().to_string()),
         "lotSize": definition.executable.map(|value| value.lot_size().as_decimal().normalize().to_string()),
         "executionTermsAvailable": definition.executable.is_some(),
+        "executionEligible": false,
         "referenceEvidence": market_data_definition_evidence(definition.market_data),
         "availability": selected.map(availability_label).unwrap_or("Unavailable"),
         "confidence": selected.map(confidence_label).unwrap_or("No eligible source"),
+        "analyticalReadiness": RUNTIME_DISPLAY_ONLY,
         "quote": quote,
         "orderBook": order_book,
         "marketObservation": market_observation,
@@ -1350,156 +1355,6 @@ fn instrument_row(
             "downgradeDimensions": selected_downgrades.iter().map(downgrade_value).collect::<Vec<_>>()
         }
     }))
-}
-
-/// Reads the typed source-preserving investment observation used by non-executable compositors.
-///
-/// The returned evidence borrows the exact selected runtime lease and definition. Callers must
-/// convert it to their owned evidence while those authorities remain alive.
-pub(super) fn read_selected_market_investment<'receipt, 'source>(
-    definition: UnifiedInstrumentDefinition<'source>,
-    streams: &[StreamView<'source>],
-    display_snapshots: &[&'source MarketDisplaySnapshotLease],
-    kraken_projections: &[&'source MarketKrakenPriceProjectionLease],
-    receipt: &'receipt MarketSelectionReceipt,
-) -> Result<MarketInvestmentRead<'receipt, 'source>, ServiceError> {
-    let selected_view = receipt
-        .selected()
-        .map(|selected| {
-            exact_selected_view(streams, display_snapshots, kraken_projections, selected)
-        })
-        .transpose()?;
-    let source = match selected_view {
-        Some(UnifiedSelectedView::Live(view)) => {
-            let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
-            Some(SelectedMarketInvestmentSource::Live(
-                LiveMarketInvestmentSource::new(
-                    view.surface_id,
-                    view.metadata.provider(),
-                    view.stream,
-                    view.route.features(),
-                    executable,
-                    view.shard.published_at(),
-                ),
-            ))
-        }
-        Some(UnifiedSelectedView::Display(snapshot)) => {
-            let market_data = definition.market_data.ok_or(ServiceError::InvalidResult)?;
-            Some(SelectedMarketInvestmentSource::Display {
-                snapshot,
-                definition: market_data,
-            })
-        }
-        Some(UnifiedSelectedView::Kraken(snapshot)) => {
-            Some(SelectedMarketInvestmentSource::Kraken(snapshot))
-        }
-        None => None,
-    };
-    read_market_investment_observation(receipt, source).map_err(market_investment_error)
-}
-
-fn market_investment_value(read: MarketInvestmentRead<'_, '_>) -> Value {
-    match read {
-        MarketInvestmentRead::Unavailable(reason) => json!({
-            "availability": "unavailable",
-            "reason": market_investment_unavailable_reason(reason)
-        }),
-        MarketInvestmentRead::Available(observation) => {
-            let mark = observation.mark();
-            let evidence_identity = mark.evidence_identity();
-            let selection_digest = observation.selection_digest();
-            json!({
-                "availability": "available",
-                "instrumentId": observation.instrument_id().to_string(),
-                "mark": {
-                    "value": mark.value().normalize().to_string(),
-                    "currency": mark.currency().as_str(),
-                    "basis": market_investment_mark_basis(mark.basis()),
-                    "evidenceIdentity": {
-                        "algorithm": evidence_identity.algorithm(),
-                        "bytes": encode_hex(evidence_identity.bytes())
-                    },
-                    "freshUntil": mark.fresh_until().map(timestamp_value)
-                },
-                "selectionDigest": {
-                    "algorithm": selection_digest.algorithm(),
-                    "bytes": encode_hex(selection_digest.bytes())
-                },
-                "selectedAt": timestamp_value(observation.selected_at()),
-                "generation": observation.generation().map(|generation| generation.get().to_string()),
-                "quality": observation.quality(),
-                "depth": observation.depth().map(depth_name),
-                "coverage": coverage_name(observation.coverage()),
-                "integrity": integrity_name(observation.integrity()),
-                "features": market_feature_evidence_value(observation.features())
-            })
-        }
-    }
-}
-
-fn market_feature_evidence_value(features: MarketFeatureEvidence<'_>) -> Value {
-    match features {
-        MarketFeatureEvidence::Available(features) => {
-            let content_digest = features.content_digest();
-            json!({
-                "availability": "available",
-                "sourceId": features.source().as_str(),
-                "venueId": features.venue().as_str(),
-                "instrumentId": features.instrument().to_string(),
-                "generation": features.connection_generation().get().to_string(),
-                "availableAt": timestamp_value(features.available_at()),
-                "contentDigest": {
-                    "algorithm": content_digest.algorithm(),
-                    "bytes": encode_hex(content_digest.bytes())
-                },
-                "valueCount": features.values().len()
-            })
-        }
-        MarketFeatureEvidence::Unavailable(reason) => json!({
-            "availability": "unavailable",
-            "reason": market_feature_unavailable_reason(reason)
-        }),
-    }
-}
-
-const fn market_investment_mark_basis(value: MarketInvestmentMarkBasis) -> &'static str {
-    match value {
-        MarketInvestmentMarkBasis::FreshLastTrade => "fresh_last_trade",
-        MarketInvestmentMarkBasis::FreshBidAskMidpoint => "fresh_bid_ask_midpoint",
-    }
-}
-
-const fn market_investment_unavailable_reason(
-    value: MarketInvestmentUnavailableReason,
-) -> &'static str {
-    match value {
-        MarketInvestmentUnavailableReason::NoEligibleSource => "no_eligible_source",
-        MarketInvestmentUnavailableReason::NoFreshLastTradeOrMidpoint => {
-            "no_fresh_last_trade_or_midpoint"
-        }
-    }
-}
-
-const fn market_feature_unavailable_reason(value: MarketFeatureUnavailableReason) -> &'static str {
-    match value {
-        MarketFeatureUnavailableReason::SourceDoesNotPublishLiveFeatures => {
-            "source_does_not_publish_live_features"
-        }
-        MarketFeatureUnavailableReason::IncompleteSnapshot => "incomplete_snapshot",
-        MarketFeatureUnavailableReason::NoExactSourceGeneration => "no_exact_source_generation",
-        MarketFeatureUnavailableReason::AvailableAfterSelection => "available_after_selection",
-        MarketFeatureUnavailableReason::IncompleteValueSet => "incomplete_value_set",
-    }
-}
-
-const fn market_investment_error(error: MarketInvestmentReadError) -> ServiceError {
-    match error {
-        MarketInvestmentReadError::ExecutionOperationForbidden
-        | MarketInvestmentReadError::SelectedSourceMismatch
-        | MarketInvestmentReadError::InvalidFinancialTerms
-        | MarketInvestmentReadError::AmbiguousFeatureEvidence
-        | MarketInvestmentReadError::EvidenceIdentityEncoding => ServiceError::InvalidResult,
-    }
 }
 
 #[derive(Clone, Copy)]

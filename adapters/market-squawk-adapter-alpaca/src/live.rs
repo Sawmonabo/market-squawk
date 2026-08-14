@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::{
 use tokio_tungstenite::{WebSocketStream, connect_async_with_config};
 use tokio_util::sync::CancellationToken;
 
+use crate::boot_snapshot::AlpacaIexBootSnapshotTransport;
 use crate::{
     AlpacaCredentials, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig, AlpacaTransportLimits,
 };
@@ -29,6 +30,7 @@ const SECRET_KEY_HEADER: HeaderName = HeaderName::from_static("apca-api-secret-k
 #[derive(Debug)]
 pub struct AlpacaIexLiveSource {
     config: AlpacaIexLiveConfig,
+    boot_snapshot: AlpacaIexBootSnapshotTransport,
     credentials: Arc<AlpacaCredentials>,
     authority: ActiveLiveSourceGeneration,
     budget: SharedProviderBudget,
@@ -42,6 +44,9 @@ impl AlpacaIexLiveSource {
         generation: LiveSourceGeneration,
         credentials: Arc<AlpacaCredentials>,
     ) -> Result<Self, SourceError> {
+        let boot_snapshot =
+            AlpacaIexBootSnapshotTransport::try_new(config.boot_snapshot_contract())
+                .map_err(|_| SourceError::InvalidProtocolState)?;
         let authority = generation.try_start(config.metadata())?;
         let budget = authority
             .budget()?
@@ -49,6 +54,7 @@ impl AlpacaIexLiveSource {
             .ok_or(SourceError::GenerationAuthorityMismatch)?;
         Ok(Self {
             config,
+            boot_snapshot,
             credentials,
             authority,
             budget,
@@ -63,6 +69,16 @@ impl AlpacaIexLiveSource {
     ) -> Result<(), SourceError> {
         begin_generation(&mut self.generation_started)?;
         validate_generation(&self.authority, &self.budget)?;
+        self.boot_snapshot
+            .acquire_and_publish(
+                self.config.metadata(),
+                &self.credentials,
+                &mut self.authority,
+                &self.budget,
+                sink,
+                &cancellation,
+            )
+            .await?;
         self.config
             .metadata()
             .network_policy()

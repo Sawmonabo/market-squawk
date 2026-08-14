@@ -351,6 +351,7 @@ impl ApplicationDomainService for MarketDomainService {
                 let market_data_definitions = load_market_data_instrument_definitions(
                     &self.market_data_instruments,
                     &display_instrument_ids,
+                    &display_batches,
                     &context,
                 )?;
                 let order_level = load_order_level_snapshots(
@@ -554,17 +555,19 @@ async fn load_display_snapshots(
         .map_err(|_error| ServiceError::ResourceExhausted)?;
     for instrument_id in instrument_ids {
         ensure_live(context)?;
-        batches.push(
-            registry
-                .display_snapshots_for_instrument(
-                    *instrument_id,
-                    maximum_sources,
-                    reference_at,
-                    context.deadline(),
-                    context.cancellation(),
-                )
-                .await?,
-        );
+        let batch = registry
+            .display_snapshots_for_instrument(
+                *instrument_id,
+                maximum_sources,
+                reference_at,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await?;
+        if batch.snapshots().is_empty() {
+            return Err(ServiceError::Unavailable);
+        }
+        batches.push(batch);
     }
     Ok(batches)
 }
@@ -605,13 +608,17 @@ fn kraken_projection_refs(
 fn load_market_data_instrument_definitions(
     reader: &MarketDataInstrumentReadCapability,
     instrument_ids: &[InstrumentId],
+    display_batches: &[MarketDisplaySnapshotBatch],
     context: &RequestContext,
 ) -> Result<Vec<MarketDataInstrumentDefinition>, ServiceError> {
+    if display_batches.len() != instrument_ids.len() {
+        return Err(ServiceError::Unavailable);
+    }
     let mut definitions = Vec::new();
     definitions
         .try_reserve_exact(instrument_ids.len())
         .map_err(|_error| ServiceError::ResourceExhausted)?;
-    for instrument_id in instrument_ids {
+    for (index, instrument_id) in instrument_ids.iter().enumerate() {
         ensure_live(context)?;
         let record = reader
             .latest(*instrument_id, context.deadline(), context.cancellation())
@@ -620,6 +627,17 @@ fn load_market_data_instrument_definitions(
                 ServiceError::Unavailable
             })?
             .ok_or(ServiceError::Unavailable)?;
+        let batch = display_batches
+            .get(index)
+            .ok_or(ServiceError::Unavailable)?;
+        if batch.snapshots().is_empty()
+            || batch.snapshots().iter().any(|snapshot| {
+                snapshot.lease().key().instrument_id() != *instrument_id
+                    || !snapshot.matches_definition_record(&record)
+            })
+        {
+            return Err(ServiceError::Unavailable);
+        }
         definitions.push(record.definition().clone());
     }
     if definitions

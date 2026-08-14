@@ -2,7 +2,11 @@
 
 use std::sync::Arc;
 
-use market_squawk_domain::{InstrumentId, SourceIdentifier};
+use market_squawk_data::MarketDataInstrumentRecord;
+use market_squawk_domain::{
+    AssetClass, EffectiveInterval, EvidenceDigest, Figi, InstrumentId,
+    MarketDataInstrumentDefinition, RevisionBoundPayloadEvidence, SourceIdentifier,
+};
 use market_squawk_services::ServiceError;
 use market_squawk_sources::SourceMetadata;
 
@@ -36,12 +40,15 @@ impl DisplaySourceDescriptor {
             let symbol = SourceIdentifier::try_from(binding.provisional_subscription_symbol())
                 .map_err(|_error| ServiceError::InvalidRequest)?;
             if symbols.iter().any(|prior: &DisplayInstrumentSymbol| {
-                prior.instrument_id == binding.instrument_id() || prior.provider_symbol == symbol
+                prior.definition_identity.instrument_id() == binding.instrument_id()
+                    || prior.provider_symbol == symbol
             }) {
                 return Err(ServiceError::InvalidRequest);
             }
             symbols.push(DisplayInstrumentSymbol {
-                instrument_id: binding.instrument_id(),
+                definition_identity: Arc::new(DisplayMarketDataDefinitionIdentity::from_binding(
+                    &binding,
+                )),
                 provider_symbol: symbol,
             });
         }
@@ -55,10 +62,13 @@ impl DisplaySourceDescriptor {
 
     pub(super) fn supports(&self, key: &DisplayMarketKey) -> bool {
         self.metadata.source_id() == key.source_id()
-            && self
-                .symbols
-                .iter()
-                .any(|binding| binding.instrument_id == key.instrument_id())
+            && self.supports_instrument(key.instrument_id())
+    }
+
+    pub(super) fn supports_instrument(&self, instrument_id: InstrumentId) -> bool {
+        self.symbols
+            .iter()
+            .any(|binding| binding.definition_identity.instrument_id() == instrument_id)
     }
 
     pub(super) fn matches_snapshot(&self, lease: &DisplayMarketSnapshotLease) -> bool {
@@ -70,27 +80,72 @@ impl DisplaySourceDescriptor {
     }
 
     pub(super) fn append_instrument_ids(&self, destination: &mut Vec<InstrumentId>) {
-        destination.extend(self.symbols.iter().map(|binding| binding.instrument_id));
+        destination.extend(
+            self.symbols
+                .iter()
+                .map(|binding| binding.definition_identity.instrument_id()),
+        );
     }
 
-    fn symbol_for(&self, instrument_id: InstrumentId) -> Option<&SourceIdentifier> {
+    fn binding_for(&self, instrument_id: InstrumentId) -> Option<&DisplayInstrumentSymbol> {
         self.symbols
             .iter()
-            .find(|binding| binding.instrument_id == instrument_id)
-            .map(|binding| &binding.provider_symbol)
+            .find(|binding| binding.definition_identity.instrument_id() == instrument_id)
     }
 }
 
 #[derive(Debug)]
 struct DisplayInstrumentSymbol {
-    instrument_id: InstrumentId,
+    definition_identity: Arc<DisplayMarketDataDefinitionIdentity>,
     provider_symbol: SourceIdentifier,
+}
+
+/// Exact immutable market-data-definition authority retained by a configured display route.
+#[derive(Debug, Eq, PartialEq)]
+struct DisplayMarketDataDefinitionIdentity {
+    instrument_id: InstrumentId,
+    permanent_figi: Figi,
+    asset_class: AssetClass,
+    reference_evidence: RevisionBoundPayloadEvidence,
+    effective_interval: EffectiveInterval,
+    revision_digest: EvidenceDigest,
+}
+
+impl DisplayMarketDataDefinitionIdentity {
+    fn from_binding(binding: &MarketDataInstrumentBinding) -> Self {
+        Self {
+            instrument_id: binding.instrument_id(),
+            permanent_figi: binding.permanent_figi().clone(),
+            asset_class: binding.asset_class(),
+            reference_evidence: binding.definition_reference_evidence().clone(),
+            effective_interval: binding.definition_effective(),
+            revision_digest: binding.definition_revision_digest(),
+        }
+    }
+
+    const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    fn matches_record(&self, record: &MarketDataInstrumentRecord) -> bool {
+        self.matches_definition(record.definition())
+            && self.revision_digest == record.revision_digest()
+    }
+
+    fn matches_definition(&self, definition: &MarketDataInstrumentDefinition) -> bool {
+        self.instrument_id == definition.instrument_id()
+            && &self.permanent_figi == definition.permanent_figi()
+            && self.asset_class == definition.asset_class()
+            && &self.reference_evidence == definition.reference_evidence()
+            && self.effective_interval == definition.effective_interval()
+    }
 }
 
 /// One bounded display snapshot joined only to its exact prepared provider-symbol authority.
 #[derive(Debug)]
 pub(crate) struct MarketDisplaySnapshotLease {
     descriptor: Arc<DisplaySourceDescriptor>,
+    definition_identity: Arc<DisplayMarketDataDefinitionIdentity>,
     provider_symbol: SourceIdentifier,
     lease: DisplayMarketSnapshotLease,
 }
@@ -103,15 +158,15 @@ impl MarketDisplaySnapshotLease {
         if !descriptor.matches_snapshot(&lease) {
             return Err(ServiceError::Unavailable);
         }
-        let provider_symbol = descriptor
-            .symbol_for(lease.key().instrument_id())
-            .ok_or(ServiceError::Unavailable)
-            .and_then(|symbol| {
-                SourceIdentifier::try_from(symbol.as_str())
-                    .map_err(|_error| ServiceError::ResourceExhausted)
-            })?;
+        let binding = descriptor
+            .binding_for(lease.key().instrument_id())
+            .ok_or(ServiceError::Unavailable)?;
+        let provider_symbol = SourceIdentifier::try_from(binding.provider_symbol.as_str())
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        let definition_identity = Arc::clone(&binding.definition_identity);
         Ok(Self {
             descriptor,
+            definition_identity,
             provider_symbol,
             lease,
         })
@@ -131,6 +186,16 @@ impl MarketDisplaySnapshotLease {
 
     pub(crate) const fn lease(&self) -> &DisplayMarketSnapshotLease {
         &self.lease
+    }
+
+    /// Requires the latest durable record to be the exact definition configured for this lease.
+    pub(crate) fn matches_definition_record(&self, record: &MarketDataInstrumentRecord) -> bool {
+        self.definition_identity.matches_record(record)
+    }
+
+    /// Rechecks every retained definition coordinate available to a definition-only consumer.
+    pub(crate) fn matches_definition(&self, definition: &MarketDataInstrumentDefinition) -> bool {
+        self.definition_identity.matches_definition(definition)
     }
 
     pub(super) const fn descriptor(&self) -> &Arc<DisplaySourceDescriptor> {

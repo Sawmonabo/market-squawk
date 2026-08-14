@@ -152,15 +152,16 @@ pub use policy::{
 pub use registry::{
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, CapturedDecodedProviderBatch,
     CurrentBatchIter, CurrentBatchKey, CurrentCoveragePolicy, CurrentDecodedProviderBatch,
-    CurrentDecodedProviderBatches, CurrentFrameEvidence, CurrentHealthReporter,
-    CurrentHealthUpdate, CurrentLivePolicy, CurrentObservationIter, CurrentProviderObservation,
-    CurrentSourceAuthorityLease, CurrentSourceSession, CurrentStreamKey, ExtractionAuthority,
-    FrameSessionLease, InstrumentUniverseAttestation, LiveSourceGeneration,
-    ProviderBackoffAuthority, ProviderBackoffDecision, ProviderBackoffError,
-    RESEARCH_SOURCE_AUTHORITY_DIRECTORY, RawFrameFactory, RegisteredSource, RegistryAuthorityState,
-    RegistryError, SessionControlDisposition, SessionIgnoredDisposition,
-    SessionQuarantineDisposition, SessionRecoveryDisposition, ValidatedCurrentSourceAuthority,
-    ValidatedLiveScope, ValidatedSessionDecodeOutcome, ValidatedSourceSession,
+    CurrentDecodedProviderBatches, CurrentFrameEvidence, CurrentHealthRecording,
+    CurrentHealthReporter, CurrentHealthUnqualification, CurrentHealthUpdate, CurrentLivePolicy,
+    CurrentObservationIter, CurrentProviderObservation, CurrentSourceAuthorityLease,
+    CurrentSourceSession, CurrentStreamKey, ExtractionAuthority, FrameSessionLease,
+    InstrumentUniverseAttestation, LiveSourceGeneration, ProviderBackoffAuthority,
+    ProviderBackoffDecision, ProviderBackoffError, RESEARCH_SOURCE_AUTHORITY_DIRECTORY,
+    RawFrameFactory, RegisteredSource, RegistryAuthorityState, RegistryError,
+    SessionControlDisposition, SessionIgnoredDisposition, SessionQuarantineDisposition,
+    SessionRecoveryDisposition, ValidatedCurrentSourceAuthority, ValidatedLiveScope,
+    ValidatedSessionDecodeOutcome, ValidatedSourceSession,
 };
 pub use tls::{TlsProviderCapability, TlsProviderError, install_ring_tls_provider};
 

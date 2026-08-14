@@ -68,15 +68,14 @@ pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 9] = [
 
 const COINBASE_DIRECT_LIVE_SURFACE: &str = "coinbase.exchange-direct-market-data";
 
-const SESSION_BACKED_LIVE_SURFACES: [&str; 4] = [
+const SESSION_BACKED_LIVE_SURFACES: [&str; 3] = [
     COINBASE_DIRECT_LIVE_SURFACE,
     ProviderMarketAccount::AlpacaBasic.surface_id(),
-    ProviderMarketAccount::TradierBrokerage.surface_id(),
     ProviderMarketAccount::KrakenLevel3.surface_id(),
 ];
 
 // New lifecycle surfaces are appended so schema-v1 backups remain an exact prefix.
-const SERIALIZED_LIFECYCLE_SURFACES: [&str; 15] = [
+const SERIALIZED_LIFECYCLE_SURFACES: [&str; 14] = [
     "coinbase.public-market-data",
     COINBASE_DIRECT_LIVE_SURFACE,
     "kraken.spot-public-market-data",
@@ -89,7 +88,6 @@ const SERIALIZED_LIFECYCLE_SURFACES: [&str; 15] = [
     "local.files",
     "local.portfolio-imports",
     ProviderMarketAccount::AlpacaBasic.surface_id(),
-    ProviderMarketAccount::TradierBrokerage.surface_id(),
     ProviderMarketAccount::KrakenLevel3.surface_id(),
     "federal-reserve-board.data-download-program",
 ];
@@ -1836,7 +1834,6 @@ fn lifecycle_surface_key(
     if let Some(account) = ProviderMarketAccount::from_surface_id(surface_id) {
         return Ok(match account {
             ProviderMarketAccount::AlpacaBasic => "alpaca-basic-market-data",
-            ProviderMarketAccount::TradierBrokerage => "tradier-brokerage-market-data",
             ProviderMarketAccount::KrakenLevel3 => "kraken-authenticated-level3-market-data",
         });
     }

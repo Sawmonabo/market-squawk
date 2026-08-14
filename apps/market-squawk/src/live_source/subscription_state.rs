@@ -13,7 +13,7 @@ use market_squawk_domain::{ConnectionGeneration, IdentityError, MetadataRevision
 use market_squawk_sources::{ControlFrameKind, IgnoredFrameReason, SessionId};
 use thiserror::Error;
 
-// Covers the largest admitted free-provider live selection (Tradier: 256) without permitting an
+// Covers the largest admitted free-provider live selection without permitting an
 // unbounded provider-controlled product set.
 const MAX_PRODUCTS: usize = 256;
 const MAX_PRODUCT_BYTES: usize = 64;

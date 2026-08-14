@@ -32,10 +32,10 @@ pub(super) fn identity_value(view: &StreamView<'_>) -> Value {
             .provider_channel()
             .as_source_identifier()
             .as_str(),
-        "connectionGeneration": view.stream.connection_generation().get(),
-        "stateRevision": view.stream.state_revision(),
+        "connectionGeneration": view.stream.connection_generation().get().to_string(),
+        "stateRevision": view.stream.state_revision().to_string(),
         "shardId": view.shard.shard_id().to_string(),
-        "shardSnapshotRevision": view.shard.snapshot_revision().get()
+        "shardSnapshotRevision": view.shard.snapshot_revision().get().to_string()
     })
 }
 
@@ -106,9 +106,10 @@ pub(super) fn trade_value(
     let mut value = identity_value(view);
     value["sourceIdentifier"] = Value::String(trade.source_identifier().as_str().to_owned());
     value["stableTradeId"] = Value::String(trade.stable_trade_id().as_str().to_owned());
-    value["tradeConnectionGeneration"] = Value::from(trade.connection_generation().get());
-    value["priceTicks"] = Value::from(trade.price().get());
-    value["quantityLots"] = Value::from(trade.quantity().get());
+    value["tradeConnectionGeneration"] =
+        Value::String(trade.connection_generation().get().to_string());
+    value["priceTicks"] = Value::String(trade.price().get().to_string());
+    value["quantityLots"] = Value::String(trade.quantity().get().to_string());
     value["aggressorSide"] = json!(trade.aggressor_side());
     value["sourceTimestamp"] = json!(trade.source_timestamp().map(timestamp_value));
     value["receivedAt"] = Value::String(timestamp_value(trade.received_at()));
@@ -129,7 +130,7 @@ pub(super) fn trade_value(
     });
     value["bindingDigest"] = Value::String(encode_hex(trade.binding_digest()));
     value["tradeTradingStatus"] = json!(trade.trading_status());
-    value["committedStateRevision"] = Value::from(trade.committed_state_revision());
+    value["committedStateRevision"] = Value::String(trade.committed_state_revision().to_string());
     value["authority"] = Value::String("not_exposed".to_owned());
     value
 }
@@ -174,7 +175,7 @@ pub(super) fn comparison_value(
                     "numeratorTicks": (
                         i128::from(bid.price().get()) + i128::from(ask.price().get())
                     ).to_string(),
-                    "denominator": 2
+                    "denominator": "2"
                 })
             });
             json!({
@@ -270,8 +271,8 @@ fn dimension_value(dimension: &SnapshotDimension) -> Value {
 
 fn level_value(level: market_squawk_live::BookLevelSnapshot) -> Value {
     json!({
-        "priceTicks": level.price().get(),
-        "quantityLots": level.quantity().get()
+        "priceTicks": level.price().get().to_string(),
+        "quantityLots": level.quantity().get().to_string()
     })
 }
 

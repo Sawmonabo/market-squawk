@@ -25,7 +25,10 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
-use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig};
+use tokio_tungstenite::tungstenite::{
+    Error as WebSocketError, Message, error::ProtocolError as WebSocketProtocolError,
+    protocol::WebSocketConfig,
+};
 use tokio_tungstenite::{WebSocketStream, connect_async_with_config};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -50,7 +53,7 @@ const DOCTOR_TIMEFRAME: &str = "1Day";
 const DOCTOR_ADJUSTMENT: &str = "raw";
 const DOCTOR_SORT: &str = "asc";
 const DOCTOR_MARKET: &str = "IEX";
-const DOCTOR_TIMEZONE: &str = "UTC";
+const DOCTOR_MARKET_TIMEZONE: &str = "America/New_York";
 const QUOTE_ENDPOINT: &str = "https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest?feed=iex";
 const SNAPSHOT_ENDPOINT: &str = "https://data.alpaca.markets/v2/stocks/snapshots";
 const HISTORICAL_ENDPOINT: &str = "https://data.alpaca.markets/v2/stocks/AAPL/bars";
@@ -556,7 +559,7 @@ impl AlpacaDoctorCalendarObservation {
         DOCTOR_MARKET
     }
     pub const fn timezone(&self) -> &'static str {
-        DOCTOR_TIMEZONE
+        DOCTOR_MARKET_TIMEZONE
     }
     pub const fn start_date(&self) -> CalendarDate {
         self.start_date
@@ -920,14 +923,12 @@ fn quote_observation(
         return Err(AlpacaError::Protocol);
     }
     let parsed = parse_quote(wire.quote)?;
-    let disposition = if parsed.bid_price.is_zero()
-        || parsed.ask_price.is_zero()
-        || parsed.bid_price > parsed.ask_price
-    {
-        AlpacaDoctorObservationDisposition::ObservedDegraded
-    } else {
-        AlpacaDoctorObservationDisposition::ObservedAvailable
-    };
+    let disposition =
+        if parsed.bid_size == 0 || parsed.ask_size == 0 || parsed.bid_price > parsed.ask_price {
+            AlpacaDoctorObservationDisposition::ObservedDegraded
+        } else {
+            AlpacaDoctorObservationDisposition::ObservedAvailable
+        };
     let semantic_result_digest = quote_semantic_digest(
         disposition,
         Some(parsed.timestamp),
@@ -1016,10 +1017,14 @@ fn batch_observation(
         }
         if requested.contains(symbol.as_str()) {
             returned.insert(symbol.clone());
-            if validate_snapshot(&snapshot).is_ok() {
-                effective.insert(symbol);
-            } else {
-                invalid_count = invalid_count.checked_add(1).ok_or(AlpacaError::Protocol)?;
+            match validate_snapshot(&snapshot) {
+                Ok(true) => {
+                    effective.insert(symbol);
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    invalid_count = invalid_count.checked_add(1).ok_or(AlpacaError::Protocol)?;
+                }
             }
         } else {
             unexpected.insert(symbol);
@@ -1373,11 +1378,7 @@ impl AlpacaPaperIexDoctor {
         }
         permit.release();
         let completed_at = system_timestamp()?;
-        let disposition = if clean_close_observed {
-            AlpacaDoctorObservationDisposition::ObservedAvailable
-        } else {
-            AlpacaDoctorObservationDisposition::ObservedDegraded
-        };
+        let disposition = AlpacaDoctorObservationDisposition::ObservedAvailable;
         let semantic_result_digest = stream_semantic_digest(
             disposition,
             handshake_status,
@@ -1729,7 +1730,7 @@ fn parse_calendar_sessions(
     end_date: CalendarDate,
 ) -> Result<BTreeSet<CalendarDate>, AlpacaError> {
     let wire: CalendarEnvelope = serde_json::from_slice(body).map_err(|_| AlpacaError::Protocol)?;
-    if wire.market.acronym != DOCTOR_MARKET || wire.market.timezone != DOCTOR_TIMEZONE {
+    if wire.market.acronym != DOCTOR_MARKET || wire.market.timezone != DOCTOR_MARKET_TIMEZONE {
         return Err(AlpacaError::Protocol);
     }
     let mut sessions = BTreeSet::new();
@@ -1762,16 +1763,24 @@ enum DoctorEndpointContract {
 fn parse_quote(wire: QuoteWire) -> Result<ParsedQuote, AlpacaError> {
     let bid_price = decimal(&wire.bid_price, true)?;
     let ask_price = decimal(&wire.ask_price, true)?;
+    let bid_size = wire.bid_size.as_u64().ok_or(AlpacaError::Protocol)?;
+    let ask_size = wire.ask_size.as_u64().ok_or(AlpacaError::Protocol)?;
+    if bid_price.is_zero() != (bid_size == 0)
+        || ask_price.is_zero() != (ask_size == 0)
+        || (bid_size == 0 && ask_size == 0)
+    {
+        return Err(AlpacaError::Protocol);
+    }
     Ok(ParsedQuote {
         timestamp: parse_timestamp(&wire.timestamp)?,
         bid_price,
         ask_price,
-        bid_size: wire.bid_size.as_u64().ok_or(AlpacaError::Protocol)?,
-        ask_size: wire.ask_size.as_u64().ok_or(AlpacaError::Protocol)?,
+        bid_size,
+        ask_size,
     })
 }
 
-fn validate_snapshot(snapshot: &Value) -> Result<(), AlpacaError> {
+fn validate_snapshot(snapshot: &Value) -> Result<bool, AlpacaError> {
     let object = snapshot.as_object().ok_or(AlpacaError::Protocol)?;
     let quote = object
         .get("latestQuote")
@@ -1779,13 +1788,11 @@ fn validate_snapshot(snapshot: &Value) -> Result<(), AlpacaError> {
         .ok_or(AlpacaError::Protocol)?;
     let wire: QuoteWire = serde_json::from_value(quote).map_err(|_| AlpacaError::Protocol)?;
     let parsed = parse_quote(wire)?;
-    if parsed.bid_price.is_zero()
-        || parsed.ask_price.is_zero()
-        || parsed.bid_price > parsed.ask_price
-    {
+    let two_sided = parsed.bid_size > 0 && parsed.ask_size > 0;
+    if two_sided && parsed.bid_price > parsed.ask_price {
         return Err(AlpacaError::Protocol);
     }
-    Ok(())
+    Ok(two_sided)
 }
 
 fn validate_historical_bar(
@@ -2215,7 +2222,14 @@ where
     let Some(message) = next else {
         return Ok(None);
     };
-    let message = message.map_err(|_| AlpacaError::Network)?;
+    let message = match message {
+        Ok(message) => message,
+        Err(WebSocketError::ConnectionClosed)
+        | Err(WebSocketError::Protocol(WebSocketProtocolError::ResetWithoutClosingHandshake)) => {
+            return Ok(None);
+        }
+        Err(_) => return Err(AlpacaError::Network),
+    };
     if message.len() > maximum_frame_bytes {
         return Err(AlpacaError::BodyTooLarge);
     }
@@ -2269,9 +2283,10 @@ fn parse_control_frame(payload: &[u8]) -> Result<ControlFacts, AlpacaError> {
                 if facts.subscription.is_some() {
                     return Err(AlpacaError::Protocol);
                 }
-                let trades = exact_aapl_subscription(object.get("trades"))?;
-                let quotes = exact_aapl_subscription(object.get("quotes"))?;
-                for key in [
+                const SUBSCRIPTION_FIELDS: [&str; 10] = [
+                    "T",
+                    "trades",
+                    "quotes",
                     "bars",
                     "updatedBars",
                     "dailyBars",
@@ -2279,14 +2294,24 @@ fn parse_control_frame(payload: &[u8]) -> Result<ControlFacts, AlpacaError> {
                     "lulds",
                     "corrections",
                     "cancelErrors",
-                ] {
-                    if object
-                        .get(key)
-                        .and_then(Value::as_array)
-                        .is_some_and(|values| !values.is_empty())
-                    {
-                        return Err(AlpacaError::Protocol);
-                    }
+                ];
+                if object
+                    .keys()
+                    .any(|key| !SUBSCRIPTION_FIELDS.contains(&key.as_str()))
+                {
+                    return Err(AlpacaError::Protocol);
+                }
+                let trades = exact_aapl_subscription(object.get("trades"))?;
+                let quotes = exact_aapl_subscription(object.get("quotes"))?;
+                optional_empty_subscription(object.get("bars"))?;
+                optional_empty_subscription(object.get("updatedBars"))?;
+                optional_empty_subscription(object.get("dailyBars"))?;
+                optional_empty_subscription(object.get("statuses"))?;
+                optional_empty_subscription(object.get("lulds"))?;
+                if exact_aapl_subscription(object.get("corrections"))? != trades
+                    || exact_aapl_subscription(object.get("cancelErrors"))? != trades
+                {
+                    return Err(AlpacaError::Protocol);
                 }
                 facts.subscription = Some((trades, quotes));
             }
@@ -2315,6 +2340,15 @@ fn exact_aapl_subscription(value: Option<&Value>) -> Result<u32, AlpacaError> {
         return Err(AlpacaError::Protocol);
     }
     Ok(1)
+}
+
+fn optional_empty_subscription(value: Option<&Value>) -> Result<(), AlpacaError> {
+    if let Some(value) = value
+        && !value.as_array().is_some_and(Vec::is_empty)
+    {
+        return Err(AlpacaError::Protocol);
+    }
+    Ok(())
 }
 
 fn add_frame_bytes(
@@ -2392,7 +2426,7 @@ fn endpoint_contract_digest(
             "GET https://data.alpaca.markets/v2/stocks/snapshots?symbols=<code-owned-50>&feed=iex"
         }
         DoctorEndpointContract::Stream => {
-            "WSS wss://stream.data.alpaca.markets/v2/iex;header-auth;subscribe=AAPL-trades+quotes;close"
+            "WSS wss://stream.data.alpaca.markets/v2/iex;header-auth;request=AAPL-trades+quotes;ack=AAPL-trades+quotes+automatic-corrections+automatic-cancelErrors;close"
         }
         DoctorEndpointContract::Historical => {
             "GET https://data.alpaca.markets/v2/stocks/AAPL/bars?timeframe=1Day&start=<utc>&end=<utc>&limit=1000&adjustment=raw&feed=iex&sort=asc&page_token=<optional>"

@@ -2,6 +2,7 @@
 
 use std::{
     num::NonZeroUsize,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -18,9 +19,10 @@ use market_squawk_platform::{
     spawn_process_journal_capture_writer,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, BudgetUnavailableReason, CaptureGenerationCapabilities,
-    ProviderBackoffAuthority, ProviderBackoffDecision, ProviderBackoffError, ProviderRateAuthority,
-    RegisteredSource, RegistryError, SessionId, SourceError,
+    AuthoritativeSourceRegistry, AuthorizationSubjectResolver, BudgetUnavailableReason,
+    CaptureGenerationCapabilities, ProviderBackoffAuthority, ProviderBackoffDecision,
+    ProviderBackoffError, ProviderRateAuthority, RegisteredSource, RegistryError, SessionId,
+    SourceError,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -223,8 +225,11 @@ impl ProductionSourceSupervisor {
         let registered_at = system_timestamp()?;
         let authority_path = paths.root().join("authority").join(profile.source_key());
         let authority_store = LocalAuthorityStateStore::try_open(authority_path)?;
-        let mut registry = AuthoritativeSourceRegistry::try_new_durable_with_provider_rate(
+        let authorization_subject_resolver: Arc<dyn AuthorizationSubjectResolver> =
+            Arc::new(provider_rate.clone());
+        let mut registry = AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
             authority_store,
+            authorization_subject_resolver,
             provider_rate,
         )?;
         let registered = match registry
@@ -437,6 +442,7 @@ impl ProductionSourceSupervisor {
                         subscription,
                         display_ingresses,
                         ingress_timeout: self.config.source_shutdown(),
+                        startup_readiness_policy: self.profile.startup_readiness_policy(),
                     };
                     match startup.take() {
                         Some(readiness) => {

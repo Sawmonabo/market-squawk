@@ -48,7 +48,6 @@ impl MarketRuntimeGroupGeneration {
         hasher.update(request.expected_credential_generation().get().to_be_bytes());
         let lease = match prepared {
             PreparedMarketProviderConfiguration::AlpacaBasic(value) => value.lease(),
-            PreparedMarketProviderConfiguration::Tradier(value) => value.lease(),
             PreparedMarketProviderConfiguration::KrakenLevel3(value) => value.lease(),
         };
         update_lease(&mut hasher, lease);
@@ -56,17 +55,6 @@ impl MarketRuntimeGroupGeneration {
             PreparedMarketProviderConfiguration::AlpacaBasic(value) => {
                 let optional = value.options_config().map(|config| config.metadata());
                 update_optional_metadata(&mut hasher, value.iex_config().metadata(), optional)?;
-            }
-            PreparedMarketProviderConfiguration::Tradier(value) => {
-                let optional = value
-                    .derived_index_rest_config()
-                    .map(|config| config.metadata());
-                update_tradier_metadata(
-                    &mut hasher,
-                    value.consolidated_stream_config().metadata(),
-                    value.consolidated_rest_config().metadata(),
-                    optional,
-                )?;
             }
             PreparedMarketProviderConfiguration::KrakenLevel3(value) => {
                 update_metadata(&mut hasher, &[value.config().metadata()])?;
@@ -88,18 +76,6 @@ fn update_optional_metadata(
     match optional {
         Some(optional) => update_metadata(hasher, &[required, optional]),
         None => update_metadata(hasher, &[required]),
-    }
-}
-
-fn update_tradier_metadata(
-    hasher: &mut Sha256,
-    stream: &SourceMetadata,
-    snapshots: &SourceMetadata,
-    derived_indexes: Option<&SourceMetadata>,
-) -> Result<(), ServiceError> {
-    match derived_indexes {
-        Some(derived_indexes) => update_metadata(hasher, &[stream, snapshots, derived_indexes]),
-        None => update_metadata(hasher, &[stream, snapshots]),
     }
 }
 

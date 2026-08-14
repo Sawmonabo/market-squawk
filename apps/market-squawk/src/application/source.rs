@@ -31,8 +31,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    ApplicationDomainService, ResearchSourceDiscovery, ResearchSourceDiscoveryCoordinator,
-    ResearchSourceObjectListing,
+    AccountMarketSurface, ApplicationDomainService, ResearchSourceDiscovery,
+    ResearchSourceDiscoveryCoordinator, ResearchSourceObjectListing,
     domain_support::{DomainLifecycle, admitted_result_limits, encode_hex, ensure_request_live},
 };
 use crate::{
@@ -910,6 +910,9 @@ impl SourceController {
                                 .any(|filter| filter.as_str() == record.source_id().as_str()))
                 })
                 .collect::<Vec<_>>();
+            if AccountMarketSurface::parse(profile.id()).is_some() && !selected_runtime.is_empty() {
+                return Err(ServiceError::InvalidResult);
+            }
             if !profile_explicit && selected_runtime.is_empty() {
                 continue;
             }
@@ -948,6 +951,16 @@ impl SourceController {
                     provider_dataset_identifier.as_ref(),
                 )?;
                 if matches!(kind, SourceReadKind::Status) {
+                    if let Some(runtime) = lifecycle_status
+                        .as_ref()
+                        .map(account_group_runtime_status)
+                        .transpose()?
+                        .flatten()
+                    {
+                        row.as_object_mut()
+                            .ok_or(ServiceError::InvalidResult)?
+                            .insert("runtime".to_owned(), runtime);
+                    }
                     attach_lifecycle_status(
                         &mut row,
                         lifecycle_managed,
@@ -1017,7 +1030,7 @@ impl SourceController {
         &self,
         provider: &SourceIdentifier,
         context: &RequestContext,
-    ) -> Result<Value, ServiceError> {
+    ) -> Result<SourceLifecycleStatus, ServiceError> {
         let deadline = TokioInstant::from_std(context.deadline());
         let status = tokio::select! {
             biased;
@@ -1038,7 +1051,7 @@ impl SourceController {
         if &status.fields().provider != provider {
             return Err(ServiceError::InvalidResult);
         }
-        source_lifecycle_status_value(&status)
+        Ok(status)
     }
 
     async fn ensure_portal(
@@ -1747,7 +1760,7 @@ const fn start_eligibility_name(eligibility: SourceStartEligibility) -> &'static
 fn attach_lifecycle_status(
     row: &mut Value,
     managed: bool,
-    status: Option<&Value>,
+    status: Option<&SourceLifecycleStatus>,
 ) -> Result<(), ServiceError> {
     if managed != status.is_some() {
         return Err(ServiceError::InvalidResult);
@@ -1759,9 +1772,35 @@ fn attach_lifecycle_status(
     );
     row.insert(
         "lifecycle".to_owned(),
-        status.cloned().unwrap_or(Value::Null),
+        status
+            .map(source_lifecycle_status_value)
+            .transpose()?
+            .unwrap_or(Value::Null),
     );
     Ok(())
+}
+
+fn account_group_runtime_status(
+    status: &SourceLifecycleStatus,
+) -> Result<Option<Value>, ServiceError> {
+    let fields = status.fields();
+    if AccountMarketSurface::parse(fields.provider.as_str()).is_none()
+        || fields.state != SourceLifecycleState::Active
+    {
+        return Ok(None);
+    }
+    if fields.current_generation.is_some() {
+        return Err(ServiceError::InvalidResult);
+    }
+    let runtime_generation = fields
+        .runtime_generation_digest
+        .ok_or(ServiceError::InvalidResult)
+        .and_then(sha256_value)?;
+    Ok(Some(json!({
+        "state": "active_group",
+        "runtimeGenerationSha256": runtime_generation,
+        "qualifiedRuntimeRecordCount": 0,
+    })))
 }
 
 fn sha256_value(digest: EvidenceDigest) -> Result<String, ServiceError> {

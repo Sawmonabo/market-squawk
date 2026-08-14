@@ -15,12 +15,15 @@ const LIVE_SOURCES = new Set([
   "coinbase.exchange-direct-market-data",
   "kraken.spot-public-market-data",
   "alpaca.basic-market-data",
-  "tradier.brokerage-market-data",
   "kraken.spot-authenticated-level3-market-data",
 ])
 const PUBLIC_LIVE_SOURCES = new Set([
   "coinbase.public-market-data",
   "kraken.spot-public-market-data",
+])
+const ACCOUNT_GROUP_SOURCES = new Set([
+  "alpaca.basic-market-data",
+  "kraken.spot-authenticated-level3-market-data",
 ])
 
 export interface StoredDataEvidence {
@@ -100,7 +103,136 @@ export interface SourceStatusRow {
   providerDatasetIdentifier: string | null
   lifecycleSupport: "managed" | "not_applicable"
   lifecycle: LifecycleEvidence | null
-  runtime: Record<string, unknown>
+  runtime: SourceStatusRuntime
+}
+
+type SourceConnection =
+  | "connecting"
+  | { live: { last_activity_at: string } }
+  | { stale: { last_activity_at: string } }
+  | { disconnected: { disconnected_at: string } }
+
+type SourceStatusRuntime =
+  | { state: "not_active" }
+  | {
+      state: "active_group"
+      runtimeGenerationSha256: string
+      qualifiedRuntimeRecordCount: 0
+    }
+  | SourceActiveRuntime
+
+interface SourceActiveRuntime {
+  state: "active"
+  sourceId: string
+  venueId: string
+  instrumentId: string
+  providerProduct: string
+  providerChannel: string
+  connectionGeneration: string
+  sessionId: string
+  healthEpoch: string
+  stateRevision: string
+  assessmentId: string
+  bindingDigest: string
+  connection: SourceConnection
+  integrity: NonNullable<SourceLifecycleReceipt["integrity"]>
+  quality: NonNullable<SourceLifecycleReceipt["quality"]>
+  observedAtUnixNanos: string
+  qualificationEvaluatedAtUnixNanos: string
+  qualificationValidUntilUnixNanos: string
+}
+
+type SourceCoverageRuntime =
+  | { state: "not_established" }
+  | {
+      state: "established"
+      sourceId: string
+      venueId: string
+      instrumentId: string
+      providerProduct: string
+      providerChannel: string
+      eventClass:
+        | "trade"
+        | "quote"
+        | "book_snapshot"
+        | "book_delta"
+        | "auction"
+        | "trading_halt"
+        | "instrument_status"
+        | "corporate_action"
+      marketDepth: "top_of_book" | "price_level" | "order_level" | null
+      delay: { kind: "real_time" } | { kind: "delayed"; value: string }
+      consolidation: "single_venue" | "partial" | "consolidated"
+      effectiveFromUnixNanos: string
+      effectiveUntilUnixNanos: string | null
+      metadataRevision: string
+      status: "sufficient" | "insufficient" | "unknown"
+    }
+
+export interface SourceCoverageRow {
+  surfaceId: string
+  releaseState: "available" | "rights_limited" | "refresh_required" | "rights_blocked"
+  declaredCoverage: string
+  qualityCeiling: NonNullable<SourceLifecycleReceipt["quality"]>
+  rights: Array<{
+    operation: "retrieve" | "display" | "persist" | "model_training" | "export" | "redistribute"
+    admission: "admitted" | "pending" | "blocked"
+  }>
+  runtimeCoverage: SourceCoverageRuntime
+}
+
+type SourceFreshness =
+  | "uninitialized"
+  | { fresh: Record<string, string> }
+  | { stale: Record<string, string> }
+
+interface SourceActiveHealth {
+  state: "active"
+  sourceId: string
+  venueId: string
+  instrumentId: string
+  connectionGeneration: string
+  sessionId: string
+  healthEpoch: string
+  stateRevision: string
+  assessmentId: string
+  bindingDigest: string
+  connection: SourceConnection
+  transportFreshness: SourceFreshness
+  marketFreshness: SourceFreshness
+  sourceTimestampFreshness: SourceFreshness
+  streamIntegrity: NonNullable<SourceLifecycleReceipt["integrity"]>
+  captureIntegrity: "disabled" | "healthy" | "incomplete"
+  coverageStatus: "sufficient" | "insufficient" | "unknown"
+  quality: NonNullable<SourceLifecycleReceipt["quality"]>
+  observedAtUnixNanos: string
+  qualificationEvaluatedAtUnixNanos: string
+  qualificationValidUntilUnixNanos: string
+}
+
+export interface SourceHealthRow {
+  surfaceId: string
+  onboardingState:
+    | "unavailable"
+    | "anonymous_available"
+    | "user_action_required"
+    | "credential_imported_unverified"
+    | "protocol_validated"
+    | "stored_unverified"
+    | "secret_reconciliation_required"
+    | "verified_least_privilege"
+    | "rights_admission_pending"
+    | "runtime_verification_pending"
+    | "active_scoped"
+    | "renewal_required"
+    | "refresh_required"
+    | "rotation_pending"
+    | "revocation_unconfirmed"
+    | "indeterminate_remote_state"
+    | "cleanup_required"
+    | "blocked"
+    | null
+  runtimeHealth: { state: "not_active" } | SourceActiveHealth
 }
 
 export type SourceLifecycleDisposition =
@@ -326,9 +458,13 @@ export function parseSourceStatusResult(
   const rows = rawRows.map((value) => parseSourceStatusRow(value))
   const profileBindings = new Map<string, string>()
   const runtimeIdentities = new Set<string>()
+  const runtimeKinds = new Map<string, Set<SourceStatusRuntime["state"]>>()
+  const profileRowCounts = new Map<string, number>()
   for (const [index, row] of rows.entries()) {
     const profileId = text(row.profile.id)
-    if (!profileId) return invalidSourceResult("Source.GetStatus profile identity")
+    if (!profileId || !requestedSources.includes(profileId)) {
+      return invalidSourceResult("Source.GetStatus profile identity")
+    }
     const raw = record(rawRows[index])
     if (!raw) return invalidSourceResult("Source.GetStatus row binding")
     const binding = JSON.stringify([
@@ -343,23 +479,33 @@ export function parseSourceStatusResult(
       return invalidSourceResult("Source.GetStatus repeated profile binding")
     }
     profileBindings.set(profileId, binding)
+    const kinds = runtimeKinds.get(profileId) ?? new Set()
+    kinds.add(row.runtime.state)
+    runtimeKinds.set(profileId, kinds)
+    profileRowCounts.set(profileId, (profileRowCounts.get(profileId) ?? 0) + 1)
     if (row.runtime.state === "active") {
-      const identity = [
-        row.runtime.sourceId,
-        row.runtime.venueId,
-        row.runtime.instrumentId,
-        row.runtime.connectionGeneration,
-      ].join("\0")
+      const identity = sourceRuntimeIdentity(row.runtime)
       if (runtimeIdentities.has(identity)) {
         return invalidSourceResult("Source.GetStatus duplicate runtime identity")
       }
       runtimeIdentities.add(identity)
     }
   }
+  for (const [profileId, kinds] of runtimeKinds) {
+    if (
+      kinds.size !== 1 ||
+      (!kinds.has("active") && (profileRowCounts.get(profileId) ?? 0) !== 1)
+    ) {
+      return invalidSourceResult("Source.GetStatus runtime grouping")
+    }
+  }
   const returnedProfiles = new Set(rows.map((row) => text(row.profile.id))).size
   const returnedRuntimeRecords = rows.filter(
     (row) => row.runtime.state === "active",
   ).length
+  const returnedRuntimeClasses = [...new Set(rows.flatMap((row) =>
+    row.runtime.state === "active" ? [row.runtime.quality] : [],
+  ))].sort()
   if (
     profileCount > availableItems ||
     runtimeRecordCount > availableItems ||
@@ -367,11 +513,341 @@ export function parseSourceStatusResult(
     returnedRuntimeRecords > runtimeRecordCount ||
     (metadata.completeness === "complete" &&
       (returnedProfiles !== profileCount ||
-        returnedRuntimeRecords !== runtimeRecordCount))
+        returnedRuntimeRecords !== runtimeRecordCount ||
+        !sameOrderedStrings(returnedRuntimeClasses, runtimeClasses))) ||
+    returnedRuntimeClasses.some((quality) => !runtimeClasses.includes(quality))
   ) {
     return invalidSourceResult("Source.GetStatus metadata counts")
   }
   return rows
+}
+
+interface ExpectedSecondarySourceRow {
+  profile: ProviderProfile
+  status: SourceStatusRow
+}
+
+export function parseSourceCoverageResult(
+  result: ApplicationResult,
+  profiles: readonly ProviderProfile[],
+  statuses: readonly SourceStatusRow[],
+  expectedRequestedSources: readonly string[] = [],
+): SourceCoverageRow[] {
+  const expected = expectedSecondarySourceRows(profiles, statuses)
+  const rawRows = parseSecondarySourceEnvelope(
+    result,
+    expected,
+    expectedRequestedSources,
+    "Source.GetCoverage",
+  )
+  const rows = rawRows.map(sourceCoverageRow)
+  const identities = new Set<string>()
+  rows.forEach((row, index) => {
+    const binding = expected[index]
+    if (!binding || !coverageRowBinding(row, binding)) {
+      invalidSourceResult("Source.GetCoverage row binding")
+    }
+    const identity = row.runtimeCoverage.state === "established"
+      ? [
+          row.surfaceId,
+          row.runtimeCoverage.sourceId,
+          row.runtimeCoverage.venueId,
+          row.runtimeCoverage.instrumentId,
+          row.runtimeCoverage.providerProduct,
+          row.runtimeCoverage.providerChannel,
+        ].join("\0")
+      : row.surfaceId
+    if (identities.has(identity)) {
+      invalidSourceResult("Source.GetCoverage duplicate identity")
+    }
+    identities.add(identity)
+  })
+  return rows
+}
+
+export function parseSourceHealthResult(
+  result: ApplicationResult,
+  profiles: readonly ProviderProfile[],
+  statuses: readonly SourceStatusRow[],
+  expectedRequestedSources: readonly string[] = [],
+): SourceHealthRow[] {
+  const expected = expectedSecondarySourceRows(profiles, statuses)
+  const rawRows = parseSecondarySourceEnvelope(
+    result,
+    expected,
+    expectedRequestedSources,
+    "Source.GetHealth",
+  )
+  const rows = rawRows.map(sourceHealthRow)
+  const identities = new Set<string>()
+  rows.forEach((row, index) => {
+    const binding = expected[index]
+    if (!binding || !healthRowBinding(row, binding)) {
+      invalidSourceResult("Source.GetHealth row binding")
+    }
+    const identity = row.runtimeHealth.state === "active"
+      ? [
+          row.surfaceId,
+          row.runtimeHealth.sourceId,
+          row.runtimeHealth.venueId,
+          row.runtimeHealth.instrumentId,
+          row.runtimeHealth.connectionGeneration,
+          row.runtimeHealth.sessionId,
+          row.runtimeHealth.healthEpoch,
+          row.runtimeHealth.stateRevision,
+        ].join("\0")
+      : row.surfaceId
+    if (identities.has(identity)) {
+      invalidSourceResult("Source.GetHealth duplicate identity")
+    }
+    identities.add(identity)
+  })
+  return rows
+}
+
+function expectedSecondarySourceRows(
+  profiles: readonly ProviderProfile[],
+  statuses: readonly SourceStatusRow[],
+): ExpectedSecondarySourceRow[] {
+  const profileById = new Map<string, ProviderProfile>()
+  for (const profile of profiles) {
+    if (profileById.has(profile.id)) {
+      invalidSourceResult("provider bootstrap duplicate profile identity")
+    }
+    profileById.set(profile.id, profile)
+  }
+  const statusById = new Map<string, SourceStatusRow[]>()
+  const runtimeIdentities = new Set<string>()
+  for (const status of statuses) {
+    const profileId = text(status.profile.id)
+    const profile = profileId ? profileById.get(profileId) : undefined
+    if (!profileId || !profile || !statusProfileBinding(profile, status.profile)) {
+      invalidSourceResult("Source.GetStatus bootstrap profile binding")
+    }
+    const rows = statusById.get(profileId) ?? []
+    rows.push(status)
+    statusById.set(profileId, rows)
+    if (status.runtime.state === "active") {
+      const identity = sourceRuntimeIdentity(status.runtime)
+      if (runtimeIdentities.has(identity)) {
+        invalidSourceResult("Source.GetStatus duplicate runtime identity")
+      }
+      runtimeIdentities.add(identity)
+    }
+  }
+
+  const expected: ExpectedSecondarySourceRow[] = []
+  for (const profile of profiles) {
+    const rows = statusById.get(profile.id)
+    if (!rows?.length) {
+      invalidSourceResult("Source.GetStatus missing profile authority")
+    }
+    const staticBinding = JSON.stringify([
+      rows[0]?.profile,
+      rows[0]?.currentSession,
+      rows[0]?.providerDatasetIdentifier,
+      rows[0]?.lifecycleSupport,
+      rows[0]?.lifecycle,
+    ])
+    const states = new Set(rows.map((row) => row.runtime.state))
+    if (
+      states.size !== 1 ||
+      (!states.has("active") && rows.length !== 1) ||
+      rows.some((row) => JSON.stringify([
+        row.profile,
+        row.currentSession,
+        row.providerDatasetIdentifier,
+        row.lifecycleSupport,
+        row.lifecycle,
+      ]) !== staticBinding)
+    ) {
+      invalidSourceResult("Source.GetStatus repeated profile authority")
+    }
+    expected.push(...rows.map((status) => ({ profile, status })))
+  }
+  return expected
+}
+
+function parseSecondarySourceEnvelope(
+  result: ApplicationResult,
+  expected: readonly ExpectedSecondarySourceRow[],
+  expectedRequestedSources: readonly string[],
+  label: string,
+): unknown[] {
+  const envelope = exactRecord(result, ["data", "metadata"])
+  const metadata = exactRecord(envelope?.metadata, [
+    "completeness",
+    "returnedItems",
+    "availableItems",
+    "sourceCoverage",
+    "dataQuality",
+  ])
+  const coverage = exactRecord(metadata?.sourceCoverage, [
+    "authority",
+    "requestedSources",
+    "profileCount",
+    "runtimeRecordCount",
+    "runtimeAbsence",
+  ])
+  const quality = exactRecord(metadata?.dataQuality, [
+    "authority",
+    "runtimeClasses",
+    "runtimeAbsence",
+    "executionEligibilityUnchanged",
+  ])
+  const returnedItems = nonnegativeInteger(metadata?.returnedItems)
+  const availableItems = nonnegativeInteger(metadata?.availableItems)
+  const requestedSources = textArray(coverage?.requestedSources)
+  const profileCount = nonnegativeInteger(coverage?.profileCount)
+  const runtimeRecordCount = nonnegativeInteger(coverage?.runtimeRecordCount)
+  const runtimeClasses = textArray(quality?.runtimeClasses)
+  const rawRows = envelope?.data === null
+    ? []
+    : Array.isArray(envelope?.data)
+      ? envelope.data
+      : null
+  const expectedProfiles = new Set(
+    expected.map((binding) => binding.profile.id),
+  ).size
+  const expectedRuntime = expected.filter(
+    (binding) => binding.status.runtime.state === "active",
+  ).length
+  const expectedRuntimeClasses = [...new Set(expected.flatMap((binding) =>
+    binding.status.runtime.state === "active"
+      ? [binding.status.runtime.quality]
+      : [],
+  ))].sort()
+  if (
+    !envelope || !metadata || !coverage || !quality ||
+    returnedItems === null || availableItems === null ||
+    requestedSources === null || profileCount === null ||
+    runtimeRecordCount === null || runtimeClasses === null || rawRows === null ||
+    (metadata.completeness !== "complete" && metadata.completeness !== "truncated") ||
+    rawRows.length !== returnedItems ||
+    (envelope.data === null) !== (returnedItems === 0) ||
+    availableItems !== expected.length || returnedItems > availableItems ||
+    metadata.completeness !== (returnedItems === availableItems ? "complete" : "truncated") ||
+    coverage.authority !== "code_owned_profiles_and_current_runtime_evidence" ||
+    coverage.runtimeAbsence !== "not_established" ||
+    profileCount !== expectedProfiles || runtimeRecordCount !== expectedRuntime ||
+    quality.authority !== "profile_ceiling_and_runtime_qualification" ||
+    quality.runtimeAbsence !== "not_active" ||
+    quality.executionEligibilityUnchanged !== true ||
+    !sameOrderedStrings(requestedSources, expectedRequestedSources) ||
+    !isStrictlySorted(requestedSources) ||
+    !sameOrderedStrings(runtimeClasses, expectedRuntimeClasses) ||
+    !isStrictlySorted(runtimeClasses)
+  ) {
+    invalidSourceResult(`${label} envelope`)
+  }
+  return rawRows
+}
+
+function sourceCoverageRow(value: unknown): SourceCoverageRow {
+  const row = exactRecord(value, [
+    "surfaceId",
+    "releaseState",
+    "declaredCoverage",
+    "qualityCeiling",
+    "rights",
+    "runtimeCoverage",
+  ])
+  const surfaceId = boundedText(row?.surfaceId, 512)
+  const releaseState = sourceReleaseState(row?.releaseState)
+  const declaredCoverage = text(row?.declaredCoverage)
+  const qualityCeiling = sourceDataQuality(row?.qualityCeiling)
+    ? row?.qualityCeiling
+    : null
+  const rights = sourceDataUseRights(row?.rights)
+  const runtimeCoverage = sourceRuntimeCoverage(row?.runtimeCoverage)
+  if (
+    !row || !surfaceId || !releaseState || !declaredCoverage || !qualityCeiling ||
+    !rights || !runtimeCoverage
+  ) {
+    return invalidSourceResult("Source.GetCoverage row")
+  }
+  return {
+    surfaceId,
+    releaseState,
+    declaredCoverage,
+    qualityCeiling,
+    rights,
+    runtimeCoverage,
+  }
+}
+
+function sourceHealthRow(value: unknown): SourceHealthRow {
+  const row = exactRecord(value, ["surfaceId", "onboardingState", "runtimeHealth"])
+  const surfaceId = boundedText(row?.surfaceId, 512)
+  const onboardingState = row?.onboardingState === null
+    ? null
+    : sourceOnboardingState(row?.onboardingState)
+  const runtimeHealth = sourceRuntimeHealth(row?.runtimeHealth)
+  if (
+    !row || !surfaceId ||
+    (row.onboardingState !== null && !onboardingState) || !runtimeHealth
+  ) {
+    return invalidSourceResult("Source.GetHealth row")
+  }
+  return { surfaceId, onboardingState, runtimeHealth }
+}
+
+function coverageRowBinding(
+  row: SourceCoverageRow,
+  binding: ExpectedSecondarySourceRow,
+) {
+  const { profile, status } = binding
+  const expectedRights = sourceDataUseRights(status.profile.rights)
+  if (
+    row.surfaceId !== profile.id ||
+    row.releaseState !== status.profile.release_state ||
+    row.declaredCoverage !== status.profile.coverage ||
+    row.qualityCeiling !== status.profile.quality_ceiling ||
+    expectedRights === null || !sameDataUseRights(row.rights, expectedRights)
+  ) return false
+  if (status.runtime.state !== "active") {
+    return row.runtimeCoverage.state === "not_established"
+  }
+  const coverage = row.runtimeCoverage
+  return coverage.state === "established" &&
+    coverage.sourceId === status.runtime.sourceId &&
+    coverage.venueId === status.runtime.venueId &&
+    coverage.instrumentId === status.runtime.instrumentId &&
+    coverage.providerProduct === status.runtime.providerProduct &&
+    coverage.providerChannel === status.runtime.providerChannel
+}
+
+function healthRowBinding(
+  row: SourceHealthRow,
+  binding: ExpectedSecondarySourceRow,
+) {
+  const { profile, status } = binding
+  if (
+    row.surfaceId !== profile.id ||
+    row.onboardingState !== (text(status.currentSession?.state) ?? null)
+  ) return false
+  if (status.runtime.state !== "active") {
+    return row.runtimeHealth.state === "not_active"
+  }
+  const health = row.runtimeHealth
+  return health.state === "active" &&
+    health.sourceId === status.runtime.sourceId &&
+    health.venueId === status.runtime.venueId &&
+    health.instrumentId === status.runtime.instrumentId &&
+    health.connectionGeneration === status.runtime.connectionGeneration &&
+    health.sessionId === status.runtime.sessionId &&
+    health.healthEpoch === status.runtime.healthEpoch &&
+    health.stateRevision === status.runtime.stateRevision &&
+    health.assessmentId === status.runtime.assessmentId &&
+    health.bindingDigest === status.runtime.bindingDigest &&
+    JSON.stringify(health.connection) === JSON.stringify(status.runtime.connection) &&
+    health.streamIntegrity === status.runtime.integrity &&
+    health.quality === status.runtime.quality &&
+    health.observedAtUnixNanos === status.runtime.observedAtUnixNanos &&
+    health.qualificationEvaluatedAtUnixNanos ===
+      status.runtime.qualificationEvaluatedAtUnixNanos &&
+    health.qualificationValidUntilUnixNanos ===
+      status.runtime.qualificationValidUntilUnixNanos
 }
 
 export function parseSourceLifecycleReceipt(
@@ -512,31 +988,78 @@ export function sourceEvidence(
   coverage: ApplicationResult | undefined,
   health: ApplicationResult | undefined,
 ): SourceEvidence[] {
-  const statusById = new Map<string, SourceStatusRow>()
+  const profileById = new Map<string, ProviderProfile>()
+  for (const profile of profiles) {
+    if (profileById.has(profile.id)) {
+      return invalidSourceResult("provider bootstrap duplicate profile identity")
+    }
+    profileById.set(profile.id, profile)
+  }
+  const statusById = new Map<string, SourceStatusRow[]>()
   for (const status of statuses) {
     const id = text(status.profile.id)
-    if (!id) return invalidSourceResult("Source.GetStatus profile identity")
-    statusById.set(id, status)
+    const profile = id ? profileById.get(id) : undefined
+    if (!id || !profile || !statusProfileBinding(profile, status.profile)) {
+      return invalidSourceResult("Source.GetStatus profile identity")
+    }
+    const rows = statusById.get(id) ?? []
+    rows.push(status)
+    statusById.set(id, rows)
   }
-  const coverageById = indexRows(coverage?.data, (row) => text(row.surfaceId))
-  const healthById = indexRows(health?.data, (row) => text(row.surfaceId))
-  const profileById = new Map(profiles.map((profile) => [profile.id, profile]))
-  const identifiers = new Set([
-    ...profileById.keys(),
-    ...statusById.keys(),
-    ...coverageById.keys(),
-    ...healthById.keys(),
-  ])
+  const runtimeIdentities = new Set<string>()
+  for (const rows of statusById.values()) {
+    const first = rows[0]
+    const binding = JSON.stringify([
+      first?.profile,
+      first?.currentSession,
+      first?.providerDatasetIdentifier,
+      first?.lifecycleSupport,
+      first?.lifecycle,
+    ])
+    const states = new Set(rows.map((row) => row.runtime.state))
+    if (
+      states.size !== 1 ||
+      (!states.has("active") && rows.length !== 1) ||
+      rows.some((row) => JSON.stringify([
+        row.profile,
+        row.currentSession,
+        row.providerDatasetIdentifier,
+        row.lifecycleSupport,
+        row.lifecycle,
+      ]) !== binding)
+    ) {
+      return invalidSourceResult("Source.GetStatus repeated profile authority")
+    }
+    for (const row of rows) {
+      if (row.runtime.state !== "active") continue
+      const identity = sourceRuntimeIdentity(row.runtime)
+      if (runtimeIdentities.has(identity)) {
+        return invalidSourceResult("Source.GetStatus duplicate runtime identity")
+      }
+      runtimeIdentities.add(identity)
+    }
+  }
+  const completeStatusAuthority = profiles.every(
+    (profile) => (statusById.get(profile.id)?.length ?? 0) > 0,
+  )
+  const coverageRows = coverage && completeStatusAuthority
+    ? parseSourceCoverageResult(coverage, profiles, statuses)
+    : []
+  const healthRows = health && completeStatusAuthority
+    ? parseSourceHealthResult(health, profiles, statuses)
+    : []
+  const coverageById = groupRows(coverageRows, (row) => row.surfaceId)
+  const healthById = groupRows(healthRows, (row) => row.surfaceId)
 
-  return [...identifiers]
+  return [...profileById.keys()]
     .map((id) =>
       toEvidence(
         id,
         profileById.get(id),
         sessions.find((session) => session.surface_id === id),
-        statusById.get(id),
-        coverageById.get(id),
-        healthById.get(id),
+        statusById.get(id) ?? [],
+        coverageById.get(id) ?? [],
+        healthById.get(id) ?? [],
       ),
     )
     .sort((left, right) => left.name.localeCompare(right.name))
@@ -762,36 +1285,62 @@ function toEvidence(
   id: string,
   bootstrapProfile: ProviderProfile | undefined,
   bootstrapSession: ProviderSession | undefined,
-  status: SourceStatusRow | undefined,
-  coverage: RecordValue | undefined,
-  health: RecordValue | undefined,
+  statuses: SourceStatusRow[],
+  coverageRows: SourceCoverageRow[],
+  healthRows: SourceHealthRow[],
 ): SourceEvidence {
+  const status = statuses[0]
   const profile = status?.profile ?? null
   const session = status?.currentSession ?? null
-  const runtime = status?.runtime ?? null
-  const runtimeCoverage = record(coverage?.runtimeCoverage)
-  const runtimeHealth = record(health?.runtimeHealth)
+  const runtimes = statuses.map((row) => row.runtime)
+  const activeRuntimes = runtimes.filter(
+    (runtime): runtime is SourceActiveRuntime => runtime.state === "active",
+  )
   const lifecycle = status?.lifecycle ?? null
   const lifecycleSupport = status?.lifecycleSupport ?? null
-  const runtimeState = text(runtime?.state) ?? text(runtimeHealth?.state)
-  const providerDatasetIdentifier = text(status?.providerDatasetIdentifier)
+  const runtimeState = commonValue(runtimes.map((runtime) => runtime.state))
+  const providerDatasetIdentifier = status?.providerDatasetIdentifier ?? null
+  const completeCoverage = coverageRows.length === statuses.length
+  const completeHealth = healthRows.length === statuses.length
+  const establishedCoverage = completeCoverage
+    ? coverageRows.flatMap((row) =>
+        row.runtimeCoverage.state === "established" ? [row.runtimeCoverage] : [],
+      )
+    : []
+  const activeHealth = completeHealth
+    ? healthRows.flatMap((row) =>
+        row.runtimeHealth.state === "active" ? [row.runtimeHealth] : [],
+      )
+    : []
+  const statusSourceId = commonValue(activeRuntimes.map((runtime) => runtime.sourceId))
+  const statusVenueId = commonValue(activeRuntimes.map((runtime) => runtime.venueId))
+  const statusInstrumentId = commonValue(
+    activeRuntimes.map((runtime) => runtime.instrumentId),
+  )
+  const statusConnection = commonValue(
+    activeRuntimes.map((runtime) => evidenceName(runtime.connection)),
+  )
+  const statusIntegrity = commonValue(
+    activeRuntimes.map((runtime) => runtime.integrity),
+  )
+  const statusQuality = commonValue(activeRuntimes.map((runtime) => runtime.quality))
+  const statusObserved = commonValue(
+    activeRuntimes.map((runtime) => runtime.observedAtUnixNanos),
+  )
 
   return {
     id,
     name:
       text(profile?.display_name) ?? bootstrapProfile?.display_name ?? id,
     declaredCoverage:
-      text(coverage?.declaredCoverage) ??
       text(profile?.coverage) ??
       bootstrapProfile?.coverage ??
       null,
     qualityCeiling:
-      text(coverage?.qualityCeiling) ??
       text(profile?.quality_ceiling) ??
       bootstrapProfile?.quality_ceiling ??
       null,
     releaseState:
-      text(coverage?.releaseState) ??
       text(profile?.release_state) ??
       bootstrapProfile?.release_state ??
       null,
@@ -805,25 +1354,31 @@ function toEvidence(
       bootstrapProfile?.credential_requirement ??
       null,
     setupState:
-      text(session?.state) ?? bootstrapSession?.state ?? text(health?.onboardingState),
+      text(session?.state) ?? bootstrapSession?.state ?? null,
     nextAction:
       text(session?.next_action) ?? bootstrapSession?.next_action ?? null,
     lifecycleSupport,
     operationalState:
-      lifecycle?.state ?? (runtimeState === "not_active" ? "stopped" : runtimeState),
+      lifecycle?.state ??
+      (runtimeState === "active" || runtimeState === "active_group"
+        ? "active"
+        : runtimeState === "not_active"
+          ? "stopped"
+          : null),
     runtimeState,
-    sourceId: text(runtime?.sourceId) ?? text(runtimeHealth?.sourceId),
-    venueId: text(runtime?.venueId) ?? text(runtimeHealth?.venueId),
-    instrumentId:
-      text(runtime?.instrumentId) ?? text(runtimeHealth?.instrumentId),
-    connection: evidenceName(runtime?.connection ?? runtimeHealth?.connection),
-    marketFreshness: evidenceName(runtimeHealth?.marketFreshness),
-    integrity: evidenceName(runtime?.integrity ?? runtimeHealth?.streamIntegrity),
-    quality: evidenceName(runtime?.quality ?? runtimeHealth?.quality),
-    coverageState: evidenceName(runtimeCoverage),
-    runtimeObservedAt: unixNanos(
-      runtime?.observedAtUnixNanos ?? runtimeHealth?.observedAtUnixNanos,
+    sourceId: statusSourceId,
+    venueId: statusVenueId,
+    instrumentId: statusInstrumentId,
+    connection: statusConnection,
+    marketFreshness: commonValue(
+      activeHealth.map((runtime) => evidenceName(runtime.marketFreshness)),
     ),
+    integrity: statusIntegrity,
+    quality: statusQuality,
+    coverageState: commonValue(
+      establishedCoverage.map((runtime) => runtime.status),
+    ),
+    runtimeObservedAt: unixNanos(statusObserved),
     latestSetupSessionId:
       text(session?.session_id) ?? bootstrapSession?.session_id ?? null,
     providerDatasetIdentifier,
@@ -951,6 +1506,7 @@ function parseSourceStatusRow(value: unknown): SourceStatusRow {
   const support = lifecycleSupportEvidence(row?.lifecycleSupport)
   const lifecycle = lifecycleEvidence(row?.lifecycle)
   const runtime = sourceStatusRuntime(row?.runtime)
+  const accountGroup = profileId !== null && ACCOUNT_GROUP_SOURCES.has(profileId)
   if (
     !row || !profile || !profileId ||
     (row.currentSession !== null && !currentSession) ||
@@ -959,6 +1515,12 @@ function parseSourceStatusRow(value: unknown): SourceStatusRow {
     (support === "managed") !== (lifecycle !== null) ||
     (row.lifecycle !== null && lifecycle === null) ||
     (lifecycle !== null && lifecycle.provider !== profileId) ||
+    (accountGroup
+      ? runtime?.state === "active" ||
+        (lifecycle?.state === "active") !== (runtime?.state === "active_group")
+      : runtime?.state === "active_group") ||
+    (runtime?.state === "active_group" &&
+      lifecycle?.runtimeGenerationSha256 !== runtime.runtimeGenerationSha256) ||
     (currentSession !== null && text(currentSession.surface_id) !== profileId)
   ) {
     return invalidSourceResult("Source.GetStatus row")
@@ -973,9 +1535,23 @@ function parseSourceStatusRow(value: unknown): SourceStatusRow {
   }
 }
 
-function sourceStatusRuntime(value: unknown): RecordValue | null {
+function sourceStatusRuntime(value: unknown): SourceStatusRuntime | null {
   const inactive = exactRecord(value, ["state"])
-  if (inactive?.state === "not_active") return inactive
+  if (inactive?.state === "not_active") return { state: "not_active" }
+  const activeGroup = exactRecord(value, [
+    "state", "runtimeGenerationSha256", "qualifiedRuntimeRecordCount",
+  ])
+  if (
+    activeGroup?.state === "active_group" &&
+    nonzeroSha256(activeGroup.runtimeGenerationSha256) &&
+    activeGroup.qualifiedRuntimeRecordCount === 0
+  ) {
+    return {
+      state: "active_group",
+      runtimeGenerationSha256: activeGroup.runtimeGenerationSha256,
+      qualifiedRuntimeRecordCount: 0,
+    }
+  }
   const active = exactRecord(value, [
     "state", "sourceId", "venueId", "instrumentId", "providerProduct",
     "providerChannel", "connectionGeneration", "sessionId", "healthEpoch",
@@ -983,34 +1559,356 @@ function sourceStatusRuntime(value: unknown): RecordValue | null {
     "quality", "observedAtUnixNanos", "qualificationEvaluatedAtUnixNanos",
     "qualificationValidUntilUnixNanos",
   ])
+  const sourceId = boundedText(active?.sourceId, 128)
+  const venueId = boundedText(active?.venueId, 64)
+  const instrumentId = uuid(active?.instrumentId)
+  const providerProduct = boundedText(active?.providerProduct, 512)
+  const providerChannel = boundedText(active?.providerChannel, 512)
+  const connectionGeneration = positiveIntegerText(active?.connectionGeneration)
+  const sessionId = boundedText(active?.sessionId, 512)
+  const healthEpoch = positiveIntegerText(active?.healthEpoch)
+  const stateRevision = positiveIntegerText(active?.stateRevision)
+  const assessmentId = boundedText(active?.assessmentId, 512)
+  const bindingDigest = sha256(active?.bindingDigest) ? active.bindingDigest : null
+  const connection = sourceConnection(active?.connection)
+  const integrity = sourceStreamIntegrity(active?.integrity)
+  const quality = sourceDataQuality(active?.quality) ? active.quality : null
+  const observedAtUnixNanos = integerText(active?.observedAtUnixNanos)
+  const qualificationEvaluatedAtUnixNanos = integerText(
+    active?.qualificationEvaluatedAtUnixNanos,
+  )
+  const qualificationValidUntilUnixNanos = integerText(
+    active?.qualificationValidUntilUnixNanos,
+  )
   if (
-    active?.state !== "active" || !text(active.sourceId) || !text(active.venueId) ||
-    !uuid(active.instrumentId) || !text(active.providerProduct) ||
-    !text(active.providerChannel) || positiveIntegerText(active.connectionGeneration) === null ||
-    !text(active.sessionId) || positiveIntegerText(active.healthEpoch) === null ||
-    positiveIntegerText(active.stateRevision) === null || !text(active.assessmentId) ||
-    !sha256(active.bindingDigest) || !sourceConnection(active.connection) ||
-    !sourceStreamIntegrity(active.integrity) || !sourceDataQuality(active.quality) ||
-    !integerLike(active.observedAtUnixNanos) ||
-    !integerLike(active.qualificationEvaluatedAtUnixNanos) ||
-    !integerLike(active.qualificationValidUntilUnixNanos)
+    active?.state !== "active" || !sourceId || !venueId || !instrumentId ||
+    !providerProduct || !providerChannel || connectionGeneration === null ||
+    !sessionId || healthEpoch === null || stateRevision === null || !assessmentId ||
+    !bindingDigest || !connection || !integrity || !quality ||
+    observedAtUnixNanos === null || qualificationEvaluatedAtUnixNanos === null ||
+    qualificationValidUntilUnixNanos === null
   ) return null
-  return active
+  return {
+    state: "active",
+    sourceId,
+    venueId,
+    instrumentId,
+    providerProduct,
+    providerChannel,
+    connectionGeneration,
+    sessionId,
+    healthEpoch,
+    stateRevision,
+    assessmentId,
+    bindingDigest,
+    connection,
+    integrity,
+    quality,
+    observedAtUnixNanos,
+    qualificationEvaluatedAtUnixNanos,
+    qualificationValidUntilUnixNanos,
+  }
 }
 
-function sourceConnection(value: unknown) {
-  if (value === "connecting") return true
+function sourceConnection(value: unknown): SourceConnection | null {
+  if (value === "connecting") return value
   const row = record(value)
-  if (!row || Object.keys(row).length !== 1) return false
-  if ("live" in row || "stale" in row) {
-    const evidence = exactRecord(row.live ?? row.stale, ["last_activity_at"])
-    return evidence !== null && integerLike(evidence.last_activity_at)
+  if (!row || Object.keys(row).length !== 1) return null
+  if ("live" in row) {
+    const evidence = exactRecord(row.live, ["last_activity_at"])
+    const at = integerText(evidence?.last_activity_at)
+    return at === null ? null : { live: { last_activity_at: at } }
+  }
+  if ("stale" in row) {
+    const evidence = exactRecord(row.stale, ["last_activity_at"])
+    const at = integerText(evidence?.last_activity_at)
+    return at === null ? null : { stale: { last_activity_at: at } }
   }
   if ("disconnected" in row) {
     const evidence = exactRecord(row.disconnected, ["disconnected_at"])
-    return evidence !== null && integerLike(evidence.disconnected_at)
+    const at = integerText(evidence?.disconnected_at)
+    return at === null ? null : { disconnected: { disconnected_at: at } }
   }
-  return false
+  return null
+}
+
+function sourceRuntimeCoverage(value: unknown): SourceCoverageRuntime | null {
+  const inactive = exactRecord(value, ["state"])
+  if (inactive?.state === "not_established") return { state: "not_established" }
+  const row = exactRecord(value, [
+    "state",
+    "sourceId",
+    "venueId",
+    "instrumentId",
+    "providerProduct",
+    "providerChannel",
+    "eventClass",
+    "marketDepth",
+    "delay",
+    "consolidation",
+    "effectiveFromUnixNanos",
+    "effectiveUntilUnixNanos",
+    "metadataRevision",
+    "status",
+  ])
+  const sourceId = boundedText(row?.sourceId, 128)
+  const venueId = boundedText(row?.venueId, 64)
+  const instrumentId = uuid(row?.instrumentId)
+  const providerProduct = boundedText(row?.providerProduct, 512)
+  const providerChannel = boundedText(row?.providerChannel, 512)
+  const eventClass = sourceEventClass(row?.eventClass)
+  const marketDepth = row?.marketDepth === null ? null : sourceMarketDepth(row?.marketDepth)
+  const delay = sourceCoverageDelay(row?.delay)
+  const consolidation = sourceConsolidation(row?.consolidation)
+  const effectiveFromUnixNanos = integerText(row?.effectiveFromUnixNanos)
+  const effectiveUntilUnixNanos = row?.effectiveUntilUnixNanos === null
+    ? null
+    : integerText(row?.effectiveUntilUnixNanos)
+  const metadataRevision = boundedText(row?.metadataRevision, 512)
+  const status = sourceCoverageValue(row?.status)
+  if (
+    row?.state !== "established" || !sourceId || !venueId || !instrumentId ||
+    !providerProduct || !providerChannel || !eventClass ||
+    (row.marketDepth !== null && !marketDepth) || !delay || !consolidation ||
+    effectiveFromUnixNanos === null ||
+    (row.effectiveUntilUnixNanos !== null && effectiveUntilUnixNanos === null) ||
+    (effectiveUntilUnixNanos !== null &&
+      compareIntegerText(effectiveUntilUnixNanos, effectiveFromUnixNanos) <= 0) ||
+    !metadataRevision || !status
+  ) return null
+  return {
+    state: "established",
+    sourceId,
+    venueId,
+    instrumentId,
+    providerProduct,
+    providerChannel,
+    eventClass,
+    marketDepth,
+    delay,
+    consolidation,
+    effectiveFromUnixNanos,
+    effectiveUntilUnixNanos,
+    metadataRevision,
+    status,
+  }
+}
+
+function sourceRuntimeHealth(
+  value: unknown,
+): SourceHealthRow["runtimeHealth"] | null {
+  const inactive = exactRecord(value, ["state"])
+  if (inactive?.state === "not_active") return { state: "not_active" }
+  const row = exactRecord(value, [
+    "state",
+    "sourceId",
+    "venueId",
+    "instrumentId",
+    "connectionGeneration",
+    "sessionId",
+    "healthEpoch",
+    "stateRevision",
+    "assessmentId",
+    "bindingDigest",
+    "connection",
+    "transportFreshness",
+    "marketFreshness",
+    "sourceTimestampFreshness",
+    "streamIntegrity",
+    "captureIntegrity",
+    "coverageStatus",
+    "quality",
+    "observedAtUnixNanos",
+    "qualificationEvaluatedAtUnixNanos",
+    "qualificationValidUntilUnixNanos",
+  ])
+  const sourceId = boundedText(row?.sourceId, 128)
+  const venueId = boundedText(row?.venueId, 64)
+  const instrumentId = uuid(row?.instrumentId)
+  const connectionGeneration = positiveIntegerText(row?.connectionGeneration)
+  const sessionId = boundedText(row?.sessionId, 512)
+  const healthEpoch = positiveIntegerText(row?.healthEpoch)
+  const stateRevision = positiveIntegerText(row?.stateRevision)
+  const assessmentId = boundedText(row?.assessmentId, 512)
+  const bindingDigest = sha256(row?.bindingDigest) ? row.bindingDigest : null
+  const connection = sourceConnection(row?.connection)
+  const transportFreshness = sourceFreshness(
+    row?.transportFreshness,
+    "last_transport_at",
+  )
+  const marketFreshness = sourceFreshness(row?.marketFreshness, "last_market_at")
+  const sourceTimestampFreshness = sourceFreshness(
+    row?.sourceTimestampFreshness,
+    "last_source_at",
+  )
+  const streamIntegrity = sourceStreamIntegrity(row?.streamIntegrity)
+  const captureIntegrity = sourceCaptureIntegrity(row?.captureIntegrity)
+  const coverageStatus = sourceCoverageValue(row?.coverageStatus)
+  const quality = sourceDataQuality(row?.quality) ? row.quality : null
+  const observedAtUnixNanos = integerText(row?.observedAtUnixNanos)
+  const qualificationEvaluatedAtUnixNanos = integerText(
+    row?.qualificationEvaluatedAtUnixNanos,
+  )
+  const qualificationValidUntilUnixNanos = integerText(
+    row?.qualificationValidUntilUnixNanos,
+  )
+  if (
+    row?.state !== "active" || !sourceId || !venueId || !instrumentId ||
+    connectionGeneration === null || !sessionId || healthEpoch === null ||
+    stateRevision === null || !assessmentId || !bindingDigest || !connection ||
+    !transportFreshness || !marketFreshness || !sourceTimestampFreshness ||
+    !streamIntegrity || !captureIntegrity || !coverageStatus || !quality ||
+    observedAtUnixNanos === null || qualificationEvaluatedAtUnixNanos === null ||
+    qualificationValidUntilUnixNanos === null
+  ) return null
+  return {
+    state: "active",
+    sourceId,
+    venueId,
+    instrumentId,
+    connectionGeneration,
+    sessionId,
+    healthEpoch,
+    stateRevision,
+    assessmentId,
+    bindingDigest,
+    connection,
+    transportFreshness,
+    marketFreshness,
+    sourceTimestampFreshness,
+    streamIntegrity,
+    captureIntegrity,
+    coverageStatus,
+    quality,
+    observedAtUnixNanos,
+    qualificationEvaluatedAtUnixNanos,
+    qualificationValidUntilUnixNanos,
+  }
+}
+
+function sourceFreshness(value: unknown, field: string): SourceFreshness | null {
+  if (value === "uninitialized") return value
+  const row = record(value)
+  if (!row || Object.keys(row).length !== 1) return null
+  const variant = "fresh" in row ? "fresh" : "stale" in row ? "stale" : null
+  if (!variant) return null
+  const evidence = exactRecord(row[variant], [field])
+  const at = integerText(evidence?.[field])
+  return at === null
+    ? null
+    : variant === "fresh"
+      ? { fresh: { [field]: at } }
+      : { stale: { [field]: at } }
+}
+
+function sourceDataUseRights(value: unknown): SourceCoverageRow["rights"] | null {
+  if (!Array.isArray(value) || value.length > 6) return null
+  const rights: SourceCoverageRow["rights"] = []
+  const operations = new Set<string>()
+  for (const item of value) {
+    const row = exactRecord(item, ["operation", "admission"])
+    const operation = sourceDataUseOperation(row?.operation)
+    const admission = sourceDataUseAdmission(row?.admission)
+    if (!row || !operation || !admission || operations.has(operation)) return null
+    operations.add(operation)
+    rights.push({ operation, admission })
+  }
+  return rights
+}
+
+function sourceReleaseState(value: unknown): SourceCoverageRow["releaseState"] | null {
+  return value === "available" || value === "rights_limited" ||
+    value === "refresh_required" || value === "rights_blocked"
+    ? value
+    : null
+}
+
+function sourceOnboardingState(
+  value: unknown,
+): Exclude<SourceHealthRow["onboardingState"], null> | null {
+  return value === "unavailable" || value === "anonymous_available" ||
+    value === "user_action_required" || value === "credential_imported_unverified" ||
+    value === "protocol_validated" || value === "stored_unverified" ||
+    value === "secret_reconciliation_required" ||
+    value === "verified_least_privilege" || value === "rights_admission_pending" ||
+    value === "runtime_verification_pending" || value === "active_scoped" ||
+    value === "renewal_required" || value === "refresh_required" ||
+    value === "rotation_pending" || value === "revocation_unconfirmed" ||
+    value === "indeterminate_remote_state" || value === "cleanup_required" ||
+    value === "blocked"
+    ? value
+    : null
+}
+
+function sourceEventClass(
+  value: unknown,
+): Extract<SourceCoverageRuntime, { state: "established" }>["eventClass"] | null {
+  return value === "trade" || value === "quote" || value === "book_snapshot" ||
+    value === "book_delta" || value === "auction" || value === "trading_halt" ||
+    value === "instrument_status" || value === "corporate_action"
+    ? value
+    : null
+}
+
+function sourceMarketDepth(
+  value: unknown,
+): Extract<SourceCoverageRuntime, { state: "established" }>["marketDepth"] {
+  return value === "top_of_book" || value === "price_level" || value === "order_level"
+    ? value
+    : null
+}
+
+function sourceCoverageDelay(
+  value: unknown,
+): Extract<SourceCoverageRuntime, { state: "established" }>["delay"] | null {
+  const realTime = exactRecord(value, ["kind"])
+  if (realTime?.kind === "real_time") return { kind: "real_time" }
+  const delayed = exactRecord(value, ["kind", "value"])
+  const nanos = positiveIntegerText(delayed?.value)
+  return delayed?.kind === "delayed" && nanos !== null
+    ? { kind: "delayed", value: nanos }
+    : null
+}
+
+function sourceConsolidation(
+  value: unknown,
+): Extract<SourceCoverageRuntime, { state: "established" }>["consolidation"] | null {
+  return value === "single_venue" || value === "partial" || value === "consolidated"
+    ? value
+    : null
+}
+
+function sourceCoverageValue(
+  value: unknown,
+): "sufficient" | "insufficient" | "unknown" | null {
+  return value === "sufficient" || value === "insufficient" || value === "unknown"
+    ? value
+    : null
+}
+
+function sourceCaptureIntegrity(
+  value: unknown,
+): SourceActiveHealth["captureIntegrity"] | null {
+  return value === "disabled" || value === "healthy" || value === "incomplete"
+    ? value
+    : null
+}
+
+function sourceDataUseOperation(
+  value: unknown,
+): SourceCoverageRow["rights"][number]["operation"] | null {
+  return value === "retrieve" || value === "display" || value === "persist" ||
+    value === "model_training" || value === "export" || value === "redistribute"
+    ? value
+    : null
+}
+
+function sourceDataUseAdmission(
+  value: unknown,
+): SourceCoverageRow["rights"][number]["admission"] | null {
+  return value === "admitted" || value === "pending" || value === "blocked"
+    ? value
+    : null
 }
 
 function validateLifecycleRequest(
@@ -1257,10 +2155,6 @@ function sameOrderedStrings(left: readonly string[], right: readonly string[]) {
 
 function isStrictlySorted(items: readonly string[]) {
   return items.every((item, index) => index === 0 || item > (items[index - 1] ?? ""))
-}
-
-function integerLike(value: unknown) {
-  return integerText(value) !== null
 }
 
 function invalidSourceResult(message: string): never {
@@ -1796,6 +2690,16 @@ function compareUnsignedIntegerText(left: string, right: string): number {
       : 1
 }
 
+function compareIntegerText(left: string, right: string): number {
+  const leftNegative = left.startsWith("-")
+  const rightNegative = right.startsWith("-")
+  if (leftNegative !== rightNegative) return leftNegative ? -1 : 1
+  const leftMagnitude = leftNegative ? left.slice(1) : left
+  const rightMagnitude = rightNegative ? right.slice(1) : right
+  const comparison = compareUnsignedIntegerText(leftMagnitude, rightMagnitude)
+  return leftNegative ? -comparison : comparison
+}
+
 function exactRecord(value: unknown, keys: string[]): RecordValue | null {
   const row = record(value)
   if (!row || Object.keys(row).sort().join("\0") !== [...keys].sort().join("\0")) {
@@ -1819,18 +2723,70 @@ function control(
   return { action, label, request, destructive }
 }
 
-function indexRows(
-  value: unknown,
-  identity: (row: RecordValue) => string | null,
+function groupRows<T>(
+  rows: readonly T[],
+  identity: (row: T) => string,
 ) {
-  const result = new Map<string, RecordValue>()
-  for (const item of Array.isArray(value) ? value : []) {
-    const row = record(item)
-    if (!row) continue
+  const result = new Map<string, T[]>()
+  for (const row of rows) {
     const id = identity(row)
-    if (id) result.set(id, row)
+    const existing = result.get(id) ?? []
+    existing.push(row)
+    result.set(id, existing)
   }
   return result
+}
+
+function commonValue<T>(values: readonly T[]): T | null {
+  const first = values[0]
+  return first === undefined || values.some((value) => value !== first)
+    ? null
+    : first
+}
+
+function statusProfileBinding(
+  profile: ProviderProfile,
+  statusProfile: RecordValue,
+) {
+  if (
+    statusProfile.id !== profile.id ||
+    statusProfile.display_name !== profile.display_name
+  ) return false
+  for (const key of [
+    "release_state",
+    "coverage",
+    "quality_ceiling",
+    "zero_fee",
+    "account_requirement",
+    "credential_requirement",
+  ] as const) {
+    if (statusProfile[key] !== undefined && statusProfile[key] !== profile[key]) return false
+  }
+  return true
+}
+
+function sourceRuntimeIdentity(runtime: SourceActiveRuntime) {
+  return [
+    runtime.sourceId,
+    runtime.venueId,
+    runtime.instrumentId,
+    runtime.providerProduct,
+    runtime.providerChannel,
+    runtime.connectionGeneration,
+    runtime.sessionId,
+    runtime.healthEpoch,
+    runtime.stateRevision,
+  ].join("\0")
+}
+
+function sameDataUseRights(
+  left: SourceCoverageRow["rights"],
+  right: SourceCoverageRow["rights"],
+) {
+  return left.length === right.length && left.every((item, index) =>
+    item.operation === right[index]?.operation &&
+    item.admission === right[index]?.admission
+  )
 }
 
 function evidenceName(value: unknown): string | null {
@@ -1857,6 +2813,11 @@ function unixNanos(value: unknown): string | null {
   } catch {
     return null
   }
+}
+
+function boundedText(value: unknown, maximum: number): string | null {
+  const parsed = text(value)
+  return parsed !== null && parsed.length <= maximum ? parsed : null
 }
 
 function sha256(value: unknown): value is string {

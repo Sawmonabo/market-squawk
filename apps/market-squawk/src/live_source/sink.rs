@@ -10,7 +10,7 @@ use super::{
     display_market::{
         DisplayMarketIngress, DisplayMarketRouteIdentity, DisplayMarketTerminalFailure,
     },
-    provider::ProductionMarketDecoder,
+    provider::{ProductionMarketDecoder, StartupReadinessPolicy},
     route_actor::{RouteActivationBinding, RouteActivationPublisher},
     subscription_state::{
         GenerationIdentity, SubscriptionFailure, SubscriptionPhase, SubscriptionStateMachine,
@@ -22,11 +22,11 @@ use market_squawk_platform::{CapturePublishError, RawCapturePublisher};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationHealth, BudgetHealth, BudgetPermitLease,
     CaptureGenerationCapabilities, ConnectionLiveness, ControlFrameKind,
-    CurrentDecodedProviderBatch, CurrentDecodedProviderBatches, CurrentHealthReporter,
-    CurrentSourceSession, DecodeInternalError, DecodeOutcome, FreshnessPolicy, MarketDecoder,
-    ProviderTimestampEvidence, QuarantineReason, RawMarketFrame, RawMarketSink, RegistryError,
-    ResynchronizationReason, SinkError, SourceHealthError, SourceHealthSnapshot, SourceMetadata,
-    SourceMetadataProvider, ValidatedSessionDecodeOutcome,
+    CurrentDecodedProviderBatch, CurrentDecodedProviderBatches, CurrentHealthRecording,
+    CurrentHealthReporter, CurrentSourceSession, DecodeInternalError, DecodeOutcome,
+    FreshnessPolicy, MarketDecoder, ProviderTimestampEvidence, QuarantineReason, RawMarketFrame,
+    RawMarketSink, RegistryError, ResynchronizationReason, SinkError, SourceHealthError,
+    SourceHealthSnapshot, SourceMetadata, SourceMetadataProvider, ValidatedSessionDecodeOutcome,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -68,6 +68,7 @@ pub(super) struct ProductionDisplayMarketSinkInput<'a> {
     pub(super) subscription: SubscriptionStateMachine,
     pub(super) display_ingresses: Vec<DisplayMarketIngress>,
     pub(super) ingress_timeout: Duration,
+    pub(super) startup_readiness_policy: StartupReadinessPolicy,
 }
 
 /// Exact capture/session/health/live-route bridge used directly by the Coinbase reader.
@@ -85,6 +86,7 @@ pub(super) struct ProductionRawMarketSink<'a> {
     output: QualifiedSourceOutput,
     startup_readiness: Option<oneshot::Sender<()>>,
     startup_ready: bool,
+    startup_readiness_policy: StartupReadinessPolicy,
     last_transport_at: Option<Timestamp>,
     last_market_at: Option<Timestamp>,
     last_source_at: Option<Timestamp>,
@@ -113,6 +115,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             metadata,
             input.subscription,
             output,
+            StartupReadinessPolicy::FirstQualifiedData,
         )
     }
 
@@ -141,6 +144,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             input.metadata,
             input.subscription,
             output,
+            StartupReadinessPolicy::FirstQualifiedData,
         )
     }
 
@@ -148,6 +152,7 @@ impl<'a> ProductionRawMarketSink<'a> {
         input: ProductionDisplayMarketSinkInput<'a>,
     ) -> Result<Self, ProductionSinkConstructionError> {
         let metadata = input.decoder.metadata().clone();
+        let startup_readiness_policy = input.startup_readiness_policy;
         validate_display_generation(&metadata, input.session, &input.display_ingresses)?;
         let output = QualifiedSourceOutput::Display(QualifiedDisplayOutput::try_new(
             input.display_ingresses,
@@ -162,6 +167,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             metadata,
             input.subscription,
             output,
+            startup_readiness_policy,
         )
     }
 
@@ -187,6 +193,7 @@ impl<'a> ProductionRawMarketSink<'a> {
         metadata: SourceMetadata,
         subscription: SubscriptionStateMachine,
         output: QualifiedSourceOutput,
+        startup_readiness_policy: StartupReadinessPolicy,
     ) -> Result<Self, ProductionSinkConstructionError> {
         let pending_data =
             PendingDataBuffer::try_new(subscription.pre_acknowledgement_data_limits())?;
@@ -203,6 +210,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             output,
             startup_readiness: None,
             startup_ready: false,
+            startup_readiness_policy,
             last_transport_at: None,
             last_market_at: None,
             last_source_at: None,
@@ -363,7 +371,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             .is_some_and(|deadline| received_at > deadline)
             && self.last_market_at.is_some()
         {
-            self.record_health(received_at)?;
+            let _recording = self.record_health(received_at)?;
             self.health_rebind_at = None;
             self.health_valid_until = None;
         }
@@ -393,8 +401,12 @@ impl<'a> ProductionRawMarketSink<'a> {
                 .pending_data
                 .try_push(data, latest_source_at, received_at);
         }
-        self.process_active_data(data, latest_source_at, received_at, received_at)?;
-        self.publish_startup_readiness()
+        match self.process_active_data(data, latest_source_at, received_at, received_at)? {
+            ActiveDataDisposition::Published => self.publish_startup_readiness(),
+            ActiveDataDisposition::FreshnessUnqualified => Err(ProductionSinkFailure::Registry(
+                RegistryError::HealthNotQualified,
+            )),
+        }
     }
 
     fn flush_pending_data(
@@ -402,16 +414,23 @@ impl<'a> ProductionRawMarketSink<'a> {
         acknowledgement_received_at: Timestamp,
     ) -> Result<(), ProductionSinkFailure> {
         let mut published = false;
+        let mut freshness_unqualified = false;
         while let Some(pending) = self.pending_data.try_pop_front()? {
-            self.process_active_data(
+            match self.process_active_data(
                 pending.data,
                 pending.latest_source_at,
                 pending.received_at,
                 acknowledgement_received_at.max(pending.received_at),
-            )?;
-            published = true;
+            )? {
+                ActiveDataDisposition::Published => published = true,
+                ActiveDataDisposition::FreshnessUnqualified => freshness_unqualified = true,
+            }
         }
-        if published {
+        if published
+            || freshness_unqualified
+                && self.startup_readiness_policy
+                    == StartupReadinessPolicy::ExactAcknowledgementAfterCapturedBootstrap
+        {
             self.publish_startup_readiness()?;
         }
         Ok(())
@@ -423,7 +442,7 @@ impl<'a> ProductionRawMarketSink<'a> {
         latest_source_at: Option<Timestamp>,
         received_at: Timestamp,
         health_observed_at: Timestamp,
-    ) -> Result<(), ProductionSinkFailure> {
+    ) -> Result<ActiveDataDisposition, ProductionSinkFailure> {
         self.subscription
             .observe_data(&self.generation, Instant::now())
             .map_err(ProductionSinkFailure::Subscription)?;
@@ -438,7 +457,17 @@ impl<'a> ProductionRawMarketSink<'a> {
             .health_rebind_at
             .is_none_or(|deadline| received_at >= deadline);
         if requires_rebind {
-            self.record_health(health_observed_at)?;
+            match self.record_health(health_observed_at)? {
+                CurrentHealthRecording::Qualified => {}
+                CurrentHealthRecording::Unqualified(cause) if cause.is_freshness_only() => {
+                    return Ok(ActiveDataDisposition::FreshnessUnqualified);
+                }
+                CurrentHealthRecording::Unqualified(_cause) => {
+                    return Err(ProductionSinkFailure::Registry(
+                        RegistryError::HealthNotQualified,
+                    ));
+                }
+            }
         }
         let current = self
             .registry
@@ -455,7 +484,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             )?);
             self.health_valid_until = Some(valid_until);
         }
-        Ok(())
+        Ok(ActiveDataDisposition::Published)
     }
 
     fn publish_startup_readiness(&mut self) -> Result<(), ProductionSinkFailure> {
@@ -469,7 +498,10 @@ impl<'a> ProductionRawMarketSink<'a> {
         Ok(())
     }
 
-    fn record_health(&mut self, observed_at: Timestamp) -> Result<(), ProductionSinkFailure> {
+    fn record_health(
+        &mut self,
+        observed_at: Timestamp,
+    ) -> Result<CurrentHealthRecording, ProductionSinkFailure> {
         let metadata = &self.metadata;
         let authorization_deadline = metadata
             .authorization()
@@ -521,10 +553,14 @@ impl<'a> ProductionRawMarketSink<'a> {
             None => self.health_reporter.report(health),
         }
         .map_err(ProductionSinkFailure::Registry)?;
-        self.registry
-            .record_health(self.session, update)
+        let recording = self
+            .registry
+            .record_health_with_qualification(self.session, update)
             .map_err(ProductionSinkFailure::Registry)?;
-        self.output.advance_health_revision()
+        if recording == CurrentHealthRecording::Qualified {
+            self.output.advance_health_revision()?;
+        }
+        Ok(recording)
     }
 
     fn fail(&mut self, failure: ProductionSinkFailure) -> SinkError {
@@ -541,6 +577,12 @@ struct PendingDecodedData {
     latest_source_at: Option<Timestamp>,
     received_at: Timestamp,
     retained_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveDataDisposition {
+    Published,
+    FreshnessUnqualified,
 }
 
 #[derive(Debug)]

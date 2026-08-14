@@ -1,7 +1,7 @@
 //! Evidence-bound construction of authenticated market-provider configurations.
 //!
 //! This boundary deliberately does not discover instruments, read the network, or mint stable
-//! instrument identities. Display-only Alpaca and Tradier routes consume stable FIGI-backed
+//! instrument identities. Display-only Alpaca routes consume stable FIGI-backed
 //! market-data definitions plus source-qualified symbol evidence; they neither require nor retain
 //! execution terms or accepted execution-provider identities. Authenticated Kraken level 3 keeps
 //! the stricter execution-capable definition contract because decimal book updates require exact
@@ -12,18 +12,16 @@ use std::num::NonZeroUsize;
 
 use market_squawk_adapter_alpaca::{
     ALPACA_BASIC_EQUITY_SYMBOL_LIMIT, ALPACA_BASIC_OPTION_SYMBOL_LIMIT, AlpacaError,
-    AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsLiveConfig,
-    AlpacaTransportLimits,
+    AlpacaIexBootSnapshotPolicy, AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionMapping,
+    AlpacaOptionsLiveConfig, AlpacaTransportLimits,
 };
 use market_squawk_adapter_kraken::{
     KrakenL3ClientTier, KrakenL3Config, KrakenL3ConfigError, KrakenL3Depth, KrakenL3MetadataError,
     KrakenL3MetadataInput, KrakenL3ProductMapping,
 };
-use market_squawk_adapter_tradier::{
-    TradierAccessSurface, TradierConfigError, TradierInstrumentKind, TradierLogicalProfile,
-    TradierSourceConfig, TradierSymbolMapping, TradierTransportLimits,
+use market_squawk_data::{
+    ListingReferenceRecord, ListingReferenceRightsState, MarketDataInstrumentRecord,
 };
-use market_squawk_data::{ListingReferenceRecord, ListingReferenceRightsState};
 use market_squawk_domain::{
     AssetClass, AssignmentVerification, AuthorizationBasis, CryptoProductType, DigestAlgorithm,
     EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, ExternalIdentifier,
@@ -52,8 +50,6 @@ use super::openfigi_identity::{
 };
 
 const MAX_PRIORITY_BINDINGS: usize = 256;
-const TRADIER_CONSOLIDATED_SYMBOL_LIMIT: usize = 256;
-const TRADIER_DERIVED_INDEX_SYMBOL_LIMIT: usize = 3;
 const KRAKEN_L3_PRODUCT_LIMIT: usize = 200;
 
 const KRAKEN_VENUE: &str = "kraken";
@@ -207,7 +203,7 @@ pub enum MarketInstrumentReferenceBinding {
 /// Source-qualified evidence for one provisional display-market subscription symbol.
 ///
 /// The evidence proves where the symbol/listing assertion came from and binds it to an exact
-/// payload. It does not claim that Alpaca or Tradier has accepted the symbol. That separate claim
+/// payload. It does not claim that Alpaca has accepted the symbol. That separate claim
 /// is established only by a provider-qualified subscription acknowledgement or first data frame
 /// in the live runtime.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -275,10 +271,10 @@ enum MarketDataSubscriptionSymbolEvidenceKind {
 
 /// Display-only binding between stable reference identity and one bounded subscription symbol.
 ///
-/// Construction consumes a [`MarketDataInstrumentDefinition`] but deliberately retains only its
-/// stable ID, FIGI, asset class, effective interval, and revision-bound reference evidence. Tick
-/// size, lot size, multiplier, trading eligibility, and accepted execution-provider identity are
-/// absent from this type by construction.
+/// Construction consumes a catalog-verified [`MarketDataInstrumentRecord`] and retains its exact
+/// whole-definition digest in addition to the stable ID, FIGI, asset class, effective interval,
+/// and revision-bound reference evidence. Tick size, lot size, multiplier, trading eligibility,
+/// and accepted execution-provider identity are absent from this type by construction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketDataInstrumentBinding {
     priority: MarketSubscriptionPriority,
@@ -287,6 +283,7 @@ pub struct MarketDataInstrumentBinding {
     asset_class: AssetClass,
     definition_reference_evidence: RevisionBoundPayloadEvidence,
     definition_effective: EffectiveInterval,
+    definition_revision_digest: EvidenceDigest,
     subscription_symbol: ProviderInstrumentId,
     symbol_evidence: MarketDataSubscriptionSymbolEvidence,
 }
@@ -305,13 +302,14 @@ impl MarketDataInstrumentBinding {
     /// invalid source timing, or any symbol other than the exact current-directory symbol.
     pub(crate) fn try_from_nasdaq_session_listing(
         priority: MarketSubscriptionPriority,
-        definition: MarketDataInstrumentDefinition,
+        definition_record: MarketDataInstrumentRecord,
         subscription_symbol: ProviderInstrumentId,
         listing: NasdaqCurrentListing,
         identity_result: &OpenFigiIdentityPublicationResult,
     ) -> Result<Self, MarketProviderConfigurationError> {
+        let definition = definition_record.definition();
         validate_market_data_session_listing_binding(
-            &definition,
+            definition,
             subscription_symbol.as_str(),
             &listing,
             identity_result,
@@ -331,7 +329,7 @@ impl MarketDataInstrumentBinding {
         };
         Ok(Self::from_validated_parts(
             priority,
-            &definition,
+            &definition_record,
             subscription_symbol,
             symbol_evidence,
         ))
@@ -345,16 +343,19 @@ impl MarketDataInstrumentBinding {
     /// incompatible asset/evidence families, or a symbol not exactly represented by the record.
     pub fn try_from_assigned_identifier(
         priority: MarketSubscriptionPriority,
-        definition: MarketDataInstrumentDefinition,
+        definition_record: MarketDataInstrumentRecord,
         subscription_symbol: ProviderInstrumentId,
-        record: ExternalIdentifierRecord,
+        identifier_record: ExternalIdentifierRecord,
     ) -> Result<Self, MarketProviderConfigurationError> {
+        let definition = definition_record.definition();
         if !definition
             .identifiers()
             .iter()
-            .any(|accepted| accepted == &record)
-            || record.assignment_verification() != AssignmentVerification::VerifiedAssigned
-            || record.rights_policy().entitlement() == IdentifierEntitlement::UnknownOrRestricted
+            .any(|accepted| accepted == &identifier_record)
+            || identifier_record.assignment_verification()
+                != AssignmentVerification::VerifiedAssigned
+            || identifier_record.rights_policy().entitlement()
+                == IdentifierEntitlement::UnknownOrRestricted
         {
             return Err(MarketProviderConfigurationError::AuthorityRequired {
                 instrument: Some(definition.instrument_id()),
@@ -365,19 +366,21 @@ impl MarketDataInstrumentBinding {
         validate_market_data_identifier_family(
             definition.instrument_id(),
             definition.asset_class(),
-            &record,
+            &identifier_record,
         )?;
         validate_market_data_identifier_symbol(
             definition.instrument_id(),
             subscription_symbol.as_str(),
-            &record,
+            &identifier_record,
         )?;
         let symbol_evidence = MarketDataSubscriptionSymbolEvidence {
-            kind: MarketDataSubscriptionSymbolEvidenceKind::AssignedExternalIdentifier { record },
+            kind: MarketDataSubscriptionSymbolEvidenceKind::AssignedExternalIdentifier {
+                record: identifier_record,
+            },
         };
         Ok(Self::from_validated_parts(
             priority,
-            &definition,
+            &definition_record,
             subscription_symbol,
             symbol_evidence,
         ))
@@ -385,10 +388,11 @@ impl MarketDataInstrumentBinding {
 
     fn from_validated_parts(
         priority: MarketSubscriptionPriority,
-        definition: &MarketDataInstrumentDefinition,
+        definition_record: &MarketDataInstrumentRecord,
         subscription_symbol: ProviderInstrumentId,
         symbol_evidence: MarketDataSubscriptionSymbolEvidence,
     ) -> Self {
+        let definition = definition_record.definition();
         Self {
             priority,
             instrument_id: definition.instrument_id(),
@@ -396,6 +400,7 @@ impl MarketDataInstrumentBinding {
             asset_class: definition.asset_class(),
             definition_reference_evidence: definition.reference_evidence().clone(),
             definition_effective: definition.effective_interval(),
+            definition_revision_digest: definition_record.revision_digest(),
             subscription_symbol,
             symbol_evidence,
         }
@@ -429,6 +434,11 @@ impl MarketDataInstrumentBinding {
     /// Returns the stable definition's half-open effective interval.
     pub const fn definition_effective(&self) -> EffectiveInterval {
         self.definition_effective
+    }
+
+    /// Returns the canonical SHA-256 digest of the complete immutable catalog definition.
+    pub const fn definition_revision_digest(&self) -> EvidenceDigest {
+        self.definition_revision_digest
     }
 
     /// Returns the bounded symbol proposed to the provider for this subscription.
@@ -715,19 +725,6 @@ pub struct AlpacaBasicMarketConfigurationInput {
     pub transport_limits: AlpacaTransportLimits,
 }
 
-/// Explicit Tradier construction inputs for three distinct logical/access surfaces.
-#[derive(Clone, Debug)]
-pub struct TradierMarketConfigurationInput {
-    /// Trusted caller instant at which every retained authority is jointly revalidated.
-    pub configured_at: Timestamp,
-    pub consolidated_stream_evidence: MarketSourceEvidence,
-    pub consolidated_rest_evidence: MarketSourceEvidence,
-    pub derived_index_rest_evidence: Option<MarketSourceEvidence>,
-    pub consolidated_instruments: BoundedMarketDataInstrumentSet,
-    pub derived_indexes: Option<BoundedMarketDataInstrumentSet>,
-    pub transport_limits: TradierTransportLimits,
-}
-
 /// Explicit authenticated Kraken level-3 construction inputs.
 #[derive(Clone, Debug)]
 pub struct KrakenL3MarketConfigurationInput {
@@ -744,7 +741,6 @@ pub struct KrakenL3MarketConfigurationInput {
 #[derive(Clone, Debug)]
 pub enum ProviderMarketConfigurationRequest {
     AlpacaBasic(AlpacaBasicMarketConfigurationInput),
-    Tradier(TradierMarketConfigurationInput),
     KrakenLevel3(KrakenL3MarketConfigurationInput),
 }
 
@@ -802,74 +798,6 @@ impl PreparedAlpacaBasicMarketConfiguration {
     }
 }
 
-/// Prepared Tradier configs plus the exact lease and separately retained source bindings.
-#[derive(Clone, Debug)]
-pub struct PreparedTradierMarketConfiguration {
-    lease: ProviderActivationLease,
-    account: ProviderAccountBinding,
-    consolidated_stream: TradierSourceConfig,
-    consolidated_rest: TradierSourceConfig,
-    consolidated_instruments: Box<[MarketDataInstrumentBinding]>,
-    derived_index: Option<(TradierSourceConfig, Box<[MarketDataInstrumentBinding]>)>,
-}
-
-impl PreparedTradierMarketConfiguration {
-    pub const fn lease(&self) -> &ProviderActivationLease {
-        &self.lease
-    }
-
-    pub const fn account_binding(&self) -> &ProviderAccountBinding {
-        &self.account
-    }
-
-    pub const fn consolidated_stream_config(&self) -> &TradierSourceConfig {
-        &self.consolidated_stream
-    }
-
-    pub const fn consolidated_rest_config(&self) -> &TradierSourceConfig {
-        &self.consolidated_rest
-    }
-
-    pub fn derived_index_rest_config(&self) -> Option<&TradierSourceConfig> {
-        self.derived_index
-            .as_ref()
-            .map(|(config, _bindings)| config)
-    }
-
-    pub fn consolidated_instruments(&self) -> &[MarketDataInstrumentBinding] {
-        &self.consolidated_instruments
-    }
-
-    pub fn derived_indexes(&self) -> Option<&[MarketDataInstrumentBinding]> {
-        self.derived_index
-            .as_ref()
-            .map(|(_config, bindings)| bindings.as_ref())
-    }
-
-    /// Moves the exact lease, configs, and route-definition inputs into central composition.
-    #[allow(
-        clippy::type_complexity,
-        reason = "the exact handoff remains one atomic value tuple"
-    )]
-    pub fn into_parts(
-        self,
-    ) -> (
-        ProviderActivationLease,
-        TradierSourceConfig,
-        TradierSourceConfig,
-        Box<[MarketDataInstrumentBinding]>,
-        Option<(TradierSourceConfig, Box<[MarketDataInstrumentBinding]>)>,
-    ) {
-        (
-            self.lease,
-            self.consolidated_stream,
-            self.consolidated_rest,
-            self.consolidated_instruments,
-            self.derived_index,
-        )
-    }
-}
-
 /// Prepared authenticated Kraken L3 config with exact per-symbol tick/lot terms.
 #[derive(Clone, Debug)]
 pub struct PreparedKrakenL3MarketConfiguration {
@@ -920,7 +848,6 @@ impl PreparedKrakenL3MarketConfiguration {
 #[derive(Clone, Debug)]
 pub enum PreparedMarketProviderConfiguration {
     AlpacaBasic(PreparedAlpacaBasicMarketConfiguration),
-    Tradier(PreparedTradierMarketConfiguration),
     KrakenLevel3(PreparedKrakenL3MarketConfiguration),
 }
 
@@ -950,9 +877,6 @@ impl ProviderAdapterActivation {
             ProviderMarketConfigurationRequest::AlpacaBasic(input) => {
                 PreparedMarketProviderConfiguration::AlpacaBasic(prepare_alpaca(&lease, input)?)
             }
-            ProviderMarketConfigurationRequest::Tradier(input) => {
-                PreparedMarketProviderConfiguration::Tradier(prepare_tradier(&lease, input)?)
-            }
             ProviderMarketConfigurationRequest::KrakenLevel3(input) => {
                 PreparedMarketProviderConfiguration::KrakenLevel3(prepare_kraken_l3(&lease, input)?)
             }
@@ -972,9 +896,6 @@ impl ProviderAdapterActivation {
         let configured = match request {
             ProviderMarketConfigurationRequest::AlpacaBasic(input) => {
                 PreparedMarketProviderConfiguration::AlpacaBasic(prepare_alpaca(&lease, input)?)
-            }
-            ProviderMarketConfigurationRequest::Tradier(input) => {
-                PreparedMarketProviderConfiguration::Tradier(prepare_tradier(&lease, input)?)
             }
             ProviderMarketConfigurationRequest::KrakenLevel3(input) => {
                 PreparedMarketProviderConfiguration::KrakenLevel3(prepare_kraken_l3(&lease, input)?)
@@ -1028,6 +949,7 @@ fn prepare_alpaca(
     };
     let budget = qualified_budget(lease, &account)?;
     let authorization = authorization(lease, &account)?;
+    let boot_snapshot = AlpacaIexBootSnapshotPolicy::from_transport_limits(input.transport_limits);
     let iex_digest = display_metadata_digest(
         lease,
         input.configured_at,
@@ -1036,6 +958,11 @@ fn prepare_alpaca(
         &input.iex_evidence,
         MetadataProfile::AlpacaIex {
             indicative_options_configured: options_configured,
+            boot_snapshot_revision: boot_snapshot.revision(),
+            boot_snapshot_maximum_body_bytes: boot_snapshot.maximum_body_bytes(),
+            boot_snapshot_total_timeout_nanos: duration_nanos_saturating(
+                boot_snapshot.total_timeout(),
+            ),
         },
         input.iex_instruments.bindings(),
         &AlpacaLimitsWire::from(input.transport_limits),
@@ -1113,181 +1040,6 @@ fn prepare_alpaca(
         iex,
         iex_instruments: input.iex_instruments.into_bindings().into_boxed_slice(),
         options,
-    })
-}
-
-fn prepare_tradier(
-    lease: &ProviderActivationLease,
-    input: TradierMarketConfigurationInput,
-) -> Result<PreparedTradierMarketConfiguration, MarketProviderConfigurationError> {
-    validate_configured_at(lease, input.configured_at)?;
-    let account =
-        ProviderAccountBinding::try_from_lease(ProviderMarketAccount::TradierBrokerage, lease)?;
-    require_distinct_source_ids(&[
-        &input.consolidated_stream_evidence,
-        &input.consolidated_rest_evidence,
-    ])?;
-    for evidence in [
-        &input.consolidated_stream_evidence,
-        &input.consolidated_rest_evidence,
-    ] {
-        validate_source_evidence(input.configured_at, evidence)?;
-    }
-    validate_set_bound(
-        "tradier-consolidated-securities",
-        input.consolidated_instruments.bindings(),
-        TRADIER_CONSOLIDATED_SYMBOL_LIMIT,
-    )?;
-    validate_market_data_bindings(
-        input.configured_at,
-        input.consolidated_instruments.bindings(),
-        |class| {
-            matches!(
-                class,
-                AssetClass::Equity | AssetClass::Fund | AssetClass::Option
-            )
-        },
-    )?;
-    let derived_indexes_configured =
-        match (&input.derived_index_rest_evidence, &input.derived_indexes) {
-            (Some(evidence), Some(instruments)) => {
-                require_distinct_source_ids(&[
-                    &input.consolidated_stream_evidence,
-                    &input.consolidated_rest_evidence,
-                    evidence,
-                ])?;
-                validate_source_evidence(input.configured_at, evidence)?;
-                validate_set_bound(
-                    "tradier-derived-indexes",
-                    instruments.bindings(),
-                    TRADIER_DERIVED_INDEX_SYMBOL_LIMIT,
-                )?;
-                validate_market_data_bindings(
-                    input.configured_at,
-                    instruments.bindings(),
-                    |class| class == AssetClass::Index,
-                )?;
-                true
-            }
-            (None, None) => false,
-            _ => {
-                return Err(
-                    MarketProviderConfigurationError::OptionalCapabilityBinding {
-                        surface: "tradier-derived-indexes",
-                    },
-                );
-            }
-        };
-    let budget = qualified_budget(lease, &account)?;
-    let authorization = authorization(lease, &account)?;
-    let mappings = input
-        .consolidated_instruments
-        .bindings()
-        .iter()
-        .map(tradier_mapping)
-        .collect::<Result<Vec<_>, _>>()?;
-    let limits_wire = TradierLimitsWire::from(input.transport_limits);
-    let stream_digest = display_metadata_digest(
-        lease,
-        input.configured_at,
-        &account,
-        &budget,
-        &input.consolidated_stream_evidence,
-        MetadataProfile::TradierConsolidatedStream {
-            derived_indexes_configured,
-        },
-        input.consolidated_instruments.bindings(),
-        &limits_wire,
-    )?;
-    let rest_digest = display_metadata_digest(
-        lease,
-        input.configured_at,
-        &account,
-        &budget,
-        &input.consolidated_rest_evidence,
-        MetadataProfile::TradierConsolidatedRest {
-            derived_indexes_configured,
-        },
-        input.consolidated_instruments.bindings(),
-        &limits_wire,
-    )?;
-    let consolidated_stream = TradierSourceConfig::try_new(
-        input.consolidated_stream_evidence.source_id.clone(),
-        revision_evidence(lease, "tradier-stream", stream_digest)?,
-        authorization.clone(),
-        input.consolidated_stream_evidence.coverage_evidence.clone(),
-        input.consolidated_stream_evidence.coverage_effective,
-        TradierLogicalProfile::ConsolidatedSecurities,
-        TradierAccessSurface::Streaming,
-        mappings.clone(),
-        input.consolidated_stream_evidence.freshness,
-        budget.clone(),
-        input.transport_limits,
-    )?;
-    let consolidated_rest = TradierSourceConfig::try_new(
-        input.consolidated_rest_evidence.source_id.clone(),
-        revision_evidence(lease, "tradier-rest", rest_digest)?,
-        authorization.clone(),
-        input.consolidated_rest_evidence.coverage_evidence.clone(),
-        input.consolidated_rest_evidence.coverage_effective,
-        TradierLogicalProfile::ConsolidatedSecurities,
-        TradierAccessSurface::RestSnapshots,
-        mappings,
-        input.consolidated_rest_evidence.freshness,
-        budget.clone(),
-        input.transport_limits,
-    )?;
-    let derived_index = match (input.derived_index_rest_evidence, input.derived_indexes) {
-        (Some(evidence), Some(instruments)) => {
-            let digest = display_metadata_digest(
-                lease,
-                input.configured_at,
-                &account,
-                &budget,
-                &evidence,
-                MetadataProfile::TradierDerivedIndexRest,
-                instruments.bindings(),
-                &limits_wire,
-            )?;
-            let mappings = instruments
-                .bindings()
-                .iter()
-                .map(tradier_mapping)
-                .collect::<Result<Vec<_>, _>>()?;
-            let config = TradierSourceConfig::try_new(
-                evidence.source_id.clone(),
-                revision_evidence(lease, "tradier-index", digest)?,
-                authorization,
-                evidence.coverage_evidence.clone(),
-                evidence.coverage_effective,
-                TradierLogicalProfile::DerivedIndexes,
-                TradierAccessSurface::RestSnapshots,
-                mappings,
-                evidence.freshness,
-                budget,
-                input.transport_limits,
-            )?;
-            Some((config, instruments.into_bindings().into_boxed_slice()))
-        }
-        (None, None) => None,
-        _ => {
-            return Err(
-                MarketProviderConfigurationError::OptionalCapabilityBinding {
-                    surface: "tradier-derived-indexes",
-                },
-            );
-        }
-    };
-    Ok(PreparedTradierMarketConfiguration {
-        lease: lease.clone(),
-        account,
-        consolidated_stream,
-        consolidated_rest,
-        consolidated_instruments: input
-            .consolidated_instruments
-            .into_bindings()
-            .into_boxed_slice(),
-        derived_index,
     })
 }
 
@@ -1769,28 +1521,6 @@ fn validate_reference_at(
     Ok(())
 }
 
-fn tradier_mapping(
-    binding: &MarketDataInstrumentBinding,
-) -> Result<TradierSymbolMapping, MarketProviderConfigurationError> {
-    let kind = match binding.asset_class() {
-        AssetClass::Equity => TradierInstrumentKind::Equity,
-        AssetClass::Fund => TradierInstrumentKind::Etf,
-        AssetClass::Option => TradierInstrumentKind::Option,
-        AssetClass::Index => TradierInstrumentKind::DerivedIndex,
-        class => {
-            return Err(MarketProviderConfigurationError::UnsupportedAssetClass {
-                instrument: binding.instrument_id(),
-                asset_class: class,
-            });
-        }
-    };
-    Ok(TradierSymbolMapping::try_new(
-        SourceIdentifier::try_from(binding.provisional_subscription_symbol())?,
-        binding.instrument_id(),
-        kind,
-    )?)
-}
-
 fn qualified_budget(
     lease: &ProviderActivationLease,
     account: &ProviderAccountBinding,
@@ -1827,15 +1557,11 @@ fn authorization(
 enum MetadataProfile {
     AlpacaIex {
         indicative_options_configured: bool,
+        boot_snapshot_revision: &'static str,
+        boot_snapshot_maximum_body_bytes: usize,
+        boot_snapshot_total_timeout_nanos: u64,
     },
     AlpacaIndicativeOptions,
-    TradierConsolidatedStream {
-        derived_indexes_configured: bool,
-    },
-    TradierConsolidatedRest {
-        derived_indexes_configured: bool,
-    },
-    TradierDerivedIndexRest,
     KrakenAuthenticatedLevel3 {
         depth: KrakenL3DepthWire,
         tier: KrakenL3ClientTierWire,
@@ -1949,6 +1675,7 @@ struct MarketDataBindingEvidenceWire<'a> {
     asset_class: AssetClass,
     definition_reference_evidence: &'a RevisionBoundPayloadEvidence,
     definition_effective: EffectiveInterval,
+    definition_revision_digest: EvidenceDigest,
     provisional_subscription_symbol: &'a str,
     symbol_evidence: &'a MarketDataSubscriptionSymbolEvidence,
 }
@@ -2025,6 +1752,7 @@ impl<'a> From<&'a MarketDataInstrumentBinding> for MarketDataBindingEvidenceWire
             asset_class: binding.asset_class(),
             definition_reference_evidence: binding.definition_reference_evidence(),
             definition_effective: binding.definition_effective(),
+            definition_revision_digest: binding.definition_revision_digest(),
             provisional_subscription_symbol: binding.provisional_subscription_symbol(),
             symbol_evidence: binding.symbol_evidence(),
         }
@@ -2065,32 +1793,6 @@ impl From<AlpacaTransportLimits> for AlpacaLimitsWire {
             max_frame_bytes: limits.max_frame_bytes(),
             connect_timeout_nanos: duration_nanos_saturating(limits.connect_timeout()),
             io_timeout_nanos: duration_nanos_saturating(limits.io_timeout()),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct TradierLimitsWire {
-    max_frame_bytes: usize,
-    io_timeout_nanos: u64,
-    connect_timeout_nanos: u64,
-    read_timeout_nanos: u64,
-    total_timeout_nanos: u64,
-    max_redirects: u8,
-    max_response_bytes: u64,
-}
-
-impl From<TradierTransportLimits> for TradierLimitsWire {
-    fn from(limits: TradierTransportLimits) -> Self {
-        let http = limits.http();
-        Self {
-            max_frame_bytes: limits.max_frame_bytes(),
-            io_timeout_nanos: duration_nanos_saturating(limits.io_timeout()),
-            connect_timeout_nanos: http.connect_timeout_nanos(),
-            read_timeout_nanos: http.read_timeout_nanos(),
-            total_timeout_nanos: http.total_timeout_nanos(),
-            max_redirects: http.max_redirects(),
-            max_response_bytes: http.max_response_bytes(),
         }
     }
 }
@@ -2327,9 +2029,6 @@ pub enum MarketProviderConfigurationError {
     /// Alpaca rejected the bounded mapping or metadata.
     #[error(transparent)]
     Alpaca(#[from] AlpacaError),
-    /// Tradier rejected the bounded mapping or metadata.
-    #[error(transparent)]
-    Tradier(#[from] TradierConfigError),
     /// Kraken rejected the bounded authenticated level-3 configuration.
     #[error(transparent)]
     KrakenConfig(#[from] KrakenL3ConfigError),

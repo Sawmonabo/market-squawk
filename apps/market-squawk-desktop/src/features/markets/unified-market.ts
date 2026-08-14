@@ -172,7 +172,11 @@ const marketInvestmentObservationSchema = z.discriminatedUnion("availability", [
   z
     .object({
       availability: z.literal("unavailable"),
-      reason: z.enum(["no_eligible_source", "no_fresh_last_trade_or_midpoint"]),
+      reason: z.enum([
+        "no_eligible_source",
+        "no_fresh_last_trade_or_midpoint",
+        "durable_pit_evidence_not_established",
+      ]),
     })
     .strict(),
 ])
@@ -1053,6 +1057,7 @@ export const unifiedMarketRowSchema = z
     tickSize: canonicalDecimalSchema.nullable(),
     lotSize: canonicalDecimalSchema.nullable(),
     executionTermsAvailable: z.boolean(),
+    executionEligible: z.literal(false),
     referenceEvidence: referenceEvidenceSchema.nullable(),
     availability: z.enum(["Live", "Delayed", "End of day", "Stored data", "Stale", "Unavailable"]),
     confidence: z.enum([
@@ -1069,6 +1074,10 @@ export const unifiedMarketRowSchema = z
     ]),
     quote: quoteSchema,
     orderBook: orderBookSchema.nullable(),
+    analyticalReadiness: z.enum([
+      "runtime_display_only",
+      "durable_pit_available",
+    ]),
     marketObservation: marketInvestmentObservationSchema,
     selectedSource: selectedSourceSchema.nullable(),
     alternatives: z.array(marketAlternativeSchema).max(8),
@@ -1353,6 +1362,26 @@ function crossBindSelection(
 ) {
   const receipt = row.selectionReceipt
   const selected = row.selectedSource
+  const observation = row.marketObservation
+  if (row.analyticalReadiness === "runtime_display_only") {
+    const expectedReason = selected
+      ? "durable_pit_evidence_not_established"
+      : "no_eligible_source"
+    if (
+      observation.availability !== "unavailable" ||
+      observation.reason !== expectedReason
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "runtime display analytical authority mismatch",
+      })
+    }
+  } else if (observation.availability !== "available" || !selected) {
+    context.addIssue({
+      code: "custom",
+      message: "durable point-in-time analytical authority mismatch",
+    })
+  }
   if (receipt.returnedAlternativeCount !== row.alternatives.length) {
     context.addIssue({ code: "custom", message: "returned alternative count mismatch" })
   }
@@ -1461,8 +1490,6 @@ function crossBindSelection(
     ) {
       context.addIssue({ code: "custom", message: "market feature identity mismatch" })
     }
-  } else if (row.marketObservation.reason !== "no_fresh_last_trade_or_midpoint") {
-    context.addIssue({ code: "custom", message: "selected market unavailability mismatch" })
   }
 
   if ("shardId" in selected) {

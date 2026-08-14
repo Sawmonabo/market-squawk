@@ -80,19 +80,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 "runtime",
             ],
         )),
-        "Source.GetCoverage" => nullable_rows(signature(vec![
-            ("surfaceId", text()),
-            ("releaseState", text()),
-            ("declaredCoverage", text()),
-            ("qualityCeiling", text()),
-            ("rights", bounded_array(data_use_right(), 6)),
-            ("runtimeCoverage", record()),
-        ])),
-        "Source.GetHealth" => nullable_rows(signature(vec![
-            ("surfaceId", text()),
-            ("onboardingState", nullable(text())),
-            ("runtimeHealth", record()),
-        ])),
+        "Source.GetCoverage" => source_coverage_rows(),
+        "Source.GetHealth" => source_health_rows(),
         "Source.ListObjects" => closed(
             vec![
                 ("profile", text()),
@@ -153,23 +142,9 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         | "Source.Reconfigure"
         | "Source.Remove" => source_lifecycle_receipt(),
         "Market.GetSnapshot" => market_rows(&["sourceId", "instrumentId", "phase", "book"]),
-        "Market.GetTrades" => market_rows(&[
-            "sourceId",
-            "instrumentId",
-            "stableTradeId",
-            "priceTicks",
-            "quantityLots",
-        ]),
-        "Market.GetQuotes" => {
-            market_rows(&["sourceId", "instrumentId", "bid", "ask", "stateEvaluatedAt"])
-        }
-        "Market.GetBooks" => market_rows(&[
-            "sourceId",
-            "instrumentId",
-            "asOf",
-            "stateEvaluatedAt",
-            "book",
-        ]),
+        "Market.GetTrades" => market_trade_rows(),
+        "Market.GetQuotes" => market_quote_rows(),
+        "Market.GetBooks" => market_book_rows(),
         "Market.GetQuality" => market_rows(&[
             "sourceId",
             "instrumentId",
@@ -177,12 +152,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             "stateBidDepth",
             "stateAskDepth",
         ]),
-        "Market.GetComparisons" => market_rows(&[
-            "instrumentId",
-            "observationCount",
-            "comparable",
-            "observations",
-        ]),
+        "Market.GetComparisons" => market_comparison_rows(),
         "Market.GetUnifiedFeed" => unified_market_rows(),
         "Market.SearchUniverse" => market_rows(&[
             "referenceId",
@@ -2770,12 +2740,275 @@ fn investment_analysis_sha256() -> Value {
     })
 }
 
+fn source_coverage_rows() -> Value {
+    nullable_rows(closed_complete(vec![
+        ("surfaceId", bounded_text(512)),
+        (
+            "releaseState",
+            enumeration(&[
+                "available",
+                "rights_limited",
+                "refresh_required",
+                "rights_blocked",
+            ]),
+        ),
+        ("declaredCoverage", text()),
+        ("qualityCeiling", market_quality()),
+        ("rights", bounded_array(data_use_right(), 6)),
+        ("runtimeCoverage", source_runtime_coverage()),
+    ]))
+}
+
+fn source_runtime_coverage() -> Value {
+    one_of(vec![
+        closed_complete(vec![("state", constant("not_established"))]),
+        closed_complete(vec![
+            ("state", constant("established")),
+            ("sourceId", bounded_text(128)),
+            ("venueId", bounded_text(64)),
+            ("instrumentId", uuid()),
+            ("providerProduct", bounded_text(512)),
+            ("providerChannel", bounded_text(512)),
+            ("eventClass", live_event_class()),
+            ("marketDepth", nullable(market_depth())),
+            ("delay", market_coverage_delay()),
+            (
+                "consolidation",
+                enumeration(&["single_venue", "partial", "consolidated"]),
+            ),
+            ("effectiveFromUnixNanos", integer_text()),
+            ("effectiveUntilUnixNanos", nullable(integer_text())),
+            ("metadataRevision", bounded_text(512)),
+            ("status", market_coverage_status()),
+        ]),
+    ])
+}
+
+fn source_health_rows() -> Value {
+    nullable_rows(closed_complete(vec![
+        ("surfaceId", bounded_text(512)),
+        ("onboardingState", nullable(source_onboarding_state())),
+        ("runtimeHealth", source_runtime_health()),
+    ]))
+}
+
+fn source_onboarding_state() -> Value {
+    enumeration(&[
+        "unavailable",
+        "anonymous_available",
+        "user_action_required",
+        "credential_imported_unverified",
+        "protocol_validated",
+        "stored_unverified",
+        "secret_reconciliation_required",
+        "verified_least_privilege",
+        "rights_admission_pending",
+        "runtime_verification_pending",
+        "active_scoped",
+        "renewal_required",
+        "refresh_required",
+        "rotation_pending",
+        "revocation_unconfirmed",
+        "indeterminate_remote_state",
+        "cleanup_required",
+        "blocked",
+    ])
+}
+
+fn source_runtime_health() -> Value {
+    one_of(vec![
+        closed_complete(vec![("state", constant("not_active"))]),
+        closed_complete(vec![
+            ("state", constant("active")),
+            ("sourceId", bounded_text(128)),
+            ("venueId", bounded_text(64)),
+            ("instrumentId", uuid()),
+            ("connectionGeneration", positive_integer_text()),
+            ("sessionId", bounded_text(512)),
+            ("healthEpoch", positive_integer_text()),
+            ("stateRevision", positive_integer_text()),
+            ("assessmentId", bounded_text(512)),
+            ("bindingDigest", investment_analysis_sha256()),
+            ("connection", market_connection_liveness()),
+            ("transportFreshness", market_transport_freshness()),
+            ("marketFreshness", market_observation_freshness()),
+            (
+                "sourceTimestampFreshness",
+                market_source_timestamp_freshness(),
+            ),
+            ("streamIntegrity", source_stream_integrity()),
+            ("captureIntegrity", market_capture_integrity()),
+            ("coverageStatus", market_coverage_status()),
+            ("quality", market_quality()),
+            ("observedAtUnixNanos", integer_text()),
+            ("qualificationEvaluatedAtUnixNanos", integer_text()),
+            ("qualificationValidUntilUnixNanos", integer_text()),
+        ]),
+    ])
+}
+
+fn source_stream_integrity() -> Value {
+    enumeration(&[
+        "initializing",
+        "synchronizing",
+        "validating",
+        "healthy",
+        "stale",
+        "gap_detected",
+        "checksum_failed",
+        "divergent",
+        "quarantined",
+    ])
+}
+
 fn market_rows(required: &[&str]) -> Value {
     let fields = required
         .iter()
         .map(|name| (*name, market_field(name)))
         .collect();
     nullable_rows(signature(fields))
+}
+
+fn market_trade_rows() -> Value {
+    let mut fields = market_detail_identity_fields();
+    fields.extend([
+        ("sourceIdentifier", bounded_text(512)),
+        ("stableTradeId", bounded_text(512)),
+        ("tradeConnectionGeneration", positive_integer_text()),
+        ("priceTicks", integer_text()),
+        ("quantityLots", unsigned_integer_text()),
+        ("aggressorSide", enumeration(&["buy", "sell", "unknown"])),
+        ("sourceTimestamp", nullable(canonical_market_timestamp())),
+        ("receivedAt", canonical_market_timestamp()),
+        ("availableAt", canonical_market_timestamp()),
+        ("ingestedAt", canonical_market_timestamp()),
+        ("recordedQuality", market_quality()),
+        ("currentDisplayQuality", market_quality()),
+        ("recordedCoverage", market_coverage_status()),
+        ("assessmentId", bounded_text(512)),
+        ("qualificationEvaluatedAt", canonical_market_timestamp()),
+        ("qualificationValidUntil", canonical_market_timestamp()),
+        ("freshAtReference", boolean()),
+        ("payloadDigest", evidence_digest()),
+        ("bindingDigest", investment_analysis_sha256()),
+        (
+            "tradeTradingStatus",
+            enumeration(&["active", "halted", "inactive", "delisted"]),
+        ),
+        ("committedStateRevision", positive_integer_text()),
+        ("authority", constant("not_exposed")),
+    ]);
+    nullable_rows(closed_complete(fields))
+}
+
+fn market_quote_rows() -> Value {
+    let mut fields = market_detail_identity_fields();
+    fields.extend([
+        ("bid", nullable(market_detail_level())),
+        ("ask", nullable(market_detail_level())),
+        ("sourceTimestamp", null()),
+        ("asOf", canonical_market_timestamp()),
+        ("stateEvaluatedAt", canonical_market_timestamp()),
+        ("recordedQuality", market_quality()),
+        ("currentDisplayQuality", market_quality()),
+        ("crossed", boolean()),
+        ("authority", constant("not_exposed")),
+    ]);
+    nullable_rows(closed_complete(fields))
+}
+
+fn market_book_rows() -> Value {
+    let mut fields = market_detail_identity_fields();
+    fields.extend([
+        ("asOf", canonical_market_timestamp()),
+        ("stateEvaluatedAt", canonical_market_timestamp()),
+        ("book", market_detail_book()),
+        ("currentDisplayQuality", market_quality()),
+    ]);
+    nullable_rows(closed_complete(fields))
+}
+
+fn market_comparison_rows() -> Value {
+    nullable_rows(closed_complete(vec![
+        ("instrumentId", uuid()),
+        ("observationCount", bounded_unsigned(10_000_000)),
+        ("comparable", boolean()),
+        (
+            "observations",
+            bounded_array(market_comparison_observation(), 10_000_000),
+        ),
+        ("authority", constant("not_exposed")),
+    ]))
+}
+
+fn market_detail_identity_fields() -> Vec<(&'static str, Value)> {
+    vec![
+        ("sourceId", bounded_text(128)),
+        ("venueId", bounded_text(64)),
+        ("instrumentId", uuid()),
+        ("providerProduct", bounded_text(512)),
+        ("providerChannel", bounded_text(512)),
+        ("connectionGeneration", positive_integer_text()),
+        ("stateRevision", unsigned_integer_text()),
+        ("shardId", bounded_text(32)),
+        ("shardSnapshotRevision", positive_integer_text()),
+    ]
+}
+
+fn market_detail_level() -> Value {
+    closed_complete(vec![
+        ("priceTicks", integer_text()),
+        ("quantityLots", unsigned_integer_text()),
+    ])
+}
+
+fn market_detail_dimension() -> Value {
+    closed_complete(vec![
+        (
+            "completeness",
+            enumeration(&["complete", "truncated", "unavailable"]),
+        ),
+        ("available", bounded_unsigned(u64::from(u32::MAX))),
+        ("returned", bounded_unsigned(u64::from(u32::MAX))),
+        ("configuredLimit", bounded_unsigned(u64::from(u32::MAX))),
+    ])
+}
+
+fn market_detail_book() -> Value {
+    closed_complete(vec![
+        ("configuredDepth", bounded_unsigned(u64::from(u32::MAX))),
+        ("stateBidDepth", bounded_unsigned(u64::from(u32::MAX))),
+        ("stateAskDepth", bounded_unsigned(u64::from(u32::MAX))),
+        ("snapshotBidDimension", market_detail_dimension()),
+        ("snapshotAskDimension", market_detail_dimension()),
+        ("resultBidDimension", market_detail_dimension()),
+        ("resultAskDimension", market_detail_dimension()),
+        ("bids", bounded_array(market_detail_level(), 10_000)),
+        ("asks", bounded_array(market_detail_level(), 10_000)),
+    ])
+}
+
+fn market_comparison_observation() -> Value {
+    closed_complete(vec![
+        ("sourceId", bounded_text(128)),
+        ("venueId", bounded_text(64)),
+        ("providerProduct", bounded_text(512)),
+        ("providerChannel", bounded_text(512)),
+        ("bid", nullable(market_detail_level())),
+        ("ask", nullable(market_detail_level())),
+        ("midpoint", nullable(market_comparison_midpoint())),
+        ("asOf", canonical_market_timestamp()),
+        ("stateEvaluatedAt", canonical_market_timestamp()),
+        ("recordedQuality", market_quality()),
+        ("currentDisplayQuality", market_quality()),
+    ])
+}
+
+fn market_comparison_midpoint() -> Value {
+    closed_complete(vec![
+        ("numeratorTicks", integer_text()),
+        ("denominator", constant("2")),
+    ])
 }
 
 fn unified_market_rows() -> Value {
@@ -2805,6 +3038,7 @@ fn unified_market_rows() -> Value {
             ("tickSize", nullable(canonical_decimal_text())),
             ("lotSize", nullable(canonical_decimal_text())),
             ("executionTermsAvailable", boolean()),
+            ("executionEligible", constant_bool(false)),
             ("referenceEvidence", nullable(market_reference_evidence())),
             (
                 "availability",
@@ -2834,6 +3068,10 @@ fn unified_market_rows() -> Value {
             ),
             ("quote", unified_market_quote()),
             ("orderBook", nullable(order_level_book())),
+            (
+                "analyticalReadiness",
+                enumeration(&["runtime_display_only", "durable_pit_available"]),
+            ),
             ("marketObservation", market_investment_observation()),
             ("selectedSource", nullable(unified_selected_market_source())),
             (
@@ -2857,11 +3095,13 @@ fn unified_market_rows() -> Value {
             "tickSize",
             "lotSize",
             "executionTermsAvailable",
+            "executionEligible",
             "referenceEvidence",
             "availability",
             "confidence",
             "quote",
             "orderBook",
+            "analyticalReadiness",
             "marketObservation",
             "selectedSource",
             "alternatives",
@@ -4261,7 +4501,11 @@ fn market_investment_observation() -> Value {
                 ("availability", constant("unavailable")),
                 (
                     "reason",
-                    enumeration(&["no_eligible_source", "no_fresh_last_trade_or_midpoint"]),
+                    enumeration(&[
+                        "no_eligible_source",
+                        "no_fresh_last_trade_or_midpoint",
+                        "durable_pit_evidence_not_established",
+                    ]),
                 ),
             ],
             &["availability", "reason"],
@@ -5321,6 +5565,18 @@ fn setup_capability() -> Value {
 fn source_runtime_status() -> Value {
     one_of(vec![
         closed(vec![("state", constant("not_active"))], &["state"]),
+        closed(
+            vec![
+                ("state", constant("active_group")),
+                ("runtimeGenerationSha256", investment_analysis_sha256()),
+                ("qualifiedRuntimeRecordCount", constant_unsigned(0)),
+            ],
+            &[
+                "state",
+                "runtimeGenerationSha256",
+                "qualifiedRuntimeRecordCount",
+            ],
+        ),
         closed(
             vec![
                 ("state", constant("active")),
@@ -7511,6 +7767,11 @@ fn one_of(variants: Vec<Value>) -> Value {
 
 fn closed(fields: Vec<(&str, Value)>, required: &[&str]) -> Value {
     object(fields, required, false)
+}
+
+fn closed_complete(fields: Vec<(&str, Value)>) -> Value {
+    let required = fields.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    object(fields, &required, false)
 }
 
 fn signature(fields: Vec<(&str, Value)>) -> Value {

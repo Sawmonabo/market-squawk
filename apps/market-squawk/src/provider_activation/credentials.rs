@@ -7,9 +7,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use hmac::{Hmac, Mac as _};
 use market_squawk_adapter_alpaca::{AlpacaCredentials, AlpacaError, AlpacaTradingApiEnvironment};
 use market_squawk_adapter_kraken::KRAKEN_L3_GET_TOKEN_ENDPOINT;
-use market_squawk_adapter_tradier::{TradierAccessToken, TradierCredentialError};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
-use reqwest::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, HeaderValue};
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest as _, Sha256, Sha512};
 use zeroize::Zeroizing;
@@ -17,7 +16,6 @@ use zeroize::Zeroizing;
 const KRAKEN_API_KEY_INFO_ENDPOINT: &str = "https://api.kraken.com/0/private/GetApiKeyInfo";
 const KRAKEN_API_KEY_INFO_PATH: &str = "/0/private/GetApiKeyInfo";
 const KRAKEN_GET_TOKEN_PATH: &str = "/0/private/GetWebSocketsToken";
-const TRADIER_PROFILE_ENDPOINT: &str = "https://api.tradier.com/v1/user/profile";
 const MAX_CREDENTIAL_ENVELOPE_BYTES: usize = 16 * 1024;
 const MAX_KRAKEN_KEY_BYTES: usize = 4_096;
 const MAX_KRAKEN_SECRET_BYTES: usize = 4_096;
@@ -196,27 +194,6 @@ impl std::fmt::Debug for KrakenL3CredentialSigner {
     }
 }
 
-pub(crate) fn tradier_verification_request(
-    client: &reqwest::Client,
-    token: &str,
-) -> Result<reqwest::RequestBuilder, ProviderCredentialError> {
-    TradierAccessToken::try_new(token.to_owned())?;
-    let mut bearer = Zeroizing::new(String::with_capacity(token.len().saturating_add(7)));
-    bearer.push_str("Bearer ");
-    bearer.push_str(token);
-    let authorization = sensitive_header(bearer.as_str())?;
-    Ok(client
-        .get(TRADIER_PROFILE_ENDPOINT)
-        .header(AUTHORIZATION, authorization)
-        .header(ACCEPT, "application/json"))
-}
-
-pub(crate) fn tradier_access_token(
-    token: &str,
-) -> Result<TradierAccessToken, ProviderCredentialError> {
-    TradierAccessToken::try_new(token.to_owned()).map_err(Into::into)
-}
-
 pub(crate) fn next_kraken_nonce() -> Result<u64, ProviderCredentialError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -312,6 +289,4 @@ pub(crate) enum ProviderCredentialError {
     Clock,
     #[error(transparent)]
     Alpaca(#[from] AlpacaError),
-    #[error(transparent)]
-    Tradier(#[from] TradierCredentialError),
 }

@@ -70,8 +70,7 @@ use super::contracts::{
     ProviderProfileRegistration, ProviderProfileView, session_view,
 };
 use crate::provider_activation::credentials::{
-    AlpacaCredentialEnvelope, KrakenL3CredentialSigner, next_kraken_nonce, tradier_access_token,
-    tradier_verification_request,
+    AlpacaCredentialEnvelope, KrakenL3CredentialSigner, next_kraken_nonce,
 };
 
 const SESSION_DURATION: Duration = Duration::from_secs(15 * 60);
@@ -96,7 +95,6 @@ const ALPACA_DOCTOR_OPERATION_DURATION: Duration = Duration::from_secs(60);
 const ALPACA_DOCTOR_FRAME_BYTES: usize = 1024 * 1024;
 const COINBASE_ACCOUNT_BINDING_DOMAIN: &[u8] =
     b"market-squawk/coinbase-exchange-account-binding/v1\0";
-const TRADIER_ACCOUNT_BINDING_DOMAIN: &[u8] = b"market-squawk/tradier-profile-account-binding/v1\0";
 const KRAKEN_ACCOUNT_BINDING_DOMAIN: &[u8] = b"market-squawk/kraken-account-binding/v1\0";
 static SECRET_OPERATION_REAPER: LazyLock<SecretOperationReaper> =
     LazyLock::new(SecretOperationReaper::start);
@@ -1172,8 +1170,7 @@ impl ProviderOnboardingService {
                         "coinbase.exchange-direct-market-data" => {
                             Some(COINBASE_DIRECT_VERIFICATION_VALIDITY_NANOS)
                         }
-                        "tradier.brokerage-market-data"
-                        | "kraken.spot-authenticated-level3-market-data" => {
+                        "kraken.spot-authenticated-level3-market-data" => {
                             Some(MARKET_DATA_VERIFICATION_VALIDITY_NANOS)
                         }
                         "alpaca.basic-market-data" => None,
@@ -1792,9 +1789,9 @@ impl ProviderOnboardingService {
             "bls.v2-registered" | "kraken.spot-authenticated-level3-market-data" => {
                 ProbeTransport::HttpPostJson
             }
-            "coinbase.exchange-direct-market-data"
-            | "fred-alfred.api-v1-v2"
-            | "tradier.brokerage-market-data" => ProbeTransport::HttpGet,
+            "coinbase.exchange-direct-market-data" | "fred-alfred.api-v1-v2" => {
+                ProbeTransport::HttpGet
+            }
             _ => return Err(ProviderOnboardingError::InvalidProfile),
         };
         if profile.probe().transport() != expected_transport {
@@ -1865,10 +1862,6 @@ impl ProviderOnboardingService {
                     .verification_request(&self.client, unix_seconds_now()?)
                     .map_err(|_error| ProviderOnboardingError::InvalidSecretShape)?
             }
-            "tradier.brokerage-market-data" => {
-                tradier_verification_request(&self.client, secret.expose_secret())
-                    .map_err(|_error| ProviderOnboardingError::InvalidSecretShape)?
-            }
             "kraken.spot-authenticated-level3-market-data" => {
                 let credentials = KrakenL3CredentialSigner::try_parse(secret.expose_secret())
                     .map_err(|_error| ProviderOnboardingError::InvalidSecretShape)?;
@@ -1909,7 +1902,6 @@ impl ProviderOnboardingService {
         validate_probe_semantics(profile.id(), &response)?;
         let account_digest = match profile.id() {
             "coinbase.exchange-direct-market-data" => Some(coinbase_account_digest(&response)?),
-            "tradier.brokerage-market-data" => Some(tradier_account_digest(&response)?),
             "kraken.spot-authenticated-level3-market-data" => {
                 let observed = kraken_account_digest(&response)?;
                 if expected_account_digest != Some(observed) {
@@ -2414,12 +2406,14 @@ impl ProviderOnboardingService {
         sequence: u64,
         issuance: AlpacaRuntimeVerificationIssuance,
     ) -> Result<(), ProviderOnboardingError> {
-        self.catalog.append_alpaca_paper_iex_doctor_observation(
-            reservation,
-            sequence,
-            issuance.generation,
-            issuance.observation,
-        )?;
+        self.catalog
+            .append_alpaca_paper_iex_doctor_observation(
+                reservation,
+                sequence,
+                issuance.generation,
+                issuance.observation,
+            )
+            .map_err(ProviderOnboardingError::Catalog)?;
         Ok(())
     }
 
@@ -2973,7 +2967,6 @@ fn validate_secret_shape(
             CoinbaseDirectHmacSigner::try_from_secret_envelope(value).is_ok()
         }
         "alpaca.basic-market-data" => AlpacaCredentialEnvelope::try_parse(value).is_ok(),
-        "tradier.brokerage-market-data" => tradier_access_token(value).is_ok(),
         "kraken.spot-authenticated-level3-market-data" => {
             KrakenL3CredentialSigner::try_parse(value).is_ok()
         }
@@ -3045,7 +3038,6 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
     let valid = match profile_id {
         "coinbase.public-market-data" => value.get("product_id").is_some(),
         "coinbase.exchange-direct-market-data" => coinbase_account_id(&value).is_some(),
-        "tradier.brokerage-market-data" => tradier_profile_id(&value).is_some(),
         "kraken.spot-public-market-data" => {
             value
                 .get("error")
@@ -3073,12 +3065,6 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
     } else {
         Err(ProviderOnboardingError::ProbeUnavailable)
     }
-}
-
-fn tradier_profile_id(value: &serde_json::Value) -> Option<&str> {
-    let profile = value.get("profile")?.as_object()?;
-    let id = profile.get("id")?.as_str()?;
-    SourceIdentifier::try_from(id).ok().map(|_validated| id)
 }
 
 fn kraken_key_info_is_least_authority(value: &serde_json::Value) -> bool {
@@ -3159,13 +3145,6 @@ fn coinbase_account_id(value: &serde_json::Value) -> Option<&str> {
     market_squawk_domain::SourceIdentifier::try_from(account)
         .ok()
         .map(|_validated| account)
-}
-
-fn tradier_account_digest(body: &[u8]) -> Result<EvidenceDigest, ProviderOnboardingError> {
-    let value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
-    let account = tradier_profile_id(&value).ok_or(ProviderOnboardingError::ProbeUnavailable)?;
-    provider_account_digest(TRADIER_ACCOUNT_BINDING_DOMAIN, account.as_bytes())
 }
 
 fn kraken_account_digest(body: &[u8]) -> Result<EvidenceDigest, ProviderOnboardingError> {
@@ -3278,10 +3257,6 @@ fn credential_assurance(
         .map_err(Into::into),
         "alpaca.basic-market-data" => SourceIdentifier::try_from(
             "alpaca-paper-market-data-credential-principal-shape-verified",
-        )
-        .map_err(Into::into),
-        "tradier.brokerage-market-data" => SourceIdentifier::try_from(
-            "tradier-production-profile-read-and-market-data-token-verified",
         )
         .map_err(Into::into),
         "kraken.spot-authenticated-level3-market-data" => {
@@ -3553,24 +3528,7 @@ mod tests {
         )?;
         assert!(validate_probe_semantics(alpaca.id(), br#"{"quote":{"ap":1}}"#).is_err());
 
-        let tradier = profiles
-            .get("tradier.brokerage-market-data")
-            .ok_or("Tradier onboarding profile is missing")?;
-        assert_eq!(
-            tradier.coverage().1,
-            market_squawk_domain::DataQuality::Aggregated
-        );
-        assert!(tradier.coverage().0.contains("Modeled"));
-        assert_eq!(
-            tradier.capability().maximum_authority().as_slice(),
-            &[SourceIdentifier::try_from("tradier.market-data.read")?]
-        );
-        validate_secret_shape(tradier, &SecretValue::new("fixture-token".to_owned())?)?;
-        validate_probe_semantics(
-            tradier.id(),
-            br#"{"profile":{"id":"fixture-user","account":[]}}"#,
-        )?;
-        assert!(validate_probe_semantics(tradier.id(), br#"{"profile":{}}"#).is_err());
+        assert!(profiles.get("tradier.brokerage-market-data").is_none());
 
         let kraken = profiles
             .get("kraken.spot-authenticated-level3-market-data")

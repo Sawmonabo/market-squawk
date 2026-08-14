@@ -554,6 +554,9 @@ function MarketCard({ row, selected, onSelect }: {
         <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
           {markSummary}
         </p>
+        <p className="mt-2 text-[10px] font-medium text-amber-200">
+          {analyticalReadinessName(row.analyticalReadiness)}
+        </p>
       </div>
       <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-border/70 pt-4">
         <Fact label="Bid" value={row.quote.bidPrice ?? "Not available"} />
@@ -773,11 +776,24 @@ function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
               ? "This mark comes from the exact source selected for this instrument. Its timing, coverage, and evidence remain attached below."
               : marketObservationUnavailableName(observation.reason)}
           </p>
+          <p className="mt-2 text-[10px] font-medium text-amber-200">
+            {analyticalReadinessName(row.analyticalReadiness)}
+          </p>
         </div>
-        <EvidenceBadge
-          label={mark ? "Selected mark available" : "Mark unavailable"}
-          tone={mark ? "good" : "bad"}
-        />
+        <div className="flex flex-wrap justify-end gap-2">
+          <EvidenceBadge
+            label={mark ? "Selected mark available" : "Mark unavailable"}
+            tone={mark ? "good" : "bad"}
+          />
+          <EvidenceBadge
+            label={
+              row.analyticalReadiness === "runtime_display_only"
+                ? "Runtime display only"
+                : "Durable PIT evidence"
+            }
+            tone={row.analyticalReadiness === "durable_pit_available" ? "good" : "neutral"}
+          />
+        </div>
       </div>
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
         <Fact
@@ -1202,7 +1218,17 @@ function marketObservationUnavailableName(
       return "No source met the current data requirements."
     case "no_fresh_last_trade_or_midpoint":
       return "The selected source has no fresh trade or bid-and-ask midpoint."
+    case "durable_pit_evidence_not_established":
+      return "The live source is usable for current display, but no durable point-in-time observation has been archived for investment analysis."
   }
+}
+
+function analyticalReadinessName(
+  readiness: UnifiedMarketRow["analyticalReadiness"],
+) {
+  return readiness === "runtime_display_only"
+    ? "Live runtime display · not archived/PIT evidence"
+    : "Durable point-in-time evidence is available for analysis"
 }
 
 function marketFeatureAvailabilityName(

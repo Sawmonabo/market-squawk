@@ -375,16 +375,20 @@ export const installationControlResultSchema = z.object({
   restartRequired: z.boolean(),
 })
 
-export const applicationResultSchema = z.object({
-  data: z.unknown(),
-  metadata: z.object({
-    completeness: z.string(),
-    returnedItems: z.number().int().nonnegative(),
-    availableItems: z.number().int().nonnegative(),
-    sourceCoverage: z.unknown(),
-    dataQuality: z.unknown(),
-  }),
-})
+export const applicationResultSchema = z
+  .object({
+    data: z.unknown(),
+    metadata: z
+      .object({
+        completeness: z.string(),
+        returnedItems: z.number().int().nonnegative(),
+        availableItems: z.number().int().nonnegative(),
+        sourceCoverage: z.unknown(),
+        dataQuality: z.unknown(),
+      })
+      .strict(),
+  })
+  .strict()
 
 export const governanceProvisioningStatusSchema = z.object({
   state: z.enum(["unprovisioned", "active"]),

@@ -20,7 +20,7 @@ pub const ALPACA_PAPER_IEX_DOCTOR_RECEIPT_SCHEMA: &str = "market-squawk.alpaca-p
 pub const MAX_ALPACA_PAPER_IEX_DOCTOR_RECEIPT_BYTES: usize = 16 * 1024;
 
 const ALPACA_PAPER_IEX_DOCTOR_IMPLEMENTATION_REVISION: &str =
-    "market-squawk.alpaca-paper-iex-doctor-implementation.v2";
+    "market-squawk.alpaca-paper-iex-doctor-implementation.v3";
 const ALPACA_PAPER_IEX_DOCTOR_CONTRACT_DOMAIN: &[u8] =
     b"market-squawk/alpaca-paper-iex-doctor-contract/v1\0";
 const ALPACA_PAPER_IEX_PROVIDER_OBSERVATION_ORIGIN: &str =
@@ -284,7 +284,10 @@ pub struct AlpacaDoctorBatchObservation {
     pub duplicate_count: u32,
     /// Structurally or semantically invalid provider components.
     pub invalid_count: u32,
-    /// Unique valid requested components available to product composition.
+    /// Unique valid two-sided requested components available to product composition.
+    ///
+    /// When a successful exact batch is degraded only by one-sided quotes, the checked difference
+    /// `returned_count - effective_cardinality - invalid_count` is their exact count.
     pub effective_cardinality: u32,
     /// Canonical exact requested-set digest.
     pub requested_set_digest: EvidenceDigest,
@@ -733,24 +736,26 @@ impl AlpacaPaperIexDoctorReceiptV1 {
         self.input.verified_at <= observed_at && observed_at < self.input.exclusive_expires_at
     }
 
-    /// Returns whether all five required Paper/IEX capabilities are exactly available.
+    /// Returns whether the exact Paper/IEX transport can start.
+    ///
+    /// Quote and batch evidence may remain truthfully degraded only when their retained evidence
+    /// proves a successful exact response whose sole limitation is one-sided market quotes.
+    /// Stream, historical, and calendar evidence must remain fully available.
     pub const fn admits_source_start(&self) -> bool {
-        matches!(
-            self.input.quote.disposition,
-            RuntimeCapabilityDisposition::Available
-        ) && matches!(
-            self.input.batch.disposition,
-            RuntimeCapabilityDisposition::Available
-        ) && matches!(
-            self.input.stream.disposition,
-            RuntimeCapabilityDisposition::Available
-        ) && matches!(
-            self.input.historical.disposition,
-            RuntimeCapabilityDisposition::Available
-        ) && matches!(
-            self.input.calendar.disposition,
-            RuntimeCapabilityDisposition::Available
-        )
+        quote_admits_source_start(&self.input.quote)
+            && batch_admits_source_start(&self.input.batch)
+            && matches!(
+                self.input.stream.disposition,
+                RuntimeCapabilityDisposition::Available
+            )
+            && matches!(
+                self.input.historical.disposition,
+                RuntimeCapabilityDisposition::Available
+            )
+            && matches!(
+                self.input.calendar.disposition,
+                RuntimeCapabilityDisposition::Available
+            )
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), RuntimeVerificationEvidenceError> {
@@ -1129,7 +1134,7 @@ fn alpaca_endpoint_contract_digest(
             "GET https://data.alpaca.markets/v2/stocks/snapshots?symbols=<code-owned-50>&feed=iex"
         }
         AlpacaDoctorEndpointContract::Stream => {
-            "WSS wss://stream.data.alpaca.markets/v2/iex;header-auth;subscribe=AAPL-trades+quotes;close"
+            "WSS wss://stream.data.alpaca.markets/v2/iex;header-auth;request=AAPL-trades+quotes;ack=AAPL-trades+quotes+automatic-corrections+automatic-cancelErrors;close"
         }
         AlpacaDoctorEndpointContract::Historical => {
             "GET https://data.alpaca.markets/v2/stocks/AAPL/bars?timeframe=1Day&start=<utc>&end=<utc>&limit=1000&adjustment=raw&feed=iex&sort=asc&page_token=<optional>"
@@ -1744,15 +1749,20 @@ fn validate_quote(
         .zip(observation.ask_price)
         .zip(observation.bid_size)
         .zip(observation.ask_size);
-    if let Some(((((quote_timestamp, bid_price), ask_price), _bid_size), _ask_size)) = complete {
+    if let Some(((((quote_timestamp, bid_price), ask_price), bid_size), ask_size)) = complete {
         let _ = quote_timestamp;
-        if bid_price.is_sign_negative() || ask_price.is_sign_negative() {
+        let bid_absent = bid_price.is_zero() && bid_size == 0;
+        let ask_absent = ask_price.is_zero() && ask_size == 0;
+        if bid_price.is_sign_negative()
+            || ask_price.is_sign_negative()
+            || bid_price.is_zero() != (bid_size == 0)
+            || ask_price.is_zero() != (ask_size == 0)
+            || bid_absent && ask_absent
+            || !bid_absent && !ask_absent && bid_price > ask_price
+        {
             return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
         }
-        Ok(observation.http.successful()
-            && !bid_price.is_zero()
-            && !ask_price.is_zero()
-            && bid_price <= ask_price)
+        Ok(observation.http.successful() && !bid_absent && !ask_absent)
     } else if observation.quote_timestamp.is_some()
         || observation.bid_price.is_some()
         || observation.ask_price.is_some()
@@ -1778,6 +1788,10 @@ fn validate_batch(
     ] {
         require_sha256(digest)?;
     }
+    let classified_count = observation
+        .effective_cardinality
+        .checked_add(observation.invalid_count)
+        .ok_or(RuntimeVerificationEvidenceError::InvalidEvidence)?;
     if observation.requested_count != ALPACA_DOCTOR_BATCH_REQUESTED
         || observation.effective_cardinality > observation.requested_count
         || observation.missing_count > observation.requested_count
@@ -1785,10 +1799,7 @@ fn validate_batch(
             .returned_count
             .checked_add(observation.missing_count)
             != Some(observation.requested_count)
-        || observation
-            .effective_cardinality
-            .checked_add(observation.invalid_count)
-            != Some(observation.returned_count)
+        || classified_count > observation.returned_count
         || observation.duplicate_count > MAX_ALPACA_DOCTOR_BATCH_COMPONENTS
         || observation.unexpected_count > MAX_ALPACA_DOCTOR_BATCH_COMPONENTS
     {
@@ -1801,6 +1812,57 @@ fn validate_batch(
         && observation.duplicate_count == 0
         && observation.invalid_count == 0
         && observation.effective_cardinality == ALPACA_DOCTOR_BATCH_REQUESTED)
+}
+
+const fn quote_admits_source_start(
+    probe: &AlpacaDoctorProbeEvidence<AlpacaDoctorQuoteObservation>,
+) -> bool {
+    match probe.disposition {
+        RuntimeCapabilityDisposition::Available => true,
+        RuntimeCapabilityDisposition::Degraded => {
+            let Some(observation) = probe.observation.as_ref() else {
+                return false;
+            };
+            if observation.http.status_code < 200 || observation.http.status_code > 299 {
+                return false;
+            }
+            matches!(
+                (observation.bid_size, observation.ask_size),
+                (Some(0), Some(ask_size)) if ask_size > 0
+            ) || matches!(
+                (observation.bid_size, observation.ask_size),
+                (Some(bid_size), Some(0)) if bid_size > 0
+            )
+        }
+        RuntimeCapabilityDisposition::Unavailable | RuntimeCapabilityDisposition::NotProbed => {
+            false
+        }
+    }
+}
+
+const fn batch_admits_source_start(
+    probe: &AlpacaDoctorProbeEvidence<AlpacaDoctorBatchObservation>,
+) -> bool {
+    match probe.disposition {
+        RuntimeCapabilityDisposition::Available => true,
+        RuntimeCapabilityDisposition::Degraded => {
+            let Some(observation) = probe.observation.as_ref() else {
+                return false;
+            };
+            observation.http.status_code >= 200
+                && observation.http.status_code <= 299
+                && observation.requested_count == ALPACA_DOCTOR_BATCH_REQUESTED
+                && observation.returned_count == ALPACA_DOCTOR_BATCH_REQUESTED
+                && observation.missing_count == 0
+                && observation.unexpected_count == 0
+                && observation.duplicate_count == 0
+                && observation.invalid_count == 0
+                && observation.effective_cardinality < ALPACA_DOCTOR_BATCH_REQUESTED
+        }
+        RuntimeCapabilityDisposition::Unavailable | RuntimeCapabilityDisposition::NotProbed => {
+            false
+        }
+    }
 }
 
 fn validate_stream(
@@ -1830,8 +1892,7 @@ fn validate_stream(
     }
     Ok(observation.subscribed_trade_count == 1
         && observation.subscribed_quote_count == 1
-        && observation.close_sent
-        && observation.clean_close_observed)
+        && observation.close_sent)
 }
 
 fn validate_history(

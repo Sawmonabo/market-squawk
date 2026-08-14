@@ -9,12 +9,6 @@ use market_squawk_adapter_alpaca::{
 };
 use market_squawk_adapter_coinbase::{CoinbaseExchangeDecoder, CoinbaseExchangeSource};
 use market_squawk_adapter_kraken::{KrakenMarketDecoder, KrakenSource};
-use market_squawk_adapter_tradier::{
-    TRADIER_WEBSOCKET_ENDPOINT, TradierAccessSurface, TradierAccountMarketData,
-    TradierAccountMarketDataError, TradierConfigError, TradierLogicalProfile, TradierMarketDecoder,
-    TradierSourceConfig, TradierStreamingSource, TradierSubscriptionAuthority,
-    TradierSubscriptionError,
-};
 use market_squawk_sources::{
     DecodeInternalError, DecodeOutcome, LiveMarketSource, LiveSourceGeneration, MarketDecoder,
     RawMarketSink, SourceError, SourceMetadata, SourceMetadataProvider, ValidatedRawMarketFrame,
@@ -51,6 +45,18 @@ pub(super) struct ProductionSourceProfile {
     pre_acknowledgement_data_message_capacity: usize,
     pre_acknowledgement_data_byte_capacity: usize,
     subscription_acknowledgement_policy: SubscriptionAcknowledgementPolicy,
+    startup_readiness_policy: StartupReadinessPolicy,
+}
+
+/// Closed proof required before a production supervisor may publish startup readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StartupReadinessPolicy {
+    /// One registry-qualified batch must reach its output.
+    FirstQualifiedData,
+    /// A mandatory captured bootstrap plus exact provider acknowledgement establishes a connected
+    /// display runtime even when that bootstrap is freshness-only unqualified. The stale batch is
+    /// never published and current-data authority remains absent until a fresh live batch arrives.
+    ExactAcknowledgementAfterCapturedBootstrap,
 }
 
 impl ProductionSourceProfile {
@@ -81,6 +87,7 @@ impl ProductionSourceProfile {
             pre_acknowledgement_data_byte_capacity,
             subscription_acknowledgement_policy:
                 SubscriptionAcknowledgementPolicy::ExplicitProviderFrame,
+            startup_readiness_policy: StartupReadinessPolicy::FirstQualifiedData,
         })
     }
 
@@ -99,6 +106,7 @@ impl ProductionSourceProfile {
             pre_acknowledgement_data_byte_capacity: 0,
             subscription_acknowledgement_policy:
                 SubscriptionAcknowledgementPolicy::ExplicitProviderFrame,
+            startup_readiness_policy: StartupReadinessPolicy::FirstQualifiedData,
         }
     }
 
@@ -117,7 +125,9 @@ impl ProductionSourceProfile {
                 .map(|mapping| mapping.symbol().to_owned()),
         );
         let transport = config.transport_limits();
+        let boot_snapshot = config.boot_snapshot_policy();
         let subscription_ack_timeout = checked_duration_sum([
+            boot_snapshot.total_timeout(),
             transport.connect_timeout(),
             transport.io_timeout(), // subscription write
             transport.io_timeout(), // connected control frame
@@ -133,10 +143,12 @@ impl ProductionSourceProfile {
             subscription_products: products.into_boxed_slice(),
             control_message_capacity: AUTHENTICATED_CONTROL_MESSAGE_CAPACITY,
             control_byte_capacity: AUTHENTICATED_CONTROL_BYTE_CAPACITY,
-            pre_acknowledgement_data_message_capacity: 0,
-            pre_acknowledgement_data_byte_capacity: 0,
+            pre_acknowledgement_data_message_capacity: 1,
+            pre_acknowledgement_data_byte_capacity: boot_snapshot.maximum_body_bytes(),
             subscription_acknowledgement_policy:
                 SubscriptionAcknowledgementPolicy::ExplicitProviderFrame,
+            startup_readiness_policy:
+                StartupReadinessPolicy::ExactAcknowledgementAfterCapturedBootstrap,
         })
     }
 
@@ -175,50 +187,7 @@ impl ProductionSourceProfile {
             pre_acknowledgement_data_byte_capacity: 0,
             subscription_acknowledgement_policy:
                 SubscriptionAcknowledgementPolicy::ExplicitProviderFrame,
-        })
-    }
-
-    pub(super) fn tradier_streaming(
-        config: TradierSourceConfig,
-        account: Arc<TradierAccountMarketData>,
-        subscriptions: TradierSubscriptionAuthority,
-    ) -> Result<Self, ProductionProviderError> {
-        if config.profile() != TradierLogicalProfile::ConsolidatedSecurities
-            || config.access_surface() != TradierAccessSurface::Streaming
-        {
-            return Err(ProductionProviderError::TradierProfileMismatch);
-        }
-        let selected = subscriptions.current_symbols()?;
-        if selected.iter().any(|symbol| {
-            !config
-                .mappings()
-                .iter()
-                .any(|mapping| mapping.symbol() == symbol)
-        }) {
-            return Err(ProductionProviderError::TradierProfileMismatch);
-        }
-        let products = owned_product_names(selected)?;
-        let transport = config.transport_limits();
-        let subscription_ack_timeout = checked_duration_sum([
-            Duration::from_nanos(transport.http().total_timeout_nanos()),
-            Duration::from_nanos(transport.http().connect_timeout_nanos()),
-            transport.io_timeout(), // subscription write
-            transport.io_timeout(), // first validated market-data frame
-        ])?;
-        Ok(Self {
-            subscription_ack_timeout,
-            connector: ProductionConnectorProfile::TradierStreaming {
-                config: Box::new(config),
-                account,
-                subscriptions,
-            },
-            subscription_products: products.into_boxed_slice(),
-            control_message_capacity: AUTHENTICATED_CONTROL_MESSAGE_CAPACITY,
-            control_byte_capacity: AUTHENTICATED_CONTROL_BYTE_CAPACITY,
-            pre_acknowledgement_data_message_capacity: 0,
-            pre_acknowledgement_data_byte_capacity: 0,
-            subscription_acknowledgement_policy:
-                SubscriptionAcknowledgementPolicy::FirstValidatedData,
+            startup_readiness_policy: StartupReadinessPolicy::FirstQualifiedData,
         })
     }
 
@@ -237,9 +206,6 @@ impl ProductionSourceProfile {
     pub(super) fn subscription_product_snapshot(
         &self,
     ) -> Result<Vec<String>, ProductionProviderError> {
-        if let Some(subscriptions) = self.connector.tradier_subscription_authority() {
-            return owned_product_names(subscriptions.current_symbols()?);
-        }
         let mut products = Vec::new();
         products
             .try_reserve_exact(self.subscription_products.len())
@@ -281,6 +247,10 @@ impl ProductionSourceProfile {
         self.subscription_acknowledgement_policy
     }
 
+    pub(super) const fn startup_readiness_policy(&self) -> StartupReadinessPolicy {
+        self.startup_readiness_policy
+    }
+
     pub(super) fn decoder(&self) -> Result<ProductionMarketDecoder, ProductionProviderError> {
         self.connector.decoder()
     }
@@ -297,7 +267,6 @@ impl ProductionSourceProfile {
             &self.connector,
             ProductionConnectorProfile::AlpacaIex { .. }
                 | ProductionConnectorProfile::AlpacaOptions { .. }
-                | ProductionConnectorProfile::TradierStreaming { .. }
         )
     }
 
@@ -315,6 +284,7 @@ impl ProductionSourceProfile {
             pre_acknowledgement_data_message_capacity,
             pre_acknowledgement_data_byte_capacity,
             subscription_acknowledgement_policy,
+            startup_readiness_policy,
         } = self;
         let ProductionConnectorProfile::Kraken(profile) = connector else {
             return Err(ProductionProviderError::TestConnectorMismatch);
@@ -330,26 +300,9 @@ impl ProductionSourceProfile {
             pre_acknowledgement_data_message_capacity,
             pre_acknowledgement_data_byte_capacity,
             subscription_acknowledgement_policy,
+            startup_readiness_policy,
         })
     }
-}
-
-fn owned_product_names(
-    selected: Vec<market_squawk_domain::SourceIdentifier>,
-) -> Result<Vec<String>, ProductionProviderError> {
-    let mut products = Vec::new();
-    products
-        .try_reserve_exact(selected.len())
-        .map_err(|_error| ProductionProviderError::AllocationFailed)?;
-    for symbol in selected {
-        let mut product = String::new();
-        product
-            .try_reserve_exact(symbol.as_str().len())
-            .map_err(|_error| ProductionProviderError::AllocationFailed)?;
-        product.push_str(symbol.as_str());
-        products.push(product);
-    }
-    Ok(products)
 }
 
 fn checked_duration_sum<const N: usize>(
@@ -374,11 +327,6 @@ enum ProductionConnectorProfile {
         config: Box<AlpacaOptionsLiveConfig>,
         credentials: Arc<AlpacaCredentials>,
     },
-    TradierStreaming {
-        config: Box<TradierSourceConfig>,
-        account: Arc<TradierAccountMarketData>,
-        subscriptions: TradierSubscriptionAuthority,
-    },
 }
 
 impl ProductionConnectorProfile {
@@ -388,7 +336,6 @@ impl ProductionConnectorProfile {
             Self::Kraken(profile) => profile.metadata(),
             Self::AlpacaIex { config, .. } => config.metadata(),
             Self::AlpacaOptions { config, .. } => config.metadata(),
-            Self::TradierStreaming { config, .. } => config.metadata(),
         }
     }
 
@@ -398,7 +345,6 @@ impl ProductionConnectorProfile {
             Self::Kraken(profile) => profile.endpoint(),
             Self::AlpacaIex { config, .. } => config.endpoint(),
             Self::AlpacaOptions { config, .. } => config.endpoint(),
-            Self::TradierStreaming { .. } => TRADIER_WEBSOCKET_ENDPOINT,
         }
     }
 
@@ -408,7 +354,6 @@ impl ProductionConnectorProfile {
             Self::Kraken(_) => "kraken-public-book-v2",
             Self::AlpacaIex { .. } => "alpaca-basic-iex-live",
             Self::AlpacaOptions { .. } => "alpaca-basic-indicative-options-live",
-            Self::TradierStreaming { .. } => "tradier-consolidated-streaming",
         }
     }
 
@@ -423,9 +368,6 @@ impl ProductionConnectorProfile {
             )),
             Self::AlpacaOptions { config, .. } => Ok(ProductionMarketDecoder::AlpacaOptions(
                 AlpacaOptionsDecoder::try_new(config)?,
-            )),
-            Self::TradierStreaming { config, .. } => Ok(ProductionMarketDecoder::Tradier(
-                TradierMarketDecoder::try_new(config)?,
             )),
         }
     }
@@ -461,24 +403,6 @@ impl ProductionConnectorProfile {
             )
             .map(ProductionLiveSource::AlpacaOptions)
             .map_err(Into::into),
-            Self::TradierStreaming {
-                config,
-                account,
-                subscriptions,
-            } => account
-                .streaming_source_with_authority(config.as_ref().clone(), generation, subscriptions)
-                .map(ProductionLiveSource::Tradier)
-                .map_err(Into::into),
-        }
-    }
-
-    fn tradier_subscription_authority(&self) -> Option<TradierSubscriptionAuthority> {
-        match self {
-            Self::TradierStreaming { subscriptions, .. } => Some(subscriptions.clone()),
-            Self::Coinbase(_)
-            | Self::Kraken(_)
-            | Self::AlpacaIex { .. }
-            | Self::AlpacaOptions { .. } => None,
         }
     }
 }
@@ -490,7 +414,6 @@ pub(super) enum ProductionMarketDecoder {
     Kraken(KrakenMarketDecoder),
     AlpacaIex(AlpacaIexDecoder),
     AlpacaOptions(AlpacaOptionsDecoder),
-    Tradier(TradierMarketDecoder),
 }
 
 impl SourceMetadataProvider for ProductionMarketDecoder {
@@ -500,7 +423,6 @@ impl SourceMetadataProvider for ProductionMarketDecoder {
             Self::Kraken(decoder) => decoder.metadata(),
             Self::AlpacaIex(decoder) => decoder.metadata(),
             Self::AlpacaOptions(decoder) => decoder.metadata(),
-            Self::Tradier(decoder) => decoder.metadata(),
         }
     }
 }
@@ -515,7 +437,6 @@ impl MarketDecoder for ProductionMarketDecoder {
             Self::Kraken(decoder) => decoder.decode(frame),
             Self::AlpacaIex(decoder) => decoder.decode(frame),
             Self::AlpacaOptions(decoder) => decoder.decode(frame),
-            Self::Tradier(decoder) => decoder.decode(frame),
         }
     }
 }
@@ -527,7 +448,6 @@ pub(super) enum ProductionLiveSource {
     Kraken(KrakenSource),
     AlpacaIex(AlpacaIexLiveSource),
     AlpacaOptions(AlpacaOptionsLiveSource),
-    Tradier(TradierStreamingSource),
 }
 
 impl ProductionLiveSource {
@@ -541,7 +461,6 @@ impl ProductionLiveSource {
             Self::Kraken(source) => source.run(sink, cancellation),
             Self::AlpacaIex(source) => source.run(sink, cancellation),
             Self::AlpacaOptions(source) => source.run(sink, cancellation),
-            Self::Tradier(source) => source.run(sink, cancellation),
         }
     }
 }
@@ -555,14 +474,6 @@ pub enum ProductionProviderError {
     KrakenProfile(#[from] ProductionKrakenProfileError),
     #[error(transparent)]
     Alpaca(#[from] market_squawk_adapter_alpaca::AlpacaError),
-    #[error(transparent)]
-    TradierAccount(#[from] TradierAccountMarketDataError),
-    #[error(transparent)]
-    TradierConfig(#[from] TradierConfigError),
-    #[error(transparent)]
-    TradierSubscription(#[from] TradierSubscriptionError),
-    #[error("Tradier production profile is not the consolidated streaming surface")]
-    TradierProfileMismatch,
     #[error("production provider startup acknowledgement deadline overflowed")]
     StartupAcknowledgementTimeoutOverflow,
     #[error(transparent)]

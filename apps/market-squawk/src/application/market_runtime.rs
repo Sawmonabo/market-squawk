@@ -22,7 +22,9 @@ pub(crate) use kraken::MarketKrakenPriceProjectionLease;
 
 use std::{
     fmt,
+    future::Future,
     num::{NonZeroU64, NonZeroUsize},
+    pin::Pin,
     sync::{Arc, Weak},
     time::{Duration, Instant},
 };
@@ -61,7 +63,10 @@ use crate::{
     paper_bot::{
         local_coinbase_direct_live_market_with_activation, local_live_market_with_provider_rate,
     },
-    provider_activation::{AccountMarketRuntimeMutationAuthority, ProviderAdapterActivation},
+    provider_activation::{
+        AccountMarketRuntimeMutationAuthority, PreparedMarketProviderConfiguration,
+        ProviderAdapterActivation,
+    },
 };
 
 pub(crate) const COINBASE_PUBLIC_SURFACE_ID: &str = "coinbase.public-market-data";
@@ -215,6 +220,7 @@ pub(crate) struct MarketRuntimeRegistry {
     shutdown: Mutex<Option<Result<(), ServiceError>>>,
     mutation: Mutex<()>,
     entries: Mutex<Vec<MarketRuntimeEntry>>,
+    account_health_cancellation: CancellationToken,
     account_health_drain: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -222,6 +228,23 @@ pub(crate) struct MarketRuntimeRegistry {
 struct AccountMarketRuntimeHealthSnapshot {
     surface_id: SourceIdentifier,
     group_generation: MarketRuntimeGroupGeneration,
+}
+
+enum AccountGroupStartPreparation {
+    Existing(MarketProviderGroupLifecycleEvidence),
+    Ready {
+        surface_id: SourceIdentifier,
+        prepared: PreparedMarketProviderConfiguration,
+        runtime_cancellation: CancellationToken,
+    },
+}
+
+enum AccountGroupPublicationAttempt {
+    Published,
+    Rejected {
+        entry: MarketRuntimeEntry,
+        error: ServiceError,
+    },
 }
 
 impl MarketRuntimeRegistry {
@@ -279,6 +302,7 @@ impl MarketRuntimeRegistry {
             shutdown: Mutex::new(None),
             mutation: Mutex::new(()),
             entries: Mutex::new(entries),
+            account_health_cancellation: CancellationToken::new(),
             account_health_drain: Mutex::new(None),
         }))
     }
@@ -288,7 +312,17 @@ impl MarketRuntimeRegistry {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), ServiceError> {
+        if !self.accepting.load(std::sync::atomic::Ordering::Acquire)
+            || self.account_health_cancellation.is_cancelled()
+        {
+            return Err(ServiceError::Unavailable);
+        }
         let mut drain = bounded_lock(&self.account_health_drain, deadline, cancellation).await?;
+        if !self.accepting.load(std::sync::atomic::Ordering::Acquire)
+            || self.account_health_cancellation.is_cancelled()
+        {
+            return Err(ServiceError::Unavailable);
+        }
         if let Some(running) = drain.as_ref() {
             return if running.is_finished() {
                 Err(ServiceError::Unavailable)
@@ -298,7 +332,7 @@ impl MarketRuntimeRegistry {
         }
         *drain = Some(tokio::spawn(run_account_health_drain(
             Arc::downgrade(self),
-            self.lifecycle.clone(),
+            self.account_health_cancellation.clone(),
         )));
         Ok(())
     }
@@ -346,8 +380,14 @@ impl MarketRuntimeRegistry {
         self.ensure_account_health_drain_started(deadline, cancellation)
             .await?;
         let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
-        self.start_account_group_owned(request, deadline, cancellation)
-            .await
+        let startup: Pin<
+            Box<
+                dyn Future<Output = Result<MarketProviderGroupLifecycleEvidence, ServiceError>>
+                    + Send
+                    + '_,
+            >,
+        > = Box::pin(self.start_account_group_owned(request, deadline, cancellation));
+        startup.await
     }
 
     async fn start_account_group_owned(
@@ -356,13 +396,67 @@ impl MarketRuntimeRegistry {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<MarketProviderGroupLifecycleEvidence, ServiceError> {
+        let preparation: Pin<
+            Box<
+                dyn Future<Output = Result<AccountGroupStartPreparation, ServiceError>> + Send + '_,
+            >,
+        > = Box::pin(self.prepare_account_group_start(request, deadline, cancellation));
+        let prepared = preparation.await?;
+        let (surface_id, prepared, runtime_cancellation) = match prepared {
+            AccountGroupStartPreparation::Existing(evidence) => return Ok(evidence),
+            AccountGroupStartPreparation::Ready {
+                surface_id,
+                prepared,
+                runtime_cancellation,
+            } => (surface_id, prepared, runtime_cancellation),
+        };
+        let group_start: Pin<
+            Box<dyn Future<Output = Result<AccountMarketRuntimeGroup, ServiceError>> + Send + '_>,
+        > = Box::pin(AccountMarketRuntimeGroup::start(
+            request,
+            prepared,
+            self.provider_activation.as_ref(),
+            self.config.clone(),
+            self.provider_rate.clone(),
+            self.capture_process,
+            self.display.clone(),
+            self.order_level.clone(),
+            self.account_limits,
+            runtime_cancellation.clone(),
+            deadline,
+            cancellation,
+        ));
+        let group = group_start.await?;
+        let publication: Pin<
+            Box<
+                dyn Future<Output = Result<MarketProviderGroupLifecycleEvidence, ServiceError>>
+                    + Send
+                    + '_,
+            >,
+        > = Box::pin(self.publish_account_group_start(
+            request,
+            surface_id,
+            runtime_cancellation,
+            group,
+            deadline,
+            cancellation,
+        ));
+        publication.await
+    }
+
+    async fn prepare_account_group_start(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<AccountGroupStartPreparation, ServiceError> {
         ensure_active(&self.accepting, deadline, cancellation)?;
         let surface_id = try_surface_identifier(request.surface())?;
         match self
             .verify_account_group_owned(request, deadline, cancellation)
             .await
         {
-            Ok(Some(evidence)) => return Ok(evidence),
+            Ok(Some(evidence)) => return Ok(AccountGroupStartPreparation::Existing(evidence)),
             Ok(None) | Err(ServiceError::Unavailable) => {}
             Err(error) => return Err(error),
         }
@@ -379,24 +473,27 @@ impl MarketRuntimeRegistry {
         .await?;
         resolution_guard.disarm();
         let runtime_cancellation = self.lifecycle.child_token();
-        let group = AccountMarketRuntimeGroup::start(
-            request,
+        Ok(AccountGroupStartPreparation::Ready {
+            surface_id,
             prepared,
-            self.provider_activation.as_ref(),
-            self.config.clone(),
-            self.provider_rate.clone(),
-            self.capture_process,
-            self.display.clone(),
-            self.order_level.clone(),
-            self.account_limits,
-            runtime_cancellation.clone(),
-            deadline,
-            cancellation,
-        )
-        .await?;
+            runtime_cancellation,
+        })
+    }
+
+    async fn publish_account_group_start(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        surface_id: SourceIdentifier,
+        runtime_cancellation: CancellationToken,
+        group: AccountMarketRuntimeGroup,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketProviderGroupLifecycleEvidence, ServiceError> {
         let account_lease = group.activation_lease().clone();
         if let Err(error) = validate_account_lease(request, &account_lease) {
-            let _cleanup = group.shutdown_before(deadline, cancellation).await;
+            let cleanup: Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + '_>> =
+                Box::pin(group.shutdown_before(deadline, cancellation));
+            let _cleanup = cleanup.await;
             return Err(error);
         }
         let evidence = group.evidence().clone();
@@ -409,9 +506,38 @@ impl MarketRuntimeRegistry {
             exports: None,
             action_hooks_installed: false,
         };
+        let attempt: Pin<Box<dyn Future<Output = AccountGroupPublicationAttempt> + Send + '_>> =
+            Box::pin(self.attempt_account_group_publication(
+                request,
+                account_lease,
+                entry,
+                deadline,
+                cancellation,
+            ));
+        match attempt.await {
+            AccountGroupPublicationAttempt::Published => Ok(evidence),
+            AccountGroupPublicationAttempt::Rejected { entry, error } => {
+                let cleanup: Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + '_>> =
+                    Box::pin(entry.shutdown(self.config.source_shutdown()));
+                let cleanup_result = cleanup.await;
+                match cleanup_result {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(cleanup_error),
+                }
+            }
+        }
+    }
+
+    async fn attempt_account_group_publication(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        account_lease: crate::ProviderActivationLease,
+        entry: MarketRuntimeEntry,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> AccountGroupPublicationAttempt {
         if let Err(error) = ensure_active(&self.accepting, deadline, cancellation) {
-            let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
-            return Err(error);
+            return AccountGroupPublicationAttempt::Rejected { entry, error };
         }
         let publication_authority = match self
             .account_market_mutation_authority_before(deadline, cancellation)
@@ -419,17 +545,14 @@ impl MarketRuntimeRegistry {
         {
             Ok(authority) => authority,
             Err(error) => {
-                let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
-                return Err(error);
+                return AccountGroupPublicationAttempt::Rejected { entry, error };
             }
         };
-        let entries = bounded_lock(&self.entries, deadline, cancellation).await;
-        let mut entries = match entries {
+        let mut entries = match bounded_lock(&self.entries, deadline, cancellation).await {
             Ok(entries) => entries,
             Err(error) => {
                 drop(publication_authority);
-                let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
-                return Err(error);
+                return AccountGroupPublicationAttempt::Rejected { entry, error };
             }
         };
         if entries.len() == MAXIMUM_CONCURRENT_MARKET_SURFACES
@@ -439,20 +562,23 @@ impl MarketRuntimeRegistry {
         {
             drop(entries);
             drop(publication_authority);
-            entry.shutdown(self.config.source_shutdown()).await?;
-            return Err(ServiceError::ResourceExhausted);
+            return AccountGroupPublicationAttempt::Rejected {
+                entry,
+                error: ServiceError::ResourceExhausted,
+            };
         }
         if let Err(error) = ensure_active(&self.accepting, deadline, cancellation) {
             drop(entries);
             drop(publication_authority);
-            let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
-            return Err(error);
+            return AccountGroupPublicationAttempt::Rejected { entry, error };
         }
         if !entry.is_healthy() {
             drop(entries);
             drop(publication_authority);
-            let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
-            return Err(ServiceError::Unavailable);
+            return AccountGroupPublicationAttempt::Rejected {
+                entry,
+                error: ServiceError::Unavailable,
+            };
         }
         let active_lease = if request.surface() == AccountMarketSurface::AlpacaBasic {
             match publication_authority.commit_prepared_activation(&account_lease) {
@@ -461,8 +587,10 @@ impl MarketRuntimeRegistry {
                     tracing::error!(%error, "account-market activation commit failed");
                     drop(entries);
                     drop(publication_authority);
-                    let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
-                    return Err(ServiceError::Unauthorized);
+                    return AccountGroupPublicationAttempt::Rejected {
+                        entry,
+                        error: ServiceError::Unauthorized,
+                    };
                 }
             }
         } else {
@@ -479,15 +607,17 @@ impl MarketRuntimeRegistry {
             tracing::error!(%error, "account-market registry publication authority failed");
             drop(entries);
             drop(publication_authority);
-            let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
-            return Err(ServiceError::Unauthorized);
+            return AccountGroupPublicationAttempt::Rejected {
+                entry,
+                error: ServiceError::Unauthorized,
+            };
         }
         // Durable Active and the exact runtime remain serialized by one onboarding mutation
         // authority until this infallible registry insertion completes.
         entries.push(entry);
         drop(entries);
         drop(publication_authority);
-        Ok(evidence)
+        AccountGroupPublicationAttempt::Published
     }
 
     async fn start_owned(
@@ -740,7 +870,7 @@ impl MarketRuntimeRegistry {
             .account_evidence()
             .ok_or(ServiceError::InvalidRequest)?;
         validate_account_evidence(request, evidence)?;
-        if !entry.is_healthy() {
+        if !entry.is_published_healthy() {
             return Err(ServiceError::Unavailable);
         }
         Ok(Some(evidence.clone()))
@@ -1034,21 +1164,25 @@ impl MarketRuntimeRegistry {
         ensure_active(&self.accepting, deadline, cancellation)?;
         let descriptors = {
             let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
-            let descriptor_count = entries
+            let descriptor_capacity = entries
                 .iter()
-                .filter(|entry| entry.is_healthy())
+                .filter(|entry| entry.is_published_healthy())
                 .try_fold(0_usize, |count, entry| {
                     count.checked_add(entry.runtime.display_descriptor_count())
                 })
                 .ok_or(ServiceError::ResourceExhausted)?;
             let mut descriptors = Vec::new();
             descriptors
-                .try_reserve_exact(descriptor_count)
+                .try_reserve_exact(descriptor_capacity)
                 .map_err(|_error| ServiceError::ResourceExhausted)?;
-            for entry in entries.iter().filter(|entry| entry.is_healthy()) {
+            for entry in entries.iter().filter(|entry| entry.is_published_healthy()) {
                 entry.runtime.append_display_descriptors(&mut descriptors);
             }
-            if descriptors.len() != descriptor_count {
+            if descriptors.len() != descriptor_capacity {
+                return Err(ServiceError::Unavailable);
+            }
+            descriptors.retain(|descriptor| descriptor.supports_instrument(instrument_id));
+            if descriptors.is_empty() {
                 return Err(ServiceError::Unavailable);
             }
             descriptors
@@ -1058,29 +1192,40 @@ impl MarketRuntimeRegistry {
             .snapshots_for_instrument(instrument_id, maximum_sources, at, cancellation, deadline)
             .await
             .map_err(map_display_read_error)?;
+        if leases.len() != descriptors.len() {
+            return Err(ServiceError::Unavailable);
+        }
+        let mut unmatched = descriptors.into_iter().map(Some).collect::<Vec<_>>();
         let mut snapshots = Vec::new();
         snapshots
             .try_reserve_exact(leases.len())
             .map_err(|_error| ServiceError::ResourceExhausted)?;
         for lease in leases {
             ensure_active(&self.accepting, deadline, cancellation)?;
-            let mut matched = descriptors
+            let mut matched = unmatched
                 .iter()
-                .filter(|descriptor| descriptor.matches_snapshot(&lease));
-            let descriptor = matched.next().ok_or(ServiceError::Unavailable)?;
+                .enumerate()
+                .filter_map(|(index, descriptor)| {
+                    descriptor
+                        .as_ref()
+                        .filter(|descriptor| descriptor.matches_snapshot(&lease))
+                        .map(|_descriptor| index)
+                });
+            let index = matched.next().ok_or(ServiceError::Unavailable)?;
             if matched.next().is_some() {
                 return Err(ServiceError::Unavailable);
             }
-            snapshots.push(MarketDisplaySnapshotLease::try_new(
-                Arc::clone(descriptor),
-                lease,
-            )?);
+            let descriptor = unmatched[index].take().ok_or(ServiceError::Unavailable)?;
+            snapshots.push(MarketDisplaySnapshotLease::try_new(descriptor, lease)?);
+        }
+        if unmatched.iter().any(Option::is_some) {
+            return Err(ServiceError::Unavailable);
         }
         {
             let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
             if snapshots.iter().any(|snapshot| {
                 !entries.iter().any(|entry| {
-                    entry.is_healthy()
+                    entry.is_published_healthy()
                         && entry.runtime.owns_display_descriptor(snapshot.descriptor())
                 })
             }) {
@@ -1127,7 +1272,7 @@ impl MarketRuntimeRegistry {
             let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
             let instrument_count = entries
                 .iter()
-                .filter(|entry| entry.is_healthy())
+                .filter(|entry| entry.is_published_healthy())
                 .try_fold(0_usize, |count, entry| {
                     count.checked_add(if include_kraken_level3 {
                         entry.runtime.market_instrument_count()?
@@ -1140,7 +1285,7 @@ impl MarketRuntimeRegistry {
             instrument_ids
                 .try_reserve_exact(instrument_count)
                 .map_err(|_error| ServiceError::ResourceExhausted)?;
-            for entry in entries.iter().filter(|entry| entry.is_healthy()) {
+            for entry in entries.iter().filter(|entry| entry.is_published_healthy()) {
                 if include_kraken_level3 {
                     entry
                         .runtime
@@ -1396,6 +1541,7 @@ impl MarketRuntimeRegistry {
     }
 
     pub(crate) fn begin_shutdown(&self) {
+        self.account_health_cancellation.cancel();
         if self
             .accepting
             .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -1414,28 +1560,22 @@ impl MarketRuntimeRegistry {
         let _mutation = match bounded_lock(&self.mutation, deadline, &cleanup).await {
             Ok(mutation) => mutation,
             Err(error) => {
+                self.account_health_cancellation.cancel();
                 self.lifecycle.cancel();
                 *shutdown = Some(Err(error));
                 return Err(error);
             }
         };
-        let entries = {
-            let mut entries = match bounded_lock(&self.entries, deadline, &cleanup).await {
-                Ok(entries) => entries,
+        let mut failure = None;
+        let account_health_drain =
+            match bounded_lock(&self.account_health_drain, deadline, &cleanup).await {
+                Ok(mut drain) => drain.take(),
                 Err(error) => {
                     self.lifecycle.cancel();
                     *shutdown = Some(Err(error));
                     return Err(error);
                 }
             };
-            std::mem::take(&mut *entries)
-        };
-        let mut failure = None;
-        self.lifecycle.cancel();
-        let account_health_drain = {
-            let mut drain = bounded_lock(&self.account_health_drain, deadline, &cleanup).await?;
-            drain.take()
-        };
         if let Some(mut drain) = account_health_drain {
             let result = tokio::select! {
                 biased;
@@ -1454,6 +1594,18 @@ impl MarketRuntimeRegistry {
                 failure = Some(error);
             }
         }
+        let entries = {
+            let mut entries = match bounded_lock(&self.entries, deadline, &cleanup).await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    self.account_health_cancellation.cancel();
+                    self.lifecycle.cancel();
+                    *shutdown = Some(Err(error));
+                    return Err(error);
+                }
+            };
+            std::mem::take(&mut *entries)
+        };
         for entry in &entries {
             entry.begin_shutdown();
         }
@@ -1471,6 +1623,7 @@ impl MarketRuntimeRegistry {
             }
         }
 
+        self.lifecycle.cancel();
         let display_shutdown = self.display.shutdown(&cleanup, deadline);
         let order_level_shutdown = self.order_level.shutdown(&cleanup, deadline);
         let resolver_shutdown = await_service_before(
@@ -1671,13 +1824,13 @@ impl MarketRuntimeRegistry {
     ) -> Result<(), ServiceError> {
         let _mutation = tokio::select! {
             biased;
-            () = self.lifecycle.cancelled() => return Ok(()),
+            () = self.account_health_cancellation.cancelled() => return Ok(()),
             mutation = self.mutation.lock() => mutation,
         };
         let entry = {
             let mut entries = tokio::select! {
                 biased;
-                () = self.lifecycle.cancelled() => return Ok(()),
+                () = self.account_health_cancellation.cancelled() => return Ok(()),
                 entries = self.entries.lock() => entries,
             };
             let Some(index) = entries.iter().position(|entry| {
@@ -1722,6 +1875,7 @@ impl Drop for MarketRuntimeRegistry {
                 entry.begin_shutdown();
             }
         }
+        self.account_health_cancellation.cancel();
         self.lifecycle.cancel();
     }
 }
@@ -2189,14 +2343,14 @@ fn matches_unhealthy_account_generation(
 
 async fn run_account_health_drain(
     registry: Weak<MarketRuntimeRegistry>,
-    lifecycle: CancellationToken,
+    cancellation: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(ACCOUNT_HEALTH_SCAN_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             biased;
-            () = lifecycle.cancelled() => break,
+            () = cancellation.cancelled() => break,
             _ = interval.tick() => {}
         }
         let Some(registry) = registry.upgrade() else {
@@ -2206,7 +2360,7 @@ async fn run_account_health_drain(
             continue;
         };
         if let Err(error) = registry.drain_account_group_generation(&snapshot).await
-            && !lifecycle.is_cancelled()
+            && !cancellation.is_cancelled()
         {
             tracing::error!(
                 %error,
@@ -2595,7 +2749,7 @@ mod tests {
     fn health_drain_cas_rejects_healthy_and_successor_coordinates() {
         let surface = SourceIdentifier::try_from(AccountMarketSurface::AlpacaBasic.surface_id())
             .expect("fixed surface");
-        let other = SourceIdentifier::try_from(AccountMarketSurface::Tradier.surface_id())
+        let other = SourceIdentifier::try_from(AccountMarketSurface::KrakenLevel3.surface_id())
             .expect("fixed surface");
         let generation = digest(6);
         assert!(matches_unhealthy_account_generation(

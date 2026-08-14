@@ -15,10 +15,11 @@ use market_squawk_sources::{
     ResynchronizationReason, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
     ValidatedRawMarketFrame,
 };
-use serde::Deserialize;
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Number, Value};
 
-use crate::config::{IEX_VENUE, INDICATIVE_OPTIONS_VENUE};
+use crate::config::{ALPACA_BASIC_EQUITY_SYMBOL_LIMIT, IEX_VENUE, INDICATIVE_OPTIONS_VENUE};
 use crate::{AlpacaError, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig};
 
 const MAX_MESSAGES_PER_FRAME: usize = market_squawk_sources::MAX_DECODED_EVENTS;
@@ -35,7 +36,7 @@ impl AlpacaIexDecoder {
             .mappings()
             .iter()
             .map(|mapping| (mapping.symbol().to_owned(), mapping.instrument()))
-            .collect::<BTreeMap<_, _>>();
+            .collect::<Vec<_>>();
         Ok(Self(AlpacaDecoder::try_new(
             config.metadata(),
             symbols,
@@ -73,7 +74,7 @@ impl AlpacaOptionsDecoder {
             .mappings()
             .iter()
             .map(|mapping| (mapping.symbol().to_owned(), mapping.instrument()))
-            .collect::<BTreeMap<_, _>>();
+            .collect::<Vec<_>>();
         Ok(Self(AlpacaDecoder::try_new(
             config.metadata(),
             symbols,
@@ -107,16 +108,19 @@ enum DecoderSurface {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionState {
+    AwaitingBootSnapshot,
     AwaitingConnected,
     AwaitingAuthenticated,
     AwaitingSubscription,
     Active,
+    Poisoned,
 }
 
 #[derive(Clone, Debug)]
 struct AlpacaDecoder {
     metadata: SourceMetadata,
     instruments: BTreeMap<String, InstrumentId>,
+    expected_symbol_order: Box<[String]>,
     expected_symbols: BTreeSet<String>,
     venue: VenueId,
     surface: DecoderSurface,
@@ -134,7 +138,7 @@ struct AlpacaDecoder {
 impl AlpacaDecoder {
     fn try_new(
         metadata: &SourceMetadata,
-        instruments: BTreeMap<String, InstrumentId>,
+        ordered_instruments: Vec<(String, InstrumentId)>,
         venue: VenueId,
         surface: DecoderSurface,
         max_frame_bytes: usize,
@@ -172,14 +176,27 @@ impl AlpacaDecoder {
                 market_squawk_domain::SnapshotApplicability::Required => None,
             })
             .ok_or(AlpacaError::Protocol)?;
+        let expected_symbol_order = ordered_instruments
+            .iter()
+            .map(|(symbol, _instrument)| symbol.clone())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let instruments = ordered_instruments.into_iter().collect::<BTreeMap<_, _>>();
+        if instruments.len() != expected_symbol_order.len() {
+            return Err(AlpacaError::InvalidCoverage);
+        }
         let expected_symbols = instruments.keys().cloned().collect();
         Ok(Self {
             metadata: metadata.clone(),
             instruments,
+            expected_symbol_order,
             expected_symbols,
             venue,
             surface,
-            state: SessionState::AwaitingConnected,
+            state: match surface {
+                DecoderSurface::Iex => SessionState::AwaitingBootSnapshot,
+                DecoderSurface::IndicativeOptions => SessionState::AwaitingConnected,
+            },
             decoder_rule: live.decoder_rule().clone(),
             timestamp_rule: live.timestamp_rule().clone(),
             sequence_rule,
@@ -197,14 +214,27 @@ impl AlpacaDecoder {
         expected_transport: TransportFrameKind,
     ) -> Result<DecodeOutcome, DecodeInternalError> {
         let evidence = DecoderEvidence::from_validated_frame(frame, self.decoder_rule.clone());
+        if self.state == SessionState::Poisoned {
+            return Ok(quarantine(
+                evidence,
+                QuarantineReason::ProtocolInvariantViolation,
+                None,
+            ));
+        }
         if frame.frame().transport() != expected_transport
             || frame.frame().payload().len() > self.max_frame_bytes
         {
+            if self.state == SessionState::AwaitingBootSnapshot {
+                self.state = SessionState::Poisoned;
+            }
             return Ok(quarantine(
                 evidence,
                 QuarantineReason::SchemaViolation,
                 None,
             ));
+        }
+        if self.state == SessionState::AwaitingBootSnapshot {
+            return self.decode_boot_snapshot(frame.frame().payload(), evidence);
         }
         let messages = match self.surface {
             DecoderSurface::Iex => {
@@ -261,6 +291,106 @@ impl AlpacaDecoder {
         self.decode_data(messages, evidence)
     }
 
+    fn decode_boot_snapshot(
+        &mut self,
+        payload: &[u8],
+        evidence: DecoderEvidence,
+    ) -> Result<DecodeOutcome, DecodeInternalError> {
+        self.state = SessionState::Poisoned;
+        let entries = match serde_json::from_slice::<BootSnapshotEntries>(payload) {
+            Ok(entries) => entries.0,
+            Err(_) => {
+                return Ok(quarantine(
+                    evidence,
+                    QuarantineReason::MalformedPayload,
+                    None,
+                ));
+            }
+        };
+        if entries.len() != self.expected_symbol_order.len() {
+            return Ok(quarantine(evidence, QuarantineReason::WrongProduct, None));
+        }
+        let mut snapshots = Vec::new();
+        snapshots
+            .try_reserve_exact(self.expected_symbol_order.len())
+            .map_err(|_| DecodeInternalError::Allocation)?;
+        snapshots.resize_with(self.expected_symbol_order.len(), || None);
+        for (symbol, snapshot) in entries {
+            let Some(index) = self
+                .expected_symbol_order
+                .iter()
+                .position(|expected| expected == &symbol)
+            else {
+                return Ok(quarantine(evidence, QuarantineReason::WrongProduct, None));
+            };
+            if snapshots[index].replace(snapshot).is_some() {
+                return Ok(quarantine(
+                    evidence,
+                    QuarantineReason::ProtocolInvariantViolation,
+                    None,
+                ));
+            }
+        }
+        let maximum_observations = self
+            .expected_symbol_order
+            .len()
+            .checked_mul(2)
+            .ok_or(DecodeInternalError::Allocation)?;
+        let mut observations = Vec::new();
+        observations
+            .try_reserve_exact(maximum_observations)
+            .map_err(|_| DecodeInternalError::Allocation)?;
+        for (symbol, snapshot) in self.expected_symbol_order.iter().zip(snapshots) {
+            let Some(snapshot) = snapshot else {
+                return Ok(quarantine(evidence, QuarantineReason::WrongProduct, None));
+            };
+            let snapshot = match serde_json::from_value::<BootSnapshotWire>(snapshot) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    return Ok(quarantine(
+                        evidence,
+                        QuarantineReason::SchemaViolation,
+                        None,
+                    ));
+                }
+            };
+            if let Some(quote) = snapshot.latest_quote {
+                let input = match self.decode_boot_quote(symbol, quote) {
+                    Ok(input) => input,
+                    Err(reason) => return Ok(quarantine(evidence, reason, None)),
+                };
+                observations.push(
+                    self.observation(input)
+                        .map_err(|_| DecodeInternalError::InvariantViolation)?,
+                );
+            }
+            if let Some(trade) = snapshot.latest_trade {
+                let input = match self.decode_boot_trade(symbol, trade) {
+                    Ok(input) => input,
+                    Err(reason) => return Ok(quarantine(evidence, reason, None)),
+                };
+                observations.push(
+                    self.observation(input)
+                        .map_err(|_| DecodeInternalError::InvariantViolation)?,
+                );
+            }
+        }
+        let outcome = if observations.is_empty() {
+            DecodeOutcome::Ignored(DecodedIgnoredFrame::new(
+                evidence,
+                IgnoredFrameReason::DocumentedNoOp,
+                SourceIdentifier::try_from("alpaca-iex-boot-snapshot-empty").ok(),
+            ))
+        } else {
+            DecodeOutcome::Data(
+                DecodedProviderBatch::try_new(evidence, observations)
+                    .map_err(|_| DecodeInternalError::InvariantViolation)?,
+            )
+        };
+        self.state = SessionState::AwaitingConnected;
+        Ok(outcome)
+    }
+
     fn decode_control(
         &mut self,
         message: Option<Value>,
@@ -313,19 +443,47 @@ impl AlpacaDecoder {
                         None,
                     );
                 }
-                let wire = match serde_json::from_value::<SubscriptionWire>(message) {
-                    Ok(wire) => wire,
-                    Err(_) => {
-                        return quarantine(evidence, QuarantineReason::SchemaViolation, None);
+                let exact = match self.surface {
+                    DecoderSurface::Iex => {
+                        let wire = match serde_json::from_value::<IexSubscriptionWire>(message) {
+                            Ok(wire) => wire,
+                            Err(_) => {
+                                return quarantine(
+                                    evidence,
+                                    QuarantineReason::SchemaViolation,
+                                    None,
+                                );
+                            }
+                        };
+                        wire.kind == "subscription"
+                            && exact_symbols(&wire.trades, &self.expected_symbols)
+                            && exact_symbols(&wire.quotes, &self.expected_symbols)
+                            && wire.bars.is_empty()
+                            && wire.updated_bars.is_empty()
+                            && wire.daily_bars.is_empty()
+                            && exact_symbols(&wire.statuses, &self.expected_symbols)
+                            && wire.lulds.is_empty()
+                            && exact_symbols(&wire.corrections, &self.expected_symbols)
+                            && exact_symbols(&wire.cancel_errors, &self.expected_symbols)
+                    }
+                    DecoderSurface::IndicativeOptions => {
+                        let wire = match serde_json::from_value::<OptionsSubscriptionWire>(message)
+                        {
+                            Ok(wire) => wire,
+                            Err(_) => {
+                                return quarantine(
+                                    evidence,
+                                    QuarantineReason::SchemaViolation,
+                                    None,
+                                );
+                            }
+                        };
+                        wire.kind == "subscription"
+                            && exact_symbols(&wire.trades, &self.expected_symbols)
+                            && exact_symbols(&wire.quotes, &self.expected_symbols)
                     }
                 };
-                if !exact_symbols(&wire.trades, &self.expected_symbols)
-                    || !exact_symbols(&wire.quotes, &self.expected_symbols)
-                    || (self.surface == DecoderSurface::Iex
-                        && !exact_symbols(&wire.statuses, &self.expected_symbols))
-                    || (self.surface == DecoderSurface::IndicativeOptions
-                        && !wire.statuses.is_empty())
-                {
+                if !exact {
                     return quarantine(evidence, QuarantineReason::WrongProduct, None);
                 }
                 self.state = SessionState::Active;
@@ -421,7 +579,7 @@ impl AlpacaDecoder {
         let trade_identity = match wire.trade_id {
             Some(id) if id.as_u64().is_some() => id.to_string(),
             Some(_) => return Err(QuarantineReason::SchemaViolation),
-            None => timestamp.unix_nanos().to_string(),
+            None => return Err(QuarantineReason::SchemaViolation),
         };
         let source_identifier = format!(
             "alpaca:{}:trade:{}:{}:{}",
@@ -455,6 +613,8 @@ impl AlpacaDecoder {
         let timestamp = parse_timestamp(&wire.timestamp)?;
         let bid = parse_quote_side(wire.bid_price, wire.bid_size)?;
         let ask = parse_quote_side(wire.ask_price, wire.ask_size)?;
+        let bid_exchange = quote_exchange_identity(&wire.bid_exchange, bid.as_ref())?;
+        let ask_exchange = quote_exchange_identity(&wire.ask_exchange, ask.as_ref())?;
         let payload = ProviderObservationPayload::quote(bid, ask)
             .map_err(|_| QuarantineReason::SchemaViolation)?;
         Ok(Some(ObservationInput {
@@ -462,14 +622,78 @@ impl AlpacaDecoder {
                 "alpaca:{}:quote:{}:{}:{}:{}",
                 surface_name(self.surface),
                 wire.symbol,
-                wire.bid_exchange,
-                wire.ask_exchange,
+                bid_exchange,
+                ask_exchange,
                 timestamp.unix_nanos()
             ),
             instrument,
             timestamp,
             payload,
         }))
+    }
+
+    fn decode_boot_quote(
+        &self,
+        symbol: &str,
+        wire: BootQuoteWire,
+    ) -> Result<ObservationInput, QuarantineReason> {
+        let instrument = self.instrument(symbol)?;
+        let timestamp = parse_timestamp(&wire.timestamp)?;
+        let bid = parse_quote_side(wire.bid_price, wire.bid_size)?;
+        let ask = parse_quote_side(wire.ask_price, wire.ask_size)?;
+        let bid_exchange = quote_exchange_identity(&wire.bid_exchange, bid.as_ref())?;
+        let ask_exchange = quote_exchange_identity(&wire.ask_exchange, ask.as_ref())?;
+        let payload = ProviderObservationPayload::quote(bid, ask)
+            .map_err(|_| QuarantineReason::SchemaViolation)?;
+        Ok(ObservationInput {
+            source_identifier: format!(
+                "alpaca:iex:quote:{symbol}:{}:{}:{}",
+                bid_exchange,
+                ask_exchange,
+                timestamp.unix_nanos()
+            ),
+            instrument,
+            timestamp,
+            payload,
+        })
+    }
+
+    fn decode_boot_trade(
+        &self,
+        symbol: &str,
+        wire: BootTradeWire,
+    ) -> Result<ObservationInput, QuarantineReason> {
+        let instrument = self.instrument(symbol)?;
+        let timestamp = parse_timestamp(&wire.timestamp)?;
+        let price = parse_price(wire.price)?;
+        let quantity = parse_quantity(wire.size, false)?;
+        let trade_identity = wire
+            .trade_id
+            .as_u64()
+            .map(|identity| identity.to_string())
+            .ok_or(QuarantineReason::SchemaViolation)?;
+        if wire.exchange.is_empty() {
+            return Err(QuarantineReason::SchemaViolation);
+        }
+        Ok(ObservationInput {
+            source_identifier: format!(
+                "alpaca:iex:trade:{symbol}:{}:{trade_identity}",
+                wire.exchange
+            ),
+            instrument,
+            timestamp,
+            payload: ProviderObservationPayload::Trade {
+                trade_id: SourceIdentifier::try_from(trade_identity)
+                    .map_err(|_| QuarantineReason::SchemaViolation)?,
+                price,
+                quantity,
+                aggressor: ProviderAggressorEvidence::new(
+                    AggressorSide::Unknown,
+                    None,
+                    self.aggressor_rule.clone(),
+                ),
+            },
+        })
     }
 
     fn decode_status(&self, message: Value) -> Result<Option<ObservationInput>, QuarantineReason> {
@@ -513,9 +737,10 @@ impl AlpacaDecoder {
         &self,
         input: ObservationInput,
     ) -> Result<ProviderNormalizedObservation, market_squawk_sources::DecodeError> {
+        let source_identifier = SourceIdentifier::try_from(input.source_identifier)
+            .map_err(|_| market_squawk_sources::DecodeError::InvalidProviderEvidence)?;
         ProviderNormalizedObservation::try_new(
-            SourceIdentifier::try_from(input.source_identifier)
-                .map_err(|_| market_squawk_sources::DecodeError::InvalidProviderEvidence)?,
+            source_identifier,
             self.venue.clone(),
             input.instrument,
             ProviderTimestampEvidence::Provided {
@@ -548,6 +773,84 @@ struct ObservationInput {
     payload: ProviderObservationPayload,
 }
 
+struct BootSnapshotEntries(Vec<(String, Value)>);
+
+impl<'de> Deserialize<'de> for BootSnapshotEntries {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EntriesVisitor;
+
+        impl<'de> Visitor<'de> for EntriesVisitor {
+            type Value = BootSnapshotEntries;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded Alpaca configured-symbol snapshot object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                entries
+                    .try_reserve_exact(ALPACA_BASIC_EQUITY_SYMBOL_LIMIT)
+                    .map_err(|_| serde::de::Error::custom("snapshot allocation failed"))?;
+                while let Some((symbol, snapshot)) = map.next_entry::<String, Value>()? {
+                    if entries.len() == ALPACA_BASIC_EQUITY_SYMBOL_LIMIT {
+                        return Err(serde::de::Error::custom("snapshot symbol count exceeded"));
+                    }
+                    entries.push((symbol, snapshot));
+                }
+                Ok(BootSnapshotEntries(entries))
+            }
+        }
+
+        deserializer.deserialize_map(EntriesVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct BootSnapshotWire {
+    #[serde(rename = "latestQuote", default)]
+    latest_quote: Option<BootQuoteWire>,
+    #[serde(rename = "latestTrade", default)]
+    latest_trade: Option<BootTradeWire>,
+}
+
+#[derive(Deserialize)]
+struct BootTradeWire {
+    #[serde(rename = "i")]
+    trade_id: Number,
+    #[serde(rename = "x")]
+    exchange: String,
+    #[serde(rename = "p")]
+    price: Number,
+    #[serde(rename = "s")]
+    size: Number,
+    #[serde(rename = "t")]
+    timestamp: String,
+}
+
+#[derive(Deserialize)]
+struct BootQuoteWire {
+    #[serde(rename = "bx")]
+    bid_exchange: String,
+    #[serde(rename = "bp")]
+    bid_price: Number,
+    #[serde(rename = "bs")]
+    bid_size: Number,
+    #[serde(rename = "ax")]
+    ask_exchange: String,
+    #[serde(rename = "ap")]
+    ask_price: Number,
+    #[serde(rename = "as")]
+    ask_size: Number,
+    #[serde(rename = "t")]
+    timestamp: String,
+}
+
 #[derive(Deserialize)]
 struct ProbeWire {
     #[serde(rename = "T")]
@@ -572,15 +875,33 @@ struct ErrorWire {
 }
 
 #[derive(Deserialize)]
-struct SubscriptionWire {
+#[serde(deny_unknown_fields)]
+struct IexSubscriptionWire {
     #[serde(rename = "T")]
-    _kind: String,
-    #[serde(default)]
+    kind: String,
     trades: Vec<String>,
-    #[serde(default)]
     quotes: Vec<String>,
     #[serde(default)]
+    bars: Vec<String>,
+    #[serde(rename = "updatedBars", default)]
+    updated_bars: Vec<String>,
+    #[serde(rename = "dailyBars", default)]
+    daily_bars: Vec<String>,
     statuses: Vec<String>,
+    #[serde(default)]
+    lulds: Vec<String>,
+    corrections: Vec<String>,
+    #[serde(rename = "cancelErrors")]
+    cancel_errors: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OptionsSubscriptionWire {
+    #[serde(rename = "T")]
+    kind: String,
+    trades: Vec<String>,
+    quotes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -694,6 +1015,18 @@ fn parse_quote_side(
         ProviderPrice::new(price),
         ProviderQuantity::new(size),
     )))
+}
+
+fn quote_exchange_identity<'a>(
+    exchange: &'a str,
+    side: Option<&ProviderBookLevel>,
+) -> Result<&'a str, QuarantineReason> {
+    if side.is_none() {
+        return Ok("none");
+    }
+    SourceIdentifier::try_from(exchange)
+        .map(|_| exchange)
+        .map_err(|_| QuarantineReason::SchemaViolation)
 }
 
 fn parse_decimal(value: Number) -> Result<ProviderDecimalLexeme, QuarantineReason> {

@@ -6,7 +6,7 @@
 //! provider connections remain owned by the market-runtime registry after this resolver returns.
 
 use std::{
-    num::{NonZeroU64, NonZeroUsize},
+    num::NonZeroUsize,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -15,7 +15,6 @@ use async_trait::async_trait;
 use market_squawk_adapter_alpaca::AlpacaTransportLimits;
 use market_squawk_adapter_kraken::{KrakenL3ClientTier, KrakenL3Depth};
 use market_squawk_adapter_nasdaq_symbols::NASDAQ_SYMBOL_DIRECTORY_VENUES;
-use market_squawk_adapter_tradier::TradierTransportLimits;
 use market_squawk_data::MarketDataInstrumentReadCapability;
 use market_squawk_domain::{
     Currency, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
@@ -23,9 +22,7 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::AppConfig;
 use market_squawk_services::ServiceError;
-use market_squawk_sources::{
-    FreshnessPolicy, HttpRequestBounds, ProviderRateAuthority, install_ring_tls_provider,
-};
+use market_squawk_sources::{FreshnessPolicy, ProviderRateAuthority, install_ring_tls_provider};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -46,7 +43,6 @@ use crate::provider_activation::{
     BoundedMarketInstrumentSet, KrakenL3MarketConfigurationInput, MarketDataInstrumentBinding,
     MarketInstrumentBinding, MarketSourceEvidence, MarketSubscriptionPriority,
     PreparedMarketProviderConfiguration, ProviderMarketConfigurationRequest,
-    TradierMarketConfigurationInput,
 };
 use crate::{ProviderAdapterActivation, ProviderOnboardingService, ResearchService};
 
@@ -66,13 +62,10 @@ const ECFR_RULE_612_SHA256: [u8; 32] = [
 ];
 
 const ALPACA_IEX_SOURCE: &str = "alpaca-basic-iex-market-data";
-const TRADIER_STREAM_SOURCE: &str = "tradier-consolidated-stream-market-data";
-const TRADIER_REST_SOURCE: &str = "tradier-consolidated-rest-market-data";
 const KRAKEN_LEVEL3_SOURCE: &str = "kraken-authenticated-level3-market-data";
 
 const SECOND_NANOS: u64 = 1_000_000_000;
 const MAX_PROVIDER_FRAME_BYTES: usize = 1024 * 1024;
-const MAX_PROVIDER_HTTP_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Production resolver shared by lifecycle restoration and foreground source activation.
 pub(super) struct ProductionMarketProviderConfigurationResolver {
@@ -174,7 +167,7 @@ impl ProductionMarketProviderConfigurationResolver {
             bindings.push(
                 MarketDataInstrumentBinding::try_from_nasdaq_session_listing(
                     MarketSubscriptionPriority::Benchmark,
-                    record.definition().clone(),
+                    record,
                     listing.key().symbol().clone(),
                     listing,
                     result,
@@ -222,34 +215,6 @@ impl ProductionMarketProviderConfigurationResolver {
             .try_construct_staged_market_provider_configuration(lease, request)
             .map_err(|error| {
                 tracing::warn!(%error, "Alpaca market configuration resolution failed");
-                request_state_error(deadline, cancellation)
-            })
-    }
-
-    async fn resolve_tradier(
-        &self,
-        lease: crate::ProviderActivationLease,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<PreparedMarketProviderConfiguration, ServiceError> {
-        let instruments = self
-            .resolve_display_bindings(deadline, cancellation)
-            .await?;
-        let configured_at = system_timestamp()?;
-        let request =
-            ProviderMarketConfigurationRequest::Tradier(TradierMarketConfigurationInput {
-                configured_at,
-                consolidated_stream_evidence: source_evidence(&lease, TRADIER_STREAM_SOURCE)?,
-                consolidated_rest_evidence: source_evidence(&lease, TRADIER_REST_SOURCE)?,
-                derived_index_rest_evidence: None,
-                consolidated_instruments: instruments,
-                derived_indexes: None,
-                transport_limits: tradier_transport_limits()?,
-            });
-        self.provider_activation
-            .try_construct_staged_market_provider_configuration(lease, request)
-            .map_err(|error| {
-                tracing::warn!(%error, "Tradier market configuration resolution failed");
                 request_state_error(deadline, cancellation)
             })
     }
@@ -328,9 +293,6 @@ impl PreparedMarketProviderConfigurationResolver for ProductionMarketProviderCon
         match request.surface() {
             AccountMarketSurface::AlpacaBasic => {
                 self.resolve_alpaca(lease, deadline, &cancellation).await
-            }
-            AccountMarketSurface::Tradier => {
-                self.resolve_tradier(lease, deadline, &cancellation).await
             }
             AccountMarketSurface::KrakenLevel3 => {
                 self.resolve_kraken(lease, deadline, &cancellation)
@@ -463,22 +425,6 @@ fn live_freshness() -> Result<FreshnessPolicy, ServiceError> {
     .map_err(|_error| ServiceError::Internal)
 }
 
-fn tradier_transport_limits() -> Result<TradierTransportLimits, ServiceError> {
-    let http = HttpRequestBounds::try_new(
-        nonzero_u64(5 * SECOND_NANOS)?,
-        nonzero_u64(10 * SECOND_NANOS)?,
-        nonzero_u64(15 * SECOND_NANOS)?,
-        0,
-        nonzero_u64(MAX_PROVIDER_HTTP_RESPONSE_BYTES)?,
-    )
-    .map_err(|_error| ServiceError::Internal)?;
-    TradierTransportLimits::try_new(MAX_PROVIDER_FRAME_BYTES, Duration::from_secs(10), http)
-        .map_err(|error| {
-            tracing::error!(%error, "Tradier transport policy is invalid");
-            ServiceError::Internal
-        })
-}
-
 fn sorted_listing_keys(
     listings: &[NasdaqCurrentListing],
 ) -> Result<Vec<NasdaqListingKey>, ServiceError> {
@@ -505,10 +451,6 @@ fn listing_for_result<'a>(
 
 fn identifier(value: &str) -> Result<SourceIdentifier, ServiceError> {
     SourceIdentifier::try_from(value).map_err(|_error| ServiceError::Internal)
-}
-
-fn nonzero_u64(value: u64) -> Result<NonZeroU64, ServiceError> {
-    NonZeroU64::new(value).ok_or(ServiceError::Internal)
 }
 
 fn system_timestamp() -> Result<Timestamp, ServiceError> {

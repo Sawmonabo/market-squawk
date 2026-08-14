@@ -4,7 +4,7 @@ Document type: decision research
 Audience: product, architecture, data, desktop, and release engineering
 Status: approved V1 design input
 Research cutoff: 2026-08-08
-Last substantive review: 2026-08-09
+Last substantive review: 2026-08-13
 
 This record preserves the evidence and resulting product decision for Market Squawk's unified
 Markets experience. It is based on 69 reviewed sources: 16 maintained repositories, 12 research
@@ -97,18 +97,23 @@ and circuit breaking protect provider budgets without duplicating requests acros
 
 ## Provider posture
 
-This is an evidence-bounded V1 candidate set, not a claim that endpoint reachability alone admits a
-provider for every operation.
+This table records the evidence-bounded selected V1 candidate set plus the historical Tradier
+evaluation that informed it. Endpoint reachability alone does not admit a provider for any
+operation.
 
 | Surface | V1 role | Required presentation |
 | --- | --- | --- |
 | Official regulatory, macro, and history sources | Default research/reference baseline after source-specific admission | Exact publication/vintage time, rights, coverage, and revision state |
 | Alpaca Basic | Optional free-account IEX equity and indicative-options display/chart candidate | `IEX only` or `Indicative`; never consolidated US or OPRA coverage |
-| Tradier | Optional brokerage-account consolidated US equity/options Level-1 candidate | Account/cost/coverage/operation terms verified at activation; never order-level |
+| Tradier (historical evaluation only) | Evaluated but not selected for V1; it has no built-in profile and does not participate in activation, scheduling, fallback, workflow composition, or release gates | Not presented as an available provider or V1 candidate |
 | Nasdaq Trader directories | Rights-gated reference candidate, not a price feed | Reference identity and freshness only; never quote/book quality |
-| Coinbase Exchange | Venue-specific crypto L2/L3 technical candidate | Exact channel, venue, depth, quality, and permitted operation |
-| Kraken Spot | Adapter retained but default activation requires a current applicable rights decision | Finite-depth Kraken L2 and checksum scope; never represented as L3 |
+| Coinbase Advanced Trade public market data | Selected no-key venue-specific crypto specialist, with Coinbase Exchange Direct remaining a distinct optional owner-enabled complement | Exact channel, venue, depth, quality, and permitted operation; never represented as non-crypto or account/trading authority |
+| Kraken Spot public market data | Selected no-key venue-specific crypto specialist for the admitted pair set | Finite-depth price-level book, trade, and checksum scope; never represented as L3, consolidated crypto, or non-crypto coverage |
 | Separately licensed market data | Optional coverage/depth improvement through the same adapter contracts | Exact entitlement and cost; no authority or quality bypass |
+
+The Tradier sources below remain solely as historical research evidence. They do not place Tradier
+in the selected stack or authorize product advertisement, credentials, runtime activation, or a V1
+release claim.
 
 Open-source implementations inform the architecture but do not become Market Squawk's authority.
 OpenBB demonstrates provider-model registries; LEAN separates live and historical acquisition;

@@ -23,6 +23,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::AlpacaError;
+use crate::boot_snapshot::AlpacaIexBootSnapshotContract;
 
 /// Alpaca Basic real-time equity WebSocket symbol ceiling.
 pub const ALPACA_BASIC_EQUITY_SYMBOL_LIMIT: usize = 30;
@@ -52,6 +53,8 @@ pub(crate) const ALPACA_IEX_ENDPOINT: &str = "wss://stream.data.alpaca.markets/v
 pub(crate) const ALPACA_OPTIONS_ENDPOINT: &str =
     "wss://stream.data.alpaca.markets/v1beta1/indicative";
 pub(crate) const ALPACA_STOCKS_BASE_ENDPOINT: &str = "https://data.alpaca.markets/v2/stocks";
+pub(crate) const ALPACA_STOCKS_SNAPSHOTS_ENDPOINT: &str =
+    "https://data.alpaca.markets/v2/stocks/snapshots";
 pub(crate) const IEX_VENUE: &str = "iex";
 pub(crate) const INDICATIVE_OPTIONS_VENUE: &str = "alpaca-indicative-options";
 
@@ -194,12 +197,49 @@ impl AlpacaTransportLimits {
     }
 }
 
+/// Secret-free resource projection for the mandatory IEX boot-snapshot request.
+///
+/// This value carries no endpoint, symbol, credential, provider-budget, or retry authority. It is
+/// safe for application composition to bind into source revision evidence and pre-acknowledgement
+/// resource limits before constructing [`AlpacaIexLiveConfig`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AlpacaIexBootSnapshotPolicy {
+    maximum_body_bytes: usize,
+    total_timeout: Duration,
+}
+
+impl AlpacaIexBootSnapshotPolicy {
+    /// Returns the current closed bootstrap protocol revision.
+    pub const fn revision(self) -> &'static str {
+        "alpaca-iex-live-boot-snapshot/v1"
+    }
+
+    /// Derives the only boot resource policy from an already validated live transport policy.
+    pub fn from_transport_limits(limits: AlpacaTransportLimits) -> Self {
+        Self {
+            maximum_body_bytes: limits.max_frame_bytes(),
+            total_timeout: limits.connect_timeout().max(limits.io_timeout()),
+        }
+    }
+
+    /// Returns the exact raw-response and raw-frame byte ceiling.
+    pub const fn maximum_body_bytes(self) -> usize {
+        self.maximum_body_bytes
+    }
+
+    /// Returns the complete HTTP operation timeout before WebSocket connection begins.
+    pub const fn total_timeout(self) -> Duration {
+        self.total_timeout
+    }
+}
+
 /// Immutable authenticated IEX live profile for Alpaca Basic.
 #[derive(Clone, Debug)]
 pub struct AlpacaIexLiveConfig {
     metadata: SourceMetadata,
     mappings: Box<[AlpacaInstrumentMapping]>,
     limits: AlpacaTransportLimits,
+    boot_snapshot: AlpacaIexBootSnapshotContract,
     subscription: Box<str>,
 }
 
@@ -222,6 +262,7 @@ impl AlpacaIexLiveConfig {
     ) -> Result<Self, AlpacaError> {
         validate_authorization_and_budget(&authorization, &budget)?;
         validate_equity_mappings(&mappings, ALPACA_BASIC_EQUITY_SYMBOL_LIMIT)?;
+        let boot_snapshot = AlpacaIexBootSnapshotContract::try_new(&mappings, limits)?;
         let metadata = live_metadata(
             source_id,
             revision_evidence,
@@ -233,12 +274,14 @@ impl AlpacaIexLiveConfig {
             freshness,
             budget,
             LiveSurface::Iex,
+            Some(&boot_snapshot),
         )?;
         let subscription = json_subscription(&mappings)?;
         Ok(Self {
             metadata,
             mappings: mappings.into_boxed_slice(),
             limits,
+            boot_snapshot,
             subscription,
         })
     }
@@ -261,6 +304,15 @@ impl AlpacaIexLiveConfig {
     /// Returns the immutable frame and deadline policy used by this source.
     pub const fn transport_limits(&self) -> AlpacaTransportLimits {
         self.limits
+    }
+
+    /// Returns the secret-free resource projection for the mandatory REST bootstrap.
+    pub fn boot_snapshot_policy(&self) -> AlpacaIexBootSnapshotPolicy {
+        AlpacaIexBootSnapshotPolicy::from_transport_limits(self.limits)
+    }
+
+    pub(crate) const fn boot_snapshot_contract(&self) -> &AlpacaIexBootSnapshotContract {
+        &self.boot_snapshot
     }
 
     pub(crate) fn subscription(&self) -> &str {
@@ -310,6 +362,7 @@ impl AlpacaOptionsLiveConfig {
             freshness,
             budget,
             LiveSurface::IndicativeOptions,
+            None,
         )?;
         let subscription = messagepack_subscription(&mappings)?;
         Ok(Self {
@@ -1189,6 +1242,7 @@ fn live_metadata(
     freshness: FreshnessPolicy,
     budget: ProviderBudgetPolicy,
     surface: LiveSurface,
+    boot_snapshot: Option<&AlpacaIexBootSnapshotContract>,
 ) -> Result<SourceMetadata, AlpacaError> {
     let (endpoint, venue, assets, instruments, product, channel, quality, delay, delivery, events) =
         match surface {
@@ -1250,6 +1304,19 @@ fn live_metadata(
         LiveSurface::Iex => CoverageTopology::partial_venues(vec![VenueId::try_from(venue)?])?,
         LiveSurface::IndicativeOptions => CoverageTopology::single_venue(VenueId::try_from(venue)?),
     };
+    let endpoint_policy = match (surface, boot_snapshot) {
+        (LiveSurface::Iex, Some(boot_snapshot)) => {
+            market_squawk_sources::EndpointPolicy::try_new_combined(
+                [endpoint],
+                vec![boot_snapshot.endpoint_rule().clone()],
+                boot_snapshot.request_bounds(),
+            )?
+        }
+        (LiveSurface::IndicativeOptions, None) => {
+            market_squawk_sources::EndpointPolicy::try_new([endpoint])?
+        }
+        _ => return Err(AlpacaError::Protocol),
+    };
     Ok(SourceMetadata::try_new(SourceMetadataInput::new(
         SchemaVersion::CURRENT,
         source_id,
@@ -1268,9 +1335,7 @@ fn live_metadata(
             delivery,
         )?,
         quality,
-        NetworkAccessPolicy::Allowlisted(market_squawk_sources::EndpointPolicy::try_new([
-            endpoint,
-        ])?),
+        NetworkAccessPolicy::Allowlisted(endpoint_policy),
         freshness,
         Some(budget),
         SourceCapabilities::new(
@@ -1283,7 +1348,7 @@ fn live_metadata(
         ),
         SourceProtocolProfile::Live(Box::new(LiveProtocolProfile::new(
             rule(match surface {
-                LiveSurface::Iex => "alpaca-iex-json-v2-decoder",
+                LiveSurface::Iex => "alpaca-iex-json-v3-boot-snapshot-decoder",
                 LiveSurface::IndicativeOptions => "alpaca-indicative-options-msgpack-v1-decoder",
             })?,
             SemanticInterpretationProfile::new(

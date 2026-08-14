@@ -13,8 +13,6 @@ use crate::provider_activation::PreparedMarketProviderConfiguration;
 
 /// Alpaca Basic account lifecycle surface.
 pub(crate) const ALPACA_BASIC_SURFACE_ID: &str = "alpaca.basic-market-data";
-/// Tradier Brokerage account lifecycle surface.
-pub(crate) const TRADIER_SURFACE_ID: &str = "tradier.brokerage-market-data";
 /// Authenticated Kraken order-level lifecycle surface.
 pub(crate) const KRAKEN_LEVEL3_SURFACE_ID: &str = "kraken.spot-authenticated-level3-market-data";
 
@@ -22,7 +20,6 @@ pub(crate) const KRAKEN_LEVEL3_SURFACE_ID: &str = "kraken.spot-authenticated-lev
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum AccountMarketSurface {
     AlpacaBasic,
-    Tradier,
     KrakenLevel3,
 }
 
@@ -30,7 +27,6 @@ impl AccountMarketSurface {
     pub(crate) const fn surface_id(self) -> &'static str {
         match self {
             Self::AlpacaBasic => ALPACA_BASIC_SURFACE_ID,
-            Self::Tradier => TRADIER_SURFACE_ID,
             Self::KrakenLevel3 => KRAKEN_LEVEL3_SURFACE_ID,
         }
     }
@@ -38,7 +34,6 @@ impl AccountMarketSurface {
     pub(crate) fn parse(surface_id: &str) -> Option<Self> {
         match surface_id {
             ALPACA_BASIC_SURFACE_ID => Some(Self::AlpacaBasic),
-            TRADIER_SURFACE_ID => Some(Self::Tradier),
             KRAKEN_LEVEL3_SURFACE_ID => Some(Self::KrakenLevel3),
             _ => None,
         }
@@ -133,9 +128,6 @@ pub(super) fn validate_resolved_configuration(
     let (surface, lease) = match prepared {
         PreparedMarketProviderConfiguration::AlpacaBasic(value) => {
             (AccountMarketSurface::AlpacaBasic, value.lease())
-        }
-        PreparedMarketProviderConfiguration::Tradier(value) => {
-            (AccountMarketSurface::Tradier, value.lease())
         }
         PreparedMarketProviderConfiguration::KrakenLevel3(value) => {
             (AccountMarketSurface::KrakenLevel3, value.lease())

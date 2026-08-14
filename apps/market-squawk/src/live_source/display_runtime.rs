@@ -5,9 +5,6 @@ use std::{sync::Arc, time::Duration};
 use market_squawk_adapter_alpaca::{
     AlpacaCredentials, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig,
 };
-use market_squawk_adapter_tradier::{
-    TradierAccountMarketData, TradierSourceConfig, TradierSubscriptionAuthority,
-};
 use market_squawk_domain::InstrumentId;
 use market_squawk_platform::{
     AppConfig, CaptureProcessInfrastructureLimits, DestinationFenceRegistryInitializationError,
@@ -105,41 +102,6 @@ impl ProductionDisplaySourceRuntime {
         .await
     }
 
-    /// Starts one consolidated Tradier display stream with its shared mutable subscription owner.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "source configuration, account, shared authorities, bounds, and cancellation stay explicit"
-    )]
-    pub(crate) async fn start_tradier_with_rate_authority(
-        app_config: AppConfig,
-        directory: DisplayMarketDirectory,
-        source: TradierSourceConfig,
-        account: Arc<TradierAccountMarketData>,
-        subscriptions: TradierSubscriptionAuthority,
-        actor_limits: DisplayMarketActorLimits,
-        read_admission: DisplayMarketReadAdmission,
-        provider_rate: ProviderRateAuthority,
-        cancellation: CancellationToken,
-    ) -> Result<Self, ProductionDisplaySourceRuntimeError> {
-        let routes = display_routes(
-            source.metadata(),
-            source.mappings().iter().map(|mapping| mapping.instrument()),
-            DisplayTopology::Consolidated,
-        )?;
-        let profile = ProductionSourceProfile::tradier_streaming(source, account, subscriptions)?;
-        Self::start(
-            app_config,
-            directory,
-            profile,
-            routes,
-            actor_limits,
-            read_admission,
-            provider_rate,
-            cancellation,
-        )
-        .await
-    }
-
     async fn start(
         app_config: AppConfig,
         directory: DisplayMarketDirectory,
@@ -220,7 +182,6 @@ fn display_routes(
     let valid_topology = match expected {
         DisplayTopology::PartialVenue => topology.is_partial(),
         DisplayTopology::SingleVenue => topology.is_single_venue(),
-        DisplayTopology::Consolidated => topology.is_consolidated(),
     };
     if !valid_topology || instruments.len() == 0 {
         return Err(ProductionDisplaySourceRuntimeError::InvalidCoverageTopology);
@@ -243,7 +204,6 @@ fn display_routes(
 enum DisplayTopology {
     PartialVenue,
     SingleVenue,
-    Consolidated,
 }
 
 fn map_startup_outcome(

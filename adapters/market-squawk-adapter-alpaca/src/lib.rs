@@ -5,6 +5,7 @@
 //! profiles supplies consolidated US equity coverage, OPRA data, execution authority, or
 //! [`market_squawk_domain::DataQuality::DirectVerified`] evidence.
 
+mod boot_snapshot;
 mod config;
 mod credentials;
 mod decoder;
@@ -21,9 +22,9 @@ pub use config::{
     ALPACA_HISTORICAL_MIN_LOOKBACK_DAYS, ALPACA_RECURRING_TARGET_REQUESTS_PER_MINUTE,
     AlpacaAdjustment, AlpacaHistoricalEquityConfig, AlpacaHistoricalEquityDataset,
     AlpacaHistoricalEquityDatasetPlan, AlpacaHistoricalEquityPreflightPlan,
-    AlpacaHistoricalLookback, AlpacaHistoricalSeriesSemantics, AlpacaIexLiveConfig,
-    AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsLiveConfig, AlpacaTimeframe,
-    AlpacaTransportLimits,
+    AlpacaHistoricalLookback, AlpacaHistoricalSeriesSemantics, AlpacaIexBootSnapshotPolicy,
+    AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsLiveConfig,
+    AlpacaTimeframe, AlpacaTransportLimits,
 };
 pub use credentials::AlpacaCredentials;
 pub use decoder::{AlpacaIexDecoder, AlpacaOptionsDecoder};

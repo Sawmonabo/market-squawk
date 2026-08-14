@@ -1,6 +1,6 @@
 //! Bounded, generation-owned authority for non-executable display-market observations.
 //!
-//! Alpaca and Tradier observations enter this module only after the source registry has bound an
+//! Account-backed observations enter this module only after the source registry has bound an
 //! exact captured frame to current source, health, coverage, budget, and generation authority.
 //! One task owns each route's mutable state. Readers receive bounded owned snapshots whose permits
 //! remain leased for the lifetime of the result. Nothing in this module constructs execution terms,
@@ -1904,13 +1904,6 @@ fn snapshot_from_state(
     at: Timestamp,
     ticket: ReadBudgetTicket,
 ) -> Result<DisplayMarketSnapshotLease, DisplayMarketReadError> {
-    if state.trade.is_none()
-        && state.quote.is_none()
-        && state.status.is_none()
-        && state.terminal_failure.is_none()
-    {
-        return Err(DisplayMarketReadError::Unavailable);
-    }
     let trade = state
         .trade
         .as_ref()

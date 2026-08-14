@@ -101,7 +101,6 @@ market-squawk-adapter-portfolio = { workspace = true }
 market-squawk-adapter-sec = { workspace = true }
 market-squawk-adapter-schwab = { workspace = true }
 market-squawk-adapter-tiingo = { workspace = true }
-market-squawk-adapter-tradier = { workspace = true }
 market-squawk-adapter-treasury = { workspace = true }
 market-squawk-adapter-yahoo = { workspace = true }
 market-squawk-analytics = { workspace = true }

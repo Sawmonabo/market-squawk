@@ -216,6 +216,61 @@ struct CurrentHealthAuthority {
     budget: CurrentBudgetAuthority,
 }
 
+/// Result of recording one exact-generation health observation.
+///
+/// An unqualified result never carries live-data authority. Its retained cause classification is
+/// intentionally opaque so callers cannot reconstruct or weaken the registry's qualification
+/// predicate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum CurrentHealthRecording {
+    /// Every registry-owned current-data requirement was satisfied.
+    Qualified,
+    /// The observation was retained but issued no current-data authority.
+    Unqualified(CurrentHealthUnqualification),
+}
+
+/// Opaque reason set for a retained health observation that issued no current-data authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CurrentHealthUnqualification {
+    causes: u16,
+}
+
+impl CurrentHealthUnqualification {
+    const CAPTURE: u16 = 1 << 0;
+    const CONNECTION_FRESHNESS: u16 = 1 << 1;
+    const TRANSPORT_FRESHNESS: u16 = 1 << 2;
+    const MARKET_FRESHNESS: u16 = 1 << 3;
+    const SOURCE_FRESHNESS: u16 = 1 << 4;
+    const STREAM_INTEGRITY: u16 = 1 << 5;
+    const CAPTURE_INTEGRITY: u16 = 1 << 6;
+    const AUTHORIZATION: u16 = 1 << 7;
+    const COVERAGE: u16 = 1 << 8;
+    const SNAPSHOT_BUDGET: u16 = 1 << 9;
+    const REPORTER_BUDGET: u16 = 1 << 10;
+    const LAST_ERROR: u16 = 1 << 11;
+    const CURRENT_DATA_DEADLINE: u16 = 1 << 12;
+    const STATIC_DEADLINE: u16 = 1 << 13;
+    const OBSERVATION_TIME: u16 = 1 << 14;
+    const FRESHNESS: u16 = Self::CONNECTION_FRESHNESS
+        | Self::TRANSPORT_FRESHNESS
+        | Self::MARKET_FRESHNESS
+        | Self::SOURCE_FRESHNESS
+        | Self::CURRENT_DATA_DEADLINE;
+
+    const fn new(causes: u16) -> Self {
+        Self { causes }
+    }
+
+    /// Returns true only when every rejected dimension is a current-data freshness clock.
+    ///
+    /// Authorization, coverage, budget, capture, integrity, and provider-error failures can never
+    /// be classified as freshness-only, including when one also coexists with stale data.
+    pub const fn is_freshness_only(self) -> bool {
+        self.causes != 0 && self.causes & !Self::FRESHNESS == 0
+    }
+}
+
 #[derive(Debug)]
 struct UnconfiguredAuthorizationSubjectResolver;
 

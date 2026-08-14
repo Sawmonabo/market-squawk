@@ -854,10 +854,93 @@ fn alpaca_doctor_receipt_closes_contract_graph_and_same_generation_renewal() -> 
     )?;
     let initial_receipt = AlpacaPaperIexDoctorReceiptV1::try_new(initial_input.clone())?;
     let initial_expires_at = initial_receipt.exclusive_expires_at();
+    assert!(initial_receipt.admits_source_start());
     assert_eq!(
         initial_receipt.provider_observation_sha256(),
         initial_input.provider_observation_sha256
     );
+
+    let mut after_hours_input = initial_input.clone();
+    after_hours_input.quote.disposition = RuntimeCapabilityDisposition::Degraded;
+    let after_hours_quote = after_hours_input
+        .quote
+        .observation
+        .as_mut()
+        .ok_or("after-hours quote observation omitted")?;
+    after_hours_quote.bid_price = Some(Decimal::ZERO);
+    after_hours_quote.bid_size = Some(0);
+    after_hours_input.batch.disposition = RuntimeCapabilityDisposition::Degraded;
+    after_hours_input
+        .batch
+        .observation
+        .as_mut()
+        .ok_or("after-hours batch observation omitted")?
+        .effective_cardinality = 49;
+    super::runtime_verification::seal_test_alpaca_provider_observation(&mut after_hours_input)?;
+    let after_hours_receipt = AlpacaPaperIexDoctorReceiptV1::try_new(after_hours_input.clone())?;
+    assert_eq!(
+        after_hours_receipt.input().quote.disposition,
+        RuntimeCapabilityDisposition::Degraded
+    );
+    assert_eq!(
+        after_hours_receipt.input().batch.disposition,
+        RuntimeCapabilityDisposition::Degraded
+    );
+    assert!(after_hours_receipt.admits_source_start());
+
+    let mut mismatched_quote = after_hours_input.clone();
+    mismatched_quote
+        .quote
+        .observation
+        .as_mut()
+        .ok_or("mismatched quote observation omitted")?
+        .bid_size = Some(1);
+    super::runtime_verification::seal_test_alpaca_provider_observation(&mut mismatched_quote)?;
+    assert!(matches!(
+        AlpacaPaperIexDoctorReceiptV1::try_new(mismatched_quote),
+        Err(RuntimeVerificationEvidenceError::InvalidEvidence)
+    ));
+
+    let mut crossed_quote = initial_input.clone();
+    crossed_quote.quote.disposition = RuntimeCapabilityDisposition::Degraded;
+    crossed_quote
+        .quote
+        .observation
+        .as_mut()
+        .ok_or("crossed quote observation omitted")?
+        .bid_price = Some(Decimal::new(10_002, 2));
+    super::runtime_verification::seal_test_alpaca_provider_observation(&mut crossed_quote)?;
+    assert!(matches!(
+        AlpacaPaperIexDoctorReceiptV1::try_new(crossed_quote),
+        Err(RuntimeVerificationEvidenceError::InvalidEvidence)
+    ));
+
+    let mut invalid_batch = after_hours_input.clone();
+    invalid_batch
+        .batch
+        .observation
+        .as_mut()
+        .ok_or("invalid batch observation omitted")?
+        .invalid_count = 1;
+    super::runtime_verification::seal_test_alpaca_provider_observation(&mut invalid_batch)?;
+    assert!(!AlpacaPaperIexDoctorReceiptV1::try_new(invalid_batch)?.admits_source_start());
+
+    let mut missing_batch = after_hours_input.clone();
+    let missing_batch_observation = missing_batch
+        .batch
+        .observation
+        .as_mut()
+        .ok_or("missing batch observation omitted")?;
+    missing_batch_observation.returned_count = 49;
+    missing_batch_observation.missing_count = 1;
+    super::runtime_verification::seal_test_alpaca_provider_observation(&mut missing_batch)?;
+    assert!(!AlpacaPaperIexDoctorReceiptV1::try_new(missing_batch)?.admits_source_start());
+
+    let mut degraded_stream = after_hours_input.clone();
+    degraded_stream.stream.disposition = RuntimeCapabilityDisposition::Degraded;
+    super::runtime_verification::seal_test_alpaca_provider_observation(&mut degraded_stream)?;
+    assert!(!AlpacaPaperIexDoctorReceiptV1::try_new(degraded_stream)?.admits_source_start());
+
     let mut forged_provider_observation = initial_input.clone();
     forged_provider_observation.provider_observation_sha256 = digest(79);
     assert!(matches!(
@@ -874,7 +957,7 @@ fn alpaca_doctor_receipt_closes_contract_graph_and_same_generation_renewal() -> 
     ));
     assert_eq!(
         initial_receipt.doctor_revision().as_str(),
-        "market-squawk.alpaca-paper-iex-doctor-implementation.v2"
+        "market-squawk.alpaca-paper-iex-doctor-implementation.v3"
     );
     let mut expected_contract = Sha256::new();
     expected_contract.update(b"market-squawk/alpaca-paper-iex-doctor-contract/v1\0");

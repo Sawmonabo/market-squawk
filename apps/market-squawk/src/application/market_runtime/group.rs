@@ -2,7 +2,9 @@
 
 use std::{
     fmt,
+    future::Future,
     num::{NonZeroU32, NonZeroUsize},
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -23,13 +25,11 @@ use crate::{
             runtime::ProductionDisplaySourceRuntime,
         },
         order_level::{OrderLevelBookKey, OrderLevelDirectory},
-        tradier_rest::{TradierRestRuntime, TradierRestRuntimeLimits},
     },
     provider_activation::{
         AlpacaBasicAccountActivation, PreparedAlpacaBasicMarketConfiguration,
         PreparedKrakenL3MarketConfiguration, PreparedMarketProviderConfiguration,
-        PreparedTradierMarketConfiguration, ProviderAccountRuntimeCurrentness,
-        ProviderAdapterActivation, TradierMarketDataAccountActivation,
+        ProviderAccountRuntimeCurrentness, ProviderAdapterActivation,
     },
 };
 
@@ -84,11 +84,10 @@ impl MarketProviderGroupLifecycleEvidence {
     }
 }
 
-/// Code-owned bounded runtime policy for display actors and on-demand Tradier REST results.
+/// Code-owned bounded runtime policy for display actors.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AccountMarketRuntimeLimits {
     display_actor: DisplayMarketActorLimits,
-    tradier_rest: TradierRestRuntimeLimits,
 }
 
 impl AccountMarketRuntimeLimits {
@@ -105,20 +104,7 @@ impl AccountMarketRuntimeLimits {
             tracing::error!(%error, "account-market display limits are invalid");
             ServiceError::Unavailable
         })?;
-        let tradier_rest = TradierRestRuntimeLimits::try_new(
-            nonzero_usize(128)?,
-            nonzero_usize(64)?,
-            nonzero_u32(16 * 1024 * 1024)?,
-            nonzero_u32(4 * 1024 * 1024)?,
-        )
-        .map_err(|error| {
-            tracing::error!(%error, "Tradier REST runtime limits are invalid");
-            ServiceError::Unavailable
-        })?;
-        Ok(Self {
-            display_actor,
-            tradier_rest,
-        })
+        Ok(Self { display_actor })
     }
 }
 
@@ -140,6 +126,23 @@ pub(super) struct AccountMarketRuntimeGroup {
 enum AccountCurrentnessMode {
     PreparedOrActiveUntilAdmission,
     ActiveOnly,
+}
+
+struct AccountRuntimeStartContext {
+    evidence: MarketProviderGroupLifecycleEvidence,
+    activation_lease: ProviderActivationLease,
+    verification_expires_at: market_squawk_domain::Timestamp,
+    cleanup_budget: Duration,
+    group_cancellation: CancellationToken,
+    read_admission: DisplayMarketReadAdmission,
+}
+
+struct StartedAccountMarketRuntime {
+    runtime: AccountMarketRuntime,
+    descriptors: Box<[Arc<DisplaySourceDescriptor>]>,
+    kraken_descriptor: Option<Arc<KrakenSourceDescriptor>>,
+    currentness: ProviderAccountRuntimeCurrentness,
+    currentness_mode: AccountCurrentnessMode,
 }
 
 impl AccountMarketRuntimeGroup {
@@ -181,7 +184,6 @@ impl AccountMarketRuntimeGroup {
         };
         let activation_lease = match &prepared {
             PreparedMarketProviderConfiguration::AlpacaBasic(prepared) => prepared.lease(),
-            PreparedMarketProviderConfiguration::Tradier(prepared) => prepared.lease(),
             PreparedMarketProviderConfiguration::KrakenLevel3(prepared) => prepared.lease(),
         }
         .clone();
@@ -190,54 +192,42 @@ impl AccountMarketRuntimeGroup {
             .ok_or(ServiceError::Unauthorized)?;
         let group_cancellation = lifecycle.child_token();
         let read_admission = DisplayMarketReadAdmission::closed();
-        let (runtime, descriptors, kraken_descriptor, currentness, currentness_mode) =
-            match prepared {
-                PreparedMarketProviderConfiguration::AlpacaBasic(prepared) => {
-                    let (runtime, descriptors, currentness) = start_alpaca(
-                        prepared,
-                        provider_activation,
-                        app_config,
-                        provider_rate,
-                        display_directory,
-                        limits.display_actor,
-                        read_admission.clone(),
-                        group_cancellation.clone(),
-                        deadline,
-                        cancellation,
-                    )
-                    .await?;
-                    (
-                        AccountMarketRuntime::Alpaca(runtime),
-                        descriptors,
-                        None,
-                        currentness,
-                        AccountCurrentnessMode::PreparedOrActiveUntilAdmission,
-                    )
-                }
-                PreparedMarketProviderConfiguration::Tradier(prepared) => {
-                    let (runtime, descriptors, currentness) = start_tradier(
-                        prepared,
-                        provider_activation,
-                        app_config,
-                        provider_rate,
-                        display_directory,
-                        limits,
-                        read_admission.clone(),
-                        group_cancellation.clone(),
-                        deadline,
-                        cancellation,
-                    )
-                    .await?;
-                    (
-                        AccountMarketRuntime::Tradier(runtime),
-                        descriptors,
-                        None,
-                        currentness,
-                        AccountCurrentnessMode::ActiveOnly,
-                    )
-                }
-                PreparedMarketProviderConfiguration::KrakenLevel3(prepared) => {
-                    let descriptor = KrakenSourceDescriptor::try_from_prepared(&prepared)?;
+        let context = AccountRuntimeStartContext {
+            evidence,
+            activation_lease,
+            verification_expires_at,
+            cleanup_budget,
+            group_cancellation: group_cancellation.clone(),
+            read_admission: read_admission.clone(),
+        };
+        let provider_start: Pin<
+            Box<dyn Future<Output = Result<StartedAccountMarketRuntime, ServiceError>> + Send + '_>,
+        > = match prepared {
+            PreparedMarketProviderConfiguration::AlpacaBasic(prepared) => Box::pin(async move {
+                let (runtime, descriptors, currentness) = start_alpaca(
+                    prepared,
+                    provider_activation,
+                    app_config,
+                    provider_rate,
+                    display_directory,
+                    limits.display_actor,
+                    read_admission,
+                    group_cancellation,
+                    deadline,
+                    cancellation,
+                )
+                .await?;
+                Ok(StartedAccountMarketRuntime {
+                    runtime: AccountMarketRuntime::Alpaca(runtime),
+                    descriptors,
+                    kraken_descriptor: None,
+                    currentness,
+                    currentness_mode: AccountCurrentnessMode::PreparedOrActiveUntilAdmission,
+                })
+            }),
+            PreparedMarketProviderConfiguration::KrakenLevel3(prepared) => {
+                let descriptor = KrakenSourceDescriptor::try_from_prepared(&prepared)?;
+                Box::pin(async move {
                     let (runtime, currentness) = start_kraken(
                         prepared,
                         provider_activation,
@@ -245,20 +235,48 @@ impl AccountMarketRuntimeGroup {
                         provider_rate,
                         capture_process,
                         order_level_directory,
-                        group_cancellation.clone(),
+                        group_cancellation,
                         deadline,
                         cancellation,
                     )
                     .await?;
-                    (
-                        AccountMarketRuntime::KrakenLevel3(runtime),
-                        Box::default(),
-                        Some(descriptor),
+                    Ok(StartedAccountMarketRuntime {
+                        runtime: AccountMarketRuntime::KrakenLevel3(runtime),
+                        descriptors: Box::default(),
+                        kraken_descriptor: Some(descriptor),
                         currentness,
-                        AccountCurrentnessMode::ActiveOnly,
-                    )
-                }
-            };
+                        currentness_mode: AccountCurrentnessMode::ActiveOnly,
+                    })
+                })
+            }
+        };
+        let started = provider_start.await?;
+        let finalization: Pin<Box<dyn Future<Output = Result<Self, ServiceError>> + Send + '_>> =
+            Box::pin(Self::finish_start(context, started, deadline, cancellation));
+        finalization.await
+    }
+
+    async fn finish_start(
+        context: AccountRuntimeStartContext,
+        started: StartedAccountMarketRuntime,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, ServiceError> {
+        let AccountRuntimeStartContext {
+            evidence,
+            activation_lease,
+            verification_expires_at,
+            cleanup_budget,
+            group_cancellation,
+            read_admission,
+        } = context;
+        let StartedAccountMarketRuntime {
+            runtime,
+            descriptors,
+            kraken_descriptor,
+            currentness,
+            currentness_mode,
+        } = started;
         if let Err(error) = ensure_before(deadline, cancellation) {
             cleanup_account_runtime(
                 runtime,
@@ -354,9 +372,10 @@ impl AccountMarketRuntimeGroup {
     }
 
     pub(super) fn is_healthy(&self) -> bool {
-        !self.lifecycle.is_cancelled()
-            && !self.currentness_monitor.is_finished()
-            && self.runtime.is_healthy()
+        let lifecycle_cancelled = self.lifecycle.is_cancelled();
+        let currentness_monitor_finished = self.currentness_monitor.is_finished();
+        let runtime_healthy = self.runtime.is_healthy();
+        !lifecycle_cancelled && !currentness_monitor_finished && runtime_healthy
     }
 
     pub(super) const fn activation_lease(&self) -> &ProviderActivationLease {
@@ -484,7 +503,7 @@ impl AccountMarketRuntimeGroup {
         }
         match &self.runtime {
             AccountMarketRuntime::Alpaca(runtime) => runtime.historical_capability().map(Some),
-            AccountMarketRuntime::Tradier(_) | AccountMarketRuntime::KrakenLevel3(_) => Ok(None),
+            AccountMarketRuntime::KrakenLevel3(_) => Ok(None),
         }
     }
 
@@ -497,7 +516,7 @@ impl AccountMarketRuntimeGroup {
         }
         match &self.runtime {
             AccountMarketRuntime::Alpaca(runtime) => runtime.owns_historical_capability(capability),
-            AccountMarketRuntime::Tradier(_) | AccountMarketRuntime::KrakenLevel3(_) => false,
+            AccountMarketRuntime::KrakenLevel3(_) => false,
         }
     }
 
@@ -554,7 +573,6 @@ impl fmt::Debug for AccountMarketRuntimeGroup {
 
 enum AccountMarketRuntime {
     Alpaca(AlpacaRuntimeGroup),
-    Tradier(TradierRuntimeGroup),
     KrakenLevel3(KrakenLevel3LiveRuntime),
 }
 
@@ -562,7 +580,6 @@ impl AccountMarketRuntime {
     fn is_healthy(&self) -> bool {
         match self {
             Self::Alpaca(runtime) => runtime.is_healthy(),
-            Self::Tradier(runtime) => runtime.is_healthy(),
             Self::KrakenLevel3(runtime) => runtime.is_healthy(),
         }
     }
@@ -580,9 +597,6 @@ impl AccountMarketRuntime {
     ) -> Result<(), ServiceError> {
         match self {
             Self::Alpaca(runtime) => runtime.shutdown_before(deadline, cancellation).await,
-            Self::Tradier(runtime) => {
-                await_before(deadline, cancellation, runtime.shutdown()).await
-            }
             Self::KrakenLevel3(runtime) => {
                 await_before(deadline, cancellation, runtime.shutdown()).await
             }
@@ -599,11 +613,12 @@ struct AlpacaRuntimeGroup {
 
 impl AlpacaRuntimeGroup {
     fn is_healthy(&self) -> bool {
-        self.iex.is_healthy()
-            && self
-                .options
-                .as_ref()
-                .is_none_or(ProductionDisplaySourceRuntime::is_healthy)
+        let iex_healthy = self.iex.is_healthy();
+        let options_healthy = self
+            .options
+            .as_ref()
+            .is_none_or(ProductionDisplaySourceRuntime::is_healthy);
+        iex_healthy && options_healthy
     }
 
     fn historical_capability(
@@ -645,54 +660,6 @@ impl AlpacaRuntimeGroup {
         retain_shutdown_error(
             &mut failure,
             await_before(deadline, cancellation, iex.shutdown()).await,
-        );
-        drop(_activation);
-        failure.map_or(Ok(()), Err)
-    }
-}
-
-struct TradierRuntimeGroup {
-    _activation: TradierMarketDataAccountActivation,
-    stream: ProductionDisplaySourceRuntime,
-    rest: TradierRestRuntime,
-}
-
-impl TradierRuntimeGroup {
-    fn is_healthy(&self) -> bool {
-        self.stream.is_healthy() && self.rest.is_healthy()
-    }
-
-    async fn shutdown(self) -> Result<(), ServiceError> {
-        let Self {
-            _activation,
-            stream,
-            rest,
-        } = self;
-        let mut failure = None;
-        retain_shutdown_error(
-            &mut failure,
-            rest.shutdown()
-                .await
-                .map(|receipt| {
-                    tracing::debug!(
-                        consolidated_generation = receipt.consolidated_generation().get(),
-                        derived_index_generation = receipt
-                            .derived_index_generation()
-                            .map(market_squawk_domain::ConnectionGeneration::get),
-                        "Tradier REST runtime shut down cleanly"
-                    );
-                })
-                .map_err(|error| {
-                    tracing::error!(%error, "Tradier REST runtime shutdown failed");
-                    ServiceError::Unavailable
-                }),
-        );
-        retain_shutdown_error(
-            &mut failure,
-            stream.shutdown().await.map_err(|error| {
-                tracing::error!(%error, "Tradier display runtime shutdown failed");
-                ServiceError::Unavailable
-            }),
         );
         drop(_activation);
         failure.map_or(Ok(()), Err)
@@ -961,199 +928,6 @@ fn duration_until(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "every account, shared-directory, REST, rate, and lifecycle authority remains explicit"
-)]
-async fn start_tradier(
-    prepared: PreparedTradierMarketConfiguration,
-    provider_activation: &ProviderAdapterActivation,
-    app_config: AppConfig,
-    provider_rate: ProviderRateAuthority,
-    directory: DisplayMarketDirectory,
-    limits: AccountMarketRuntimeLimits,
-    read_admission: DisplayMarketReadAdmission,
-    group_cancellation: CancellationToken,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<
-    (
-        TradierRuntimeGroup,
-        Box<[Arc<DisplaySourceDescriptor>]>,
-        ProviderAccountRuntimeCurrentness,
-    ),
-    ServiceError,
-> {
-    let (lease, stream_config, rest_config, bindings, derived) = prepared.into_parts();
-    let consolidated_descriptor = DisplaySourceDescriptor::try_new(
-        AccountMarketSurface::Tradier.surface_id(),
-        stream_config.metadata().clone(),
-        bindings,
-    )?;
-    let (derived_activation_config, derived_runtime_config, derived_descriptor) = match derived {
-        Some((config, bindings)) => {
-            let descriptor = DisplaySourceDescriptor::try_new(
-                AccountMarketSurface::Tradier.surface_id(),
-                config.metadata().clone(),
-                bindings,
-            )?;
-            (Some(config.clone()), Some(config), Some(descriptor))
-        }
-        None => (None, None, None),
-    };
-    let descriptor_count = 1_usize + usize::from(derived_descriptor.is_some());
-    let mut descriptors = Vec::new();
-    descriptors
-        .try_reserve_exact(descriptor_count)
-        .map_err(|_error| ServiceError::ResourceExhausted)?;
-    descriptors.push(consolidated_descriptor);
-    if let Some(descriptor) = derived_descriptor {
-        descriptors.push(descriptor);
-    }
-    let descriptors = descriptors.into_boxed_slice();
-    let initial_symbols = tradier_stream_symbols(&stream_config)?;
-    let transport_limits = stream_config.transport_limits();
-    let rest_runtime_config = rest_config.clone();
-    let rest_probe_metadata = rest_runtime_config.metadata().clone();
-    let rest_probe_count = rest_runtime_config.mappings().len();
-    let derived_probe = derived_runtime_config
-        .as_ref()
-        .map(|config| (config.metadata().clone(), config.mappings().len()));
-    let mut activation_guard = StartupCancellation::new(group_cancellation.child_token());
-    let mut activation = await_before(
-        deadline,
-        cancellation,
-        provider_activation.activate_tradier_market_data_account(
-            lease,
-            stream_config,
-            rest_config,
-            derived_activation_config,
-            transport_limits,
-            initial_symbols,
-            activation_guard.token(),
-        ),
-    )
-    .await?;
-    activation_guard.disarm();
-
-    let mut rest_guard = StartupCancellation::new(group_cancellation.child_token());
-    let rest = await_before(
-        deadline,
-        cancellation,
-        TradierRestRuntime::start(
-            &mut activation,
-            rest_runtime_config,
-            derived_runtime_config,
-            app_config.clone(),
-            provider_rate.clone(),
-            limits.tradier_rest,
-            rest_guard.token(),
-        ),
-    )
-    .await?;
-    rest_guard.disarm();
-
-    let rest_client = rest.client();
-    let quote_probe = match await_before(
-        deadline,
-        cancellation,
-        rest_client.fetch_configured_quotes(false, cancellation, deadline),
-    )
-    .await
-    {
-        Ok(probe) => probe,
-        Err(error) => {
-            group_cancellation.cancel();
-            cleanup_tradier_rest(rest).await;
-            return Err(error);
-        }
-    };
-    if quote_probe.batch().observations().len() != rest_probe_count
-        || quote_probe.batch().evidence().source_id() != rest_probe_metadata.source_id()
-        || quote_probe.batch().evidence().metadata_revision() != rest_probe_metadata.revision()
-        || quote_probe.batch().evidence().connection_generation() != rest.consolidated_generation()
-    {
-        group_cancellation.cancel();
-        cleanup_tradier_rest(rest).await;
-        return Err(ServiceError::InvalidResult);
-    }
-    drop(quote_probe);
-    if let Some((metadata, expected_count)) = derived_probe {
-        let derived_probe = match await_before(
-            deadline,
-            cancellation,
-            rest_client.fetch_derived_indexes(cancellation, deadline),
-        )
-        .await
-        {
-            Ok(probe) => probe,
-            Err(error) => {
-                group_cancellation.cancel();
-                cleanup_tradier_rest(rest).await;
-                return Err(error);
-            }
-        };
-        if derived_probe.batch().observations().len() != expected_count
-            || derived_probe.batch().evidence().source_id() != metadata.source_id()
-            || derived_probe.batch().evidence().metadata_revision() != metadata.revision()
-            || Some(derived_probe.batch().evidence().connection_generation())
-                != rest.derived_index_generation()
-        {
-            group_cancellation.cancel();
-            cleanup_tradier_rest(rest).await;
-            return Err(ServiceError::InvalidResult);
-        }
-    }
-
-    let streaming = match activation.take_streaming_activation() {
-        Ok(streaming) => streaming,
-        Err(error) => {
-            tracing::error!(%error, "Tradier streaming activation handoff failed");
-            group_cancellation.cancel();
-            cleanup_tradier_rest(rest).await;
-            return Err(ServiceError::Unavailable);
-        }
-    };
-    let mut stream_guard = StartupCancellation::new(group_cancellation.child_token());
-    let stream = match await_before(
-        deadline,
-        cancellation,
-        ProductionDisplaySourceRuntime::start_tradier_with_rate_authority(
-            app_config,
-            directory,
-            streaming.config().clone(),
-            streaming.account(),
-            streaming.subscriptions().clone(),
-            limits.display_actor,
-            read_admission,
-            provider_rate,
-            stream_guard.token(),
-        ),
-    )
-    .await
-    {
-        Ok(runtime) => {
-            stream_guard.disarm();
-            runtime
-        }
-        Err(error) => {
-            group_cancellation.cancel();
-            cleanup_tradier_rest(rest).await;
-            return Err(error);
-        }
-    };
-    let currentness = activation.currentness();
-    Ok((
-        TradierRuntimeGroup {
-            _activation: activation,
-            stream,
-            rest,
-        },
-        descriptors,
-        currentness,
-    ))
-}
-
-#[allow(
-    clippy::too_many_arguments,
     reason = "every account, capture, rate, order-level, and lifecycle authority remains explicit"
 )]
 async fn start_kraken(
@@ -1195,22 +969,6 @@ async fn start_kraken(
     Ok((runtime, currentness))
 }
 
-fn tradier_stream_symbols(
-    config: &market_squawk_adapter_tradier::TradierSourceConfig,
-) -> Result<Vec<SourceIdentifier>, ServiceError> {
-    let mut symbols = Vec::new();
-    symbols
-        .try_reserve_exact(config.mappings().len())
-        .map_err(|_error| ServiceError::ResourceExhausted)?;
-    for mapping in config.mappings() {
-        symbols.push(
-            SourceIdentifier::try_from(mapping.symbol().as_str())
-                .map_err(|_error| ServiceError::ResourceExhausted)?,
-        );
-    }
-    Ok(symbols)
-}
-
 async fn cleanup_display_runtime(runtime: ProductionDisplaySourceRuntime, context: &'static str) {
     if let Err(error) = runtime.shutdown().await {
         tracing::error!(%error, context, "display child partial-start cleanup failed");
@@ -1232,12 +990,6 @@ async fn cleanup_account_runtime(
     let cleanup = CancellationToken::new();
     if let Err(error) = runtime.shutdown_before(deadline, &cleanup).await {
         tracing::error!(%error, context, "account-market startup cleanup failed");
-    }
-}
-
-async fn cleanup_tradier_rest(runtime: TradierRestRuntime) {
-    if let Err(error) = runtime.shutdown().await {
-        tracing::error!(%error, "Tradier REST partial-start cleanup failed");
     }
 }
 

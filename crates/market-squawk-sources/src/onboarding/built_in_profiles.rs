@@ -128,7 +128,6 @@ pub(super) const FEDERAL_RESERVE_BOARD_H15_PROBE_URL: &str = concat!(
     "type=package"
 );
 const TIINGO_PROFILE: &str = "tiingo.starter-eod-nav";
-const TRADIER_MARKET_DATA_PROFILE: &str = "tradier.brokerage-market-data";
 const KRAKEN_L3_PROFILE: &str = "kraken.spot-authenticated-level3-market-data";
 const TREASURY_DAILY_RATES_PROFILE: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL_PROFILE: &str = "treasury.fiscal-data";
@@ -623,36 +622,6 @@ const TIINGO_EVIDENCE: &[ProfileEvidence] = &[
         true,
     ),
 ];
-const TRADIER_MARKET_DATA_EVIDENCE: &[ProfileEvidence] = &[
-    ProfileEvidence::new(
-        "TRADIER-MARKET-DATA",
-        "https://docs.tradier.com/docs/market-data",
-        "2026-08-09",
-        None,
-        false,
-    ),
-    ProfileEvidence::new(
-        "TRADIER-RATE-LIMITS",
-        "https://docs.tradier.com/docs/rate-limiting",
-        "2026-08-09",
-        None,
-        false,
-    ),
-    ProfileEvidence::new(
-        "TRADIER-ENDPOINTS",
-        "https://docs.tradier.com/docs/endpoints",
-        "2026-08-09",
-        None,
-        false,
-    ),
-    ProfileEvidence::new(
-        "TRADIER-STANDARD-PRICING",
-        "https://join.tradier.com/partner",
-        "2026-08-09",
-        None,
-        true,
-    ),
-];
 const KRAKEN_L3_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
         "KRAKEN-L3-CHANNEL",
@@ -962,7 +931,6 @@ pub fn built_in_provider_profiles() -> Result<ProviderProfileRegistry, ProviderP
         build(eia()?)?,
         build(federal_reserve_board()?)?,
         build(tiingo()?)?,
-        build(tradier_market_data()?)?,
         build(kraken()?)?,
         build(kraken_l3()?)?,
         build(sec()?)?,
@@ -1343,7 +1311,6 @@ fn build_capability_with_rights_state(
             "bls.v2-registered"
                 | "coinbase.exchange-direct-market-data"
                 | ALPACA_BASIC_PROFILE
-                | TRADIER_MARKET_DATA_PROFILE
                 | KRAKEN_L3_PROFILE
         ) {
             LifecycleSupport::new(true, false, true)
@@ -1591,14 +1558,6 @@ fn built_in_budget(
             simple_budget("federal-reserve-board", None, 1, MINUTE_NANOS, 1, backoff)
         }
         TIINGO_PROFILE => tiingo_budget(backoff),
-        TRADIER_MARKET_DATA_PROFILE => simple_budget(
-            "tradier-brokerage",
-            Some("tradier.brokerage.account-template"),
-            120,
-            MINUTE_NANOS,
-            2,
-            backoff,
-        ),
         "kraken.spot-public-market-data" => {
             simple_budget("kraken", None, 1, MINUTE_NANOS, 1, backoff)
         }
@@ -2285,44 +2244,6 @@ fn tiingo() -> Result<BuiltInSpec, ProviderProfileError> {
         rate_policy: "tiingo.starter-eod-nav.pending-rate-policy.v1",
         refresh_trigger: "TIINGO-STARTER-EOD-NAV",
         handoff_instruction: "Import the configured Tiingo API token. The provider-native HTTP/capture, decoder, quota-state, NAV/EOD, and FundNav-mapping core is present; the profile remains unavailable until an application redacted doctor, durable quota-store binding, activation, final canonical publication, PIT read, Funds composition, and restart/release proof are implemented.",
-    })
-}
-
-fn tradier_market_data() -> Result<BuiltInSpec, ProviderProfileError> {
-    Ok(BuiltInSpec {
-        id: TRADIER_MARKET_DATA_PROFILE,
-        display_name: "Tradier Brokerage market data",
-        official_entry: "https://join.tradier.com/partner",
-        setup: ProfileActivationMode::ManualSecretImport,
-        zero_fee: ZeroFeeStatus::Confirmed,
-        account: Requirement::RequiredProviderControlled,
-        contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RightsLimited,
-        rights_state: RightsAdmissionState::AdmittedScoped,
-        authority: Some("tradier.market-data.read"),
-        permissions: &["market-data.read"],
-        coverage: "One user-authorized Tradier production brokerage account: consolidated real-time US equity, ETF, and option trades and top-of-book quotes at Aggregated quality; NDX, RUT, and COMP derived index values at Modeled quality with no market book; no execution authority",
-        quality: DataQuality::Aggregated,
-        probe: VerificationProbe::network(
-            ProbeTransport::HttpGet,
-            "https://api.tradier.com/v1/user/profile",
-            None,
-        )?,
-        rights: RIGHTS_LIMITED,
-        duties: &[
-            "retain consolidated-securities and derived-index observations as separate logical surfaces",
-            "enforce one physical market stream and one shared account budget across every logical surface",
-            "use this credential only with code-owned market-data and read-only profile endpoints and never for order submission",
-            "do not admit persistence, modeling, export, or redistribution without a later rights decision",
-        ],
-        persistence_evidence_source_id: None,
-        rotation: "create a replacement production API access token and import it as a higher generation",
-        revocation: "revoke or replace the exact Tradier token remotely, then delete the exact local generation",
-        recovery: COMMON_RECOVERY,
-        evidence: TRADIER_MARKET_DATA_EVIDENCE,
-        rate_policy: "tradier.brokerage-market-data.account-rate-policy.v1",
-        refresh_trigger: "TRADIER-BROKERAGE-MARKET-DATA",
-        handoff_instruction: "Open a zero-monthly-fee Tradier Brokerage account, retrieve the production API token from the official API settings page, and import it write-only. Sandbox tokens are not admitted for this real-time profile.",
     })
 }
 

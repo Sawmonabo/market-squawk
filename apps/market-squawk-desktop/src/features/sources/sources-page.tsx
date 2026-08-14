@@ -104,12 +104,20 @@ function ReadySourcesPage({
     ),
     queryFn: () => transport.query({ query: "sourceHealth" }),
   })
-  const sourceRows = sourceEvidence(
+  const statusRows = statusReads.flatMap((query) => query.data ?? [])
+  const sourceRead = parseRead(() => sourceEvidence(
     bootstrap.providerProfiles,
     bootstrap.providerSessions,
-    statusReads.flatMap((query) => query.data ?? []),
+    statusRows,
     coverage.data,
     health.data,
+  ))
+  const sourceRows = sourceRead.value ?? sourceEvidence(
+    bootstrap.providerProfiles,
+    bootstrap.providerSessions,
+    statusRows,
+    undefined,
+    undefined,
   )
   const manifestReadsAvailable = bootstrap.operations.some(
     (operation) => operation.name === "Research.GetManifest",
@@ -152,10 +160,15 @@ function ReadySourcesPage({
     health.isFetching ||
     manifestReads.some((query) => query.isFetching)
   const failedStatusReads = statusReads.filter((query) => query.isError).length
+  const failedSecondaryReads = Math.min(
+    2,
+    Number(coverage.isError) +
+      Number(health.isError) +
+      Number(sourceRead.error !== null && !coverage.isError && !health.isError),
+  )
   const failedReads =
     failedStatusReads +
-    Number(coverage.isError) +
-    Number(health.isError) +
+    failedSecondaryReads +
     manifestReads.filter((query) => query.isError).length
   const totalReads = statusReads.length + manifestReads.length + 2
   const active = sources.filter(
@@ -216,6 +229,7 @@ function ReadySourcesPage({
             statusReads.find((query) => query.error)?.error ??
               coverage.error ??
               health.error ??
+              sourceRead.error ??
               manifestReads.find((query) => query.error)?.error,
           )}
         />
@@ -256,6 +270,17 @@ function ReadySourcesPage({
       )}
     </PageFrame>
   )
+}
+
+function parseRead<T>(read: () => T): { value: T | null; error: Error | null } {
+  try {
+    return { value: read(), error: null }
+  } catch (error) {
+    return {
+      value: null,
+      error: error instanceof Error ? error : new Error(String(error)),
+    }
+  }
 }
 
 function SourceCard({
@@ -367,8 +392,18 @@ function SourceCard({
         <EvidencePanel
           title="Live runtime"
           icon={Activity}
-          headline={runtimeName(source.runtimeState)}
-          detail={source.connection ? `Connection: ${humanize(source.connection)}` : "Connection not reported"}
+          headline={
+            source.runtimeState === "active_group"
+              ? "Active account/display runtime"
+              : runtimeName(source.runtimeState)
+          }
+          detail={
+            source.runtimeState === "active_group"
+              ? "Admitted account/display group. Current observations are reported on Markets."
+              : source.connection
+                ? `Connection: ${humanize(source.connection)}`
+                : "Connection not reported"
+          }
         />
       </div>
 

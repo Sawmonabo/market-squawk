@@ -14,7 +14,6 @@ mod route_actor;
 mod sink;
 mod subscription_state;
 mod supervisor;
-pub(crate) mod tradier_rest;
 
 pub use composition::{
     ProductionCoinbaseProfileError, ProductionLiveSourceComposition,

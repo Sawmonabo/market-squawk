@@ -4372,7 +4372,6 @@ dependencies = [
  "market-squawk-adapter-schwab",
  "market-squawk-adapter-sec",
  "market-squawk-adapter-tiingo",
- "market-squawk-adapter-tradier",
  "market-squawk-adapter-treasury",
  "market-squawk-adapter-yahoo",
  "market-squawk-analytics",

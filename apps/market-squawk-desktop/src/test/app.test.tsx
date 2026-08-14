@@ -10,8 +10,16 @@ import { CredentialField } from "@/components/setup/credential-field"
 import { ProviderStep } from "@/components/setup/provider-step"
 import type { AnalyticalControllerStatus } from "@/features/advanced/analytical-profile-contracts"
 import { lookupRoute } from "@/features/lookup/lookup-surface"
+import {
+  instrumentBooks,
+  instrumentComparison,
+  instrumentQuotes,
+  instrumentTrades,
+} from "@/features/markets/market-evidence"
 import { parseUnifiedMarketResult } from "@/features/markets/unified-market"
 import {
+  parseSourceCoverageResult,
+  parseSourceHealthResult,
   parseSourceLifecycleReceipt,
   parseSourceStatusResult,
 } from "@/features/sources/source-evidence"
@@ -590,9 +598,15 @@ const h15ProviderProfile: DesktopBootstrap["providerProfiles"][number] = {
   zero_fee: "No fee",
   account_requirement: "No account",
   credential_requirement: "No credential",
-  release_state: "selected",
+  release_state: "available",
   coverage: "Federal Reserve Board H.15 selected interest rates",
   quality_ceiling: "official_delayed",
+  rights: [
+    { operation: "retrieve", admission: "admitted" },
+    { operation: "display", admission: "admitted" },
+    { operation: "persist", admission: "admitted" },
+    { operation: "model_training", admission: "admitted" },
+  ],
 }
 
 const alpacaProviderProfile: DesktopBootstrap["providerProfiles"][number] = {
@@ -603,9 +617,15 @@ const alpacaProviderProfile: DesktopBootstrap["providerProfiles"][number] = {
   zero_fee: "Basic IEX market data",
   account_requirement: "Paper credential realm",
   credential_requirement: "Paper API key and secret",
-  release_state: "selected",
+  release_state: "available",
   coverage: "Alpaca Basic IEX market data",
   quality_ceiling: "direct_unverified",
+  rights: [
+    { operation: "retrieve", admission: "admitted" },
+    { operation: "display", admission: "admitted" },
+    { operation: "persist", admission: "blocked" },
+    { operation: "model_training", admission: "blocked" },
+  ],
 }
 
 const alpacaOnboardingSessionId = "3f99c998-b834-4d34-a759-66fbf3d8ab3a"
@@ -618,8 +638,6 @@ const alpacaDoctorPredecessors = new Map([
 const initialAlpacaRuntimeGenerationSha256 = "8".repeat(64)
 const resynchronizedAlpacaRuntimeGenerationSha256 = "9".repeat(64)
 const reactivatedAlpacaRuntimeGenerationSha256 = "a".repeat(64)
-const alpacaRuntimeSourceId = "alpaca-paper-iex-live"
-const alpacaRuntimeInstrumentId = "6d6cead8-bf3a-5f46-a17d-34754eb67768"
 
 function alpacaDoctorRate(observed: boolean) {
   return observed
@@ -862,24 +880,9 @@ function alpacaSourceStatus(stage: AlpacaSourceStage): ApplicationResult {
     : "2026-08-12T20:00:07.000000000Z"
   const runtime = active
     ? {
-        state: "active",
-        sourceId: alpacaRuntimeSourceId,
-        venueId: "iex",
-        instrumentId: alpacaRuntimeInstrumentId,
-        providerProduct: "stocks",
-        providerChannel: "iex",
-        connectionGeneration: stage === "reactivated" ? "3" : stage === "resynchronized" ? "2" : "1",
-        sessionId: `alpaca-${stage}-session`,
-        healthEpoch: "1",
-        stateRevision,
-        assessmentId: `alpaca-${stage}-assessment`,
-        bindingDigest: runtimeGenerationSha256,
-        connection: { live: { last_activity_at: "1786565107000000000" } },
-        integrity: "healthy",
-        quality: "direct_unverified",
-        observedAtUnixNanos: "1786565107000000000",
-        qualificationEvaluatedAtUnixNanos: "1786565107000000000",
-        qualificationValidUntilUnixNanos: "1786565167000000000",
+        state: "active_group",
+        runtimeGenerationSha256,
+        qualifiedRuntimeRecordCount: 0,
       }
     : { state: "not_active" }
   const currentSession = configured
@@ -894,8 +897,7 @@ function alpacaSourceStatus(stage: AlpacaSourceStage): ApplicationResult {
   const result = {
     data: [{
       profile: {
-        id: "alpaca.basic-market-data",
-        display_name: "Alpaca Basic Market Data",
+        ...alpacaProviderProfile,
       },
       currentSession,
       providerDatasetIdentifier: null,
@@ -927,12 +929,12 @@ function alpacaSourceStatus(stage: AlpacaSourceStage): ApplicationResult {
         authority: "code_owned_profiles_and_current_runtime_evidence",
         requestedSources: ["alpaca.basic-market-data"],
         profileCount: 1,
-        runtimeRecordCount: active ? 1 : 0,
+        runtimeRecordCount: 0,
         runtimeAbsence: "not_established",
       },
       dataQuality: {
         authority: "profile_ceiling_and_runtime_qualification",
-        runtimeClasses: active ? ["direct_unverified"] : [],
+        runtimeClasses: [],
         runtimeAbsence: "not_active",
         executionEligibilityUnchanged: true,
       },
@@ -1048,8 +1050,7 @@ const inactiveH15SourceStatus: ApplicationResult = {
   data: [
     {
       profile: {
-        id: "federal-reserve-board.data-download-program",
-        display_name: "Federal Reserve Board Data Download Program",
+        ...h15ProviderProfile,
       },
       currentSession: null,
       providerDatasetIdentifier:
@@ -1095,6 +1096,87 @@ parseSourceStatusResult(
   inactiveH15SourceStatus,
   ["federal-reserve-board.data-download-program"],
 )
+
+function sourceSecondaryMetadata(): ApplicationResult["metadata"] {
+  return {
+    completeness: "complete",
+    returnedItems: 2,
+    availableItems: 2,
+    sourceCoverage: {
+      authority: "code_owned_profiles_and_current_runtime_evidence",
+      requestedSources: [],
+      profileCount: 2,
+      runtimeRecordCount: 0,
+      runtimeAbsence: "not_established",
+    },
+    dataQuality: {
+      authority: "profile_ceiling_and_runtime_qualification",
+      runtimeClasses: [],
+      runtimeAbsence: "not_active",
+      executionEligibilityUnchanged: true,
+    },
+  }
+}
+
+function sourceCoverageResult(): ApplicationResult {
+  return {
+    data: [
+      {
+        surfaceId: h15ProviderProfile.id,
+        releaseState: h15ProviderProfile.release_state,
+        declaredCoverage: h15ProviderProfile.coverage,
+        qualityCeiling: h15ProviderProfile.quality_ceiling,
+        rights: h15ProviderProfile.rights,
+        runtimeCoverage: { state: "not_established" },
+      },
+      {
+        surfaceId: alpacaProviderProfile.id,
+        releaseState: alpacaProviderProfile.release_state,
+        declaredCoverage: alpacaProviderProfile.coverage,
+        qualityCeiling: alpacaProviderProfile.quality_ceiling,
+        rights: alpacaProviderProfile.rights,
+        runtimeCoverage: { state: "not_established" },
+      },
+    ],
+    metadata: sourceSecondaryMetadata(),
+  }
+}
+
+function sourceHealthResult(stage: AlpacaSourceStage): ApplicationResult {
+  const alpacaStatus = alpacaSourceStatus(stage)
+  const alpacaRow = Array.isArray(alpacaStatus.data)
+    ? alpacaStatus.data[0] as Record<string, unknown> | undefined
+    : undefined
+  const session = alpacaRow?.currentSession as Record<string, unknown> | null | undefined
+  return {
+    data: [
+      {
+        surfaceId: h15ProviderProfile.id,
+        onboardingState: null,
+        runtimeHealth: { state: "not_active" },
+      },
+      {
+        surfaceId: alpacaProviderProfile.id,
+        onboardingState: session?.state ?? null,
+        runtimeHealth: { state: "not_active" },
+      },
+    ],
+    metadata: sourceSecondaryMetadata(),
+  }
+}
+
+function groupedSourceStatuses(stage: AlpacaSourceStage) {
+  return [
+    ...parseSourceStatusResult(
+      inactiveH15SourceStatus,
+      ["federal-reserve-board.data-download-program"],
+    ),
+    ...parseSourceStatusResult(
+      alpacaSourceStatus(stage),
+      ["alpaca.basic-market-data"],
+    ),
+  ]
+}
 
 const stoppedPaperStatus: ApplicationResult = {
   data: { state: "stopped", lastShutdownComplete: true },
@@ -1674,6 +1756,7 @@ const unifiedKrakenMarket: ApplicationResult = {
       tickSize: "0.1",
       lotSize: "0.00000001",
       executionTermsAvailable: true,
+      executionEligible: false,
       referenceEvidence: null,
       availability: "Live",
       confidence: "Direct, unverified",
@@ -1747,33 +1830,10 @@ const unifiedKrakenMarket: ApplicationResult = {
           },
         ],
       },
+      analyticalReadiness: "runtime_display_only",
       marketObservation: {
-        availability: "available",
-        instrumentId: krakenInstrumentId,
-        mark: {
-          value: "68000.15",
-          currency: "USD",
-          basis: "fresh_bid_ask_midpoint",
-          evidenceIdentity: {
-            algorithm: "sha256",
-            bytes: "11".repeat(32),
-          },
-          freshUntil: null,
-        },
-        selectionDigest: {
-          algorithm: "sha256",
-          bytes: "22".repeat(32),
-        },
-        selectedAt: krakenAvailableAt,
-        generation: "1",
-        quality: "direct_unverified",
-        depth: "price_level",
-        coverage: "single_venue",
-        integrity: "verified",
-        features: {
-          availability: "unavailable",
-          reason: "source_does_not_publish_live_features",
-        },
+        availability: "unavailable",
+        reason: "durable_pit_evidence_not_established",
       },
       selectedSource: {
         surfaceId: "kraken-l3",
@@ -1897,10 +1957,190 @@ const unifiedKrakenMarket: ApplicationResult = {
   },
 }
 
+const krakenDetailIdentity = {
+  sourceId: "kraken-l3-account",
+  venueId: "kraken",
+  instrumentId: krakenInstrumentId,
+  providerProduct: "websocket-v2",
+  providerChannel: "level3",
+  connectionGeneration: "1",
+  stateRevision: "17",
+  shardId: "0/1",
+  shardSnapshotRevision: "17",
+}
+
+function marketDetailMetadata({
+  availableItems,
+  observations,
+  sources = ["kraken-l3-account"],
+  venues = ["kraken"],
+}: {
+  availableItems: number
+  observations: number
+  sources?: string[]
+  venues?: string[]
+}): ApplicationResult["metadata"] {
+  const classifications = observations > 0
+    ? [{ quality: "direct_unverified", count: observations }]
+    : []
+  return {
+    completeness: "complete",
+    returnedItems: availableItems,
+    availableItems,
+    sourceCoverage: {
+      mode: "current_live_runtime",
+      consistency: "per_shard_current_non_atomic",
+      historicalDataset: null,
+      requestedSourceCount: 0,
+      listedRequestedSources: [],
+      listedRequestedSourcesComplete: true,
+      observedSourceCount: sources.length,
+      listedSources: sources,
+      listedSourcesComplete: true,
+      observedVenueCount: venues.length,
+      listedVenues: venues,
+      listedVenuesComplete: true,
+      failedSourceCount: 0,
+      failedSources: [],
+      listedFailedSourcesComplete: true,
+      streamIdentityScope: "complete",
+      bookDepthScope: "per_record_explicit",
+      displayObservationCount: 0,
+      krakenOrderLevelProjectionCount: 0,
+      availability: availableItems === 0 ? "no_current_observation" : "current",
+    },
+    dataQuality: {
+      referenceAt: krakenAvailableAt,
+      recordedClassifications: classifications,
+      currentDisplayClassifications: classifications,
+      freshObservations: observations,
+      staleObservations: 0,
+      authority: "not_exposed",
+    },
+  }
+}
+
+const krakenTradeResult: ApplicationResult = {
+  data: [{
+    ...krakenDetailIdentity,
+    sourceIdentifier: "kraken:trade:42",
+    stableTradeId: "kraken-trade-42",
+    tradeConnectionGeneration: "1",
+    priceTicks: "680001",
+    quantityLots: "25000000",
+    aggressorSide: "buy",
+    sourceTimestamp: krakenSourceAt,
+    receivedAt: krakenReceivedAt,
+    availableAt: krakenAvailableAt,
+    ingestedAt: krakenAvailableAt,
+    recordedQuality: "direct_unverified",
+    currentDisplayQuality: "direct_unverified",
+    recordedCoverage: "sufficient",
+    assessmentId: "kraken-assessment-17",
+    qualificationEvaluatedAt: krakenAvailableAt,
+    qualificationValidUntil: "2026-08-09T14:30:10.000000000Z",
+    freshAtReference: true,
+    payloadDigest: { algorithm: "blake3", bytes: "6".repeat(64) },
+    bindingDigest: "7".repeat(64),
+    tradeTradingStatus: "active",
+    committedStateRevision: "17",
+    authority: "not_exposed",
+  }],
+  metadata: marketDetailMetadata({ availableItems: 1, observations: 1 }),
+}
+
+const krakenQuoteResult: ApplicationResult = {
+  data: [{
+    ...krakenDetailIdentity,
+    bid: { priceTicks: "680001", quantityLots: "25000000" },
+    ask: { priceTicks: "680002", quantityLots: "30000000" },
+    sourceTimestamp: null,
+    asOf: krakenAvailableAt,
+    stateEvaluatedAt: krakenReceivedAt,
+    recordedQuality: "direct_unverified",
+    currentDisplayQuality: "direct_unverified",
+    crossed: false,
+    authority: "not_exposed",
+  }],
+  metadata: marketDetailMetadata({ availableItems: 1, observations: 1 }),
+}
+
+function completeBookDimension() {
+  return { completeness: "complete", available: 1, returned: 1, configuredLimit: 10 }
+}
+
+const krakenBookResult: ApplicationResult = {
+  data: [{
+    ...krakenDetailIdentity,
+    asOf: krakenAvailableAt,
+    stateEvaluatedAt: krakenReceivedAt,
+    book: {
+      configuredDepth: 10,
+      stateBidDepth: 1,
+      stateAskDepth: 1,
+      snapshotBidDimension: completeBookDimension(),
+      snapshotAskDimension: completeBookDimension(),
+      resultBidDimension: completeBookDimension(),
+      resultAskDimension: completeBookDimension(),
+      bids: [{ priceTicks: "680001", quantityLots: "25000000" }],
+      asks: [{ priceTicks: "680002", quantityLots: "30000000" }],
+    },
+    currentDisplayQuality: "direct_unverified",
+  }],
+  metadata: marketDetailMetadata({ availableItems: 1, observations: 1 }),
+}
+
+const krakenComparisonResult: ApplicationResult = {
+  data: [{
+    instrumentId: krakenInstrumentId,
+    observationCount: 2,
+    comparable: true,
+    observations: [
+      {
+        sourceId: "coinbase-public",
+        venueId: "coinbase",
+        providerProduct: "advanced-trade",
+        providerChannel: "ticker",
+        bid: { priceTicks: "679999", quantityLots: "11000000" },
+        ask: { priceTicks: "680003", quantityLots: "12000000" },
+        midpoint: { numeratorTicks: "1360002", denominator: "2" },
+        asOf: krakenAvailableAt,
+        stateEvaluatedAt: krakenReceivedAt,
+        recordedQuality: "direct_unverified",
+        currentDisplayQuality: "direct_unverified",
+      },
+      {
+        sourceId: "kraken-l3-account",
+        venueId: "kraken",
+        providerProduct: "websocket-v2",
+        providerChannel: "level3",
+        bid: { priceTicks: "680001", quantityLots: "25000000" },
+        ask: { priceTicks: "680002", quantityLots: "30000000" },
+        midpoint: { numeratorTicks: "1360003", denominator: "2" },
+        asOf: krakenAvailableAt,
+        stateEvaluatedAt: krakenReceivedAt,
+        recordedQuality: "direct_unverified",
+        currentDisplayQuality: "direct_unverified",
+      },
+    ],
+    authority: "not_exposed",
+  }],
+  metadata: marketDetailMetadata({
+    availableItems: 1,
+    observations: 2,
+    sources: ["coinbase-public", "kraken-l3-account"],
+    venues: ["coinbase", "kraken"],
+  }),
+}
+
 // Keep this production-shaped evidence fixture at the strict Rust/Desktop wire boundary.
 // Parsing here makes a schema drift failure point at the fixture instead of disappearing
 // behind the Markets page's deliberately user-facing unavailable state.
 parseUnifiedMarketResult(unifiedKrakenMarket)
+instrumentTrades(krakenTradeResult, krakenInstrumentId)
+instrumentQuotes(krakenQuoteResult, krakenInstrumentId)
+instrumentBooks(krakenBookResult, krakenInstrumentId)
+instrumentComparison(krakenComparisonResult, krakenInstrumentId)
 
 const portfolioAccountId = "55e7626c-81c8-4e78-8aa6-45a1d9c2949a"
 const heldInstrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
@@ -2108,6 +2348,7 @@ describe("Market Squawk desktop boundary", () => {
 
   it("renders one unified market with automatic source confidence and order-level detail", async () => {
     const user = userEvent.setup()
+    const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
     const readyBootstrap: DesktopBootstrap = {
       ...blockedBootstrap,
       operations: [
@@ -2116,13 +2357,26 @@ describe("Market Squawk desktop boundary", () => {
           "market",
           "Return the bounded unified market view.",
         ),
+        datasetRead("Market.GetTrades", "market", "Return current trades."),
+        datasetRead("Market.GetQuotes", "market", "Return current quotes."),
+        datasetRead("Market.GetBooks", "market", "Return current books."),
+        datasetRead(
+          "Market.GetComparisons",
+          "market",
+          "Compare current sources.",
+        ),
       ],
     }
     render(
       <MemoryRouter initialEntries={["/markets"]}>
         <App
           transport={transport(readyBootstrap, undefined, async (request) => {
+            issuedQueries.push(request)
             if (request.query === "marketUnifiedFeed") return unifiedKrakenMarket
+            if (request.query === "marketTrades") return krakenTradeResult
+            if (request.query === "marketQuotes") return krakenQuoteResult
+            if (request.query === "marketBooks") return krakenBookResult
+            if (request.query === "marketComparisons") return krakenComparisonResult
             throw new Error(`Unexpected market query: ${request.query}`)
           })}
         />
@@ -2140,6 +2394,12 @@ describe("Market Squawk desktop boundary", () => {
     expect(within(marketCard).getByText("Live")).toBeTruthy()
     expect(within(marketCard).getByText("Price-level book")).toBeTruthy()
     expect(within(marketCard).getByText("2 of 2")).toBeTruthy()
+    expect(
+      within(marketCard).getByText(
+        "Live runtime display · not archived/PIT evidence",
+      ),
+    ).toBeTruthy()
+    expect(within(marketCard).getByText("Not available")).toBeTruthy()
     expect(screen.queryByRole("combobox", { name: /provider/i })).toBeNull()
 
     await user.click(
@@ -2147,9 +2407,67 @@ describe("Market Squawk desktop boundary", () => {
     )
     expect(await screen.findByText("Selected market evidence")).toBeTruthy()
     expect(screen.getByText("Orders behind the visible market")).toBeTruthy()
+    expect(await screen.findByText("kraken-trade-42")).toBeTruthy()
+    expect(screen.getAllByText("680001 ticks").length).toBeGreaterThan(0)
+    expect(screen.getByText("25000000 lots")).toBeTruthy()
+    expect(screen.getByText("Bids · Complete")).toBeTruthy()
+    expect(screen.getByText("Asks · Complete")).toBeTruthy()
+    expect(screen.getByText("2 current observations can be compared.")).toBeTruthy()
+    expect(screen.getByText("coinbase-public · coinbase")).toBeTruthy()
     await user.click(screen.getByText("Source, quality, and evidence details"))
     expect(screen.getAllByText("kraken").length).toBeGreaterThan(0)
-    expect(screen.getByText("Verified")).toBeTruthy()
+    expect(screen.getByText("Runtime display only")).toBeTruthy()
+    expect(
+      issuedQueries.filter((request) => [
+        "marketTrades",
+        "marketQuotes",
+        "marketBooks",
+        "marketComparisons",
+      ].includes(request.query)),
+    ).toEqual([
+      { query: "marketTrades", instrumentId: krakenInstrumentId },
+      { query: "marketQuotes", instrumentId: krakenInstrumentId },
+      { query: "marketBooks", instrumentId: krakenInstrumentId },
+      { query: "marketComparisons", instrumentId: krakenInstrumentId },
+    ])
+
+    const numericTrade = structuredClone(krakenTradeResult)
+    const numericTradeRows = numericTrade.data as Array<Record<string, unknown>>
+    if (!numericTradeRows[0]) throw new Error("The trade fixture is absent")
+    numericTradeRows[0].priceTicks = 680001
+    expect(() => instrumentTrades(numericTrade, krakenInstrumentId)).toThrow()
+
+    const extraEnvelope = { ...krakenQuoteResult, unexpected: true }
+    expect(() => instrumentQuotes(extraEnvelope, krakenInstrumentId)).toThrow()
+
+    const wrongInstrument = structuredClone(krakenBookResult)
+    const wrongInstrumentRows = wrongInstrument.data as Array<Record<string, unknown>>
+    if (!wrongInstrumentRows[0]) throw new Error("The book fixture is absent")
+    wrongInstrumentRows[0].instrumentId = candidateInstrumentId
+    expect(() => instrumentBooks(wrongInstrument, krakenInstrumentId)).toThrow()
+
+    const duplicateComparison = structuredClone(krakenComparisonResult)
+    const duplicateComparisonRows = duplicateComparison.data as Array<Record<string, unknown>>
+    const duplicateObservations = duplicateComparisonRows[0]?.observations as
+      | Array<Record<string, unknown>>
+      | undefined
+    if (!duplicateObservations?.[0] || !duplicateObservations[1]) {
+      throw new Error("The comparison fixture is absent")
+    }
+    duplicateObservations[1] = { ...duplicateObservations[0] }
+    expect(() =>
+      instrumentComparison(duplicateComparison, krakenInstrumentId)
+    ).toThrow()
+
+    const inconsistentCounts = structuredClone(krakenQuoteResult)
+    inconsistentCounts.metadata.returnedItems = 0
+    expect(() => instrumentQuotes(inconsistentCounts, krakenInstrumentId)).toThrow()
+
+    const falseAnalyticalAuthority = structuredClone(unifiedKrakenMarket)
+    const falseAnalyticalRows = falseAnalyticalAuthority.data as Array<Record<string, unknown>>
+    if (!falseAnalyticalRows[0]) throw new Error("The unified fixture is absent")
+    falseAnalyticalRows[0].analyticalReadiness = "durable_pit_available"
+    expect(() => parseUnifiedMarketResult(falseAnalyticalAuthority)).toThrow()
   })
 
   it("keeps candidate impact server-resolved and visibly analysis-only", async () => {
@@ -2265,6 +2583,7 @@ describe("Market Squawk desktop boundary", () => {
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
     let alpacaStage: AlpacaSourceStage = "unconfigured"
+    let corruptSecondaryEvidence = false
     const credentialProviders = [
       "schwab",
       "alpaca",
@@ -2413,12 +2732,19 @@ describe("Market Squawk desktop boundary", () => {
             : inactiveH15SourceStatus
         }
         if (request.query === "paperStatus") return stoppedPaperStatus
+        if (request.query === "sourceCoverage") {
+          const result = sourceCoverageResult()
+          if (corruptSecondaryEvidence && Array.isArray(result.data)) {
+            const first = result.data[0] as Record<string, unknown> | undefined
+            if (first) first.surfaceId = "alpaca.basic-market-data"
+          }
+          return result
+        }
+        if (request.query === "sourceHealth") return sourceHealthResult(alpacaStage)
         if (
           request.query === "paperOrders" ||
           request.query === "paperFills" ||
-          request.query === "portfolioAccounts" ||
-          request.query === "sourceCoverage" ||
-          request.query === "sourceHealth"
+          request.query === "portfolioAccounts"
         ) {
           return emptyRowsResult
         }
@@ -2857,7 +3183,7 @@ describe("Market Squawk desktop boundary", () => {
     })
     await user.click(within(alpacaSource).getByRole("button", { name: "Start" }))
     await waitFor(() => {
-      expect(within(alpacaSource).getAllByText("Active", { selector: "p" })).toHaveLength(2)
+      expect(within(alpacaSource).getByText("Active account/display runtime")).toBeTruthy()
     })
     expect(within(alpacaSource).getByText("Already active")).toBeTruthy()
     expect(within(alpacaSource).queryByRole("button", { name: "Start" })).toBeNull()
@@ -2935,7 +3261,7 @@ describe("Market Squawk desktop boundary", () => {
     })
     await user.click(within(alpacaSource).getByRole("button", { name: "Start" }))
     await waitFor(() => {
-      expect(within(alpacaSource).getAllByText("Active", { selector: "p" })).toHaveLength(2)
+      expect(within(alpacaSource).getByText("Active account/display runtime")).toBeTruthy()
     })
     expect(within(alpacaSource).getByText("Already active")).toBeTruthy()
     expect(sourceControls[4]).toEqual({
@@ -2961,10 +3287,103 @@ describe("Market Squawk desktop boundary", () => {
       expect(readCount("sourceCoverage")).toBeGreaterThan(0)
       expect(readCount("sourceHealth")).toBeGreaterThan(0)
     })
+    const exactStatuses = groupedSourceStatuses(alpacaStage)
+    expect(
+      parseSourceCoverageResult(
+        sourceCoverageResult(),
+        readyBootstrap.providerProfiles,
+        exactStatuses,
+      ),
+    ).toHaveLength(2)
+    expect(
+      parseSourceHealthResult(
+        sourceHealthResult(alpacaStage),
+        readyBootstrap.providerProfiles,
+        exactStatuses,
+      ),
+    ).toHaveLength(2)
+
+    const duplicateCoverage = structuredClone(sourceCoverageResult())
+    const duplicateCoverageRows = duplicateCoverage.data as Array<Record<string, unknown>>
+    if (!duplicateCoverageRows[0] || !duplicateCoverageRows[1]) {
+      throw new Error("The source coverage fixture is absent")
+    }
+    duplicateCoverageRows[1] = { ...duplicateCoverageRows[0] }
+    expect(() =>
+      parseSourceCoverageResult(
+        duplicateCoverage,
+        readyBootstrap.providerProfiles,
+        exactStatuses,
+      )
+    ).toThrow()
+
+    const crossProfileHealth = structuredClone(sourceHealthResult(alpacaStage))
+    const crossProfileHealthRows = crossProfileHealth.data as Array<Record<string, unknown>>
+    if (!crossProfileHealthRows[0]) {
+      throw new Error("The source health fixture is absent")
+    }
+    crossProfileHealthRows[0].surfaceId = "alpaca.basic-market-data"
+    expect(() =>
+      parseSourceHealthResult(
+        crossProfileHealth,
+        readyBootstrap.providerProfiles,
+        exactStatuses,
+      )
+    ).toThrow()
+
+    const activeGroupHealth = structuredClone(sourceHealthResult(alpacaStage))
+    const activeGroupHealthRows = activeGroupHealth.data as Array<Record<string, unknown>>
+    if (!activeGroupHealthRows[1]) {
+      throw new Error("The Alpaca health fixture is absent")
+    }
+    activeGroupHealthRows[1].runtimeHealth = {
+      state: "active",
+      sourceId: "alpaca-iex-runtime",
+      venueId: "iex",
+      instrumentId: krakenInstrumentId,
+      connectionGeneration: "1",
+      sessionId: "alpaca-runtime-session",
+      healthEpoch: "1",
+      stateRevision: "1",
+      assessmentId: "alpaca-runtime-assessment",
+      bindingDigest: "d".repeat(64),
+      connection: "connecting",
+      transportFreshness: "uninitialized",
+      marketFreshness: "uninitialized",
+      sourceTimestampFreshness: "uninitialized",
+      streamIntegrity: "initializing",
+      captureIntegrity: "disabled",
+      coverageStatus: "unknown",
+      quality: "direct_unverified",
+      observedAtUnixNanos: "1786564800000000000",
+      qualificationEvaluatedAtUnixNanos: "1786564800000000000",
+      qualificationValidUntilUnixNanos: "1786564810000000000",
+    }
+    expect(() =>
+      parseSourceHealthResult(
+        activeGroupHealth,
+        readyBootstrap.providerProfiles,
+        exactStatuses,
+      )
+    ).toThrow()
+
+    const mismatchedSourceCounts = structuredClone(sourceCoverageResult())
+    const mismatchedCoverage = mismatchedSourceCounts.metadata.sourceCoverage as
+      Record<string, unknown>
+    mismatchedCoverage.profileCount = 1
+    expect(() =>
+      parseSourceCoverageResult(
+        mismatchedSourceCounts,
+        readyBootstrap.providerProfiles,
+        exactStatuses,
+      )
+    ).toThrow()
+
     const sourceReadsBeforeSourceInvalidation = readCount("sourceStatus")
     const coverageReadsBeforeSourceInvalidation = readCount("sourceCoverage")
     const healthReadsBeforeSourceInvalidation = readCount("sourceHealth")
     const macroReadsBeforeSourceInvalidation = readCount("macroDashboard")
+    corruptSecondaryEvidence = true
     await notifyAuthorityChanged("2", "source", "Source.Setup")
     await waitFor(() => {
       expect(readCount("sourceStatus")).toBeGreaterThan(
@@ -2978,6 +3397,18 @@ describe("Market Squawk desktop boundary", () => {
       )
     })
     expect(readCount("macroDashboard")).toBe(macroReadsBeforeSourceInvalidation)
+    expect(
+      await screen.findByText(/source evidence reads could not be completed/),
+    ).toBeTruthy()
+    const runtimeSource = within(alpacaSource)
+      .getByText("Runtime source")
+      .closest("div")
+    const marketFreshness = within(alpacaSource)
+      .getByText("Market freshness")
+      .closest("div")
+    expect(within(alpacaSource).getByText("Operational")).toBeTruthy()
+    expect(runtimeSource?.querySelector("dd")?.textContent).toBe("Not reported")
+    expect(marketFreshness?.querySelector("dd")?.textContent).toBe("Not reported")
 
     await user.click(
       within(refreshedNavigation).getByRole("link", { name: "Opportunities" }),

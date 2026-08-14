@@ -1525,13 +1525,18 @@ adapters alone. The binding target authorities are the
 template, paused goal attachment, and current delivery-ledger entry.
 
 The selected sources are complementary: Alpaca Paper Only/Basic supplies the no-live-brokerage IEX
-current-data and stock-history core; owner-authorized Schwab supplies an optional read-only
-multi-asset REST and Streamer complement; Yahoo/yfinance is explicit-demand experimental
-enrichment; IEX HIST is a selected feed/date T+1 cold lane; Nasdaq Trader, OCC, and Cboe supply
-reference identity; SEC
-supplies company/fund evidence; FRED/ALFRED and the selected direct government sources supply macro,
-rates, fiscal, labor, national-account, demographic/trade, and energy evidence; and Tiingo is the
-optional supported mutual-fund NAV/EOD lane. Tiingo NAV uses the closed
+current-data and stock-history core; public Coinbase Advanced Trade and public Kraken Spot remain
+no-key crypto specialists for venue-qualified books and trades; optional owner-enabled Coinbase
+Exchange Direct remains a distinct authenticated crypto market-data complement; owner-authorized
+Schwab supplies an optional read-only multi-asset REST and Streamer complement; Yahoo/yfinance is
+explicit-demand experimental enrichment; IEX HIST is a selected feed/date T+1 cold lane; Nasdaq
+Trader, OCC, and Cboe supply reference identity; SEC supplies company/fund evidence; FRED/ALFRED
+and the selected direct government sources supply macro, rates, fiscal, labor, national-account,
+demographic/trade, and energy evidence; and Tiingo is the optional supported mutual-fund NAV/EOD
+lane. The Coinbase and Kraken sources add crypto coverage only; they do not supply the stock, ETF,
+index, bond, mutual-fund, or REIT breadth assigned to the rest of the stack. Tradier remains outside
+the selected stack and does not participate in new credential import, activation, scheduling,
+fallback, product composition, or release gates. Tiingo NAV uses the closed
 `ResearchObservation::FundNav(FundNavObservation)` research variant with exact fund/share-class,
 NAV date/value-or-missing state, availability, revision, and PIT evidence; EOD remains a separate
 bar family. Only those selected sources participate in new

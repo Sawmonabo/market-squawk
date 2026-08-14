@@ -7,11 +7,16 @@ automatically reducing breadth or cadence when measured capacity is insufficient
 **Selected stack:** Alpaca Paper Only/Basic is the governed no-brokerage current and
 historical stock/ETF core. An owner-authorized Schwab Trader API connection is an optional,
 account-backed complementary market-data surface for multi-asset REST and Streamer data; the base
-product cannot depend on it. Yahoo/yfinance remains adaptive explicit-demand enrichment, Tiingo is
-the optional daily mutual-fund NAV/EOD source, Nasdaq Trader/OCC/Cboe provide reference identity,
-and SEC plus government APIs provide fundamentals, holdings, rates, and macro evidence. No source
-enters a recurring lane unless its official contract and account-specific measurements fit that
-lane's complete workload.
+product cannot depend on it. Public Coinbase Advanced Trade and Kraken Spot are retained no-key
+crypto-specialist sources; they add venue-qualified crypto books and trades but provide none of the
+stock, ETF, index, bond, mutual-fund, or REIT breadth assigned elsewhere. Coinbase Direct is an
+optional authenticated crypto market-data surface and grants no account or order authority.
+Yahoo/yfinance remains adaptive explicit-demand enrichment, Tiingo is the optional daily
+mutual-fund NAV/EOD source, Nasdaq Trader/OCC/Cboe provide reference identity, and SEC plus
+government APIs provide fundamentals, holdings, rates, and macro evidence. No source enters a
+recurring lane unless its official contract and account-specific measurements fit that lane's
+complete workload. Tradier remains outside this selected stack; retained dormant support does not
+authorize new import, activation, scheduling, fallback, product composition, or release-gate use.
 
 | Field | Value |
 | --- | --- |
@@ -56,6 +61,9 @@ because it is free.
 | Provider or plane | Admission | Responsibility |
 | --- | --- | --- |
 | Alpaca Paper Only / Basic | Core | IEX equity/ETF live and latest data, stock history, gap repair, and option data only after an entitlement probe |
+| Coinbase Advanced Trade public market data | Core crypto, no key | Venue-qualified public crypto price-level books and trades for the admitted product set; `DirectUnverified`, never non-crypto coverage, consolidated crypto coverage, account data, or trading authority |
+| Kraken Spot WebSocket v2 public channels | Core crypto, no key | Independent venue-qualified public crypto price-level books and trades for the admitted pair set; `DirectUnverified`, never non-crypto coverage, consolidated crypto coverage, account data, or trading authority |
+| Coinbase Exchange Direct market data | Owner-enabled crypto complement, optional and runtime-gated | Authenticated direct crypto market data for an exact admitted account generation; distinct from the public feed and never granted account, position, order, or money-movement authority |
 | Nasdaq Trader, OCC, and Cboe reference files | Core, no key | Current listed equity/ETF/bond identifiers, listed option products/series, symbology, contract-reference events, and exchange status; never current consolidated quotes or a complete open-interest/volume source |
 | SEC EDGAR/XBRL/N-PORT/N-CEN | Core, no key | Company filings/facts and fund/ETF holdings/metadata |
 | FRED/ALFRED, BLS, BEA, Board, Census, EIA, Treasury | Core macro/release plane | Point-in-time macro, rates, fiscal, labor, national-account, demographic/trade, and energy evidence |
@@ -157,6 +165,9 @@ Only read-only routes belong in provider profiles. Endpoints and hard caps remai
 | Alpaca option chain | `GET https://data.alpaca.markets/v1beta1/options/snapshots/{underlying_symbol}` — paginated, at most 1,000 returned data points/page ([reference](https://docs.alpaca.markets/us/v1.4.2/reference/optionchain)) |
 | Alpaca fixed income | `GET https://data.alpaca.markets/v1beta1/fixed_income/latest/prices` and `/latest/quotes` ([prices](https://docs.alpaca.markets/us/reference/fixedincomelatestprices), [quotes](https://docs.alpaca.markets/us/reference/fixedincomelatestquotes)). **RUNTIME-MEASURED VALUE:** the configured Paper credential returned HTTP 403, so this lane is unavailable for that credential generation. |
 | Alpaca corporate actions | `GET https://data.alpaca.markets/v1/corporate-actions` |
+| Coinbase Advanced Trade public market data | `wss://advanced-trade-ws.coinbase.com`; admitted public channels are `level2`, `market_trades`, and `heartbeats` for the exact configured product |
+| Coinbase Exchange public/direct market data | `wss://ws-feed.exchange.coinbase.com` is the unauthenticated Exchange market-data feed; `wss://ws-direct.exchange.coinbase.com` is the separately authenticated Direct market-data feed |
+| Kraken Spot public market data | `wss://ws.kraken.com/v2`; admitted public channels are exact `book` and `trade` subscriptions for configured pairs |
 | Schwab read-only REST | **RUNTIME-MEASURED VALUE:** the configured read-only probe exercised server `https://api.schwabapi.com/marketdata/v1` and the `GET /quotes`, `GET /chains`, `GET /expirationchain`, `GET /pricehistory`, `GET /movers/{symbol_id}`, `GET /markets`, and `GET /instruments` families. **UNVERIFIED ENTITLEMENT/ASSUMPTION:** freeze the current authenticated official OpenAPI—including `/{symbol_id}/quotes`, `/markets/{market_id}`, and `/instruments/{cusip_id}`—before mapper implementation because later anonymous schema access returned `unauthorized`. |
 | Schwab Streamer bootstrap | **VERIFIED PROVIDER FACT:** use the minimum read-only `GET https://api.schwabapi.com/trader/v1/userPreference`, extract only Streamer/offer fields, obtain the WebSocket URL and login coordinates dynamically, and discard all unrelated returned fields. Do not hard-code a copied socket URL. |
 | Schwab Streamer services | **VERIFIED PROVIDER FACT:** admitted market-data families are `LEVELONE_EQUITIES`, `LEVELONE_OPTIONS`, `LEVELONE_FUTURES`, `LEVELONE_FUTURES_OPTIONS`, `LEVELONE_FOREX`, `NYSE_BOOK`, `NASDAQ_BOOK`, `OPTIONS_BOOK`, `CHART_EQUITY`, `CHART_FUTURES`, `SCREENER_EQUITY`, and `SCREENER_OPTION`. `SUBS` replaces one service's set; one serialized desired-state controller owns the sole connection. Account activity is excluded. |
@@ -181,6 +192,8 @@ Only read-only routes belong in provider profiles. Endpoints and hard caps remai
 | --- | --- | --- |
 | Alpaca Basic | **VERIFIED PROVIDER FACT:** 200 historical calls/minute; 30 equity WebSocket symbols; 200 option quote subscriptions | **APPLICATION POLICY:** provisional 150-RPM maximum and 120-RPM recurring target across admitted Alpaca data work, lowered whenever headers or pressure require |
 | Alpaca latest/snapshot pool | **UNVERIFIED ENTITLEMENT/ASSUMPTION:** no reviewed page proves that the 200 historical-call number is a universal shared latest/snapshot/options allowance | **APPLICATION POLICY:** provider doctor must read `X-RateLimit-*`, HTTP 429, and `Retry-After`; no 8,000-symbol schedule is admitted before this proof |
+| Coinbase public market data | **VERIFIED PROVIDER FACT:** the public WebSocket channels require no authentication; Coinbase Exchange documents 8 requests/second/IP, bursts to 20, and 100 client messages/second/IP for its Exchange WebSocket feed | **APPLICATION POLICY:** one bounded connection per admitted public profile, one configured product on the current profile, exact snapshot/sequence health, adaptive reconnect, and no use as a non-crypto fallback |
+| Kraken Spot public market data | **VERIFIED PROVIDER FACT:** Spot WebSocket v2 exposes public `book` and `trade` channels with explicit subscription acknowledgements; the book carries snapshot/update checksums | **APPLICATION POLICY:** use only the configured pairs/depths through the existing bounded public profile; runtime pressure and provider refusal can only lower work, and no unreviewed numeric capacity is assumed |
 | Yahoo/yfinance | **UNVERIFIED ENTITLEMENT/ASSUMPTION:** Yahoo publishes display timing but no Finance API, watchlist, batch, request-rate, daily-volume, or WebSocket subscription contract; pinned yfinance history fans out per ticker | **APPLICATION POLICY:** enabled for explicit-demand, runtime-admitted enrichment; one shared bounded lane owns cache/coalescing, actual-attempt accounting, and the 429 circuit; never WARM, bulk, or sole-decision authority |
 | Nasdaq Trader/OCC/Cboe reference | **UNVERIFIED ENTITLEMENT/ASSUMPTION:** the reviewed public downloads publish no numeric automated-request ceiling | **APPLICATION POLICY:** fetch each applicable daily/reference file once per provider publication cycle, cache by content digest, and never poll it as a quote source |
 | IEX HIST | **VERIFIED PROVIDER FACT:** HIST is a free T+1, versioned IEX feed-file surface; current product prose describes the most recent 12 months, while no numeric download/day or bandwidth limit is published | **APPLICATION POLICY:** enabled only for explicitly selected feed/date cold imports; pre-admit bytes/storage/decoder capacity and never use it as a live fallback or automatic archive job |
@@ -382,7 +395,7 @@ owns provider roles and scheduling; that reference owns the shared data contract
 
 ```mermaid
 flowchart LR
-    Sources["Alpaca · owner-enabled Schwab · SEC · government APIs · Tiingo · Yahoo · IEX HIST · exchange reference files"]
+    Sources["Alpaca · public Coinbase/Kraken crypto · optional Coinbase Direct · owner-enabled Schwab · SEC · government APIs · Tiingo · Yahoo · IEX HIST · exchange reference files"]
     Raw["Bounded raw evidence"]
     Canonical["Canonical typed schemas"]
     Store["Immutable Parquet generations + manifests"]
@@ -397,6 +410,8 @@ flowchart LR
 | Source | What it supplies | Canonical destination | Product workflows |
 | --- | --- | --- | --- |
 | Alpaca Paper Only/Basic | IEX quotes/trades, snapshots, stock/ETF history, and gap repair | `market_squawk.market_events`, historical `market_squawk.research_observations`, and local bars/features | Markets current view and charts, model inputs, backtests, portfolio marks, and virtual paper |
+| Coinbase Advanced Trade public and Kraken Spot public | Venue-qualified crypto price-level books and trades with explicit public-feed, sequence/checksum, freshness, and `DirectUnverified` evidence | `market_squawk.market_events` and bounded current book projections for exact canonical crypto instruments | Crypto rows in Markets, cross-venue comparison, liquidity/microstructure research, model inputs, and virtual paper only when the separate instrument/risk requirements admit them |
+| Coinbase Exchange Direct, while owner-authorized and healthy | Authenticated direct crypto market data bound to an exact credential and runtime generation | Provider-native raw receipts and `market_squawk.market_events` with its distinct direct-feed evidence | Optional higher-authority crypto Markets evidence and virtual paper; never personal account/position data or real trading |
 | Schwab, while owner-authorized and healthy | Provider-qualified multi-asset quotes; option chains; equity/ETF history; instrument/fundamental lookup; market hours/movers; Level-1 equity/option/futures/forex; venue-book, chart, and screener events | Provider-native raw receipts, `market_squawk.market_events`, `market_squawk.option_snapshots`, historical observations, and typed reference candidates with explicit Schwab quality/delay state | Complementary Markets current/history/options, source comparison, liquidity/microstructure research, model inputs, and paper-market evidence; never personal Portfolio data or real trading |
 | Alpaca options after the Paper key passes entitlement | Indicative option chains, quotes, trades, IV, and Greeks | `market_squawk.option_snapshots` | Options workspace, option research, and volatility features |
 | Nasdaq Trader | Listed equities, ETFs, bonds, symbols, and exchanges | `market_squawk.instrument_lifecycle` | Search, instrument identity, and provider-symbol resolution |
@@ -777,4 +792,8 @@ release candidate, not after every provider lane.
 The fill-in input is the
 [provider credential template](../reference/market-squawk-provider-credentials.env.example), and
 account steps are in [provider account setup](../operations/provider-account-setup.md). The current
-product still cannot consume that file until the thin importer is implemented.
+dirty candidate can consume that format through the existing protected one-time importer. A focused
+real Alpaca Paper/IEX journey imported a protected bundle and exercised the doctor, activation,
+native and MCP Markets reads, clean shutdown, and restart. That result is dirty-candidate
+implementation evidence only: it is not clean exact-head or release acceptance, and it does not
+prove the other selected providers or downstream data-to-workflow capabilities.

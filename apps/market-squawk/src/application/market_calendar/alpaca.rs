@@ -28,7 +28,7 @@ use super::{
 const ALPACA_PROVIDER_ID: &str = "alpaca-market-data";
 const ALPACA_IEX_VENUE: &str = "iex";
 const ALPACA_IEX_MARKET: &str = "IEX";
-const ALPACA_UTC_TIME_ZONE: &str = "UTC";
+const ALPACA_MARKET_TIME_ZONE: &str = "America/New_York";
 const ALPACA_DAILY_TIMEFRAME: &str = "1Day";
 const ALPACA_CALENDAR_ID: &str = "alpaca-v3-calendar-iex-utc";
 const ALPACA_DAILY_RULESET_ID: &str = "alpaca-v3-iex-utc-daily-rules-v1";
@@ -437,7 +437,7 @@ struct ParsedCalendarDay {
 
 fn validate_market_identity(market: &AlpacaMarketWire) -> Result<(), AlpacaIexUtcCalendarError> {
     if market.acronym != ALPACA_IEX_MARKET
-        || market.timezone != ALPACA_UTC_TIME_ZONE
+        || market.timezone != ALPACA_MARKET_TIME_ZONE
         || market.name.is_empty()
         || market.name.len() > MAXIMUM_ALPACA_MARKET_NAME_BYTES
         || market.name.trim() != market.name

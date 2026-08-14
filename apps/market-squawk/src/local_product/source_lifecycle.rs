@@ -1,7 +1,9 @@
 //! Production source lifecycle authority over live and research runtime owners.
 
 use std::{
+    future::Future,
     num::NonZeroU64,
+    pin::Pin,
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -44,12 +46,11 @@ const COINBASE_PUBLIC_LIVE_SURFACE: &str = "coinbase.public-market-data";
 const COINBASE_DIRECT_LIVE_SURFACE: &str = "coinbase.exchange-direct-market-data";
 const KRAKEN_PUBLIC_LIVE_SURFACE: &str = "kraken.spot-public-market-data";
 
-const LIVE_SURFACES: [&str; 6] = [
+const LIVE_SURFACES: [&str; 5] = [
     COINBASE_PUBLIC_LIVE_SURFACE,
     COINBASE_DIRECT_LIVE_SURFACE,
     KRAKEN_PUBLIC_LIVE_SURFACE,
     ProviderMarketAccount::AlpacaBasic.surface_id(),
-    ProviderMarketAccount::TradierBrokerage.surface_id(),
     ProviderMarketAccount::KrakenLevel3.surface_id(),
 ];
 const PUBLIC_LIVE_SURFACES: [&str; 2] = [COINBASE_PUBLIC_LIVE_SURFACE, KRAKEN_PUBLIC_LIVE_SURFACE];
@@ -358,15 +359,43 @@ impl ProductionSourceLifecycleAuthority {
         let prior_credential_generation = transition.record().credential_generation();
         let prior_record = current;
         let result = if LIVE_SURFACES.contains(&provider.as_str()) {
-            self.execute_live(
-                command,
-                prior_record.phase(),
-                prior_session_id,
-                prior_public_configuration_digest,
-                prior_runtime_verification_receipt_digest,
-                prior_credential_generation,
-            )
-            .await
+            let execution: Pin<
+                Box<
+                    dyn Future<Output = Result<LifecycleOutcome, SourceLifecycleError>> + Send + '_,
+                >,
+            > = if command.action() == SourceLifecycleAction::Verify
+                && command.provider().as_str() == ProviderMarketAccount::AlpacaBasic.surface_id()
+            {
+                Box::pin(self.execute_alpaca_verify(
+                    command,
+                    prior_record.phase(),
+                    prior_session_id,
+                    prior_public_configuration_digest,
+                    prior_runtime_verification_receipt_digest,
+                    prior_credential_generation,
+                ))
+            } else if command.action() == SourceLifecycleAction::Start
+                && AccountMarketSurface::parse(command.provider().as_str()).is_some()
+            {
+                Box::pin(
+                    self.execute_account_group_start(
+                        command,
+                        AccountMarketSurface::parse(command.provider().as_str())
+                            .ok_or(SourceLifecycleError::InvalidRequest)?,
+                        prior_session_id,
+                        prior_public_configuration_digest,
+                    ),
+                )
+            } else {
+                Box::pin(self.execute_live(
+                    command,
+                    prior_session_id,
+                    prior_public_configuration_digest,
+                    prior_runtime_verification_receipt_digest,
+                    prior_credential_generation,
+                ))
+            };
+            execution.await
         } else {
             self.execute_research(command, prior_session_id, prior_public_configuration_digest)
                 .await
@@ -565,7 +594,7 @@ impl ProductionSourceLifecycleAuthority {
         })
     }
 
-    async fn execute_live(
+    async fn execute_alpaca_verify(
         &self,
         command: &SourceLifecycleCommand,
         prior_phase: DurableSourceLifecyclePhase,
@@ -574,41 +603,127 @@ impl ProductionSourceLifecycleAuthority {
         prior_runtime_verification_receipt_digest: Option<EvidenceDigest>,
         prior_credential_generation: Option<market_squawk_platform::SecretGeneration>,
     ) -> Result<LifecycleOutcome, SourceLifecycleError> {
-        if command.action() == SourceLifecycleAction::Verify
-            && command.provider().as_str() == ProviderMarketAccount::AlpacaBasic.surface_id()
+        if command.action() != SourceLifecycleAction::Verify
+            || command.provider().as_str() != ProviderMarketAccount::AlpacaBasic.surface_id()
         {
-            let session_id = prior_session_id.ok_or(SourceLifecycleError::InvalidRequest)?;
-            let prior_request = if prior_phase == DurableSourceLifecyclePhase::Active {
-                Some(account_group_request_from_values(
-                    AccountMarketSurface::AlpacaBasic,
-                    prior_session_id,
-                    prior_public_configuration_digest,
-                    prior_runtime_verification_receipt_digest,
-                    prior_credential_generation,
-                )?)
-            } else {
-                None
-            };
-            let lease = self
-                .onboarding
-                .verify_runtime_activation_target(session_id, command.cancellation().child_token())
-                .await
-                .map_err(map_onboarding_error)?;
-            if lease.surface_id() != command.provider()
-                || Some(lease.public_configuration_digest()) != prior_public_configuration_digest
-            {
-                return Err(SourceLifecycleError::Conflict);
-            }
-            if let Some(request) = prior_request {
-                let deadline = self.live.cleanup_deadline().map_err(map_live_error)?;
-                let cleanup = CancellationToken::new();
-                self.live
-                    .stop_account_group(request, None, deadline, &cleanup)
-                    .await
-                    .map_err(map_live_error)?;
-            }
-            return LifecycleOutcome::stopped_with_runtime_verification(&lease);
+            return Err(SourceLifecycleError::InvalidRequest);
         }
+        let session_id = prior_session_id.ok_or(SourceLifecycleError::InvalidRequest)?;
+        let prior_request = if prior_phase == DurableSourceLifecyclePhase::Active {
+            Some(account_group_request_from_values(
+                AccountMarketSurface::AlpacaBasic,
+                prior_session_id,
+                prior_public_configuration_digest,
+                prior_runtime_verification_receipt_digest,
+                prior_credential_generation,
+            )?)
+        } else {
+            None
+        };
+        let verification: Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::ProviderActivationLease,
+                            crate::ProviderOnboardingError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(
+            self.onboarding
+                .verify_runtime_activation_target(session_id, command.cancellation().child_token()),
+        );
+        let lease = verification.await.map_err(map_onboarding_error)?;
+        if lease.surface_id() != command.provider()
+            || Some(lease.public_configuration_digest()) != prior_public_configuration_digest
+        {
+            return Err(SourceLifecycleError::Conflict);
+        }
+        if let Some(request) = prior_request {
+            let deadline = self.live.cleanup_deadline().map_err(map_live_error)?;
+            let cleanup = CancellationToken::new();
+            self.live
+                .stop_account_group(request, None, deadline, &cleanup)
+                .await
+                .map_err(map_live_error)?;
+        }
+        LifecycleOutcome::stopped_with_runtime_verification(&lease)
+    }
+
+    async fn execute_account_group_start(
+        &self,
+        command: &SourceLifecycleCommand,
+        surface: AccountMarketSurface,
+        prior_session_id: Option<uuid::Uuid>,
+        prior_public_configuration_digest: Option<EvidenceDigest>,
+    ) -> Result<LifecycleOutcome, SourceLifecycleError> {
+        if command.action() != SourceLifecycleAction::Start
+            || command.provider().as_str() != surface.surface_id()
+        {
+            return Err(SourceLifecycleError::InvalidRequest);
+        }
+        let lease = match self.optional_exact_lease(command)? {
+            Some(lease) => lease,
+            None => prior_session_id
+                .and_then(|session_id| {
+                    self.onboarding
+                        .activation_lease(session_id)
+                        .or_else(|_| self.onboarding.prepared_activation_lease(session_id))
+                        .ok()
+                })
+                .ok_or(SourceLifecycleError::Unauthorized)?,
+        };
+        if lease.surface_id() != command.provider()
+            || (prior_session_id.is_some() || prior_public_configuration_digest.is_some())
+                && (prior_session_id != Some(lease.session_id())
+                    || prior_public_configuration_digest
+                        != Some(lease.public_configuration_digest()))
+        {
+            return Err(SourceLifecycleError::Conflict);
+        }
+        let request = account_group_request_from_binding(
+            surface,
+            Some(lease.session_id()),
+            Some(lease.public_configuration_digest()),
+            Some(&lease),
+        )?;
+        let startup: Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            MarketProviderGroupLifecycleEvidence,
+                            market_squawk_services::ServiceError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(self.live.start_account_group(
+            request,
+            command.deadline(),
+            command.cancellation(),
+        ));
+        let evidence = startup.await.map_err(map_live_error)?;
+        let group_generation = validate_account_group_evidence(request, &evidence)?;
+        let mut outcome = LifecycleOutcome::active_account(
+            Some(lease.session_id()),
+            Some(lease.public_configuration_digest()),
+            None,
+            request,
+            group_generation,
+        );
+        outcome.bind_runtime_verification(&lease)?;
+        Ok(outcome)
+    }
+
+    async fn execute_live(
+        &self,
+        command: &SourceLifecycleCommand,
+        prior_session_id: Option<uuid::Uuid>,
+        prior_public_configuration_digest: Option<EvidenceDigest>,
+        prior_runtime_verification_receipt_digest: Option<EvidenceDigest>,
+        prior_credential_generation: Option<market_squawk_platform::SecretGeneration>,
+    ) -> Result<LifecycleOutcome, SourceLifecycleError> {
         let supplied_lease = self.optional_exact_lease(command)?;
         let lease = match supplied_lease {
             Some(lease) => Some(lease),
@@ -1705,7 +1820,14 @@ impl SourceLifecycleAuthority for ProductionSourceLifecycleAuthority {
         &self,
         command: SourceLifecycleCommand,
     ) -> Result<SourceLifecycleReceipt, SourceLifecycleError> {
-        self.execute_owned(&command).await
+        let execution: Pin<
+            Box<
+                dyn Future<Output = Result<SourceLifecycleReceipt, SourceLifecycleError>>
+                    + Send
+                    + '_,
+            >,
+        > = Box::pin(self.execute_owned(&command));
+        execution.await
     }
 }
 
