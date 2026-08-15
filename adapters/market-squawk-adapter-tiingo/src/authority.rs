@@ -1,9 +1,10 @@
-//! Tiingo-specific requirements for the product-wide durable provider/account queue.
+//! Tiingo-specific extension requirements for the product-wide durable provider/account queue.
 //!
-//! The adapter deliberately owns no quota database or second admission ledger. The installed
-//! shared provider-rate authority implements this capability so request windows, concurrency,
-//! monthly unique symbols, monthly response bytes, `Retry-After`, and native-schema circuit state
-//! advance in one serialized SQLite authority.
+//! The adapter deliberately owns no quota database or second persistence root. Generic request
+//! windows, concurrency, and refusal backoff use `SharedProviderBudget`; the installed extension
+//! owns Tiingo monthly unique symbols, monthly response bytes, request-graph checkpoints, and the
+//! native-schema circuit. Product composition must root both capabilities in the same stable
+//! provider subject and serialized SQLite authority.
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -11,17 +12,15 @@ use std::num::NonZeroU64;
 use market_squawk_domain::{
     EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
-use market_squawk_sources::{
-    BudgetUnavailableReason, MonotonicInstant, ProviderRateDeclaration,
-};
+use market_squawk_sources::{BudgetUnavailableReason, MonotonicInstant, ProviderRateDeclaration};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
     TIINGO_APPLICATION_BYTES_PER_MONTH, TIINGO_APPLICATION_UNIQUE_SYMBOLS_PER_MONTH,
-    TIINGO_PROVIDER_BYTES_PER_MONTH, TIINGO_PROVIDER_UNIQUE_SYMBOLS_PER_MONTH,
-    TiingoHistoryPlan, TiingoQuotaAdmission, TiingoSchemaChange, TiingoSchemaCircuitState,
-    TiingoSealedHistoryPage, TiingoTicker,
+    TIINGO_PROVIDER_BYTES_PER_MONTH, TIINGO_PROVIDER_UNIQUE_SYMBOLS_PER_MONTH, TiingoHistoryPlan,
+    TiingoQuotaAdmission, TiingoSchemaChange, TiingoSchemaCircuitState, TiingoSealedHistoryPage,
+    TiingoTicker,
 };
 
 /// Exact installation contract the shared provider/account authority must prove at source open.
@@ -107,10 +106,7 @@ impl TiingoProviderAuthorityRequirements {
     fn identity(&self) -> EvidenceDigest {
         digest_fields(&[
             b"market-squawk/tiingo/provider-authority-requirements/v2",
-            &self
-                .provider_rate_declaration
-                .declaration_digest()
-                .bytes(),
+            &self.provider_rate_declaration.declaration_digest().bytes(),
             &self.provider_rate_declaration.policy_digest().bytes(),
             &self.provider_unique_symbols_per_month.to_be_bytes(),
             &self.application_unique_symbols_per_month.to_be_bytes(),
@@ -559,6 +555,8 @@ pub enum TiingoCompletedResponseDisposition {
 /// Exact response settlement applied atomically before a permit can release concurrency.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TiingoResponseSettlement {
+    /// Admission completed, but the exact request never reached transport dispatch.
+    NotDispatched,
     /// A complete bounded response body was received and its terminal meaning is known.
     Complete {
         response_bytes: u64,
@@ -575,6 +573,7 @@ impl TiingoResponseSettlement {
     /// Returns exact bytes observed at the socket boundary.
     pub const fn observed_response_bytes(&self) -> u64 {
         match self {
+            Self::NotDispatched => 0,
             Self::Complete { response_bytes, .. } => *response_bytes,
             Self::Incomplete {
                 observed_response_bytes,
@@ -586,6 +585,7 @@ impl TiingoResponseSettlement {
     /// Returns bytes conservatively charged to the durable monthly ledger.
     pub const fn charged_response_bytes(&self) -> u64 {
         match self {
+            Self::NotDispatched => 0,
             Self::Complete { response_bytes, .. } => *response_bytes,
             Self::Incomplete {
                 charged_response_bytes,
@@ -598,8 +598,13 @@ impl TiingoResponseSettlement {
     pub const fn complete_disposition(&self) -> Option<&TiingoCompletedResponseDisposition> {
         match self {
             Self::Complete { disposition, .. } => Some(disposition),
-            Self::Incomplete { .. } => None,
+            Self::NotDispatched | Self::Incomplete { .. } => None,
         }
+    }
+
+    /// Returns whether the admitted request was cancelled before any transport dispatch.
+    pub const fn was_not_dispatched(&self) -> bool {
+        matches!(self, Self::NotDispatched)
     }
 }
 
@@ -640,19 +645,22 @@ pub trait TiingoProviderAuthority: fmt::Debug + Send + Sync {
     ) -> Result<TiingoHistoryCheckpointReceipt, TiingoProviderAuthorityError>;
 
     /// Atomically validates the native-schema circuit and any history checkpoint, admits every
-    /// request dimension, and returns only after the exact reservation is durable. An open circuit
-    /// must be returned with its exact evidence; checking it only before this transaction is not
-    /// sufficient because another process may open it concurrently.
+    /// Tiingo-specific quota dimension, and returns only after that exact reservation is durable.
+    /// Generic shared-rate reservation follows this transaction and remains uncharged until its
+    /// dispatch commit. An open circuit must be returned with its exact evidence; checking it only
+    /// before this transaction is not sufficient because another process may open it concurrently.
     fn try_acquire(
         &self,
         request: &TiingoProviderAdmissionRequest,
     ) -> Result<TiingoProviderAdmissionDecision, TiingoProviderAuthorityError>;
 
-    /// Atomically settles bytes and terminal response meaning, then releases concurrency last.
+    /// Atomically settles dispatch cancellation or bytes and terminal response meaning, then
+    /// releases concurrency last.
     ///
-    /// A rate-limit disposition must commit shared cooldown in this transaction. A schema-change
-    /// disposition must commit the open circuit in this transaction. A decoded success may clear
-    /// only ordinary refusal escalation; it must never clear a schema circuit.
+    /// A rate-limit disposition must retain the provider-specific response meaning while the
+    /// caller still holds the generic shared-rate permit and commits its refusal transition. A
+    /// schema-change disposition must commit the open circuit in this transaction. A decoded
+    /// success must never clear a schema circuit.
     fn settle_response(
         &self,
         permit: &TiingoProviderPermit,
@@ -664,7 +672,6 @@ pub trait TiingoProviderAuthority: fmt::Debug + Send + Sync {
         &self,
         contract_revision: &SourceIdentifier,
     ) -> Result<TiingoSchemaCircuitState, TiingoProviderAuthorityError>;
-
 }
 
 /// Failure of the one shared Tiingo provider/account authority.

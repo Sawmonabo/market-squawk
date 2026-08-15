@@ -12,10 +12,12 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_sources::{
-    BackoffPolicy, BudgetPoolError, BudgetScope, BudgetUnavailableReason,
-    BudgetWindowSemantics, MonotonicInstant, ProviderBudgetPolicy, ProviderBudgetWindow,
-    ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderRateDeclaration,
+    BackoffPolicy, BudgetDecision, BudgetDispatchDecision, BudgetPoolError,
+    BudgetReservationDecision, BudgetScope, BudgetUnavailableReason, BudgetWindowSemantics,
+    MonotonicInstant, ProviderBudgetPolicy, ProviderBudgetWindow, ProviderCaptureError,
+    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, ProviderRateAuthority, ProviderRateDeclaration,
+    SharedProviderBudget, apply_http_retry_after,
 };
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER};
 use sha2::{Digest as _, Sha256};
@@ -26,14 +28,15 @@ use uuid::Uuid;
 
 use crate::{
     TIINGO_APPLICATION_REQUESTS_PER_DAY, TIINGO_APPLICATION_REQUESTS_PER_HOUR, TiingoAdapterError,
-    TiingoApiToken, TiingoCompletedResponseDisposition, TiingoDecoder, TiingoEndpointFamily,
-    TiingoEodReceipt, TiingoMetadataReceipt, TiingoProviderAdmissionDecision,
-    TiingoProviderAdmissionRequest, TiingoProviderAuthority, TiingoProviderAuthorityError,
-    TiingoProviderAuthorityInstallation, TiingoProviderAuthorityRequirements,
-    TiingoProviderFailure, TiingoProviderPermit, TiingoQuotaAdmission, TiingoRateLimitDisposition,
-    TiingoCompletedHistoryCapture, TiingoHistoryCheckpointReceipt, TiingoHistoryEvidenceError,
-    TiingoHistoryPlan, TiingoRequestBuilder, TiingoRequestSpec, TiingoResponseSettlement,
-    TiingoSchemaChange, TiingoSchemaCircuitState, TiingoSealedHistoryPage, TiingoTicker,
+    TiingoApiToken, TiingoCompletedHistoryCapture, TiingoCompletedResponseDisposition,
+    TiingoDecoder, TiingoEndpointFamily, TiingoEodReceipt, TiingoHistoryCheckpointReceipt,
+    TiingoHistoryEvidenceError, TiingoHistoryPlan, TiingoMetadataReceipt,
+    TiingoProviderAdmissionDecision, TiingoProviderAdmissionRequest, TiingoProviderAuthority,
+    TiingoProviderAuthorityError, TiingoProviderAuthorityInstallation,
+    TiingoProviderAuthorityRequirements, TiingoProviderFailure, TiingoProviderPermit,
+    TiingoQuotaAdmission, TiingoRateLimitDisposition, TiingoRequestBuilder, TiingoRequestSpec,
+    TiingoResponseSettlement, TiingoSchemaChange, TiingoSchemaCircuitState,
+    TiingoSealedHistoryPage, TiingoTicker,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -225,7 +228,7 @@ impl TiingoProviderHttpFailure {
         &self.http
     }
 
-    /// Returns the applied shared refusal decision for HTTP 429/503.
+    /// Returns the applied shared refusal/backoff decision for this non-success response.
     pub const fn rate_limit(&self) -> Option<TiingoRateLimitDisposition> {
         self.rate_limit
     }
@@ -350,6 +353,14 @@ pub enum TiingoHttpSourceError {
         #[source]
         authority: TiingoProviderAuthorityError,
     },
+    /// A complete response could not update the shared generic provider-rate authority.
+    #[error("Tiingo HTTP response could not update shared provider-rate state")]
+    ProviderRateSettlementPersistence {
+        /// Exact retained response material.
+        response: Box<TiingoHttpResponseMaterial>,
+        /// Closed shared-budget failure; the generic authority remains fail-closed.
+        reason: BudgetUnavailableReason,
+    },
     /// A complete successful response could not be bound to source-neutral capture evidence.
     #[error("Tiingo response could not be bound to source-neutral capture evidence")]
     CaptureResponse {
@@ -416,6 +427,7 @@ pub enum TiingoHttpSourceError {
 pub struct TiingoHttpSource {
     requests: TiingoRequestBuilder,
     transport: Arc<dyn TiingoTransport>,
+    budget: SharedProviderBudget,
     authority: Arc<dyn TiingoProviderAuthority>,
     authority_installation: TiingoProviderAuthorityInstallation,
     runtime: tokio::sync::Mutex<TiingoRuntime>,
@@ -449,17 +461,18 @@ impl fmt::Debug for TiingoHttpSource {
 }
 
 impl TiingoHttpSource {
-    /// Opens a hardened production transport behind the one shared durable provider authority.
+    /// Opens a hardened transport behind the shared generic budget and Tiingo extension.
     ///
-    /// The authority must be backed by the product-wide provider/account SQLite queue extended
-    /// with Tiingo monthly-symbol, monthly-bandwidth, and schema-circuit state. The API token is
-    /// never passed through that capability.
+    /// Both capabilities must be backed by the same product-wide provider/account SQLite root,
+    /// extended with Tiingo monthly-symbol, monthly-bandwidth, and schema-circuit state. The API
+    /// token is never passed through either capability.
     #[allow(
         clippy::too_many_arguments,
         reason = "security, source identity, schema identity, and durable authority remain explicit"
     )]
     pub fn try_new(
         token: TiingoApiToken,
+        rate_authority: &ProviderRateAuthority,
         authority: Arc<dyn TiingoProviderAuthority>,
         source_id: SourceId,
         metadata_revision: MetadataRevision,
@@ -471,6 +484,7 @@ impl TiingoHttpSource {
             Arc::new(ReqwestTiingoTransport::new(client.clone()));
         Self::try_new_inner(
             token,
+            rate_authority,
             authority,
             source_id,
             metadata_revision,
@@ -485,6 +499,7 @@ impl TiingoHttpSource {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new_with_transport(
         token: TiingoApiToken,
+        rate_authority: &ProviderRateAuthority,
         authority: Arc<dyn TiingoProviderAuthority>,
         source_id: SourceId,
         metadata_revision: MetadataRevision,
@@ -495,6 +510,7 @@ impl TiingoHttpSource {
         let client = hardened_client()?;
         Self::try_new_inner(
             token,
+            rate_authority,
             authority,
             source_id,
             metadata_revision,
@@ -508,6 +524,7 @@ impl TiingoHttpSource {
     #[allow(clippy::too_many_arguments)]
     fn try_new_inner(
         token: TiingoApiToken,
+        rate_authority: &ProviderRateAuthority,
         authority: Arc<dyn TiingoProviderAuthority>,
         source_id: SourceId,
         metadata_revision: MetadataRevision,
@@ -521,6 +538,7 @@ impl TiingoHttpSource {
         }
         let provider_rate_declaration = tiingo_provider_rate_declaration()?;
         provider_rate_declaration.validate()?;
+        let budget = rate_authority.register_budget(provider_rate_declaration.clone())?;
         let requirements = TiingoProviderAuthorityRequirements::new(
             provider_rate_declaration,
             source_id.clone(),
@@ -538,6 +556,7 @@ impl TiingoHttpSource {
         Ok(Self {
             requests: TiingoRequestBuilder::new(client, token),
             transport,
+            budget,
             authority,
             authority_installation,
             runtime: tokio::sync::Mutex::new(TiingoRuntime {
@@ -834,15 +853,9 @@ impl TiingoHttpSource {
             Err(authority) => authority,
         };
         if schema_change.is_some() {
-            Err(TiingoHttpSourceError::SchemaCircuitPersistence {
-                failure,
-                authority,
-            })
+            Err(TiingoHttpSourceError::SchemaCircuitPersistence { failure, authority })
         } else {
-            Err(TiingoHttpSourceError::DecodeSettlementPersistence {
-                failure,
-                authority,
-            })
+            Err(TiingoHttpSourceError::DecodeSettlementPersistence { failure, authority })
         }
     }
 
@@ -865,6 +878,20 @@ impl TiingoHttpSource {
         }
     }
 
+    fn settle_not_dispatched(
+        &self,
+        permit: &TiingoProviderPermit,
+    ) -> Result<(), TiingoHttpSourceError> {
+        match self
+            .authority
+            .settle_response(permit, &TiingoResponseSettlement::NotDispatched)
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(TiingoProviderAuthorityError::InvalidReceipt.into()),
+            Err(authority) => Err(authority.into()),
+        }
+    }
+
     async fn fetch_raw_locked(
         &self,
         runtime: &mut TiingoRuntime,
@@ -882,9 +909,6 @@ impl TiingoHttpSource {
                 Instant::now(),
             )));
         }
-        let now = system_timestamp()?;
-        let timeout = remaining_timeout(deadline, now)?;
-        let request = self.requests.build(&spec)?;
         let reservation = NonZeroU64::new(
             u64::try_from(spec.max_response_bytes())
                 .map_err(|_| TiingoHttpSourceError::InvalidConfiguration)?,
@@ -912,12 +936,61 @@ impl TiingoHttpSource {
                 return Err(TiingoHttpSourceError::BudgetUnavailable(reason));
             }
         };
-        if !permit.matches(
-            &admission_request,
-            &self.authority_installation,
-        ) {
+        if !permit.matches(&admission_request, &self.authority_installation) {
             return Err(TiingoProviderAuthorityError::InvalidReceipt.into());
         }
+
+        let provider_reservation = match self.budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => reservation,
+            BudgetReservationDecision::WaitUntil(deadline) => {
+                self.settle_not_dispatched(&permit)?;
+                return Err(TiingoHttpSourceError::BudgetWaitUntil(deadline));
+            }
+            BudgetReservationDecision::Unavailable(reason) => {
+                self.settle_not_dispatched(&permit)?;
+                return Err(TiingoHttpSourceError::BudgetUnavailable(reason));
+            }
+        };
+        let request = match self.requests.build(&spec) {
+            Ok(request) => request,
+            Err(error) => {
+                let settlement = self.settle_not_dispatched(&permit);
+                provider_reservation.release();
+                settlement?;
+                return Err(error.into());
+            }
+        };
+        if cancellation.is_cancelled() {
+            let settlement = self.settle_not_dispatched(&permit);
+            provider_reservation.release();
+            settlement?;
+            return Err(TiingoHttpSourceError::Transport(transport_failure(
+                TiingoTransportFailureKind::Cancelled,
+                0,
+                0,
+                Instant::now(),
+            )));
+        }
+        let timeout = match system_timestamp().and_then(|now| remaining_timeout(deadline, now)) {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                let settlement = self.settle_not_dispatched(&permit);
+                provider_reservation.release();
+                settlement?;
+                return Err(error);
+            }
+        };
+        let provider_permit = match provider_reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => permit,
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                self.settle_not_dispatched(&permit)?;
+                return Err(TiingoHttpSourceError::BudgetWaitUntil(deadline));
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                self.settle_not_dispatched(&permit)?;
+                return Err(TiingoHttpSourceError::BudgetUnavailable(reason));
+            }
+        };
 
         let response = match self
             .transport
@@ -935,18 +1008,18 @@ impl TiingoHttpSource {
                     observed_response_bytes: failure.received_body_bytes,
                     charged_response_bytes: failure.quota_charge_bytes,
                 };
-                return match self.authority.settle_response(&permit, &settlement) {
+                let settlement_result = self.authority.settle_response(&permit, &settlement);
+                provider_permit.release();
+                return match settlement_result {
                     Ok(None) => Err(TiingoHttpSourceError::Transport(failure)),
                     Ok(Some(_)) => Err(TiingoHttpSourceError::TransportSettlementPersistence {
                         failure,
                         authority: TiingoProviderAuthorityError::InvalidReceipt,
                     }),
-                    Err(authority) => {
-                        Err(TiingoHttpSourceError::TransportSettlementPersistence {
-                            failure,
-                            authority,
-                        })
-                    }
+                    Err(authority) => Err(TiingoHttpSourceError::TransportSettlementPersistence {
+                        failure,
+                        authority,
+                    }),
                 };
             }
         };
@@ -965,8 +1038,20 @@ impl TiingoHttpSource {
                 response_bytes: response.response_bytes(),
                 disposition,
             };
-            let rate_limit = match self.authority.settle_response(&permit, &settlement) {
-                Ok(rate_limit) if rate_limited == rate_limit.is_some() => rate_limit,
+            let shared_refusal = if rate_limited {
+                apply_http_retry_after(
+                    &self.budget,
+                    response.retry_after(),
+                    BACKOFF_JITTER_BASIS_POINTS,
+                )
+            } else {
+                self.budget.apply_refusal(BACKOFF_JITTER_BASIS_POINTS)
+            };
+            let shared_rate_limit = shared_rate_limit_disposition(shared_refusal);
+            let local_rate_limit = self.authority.settle_response(&permit, &settlement);
+            provider_permit.release();
+            match local_rate_limit {
+                Ok(rate_limit) if rate_limited == rate_limit.is_some() => {}
                 Ok(_) => {
                     return Err(TiingoHttpSourceError::HttpSettlementPersistence {
                         response: Box::new(response),
@@ -977,6 +1062,15 @@ impl TiingoHttpSource {
                     return Err(TiingoHttpSourceError::HttpSettlementPersistence {
                         response: Box::new(response),
                         authority,
+                    });
+                }
+            };
+            let rate_limit = match shared_rate_limit {
+                Ok(rate_limit) => Some(rate_limit),
+                Err(reason) => {
+                    return Err(TiingoHttpSourceError::ProviderRateSettlementPersistence {
+                        response: Box::new(response),
+                        reason,
                     });
                 }
             };
@@ -999,7 +1093,12 @@ impl TiingoHttpSource {
                 response_bytes: response.response_bytes(),
                 disposition: TiingoCompletedResponseDisposition::Rejected,
             };
-            match self.authority.settle_response(&permit, &settlement) {
+            let shared_refusal = shared_rate_limit_disposition(
+                self.budget.apply_refusal(BACKOFF_JITTER_BASIS_POINTS),
+            );
+            let local_settlement = self.authority.settle_response(&permit, &settlement);
+            provider_permit.release();
+            match local_settlement {
                 Ok(None) => {}
                 Ok(Some(_)) => {
                     return Err(TiingoHttpSourceError::HttpSettlementPersistence {
@@ -1014,6 +1113,12 @@ impl TiingoHttpSource {
                     });
                 }
             }
+            if let Err(reason) = shared_refusal {
+                return Err(TiingoHttpSourceError::ProviderRateSettlementPersistence {
+                    response: Box::new(response),
+                    reason,
+                });
+            }
             return Err(TiingoHttpSourceError::InvalidHttpResponse(Box::new(
                 response,
             )));
@@ -1026,8 +1131,19 @@ impl TiingoHttpSource {
                     response_bytes: retained_response.response_bytes(),
                     disposition: TiingoCompletedResponseDisposition::Rejected,
                 };
-                match self.authority.settle_response(&permit, &settlement) {
+                let shared_refusal = shared_rate_limit_disposition(
+                    self.budget.apply_refusal(BACKOFF_JITTER_BASIS_POINTS),
+                );
+                let local_settlement = self.authority.settle_response(&permit, &settlement);
+                provider_permit.release();
+                match local_settlement {
                     Ok(None) => {
+                        if let Err(reason) = shared_refusal {
+                            return Err(TiingoHttpSourceError::ProviderRateSettlementPersistence {
+                                response: Box::new(retained_response),
+                                reason,
+                            });
+                        }
                         return Err(TiingoHttpSourceError::CaptureResponse {
                             response: Box::new(retained_response),
                             capture,
@@ -1048,6 +1164,34 @@ impl TiingoHttpSource {
                 }
             }
         };
+        let shared_success = self.budget.record_success();
+        provider_permit.release();
+        if let Err(reason) = shared_success {
+            let settlement = TiingoResponseSettlement::Complete {
+                response_bytes: raw.http.response_bytes(),
+                disposition: TiingoCompletedResponseDisposition::Rejected,
+            };
+            match self.authority.settle_response(&permit, &settlement) {
+                Ok(None) => {
+                    return Err(TiingoHttpSourceError::ProviderRateSettlementPersistence {
+                        response: Box::new(raw.http.clone()),
+                        reason,
+                    });
+                }
+                Ok(Some(_)) => {
+                    return Err(TiingoHttpSourceError::HttpSettlementPersistence {
+                        response: Box::new(raw.http.clone()),
+                        authority: TiingoProviderAuthorityError::InvalidReceipt,
+                    });
+                }
+                Err(authority) => {
+                    return Err(TiingoHttpSourceError::HttpSettlementPersistence {
+                        response: Box::new(raw.http.clone()),
+                        authority,
+                    });
+                }
+            }
+        }
         Ok(TiingoPendingRawMaterial { raw, permit })
     }
 
@@ -1137,6 +1281,19 @@ pub fn tiingo_provider_rate_declaration() -> Result<ProviderRateDeclaration, Tii
 
 fn identifier(value: &str) -> Result<SourceIdentifier, TiingoHttpSourceError> {
     SourceIdentifier::try_from(value).map_err(|_| TiingoHttpSourceError::InvalidConfiguration)
+}
+
+fn shared_rate_limit_disposition(
+    decision: BudgetDecision,
+) -> Result<TiingoRateLimitDisposition, BudgetUnavailableReason> {
+    match decision {
+        BudgetDecision::WaitUntil(deadline) => Ok(TiingoRateLimitDisposition::WaitUntil(deadline)),
+        BudgetDecision::Unavailable(reason) => Ok(TiingoRateLimitDisposition::Unavailable(reason)),
+        BudgetDecision::Ready(permit) => {
+            permit.release();
+            Err(BudgetUnavailableReason::StateCorrupt)
+        }
+    }
 }
 
 fn content_type_is_json(value: Option<&[u8]>) -> bool {
@@ -1410,18 +1567,232 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
+    use crate::{
+        TiingoHistoryPlan, TiingoQuotaError, TiingoQuotaLedger, TiingoQuotaPermit,
+        TiingoQuotaSnapshot, TiingoQuotaWindows,
+    };
     use market_squawk_domain::{
         CalendarDate, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
     };
     use market_squawk_platform::LocalPaths;
-    use crate::{
-        TiingoHistoryPlan, TiingoQuotaError, TiingoQuotaLedger, TiingoQuotaPermit,
-        TiingoQuotaSnapshot, TiingoQuotaWindows,
+    use market_squawk_sources::{
+        AuthorizationMode, ProviderRateDispatchDecision, ProviderRateGroupId, ProviderRatePermitId,
+        ProviderRateRegistration, ProviderRateReservationDecision, ProviderRateReservationId,
+        ProviderRateRunId, ProviderRateStore, ProviderRateStoreError, RetryAfter,
     };
     use reqwest::header::AUTHORIZATION;
     use uuid::Uuid;
 
     use super::*;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct MemoryRateSnapshot {
+        reservations: u64,
+        dispatches: u64,
+        successes: u64,
+        refusals: u64,
+        active_reservation: Option<ProviderRateReservationId>,
+        active_permit: Option<ProviderRatePermitId>,
+    }
+
+    #[derive(Debug, Default)]
+    struct MemoryRateStore {
+        state: Mutex<MemoryRateSnapshot>,
+    }
+
+    impl MemoryRateStore {
+        fn snapshot(&self) -> Result<MemoryRateSnapshot, ProviderRateStoreError> {
+            self.state
+                .lock()
+                .map(|state| *state)
+                .map_err(|_| ProviderRateStoreError::Unavailable)
+        }
+    }
+
+    impl ProviderRateStore for MemoryRateStore {
+        fn start_run(&self, _now: Timestamp) -> Result<ProviderRateRunId, ProviderRateStoreError> {
+            Ok(ProviderRateRunId::from_bytes([1; 16]))
+        }
+
+        fn register(
+            &self,
+            _run_id: ProviderRateRunId,
+            declaration: &ProviderRateDeclaration,
+            _now: Timestamp,
+        ) -> Result<ProviderRateRegistration, ProviderRateStoreError> {
+            Ok(ProviderRateRegistration::new(
+                ProviderRateGroupId::from_bytes([2; 16]),
+                declaration.policy_digest(),
+                declaration.declaration_digest(),
+            ))
+        }
+
+        fn try_reserve(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?;
+            if state.active_reservation.is_some() || state.active_permit.is_some() {
+                return Err(ProviderRateStoreError::Conflict);
+            }
+            state.reservations = state
+                .reservations
+                .checked_add(1)
+                .ok_or(ProviderRateStoreError::Capacity)?;
+            let reservation_id =
+                ProviderRateReservationId::from_bytes(u128::from(state.reservations).to_be_bytes());
+            state.active_reservation = Some(reservation_id);
+            Ok(ProviderRateReservationDecision::Ready(reservation_id))
+        }
+
+        fn commit_dispatch(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            reservation_id: ProviderRateReservationId,
+            _now: Timestamp,
+        ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?;
+            if state.active_reservation != Some(reservation_id) || state.active_permit.is_some() {
+                return Err(ProviderRateStoreError::Conflict);
+            }
+            state.active_reservation = None;
+            state.dispatches = state
+                .dispatches
+                .checked_add(1)
+                .ok_or(ProviderRateStoreError::Capacity)?;
+            let permit_id = ProviderRatePermitId::from_bytes(reservation_id.bytes());
+            state.active_permit = Some(permit_id);
+            Ok(ProviderRateDispatchDecision::Ready(permit_id))
+        }
+
+        fn cancel_reservation(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            reservation_id: ProviderRateReservationId,
+        ) -> Result<(), ProviderRateStoreError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?;
+            if state.active_reservation != Some(reservation_id) {
+                return Err(ProviderRateStoreError::Conflict);
+            }
+            state.active_reservation = None;
+            Ok(())
+        }
+
+        fn release(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            permit_id: ProviderRatePermitId,
+        ) -> Result<(), ProviderRateStoreError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?;
+            if state.active_permit != Some(permit_id) {
+                return Err(ProviderRateStoreError::Conflict);
+            }
+            state.active_permit = None;
+            Ok(())
+        }
+
+        fn apply_retry_after(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+            _retry_after: RetryAfter,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?;
+            if state.active_permit.is_none() {
+                return Err(ProviderRateStoreError::Conflict);
+            }
+            state.refusals = state
+                .refusals
+                .checked_add(1)
+                .ok_or(ProviderRateStoreError::Capacity)?;
+            Ok(ProviderRateReservationDecision::Unavailable(
+                BudgetUnavailableReason::Disabled,
+            ))
+        }
+
+        fn apply_refusal(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+            _jitter_sample_basis_points: u16,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?;
+            if state.active_permit.is_none() {
+                return Err(ProviderRateStoreError::Conflict);
+            }
+            state.refusals = state
+                .refusals
+                .checked_add(1)
+                .ok_or(ProviderRateStoreError::Capacity)?;
+            Ok(ProviderRateReservationDecision::Unavailable(
+                BudgetUnavailableReason::Disabled,
+            ))
+        }
+
+        fn record_success(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+        ) -> Result<(), ProviderRateStoreError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?;
+            if state.active_permit.is_none() {
+                return Err(ProviderRateStoreError::Conflict);
+            }
+            state.successes = state
+                .successes
+                .checked_add(1)
+                .ok_or(ProviderRateStoreError::Capacity)?;
+            Ok(())
+        }
+
+        fn bind_authorization_subject(
+            &self,
+            _run_id: ProviderRateRunId,
+            _mode: AuthorizationMode,
+            _evidence: EvidenceDigest,
+            _subject: &SourceIdentifier,
+            _now: Timestamp,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn resolve_authorization_subject(
+            &self,
+            _mode: AuthorizationMode,
+            _evidence: EvidenceDigest,
+        ) -> Result<Option<SourceIdentifier>, ProviderRateStoreError> {
+            Ok(None)
+        }
+    }
 
     #[derive(Debug)]
     struct MemoryProviderAuthority {
@@ -1500,8 +1871,7 @@ mod tests {
                     != crate::TIINGO_PROVIDER_UNIQUE_SYMBOLS_PER_MONTH
                 || requirements.application_unique_symbols_per_month()
                     != crate::TIINGO_APPLICATION_UNIQUE_SYMBOLS_PER_MONTH
-                || requirements.provider_bytes_per_month()
-                    != crate::TIINGO_PROVIDER_BYTES_PER_MONTH
+                || requirements.provider_bytes_per_month() != crate::TIINGO_PROVIDER_BYTES_PER_MONTH
                 || requirements.application_bytes_per_month()
                     != crate::TIINGO_APPLICATION_BYTES_PER_MONTH
                 || requirements.source_id() != &self.source_id
@@ -1558,10 +1928,8 @@ mod tests {
             let mut authority_hasher = Sha256::new();
             authority_hasher.update(b"fixture-history-plan");
             authority_hasher.update(plan.request_set_identity().bytes());
-            let authority_receipt = EvidenceDigest::new(
-                DigestAlgorithm::Sha256,
-                authority_hasher.finalize().into(),
-            );
+            let authority_receipt =
+                EvidenceDigest::new(DigestAlgorithm::Sha256, authority_hasher.finalize().into());
             let checkpoint = TiingoHistoryCheckpointReceipt::try_new(
                 plan,
                 0,
@@ -1614,10 +1982,8 @@ mod tests {
             authority_hasher.update(checkpoint.authority_receipt().bytes());
             authority_hasher.update(page.page_identity().bytes());
             authority_hasher.update(next_index.to_be_bytes());
-            let authority_receipt = EvidenceDigest::new(
-                DigestAlgorithm::Sha256,
-                authority_hasher.finalize().into(),
-            );
+            let authority_receipt =
+                EvidenceDigest::new(DigestAlgorithm::Sha256, authority_hasher.finalize().into());
             let next = TiingoHistoryCheckpointReceipt::try_new(
                 &plan,
                 next_index,
@@ -1728,6 +2094,7 @@ mod tests {
                 return Err(TiingoProviderAuthorityError::Conflict);
             };
             let settlement_is_valid = match settlement {
+                TiingoResponseSettlement::NotDispatched => true,
                 TiingoResponseSettlement::Complete { response_bytes, .. } => {
                     *response_bytes <= permit.maximum_response_bytes().get()
                 }
@@ -1742,64 +2109,67 @@ mod tests {
             if pending_permit != permit
                 || pending.ticker() != permit.ticker()
                 || permit.authority_generation() != &self.authority_generation
-                || state
-                    .installation
-                    .as_ref()
-                    .is_none_or(|installation| {
-                        permit.installation_identity() != installation.installation_identity()
-                    })
+                || state.installation.as_ref().is_none_or(|installation| {
+                    permit.installation_identity() != installation.installation_identity()
+                })
                 || !settlement_is_valid
             {
                 return Err(TiingoProviderAuthorityError::InvalidReceipt);
             }
             let mut next_circuit = state.circuit.clone();
             let mut next_provider_disabled = state.provider_disabled;
-            let rate_limit = match settlement.complete_disposition() {
-                None
-                | Some(
+            let rate_limit = match settlement {
+                TiingoResponseSettlement::NotDispatched => None,
+                TiingoResponseSettlement::Incomplete { .. } => None,
+                TiingoResponseSettlement::Complete { disposition, .. } => match disposition {
                     TiingoCompletedResponseDisposition::DecodedSuccess
                     | TiingoCompletedResponseDisposition::ProviderRefusal
-                    | TiingoCompletedResponseDisposition::Rejected,
-                ) => None,
-                Some(TiingoCompletedResponseDisposition::ProviderRateLimited {
-                    retry_after,
-                    jitter_sample_basis_points,
-                }) => {
-                    if retry_after.as_ref().is_some_and(|value| value.len() > 128)
-                        || *jitter_sample_basis_points > 10_000
-                    {
-                        return Err(TiingoProviderAuthorityError::InvalidReceipt);
-                    }
-                    next_provider_disabled = true;
-                    Some(TiingoRateLimitDisposition::Unavailable(
-                        BudgetUnavailableReason::Disabled,
-                    ))
-                }
-                Some(TiingoCompletedResponseDisposition::SchemaChanged {
-                    contract_revision,
-                    change,
-                }) => {
-                    if contract_revision != &self.contract_revision {
-                        return Err(TiingoProviderAuthorityError::InvalidReceipt);
-                    }
-                    match &next_circuit {
-                        TiingoSchemaCircuitState::Closed => {
-                            next_circuit = TiingoSchemaCircuitState::Open(change.clone());
+                    | TiingoCompletedResponseDisposition::Rejected => None,
+                    TiingoCompletedResponseDisposition::ProviderRateLimited {
+                        retry_after,
+                        jitter_sample_basis_points,
+                    } => {
+                        if retry_after.as_ref().is_some_and(|value| value.len() > 128)
+                            || *jitter_sample_basis_points > 10_000
+                        {
+                            return Err(TiingoProviderAuthorityError::InvalidReceipt);
                         }
-                        TiingoSchemaCircuitState::Open(existing) if existing == change => {}
-                        TiingoSchemaCircuitState::Open(_) => {
-                            return Err(TiingoProviderAuthorityError::Conflict);
-                        }
+                        next_provider_disabled = true;
+                        Some(TiingoRateLimitDisposition::Unavailable(
+                            BudgetUnavailableReason::Disabled,
+                        ))
                     }
-                    None
-                }
+                    TiingoCompletedResponseDisposition::SchemaChanged {
+                        contract_revision,
+                        change,
+                    } => {
+                        if contract_revision != &self.contract_revision {
+                            return Err(TiingoProviderAuthorityError::InvalidReceipt);
+                        }
+                        match &next_circuit {
+                            TiingoSchemaCircuitState::Closed => {
+                                next_circuit = TiingoSchemaCircuitState::Open(change.clone());
+                            }
+                            TiingoSchemaCircuitState::Open(existing) if existing == change => {}
+                            TiingoSchemaCircuitState::Open(_) => {
+                                return Err(TiingoProviderAuthorityError::Conflict);
+                            }
+                        }
+                        None
+                    }
+                },
             };
             let mut next_ledger = state.ledger.clone();
-            match next_ledger.commit_response(
-                pending,
-                permit.ticker(),
-                settlement.charged_response_bytes(),
-            ) {
+            let quota_result = if settlement.was_not_dispatched() {
+                next_ledger.cancel_before_dispatch(pending, permit.ticker())
+            } else {
+                next_ledger.commit_response(
+                    pending,
+                    permit.ticker(),
+                    settlement.charged_response_bytes(),
+                )
+            };
+            match quota_result {
                 Ok(()) => {}
                 Err(TiingoQuotaError::ResponseExceededReservation) => {
                     next_provider_disabled = true;
@@ -1825,17 +2195,13 @@ mod tests {
                 .map_err(|_| TiingoProviderAuthorityError::Unavailable)
                 .map(|state| state.circuit.clone())
         }
-
     }
 
     struct TemporaryDirectory(PathBuf);
 
     impl TemporaryDirectory {
         fn new() -> Self {
-            Self(std::env::temp_dir().join(format!(
-                "market-squawk-tiingo-http-{}",
-                Uuid::new_v4()
-            )))
+            Self(std::env::temp_dir().join(format!("market-squawk-tiingo-http-{}", Uuid::new_v4())))
         }
 
         fn path(&self) -> &Path {
@@ -1960,6 +2326,8 @@ mod tests {
             contract_revision.clone(),
             entitlement_generation.clone(),
         )?);
+        let rate_store = Arc::new(MemoryRateStore::default());
+        let rate_authority = ProviderRateAuthority::try_new(rate_store.clone())?;
 
         let success_bodies = vec![
             Bytes::from_static(br#"{"ticker":"VTSAX","name":"Vanguard Total Stock Market Index Fund Admiral Shares","exchangeCode":"MF","description":"Mutual fund","startDate":"2000-11-13","endDate":"2026-01-02"}"#),
@@ -1991,6 +2359,7 @@ mod tests {
         });
         let source = TiingoHttpSource::try_new_with_transport(
             TiingoApiToken::try_new("fixture-token".to_owned())?,
+            &rate_authority,
             authority.clone(),
             source_id.clone(),
             source_contract_revision.clone(),
@@ -2041,12 +2410,7 @@ mod tests {
                 .ok_or("missing expected Tiingo history page")?
                 .clone();
             let captured = source
-                .fetch_history_page(
-                    &history_plan,
-                    &history_checkpoint,
-                    deadline,
-                    &cancellation,
-                )
+                .fetch_history_page(&history_plan, &history_checkpoint, deadline, &cancellation)
                 .await?;
             let sealed_capture = captured
                 .capture_material(
@@ -2059,11 +2423,8 @@ mod tests {
                 captured.decoded(),
                 &sealed_capture,
             )?;
-            history_checkpoint = source.checkpoint_history_page(
-                &history_plan,
-                &history_checkpoint,
-                &sealed_page,
-            )?;
+            history_checkpoint =
+                source.checkpoint_history_page(&history_plan, &history_checkpoint, &sealed_page)?;
             sealed_history_pages.push(sealed_page);
         }
         let completed_history = source.complete_history_capture(
@@ -2100,9 +2461,21 @@ mod tests {
         let encoded = serde_json::to_vec(&snapshot)?;
         let restored: TiingoQuotaSnapshot = serde_json::from_slice(&encoded)?;
         assert_eq!(restored, snapshot);
+        assert_eq!(
+            rate_store.snapshot()?,
+            MemoryRateSnapshot {
+                reservations: 5,
+                dispatches: 5,
+                successes: 4,
+                refusals: 1,
+                active_reservation: None,
+                active_permit: None,
+            }
+        );
 
         let restarted = TiingoHttpSource::try_new_with_transport(
             TiingoApiToken::try_new("fixture-token".to_owned())?,
+            &rate_authority,
             authority.clone(),
             source_id.clone(),
             source_contract_revision.clone(),
@@ -2124,8 +2497,11 @@ mod tests {
             drift_contract.clone(),
             identifier("tiingo-entitlement-generation-11")?,
         )?);
+        let drift_rate_store = Arc::new(MemoryRateStore::default());
+        let drift_rate_authority = ProviderRateAuthority::try_new(drift_rate_store.clone())?;
         let drift_source = TiingoHttpSource::try_new_with_transport(
             TiingoApiToken::try_new("fixture-token".to_owned())?,
+            &drift_rate_authority,
             drift_authority.clone(),
             source_id.clone(),
             source_contract_revision.clone(),
@@ -2138,11 +2514,7 @@ mod tests {
             }])),
         )?;
         match drift_source
-            .fetch_latest(
-                TiingoTicker::try_new("VTSAX")?,
-                deadline,
-                &cancellation,
-            )
+            .fetch_latest(TiingoTicker::try_new("VTSAX")?, deadline, &cancellation)
             .await
         {
             Err(TiingoHttpSourceError::Decode(failure))
@@ -2155,6 +2527,7 @@ mod tests {
         ));
         let drift_restarted = TiingoHttpSource::try_new_with_transport(
             TiingoApiToken::try_new("fixture-token".to_owned())?,
+            &drift_rate_authority,
             drift_authority,
             source_id,
             source_contract_revision,
@@ -2164,16 +2537,23 @@ mod tests {
         )?;
         assert!(matches!(
             drift_restarted
-                .fetch_latest(
-                    TiingoTicker::try_new("VTSAX")?,
-                    deadline,
-                    &cancellation,
-                )
+                .fetch_latest(TiingoTicker::try_new("VTSAX")?, deadline, &cancellation,)
                 .await,
             Err(TiingoHttpSourceError::Adapter(
                 TiingoAdapterError::SchemaCircuitOpen
             ))
         ));
+        assert_eq!(
+            drift_rate_store.snapshot()?,
+            MemoryRateSnapshot {
+                reservations: 1,
+                dispatches: 1,
+                successes: 1,
+                refusals: 0,
+                active_reservation: None,
+                active_permit: None,
+            }
+        );
         Ok(())
     }
 }

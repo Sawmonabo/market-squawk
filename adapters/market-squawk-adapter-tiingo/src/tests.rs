@@ -21,18 +21,16 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    TIINGO_APPLICATION_BYTES_PER_MONTH, TiingoAdapterError,
-    TiingoCompletedFundNavHistoryCandidate, TiingoCompletedHistoryCandidate,
-    TiingoCompletedHistoryCapture, TiingoDecoder, TiingoEodBarTimeAuthority,
-    TiingoEodBarTimeRequest, TiingoEodContractEvidence, TiingoEodExpectedSessionAuthority,
-    TiingoEodExpectedSessionEvidence, TiingoEodExpectedSessionRequest,
-    TiingoEodExpectedSessionValidationReceipt,
-    TiingoEodFinancialCoverageDisposition, TiingoEodInstrumentAuthority,
-    TiingoEodInstrumentKind, TiingoEodMapError, TiingoEodMappingInput, TiingoFundContext,
-    TiingoFundNavContractEvidence, TiingoFundNavHistoryFinancialCoverage,
-    TiingoFundNavMappingInput, TiingoFundSupport, TiingoHistoryCheckpointReceipt,
-    TiingoHistoryPlan, TiingoHistoryTerminalDisposition, TiingoNavValueState,
-    TiingoProviderAuthorityInstallation, TiingoProviderAuthorityRequirements,
+    TIINGO_APPLICATION_BYTES_PER_MONTH, TiingoAdapterError, TiingoCompletedFundNavHistoryCandidate,
+    TiingoCompletedHistoryCandidate, TiingoCompletedHistoryCapture, TiingoDecoder,
+    TiingoEodBarTimeAuthority, TiingoEodBarTimeRequest, TiingoEodContractEvidence,
+    TiingoEodExpectedSessionAuthority, TiingoEodExpectedSessionEvidence,
+    TiingoEodExpectedSessionRequest, TiingoEodExpectedSessionValidationReceipt,
+    TiingoEodFinancialCoverageDisposition, TiingoEodInstrumentAuthority, TiingoEodInstrumentKind,
+    TiingoEodMapError, TiingoEodMappingInput, TiingoFundContext, TiingoFundNavContractEvidence,
+    TiingoFundNavHistoryFinancialCoverage, TiingoFundNavMappingInput, TiingoFundSupport,
+    TiingoHistoryCheckpointReceipt, TiingoHistoryPlan, TiingoHistoryTerminalDisposition,
+    TiingoNavValueState, TiingoProviderAuthorityInstallation, TiingoProviderAuthorityRequirements,
     TiingoQuotaAdmission, TiingoQuotaLedger, TiingoQuotaWindows, TiingoRequestSpec,
     TiingoResponseEvidence, TiingoSealedHistoryPage, TiingoTicker, classify_fund_support,
     map_eod_bars, map_fund_nav_candidate, missing_nav_candidate, normalize_mutual_fund_row,
@@ -200,9 +198,10 @@ impl TiingoEodBarTimeAuthority for FixedEodTimeAuthority {
         &self,
         request: &TiingoEodBarTimeRequest,
     ) -> Result<BarTimeSemantics, TiingoEodMapError> {
-        if request.provider_date() != CalendarDate::new(2026, 8, 10).map_err(|_| {
-            TiingoEodMapError::InvalidTimeAuthority
-        })? {
+        if request.provider_date()
+            != CalendarDate::new(2026, 8, 10)
+                .map_err(|_| TiingoEodMapError::InvalidTimeAuthority)?
+        {
             return Err(TiingoEodMapError::InvalidTimeAuthority);
         }
         let session = MarketBarSessionEvidence::try_new(
@@ -315,7 +314,10 @@ fn mutual_fund_nav_maps_exactly_and_defers_revision_authority() -> Result<(), Bo
     assert_eq!(nav.amount().to_string(), "151.23");
     assert_eq!(nav.currency().as_str(), "USD");
     assert_eq!(candidate.nav_date(), date(2026, 8, 10)?);
-    assert_ne!(latest_response.rows()[0].adjusted_ohlc().3, Some(nav.amount()));
+    assert_ne!(
+        latest_response.rows()[0].adjusted_ohlc().3,
+        Some(nav.amount())
+    );
     let sealed = seal_response(body, latest_response.evidence(), &contract, &store)?;
     let sealed_metadata = seal_response(metadata_body, metadata.evidence(), &contract, &store)?;
     let mapped = map_fund_nav_candidate(TiingoFundNavMappingInput {
@@ -331,10 +333,7 @@ fn mutual_fund_nav_maps_exactly_and_defers_revision_authority() -> Result<(), Bo
         mapped.lineage().completeness(),
         FundNavCompleteness::Complete
     );
-    assert_eq!(
-        mapped.lineage().disposition(),
-        FundNavDisposition::Returned
-    );
+    assert_eq!(mapped.lineage().disposition(), FundNavDisposition::Returned);
     assert_eq!(mapped.nav_date(), date(2026, 8, 10)?);
     assert_eq!(mapped.sealed_capture_receipt(), sealed.receipt_digest());
     assert_eq!(
@@ -389,11 +388,8 @@ fn unsupported_or_missing_fund_stays_explicit_and_quota_is_conjunctive()
         ),
         Err(TiingoAdapterError::InvalidResponseSelection)
     ));
-    let unsupported_plan = TiingoHistoryPlan::try_new(
-        ticker.clone(),
-        date(2026, 8, 10)?,
-        date(2026, 8, 10)?,
-    )?;
+    let unsupported_plan =
+        TiingoHistoryPlan::try_new(ticker.clone(), date(2026, 8, 10)?, date(2026, 8, 10)?)?;
     let response = decoder.decode_eod(
         unsupported_plan.pages()[0].clone(),
         200,
@@ -412,12 +408,8 @@ fn unsupported_or_missing_fund_stays_explicit_and_quota_is_conjunctive()
     assert!(unsupported.provider_row_digest().is_none());
     let sealed = seal_response(empty_body, response.evidence(), &contract, &store)?;
     let sealed_metadata = seal_response(metadata_body, metadata.evidence(), &contract, &store)?;
-    let unsupported_completed_history = completed_single_page_history(
-        unsupported_plan,
-        &response,
-        &sealed,
-        &contract,
-    )?;
+    let unsupported_completed_history =
+        completed_single_page_history(unsupported_plan, &response, &sealed, &contract)?;
     let mapped = map_fund_nav_candidate(TiingoFundNavMappingInput {
         candidate: &unsupported,
         sealed_capture: &sealed,
@@ -499,10 +491,8 @@ fn unsupported_or_missing_fund_stays_explicit_and_quota_is_conjunctive()
         mapped.lineage().completeness(),
         FundNavCompleteness::Incomplete
     );
-    let completed_nav_history = TiingoCompletedFundNavHistoryCandidate::try_new(
-        supported_completed_history,
-        vec![mapped],
-    )?;
+    let completed_nav_history =
+        TiingoCompletedFundNavHistoryCandidate::try_new(supported_completed_history, vec![mapped])?;
     assert_eq!(completed_nav_history.returned_provider_rows(), 0);
     assert_eq!(
         completed_nav_history.financial_coverage(),
@@ -568,9 +558,7 @@ fn unsupported_or_missing_fund_stays_explicit_and_quota_is_conjunctive()
         raw_feed.clone(),
         adjusted_feed.clone(),
         MarketBarAdjustment::All,
-        ExactPayloadEvidence::from_content_digest(digest(
-            b"tiingo-adjusted-eod-surface-v1",
-        )),
+        ExactPayloadEvidence::from_content_digest(digest(b"tiingo-adjusted-eod-surface-v1")),
     )?;
     let eod_instrument = TiingoEodInstrumentAuthority::try_new(
         "06dd06da-ef2d-44dd-bf28-b006da06b24b".parse::<InstrumentId>()?,
@@ -610,8 +598,10 @@ fn unsupported_or_missing_fund_stays_explicit_and_quota_is_conjunctive()
     assert_eq!(mapped_eod.observations().len(), 2);
     assert!(mapped_eod.gaps().is_empty());
     assert_eq!(mapped_eod.provider_actions().len(), 1);
-    let [ResearchObservation::MarketBar(raw), ResearchObservation::MarketBar(adjusted)] =
-        mapped_eod.observations()
+    let [
+        ResearchObservation::MarketBar(raw),
+        ResearchObservation::MarketBar(adjusted),
+    ] = mapped_eod.observations()
     else {
         return Err("expected separate raw and adjusted Tiingo EOD bars".into());
     };
@@ -678,6 +668,19 @@ fn unsupported_or_missing_fund_stays_explicit_and_quota_is_conjunctive()
         TiingoQuotaAdmission::MonthlyBandwidthExhausted
     );
     let reservation = NonZeroU64::new(64).ok_or("expected nonzero reservation")?;
+    let Ok(cancelled) = ledger.reserve(ticker.clone(), reservation)? else {
+        return Err("unexpected pre-dispatch quota denial".into());
+    };
+    ledger.cancel_before_dispatch(&cancelled, &ticker)?;
+    assert_eq!(ledger.snapshot().requests_this_hour(), 0);
+    assert_eq!(ledger.snapshot().requests_this_day(), 0);
+    assert!(ledger.snapshot().pending_response().is_none());
+    assert!(
+        !ledger
+            .snapshot()
+            .unique_symbols_this_month()
+            .contains(&ticker)
+    );
     let Ok(permit) = ledger.reserve(ticker.clone(), reservation)? else {
         return Err("unexpected quota denial".into());
     };

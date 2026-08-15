@@ -269,7 +269,8 @@ impl TiingoQuotaLedger {
             .pending_response
             .as_ref()
             .is_none_or(|pending| snapshot.unique_symbols_this_month.contains(&pending.ticker));
-        let windows_are_ordered = snapshot.windows.day_resets_at() >= snapshot.windows.hour_resets_at()
+        let windows_are_ordered = snapshot.windows.day_resets_at()
+            >= snapshot.windows.hour_resets_at()
             && snapshot.windows.month_resets_at() >= snapshot.windows.day_resets_at();
         let pending_has_charged_request = snapshot.pending_response.is_none()
             || (snapshot.requests_this_hour != 0 && snapshot.requests_this_day != 0);
@@ -377,7 +378,7 @@ impl TiingoQuotaLedger {
             .requests_this_day
             .checked_add(1)
             .ok_or(TiingoQuotaError::Overflow)?;
-        let introduced_monthly_ticker = self
+        let symbol_was_new = self
             .snapshot
             .unique_symbols_this_month
             .insert(ticker.clone());
@@ -393,18 +394,18 @@ impl TiingoQuotaLedger {
         Ok(Ok(TiingoQuotaPermit {
             ticker,
             reserved_response_bytes,
+            symbol_was_new,
             prior_state_version,
             reserved_state_version: self.snapshot.state_version,
-            introduced_monthly_ticker,
         }))
     }
 
-    /// Cancels one exact reservation after aggregate authority proves no request was dispatched.
+    /// Cancels an exact reservation that never reached transport dispatch.
     ///
-    /// The rollback restores request counters and monthly membership while retaining a monotonic
-    /// state version. Its resulting snapshot must be compare-and-swap persisted before another
-    /// request can be admitted.
-    pub fn cancel_undispatched(
+    /// Request, symbol, and response-byte dimensions are restored transactionally while the state
+    /// version still advances. This operation is valid only for the currently pending permit; it
+    /// cannot erase a dispatched or partially observed response.
+    pub fn cancel_before_dispatch(
         &mut self,
         permit: &TiingoQuotaPermit,
         ticker: &TiingoTicker,
@@ -450,10 +451,9 @@ impl TiingoQuotaLedger {
             .state_version
             .checked_add(1)
             .ok_or(TiingoQuotaError::Overflow)?;
-
         self.snapshot.requests_this_hour = requests_this_hour;
         self.snapshot.requests_this_day = requests_this_day;
-        if permit.introduced_monthly_ticker {
+        if permit.symbol_was_new {
             self.snapshot
                 .unique_symbols_this_month
                 .remove(&permit.ticker);
@@ -586,9 +586,9 @@ impl TiingoQuotaLedger {
 pub struct TiingoQuotaPermit {
     ticker: TiingoTicker,
     reserved_response_bytes: NonZeroU64,
+    symbol_was_new: bool,
     prior_state_version: u64,
     reserved_state_version: u64,
-    introduced_monthly_ticker: bool,
 }
 
 impl TiingoQuotaPermit {
