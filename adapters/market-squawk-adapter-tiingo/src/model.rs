@@ -1,6 +1,6 @@
 use std::fmt;
 
-use market_squawk_domain::{CalendarDate, EvidenceDigest, Timestamp};
+use market_squawk_domain::{CalendarDate, EvidenceDigest, SourceIdentifier, Timestamp};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -222,6 +222,8 @@ impl TiingoRequestDisposition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TiingoResponseEvidence {
     request: TiingoRequestSpec,
+    native_contract_revision: SourceIdentifier,
+    entitlement_generation: SourceIdentifier,
     status: u16,
     body_digest: EvidenceDigest,
     response_bytes: u64,
@@ -232,6 +234,8 @@ pub struct TiingoResponseEvidence {
 impl TiingoResponseEvidence {
     pub(crate) const fn new(
         request: TiingoRequestSpec,
+        native_contract_revision: SourceIdentifier,
+        entitlement_generation: SourceIdentifier,
         status: u16,
         body_digest: EvidenceDigest,
         response_bytes: u64,
@@ -240,6 +244,8 @@ impl TiingoResponseEvidence {
     ) -> Self {
         Self {
             request,
+            native_contract_revision,
+            entitlement_generation,
             status,
             body_digest,
             response_bytes,
@@ -251,6 +257,16 @@ impl TiingoResponseEvidence {
     /// Returns the exact credential-free request description.
     pub const fn request(&self) -> &TiingoRequestSpec {
         &self.request
+    }
+
+    /// Returns the exact reviewed provider-native decoder contract revision.
+    pub const fn native_contract_revision(&self) -> &SourceIdentifier {
+        &self.native_contract_revision
+    }
+
+    /// Returns the exact credential/entitlement generation that authorized this response.
+    pub const fn entitlement_generation(&self) -> &SourceIdentifier {
+        &self.entitlement_generation
     }
 
     /// Returns the HTTP status.

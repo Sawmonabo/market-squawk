@@ -230,8 +230,11 @@ pub enum TiingoQuotaAdmission {
     PendingResponseUnreconciled,
 }
 
-/// In-memory transition engine over a snapshot that must be durably compare-and-swap persisted by
-/// the shared provider-rate authority before any request is sent.
+/// Pure Tiingo-dimension transition kernel for the shared provider-rate authority.
+///
+/// The HTTP adapter never owns or runs this as a sidecar limiter. The product-wide SQLite
+/// provider/account queue may use it internally, atomically with its standard windows,
+/// concurrency, retry, byte, symbol, and circuit state, before any request is sent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TiingoQuotaLedger {
     snapshot: TiingoQuotaSnapshot,
@@ -266,7 +269,14 @@ impl TiingoQuotaLedger {
             .pending_response
             .as_ref()
             .is_none_or(|pending| snapshot.unique_symbols_this_month.contains(&pending.ticker));
-        if snapshot.requests_this_hour > TIINGO_APPLICATION_REQUESTS_PER_HOUR
+        let windows_are_ordered = snapshot.windows.day_resets_at() >= snapshot.windows.hour_resets_at()
+            && snapshot.windows.month_resets_at() >= snapshot.windows.day_resets_at();
+        let pending_has_charged_request = snapshot.pending_response.is_none()
+            || (snapshot.requests_this_hour != 0 && snapshot.requests_this_day != 0);
+        if !windows_are_ordered
+            || !pending_has_charged_request
+            || snapshot.requests_this_hour > snapshot.requests_this_day
+            || snapshot.requests_this_hour > TIINGO_APPLICATION_REQUESTS_PER_HOUR
             || snapshot.requests_this_day > TIINGO_APPLICATION_REQUESTS_PER_DAY
             || snapshot.response_bytes_this_month > TIINGO_PROVIDER_BYTES_PER_MONTH
             || snapshot

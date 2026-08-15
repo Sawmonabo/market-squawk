@@ -21,7 +21,7 @@ const MAX_NAME_BYTES: usize = 512;
 const MAX_DESCRIPTION_BYTES: usize = 32 * 1024;
 const MAX_EXCHANGE_CODE_BYTES: usize = 64;
 
-/// Durable schema-circuit state for one exact reviewed native contract revision.
+/// Restart-durable schema-circuit state returned by the single shared provider authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TiingoSchemaCircuitState {
     /// The reviewed contract may decode another response.
@@ -30,109 +30,44 @@ pub enum TiingoSchemaCircuitState {
     Open(TiingoSchemaChange),
 }
 
-/// Fail-closed Tiingo provider-native schema circuit.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TiingoSchemaCircuit {
-    contract_revision: SourceIdentifier,
-    state: TiingoSchemaCircuitState,
-    last_reset_evidence: Option<SourceIdentifier>,
-}
-
-impl TiingoSchemaCircuit {
-    /// Starts a circuit under one exact reviewed provider-native contract revision.
-    pub const fn new(contract_revision: SourceIdentifier) -> Self {
-        Self {
-            contract_revision,
-            state: TiingoSchemaCircuitState::Closed,
-            last_reset_evidence: None,
-        }
-    }
-
-    /// Returns the reviewed native contract revision.
-    pub const fn contract_revision(&self) -> &SourceIdentifier {
-        &self.contract_revision
-    }
-
-    /// Returns current closed/open state and exact opening evidence.
-    pub const fn state(&self) -> &TiingoSchemaCircuitState {
-        &self.state
-    }
-
-    /// Returns evidence for the most recent explicit reviewed reset.
-    pub const fn last_reset_evidence(&self) -> Option<&SourceIdentifier> {
-        self.last_reset_evidence.as_ref()
-    }
-
-    /// Resets an open circuit only while advancing to a different reviewed contract revision.
-    ///
-    /// # Errors
-    ///
-    /// Rejects a reset of a closed circuit or reuse of the failed revision.
-    pub fn reset_after_review(
-        &mut self,
-        next_contract_revision: SourceIdentifier,
-        review_evidence: SourceIdentifier,
-    ) -> Result<(), TiingoAdapterError> {
-        if matches!(self.state, TiingoSchemaCircuitState::Closed)
-            || self.contract_revision == next_contract_revision
-        {
-            return Err(TiingoAdapterError::SchemaCircuitOpen);
-        }
-        self.contract_revision = next_contract_revision;
-        self.state = TiingoSchemaCircuitState::Closed;
-        self.last_reset_evidence = Some(review_evidence);
-        Ok(())
-    }
-
-    fn ensure_closed(&self) -> Result<(), TiingoAdapterError> {
-        if matches!(self.state, TiingoSchemaCircuitState::Closed) {
-            Ok(())
-        } else {
-            Err(TiingoAdapterError::SchemaCircuitOpen)
-        }
-    }
-
-    fn trip(&mut self, change: TiingoSchemaChange) {
-        if matches!(self.state, TiingoSchemaCircuitState::Closed) {
-            self.state = TiingoSchemaCircuitState::Open(change);
-        }
-    }
-}
-
 /// Strict bounded decoder for the reviewed metadata and daily-price native contracts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TiingoDecoder {
-    circuit: TiingoSchemaCircuit,
+    contract_revision: SourceIdentifier,
+    entitlement_generation: SourceIdentifier,
 }
 
 impl TiingoDecoder {
     /// Constructs a decoder bound to one reviewed provider-native contract revision.
-    pub const fn new(contract_revision: SourceIdentifier) -> Self {
+    pub const fn new(
+        contract_revision: SourceIdentifier,
+        entitlement_generation: SourceIdentifier,
+    ) -> Self {
         Self {
-            circuit: TiingoSchemaCircuit::new(contract_revision),
+            contract_revision,
+            entitlement_generation,
         }
     }
 
-    /// Returns the durable fail-closed schema circuit.
-    pub const fn circuit(&self) -> &TiingoSchemaCircuit {
-        &self.circuit
+    /// Returns the exact reviewed provider-native contract revision.
+    pub const fn contract_revision(&self) -> &SourceIdentifier {
+        &self.contract_revision
     }
 
-    /// Returns mutable circuit access for an explicit reviewed reset or persistence handoff.
-    pub const fn circuit_mut(&mut self) -> &mut TiingoSchemaCircuit {
-        &mut self.circuit
+    /// Returns the exact credential/entitlement generation owning decoded responses.
+    pub const fn entitlement_generation(&self) -> &SourceIdentifier {
+        &self.entitlement_generation
     }
 
     /// Decodes one exact metadata response and validates the returned ticker.
     pub fn decode_metadata(
-        &mut self,
+        &self,
         request: TiingoRequestSpec,
         status: u16,
         body: &[u8],
         received_at: Timestamp,
         decoded_at: Timestamp,
     ) -> Result<TiingoMetadataReceipt, TiingoAdapterError> {
-        self.circuit.ensure_closed()?;
         if request.endpoint() != TiingoEndpointFamily::Metadata {
             return Err(TiingoAdapterError::RequestBuild);
         }
@@ -150,6 +85,8 @@ impl TiingoDecoder {
             metadata,
             evidence: TiingoResponseEvidence::new(
                 request,
+                self.contract_revision.clone(),
+                self.entitlement_generation.clone(),
                 status,
                 body_digest,
                 response_bytes,
@@ -162,14 +99,13 @@ impl TiingoDecoder {
 
     /// Decodes one exact latest or application-date-window EOD/NAV response.
     pub fn decode_eod(
-        &mut self,
+        &self,
         request: TiingoRequestSpec,
         status: u16,
         body: &[u8],
         received_at: Timestamp,
         decoded_at: Timestamp,
     ) -> Result<TiingoEodReceipt, TiingoAdapterError> {
-        self.circuit.ensure_closed()?;
         if request.endpoint() == TiingoEndpointFamily::Metadata {
             return Err(TiingoAdapterError::RequestBuild);
         }
@@ -194,6 +130,8 @@ impl TiingoDecoder {
             rows: rows.into_boxed_slice(),
             evidence: TiingoResponseEvidence::new(
                 request,
+                self.contract_revision.clone(),
+                self.entitlement_generation.clone(),
                 status,
                 body_digest,
                 response_bytes,
@@ -206,14 +144,13 @@ impl TiingoDecoder {
     }
 
     fn schema_error(
-        &mut self,
+        &self,
         request: &TiingoRequestSpec,
         reason: TiingoSchemaChangeReason,
         body_digest: EvidenceDigest,
         observed_at: Timestamp,
     ) -> TiingoAdapterError {
         let change = TiingoSchemaChange::new(request.endpoint(), reason, body_digest, observed_at);
-        self.circuit.trip(change.clone());
         TiingoAdapterError::SchemaChanged(change)
     }
 }

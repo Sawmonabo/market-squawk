@@ -1,15 +1,19 @@
 //! Bounded Tiingo Starter adapter core for supported mutual-fund NAV and curated daily EOD data.
 //!
 //! The crate owns only provider-specific authentication, request planning, native decoding,
-//! NAV-versus-EOD semantics, exact canonical mapping, and persistent quota-state contracts. It
-//! does not allocate canonical revisions, publish datasets, or claim that a provider EOD row is
-//! an intraday trade or bar. Its optional HTTP source emits bounded raw/capture/native receipts;
-//! canonical NAV mapping requires their shared durable seal and shared observed-revision input.
+//! NAV-versus-EOD semantics, exact pre-publication canonical mapping, and Tiingo-specific shared
+//! authority requirements. It does not allocate canonical revisions, mint dataset/PIT receipts,
+//! or claim that a provider EOD row is an intraday trade or bar. Its optional HTTP source emits
+//! one bounded raw/capture/native page at a time; shared durable authority must seal/checkpoint
+//! each page and own quota, schema-circuit, revision, immutable publication, and PIT selection.
 
+mod authority;
 mod canonical;
 mod credentials;
 mod decoder;
+mod eod;
 mod error;
+mod history;
 mod http;
 mod model;
 mod nav;
@@ -17,20 +21,41 @@ mod quota;
 mod request;
 
 pub use canonical::{
-    TiingoFundNavContractEvidence, TiingoFundNavMapError, TiingoFundNavMappingInput,
-    TiingoFundNavRevisionLinks, TiingoMappedFundNav, map_fund_nav,
+    TiingoCompletedFundNavHistoryCandidate, TiingoFundNavCanonicalCandidate,
+    TiingoFundNavContractEvidence, TiingoFundNavHistoryFinancialCoverage, TiingoFundNavMapError,
+    TiingoFundNavMappingInput, map_fund_nav_candidate,
+};
+pub use authority::{
+    TiingoCompletedResponseDisposition, TiingoProviderAdmissionDecision,
+    TiingoHistoryCheckpointReceipt, TiingoProviderAdmissionRequest, TiingoProviderAuthority,
+    TiingoProviderAuthorityError, TiingoProviderAuthorityInstallation,
+    TiingoProviderAuthorityRequirements, TiingoProviderPermit, TiingoRateLimitDisposition,
+    TiingoResponseSettlement,
 };
 pub use credentials::{TiingoApiToken, TiingoRequestBuilder};
-pub use decoder::{TiingoDecoder, TiingoSchemaCircuit, TiingoSchemaCircuitState};
+pub use decoder::{TiingoDecoder, TiingoSchemaCircuitState};
+pub use eod::{
+    TiingoCompletedHistoryCandidate, TiingoEodBarTimeAuthority, TiingoEodBarTimeRequest,
+    TiingoEodContractEvidence, TiingoEodExpectedSessionAuthority,
+    TiingoEodExpectedSessionEvidence, TiingoEodExpectedSessionRequest,
+    TiingoEodExpectedSessionValidationReceipt,
+    TiingoEodFinancialCoverageDisposition, TiingoEodInstrumentAuthority,
+    TiingoEodInstrumentKind, TiingoEodMapError, TiingoEodMappingInput,
+    TiingoEodProviderActionEvidence, TiingoEodSurface, TiingoEodSurfaceGap,
+    TiingoEodSurfaceGapReason, TiingoMappedEodPage, map_eod_bars,
+};
 pub use error::{
     TiingoAdapterError, TiingoProviderFailure, TiingoSchemaChange, TiingoSchemaChangeReason,
 };
 pub use http::{
-    TiingoCaptureMaterialError, TiingoCapturedPage, TiingoDecodeFailure, TiingoHistoryCapture,
-    TiingoHistoryTerminalDisposition, TiingoHttpResponseMaterial, TiingoHttpSource,
-    TiingoHttpSourceError, TiingoProviderHttpFailure, TiingoQuotaStore, TiingoQuotaStoreError,
-    TiingoRateLimitDisposition, TiingoRawMaterial, TiingoTransportFailure,
+    TiingoCaptureMaterialError, TiingoCapturedPage, TiingoDecodeFailure,
+    TiingoHttpResponseMaterial, TiingoHttpSource, TiingoHttpSourceError,
+    TiingoProviderHttpFailure, TiingoRawMaterial, TiingoTransportFailure,
     TiingoTransportFailureKind, tiingo_provider_rate_declaration,
+};
+pub use history::{
+    TiingoCompletedHistoryCapture, TiingoHistoryEvidenceError,
+    TiingoHistoryTerminalDisposition, TiingoSealedHistoryPage,
 };
 pub use model::{
     TiingoApplicationPage, TiingoCoverage, TiingoEodReceipt, TiingoEodRow, TiingoMetadata,
@@ -41,7 +66,7 @@ pub use nav::{
     TiingoAvailabilityGuidance, TiingoFundContext, TiingoFundSupport, TiingoNavClocks,
     TiingoNavInvalidReason, TiingoNavObservationCandidate, TiingoNavValueState,
     TiingoProviderRevisionEvidence, TiingoSourcePublicationEvidence, classify_fund_support,
-    normalize_mutual_fund_row, unavailable_nav_candidate,
+    missing_nav_candidate, normalize_mutual_fund_row,
 };
 pub use quota::{
     TIINGO_APPLICATION_BYTES_PER_MONTH, TIINGO_APPLICATION_REQUESTS_PER_DAY,

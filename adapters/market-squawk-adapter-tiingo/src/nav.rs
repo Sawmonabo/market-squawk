@@ -1,6 +1,6 @@
 use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, Currency, DigestAlgorithm, EvidenceDigest, InstrumentId,
-    Money, ProviderInstrumentId, SourceIdentifier, Timestamp,
+    Money, ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
@@ -20,10 +20,11 @@ pub struct TiingoFundContext {
     instrument_id: InstrumentId,
     provider_instrument_id: ProviderInstrumentId,
     ticker: TiingoTicker,
-    instrument_definition_revision: SourceIdentifier,
-    mutual_fund_classification_revision: SourceIdentifier,
+    instrument_definition: RevisionBoundPayloadEvidence,
+    mutual_fund_classification: RevisionBoundPayloadEvidence,
     entitlement_generation: SourceIdentifier,
     native_schema_revision: SourceIdentifier,
+    resolved_at: Timestamp,
     currency: Currency,
 }
 
@@ -39,23 +40,36 @@ impl TiingoFundContext {
         instrument_id: InstrumentId,
         provider_instrument_id: ProviderInstrumentId,
         ticker: TiingoTicker,
-        instrument_definition_revision: SourceIdentifier,
-        mutual_fund_classification_revision: SourceIdentifier,
+        instrument_definition: RevisionBoundPayloadEvidence,
+        mutual_fund_classification: RevisionBoundPayloadEvidence,
         entitlement_generation: SourceIdentifier,
         native_schema_revision: SourceIdentifier,
+        resolved_at: Timestamp,
         currency: Currency,
     ) -> Result<Self, TiingoAdapterError> {
-        if provider_instrument_id.as_str() != ticker.as_str() {
+        if provider_instrument_id.as_str() != ticker.as_str()
+            || instrument_definition
+                .payload_evidence()
+                .content_digest()
+                .bytes()
+                == [0; 32]
+            || mutual_fund_classification
+                .payload_evidence()
+                .content_digest()
+                .bytes()
+                == [0; 32]
+        {
             return Err(TiingoAdapterError::InvalidFundContext);
         }
         Ok(Self {
             instrument_id,
             provider_instrument_id,
             ticker,
-            instrument_definition_revision,
-            mutual_fund_classification_revision,
+            instrument_definition,
+            mutual_fund_classification,
             entitlement_generation,
             native_schema_revision,
+            resolved_at,
             currency,
         })
     }
@@ -76,13 +90,13 @@ impl TiingoFundContext {
     }
 
     /// Returns the exact external instrument-definition revision.
-    pub const fn instrument_definition_revision(&self) -> &SourceIdentifier {
-        &self.instrument_definition_revision
+    pub const fn instrument_definition(&self) -> &RevisionBoundPayloadEvidence {
+        &self.instrument_definition
     }
 
     /// Returns the evidence revision proving this share class is a mutual fund.
-    pub const fn mutual_fund_classification_revision(&self) -> &SourceIdentifier {
-        &self.mutual_fund_classification_revision
+    pub const fn mutual_fund_classification(&self) -> &RevisionBoundPayloadEvidence {
+        &self.mutual_fund_classification
     }
 
     /// Returns the credential/entitlement generation authorizing the response.
@@ -93,6 +107,11 @@ impl TiingoFundContext {
     /// Returns the reviewed provider-native decoder revision.
     pub const fn native_schema_revision(&self) -> &SourceIdentifier {
         &self.native_schema_revision
+    }
+
+    /// Returns when exact fund/share-class/provider identity became locally available.
+    pub const fn resolved_at(&self) -> Timestamp {
+        self.resolved_at
     }
 
     /// Returns exact externally resolved currency. Tiingo wire data never supplies this field.
@@ -240,9 +259,16 @@ pub struct TiingoNavObservationCandidate {
     value: TiingoNavValueState,
     clocks: TiingoNavClocks,
     provider_revision: TiingoProviderRevisionEvidence,
+    response_endpoint: crate::TiingoEndpointFamily,
     response_status: u16,
     request_identity: EvidenceDigest,
     raw_object_digest: EvidenceDigest,
+    metadata_response_status: u16,
+    metadata_request_identity: EvidenceDigest,
+    metadata_raw_object_digest: EvidenceDigest,
+    metadata_response_bytes: u64,
+    metadata_received_at: Timestamp,
+    provider_row_index: Option<u32>,
     provider_row_digest: Option<EvidenceDigest>,
     pagination: TiingoPaginationEvidence,
     request_disposition: TiingoRequestDisposition,
@@ -277,6 +303,11 @@ impl TiingoNavObservationCandidate {
         self.provider_revision
     }
 
+    /// Returns the exact latest/history daily-price response family.
+    pub const fn response_endpoint(&self) -> crate::TiingoEndpointFamily {
+        self.response_endpoint
+    }
+
     /// Returns the exact successful provider status retained by native decoding.
     pub const fn response_status(&self) -> u16 {
         self.response_status
@@ -290,6 +321,36 @@ impl TiingoNavObservationCandidate {
     /// Returns the exact raw response-body identity.
     pub const fn raw_object_digest(&self) -> EvidenceDigest {
         self.raw_object_digest
+    }
+
+    /// Returns the exact successful metadata-response status.
+    pub const fn metadata_response_status(&self) -> u16 {
+        self.metadata_response_status
+    }
+
+    /// Returns the exact credential-free metadata-request identity.
+    pub const fn metadata_request_identity(&self) -> EvidenceDigest {
+        self.metadata_request_identity
+    }
+
+    /// Returns the exact raw metadata-response identity.
+    pub const fn metadata_raw_object_digest(&self) -> EvidenceDigest {
+        self.metadata_raw_object_digest
+    }
+
+    /// Returns exact retained metadata-response bytes.
+    pub const fn metadata_response_bytes(&self) -> u64 {
+        self.metadata_response_bytes
+    }
+
+    /// Returns when exact metadata response receipt completed locally.
+    pub const fn metadata_received_at(&self) -> Timestamp {
+        self.metadata_received_at
+    }
+
+    /// Returns the exact zero-based provider-native row ordinal when a row existed.
+    pub const fn provider_row_index(&self) -> Option<u32> {
+        self.provider_row_index
     }
 
     /// Returns the exact provider-native row identity when a row existed.
@@ -331,9 +392,15 @@ pub fn normalize_mutual_fund_row(
     context: TiingoFundContext,
     metadata: &TiingoMetadataReceipt,
     response: &TiingoEodReceipt,
-    row: &TiingoEodRow,
+    row_index: usize,
 ) -> Result<TiingoNavObservationCandidate, TiingoAdapterError> {
     validate_context(&context, metadata, response.evidence())?;
+    let row = response
+        .rows()
+        .get(row_index)
+        .ok_or(TiingoAdapterError::InvalidResponseSelection)?;
+    let provider_row_index =
+        u32::try_from(row_index).map_err(|_| TiingoAdapterError::InvalidResponseSelection)?;
     if metadata.metadata().exchange_code() != TIINGO_MUTUAL_FUND_EXCHANGE_CODE {
         return Err(TiingoAdapterError::InvalidFundContext);
     }
@@ -351,28 +418,73 @@ pub fn normalize_mutual_fund_row(
         context,
         row.date(),
         value,
+        metadata.evidence(),
         response.evidence(),
+        Some(provider_row_index),
         Some(row.row_digest()),
         response.pagination(),
         response.disposition(),
     ))
 }
 
-/// Constructs explicit unsupported/not-yet-published/source-missing/unavailable evidence.
+/// Constructs an explicit unsupported or source-missing NAV from one successful, empty,
+/// exact-single-date history response.
 ///
 /// # Errors
 ///
-/// Rejects `Observed`, which must come only from strict row normalization, and rejects a response
-/// for a different provider ticker.
-pub fn unavailable_nav_candidate(
+/// `NotYetPublished` requires separate scheduler authority, while `Unavailable` requires exact
+/// retrieval/quota/publication failure evidence. Neither may be inferred from a successful empty
+/// response. A latest response has no date scope and cannot prove a dated missing-state family.
+/// `Observed`/`Invalid` remain row-normalization outcomes.
+pub fn missing_nav_candidate(
     context: TiingoFundContext,
     nav_date: CalendarDate,
     state: TiingoNavValueState,
-    evidence: &TiingoResponseEvidence,
-    disposition: TiingoRequestDisposition,
+    metadata: &TiingoMetadataReceipt,
+    response: &TiingoEodReceipt,
 ) -> Result<TiingoNavObservationCandidate, TiingoAdapterError> {
-    if matches!(state, TiingoNavValueState::Observed(_))
+    let evidence = response.evidence();
+    let disposition = response.disposition();
+    let supported = matches!(metadata.metadata().coverage(), TiingoCoverage::Supported { .. });
+    let date_is_covered = metadata.metadata().coverage().contains(nav_date);
+    let state_matches_metadata = match state {
+        TiingoNavValueState::Unsupported => !supported,
+        TiingoNavValueState::SourceMissing => {
+            supported
+                && date_is_covered
+                && metadata.metadata().exchange_code() == TIINGO_MUTUAL_FUND_EXCHANGE_CODE
+        }
+        TiingoNavValueState::Observed(_)
+        | TiingoNavValueState::Invalid(_)
+        | TiingoNavValueState::NotYetPublished
+        | TiingoNavValueState::Unavailable => false,
+    };
+    if !state_matches_metadata {
+        return Err(TiingoAdapterError::UnprovenNavState);
+    }
+    let exact_single_date_absence = matches!(
+        evidence.request().scope(),
+        TiingoRequestScope::History {
+            start_date,
+            end_date,
+            ..
+        } if *start_date == nav_date && *end_date == nav_date
+    );
+    if !response.rows().is_empty()
+        || disposition.returned_rows() != 0
+        || !exact_single_date_absence
+    {
+        return Err(TiingoAdapterError::InvalidResponseSelection);
+    }
+    if context.ticker() != metadata.metadata().ticker()
         || context.ticker() != evidence.request().ticker()
+        || evidence.request().endpoint() == crate::TiingoEndpointFamily::Metadata
+        || context.native_schema_revision() != metadata.evidence().native_contract_revision()
+        || context.native_schema_revision() != evidence.native_contract_revision()
+        || context.entitlement_generation() != metadata.evidence().entitlement_generation()
+        || context.entitlement_generation() != evidence.entitlement_generation()
+        || metadata.evidence().decoded_at() > evidence.received_at()
+        || context.resolved_at() > evidence.received_at()
     {
         return Err(TiingoAdapterError::InvalidFundContext);
     }
@@ -380,7 +492,9 @@ pub fn unavailable_nav_candidate(
         context,
         nav_date,
         state,
+        metadata.evidence(),
         evidence,
+        None,
         None,
         pagination_from_request(evidence),
         disposition,
@@ -406,6 +520,12 @@ fn validate_context(
     if context.ticker() != metadata.metadata().ticker()
         || context.ticker() != response.request().ticker()
         || context.provider_instrument_id().as_str() != context.ticker().as_str()
+        || metadata.evidence().decoded_at() > response.received_at()
+        || context.native_schema_revision() != metadata.evidence().native_contract_revision()
+        || context.native_schema_revision() != response.native_contract_revision()
+        || context.entitlement_generation() != metadata.evidence().entitlement_generation()
+        || context.entitlement_generation() != response.entitlement_generation()
+        || context.resolved_at() > response.received_at()
     {
         return Err(TiingoAdapterError::InvalidFundContext);
     }
@@ -434,7 +554,9 @@ fn build_candidate(
     context: TiingoFundContext,
     nav_date: CalendarDate,
     value: TiingoNavValueState,
+    metadata: &TiingoResponseEvidence,
     response: &TiingoResponseEvidence,
+    provider_row_index: Option<u32>,
     provider_row_digest: Option<EvidenceDigest>,
     pagination: TiingoPaginationEvidence,
     request_disposition: TiingoRequestDisposition,
@@ -442,17 +564,30 @@ fn build_candidate(
     let family_identity = nav_family_identity(&context, nav_date);
     let payload_identity = nav_payload_identity(family_identity, value);
     let clocks = TiingoNavClocks::from_response(nav_date, response);
-    let provenance_identity =
-        nav_provenance_identity(&context, response, provider_row_digest, request_disposition);
+    let provenance_identity = nav_provenance_identity(
+        &context,
+        metadata,
+        response,
+        provider_row_index,
+        provider_row_digest,
+        request_disposition,
+    );
     TiingoNavObservationCandidate {
         context,
         nav_date,
         value,
         clocks,
         provider_revision: TiingoProviderRevisionEvidence::NotSupplied,
+        response_endpoint: response.request().endpoint(),
         response_status: response.status(),
         request_identity: response.request().request_identity(),
         raw_object_digest: response.body_digest(),
+        metadata_response_status: metadata.status(),
+        metadata_request_identity: metadata.request().request_identity(),
+        metadata_raw_object_digest: metadata.body_digest(),
+        metadata_response_bytes: metadata.response_bytes(),
+        metadata_received_at: metadata.received_at(),
+        provider_row_index,
         provider_row_digest,
         pagination,
         request_disposition,
@@ -510,22 +645,47 @@ fn nav_payload_identity(family: EvidenceDigest, value: TiingoNavValueState) -> E
 
 fn nav_provenance_identity(
     context: &TiingoFundContext,
+    metadata: &TiingoResponseEvidence,
     response: &TiingoResponseEvidence,
+    provider_row_index: Option<u32>,
     provider_row_digest: Option<EvidenceDigest>,
     disposition: TiingoRequestDisposition,
 ) -> EvidenceDigest {
     let mut hasher = Sha256::new();
-    append_field(&mut hasher, b"market-squawk.fund-nav-provenance.v1");
+    append_field(&mut hasher, b"market-squawk.fund-nav-provenance.v2");
     append_field(
         &mut hasher,
-        context.instrument_definition_revision().as_str().as_bytes(),
+        context
+            .instrument_definition()
+            .metadata_revision()
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
     );
     append_field(
         &mut hasher,
         context
-            .mutual_fund_classification_revision()
+            .mutual_fund_classification()
+            .metadata_revision()
+            .as_source_identifier()
             .as_str()
             .as_bytes(),
+    );
+    append_field(
+        &mut hasher,
+        &context
+            .instrument_definition()
+            .payload_evidence()
+            .content_digest()
+            .bytes(),
+    );
+    append_field(
+        &mut hasher,
+        &context
+            .mutual_fund_classification()
+            .payload_evidence()
+            .content_digest()
+            .bytes(),
     );
     append_field(
         &mut hasher,
@@ -535,8 +695,22 @@ fn nav_provenance_identity(
         &mut hasher,
         context.native_schema_revision().as_str().as_bytes(),
     );
+    append_field(
+        &mut hasher,
+        &context.resolved_at().unix_nanos().to_be_bytes(),
+    );
     append_field(&mut hasher, &response.body_digest().bytes());
-    if let Some(row) = provider_row_digest {
+    append_field(&mut hasher, &metadata.body_digest().bytes());
+    append_field(
+        &mut hasher,
+        &metadata.request().request_identity().bytes(),
+    );
+    append_field(
+        &mut hasher,
+        &metadata.received_at().unix_nanos().to_be_bytes(),
+    );
+    if let (Some(row_index), Some(row)) = (provider_row_index, provider_row_digest) {
+        append_field(&mut hasher, &row_index.to_be_bytes());
         append_field(&mut hasher, &row.bytes());
     } else {
         append_field(&mut hasher, b"no-provider-row");

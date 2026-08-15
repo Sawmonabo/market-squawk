@@ -83,6 +83,28 @@ impl TiingoSchemaChange {
         }
     }
 
+    /// Reconstructs one exact restart-durable open-circuit fact from the shared authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty digest, which cannot identify the response that opened the circuit.
+    pub fn try_from_durable_evidence(
+        endpoint: TiingoEndpointFamily,
+        reason: TiingoSchemaChangeReason,
+        response_digest: EvidenceDigest,
+        observed_at: Timestamp,
+    ) -> Result<Self, TiingoAdapterError> {
+        if response_digest.bytes() == [0; 32] {
+            return Err(TiingoAdapterError::InvalidSchemaCircuitEvidence);
+        }
+        Ok(Self::new(
+            endpoint,
+            reason,
+            response_digest,
+            observed_at,
+        ))
+    }
+
     /// Returns the response family whose native contract changed.
     pub const fn endpoint(&self) -> TiingoEndpointFamily {
         self.endpoint
@@ -134,12 +156,21 @@ pub enum TiingoAdapterError {
     /// The provider-native schema circuit is already open.
     #[error("Tiingo native-schema circuit is open")]
     SchemaCircuitOpen,
+    /// Restart-durable schema-circuit evidence was empty or malformed.
+    #[error("invalid Tiingo native-schema circuit evidence")]
+    InvalidSchemaCircuitEvidence,
     /// The current body violated the reviewed provider-native contract and opened the circuit.
     #[error("Tiingo native schema changed")]
     SchemaChanged(TiingoSchemaChange),
     /// Exact fund/share-class context was incompatible with the provider row.
     #[error("invalid Tiingo fund normalization context")]
     InvalidFundContext,
+    /// A caller selected a row or absence state that was not contained in the exact response.
+    #[error("invalid Tiingo response selection")]
+    InvalidResponseSelection,
+    /// The requested NAV missing/unavailable state was not proven by the supplied evidence.
+    #[error("Tiingo NAV state is not proven by the supplied evidence")]
+    UnprovenNavState,
 }
 
 pub(crate) type SchemaResult<T> = Result<T, TiingoSchemaChangeReason>;

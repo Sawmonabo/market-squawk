@@ -198,6 +198,7 @@ pub struct TiingoHistoryPlan {
     start_date: CalendarDate,
     end_date: CalendarDate,
     pages: Box<[TiingoRequestSpec]>,
+    maximum_response_bytes: u64,
 }
 
 impl TiingoHistoryPlan {
@@ -247,11 +248,19 @@ impl TiingoHistoryPlan {
             )?);
         }
 
+        let maximum_response_bytes = pages.iter().try_fold(0_u64, |total, page| {
+            let page_bytes = u64::try_from(page.max_response_bytes())
+                .map_err(|_| TiingoAdapterError::HistoryTooLarge)?;
+            total
+                .checked_add(page_bytes)
+                .ok_or(TiingoAdapterError::HistoryTooLarge)
+        })?;
         Ok(Self {
             ticker,
             start_date,
             end_date,
             pages: pages.into_boxed_slice(),
+            maximum_response_bytes,
         })
     }
 
@@ -270,10 +279,16 @@ impl TiingoHistoryPlan {
         &self.pages
     }
 
+    /// Returns the complete plan's worst-case response bytes for pre-dispatch storage/quota
+    /// admission. A scheduler must admit this aggregate capacity before requesting page one.
+    pub const fn maximum_response_bytes(&self) -> u64 {
+        self.maximum_response_bytes
+    }
+
     /// Returns the credential-free identity of the complete ordered application date-window plan.
     pub fn request_set_identity(&self) -> EvidenceDigest {
         let mut hash = Sha256::new();
-        hash.update(b"market-squawk/tiingo/history-request-set/v1\0");
+        hash.update(b"market-squawk/tiingo/history-request-set/v2\0");
         hash.update(self.ticker.as_str().as_bytes());
         hash.update(self.start_date.to_string().as_bytes());
         hash.update([0]);
@@ -283,6 +298,7 @@ impl TiingoHistoryPlan {
                 .unwrap_or(u64::MAX)
                 .to_be_bytes(),
         );
+        hash.update(self.maximum_response_bytes.to_be_bytes());
         for page in &self.pages {
             hash.update(page.request_identity().bytes());
         }

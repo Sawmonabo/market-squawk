@@ -12,12 +12,10 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_sources::{
-    BackoffPolicy, BudgetDecision, BudgetDispatchDecision, BudgetPoolError,
-    BudgetReservationDecision, BudgetScope, BudgetUnavailableReason, BudgetWindowSemantics,
-    MonotonicInstant, ProviderBudgetPolicy, ProviderBudgetWindow, ProviderCaptureError,
-    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition, ProviderRateAuthority, ProviderRateDeclaration,
-    SharedProviderBudget, apply_http_retry_after,
+    BackoffPolicy, BudgetPoolError, BudgetScope, BudgetUnavailableReason,
+    BudgetWindowSemantics, MonotonicInstant, ProviderBudgetPolicy, ProviderBudgetWindow,
+    ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderRateDeclaration,
 };
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER};
 use sha2::{Digest as _, Sha256};
@@ -28,10 +26,14 @@ use uuid::Uuid;
 
 use crate::{
     TIINGO_APPLICATION_REQUESTS_PER_DAY, TIINGO_APPLICATION_REQUESTS_PER_HOUR, TiingoAdapterError,
-    TiingoApiToken, TiingoDecoder, TiingoEndpointFamily, TiingoEodReceipt, TiingoHistoryPlan,
-    TiingoMetadataReceipt, TiingoProviderFailure, TiingoQuotaAdmission, TiingoQuotaError,
-    TiingoQuotaLedger, TiingoQuotaSnapshot, TiingoQuotaWindows, TiingoRequestBuilder,
-    TiingoRequestSpec, TiingoSchemaCircuitState, TiingoTicker,
+    TiingoApiToken, TiingoCompletedResponseDisposition, TiingoDecoder, TiingoEndpointFamily,
+    TiingoEodReceipt, TiingoMetadataReceipt, TiingoProviderAdmissionDecision,
+    TiingoProviderAdmissionRequest, TiingoProviderAuthority, TiingoProviderAuthorityError,
+    TiingoProviderAuthorityInstallation, TiingoProviderAuthorityRequirements,
+    TiingoProviderFailure, TiingoProviderPermit, TiingoQuotaAdmission, TiingoRateLimitDisposition,
+    TiingoCompletedHistoryCapture, TiingoHistoryCheckpointReceipt, TiingoHistoryEvidenceError,
+    TiingoHistoryPlan, TiingoRequestBuilder, TiingoRequestSpec, TiingoResponseSettlement,
+    TiingoSchemaChange, TiingoSchemaCircuitState, TiingoSealedHistoryPage, TiingoTicker,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -45,36 +47,7 @@ const BACKOFF_JITTER_BASIS_POINTS: u16 = 1_000;
 const DATASET_METADATA: &str = "tiingo-daily-metadata";
 const DATASET_LATEST: &str = "tiingo-daily-latest";
 const DATASET_HISTORY_WINDOW: &str = "tiingo-daily-history-window";
-
-/// Durable-store failure at the Tiingo-specific 4D quota boundary.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum TiingoQuotaStoreError {
-    /// The durable quota store could not be read or atomically replaced.
-    #[error("Tiingo quota persistence is unavailable")]
-    Unavailable,
-    /// The exact expected predecessor did not match durable state.
-    #[error("Tiingo quota state changed concurrently")]
-    Conflict,
-    /// Persisted bytes did not decode to the closed quota schema or failed validation.
-    #[error("Tiingo quota persistence is corrupt")]
-    Corrupt,
-}
-
-/// Restart-durable compare-and-swap boundary for Tiingo's unique-symbol and bandwidth dimensions.
-///
-/// Implementations persist only [`TiingoQuotaSnapshot`]. They must never persist the API token,
-/// authorization header, request object, or response body through this interface.
-pub trait TiingoQuotaStore: fmt::Debug + Send + Sync {
-    /// Loads the exact current state, or `None` before first initialization.
-    fn load(&self) -> Result<Option<TiingoQuotaSnapshot>, TiingoQuotaStoreError>;
-
-    /// Atomically replaces the exact predecessor digest with `next`.
-    fn compare_and_swap(
-        &self,
-        expected: Option<EvidenceDigest>,
-        next: &TiingoQuotaSnapshot,
-    ) -> Result<(), TiingoQuotaStoreError>;
-}
+const TIINGO_SOURCE_ID: &str = "tiingo-starter";
 
 /// Failure while binding one standalone Tiingo response to an exact raw `MSJ1` record.
 #[derive(Debug, Error)]
@@ -85,15 +58,6 @@ pub enum TiingoCaptureMaterialError {
     /// The raw record did not bind exactly to the source-neutral response receipt.
     #[error(transparent)]
     Capture(#[from] ProviderCaptureError),
-}
-
-/// Provider refusal scheduling result after applying bounded `Retry-After` semantics.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TiingoRateLimitDisposition {
-    /// Every worker sharing the provider allocation must wait until this monotonic coordinate.
-    WaitUntil(MonotonicInstant),
-    /// The shared provider allocation became unavailable for the exact closed reason.
-    Unavailable(BudgetUnavailableReason),
 }
 
 /// Exact bounded HTTP material retained before provider-native decoding.
@@ -170,6 +134,11 @@ pub struct TiingoRawMaterial {
     capture: ProviderCaptureSetReceipt,
 }
 
+struct TiingoPendingRawMaterial {
+    raw: TiingoRawMaterial,
+    permit: TiingoProviderPermit,
+}
+
 impl TiingoRawMaterial {
     /// Returns the exact credential-free request semantics.
     pub const fn request(&self) -> &TiingoRequestSpec {
@@ -234,56 +203,6 @@ impl<T> TiingoCapturedPage<T> {
         connection_id: Uuid,
     ) -> Result<ProviderCaptureMaterial, TiingoCaptureMaterialError> {
         self.raw.capture_material(event_id, connection_id)
-    }
-}
-
-/// Terminal proof for an ordered Tiingo history plan.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TiingoHistoryTerminalDisposition {
-    /// Every application-created date window completed; Tiingo supplied no cursor contract.
-    ApplicationDateWindowsExhaustedWithoutProviderCursor,
-}
-
-/// Complete, bounded history response graph.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TiingoHistoryCapture {
-    plan: TiingoHistoryPlan,
-    pages: Box<[TiingoCapturedPage<TiingoEodReceipt>]>,
-    terminal: TiingoHistoryTerminalDisposition,
-    total_response_bytes: u64,
-    total_latency_nanos: u64,
-    graph_digest: EvidenceDigest,
-}
-
-impl TiingoHistoryCapture {
-    /// Returns the exact complete application-created request plan.
-    pub const fn plan(&self) -> &TiingoHistoryPlan {
-        &self.plan
-    }
-
-    /// Returns every ordered response page.
-    pub fn pages(&self) -> &[TiingoCapturedPage<TiingoEodReceipt>] {
-        &self.pages
-    }
-
-    /// Returns terminal evidence without claiming a provider cursor existed.
-    pub const fn terminal(&self) -> TiingoHistoryTerminalDisposition {
-        self.terminal
-    }
-
-    /// Returns exact retained response bytes across all windows.
-    pub const fn total_response_bytes(&self) -> u64 {
-        self.total_response_bytes
-    }
-
-    /// Returns checked aggregate measured latency across all window requests.
-    pub const fn total_latency_nanos(&self) -> u64 {
-        self.total_latency_nanos
-    }
-
-    /// Returns the identity of the request plan and every ordered response observation.
-    pub const fn graph_digest(&self) -> EvidenceDigest {
-        self.graph_digest
     }
 }
 
@@ -389,12 +308,9 @@ pub enum TiingoHttpSourceError {
     /// Product-wide durable provider-rate registration failed.
     #[error(transparent)]
     ProviderRate(#[from] BudgetPoolError),
-    /// Tiingo-specific quota state was unavailable or changed concurrently.
+    /// The single shared provider/account authority failed closed.
     #[error(transparent)]
-    QuotaStore(#[from] TiingoQuotaStoreError),
-    /// The Tiingo 4D quota ledger rejected a transition.
-    #[error(transparent)]
-    Quota(#[from] TiingoQuotaError),
+    ProviderAuthority(#[from] TiingoProviderAuthorityError),
     /// A lower application quota dimension denied this request without transport.
     #[error("Tiingo application quota denied the request")]
     QuotaDenied(TiingoQuotaAdmission),
@@ -410,21 +326,87 @@ pub enum TiingoHttpSourceError {
     /// Bounded HTTP transport failed after exact/conservative byte accounting.
     #[error("Tiingo HTTP transport failed")]
     Transport(TiingoTransportFailure),
+    /// Transport failed and the shared authority could not atomically settle its permit.
+    #[error("Tiingo transport failure could not be settled in shared authority")]
+    TransportSettlementPersistence {
+        /// Exact bounded transport failure that remains reconcilable.
+        failure: TiingoTransportFailure,
+        /// Shared authority failure; the permit must remain crash-reconcilable and blocking.
+        #[source]
+        authority: TiingoProviderAuthorityError,
+    },
     /// Tiingo returned a bounded non-success response, retained exactly.
     #[error("Tiingo returned a bounded non-success HTTP response")]
     Provider(Box<TiingoProviderHttpFailure>),
     /// A successful HTTP response violated URL or content-header invariants.
     #[error("Tiingo HTTP response violated the transport contract")]
     InvalidHttpResponse(Box<TiingoHttpResponseMaterial>),
-    /// A source-neutral capture receipt could not be constructed.
+    /// A complete HTTP response could not atomically commit its terminal queue meaning.
+    #[error("Tiingo HTTP response could not be settled in shared authority")]
+    HttpSettlementPersistence {
+        /// Exact retained response material.
+        response: Box<TiingoHttpResponseMaterial>,
+        /// Shared authority failure; concurrency must remain unavailable until reconciliation.
+        #[source]
+        authority: TiingoProviderAuthorityError,
+    },
+    /// A complete successful response could not be bound to source-neutral capture evidence.
+    #[error("Tiingo response could not be bound to source-neutral capture evidence")]
+    CaptureResponse {
+        /// Exact retained successful response material.
+        response: Box<TiingoHttpResponseMaterial>,
+        /// Exact source-neutral capture contract failure.
+        #[source]
+        capture: ProviderCaptureError,
+    },
+    /// Exact sealed pages could not close the durably checkpointed history request graph.
     #[error(transparent)]
-    Capture(#[from] ProviderCaptureError),
+    HistoryEvidence(#[from] TiingoHistoryEvidenceError),
     /// Strict native decoding failed; exact raw material remains attached.
     #[error("Tiingo provider-native decoding failed")]
     Decode(Box<TiingoDecodeFailure>),
-    /// Complete history material crossed the aggregate retained-byte or latency bound.
-    #[error("Tiingo history capture exceeded its aggregate bound")]
-    HistoryCaptureTooLarge,
+    /// A non-schema decode failure could not atomically settle its durable permit.
+    #[error("Tiingo decode failure could not be settled in shared authority")]
+    DecodeSettlementPersistence {
+        /// Exact raw response plus strict decode failure.
+        failure: Box<TiingoDecodeFailure>,
+        /// Shared authority failure; the pending permit must remain blocking.
+        #[source]
+        authority: TiingoProviderAuthorityError,
+    },
+    /// Strict decoding succeeded but its terminal permit settlement failed closed.
+    #[error("Tiingo decoded response could not be settled in shared authority")]
+    DecodedSuccessSettlementPersistence {
+        /// Exact raw response; deterministic strict decode can be repeated after reconciliation.
+        raw: Box<TiingoRawMaterial>,
+        /// Shared authority failure; the pending permit must remain blocking.
+        #[source]
+        authority: TiingoProviderAuthorityError,
+    },
+    /// A complete raw response could not enter strict decoding because its decode clock failed.
+    #[error("Tiingo decode clock is unavailable")]
+    DecodeClockUnavailable {
+        /// Exact raw response rejected by the authoritative settlement.
+        raw: Box<TiingoRawMaterial>,
+    },
+    /// Decode-clock failure could not atomically reject the complete raw response.
+    #[error("Tiingo decode-clock failure could not be settled in shared authority")]
+    DecodeClockSettlementPersistence {
+        /// Exact raw response that remains deterministically decodable after reconciliation.
+        raw: Box<TiingoRawMaterial>,
+        /// Shared authority failure; the pending permit must remain blocking.
+        #[source]
+        authority: TiingoProviderAuthorityError,
+    },
+    /// A schema-changing body was retained, but durable circuit opening failed closed.
+    #[error("Tiingo schema change could not be committed to shared authority")]
+    SchemaCircuitPersistence {
+        /// Exact raw response and schema failure that must remain reviewable.
+        failure: Box<TiingoDecodeFailure>,
+        /// Shared authority failure; its queue must remain unavailable across restart.
+        #[source]
+        authority: TiingoProviderAuthorityError,
+    },
     /// Trusted wall-clock material could not be represented.
     #[error("Tiingo source clock is unavailable")]
     ClockUnavailable,
@@ -434,20 +416,21 @@ pub enum TiingoHttpSourceError {
 pub struct TiingoHttpSource {
     requests: TiingoRequestBuilder,
     transport: Arc<dyn TiingoTransport>,
-    budget: SharedProviderBudget,
-    quota_store: Arc<dyn TiingoQuotaStore>,
+    authority: Arc<dyn TiingoProviderAuthority>,
+    authority_installation: TiingoProviderAuthorityInstallation,
     runtime: tokio::sync::Mutex<TiingoRuntime>,
     source_id: SourceId,
     metadata_revision: MetadataRevision,
+    native_contract_revision: SourceIdentifier,
+    entitlement_generation: SourceIdentifier,
     metadata_dataset: SourceIdentifier,
     latest_dataset: SourceIdentifier,
     history_dataset: SourceIdentifier,
 }
 
 struct TiingoRuntime {
-    quota: TiingoQuotaLedger,
-    quota_available: bool,
     decoder: TiingoDecoder,
+    latched_schema_change: Option<TiingoSchemaChange>,
 }
 
 impl fmt::Debug for TiingoHttpSource {
@@ -456,41 +439,43 @@ impl fmt::Debug for TiingoHttpSource {
             .debug_struct("TiingoHttpSource")
             .field("source_id", &self.source_id)
             .field("metadata_revision", &self.metadata_revision)
+            .field(
+                "authority_generation",
+                self.authority_installation.authority_generation(),
+            )
             .field("credential", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
 
 impl TiingoHttpSource {
-    /// Opens a hardened production transport and durable 4D quota state.
+    /// Opens a hardened production transport behind the one shared durable provider authority.
     ///
-    /// A crash-retained response reservation is conservatively charged at its admitted maximum
-    /// and compare-and-swap persisted during construction. No credential is passed to either
-    /// durable authority.
+    /// The authority must be backed by the product-wide provider/account SQLite queue extended
+    /// with Tiingo monthly-symbol, monthly-bandwidth, and schema-circuit state. The API token is
+    /// never passed through that capability.
     #[allow(
         clippy::too_many_arguments,
-        reason = "security, source identity, schema identity, and two durable authorities remain explicit"
+        reason = "security, source identity, schema identity, and durable authority remain explicit"
     )]
     pub fn try_new(
         token: TiingoApiToken,
-        rate_authority: &ProviderRateAuthority,
-        quota_store: Arc<dyn TiingoQuotaStore>,
-        initial_quota_windows: TiingoQuotaWindows,
+        authority: Arc<dyn TiingoProviderAuthority>,
         source_id: SourceId,
         metadata_revision: MetadataRevision,
         native_contract_revision: SourceIdentifier,
+        entitlement_generation: SourceIdentifier,
     ) -> Result<Self, TiingoHttpSourceError> {
         let client = hardened_client()?;
         let transport: Arc<dyn TiingoTransport> =
             Arc::new(ReqwestTiingoTransport::new(client.clone()));
         Self::try_new_inner(
             token,
-            rate_authority,
-            quota_store,
-            initial_quota_windows,
+            authority,
             source_id,
             metadata_revision,
             native_contract_revision,
+            entitlement_generation,
             client,
             transport,
         )
@@ -500,23 +485,21 @@ impl TiingoHttpSource {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new_with_transport(
         token: TiingoApiToken,
-        rate_authority: &ProviderRateAuthority,
-        quota_store: Arc<dyn TiingoQuotaStore>,
-        initial_quota_windows: TiingoQuotaWindows,
+        authority: Arc<dyn TiingoProviderAuthority>,
         source_id: SourceId,
         metadata_revision: MetadataRevision,
         native_contract_revision: SourceIdentifier,
+        entitlement_generation: SourceIdentifier,
         transport: Arc<dyn TiingoTransport>,
     ) -> Result<Self, TiingoHttpSourceError> {
         let client = hardened_client()?;
         Self::try_new_inner(
             token,
-            rate_authority,
-            quota_store,
-            initial_quota_windows,
+            authority,
             source_id,
             metadata_revision,
             native_contract_revision,
+            entitlement_generation,
             client,
             transport,
         )
@@ -525,30 +508,49 @@ impl TiingoHttpSource {
     #[allow(clippy::too_many_arguments)]
     fn try_new_inner(
         token: TiingoApiToken,
-        rate_authority: &ProviderRateAuthority,
-        quota_store: Arc<dyn TiingoQuotaStore>,
-        initial_quota_windows: TiingoQuotaWindows,
+        authority: Arc<dyn TiingoProviderAuthority>,
         source_id: SourceId,
         metadata_revision: MetadataRevision,
         native_contract_revision: SourceIdentifier,
+        entitlement_generation: SourceIdentifier,
         client: reqwest::Client,
         transport: Arc<dyn TiingoTransport>,
     ) -> Result<Self, TiingoHttpSourceError> {
-        let declaration = tiingo_provider_rate_declaration()?;
-        let budget = rate_authority.register_budget(declaration)?;
-        let quota = restore_quota(&quota_store, initial_quota_windows)?;
+        if source_id.as_str() != TIINGO_SOURCE_ID {
+            return Err(TiingoHttpSourceError::InvalidConfiguration);
+        }
+        let provider_rate_declaration = tiingo_provider_rate_declaration()?;
+        provider_rate_declaration.validate()?;
+        let requirements = TiingoProviderAuthorityRequirements::new(
+            provider_rate_declaration,
+            source_id.clone(),
+            metadata_revision.clone(),
+            native_contract_revision.clone(),
+            entitlement_generation.clone(),
+        );
+        let authority_installation = authority.validate_requirements(&requirements)?;
+        authority_installation.validate_against(&requirements)?;
+        let initial_schema_state = authority.schema_circuit_state(&native_contract_revision)?;
+        let latched_schema_change = match initial_schema_state {
+            TiingoSchemaCircuitState::Closed => None,
+            TiingoSchemaCircuitState::Open(change) => Some(change),
+        };
         Ok(Self {
             requests: TiingoRequestBuilder::new(client, token),
             transport,
-            budget,
-            quota_store,
+            authority,
+            authority_installation,
             runtime: tokio::sync::Mutex::new(TiingoRuntime {
-                quota,
-                quota_available: true,
-                decoder: TiingoDecoder::new(native_contract_revision),
+                decoder: TiingoDecoder::new(
+                    native_contract_revision.clone(),
+                    entitlement_generation.clone(),
+                ),
+                latched_schema_change,
             }),
             source_id,
             metadata_revision,
+            native_contract_revision,
+            entitlement_generation,
             metadata_dataset: identifier(DATASET_METADATA)?,
             latest_dataset: identifier(DATASET_LATEST)?,
             history_dataset: identifier(DATASET_HISTORY_WINDOW)?,
@@ -564,10 +566,11 @@ impl TiingoHttpSource {
     ) -> Result<TiingoCapturedPage<TiingoMetadataReceipt>, TiingoHttpSourceError> {
         let spec = TiingoRequestSpec::metadata(ticker)?;
         let mut runtime = self.runtime.lock().await;
-        let raw = self
-            .fetch_raw_locked(&mut runtime, spec.clone(), deadline, cancellation)
+        let pending = self
+            .fetch_raw_locked(&mut runtime, spec.clone(), None, deadline, cancellation)
             .await?;
-        let decoded_at = system_timestamp()?;
+        let raw = pending.raw;
+        let decoded_at = self.decode_timestamp_or_reject(&pending.permit, &raw)?;
         match runtime.decoder.decode_metadata(
             spec,
             raw.http.status,
@@ -575,10 +578,11 @@ impl TiingoHttpSource {
             raw.http.received_at,
             decoded_at,
         ) {
-            Ok(decoded) => Ok(TiingoCapturedPage { raw, decoded }),
-            Err(error) => Err(TiingoHttpSourceError::Decode(Box::new(
-                TiingoDecodeFailure { error, raw },
-            ))),
+            Ok(decoded) => {
+                self.settle_decoded_success(&pending.permit, &raw)?;
+                Ok(TiingoCapturedPage { raw, decoded })
+            }
+            Err(error) => self.decode_failure(&mut runtime, error, raw, pending.permit),
         }
     }
 
@@ -591,90 +595,149 @@ impl TiingoHttpSource {
     ) -> Result<TiingoCapturedPage<TiingoEodReceipt>, TiingoHttpSourceError> {
         let spec = TiingoRequestSpec::latest(ticker)?;
         let mut runtime = self.runtime.lock().await;
-        self.fetch_eod_locked(&mut runtime, spec, deadline, cancellation)
+        self.fetch_eod_locked(&mut runtime, spec, None, deadline, cancellation)
             .await
     }
 
-    /// Fetches every ordered application date window and returns terminal graph evidence only
-    /// after the complete bounded plan succeeds.
-    pub async fn fetch_history(
+    /// Pre-admits aggregate history capacity and initializes or resumes durable graph state.
+    pub fn prepare_history_plan(
+        &self,
+        plan: &TiingoHistoryPlan,
+    ) -> Result<TiingoHistoryCheckpointReceipt, TiingoHttpSourceError> {
+        let checkpoint = self.authority.prepare_history_plan(plan)?;
+        checkpoint.validate_for(
+            plan,
+            &self.authority_installation,
+            checkpoint.next_page_index(),
+            checkpoint.predecessor_page_identity(),
+        )?;
+        Ok(checkpoint)
+    }
+
+    /// Commits one exact externally sealed history page before its successor can dispatch.
+    pub fn checkpoint_history_page(
+        &self,
+        plan: &TiingoHistoryPlan,
+        checkpoint: &TiingoHistoryCheckpointReceipt,
+        page: &TiingoSealedHistoryPage,
+    ) -> Result<TiingoHistoryCheckpointReceipt, TiingoHttpSourceError> {
+        checkpoint.validate_for(
+            plan,
+            &self.authority_installation,
+            checkpoint.next_page_index(),
+            checkpoint.predecessor_page_identity(),
+        )?;
+        let current_index = usize::try_from(checkpoint.next_page_index())
+            .map_err(|_| TiingoHttpSourceError::InvalidConfiguration)?;
+        let Some(expected_request) = plan.pages().get(current_index) else {
+            return Err(TiingoHttpSourceError::InvalidConfiguration);
+        };
+        if page.request() != expected_request
+            || page.source_id() != &self.source_id
+            || page.source_contract_revision() != &self.metadata_revision
+            || page.native_contract_revision() != &self.native_contract_revision
+            || page.entitlement_generation() != &self.entitlement_generation
+        {
+            return Err(TiingoProviderAuthorityError::InvalidReceipt.into());
+        }
+        let next = self.authority.checkpoint_history_page(checkpoint, page)?;
+        let expected_next = checkpoint
+            .next_page_index()
+            .checked_add(1)
+            .ok_or(TiingoProviderAuthorityError::InvalidReceipt)?;
+        next.validate_for(
+            plan,
+            &self.authority_installation,
+            expected_next,
+            Some(page.page_identity()),
+        )?;
+        Ok(next)
+    }
+
+    /// Closes the exact request graph after every page has been externally sealed/checkpointed.
+    pub fn complete_history_capture(
         &self,
         plan: TiingoHistoryPlan,
+        pages: Vec<TiingoSealedHistoryPage>,
+        checkpoint: &TiingoHistoryCheckpointReceipt,
+    ) -> Result<TiingoCompletedHistoryCapture, TiingoHttpSourceError> {
+        TiingoCompletedHistoryCapture::try_new(
+            plan,
+            pages,
+            checkpoint,
+            &self.authority_installation,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Fetches exactly the one page authorized by the shared durable history checkpoint.
+    ///
+    /// The caller must seal and durably checkpoint this page before requesting the next page from
+    /// its [`crate::TiingoHistoryPlan`]. The source deliberately never buffers a complete history
+    /// graph, so a later failure cannot discard already charged successful pages.
+    pub async fn fetch_history_page(
+        &self,
+        plan: &TiingoHistoryPlan,
+        checkpoint: &TiingoHistoryCheckpointReceipt,
         deadline: Timestamp,
         cancellation: &CancellationToken,
-    ) -> Result<TiingoHistoryCapture, TiingoHttpSourceError> {
-        let mut runtime = self.runtime.lock().await;
-        let mut pages = Vec::new();
-        pages
-            .try_reserve_exact(plan.pages().len())
-            .map_err(|_| TiingoHttpSourceError::HistoryCaptureTooLarge)?;
-        let mut total_response_bytes = 0_u64;
-        let mut total_latency_nanos = 0_u64;
-        for spec in plan.pages() {
-            let page = self
-                .fetch_eod_locked(&mut runtime, spec.clone(), deadline, cancellation)
-                .await?;
-            total_response_bytes = total_response_bytes
-                .checked_add(page.raw.http.response_bytes())
-                .filter(|bytes| *bytes <= market_squawk_sources::MAX_PROVIDER_CAPTURE_BYTES)
-                .ok_or(TiingoHttpSourceError::HistoryCaptureTooLarge)?;
-            total_latency_nanos = total_latency_nanos
-                .checked_add(page.raw.http.latency_nanos)
-                .ok_or(TiingoHttpSourceError::HistoryCaptureTooLarge)?;
-            pages.push(page);
-        }
-        let graph_digest = history_graph_digest(&plan, &pages, total_response_bytes);
-        Ok(TiingoHistoryCapture {
+    ) -> Result<TiingoCapturedPage<TiingoEodReceipt>, TiingoHttpSourceError> {
+        checkpoint.validate_for(
             plan,
-            pages: pages.into_boxed_slice(),
-            terminal:
-                TiingoHistoryTerminalDisposition::ApplicationDateWindowsExhaustedWithoutProviderCursor,
-            total_response_bytes,
-            total_latency_nanos,
-            graph_digest,
-        })
-    }
-
-    /// Returns an exact snapshot suitable for telemetry or durable-state verification.
-    pub async fn quota_snapshot(&self) -> TiingoQuotaSnapshot {
-        self.runtime.lock().await.quota.snapshot().clone()
-    }
-
-    /// Advances caller-supplied conservative quota windows and persists the exact transition.
-    ///
-    /// The source never invents Tiingo reset timezone semantics. A scheduler must call this only
-    /// with externally governed boundaries after the retained hour boundary has elapsed.
-    pub async fn advance_quota_windows(
-        &self,
-        observed_at: Timestamp,
-        next: TiingoQuotaWindows,
-    ) -> Result<TiingoQuotaSnapshot, TiingoHttpSourceError> {
+            &self.authority_installation,
+            checkpoint.next_page_index(),
+            checkpoint.predecessor_page_identity(),
+        )?;
+        let page_index = usize::try_from(checkpoint.next_page_index())
+            .map_err(|_| TiingoHttpSourceError::InvalidConfiguration)?;
+        let request = plan
+            .pages()
+            .get(page_index)
+            .ok_or(TiingoHttpSourceError::InvalidConfiguration)?
+            .clone();
         let mut runtime = self.runtime.lock().await;
-        if !runtime.quota_available {
-            return Err(TiingoQuotaStoreError::Unavailable.into());
-        }
-        let predecessor = runtime.quota.snapshot().digest();
-        runtime.quota.advance_windows(observed_at, next)?;
-        persist_quota_transition(&self.quota_store, &mut runtime, Some(predecessor))?;
-        Ok(runtime.quota.snapshot().clone())
+        self.fetch_eod_locked(
+            &mut runtime,
+            request,
+            Some(checkpoint),
+            deadline,
+            cancellation,
+        )
+        .await
     }
 
-    /// Returns the current in-process fail-closed provider-native schema circuit.
-    pub async fn schema_circuit_state(&self) -> TiingoSchemaCircuitState {
-        self.runtime.lock().await.decoder.circuit().state().clone()
+    /// Returns restart-durable schema-circuit state from the single shared authority.
+    pub async fn schema_circuit_state(
+        &self,
+    ) -> Result<TiingoSchemaCircuitState, TiingoHttpSourceError> {
+        let runtime = self.runtime.lock().await;
+        if let Some(change) = &runtime.latched_schema_change {
+            return Ok(TiingoSchemaCircuitState::Open(change.clone()));
+        }
+        self.authority
+            .schema_circuit_state(runtime.decoder.contract_revision())
+            .map_err(Into::into)
     }
 
     async fn fetch_eod_locked(
         &self,
         runtime: &mut TiingoRuntime,
         spec: TiingoRequestSpec,
+        history_checkpoint: Option<&TiingoHistoryCheckpointReceipt>,
         deadline: Timestamp,
         cancellation: &CancellationToken,
     ) -> Result<TiingoCapturedPage<TiingoEodReceipt>, TiingoHttpSourceError> {
-        let raw = self
-            .fetch_raw_locked(runtime, spec.clone(), deadline, cancellation)
+        let pending = self
+            .fetch_raw_locked(
+                runtime,
+                spec.clone(),
+                history_checkpoint,
+                deadline,
+                cancellation,
+            )
             .await?;
-        let decoded_at = system_timestamp()?;
+        let raw = pending.raw;
+        let decoded_at = self.decode_timestamp_or_reject(&pending.permit, &raw)?;
         match runtime.decoder.decode_eod(
             spec,
             raw.http.status,
@@ -682,10 +745,123 @@ impl TiingoHttpSource {
             raw.http.received_at,
             decoded_at,
         ) {
-            Ok(decoded) => Ok(TiingoCapturedPage { raw, decoded }),
-            Err(error) => Err(TiingoHttpSourceError::Decode(Box::new(
-                TiingoDecodeFailure { error, raw },
-            ))),
+            Ok(decoded) => {
+                self.settle_decoded_success(&pending.permit, &raw)?;
+                Ok(TiingoCapturedPage { raw, decoded })
+            }
+            Err(error) => self.decode_failure(runtime, error, raw, pending.permit),
+        }
+    }
+
+    fn settle_decoded_success(
+        &self,
+        permit: &TiingoProviderPermit,
+        raw: &TiingoRawMaterial,
+    ) -> Result<(), TiingoHttpSourceError> {
+        let settlement = TiingoResponseSettlement::Complete {
+            response_bytes: raw.http.response_bytes(),
+            disposition: TiingoCompletedResponseDisposition::DecodedSuccess,
+        };
+        match self.authority.settle_response(permit, &settlement) {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(TiingoHttpSourceError::DecodedSuccessSettlementPersistence {
+                raw: Box::new(raw.clone()),
+                authority: TiingoProviderAuthorityError::InvalidReceipt,
+            }),
+            Err(authority) => Err(TiingoHttpSourceError::DecodedSuccessSettlementPersistence {
+                raw: Box::new(raw.clone()),
+                authority,
+            }),
+        }
+    }
+
+    fn decode_timestamp_or_reject(
+        &self,
+        permit: &TiingoProviderPermit,
+        raw: &TiingoRawMaterial,
+    ) -> Result<Timestamp, TiingoHttpSourceError> {
+        if let Ok(decoded_at) = system_timestamp() {
+            return Ok(decoded_at);
+        }
+        let settlement = TiingoResponseSettlement::Complete {
+            response_bytes: raw.http.response_bytes(),
+            disposition: TiingoCompletedResponseDisposition::Rejected,
+        };
+        match self.authority.settle_response(permit, &settlement) {
+            Ok(None) => Err(TiingoHttpSourceError::DecodeClockUnavailable {
+                raw: Box::new(raw.clone()),
+            }),
+            Ok(Some(_)) => Err(TiingoHttpSourceError::DecodeClockSettlementPersistence {
+                raw: Box::new(raw.clone()),
+                authority: TiingoProviderAuthorityError::InvalidReceipt,
+            }),
+            Err(authority) => Err(TiingoHttpSourceError::DecodeClockSettlementPersistence {
+                raw: Box::new(raw.clone()),
+                authority,
+            }),
+        }
+    }
+
+    fn decode_failure<T>(
+        &self,
+        runtime: &mut TiingoRuntime,
+        error: TiingoAdapterError,
+        raw: TiingoRawMaterial,
+        permit: TiingoProviderPermit,
+    ) -> Result<T, TiingoHttpSourceError> {
+        let schema_change = match &error {
+            TiingoAdapterError::SchemaChanged(change) => Some(change.clone()),
+            _ => None,
+        };
+        let failure = Box::new(TiingoDecodeFailure { error, raw });
+        let disposition = if let Some(change) = &schema_change {
+            runtime.latched_schema_change = Some(change.clone());
+            TiingoCompletedResponseDisposition::SchemaChanged {
+                contract_revision: runtime.decoder.contract_revision().clone(),
+                change: change.clone(),
+            }
+        } else {
+            TiingoCompletedResponseDisposition::Rejected
+        };
+        let settlement = TiingoResponseSettlement::Complete {
+            response_bytes: failure.raw.http.response_bytes(),
+            disposition,
+        };
+        let settlement_result = self.authority.settle_response(&permit, &settlement);
+        let authority = match settlement_result {
+            Ok(None) => return Err(TiingoHttpSourceError::Decode(failure)),
+            Ok(Some(_)) => TiingoProviderAuthorityError::InvalidReceipt,
+            Err(authority) => authority,
+        };
+        if schema_change.is_some() {
+            Err(TiingoHttpSourceError::SchemaCircuitPersistence {
+                failure,
+                authority,
+            })
+        } else {
+            Err(TiingoHttpSourceError::DecodeSettlementPersistence {
+                failure,
+                authority,
+            })
+        }
+    }
+
+    fn ensure_schema_decode_admitted(
+        &self,
+        runtime: &mut TiingoRuntime,
+    ) -> Result<(), TiingoHttpSourceError> {
+        if runtime.latched_schema_change.is_some() {
+            return Err(TiingoAdapterError::SchemaCircuitOpen.into());
+        }
+        match self
+            .authority
+            .schema_circuit_state(runtime.decoder.contract_revision())?
+        {
+            TiingoSchemaCircuitState::Closed => Ok(()),
+            TiingoSchemaCircuitState::Open(change) => {
+                runtime.latched_schema_change = Some(change);
+                Err(TiingoAdapterError::SchemaCircuitOpen.into())
+            }
         }
     }
 
@@ -693,9 +869,11 @@ impl TiingoHttpSource {
         &self,
         runtime: &mut TiingoRuntime,
         spec: TiingoRequestSpec,
+        history_checkpoint: Option<&TiingoHistoryCheckpointReceipt>,
         deadline: Timestamp,
         cancellation: &CancellationToken,
-    ) -> Result<TiingoRawMaterial, TiingoHttpSourceError> {
+    ) -> Result<TiingoPendingRawMaterial, TiingoHttpSourceError> {
+        self.ensure_schema_decode_admitted(runtime)?;
         if cancellation.is_cancelled() {
             return Err(TiingoHttpSourceError::Transport(transport_failure(
                 TiingoTransportFailureKind::Cancelled,
@@ -712,55 +890,34 @@ impl TiingoHttpSource {
                 .map_err(|_| TiingoHttpSourceError::InvalidConfiguration)?,
         )
         .ok_or(TiingoHttpSourceError::InvalidConfiguration)?;
-        if !runtime.quota_available {
-            return Err(TiingoHttpSourceError::QuotaStore(
-                TiingoQuotaStoreError::Unavailable,
-            ));
-        }
-        let admission = runtime.quota.classify(spec.ticker(), reservation)?;
-        if admission != TiingoQuotaAdmission::Admitted {
-            return Err(TiingoHttpSourceError::QuotaDenied(admission));
-        }
-        let provider_reservation = match self.budget.try_reserve_request() {
-            BudgetReservationDecision::Ready(reservation) => reservation,
-            BudgetReservationDecision::WaitUntil(deadline) => {
+        let admission_request = TiingoProviderAdmissionRequest::new(
+            spec.ticker().clone(),
+            spec.request_identity(),
+            reservation,
+            history_checkpoint.cloned(),
+        );
+        let permit = match self.authority.try_acquire(&admission_request)? {
+            TiingoProviderAdmissionDecision::Ready(permit) => permit,
+            TiingoProviderAdmissionDecision::WaitUntil(deadline) => {
                 return Err(TiingoHttpSourceError::BudgetWaitUntil(deadline));
             }
-            BudgetReservationDecision::Unavailable(reason) => {
-                return Err(TiingoHttpSourceError::BudgetUnavailable(reason));
-            }
-        };
-        let prior = runtime.quota.snapshot().clone();
-        let quota_permit = match runtime.quota.reserve(spec.ticker().clone(), reservation)? {
-            Ok(permit) => permit,
-            Err(admission) => {
-                provider_reservation.release();
+            TiingoProviderAdmissionDecision::QuotaDenied(admission) => {
                 return Err(TiingoHttpSourceError::QuotaDenied(admission));
             }
-        };
-        persist_quota_transition(&self.quota_store, runtime, Some(prior.digest()))?;
-
-        let provider_permit = match provider_reservation.commit_dispatch() {
-            BudgetDispatchDecision::Ready(permit) => permit,
-            BudgetDispatchDecision::WaitUntil(deadline) => {
-                cancel_undispatched_quota(
-                    &self.quota_store,
-                    runtime,
-                    &quota_permit,
-                    spec.ticker(),
-                )?;
-                return Err(TiingoHttpSourceError::BudgetWaitUntil(deadline));
+            TiingoProviderAdmissionDecision::SchemaCircuitOpen(change) => {
+                runtime.latched_schema_change = Some(change);
+                return Err(TiingoAdapterError::SchemaCircuitOpen.into());
             }
-            BudgetDispatchDecision::Unavailable(reason) => {
-                cancel_undispatched_quota(
-                    &self.quota_store,
-                    runtime,
-                    &quota_permit,
-                    spec.ticker(),
-                )?;
+            TiingoProviderAdmissionDecision::Unavailable(reason) => {
                 return Err(TiingoHttpSourceError::BudgetUnavailable(reason));
             }
         };
+        if !permit.matches(
+            &admission_request,
+            &self.authority_installation,
+        ) {
+            return Err(TiingoProviderAuthorityError::InvalidReceipt.into());
+        }
 
         let response = match self
             .transport
@@ -774,32 +931,54 @@ impl TiingoHttpSource {
         {
             Ok(response) => response,
             Err(failure) => {
-                settle_response_quota(
-                    &self.quota_store,
-                    runtime,
-                    &quota_permit,
-                    spec.ticker(),
-                    failure.quota_charge_bytes,
-                )?;
-                return Err(TiingoHttpSourceError::Transport(failure));
+                let settlement = TiingoResponseSettlement::Incomplete {
+                    observed_response_bytes: failure.received_body_bytes,
+                    charged_response_bytes: failure.quota_charge_bytes,
+                };
+                return match self.authority.settle_response(&permit, &settlement) {
+                    Ok(None) => Err(TiingoHttpSourceError::Transport(failure)),
+                    Ok(Some(_)) => Err(TiingoHttpSourceError::TransportSettlementPersistence {
+                        failure,
+                        authority: TiingoProviderAuthorityError::InvalidReceipt,
+                    }),
+                    Err(authority) => {
+                        Err(TiingoHttpSourceError::TransportSettlementPersistence {
+                            failure,
+                            authority,
+                        })
+                    }
+                };
             }
         };
-        settle_response_quota(
-            &self.quota_store,
-            runtime,
-            &quota_permit,
-            spec.ticker(),
-            response.response_bytes(),
-        )?;
+
         if !(200..=299).contains(&response.status) {
-            let rate_limit = if matches!(response.status, 429 | 503) {
-                Some(rate_limit_disposition(apply_http_retry_after(
-                    &self.budget,
-                    response.retry_after(),
-                    0,
-                ))?)
+            let rate_limited = matches!(response.status, 429 | 503);
+            let disposition = if rate_limited {
+                TiingoCompletedResponseDisposition::ProviderRateLimited {
+                    retry_after: response.retry_after.clone(),
+                    jitter_sample_basis_points: BACKOFF_JITTER_BASIS_POINTS,
+                }
             } else {
-                None
+                TiingoCompletedResponseDisposition::ProviderRefusal
+            };
+            let settlement = TiingoResponseSettlement::Complete {
+                response_bytes: response.response_bytes(),
+                disposition,
+            };
+            let rate_limit = match self.authority.settle_response(&permit, &settlement) {
+                Ok(rate_limit) if rate_limited == rate_limit.is_some() => rate_limit,
+                Ok(_) => {
+                    return Err(TiingoHttpSourceError::HttpSettlementPersistence {
+                        response: Box::new(response),
+                        authority: TiingoProviderAuthorityError::InvalidReceipt,
+                    });
+                }
+                Err(authority) => {
+                    return Err(TiingoHttpSourceError::HttpSettlementPersistence {
+                        response: Box::new(response),
+                        authority,
+                    });
+                }
             };
             let provider = TiingoProviderFailure::new(response.status, &response.body);
             return Err(TiingoHttpSourceError::Provider(Box::new(
@@ -816,23 +995,67 @@ impl TiingoHttpSource {
                 .is_some_and(|value| !value.eq_ignore_ascii_case(b"identity"))
             || !content_type_is_json(response.content_type())
         {
+            let settlement = TiingoResponseSettlement::Complete {
+                response_bytes: response.response_bytes(),
+                disposition: TiingoCompletedResponseDisposition::Rejected,
+            };
+            match self.authority.settle_response(&permit, &settlement) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return Err(TiingoHttpSourceError::HttpSettlementPersistence {
+                        response: Box::new(response),
+                        authority: TiingoProviderAuthorityError::InvalidReceipt,
+                    });
+                }
+                Err(authority) => {
+                    return Err(TiingoHttpSourceError::HttpSettlementPersistence {
+                        response: Box::new(response),
+                        authority,
+                    });
+                }
+            }
             return Err(TiingoHttpSourceError::InvalidHttpResponse(Box::new(
                 response,
             )));
         }
-        let raw = self.capture_success(spec, response)?;
-        self.budget
-            .record_success()
-            .map_err(TiingoHttpSourceError::BudgetUnavailable)?;
-        provider_permit.release();
-        Ok(raw)
+        let retained_response = response.clone();
+        let raw = match self.capture_success(spec, response) {
+            Ok(raw) => raw,
+            Err(capture) => {
+                let settlement = TiingoResponseSettlement::Complete {
+                    response_bytes: retained_response.response_bytes(),
+                    disposition: TiingoCompletedResponseDisposition::Rejected,
+                };
+                match self.authority.settle_response(&permit, &settlement) {
+                    Ok(None) => {
+                        return Err(TiingoHttpSourceError::CaptureResponse {
+                            response: Box::new(retained_response),
+                            capture,
+                        });
+                    }
+                    Ok(Some(_)) => {
+                        return Err(TiingoHttpSourceError::HttpSettlementPersistence {
+                            response: Box::new(retained_response),
+                            authority: TiingoProviderAuthorityError::InvalidReceipt,
+                        });
+                    }
+                    Err(authority) => {
+                        return Err(TiingoHttpSourceError::HttpSettlementPersistence {
+                            response: Box::new(retained_response),
+                            authority,
+                        });
+                    }
+                }
+            }
+        };
+        Ok(TiingoPendingRawMaterial { raw, permit })
     }
 
     fn capture_success(
         &self,
         request: TiingoRequestSpec,
         http: TiingoHttpResponseMaterial,
-    ) -> Result<TiingoRawMaterial, TiingoHttpSourceError> {
+    ) -> Result<TiingoRawMaterial, ProviderCaptureError> {
         let request_identity = request.request_identity();
         let page = ProviderCapturePageReceipt::try_new(
             0,
@@ -910,97 +1133,6 @@ pub fn tiingo_provider_rate_declaration() -> Result<ProviderRateDeclaration, Tii
     .map_err(|_| TiingoHttpSourceError::InvalidConfiguration)?;
     ProviderRateDeclaration::try_for_authorization_subject(policy, &subject)
         .map_err(TiingoHttpSourceError::ProviderRate)
-}
-
-fn restore_quota(
-    store: &Arc<dyn TiingoQuotaStore>,
-    initial_windows: TiingoQuotaWindows,
-) -> Result<TiingoQuotaLedger, TiingoHttpSourceError> {
-    match store.load()? {
-        Some(snapshot) => {
-            let predecessor = snapshot.digest();
-            let mut ledger = TiingoQuotaLedger::try_restore(snapshot)?;
-            if ledger.reconcile_incomplete_response()? {
-                store.compare_and_swap(Some(predecessor), ledger.snapshot())?;
-            }
-            Ok(ledger)
-        }
-        None => {
-            let ledger = TiingoQuotaLedger::new(initial_windows);
-            store.compare_and_swap(None, ledger.snapshot())?;
-            Ok(ledger)
-        }
-    }
-}
-
-fn persist_quota_transition(
-    store: &Arc<dyn TiingoQuotaStore>,
-    runtime: &mut TiingoRuntime,
-    expected: Option<EvidenceDigest>,
-) -> Result<(), TiingoHttpSourceError> {
-    if let Err(error) = store.compare_and_swap(expected, runtime.quota.snapshot()) {
-        runtime.quota_available = false;
-        return Err(TiingoHttpSourceError::QuotaStore(error));
-    }
-    Ok(())
-}
-
-fn settle_response_quota(
-    store: &Arc<dyn TiingoQuotaStore>,
-    runtime: &mut TiingoRuntime,
-    permit: &crate::TiingoQuotaPermit,
-    ticker: &TiingoTicker,
-    actual_response_bytes: u64,
-) -> Result<(), TiingoHttpSourceError> {
-    let predecessor = runtime.quota.snapshot().digest();
-    let transition = runtime
-        .quota
-        .commit_response(permit, ticker, actual_response_bytes);
-    persist_quota_transition(store, runtime, Some(predecessor))?;
-    transition.map_err(TiingoHttpSourceError::Quota)
-}
-
-fn cancel_undispatched_quota(
-    store: &Arc<dyn TiingoQuotaStore>,
-    runtime: &mut TiingoRuntime,
-    permit: &crate::TiingoQuotaPermit,
-    ticker: &TiingoTicker,
-) -> Result<(), TiingoHttpSourceError> {
-    let predecessor = runtime.quota.snapshot().digest();
-    runtime.quota.cancel_undispatched(permit, ticker)?;
-    persist_quota_transition(store, runtime, Some(predecessor))
-}
-
-fn rate_limit_disposition(
-    decision: BudgetDecision,
-) -> Result<TiingoRateLimitDisposition, TiingoHttpSourceError> {
-    match decision {
-        BudgetDecision::WaitUntil(deadline) => Ok(TiingoRateLimitDisposition::WaitUntil(deadline)),
-        BudgetDecision::Unavailable(reason) => Ok(TiingoRateLimitDisposition::Unavailable(reason)),
-        BudgetDecision::Ready(permit) => {
-            permit.release();
-            Err(TiingoHttpSourceError::BudgetUnavailable(
-                BudgetUnavailableReason::StateCorrupt,
-            ))
-        }
-    }
-}
-
-fn history_graph_digest(
-    plan: &TiingoHistoryPlan,
-    pages: &[TiingoCapturedPage<TiingoEodReceipt>],
-    total_response_bytes: u64,
-) -> EvidenceDigest {
-    let mut hash = Sha256::new();
-    hash.update(b"market-squawk/tiingo/history-capture/v1\0");
-    hash.update(plan.request_set_identity().bytes());
-    hash.update(total_response_bytes.to_be_bytes());
-    hash.update(u64::try_from(pages.len()).unwrap_or(u64::MAX).to_be_bytes());
-    for page in pages {
-        hash.update(page.raw.capture.observation_digest().bytes());
-    }
-    hash.update(b"application-date-windows-exhausted-without-provider-cursor");
-    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
 }
 
 fn identifier(value: &str) -> Result<SourceIdentifier, TiingoHttpSourceError> {
@@ -1229,7 +1361,7 @@ impl TiingoTransport for ReqwestTiingoTransport {
                     transport_failure(
                         TiingoTransportFailureKind::BodyTooLarge,
                         u64::MAX,
-                        u64::try_from(max_response_bytes).unwrap_or(u64::MAX),
+                        u64::MAX,
                         started,
                     )
                 })?;
@@ -1238,7 +1370,7 @@ impl TiingoTransport for ReqwestTiingoTransport {
                     return Err(transport_failure(
                         TiingoTransportFailureKind::BodyTooLarge,
                         observed,
-                        u64::try_from(max_response_bytes).unwrap_or(u64::MAX),
+                        observed,
                         started,
                     ));
                 }
@@ -1275,17 +1407,16 @@ mod tests {
     use std::collections::VecDeque;
     use std::error::Error;
     use std::num::NonZeroU64;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     use market_squawk_domain::{
         CalendarDate, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
     };
-    use market_squawk_sources::{
-        AuthorizationMode, PreparedProviderRateRegistrationBatch, ProviderRateDispatchDecision,
-        ProviderRateGroupId, ProviderRatePermitId, ProviderRateRegistration,
-        ProviderRateReservationDecision, ProviderRateReservationId, ProviderRateRunId,
-        ProviderRateStore, ProviderRateStoreError, RetryAfter,
+    use market_squawk_platform::LocalPaths;
+    use crate::{
+        TiingoHistoryPlan, TiingoQuotaError, TiingoQuotaLedger, TiingoQuotaPermit,
+        TiingoQuotaSnapshot, TiingoQuotaWindows,
     };
     use reqwest::header::AUTHORIZATION;
     use uuid::Uuid;
@@ -1293,212 +1424,434 @@ mod tests {
     use super::*;
 
     #[derive(Debug)]
-    struct MemoryQuotaStore {
-        snapshot: Mutex<Option<TiingoQuotaSnapshot>>,
-    }
-
-    impl MemoryQuotaStore {
-        fn with_snapshot(snapshot: TiingoQuotaSnapshot) -> Self {
-            Self {
-                snapshot: Mutex::new(Some(snapshot)),
-            }
-        }
-    }
-
-    impl TiingoQuotaStore for MemoryQuotaStore {
-        fn load(&self) -> Result<Option<TiingoQuotaSnapshot>, TiingoQuotaStoreError> {
-            self.snapshot
-                .lock()
-                .map_err(|_| TiingoQuotaStoreError::Unavailable)
-                .map(|state| state.clone())
-        }
-
-        fn compare_and_swap(
-            &self,
-            expected: Option<EvidenceDigest>,
-            next: &TiingoQuotaSnapshot,
-        ) -> Result<(), TiingoQuotaStoreError> {
-            let mut state = self
-                .snapshot
-                .lock()
-                .map_err(|_| TiingoQuotaStoreError::Unavailable)?;
-            if state.as_ref().map(TiingoQuotaSnapshot::digest) != expected {
-                return Err(TiingoQuotaStoreError::Conflict);
-            }
-            *state = Some(next.clone());
-            Ok(())
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct MemoryRateStore {
-        next_permit: Mutex<u128>,
-        dispatch_override: Mutex<Option<ProviderRateDispatchDecision>>,
-    }
-
-    impl MemoryRateStore {
-        fn with_dispatch_override(decision: ProviderRateDispatchDecision) -> Self {
-            Self {
-                next_permit: Mutex::new(0),
-                dispatch_override: Mutex::new(Some(decision)),
-            }
-        }
+    struct MemoryProviderAuthority {
+        state: Mutex<MemoryProviderState>,
+        authority_generation: SourceIdentifier,
+        source_id: SourceId,
+        source_contract_revision: MetadataRevision,
+        contract_revision: SourceIdentifier,
+        entitlement_generation: SourceIdentifier,
     }
 
     #[derive(Debug)]
-    struct MemoryPreparedRateBatch {
-        registrations: Box<[ProviderRateRegistration]>,
+    struct MemoryProviderState {
+        ledger: TiingoQuotaLedger,
+        pending: Option<(TiingoProviderPermit, TiingoQuotaPermit)>,
+        installation: Option<TiingoProviderAuthorityInstallation>,
+        circuit: TiingoSchemaCircuitState,
+        provider_disabled: bool,
+        history_plan: Option<TiingoHistoryPlan>,
+        history_checkpoint: Option<TiingoHistoryCheckpointReceipt>,
+        next_permit: u64,
     }
 
-    impl PreparedProviderRateRegistrationBatch for MemoryPreparedRateBatch {
-        fn registrations(&self) -> &[ProviderRateRegistration] {
-            &self.registrations
+    impl MemoryProviderAuthority {
+        fn try_new(
+            mut ledger: TiingoQuotaLedger,
+            source_id: SourceId,
+            source_contract_revision: MetadataRevision,
+            contract_revision: SourceIdentifier,
+            entitlement_generation: SourceIdentifier,
+        ) -> Result<Self, TiingoProviderAuthorityError> {
+            ledger
+                .reconcile_incomplete_response()
+                .map_err(|_| TiingoProviderAuthorityError::Corrupt)?;
+            Ok(Self {
+                state: Mutex::new(MemoryProviderState {
+                    ledger,
+                    pending: None,
+                    installation: None,
+                    circuit: TiingoSchemaCircuitState::Closed,
+                    provider_disabled: false,
+                    history_plan: None,
+                    history_checkpoint: None,
+                    next_permit: 0,
+                }),
+                authority_generation: SourceIdentifier::try_from("fixture-rate-authority-1")
+                    .map_err(|_| TiingoProviderAuthorityError::Corrupt)?,
+                source_id,
+                source_contract_revision,
+                contract_revision,
+                entitlement_generation,
+            })
         }
 
-        fn commit(self: Box<Self>) -> Result<(), ProviderRateStoreError> {
-            Ok(())
+        fn snapshot(&self) -> Result<TiingoQuotaSnapshot, TiingoProviderAuthorityError> {
+            self.state
+                .lock()
+                .map_err(|_| TiingoProviderAuthorityError::Unavailable)
+                .map(|state| state.ledger.snapshot().clone())
         }
     }
 
-    impl ProviderRateStore for MemoryRateStore {
-        fn start_run(&self, _now: Timestamp) -> Result<ProviderRateRunId, ProviderRateStoreError> {
-            Ok(ProviderRateRunId::from_bytes([1; 16]))
-        }
-
-        fn prepare_registration_batch(
+    impl TiingoProviderAuthority for MemoryProviderAuthority {
+        fn validate_requirements(
             &self,
-            _run_id: ProviderRateRunId,
-            declarations: &[ProviderRateDeclaration],
-            _now: Timestamp,
-        ) -> Result<Box<dyn PreparedProviderRateRegistrationBatch>, ProviderRateStoreError>
-        {
-            let registrations = declarations
-                .iter()
-                .map(|declaration| {
-                    ProviderRateRegistration::new(
-                        ProviderRateGroupId::from_bytes([2; 16]),
-                        declaration.policy_digest(),
-                        declaration.declaration_digest(),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            Ok(Box::new(MemoryPreparedRateBatch { registrations }))
-        }
-
-        fn try_reserve(
-            &self,
-            _run_id: ProviderRateRunId,
-            _registration: ProviderRateRegistration,
-            _now: Timestamp,
-        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
-            let mut next = self
-                .next_permit
-                .lock()
-                .map_err(|_| ProviderRateStoreError::Unavailable)?;
-            *next = next
-                .checked_add(1)
-                .ok_or(ProviderRateStoreError::Capacity)?;
-            Ok(ProviderRateReservationDecision::Ready(
-                ProviderRateReservationId::from_bytes(next.to_be_bytes()),
-            ))
-        }
-
-        fn commit_dispatch(
-            &self,
-            _run_id: ProviderRateRunId,
-            _registration: ProviderRateRegistration,
-            reservation_id: ProviderRateReservationId,
-            _now: Timestamp,
-        ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
-            if let Some(decision) = self
-                .dispatch_override
-                .lock()
-                .map_err(|_| ProviderRateStoreError::Unavailable)?
-                .take()
+            requirements: &TiingoProviderAuthorityRequirements,
+        ) -> Result<TiingoProviderAuthorityInstallation, TiingoProviderAuthorityError> {
+            let expected = tiingo_provider_rate_declaration()
+                .map_err(|_| TiingoProviderAuthorityError::Corrupt)?;
+            requirements
+                .provider_rate_declaration()
+                .validate()
+                .map_err(|_| TiingoProviderAuthorityError::Corrupt)?;
+            if requirements.provider_rate_declaration() != &expected
+                || requirements.provider_unique_symbols_per_month()
+                    != crate::TIINGO_PROVIDER_UNIQUE_SYMBOLS_PER_MONTH
+                || requirements.application_unique_symbols_per_month()
+                    != crate::TIINGO_APPLICATION_UNIQUE_SYMBOLS_PER_MONTH
+                || requirements.provider_bytes_per_month()
+                    != crate::TIINGO_PROVIDER_BYTES_PER_MONTH
+                || requirements.application_bytes_per_month()
+                    != crate::TIINGO_APPLICATION_BYTES_PER_MONTH
+                || requirements.source_id() != &self.source_id
+                || requirements.source_contract_revision() != &self.source_contract_revision
+                || requirements.native_contract_revision() != &self.contract_revision
+                || requirements.entitlement_generation() != &self.entitlement_generation
             {
-                return Ok(decision);
+                return Err(TiingoProviderAuthorityError::InvalidReceipt);
             }
-            Ok(ProviderRateDispatchDecision::Ready(
-                ProviderRatePermitId::from_bytes(reservation_id.bytes()),
-            ))
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| TiingoProviderAuthorityError::Unavailable)?;
+            if let Some(existing) = &state.installation {
+                existing.validate_against(requirements)?;
+                return Ok(existing.clone());
+            }
+            let installation = TiingoProviderAuthorityInstallation::try_new(
+                requirements,
+                self.authority_generation.clone(),
+                SourceIdentifier::try_from("fixture-tiingo-sqlite-schema-1")
+                    .map_err(|_| TiingoProviderAuthorityError::Corrupt)?,
+                EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    Sha256::digest(b"fixture-tiingo-authority-installation").into(),
+                ),
+                system_timestamp().map_err(|_| TiingoProviderAuthorityError::Unavailable)?,
+            )?;
+            state.installation = Some(installation.clone());
+            Ok(installation)
         }
 
-        fn cancel_reservation(
+        fn prepare_history_plan(
             &self,
-            _run_id: ProviderRateRunId,
-            _registration: ProviderRateRegistration,
-            _reservation_id: ProviderRateReservationId,
-        ) -> Result<(), ProviderRateStoreError> {
-            Ok(())
+            plan: &TiingoHistoryPlan,
+        ) -> Result<TiingoHistoryCheckpointReceipt, TiingoProviderAuthorityError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| TiingoProviderAuthorityError::Unavailable)?;
+            let installation_identity = state
+                .installation
+                .as_ref()
+                .ok_or(TiingoProviderAuthorityError::Conflict)?
+                .installation_identity();
+            if let (Some(existing_plan), Some(existing_checkpoint)) =
+                (&state.history_plan, &state.history_checkpoint)
+            {
+                if existing_plan == plan {
+                    return Ok(existing_checkpoint.clone());
+                }
+                return Err(TiingoProviderAuthorityError::Conflict);
+            }
+            let mut authority_hasher = Sha256::new();
+            authority_hasher.update(b"fixture-history-plan");
+            authority_hasher.update(plan.request_set_identity().bytes());
+            let authority_receipt = EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                authority_hasher.finalize().into(),
+            );
+            let checkpoint = TiingoHistoryCheckpointReceipt::try_new(
+                plan,
+                0,
+                None,
+                self.authority_generation.clone(),
+                installation_identity,
+                authority_receipt,
+                system_timestamp().map_err(|_| TiingoProviderAuthorityError::Unavailable)?,
+            )?;
+            state.history_plan = Some(plan.clone());
+            state.history_checkpoint = Some(checkpoint.clone());
+            Ok(checkpoint)
         }
 
-        fn release(
+        fn checkpoint_history_page(
             &self,
-            _run_id: ProviderRateRunId,
-            _registration: ProviderRateRegistration,
-            _permit_id: ProviderRatePermitId,
-        ) -> Result<(), ProviderRateStoreError> {
-            Ok(())
+            checkpoint: &TiingoHistoryCheckpointReceipt,
+            page: &TiingoSealedHistoryPage,
+        ) -> Result<TiingoHistoryCheckpointReceipt, TiingoProviderAuthorityError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| TiingoProviderAuthorityError::Unavailable)?;
+            let installation_identity = state
+                .installation
+                .as_ref()
+                .ok_or(TiingoProviderAuthorityError::Conflict)?
+                .installation_identity();
+            let plan = state
+                .history_plan
+                .as_ref()
+                .ok_or(TiingoProviderAuthorityError::Conflict)?
+                .clone();
+            if state.history_checkpoint.as_ref() != Some(checkpoint) {
+                return Err(TiingoProviderAuthorityError::Conflict);
+            }
+            if checkpoint.installation_identity() != installation_identity {
+                return Err(TiingoProviderAuthorityError::InvalidReceipt);
+            }
+            let index = usize::try_from(checkpoint.next_page_index())
+                .map_err(|_| TiingoProviderAuthorityError::InvalidReceipt)?;
+            if plan.pages().get(index) != Some(page.request()) {
+                return Err(TiingoProviderAuthorityError::InvalidReceipt);
+            }
+            let next_index = checkpoint
+                .next_page_index()
+                .checked_add(1)
+                .ok_or(TiingoProviderAuthorityError::Corrupt)?;
+            let mut authority_hasher = Sha256::new();
+            authority_hasher.update(checkpoint.authority_receipt().bytes());
+            authority_hasher.update(page.page_identity().bytes());
+            authority_hasher.update(next_index.to_be_bytes());
+            let authority_receipt = EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                authority_hasher.finalize().into(),
+            );
+            let next = TiingoHistoryCheckpointReceipt::try_new(
+                &plan,
+                next_index,
+                Some(page.page_identity()),
+                self.authority_generation.clone(),
+                installation_identity,
+                authority_receipt,
+                system_timestamp().map_err(|_| TiingoProviderAuthorityError::Unavailable)?,
+            )?;
+            state.history_checkpoint = Some(next.clone());
+            Ok(next)
         }
 
-        fn apply_retry_after(
+        fn try_acquire(
             &self,
-            _run_id: ProviderRateRunId,
-            _registration: ProviderRateRegistration,
-            _now: Timestamp,
-            _retry_after: RetryAfter,
-        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
-            Ok(ProviderRateReservationDecision::Unavailable(
-                BudgetUnavailableReason::Disabled,
-            ))
+            request: &TiingoProviderAdmissionRequest,
+        ) -> Result<TiingoProviderAdmissionDecision, TiingoProviderAuthorityError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| TiingoProviderAuthorityError::Unavailable)?;
+            let installation_identity = state
+                .installation
+                .as_ref()
+                .ok_or(TiingoProviderAuthorityError::Conflict)?
+                .installation_identity();
+            if let TiingoSchemaCircuitState::Open(change) = &state.circuit {
+                return Ok(TiingoProviderAdmissionDecision::SchemaCircuitOpen(
+                    change.clone(),
+                ));
+            }
+            if state.provider_disabled {
+                return Ok(TiingoProviderAdmissionDecision::Unavailable(
+                    BudgetUnavailableReason::Disabled,
+                ));
+            }
+            if state.pending.is_some() {
+                return Err(TiingoProviderAuthorityError::Conflict);
+            }
+            if let Some(checkpoint) = request.history_checkpoint() {
+                let plan = state
+                    .history_plan
+                    .as_ref()
+                    .ok_or(TiingoProviderAuthorityError::Conflict)?;
+                let current = state
+                    .history_checkpoint
+                    .as_ref()
+                    .ok_or(TiingoProviderAuthorityError::Conflict)?;
+                let page_index = usize::try_from(checkpoint.next_page_index())
+                    .map_err(|_| TiingoProviderAuthorityError::InvalidReceipt)?;
+                if current != checkpoint
+                    || checkpoint.installation_identity() != installation_identity
+                    || plan
+                        .pages()
+                        .get(page_index)
+                        .map(TiingoRequestSpec::request_identity)
+                        != Some(request.request_identity())
+                {
+                    return Err(TiingoProviderAuthorityError::Conflict);
+                }
+            }
+            let mut next_ledger = state.ledger.clone();
+            let internal = match next_ledger
+                .reserve(request.ticker().clone(), request.maximum_response_bytes())
+                .map_err(|_| TiingoProviderAuthorityError::Corrupt)?
+            {
+                Ok(permit) => permit,
+                Err(admission) => {
+                    return Ok(TiingoProviderAdmissionDecision::QuotaDenied(admission));
+                }
+            };
+            let next_permit = state
+                .next_permit
+                .checked_add(1)
+                .ok_or(TiingoProviderAuthorityError::Corrupt)?;
+            let permit_identity = EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(next_permit.to_be_bytes()).into(),
+            );
+            let permit = TiingoProviderPermit::try_new(
+                request.ticker().clone(),
+                request.request_identity(),
+                request.maximum_response_bytes(),
+                self.authority_generation.clone(),
+                installation_identity,
+                request
+                    .history_checkpoint()
+                    .map(TiingoHistoryCheckpointReceipt::receipt_identity),
+                permit_identity,
+                system_timestamp().map_err(|_| TiingoProviderAuthorityError::Unavailable)?,
+            )?;
+            state.ledger = next_ledger;
+            state.next_permit = next_permit;
+            state.pending = Some((permit.clone(), internal));
+            Ok(TiingoProviderAdmissionDecision::Ready(permit))
         }
 
-        fn apply_refusal(
+        fn settle_response(
             &self,
-            _run_id: ProviderRateRunId,
-            _registration: ProviderRateRegistration,
-            _now: Timestamp,
-            _jitter_sample_basis_points: u16,
-        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
-            Ok(ProviderRateReservationDecision::Unavailable(
-                BudgetUnavailableReason::Disabled,
-            ))
+            permit: &TiingoProviderPermit,
+            settlement: &TiingoResponseSettlement,
+        ) -> Result<Option<TiingoRateLimitDisposition>, TiingoProviderAuthorityError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| TiingoProviderAuthorityError::Unavailable)?;
+            let Some((pending_permit, pending)) = state.pending.as_ref() else {
+                return Err(TiingoProviderAuthorityError::Conflict);
+            };
+            let settlement_is_valid = match settlement {
+                TiingoResponseSettlement::Complete { response_bytes, .. } => {
+                    *response_bytes <= permit.maximum_response_bytes().get()
+                }
+                TiingoResponseSettlement::Incomplete {
+                    observed_response_bytes,
+                    charged_response_bytes,
+                } => {
+                    observed_response_bytes <= charged_response_bytes
+                        && *charged_response_bytes >= permit.maximum_response_bytes().get()
+                }
+            };
+            if pending_permit != permit
+                || pending.ticker() != permit.ticker()
+                || permit.authority_generation() != &self.authority_generation
+                || state
+                    .installation
+                    .as_ref()
+                    .is_none_or(|installation| {
+                        permit.installation_identity() != installation.installation_identity()
+                    })
+                || !settlement_is_valid
+            {
+                return Err(TiingoProviderAuthorityError::InvalidReceipt);
+            }
+            let mut next_circuit = state.circuit.clone();
+            let mut next_provider_disabled = state.provider_disabled;
+            let rate_limit = match settlement.complete_disposition() {
+                None
+                | Some(
+                    TiingoCompletedResponseDisposition::DecodedSuccess
+                    | TiingoCompletedResponseDisposition::ProviderRefusal
+                    | TiingoCompletedResponseDisposition::Rejected,
+                ) => None,
+                Some(TiingoCompletedResponseDisposition::ProviderRateLimited {
+                    retry_after,
+                    jitter_sample_basis_points,
+                }) => {
+                    if retry_after.as_ref().is_some_and(|value| value.len() > 128)
+                        || *jitter_sample_basis_points > 10_000
+                    {
+                        return Err(TiingoProviderAuthorityError::InvalidReceipt);
+                    }
+                    next_provider_disabled = true;
+                    Some(TiingoRateLimitDisposition::Unavailable(
+                        BudgetUnavailableReason::Disabled,
+                    ))
+                }
+                Some(TiingoCompletedResponseDisposition::SchemaChanged {
+                    contract_revision,
+                    change,
+                }) => {
+                    if contract_revision != &self.contract_revision {
+                        return Err(TiingoProviderAuthorityError::InvalidReceipt);
+                    }
+                    match &next_circuit {
+                        TiingoSchemaCircuitState::Closed => {
+                            next_circuit = TiingoSchemaCircuitState::Open(change.clone());
+                        }
+                        TiingoSchemaCircuitState::Open(existing) if existing == change => {}
+                        TiingoSchemaCircuitState::Open(_) => {
+                            return Err(TiingoProviderAuthorityError::Conflict);
+                        }
+                    }
+                    None
+                }
+            };
+            let mut next_ledger = state.ledger.clone();
+            match next_ledger.commit_response(
+                pending,
+                permit.ticker(),
+                settlement.charged_response_bytes(),
+            ) {
+                Ok(()) => {}
+                Err(TiingoQuotaError::ResponseExceededReservation) => {
+                    next_provider_disabled = true;
+                }
+                Err(_) => return Err(TiingoProviderAuthorityError::Corrupt),
+            }
+            state.ledger = next_ledger;
+            state.circuit = next_circuit;
+            state.provider_disabled = next_provider_disabled;
+            state.pending = None;
+            Ok(rate_limit)
         }
 
-        fn record_success(
+        fn schema_circuit_state(
             &self,
-            _run_id: ProviderRateRunId,
-            _registration: ProviderRateRegistration,
-            _now: Timestamp,
-        ) -> Result<(), ProviderRateStoreError> {
-            Ok(())
+            contract_revision: &SourceIdentifier,
+        ) -> Result<TiingoSchemaCircuitState, TiingoProviderAuthorityError> {
+            if contract_revision != &self.contract_revision {
+                return Err(TiingoProviderAuthorityError::InvalidReceipt);
+            }
+            self.state
+                .lock()
+                .map_err(|_| TiingoProviderAuthorityError::Unavailable)
+                .map(|state| state.circuit.clone())
         }
 
-        fn bind_authorization_subject(
-            &self,
-            _run_id: ProviderRateRunId,
-            _mode: AuthorizationMode,
-            _evidence: EvidenceDigest,
-            _subject: &SourceIdentifier,
-            _now: Timestamp,
-        ) -> Result<(), ProviderRateStoreError> {
-            Ok(())
+    }
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "market-squawk-tiingo-http-{}",
+                Uuid::new_v4()
+            )))
         }
 
-        fn resolve_authorization_subject(
-            &self,
-            _mode: AuthorizationMode,
-            _evidence: EvidenceDigest,
-        ) -> Result<Option<SourceIdentifier>, ProviderRateStoreError> {
-            Ok(None)
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ignored = std::fs::remove_dir_all(&self.0);
         }
     }
 
     #[derive(Debug)]
     struct MockTransport {
         replies: Mutex<VecDeque<MockReply>>,
-        calls: AtomicUsize,
     }
 
     #[derive(Debug)]
@@ -1512,12 +1865,7 @@ mod tests {
         fn new(replies: Vec<MockReply>) -> Self {
             Self {
                 replies: Mutex::new(replies.into()),
-                calls: AtomicUsize::new(0),
             }
-        }
-
-        fn calls(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
         }
     }
 
@@ -1529,7 +1877,6 @@ mod tests {
             _timeout: Duration,
             _cancellation: CancellationToken,
         ) -> BoxFuture<'_, Result<TiingoHttpResponseMaterial, TiingoTransportFailure>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 let started = Instant::now();
                 let Some(authorization) = request.headers().get(AUTHORIZATION) else {
@@ -1583,75 +1930,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregate_dispatch_rejection_cancels_undispatched_local_quota()
-    -> Result<(), Box<dyn Error>> {
-        let now = system_timestamp()?;
-        let windows = TiingoQuotaWindows::try_new(
-            now,
-            Timestamp::from_unix_nanos(now.unix_nanos() + 3_600_000_000_000),
-            Timestamp::from_unix_nanos(now.unix_nanos() + 86_400_000_000_000),
-            Timestamp::from_unix_nanos(now.unix_nanos() + 2_592_000_000_000_000),
-        )?;
-        let quota_store = Arc::new(MemoryQuotaStore {
-            snapshot: Mutex::new(None),
-        });
-        let rate_authority =
-            ProviderRateAuthority::try_new(Arc::new(MemoryRateStore::with_dispatch_override(
-                ProviderRateDispatchDecision::Unavailable(BudgetUnavailableReason::Disabled),
-            )))?;
-        let transport = Arc::new(MockTransport::new(Vec::new()));
-        let source = TiingoHttpSource::try_new_with_transport(
-            TiingoApiToken::try_new("fixture-token".to_owned())?,
-            &rate_authority,
-            quota_store.clone(),
-            windows,
-            SourceId::try_from("tiingo-starter")?,
-            MetadataRevision::new(identifier("tiingo-source-metadata-v1")?),
-            identifier("tiingo-daily-native-v1")?,
-            transport.clone(),
-        )?;
-        let before = source.quota_snapshot().await;
-        let deadline =
-            Timestamp::from_unix_nanos(system_timestamp()?.unix_nanos() + 60_000_000_000);
-
-        assert!(matches!(
-            source
-                .fetch_latest(
-                    TiingoTicker::try_new("VTSAX")?,
-                    deadline,
-                    &CancellationToken::new(),
-                )
-                .await,
-            Err(TiingoHttpSourceError::BudgetUnavailable(
-                BudgetUnavailableReason::Disabled
-            ))
-        ));
-
-        let after = source.quota_snapshot().await;
-        assert_eq!(after.requests_this_hour(), before.requests_this_hour());
-        assert_eq!(after.requests_this_day(), before.requests_this_day());
-        assert_eq!(
-            after.response_bytes_this_month(),
-            before.response_bytes_this_month()
-        );
-        assert_eq!(
-            after.unique_symbols_this_month(),
-            before.unique_symbols_this_month()
-        );
-        assert_eq!(after.pending_response(), before.pending_response());
-        assert_eq!(
-            after.state_version(),
-            before
-                .state_version()
-                .checked_add(2)
-                .ok_or("quota state version overflow")?
-        );
-        assert_eq!(quota_store.load()?, Some(after));
-        assert_eq!(transport.calls(), 0);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn bounded_http_journey_reconciles_restart_quota_and_proves_all_terminal_shapes()
     -> Result<(), Box<dyn Error>> {
         let now = system_timestamp()?;
@@ -1670,10 +1948,18 @@ mod tests {
         else {
             return Err("unexpected crash-reservation denial".into());
         };
-        let quota_store = Arc::new(MemoryQuotaStore::with_snapshot(
-            interrupted.snapshot().clone(),
-        ));
-        let rate_authority = ProviderRateAuthority::try_new(Arc::new(MemoryRateStore::default()))?;
+        let source_id = SourceId::try_from(TIINGO_SOURCE_ID)?;
+        let source_contract_revision =
+            MetadataRevision::new(identifier("tiingo-source-metadata-v1")?);
+        let contract_revision = identifier("tiingo-daily-native-v1")?;
+        let entitlement_generation = identifier("tiingo-entitlement-generation-11")?;
+        let authority = Arc::new(MemoryProviderAuthority::try_new(
+            interrupted,
+            source_id.clone(),
+            source_contract_revision.clone(),
+            contract_revision.clone(),
+            entitlement_generation.clone(),
+        )?);
 
         let success_bodies = vec![
             Bytes::from_static(br#"{"ticker":"VTSAX","name":"Vanguard Total Stock Market Index Fund Admiral Shares","exchangeCode":"MF","description":"Mutual fund","startDate":"2000-11-13","endDate":"2026-01-02"}"#),
@@ -1705,12 +1991,11 @@ mod tests {
         });
         let source = TiingoHttpSource::try_new_with_transport(
             TiingoApiToken::try_new("fixture-token".to_owned())?,
-            &rate_authority,
-            quota_store.clone(),
-            windows,
-            SourceId::try_from("tiingo-starter")?,
-            MetadataRevision::new(identifier("tiingo-source-metadata-v1")?),
-            identifier("tiingo-daily-native-v1")?,
+            authority.clone(),
+            source_id.clone(),
+            source_contract_revision.clone(),
+            contract_revision.clone(),
+            entitlement_generation.clone(),
             Arc::new(MockTransport::new(replies)),
         )?;
         let deadline =
@@ -1738,28 +2023,58 @@ mod tests {
             .fetch_latest(ticker.clone(), deadline, &cancellation)
             .await?;
         assert_eq!(latest.decoded().rows().len(), 1);
-        let history = source
-            .fetch_history(
-                TiingoHistoryPlan::try_new(
-                    ticker,
-                    CalendarDate::new(2025, 1, 1)?,
-                    CalendarDate::new(2026, 1, 2)?,
-                )?,
-                deadline,
-                &cancellation,
-            )
-            .await?;
-        assert_eq!(history.pages().len(), 2);
-        assert_eq!(
-            history.terminal(),
-            TiingoHistoryTerminalDisposition::ApplicationDateWindowsExhaustedWithoutProviderCursor
-        );
-        assert!(
-            history
+        let history_plan = TiingoHistoryPlan::try_new(
+            ticker,
+            CalendarDate::new(2025, 1, 1)?,
+            CalendarDate::new(2026, 1, 2)?,
+        )?;
+        let temporary = TemporaryDirectory::new();
+        let paths = LocalPaths::prepare(temporary.path())?;
+        let store = paths.sealed_research_journal_store()?;
+        let mut history_checkpoint = source.prepare_history_plan(&history_plan)?;
+        let mut sealed_history_pages = Vec::new();
+        while usize::try_from(history_checkpoint.next_page_index())? < history_plan.pages().len() {
+            let page_index = usize::try_from(history_checkpoint.next_page_index())?;
+            let expected_request = history_plan
                 .pages()
-                .iter()
-                .all(|page| page.raw().capture().terminal()
-                    == ProviderCaptureTerminalDisposition::StandaloneResponse)
+                .get(page_index)
+                .ok_or("missing expected Tiingo history page")?
+                .clone();
+            let captured = source
+                .fetch_history_page(
+                    &history_plan,
+                    &history_checkpoint,
+                    deadline,
+                    &cancellation,
+                )
+                .await?;
+            let sealed_capture = captured
+                .capture_material(
+                    Uuid::from_u128(10 + u128::try_from(page_index)?),
+                    Uuid::from_u128(3),
+                )?
+                .seal(&store)?;
+            let sealed_page = TiingoSealedHistoryPage::try_new(
+                &expected_request,
+                captured.decoded(),
+                &sealed_capture,
+            )?;
+            history_checkpoint = source.checkpoint_history_page(
+                &history_plan,
+                &history_checkpoint,
+                &sealed_page,
+            )?;
+            sealed_history_pages.push(sealed_page);
+        }
+        let completed_history = source.complete_history_capture(
+            history_plan,
+            sealed_history_pages,
+            &history_checkpoint,
+        )?;
+        assert_eq!(completed_history.pages().len(), 2);
+        assert_eq!(
+            completed_history.checkpoint_receipt_identity(),
+            history_checkpoint.receipt_identity()
         );
         match source
             .fetch_latest(TiingoTicker::try_new("VTSAX")?, deadline, &cancellation)
@@ -1778,7 +2093,7 @@ mod tests {
             _ => return Err("expected preserved Tiingo 429 refusal".into()),
         }
 
-        let snapshot = source.quota_snapshot().await;
+        let snapshot = authority.snapshot()?;
         assert!(snapshot.pending_response().is_none());
         assert_eq!(snapshot.requests_this_hour(), 6);
         assert_eq!(snapshot.response_bytes_this_month(), expected_bytes);
@@ -1788,15 +2103,77 @@ mod tests {
 
         let restarted = TiingoHttpSource::try_new_with_transport(
             TiingoApiToken::try_new("fixture-token".to_owned())?,
-            &rate_authority,
-            quota_store,
-            windows,
-            SourceId::try_from("tiingo-starter")?,
-            MetadataRevision::new(identifier("tiingo-source-metadata-v1")?),
-            identifier("tiingo-daily-native-v1")?,
+            authority.clone(),
+            source_id.clone(),
+            source_contract_revision.clone(),
+            contract_revision,
+            entitlement_generation,
             Arc::new(MockTransport::new(Vec::new())),
         )?;
-        assert_eq!(restarted.quota_snapshot().await, snapshot);
+        assert_eq!(authority.snapshot()?, snapshot);
+        assert_eq!(
+            restarted.schema_circuit_state().await?,
+            TiingoSchemaCircuitState::Closed
+        );
+
+        let drift_contract = identifier("tiingo-daily-native-v1")?;
+        let drift_authority = Arc::new(MemoryProviderAuthority::try_new(
+            TiingoQuotaLedger::new(windows),
+            source_id.clone(),
+            source_contract_revision.clone(),
+            drift_contract.clone(),
+            identifier("tiingo-entitlement-generation-11")?,
+        )?);
+        let drift_source = TiingoHttpSource::try_new_with_transport(
+            TiingoApiToken::try_new("fixture-token".to_owned())?,
+            drift_authority.clone(),
+            source_id.clone(),
+            source_contract_revision.clone(),
+            drift_contract.clone(),
+            identifier("tiingo-entitlement-generation-11")?,
+            Arc::new(MockTransport::new(vec![MockReply {
+                status: 200,
+                body: Bytes::from_static(b"{}"),
+                retry_after: None,
+            }])),
+        )?;
+        match drift_source
+            .fetch_latest(
+                TiingoTicker::try_new("VTSAX")?,
+                deadline,
+                &cancellation,
+            )
+            .await
+        {
+            Err(TiingoHttpSourceError::Decode(failure))
+                if matches!(failure.error(), TiingoAdapterError::SchemaChanged(_)) => {}
+            _ => return Err("expected strict schema drift to open the shared circuit".into()),
+        }
+        assert!(matches!(
+            drift_source.schema_circuit_state().await?,
+            TiingoSchemaCircuitState::Open(_)
+        ));
+        let drift_restarted = TiingoHttpSource::try_new_with_transport(
+            TiingoApiToken::try_new("fixture-token".to_owned())?,
+            drift_authority,
+            source_id,
+            source_contract_revision,
+            drift_contract,
+            identifier("tiingo-entitlement-generation-11")?,
+            Arc::new(MockTransport::new(Vec::new())),
+        )?;
+        assert!(matches!(
+            drift_restarted
+                .fetch_latest(
+                    TiingoTicker::try_new("VTSAX")?,
+                    deadline,
+                    &cancellation,
+                )
+                .await,
+            Err(TiingoHttpSourceError::Adapter(
+                TiingoAdapterError::SchemaCircuitOpen
+            ))
+        ));
         Ok(())
     }
 }
