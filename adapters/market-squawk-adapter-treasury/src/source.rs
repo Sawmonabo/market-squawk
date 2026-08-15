@@ -1,17 +1,22 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use market_squawk_domain::{
-    DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
+    DataQuality, DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
+    Timestamp,
 };
-use market_squawk_platform::RawCaptureRecord;
+use market_squawk_platform::{RawCaptureRecord, SealedResearchJournalStore};
 use market_squawk_sources::{
-    AuthorizationMode, CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
-    ExtractionBatch, ExtractionRequest, ExtractionRevisionEvidence, ExtractionRevisionPlan,
-    ExtractionSource, ExtractionSourceError, HistoricalCapability, ObservedProviderOrder,
-    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    AuthorizationMode, BudgetWindowSemantics, CoverageDomain, DiscoveryBatch, DiscoveryRequest,
+    ExtractionAuthority, ExtractionBatch, ExtractionError, ExtractionRequest,
+    ExtractionRevisionEvidence, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
+    HistoricalCapability, ObservedProviderOrder, ProviderCaptureMaterial,
+    ProviderCaptureMaterialSealError, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
     ProviderCaptureTerminalDisposition, SourceClass, SourceError, SourceMetadata,
     SourceMetadataProvider, SourceProtocolProfile,
 };
@@ -27,9 +32,20 @@ use crate::{
     TreasuryProtocolError, TreasuryYieldCurvePageRequest,
 };
 
+mod backfill;
 mod lineage;
-mod normalize;
+pub(crate) mod normalize;
 
+pub use backfill::{
+    TreasuryAllHistoryAcquisitionCompletion, TreasuryAllHistoryBackfill,
+    TreasuryAllHistoryCanonicalPage, TreasuryAllHistoryCheckpoint, TreasuryAllHistoryFetchedPage,
+    TreasuryAllHistoryPageAdmission,
+};
+
+use crate::vertical::{
+    TreasuryDiscoveryAccounting, TreasuryDiscoveryAccountingInput, TreasuryDiscoveryOutput,
+    TreasuryExtractionAccounting, TreasuryExtractionAccountingInput,
+};
 use lineage::{
     ObjectKind, ParsedObjectId, invalid_protocol, lower_hex, source_object, verify_refetched_object,
 };
@@ -113,6 +129,20 @@ impl TreasuryDailyRatesConfig {
         Self::try_new(queries)
     }
 
+    /// Builds one explicit resumable all-history query for every official daily-rate family.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if any official family request cannot be represented by the exact query
+    /// grammar or the duplicate-free configuration bound.
+    pub fn all_history_all_families() -> Result<Self, TreasuryProtocolError> {
+        let queries = TreasuryDailyRateFamily::ALL
+            .into_iter()
+            .map(TreasuryDailyRateQuery::all_history)
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_new(queries)
+    }
+
     /// Returns all exact configured queries in stable family/range order.
     pub fn queries(&self) -> &[TreasuryDailyRateQuery] {
         &self.queries
@@ -166,6 +196,38 @@ impl TreasurySourceConfig {
         end_year: u16,
     ) -> Result<Self, TreasuryProtocolError> {
         TreasuryDailyRatesConfig::all_families(start_year, end_year).map(Self::DailyRates)
+    }
+
+    /// Creates explicit resumable all-history acquisition for all five daily-rate families.
+    pub fn daily_rates_all_history() -> Result<Self, TreasuryProtocolError> {
+        TreasuryDailyRatesConfig::all_history_all_families().map(Self::DailyRates)
+    }
+
+    /// Returns every exact provider and analytical dataset carried by this configuration.
+    ///
+    /// The catalog is the activation intent used by provider-local doctor, publication, and
+    /// dashboard-read gates. A multi-year daily-rate source therefore exposes every year/family
+    /// selector instead of pretending it has one representative dataset.
+    pub fn dataset_catalog(
+        &self,
+    ) -> Result<crate::TreasuryDatasetCatalog, crate::TreasuryVerticalError> {
+        crate::TreasuryDatasetCatalog::try_from_config(self)
+    }
+
+    /// Binds exact configured datasets to the owner's private-research use authorization.
+    pub fn activation_intent(
+        &self,
+        owner_use: crate::TreasuryOwnerUseAttestation,
+    ) -> Result<crate::TreasuryActivationIntent, crate::TreasuryVerticalError> {
+        crate::TreasuryActivationIntent::try_new(self, owner_use)
+    }
+
+    /// Builds one bounded representative doctor request per configured Treasury family.
+    pub fn doctor_plan(
+        &self,
+        owner_use: crate::TreasuryOwnerUseAttestation,
+    ) -> Result<crate::TreasuryDoctorPlan, crate::TreasuryVerticalError> {
+        self.activation_intent(owner_use)?.doctor_plan(self)
     }
 
     /// Returns the exact quality ceiling required by this profile.
@@ -382,6 +444,85 @@ pub type RetrievedYieldCurvePage = RetrievedDailyRatePage;
 pub struct TreasuryExtractionOutput {
     batch: ExtractionBatch,
     capture: ProviderCaptureMaterial,
+    accounting: TreasuryExtractionAccounting,
+}
+
+/// Canonical Treasury rows whose exact producing response is durably sealed and identity-bound.
+///
+/// This value can only be produced by consuming [`TreasuryExtractionOutput`]. The canonical batch
+/// and provider-local commitment therefore cross the application boundary together; callers
+/// cannot substitute another retry's same-body capture after normalization.
+#[derive(Debug)]
+pub struct TreasurySealedExtraction {
+    batch: ExtractionBatch,
+    commitment: crate::TreasuryExtractionCommitment,
+}
+
+/// Network-authorized Treasury doctor result paired with every exact raw probe response.
+///
+/// The receipt can only be minted by [`TreasurySource::run_doctor`], which traverses the normal
+/// extraction authority, network allowlist, shared provider budget/cooldown, strict parser, and
+/// canonical normalizer. The application must seal every returned capture before persisting an
+/// activation decision.
+#[derive(Debug)]
+pub struct TreasuryDoctorRun {
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    receipt: crate::TreasuryDoctorReceipt,
+    captures: Box<[ProviderCaptureMaterial]>,
+}
+
+impl TreasuryDoctorRun {
+    /// Returns the number of exact raw probe responses awaiting durable sealing.
+    pub fn probe_count(&self) -> usize {
+        self.captures.len()
+    }
+
+    /// Seals every exact probe response before exposing an activation receipt.
+    pub fn seal(
+        self,
+        store: &SealedResearchJournalStore,
+    ) -> Result<crate::TreasurySealedDoctorReceipt, TreasuryDoctorSealError> {
+        let mut sealed = Vec::new();
+        sealed.try_reserve_exact(self.captures.len()).map_err(|_| {
+            TreasuryDoctorSealError::Contract(crate::TreasuryVerticalError::AccountingOverflow)
+        })?;
+        for capture in self.captures.into_vec() {
+            sealed.push(capture.seal(store)?);
+        }
+        crate::TreasurySealedDoctorReceipt::try_new(
+            self.source_id,
+            self.metadata_revision,
+            self.receipt,
+            sealed,
+        )
+        .map_err(Into::into)
+    }
+}
+
+/// Failure while sealing or identity-binding a completed Treasury doctor run.
+#[derive(Debug, Error)]
+pub enum TreasuryDoctorSealError {
+    /// The shared sealed research journal rejected an exact provider response.
+    #[error(transparent)]
+    Capture(#[from] ProviderCaptureMaterialSealError),
+    /// The sealed response set no longer matches parsed doctor evidence.
+    #[error(transparent)]
+    Contract(#[from] crate::TreasuryVerticalError),
+}
+
+/// Failure while binding and sealing one exact Treasury extraction observation.
+#[derive(Debug, Error)]
+pub enum TreasuryExtractionSealError {
+    /// The canonical batch could not bind to its exact provider-capture lineage.
+    #[error(transparent)]
+    Batch(#[from] ExtractionError),
+    /// The shared sealed research journal rejected the exact raw response.
+    #[error(transparent)]
+    Capture(#[from] ProviderCaptureMaterialSealError),
+    /// Provider-local canonical, accounting, and physical-capture facts did not match exactly.
+    #[error(transparent)]
+    Contract(#[from] crate::TreasuryVerticalError),
 }
 
 impl TreasuryExtractionOutput {
@@ -395,9 +536,47 @@ impl TreasuryExtractionOutput {
         &self.capture
     }
 
-    /// Consumes the application handoff into canonical and exact raw components.
-    pub fn into_parts(self) -> (ExtractionBatch, ProviderCaptureMaterial) {
-        (self.batch, self.capture)
+    /// Returns exact page, row, canonical-point, byte, request, and terminal accounting.
+    pub const fn accounting(&self) -> &TreasuryExtractionAccounting {
+        &self.accounting
+    }
+
+    /// Consumes this one-shot output, seals its exact raw response, and returns the canonical batch
+    /// only alongside the matching provider-local commitment.
+    pub fn seal_for_publication(
+        self,
+        store: &SealedResearchJournalStore,
+    ) -> Result<TreasurySealedExtraction, TreasuryExtractionSealError> {
+        let Self {
+            batch,
+            capture,
+            accounting,
+        } = self;
+        let batch = batch.try_bind_provider_capture(capture.receipt())?;
+        let sealed_capture = capture.seal(store)?;
+        let commitment = crate::TreasuryExtractionCommitment::try_from_output(
+            &batch,
+            accounting,
+            sealed_capture,
+        )?;
+        Ok(TreasurySealedExtraction { batch, commitment })
+    }
+}
+
+impl TreasurySealedExtraction {
+    /// Returns the canonical batch bound to the sealed provider response.
+    pub const fn batch(&self) -> &ExtractionBatch {
+        &self.batch
+    }
+
+    /// Returns the exact semantic, observation, and physical-capture commitment.
+    pub const fn commitment(&self) -> &crate::TreasuryExtractionCommitment {
+        &self.commitment
+    }
+
+    /// Consumes the sealed handoff without allowing either side to be replaced before binding.
+    pub fn into_parts(self) -> (ExtractionBatch, crate::TreasuryExtractionCommitment) {
+        (self.batch, self.commitment)
     }
 }
 
@@ -405,6 +584,7 @@ impl TreasuryExtractionOutput {
 pub struct TreasurySource {
     metadata: SourceMetadata,
     config: TreasurySourceConfig,
+    activation: crate::TreasuryActivationIntent,
     client: TreasuryHttpClient,
     health: Mutex<TreasurySourceHealth>,
 }
@@ -476,16 +656,22 @@ impl TreasurySource {
     /// # Errors
     ///
     /// Fails closed unless the metadata authorizes this exact official-agency profile, coverage,
-    /// quality ceiling, network target and public-interface budget.
+    /// quality ceiling, network target and public-interface budget, and unless the source is bound
+    /// to the owner's closed private-research/non-sale/non-redistribution attestation.
     pub fn try_new(
         metadata: SourceMetadata,
         config: TreasurySourceConfig,
+        owner_use: crate::TreasuryOwnerUseAttestation,
     ) -> Result<Self, TreasurySourceError> {
         Self::validate_metadata(&metadata, &config)?;
+        let activation = config
+            .activation_intent(owner_use)
+            .map_err(|_| TreasurySourceError::InvalidOwnerUseAttestation)?;
         let client = TreasuryHttpClient::try_new(&metadata)?;
         Ok(Self {
             metadata,
             config,
+            activation,
             client,
             health: Mutex::new(TreasurySourceHealth::new()),
         })
@@ -495,13 +681,18 @@ impl TreasurySource {
     fn try_new_with_transport(
         metadata: SourceMetadata,
         config: TreasurySourceConfig,
+        owner_use: crate::TreasuryOwnerUseAttestation,
         transport: Arc<dyn crate::client::TreasuryTransport>,
     ) -> Result<Self, TreasurySourceError> {
         Self::validate_metadata(&metadata, &config)?;
+        let activation = config
+            .activation_intent(owner_use)
+            .map_err(|_| TreasurySourceError::InvalidOwnerUseAttestation)?;
         let client = TreasuryHttpClient::try_new_with_transport(&metadata, transport)?;
         Ok(Self {
             metadata,
             config,
+            activation,
             client,
             health: Mutex::new(TreasurySourceHealth::new()),
         })
@@ -511,12 +702,24 @@ impl TreasurySource {
         metadata: &SourceMetadata,
         config: &TreasurySourceConfig,
     ) -> Result<(), TreasurySourceError> {
+        let budget = metadata
+            .budget_policy()
+            .ok_or(TreasurySourceError::InvalidMetadata)?;
+        let budget_window = budget
+            .window(0)
+            .ok_or(TreasurySourceError::InvalidMetadata)?;
         if metadata.source_class() != SourceClass::OfficialAgency
             || metadata.provider().as_str() != "us-treasury"
             || metadata.authorization().mode() != AuthorizationMode::PublicInterface
             || metadata.coverage().domain() != CoverageDomain::Macroeconomic
             || metadata.quality_ceiling() != config.quality()
-            || metadata.budget_policy().is_none()
+            || budget.scope().as_source_identifier().as_str() != "us-treasury"
+            || budget.scope().authorization_account().is_some()
+            || budget.window_count() != 1
+            || budget_window.requests_per_window() != 1
+            || budget_window.window_nanos() != 1_000_000_000
+            || budget_window.semantics() != BudgetWindowSemantics::Sliding
+            || budget.max_concurrent() != 1
             || metadata.capabilities().live()
             || !metadata.capabilities().extraction()
             || metadata.capabilities().historical() != HistoricalCapability::Historical
@@ -536,6 +739,118 @@ impl TreasurySource {
     /// Returns the exact configured profile.
     pub const fn config(&self) -> &TreasurySourceConfig {
         &self.config
+    }
+
+    /// Returns the exact multi-dataset activation intent for this source generation.
+    pub fn dataset_catalog(
+        &self,
+    ) -> Result<crate::TreasuryDatasetCatalog, crate::TreasuryVerticalError> {
+        self.config.dataset_catalog()
+    }
+
+    /// Returns the immutable owner-authorized activation bound at source construction.
+    pub const fn activation_intent(&self) -> &crate::TreasuryActivationIntent {
+        &self.activation
+    }
+
+    /// Returns the bounded exact-query doctor plan for this source generation.
+    pub fn doctor_plan(&self) -> Result<crate::TreasuryDoctorPlan, crate::TreasuryVerticalError> {
+        self.activation.doctor_plan(&self.config)
+    }
+
+    /// Executes every bounded doctor probe through production retrieval and normalization.
+    pub async fn run_doctor(
+        &self,
+        authority: ExtractionAuthority,
+        deadline: Timestamp,
+        cancellation: CancellationToken,
+    ) -> Result<TreasuryDoctorRun, ExtractionSourceError> {
+        self.validate_authority(&authority)?;
+        let plan = self.doctor_plan().map_err(|_| invalid_protocol())?;
+        let mut observations = Vec::new();
+        let mut captures = Vec::new();
+        observations
+            .try_reserve_exact(plan.probes().len())
+            .map_err(|_| invalid_protocol())?;
+        captures
+            .try_reserve_exact(plan.probes().len())
+            .map_err(|_| invalid_protocol())?;
+        for probe in plan.probes() {
+            let started = Instant::now();
+            let (received_at, body, capture) = if let Some(request) = probe.fiscal_request() {
+                let retrieved = self
+                    .fetch_fiscal_page(
+                        &authority,
+                        request,
+                        FiscalDataParseLimits::production_defaults(),
+                        deadline,
+                        &cancellation,
+                    )
+                    .await?;
+                let (received_at, body, _page, capture) = retrieved.into_parts();
+                (received_at, body, capture)
+            } else if let Some(request) = probe.daily_request() {
+                let retrieved = self
+                    .fetch_daily_rate_page(
+                        &authority,
+                        request,
+                        FiscalDataParseLimits::production_defaults(),
+                        deadline,
+                        &cancellation,
+                    )
+                    .await?;
+                let (received_at, body, _page, capture) = retrieved.into_parts();
+                (received_at, body, capture)
+            } else {
+                return Err(invalid_protocol());
+            };
+            let normalized_at = system_timestamp().map_err(map_adapter_error)?;
+            let observation = probe
+                .inspect_response(
+                    &self.metadata,
+                    200,
+                    &body,
+                    received_at,
+                    normalized_at,
+                    started.elapsed(),
+                )
+                .map_err(|_| invalid_protocol())?;
+            observations.push(observation);
+            captures.push(capture);
+        }
+        let receipt = plan.close(observations).map_err(|_| invalid_protocol())?;
+        Ok(TreasuryDoctorRun {
+            source_id: self.metadata.source_id().clone(),
+            metadata_revision: self.metadata.revision().clone(),
+            receipt,
+            captures: captures.into_boxed_slice(),
+        })
+    }
+
+    /// Builds exact delta/capture expectations for the root analytical publication authority.
+    pub fn publication_expectation(
+        &self,
+        discovery: &crate::TreasuryDiscoveryAccounting,
+        commitments: impl IntoIterator<Item = crate::TreasuryExtractionCommitment>,
+    ) -> Result<crate::TreasuryPublicationExpectation, crate::TreasuryVerticalError> {
+        crate::TreasuryPublicationExpectation::try_from_discovery(
+            &self.activation,
+            &self.metadata,
+            discovery,
+            commitments,
+        )
+    }
+
+    /// Builds root-publication expectations from a restart-verified all-history acquisition.
+    pub fn all_history_publication_expectation(
+        &self,
+        completion: &TreasuryAllHistoryAcquisitionCompletion,
+    ) -> Result<crate::TreasuryPublicationExpectation, crate::TreasuryVerticalError> {
+        crate::TreasuryPublicationExpectation::try_from_all_history(
+            &self.activation,
+            &self.metadata,
+            completion,
+        )
     }
 
     /// Returns the exact dataset identity accepted by discovery for this configured source.
@@ -708,12 +1023,18 @@ impl TreasurySource {
         .await
     }
 
-    async fn discover_impl(
+    /// Traverses one exact configured query to its provider-defined terminal condition and
+    /// retains complete page, row, point, byte, and raw-terminal accounting.
+    ///
+    /// This provider-local API is used by publication orchestration. Source-neutral discovery
+    /// intentionally exposes only results whose terminal response can be represented by the
+    /// publishable source objects; all-history remains a separately checkpointed backfill mode.
+    pub async fn discover_with_accounting(
         &self,
         authority: ExtractionAuthority,
         request: DiscoveryRequest,
         cancellation: CancellationToken,
-    ) -> Result<DiscoveryBatch, ExtractionSourceError> {
+    ) -> Result<TreasuryDiscoveryOutput, ExtractionSourceError> {
         self.validate_authority(&authority)?;
         if request.effective_at().is_some()
             || !self
@@ -727,6 +1048,26 @@ impl TreasurySource {
         }
         let limits = FiscalDataParseLimits::production_defaults();
         let mut objects = Vec::new();
+        let descriptor = self
+            .config
+            .dataset_catalog()
+            .map_err(|_| invalid_protocol())?
+            .dataset(request.dataset())
+            .cloned()
+            .ok_or_else(invalid_protocol)?;
+        if descriptor.publication_mode() == crate::TreasuryPublicationMode::ResumableBackfill {
+            return Err(invalid_protocol());
+        }
+        let mut request_count = 0_usize;
+        let mut response_count = 0_usize;
+        let mut returned_source_rows = 0_usize;
+        let mut canonical_points = 0_usize;
+        let mut raw_body_bytes = 0_u64;
+        let mut reported_total_rows = None;
+        let mut reported_total_pages = None;
+        let mut first_received_at = None;
+        let mut last_received_at = None;
+        let mut source_payload_digests = Vec::new();
         match &self.config {
             TreasurySourceConfig::AverageInterestRates(query) => {
                 let mut tracker = crate::TreasuryPaginationTracker::try_new(
@@ -736,10 +1077,11 @@ impl TreasurySource {
                 )
                 .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
                 let mut page_number = 1_usize;
-                while objects.len() < usize::from(request.max_results()) {
+                loop {
                     let page_request = query.page(page_number).map_err(|_| {
                         ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                     })?;
+                    request_count = request_count.checked_add(1).ok_or_else(invalid_protocol)?;
                     let retrieved = self
                         .fetch_fiscal_page(
                             &authority,
@@ -749,10 +1091,29 @@ impl TreasurySource {
                             &cancellation,
                         )
                         .await?;
+                    response_count = response_count.checked_add(1).ok_or_else(invalid_protocol)?;
+                    let payload_bytes = u64::try_from(retrieved.exact_payload().len())
+                        .map_err(|_| invalid_protocol())?;
+                    raw_body_bytes = raw_body_bytes
+                        .checked_add(payload_bytes)
+                        .ok_or_else(invalid_protocol)?;
+                    returned_source_rows = returned_source_rows
+                        .checked_add(retrieved.page().records().len())
+                        .ok_or_else(invalid_protocol)?;
+                    canonical_points = canonical_points
+                        .checked_add(retrieved.page().records().len())
+                        .ok_or_else(invalid_protocol)?;
+                    reported_total_rows = Some(retrieved.page().total_count());
+                    reported_total_pages = Some(retrieved.page().total_pages());
+                    if last_received_at.is_some_and(|previous| retrieved.received_at() < previous) {
+                        return Err(invalid_protocol());
+                    }
+                    first_received_at.get_or_insert(retrieved.received_at());
+                    last_received_at = Some(retrieved.received_at());
                     let terminal = tracker.accept(retrieved.page()).map_err(|_| {
                         ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                     })?;
-                    objects.push(source_object(
+                    let object = source_object(
                         &self.metadata,
                         &request,
                         &page_request,
@@ -760,9 +1121,14 @@ impl TreasurySource {
                         retrieved.received_at(),
                         "application/json",
                         ObjectKind::Fiscal,
-                    )?);
+                    )?;
+                    source_payload_digests.push(object.evidence().content_digest());
+                    objects.push(object);
                     if terminal {
                         break;
+                    }
+                    if objects.len() == usize::from(request.max_results()) {
+                        return Err(invalid_protocol());
                     }
                     page_number = page_number.checked_add(1).ok_or({
                         ExtractionSourceError::Source(SourceError::InvalidProtocolState)
@@ -786,6 +1152,9 @@ impl TreasurySource {
                     .map_err(|_| invalid_protocol())?;
                 let mut page_number = 0_usize;
                 loop {
+                    if objects.len() == usize::from(request.max_results()) {
+                        return Err(invalid_protocol());
+                    }
                     let page_request = query.page(page_number).map_err(|_| {
                         ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                     })?;
@@ -798,19 +1167,39 @@ impl TreasurySource {
                             &cancellation,
                         )
                         .await?;
+                    request_count = request_count.checked_add(1).ok_or_else(invalid_protocol)?;
+                    response_count = response_count.checked_add(1).ok_or_else(invalid_protocol)?;
+                    let payload_bytes = u64::try_from(retrieved.exact_payload().len())
+                        .map_err(|_| invalid_protocol())?;
+                    raw_body_bytes = raw_body_bytes
+                        .checked_add(payload_bytes)
+                        .ok_or_else(invalid_protocol)?;
+                    returned_source_rows = returned_source_rows
+                        .checked_add(retrieved.page().observations().len())
+                        .ok_or_else(invalid_protocol)?;
+                    let page_points = retrieved.page().observations().iter().try_fold(
+                        0_usize,
+                        |total, observation| {
+                            total
+                                .checked_add(observation.metric_points().count())
+                                .ok_or_else(invalid_protocol)
+                        },
+                    )?;
+                    canonical_points = canonical_points
+                        .checked_add(page_points)
+                        .ok_or_else(invalid_protocol)?;
+                    if last_received_at.is_some_and(|previous| retrieved.received_at() < previous) {
+                        return Err(invalid_protocol());
+                    }
+                    first_received_at.get_or_insert(retrieved.received_at());
+                    last_received_at = Some(retrieved.received_at());
                     let terminal = match tracker.as_mut() {
                         Some(tracker) => tracker
                             .accept(retrieved.page())
                             .map_err(|_| invalid_protocol())?,
                         None => retrieved.page().is_terminal(),
                     };
-                    if terminal {
-                        break;
-                    }
-                    if objects.len() == usize::from(request.max_results()) {
-                        return Err(invalid_protocol());
-                    }
-                    objects.push(source_object(
+                    let object = source_object(
                         &self.metadata,
                         &request,
                         &page_request,
@@ -818,7 +1207,12 @@ impl TreasurySource {
                         retrieved.received_at(),
                         "application/atom+xml",
                         ObjectKind::DailyRate,
-                    )?);
+                    )?;
+                    source_payload_digests.push(object.evidence().content_digest());
+                    objects.push(object);
+                    if terminal {
+                        break;
+                    }
                     if !query.is_all_history() {
                         break;
                     }
@@ -826,7 +1220,28 @@ impl TreasurySource {
                 }
             }
         }
-        DiscoveryBatch::try_new(&request, objects).map_err(ExtractionSourceError::from)
+        let first_received_at = first_received_at.ok_or_else(invalid_protocol)?;
+        let last_received_at = last_received_at.ok_or_else(invalid_protocol)?;
+        let source_object_count = objects.len();
+        let batch = DiscoveryBatch::try_new(&request, objects)?;
+        let accounting = TreasuryDiscoveryAccounting::try_new(TreasuryDiscoveryAccountingInput {
+            descriptor,
+            request_count,
+            response_count,
+            source_object_count,
+            returned_source_rows,
+            canonical_points,
+            raw_body_bytes,
+            terminal_response_observed: true,
+            terminal_response_represented_by_source_object: true,
+            reported_total_rows,
+            reported_total_pages,
+            first_received_at,
+            last_received_at,
+            source_payload_digests,
+        })
+        .map_err(|_| invalid_protocol())?;
+        TreasuryDiscoveryOutput::try_new(batch, accounting).map_err(|_| invalid_protocol())
     }
 
     /// Refetches one discovered Treasury page and returns its canonical rows with the exact raw
@@ -849,9 +1264,16 @@ impl TreasurySource {
                 SourceError::InvalidProtocolState,
             ));
         }
+        let descriptor = self
+            .config
+            .dataset_catalog()
+            .map_err(|_| invalid_protocol())?
+            .dataset(request.object().dataset())
+            .cloned()
+            .ok_or_else(invalid_protocol)?;
         let parsed = ParsedObjectId::parse(request.object().object_id())?;
         let limits = FiscalDataParseLimits::production_defaults();
-        let (records, capture) = match (&self.config, parsed.kind) {
+        let (records, capture, accounting) = match (&self.config, parsed.kind) {
             (TreasurySourceConfig::AverageInterestRates(query), ObjectKind::Fiscal) => {
                 let page_request = query.page(parsed.page_number).map_err(|_| {
                     ExtractionSourceError::Source(SourceError::InvalidProtocolState)
@@ -872,6 +1294,14 @@ impl TreasurySource {
                     retrieved.exact_payload(),
                 )?;
                 let ingested_at = system_timestamp().map_err(map_adapter_error)?;
+                let source_rows = retrieved.page().records().len();
+                let page_number = retrieved.page().page_number();
+                let terminal_for_query = page_number == retrieved.page().total_pages();
+                let raw_body_bytes = retrieved.exact_payload().len();
+                let received_at = retrieved.received_at();
+                let query_digest = retrieved.page().query_digest();
+                let request_digest = retrieved.page().request_digest();
+                let payload_digest = retrieved.page().response_payload_digest();
                 let records = canonical_fiscal_records(
                     &self.metadata,
                     retrieved.page(),
@@ -879,7 +1309,22 @@ impl TreasurySource {
                     ingested_at,
                 )
                 .map_err(map_adapter_error)?;
-                (records, retrieved.capture)
+                let accounting =
+                    TreasuryExtractionAccounting::try_new(TreasuryExtractionAccountingInput {
+                        descriptor,
+                        page_number,
+                        returned_source_rows: source_rows,
+                        canonical_points: records.len(),
+                        raw_body_bytes,
+                        query_digest,
+                        request_digest,
+                        payload_digest,
+                        received_at,
+                        provider_published_at: None,
+                        terminal_for_query,
+                    })
+                    .map_err(|_| invalid_protocol())?;
+                (records, retrieved.capture, accounting)
             }
             (TreasurySourceConfig::DailyRates(config), ObjectKind::DailyRate) => {
                 let query = config
@@ -904,6 +1349,15 @@ impl TreasurySource {
                     retrieved.exact_payload(),
                 )?;
                 let ingested_at = system_timestamp().map_err(map_adapter_error)?;
+                let source_rows = retrieved.page().observations().len();
+                let page_number = retrieved.page().page_number();
+                let terminal_for_query = !query.is_all_history() || retrieved.page().is_terminal();
+                let raw_body_bytes = retrieved.exact_payload().len();
+                let received_at = retrieved.received_at();
+                let provider_published_at = Some(retrieved.page().feed_published_at());
+                let query_digest = retrieved.page().query_digest();
+                let request_digest = retrieved.page().request_digest();
+                let payload_digest = retrieved.page().response_payload_digest();
                 let records = canonical_daily_rate_records(
                     &self.metadata,
                     retrieved.page(),
@@ -911,7 +1365,22 @@ impl TreasurySource {
                     ingested_at,
                 )
                 .map_err(map_adapter_error)?;
-                (records, retrieved.capture)
+                let accounting =
+                    TreasuryExtractionAccounting::try_new(TreasuryExtractionAccountingInput {
+                        descriptor,
+                        page_number,
+                        returned_source_rows: source_rows,
+                        canonical_points: records.len(),
+                        raw_body_bytes,
+                        query_digest,
+                        request_digest,
+                        payload_digest,
+                        received_at,
+                        provider_published_at,
+                        terminal_for_query,
+                    })
+                    .map_err(|_| invalid_protocol())?;
+                (records, retrieved.capture, accounting)
             }
             _ => {
                 return Err(ExtractionSourceError::Source(
@@ -945,13 +1414,22 @@ impl TreasurySource {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let batch = ExtractionBatch::try_new(&request, records)?;
-        Ok(TreasuryExtractionOutput { batch, capture })
+        Ok(TreasuryExtractionOutput {
+            batch,
+            capture,
+            accounting,
+        })
     }
 
     fn validate_authority(
         &self,
         authority: &ExtractionAuthority,
     ) -> Result<(), ExtractionSourceError> {
+        if !self.activation.authorizes_private_research() {
+            return Err(ExtractionSourceError::Source(
+                SourceError::InvalidProtocolState,
+            ));
+        }
         authority.validate_current()?;
         if authority.metadata() != &self.metadata {
             return Err(ExtractionSourceError::Source(
@@ -1007,7 +1485,15 @@ impl ExtractionSource for TreasurySource {
         request: DiscoveryRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<DiscoveryBatch, ExtractionSourceError>> {
-        Box::pin(self.discover_impl(authority, request, cancellation))
+        Box::pin(async move {
+            let output = self
+                .discover_with_accounting(authority, request, cancellation)
+                .await?;
+            if !output.accounting().publication_expectation_ready() {
+                return Err(invalid_protocol());
+            }
+            Ok(output.into_batch())
+        })
     }
 
     fn extract(
@@ -1071,9 +1557,9 @@ fn deterministic_capture_uuid(tag: &[u8], receipt: &ProviderCaptureSetReceipt) -
     hash.update(tag);
     hash.update(receipt.request_set_identity().bytes());
     hash.update(receipt.observation_digest().bytes());
-    let mut bytes: [u8; 16] = hash.finalize()[..16]
-        .try_into()
-        .expect("SHA-256 prefix has a fixed length");
+    let finalized = hash.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&finalized[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
@@ -1085,6 +1571,9 @@ fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {
         TreasurySourceError::DeadlineExceeded => ExtractionSourceError::DeadlineExceeded,
         TreasurySourceError::Source(error) => ExtractionSourceError::Source(error),
         TreasurySourceError::InvalidMetadata
+        | TreasurySourceError::InvalidOwnerUseAttestation
+        | TreasurySourceError::InvalidBackfillCheckpoint
+        | TreasurySourceError::BackfillIncomplete
         | TreasurySourceError::QueryBindingMismatch
         | TreasurySourceError::InvalidProtocol
         | TreasurySourceError::Protocol(_)
@@ -1105,6 +1594,15 @@ pub enum TreasurySourceError {
     /// Metadata or registry authority does not authorize this source profile.
     #[error("Treasury source metadata is incompatible with the configured profile")]
     InvalidMetadata,
+    /// The source was not bound to the owner's closed private-research authorization.
+    #[error("Treasury owner-use attestation is missing or invalid")]
+    InvalidOwnerUseAttestation,
+    /// A persisted all-history checkpoint or one of its retained page seals failed validation.
+    #[error("Treasury all-history checkpoint is invalid")]
+    InvalidBackfillCheckpoint,
+    /// The provider-defined empty terminal response has not yet been durably sealed.
+    #[error("Treasury all-history backfill is incomplete")]
+    BackfillIncomplete,
     /// The page request does not belong to this source's exact query family.
     #[error("Treasury request does not match the configured query")]
     QueryBindingMismatch,

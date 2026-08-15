@@ -39,6 +39,33 @@ pub enum TreasuryMaturity {
 }
 
 impl TreasuryMaturity {
+    /// Every nominal par-curve maturity supported by the strict provider schema.
+    pub const NOMINAL_CURVE: [Self; 14] = [
+        Self::OneMonth,
+        Self::OneAndOneHalfMonths,
+        Self::TwoMonths,
+        Self::ThreeMonths,
+        Self::FourMonths,
+        Self::SixMonths,
+        Self::OneYear,
+        Self::TwoYears,
+        Self::ThreeYears,
+        Self::FiveYears,
+        Self::SevenYears,
+        Self::TenYears,
+        Self::TwentyYears,
+        Self::ThirtyYears,
+    ];
+
+    /// Every real par-curve maturity supported by the strict provider schema.
+    pub const REAL_CURVE: [Self; 5] = [
+        Self::FiveYears,
+        Self::SevenYears,
+        Self::TenYears,
+        Self::TwentyYears,
+        Self::ThirtyYears,
+    ];
+
     /// Returns the stable maturity token used in canonical series identities.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -81,6 +108,17 @@ pub enum TreasuryBillMaturity {
 }
 
 impl TreasuryBillMaturity {
+    /// Every bill maturity supported by the strict provider schema.
+    pub const ALL: [Self; 7] = [
+        Self::FourWeeks,
+        Self::SixWeeks,
+        Self::EightWeeks,
+        Self::ThirteenWeeks,
+        Self::SeventeenWeeks,
+        Self::TwentySixWeeks,
+        Self::FiftyTwoWeeks,
+    ];
+
     /// Returns the stable maturity token used in canonical series identities.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -110,6 +148,14 @@ pub enum TreasuryBillRateMeasure {
 }
 
 impl TreasuryBillRateMeasure {
+    /// Every bill measure supported by the strict provider schema.
+    pub const ALL: [Self; 4] = [
+        Self::BankDiscount,
+        Self::CouponEquivalent,
+        Self::BankDiscountAverage,
+        Self::CouponEquivalentAverage,
+    ];
+
     /// Returns a stable series token.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -134,6 +180,13 @@ pub enum TreasuryLongTermRateType {
 }
 
 impl TreasuryLongTermRateType {
+    /// Every long-term rate type supported by the strict provider schema.
+    pub const ALL: [Self; 3] = [
+        Self::TwentyYearConstantMaturity,
+        Self::OverTenYearsAverage,
+        Self::RealRate,
+    ];
+
     /// Returns the exact provider token.
     pub const fn provider_key(self) -> &'static str {
         match self {
@@ -185,6 +238,25 @@ pub enum TreasuryDailyRateMetric {
 }
 
 impl TreasuryDailyRateMetric {
+    /// Returns the first calendar year in which the reviewed provider schema exposes this metric.
+    ///
+    /// Treasury's documented 2025 additive change introduced the 1.5-month nominal point and all
+    /// six-week bill measures. Other metrics use their family's established historical schema.
+    pub const fn first_schema_year(self) -> u16 {
+        match self {
+            Self::NominalParYield(TreasuryMaturity::OneAndOneHalfMonths)
+            | Self::Bill {
+                maturity: TreasuryBillMaturity::SixWeeks,
+                ..
+            } => 2025,
+            Self::NominalParYield(_)
+            | Self::Bill { .. }
+            | Self::LongTerm(_)
+            | Self::RealParYield(_)
+            | Self::RealLongTermAverage => 0,
+        }
+    }
+
     /// Returns a stable provider-independent series token.
     pub fn as_series_token(self) -> String {
         match self {
@@ -199,6 +271,55 @@ impl TreasuryDailyRateMetric {
                 format!("real-par-yield:{}", maturity.as_str())
             }
             Self::RealLongTermAverage => "real-long-term-average".to_owned(),
+        }
+    }
+
+    /// Returns the exact canonical macro-series identity emitted by normalization.
+    pub fn canonical_series(self) -> String {
+        match self {
+            Self::NominalParYield(maturity) => {
+                format!("treasury:daily-par-yield-curve:{}", maturity.as_str())
+            }
+            Self::Bill { maturity, measure } => format!(
+                "treasury:daily-bill-rates:{}:{}",
+                maturity.as_str(),
+                measure.as_str()
+            ),
+            Self::LongTerm(rate_type) => {
+                format!("treasury:daily-long-term-rates:{}", rate_type.as_str())
+            }
+            Self::RealParYield(maturity) => {
+                format!("treasury:daily-real-par-yield-curve:{}", maturity.as_str())
+            }
+            Self::RealLongTermAverage => "treasury:daily-real-long-term-rates:average".to_owned(),
+        }
+    }
+}
+
+impl TreasuryDailyRateFamily {
+    /// Returns the closed canonical series allowlist for one dashboard/read query.
+    ///
+    /// Each family is deliberately returned separately and contains at most 28 series, below the
+    /// analytical latest-known reader's 32-series request ceiling.
+    pub fn dashboard_metrics(self) -> Vec<TreasuryDailyRateMetric> {
+        match self {
+            Self::NominalParYieldCurve => TreasuryMaturity::NOMINAL_CURVE
+                .map(TreasuryDailyRateMetric::NominalParYield)
+                .into(),
+            Self::BillRates => TreasuryBillMaturity::ALL
+                .into_iter()
+                .flat_map(|maturity| {
+                    TreasuryBillRateMeasure::ALL
+                        .map(|measure| TreasuryDailyRateMetric::Bill { maturity, measure })
+                })
+                .collect(),
+            Self::LongTermRates => TreasuryLongTermRateType::ALL
+                .map(TreasuryDailyRateMetric::LongTerm)
+                .into(),
+            Self::RealParYieldCurve => TreasuryMaturity::REAL_CURVE
+                .map(TreasuryDailyRateMetric::RealParYield)
+                .into(),
+            Self::RealLongTermRates => vec![TreasuryDailyRateMetric::RealLongTermAverage],
         }
     }
 }

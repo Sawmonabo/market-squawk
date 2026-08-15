@@ -13,11 +13,11 @@ use market_squawk_sources::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AverageInterestRate, FiscalDataPage, TreasuryDailyRateMetric, TreasuryDailyRatePage,
-    TreasuryRateProfile, TreasurySourceError,
+    AverageInterestRate, FiscalDataPage, TreasuryDailyRatePage, TreasuryRateProfile,
+    TreasurySourceError,
 };
 
-pub(super) struct CanonicalTreasuryRecord {
+pub(crate) struct CanonicalTreasuryRecord {
     pub(super) effective: ResearchTemporalCoordinate,
     pub(super) published: Option<ResearchTemporalCoordinate>,
     pub(super) availability: ExtractionAvailabilityEvidence,
@@ -26,7 +26,7 @@ pub(super) struct CanonicalTreasuryRecord {
     pub(super) payload: Bytes,
 }
 
-pub(super) fn canonical_fiscal_records(
+pub(crate) fn canonical_fiscal_records(
     source: &SourceMetadata,
     page: &FiscalDataPage,
     received_at: Timestamp,
@@ -64,7 +64,7 @@ pub(super) fn canonical_fiscal_records(
         .collect()
 }
 
-pub(super) fn canonical_daily_rate_records(
+pub(crate) fn canonical_daily_rate_records(
     source: &SourceMetadata,
     page: &TreasuryDailyRatePage,
     received_at: Timestamp,
@@ -78,7 +78,7 @@ pub(super) fn canonical_daily_rate_records(
                 .map(move |(metric, point)| (observation, metric, point))
         })
         .map(|(observation, metric, point)| {
-            let series = identifier(metric_series(metric))?;
+            let series = identifier(metric.canonical_series())?;
             let revision = identifier(format!(
                 "treasury-daily-rate:{}:{}:{}:{}:{}",
                 observation.family().dataset_family_token(),
@@ -101,28 +101,6 @@ pub(super) fn canonical_daily_rate_records(
             )
         })
         .collect()
-}
-
-fn metric_series(metric: TreasuryDailyRateMetric) -> String {
-    match metric {
-        TreasuryDailyRateMetric::NominalParYield(maturity) => {
-            format!("treasury:daily-par-yield-curve:{}", maturity.as_str())
-        }
-        TreasuryDailyRateMetric::Bill { maturity, measure } => format!(
-            "treasury:daily-bill-rates:{}:{}",
-            maturity.as_str(),
-            measure.as_str()
-        ),
-        TreasuryDailyRateMetric::LongTerm(rate_type) => {
-            format!("treasury:daily-long-term-rates:{}", rate_type.as_str())
-        }
-        TreasuryDailyRateMetric::RealParYield(maturity) => {
-            format!("treasury:daily-real-par-yield-curve:{}", maturity.as_str())
-        }
-        TreasuryDailyRateMetric::RealLongTermAverage => {
-            "treasury:daily-real-long-term-rates:average".to_owned()
-        }
-    }
 }
 
 #[allow(

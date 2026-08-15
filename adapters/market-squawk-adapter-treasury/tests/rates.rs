@@ -1,15 +1,29 @@
 use market_squawk_adapter_treasury::{
     AverageInterestRate, DailyParYieldCurvePage, FiscalDataPage, FiscalDataParseLimits,
-    TreasuryBillMaturity, TreasuryBillRateMeasure, TreasuryDailyRateFamily,
+    TreasuryAuthorizedUse, TreasuryBillMaturity, TreasuryBillRateMeasure, TreasuryDailyRateFamily,
     TreasuryDailyRateMetric, TreasuryDailyRatePage, TreasuryDailyRatePaginationTracker,
-    TreasuryDailyRateQuery, TreasuryExtrapolationFactor, TreasuryFiscalQuery,
-    TreasuryLongTermRateType, TreasuryRateProfile, TreasuryYieldCurveProfile,
+    TreasuryDailyRateQuery, TreasuryDailyRatesConfig, TreasuryDashboardReadPlan,
+    TreasuryDatasetFamily, TreasuryDatasetPeriod, TreasuryExtrapolationFactor, TreasuryFiscalQuery,
+    TreasuryLongTermRateType, TreasuryOwnerUseAttestation, TreasuryPublicationMode,
+    TreasuryRateProfile, TreasurySourceConfig, TreasurySurface, TreasuryYieldCurveProfile,
 };
-use market_squawk_domain::{CalendarDate, DataQuality};
+use market_squawk_domain::{CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest, Timestamp};
 use sha2::{Digest, Sha256};
 use std::num::NonZeroU16;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+fn owner_use_attestation(
+    at: Timestamp,
+) -> Result<TreasuryOwnerUseAttestation, Box<dyn std::error::Error>> {
+    Ok(TreasuryOwnerUseAttestation::try_private_personal_research(
+        EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(b"owner-authorized-private-treasury-research").into(),
+        ),
+        at,
+    )?)
+}
 
 #[test]
 fn official_average_rate_profile_preserves_exact_decimal_and_methodology_evidence() -> TestResult {
@@ -271,6 +285,130 @@ fn daily_rate_queries_bind_all_five_official_datasets_and_periods() -> TestResul
         assert_ne!(all.page(0)?.request_digest(), all.page(1)?.request_digest());
         assert!(TreasuryDailyRateQuery::year(family, start_year - 1).is_err());
     }
+
+    let config = TreasurySourceConfig::daily_rates_all_families(2025, 2025)?;
+    let catalog = config.dataset_catalog()?;
+    assert_eq!(catalog.surface(), TreasurySurface::DailyRatesXml);
+    assert_eq!(catalog.datasets().len(), TreasuryDailyRateFamily::ALL.len());
+    assert!(catalog.complete_selected_family_coverage());
+    for family in TreasuryDailyRateFamily::ALL {
+        let datasets = catalog
+            .datasets()
+            .iter()
+            .filter(|dataset| dataset.family() == TreasuryDatasetFamily::DailyRate(family))
+            .collect::<Vec<_>>();
+        assert_eq!(datasets.len(), 1);
+        assert_eq!(
+            datasets[0].publication_mode(),
+            TreasuryPublicationMode::AtomicResponse
+        );
+        assert!(!datasets[0].analytical_dataset().as_str().contains(':'));
+    }
+    let owner_use = owner_use_attestation(Timestamp::from_unix_nanos(1_800_000_000_000_000_000))?;
+    assert!(owner_use.permits(TreasuryAuthorizedUse::TrainModel));
+    assert!(owner_use.permits(TreasuryAuthorizedUse::OperateModel));
+    assert!(owner_use.commercial_sale_prohibited());
+    assert!(owner_use.redistribution_prohibited());
+    let activation = config.activation_intent(owner_use)?;
+    assert_eq!(activation.catalog(), &catalog);
+    let read_plan = TreasuryDashboardReadPlan::try_new(&activation)?;
+    assert!(read_plan.complete_selected_family_coverage());
+    assert_eq!(
+        read_plan.datasets().len(),
+        TreasuryDailyRateFamily::ALL.len()
+    );
+    assert_eq!(
+        read_plan
+            .datasets()
+            .iter()
+            .map(|dataset| dataset.expected_series().len())
+            .collect::<Vec<_>>(),
+        [14, 28, 3, 5, 1]
+    );
+    let pre_additive = TreasurySourceConfig::daily_rates_all_families(2024, 2024)?;
+    let pre_additive_plan = TreasuryDashboardReadPlan::try_new(&pre_additive.activation_intent(
+        owner_use_attestation(Timestamp::from_unix_nanos(1_800_000_000_000_000_000))?,
+    )?)?;
+    assert_eq!(
+        pre_additive_plan
+            .datasets()
+            .iter()
+            .map(|dataset| dataset.expected_series().len())
+            .collect::<Vec<_>>(),
+        [13, 24, 3, 5, 1]
+    );
+    let multi_year = TreasurySourceConfig::daily_rates_all_families(2025, 2026)?;
+    let multi_year_activation = multi_year.activation_intent(owner_use_attestation(
+        Timestamp::from_unix_nanos(1_800_000_000_000_000_000),
+    )?)?;
+    let multi_year_dashboard = TreasuryDashboardReadPlan::try_new(&multi_year_activation)?;
+    assert_eq!(
+        multi_year_dashboard.datasets().len(),
+        TreasuryDailyRateFamily::ALL.len()
+    );
+    assert!(multi_year_dashboard.datasets().iter().all(|dataset| {
+        dataset.descriptor().period() == (TreasuryDatasetPeriod::CalendarYear { year: 2026 })
+    }));
+    let doctor = activation.doctor_plan(&config)?;
+    assert_eq!(doctor.surface(), TreasurySurface::DailyRatesXml);
+    assert_eq!(doctor.probes().len(), TreasuryDailyRateFamily::ALL.len());
+    assert!(doctor.complete_selected_family_coverage());
+
+    let all_history_config =
+        TreasurySourceConfig::daily_rates(TreasuryDailyRatesConfig::try_new([
+            TreasuryDailyRateQuery::all_history(TreasuryDailyRateFamily::NominalParYieldCurve)?,
+        ])?);
+    let all_history = all_history_config.dataset_catalog()?;
+    assert_eq!(all_history.datasets().len(), 1);
+    assert_eq!(
+        all_history.datasets()[0].publication_mode(),
+        TreasuryPublicationMode::ResumableBackfill
+    );
+    assert!(!all_history.complete_selected_family_coverage());
+    let all_history_doctor = all_history_config.doctor_plan(owner_use_attestation(
+        Timestamp::from_unix_nanos(1_800_000_000_000_000_000),
+    )?)?;
+    assert_eq!(all_history_doctor.probes().len(), 1);
+    let all_history_families = TreasurySourceConfig::daily_rates_all_history()?;
+    let all_history_activation = all_history_families.activation_intent(owner_use_attestation(
+        Timestamp::from_unix_nanos(1_800_000_000_000_000_000),
+    )?)?;
+    assert_eq!(
+        all_history_activation.catalog().datasets().len(),
+        TreasuryDailyRateFamily::ALL.len()
+    );
+    assert!(
+        all_history_activation
+            .catalog()
+            .datasets()
+            .iter()
+            .all(|dataset| dataset.publication_mode() == TreasuryPublicationMode::ResumableBackfill)
+    );
+    assert!(
+        all_history_activation
+            .catalog()
+            .complete_selected_family_coverage()
+    );
+    assert_eq!(
+        TreasuryDashboardReadPlan::try_new(&all_history_activation)?
+            .datasets()
+            .len(),
+        TreasuryDailyRateFamily::ALL.len()
+    );
+
+    let ranked_doctor = TreasurySourceConfig::daily_rates(TreasuryDailyRatesConfig::try_new([
+        TreasuryDailyRateQuery::all_history(TreasuryDailyRateFamily::NominalParYieldCurve)?,
+        TreasuryDailyRateQuery::month(TreasuryDailyRateFamily::NominalParYieldCurve, 2024, 12)?,
+        TreasuryDailyRateQuery::year(TreasuryDailyRateFamily::NominalParYieldCurve, 2025)?,
+    ])?)
+    .doctor_plan(owner_use_attestation(Timestamp::from_unix_nanos(
+        1_800_000_000_000_000_000,
+    ))?)?;
+    assert_eq!(ranked_doctor.probes().len(), 1);
+    assert_eq!(
+        ranked_doctor.probes()[0].descriptor().period(),
+        TreasuryDatasetPeriod::CalendarYear { year: 2025 }
+    );
     Ok(())
 }
 
@@ -380,6 +518,12 @@ fn five_daily_rate_schemas_preserve_typed_rates_and_provider_metadata() -> TestR
             .as_deref(),
         Some("2.55")
     );
+
+    let config = TreasurySourceConfig::daily_rates_all_families(2026, 2026)?;
+    let doctor = config.doctor_plan(owner_use_attestation(Timestamp::from_unix_nanos(
+        1_800_000_000_000_000_000,
+    ))?)?;
+    assert_eq!(doctor.probes().len(), TreasuryDailyRateFamily::ALL.len());
     Ok(())
 }
 
