@@ -507,6 +507,7 @@ pub(in crate::strategy) mod tests {
                 PriceTicks::new(100),
                 QuantityLots::new(1)?,
                 AggressorSide::Buy,
+                None,
             )?),
             _ => return Err("unsupported paper strategy event fixture".into()),
         })

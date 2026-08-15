@@ -6,10 +6,10 @@ use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use market_squawk_domain::{InstrumentId, MetadataRevision, SourceId, SourceIdentifier};
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, LiveMarketSource,
-    LiveSourceGeneration, RawMarketSink, RetryAfter, SharedProviderBudget, SourceError,
-    SourceMetadata, SourceMetadataProvider, TlsProviderCapability, TransportFrameKind,
-    apply_http_retry_after,
+    ActiveLiveSourceGeneration, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
+    BudgetReservationDecision, LiveMarketSource, LiveSourceGeneration, RawMarketSink, RetryAfter,
+    SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider,
+    TlsProviderCapability, TransportFrameKind, apply_http_retry_after,
 };
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue,
@@ -518,10 +518,27 @@ impl TradierStreamingSource {
         Ok(())
     }
 
-    fn acquire_budget(&self) -> Result<BudgetPermit, SourceError> {
-        match self.budget.try_acquire() {
-            BudgetDecision::Ready(permit) => Ok(permit),
-            refusal => Err(SourceError::from_applied_budget_refusal(refusal)),
+    fn reserve_budget(&self) -> Result<BudgetReservation, SourceError> {
+        match self.budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => Ok(reservation),
+            BudgetReservationDecision::WaitUntil(deadline) => {
+                Err(SourceError::BudgetWaitUntil { deadline })
+            }
+            BudgetReservationDecision::Unavailable(reason) => {
+                Err(SourceError::BudgetUnavailable { reason })
+            }
+        }
+    }
+
+    fn commit_budget(reservation: BudgetReservation) -> Result<BudgetPermit, SourceError> {
+        match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => Ok(permit),
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                Err(SourceError::BudgetWaitUntil { deadline })
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                Err(SourceError::BudgetUnavailable { reason })
+            }
         }
     }
 
@@ -546,7 +563,6 @@ impl TradierStreamingSource {
             .authorize(TRADIER_WEBSOCKET_ENDPOINT)
             .map_err(|_| SourceError::InvalidProtocolState)?;
         let _session_gate = AccountStreamLease::try_acquire(&self.account)?;
-        let permit = self.acquire_budget()?;
         let session = create_session(
             &self.account,
             &self.budget,
@@ -562,6 +578,8 @@ impl TradierStreamingSource {
             .max_message_size(Some(limits.max_frame_bytes()))
             .max_frame_size(Some(limits.max_frame_bytes()));
         let connect = connect_async_with_config(TRADIER_WEBSOCKET_ENDPOINT, Some(websocket), true);
+        let reservation = self.reserve_budget()?;
+        let permit = Self::commit_budget(reservation)?;
         let (socket, _response) = await_operation(
             &cancellation,
             Duration::from_nanos(limits.http().connect_timeout_nanos()),
@@ -569,6 +587,9 @@ impl TradierStreamingSource {
             |error| map_websocket_error(error, &self.budget),
         )
         .await?;
+        self.budget
+            .record_success()
+            .map_err(|_| SourceError::ProviderUnavailable)?;
         self.run_socket(socket, session, permit, sink, cancellation)
             .await
     }
@@ -750,6 +771,15 @@ async fn create_session(
     cancellation: &CancellationToken,
     limits: TradierTransportLimits,
 ) -> Result<StreamingSession, SourceError> {
+    let reservation = match budget.try_reserve_request() {
+        BudgetReservationDecision::Ready(reservation) => reservation,
+        BudgetReservationDecision::WaitUntil(deadline) => {
+            return Err(SourceError::BudgetWaitUntil { deadline });
+        }
+        BudgetReservationDecision::Unavailable(reason) => {
+            return Err(SourceError::BudgetUnavailable { reason });
+        }
+    };
     let operation = async {
         let authorization = format!("Bearer {}", account.token.expose());
         let mut authorization = Zeroizing::new(authorization);
@@ -757,15 +787,22 @@ async fn create_session(
             HeaderValue::try_from(authorization.as_str()).map_err(|_| SourceError::Unauthorized)?;
         authorization_header.set_sensitive(true);
         authorization.clear();
-        let response = account
+        let request = account
             .client
             .post(TRADIER_MARKET_SESSION_ENDPOINT)
             .header(ACCEPT, "application/json")
             .header(ACCEPT_ENCODING, "identity")
-            .header(AUTHORIZATION, authorization_header)
-            .send()
-            .await
-            .map_err(|_| SourceError::Network)?;
+            .header(AUTHORIZATION, authorization_header);
+        let permit = match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => permit,
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                return Err(SourceError::BudgetWaitUntil { deadline });
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                return Err(SourceError::BudgetUnavailable { reason });
+            }
+        };
+        let response = request.send().await.map_err(|_| SourceError::Network)?;
         let status = response.status();
         if response.url().as_str() != TRADIER_MARKET_SESSION_ENDPOINT {
             return Err(SourceError::InvalidProtocolState);
@@ -822,6 +859,7 @@ async fn create_session(
         budget
             .record_success()
             .map_err(|_| SourceError::ProviderUnavailable)?;
+        permit.release();
         Ok(StreamingSession {
             session_id: Zeroizing::new(session.stream.sessionid),
         })

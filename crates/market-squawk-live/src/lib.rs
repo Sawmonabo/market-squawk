@@ -61,9 +61,9 @@ pub use qualified_export::{
 };
 pub use runtime::{
     BoundShardIngress, DormantRouteIngress, LiveIngressBindError, LiveIngressError,
-    LiveRouteConfig, LiveRouteConfigInput, LiveRuntime, LiveRuntimeConfig, LiveRuntimeConfigError,
-    LiveRuntimeConfigInput, LiveRuntimeHealthEvent, LiveRuntimeHealthKind, LiveRuntimeIngress,
-    LiveRuntimeReplaceError, LiveRuntimeShutdown, LiveRuntimeStartError,
+    LiveIngressRevokeError, LiveRouteConfig, LiveRouteConfigInput, LiveRuntime, LiveRuntimeConfig,
+    LiveRuntimeConfigError, LiveRuntimeConfigInput, LiveRuntimeHealthEvent, LiveRuntimeHealthKind,
+    LiveRuntimeIngress, LiveRuntimeReplaceError, LiveRuntimeShutdown, LiveRuntimeStartError,
     MAX_SNAPSHOT_EVENT_TRIGGER_OVERSHOOT, RegistrationFailure, ShardShutdownOutcome,
     ShardShutdownStatus,
 };

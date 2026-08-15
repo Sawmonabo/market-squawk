@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::{
     AggressorSide, AuctionPhase, BookChange, BookLevel, CorporateActionInvariantError,
     CorporateActionKind, HaltTransition, LiveProvenance, MarketDepth, MarketEventError,
-    SequenceNumber, SourceIdentifier, Timestamp, TradingStatus, validate_book, validate_book_depth,
-    validate_market_provenance,
+    SequenceNumber, SourceIdentifier, Timestamp, TradeTakerOrderType, TradingStatus, validate_book,
+    validate_book_depth, validate_market_provenance,
 };
 use crate::{PriceTicks, QuantityLots};
 
@@ -17,6 +17,7 @@ pub struct TradeEvent {
     price: PriceTicks,
     quantity: QuantityLots,
     aggressor_side: AggressorSide,
+    taker_order_type: Option<TradeTakerOrderType>,
 }
 
 impl TradeEvent {
@@ -26,6 +27,7 @@ impl TradeEvent {
         price: PriceTicks,
         quantity: QuantityLots,
         aggressor_side: AggressorSide,
+        taker_order_type: Option<TradeTakerOrderType>,
     ) -> Result<Self, MarketEventError> {
         validate_market_provenance(&provenance, true, crate::LiveEventClass::Trade)?;
         if quantity.get() == 0 {
@@ -36,6 +38,7 @@ impl TradeEvent {
             price,
             quantity,
             aggressor_side,
+            taker_order_type,
         })
     }
 
@@ -58,6 +61,11 @@ impl TradeEvent {
     pub const fn aggressor_side(&self) -> AggressorSide {
         self.aggressor_side
     }
+
+    /// Returns the provider-authored taker order type when the selected feed supplies it.
+    pub const fn taker_order_type(&self) -> Option<TradeTakerOrderType> {
+        self.taker_order_type
+    }
 }
 
 #[derive(Deserialize)]
@@ -67,6 +75,7 @@ struct TradeEventWire {
     price: PriceTicks,
     quantity: QuantityLots,
     aggressor_side: AggressorSide,
+    taker_order_type: Option<TradeTakerOrderType>,
 }
 
 impl<'de> Deserialize<'de> for TradeEvent {
@@ -80,6 +89,7 @@ impl<'de> Deserialize<'de> for TradeEvent {
             wire.price,
             wire.quantity,
             wire.aggressor_side,
+            wire.taker_order_type,
         )
         .map_err(serde::de::Error::custom)
     }

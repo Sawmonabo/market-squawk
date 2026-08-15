@@ -185,21 +185,12 @@ impl ProductionLiveSourceComposition {
         self.installation.primary().endpoint()
     }
 
-    /// Returns exact canonical source metadata, including coverage and quality ceiling.
-    pub fn metadata(&self) -> &SourceMetadata {
-        // This legacy singular accessor is deterministic for Kraken and returns only book
-        // metadata. Trade metadata remains independently bound to its source profile and is never
-        // inferred from this value.
-        self.installation.primary().metadata()
-    }
-
     /// Returns every exact source-metadata record installed by this composition.
     ///
     /// The ordering is closed and deterministic: a single-source provider contributes one record,
     /// while Kraken contributes `[book, trades]`. Consumers must retain the complete set when
-    /// joining native stream snapshots to source provenance; [`Self::metadata`] remains only the
-    /// legacy primary-book accessor.
-    pub(crate) fn source_metadata(
+    /// joining native stream snapshots to source provenance.
+    pub fn source_metadata(
         &self,
     ) -> Result<Arc<[SourceMetadata]>, ProductionLiveSourceCompositionError> {
         let capacity = match &self.installation {
@@ -220,6 +211,15 @@ impl ProductionLiveSourceComposition {
             }
         }
         Ok(metadata.into())
+    }
+
+    /// Returns the source whose quote/book observations feed the bounded fair-value export.
+    ///
+    /// This deliberately does not describe the complete installed topology. Public provenance
+    /// consumers must use [`Self::source_metadata`]. Kraken trade observations remain available
+    /// through the native market snapshot rather than the quote/book fair-value export.
+    pub(crate) fn qualified_market_export_source_id(&self) -> &SourceId {
+        self.installation.primary().metadata().source_id()
     }
 
     /// Returns the complete validated route set that will be reserved before network access.
@@ -909,8 +909,8 @@ impl ProductionCoinbaseProfile {
             freshness_nanos,
             freshness_nanos,
             freshness_nanos,
-            MAX_CLOCK_SKEW_NANOS,
             freshness_nanos,
+            MAX_CLOCK_SKEW_NANOS,
         )?;
         let transport_limits = CoinbaseTransportLimits::try_new(
             config.max_frame_bytes().get(),

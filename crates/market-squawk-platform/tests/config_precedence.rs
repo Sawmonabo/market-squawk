@@ -95,7 +95,7 @@ fn kraken_config_json(endpoint: &str) -> String {
     format!(
         r#"{{
   "endpoint":"{endpoint}",
-  "channel":"book",
+  "channels":["book","trade"],
   "depth":10,
   "freshness_ms":5000,
   "max_frame_bytes":1048576,
@@ -107,8 +107,8 @@ fn kraken_config_json(endpoint: &str) -> String {
     "provider":"kraken",
     "basis":"user-reviewed-kraken-public-interface",
     "evidence_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "evidence_reference":"https://docs.kraken.com/api/docs/websocket-v2/book/",
-    "evidence_version":"reviewed-2026-07-21",
+    "evidence_reference":"https://github.com/Sawmonabo/market-squawk/blob/main/docs/research/2026-07-16-kraken-websocket-v2-checksum.md",
+    "evidence_version":"reviewed-2026-08-14",
     "effective_from_unix_nanos":1700000000000000000,
     "effective_until_unix_nanos":1900000000000000000
   }},
@@ -144,6 +144,14 @@ fn production_kraken_config_is_explicit_typed_and_endpoint_sealed()
     assert_eq!(kraken.symbol(), "BTC/USD");
     assert_eq!(kraken.depth(), 10);
     assert_eq!(
+        kraken.event_classes(),
+        [
+            LiveEventClass::BookSnapshot,
+            LiveEventClass::BookDelta,
+            LiveEventClass::Trade,
+        ]
+    );
+    assert_eq!(
         kraken.definition().venue_mappings()[0].venue_id().as_str(),
         "kraken"
     );
@@ -158,6 +166,19 @@ fn production_kraken_config_is_explicit_typed_and_endpoint_sealed()
         ))
         .is_err()
     );
+
+    for invalid_channels in ["[\"book\"]", "[\"trade\",\"book\"]"] {
+        let invalid = json.replace("[\"book\",\"trade\"]", invalid_channels);
+        let invalid_environment = environment(&[("MARKET_SQUAWK_KRAKEN_JSON", &invalid)]);
+        assert!(
+            AppConfig::load(ConfigSources::new(
+                None,
+                &invalid_environment,
+                ConfigOverrides::default(),
+            ))
+            .is_err()
+        );
+    }
     Ok(())
 }
 

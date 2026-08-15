@@ -695,7 +695,11 @@ function InstrumentWorkspace({
                   </div>
                   <div className="text-left sm:text-right">
                     <p className="font-mono text-xs">{trade.priceTicks.toLocaleString()} ticks</p>
-                    <p className="mt-1 text-[10px] text-muted-foreground">{trade.quantityLots.toLocaleString()} lots · {dateTime(trade.availableAt)}</p>
+                    <p className="mt-1 text-[10px] text-muted-foreground">
+                      {trade.quantityLots.toLocaleString()} lots
+                      {trade.takerOrderType ? ` · ${trade.takerOrderType === "market" ? "Market" : "Limit"} taker` : ""}
+                      {` · ${dateTime(trade.availableAt)}`}
+                    </p>
                   </div>
                   <p className="text-[10px] text-muted-foreground sm:col-span-2">
                     {qualityName(trade.currentQuality)} · {truth(trade.fresh, "fresh", "stale")}

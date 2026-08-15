@@ -48,8 +48,8 @@ const RECOMMENDED_INSTRUMENT_ID: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
 const RECOMMENDED_PRIMARY_ASSET_ID: &str = "b9f6d14f-9140-4ca3-a412-9bd59b3b5e67";
 const COINBASE_REVIEW_EVIDENCE_SHA256: &str =
     "18e2c5d1c52a32b3bf734415a579ec99aea8ef2cb8d3c34a38f4fea577ab73bb";
-const KRAKEN_REVIEW_EVIDENCE_SHA256: &str =
-    "4e2ffd272197009ca5d5cfd3f8e5adc3f84a7fc87d40159d1185d58a7aa54f44";
+const KRAKEN_PUBLIC_FEED_REVIEW_EVIDENCE_SHA256: &str =
+    "10ad4be02cbc6d2047e67e4703a604c104991d10a9f0ece531e070309715cbe7";
 
 const REQUIRED_EVENT_CLASSES: [LiveEventClass; 3] = [
     LiveEventClass::BookSnapshot,
@@ -551,7 +551,7 @@ impl KrakenAuthorizationAttestation {
     }
 }
 
-/// Complete validated Kraken book-v2 production configuration.
+/// Complete validated Kraken public book-and-trade production configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KrakenSourceConfig {
     authorization: KrakenAuthorizationAttestation,
@@ -588,6 +588,11 @@ impl KrakenSourceConfig {
         10
     }
 
+    /// Returns the exact public event profile authorized by the composite configuration.
+    pub const fn event_classes(&self) -> &[LiveEventClass] {
+        &REQUIRED_EVENT_CLASSES
+    }
+
     /// Returns the configured market-price freshness threshold.
     pub const fn freshness(&self) -> Duration {
         self.freshness
@@ -614,7 +619,7 @@ pub(super) fn recommended_kraken_public_config()
     let wire = format!(
         r#"{{
           "endpoint":"{KRAKEN_WEBSOCKET_V2_ENDPOINT}",
-          "channel":"book",
+          "channels":["book","trade"],
           "depth":10,
           "freshness_ms":5000,
           "max_frame_bytes":1048576,
@@ -625,9 +630,9 @@ pub(super) fn recommended_kraken_public_config()
             "mode":"public_interface",
             "provider":"kraken",
             "basis":"market-squawk-reviewed-kraken-public-interface",
-            "evidence_sha256":"{KRAKEN_REVIEW_EVIDENCE_SHA256}",
-            "evidence_reference":"https://docs.kraken.com/api/docs/websocket-v2/book/",
-            "evidence_version":"reviewed-2026-07-23",
+            "evidence_sha256":"{KRAKEN_PUBLIC_FEED_REVIEW_EVIDENCE_SHA256}",
+            "evidence_reference":"https://github.com/Sawmonabo/market-squawk/blob/main/docs/research/2026-07-16-kraken-websocket-v2-checksum.md",
+            "evidence_version":"reviewed-2026-08-14",
             "effective_from_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_FROM_UNIX_NANOS},
             "effective_until_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_UNTIL_UNIX_NANOS}
           }},
@@ -701,6 +706,7 @@ fn invalid_recommended_profile<T>(_error: T) -> EmbeddedRecommendedProfileError 
 #[serde(rename_all = "snake_case")]
 enum KrakenChannelWire {
     Book,
+    Trade,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -708,7 +714,7 @@ enum KrakenChannelWire {
 struct KrakenSourceConfigWire {
     endpoint: String,
     authorization: KrakenAuthorizationAttestationWire,
-    channel: KrakenChannelWire,
+    channels: [KrakenChannelWire; 2],
     depth: usize,
     freshness_ms: u64,
     max_frame_bytes: usize,
@@ -763,7 +769,7 @@ impl TryFrom<KrakenSourceConfigWire> for KrakenSourceConfig {
 
     fn try_from(wire: KrakenSourceConfigWire) -> Result<Self, Self::Error> {
         if wire.endpoint != KRAKEN_WEBSOCKET_V2_ENDPOINT
-            || wire.channel != KrakenChannelWire::Book
+            || wire.channels != [KrakenChannelWire::Book, KrakenChannelWire::Trade]
             || wire.depth != 10
         {
             return Err(KrakenConfigurationError::InvalidProtocolProfile);

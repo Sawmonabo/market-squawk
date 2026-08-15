@@ -17,7 +17,7 @@ use super::super::{LiveRuntime, initial_snapshots};
 use crate::authority::{RuntimeLease, RuntimeLeaseOwner};
 use crate::runtime::actor::ActorCompletion;
 use crate::runtime::admission::LiveRuntimeIngress;
-use crate::snapshot::create_snapshot_plane;
+use crate::snapshot::{SnapshotPublisher, create_snapshot_plane};
 use crate::{
     DepthLimit, LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigInput,
     LiveSnapshotReader, ShardId, ShardKey, ShardRoutingVersion, SnapshotLimits,
@@ -122,6 +122,9 @@ pub(super) struct RuntimeHarness {
     pub(super) runtime: LiveRuntime,
     pub(super) runtime_lease: RuntimeLease,
     pub(super) reader: LiveSnapshotReader,
+    // Synthetic actors in these lifecycle tests do not own the real shard publishers. Retain them
+    // until the tested runtime barrier closes the plane so pre-shutdown reads are genuinely open.
+    pub(super) _publishers: Box<[SnapshotPublisher]>,
 }
 
 pub(super) fn runtime_shell(
@@ -167,5 +170,6 @@ pub(super) fn runtime_shell(
         runtime,
         runtime_lease,
         reader,
+        _publishers: bundle.publishers,
     })
 }

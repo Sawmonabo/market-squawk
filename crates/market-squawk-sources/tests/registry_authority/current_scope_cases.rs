@@ -133,6 +133,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
                 Some(source_identifier("BUY")?),
                 rule("coinbase-aggressor")?,
             ),
+            taker_order_type: None,
         },
     )?;
     let batch = DecodedProviderBatch::try_new(evidence, vec![observation])?;
@@ -194,6 +195,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
                         Some(source_identifier("BUY")?),
                         rule("coinbase-aggressor")?,
                     ),
+                    taker_order_type: None,
                 },
             )?)
         };

@@ -18,13 +18,13 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::RawCaptureRecord;
 use market_squawk_sources::{
-    AvailabilityEvidence, BudgetDecision, BudgetPermit, CURRENT_RESEARCH_RECORD_SCHEMA,
-    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRecord,
-    ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
-    HttpRequestBounds, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SharedProviderBudget,
-    SourceError, SourceMetadata, SourceMetadataProvider, SourceObject, apply_http_retry_after,
-    payload_matches_exact_evidence,
+    AvailabilityEvidence, BudgetDecision, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
+    BudgetReservationDecision, CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryBatch, DiscoveryRequest,
+    ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest,
+    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HttpRequestBounds,
+    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, SharedProviderBudget, SourceError, SourceMetadata,
+    SourceMetadataProvider, SourceObject, apply_http_retry_after, payload_matches_exact_evidence,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -397,9 +397,11 @@ impl AlpacaHistoricalEquityPreflightClient {
         cancellation: &CancellationToken,
     ) -> Result<PreflightFetchedPage, AlpacaError> {
         loop {
-            let permit = acquire_preflight_budget(budget, deadline, cancellation).await?;
+            let reservation = acquire_preflight_budget(budget, deadline, cancellation).await?;
             let maximum = usize::try_from(self.bounds.max_response_bytes())
                 .map_err(|_| AlpacaError::InvalidTransportLimits)?;
+            let permit =
+                commit_preflight_budget(reservation, budget, deadline, cancellation).await?;
             let response = authenticated_bounded_get(
                 &self.client,
                 &self.credentials,
@@ -1372,15 +1374,60 @@ async fn acquire_preflight_budget(
     budget: &SharedProviderBudget,
     deadline: std::time::Instant,
     cancellation: &CancellationToken,
-) -> Result<BudgetPermit, AlpacaError> {
+) -> Result<BudgetReservation, AlpacaError> {
     loop {
         if cancellation.is_cancelled() {
             return Err(AlpacaError::Cancelled);
         }
-        match budget.try_acquire() {
-            BudgetDecision::Ready(permit) => return Ok(permit),
-            decision => wait_for_budget_decision(budget, decision, deadline, cancellation).await?,
+        match budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => return Ok(reservation),
+            BudgetReservationDecision::WaitUntil(wait_until) => {
+                wait_for_budget_deadline(budget, wait_until, deadline, cancellation).await?;
+            }
+            BudgetReservationDecision::Unavailable(_reason) => {
+                return Err(AlpacaError::Network);
+            }
         }
+    }
+}
+
+async fn commit_preflight_budget(
+    mut reservation: BudgetReservation,
+    budget: &SharedProviderBudget,
+    deadline: std::time::Instant,
+    cancellation: &CancellationToken,
+) -> Result<BudgetPermit, AlpacaError> {
+    loop {
+        match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => return Ok(permit),
+            BudgetDispatchDecision::WaitUntil(wait_until) => {
+                wait_for_budget_deadline(budget, wait_until, deadline, cancellation).await?;
+                reservation = acquire_preflight_budget(budget, deadline, cancellation).await?;
+            }
+            BudgetDispatchDecision::Unavailable(_reason) => return Err(AlpacaError::Network),
+        }
+    }
+}
+
+async fn wait_for_budget_deadline(
+    budget: &SharedProviderBudget,
+    wait_until: market_squawk_sources::MonotonicInstant,
+    deadline: std::time::Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), AlpacaError> {
+    let wait = budget
+        .remaining_wait(wait_until)
+        .map_err(|_| AlpacaError::Network)?;
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .ok_or(AlpacaError::DeadlineExceeded)?;
+    if wait > remaining {
+        return Err(AlpacaError::DeadlineExceeded);
+    }
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(AlpacaError::Cancelled),
+        () = tokio::time::sleep(wait) => Ok(()),
     }
 }
 
@@ -1398,20 +1445,7 @@ async fn wait_for_budget_decision(
         }
         BudgetDecision::Unavailable(_reason) => return Err(AlpacaError::Network),
     };
-    let wait = budget
-        .remaining_wait(wait_until)
-        .map_err(|_| AlpacaError::Network)?;
-    let remaining = deadline
-        .checked_duration_since(std::time::Instant::now())
-        .ok_or(AlpacaError::DeadlineExceeded)?;
-    if wait > remaining {
-        return Err(AlpacaError::DeadlineExceeded);
-    }
-    tokio::select! {
-        biased;
-        () = cancellation.cancelled() => Err(AlpacaError::Cancelled),
-        () = tokio::time::sleep(wait) => Ok(()),
-    }
+    wait_for_budget_deadline(budget, wait_until, deadline, cancellation).await
 }
 
 fn enforce_preflight_window(plan: &AlpacaHistoricalEquityPreflightPlan) -> Result<(), AlpacaError> {

@@ -211,6 +211,12 @@ const EXCHANGE_DUTIES: &[&str] = &[
     "preserve exact provider and venue provenance",
     "do not admit persistence, modeling, export, or redistribution without a later rights decision",
 ];
+const PRIVATE_CRYPTO_RESEARCH_DUTIES: &[&str] = &[
+    "preserve exact provider, venue, product, channel, generation, and raw-payload provenance",
+    "restrict persisted source data and every transformed or model-derived artifact to owner-local personal research use",
+    "prohibit sale, export, redistribution, third-party serving, and commercial exploitation of source data or derived datasets",
+    "never infer account, position, order, funds, money-movement, or execution authority from a market-data surface",
+];
 const BLS_DUTIES: &[&str] = &[
     "retain BLS provenance and access date",
     "preserve the required disclaimer and truthful representation",
@@ -310,6 +316,13 @@ const COINBASE_DIRECT_EVIDENCE: &[ProfileEvidence] = &[
     ),
 ];
 const KRAKEN_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
     ProfileEvidence::new(
         "DOC-011",
         "https://docs.kraken.com/exchange/guides/overview",
@@ -623,6 +636,13 @@ const TIINGO_EVIDENCE: &[ProfileEvidence] = &[
     ),
 ];
 const KRAKEN_L3_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
     ProfileEvidence::new(
         "KRAKEN-L3-CHANNEL",
         "https://docs.kraken.com/api/docs/websocket-v2/level3/",
@@ -1439,6 +1459,8 @@ fn is_selected_architecture_profile(profile_id: &str) -> bool {
             | EIA_PROFILE
             | FEDERAL_RESERVE_BOARD_PROFILE
             | TIINGO_PROFILE
+            | "kraken.spot-public-market-data"
+            | KRAKEN_L3_PROFILE
     )
 }
 
@@ -2256,20 +2278,20 @@ fn kraken() -> Result<BuiltInSpec, ProviderProfileError> {
         zero_fee: ZeroFeeStatus::NoCredentialFeeNotEstablished,
         account: Requirement::NotRequired,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RightsLimited,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: None,
         permissions: &[],
-        coverage: "Kraken Spot venue public instruments and books; not consolidated",
+        coverage: "Kraken Spot WebSocket v2 venue-qualified public instruments, price-level books, and trades for the exact configured pairs; independent book and trade channels, DirectUnverified, crypto-only, and never consolidated market, account, order, or execution coverage",
         quality: DataQuality::DirectUnverified,
         probe: VerificationProbe::network(
             ProbeTransport::HttpGet,
             "https://api.kraken.com/0/public/SystemStatus",
             None,
         )?,
-        rights: RIGHTS_LIMITED,
-        duties: EXCHANGE_DUTIES,
-        persistence_evidence_source_id: None,
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: PRIVATE_CRYPTO_RESEARCH_DUTIES,
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
         rotation: "not applicable: this surface has no credential",
         revocation: "not applicable: this surface has no credential",
         recovery: COMMON_RECOVERY,
@@ -2289,7 +2311,7 @@ fn kraken_l3() -> Result<BuiltInSpec, ProviderProfileError> {
         zero_fee: ZeroFeeStatus::Confirmed,
         account: Requirement::RequiredProviderControlled,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RightsLimited,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("kraken.websocket-token.create"),
         permissions: &["create-ws-token"],
@@ -2300,16 +2322,18 @@ fn kraken_l3() -> Result<BuiltInSpec, ProviderProfileError> {
             "https://api.kraken.com/0/private/GetApiKeyInfo",
             Some(r#"{"nonce":"runtime-generated-monotonic"}"#),
         )?,
-        rights: RIGHTS_LIMITED,
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
         duties: &[
             "admit only a key whose exact permission set is create-ws-token",
             "retain OrderLevel depth separately from DirectUnverified data quality",
             "treat the provider sequence as unsupported and validate every supplied checksum",
             "enforce the documented depth-weighted subscription counter through the account runtime",
             "use the credential only for API-key inspection and WebSocket-token creation and never for trading",
-            "do not admit persistence, modeling, export, or redistribution without a later rights decision",
+            "preserve exact provider, venue, pair, channel, credential generation, connection generation, and raw-payload provenance",
+            "restrict persisted source data and every transformed or model-derived artifact to owner-local personal research use",
+            "prohibit sale, export, redistribution, third-party serving, and commercial exploitation of source data or derived datasets",
         ],
-        persistence_evidence_source_id: None,
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
         rotation: "create a replacement Kraken key with only WebSocket interface permission and import one complete version-1 envelope as a higher generation",
         revocation: "delete the exact Kraken key remotely, then delete the exact local generation",
         recovery: COMMON_RECOVERY,

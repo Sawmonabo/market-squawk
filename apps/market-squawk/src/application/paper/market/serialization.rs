@@ -111,6 +111,7 @@ pub(super) fn trade_value(
     value["priceTicks"] = Value::String(trade.price().get().to_string());
     value["quantityLots"] = Value::String(trade.quantity().get().to_string());
     value["aggressorSide"] = json!(trade.aggressor_side());
+    value["takerOrderType"] = json!(trade.taker_order_type());
     value["sourceTimestamp"] = json!(trade.source_timestamp().map(timestamp_value));
     value["receivedAt"] = Value::String(timestamp_value(trade.received_at()));
     value["availableAt"] = Value::String(timestamp_value(trade.available_at()));

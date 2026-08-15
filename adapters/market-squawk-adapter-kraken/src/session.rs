@@ -6,9 +6,10 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use market_squawk_domain::{LiveEventClass, Timestamp};
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, LiveMarketSource,
-    LiveSourceGeneration, RawMarketSink, SharedProviderBudget, SourceError, SourceMetadata,
-    SourceMetadataProvider, TransportFrameKind, apply_http_retry_after,
+    ActiveLiveSourceGeneration, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
+    BudgetReservationDecision, LiveMarketSource, LiveSourceGeneration, RawMarketSink,
+    SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
+    apply_http_retry_after,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
@@ -16,6 +17,7 @@ use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_util::sync::CancellationToken;
 
+use crate::messages::PUBLIC_SUBSCRIPTION_REQUEST_ID;
 use crate::{
     KrakenChannel, KrakenConfig, KrakenControl, KrakenDecodeOutcome, KrakenDecoder,
     KrakenDecoderState, KrakenSubscription,
@@ -180,13 +182,14 @@ impl KrakenSource {
         self.health.book_subscribed = false;
         self.health.trade_subscribed = false;
         self.health.last_market_timestamp = None;
-        let permit = acquire_budget(&self.budget)?;
+        let reservation = reserve_budget(&self.budget)?;
         let socket_config = WebSocketConfig::default()
             .read_buffer_size(READ_BUFFER_BYTES)
             .write_buffer_size(WRITE_BUFFER_BYTES)
             .max_write_buffer_size(MAX_WRITE_BUFFER_BYTES)
             .max_message_size(Some(self.config.max_message_bytes()))
             .max_frame_size(Some(self.config.max_message_bytes()));
+        let permit = commit_budget(reservation)?;
         let connect = connect_async_tls_with_config(
             self.config.endpoint().as_str(),
             Some(socket_config),
@@ -200,15 +203,15 @@ impl KrakenSource {
                 result.map_err(|error| map_connect_error(error, &self.budget))?
             }
         };
-        drop(permit);
         if response.status().is_redirection() {
             self.health.state = KrakenDecoderState::Quarantined;
             return Err(SourceError::InvalidProtocolState);
         }
-        if self.budget.record_success().is_err() {
+        if let Err(reason) = self.budget.record_success() {
             self.health.state = KrakenDecoderState::Quarantined;
-            return Err(SourceError::ProviderUnavailable);
+            return Err(SourceError::BudgetUnavailable { reason });
         }
+        drop(permit);
         self.run_established(&mut socket, sink, cancellation).await
     }
 
@@ -251,14 +254,16 @@ impl KrakenSource {
             KrakenChannel::Trades => ("trade", None),
         };
         let subscribe_payload = subscription(self.config.symbol(), channel, depth)?;
-        send_subscription(
-            socket,
-            &self.budget,
-            subscribe_payload,
-            cancellation,
-            deadlines.write,
-        )
-        .await?;
+        let mut subscription_permit = Some(
+            send_subscription(
+                socket,
+                &self.budget,
+                subscribe_payload,
+                cancellation,
+                deadlines.write,
+            )
+            .await?,
+        );
 
         let mut decoder = match self.config.channel() {
             KrakenChannel::Book(depth) => {
@@ -303,6 +308,7 @@ impl KrakenSource {
                         &mut decoder,
                         TransportFrameKind::Text,
                         payload,
+                        &mut subscription_permit,
                     )?;
                 }
                 Message::Binary(binary) => {
@@ -362,6 +368,7 @@ impl KrakenSource {
         decoder: &mut KrakenDecoder,
         transport: TransportFrameKind,
         payload: Bytes,
+        subscription_permit: &mut Option<BudgetPermit>,
     ) -> Result<(), SourceError> {
         if payload.len() > self.config.max_message_bytes() {
             self.health.state = KrakenDecoderState::Quarantined;
@@ -380,7 +387,14 @@ impl KrakenSource {
                 return Err(error);
             }
         };
-        if let Err(error) = sink.try_publish(frame) {
+        let publication = sink.try_publish(frame);
+        let outcome = decoder
+            .decode_payload(payload.as_ref())
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        if let Err(error) = publication {
+            if let KrakenDecodeOutcome::Control(control) = outcome {
+                self.apply_control(control, subscription_permit)?;
+            }
             self.health.state = KrakenDecoderState::Quarantined;
             return Err(SourceError::Sink(error));
         }
@@ -389,8 +403,8 @@ impl KrakenSource {
             .captured_frames
             .checked_add(1)
             .ok_or(SourceError::InvalidProtocolState)?;
-        match decoder.decode_payload(payload.as_ref()) {
-            Ok(KrakenDecodeOutcome::Market(observations)) => {
+        match outcome {
+            KrakenDecodeOutcome::Market(observations) => {
                 let acknowledged =
                     observations
                         .iter()
@@ -425,36 +439,55 @@ impl KrakenSource {
                     }
                         });
             }
-            Ok(KrakenDecodeOutcome::Control(control)) => {
-                match control {
-                    KrakenControl::Subscribed(KrakenSubscription::Book) => {
-                        if self.health.book_subscribed {
-                            self.health.state = KrakenDecoderState::Quarantined;
-                            return Err(SourceError::InvalidProtocolState);
-                        }
-                        self.health.book_subscribed = true;
-                    }
-                    KrakenControl::Subscribed(KrakenSubscription::Trade) => {
-                        if self.health.trade_subscribed {
-                            self.health.state = KrakenDecoderState::Quarantined;
-                            return Err(SourceError::InvalidProtocolState);
-                        }
-                        self.health.trade_subscribed = true;
-                    }
-                    KrakenControl::Heartbeat | KrakenControl::Pong | KrakenControl::Online => {}
-                }
-                self.health.control_messages = self
-                    .health
-                    .control_messages
-                    .checked_add(1)
-                    .ok_or(SourceError::InvalidProtocolState)?;
-            }
-            Err(_) => {
-                self.health.state = KrakenDecoderState::Quarantined;
-                return Err(SourceError::InvalidProtocolState);
+            KrakenDecodeOutcome::Control(control) => {
+                self.apply_control(control, subscription_permit)?;
             }
         }
         self.health.state = decoder.state();
+        Ok(())
+    }
+
+    fn apply_control(
+        &mut self,
+        control: KrakenControl,
+        subscription_permit: &mut Option<BudgetPermit>,
+    ) -> Result<(), SourceError> {
+        match control {
+            KrakenControl::Subscribed(KrakenSubscription::Book) => {
+                if self.health.book_subscribed
+                    || !matches!(self.config.channel(), KrakenChannel::Book(_))
+                {
+                    self.health.state = KrakenDecoderState::Quarantined;
+                    return Err(SourceError::InvalidProtocolState);
+                }
+                settle_subscription_success(&self.budget, subscription_permit)?;
+                self.health.book_subscribed = true;
+            }
+            KrakenControl::Subscribed(KrakenSubscription::Trade) => {
+                if self.health.trade_subscribed || self.config.channel() != KrakenChannel::Trades {
+                    self.health.state = KrakenDecoderState::Quarantined;
+                    return Err(SourceError::InvalidProtocolState);
+                }
+                settle_subscription_success(&self.budget, subscription_permit)?;
+                self.health.trade_subscribed = true;
+            }
+            KrakenControl::SubscriptionRefused => {
+                let permit = subscription_permit
+                    .take()
+                    .ok_or(SourceError::InvalidProtocolState)?;
+                let refusal =
+                    SourceError::from_applied_budget_refusal(self.budget.apply_refusal(0));
+                drop(permit);
+                self.health.state = KrakenDecoderState::Quarantined;
+                return Err(refusal);
+            }
+            KrakenControl::Heartbeat | KrakenControl::Pong | KrakenControl::Online => {}
+        }
+        self.health.control_messages = self
+            .health
+            .control_messages
+            .checked_add(1)
+            .ok_or(SourceError::InvalidProtocolState)?;
         Ok(())
     }
 }
@@ -519,6 +552,7 @@ fn subscription(symbol: &str, channel: &str, depth: Option<usize>) -> Result<Str
     serde_json::to_string(&serde_json::json!({
         "method": "subscribe",
         "params": params,
+        "req_id": PUBLIC_SUBSCRIPTION_REQUEST_ID,
     }))
     .map_err(|_| SourceError::InvalidProtocolState)
 }
@@ -529,11 +563,12 @@ async fn send_subscription<S>(
     payload: String,
     cancellation: &CancellationToken,
     deadline: Duration,
-) -> Result<(), SourceError>
+) -> Result<BudgetPermit, SourceError>
 where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    let permit = acquire_budget(budget)?;
+    let reservation = reserve_budget(budget)?;
+    let permit = commit_budget(reservation)?;
     send_message_with_deadline(
         socket,
         Message::Text(payload.into()),
@@ -541,17 +576,44 @@ where
         deadline,
     )
     .await?;
-    drop(permit);
-    budget
-        .record_success()
-        .map_err(|_| SourceError::ProviderUnavailable)
+    Ok(permit)
 }
 
-fn acquire_budget(budget: &SharedProviderBudget) -> Result<BudgetPermit, SourceError> {
-    match budget.try_acquire() {
-        BudgetDecision::Ready(permit) => Ok(permit),
-        BudgetDecision::WaitUntil(deadline) => Err(SourceError::BudgetWaitUntil { deadline }),
-        BudgetDecision::Unavailable(reason) => Err(SourceError::BudgetUnavailable { reason }),
+fn settle_subscription_success(
+    budget: &SharedProviderBudget,
+    subscription_permit: &mut Option<BudgetPermit>,
+) -> Result<(), SourceError> {
+    let permit = subscription_permit
+        .take()
+        .ok_or(SourceError::InvalidProtocolState)?;
+    budget
+        .record_success()
+        .map_err(|reason| SourceError::BudgetUnavailable { reason })?;
+    drop(permit);
+    Ok(())
+}
+
+fn reserve_budget(budget: &SharedProviderBudget) -> Result<BudgetReservation, SourceError> {
+    match budget.try_reserve_request() {
+        BudgetReservationDecision::Ready(reservation) => Ok(reservation),
+        BudgetReservationDecision::WaitUntil(deadline) => {
+            Err(SourceError::BudgetWaitUntil { deadline })
+        }
+        BudgetReservationDecision::Unavailable(reason) => {
+            Err(SourceError::BudgetUnavailable { reason })
+        }
+    }
+}
+
+fn commit_budget(reservation: BudgetReservation) -> Result<BudgetPermit, SourceError> {
+    match reservation.commit_dispatch() {
+        BudgetDispatchDecision::Ready(permit) => Ok(permit),
+        BudgetDispatchDecision::WaitUntil(deadline) => {
+            Err(SourceError::BudgetWaitUntil { deadline })
+        }
+        BudgetDispatchDecision::Unavailable(reason) => {
+            Err(SourceError::BudgetUnavailable { reason })
+        }
     }
 }
 

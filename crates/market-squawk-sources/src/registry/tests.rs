@@ -3,8 +3,8 @@ mod tests {
     use std::cell::Cell;
     use std::marker::PhantomData;
     use std::str::FromStr;
-    use std::sync::{Arc, Barrier, Mutex};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -15,8 +15,8 @@ mod tests {
     };
 
     use super::{
-        AuthoritativeSourceRegistry, BoundedVec, PersistedSourceAuthority, RawFrameFactory,
-        RegistryAuthorityState, RegistryError, MAX_AUTHORITY_SOURCES, SessionLeaseState,
+        AuthoritativeSourceRegistry, BoundedVec, MAX_AUTHORITY_SOURCES, PersistedSourceAuthority,
+        RawFrameFactory, RegistryAuthorityState, RegistryError, SessionLeaseState,
         SourceAuthorityHistory, UnconfiguredAuthorizationSubjectResolver,
         validate_observation_profile,
     };
@@ -26,6 +26,11 @@ mod tests {
     };
     use crate::policy::AuthorityStateStore;
     use crate::policy::persistence::AuthorityStateStoreError;
+    use crate::registry::test_support::{
+        TestResult, direct_metadata, direct_metadata_with_provider_and_limit,
+        direct_metadata_with_quality, direct_metadata_with_revision_evidence, exact_evidence,
+        extraction_metadata, freshness_policy, healthy_snapshot, source_identifier,
+    };
     use crate::{
         BudgetDecision, BudgetUnavailableReason, ChecksumValidationProfile, CurrentHealthReporter,
         CurrentSourceSession, FrameSessionBinding, LiveProtocolProfile, ProviderAggressorEvidence,
@@ -34,11 +39,6 @@ mod tests {
         ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
         ProviderSnapshotEvidence, ProviderTimestampEvidence, SemanticInterpretationProfile,
         SequenceValidationProfile, SessionId, SourceError, TransportFrameKind,
-    };
-    use crate::registry::test_support::{
-        TestResult, direct_metadata, direct_metadata_with_provider_and_limit,
-        direct_metadata_with_quality, direct_metadata_with_revision_evidence, exact_evidence,
-        extraction_metadata, freshness_policy, healthy_snapshot, source_identifier,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -162,8 +162,7 @@ mod tests {
         }
 
         fn shared_allocation_charge(&self) -> usize {
-            std::mem::size_of::<Self>()
-                + crate::conservative_arc_control_block_charge::<Self>()
+            std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
         }
     }
 
@@ -263,8 +262,13 @@ mod tests {
             Ok(self.wall_origin.checked_add_nanos(offset_nanos)?)
         }
 
-        fn reading(&self, wall_offset: i64, monotonic_offset: u64) -> TestResult<TrustedRegistryTime> {
-            let monotonic = self.monotonic_origin
+        fn reading(
+            &self,
+            wall_offset: i64,
+            monotonic_offset: u64,
+        ) -> TestResult<TrustedRegistryTime> {
+            let monotonic = self
+                .monotonic_origin
                 .checked_add(Duration::from_nanos(monotonic_offset))
                 .ok_or_else(|| std::io::Error::other("manual monotonic time overflowed"))?;
             Ok(TrustedRegistryTime::new(
@@ -274,11 +278,14 @@ mod tests {
         }
 
         fn set_time(&self, wall_offset: i64, monotonic_offset: u64) -> TestResult {
-            self.clock
-                .set(self.reading(wall_offset, monotonic_offset)?)
+            self.clock.set(self.reading(wall_offset, monotonic_offset)?)
         }
 
-        fn snapshot(&self, observed_offset: i64, deadline_offset: i64) -> TestResult<crate::SourceHealthSnapshot> {
+        fn snapshot(
+            &self,
+            observed_offset: i64,
+            deadline_offset: i64,
+        ) -> TestResult<crate::SourceHealthSnapshot> {
             healthy_snapshot(
                 &self.session,
                 self.timestamp(observed_offset)?,
@@ -346,7 +353,10 @@ mod tests {
 
         fn epoch_and_cursor(&self) -> (u64, i64) {
             (
-                self.session.lease.health_epoch.load(std::sync::atomic::Ordering::Acquire),
+                self.session
+                    .lease
+                    .health_epoch
+                    .load(std::sync::atomic::Ordering::Acquire),
                 self.session
                     .lease
                     .last_health_observed_nanos
@@ -357,8 +367,10 @@ mod tests {
 
     #[test]
     fn source_timestamp_freshness_is_quality_ceiling_aware() -> TestResult {
-        let mut research =
-            HealthHarness::new_with_quality("research-current-data", DataQuality::DirectUnverified)?;
+        let mut research = HealthHarness::new_with_quality(
+            "research-current-data",
+            DataQuality::DirectUnverified,
+        )?;
         research.set_time(20, 20)?;
         let uninitialized = research.snapshot_with_source_timestamp(10, None, 1_000)?;
         let update = research.reporter.report(uninitialized)?;
@@ -373,7 +385,9 @@ mod tests {
         let uninitialized = executable.snapshot_with_source_timestamp(10, None, 1_000)?;
         let update = executable.reporter.report(uninitialized)?;
         executable.set_time(30, 30)?;
-        executable.registry.record_health(&executable.session, update)?;
+        executable
+            .registry
+            .record_health(&executable.session, update)?;
         assert_eq!(
             executable
                 .registry
@@ -396,7 +410,6 @@ mod tests {
         );
         Ok(())
     }
-
 
     #[test]
     fn frame_ordinal_exhaustion_terminally_invalidates_factory()
@@ -433,10 +446,7 @@ mod tests {
             not_sync: PhantomData::<Cell<()>>,
         };
         assert!(matches!(
-            factory.try_frame(
-                TransportFrameKind::Binary,
-                Bytes::from_static(b"frame"),
-            ),
+            factory.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"frame"),),
             Err(SourceError::FrameIdentityExhausted)
         ));
         assert!(!lease.is_current());
@@ -507,6 +517,7 @@ mod tests {
             price: price()?,
             quantity: quantity()?,
             aggressor: ProviderAggressorEvidence::new(AggressorSide::Buy, None, aggressor),
+            taker_order_type: None,
         })?;
         assert!(
             validate_observation_profile(&protocol, DataQuality::DirectVerified, &valid).is_ok()
@@ -517,6 +528,7 @@ mod tests {
             price: price()?,
             quantity: quantity()?,
             aggressor: ProviderAggressorEvidence::new(AggressorSide::Buy, None, corporate_action),
+            taker_order_type: None,
         })?;
         assert!(
             validate_observation_profile(&protocol, DataQuality::DirectVerified, &transplanted)
@@ -549,8 +561,7 @@ mod tests {
             true,
             ProviderNumericPolicy::ExactDecimalLexeme,
         );
-        let instrument =
-            InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
+        let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
         let observation = |id, snapshot, payload| {
             ProviderNormalizedObservation::try_new(
                 SourceIdentifier::try_from(id)?,
@@ -580,12 +591,8 @@ mod tests {
             )?,
         )?;
         assert!(
-            validate_observation_profile(
-                &protocol,
-                DataQuality::DirectUnverified,
-                &initializing,
-            )
-            .is_ok()
+            validate_observation_profile(&protocol, DataQuality::DirectUnverified, &initializing,)
+                .is_ok()
         );
         assert_eq!(
             validate_observation_profile(&protocol, DataQuality::DirectVerified, &initializing),
@@ -623,6 +630,7 @@ mod tests {
                     None,
                     protocol.semantic_interpretation().aggressor_rule().clone(),
                 ),
+                taker_order_type: None,
             },
         )?;
         assert_eq!(

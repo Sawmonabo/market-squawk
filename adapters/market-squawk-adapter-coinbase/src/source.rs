@@ -5,9 +5,10 @@ use std::{future::Future, time::Instant};
 use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, LiveMarketSource,
-    LiveSourceGeneration, RawMarketSink, SharedProviderBudget, SourceError, SourceMetadata,
-    SourceMetadataProvider, TransportFrameKind, apply_http_retry_after,
+    ActiveLiveSourceGeneration, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
+    BudgetReservationDecision, LiveMarketSource, LiveSourceGeneration, RawMarketSink,
+    SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
+    apply_http_retry_after,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::{
@@ -70,11 +71,27 @@ impl CoinbaseExchangeSource {
         Ok(())
     }
 
-    fn acquire_budget(&self) -> Result<BudgetPermit, SourceError> {
-        match self.budget.try_acquire() {
-            BudgetDecision::Ready(permit) => Ok(permit),
-            BudgetDecision::WaitUntil(deadline) => Err(SourceError::BudgetWaitUntil { deadline }),
-            BudgetDecision::Unavailable(reason) => Err(SourceError::BudgetUnavailable { reason }),
+    fn reserve_budget(&self) -> Result<BudgetReservation, SourceError> {
+        match self.budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => Ok(reservation),
+            BudgetReservationDecision::WaitUntil(deadline) => {
+                Err(SourceError::BudgetWaitUntil { deadline })
+            }
+            BudgetReservationDecision::Unavailable(reason) => {
+                Err(SourceError::BudgetUnavailable { reason })
+            }
+        }
+    }
+
+    fn commit_budget(reservation: BudgetReservation) -> Result<BudgetPermit, SourceError> {
+        match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => Ok(permit),
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                Err(SourceError::BudgetWaitUntil { deadline })
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                Err(SourceError::BudgetUnavailable { reason })
+            }
         }
     }
 
@@ -93,7 +110,7 @@ impl CoinbaseExchangeSource {
             .network_policy()
             .authorize(self.config.endpoint())
             .map_err(|_| SourceError::InvalidProtocolState)?;
-        let permit = self.acquire_budget()?;
+        let reservation = self.reserve_budget()?;
         let limits = self.config.transport_limits();
         let websocket_config = WebSocketConfig::default()
             .read_buffer_size(limits.max_frame_bytes().clamp(4 * 1024, 128 * 1024))
@@ -101,6 +118,7 @@ impl CoinbaseExchangeSource {
             .max_write_buffer_size(32 * 1024)
             .max_message_size(Some(limits.max_frame_bytes()))
             .max_frame_size(Some(limits.max_frame_bytes()));
+        let permit = Self::commit_budget(reservation)?;
         let connect =
             connect_async_with_config(self.config.endpoint(), Some(websocket_config), true);
         let (socket, _response) =
@@ -198,7 +216,7 @@ impl CoinbaseExchangeSource {
             return Err(SourceError::Cancelled);
         }
         self.validate_generation()?;
-        let permit = self.acquire_budget()?;
+        let permit = Self::commit_budget(self.reserve_budget()?)?;
         self.run_socket(socket, permit, sink, cancellation).await
     }
 

@@ -16,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::system_timestamp;
 use crate::authority::{RuntimeLease, ShardLease};
-use crate::processor::GenerationAdmission;
+use crate::processor::{GenerationAdmission, GenerationRevocation};
+use crate::snapshot::SnapshotPlaneRevocation;
 use crate::{
     ActionHookActivationLease, LiveActionHookGeneration, RouteActionHook, RouteActionHookError,
     ShardId, ShardKey,
@@ -119,8 +120,16 @@ pub(crate) struct RegistrationCommand {
 }
 
 #[derive(Debug)]
+pub(crate) struct GenerationRevocationCommand {
+    pub(crate) route: ShardKey,
+    pub(crate) revocation: GenerationRevocation,
+    pub(crate) response: oneshot::Sender<Result<(), LiveIngressRevokeError>>,
+}
+
+#[derive(Debug)]
 pub(crate) enum ActorControlCommand {
     Register(RegistrationCommand),
+    RevokeGeneration(GenerationRevocationCommand),
     InstallActionHooks(ActionHookInstallCommand),
     RemoveActionHooks(ActionHookRemoveCommand),
 }
@@ -168,22 +177,35 @@ const _: () = assert!(size_of::<ActorControlCommand>() <= CONTROL_COMMAND_SLOT_B
 
 /// Drop-invalidating transfer guard for one actor-minted generation admission.
 #[derive(Debug)]
-pub(crate) struct RegistrationGrant(Option<GenerationAdmission>);
+pub(crate) struct RegistrationGrant {
+    admission: Option<GenerationAdmission>,
+    snapshot_plane: Option<SnapshotPlaneRevocation>,
+}
 
 impl RegistrationGrant {
-    pub(crate) const fn new(admission: GenerationAdmission) -> Self {
-        Self(Some(admission))
+    pub(crate) const fn new(
+        admission: GenerationAdmission,
+        snapshot_plane: SnapshotPlaneRevocation,
+    ) -> Self {
+        Self {
+            admission: Some(admission),
+            snapshot_plane: Some(snapshot_plane),
+        }
     }
 
     fn into_admission(mut self) -> Option<GenerationAdmission> {
-        self.0.take()
+        drop(self.snapshot_plane.take());
+        self.admission.take()
     }
 }
 
 impl Drop for RegistrationGrant {
     fn drop(&mut self) {
-        if let Some(admission) = self.0.take() {
+        if let Some(admission) = self.admission.take() {
             admission.invalidate_on_admission_failure();
+            if let Some(snapshot_plane) = self.snapshot_plane.take() {
+                snapshot_plane.revoke();
+            }
         }
     }
 }
@@ -196,6 +218,8 @@ pub enum RegistrationFailure {
     Capacity,
     #[error("route is not configured on this shard")]
     UnknownRoute,
+    #[error("generation registration currentness snapshot publication failed")]
+    SnapshotPublication,
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +290,7 @@ impl LiveRuntimeIngress {
             shard_liveness: channels.shard_liveness,
             mailbox: channels.mailbox,
             byte_budget: channels.byte_budget,
+            control: channels.control,
             registration,
             registration_deadline: channels.registration_deadline,
             maximum_message_bytes: channels.maximum_message_bytes,
@@ -295,6 +320,7 @@ pub struct DormantRouteIngress {
     shard_liveness: ShardLease,
     mailbox: mpsc::Sender<ShardCommand>,
     byte_budget: Arc<Semaphore>,
+    control: mpsc::Sender<ActorControlCommand>,
     registration: mpsc::OwnedPermit<ActorControlCommand>,
     registration_deadline: Duration,
     maximum_message_bytes: u32,
@@ -367,6 +393,8 @@ impl DormantRouteIngress {
             shard_liveness: self.shard_liveness,
             mailbox: self.mailbox,
             byte_budget: self.byte_budget,
+            control: self.control,
+            control_deadline: self.registration_deadline,
             maximum_message_bytes: self.maximum_message_bytes,
             admission,
             health: self.health,
@@ -398,12 +426,59 @@ pub struct BoundShardIngress {
     shard_liveness: ShardLease,
     mailbox: mpsc::Sender<ShardCommand>,
     byte_budget: Arc<Semaphore>,
+    control: mpsc::Sender<ActorControlCommand>,
+    control_deadline: Duration,
     maximum_message_bytes: u32,
     admission: GenerationAdmission,
     health: mpsc::Sender<LiveRuntimeHealthEvent>,
 }
 
 impl BoundShardIngress {
+    /// Revokes this exact generation and publishes the transition through the owning shard actor.
+    ///
+    /// Revocation is applied locally before the bounded control handoff, so losing the actor never
+    /// preserves source authority. Success is returned only after the owning actor has published
+    /// the immutable currentness transition; closed runtime/shard authority is a typed non-success
+    /// because publication completion can no longer be proven by this handle.
+    pub async fn revoke_generation(self) -> Result<(), LiveIngressRevokeError> {
+        let revocation = self.admission.revocation();
+        revocation.invalidate();
+        self.runtime
+            .validate()
+            .map_err(|_| LiveIngressRevokeError::RuntimeClosed)?;
+        self.shard_liveness
+            .validate()
+            .map_err(|_| LiveIngressRevokeError::ShardClosed)?;
+        let deadline = Instant::now()
+            .checked_add(self.control_deadline)
+            .ok_or(LiveIngressRevokeError::DeadlineRange)?;
+        let control = self.control.clone();
+        let permit = tokio::select! {
+            biased;
+            permit = control.reserve_owned() => {
+                permit.map_err(|_error| LiveIngressRevokeError::ControlClosed)?
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(LiveIngressRevokeError::DeadlineExceeded);
+            }
+        };
+        let (response, receiver) = oneshot::channel();
+        permit.send(ActorControlCommand::RevokeGeneration(
+            GenerationRevocationCommand {
+                route: self.route,
+                revocation,
+                response,
+            },
+        ));
+        tokio::select! {
+            biased;
+            result = receiver => result.map_err(|_closed| LiveIngressRevokeError::ControlClosed)?,
+            () = tokio::time::sleep_until(deadline) => {
+                Err(LiveIngressRevokeError::DeadlineExceeded)
+            }
+        }
+    }
+
     /// Attempts exact count-and-byte admission without awaiting mailbox capacity.
     pub fn try_publish(&self, batch: CurrentDecodedProviderBatch) -> Result<(), LiveIngressError> {
         match self.try_publish_inner(batch) {
@@ -518,6 +593,27 @@ pub enum LiveIngressBindError {
     ClockRange,
     #[error(transparent)]
     Registration(RegistrationFailure),
+}
+
+/// Exact-generation revocation/publication failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum LiveIngressRevokeError {
+    #[error("generation revocation runtime incarnation is closed")]
+    RuntimeClosed,
+    #[error("generation revocation route shard is closed")]
+    ShardClosed,
+    #[error("generation revocation deadline cannot be represented")]
+    DeadlineRange,
+    #[error("generation revocation exceeded its bounded deadline")]
+    DeadlineExceeded,
+    #[error("generation revocation control channel is closed")]
+    ControlClosed,
+    #[error("generation revocation targeted an unknown route")]
+    UnknownRoute,
+    #[error("generation revocation authority belongs to another route registry")]
+    AuthorityMismatch,
+    #[error("generation revocation currentness snapshot publication failed")]
+    SnapshotPublication,
 }
 
 /// Nonblocking live mailbox admission failure.

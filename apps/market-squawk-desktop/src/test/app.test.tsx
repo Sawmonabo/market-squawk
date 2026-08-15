@@ -2031,6 +2031,7 @@ const krakenTradeResult: ApplicationResult = {
     priceTicks: "680001",
     quantityLots: "25000000",
     aggressorSide: "buy",
+    takerOrderType: "market",
     sourceTimestamp: krakenSourceAt,
     receivedAt: krakenReceivedAt,
     availableAt: krakenAvailableAt,

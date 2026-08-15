@@ -19,7 +19,7 @@ fn typed_kraken_selection_builds_the_sealed_direct_unverified_profile()
     let temporary = tempfile::tempdir()?;
     let json = r#"{
       "endpoint":"wss://ws.kraken.com/v2",
-      "channel":"book",
+      "channels":["book","trade"],
       "depth":10,
       "freshness_ms":5000,
       "max_frame_bytes":1048576,
@@ -31,8 +31,8 @@ fn typed_kraken_selection_builds_the_sealed_direct_unverified_profile()
         "provider":"kraken",
         "basis":"user-reviewed-kraken-public-interface",
         "evidence_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "evidence_reference":"https://docs.kraken.com/api/docs/websocket-v2/book/",
-        "evidence_version":"reviewed-2026-07-21",
+        "evidence_reference":"https://github.com/Sawmonabo/market-squawk/blob/main/docs/research/2026-07-16-kraken-websocket-v2-checksum.md",
+        "evidence_version":"reviewed-2026-08-14",
         "effective_from_unix_nanos":1700000000000000000,
         "effective_until_unix_nanos":1900000000000000000
       },
@@ -80,11 +80,13 @@ fn typed_kraken_selection_builds_the_sealed_direct_unverified_profile()
         ProductionSourceProvider::Kraken,
     )?;
     assert_eq!(composition.endpoint(), "wss://ws.kraken.com/v2");
-    assert_eq!(composition.metadata().provider().as_str(), "kraken");
-    assert_eq!(
-        composition.metadata().quality_ceiling(),
-        DataQuality::DirectUnverified
-    );
+    let metadata = composition.source_metadata()?;
+    assert_eq!(metadata.len(), 2);
+    assert!(metadata.iter().all(|source| {
+        source.provider().as_str() == "kraken"
+            && source.quality_ceiling() == DataQuality::DirectUnverified
+    }));
+    assert_ne!(metadata[0].source_id(), metadata[1].source_id());
     Ok(())
 }
 
@@ -210,7 +212,7 @@ fn validated_instruments_flow_to_adapter_mappings_without_identity_regeneration(
             .revision()
             .as_source_identifier()
             .as_str()
-            .starts_with("coinbase-v1-")
+            .starts_with("coinbase-v2-")
     );
 
     let mut changed = parsed;

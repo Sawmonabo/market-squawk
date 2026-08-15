@@ -2878,6 +2878,10 @@ fn market_trade_rows() -> Value {
         ("priceTicks", integer_text()),
         ("quantityLots", unsigned_integer_text()),
         ("aggressorSide", enumeration(&["buy", "sell", "unknown"])),
+        (
+            "takerOrderType",
+            nullable(enumeration(&["limit", "market"])),
+        ),
         ("sourceTimestamp", nullable(canonical_market_timestamp())),
         ("receivedAt", canonical_market_timestamp()),
         ("availableAt", canonical_market_timestamp()),

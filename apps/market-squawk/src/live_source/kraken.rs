@@ -158,8 +158,8 @@ impl ProductionKrakenProfile {
             freshness_nanos,
             freshness_nanos,
             freshness_nanos,
-            MAX_CLOCK_SKEW_NANOS,
             freshness_nanos,
+            MAX_CLOCK_SKEW_NANOS,
         )?;
         let revision = RevisionBoundPayloadEvidence::new(
             MetadataRevision::new(content_addressed_revision(digest)?),

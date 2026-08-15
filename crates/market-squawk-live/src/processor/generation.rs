@@ -49,9 +49,27 @@ pub(crate) struct GenerationAdmission {
     registry: RegistryLifecycleLease,
 }
 
+/// Revocation-only capability for one exact route generation.
+///
+/// This carries no source observation or publish authority. It exists so the generation owner can
+/// withdraw currentness and ask the shard actor to publish that transition before replacement data
+/// is available.
+#[derive(Clone, Debug)]
+pub(crate) struct GenerationRevocation {
+    generation: GenerationLease,
+    registry: RegistryLifecycleLease,
+}
+
 impl GenerationAdmission {
     pub(crate) fn invalidate_on_admission_failure(&self) {
         self.generation.invalidate();
+    }
+
+    pub(crate) fn revocation(&self) -> GenerationRevocation {
+        GenerationRevocation {
+            generation: self.generation.clone(),
+            registry: self.registry.clone(),
+        }
     }
 
     pub(crate) const fn source(&self) -> &CurrentSourceAuthorityLease {
@@ -78,6 +96,12 @@ impl GenerationAdmission {
                 value.checked_add(2 * market_squawk_domain::SourceIdentifier::MAX_LENGTH)
             })
             .ok_or(LiveApplyError::SnapshotRetainedSizeOverflow)
+    }
+}
+
+impl GenerationRevocation {
+    pub(crate) fn invalidate(&self) {
+        self.generation.invalidate();
     }
 }
 
@@ -145,6 +169,12 @@ impl GenerationAuthorityRegistry {
                 {
                     return Err(LiveApplyError::GenerationAdmissionTransplant);
                 }
+                if existing.owner.lease().validate().is_err() {
+                    // Explicit or admission-failure revocation is terminal for this exact key.
+                    // A later healthy epoch or connection generation may bind a fresh owner, but
+                    // retrying the revoked key must never return an already-dead admission.
+                    return Err(LiveApplyError::GenerationNotAdvanced);
+                }
                 existing.source = source.clone();
                 return Ok(GenerationAdmission {
                     source: source.clone(),
@@ -202,6 +232,12 @@ impl GenerationAuthorityRegistry {
 
     pub(crate) fn exit_handle(&self) -> GenerationRegistryExitHandle {
         GenerationRegistryExitHandle(self.lifecycle.lease())
+    }
+
+    pub(crate) fn owns_revocation(&self, revocation: &GenerationRevocation) -> bool {
+        self.lifecycle
+            .lease()
+            .shares_allocation_with(&revocation.registry)
     }
 
     pub(crate) fn invalidate_all(&mut self) {

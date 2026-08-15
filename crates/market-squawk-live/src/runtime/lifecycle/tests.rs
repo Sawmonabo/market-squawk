@@ -218,7 +218,9 @@ async fn partial_startup_cleanup_invalidates_closes_aborts_and_awaits_every_task
         NonZeroU64::new(70).ok_or("zero incarnation")?,
         &[Vec::new()],
     )?;
-    let snapshots = create_snapshot_plane(initial, 1)?.reader;
+    let snapshot_bundle = create_snapshot_plane(initial, 1)?;
+    let snapshots = snapshot_bundle.reader.clone();
+    assert!(snapshots.try_load(shard).is_ok());
 
     cleanup_failed_startup(&mut owner, &cancellation, &mut actors, &snapshots).await;
 
@@ -230,6 +232,7 @@ async fn partial_startup_cleanup_invalidates_closes_aborts_and_awaits_every_task
         snapshots.try_load(ShardId::new(0, 1)?).err(),
         Some(SnapshotReadError::Closed)
     );
+    drop(snapshot_bundle.publishers);
     Ok(())
 }
 
@@ -260,6 +263,7 @@ async fn graceful_shutdown_invalidates_before_controlled_drain_then_joins_withou
     let harness = runtime_shell(config, 80, owner, cancellation, actors, task_shards)?;
     let runtime_lease = harness.runtime_lease.clone();
     let reader = harness.reader.clone();
+    assert!(reader.try_load(shard).is_ok());
     let shutdown = harness.runtime.shutdown();
     tokio::pin!(shutdown);
 
@@ -422,12 +426,8 @@ async fn actor_exit_invalidates_shared_runtime_before_completion_is_observed() -
     assert!(runtime_lease.validate().is_err());
     runtime_owner.invalidate();
     assert_eq!(
-        plane
-            .reader
-            .try_load(ShardId::new(0, 1)?)?
-            .snapshot()
-            .lifecycle(),
-        ShardLifecycleSnapshot::Ready
+        plane.reader.try_load(ShardId::new(0, 1)?).err(),
+        Some(SnapshotReadError::Closed)
     );
     Ok(())
 }

@@ -5,7 +5,7 @@ use std::num::NonZeroU16;
 use chrono::DateTime;
 use market_squawk_domain::{
     AggressorSide, InstrumentId, IntegrityRule, MarketDepth, RuleVersion, SourceIdentifier,
-    Timestamp, VenueId,
+    Timestamp, TradeTakerOrderType, VenueId,
 };
 use market_squawk_sources::{
     ControlFrameKind, DecodeError, DecodeInternalError, DecodeOutcome, DecodedControlFrame,
@@ -22,8 +22,9 @@ use rust_decimal::Decimal;
 
 use crate::config::{KrakenChannel, KrakenDepth};
 use crate::messages::{
-    BookData, BookEnvelope, EnvelopeKind, Heartbeat, Pong, StatusEnvelope, SubscribeAck, TradeData,
-    TradeEnvelope, WireLevel, bounded_trade_count, classify, exact_decimal, validate_warnings,
+    BookData, BookEnvelope, EnvelopeKind, Heartbeat, MAX_SUBSCRIPTION_ERROR_BYTES,
+    PUBLIC_SUBSCRIPTION_REQUEST_ID, Pong, StatusEnvelope, SubscribeAck, TradeData, TradeEnvelope,
+    WireLevel, bounded_trade_count, classify, exact_decimal, validate_warnings,
 };
 use crate::qualification::{KRAKEN_BOOK_SEQUENCE_RULE, KRAKEN_TRADE_SEQUENCE_RULE};
 
@@ -162,6 +163,15 @@ fn control_outcome(
         KrakenControl::Subscribed(KrakenSubscription::Trade) => {
             (ControlFrameKind::SubscriptionAcknowledgement, Some("trade"))
         }
+        KrakenControl::SubscriptionRefused => {
+            let provider_code = SourceIdentifier::try_from("subscription_refused")
+                .map_err(|_| DecodeInternalError::InvariantViolation)?;
+            return Ok(DecodeOutcome::Resynchronize(DecodedRecoveryAction::new(
+                evidence,
+                ResynchronizationReason::ProviderRequestedReset,
+                Some(provider_code),
+            )));
+        }
     };
     let provider_code = provider_code
         .map(SourceIdentifier::try_from)
@@ -223,6 +233,8 @@ pub enum KrakenControl {
     Online,
     /// Successful subscription acknowledgement.
     Subscribed(KrakenSubscription),
+    /// Structurally valid provider refusal of the exact subscription request.
+    SubscriptionRefused,
 }
 
 /// Acknowledged Kraken channel.
@@ -255,7 +267,7 @@ impl Rules {
             sequence: rule(sequence_rule)?,
             checksum: rule("kraken-ws-v2-book-checksum-v1")?,
             no_checksum: rule("kraken-ws-v2-trade-checksum-unsupported-v1")?,
-            no_snapshot: rule("kraken-ws-v2-non-book-snapshot-na-v1")?,
+            no_snapshot: rule("kraken-ws-v2-trade-snapshot-na-v1")?,
             aggressor: rule("kraken-ws-v2-trade-taker-side-v1")?,
         })
     }
@@ -361,6 +373,14 @@ impl KrakenDecoder {
             EnvelopeKind::SubscribeAck => validate_ack(payload, &self.symbol, self.channel),
             EnvelopeKind::Pong => validate_pong(payload),
         };
+        if matches!(
+            outcome,
+            Ok(KrakenDecodeOutcome::Control(
+                KrakenControl::SubscriptionRefused
+            ))
+        ) {
+            self.state = KrakenDecoderState::Quarantined;
+        }
         if outcome.is_err() {
             self.state = KrakenDecoderState::Quarantined;
         }
@@ -532,7 +552,7 @@ impl KrakenDecoder {
         }
         let mut observations = Vec::with_capacity(trade_count);
         for trade in trades {
-            if trade.symbol != self.symbol || trade.trade_id < 0 || trade.ord_type.is_empty() {
+            if trade.symbol != self.symbol || trade.trade_id < 0 {
                 return Err(DecodeError::MalformedPayload);
             }
             let side = match trade.side {
@@ -541,6 +561,11 @@ impl KrakenDecoder {
                 _ => return Err(DecodeError::MalformedPayload),
             };
             let trade_id = trade.trade_id.to_string();
+            let taker_order_type = match trade.ord_type {
+                "limit" => TradeTakerOrderType::Limit,
+                "market" => TradeTakerOrderType::Market,
+                _ => return Err(DecodeError::MalformedPayload),
+            };
             observations.push(ProviderNormalizedObservation::try_new(
                 source_identifier(&trade_id)?,
                 VenueId::try_from(VENUE).map_err(|_| DecodeError::MalformedPayload)?,
@@ -565,6 +590,7 @@ impl KrakenDecoder {
                         Some(source_identifier(trade.side)?),
                         self.rules.aggressor.clone(),
                     ),
+                    taker_order_type: Some(taker_order_type),
                 },
             )?);
         }
@@ -769,41 +795,63 @@ fn validate_ack(
 ) -> Result<KrakenDecodeOutcome, DecodeError> {
     let ack: SubscribeAck<'_> =
         serde_json::from_slice(payload).map_err(|_| DecodeError::MalformedPayload)?;
-    let result = ack.result.as_ref().ok_or(DecodeError::MalformedPayload)?;
-    validate_warnings(result.warnings).map_err(|_| DecodeError::MalformedPayload)?;
     if ack.method != "subscribe"
-        || !ack.success
-        || ack.error.is_some()
         || ack.time_in.is_empty()
         || ack.time_out.is_empty()
-        || ack.req_id == Some(0)
-        || !matches!(result.channel, "book" | "trade")
-        || result.symbol != symbol
+        || ack.req_id != Some(PUBLIC_SUBSCRIPTION_REQUEST_ID)
     {
         return Err(DecodeError::ResynchronizationRequired);
     }
-    let subscription = match channel {
+    if !ack.success {
+        let error = ack.error.ok_or(DecodeError::ResynchronizationRequired)?;
+        if error.is_empty() || error.len() > MAX_SUBSCRIPTION_ERROR_BYTES {
+            return Err(DecodeError::ResynchronizationRequired);
+        }
+        if let Some(result) = ack.result.as_ref() {
+            validate_subscription_result(result, symbol, channel)?;
+        }
+        return Ok(KrakenDecodeOutcome::Control(
+            KrakenControl::SubscriptionRefused,
+        ));
+    }
+    if ack.error.is_some() {
+        return Err(DecodeError::ResynchronizationRequired);
+    }
+    let result = ack.result.as_ref().ok_or(DecodeError::MalformedPayload)?;
+    let subscription = validate_subscription_result(result, symbol, channel)?;
+    Ok(KrakenDecodeOutcome::Control(KrakenControl::Subscribed(
+        subscription,
+    )))
+}
+
+fn validate_subscription_result(
+    result: &crate::messages::SubscribeResult<'_>,
+    symbol: &str,
+    channel: KrakenChannel,
+) -> Result<KrakenSubscription, DecodeError> {
+    validate_warnings(result.warnings).map_err(|_| DecodeError::MalformedPayload)?;
+    if !matches!(result.channel, "book" | "trade") || result.symbol != symbol {
+        return Err(DecodeError::ResynchronizationRequired);
+    }
+    match channel {
         KrakenChannel::Book(depth)
             if result.channel == "book"
                 && result.depth == Some(depth.get())
                 && result.snapshot == Some(true) =>
         {
-            KrakenSubscription::Book
+            Ok(KrakenSubscription::Book)
         }
         KrakenChannel::Trades
             if result.channel == "trade"
                 && result.depth.is_none()
                 && result.snapshot == Some(true) =>
         {
-            KrakenSubscription::Trade
+            Ok(KrakenSubscription::Trade)
         }
         KrakenChannel::Book(_) | KrakenChannel::Trades => {
-            return Err(DecodeError::ResynchronizationRequired);
+            Err(DecodeError::ResynchronizationRequired)
         }
-    };
-    Ok(KrakenDecodeOutcome::Control(KrakenControl::Subscribed(
-        subscription,
-    )))
+    }
 }
 
 fn validate_pong(payload: &[u8]) -> Result<KrakenDecodeOutcome, DecodeError> {

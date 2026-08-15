@@ -7,7 +7,7 @@
 use market_squawk_domain::{
     AggressorSide, AuctionPhase, CorporateActionKind, DigestAlgorithm, EvidenceDigest,
     HaltTransition, InstrumentId, IntegrityRule, LiveEventClass, MarketDepth, SequenceNumber,
-    SourceIdentifier, Timestamp, TradingStatus, VenueId,
+    SourceIdentifier, Timestamp, TradeTakerOrderType, TradingStatus, VenueId,
 };
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};

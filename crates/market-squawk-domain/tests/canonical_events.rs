@@ -18,8 +18,8 @@ use market_squawk_domain::{
     PayloadReference, PositionObservation, PositionSide, PriceTicks, QuantityLots, QuoteEvent,
     ResearchContext, ResearchError, ResearchObservation, ResearchProvenance,
     ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber,
-    SchemaVersion, SourceId, SourceIdentifier, Timestamp, TradeEvent, TradingHaltEvent,
-    TradingStatus, TransactionObservation,
+    SchemaVersion, SourceId, SourceIdentifier, Timestamp, TradeEvent, TradeTakerOrderType,
+    TradingHaltEvent, TradingStatus, TransactionObservation,
 };
 use rust_decimal::Decimal;
 
@@ -122,6 +122,7 @@ fn trade_event_requires_positive_quantity_and_matching_live_identity() -> Result
             PriceTicks::new(10_000),
             QuantityLots::new(0)?,
             AggressorSide::Buy,
+            None,
         ),
         Err(MarketEventError::ZeroQuantity)
     ));
@@ -131,6 +132,7 @@ fn trade_event_requires_positive_quantity_and_matching_live_identity() -> Result
             PriceTicks::new(10_000),
             QuantityLots::new(1)?,
             AggressorSide::Buy,
+            None,
         ),
         Err(MarketEventError::ProvenanceEventClassMismatch)
     ));
@@ -197,6 +199,7 @@ fn canonical_market_family_is_serializable() -> Result<(), Box<dyn Error>> {
         PriceTicks::new(10_000),
         QuantityLots::new(3)?,
         AggressorSide::Sell,
+        Some(TradeTakerOrderType::Market),
     )?);
 
     let wire = serde_json::to_string(&event)?;
@@ -212,6 +215,7 @@ fn market_payload_fields_are_available_through_typed_views() -> Result<(), Box<d
         PriceTicks::new(100),
         QuantityLots::new(2)?,
         AggressorSide::Buy,
+        Some(TradeTakerOrderType::Limit),
     )?;
     let quote = QuoteEvent::new(
         live_provenance(LiveEventClass::Quote)?,
@@ -257,6 +261,7 @@ fn market_payload_fields_are_available_through_typed_views() -> Result<(), Box<d
     )?;
 
     assert_eq!(trade.aggressor_side(), AggressorSide::Buy);
+    assert_eq!(trade.taker_order_type(), Some(TradeTakerOrderType::Limit));
     assert_eq!(quote.provenance().quality(), DataQuality::DirectUnverified);
     assert_eq!(snapshot.depth(), MarketDepth::PriceLevel);
     assert_eq!(snapshot.sequence(), None);

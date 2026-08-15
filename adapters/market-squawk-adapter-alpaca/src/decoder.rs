@@ -602,6 +602,7 @@ impl AlpacaDecoder {
                     None,
                     self.aggressor_rule.clone(),
                 ),
+                taker_order_type: None,
             },
         }))
     }
@@ -692,6 +693,7 @@ impl AlpacaDecoder {
                     None,
                     self.aggressor_rule.clone(),
                 ),
+                taker_order_type: None,
             },
         })
     }

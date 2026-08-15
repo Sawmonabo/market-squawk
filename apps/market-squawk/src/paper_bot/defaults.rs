@@ -4,6 +4,7 @@ use std::{
     collections::BTreeSet,
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     str::FromStr,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -42,7 +43,7 @@ use market_squawk_portfolio::{
     PortfolioLimits, PortfolioService, PortfolioServiceLimitInput, PortfolioServiceLimits,
     RevisionEvidence, TransactionRevision, ValuationSet,
 };
-use market_squawk_sources::{FreshnessPolicy, ProviderRateAuthority};
+use market_squawk_sources::{FreshnessPolicy, ProviderRateAuthority, SourceMetadata};
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -55,7 +56,8 @@ use crate::live_source::order_level::OrderLevelDirectory;
 use crate::provider_rate::open_provider_rate_authority;
 use crate::{
     AppConfig, CoinbaseDirectAccountActivation, CoinbaseDirectAdapterActivation,
-    CoinbaseDirectProductActivation, ProductionLiveSourceComposition, ProductionLiveSourceRuntime,
+    CoinbaseDirectProductActivation, ProductionLiveSourceComposition,
+    ProductionLiveSourceCompositionError, ProductionLiveSourceRuntime,
     ProductionLiveSourceRuntimeError, ProductionSourceProvider, ProviderActivationOutcome,
     ProviderAdapterActivation, ProviderAdapterActivationRequest,
 };
@@ -96,6 +98,8 @@ const SNAPSHOT_BYTES_PER_ROUTE: u32 = 1024 * 1024;
 const HEALTH_EVENTS_PER_ROUTE: usize = 1_024;
 const REGISTRATION_COMMANDS_PER_ROUTE: usize = 128;
 const RETAINED_SNAPSHOT_READERS_PER_SHARD: u32 = 4;
+const MAXIMUM_SOURCES_PER_ROUTE: usize = 2;
+const MAXIMUM_STREAMS_PER_ROUTE: usize = 8;
 const LOCAL_LIVE_RUNTIME_MEMORY_CEILING_BYTES: u64 = 512 * 1024 * 1024;
 const LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES: usize = 64 * 1024 * 1024;
 const LOCAL_PAPER_MATCHING_WORK_QUANTUM: usize = 256;
@@ -237,14 +241,16 @@ impl CoinbaseDirectLiveMarketComposition {
 }
 
 impl ProductionLiveMarketComposition {
-    /// Returns the exact canonical source identity whose observations this runtime publishes.
-    pub(crate) fn source_id(&self) -> &market_squawk_domain::SourceId {
-        self.source.metadata().source_id()
+    /// Returns the quote/book source retained by the bounded fair-value export.
+    pub(crate) fn qualified_market_export_source_id(&self) -> &market_squawk_domain::SourceId {
+        self.source.qualified_market_export_source_id()
     }
 
-    /// Returns exact metadata for the source that owns this composition.
-    pub(crate) fn metadata(&self) -> &market_squawk_sources::SourceMetadata {
-        self.source.metadata()
+    /// Returns every exact source-metadata record installed by this composition.
+    pub(crate) fn source_metadata(
+        &self,
+    ) -> std::result::Result<Arc<[SourceMetadata]>, ProductionLiveSourceCompositionError> {
+        self.source.source_metadata()
     }
 
     /// Returns the complete immutable route set used to create bounded market exports.
@@ -342,6 +348,35 @@ struct ConfiguredPaperSource {
     routes: Vec<LiveRouteConfig>,
     maximum_message_bytes: u32,
     freshness_nanos: u64,
+    session_authority: ContinuousPaperSessionAuthority,
+}
+
+/// Exact provider-owned identity for one continuously open paper-market calendar.
+///
+/// Coinbase and Kraken are both continuously traded, but their session evidence is not
+/// interchangeable: the identities are retained in checkpoints and audit receipts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContinuousPaperSessionAuthority {
+    calendar_id: &'static str,
+    session_id: &'static str,
+}
+
+impl ContinuousPaperSessionAuthority {
+    const COINBASE: Self = Self {
+        calendar_id: "coinbase-continuous-calendar",
+        session_id: "coinbase-continuous-session",
+    };
+
+    const KRAKEN: Self = Self {
+        calendar_id: "kraken-continuous-calendar",
+        session_id: "kraken-continuous-session",
+    };
+
+    #[cfg(feature = "release-evidence")]
+    const RELEASE_BENCHMARK: Self = Self {
+        calendar_id: "release-benchmark-continuous-calendar",
+        session_id: "release-benchmark-continuous-session",
+    };
 }
 
 fn maximum_local_paper_action_hook_bytes_per_route(
@@ -367,6 +402,7 @@ fn maximum_local_paper_action_hook_bytes_per_route(
         venue,
         maximum_fee_basis_points,
         source.freshness_nanos,
+        source.session_authority,
     )?
     .market_ingress_retained_bytes()?;
     let mut maximum = 0_usize;
@@ -522,6 +558,7 @@ fn configured_source(
                 COINBASE_RETAINED_DEPTH,
                 u32::try_from(source.max_frame_bytes().get())?,
                 u64::try_from(source.freshness().as_nanos())?,
+                ContinuousPaperSessionAuthority::COINBASE,
             )
         }
         ProductionSourceProvider::Kraken => {
@@ -534,6 +571,7 @@ fn configured_source(
                 source.depth(),
                 u32::try_from(source.max_frame_bytes().get())?,
                 u64::try_from(source.freshness().as_nanos())?,
+                ContinuousPaperSessionAuthority::KRAKEN,
             )
         }
     }
@@ -545,6 +583,7 @@ fn configured_paper_source(
     retained_depth: usize,
     maximum_message_bytes: u32,
     freshness_nanos: u64,
+    session_authority: ContinuousPaperSessionAuthority,
 ) -> Result<ConfiguredPaperSource> {
     if definitions.is_empty() {
         bail!("production source instrument set is empty");
@@ -572,6 +611,7 @@ fn configured_paper_source(
         routes,
         maximum_message_bytes,
         freshness_nanos,
+        session_authority,
     })
 }
 
@@ -648,6 +688,7 @@ where
         routes,
         maximum_message_bytes,
         freshness_nanos,
+        session_authority,
     } = source_profile;
     if initial_cash <= Decimal::ZERO {
         bail!("paper initial cash must be positive");
@@ -698,7 +739,13 @@ where
     let portfolio =
         paper_sandbox_portfolio_capability(account_id, cash, routes.len(), current_timestamp()?)?;
     let risk_limits = local_risk_limits(&routes, cash, fee_basis_points)?;
-    let paper = paper_config(currency, venue, fee_basis_points, freshness_nanos)?;
+    let paper = paper_config(
+        currency,
+        venue,
+        fee_basis_points,
+        freshness_nanos,
+        session_authority,
+    )?;
     let paths = LocalPaths::prepare(config.data_dir())?;
     let paper_checkpoint_repository = PaperCheckpointRepository::try_new(
         paths.artifacts()?.clone(),
@@ -845,6 +892,7 @@ where
             10,
             16 * 1024 * 1024,
             60_000_000_000,
+            ContinuousPaperSessionAuthority::RELEASE_BENCHMARK,
         )?,
         Decimal::new(1_000_000, 0),
         0,
@@ -1077,8 +1125,8 @@ fn live_runtime_config(
         mailbox_bytes_per_shard: scaled_u32(MAILBOX_BYTES_PER_ROUTE, route_count)?,
         maximum_message_bytes,
         maximum_routes_per_shard: route_count,
-        maximum_sources_per_route: 2,
-        maximum_streams_per_route: 8,
+        maximum_sources_per_route: MAXIMUM_SOURCES_PER_ROUTE,
+        maximum_streams_per_route: MAXIMUM_STREAMS_PER_ROUTE,
         maximum_feature_window_observations_per_route: FEATURE_WINDOW_OBSERVATIONS_PER_ROUTE,
         maximum_feature_window_bytes_per_route: FEATURE_WINDOW_BYTES_PER_ROUTE,
         maximum_feature_sets_per_route: FEATURE_SETS_PER_ROUTE,
@@ -1095,8 +1143,8 @@ fn live_runtime_config(
         snapshot_interval: Duration::from_secs(1),
         snapshot_limits: SnapshotLimits::try_new(
             route_count,
-            route_count,
-            route_count,
+            MAXIMUM_STREAMS_PER_ROUTE,
+            MAXIMUM_SOURCES_PER_ROUTE,
             u32::try_from(maximum_depth)?,
             scaled_u32(SNAPSHOT_BYTES_PER_ROUTE, route_count)?,
         )?,
@@ -1125,14 +1173,15 @@ fn paper_config(
     venue: market_squawk_domain::VenueId,
     fee_basis_points: u32,
     maximum_mark_age_nanos: u64,
+    session_authority: ContinuousPaperSessionAuthority,
 ) -> Result<PaperExecutionConfig> {
     let calendar = PaperVenueSessionCalendar::try_new(
-        SourceIdentifier::try_from("coinbase-continuous-calendar")?,
+        SourceIdentifier::try_from(session_authority.calendar_id)?,
         RuleVersion::new(1)?,
         venue,
         "UTC",
         vec![PaperVenueSession::try_new(
-            SourceIdentifier::try_from("coinbase-continuous-session")?,
+            SourceIdentifier::try_from(session_authority.session_id)?,
             Timestamp::from_unix_nanos(i64::MIN),
             Timestamp::from_unix_nanos(i64::MAX),
         )?],

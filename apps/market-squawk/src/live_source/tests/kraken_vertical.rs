@@ -126,8 +126,20 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
         Box::new(InvocationProbeStrategy {
             invocations: Arc::clone(&invocations),
         }),
-    )?
-    .with_local_kraken_endpoint_for_test(&endpoint)?;
+    )?;
+    let calendar = composition.day_session_calendar_for_test();
+    assert_eq!(
+        calendar.calendar_id().as_str(),
+        "kraken-continuous-calendar"
+    );
+    assert_eq!(calendar.venue_id().as_str(), "kraken");
+    assert_eq!(calendar.time_zone(), "UTC");
+    assert_eq!(calendar.sessions().len(), 1);
+    assert_eq!(
+        calendar.sessions()[0].session_id().as_str(),
+        "kraken-continuous-session"
+    );
+    let composition = composition.with_local_kraken_endpoint_for_test(&endpoint)?;
     let cancellation = CancellationToken::new();
     let runtime = composition.start(cancellation.clone()).await?;
 
@@ -157,6 +169,7 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
         trade_metadata.source_id(),
     )
     .await?;
+    wait_for_source_health(&runtime, true).await?;
     assert!(runtime.source_is_healthy());
     assert_eq!(
         book_metadata.quality_ceiling(),
@@ -861,6 +874,7 @@ async fn accept_kraken_subscription(
         _ => return Err("Kraken source sent an unsupported channel subscription".into()),
     };
     if request["method"] != "subscribe"
+        || request["req_id"] != serde_json::json!(1)
         || params.get("snapshot") != Some(&serde_json::Value::Bool(true))
         || params.get("symbol") != Some(&serde_json::json!(["BTC/USD"]))
     {
@@ -890,7 +904,8 @@ fn current_kraken_frames() -> TestResult<KrakenTestFrames> {
         },
         "success": true,
         "time_in": now.clone(),
-        "time_out": now.clone()
+        "time_out": now.clone(),
+        "req_id": 1
     })
     .to_string();
     let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
@@ -907,7 +922,8 @@ fn current_kraken_frames() -> TestResult<KrakenTestFrames> {
         },
         "success": true,
         "time_in": now.clone(),
-        "time_out": now.clone()
+        "time_out": now.clone(),
+        "req_id": 1
     })
     .to_string();
     let trade_snapshot = serde_json::json!({
@@ -945,7 +961,7 @@ fn kraken_config_with_ack_timeout(
     let json = format!(
         r#"{{
           "endpoint":"wss://ws.kraken.com/v2",
-          "channel":"book",
+          "channels":["book","trade"],
           "depth":10,
           "freshness_ms":120000,
           "max_frame_bytes":1048576,
@@ -957,8 +973,8 @@ fn kraken_config_with_ack_timeout(
             "provider":"kraken",
             "basis":"user-reviewed-kraken-public-interface",
             "evidence_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "evidence_reference":"https://docs.kraken.com/api/docs/websocket-v2/book/",
-            "evidence_version":"reviewed-2026-07-21",
+            "evidence_reference":"https://github.com/Sawmonabo/market-squawk/blob/main/docs/research/2026-07-16-kraken-websocket-v2-checksum.md",
+            "evidence_version":"reviewed-2026-08-14",
             "effective_from_unix_nanos":1700000000000000000,
             "effective_until_unix_nanos":1900000000000000000
           }},

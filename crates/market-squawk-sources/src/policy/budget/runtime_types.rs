@@ -80,11 +80,33 @@ pub enum BudgetUnavailableReason {
 /// Atomic dispatch outcome for one shared provider/account budget.
 #[derive(Debug)]
 pub enum BudgetDecision {
-    /// A request slot was atomically reserved until this permit is dropped.
+    /// A response-control operation unexpectedly produced a request permit.
     Ready(BudgetPermit),
     /// Dispatch must wait until the inclusive instant is reached.
     WaitUntil(MonotonicInstant),
     /// Dispatch is unavailable without an external state change.
+    Unavailable(BudgetUnavailableReason),
+}
+
+/// Concurrency-reservation outcome before any provider request window is charged.
+#[derive(Debug)]
+pub enum BudgetReservationDecision {
+    /// Concurrency is reserved; the request must still commit at the transport dispatch boundary.
+    Ready(BudgetReservation),
+    /// Reservation must wait until the inclusive instant is reached.
+    WaitUntil(MonotonicInstant),
+    /// Reservation is unavailable without an external state change.
+    Unavailable(BudgetUnavailableReason),
+}
+
+/// Dispatch outcome after consuming one exact concurrency reservation.
+#[derive(Debug)]
+pub enum BudgetDispatchDecision {
+    /// Request windows are durably charged and the permit must span response classification.
+    Ready(BudgetPermit),
+    /// No request was charged; retry at or after the inclusive instant.
+    WaitUntil(MonotonicInstant),
+    /// No request was charged and progress requires an external state change.
     Unavailable(BudgetUnavailableReason),
 }
 

@@ -20,14 +20,15 @@ use market_squawk_domain::{
     SequenceNumber, SnapshotApplicability, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, ChecksumValidationProfile,
-    ControlFrameKind, DecodedControlFrame, DecodedProviderBatch, DecoderEvidence, DirectOrderBook,
-    DirectOrderBookError, DirectPublishedBook, DirectPublishedLevel, HttpCaptureMethod,
-    LiveSourceGeneration, NetworkAccessPolicy, ProviderBookChange, ProviderBookLevel,
-    ProviderBookSide, ProviderChecksumEvidence, ProviderDecimalLexeme,
-    ProviderNormalizedObservation, ProviderObservationPayload, ProviderOrderEvent,
-    ProviderOrderRecord, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
-    ProviderSnapshotEvidence, ProviderTimestampEvidence, RawMarketSink, SegmentedHttpCaptureError,
+    ActiveLiveSourceGeneration, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
+    BudgetReservationDecision, ChecksumValidationProfile, ControlFrameKind, DecodedControlFrame,
+    DecodedProviderBatch, DecoderEvidence, DirectOrderBook, DirectOrderBookError,
+    DirectPublishedBook, DirectPublishedLevel, HttpCaptureMethod, LiveSourceGeneration,
+    NetworkAccessPolicy, ProviderBookChange, ProviderBookLevel, ProviderBookSide,
+    ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNormalizedObservation,
+    ProviderObservationPayload, ProviderOrderEvent, ProviderOrderRecord, ProviderPrice,
+    ProviderQuantity, ProviderSequenceEvidence, ProviderSnapshotEvidence,
+    ProviderTimestampEvidence, RawMarketSink, SegmentedHttpCaptureError,
     SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt, SequenceValidationProfile,
     SharedProviderBudget, SinkError, SourceError, SourceMetadata, SourceMetadataProvider,
     SourceProtocolProfile, TlsProviderCapability, TransportFrameKind, apply_http_retry_after,
@@ -907,6 +908,12 @@ pub enum CoinbaseDirectSessionError {
 }
 
 #[derive(Debug)]
+struct CoinbaseDirectDispatchedHttpResponse {
+    response: CoinbaseDirectHttpResponse,
+    permit: BudgetPermit,
+}
+
+#[derive(Debug)]
 struct SequencedFrameEvidence {
     sequence: SequenceNumber,
     evidence: DecoderEvidence,
@@ -1037,7 +1044,6 @@ impl CoinbaseDirectSession {
         }
         self.validate_generation()?;
         self.authorize_endpoint(self.config.websocket_endpoint())?;
-        let permit = self.acquire_budget()?;
         let limits = self.config.limits().websocket();
         let websocket_config = WebSocketConfig::default()
             .read_buffer_size(limits.max_frame_bytes().clamp(4 * 1024, 128 * 1024))
@@ -1050,15 +1056,17 @@ impl CoinbaseDirectSession {
             Some(websocket_config),
             true,
         );
+        let reservation = self.reserve_budget()?;
+        let permit = self.commit_budget(reservation)?;
         let (socket, _response) =
             await_websocket(&cancellation, limits.connect_timeout(), connect, |error| {
                 map_connect_error(error, &self.budget)
             })
             .await?;
-        permit.release();
         self.budget
             .record_success()
             .map_err(|reason| SourceError::BudgetUnavailable { reason })?;
+        permit.release();
         self.run_connected(socket, signer, None, output, cancellation)
             .await
     }
@@ -1081,7 +1089,8 @@ impl CoinbaseDirectSession {
                 return Err(SourceError::Cancelled.into());
             }
             self.validate_generation()?;
-            let permit = self.acquire_budget()?;
+            let reservation = self.reserve_budget()?;
+            let permit = self.commit_budget(reservation)?;
             permit.release();
             self.run_connected(socket, signer, Some(unix_seconds), output, cancellation)
                 .await
@@ -1149,7 +1158,8 @@ impl CoinbaseDirectSession {
     {
         let limits = self.config.limits().websocket();
         self.validate_generation()?;
-        let subscription_permit = self.acquire_budget()?;
+        let subscription_reservation = self.reserve_budget()?;
+        let subscription_permit = self.commit_budget(subscription_reservation)?;
         send_with_deadline(
             socket,
             Message::Text(subscription.as_str().into()),
@@ -1160,10 +1170,10 @@ impl CoinbaseDirectSession {
         drop(subscription);
         self.await_subscription(socket, output, cancellation)
             .await?;
-        subscription_permit.release();
         self.budget
             .record_success()
             .map_err(|reason| SourceError::BudgetUnavailable { reason })?;
+        subscription_permit.release();
 
         self.bootstrap_and_run_live(socket, output, cancellation)
             .await
@@ -1378,7 +1388,7 @@ impl CoinbaseDirectSession {
         cancellation: &CancellationToken,
         url: &str,
         mode: InboundMode,
-    ) -> Result<CoinbaseDirectHttpResponse, CoinbaseDirectSessionError>
+    ) -> Result<CoinbaseDirectDispatchedHttpResponse, CoinbaseDirectSessionError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -1401,7 +1411,7 @@ impl CoinbaseDirectSession {
                     return Err(SourceError::ConnectionIdle.into());
                 }
                 completed = &mut response => {
-                    return completed.map_err(map_http_transport_error);
+                    return completed;
                 }
                 message = socket.next() => {
                     let message = map_next_message(message)?;
@@ -1424,12 +1434,14 @@ impl CoinbaseDirectSession {
         url: &str,
         cancellation: CancellationToken,
     ) -> Result<
-        BoxFuture<'static, Result<CoinbaseDirectHttpResponse, CoinbaseDirectHttpTransportError>>,
+        BoxFuture<
+            'static,
+            Result<CoinbaseDirectDispatchedHttpResponse, CoinbaseDirectSessionError>,
+        >,
         CoinbaseDirectSessionError,
     > {
         self.validate_generation()?;
         self.authorize_endpoint(url)?;
-        let permit = self.acquire_budget()?;
         let limits = self.config.limits();
         let request = CoinbaseDirectHttpRequest::new(
             url,
@@ -1439,18 +1451,31 @@ impl CoinbaseDirectSession {
             cancellation,
         );
         let transport = Arc::clone(&self.http);
+        let reservation = self.reserve_budget()?;
         Ok(Box::pin(async move {
-            let outcome = transport.get(request).await;
-            drop(permit);
-            outcome
+            let permit = match reservation.commit_dispatch() {
+                BudgetDispatchDecision::Ready(permit) => permit,
+                BudgetDispatchDecision::WaitUntil(deadline) => {
+                    return Err(SourceError::BudgetWaitUntil { deadline }.into());
+                }
+                BudgetDispatchDecision::Unavailable(reason) => {
+                    return Err(SourceError::BudgetUnavailable { reason }.into());
+                }
+            };
+            let response = transport
+                .get(request)
+                .await
+                .map_err(map_http_transport_error)?;
+            Ok(CoinbaseDirectDispatchedHttpResponse { response, permit })
         }))
     }
 
     fn finish_http_capture(
         &mut self,
         expected_url: &str,
-        response: CoinbaseDirectHttpResponse,
+        dispatched: CoinbaseDirectDispatchedHttpResponse,
     ) -> Result<SegmentedHttpResponseCapture, CoinbaseDirectSessionError> {
+        let CoinbaseDirectDispatchedHttpResponse { response, permit } = dispatched;
         self.validate_generation()?;
         self.authorize_endpoint(response.final_url.as_ref())?;
         if response.final_url.as_ref() != expected_url {
@@ -1495,6 +1520,7 @@ impl CoinbaseDirectSession {
         self.budget
             .record_success()
             .map_err(|reason| SourceError::BudgetUnavailable { reason })?;
+        permit.release();
         Ok(capture)
     }
 
@@ -1825,12 +1851,29 @@ impl CoinbaseDirectSession {
             .map_err(|_error| SourceError::InvalidProtocolState)
     }
 
-    fn acquire_budget(&self) -> Result<BudgetPermit, SourceError> {
+    fn reserve_budget(&self) -> Result<BudgetReservation, SourceError> {
         self.validate_generation()?;
-        match self.budget.try_acquire() {
-            BudgetDecision::Ready(permit) => Ok(permit),
-            BudgetDecision::WaitUntil(deadline) => Err(SourceError::BudgetWaitUntil { deadline }),
-            BudgetDecision::Unavailable(reason) => Err(SourceError::BudgetUnavailable { reason }),
+        match self.budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => Ok(reservation),
+            BudgetReservationDecision::WaitUntil(deadline) => {
+                Err(SourceError::BudgetWaitUntil { deadline })
+            }
+            BudgetReservationDecision::Unavailable(reason) => {
+                Err(SourceError::BudgetUnavailable { reason })
+            }
+        }
+    }
+
+    fn commit_budget(&self, reservation: BudgetReservation) -> Result<BudgetPermit, SourceError> {
+        self.validate_generation()?;
+        match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => Ok(permit),
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                Err(SourceError::BudgetWaitUntil { deadline })
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                Err(SourceError::BudgetUnavailable { reason })
+            }
         }
     }
 

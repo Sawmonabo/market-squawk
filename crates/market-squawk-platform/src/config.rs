@@ -481,7 +481,7 @@ pub struct ConfigOverrides {
     pub source_secret: Option<SecretReference>,
     /// Complete validated production Coinbase source profile.
     pub coinbase: Option<CoinbaseSourceConfig>,
-    /// Complete validated production Kraken book-v2 source profile.
+    /// Complete validated production Kraken public book-and-trade source profile.
     pub kraken: Option<KrakenSourceConfig>,
 }
 
@@ -775,7 +775,7 @@ impl AppConfig {
         self.coinbase.as_ref()
     }
 
-    /// Returns the optional strict production Kraken book-v2 source profile.
+    /// Returns the optional strict production Kraken public book-and-trade source profile.
     pub const fn kraken(&self) -> Option<&KrakenSourceConfig> {
         self.kraken.as_ref()
     }

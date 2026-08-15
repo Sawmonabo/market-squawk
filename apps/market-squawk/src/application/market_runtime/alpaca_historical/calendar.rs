@@ -16,8 +16,8 @@ use market_squawk_domain::{
     MarketBarSessionKind, ProviderInstrumentId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
-    BudgetDecision, BudgetPermit, HttpRequestBounds, ProviderCaptureMaterial, SharedProviderBudget,
-    apply_http_retry_after,
+    BudgetDecision, BudgetDispatchDecision, BudgetPermit, BudgetReservationDecision,
+    HttpRequestBounds, ProviderCaptureMaterial, SharedProviderBudget, apply_http_retry_after,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -441,7 +441,7 @@ async fn execute_rate_accounted_calendar(
         .map_err(|_| AlpacaHistoricalCalendarError::Allocation)?;
     for attempt in 0..MAXIMUM_CALENDAR_HTTP_ATTEMPTS {
         ensure_before(deadline, cancellation)?;
-        let permit = acquire_budget(budget, deadline, cancellation).await?;
+        let permit = commit_calendar_dispatch(budget, deadline, cancellation).await?;
         let response = executor
             .execute(request.clone(), deadline, cancellation)
             .await?;
@@ -489,16 +489,31 @@ async fn execute_rate_accounted_calendar(
     Err(AlpacaHistoricalCalendarError::RetryLimitExceeded)
 }
 
-async fn acquire_budget(
+async fn commit_calendar_dispatch(
     budget: &SharedProviderBudget,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<BudgetPermit, AlpacaHistoricalCalendarError> {
     loop {
         ensure_before(deadline, cancellation)?;
-        match budget.try_acquire() {
-            BudgetDecision::Ready(permit) => return Ok(permit),
-            decision => wait_for_budget(budget, decision, deadline, cancellation).await?,
+        let reservation = match budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => reservation,
+            BudgetReservationDecision::WaitUntil(wait_until) => {
+                wait_until_budget(budget, wait_until, deadline, cancellation).await?;
+                continue;
+            }
+            BudgetReservationDecision::Unavailable(_reason) => {
+                return Err(AlpacaHistoricalCalendarError::BudgetUnavailable);
+            }
+        };
+        match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => return Ok(permit),
+            BudgetDispatchDecision::WaitUntil(wait_until) => {
+                wait_until_budget(budget, wait_until, deadline, cancellation).await?;
+            }
+            BudgetDispatchDecision::Unavailable(_reason) => {
+                return Err(AlpacaHistoricalCalendarError::BudgetUnavailable);
+            }
         }
     }
 }
@@ -519,6 +534,15 @@ async fn wait_for_budget(
             return Err(AlpacaHistoricalCalendarError::BudgetUnavailable);
         }
     };
+    wait_until_budget(budget, wait_until, deadline, cancellation).await
+}
+
+async fn wait_until_budget(
+    budget: &SharedProviderBudget,
+    wait_until: market_squawk_sources::MonotonicInstant,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), AlpacaHistoricalCalendarError> {
     let wait = budget
         .remaining_wait(wait_until)
         .map_err(|_| AlpacaHistoricalCalendarError::BudgetUnavailable)?;

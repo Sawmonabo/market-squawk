@@ -12,11 +12,12 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_sources::{
-    BackoffPolicy, BudgetDecision, BudgetPoolError, BudgetScope, BudgetUnavailableReason,
-    BudgetWindowSemantics, MonotonicInstant, ProviderBudgetPolicy, ProviderBudgetWindow,
-    ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderRateAuthority,
-    ProviderRateDeclaration, SharedProviderBudget, apply_http_retry_after,
+    BackoffPolicy, BudgetDecision, BudgetDispatchDecision, BudgetPoolError,
+    BudgetReservationDecision, BudgetScope, BudgetUnavailableReason, BudgetWindowSemantics,
+    MonotonicInstant, ProviderBudgetPolicy, ProviderBudgetWindow, ProviderCaptureError,
+    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, ProviderRateAuthority, ProviderRateDeclaration,
+    SharedProviderBudget, apply_http_retry_after,
 };
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER};
 use sha2::{Digest as _, Sha256};
@@ -720,12 +721,12 @@ impl TiingoHttpSource {
         if admission != TiingoQuotaAdmission::Admitted {
             return Err(TiingoHttpSourceError::QuotaDenied(admission));
         }
-        let provider_permit = match self.budget.try_acquire() {
-            BudgetDecision::Ready(permit) => permit,
-            BudgetDecision::WaitUntil(deadline) => {
+        let provider_reservation = match self.budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => reservation,
+            BudgetReservationDecision::WaitUntil(deadline) => {
                 return Err(TiingoHttpSourceError::BudgetWaitUntil(deadline));
             }
-            BudgetDecision::Unavailable(reason) => {
+            BudgetReservationDecision::Unavailable(reason) => {
                 return Err(TiingoHttpSourceError::BudgetUnavailable(reason));
             }
         };
@@ -733,11 +734,23 @@ impl TiingoHttpSource {
         let quota_permit = match runtime.quota.reserve(spec.ticker().clone(), reservation)? {
             Ok(permit) => permit,
             Err(admission) => {
-                provider_permit.release();
+                provider_reservation.release();
                 return Err(TiingoHttpSourceError::QuotaDenied(admission));
             }
         };
         persist_quota_transition(&self.quota_store, runtime, Some(prior.digest()))?;
+
+        let provider_permit = match provider_reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => permit,
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                settle_response_quota(&self.quota_store, runtime, &quota_permit, spec.ticker(), 0)?;
+                return Err(TiingoHttpSourceError::BudgetWaitUntil(deadline));
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                settle_response_quota(&self.quota_store, runtime, &quota_permit, spec.ticker(), 0)?;
+                return Err(TiingoHttpSourceError::BudgetUnavailable(reason));
+            }
+        };
 
         let response = match self
             .transport
@@ -758,7 +771,6 @@ impl TiingoHttpSource {
                     spec.ticker(),
                     failure.quota_charge_bytes,
                 )?;
-                provider_permit.release();
                 return Err(TiingoHttpSourceError::Transport(failure));
             }
         };
@@ -769,8 +781,6 @@ impl TiingoHttpSource {
             spec.ticker(),
             response.response_bytes(),
         )?;
-        provider_permit.release();
-
         if !(200..=299).contains(&response.status) {
             let rate_limit = if matches!(response.status, 429 | 503) {
                 Some(rate_limit_disposition(apply_http_retry_after(
@@ -804,6 +814,7 @@ impl TiingoHttpSource {
         self.budget
             .record_success()
             .map_err(TiingoHttpSourceError::BudgetUnavailable)?;
+        provider_permit.release();
         Ok(raw)
     }
 

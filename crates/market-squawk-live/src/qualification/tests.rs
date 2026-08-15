@@ -327,6 +327,7 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
                     Some(id("BUY")?),
                     rule("coinbase-aggressor")?,
                 ),
+                taker_order_type: None,
             },
         )?;
         let batch = DecodedProviderBatch::try_new(decoder, vec![observation])?;
@@ -420,6 +421,7 @@ fn qualify(
                 PriceTicks::new(10_000),
                 QuantityLots::new(100).map_err(|_| MarketEventError::ZeroQuantity)?,
                 AggressorSide::Buy,
+                None,
             )?))
         },
     )

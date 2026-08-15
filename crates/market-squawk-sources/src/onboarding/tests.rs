@@ -196,6 +196,50 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         Some("MSQ-SELECTED-MARKET-DATA-ARCHITECTURE-2026-08-11")
     );
 
+    for profile_id in [
+        "kraken.spot-public-market-data",
+        "kraken.spot-authenticated-level3-market-data",
+    ] {
+        let profile = profiles
+            .get(profile_id)
+            .ok_or("missing Kraken market-data profile")?;
+        assert_eq!(profile.release_state(), ProfileReleaseState::Available);
+        assert_eq!(
+            profile.capability().rights_state(),
+            RightsAdmissionState::AdmittedScoped
+        );
+        assert_eq!(
+            profile
+                .rights()
+                .0
+                .iter()
+                .map(|right| right.admission())
+                .collect::<Vec<_>>(),
+            [
+                OperationAdmission::Admitted,
+                OperationAdmission::Admitted,
+                OperationAdmission::Admitted,
+                OperationAdmission::Admitted,
+                OperationAdmission::Blocked,
+                OperationAdmission::Blocked,
+            ]
+        );
+        assert_eq!(
+            profile
+                .persistence_evidence()
+                .map(ProfileEvidence::source_id),
+            Some("MSQ-SELECTED-MARKET-DATA-ARCHITECTURE-2026-08-11")
+        );
+    }
+    assert!(
+        profiles
+            .get("kraken.spot-public-market-data")
+            .ok_or("missing public Kraken profile")?
+            .coverage()
+            .0
+            .contains("books, and trades")
+    );
+
     let nasdaq = profiles
         .get("nasdaq-trader-symbol-directory-reference")
         .ok_or("missing Nasdaq reference profile")?;

@@ -139,15 +139,17 @@ pub use order::{
     ProviderOrderEventError, ProviderOrderEventKind, ProviderOrderRecord,
 };
 pub use policy::{
-    ApiEndpointRule, AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetPermit,
-    BudgetPermitLease, BudgetPoolError, BudgetScope, BudgetUnavailableReason,
-    BudgetWindowSemantics, EndpointDenialReason, EndpointPolicy, HttpClientProfile,
-    HttpRequestBounds, MonotonicInstant, NetworkPolicyError, PathScope, ProviderBudgetPolicy,
-    ProviderBudgetWindow, ProviderRateAuthority, ProviderRateCollisionIdentity,
-    ProviderRateCollisionKind, ProviderRateDecision, ProviderRateDeclaration, ProviderRateGroupId,
-    ProviderRatePermitId, ProviderRateRegistration, ProviderRateRunId, ProviderRateStore,
-    ProviderRateStoreError, QueryParameterRule, QuerySensitivity, RedirectAuthorization,
-    RetryAfter, SharedProviderBudget, apply_http_retry_after,
+    ApiEndpointRule, AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetDispatchDecision,
+    BudgetPermit, BudgetPermitLease, BudgetPoolError, BudgetReservation, BudgetReservationDecision,
+    BudgetScope, BudgetUnavailableReason, BudgetWindowSemantics, EndpointDenialReason,
+    EndpointPolicy, HttpClientProfile, HttpRequestBounds, MonotonicInstant, NetworkPolicyError,
+    PathScope, PreparedProviderRateRegistrationBatch, ProviderBudgetPolicy, ProviderBudgetWindow,
+    ProviderRateAuthority, ProviderRateCollisionIdentity, ProviderRateCollisionKind,
+    ProviderRateDeclaration, ProviderRateDispatchDecision, ProviderRateGroupId,
+    ProviderRatePermitId, ProviderRateRegistration, ProviderRateReservationDecision,
+    ProviderRateReservationId, ProviderRateRunId, ProviderRateStore, ProviderRateStoreError,
+    QueryParameterRule, QuerySensitivity, RedirectAuthorization, RetryAfter, SharedProviderBudget,
+    apply_http_retry_after,
 };
 pub use registry::{
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, CapturedDecodedProviderBatch,

@@ -16,7 +16,7 @@ pub(crate) use configuration::{
     PreparedMarketProviderConfigurationResolver,
 };
 pub(crate) use display::{MarketDisplaySnapshotBatch, MarketDisplaySnapshotLease};
-pub(crate) use generation::MarketRuntimeGroupGeneration;
+pub(crate) use generation::{MarketRuntimeGroupGeneration, MarketSourceRuntimeGeneration};
 pub(crate) use group::MarketProviderGroupLifecycleEvidence;
 pub(crate) use kraken::MarketKrakenPriceProjectionLease;
 
@@ -26,7 +26,7 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     pin::Pin,
     sync::{Arc, Weak},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use market_squawk_domain::{
@@ -34,8 +34,9 @@ use market_squawk_domain::{
     SourceIdentifier, StreamIntegrityState, Timestamp, VenueId,
 };
 use market_squawk_live::{
-    LiveActionHookGeneration, LiveActionHookReapReceipt, LiveRuntimeSnapshotLease,
-    LiveSnapshotReader, PreparedLiveActionHookGroup, RouteActionHook,
+    LiveActionHookGeneration, LiveActionHookReapReceipt, LiveRouteConfig, LiveRuntimeSnapshotLease,
+    LiveSnapshotReader, PreparedLiveActionHookGroup, RouteActionHook, ShardKey,
+    ShardLifecycleSnapshot, SnapshotCompleteness, StreamPhaseSnapshot,
 };
 use market_squawk_platform::SecretGeneration;
 use market_squawk_services::ServiceError;
@@ -46,6 +47,7 @@ use tokio_util::sync::CancellationToken;
 use self::{
     alpaca_historical::AlpacaHistoricalCapabilityError,
     display::DisplaySourceDescriptor,
+    generation::MarketRuntimeTopology,
     group::{AccountMarketRuntimeGroup, AccountMarketRuntimeLimits},
     kraken::KrakenSourceDescriptor,
 };
@@ -80,7 +82,7 @@ const ACCOUNT_HEALTH_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Clone, Debug)]
 pub(crate) struct MarketSourceLifecycleEvidence {
     pub(crate) provider: SourceIdentifier,
-    pub(crate) generation: ConnectionGeneration,
+    pub(crate) generation: MarketSourceRuntimeGeneration,
     pub(crate) coverage: CoverageStatus,
     pub(crate) integrity: StreamIntegrityState,
     pub(crate) quality: DataQuality,
@@ -501,6 +503,7 @@ impl MarketRuntimeRegistry {
             surface_id,
             onboarding_session_id: Some(request.onboarding_session_id()),
             metadata: Arc::<[SourceMetadata]>::from([]),
+            topology: None,
             cancellation: runtime_cancellation,
             runtime: MarketRuntime::Account(group),
             exports: None,
@@ -655,9 +658,19 @@ impl MarketRuntimeRegistry {
                     tracing::error!(provider = ?provider_kind, %error, "market source composition failed");
                     ServiceError::Unavailable
                 })?;
-                let metadata: Arc<[SourceMetadata]> = Arc::from([composition.metadata().clone()]);
+                let metadata = composition.source_metadata().map_err(|error| {
+                    tracing::error!(
+                        provider = ?provider_kind,
+                        %error,
+                        "market source metadata-set construction failed"
+                    );
+                    ServiceError::Unavailable
+                })?;
+                let route_keys = clone_route_keys(composition.live_routes())?;
+                let topology =
+                    MarketRuntimeTopology::try_new(provider, Arc::clone(&metadata), route_keys)?;
                 let (exports, drains) = LiveFairValueExportDrains::try_start(
-                    composition.source_id().clone(),
+                    composition.qualified_market_export_source_id().clone(),
                     composition.live_routes(),
                     composition.maximum_message_bytes(),
                     Arc::clone(&self.live_fair_value),
@@ -690,6 +703,7 @@ impl MarketRuntimeRegistry {
                     surface_id: provider.clone(),
                     onboarding_session_id: None,
                     metadata,
+                    topology: Some(topology),
                     cancellation: runtime_cancellation,
                     runtime: MarketRuntime::Public(runtime),
                     exports: Some(drains),
@@ -725,10 +739,21 @@ impl MarketRuntimeRegistry {
                     }
                 };
                 let metadata = runtime.metadata();
+                let routes = runtime.routes();
+                let topology =
+                    match MarketRuntimeTopology::try_new(provider, Arc::clone(&metadata), routes) {
+                        Ok(topology) => topology,
+                        Err(error) => {
+                            runtime_cancellation.cancel();
+                            let _cleanup = runtime.shutdown().await;
+                            return Err(error);
+                        }
+                    };
                 MarketRuntimeEntry {
                     surface_id: provider.clone(),
                     onboarding_session_id: Some(session_id),
                     metadata,
+                    topology: Some(topology),
                     cancellation: runtime_cancellation,
                     runtime: MarketRuntime::CoinbaseDirect(runtime),
                     exports: None,
@@ -942,17 +967,22 @@ impl MarketRuntimeRegistry {
         &self,
         provider: &SourceIdentifier,
     ) -> Result<Option<MarketSourceLifecycleEvidence>, ServiceError> {
-        let reader = {
-            let entries = self.entries.lock().await;
-            let Some(entry) = entries.iter().find(|entry| &entry.surface_id == provider) else {
-                return Ok(None);
-            };
-            if !entry.is_healthy() {
-                return Err(ServiceError::Unavailable);
-            }
-            entry.scalar_snapshots()?
+        let entries = self.entries.lock().await;
+        let Some(entry) = entries.iter().find(|entry| &entry.surface_id == provider) else {
+            return Ok(None);
         };
-        aggregate(provider.clone(), reader)
+        if !entry.is_healthy() {
+            return Err(ServiceError::Unavailable);
+        }
+        let evidence = aggregate(
+            provider.clone(),
+            entry.topology()?,
+            entry.scalar_snapshots()?,
+        )?;
+        if !entry.is_healthy() {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(evidence)
     }
 
     /// Stops one exact account group with an optional group-digest compare-and-set guard.
@@ -1015,10 +1045,10 @@ impl MarketRuntimeRegistry {
     pub(crate) async fn stop(
         &self,
         provider: &SourceIdentifier,
-        expected_generation: Option<ConnectionGeneration>,
+        expected_generation: Option<MarketSourceRuntimeGeneration>,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<Option<ConnectionGeneration>, ServiceError> {
+    ) -> Result<Option<MarketSourceRuntimeGeneration>, ServiceError> {
         let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
         self.stop_owned(provider, expected_generation, deadline, cancellation)
             .await
@@ -1027,10 +1057,10 @@ impl MarketRuntimeRegistry {
     async fn stop_owned(
         &self,
         provider: &SourceIdentifier,
-        expected_generation: Option<ConnectionGeneration>,
+        expected_generation: Option<MarketSourceRuntimeGeneration>,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<Option<ConnectionGeneration>, ServiceError> {
+    ) -> Result<Option<MarketSourceRuntimeGeneration>, ServiceError> {
         ensure_before(deadline, cancellation)?;
         let previous = self
             .verify_owned(provider)
@@ -1058,11 +1088,11 @@ impl MarketRuntimeRegistry {
     pub(crate) async fn resynchronize(
         &self,
         provider: &SourceIdentifier,
-        expected_generation: ConnectionGeneration,
+        expected_generation: MarketSourceRuntimeGeneration,
         onboarding_session_id: Option<uuid::Uuid>,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<(ConnectionGeneration, MarketSourceLifecycleEvidence), ServiceError> {
+    ) -> Result<(MarketSourceRuntimeGeneration, MarketSourceLifecycleEvidence), ServiceError> {
         let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
         let previous = self
             .stop_owned(provider, Some(expected_generation), deadline, cancellation)
@@ -1071,7 +1101,18 @@ impl MarketRuntimeRegistry {
         let current = self
             .start_owned(provider, onboarding_session_id, deadline, cancellation)
             .await?;
-        if current.generation.get() <= previous.get() {
+        let replaced = match (previous, current.generation) {
+            (
+                MarketSourceRuntimeGeneration::Scalar(previous),
+                MarketSourceRuntimeGeneration::Scalar(current),
+            ) => current.get() > previous.get(),
+            (
+                MarketSourceRuntimeGeneration::Group(previous),
+                MarketSourceRuntimeGeneration::Group(current),
+            ) => current != previous,
+            _ => false,
+        };
+        if !replaced {
             let cleanup = CancellationToken::new();
             let _stopped = self
                 .stop_owned(
@@ -1091,7 +1132,7 @@ impl MarketRuntimeRegistry {
         provider: &SourceIdentifier,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<Option<ConnectionGeneration>, ServiceError> {
+    ) -> Result<Option<MarketSourceRuntimeGeneration>, ServiceError> {
         self.stop(provider, None, deadline, cancellation).await
     }
 
@@ -1917,6 +1958,7 @@ struct MarketRuntimeEntry {
     surface_id: SourceIdentifier,
     onboarding_session_id: Option<uuid::Uuid>,
     metadata: Arc<[SourceMetadata]>,
+    topology: Option<MarketRuntimeTopology>,
     cancellation: CancellationToken,
     runtime: MarketRuntime,
     exports: Option<LiveFairValueExportDrains>,
@@ -1951,6 +1993,10 @@ impl MarketRuntimeEntry {
 
     fn scalar_snapshots(&self) -> Result<LiveSnapshotReader, ServiceError> {
         self.runtime.scalar_snapshots()
+    }
+
+    fn topology(&self) -> Result<&MarketRuntimeTopology, ServiceError> {
+        self.topology.as_ref().ok_or(ServiceError::InvalidRequest)
     }
 
     async fn shutdown(mut self, shutdown_budget: std::time::Duration) -> Result<(), ServiceError> {
@@ -2484,22 +2530,117 @@ fn require_kraken_order_read_authority(
 
 fn aggregate(
     provider: SourceIdentifier,
+    topology: &MarketRuntimeTopology,
     reader: LiveSnapshotReader,
 ) -> Result<Option<MarketSourceLifecycleEvidence>, ServiceError> {
     let lease = reader
         .try_load_all()
         .map_err(|_error| ServiceError::Unavailable)?;
+    let evaluated_at = market_runtime_timestamp()?;
+    let metadata = topology.metadata();
+    let mut observed_sources = Vec::new();
+    observed_sources
+        .try_reserve_exact(metadata.len())
+        .map_err(|_| ServiceError::ResourceExhausted)?;
+    observed_sources.resize(
+        metadata.len(),
+        None::<(ConnectionGeneration, SourceIdentifier)>,
+    );
+    let mut observed_routes = Vec::new();
+    observed_routes
+        .try_reserve_exact(topology.routes().len())
+        .map_err(|_| ServiceError::ResourceExhausted)?;
+    observed_routes.resize(topology.routes().len(), false);
     let mut aggregate = None;
     for shard in lease.snapshots() {
+        if shard.lifecycle() != ShardLifecycleSnapshot::Ready
+            || shard.route_dimension().completeness() != SnapshotCompleteness::Complete
+            || shard.evaluated_at() > evaluated_at
+            || shard.published_at() > evaluated_at
+        {
+            return Err(ServiceError::Unavailable);
+        }
         for route in shard.routes() {
+            let expected_route_index = topology
+                .routes()
+                .iter()
+                .position(|expected| expected.route() == route.route())
+                .ok_or(ServiceError::Unavailable)?;
+            if std::mem::replace(&mut observed_routes[expected_route_index], true) {
+                return Err(ServiceError::Unavailable);
+            }
+            let expected_route = &topology.routes()[expected_route_index];
+            if route.stream_dimension().completeness() != SnapshotCompleteness::Complete
+                || route.status_dimension().completeness() != SnapshotCompleteness::Complete
+                || route.streams().len() != expected_route.source_indexes().len()
+            {
+                return Err(ServiceError::Unavailable);
+            }
+            let mut observed_route_sources = Vec::new();
+            observed_route_sources
+                .try_reserve_exact(expected_route.source_indexes().len())
+                .map_err(|_| ServiceError::ResourceExhausted)?;
+            observed_route_sources.resize(expected_route.source_indexes().len(), false);
             for stream in route.streams() {
+                let expected_source_position = expected_route
+                    .source_indexes()
+                    .iter()
+                    .position(|source_index| metadata[*source_index].source_id() == stream.source())
+                    .ok_or(ServiceError::Unavailable)?;
+                if std::mem::replace(&mut observed_route_sources[expected_source_position], true) {
+                    return Err(ServiceError::Unavailable);
+                }
+                let source_index = expected_route.source_indexes()[expected_source_position];
+                let expected_source = &metadata[source_index];
+                let expected_live = expected_source
+                    .coverage()
+                    .live()
+                    .ok_or(ServiceError::Unavailable)?;
                 let runtime = stream
                     .runtime_evidence()
                     .filter(|evidence| evidence.matches_stream(stream))
                     .ok_or(ServiceError::Unavailable)?;
+                if stream.venue() != route.route().venue()
+                    || stream.instrument() != route.route().instrument()
+                    || stream.provider_product() != expected_live.provider_product()
+                    || stream.provider_channel() != expected_live.provider_channel()
+                    || !expected_source.is_effective_at(evaluated_at)
+                    || runtime.coverage_scope().metadata_revision() != expected_source.revision()
+                    || !stream.generation_current()
+                    || stream.phase() != StreamPhaseSnapshot::Healthy
+                    || stream.source_valid_until() < evaluated_at
+                    || stream.evaluated_at() > evaluated_at
+                    || runtime.health_observed_at() > evaluated_at
+                    || runtime.qualification_evaluated_at() > evaluated_at
+                    || runtime.qualification_valid_until() < evaluated_at
+                    || runtime.coverage_status() != CoverageStatus::Sufficient
+                    || runtime.stream_integrity() != StreamIntegrityState::Healthy
+                    || matches!(
+                        runtime.quality(),
+                        DataQuality::Stale | DataQuality::Quarantined
+                    )
+                {
+                    return Err(ServiceError::Unavailable);
+                }
+                let session = runtime.session_id().clone();
+                match &observed_sources[source_index] {
+                    Some((generation, prior_session))
+                        if *generation != stream.connection_generation()
+                            || prior_session != &session =>
+                    {
+                        return Err(ServiceError::Unavailable);
+                    }
+                    Some(_) => {}
+                    None => {
+                        observed_sources[source_index] =
+                            Some((stream.connection_generation(), session));
+                    }
+                }
+                let generation = topology
+                    .generation((metadata.len() == 1).then_some(stream.connection_generation()))?;
                 let candidate = MarketSourceLifecycleEvidence {
                     provider: provider.clone(),
-                    generation: stream.connection_generation(),
+                    generation,
                     coverage: runtime.coverage_status(),
                     integrity: runtime.stream_integrity(),
                     quality: runtime.quality(),
@@ -2510,7 +2651,15 @@ fn aggregate(
                     Some(previous) => merge(previous, candidate)?,
                 });
             }
+            if observed_route_sources.iter().any(|observed| !observed) {
+                return Err(ServiceError::Unavailable);
+            }
         }
+    }
+    if observed_routes.iter().any(|observed| !observed)
+        || observed_sources.iter().any(Option::is_none)
+    {
+        return Err(ServiceError::Unavailable);
     }
     Ok(aggregate)
 }
@@ -2527,6 +2676,22 @@ fn merge(
     aggregate.quality = weakest_quality(aggregate.quality, candidate.quality);
     aggregate.observed_at = aggregate.observed_at.min(candidate.observed_at);
     Ok(aggregate)
+}
+
+fn clone_route_keys(routes: &[LiveRouteConfig]) -> Result<Arc<[ShardKey]>, ServiceError> {
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(routes.len())
+        .map_err(|_| ServiceError::ResourceExhausted)?;
+    keys.extend(routes.iter().map(|route| route.route().clone()));
+    Ok(keys.into())
+}
+
+fn market_runtime_timestamp() -> Result<Timestamp, ServiceError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ServiceError::Unavailable)?;
+    let nanos = i64::try_from(elapsed.as_nanos()).map_err(|_| ServiceError::Unavailable)?;
+    Ok(Timestamp::from_unix_nanos(nanos))
 }
 
 const fn weakest_coverage(left: CoverageStatus, right: CoverageStatus) -> CoverageStatus {

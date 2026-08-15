@@ -22,7 +22,8 @@ pub(crate) use memory::book_processing_peak;
 
 pub use admission::{
     BoundShardIngress, DormantRouteIngress, LiveIngressBindError, LiveIngressError,
-    LiveRuntimeHealthEvent, LiveRuntimeHealthKind, LiveRuntimeIngress, RegistrationFailure,
+    LiveIngressRevokeError, LiveRuntimeHealthEvent, LiveRuntimeHealthKind, LiveRuntimeIngress,
+    RegistrationFailure,
 };
 pub use config::{
     LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,

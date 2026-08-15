@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, BudgetDecision, SharedProviderBudget, SourceError,
-    TransportFrameKind,
+    ActiveLiveSourceGeneration, BudgetDispatchDecision, BudgetReservationDecision,
+    SharedProviderBudget, SourceError, TransportFrameKind,
 };
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue,
@@ -37,12 +37,17 @@ pub(super) async fn fetch_json(
         .network_policy()
         .authorize(url.as_str())
         .map_err(|_| TradierRestError::NetworkPolicy)?;
-    let permit = match budget.try_acquire() {
-        BudgetDecision::Ready(permit) => permit,
-        refusal => {
-            return Err(TradierRestError::Source(
-                SourceError::from_applied_budget_refusal(refusal),
-            ));
+    let reservation = match budget.try_reserve_request() {
+        BudgetReservationDecision::Ready(reservation) => reservation,
+        BudgetReservationDecision::WaitUntil(deadline) => {
+            return Err(TradierRestError::Source(SourceError::BudgetWaitUntil {
+                deadline,
+            }));
+        }
+        BudgetReservationDecision::Unavailable(reason) => {
+            return Err(TradierRestError::Source(SourceError::BudgetUnavailable {
+                reason,
+            }));
         }
     };
     let maximum = usize::try_from(config.transport_limits().http().max_response_bytes())
@@ -56,12 +61,26 @@ pub(super) async fn fetch_json(
         authorization_header.set_sensitive(true);
         let mut authorization = authorization;
         authorization.clear();
-        let response = account
+        let request = account
             .client
             .get(url.clone())
             .header(ACCEPT, "application/json")
             .header(ACCEPT_ENCODING, "identity")
-            .header(AUTHORIZATION, authorization_header)
+            .header(AUTHORIZATION, authorization_header);
+        let permit = match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => permit,
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                return Err(TradierRestError::Source(SourceError::BudgetWaitUntil {
+                    deadline,
+                }));
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                return Err(TradierRestError::Source(SourceError::BudgetUnavailable {
+                    reason,
+                }));
+            }
+        };
+        let response = request
             .send()
             .await
             .map_err(|_| TradierRestError::Source(SourceError::Network));

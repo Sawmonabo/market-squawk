@@ -14,7 +14,8 @@ use chrono::{DateTime, Datelike as _, Days, NaiveDate, Utc};
 use futures_util::{SinkExt as _, StreamExt as _};
 use market_squawk_domain::{CalendarDate, DigestAlgorithm, EvidenceDigest, Timestamp};
 use market_squawk_sources::{
-    BudgetDecision, BudgetPermit, HttpRequestBounds, RetryAfter, SharedProviderBudget,
+    BudgetDispatchDecision, BudgetPermit, BudgetReservation, BudgetReservationDecision,
+    HttpRequestBounds, RetryAfter, SharedProviderBudget,
 };
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use rust_decimal::Decimal;
@@ -792,9 +793,10 @@ impl AlpacaPaperIexDoctor {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<HttpProbeResponse, AlpacaError> {
-        let permit = acquire_budget(budget, deadline, cancellation).await?;
+        let reservation = acquire_budget(budget, deadline, cancellation).await?;
         let started = Instant::now();
         let request_digest = request_digest("GET", url.as_str())?;
+        let permit = commit_budget(reservation, budget, deadline, cancellation).await?;
         let response = authenticated_bounded_get(
             &self.client,
             &self.credentials,
@@ -1174,7 +1176,7 @@ impl AlpacaPaperIexDoctor {
         cancellation: &CancellationToken,
     ) -> Result<AlpacaDoctorStreamObservation, AlpacaError> {
         ensure_before(deadline, cancellation)?;
-        let permit = acquire_budget(budget, deadline, cancellation).await?;
+        let reservation = acquire_budget(budget, deadline, cancellation).await?;
         let endpoint_contract_digest = endpoint_contract_digest(DoctorEndpointContract::Stream)?;
         let request_digest = stream_request_digest()?;
         let request = authenticated_stream_request(&self.credentials)?;
@@ -1190,6 +1192,7 @@ impl AlpacaPaperIexDoctor {
             .max_frame_size(Some(self.stream_limits.max_frame_bytes()));
         let connect_timeout =
             bounded_timeout(deadline, self.stream_limits.connect_timeout(), cancellation)?;
+        let permit = commit_budget(reservation, budget, deadline, cancellation).await?;
         let connected = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(AlpacaError::Cancelled),
@@ -2090,12 +2093,12 @@ async fn acquire_budget(
     budget: &SharedProviderBudget,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<BudgetPermit, AlpacaError> {
+) -> Result<BudgetReservation, AlpacaError> {
     loop {
         ensure_before(deadline, cancellation)?;
-        match budget.try_acquire() {
-            BudgetDecision::Ready(permit) => return Ok(permit),
-            BudgetDecision::WaitUntil(wait_until) => {
+        match budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => return Ok(reservation),
+            BudgetReservationDecision::WaitUntil(wait_until) => {
                 let wait = budget
                     .remaining_wait(wait_until)
                     .map_err(|_| AlpacaError::Network)?;
@@ -2111,7 +2114,38 @@ async fn acquire_budget(
                     () = tokio::time::sleep(wait) => {}
                 }
             }
-            BudgetDecision::Unavailable(_) => return Err(AlpacaError::Network),
+            BudgetReservationDecision::Unavailable(_) => return Err(AlpacaError::Network),
+        }
+    }
+}
+
+async fn commit_budget(
+    mut reservation: BudgetReservation,
+    budget: &SharedProviderBudget,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<BudgetPermit, AlpacaError> {
+    loop {
+        match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => return Ok(permit),
+            BudgetDispatchDecision::WaitUntil(wait_until) => {
+                let wait = budget
+                    .remaining_wait(wait_until)
+                    .map_err(|_| AlpacaError::Network)?;
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or(AlpacaError::DeadlineExceeded)?;
+                if wait > remaining {
+                    return Err(AlpacaError::DeadlineExceeded);
+                }
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(AlpacaError::Cancelled),
+                    () = tokio::time::sleep(wait) => {}
+                }
+                reservation = acquire_budget(budget, deadline, cancellation).await?;
+            }
+            BudgetDispatchDecision::Unavailable(_) => return Err(AlpacaError::Network),
         }
     }
 }

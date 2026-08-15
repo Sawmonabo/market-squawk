@@ -815,11 +815,14 @@ include!("policy/budget.rs");
 #[path = "policy/provider_rate.rs"]
 mod provider_rate;
 pub use provider_rate::{
-    ProviderRateAuthority, ProviderRateCollisionIdentity, ProviderRateCollisionKind,
-    ProviderRateDecision, ProviderRateDeclaration, ProviderRateGroupId, ProviderRatePermitId,
-    ProviderRateRegistration, ProviderRateRunId, ProviderRateStore, ProviderRateStoreError,
+    PreparedProviderRateRegistrationBatch, ProviderRateAuthority, ProviderRateCollisionIdentity,
+    ProviderRateCollisionKind, ProviderRateDeclaration, ProviderRateDispatchDecision,
+    ProviderRateGroupId, ProviderRatePermitId, ProviderRateRegistration,
+    ProviderRateReservationDecision, ProviderRateReservationId, ProviderRateRunId,
+    ProviderRateStore, ProviderRateStoreError,
 };
 pub(in crate::policy) use provider_rate::{
-    ProviderRateBinding, ProviderRatePermit, wall_deadline_to_monotonic,
+    ProviderRateBinding, ProviderRatePermit, ProviderRateReservation,
+    ProviderRateReservationDispatch, wall_deadline_to_monotonic,
 };
 include!("policy/tests.rs");
