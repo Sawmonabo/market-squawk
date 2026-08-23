@@ -23,9 +23,10 @@ use market_squawk_domain::{
 use market_squawk_platform::SecretGeneration;
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
-    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRequest,
-    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HttpRequestBounds,
-    ProviderCaptureMaterial, ProviderRateDeclaration, SharedProviderBudget, SourceError,
+    CompleteMarketBarHistoryV1, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
+    ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan, ExtractionSource,
+    ExtractionSourceError, HttpRequestBounds, ProviderCaptureMaterial, ProviderRateDeclaration,
+    SharedProviderBudget, SourceError,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -51,6 +52,7 @@ pub(crate) struct AlpacaHistoricalExtractionWithCapture {
     batch: ExtractionBatch,
     bar_capture: ProviderCaptureMaterial,
     calendar_capture: ProviderCaptureMaterial,
+    history_capture_semantic: CompleteMarketBarHistoryV1,
 }
 
 impl AlpacaHistoricalExtractionWithCapture {
@@ -72,8 +74,14 @@ impl AlpacaHistoricalExtractionWithCapture {
         ExtractionBatch,
         ProviderCaptureMaterial,
         ProviderCaptureMaterial,
+        CompleteMarketBarHistoryV1,
     ) {
-        (self.batch, self.bar_capture, self.calendar_capture)
+        (
+            self.batch,
+            self.bar_capture,
+            self.calendar_capture,
+            self.history_capture_semantic,
+        )
     }
 }
 
@@ -304,6 +312,7 @@ impl AlpacaHistoricalRuntimeCapability {
         &self,
         config: AlpacaHistoricalEquityConfig,
         canonical_instrument: MarketDataInstrumentDefinition,
+        admitted_plan_digest: EvidenceDigest,
         bar_time_authority: Arc<AlpacaHistoricalCompositeCalendarAuthority>,
         preflight: Arc<AlpacaHistoricalEquityPreflightReceipt>,
         authority: ExtractionAuthority,
@@ -319,6 +328,15 @@ impl AlpacaHistoricalRuntimeCapability {
             .map_err(|_error| SourceError::InvalidProtocolState)?;
         let calendar_capture = bar_time_authority
             .provider_capture_material(&config, &preflight)
+            .map_err(|_error| SourceError::InvalidProtocolState)?;
+        let canonical_instrument_json = serde_json::to_vec(&canonical_instrument)
+            .map_err(|_error| SourceError::InvalidProtocolState)?;
+        let instrument_revision_digest = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(&canonical_instrument_json).into(),
+        );
+        let history_capture_semantic = bar_time_authority
+            .history_capture_semantic(instrument_revision_digest, admitted_plan_digest)
             .map_err(|_error| SourceError::InvalidProtocolState)?;
         self.validate_current(&cancellation)
             .await
@@ -348,6 +366,7 @@ impl AlpacaHistoricalRuntimeCapability {
             batch,
             bar_capture,
             calendar_capture,
+            history_capture_semantic,
         })
     }
 

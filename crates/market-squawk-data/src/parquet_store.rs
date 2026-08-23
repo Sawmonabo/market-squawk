@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::arrow_convert::DatasetArrowBatch;
 use crate::blocking_supervisor::{BlockingIoAdmissionError, BlockingIoSupervisor};
-use crate::manifest::{PinnedDataset, Sha256Digest};
+use crate::manifest::{PinnedDataset, PinnedManifestObject, Sha256Digest};
 use crate::publication_coordinator::PublicationLease;
 use crate::query::QueryArtifactMemoryLease;
 use crate::schema::{
@@ -968,84 +968,13 @@ impl ParquetObjectStore {
             {
                 return Err(ParquetStoreError::ReadLimitExceeded);
             }
-            let digest = encode_hex(object.content_hash().bytes());
-            let expected_reference = format!("{OBJECTS}/{}/{}.parquet", &digest[..2], digest);
-            if pinned.relative_reference() != expected_reference {
-                return Err(ParquetStoreError::ObjectMetadataMismatch);
-            }
-            self.root.resolve(pinned.relative_reference())?;
-            let mut file = self.directory.open(pinned.relative_reference())?.into_std();
-            let metadata = file.metadata()?;
-            if metadata.len() != object.size_bytes()
-                || metadata.len() > self.config.max_staging_bytes
-                || hash_file(&mut file, Some(cancellation))? != object.content_hash()
-            {
-                return Err(ParquetStoreError::ObjectMetadataMismatch);
-            }
-            file.seek(SeekFrom::Start(0))?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-            let row_groups = builder.metadata().row_groups();
-            let object_estimate = row_groups.iter().try_fold(0_usize, |total, row_group| {
-                row_group.columns().iter().try_fold(total, |total, column| {
-                    total
-                        .checked_add(
-                            usize::try_from(column.uncompressed_size())
-                                .map_err(|_| ParquetStoreError::SizeOverflow)?,
-                        )
-                        .ok_or(ParquetStoreError::SizeOverflow)
-                })
-            })?;
-            let structural = usize::try_from(object.row_count())
-                .ok()
-                .and_then(|rows| rows.checked_mul(builder.schema().fields().len()))
-                .and_then(|cells| cells.checked_mul(std::mem::size_of::<u64>()))
-                .ok_or(ParquetStoreError::SizeOverflow)?;
-            let estimated_peak = retained_bytes
-                .checked_add(object_estimate)
-                .and_then(|bytes| bytes.checked_add(structural))
-                .ok_or(ParquetStoreError::SizeOverflow)?;
-            if estimated_peak > max_retained_bytes {
-                return Err(ParquetStoreError::ReadLimitExceeded);
-            }
-            batches
-                .try_reserve(row_groups.len())
-                .map_err(|_| ParquetStoreError::ReadLimitExceeded)?;
-            let schema = Arc::clone(builder.schema());
-            let reader = builder
-                .with_batch_size(self.config.max_row_group_rows)
-                .build()?;
-            let first_index = batches.len();
-            for batch in reader {
-                if cancellation.is_cancelled() {
-                    return Err(ParquetStoreError::Cancelled);
-                }
-                let batch = batch?;
-                retained_bytes = retained_bytes
-                    .checked_add(batch.get_array_memory_size())
-                    .ok_or(ParquetStoreError::SizeOverflow)?;
-                if retained_bytes > max_retained_bytes {
-                    return Err(ParquetStoreError::ReadLimitExceeded);
-                }
-                let mut columns = Vec::new();
-                columns
-                    .try_reserve_exact(batch.num_columns())
-                    .map_err(|_| ParquetStoreError::ReadLimitExceeded)?;
-                columns.extend(batch.columns().iter().cloned());
-                batches.push(RecordBatch::try_new(Arc::clone(&schema), columns)?);
-            }
-            let object_rows = batches[first_index..]
-                .iter()
-                .try_fold(0_u64, |total, batch| {
-                    total
-                        .checked_add(
-                            u64::try_from(batch.num_rows())
-                                .map_err(|_| ParquetStoreError::SizeOverflow)?,
-                        )
-                        .ok_or(ParquetStoreError::SizeOverflow)
-                })?;
-            if object_rows != object.row_count() {
-                return Err(ParquetStoreError::ObjectMetadataMismatch);
-            }
+            let object_rows = self.read_one_pinned_object_with_limits(
+                pinned,
+                max_retained_bytes,
+                &mut retained_bytes,
+                &mut batches,
+                cancellation,
+            )?;
             generation_rows = generation_rows
                 .checked_add(object_rows)
                 .ok_or(ParquetStoreError::SizeOverflow)?;
@@ -1054,6 +983,102 @@ impl ParquetObjectStore {
             return Err(ParquetStoreError::ObjectMetadataMismatch);
         }
         Ok(batches)
+    }
+
+    fn read_one_pinned_object_with_limits(
+        &self,
+        pinned: &PinnedManifestObject,
+        max_retained_bytes: usize,
+        retained_bytes: &mut usize,
+        batches: &mut Vec<RecordBatch>,
+        cancellation: &CancellationToken,
+    ) -> Result<u64, ParquetStoreError> {
+        let object = pinned.object();
+        let digest = encode_hex(object.content_hash().bytes());
+        let expected_reference = format!("{OBJECTS}/{}/{}.parquet", &digest[..2], digest);
+        if pinned.relative_reference() != expected_reference {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        self.root.resolve(pinned.relative_reference())?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = self
+            .directory
+            .open_with(pinned.relative_reference(), &options)?
+            .into_std();
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.len() != object.size_bytes()
+            || metadata.len() > self.config.max_staging_bytes
+            || hash_file(&mut file, Some(cancellation))? != object.content_hash()
+        {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let row_groups = builder.metadata().row_groups();
+        let object_estimate = row_groups.iter().try_fold(0_usize, |total, row_group| {
+            row_group.columns().iter().try_fold(total, |total, column| {
+                total
+                    .checked_add(
+                        usize::try_from(column.uncompressed_size())
+                            .map_err(|_| ParquetStoreError::SizeOverflow)?,
+                    )
+                    .ok_or(ParquetStoreError::SizeOverflow)
+            })
+        })?;
+        let structural = usize::try_from(object.row_count())
+            .ok()
+            .and_then(|rows| rows.checked_mul(builder.schema().fields().len()))
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<u64>()))
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        let estimated_peak = retained_bytes
+            .checked_add(object_estimate)
+            .and_then(|bytes| bytes.checked_add(structural))
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        if estimated_peak > max_retained_bytes {
+            return Err(ParquetStoreError::ReadLimitExceeded);
+        }
+        batches
+            .try_reserve(row_groups.len())
+            .map_err(|_| ParquetStoreError::ReadLimitExceeded)?;
+        let schema = Arc::clone(builder.schema());
+        let reader = builder
+            .with_batch_size(self.config.max_row_group_rows)
+            .build()?;
+        let first_index = batches.len();
+        for batch in reader {
+            if cancellation.is_cancelled() {
+                return Err(ParquetStoreError::Cancelled);
+            }
+            let batch = batch?;
+            *retained_bytes = retained_bytes
+                .checked_add(batch.get_array_memory_size())
+                .ok_or(ParquetStoreError::SizeOverflow)?;
+            if *retained_bytes > max_retained_bytes {
+                return Err(ParquetStoreError::ReadLimitExceeded);
+            }
+            let mut columns = Vec::new();
+            columns
+                .try_reserve_exact(batch.num_columns())
+                .map_err(|_| ParquetStoreError::ReadLimitExceeded)?;
+            columns.extend(batch.columns().iter().cloned());
+            batches.push(RecordBatch::try_new(Arc::clone(&schema), columns)?);
+        }
+        let object_rows = batches[first_index..]
+            .iter()
+            .try_fold(0_u64, |total, batch| {
+                total
+                    .checked_add(
+                        u64::try_from(batch.num_rows())
+                            .map_err(|_| ParquetStoreError::SizeOverflow)?,
+                    )
+                    .ok_or(ParquetStoreError::SizeOverflow)
+            })?;
+        if object_rows != object.row_count() {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        Ok(object_rows)
     }
 
     /// Reads one immutable generation through bounded blocking-task admission.
@@ -1126,6 +1151,73 @@ impl ParquetObjectStore {
             }
             _ = cancellation.cancelled() => {
                 operation_cancellation.cancel();
+                Err(ParquetStoreError::Cancelled)
+            }
+        }
+    }
+
+    /// Reads one exact catalog-pinned object under caller-selected row and Arrow-memory bounds.
+    ///
+    /// The artifact and ordinal are both required so an inherited or compacted generation cannot
+    /// silently substitute another object with the same schema. The content-addressed reference,
+    /// exact bytes, Parquet metadata, and row count are reverified before any batch is returned.
+    pub(crate) async fn read_pinned_object_bounded_async(
+        &self,
+        dataset: &PinnedDataset,
+        artifact_id: Uuid,
+        object_ordinal: usize,
+        max_rows: usize,
+        max_retained_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RecordBatch>, ParquetStoreError> {
+        if max_rows == 0 || max_retained_bytes == 0 {
+            return Err(ParquetStoreError::ReadLimitExceeded);
+        }
+        let pinned = dataset
+            .objects()
+            .get(object_ordinal)
+            .filter(|pinned| pinned.artifact_id() == artifact_id)
+            .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
+        if usize::try_from(pinned.object().row_count())
+            .ok()
+            .is_none_or(|rows| rows > max_rows)
+        {
+            return Err(ParquetStoreError::ReadLimitExceeded);
+        }
+        let store = Self {
+            root: self.root.clone(),
+            directory: self.directory.try_clone()?,
+            config: self.config,
+            blocking_tasks: Arc::clone(&self.blocking_tasks),
+            authority: Arc::clone(&self.authority),
+        };
+        let pinned = pinned.clone();
+        let permit = self.acquire_blocking_permit(cancellation).await?;
+        let operation_cancellation = cancellation.child_token();
+        let worker_cancellation = operation_cancellation.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut batches = Vec::new();
+            let mut retained_bytes = 0_usize;
+            let rows = store.read_one_pinned_object_with_limits(
+                &pinned,
+                max_retained_bytes,
+                &mut retained_bytes,
+                &mut batches,
+                &worker_cancellation,
+            )?;
+            if rows != pinned.object().row_count() || batches.is_empty() {
+                return Err(ParquetStoreError::ObjectMetadataMismatch);
+            }
+            Ok(batches)
+        });
+        tokio::select! {
+            result = &mut worker => {
+                result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
+            }
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                worker.await.map_err(|_| ParquetStoreError::BlockingTaskFailed)??;
                 Err(ParquetStoreError::Cancelled)
             }
         }

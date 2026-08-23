@@ -20,11 +20,17 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::market_history::{
+    CompleteMarketBarHistoryRequest, CompleteMarketBarHistorySelection,
+    generation_market_bar_history_candidate_matches,
+    generation_market_bar_history_inputs_match_manifest,
+    insert_generation_market_bar_history_inputs, select_complete_market_bar_history,
+};
 use super::{
     DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DerivedGenerationCommitAuthority,
     DerivedGenerationParents, GenerationParent, GenerationParentRelation,
-    MAX_DERIVED_GENERATION_PARENTS, ManifestObject, ManifestPlan, ManifestPlanError, Sha256Digest,
-    compare_manifest_refs,
+    MAX_DERIVED_GENERATION_PARENTS, ManifestObject, ManifestPlan, ManifestPlanError,
+    MarketBarHistoryPublicationCandidate, Sha256Digest, compare_manifest_refs,
 };
 use crate::catalog::exact_catalog_file_binding;
 use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
@@ -335,6 +341,7 @@ impl AnalyticalManifestCatalog {
         schema: &DatasetSchemaRef,
         kind: GenerationKind,
         source_input: Option<&IngestRunRecord>,
+        market_bar_history: Option<&MarketBarHistoryPublicationCandidate>,
     ) -> Result<DatasetManifestRef, ManifestCatalogError> {
         if kind == GenerationKind::Derived
             || !matches!(
@@ -367,6 +374,11 @@ impl AnalyticalManifestCatalog {
                 && pinned.build_spec_digest.is_none()
                 && generation_source_input_matches(&transaction, &existing, kind, source_input)?
                 && generation_capture_inputs_match_manifest(&transaction, &existing)?
+                && generation_market_bar_history_candidate_matches(
+                    &transaction,
+                    &existing,
+                    market_bar_history,
+                )?
             {
                 transaction.commit()?;
                 return Ok(existing);
@@ -497,6 +509,16 @@ impl AnalyticalManifestCatalog {
             insert_generation_parent(&transaction, &plan.dataset_id, version, 0, parent)?;
         }
         insert_generation_capture_inputs(&transaction, generation_sequence)?;
+        insert_generation_market_bar_history_inputs(
+            &transaction,
+            generation_sequence,
+            plan,
+            artifact,
+            anchor,
+            schema,
+            source_input,
+            market_bar_history,
+        )?;
         let manifest = DatasetManifestRef::try_new_with_schema(
             plan.dataset_id.clone(),
             version,
@@ -663,6 +685,50 @@ impl AnalyticalManifestCatalog {
             .map_err(|_| ManifestCatalogError::SchemaMismatch)?;
         let connection = self.lock()?;
         load_pinned(&connection, manifest, self.max_objects_per_generation)
+    }
+
+    /// Selects only a clock-safe complete market-bar window under one immutable generation.
+    pub fn select_complete_market_bar_history(
+        &self,
+        request: &CompleteMarketBarHistoryRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CompleteMarketBarHistorySelection>, ManifestCatalogError> {
+        check_read_operation(deadline, cancellation)?;
+        let mut connection = self.lock()?;
+        let token = cancellation.clone();
+        connection.progress_handler(
+            SQLITE_PROGRESS_OPERATIONS,
+            Some(move || token.is_cancelled() || Instant::now() >= deadline),
+        )?;
+        let result = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            match select_complete_market_bar_history(
+                &transaction,
+                self.max_objects_per_generation,
+                request,
+                deadline,
+                cancellation,
+            ) {
+                Ok(selection) => {
+                    transaction.commit()?;
+                    Ok(selection)
+                }
+                Err(error) => Err(error),
+            }
+        })();
+        connection.progress_handler::<fn() -> bool>(0, None)?;
+        result.map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
+    }
+
+    pub(crate) fn market_bar_history_candidate_matches(
+        &self,
+        manifest: &DatasetManifestRef,
+        candidate: Option<&MarketBarHistoryPublicationCandidate>,
+    ) -> Result<bool, ManifestCatalogError> {
+        let connection = self.lock()?;
+        generation_market_bar_history_candidate_matches(&connection, manifest, candidate)
     }
 
     /// Returns the current generation only as an explicit pin, never as a directory inference.
@@ -1519,6 +1585,12 @@ pub enum ManifestCatalogError {
     /// Transitive provider-capture lineage exceeds the fixed generation ceiling.
     #[error("analytical generation exceeds the {max}-provider-capture input ceiling")]
     CaptureInputLimitExceeded { max: usize },
+    /// Typed market-bar history lineage disagrees with rows, capture, or immutable generation.
+    #[error("complete market-bar history publication evidence is invalid")]
+    MarketBarHistoryMismatch,
+    /// Transitive complete-history lineage exceeds the fixed generation ceiling.
+    #[error("analytical generation exceeds the {max}-market-bar-history input ceiling")]
+    MarketBarHistoryInputLimitExceeded { max: usize },
     /// Candidate reachability work exceeds the explicit operation ceiling.
     #[error("analytical reference lookup exceeds the {max_candidates}-candidate work ceiling")]
     ReferenceWorkLimitExceeded { max_candidates: usize },
@@ -1708,7 +1780,7 @@ fn load_latest(
         .transpose()
 }
 
-fn load_pinned(
+pub(super) fn load_pinned(
     connection: &Connection,
     reference: &DatasetManifestRef,
     max_objects: usize,
@@ -1769,6 +1841,9 @@ fn load_pinned(
         parent_count,
     )?;
     if !generation_capture_inputs_match_manifest(connection, reference)? {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    if !generation_market_bar_history_inputs_match_manifest(connection, reference)? {
         return Err(ManifestCatalogError::CorruptCatalog);
     }
     let retrieval_limit = max_objects

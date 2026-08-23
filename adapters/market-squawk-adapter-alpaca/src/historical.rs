@@ -3,8 +3,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use chrono::{DateTime, Datelike as _, Utc};
 use futures_util::future::BoxFuture;
@@ -23,8 +21,8 @@ use market_squawk_sources::{
     ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
     HttpRequestBounds, ProviderCaptureMaterial, ProviderCapturePageReceipt,
     ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SharedProviderBudget,
-    SourceError, SourceMetadata, SourceMetadataProvider, SourceObject, apply_http_retry_after,
-    payload_matches_exact_evidence,
+    SourceError, SourceMetadata, SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
+    apply_http_retry_after,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -50,6 +48,8 @@ const MAXIMUM_PREFLIGHT_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 const MAXIMUM_PREFLIGHT_RETURNED_TIMESTAMPS: usize =
     ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS as usize + 2;
 const PREFLIGHT_USER_AGENT: &str = "market-squawk/0.1 alpaca-historical-preflight";
+const COMPLETE_DAILY_HISTORY_MEDIA_TYPE: &str =
+    "application/vnd.market-squawk.alpaca-iex-complete-daily-history+json";
 
 /// Validated provider rate-limit response evidence from the most recent historical request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -683,10 +683,12 @@ impl AlpacaHistoricalEquitySource {
             .verify_provider_identity(self.config.metadata())
             .map_err(map_adapter_error)?;
         enforce_historical_window(dataset).map_err(map_adapter_error)?;
-        let mut objects = Vec::new();
-        objects
-            .try_reserve_exact(self.preflight.pages.len())
-            .map_err(|_| SourceError::InvalidProtocolState)?;
+        let capture = self
+            .provider_capture_material()
+            .map_err(map_adapter_error)?;
+        let capture_identity = SourceObjectCaptureIdentity::try_from_capture(capture.receipt())
+            .map_err(|_| SourceError::GenerationResynchronizationRequired)?;
+        let mut returned_bar_count = 0_usize;
         for (page_index, page) in self.preflight.pages.iter().enumerate() {
             if cancellation.is_cancelled() {
                 return Err(ExtractionSourceError::Cancelled);
@@ -706,46 +708,45 @@ impl AlpacaHistoricalEquitySource {
                 }
                 continue;
             }
-            if objects.len() == usize::from(request.max_results()) {
-                return Err(
-                    market_squawk_sources::ExtractionError::DiscoveryLimitExceeded {
-                        requested: request.max_results(),
-                    }
-                    .into(),
-                );
-            }
-            let page_index =
-                u16::try_from(page_index).map_err(|_| SourceError::InvalidProtocolState)?;
-            let object_id = page_object_id(
-                page_index,
-                page.request_page_token.as_deref(),
-                &page.evidence,
-            )
-            .map_err(map_adapter_error)?;
-            let effective = EffectiveInterval::new(page.received_at, None)
-                .map_err(|_| SourceError::InvalidProtocolState)?;
-            objects.push(SourceObject::try_new_with_availability(
-                self.config.metadata().source_id().clone(),
-                self.config.metadata().revision().clone(),
-                &request,
-                object_id,
-                SourceIdentifier::try_from("application/vnd.alpaca.iex-bars+json")
-                    .map_err(|_| SourceError::InvalidProtocolState)?,
-                page.evidence.clone(),
-                effective,
-                None,
-                AvailabilityEvidence::LocalFirstObserved {
-                    observed_at: page.received_at,
-                },
-                Some(
-                    u64::try_from(page.body.len())
-                        .map_err(|_| SourceError::InvalidProtocolState)?,
-                ),
-            )?);
+            returned_bar_count = returned_bar_count
+                .checked_add(parsed.bars.len())
+                .ok_or(SourceError::InvalidProtocolState)?;
         }
+        if returned_bar_count != self.preflight.returned_bar_times.len() || returned_bar_count == 0
+        {
+            return Err(SourceError::GenerationResynchronizationRequired.into());
+        }
+        let observed_at = self
+            .preflight
+            .pages
+            .last()
+            .map(|page| page.received_at)
+            .ok_or(SourceError::GenerationResynchronizationRequired)?;
+        let effective = EffectiveInterval::new(observed_at, None)
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        let evidence =
+            ExactPayloadEvidence::from_content_digest(capture.receipt().content_digest());
+        let object = SourceObject::try_new_with_capture_identity(
+            self.config.metadata().source_id().clone(),
+            self.config.metadata().revision().clone(),
+            &request,
+            complete_range_object_id(capture.receipt().content_digest())
+                .map_err(map_adapter_error)?,
+            SourceIdentifier::try_from(COMPLETE_DAILY_HISTORY_MEDIA_TYPE)
+                .map_err(|_| SourceError::InvalidProtocolState)?,
+            evidence,
+            capture_identity,
+            effective,
+            None,
+            AvailabilityEvidence::LocalFirstObserved { observed_at },
+            Some(
+                u64::try_from(self.preflight.total_response_bytes)
+                    .map_err(|_| SourceError::InvalidProtocolState)?,
+            ),
+        )?;
         ensure_wall_deadline(request.deadline()).map_err(map_adapter_error)?;
         authority.validate_current()?;
-        DiscoveryBatch::try_new(&request, objects).map_err(Into::into)
+        DiscoveryBatch::try_new(&request, vec![object]).map_err(Into::into)
     }
 
     async fn extract_impl(
@@ -771,33 +772,28 @@ impl AlpacaHistoricalEquitySource {
             .verify_provider_identity(self.config.metadata())
             .map_err(map_adapter_error)?;
         enforce_historical_window(dataset).map_err(map_adapter_error)?;
-        let identity =
-            parse_page_object_id(request.object().object_id()).map_err(map_adapter_error)?;
-        let page = self
-            .preflight
-            .pages
-            .get(usize::from(identity.page_index))
-            .ok_or(SourceError::GenerationResynchronizationRequired)?;
-        if page.request_page_token.as_deref() != identity.page_token.as_deref()
-            || identity.digest != page.evidence
-            || identity.digest != exact_evidence(&page.body)
-            || !payload_matches_exact_evidence(&page.body, request.object().evidence())
-            || request
-                .object()
-                .expected_bytes()
-                .is_some_and(|expected| u64::try_from(page.body.len()).ok() != Some(expected))
-        {
-            return Err(SourceError::GenerationResynchronizationRequired.into());
-        }
-        let parsed = serde_json::from_slice::<BarPage>(&page.body)
+        let capture = self
+            .provider_capture_material()
+            .map_err(map_adapter_error)?;
+        let capture_identity = SourceObjectCaptureIdentity::try_from_capture(capture.receipt())
             .map_err(|_| SourceError::GenerationResynchronizationRequired)?;
-        validate_page(dataset, &parsed).map_err(map_adapter_error)?;
-        if parsed.next_page_token.as_deref() != page.response_page_token.as_deref()
-            || parsed.bars.is_empty()
+        let expected_evidence =
+            ExactPayloadEvidence::from_content_digest(capture.receipt().content_digest());
+        if request.object().object_id()
+            != &complete_range_object_id(capture.receipt().content_digest())
+                .map_err(map_adapter_error)?
+            || request.object().media_type().as_str() != COMPLETE_DAILY_HISTORY_MEDIA_TYPE
+            || request.object().evidence() != &expected_evidence
+            || request.object().capture_identity() != capture_identity
+            || request.object().expected_bytes()
+                != Some(
+                    u64::try_from(self.preflight.total_response_bytes)
+                        .map_err(|_| SourceError::InvalidProtocolState)?,
+                )
         {
             return Err(SourceError::GenerationResynchronizationRequired.into());
         }
-        if parsed.bars.len()
+        if self.preflight.returned_bar_times.len()
             > usize::try_from(request.max_records())
                 .map_err(|_| SourceError::InvalidProtocolState)?
         {
@@ -812,45 +808,80 @@ impl AlpacaHistoricalEquitySource {
             .map_err(|_| SourceError::InvalidProtocolState)?;
         let mut records = Vec::new();
         records
-            .try_reserve_exact(parsed.bars.len())
+            .try_reserve_exact(self.preflight.returned_bar_times.len())
             .map_err(|_| SourceError::InvalidProtocolState)?;
         let instrument_authority = self
             .instrument_authorities
             .get(dataset.dataset().as_str())
             .ok_or(SourceError::InvalidProtocolState)?;
-        let provider_page_evidence = page.evidence.clone();
         let ingested_at = system_timestamp().map_err(map_adapter_error)?;
-        for bar in parsed.bars {
-            let normalized = normalize_bar(
-                dataset,
-                instrument_authority,
-                self.config.metadata().source_id(),
-                &provider_page_evidence,
-                page.received_at,
-                ingested_at,
-                self.bar_time_authority.as_ref(),
-                bar,
-            )
-            .map_err(map_adapter_error)?;
-            let payload = serde_json::to_vec(&normalized)
-                .map(Bytes::from)
-                .map_err(|_| SourceError::InvalidProtocolState)?;
-            let evidence = exact_evidence(&payload);
-            let effective_at = observation_effective_at(&normalized).map_err(map_adapter_error)?;
-            let revision = record_revision(effective_at, &evidence).map_err(map_adapter_error)?;
-            records.push(ExtractionRecord::try_new(
-                &request,
-                schema.clone(),
-                evidence,
-                effective_at,
-                None,
-                AvailabilityEvidence::LocalFirstObserved {
-                    observed_at: page.received_at,
-                },
-                revision,
-                None,
-                payload,
-            )?);
+        let mut previous_response_token: Option<&str> = None;
+        let mut returned_index = 0_usize;
+        for (page_index, page) in self.preflight.pages.iter().enumerate() {
+            let parsed = serde_json::from_slice::<BarPage>(&page.body)
+                .map_err(|_| SourceError::GenerationResynchronizationRequired)?;
+            validate_page(dataset, &parsed).map_err(map_adapter_error)?;
+            if page.request_page_token.as_deref() != previous_response_token
+                || parsed.next_page_token.as_deref() != page.response_page_token.as_deref()
+                || exact_evidence(&page.body) != page.evidence
+                || (page_index + 1 < self.preflight.pages.len()
+                    && page.response_page_token.is_none())
+                || (page_index + 1 == self.preflight.pages.len()
+                    && page.response_page_token.is_some())
+                || (parsed.bars.is_empty()
+                    && (parsed.next_page_token.is_some()
+                        || page_index + 1 != self.preflight.pages.len()))
+            {
+                return Err(SourceError::GenerationResynchronizationRequired.into());
+            }
+            for bar in parsed.bars {
+                let returned =
+                    parse_returned_bar_time(&bar.timestamp).map_err(map_adapter_error)?;
+                if self.preflight.returned_bar_times.get(returned_index) != Some(&returned) {
+                    return Err(SourceError::GenerationResynchronizationRequired.into());
+                }
+                returned_index = returned_index
+                    .checked_add(1)
+                    .ok_or(SourceError::InvalidProtocolState)?;
+                let normalized = normalize_bar(
+                    dataset,
+                    instrument_authority,
+                    self.config.metadata().source_id(),
+                    &page.evidence,
+                    page.received_at,
+                    ingested_at,
+                    self.bar_time_authority.as_ref(),
+                    bar,
+                )
+                .map_err(map_adapter_error)?;
+                let payload = serde_json::to_vec(&normalized)
+                    .map(Bytes::from)
+                    .map_err(|_| SourceError::InvalidProtocolState)?;
+                let evidence = exact_evidence(&payload);
+                let effective_at =
+                    observation_effective_at(&normalized).map_err(map_adapter_error)?;
+                let revision =
+                    record_revision(effective_at, &evidence).map_err(map_adapter_error)?;
+                records.push(ExtractionRecord::try_new(
+                    &request,
+                    schema.clone(),
+                    evidence,
+                    effective_at,
+                    None,
+                    AvailabilityEvidence::LocalFirstObserved {
+                        observed_at: page.received_at,
+                    },
+                    revision,
+                    None,
+                    payload,
+                )?);
+            }
+            previous_response_token = page.response_page_token.as_deref();
+        }
+        if returned_index != self.preflight.returned_bar_times.len()
+            || records.len() != self.preflight.returned_bar_times.len()
+        {
+            return Err(SourceError::GenerationResynchronizationRequired.into());
         }
         self.bar_time_authority
             .validate_current()
@@ -1475,62 +1506,17 @@ where
         .transpose()
 }
 
-struct PageObjectIdentity {
-    page_index: u16,
-    page_token: Option<String>,
-    digest: ExactPayloadEvidence,
-}
-
-fn page_object_id(
-    page_index: u16,
-    token: Option<&str>,
-    evidence: &ExactPayloadEvidence,
+fn complete_range_object_id(
+    content_digest: EvidenceDigest,
 ) -> Result<SourceIdentifier, AlpacaError> {
-    let token = token.map_or_else(|| "-".to_owned(), |value| URL_SAFE_NO_PAD.encode(value));
-    let digest = hex(evidence.content_digest().bytes());
-    Ok(SourceIdentifier::try_from(format!(
-        "alpaca-iex-bars:{page_index}:{token}:{digest}"
-    ))?)
-}
-
-fn parse_page_object_id(value: &SourceIdentifier) -> Result<PageObjectIdentity, AlpacaError> {
-    let mut fields = value.as_str().split(':');
-    if fields.next() != Some("alpaca-iex-bars") {
+    if content_digest.algorithm() != DigestAlgorithm::Sha256 || content_digest.bytes() == [0; 32] {
         return Err(AlpacaError::Protocol);
     }
-    let page_index = fields
-        .next()
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or(AlpacaError::Protocol)?;
-    let encoded_token = fields.next().ok_or(AlpacaError::Protocol)?;
-    let digest = fields.next().ok_or(AlpacaError::Protocol)?;
-    if fields.next().is_some()
-        || digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(AlpacaError::Protocol);
-    }
-    let page_token = if encoded_token == "-" {
-        None
-    } else {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(encoded_token)
-            .map_err(|_| AlpacaError::Protocol)?;
-        let token = String::from_utf8(bytes).map_err(|_| AlpacaError::Protocol)?;
-        validate_page_token(&token)?;
-        Some(token)
-    };
-    let digest_bytes = decode_hex(digest)?;
-    Ok(PageObjectIdentity {
-        page_index,
-        page_token,
-        digest: ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            digest_bytes,
-        )),
-    })
+    SourceIdentifier::try_from(format!(
+        "alpaca-iex-complete-daily-history:{}",
+        hex(content_digest.bytes())
+    ))
+    .map_err(Into::into)
 }
 
 fn record_revision(
@@ -1936,24 +1922,6 @@ fn hex(bytes: [u8; 32]) -> String {
         output.push(char::from(ALPHABET[usize::from(byte & 0x0f)]));
     }
     output
-}
-
-fn decode_hex(value: &str) -> Result<[u8; 32], AlpacaError> {
-    let mut bytes = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = hex_value(pair[0]).ok_or(AlpacaError::Protocol)?;
-        let low = hex_value(pair[1]).ok_or(AlpacaError::Protocol)?;
-        bytes[index] = (high << 4) | low;
-    }
-    Ok(bytes)
-}
-
-const fn hex_value(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        _ => None,
-    }
 }
 
 fn map_adapter_error(error: AlpacaError) -> ExtractionSourceError {

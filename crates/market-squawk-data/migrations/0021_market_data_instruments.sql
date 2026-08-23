@@ -667,3 +667,280 @@ CREATE TRIGGER analytical_generation_capture_inputs_immutable_delete
 BEFORE DELETE ON analytical_generation_capture_inputs BEGIN
     SELECT RAISE(ABORT, 'analytical generation provider capture inputs are immutable');
 END;
+
+CREATE TABLE market_bar_history_publications (
+    publication_receipt_digest BLOB PRIMARY KEY CHECK (
+        length(publication_receipt_digest) = 32
+        AND publication_receipt_digest <> zeroblob(32)
+    ),
+    receipt_version INTEGER NOT NULL CHECK (receipt_version = 1),
+    origin_generation_sequence INTEGER NOT NULL UNIQUE
+        REFERENCES analytical_generations(generation_sequence),
+    origin_run_id TEXT NOT NULL UNIQUE REFERENCES ingest_runs(run_id),
+    origin_anchor_manifest_id TEXT NOT NULL UNIQUE
+        REFERENCES dataset_manifests(manifest_id),
+    origin_artifact_id TEXT NOT NULL UNIQUE REFERENCES artifacts(artifact_id),
+    origin_object_ordinal INTEGER NOT NULL CHECK (
+        origin_object_ordinal BETWEEN 0 AND 1023
+    ),
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    capture_receipt_digest BLOB NOT NULL UNIQUE
+        REFERENCES provider_capture_sets(capture_receipt_digest),
+    capture_content_digest BLOB NOT NULL CHECK (
+        length(capture_content_digest) = 32
+        AND capture_content_digest <> zeroblob(32)
+    ),
+    capture_observation_digest BLOB NOT NULL CHECK (
+        length(capture_observation_digest) = 32
+        AND capture_observation_digest <> zeroblob(32)
+    ),
+    capture_recorded_at_ns INTEGER NOT NULL,
+    provider_dataset TEXT NOT NULL CHECK (
+        length(CAST(provider_dataset AS BLOB)) BETWEEN 1 AND 512
+    ),
+    instrument_id TEXT NOT NULL
+        REFERENCES market_data_instrument_identities(instrument_id),
+    asset_class TEXT NOT NULL CHECK (asset_class IN ('equity', 'fund')),
+    instrument_revision_digest BLOB NOT NULL
+        REFERENCES market_data_instrument_revisions(revision_digest),
+    admitted_plan_digest BLOB NOT NULL CHECK (
+        length(admitted_plan_digest) = 32
+        AND admitted_plan_digest <> zeroblob(32)
+    ),
+    provider_instrument_id TEXT NOT NULL CHECK (
+        length(CAST(provider_instrument_id AS BLOB)) BETWEEN 1 AND 256
+    ),
+    venue_id TEXT NOT NULL CHECK (
+        length(CAST(venue_id AS BLOB)) BETWEEN 1 AND 128
+    ),
+    feed TEXT NOT NULL CHECK (length(CAST(feed AS BLOB)) BETWEEN 1 AND 128),
+    bar_interval TEXT NOT NULL CHECK (
+        length(CAST(bar_interval AS BLOB)) BETWEEN 1 AND 128
+    ),
+    adjustment TEXT NOT NULL CHECK (
+        adjustment IN ('raw', 'split', 'dividend', 'spin_off', 'all')
+    ),
+    timestamp_basis TEXT NOT NULL CHECK (
+        timestamp_basis IN ('period_start', 'period_end')
+    ),
+    session_kind TEXT NOT NULL CHECK (
+        session_kind IN ('regular', 'extended', 'continuous', 'provider_defined')
+    ),
+    session_ruleset TEXT NOT NULL CHECK (
+        length(CAST(session_ruleset AS BLOB)) BETWEEN 1 AND 512
+    ),
+    graph_purpose TEXT NOT NULL CHECK (
+        length(CAST(graph_purpose AS BLOB)) BETWEEN 1 AND 512
+    ),
+    currency TEXT NOT NULL CHECK (
+        length(CAST(currency AS BLOB)) BETWEEN 1 AND 16
+    ),
+    requested_start_ns INTEGER NOT NULL,
+    requested_end_ns INTEGER NOT NULL CHECK (requested_end_ns > requested_start_ns),
+    coverage_first_ns INTEGER NOT NULL CHECK (
+        coverage_first_ns BETWEEN requested_start_ns AND requested_end_ns
+    ),
+    coverage_last_ns INTEGER NOT NULL CHECK (
+        coverage_last_ns BETWEEN coverage_first_ns AND requested_end_ns
+    ),
+    coverage_last_complete_ns INTEGER NOT NULL CHECK (
+        coverage_last_complete_ns >= coverage_last_ns
+        AND coverage_last_complete_ns <= requested_end_ns
+    ),
+    expected_bar_count INTEGER NOT NULL CHECK (
+        expected_bar_count BETWEEN 1 AND 10000
+    ),
+    returned_bar_count INTEGER NOT NULL CHECK (
+        returned_bar_count = expected_bar_count
+    ),
+    expected_timestamp_set_digest BLOB NOT NULL CHECK (
+        length(expected_timestamp_set_digest) = 32
+        AND expected_timestamp_set_digest <> zeroblob(32)
+    ),
+    bar_set_digest BLOB NOT NULL CHECK (
+        length(bar_set_digest) = 32 AND bar_set_digest <> zeroblob(32)
+    ),
+    completeness_evidence_digest BLOB NOT NULL CHECK (
+        length(completeness_evidence_digest) = 32
+        AND completeness_evidence_digest <> zeroblob(32)
+    ),
+    market_bar_component_ordinal INTEGER NOT NULL CHECK (
+        market_bar_component_ordinal BETWEEN 0 AND 63
+    ),
+    market_bar_component_content_digest BLOB NOT NULL CHECK (
+        length(market_bar_component_content_digest) = 32
+        AND market_bar_component_content_digest <> zeroblob(32)
+    ),
+    market_bar_component_page_count INTEGER NOT NULL CHECK (
+        market_bar_component_page_count BETWEEN 1 AND 64
+    ),
+    session_calendar_component_ordinal INTEGER NOT NULL CHECK (
+        session_calendar_component_ordinal BETWEEN 0 AND 63
+        AND session_calendar_component_ordinal <> market_bar_component_ordinal
+    ),
+    session_calendar_component_content_digest BLOB NOT NULL CHECK (
+        length(session_calendar_component_content_digest) = 32
+        AND session_calendar_component_content_digest <> zeroblob(32)
+    ),
+    session_calendar_component_page_count INTEGER NOT NULL CHECK (
+        session_calendar_component_page_count BETWEEN 1 AND 64
+    ),
+    max_available_at_ns INTEGER NOT NULL,
+    max_received_at_ns INTEGER NOT NULL,
+    max_ingested_at_ns INTEGER NOT NULL CHECK (
+        max_ingested_at_ns >= max_available_at_ns
+        AND max_ingested_at_ns >= max_received_at_ns
+    ),
+    published_at_ns INTEGER NOT NULL CHECK (published_at_ns >= max_ingested_at_ns),
+    admission_class TEXT NOT NULL CHECK (
+        admission_class = 'current_research_only'
+    ),
+    current_research_eligible INTEGER NOT NULL CHECK (current_research_eligible = 1),
+    point_in_time_eligible INTEGER NOT NULL CHECK (point_in_time_eligible = 0),
+    backtest_eligible INTEGER NOT NULL CHECK (backtest_eligible = 0),
+    retrospective_training_eligible INTEGER NOT NULL CHECK (
+        retrospective_training_eligible = 0
+    ),
+    admission_reason TEXT NOT NULL CHECK (
+        admission_reason = 'local_first_observed_without_provider_publication_time'
+    ),
+    receipt_json TEXT NOT NULL CHECK (
+        length(CAST(receipt_json AS BLOB)) BETWEEN 2 AND 4194304
+        AND json_valid(receipt_json)
+    ),
+    UNIQUE (origin_generation_sequence, capture_receipt_digest),
+    FOREIGN KEY (origin_generation_sequence, capture_receipt_digest)
+        REFERENCES analytical_generation_capture_inputs(
+            generation_sequence, capture_receipt_digest
+        )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE analytical_generation_market_bar_history_inputs (
+    generation_sequence INTEGER NOT NULL
+        REFERENCES analytical_generations(generation_sequence),
+    input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 4095),
+    publication_receipt_digest BLOB NOT NULL
+        REFERENCES market_bar_history_publications(publication_receipt_digest),
+    PRIMARY KEY (generation_sequence, input_ordinal),
+    UNIQUE (generation_sequence, publication_receipt_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX market_bar_history_publications_latest
+ON market_bar_history_publications(
+    instrument_id,
+    published_at_ns DESC,
+    origin_generation_sequence DESC,
+    publication_receipt_digest
+);
+
+CREATE INDEX analytical_generation_market_bar_history_receipt
+ON analytical_generation_market_bar_history_inputs(
+    publication_receipt_digest,
+    generation_sequence
+);
+
+CREATE TRIGGER market_bar_history_publications_guarded_insert
+BEFORE INSERT ON market_bar_history_publications
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM analytical_generations AS generation
+    JOIN analytical_generation_source_inputs AS source_input
+      ON source_input.generation_sequence = generation.generation_sequence
+    JOIN ingest_runs AS run ON run.run_id = source_input.run_id
+    JOIN dataset_manifests AS manifest
+      ON manifest.manifest_id = generation.anchor_manifest_id
+    JOIN artifacts AS artifact ON artifact.artifact_id = manifest.artifact_id
+    JOIN analytical_generation_objects AS object
+      ON object.dataset_id = generation.dataset_id
+     AND object.manifest_version = generation.manifest_version
+     AND object.ordinal = NEW.origin_object_ordinal
+    JOIN analytical_generation_capture_inputs AS capture_input
+      ON capture_input.generation_sequence = generation.generation_sequence
+     AND capture_input.run_id = run.run_id
+    JOIN provider_capture_sets AS capture
+      ON capture.capture_receipt_digest = capture_input.capture_receipt_digest
+    JOIN market_data_instrument_revisions AS instrument_revision
+      ON instrument_revision.revision_digest = NEW.instrument_revision_digest
+     AND instrument_revision.instrument_id = NEW.instrument_id
+    WHERE generation.generation_sequence = NEW.origin_generation_sequence
+      AND generation.generation_kind = 'ingest'
+      AND run.run_id = NEW.origin_run_id
+      AND run.state = 'reserved'
+      AND run.operation = 'persist'
+      AND run.source_id = NEW.source_id
+      AND generation.anchor_manifest_id = NEW.origin_anchor_manifest_id
+      AND artifact.artifact_id = NEW.origin_artifact_id
+      AND object.artifact_id = NEW.origin_artifact_id
+      AND object.row_count = NEW.returned_bar_count
+      AND capture_input.capture_receipt_digest = NEW.capture_receipt_digest
+      AND capture_input.source_id = NEW.source_id
+      AND capture.source_id = NEW.source_id
+      AND capture.provider_dataset = NEW.provider_dataset
+      AND capture.terminal_disposition = 'complete_request_graph'
+      AND capture.capture_content_digest = NEW.capture_content_digest
+      AND capture.capture_observation_digest = NEW.capture_observation_digest
+      AND capture.recorded_at_ns = NEW.capture_recorded_at_ns
+      AND instrument_revision.published_at_ns <= run.requested_at_ns
+      AND instrument_revision.effective_start_ns <= NEW.requested_start_ns
+      AND (
+          instrument_revision.effective_end_ns IS NULL
+          OR NEW.requested_end_ns < instrument_revision.effective_end_ns
+      )
+      AND generation.created_at_ns = NEW.published_at_ns
+      AND manifest.created_at_ns = NEW.published_at_ns
+)
+BEGIN
+    SELECT RAISE(ABORT, 'market-bar history publication lineage is invalid');
+END;
+
+CREATE TRIGGER analytical_generation_market_bar_history_inputs_guarded_insert
+BEFORE INSERT ON analytical_generation_market_bar_history_inputs
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM market_bar_history_publications AS publication
+    JOIN analytical_generation_capture_inputs AS capture_input
+      ON capture_input.generation_sequence = NEW.generation_sequence
+     AND capture_input.capture_receipt_digest = publication.capture_receipt_digest
+    WHERE publication.publication_receipt_digest = NEW.publication_receipt_digest
+      AND publication.origin_generation_sequence = NEW.generation_sequence
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM analytical_generations AS child
+    JOIN analytical_generation_parents AS edge
+      ON edge.child_dataset_id = child.dataset_id
+     AND edge.child_manifest_version = child.manifest_version
+    JOIN analytical_generation_market_bar_history_inputs AS parent_input
+      ON parent_input.generation_sequence = edge.parent_generation_sequence
+    JOIN market_bar_history_publications AS publication
+      ON publication.publication_receipt_digest = parent_input.publication_receipt_digest
+    JOIN analytical_generation_capture_inputs AS capture_input
+      ON capture_input.generation_sequence = NEW.generation_sequence
+     AND capture_input.capture_receipt_digest = publication.capture_receipt_digest
+    WHERE child.generation_sequence = NEW.generation_sequence
+      AND child.generation_kind IN ('ingest', 'compaction')
+      AND parent_input.publication_receipt_digest = NEW.publication_receipt_digest
+)
+BEGIN
+    SELECT RAISE(ABORT, 'analytical generation market-bar history input is invalid');
+END;
+
+CREATE TRIGGER market_bar_history_publications_immutable_update
+BEFORE UPDATE ON market_bar_history_publications BEGIN
+    SELECT RAISE(ABORT, 'market-bar history publications are immutable');
+END;
+
+CREATE TRIGGER market_bar_history_publications_immutable_delete
+BEFORE DELETE ON market_bar_history_publications BEGIN
+    SELECT RAISE(ABORT, 'market-bar history publications are immutable');
+END;
+
+CREATE TRIGGER analytical_generation_market_bar_history_inputs_immutable_update
+BEFORE UPDATE ON analytical_generation_market_bar_history_inputs BEGIN
+    SELECT RAISE(ABORT, 'analytical generation market-bar history inputs are immutable');
+END;
+
+CREATE TRIGGER analytical_generation_market_bar_history_inputs_immutable_delete
+BEFORE DELETE ON analytical_generation_market_bar_history_inputs BEGIN
+    SELECT RAISE(ABORT, 'analytical generation market-bar history inputs are immutable');
+END;

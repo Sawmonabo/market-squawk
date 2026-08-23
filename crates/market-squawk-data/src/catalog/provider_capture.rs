@@ -8,6 +8,7 @@ use market_squawk_sources::{
     SourceObjectCaptureIdentity,
 };
 use rusqlite::{Connection, OptionalExtension as _, params};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use super::storage::{append_audit, require_reserved_run, sha256, trusted_catalog_now};
@@ -264,7 +265,7 @@ fn insert_page(
     Ok(())
 }
 
-fn load_provider_capture_for_run(
+pub(crate) fn load_provider_capture_for_run(
     connection: &Connection,
     run_id: Uuid,
 ) -> Result<Option<PersistedProviderCapture>, CatalogError> {
@@ -344,6 +345,8 @@ fn load_provider_capture_for_run(
         || required_digest(&stored.13)? != claim.content_digest()
         || u64::try_from(stored.14).ok() != Some(claim.size_bytes())
         || required_digest(&stored.15)? != claim.physical_receipt_digest()
+        || receipt_digest != sealed_provider_capture_receipt_digest(&capture, &claim)
+        || !capture_matches_claim(&capture, &claim)
     {
         return Err(CatalogError::CorruptCatalog);
     }
@@ -355,6 +358,42 @@ fn load_provider_capture_for_run(
         claim,
         receipt_digest,
     }))
+}
+
+fn capture_matches_claim(
+    capture: &ProviderCaptureSetReceipt,
+    claim: &SealedResearchJournalSegmentClaim,
+) -> bool {
+    capture.pages().len() == claim.frames().len()
+        && capture
+            .pages()
+            .iter()
+            .zip(claim.frames())
+            .all(|(page, frame)| {
+                frame.ordinal() == u32::from(page.ordinal())
+                    && frame.provider_payload_bytes() == page.body_bytes()
+                    && frame.provider_payload_digest() == page.body_digest()
+                    && frame.received_at() == page.received_at()
+            })
+}
+
+fn sealed_provider_capture_receipt_digest(
+    capture: &ProviderCaptureSetReceipt,
+    claim: &SealedResearchJournalSegmentClaim,
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/sealed-provider-capture-receipt/v1");
+    hash_evidence(&mut hash, capture.observation_digest());
+    hash_evidence(&mut hash, claim.physical_receipt_digest());
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn hash_evidence(hash: &mut Sha256, digest: EvidenceDigest) {
+    hash.update([match digest.algorithm() {
+        DigestAlgorithm::Sha256 => 1,
+        DigestAlgorithm::Blake3 => 2,
+    }]);
+    hash.update(digest.bytes());
 }
 
 fn validate_source_revision(

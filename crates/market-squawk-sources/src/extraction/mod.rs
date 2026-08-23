@@ -18,10 +18,12 @@ use crate::{
 
 pub use batch::{ExtractionBatch, ExtractionBatchAccumulator, ExtractionContentIdentity};
 pub use capture::{
-    MAX_PROVIDER_CAPTURE_BYTES, MAX_PROVIDER_CAPTURE_PAGE_BYTES, MAX_PROVIDER_CAPTURE_PAGES,
-    ProviderCaptureError, ProviderCaptureMaterial, ProviderCaptureMaterialSealError,
-    ProviderCapturePageReceipt, ProviderCaptureRequestGraphComponent, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
+    CompleteMarketBarHistoryV1, MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMP_BYTES,
+    MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS, MAX_PROVIDER_CAPTURE_BYTES,
+    MAX_PROVIDER_CAPTURE_PAGE_BYTES, MAX_PROVIDER_CAPTURE_PAGES, ProviderCaptureError,
+    ProviderCaptureMaterial, ProviderCaptureMaterialSealError, ProviderCapturePageReceipt,
+    ProviderCaptureRequestGraphComponent, ProviderCaptureSemanticBinding,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
     SourceObjectCaptureIdentity,
 };
 pub use contracts::{

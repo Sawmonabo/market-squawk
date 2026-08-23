@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 
 mod catalog;
+mod market_history;
 
 #[cfg(feature = "release-evidence")]
 pub use self::catalog::benchmark_support::{
@@ -23,6 +24,11 @@ pub use self::catalog::{
 pub(crate) use self::catalog::{
     CatalogFeatureDataset, CatalogFeatureDatasetPage, CatalogFeatureDatasetSelection,
     CatalogGenerationPage,
+};
+pub(crate) use self::market_history::MarketBarHistoryPublicationCandidate;
+pub use self::market_history::{
+    CompleteMarketBarHistoryRequest, CompleteMarketBarHistorySelection,
+    MarketBarHistoryPublicationReceipt,
 };
 
 /// Fixed maximum number of exact input generations retained by one derived generation.

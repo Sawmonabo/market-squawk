@@ -582,7 +582,7 @@ fn encode_market_bar_series_semantics(
     semantics: &market_squawk_domain::BarTimeSemantics,
 ) -> Result<(), CanonicalEncodingError> {
     encoder.u8(bar_timestamp_basis_tag(semantics.timestamp_basis()))?;
-    encode_market_bar_session(encoder, semantics.session())
+    encode_market_bar_session_family(encoder, semantics.session())
 }
 
 fn encode_market_bar_time(
@@ -591,7 +591,16 @@ fn encode_market_bar_time(
 ) -> Result<(), CanonicalEncodingError> {
     encoder.i64(semantics.period_start().unix_nanos())?;
     encoder.i64(semantics.period_end_exclusive().unix_nanos())?;
-    encode_market_bar_series_semantics(encoder, semantics)
+    encoder.u8(bar_timestamp_basis_tag(semantics.timestamp_basis()))?;
+    encode_market_bar_session(encoder, semantics.session())
+}
+
+fn encode_market_bar_session_family(
+    encoder: &mut CanonicalEncoder<'_>,
+    session: &market_squawk_domain::MarketBarSessionEvidence,
+) -> Result<(), CanonicalEncodingError> {
+    encoder.u8(market_bar_session_kind_tag(session.kind()))?;
+    encoder.str(session.ruleset().as_str())
 }
 
 fn encode_market_bar_session(

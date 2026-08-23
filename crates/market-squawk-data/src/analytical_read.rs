@@ -8,13 +8,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array as _, BinaryArray, Date32Array, Int64Array, StringArray, UInt32Array};
+use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     BarTimestampBasis, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
     FundNavObservation, InstrumentId, MacroObservation, MarketBarAdjustment, MarketBarObservation,
-    MarketBarSessionEvidence, ProviderInstrumentId, ResearchObservation,
+    MarketBarSessionEvidence, MarketBarSessionKind, ProviderInstrumentId, ResearchObservation,
     ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
-use market_squawk_sources::CanonicalObservationFamily;
+use market_squawk_sources::{CanonicalObservationFamily, CanonicalObservationPayload};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -32,11 +33,12 @@ use crate::manifest::{
     CatalogGenerationPage,
 };
 use crate::{
-    AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
-    DatasetSchemaRegistry, DatasetSplitCounts, FeatureDatasetProductContract, GenerationKind,
-    GenerationParent, ManifestCatalogError, ParquetObjectStore, PinnedDataset,
-    PinnedFeatureMonetaryValue, PinnedMonetaryValue, PinnedQueryOutput, QueryError, QueryLimits,
-    QueryRequest, ResearchQueryEngine, Sha256Digest, UniverseId,
+    AnalyticalManifestCatalog, CompleteMarketBarHistoryRequest, CompleteMarketBarHistorySelection,
+    DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
+    DatasetSplitCounts, FeatureDatasetProductContract, GenerationKind, GenerationParent,
+    ManifestCatalogError, ParquetObjectStore, PinnedDataset, PinnedFeatureMonetaryValue,
+    PinnedMonetaryValue, PinnedQueryOutput, QueryError, QueryLimits, QueryRequest,
+    ResearchArrowBatch, ResearchQueryEngine, Sha256Digest, UniverseId,
 };
 use crate::{
     PointInTimeCandidate, PointInTimeLimits, PointInTimePolicy, PointInTimeRequest,
@@ -54,6 +56,9 @@ const MAX_MACRO_SNAPSHOT_TIED_CANDIDATES_PER_SERIES: usize = 8;
 const MAX_OUTCOME_MARKET_BAR_CANDIDATES: usize = 4_096;
 const OUTCOME_MARKET_BAR_QUERY_BYTES: u64 = 64 * 1024 * 1024;
 const OUTCOME_MARKET_BAR_QUERY_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+const COMPLETE_MARKET_BAR_HISTORY_OBJECT_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+const COMPLETE_MARKET_BAR_HISTORY_READ_DOMAIN: &[u8] =
+    b"market-squawk/complete-market-bar-history-read/v1";
 const OBSERVATION_TABLE: &str = "observations";
 
 /// Nonzero caller-selected page size under the analytical service ceiling.
@@ -855,6 +860,16 @@ impl AnalyticalMarketBarReadRequest {
                 "CAST(available_at AS BIGINT) <= {}",
                 self.knowledge_cutoff.unix_nanos()
             ),
+            "received_at IS NOT NULL".to_owned(),
+            format!(
+                "CAST(received_at AS BIGINT) <= {}",
+                self.knowledge_cutoff.unix_nanos()
+            ),
+            "ingested_at IS NOT NULL".to_owned(),
+            format!(
+                "CAST(ingested_at AS BIGINT) <= {}",
+                self.knowledge_cutoff.unix_nanos()
+            ),
             "effective_at IS NOT NULL".to_owned(),
         ];
         if let Some(range) = self.effective_range {
@@ -888,7 +903,8 @@ pub struct OutcomeMarketBarSeries {
     interval: SourceIdentifier,
     adjustment: MarketBarAdjustment,
     timestamp_basis: BarTimestampBasis,
-    session: MarketBarSessionEvidence,
+    session_kind: MarketBarSessionKind,
+    session_ruleset: SourceIdentifier,
 }
 
 impl OutcomeMarketBarSeries {
@@ -906,7 +922,8 @@ impl OutcomeMarketBarSeries {
         interval: SourceIdentifier,
         adjustment: MarketBarAdjustment,
         timestamp_basis: BarTimestampBasis,
-        session: MarketBarSessionEvidence,
+        session_kind: MarketBarSessionKind,
+        session_ruleset: SourceIdentifier,
     ) -> Self {
         Self {
             instrument_id,
@@ -917,7 +934,8 @@ impl OutcomeMarketBarSeries {
             interval,
             adjustment,
             timestamp_basis,
-            session,
+            session_kind,
+            session_ruleset,
         }
     }
 
@@ -961,9 +979,14 @@ impl OutcomeMarketBarSeries {
         self.timestamp_basis
     }
 
-    /// Returns exact session kind, ruleset, and ruleset evidence.
-    pub const fn session(&self) -> &MarketBarSessionEvidence {
-        &self.session
+    /// Returns the stable market-session class.
+    pub const fn session_kind(&self) -> MarketBarSessionKind {
+        self.session_kind
+    }
+
+    /// Returns the stable market-session ruleset identity.
+    pub const fn session_ruleset(&self) -> &SourceIdentifier {
+        &self.session_ruleset
     }
 }
 
@@ -1051,6 +1074,10 @@ impl OutcomeMarketBarRequest {
                AND venue_id = {venue_id} \
                AND available_at IS NOT NULL \
                AND CAST(available_at AS BIGINT) <= {cutoff} \
+               AND received_at IS NOT NULL \
+               AND CAST(received_at AS BIGINT) <= {cutoff} \
+               AND ingested_at IS NOT NULL \
+               AND CAST(ingested_at AS BIGINT) <= {cutoff} \
                AND effective_at IS NOT NULL \
                AND CAST(effective_at AS BIGINT) <= {latest}{completion_lower_bound} \
              ORDER BY effective_at, source_id, venue_id, revision DESC, payload_sha256, \
@@ -1334,6 +1361,83 @@ pub struct AnalyticalMarketBarOutput {
     source_id: SourceId,
     output: PinnedQueryOutput,
     bars: Box<[MarketBarObservation]>,
+}
+
+/// Exact complete daily history plus catalog publication and immutable object-read evidence.
+#[derive(Debug)]
+pub struct CompleteMarketBarHistoryOutput {
+    selection: CompleteMarketBarHistorySelection,
+    read_receipt: CompleteMarketBarHistoryReadReceipt,
+    bars: Box<[MarketBarObservation]>,
+}
+
+/// Non-forgeable receipt for the one origin object that published a complete history window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompleteMarketBarHistoryReadReceipt {
+    selection_digest: Sha256Digest,
+    publication_receipt_digest: Sha256Digest,
+    origin_manifest: DatasetManifestRef,
+    origin_artifact_id: uuid::Uuid,
+    origin_object_ordinal: u16,
+    object_content_hash: Sha256Digest,
+    object_lineage_digest: Sha256Digest,
+    object_row_count: u64,
+    object_size_bytes: u64,
+    result_digest: Sha256Digest,
+}
+
+impl CompleteMarketBarHistoryOutput {
+    /// Returns the restart-safe descendant generation and exact origin publication receipt.
+    pub const fn selection(&self) -> &CompleteMarketBarHistorySelection {
+        &self.selection
+    }
+
+    /// Returns the exact origin object and typed result evidence for this read.
+    pub const fn read_receipt(&self) -> &CompleteMarketBarHistoryReadReceipt {
+        &self.read_receipt
+    }
+
+    /// Returns every exactly expected daily bar in provider-timestamp order.
+    pub fn bars(&self) -> &[MarketBarObservation] {
+        &self.bars
+    }
+}
+
+impl CompleteMarketBarHistoryReadReceipt {
+    /// Returns the exact catalog selection identity consumed by this read.
+    pub const fn selection_digest(&self) -> Sha256Digest {
+        self.selection_digest
+    }
+
+    /// Returns the immutable publication receipt whose exact window was read.
+    pub const fn publication_receipt_digest(&self) -> Sha256Digest {
+        self.publication_receipt_digest
+    }
+
+    /// Returns the original generation that owns the exact publication object.
+    pub const fn origin_manifest(&self) -> &DatasetManifestRef {
+        &self.origin_manifest
+    }
+
+    /// Returns the exact origin artifact and object ordinal.
+    pub const fn origin_object(&self) -> (uuid::Uuid, u16) {
+        (self.origin_artifact_id, self.origin_object_ordinal)
+    }
+
+    /// Returns exact Parquet content, canonical lineage, row-count, and size evidence.
+    pub const fn object_evidence(&self) -> (Sha256Digest, Sha256Digest, u64, u64) {
+        (
+            self.object_content_hash,
+            self.object_lineage_digest,
+            self.object_row_count,
+            self.object_size_bytes,
+        )
+    }
+
+    /// Returns the versioned identity of the verified object read and exact typed result.
+    pub const fn result_digest(&self) -> Sha256Digest {
+        self.result_digest
+    }
 }
 
 /// Typed NAV history plus non-forgeable evidence for its exact manifest-pinned query.
@@ -1732,6 +1836,106 @@ impl AnalyticalReadCapability {
         })
     }
 
+    /// Selects and reads the code-owned complete Alpaca/IEX daily adjusted history product.
+    ///
+    /// Selection, publication clocks, exact provider-calendar timestamps, stable series
+    /// coordinates, revision resolution, and immutable query evidence all fail closed. `None`
+    /// means no complete current-research publication was knowable at the requested cutoff.
+    pub async fn read_complete_market_bar_history(
+        &self,
+        request: CompleteMarketBarHistoryRequest,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Option<CompleteMarketBarHistoryOutput>, AnalyticalReadError> {
+        let Some(selection) =
+            self.manifests
+                .select_complete_market_bar_history(&request, deadline, &cancellation)?
+        else {
+            return Ok(None);
+        };
+        let receipt = selection.receipt();
+        let (origin, origin_source, _) =
+            self.manifests
+                .read_exact(receipt.origin_manifest(), deadline, &cancellation)?;
+        let origin_ordinal = usize::from(receipt.origin_object_ordinal());
+        let origin_object = origin
+            .objects()
+            .get(origin_ordinal)
+            .filter(|object| object.artifact_id() == receipt.origin_artifact_id())
+            .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
+        if origin_source != *receipt.source_id()
+            || origin_object.object().row_count()
+                != u64::try_from(receipt.bar_count())
+                    .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?
+        {
+            return Err(AnalyticalReadError::InvalidMarketBarResult);
+        }
+        let origin_artifact_id = origin_object.artifact_id();
+        let object_content_hash = origin_object.object().content_hash();
+        let object_lineage_digest = origin_object.object().lineage_digest();
+        let object_row_count = origin_object.object().row_count();
+        let object_size_bytes = origin_object.object().size_bytes();
+        let operation_cancellation = cancellation.child_token();
+        let read_cancellation = operation_cancellation.clone();
+        let read = self.objects.read_pinned_object_bounded_async(
+            &origin,
+            origin_artifact_id,
+            origin_ordinal,
+            receipt.bar_count(),
+            COMPLETE_MARKET_BAR_HISTORY_OBJECT_MEMORY_BYTES,
+            &read_cancellation,
+        );
+        tokio::pin!(read);
+        let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(deadline_wait);
+        let batches = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                let _ignored = read.as_mut().await;
+                return Err(AnalyticalReadError::Parquet(crate::ParquetStoreError::Cancelled));
+            }
+            _ = deadline_wait.as_mut() => {
+                operation_cancellation.cancel();
+                let _ignored = read.as_mut().await;
+                return Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded));
+            }
+            result = read.as_mut() => result?,
+        };
+        let bars = decode_complete_market_bar_history_object(
+            batches,
+            &selection,
+            request.knowledge_cutoff(),
+        )?;
+        let result_digest = complete_market_bar_history_read_digest(
+            &selection,
+            origin_artifact_id,
+            receipt.origin_object_ordinal(),
+            object_content_hash,
+            object_lineage_digest,
+            object_row_count,
+            object_size_bytes,
+            &bars,
+        )?;
+        let read_receipt = CompleteMarketBarHistoryReadReceipt {
+            selection_digest: selection.selection_digest(),
+            publication_receipt_digest: receipt.receipt_digest(),
+            origin_manifest: receipt.origin_manifest().clone(),
+            origin_artifact_id,
+            origin_object_ordinal: receipt.origin_object_ordinal(),
+            object_content_hash,
+            object_lineage_digest,
+            object_row_count,
+            object_size_bytes,
+            result_digest,
+        };
+        Ok(Some(CompleteMarketBarHistoryOutput {
+            selection,
+            read_receipt,
+            bars,
+        }))
+    }
+
     /// Reads bounded exact daily NAV history for one resolved fund/share class.
     ///
     /// The query rejects future availability and preserves calendar-date precision. The shared
@@ -2009,7 +2213,7 @@ pub enum AnalyticalReadError {
     #[error("analytical fixed-template query failed: {0}")]
     Query(#[from] QueryError),
     /// Bounded immutable-object reading failed.
-    #[error("analytical forecast object read failed: {0}")]
+    #[error("analytical immutable object read failed: {0}")]
     Parquet(#[from] crate::ParquetStoreError),
     /// Canonical feature-row verification failed.
     #[error("analytical forecast row verification failed: {0}")]
@@ -2424,6 +2628,107 @@ async fn decode_fund_nav_history(
     Ok(observations.into_boxed_slice())
 }
 
+fn decode_complete_market_bar_history_object(
+    batches: Vec<RecordBatch>,
+    selection: &CompleteMarketBarHistorySelection,
+    knowledge_cutoff: Timestamp,
+) -> Result<Box<[MarketBarObservation]>, AnalyticalReadError> {
+    let receipt = selection.receipt();
+    let row_count = batches.iter().try_fold(0_usize, |total, batch| {
+        total
+            .checked_add(batch.num_rows())
+            .ok_or(AnalyticalReadError::InvalidMarketBarResult)
+    })?;
+    if row_count != receipt.bar_count() {
+        return Err(AnalyticalReadError::InvalidMarketBarResult);
+    }
+    let mut bars = Vec::new();
+    bars.try_reserve_exact(row_count)
+        .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
+    for batch in batches {
+        let observations = ResearchArrowBatch::try_from_record_batch(batch)
+            .and_then(|batch| batch.observations())
+            .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
+        for observation in observations {
+            let ResearchObservation::MarketBar(bar) = observation else {
+                return Err(AnalyticalReadError::InvalidMarketBarResult);
+            };
+            let provenance = bar.context().provenance();
+            let available_at = provenance
+                .availability()
+                .conservative_available_at()
+                .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
+            if available_at > knowledge_cutoff
+                || provenance.received_at() > knowledge_cutoff
+                || provenance.ingested_at() > knowledge_cutoff
+            {
+                return Err(AnalyticalReadError::InvalidMarketBarResult);
+            }
+            bars.push(bar);
+        }
+    }
+    bars.sort_unstable_by(|left, right| {
+        left.time_semantics()
+            .provider_timestamp()
+            .cmp(&right.time_semantics().provider_timestamp())
+    });
+    receipt.validate_selected_bars(&bars)?;
+    Ok(bars.into_boxed_slice())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the read digest binds every independently verified object coordinate"
+)]
+fn complete_market_bar_history_read_digest(
+    selection: &CompleteMarketBarHistorySelection,
+    origin_artifact_id: uuid::Uuid,
+    origin_object_ordinal: u16,
+    object_content_hash: Sha256Digest,
+    object_lineage_digest: Sha256Digest,
+    object_row_count: u64,
+    object_size_bytes: u64,
+    bars: &[MarketBarObservation],
+) -> Result<Sha256Digest, AnalyticalReadError> {
+    let receipt = selection.receipt();
+    let origin_manifest = receipt.origin_manifest();
+    let mut hash = Sha256::new();
+    hash.update(COMPLETE_MARKET_BAR_HISTORY_READ_DOMAIN);
+    hash.update(selection.selection_digest().bytes());
+    hash.update(receipt.receipt_digest().bytes());
+    hash_str(&mut hash, origin_manifest.dataset_id().as_str());
+    hash.update(origin_manifest.manifest_version().to_be_bytes());
+    hash_str(&mut hash, origin_manifest.schema().name());
+    hash.update(origin_manifest.schema_version().get().to_be_bytes());
+    hash.update(origin_manifest.schema().fingerprint());
+    hash.update(origin_manifest.content_hash().bytes());
+    hash.update(origin_artifact_id.as_bytes());
+    hash.update(origin_object_ordinal.to_be_bytes());
+    hash.update(object_content_hash.bytes());
+    hash.update(object_lineage_digest.bytes());
+    hash.update(object_row_count.to_be_bytes());
+    hash.update(object_size_bytes.to_be_bytes());
+    hash.update(receipt.bar_set_digest().bytes());
+    hash.update(
+        u64::try_from(bars.len())
+            .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?
+            .to_be_bytes(),
+    );
+    for bar in bars {
+        let observation = ResearchObservation::MarketBar(bar.clone());
+        let payload = CanonicalObservationPayload::try_from_observation(&observation)
+            .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
+        hash.update(
+            bar.time_semantics()
+                .provider_timestamp()
+                .unix_nanos()
+                .to_be_bytes(),
+        );
+        hash_evidence(&mut hash, payload.identity());
+    }
+    Ok(Sha256Digest::new(hash.finalize().into()))
+}
+
 fn decode_market_bars(
     output: &PinnedQueryOutput,
     request: &AnalyticalMarketBarReadRequest,
@@ -2436,6 +2741,8 @@ fn decode_market_bars(
         let provenance = candidate.bar.context().provenance();
         if provenance.instrument_id() != Some(request.instrument_id)
             || candidate.available_at > request.knowledge_cutoff
+            || provenance.received_at() > request.knowledge_cutoff
+            || provenance.ingested_at() > request.knowledge_cutoff
             || request.effective_range.is_some_and(|range| {
                 candidate.effective_at < range.start || candidate.effective_at > range.end
             })
@@ -2639,6 +2946,8 @@ fn select_outcome_from_output(
             || provenance.source_id() != &request.series.source_id
             || provenance.venue_id() != Some(&request.series.venue_id)
             || candidate.available_at > request.knowledge_cutoff
+            || provenance.received_at() > request.knowledge_cutoff
+            || provenance.ingested_at() > request.knowledge_cutoff
             || candidate.effective_at > request.latest_eligible_completion
             || effective_before_horizon
         {
@@ -2724,12 +3033,13 @@ fn outcome_series_matches(bar: &MarketBarObservation, series: &OutcomeMarketBarS
         && bar.interval() == &series.interval
         && bar.adjustment() == series.adjustment
         && bar.time_semantics().timestamp_basis() == series.timestamp_basis
-        && bar.time_semantics().session() == &series.session
+        && bar.time_semantics().session().kind() == series.session_kind
+        && bar.time_semantics().session().ruleset() == &series.session_ruleset
 }
 
 fn outcome_market_bar_request_digest(request: &OutcomeMarketBarRequest) -> EvidenceDigest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/outcome-market-bar-request/v1");
+    hash.update(b"market-squawk/outcome-market-bar-request/v2");
     hash_manifest(&mut hash, request.manifest());
     let series = request.series();
     hash.update(series.instrument_id().as_uuid().as_bytes());
@@ -2740,7 +3050,7 @@ fn outcome_market_bar_request_digest(request: &OutcomeMarketBarRequest) -> Evide
     hash_str(&mut hash, series.interval().as_str());
     hash.update([market_bar_adjustment_digest_tag(series.adjustment())]);
     hash.update([bar_timestamp_basis_digest_tag(series.timestamp_basis())]);
-    hash_market_bar_session(&mut hash, series.session());
+    hash_market_bar_session_family(&mut hash, series.session_kind(), series.session_ruleset());
     hash_timestamp(&mut hash, request.knowledge_cutoff());
     hash_timestamp(&mut hash, request.horizon());
     hash_timestamp(&mut hash, request.latest_eligible_completion());
@@ -2778,7 +3088,7 @@ fn outcome_market_bar_receipt_digest(
     hash.update([bar_timestamp_basis_digest_tag(
         bar.time_semantics().timestamp_basis(),
     )]);
-    hash_market_bar_session(&mut hash, bar.time_semantics().session());
+    hash_market_bar_session_evidence(&mut hash, bar.time_semantics().session());
     let close = bar.close().amount().normalize();
     hash.update(close.mantissa().to_be_bytes());
     hash.update(close.scale().to_be_bytes());
@@ -2790,14 +3100,22 @@ fn outcome_market_bar_receipt_digest(
     ))
 }
 
-fn hash_market_bar_session(hash: &mut Sha256, session: &MarketBarSessionEvidence) {
-    hash.update([match session.kind() {
+fn hash_market_bar_session_family(
+    hash: &mut Sha256,
+    session_kind: MarketBarSessionKind,
+    session_ruleset: &SourceIdentifier,
+) {
+    hash.update([match session_kind {
         market_squawk_domain::MarketBarSessionKind::Regular => 1,
         market_squawk_domain::MarketBarSessionKind::Extended => 2,
         market_squawk_domain::MarketBarSessionKind::Continuous => 3,
         market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
     }]);
-    hash_str(hash, session.ruleset().as_str());
+    hash_str(hash, session_ruleset.as_str());
+}
+
+fn hash_market_bar_session_evidence(hash: &mut Sha256, session: &MarketBarSessionEvidence) {
+    hash_market_bar_session_family(hash, session.kind(), session.ruleset());
     hash_evidence(hash, session.evidence());
 }
 

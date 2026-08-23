@@ -92,7 +92,7 @@ pub use self::types::{
 };
 pub(crate) use observed_revisions::CatalogObservedRevisionAuthority;
 pub use observed_revisions::StoredObservedRevision;
-pub(crate) use provider_capture::provider_capture_matches_batch;
+pub(crate) use provider_capture::{load_provider_capture_for_run, provider_capture_matches_batch};
 pub use publication::PublishedIngest;
 #[cfg(test)]
 pub(crate) use query_artifacts::QueryArtifactBindCheckpoint;

@@ -692,18 +692,6 @@ impl AlpacaHistoricalEquityDatasetPlan {
     pub const fn series_semantics(&self) -> &AlpacaHistoricalSeriesSemantics {
         &self.series_semantics
     }
-
-    pub(crate) fn matches_preflight(
-        &self,
-        preflight: &AlpacaHistoricalEquityPreflightPlan,
-    ) -> bool {
-        self.mapping == preflight.mapping
-            && self.timeframe == preflight.timeframe
-            && self.start == preflight.start
-            && self.end == preflight.end
-            && self.adjustment == preflight.adjustment
-            && self.page_limit == preflight.page_limit
-    }
 }
 
 /// One source-generation-bound historical IEX request dataset.
@@ -818,7 +806,7 @@ impl AlpacaHistoricalEquityDataset {
         digest.update([bar_timestamp_basis_tag(
             self.series_semantics.timestamp_basis(),
         )]);
-        hash_session(&mut digest, self.series_semantics.session());
+        hash_session_coordinates(&mut digest, self.series_semantics.session());
         SourceIdentifier::try_from(format!(
             "{ANALYTICAL_DATASET_PREFIX}{}",
             encode_lower_hex(digest.finalize().into())
@@ -836,6 +824,42 @@ pub struct AlpacaHistoricalEquityConfig {
 }
 
 impl AlpacaHistoricalEquityConfig {
+    /// Constructs generation-wide delayed-IEX historical metadata without inventing a click
+    /// window or historical knowledge time.
+    ///
+    /// The supplied mappings declare only the bounded instruments this generation may later
+    /// admit. Each click still needs terminal provider pages, exact range-calendar authority, and
+    /// first-observed availability before [`Self::try_bind_one_plan`] can construct a source.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "source evidence and request bounds stay explicit"
+    )]
+    pub fn try_parent_metadata(
+        source_id: SourceId,
+        revision_evidence: RevisionBoundPayloadEvidence,
+        authorization: AuthorizationGrant,
+        coverage_evidence: ExactPayloadEvidence,
+        effective: EffectiveInterval,
+        mappings: Vec<AlpacaInstrumentMapping>,
+        freshness: FreshnessPolicy,
+        budget: ProviderBudgetPolicy,
+        request_bounds: HttpRequestBounds,
+    ) -> Result<SourceMetadata, AlpacaError> {
+        validate_authorization_and_budget(&authorization, &budget)?;
+        validate_equity_mappings(&mappings, 4_096)?;
+        historical_parent_metadata(
+            source_id,
+            revision_evidence,
+            authorization,
+            coverage_evidence,
+            effective,
+            &mappings,
+            freshness,
+            budget,
+            request_bounds,
+        )
+    }
+
     /// Constructs an extraction-only IEX bars profile.
     #[allow(
         clippy::too_many_arguments,
@@ -856,51 +880,29 @@ impl AlpacaHistoricalEquityConfig {
         if datasets.is_empty() || datasets.len() > 4_096 {
             return Err(AlpacaError::InvalidCoverage);
         }
-        let instruments = datasets
-            .iter()
-            .map(|dataset| dataset.mapping.instrument())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let mut asset_classes = Vec::new();
+        let mut mappings = Vec::new();
+        mappings
+            .try_reserve_exact(datasets.len())
+            .map_err(|_| AlpacaError::Allocation)?;
         for dataset in &datasets {
-            let asset_class = dataset.mapping.asset_class();
-            if !asset_classes.contains(&asset_class) {
-                asset_classes.push(asset_class);
+            if !mappings
+                .iter()
+                .any(|mapping: &AlpacaInstrumentMapping| mapping == &dataset.mapping)
+            {
+                mappings.push(dataset.mapping.clone());
             }
         }
-        let provider = SourceIdentifier::try_from(ALPACA_PROVIDER)?;
-        let metadata = SourceMetadata::try_new(SourceMetadataInput::new(
-            SchemaVersion::CURRENT,
+        let metadata = Self::try_parent_metadata(
             source_id,
             revision_evidence,
-            SourceClass::Broker,
-            provider,
             authorization,
-            SourceCoverage::try_instrument(
-                coverage_evidence,
-                effective,
-                asset_classes,
-                CoverageTopology::partial_venues(vec![VenueId::try_from(IEX_VENUE)?])?,
-                InstrumentCoverage::enumerated(instruments)?,
-                None,
-                CoverageDelay::Delayed(ALPACA_HISTORICAL_EXCLUSION_NANOS),
-                DeliveryEvidence::AuthorizedBroker,
-            )?,
-            DataQuality::Aggregated,
-            NetworkAccessPolicy::Allowlisted(historical_endpoint_policy(request_bounds)?),
+            coverage_evidence,
+            effective,
+            mappings,
             freshness,
-            Some(budget),
-            SourceCapabilities::new(
-                false,
-                true,
-                SequenceCapability::Unsupported,
-                ChecksumCapability::Unsupported,
-                HistoricalCapability::Historical,
-                false,
-            ),
-            SourceProtocolProfile::NotLive,
-        ))?;
+            budget,
+            request_bounds,
+        )?;
         let mut by_id = BTreeMap::new();
         for plan in datasets {
             let dataset = AlpacaHistoricalEquityDataset::bind(&metadata, plan)?;
@@ -995,8 +997,8 @@ fn validate_historical_parent_metadata(
             InstrumentCoverageMembership::Enumerated
                 | InstrumentCoverageMembership::EvidenceBackedUniverse
         )
-        || !metadata.is_effective_at(plan.start)
-        || !metadata.is_effective_at(plan.end)
+        || !coverage.is_effective_at(plan.start)
+        || !coverage.is_effective_at(plan.end)
     {
         return Err(AlpacaError::InvalidCoverage);
     }
@@ -1041,6 +1043,67 @@ fn validate_historical_parent_surface(
     }
     let budget = metadata.budget_policy().ok_or(AlpacaError::InvalidBudget)?;
     validate_authorization_and_budget(metadata.authorization(), budget)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "source evidence and request bounds stay explicit"
+)]
+fn historical_parent_metadata(
+    source_id: SourceId,
+    revision_evidence: RevisionBoundPayloadEvidence,
+    authorization: AuthorizationGrant,
+    coverage_evidence: ExactPayloadEvidence,
+    effective: EffectiveInterval,
+    mappings: &[AlpacaInstrumentMapping],
+    freshness: FreshnessPolicy,
+    budget: ProviderBudgetPolicy,
+    request_bounds: HttpRequestBounds,
+) -> Result<SourceMetadata, AlpacaError> {
+    let instruments = mappings
+        .iter()
+        .map(AlpacaInstrumentMapping::instrument)
+        .collect::<Vec<_>>();
+    let mut asset_classes = Vec::new();
+    for mapping in mappings {
+        let asset_class = mapping.asset_class();
+        if !asset_classes.contains(&asset_class) {
+            asset_classes.push(asset_class);
+        }
+    }
+    let provider = SourceIdentifier::try_from(ALPACA_PROVIDER)?;
+    SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        source_id,
+        revision_evidence,
+        SourceClass::Broker,
+        provider,
+        authorization,
+        SourceCoverage::try_instrument(
+            coverage_evidence,
+            effective,
+            asset_classes,
+            CoverageTopology::partial_venues(vec![VenueId::try_from(IEX_VENUE)?])?,
+            InstrumentCoverage::enumerated(instruments)?,
+            None,
+            CoverageDelay::Delayed(ALPACA_HISTORICAL_EXCLUSION_NANOS),
+            DeliveryEvidence::AuthorizedBroker,
+        )?,
+        DataQuality::Aggregated,
+        NetworkAccessPolicy::Allowlisted(historical_endpoint_policy(request_bounds)?),
+        freshness,
+        Some(budget),
+        SourceCapabilities::new(
+            false,
+            true,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            HistoricalCapability::Historical,
+            false,
+        ),
+        SourceProtocolProfile::NotLive,
+    ))
+    .map_err(Into::into)
 }
 
 fn provider_dataset_identifier(
@@ -1094,7 +1157,7 @@ fn provider_dataset_identifier_from_parts(
     hash_timestamp(&mut digest, start);
     hash_timestamp(&mut digest, end);
     digest.update([bar_timestamp_basis_tag(series_semantics.timestamp_basis())]);
-    hash_session(&mut digest, series_semantics.session());
+    hash_session_coordinates(&mut digest, series_semantics.session());
     SourceIdentifier::try_from(format!(
         "{PROVIDER_DATASET_PREFIX}{}",
         encode_lower_hex(digest.finalize().into())
@@ -1149,7 +1212,7 @@ fn hash_evidence(hash: &mut Sha256, evidence: EvidenceDigest) {
     hash.update(evidence.bytes());
 }
 
-fn hash_session(hash: &mut Sha256, session: &MarketBarSessionEvidence) {
+fn hash_session_coordinates(hash: &mut Sha256, session: &MarketBarSessionEvidence) {
     hash.update([match session.kind() {
         market_squawk_domain::MarketBarSessionKind::Regular => 1,
         market_squawk_domain::MarketBarSessionKind::Extended => 2,
@@ -1157,7 +1220,6 @@ fn hash_session(hash: &mut Sha256, session: &MarketBarSessionEvidence) {
         market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
     }]);
     hash_str(hash, session.ruleset().as_str());
-    hash_evidence(hash, session.evidence());
 }
 
 fn hash_str(hash: &mut Sha256, value: &str) {

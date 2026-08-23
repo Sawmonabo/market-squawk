@@ -28,6 +28,7 @@ use crate::catalog::CatalogObservedRevisionAuthority;
 use crate::catalog::QueryArtifactBindCheckpoint;
 use crate::catalog::QueryArtifactPublisher;
 use crate::catalog::provider_capture_matches_batch;
+use crate::manifest::MarketBarHistoryPublicationCandidate;
 use crate::parquet_store::MAX_SCAN_OBJECTS;
 use crate::parquet_store::{ArtifactRootIdentity, QueryArtifactWriterAdmission};
 use crate::query::QueryArtifactMemoryLease;
@@ -1246,6 +1247,7 @@ impl AnalyticalDataService {
             &schema,
             &object,
             None,
+            None,
         )? {
             return Ok(committed);
         }
@@ -1261,6 +1263,7 @@ impl AnalyticalDataService {
             plan,
             published,
             GenerationKind::Compaction,
+            None,
             None,
             None,
         )
@@ -1354,6 +1357,12 @@ impl AnalyticalDataService {
         }
         let dataset_name = SourceIdentifier::try_from(analytical_dataset.as_str())
             .map_err(|_| IngestError::InvalidDataset)?;
+        let observations = ResearchArrowBatch::validated_extraction_observations(&batch)?;
+        let market_bar_history = MarketBarHistoryPublicationCandidate::try_from_batch(
+            &batch,
+            &observations,
+            provider_capture.as_ref().map(ProviderCaptureInput::receipt),
+        )?;
         {
             let authority = self.lock_authority()?;
             let run =
@@ -1372,11 +1381,11 @@ impl AnalyticalDataService {
                 run.state(),
                 &analytical_dataset,
                 company_identity.as_ref(),
+                market_bar_history.as_ref(),
             )? {
                 return Ok(committed);
             }
         }
-        let observations = ResearchArrowBatch::validated_extraction_observations(&batch)?;
         let revision_plan = match revision_plan {
             Some(plan) => plan,
             None => {
@@ -1468,6 +1477,7 @@ impl AnalyticalDataService {
             &schema,
             &object,
             company_identity.as_ref(),
+            market_bar_history.as_ref(),
         )? {
             return Ok(committed);
         }
@@ -1485,6 +1495,7 @@ impl AnalyticalDataService {
             GenerationKind::Ingest,
             precommit_authority.as_deref(),
             company_identity.as_ref(),
+            market_bar_history.as_ref(),
         )
     }
 
@@ -1744,6 +1755,7 @@ impl AnalyticalDataService {
         state: IngestRunState,
         dataset_id: &DatasetId,
         company_identity: Option<&CompanyIdentityObservation>,
+        market_bar_history: Option<&MarketBarHistoryPublicationCandidate>,
     ) -> Result<Option<CommittedDataset>, IngestError> {
         let Some(existing) = self.manifests.for_run(reservation.run_id())? else {
             return match state {
@@ -1752,7 +1764,11 @@ impl AnalyticalDataService {
                 IngestRunState::Failed => Err(IngestError::TerminalRun),
             };
         };
-        if existing.manifest().dataset_id() != dataset_id {
+        if existing.manifest().dataset_id() != dataset_id
+            || !self
+                .manifests
+                .market_bar_history_candidate_matches(existing.manifest(), market_bar_history)?
+        {
             return Err(IngestError::ReplayConflict);
         }
         match state {
@@ -1786,6 +1802,7 @@ impl AnalyticalDataService {
         schema: &DatasetSchemaRef,
         object: &ManifestObject,
         company_identity: Option<&CompanyIdentityObservation>,
+        market_bar_history: Option<&MarketBarHistoryPublicationCandidate>,
     ) -> Result<Option<CommittedDataset>, IngestError> {
         let Some(existing) = self.manifests.for_run(reservation.run_id())? else {
             return match state {
@@ -1797,6 +1814,9 @@ impl AnalyticalDataService {
         if existing.manifest().dataset_id() != dataset_id
             || existing.manifest().schema() != schema
             || existing.plan().objects().last() != Some(object)
+            || !self
+                .manifests
+                .market_bar_history_candidate_matches(existing.manifest(), market_bar_history)?
         {
             return Err(IngestError::ReplayConflict);
         }
@@ -1834,6 +1854,7 @@ impl AnalyticalDataService {
         kind: GenerationKind,
         precommit_authority: Option<&dyn IngestPrecommitAuthority>,
         company_identity: Option<&CompanyIdentityObservation>,
+        market_bar_history: Option<&MarketBarHistoryPublicationCandidate>,
     ) -> Result<CommittedDataset, IngestError> {
         if run.state() != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
@@ -1866,6 +1887,7 @@ impl AnalyticalDataService {
                 GenerationKind::Ingest => Some(run),
                 GenerationKind::Compaction | GenerationKind::Derived => None,
             },
+            market_bar_history,
         )?;
         authority.complete_ingest_with_company_identity(
             reservation,

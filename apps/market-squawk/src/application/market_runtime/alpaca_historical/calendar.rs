@@ -2,9 +2,12 @@
 
 use std::{sync::Arc, time::Instant};
 
+use chrono::{DateTime, Datelike as _, LocalResult, NaiveDate, TimeZone as _, Utc};
+use chrono_tz::America::New_York;
+
 use market_squawk_adapter_alpaca::{
     ALPACA_HISTORICAL_CALENDAR_MAX_RESPONSE_BYTES, ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS,
-    AlpacaAuthenticatedCalendarExecutor, AlpacaAuthenticatedCalendarRequest,
+    AlpacaAdjustment, AlpacaAuthenticatedCalendarExecutor, AlpacaAuthenticatedCalendarRequest,
     AlpacaAuthenticatedCalendarResponse, AlpacaError, AlpacaHistoricalBarTimeAuthority,
     AlpacaHistoricalBarTimeRequest, AlpacaHistoricalEquityConfig,
     AlpacaHistoricalEquityPreflightReceipt, AlpacaHistoricalReturnedBarTime,
@@ -12,12 +15,13 @@ use market_squawk_adapter_alpaca::{
 };
 use market_squawk_domain::{
     AvailabilityEvidence, BarTimeSemantics, BarTimestampBasis, CalendarDate, DigestAlgorithm,
-    EvidenceDigest, ExactPayloadEvidence, InstrumentId, MarketBarSessionEvidence,
-    MarketBarSessionKind, ProviderInstrumentId, SourceIdentifier, Timestamp, VenueId,
+    EvidenceDigest, ExactPayloadEvidence, InstrumentId, MarketBarAdjustment,
+    MarketBarSessionEvidence, MarketBarSessionKind, ProviderInstrumentId, SourceIdentifier,
+    Timestamp, VenueId,
 };
 use market_squawk_sources::{
-    BudgetDecision, BudgetPermit, HttpRequestBounds, ProviderCaptureMaterial, SharedProviderBudget,
-    apply_http_retry_after,
+    BudgetDecision, BudgetPermit, CompleteMarketBarHistoryV1, HttpRequestBounds,
+    ProviderCaptureMaterial, SharedProviderBudget, apply_http_retry_after,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -73,11 +77,16 @@ pub(crate) struct AlpacaHistoricalCompositeCalendarAuthority {
     instrument_id: InstrumentId,
     provider_instrument_id: ProviderInstrumentId,
     venue_id: VenueId,
+    feed: SourceIdentifier,
     timeframe: SourceIdentifier,
+    requested_start: Timestamp,
+    requested_end: Timestamp,
+    adjustment: MarketBarAdjustment,
     range_responses: Box<[RetainedCalendarRangeResponse]>,
     sessions: Box<[ExactCalendarSession]>,
     fragments: Box<[ExactCalendarFragment]>,
     series_semantics: AlpacaHistoricalSeriesSemantics,
+    expected_provider_timestamps: Box<[Timestamp]>,
     retained_response_bytes: usize,
 }
 
@@ -94,6 +103,40 @@ impl AlpacaHistoricalCompositeCalendarAuthority {
         self.retained_response_bytes
     }
 
+    pub(crate) fn history_capture_semantic(
+        &self,
+        instrument_revision_digest: EvidenceDigest,
+        admitted_plan_digest: EvidenceDigest,
+    ) -> Result<CompleteMarketBarHistoryV1, AlpacaHistoricalCalendarError> {
+        let mut expected_provider_timestamps = Vec::new();
+        expected_provider_timestamps
+            .try_reserve_exact(self.expected_provider_timestamps.len())
+            .map_err(|_| AlpacaHistoricalCalendarError::Allocation)?;
+        expected_provider_timestamps.extend_from_slice(&self.expected_provider_timestamps);
+        CompleteMarketBarHistoryV1::try_new(
+            self.requested_start,
+            self.requested_end,
+            self.instrument_id,
+            instrument_revision_digest,
+            admitted_plan_digest,
+            self.provider_instrument_id.clone(),
+            self.venue_id.clone(),
+            self.feed.clone(),
+            self.timeframe.clone(),
+            self.adjustment,
+            self.series_semantics.timestamp_basis(),
+            self.series_semantics.session().kind(),
+            self.series_semantics.session().ruleset().clone(),
+            SourceIdentifier::try_from("alpaca-iex-historical-bars-and-calendar/v1")
+                .map_err(|_| AlpacaHistoricalCalendarError::Identity)?,
+            0,
+            1,
+            expected_provider_timestamps,
+            self.series_semantics.session().evidence(),
+        )
+        .map_err(|_| AlpacaHistoricalCalendarError::ConflictingFragment)
+    }
+
     /// Returns the accepted exact range-calendar response as source-neutral capture material.
     ///
     /// Refusal attempts remain bounded telemetry in this authority and are intentionally excluded.
@@ -105,14 +148,8 @@ impl AlpacaHistoricalCompositeCalendarAuthority {
         preflight: &AlpacaHistoricalEquityPreflightReceipt,
     ) -> Result<ProviderCaptureMaterial, AlpacaHistoricalCalendarError> {
         self.validate_current()?;
-        let first_returned = preflight
-            .returned_bar_times()
-            .first()
-            .ok_or(AlpacaHistoricalCalendarError::UnsupportedOrEmptyPlan)?;
-        let last_returned = preflight
-            .returned_bar_times()
-            .last()
-            .ok_or(AlpacaHistoricalCalendarError::UnsupportedOrEmptyPlan)?;
+        let start_date = utc_calendar_date(preflight.plan().start())?;
+        let end_date = utc_calendar_date(preflight.plan().end())?;
         let timeframe = preflight.plan().timeframe().provider_identifier()?;
         if preflight.digest() != self.preflight_digest
             || preflight.plan().mapping().instrument() != self.instrument_id
@@ -128,8 +165,8 @@ impl AlpacaHistoricalCompositeCalendarAuthority {
         validate_range_responses(&self.range_responses, successful.response.request())?;
         if successful.response.status() != 200
             || successful.received_at != successful.response.received_at()
-            || successful.response.request().start_date() != first_returned.calendar_date()
-            || successful.response.request().end_date() != last_returned.calendar_date()
+            || successful.response.request().start_date() != start_date
+            || successful.response.request().end_date() != end_date
         {
             return Err(AlpacaHistoricalCalendarError::InvalidRangeResponse);
         }
@@ -253,14 +290,8 @@ impl AlpacaHistoricalRuntimeCapability {
         let timeframe = SourceIdentifier::try_from("1Day")
             .map_err(|_| AlpacaHistoricalCalendarError::Identity)?;
         let returned_bar_times = preflight.returned_bar_times();
-        let start_date = returned_bar_times
-            .first()
-            .map(|returned| returned.calendar_date())
-            .ok_or(AlpacaHistoricalCalendarError::UnsupportedOrEmptyPlan)?;
-        let end_date = returned_bar_times
-            .last()
-            .map(|returned| returned.calendar_date())
-            .ok_or(AlpacaHistoricalCalendarError::UnsupportedOrEmptyPlan)?;
+        let start_date = utc_calendar_date(preflight.plan().start())?;
+        let end_date = utc_calendar_date(preflight.plan().end())?;
         let environment = self.trading_api_environment();
         let transport_request =
             AlpacaAuthenticatedCalendarRequest::try_new(environment, start_date, end_date)?;
@@ -304,6 +335,10 @@ impl AlpacaHistoricalRuntimeCapability {
         let mut fragments = Vec::new();
         fragments
             .try_reserve_exact(returned_bar_times.len())
+            .map_err(|_| AlpacaHistoricalCalendarError::Allocation)?;
+        let mut expected_provider_timestamps = Vec::new();
+        expected_provider_timestamps
+            .try_reserve_exact(range_rows.len())
             .map_err(|_| AlpacaHistoricalCalendarError::Allocation)?;
         let mut retained_response_bytes =
             range_responses
@@ -351,20 +386,31 @@ impl AlpacaHistoricalRuntimeCapability {
                 successful.received_at,
             )?;
             let calendar = Arc::new(try_produce_alpaca_iex_utc_daily_calendar(fetch_result)?);
+            let expected_provider_timestamp = alpaca_daily_provider_timestamp(row.date)?;
+            let resolved_semantics = calendar.resolve_at(
+                &venue_id,
+                &timeframe,
+                expected_provider_timestamp,
+                clock.now()?,
+            )?;
+            let expected_in_plan = expected_provider_timestamp >= preflight.plan().start()
+                && expected_provider_timestamp <= preflight.plan().end()
+                && resolved_semantics.period_end_exclusive() <= preflight.plan().end();
             let returned = returned_bar_times
                 .binary_search_by_key(&row.date, |returned| returned.calendar_date())
                 .ok()
                 .and_then(|index| returned_bar_times.get(index));
-            let original_semantics = returned
-                .map(|returned| {
-                    calendar.resolve_at(
-                        &venue_id,
-                        &timeframe,
-                        returned.provider_timestamp(),
-                        clock.now()?,
-                    )
+            if expected_in_plan {
+                expected_provider_timestamps.push(expected_provider_timestamp);
+            }
+            if expected_in_plan != returned.is_some()
+                || returned.is_some_and(|returned| {
+                    returned.provider_timestamp() != expected_provider_timestamp
                 })
-                .transpose()?;
+            {
+                return Err(AlpacaHistoricalCalendarError::MissingReturnedSession);
+            }
+            let original_semantics = expected_in_plan.then_some(resolved_semantics);
             let authority = Arc::new(AlpacaPreauthorizedBarTimeAuthority::try_new(
                 calendar,
                 Arc::clone(&clock),
@@ -388,7 +434,13 @@ impl AlpacaHistoricalRuntimeCapability {
         self.validate_current(cancellation).await?;
         validate_sessions(&sessions)?;
         validate_fragments(&fragments)?;
-        if fragments.len() != returned_bar_times.len() {
+        if expected_provider_timestamps.len() != returned_bar_times.len()
+            || expected_provider_timestamps
+                .iter()
+                .zip(returned_bar_times)
+                .any(|(expected, returned)| *expected != returned.provider_timestamp())
+            || fragments.len() != returned_bar_times.len()
+        {
             return Err(AlpacaHistoricalCalendarError::MissingReturnedSession);
         }
         let session_digest = composite_session_digest(
@@ -410,6 +462,9 @@ impl AlpacaHistoricalRuntimeCapability {
             session_digest,
         )
         .map_err(|_| AlpacaHistoricalCalendarError::Identity)?;
+        let feed = SourceIdentifier::try_from("iex")
+            .map_err(|_| AlpacaHistoricalCalendarError::Identity)?;
+        let adjustment = market_bar_adjustment(preflight.plan().adjustment());
         let series_semantics =
             AlpacaHistoricalSeriesSemantics::new(BarTimestampBasis::PeriodStart, session);
         Ok(Arc::new(AlpacaHistoricalCompositeCalendarAuthority {
@@ -418,11 +473,16 @@ impl AlpacaHistoricalRuntimeCapability {
             instrument_id,
             provider_instrument_id,
             venue_id,
+            feed,
             timeframe,
+            requested_start: preflight.plan().start(),
+            requested_end: preflight.plan().end(),
+            adjustment,
             range_responses,
             sessions: sessions.into_boxed_slice(),
             fragments: fragments.into_boxed_slice(),
             series_semantics,
+            expected_provider_timestamps: expected_provider_timestamps.into_boxed_slice(),
             retained_response_bytes,
         }))
     }
@@ -667,6 +727,51 @@ fn parse_calendar_date(value: &str) -> Result<CalendarDate, AlpacaHistoricalCale
         .map_err(|_| AlpacaHistoricalCalendarError::InvalidRangeResponse)?;
     CalendarDate::new(year, month, day)
         .map_err(|_| AlpacaHistoricalCalendarError::InvalidRangeResponse)
+}
+
+fn utc_calendar_date(value: Timestamp) -> Result<CalendarDate, AlpacaHistoricalCalendarError> {
+    let date = DateTime::<Utc>::from_timestamp_nanos(value.unix_nanos()).date_naive();
+    CalendarDate::new(
+        u16::try_from(date.year()).map_err(|_| AlpacaHistoricalCalendarError::RequestMismatch)?,
+        u8::try_from(date.month()).map_err(|_| AlpacaHistoricalCalendarError::RequestMismatch)?,
+        u8::try_from(date.day()).map_err(|_| AlpacaHistoricalCalendarError::RequestMismatch)?,
+    )
+    .map_err(|_| AlpacaHistoricalCalendarError::RequestMismatch)
+}
+
+fn alpaca_daily_provider_timestamp(
+    date: CalendarDate,
+) -> Result<Timestamp, AlpacaHistoricalCalendarError> {
+    let local_date = NaiveDate::from_ymd_opt(
+        i32::from(date.year()),
+        u32::from(date.month()),
+        u32::from(date.day()),
+    )
+    .ok_or(AlpacaHistoricalCalendarError::InvalidRangeResponse)?;
+    let local_midnight = local_date
+        .and_hms_opt(0, 0, 0)
+        .ok_or(AlpacaHistoricalCalendarError::InvalidRangeResponse)?;
+    let local = match New_York.from_local_datetime(&local_midnight) {
+        LocalResult::Single(value) => value,
+        LocalResult::Ambiguous(_, _) | LocalResult::None => {
+            return Err(AlpacaHistoricalCalendarError::InvalidRangeResponse);
+        }
+    };
+    local
+        .with_timezone(&Utc)
+        .timestamp_nanos_opt()
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(AlpacaHistoricalCalendarError::InvalidRangeResponse)
+}
+
+const fn market_bar_adjustment(adjustment: AlpacaAdjustment) -> MarketBarAdjustment {
+    match adjustment {
+        AlpacaAdjustment::Raw => MarketBarAdjustment::Raw,
+        AlpacaAdjustment::Split => MarketBarAdjustment::Split,
+        AlpacaAdjustment::Dividend => MarketBarAdjustment::Dividend,
+        AlpacaAdjustment::SpinOff => MarketBarAdjustment::SpinOff,
+        AlpacaAdjustment::All => MarketBarAdjustment::All,
+    }
 }
 
 fn validate_sessions(
@@ -964,7 +1069,7 @@ pub(crate) enum AlpacaHistoricalCalendarError {
     ResponseBoundExceeded,
     #[error("duplicate or conflicting exact calendar fragments were returned")]
     ConflictingFragment,
-    #[error("the returned historical bars were not all covered by exact calendar sessions")]
+    #[error("the exact requested calendar-session set and returned historical-bar set differ")]
     MissingReturnedSession,
     #[error("calendar identity construction failed")]
     Identity,

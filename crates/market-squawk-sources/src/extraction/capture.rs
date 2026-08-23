@@ -1,11 +1,14 @@
 //! Bounded, source-neutral provider response capture receipts.
 
+use std::mem::size_of;
 use std::num::NonZeroU16;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+    BarTimestampBasis, DigestAlgorithm, EvidenceDigest, InstrumentId, MarketBarAdjustment,
+    MarketBarSessionKind, MetadataRevision, ProviderInstrumentId, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
 };
 use market_squawk_platform::{
     RawCaptureRecord, SealedResearchJournalSegmentReceipt, SealedResearchJournalStore,
@@ -27,6 +30,11 @@ pub const MAX_PROVIDER_CAPTURE_PAGE_BYTES: u64 =
 /// This remains conservatively sealable below the 512 MiB `MSJ1` bound even under worst-case JSON
 /// byte-array expansion in the committed raw-envelope wire.
 pub const MAX_PROVIDER_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum exact expected provider timestamps retained by one complete market-bar history graph.
+pub const MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS: usize = 10_000;
+/// Maximum architecture-independent timestamp bytes retained by that exact expected set.
+pub const MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMP_BYTES: usize =
+    MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS * size_of::<i64>();
 
 /// Exact terminal condition observed after the last ordered response page.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -48,6 +56,262 @@ impl ProviderCaptureTerminalDisposition {
             Self::CompleteRequestGraph => b"complete_request_graph",
         }
     }
+}
+
+/// Version-one semantic proof attached only to a complete market-bar history request graph.
+///
+/// The exact expected provider timestamp set is retained directly rather than hidden behind an
+/// identifier. That lets publication validate requested-range completeness after restart without
+/// reopening provider transport or trusting a sidecar.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteMarketBarHistoryV1 {
+    requested_start: Timestamp,
+    requested_end: Timestamp,
+    instrument_id: InstrumentId,
+    instrument_revision_digest: EvidenceDigest,
+    admitted_plan_digest: EvidenceDigest,
+    provider_instrument_id: ProviderInstrumentId,
+    venue_id: VenueId,
+    feed: SourceIdentifier,
+    interval: SourceIdentifier,
+    adjustment: MarketBarAdjustment,
+    timestamp_basis: BarTimestampBasis,
+    session_kind: MarketBarSessionKind,
+    session_ruleset: SourceIdentifier,
+    graph_purpose: SourceIdentifier,
+    market_bar_component_ordinal: u16,
+    session_calendar_component_ordinal: u16,
+    expected_provider_timestamps: Box<[Timestamp]>,
+    completeness_evidence: EvidenceDigest,
+}
+
+impl CompleteMarketBarHistoryV1 {
+    /// Constructs a bounded, nonempty, strictly ordered exact expected-session set.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "requested coordinates and stable series identity remain explicit"
+    )]
+    pub fn try_new(
+        requested_start: Timestamp,
+        requested_end: Timestamp,
+        instrument_id: InstrumentId,
+        instrument_revision_digest: EvidenceDigest,
+        admitted_plan_digest: EvidenceDigest,
+        provider_instrument_id: ProviderInstrumentId,
+        venue_id: VenueId,
+        feed: SourceIdentifier,
+        interval: SourceIdentifier,
+        adjustment: MarketBarAdjustment,
+        timestamp_basis: BarTimestampBasis,
+        session_kind: MarketBarSessionKind,
+        session_ruleset: SourceIdentifier,
+        graph_purpose: SourceIdentifier,
+        market_bar_component_ordinal: u16,
+        session_calendar_component_ordinal: u16,
+        expected_provider_timestamps: Vec<Timestamp>,
+        completeness_evidence: EvidenceDigest,
+    ) -> Result<Self, ProviderCaptureError> {
+        if requested_start >= requested_end
+            || expected_provider_timestamps.is_empty()
+            || expected_provider_timestamps.len() > MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS
+            || expected_provider_timestamps
+                .len()
+                .checked_mul(size_of::<i64>())
+                .is_none_or(|bytes| bytes > MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMP_BYTES)
+            || completeness_evidence.algorithm() != DigestAlgorithm::Sha256
+            || completeness_evidence.bytes() == [0; 32]
+            || instrument_revision_digest.algorithm() != DigestAlgorithm::Sha256
+            || instrument_revision_digest.bytes() == [0; 32]
+            || admitted_plan_digest.algorithm() != DigestAlgorithm::Sha256
+            || admitted_plan_digest.bytes() == [0; 32]
+            || market_bar_component_ordinal != 0
+            || session_calendar_component_ordinal != 1
+        {
+            return Err(ProviderCaptureError::InvalidMarketBarHistorySemantics);
+        }
+        let mut previous = None;
+        for timestamp in &expected_provider_timestamps {
+            if *timestamp < requested_start
+                || *timestamp > requested_end
+                || previous.is_some_and(|prior| prior >= *timestamp)
+            {
+                return Err(ProviderCaptureError::InvalidMarketBarHistorySemantics);
+            }
+            previous = Some(*timestamp);
+        }
+        Ok(Self {
+            requested_start,
+            requested_end,
+            instrument_id,
+            instrument_revision_digest,
+            admitted_plan_digest,
+            provider_instrument_id,
+            venue_id,
+            feed,
+            interval,
+            adjustment,
+            timestamp_basis,
+            session_kind,
+            session_ruleset,
+            graph_purpose,
+            market_bar_component_ordinal,
+            session_calendar_component_ordinal,
+            expected_provider_timestamps: expected_provider_timestamps.into_boxed_slice(),
+            completeness_evidence,
+        })
+    }
+
+    /// Returns the inclusive provider request start.
+    pub const fn requested_start(&self) -> Timestamp {
+        self.requested_start
+    }
+
+    /// Returns the inclusive provider request end.
+    pub const fn requested_end(&self) -> Timestamp {
+        self.requested_end
+    }
+
+    /// Returns the canonical instrument expected in every bar.
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the exact canonical instrument-definition revision used by plan admission.
+    pub const fn instrument_revision_digest(&self) -> EvidenceDigest {
+        self.instrument_revision_digest
+    }
+
+    /// Returns the exact immutable application plan that admitted this capture.
+    pub const fn admitted_plan_digest(&self) -> EvidenceDigest {
+        self.admitted_plan_digest
+    }
+
+    /// Returns the exact provider-native instrument identity.
+    pub const fn provider_instrument_id(&self) -> &ProviderInstrumentId {
+        &self.provider_instrument_id
+    }
+
+    /// Returns the exact venue expected in every bar.
+    pub const fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+
+    /// Returns the exact provider feed.
+    pub const fn feed(&self) -> &SourceIdentifier {
+        &self.feed
+    }
+
+    /// Returns the exact provider bar interval.
+    pub const fn interval(&self) -> &SourceIdentifier {
+        &self.interval
+    }
+
+    /// Returns the corporate-action adjustment contract.
+    pub const fn adjustment(&self) -> MarketBarAdjustment {
+        self.adjustment
+    }
+
+    /// Returns which exact boundary anchors provider timestamps.
+    pub const fn timestamp_basis(&self) -> BarTimestampBasis {
+        self.timestamp_basis
+    }
+
+    /// Returns the source-neutral session class shared by every expected bar.
+    pub const fn session_kind(&self) -> MarketBarSessionKind {
+        self.session_kind
+    }
+
+    /// Returns the exact session-ruleset identity shared by every expected bar.
+    pub const fn session_ruleset(&self) -> &SourceIdentifier {
+        &self.session_ruleset
+    }
+
+    /// Returns the versioned complete-request-graph composition purpose.
+    pub const fn graph_purpose(&self) -> &SourceIdentifier {
+        &self.graph_purpose
+    }
+
+    /// Returns the request-graph component containing the exact market-bar responses.
+    pub const fn market_bar_component_ordinal(&self) -> u16 {
+        self.market_bar_component_ordinal
+    }
+
+    /// Returns the request-graph component containing the session-calendar response.
+    pub const fn session_calendar_component_ordinal(&self) -> u16 {
+        self.session_calendar_component_ordinal
+    }
+
+    /// Returns every expected provider timestamp in strict ascending order.
+    pub fn expected_provider_timestamps(&self) -> &[Timestamp] {
+        &self.expected_provider_timestamps
+    }
+
+    /// Returns provider/calendar evidence that established exact set equality.
+    pub const fn completeness_evidence(&self) -> EvidenceDigest {
+        self.completeness_evidence
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompleteMarketBarHistoryV1Wire {
+    requested_start: Timestamp,
+    requested_end: Timestamp,
+    instrument_id: InstrumentId,
+    instrument_revision_digest: EvidenceDigest,
+    admitted_plan_digest: EvidenceDigest,
+    provider_instrument_id: ProviderInstrumentId,
+    venue_id: VenueId,
+    feed: SourceIdentifier,
+    interval: SourceIdentifier,
+    adjustment: MarketBarAdjustment,
+    timestamp_basis: BarTimestampBasis,
+    session_kind: MarketBarSessionKind,
+    session_ruleset: SourceIdentifier,
+    graph_purpose: SourceIdentifier,
+    market_bar_component_ordinal: u16,
+    session_calendar_component_ordinal: u16,
+    expected_provider_timestamps: BoundedVec<Timestamp, MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS>,
+    completeness_evidence: EvidenceDigest,
+}
+
+impl<'de> Deserialize<'de> for CompleteMarketBarHistoryV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CompleteMarketBarHistoryV1Wire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.requested_start,
+            wire.requested_end,
+            wire.instrument_id,
+            wire.instrument_revision_digest,
+            wire.admitted_plan_digest,
+            wire.provider_instrument_id,
+            wire.venue_id,
+            wire.feed,
+            wire.interval,
+            wire.adjustment,
+            wire.timestamp_basis,
+            wire.session_kind,
+            wire.session_ruleset,
+            wire.graph_purpose,
+            wire.market_bar_component_ordinal,
+            wire.session_calendar_component_ordinal,
+            wire.expected_provider_timestamps.into_vec(),
+            wire.completeness_evidence,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Closed semantic binding carried by a complete provider request graph.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "receipt", rename_all = "snake_case")]
+pub enum ProviderCaptureSemanticBinding {
+    /// Exact requested and expected daily market-bar history coordinates.
+    CompleteMarketBarHistoryV1(CompleteMarketBarHistoryV1),
 }
 
 /// One independently complete request component retained inside an ordered request graph.
@@ -278,6 +542,7 @@ pub struct ProviderCaptureSetReceipt {
     total_body_bytes: u64,
     pages: Box<[ProviderCapturePageReceipt]>,
     request_graph_components: Box<[ProviderCaptureRequestGraphComponent]>,
+    semantic_binding: Option<ProviderCaptureSemanticBinding>,
     content_digest: EvidenceDigest,
     observation_digest: EvidenceDigest,
 }
@@ -300,6 +565,7 @@ impl ProviderCaptureSetReceipt {
             terminal,
             pages,
             Vec::new(),
+            None,
         )
     }
 
@@ -315,6 +581,7 @@ impl ProviderCaptureSetReceipt {
         terminal: ProviderCaptureTerminalDisposition,
         pages: Vec<ProviderCapturePageReceipt>,
         request_graph_components: Vec<ProviderCaptureRequestGraphComponent>,
+        semantic_binding: Option<ProviderCaptureSemanticBinding>,
     ) -> Result<Self, ProviderCaptureError> {
         require_sha256_identity(request_set_identity)?;
         if pages.is_empty() {
@@ -349,7 +616,7 @@ impl ProviderCaptureSetReceipt {
         match terminal {
             ProviderCaptureTerminalDisposition::StandaloneResponse
             | ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage => {
-                if !request_graph_components.is_empty() {
+                if !request_graph_components.is_empty() || semantic_binding.is_some() {
                     return Err(ProviderCaptureError::RequestGraphInvalid);
                 }
                 validate_page_chain(terminal, &pages)?;
@@ -361,6 +628,16 @@ impl ProviderCaptureSetReceipt {
                     &pages,
                     &request_graph_components,
                 )?;
+                if let Some(semantic_binding) = semantic_binding.as_ref() {
+                    validate_semantic_graph_binding(
+                        semantic_binding,
+                        &source_id,
+                        &metadata_revision,
+                        &dataset,
+                        request_set_identity,
+                        &request_graph_components,
+                    )?;
+                }
             }
         }
         let content_digest = if terminal == ProviderCaptureTerminalDisposition::CompleteRequestGraph
@@ -373,6 +650,7 @@ impl ProviderCaptureSetReceipt {
                 total_body_bytes,
                 &pages,
                 &request_graph_components,
+                semantic_binding.as_ref(),
             )
         } else {
             capture_content_digest(
@@ -400,6 +678,7 @@ impl ProviderCaptureSetReceipt {
             total_body_bytes,
             pages: pages.into_boxed_slice(),
             request_graph_components: request_graph_components.into_boxed_slice(),
+            semantic_binding,
             content_digest,
             observation_digest,
         })
@@ -445,6 +724,11 @@ impl ProviderCaptureSetReceipt {
         &self.request_graph_components
     }
 
+    /// Returns the typed complete-request semantic proof, when this graph carries one.
+    pub const fn semantic_binding(&self) -> Option<&ProviderCaptureSemanticBinding> {
+        self.semantic_binding.as_ref()
+    }
+
     /// Returns the stable provider-content identity, excluding receive/storage facts.
     pub const fn content_digest(&self) -> EvidenceDigest {
         self.content_digest
@@ -468,6 +752,7 @@ struct ProviderCaptureSetReceiptWire {
     pages: BoundedVec<ProviderCapturePageReceipt, MAX_PROVIDER_CAPTURE_PAGES>,
     request_graph_components:
         BoundedVec<ProviderCaptureRequestGraphComponent, MAX_PROVIDER_CAPTURE_PAGES>,
+    semantic_binding: Option<ProviderCaptureSemanticBinding>,
     content_digest: EvidenceDigest,
     observation_digest: EvidenceDigest,
 }
@@ -486,6 +771,7 @@ impl<'de> Deserialize<'de> for ProviderCaptureSetReceipt {
             wire.terminal,
             wire.pages.into_vec(),
             wire.request_graph_components.into_vec(),
+            wire.semantic_binding,
         )
         .map_err(serde::de::Error::custom)?;
         if rebuilt.total_body_bytes != wire.total_body_bytes
@@ -593,6 +879,58 @@ impl ProviderCaptureMaterial {
         dataset: SourceIdentifier,
         request_set_identity: EvidenceDigest,
         components: Vec<Self>,
+    ) -> Result<Self, ProviderCaptureError> {
+        Self::try_combine_request_graph_inner(dataset, request_set_identity, components, None)
+    }
+
+    /// Combines a complete request graph with one typed, hash-bound semantic proof.
+    ///
+    /// The semantic is retained inside the canonical capture receipt and therefore follows the
+    /// same raw-storage, run-lineage, generation-lineage, and restart verification path as its
+    /// exact provider response components. The graph request identity is derived here from the
+    /// semantic's versioned purpose and the exact ordered component receipts; callers cannot
+    /// supply or accidentally drift that authority-critical hash.
+    pub fn try_combine_request_graph_with_semantic(
+        dataset: SourceIdentifier,
+        components: Vec<Self>,
+        semantic_binding: ProviderCaptureSemanticBinding,
+    ) -> Result<Self, ProviderCaptureError> {
+        if components.len() < 2 {
+            return Err(ProviderCaptureError::RequestGraphInvalid);
+        }
+        if components.len() > MAX_PROVIDER_CAPTURE_PAGES {
+            return Err(ProviderCaptureError::PageLimitExceeded {
+                max: MAX_PROVIDER_CAPTURE_PAGES,
+            });
+        }
+        let first = components
+            .first()
+            .ok_or(ProviderCaptureError::RequestGraphInvalid)?;
+        let purpose = match &semantic_binding {
+            ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) => {
+                binding.graph_purpose()
+            }
+        };
+        let request_set_identity = semantic_material_request_graph_identity(
+            first.receipt.source_id(),
+            first.receipt.metadata_revision(),
+            &dataset,
+            purpose,
+            &components,
+        );
+        Self::try_combine_request_graph_inner(
+            dataset,
+            request_set_identity,
+            components,
+            Some(semantic_binding),
+        )
+    }
+
+    fn try_combine_request_graph_inner(
+        dataset: SourceIdentifier,
+        request_set_identity: EvidenceDigest,
+        components: Vec<Self>,
+        semantic_binding: Option<ProviderCaptureSemanticBinding>,
     ) -> Result<Self, ProviderCaptureError> {
         require_sha256_identity(request_set_identity)?;
         if components.len() < 2 {
@@ -705,6 +1043,7 @@ impl ProviderCaptureMaterial {
             ProviderCaptureTerminalDisposition::CompleteRequestGraph,
             pages,
             framing,
+            semantic_binding,
         )?;
         Self::try_new(receipt, records)
     }
@@ -958,6 +1297,9 @@ pub enum ProviderCaptureError {
     /// A complete request graph cannot be used as another graph's component.
     #[error("nested provider capture request graphs are not admitted")]
     NestedRequestGraph,
+    /// Complete market-bar history semantic coordinates are invalid or unbounded.
+    #[error("complete market-bar history capture semantics are invalid")]
+    InvalidMarketBarHistorySemantics,
 }
 
 fn require_sha256_identity(digest: EvidenceDigest) -> Result<(), ProviderCaptureError> {
@@ -1067,6 +1409,103 @@ fn validate_request_graph_components(
     Ok(())
 }
 
+fn validate_semantic_graph_binding(
+    semantic_binding: &ProviderCaptureSemanticBinding,
+    source_id: &SourceId,
+    metadata_revision: &MetadataRevision,
+    dataset: &SourceIdentifier,
+    request_set_identity: EvidenceDigest,
+    components: &[ProviderCaptureRequestGraphComponent],
+) -> Result<(), ProviderCaptureError> {
+    let ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) = semantic_binding;
+    let market_bar_component = components
+        .get(usize::from(binding.market_bar_component_ordinal))
+        .ok_or(ProviderCaptureError::RequestGraphInvalid)?;
+    let session_calendar_component = components
+        .get(usize::from(binding.session_calendar_component_ordinal))
+        .ok_or(ProviderCaptureError::RequestGraphInvalid)?;
+    if market_bar_component.ordinal != binding.market_bar_component_ordinal
+        || session_calendar_component.ordinal != binding.session_calendar_component_ordinal
+        || request_set_identity
+            != semantic_request_graph_identity(
+                source_id,
+                metadata_revision,
+                dataset,
+                &binding.graph_purpose,
+                components,
+            )
+    {
+        return Err(ProviderCaptureError::RequestGraphInvalid);
+    }
+    Ok(())
+}
+
+fn semantic_request_graph_identity(
+    source_id: &SourceId,
+    metadata_revision: &MetadataRevision,
+    dataset: &SourceIdentifier,
+    purpose: &SourceIdentifier,
+    components: &[ProviderCaptureRequestGraphComponent],
+) -> EvidenceDigest {
+    request_graph_identity_from_fields(
+        source_id,
+        metadata_revision,
+        dataset,
+        purpose,
+        components.len(),
+        components
+            .iter()
+            .map(|component| (&component.dataset, component.request_set_identity)),
+    )
+}
+
+fn semantic_material_request_graph_identity(
+    source_id: &SourceId,
+    metadata_revision: &MetadataRevision,
+    dataset: &SourceIdentifier,
+    purpose: &SourceIdentifier,
+    components: &[ProviderCaptureMaterial],
+) -> EvidenceDigest {
+    request_graph_identity_from_fields(
+        source_id,
+        metadata_revision,
+        dataset,
+        purpose,
+        components.len(),
+        components.iter().map(|component| {
+            (
+                component.receipt().dataset(),
+                component.receipt().request_set_identity(),
+            )
+        }),
+    )
+}
+
+fn request_graph_identity_from_fields<'a>(
+    source_id: &SourceId,
+    metadata_revision: &MetadataRevision,
+    dataset: &SourceIdentifier,
+    purpose: &SourceIdentifier,
+    component_count: usize,
+    components: impl IntoIterator<Item = (&'a SourceIdentifier, EvidenceDigest)>,
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/provider-request-graph-composition/v1\0");
+    hash_field(&mut hash, purpose.as_str().as_bytes());
+    hash_field(&mut hash, source_id.as_str().as_bytes());
+    hash_field(
+        &mut hash,
+        metadata_revision.as_source_identifier().as_str().as_bytes(),
+    );
+    hash_field(&mut hash, dataset.as_str().as_bytes());
+    hash.update((component_count as u64).to_be_bytes());
+    for (component_dataset, component_request_identity) in components {
+        hash_field(&mut hash, component_dataset.as_str().as_bytes());
+        hash.update(component_request_identity.bytes());
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "all stable capture coordinates are bound"
@@ -1116,9 +1555,14 @@ fn request_graph_content_digest(
     total_body_bytes: u64,
     pages: &[ProviderCapturePageReceipt],
     components: &[ProviderCaptureRequestGraphComponent],
+    semantic_binding: Option<&ProviderCaptureSemanticBinding>,
 ) -> EvidenceDigest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/provider-capture-request-graph-content/v1");
+    hash.update(if semantic_binding.is_some() {
+        b"market-squawk/provider-capture-request-graph-content/v2".as_slice()
+    } else {
+        b"market-squawk/provider-capture-request-graph-content/v1".as_slice()
+    });
     hash_field(&mut hash, source_id.as_str().as_bytes());
     hash_field(
         &mut hash,
@@ -1139,6 +1583,9 @@ fn request_graph_content_digest(
         hash.update(component.total_body_bytes.to_be_bytes());
         hash_digest(&mut hash, component.content_digest);
     }
+    if let Some(semantic_binding) = semantic_binding {
+        hash_semantic_binding(&mut hash, semantic_binding);
+    }
     hash.update((pages.len() as u64).to_be_bytes());
     for page in pages {
         hash.update(page.ordinal.to_be_bytes());
@@ -1150,6 +1597,51 @@ fn request_graph_content_digest(
         hash_digest(&mut hash, page.body_digest);
     }
     EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn hash_semantic_binding(hash: &mut Sha256, semantic_binding: &ProviderCaptureSemanticBinding) {
+    let ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) = semantic_binding;
+    hash.update([1]);
+    hash.update(b"complete_market_bar_history_v1");
+    hash.update(binding.requested_start.unix_nanos().to_be_bytes());
+    hash.update(binding.requested_end.unix_nanos().to_be_bytes());
+    hash.update(binding.instrument_id.as_uuid().as_bytes());
+    hash_digest(hash, binding.instrument_revision_digest);
+    hash_digest(hash, binding.admitted_plan_digest);
+    hash_field(hash, binding.provider_instrument_id.as_str().as_bytes());
+    hash_field(hash, binding.venue_id.as_str().as_bytes());
+    hash_field(hash, binding.feed.as_str().as_bytes());
+    hash_field(hash, binding.interval.as_str().as_bytes());
+    hash.update([match binding.adjustment {
+        MarketBarAdjustment::Raw => 1,
+        MarketBarAdjustment::Split => 2,
+        MarketBarAdjustment::Dividend => 3,
+        MarketBarAdjustment::SpinOff => 4,
+        MarketBarAdjustment::All => 5,
+    }]);
+    hash.update([match binding.timestamp_basis {
+        BarTimestampBasis::PeriodStart => 1,
+        BarTimestampBasis::PeriodEnd => 2,
+    }]);
+    hash.update([match binding.session_kind {
+        MarketBarSessionKind::Regular => 1,
+        MarketBarSessionKind::Extended => 2,
+        MarketBarSessionKind::Continuous => 3,
+        MarketBarSessionKind::ProviderDefined => 4,
+    }]);
+    hash_field(hash, binding.session_ruleset.as_str().as_bytes());
+    hash_field(hash, binding.graph_purpose.as_str().as_bytes());
+    hash.update(binding.market_bar_component_ordinal.to_be_bytes());
+    hash.update(binding.session_calendar_component_ordinal.to_be_bytes());
+    hash.update(
+        u64::try_from(binding.expected_provider_timestamps.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for timestamp in &binding.expected_provider_timestamps {
+        hash.update(timestamp.unix_nanos().to_be_bytes());
+    }
+    hash_digest(hash, binding.completeness_evidence);
 }
 
 fn capture_observation_digest(

@@ -42,11 +42,12 @@ pub use analytical_read::{
     AnalyticalMacroLatestKnownRequest, AnalyticalMacroSeriesAllowlist, AnalyticalMarketBarOutput,
     AnalyticalMarketBarReadLimit, AnalyticalMarketBarReadRequest, AnalyticalObservationOutput,
     AnalyticalObservationReadRequest, AnalyticalObservationTemplate, AnalyticalReadCapability,
-    AnalyticalReadError, AnalyticalReadLimit, ForecastDatasetEvidence,
-    ForecastDatasetEvidenceFence, ForecastDatasetReadLimits, ForecastFeatureRow,
-    ForecastFeatureValue, FundNavDateRange, MarketBarEffectiveRange, ObservationKnowledgeRange,
-    OutcomeMarketBarRequest, OutcomeMarketBarSelectedReceipt, OutcomeMarketBarSelection,
-    OutcomeMarketBarSeries, OutcomeMarketBarUnavailableReason,
+    AnalyticalReadError, AnalyticalReadLimit, CompleteMarketBarHistoryOutput,
+    CompleteMarketBarHistoryReadReceipt, ForecastDatasetEvidence, ForecastDatasetEvidenceFence,
+    ForecastDatasetReadLimits, ForecastFeatureRow, ForecastFeatureValue, FundNavDateRange,
+    MarketBarEffectiveRange, ObservationKnowledgeRange, OutcomeMarketBarRequest,
+    OutcomeMarketBarSelectedReceipt, OutcomeMarketBarSelection, OutcomeMarketBarSeries,
+    OutcomeMarketBarUnavailableReason,
 };
 pub use arrow_convert::{
     ArrowConversionError, DatasetArrowBatch, DatasetSchemaError, DatasetSchemaRef,
@@ -133,11 +134,13 @@ pub use ingest::{
     extraction_provider_payload_digest,
 };
 pub use manifest::{
-    AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
-    DerivedGenerationParents, GenerationKind, GenerationParent, GenerationParentRelation,
-    MAX_DERIVED_GENERATION_PARENTS, MAX_RETAINED_FEATURE_DATASET_PRODUCTION_ADMISSIONS,
+    AnalyticalManifestCatalog, CompleteMarketBarHistoryRequest, CompleteMarketBarHistorySelection,
+    DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DerivedGenerationParents,
+    GenerationKind, GenerationParent, GenerationParentRelation, MAX_DERIVED_GENERATION_PARENTS,
+    MAX_RETAINED_FEATURE_DATASET_PRODUCTION_ADMISSIONS,
     MAX_RETAINED_FEATURE_DATASET_PRODUCTION_PAYLOAD_BYTES, ManifestCatalogError, ManifestObject,
-    ManifestPlan, ManifestPlanError, PinnedDataset, PinnedManifestObject, Sha256Digest,
+    ManifestPlan, ManifestPlanError, MarketBarHistoryPublicationReceipt, PinnedDataset,
+    PinnedManifestObject, Sha256Digest,
 };
 #[cfg(feature = "release-evidence")]
 pub use manifest::{

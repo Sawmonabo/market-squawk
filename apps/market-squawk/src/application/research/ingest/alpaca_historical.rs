@@ -20,14 +20,15 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     AuthorizationMode, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch,
     ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
-    HttpRequestBounds, SourceError, SourceMetadata, SourceMetadataProvider,
+    HttpRequestBounds, ProviderCaptureMaterial, ProviderCaptureSemanticBinding, SourceError,
+    SourceMetadata, SourceMetadataProvider,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::{
     ManagedExtraction, ManagedResearchExtractionSource, ResearchRevisionPlanError,
-    bind_provider_capture_graph,
+    invalid_capture_protocol,
 };
 use crate::{
     application::market_runtime::{
@@ -444,6 +445,7 @@ impl ManagedResearchExtractionSource for AlpacaHistoricalManagedSource {
                 .extract_plan_with_capture(
                     record.config.clone(),
                     record.canonical_instrument.clone(),
+                    record.plan_digest,
                     bar_time_authority,
                     preflight,
                     authority,
@@ -451,11 +453,14 @@ impl ManagedResearchExtractionSource for AlpacaHistoricalManagedSource {
                     cancellation,
                 )
                 .await?;
-            let (batch, bar_capture, calendar_capture) = output.into_parts();
-            bind_provider_capture_graph(
+            let (batch, bar_capture, calendar_capture, history_capture_semantic) =
+                output.into_parts();
+            bind_complete_market_history_capture_graph(
                 batch,
-                b"alpaca-iex-historical-bars-and-calendar/v1",
                 vec![bar_capture, calendar_capture],
+                ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(
+                    history_capture_semantic,
+                ),
             )
         })
     }
@@ -495,6 +500,28 @@ impl ManagedResearchExtractionSource for AlpacaHistoricalManagedSource {
             .map(Some)
             .map_err(|_error| ResearchRevisionPlanError)
     }
+}
+
+fn bind_complete_market_history_capture_graph(
+    batch: ExtractionBatch,
+    components: Vec<ProviderCaptureMaterial>,
+    semantic_binding: ProviderCaptureSemanticBinding,
+) -> Result<ManagedExtraction, ExtractionSourceError> {
+    let dataset = batch.request().object().dataset().clone();
+    let capture_material = ProviderCaptureMaterial::try_combine_request_graph_with_semantic(
+        dataset,
+        components,
+        semantic_binding,
+    )
+    .map_err(|_error| invalid_capture_protocol())?;
+    let batch = batch
+        .try_bind_provider_capture(capture_material.receipt())
+        .map_err(|_error| invalid_capture_protocol())?;
+    Ok(ManagedExtraction {
+        batch,
+        company_identity: None,
+        capture_material: Some(capture_material),
+    })
 }
 
 impl AlpacaHistoricalPlanDirectoryInner {

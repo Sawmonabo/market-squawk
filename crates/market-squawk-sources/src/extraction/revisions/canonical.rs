@@ -272,10 +272,7 @@ fn encode_market_bar_session(
     session: &market_squawk_domain::MarketBarSessionEvidence,
 ) -> Result<(), PitV1EncodingError> {
     encoder.u8(market_bar_session_kind_tag(session.kind()))?;
-    encoder.str(session.ruleset().as_str())?;
-    let evidence = session.evidence();
-    encoder.u8(digest_algorithm_tag(evidence.algorithm()))?;
-    encoder.bytes(&evidence.bytes())
+    encoder.str(session.ruleset().as_str())
 }
 
 const fn bar_timestamp_basis_tag(basis: market_squawk_domain::BarTimestampBasis) -> u8 {
@@ -291,13 +288,6 @@ const fn market_bar_session_kind_tag(kind: market_squawk_domain::MarketBarSessio
         market_squawk_domain::MarketBarSessionKind::Extended => 2,
         market_squawk_domain::MarketBarSessionKind::Continuous => 3,
         market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
-    }
-}
-
-const fn digest_algorithm_tag(algorithm: DigestAlgorithm) -> u8 {
-    match algorithm {
-        DigestAlgorithm::Sha256 => 1,
-        DigestAlgorithm::Blake3 => 2,
     }
 }
 

@@ -63,11 +63,12 @@ pub use direct_order_book::{
 };
 pub use extraction::{
     AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, CanonicalObservationFamily,
-    CanonicalObservationPayload, DiscoveryBatch, DiscoveryRequest, DiscoveryRequestId,
-    ExtractionAuthorityError, ExtractionBatch, ExtractionBatchAccumulator,
+    CanonicalObservationPayload, CompleteMarketBarHistoryV1, DiscoveryBatch, DiscoveryRequest,
+    DiscoveryRequestId, ExtractionAuthorityError, ExtractionBatch, ExtractionBatchAccumulator,
     ExtractionContentIdentity, ExtractionError, ExtractionRecord, ExtractionRedirectPermit,
     ExtractionRequest, ExtractionRequestId, ExtractionRequestPermit, ExtractionRevisionEvidence,
     ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, InFlightExtractionRequest,
+    MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMP_BYTES, MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS,
     MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORD_BYTES,
     MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
     MAX_OBSERVED_REVISION_BATCH_BYTES, MAX_OBSERVED_REVISION_BATCH_RECORDS,
@@ -78,9 +79,9 @@ pub use extraction::{
     ObservedVersionEvidence, ObservedVersionKind, PitV1CanonicalEncoder, PitV1EncodingControl,
     PitV1EncodingError, ProviderCaptureError, ProviderCaptureMaterial,
     ProviderCaptureMaterialSealError, ProviderCapturePageReceipt,
-    ProviderCaptureRequestGraphComponent, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt, SourceObject,
-    SourceObjectCaptureIdentity, payload_matches_exact_evidence,
+    ProviderCaptureRequestGraphComponent, ProviderCaptureSemanticBinding,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
+    SourceObject, SourceObjectCaptureIdentity, payload_matches_exact_evidence,
 };
 pub use health::{
     AuthorizationHealth, BudgetHealth, ConnectionLiveness, CoverageHealth, HealthErrorClass,
