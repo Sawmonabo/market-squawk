@@ -26,16 +26,19 @@ use market_squawk_sources::{
     CompleteMarketBarHistoryV1, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
     ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan, ExtractionSource,
     ExtractionSourceError, HttpRequestBounds, ProviderCaptureMaterial, ProviderRateDeclaration,
-    SharedProviderBudget, SourceError,
+    SharedProviderBudget, SourceError, SourceMetadata,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::application::ResearchRightsAuthority;
 use crate::provider_activation::{
     AlpacaBasicAccountActivation, ProviderAccountBinding, ProviderMarketAccount,
 };
+
+use super::MarketRuntimeGroupGeneration;
 
 mod calendar;
 pub(crate) use calendar::AlpacaHistoricalCompositeCalendarAuthority;
@@ -114,6 +117,10 @@ pub(crate) struct AlpacaHistoricalRuntimeCapability {
 }
 
 impl AlpacaHistoricalRuntimeCapability {
+    pub(crate) fn group_generation(&self) -> MarketRuntimeGroupGeneration {
+        self.inner.group_generation
+    }
+
     pub(crate) fn account_binding(&self) -> &ProviderAccountBinding {
         &self.inner.account_binding
     }
@@ -146,25 +153,20 @@ impl AlpacaHistoricalRuntimeCapability {
         self.inner.trading_api_environment
     }
 
-    pub(crate) fn is_revoked(&self) -> bool {
-        !self.inner.accepting.load(Ordering::Acquire) || self.inner.cancellation.is_cancelled()
+    pub(crate) fn historical_metadata(&self) -> &SourceMetadata {
+        &self.inner.historical_metadata
     }
 
-    /// Claims the sole long-lived historical source wrapper for this parent generation.
-    ///
-    /// The claim is intentionally generation-lifetime and is never recycled for a per-click
-    /// profile or replacement. A fresh account generation is required to claim another wrapper.
-    pub(crate) fn try_claim_plan_source(&self) -> Result<bool, AlpacaHistoricalCapabilityError> {
-        self.validate_current_now()?;
-        let claimed = self
-            .inner
-            .plan_source_claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if claimed {
-            self.inner.ensure_usable()?;
-        }
-        Ok(claimed)
+    pub(crate) fn historical_request_bounds(&self) -> HttpRequestBounds {
+        self.inner.historical_request_bounds
+    }
+
+    pub(crate) fn historical_rights(&self) -> &ResearchRightsAuthority {
+        &self.inner.historical_rights
+    }
+
+    pub(crate) fn is_revoked(&self) -> bool {
+        !self.inner.accepting.load(Ordering::Acquire) || self.inner.cancellation.is_cancelled()
     }
 
     pub(crate) async fn require_current(
@@ -425,7 +427,7 @@ impl AlpacaHistoricalRuntimeCapability {
         self.inner.ensure_usable()
     }
 
-    fn validate_current_now(&self) -> Result<(), AlpacaHistoricalCapabilityError> {
+    pub(crate) fn validate_current_now(&self) -> Result<(), AlpacaHistoricalCapabilityError> {
         self.inner.ensure_usable()?;
         if !(self.inner.synchronous_currentness)() {
             return Err(AlpacaHistoricalCapabilityError::Stale);
@@ -457,6 +459,10 @@ pub(super) struct AlpacaHistoricalCapabilityOwner {
 impl AlpacaHistoricalCapabilityOwner {
     pub(super) fn try_new(
         activation: &AlpacaBasicAccountActivation,
+        group_generation: MarketRuntimeGroupGeneration,
+        historical_metadata: SourceMetadata,
+        historical_request_bounds: HttpRequestBounds,
+        historical_rights: ResearchRightsAuthority,
         cancellation: CancellationToken,
     ) -> Result<Self, ServiceError> {
         let lease = activation.lease();
@@ -479,6 +485,12 @@ impl AlpacaHistoricalCapabilityOwner {
             || public_configuration_digest.bytes() == [0; 32]
             || runtime_evidence_digest.bytes() == [0; 32]
             || lease.verification_evidence_digest() != Some(account_binding.verification_evidence())
+            || historical_metadata.source_id() != historical_rights.source_id()
+            || AlpacaHistoricalEquityConfig::validate_parent_metadata(
+                &historical_metadata,
+                historical_request_bounds,
+            )
+            .is_err()
         {
             return Err(ServiceError::Unavailable);
         }
@@ -508,9 +520,12 @@ impl AlpacaHistoricalCapabilityOwner {
                 public_configuration_digest,
                 runtime_evidence_digest,
                 trading_api_environment: activation.trading_api_environment(),
+                group_generation,
+                historical_metadata,
+                historical_request_bounds,
+                historical_rights,
                 currentness,
                 synchronous_currentness,
-                plan_source_claimed: AtomicBool::new(false),
                 accepting: AtomicBool::new(true),
                 cancellation,
                 active: AtomicUsize::new(0),
@@ -569,9 +584,12 @@ struct AlpacaHistoricalInner {
     public_configuration_digest: EvidenceDigest,
     runtime_evidence_digest: EvidenceDigest,
     trading_api_environment: AlpacaTradingApiEnvironment,
+    group_generation: MarketRuntimeGroupGeneration,
+    historical_metadata: SourceMetadata,
+    historical_request_bounds: HttpRequestBounds,
+    historical_rights: ResearchRightsAuthority,
     currentness: Arc<CurrentnessValidator>,
     synchronous_currentness: Arc<SynchronousCurrentnessValidator>,
-    plan_source_claimed: AtomicBool,
     accepting: AtomicBool,
     cancellation: CancellationToken,
     active: AtomicUsize,

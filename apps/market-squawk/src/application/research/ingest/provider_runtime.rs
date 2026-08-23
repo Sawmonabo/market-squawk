@@ -378,6 +378,28 @@ impl ResearchProviderAdmission {
         Self::with_phase(Some(generation), ADMISSION_PENDING)
     }
 
+    /// Creates one pending admission for a sealed, non-generic parent generation.
+    ///
+    /// Alpaca history is subordinate to a market-runtime group rather than to a generic research
+    /// provider generation. Keeping this constructor digest-only prevents that private parent from
+    /// changing the generic generation wire identity or successor protocol.
+    pub(super) fn new_pending_for_parent_digest(
+        parent_digest: EvidenceDigest,
+    ) -> Result<Self, ResearchIngestCompositionError> {
+        if parent_digest.algorithm() != DigestAlgorithm::Sha256 || parent_digest.bytes() == [0; 32]
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        Ok(Self {
+            generation_digest: Some(parent_digest),
+            state: Arc::new(ResearchProviderAdmissionState {
+                phase: AtomicU8::new(ADMISSION_PENDING),
+                publication_barrier: Arc::new(RwLock::new(())),
+            }),
+            cancellation: CancellationToken::new(),
+        })
+    }
+
     fn with_phase(
         generation: Option<&ResearchProviderRuntimeGeneration>,
         phase: u8,
@@ -428,7 +450,7 @@ impl ResearchProviderAdmission {
         self.cancellation.cancel();
     }
 
-    fn ensure_pending(&self) -> Result<(), ResearchIngestCompositionError> {
+    pub(super) fn ensure_pending(&self) -> Result<(), ResearchIngestCompositionError> {
         if self.cancellation.is_cancelled()
             || self.state.phase.load(Ordering::Acquire) != ADMISSION_PENDING
         {
@@ -438,7 +460,7 @@ impl ResearchProviderAdmission {
         }
     }
 
-    fn activate_pending(&self) {
+    pub(super) fn activate_pending(&self) {
         debug_assert!(!self.cancellation.is_cancelled());
         let prior = self.state.phase.swap(ADMISSION_ACTIVE, Ordering::AcqRel);
         debug_assert_eq!(prior, ADMISSION_PENDING);
@@ -731,6 +753,7 @@ impl CommittedResearchProviderReplacement {
             sources,
             pending_replacements,
             selections: _,
+            alpaca_historical: _,
         } = &mut *authority;
         let current = sources
             .get_mut(&self.profile)
@@ -767,7 +790,7 @@ impl CommittedResearchProviderReplacement {
         current.source = candidate_source;
         current.metadata = self.candidate.metadata.clone();
         if let Some(registration) = replacement_registration {
-            current.registration = registration;
+            current.registration = Box::new(registration);
         }
         current.rights = self.candidate.rights.clone();
         current.generation = Some(self.candidate.clone());

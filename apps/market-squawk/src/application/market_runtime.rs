@@ -29,9 +29,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use market_squawk_adapter_alpaca::AlpacaHistoricalEquityPreflightPlan;
 use market_squawk_domain::{
-    ConnectionGeneration, CoverageStatus, DataQuality, EvidenceDigest, InstrumentId, SourceId,
-    SourceIdentifier, StreamIntegrityState, Timestamp, VenueId,
+    ConnectionGeneration, CoverageStatus, DataQuality, EvidenceDigest, InstrumentId,
+    MarketDataInstrumentDefinition, SourceId, SourceIdentifier, StreamIntegrityState, Timestamp,
+    VenueId,
 };
 use market_squawk_live::{
     LiveActionHookGeneration, LiveActionHookReapReceipt, LiveRouteConfig, LiveRuntimeSnapshotLease,
@@ -52,6 +54,10 @@ use self::{
     kraken::KrakenSourceDescriptor,
 };
 use super::live_fair_value::{LiveFairValueExportDrains, LiveFairValueObservationBuffer};
+use super::{
+    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
+    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
+};
 use crate::{
     AppConfig, CoinbaseDirectLiveRuntime, ProductionLiveSourceRuntime, ProductionSourceProvider,
     live_source::display_market::{
@@ -211,6 +217,7 @@ pub(crate) struct MarketRuntimeRegistry {
     config: AppConfig,
     provider_rate: ProviderRateAuthority,
     provider_activation: Arc<ProviderAdapterActivation>,
+    alpaca_historical_source: AlpacaHistoricalSourceMutationAuthority,
     prepared_configuration: Arc<dyn PreparedMarketProviderConfigurationResolver>,
     live_fair_value: Arc<LiveFairValueObservationBuffer>,
     accepting: std::sync::atomic::AtomicBool,
@@ -254,6 +261,7 @@ impl MarketRuntimeRegistry {
         config: AppConfig,
         provider_rate: ProviderRateAuthority,
         provider_activation: Arc<ProviderAdapterActivation>,
+        alpaca_historical_source: AlpacaHistoricalSourceMutationAuthority,
         prepared_configuration: Arc<dyn PreparedMarketProviderConfigurationResolver>,
         live_fair_value: Arc<LiveFairValueObservationBuffer>,
     ) -> Result<Arc<Self>, ServiceError> {
@@ -293,6 +301,7 @@ impl MarketRuntimeRegistry {
             config,
             provider_rate,
             provider_activation,
+            alpaca_historical_source,
             prepared_configuration,
             live_fair_value,
             accepting: std::sync::atomic::AtomicBool::new(true),
@@ -961,6 +970,181 @@ impl MarketRuntimeRegistry {
             }
         }
         Ok(capability)
+    }
+
+    /// Lazily installs/reuses the one sealed Alpaca-history source and admits one exact plan.
+    ///
+    /// This crate-private path accepts only canonical application authority. It exposes neither
+    /// provider selection nor credentials, endpoint, feed, dataset, manifest, or transport
+    /// coordinates and is intentionally not routed to a public service operation in this wave.
+    pub(crate) async fn admit_alpaca_historical_plan(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        preflight_plan: AlpacaHistoricalEquityPreflightPlan,
+        canonical_instrument: MarketDataInstrumentDefinition,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<AlpacaHistoricalPlanReceipt, AlpacaHistoricalPlanAdmissionError> {
+        if request.surface() != AccountMarketSurface::AlpacaBasic {
+            return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
+        }
+        ensure_alpaca_historical_lookup(&self.accepting, deadline, cancellation)
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        let (surface_id, capability) = {
+            let _mutation = bounded_lock(&self.mutation, deadline, cancellation)
+                .await
+                .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            ensure_alpaca_historical_lookup(&self.accepting, deadline, cancellation)
+                .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            let surface_id = try_surface_identifier(AccountMarketSurface::AlpacaBasic)
+                .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            let entries = bounded_lock(&self.entries, deadline, cancellation)
+                .await
+                .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            let entry = entries
+                .iter()
+                .find(|entry| entry.surface_id == surface_id)
+                .ok_or(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            validate_alpaca_historical_entry(entry, request)
+                .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            let MarketRuntime::Account(group) = &entry.runtime else {
+                return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
+            };
+            let capability = group
+                .alpaca_historical_capability()
+                .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?
+                .ok_or(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            (surface_id, capability)
+        };
+        capability
+            .require_current(deadline, cancellation)
+            .await
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        let lease = self
+            .alpaca_historical_source
+            .install_or_join_runtime(capability.clone(), deadline, cancellation)
+            .await
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        let receipt = lease
+            .admit_plan(preflight_plan, canonical_instrument, deadline, cancellation)
+            .await?;
+        drop(lease);
+        let mutation = bounded_lock(&self.mutation, deadline, cancellation)
+            .await
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        ensure_alpaca_historical_lookup(&self.accepting, deadline, cancellation)
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        {
+            let entries = bounded_lock(&self.entries, deadline, cancellation)
+                .await
+                .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            let entry = entries
+                .iter()
+                .find(|entry| entry.surface_id == surface_id)
+                .ok_or(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            validate_alpaca_historical_entry(entry, request)
+                .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            let MarketRuntime::Account(group) = &entry.runtime else {
+                return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
+            };
+            if !group.owns_alpaca_historical_capability(&capability)
+                || !receipt.matches_group_generation(group.evidence().group_generation())
+                || capability.is_revoked()
+                || capability.validate_current_now().is_err()
+            {
+                return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
+            }
+        }
+        let validated = self
+            .alpaca_historical_source
+            .validate_plan_receipt(&receipt, deadline, cancellation)
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        let authorized = validated
+            .authorize(deadline, cancellation)
+            .await
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        ensure_alpaca_historical_lookup(&self.accepting, deadline, cancellation)
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        if !receipt.matches_group_generation(capability.group_generation()) {
+            return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
+        }
+        capability
+            .validate_current_now()
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        authorized
+            .validate_current()
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        drop(mutation);
+        drop(authorized);
+        Ok(receipt)
+    }
+
+    /// Converts one retained receipt into bounded current plan authority for a later consumer.
+    ///
+    /// Wave-C orchestration can retain the opaque receipt and call this method immediately before
+    /// discovery/materialization. The returned non-cloneable view owns the specialized source's
+    /// publication barrier and exposes only the fixed admitted plan coordinates.
+    pub(crate) async fn authorize_alpaca_historical_plan_receipt<'receipt>(
+        &self,
+        receipt: &'receipt AlpacaHistoricalPlanReceipt,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<AlpacaHistoricalAuthorizedPlan<'receipt>, AlpacaHistoricalPlanAdmissionError> {
+        let mutation = bounded_lock(&self.mutation, deadline, cancellation)
+            .await
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        ensure_alpaca_historical_lookup(&self.accepting, deadline, cancellation)
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        let surface_id = try_surface_identifier(AccountMarketSurface::AlpacaBasic)
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        let capability = {
+            let entries = bounded_lock(&self.entries, deadline, cancellation)
+                .await
+                .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            let entry = entries
+                .iter()
+                .find(|entry| entry.surface_id == surface_id)
+                .ok_or(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            if !entry.is_published_healthy() {
+                return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
+            }
+            let MarketRuntime::Account(group) = &entry.runtime else {
+                return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
+            };
+            let capability = group
+                .alpaca_historical_capability()
+                .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?
+                .ok_or(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            if !group.owns_alpaca_historical_capability(&capability)
+                || !receipt.matches_group_generation(group.evidence().group_generation())
+                || capability.is_revoked()
+                || capability.validate_current_now().is_err()
+            {
+                return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
+            }
+            capability
+        };
+        let validated = self
+            .alpaca_historical_source
+            .validate_plan_receipt(receipt, deadline, cancellation)
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        let authorized = validated
+            .authorize(deadline, cancellation)
+            .await
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        ensure_alpaca_historical_lookup(&self.accepting, deadline, cancellation)
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        if !receipt.matches_group_generation(capability.group_generation()) {
+            return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
+        }
+        capability
+            .validate_current_now()
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        authorized
+            .validate_current()
+            .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        drop(mutation);
+        Ok(authorized)
     }
 
     async fn verify_owned(

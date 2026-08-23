@@ -54,11 +54,12 @@ mod provider_runtime;
 mod selection;
 
 pub(crate) use alpaca_historical::{
-    AlpacaHistoricalManagedSource, AlpacaHistoricalPlanAdmissionError,
-    AlpacaHistoricalPlanDirectoryAuthority, AlpacaHistoricalPlanReceipt,
+    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
+    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
+    AlpacaHistoricalSourceSlotError,
 };
-use provider_runtime::ResearchProviderAdmission;
 pub use provider_runtime::ResearchProviderRuntimeGeneration;
+use provider_runtime::{ResearchProviderAdmission, ResearchProviderPublicationLease};
 pub(crate) use provider_runtime::{
     ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
 };
@@ -167,6 +168,35 @@ impl ResearchRightsAuthority {
             authorization_expires_at,
             exact_subjects: None,
             permitted_operations: BTreeSet::from([SourceOperation::Persist]),
+        })
+    }
+
+    /// Binds a source-wide provider authority to an exact affirmative operation set.
+    pub(crate) fn try_new_source_wide(
+        source_id: SourceId,
+        basis: RightsBasis,
+        authorization_evidence: EvidenceDigest,
+        authorization_expires_at: Option<Timestamp>,
+        permitted_operations: Vec<SourceOperation>,
+    ) -> Result<Self, ResearchIngestCompositionError> {
+        let operation_count = permitted_operations.len();
+        let permitted_operations = permitted_operations.into_iter().collect::<BTreeSet<_>>();
+        if basis.digest().bytes() == [0; 32]
+            || authorization_evidence.bytes() == [0; 32]
+            || permitted_operations.is_empty()
+            || permitted_operations.len() != operation_count
+            || !permitted_operations.contains(&SourceOperation::Persist)
+        {
+            return Err(ResearchIngestCompositionError::InvalidRightsEvidence);
+        }
+        Ok(Self {
+            source_id,
+            basis,
+            parent_authorization_evidence: authorization_evidence,
+            authorization_evidence,
+            authorization_expires_at,
+            exact_subjects: None,
+            permitted_operations,
         })
     }
 
@@ -895,7 +925,7 @@ impl ManagedResearchExtractionSource
 struct RegisteredExtractionSource {
     source: Arc<dyn ManagedResearchExtractionSource>,
     metadata: SourceMetadata,
-    registration: RegisteredSource,
+    registration: Box<RegisteredSource>,
     rights: ResearchRightsAuthority,
     generation: Option<ResearchProviderRuntimeGeneration>,
     admission: ResearchProviderAdmission,
@@ -906,6 +936,7 @@ struct CoordinatorAuthority {
     sources: BTreeMap<SourceIdentifier, RegisteredExtractionSource>,
     pending_replacements: BTreeMap<SourceIdentifier, Uuid>,
     selections: RetainedDiscoverySelections,
+    alpaca_historical: alpaca_historical::AlpacaHistoricalSourceSlot,
 }
 
 /// Sole production coordinator for source discovery, extraction, and analytical publication.
@@ -913,7 +944,7 @@ pub struct ProductionResearchIngestCoordinator {
     research: Arc<ResearchService>,
     limits: ResearchExtractionLimits,
     lifecycle: Arc<DomainLifecycle>,
-    authority: Mutex<CoordinatorAuthority>,
+    authority: Arc<Mutex<CoordinatorAuthority>>,
 }
 
 impl ProductionResearchIngestCoordinator {
@@ -928,12 +959,13 @@ impl ProductionResearchIngestCoordinator {
             research,
             limits,
             lifecycle: DomainLifecycle::new(),
-            authority: Mutex::new(CoordinatorAuthority {
+            authority: Arc::new(Mutex::new(CoordinatorAuthority {
                 registry: Some(registry),
                 sources: BTreeMap::new(),
                 pending_replacements: BTreeMap::new(),
                 selections: RetainedDiscoverySelections::new(),
-            }),
+                alpaca_historical: alpaca_historical::AlpacaHistoricalSourceSlot::absent(),
+            })),
         }
     }
 
@@ -977,14 +1009,23 @@ impl ProductionResearchIngestCoordinator {
         Ok(coordinator)
     }
 
-    /// Constructs the production coordinator together with its one sealed provider-mutation
-    /// authority. The authority cannot be recovered from the coordinator after composition.
-    pub(crate) fn try_new_with_provider_runtime_authority<I>(
+    /// Constructs the coordinator and both disjoint runtime mutation capabilities.
+    ///
+    /// Generic provider activation receives only the first capability. The market-runtime
+    /// registry owns the second capability for the one reserved Alpaca-history slot.
+    pub(crate) fn try_new_with_runtime_authorities<I>(
         registry: AuthoritativeSourceRegistry,
         research: Arc<ResearchService>,
         limits: ResearchExtractionLimits,
         registrations: I,
-    ) -> Result<(Arc<Self>, ResearchProviderRuntimeMutationAuthority), ResearchIngestCompositionError>
+    ) -> Result<
+        (
+            Arc<Self>,
+            ResearchProviderRuntimeMutationAuthority,
+            AlpacaHistoricalSourceMutationAuthority,
+        ),
+        ResearchIngestCompositionError,
+    >
     where
         I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
     {
@@ -994,8 +1035,9 @@ impl ProductionResearchIngestCoordinator {
             limits,
             registrations,
         )?);
-        let authority = ResearchProviderRuntimeMutationAuthority::new(Arc::clone(&coordinator));
-        Ok((coordinator, authority))
+        let generic = ResearchProviderRuntimeMutationAuthority::new(Arc::clone(&coordinator));
+        let alpaca = AlpacaHistoricalSourceMutationAuthority::new(Arc::clone(&coordinator));
+        Ok((coordinator, generic, alpaca))
     }
 
     /// Captures registry tombstones and clean durable budget checkpoints under the sole
@@ -1062,6 +1104,12 @@ impl ProductionResearchIngestCoordinator {
         if metadata.source_id() != &rights.source_id {
             return Err(ResearchIngestCompositionError::SourceRightsMismatch);
         }
+        if profile
+            == alpaca_historical::canonical_alpaca_historical_profile()
+                .map_err(|_error| ResearchIngestCompositionError::InvalidRuntimeGeneration)?
+        {
+            return Err(ResearchIngestCompositionError::BuiltInProfileRequiresOnboarding);
+        }
         let registered_at = system_timestamp()
             .map_err(|_error| ResearchIngestCompositionError::TrustedTimeUnavailable)?;
         let admission = ResearchProviderAdmission::new(generation.as_ref())?;
@@ -1085,7 +1133,7 @@ impl ProductionResearchIngestCoordinator {
             RegisteredExtractionSource {
                 source,
                 metadata,
-                registration,
+                registration: Box::new(registration),
                 rights,
                 generation,
                 admission,
@@ -1845,9 +1893,17 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
-        let drained = self.lifecycle.finish_shutdown(deadline).await;
-        let closed = self.close_registry();
-        drained.and(closed)
+        self.lifecycle.finish_shutdown(deadline).await?;
+        alpaca_historical::drain_before_registry_close(self, deadline)
+            .await
+            .map_err(|error| match error {
+                AlpacaHistoricalSourceSlotError::WaitDeadlineExceeded => {
+                    ServiceError::DeadlineExceeded
+                }
+                AlpacaHistoricalSourceSlotError::WaitCancelled => ServiceError::Cancelled,
+                _ => ServiceError::Unavailable,
+            })?;
+        self.close_registry()
     }
 }
 

@@ -384,8 +384,8 @@ impl LocalProduct {
                 )
             }
         }?;
-        let (research_ingest, provider_runtime_mutation) =
-            ProductionResearchIngestCoordinator::try_new_with_provider_runtime_authority(
+        let (research_ingest, provider_runtime_mutation, alpaca_historical_source) =
+            ProductionResearchIngestCoordinator::try_new_with_runtime_authorities(
                 source_registry,
                 Arc::clone(&research),
                 ResearchExtractionLimits::standard(),
@@ -492,6 +492,7 @@ impl LocalProduct {
             config.clone(),
             provider_rate.clone(),
             Arc::clone(&provider_activation),
+            alpaca_historical_source,
             prepared_market_configuration,
             Arc::clone(&live_fair_value),
         )?;

@@ -65,6 +65,8 @@ pub(crate) use paper::{
     MarketReferenceSearchPage, PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
 };
 pub(crate) use research::{
+    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
+    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
     AnalyticalForecastEvidenceReader, DatasetPreparationAuthority, DatasetPreparationError,
     DatasetPreparationOptions, DatasetPreparationPreview, DatasetPreparationPreviewRequest,
     DatasetPreparationReceipt, DatasetPreparationSelection,

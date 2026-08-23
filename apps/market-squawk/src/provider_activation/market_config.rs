@@ -12,15 +12,16 @@ use std::num::NonZeroUsize;
 
 use market_squawk_adapter_alpaca::{
     ALPACA_BASIC_EQUITY_SYMBOL_LIMIT, ALPACA_BASIC_OPTION_SYMBOL_LIMIT, AlpacaError,
-    AlpacaIexBootSnapshotPolicy, AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionMapping,
-    AlpacaOptionsLiveConfig, AlpacaTransportLimits,
+    AlpacaHistoricalEquityConfig, AlpacaIexBootSnapshotPolicy, AlpacaIexLiveConfig,
+    AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsLiveConfig, AlpacaTransportLimits,
 };
 use market_squawk_adapter_kraken::{
     KrakenL3ClientTier, KrakenL3Config, KrakenL3ConfigError, KrakenL3Depth, KrakenL3MetadataError,
     KrakenL3MetadataInput, KrakenL3ProductMapping,
 };
 use market_squawk_data::{
-    ListingReferenceRecord, ListingReferenceRightsState, MarketDataInstrumentRecord,
+    ListingReferenceRecord, ListingReferenceRightsState, MarketDataInstrumentRecord, RightsBasis,
+    SourceOperation,
 };
 use market_squawk_domain::{
     AssetClass, AssignmentVerification, AuthorizationBasis, CryptoProductType, DigestAlgorithm,
@@ -31,13 +32,14 @@ use market_squawk_domain::{
     SourceIdentifier, Timestamp, TradingStatus, VenueId,
 };
 use market_squawk_sources::{
-    AuthorizationGrant, AuthorizationMode, BudgetPoolError, FreshnessPolicy, ProviderBudgetPolicy,
-    ProviderRateDeclaration,
+    AuthorizationGrant, AuthorizationMode, BudgetPoolError, DataUseOperation, FreshnessPolicy,
+    HttpRequestBounds, ProviderBudgetPolicy, ProviderRateDeclaration, SourceMetadata,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::application::ResearchRightsAuthority;
 use crate::{ProviderActivationLease, ProviderOnboardingError};
 
 use super::ProviderAdapterActivation;
@@ -58,6 +60,8 @@ const METADATA_EVIDENCE_DOMAIN: &[u8] =
     b"market-squawk/authenticated-market-provider-metadata/v2\0";
 const DISPLAY_METADATA_EVIDENCE_DOMAIN: &[u8] =
     b"market-squawk/authenticated-display-market-provider-metadata/v2\0";
+const HISTORICAL_METADATA_EVIDENCE_DOMAIN: &[u8] =
+    b"market-squawk/authenticated-historical-market-provider-metadata/v1\0";
 const KRAKEN_CONFIGURED_SYMBOL_EVIDENCE_REVISION: &str =
     "market-squawk/kraken-configured-provisional-symbol/v1";
 
@@ -751,6 +755,9 @@ pub struct PreparedAlpacaBasicMarketConfiguration {
     account: ProviderAccountBinding,
     iex: AlpacaIexLiveConfig,
     iex_instruments: Box<[MarketDataInstrumentBinding]>,
+    historical_metadata: SourceMetadata,
+    historical_request_bounds: HttpRequestBounds,
+    historical_rights: ResearchRightsAuthority,
     options: Option<(AlpacaOptionsLiveConfig, Box<[MarketDataInstrumentBinding]>)>,
 }
 
@@ -781,6 +788,18 @@ impl PreparedAlpacaBasicMarketConfiguration {
             .map(|(_config, bindings)| bindings.as_ref())
     }
 
+    pub const fn historical_metadata(&self) -> &SourceMetadata {
+        &self.historical_metadata
+    }
+
+    pub const fn historical_request_bounds(&self) -> HttpRequestBounds {
+        self.historical_request_bounds
+    }
+
+    pub const fn historical_rights(&self) -> &ResearchRightsAuthority {
+        &self.historical_rights
+    }
+
     /// Moves the exact lease, configs, and route-definition inputs into central composition.
     #[allow(
         clippy::type_complexity,
@@ -792,9 +811,20 @@ impl PreparedAlpacaBasicMarketConfiguration {
         ProviderActivationLease,
         AlpacaIexLiveConfig,
         Box<[MarketDataInstrumentBinding]>,
+        SourceMetadata,
+        HttpRequestBounds,
+        ResearchRightsAuthority,
         Option<(AlpacaOptionsLiveConfig, Box<[MarketDataInstrumentBinding]>)>,
     ) {
-        (self.lease, self.iex, self.iex_instruments, self.options)
+        (
+            self.lease,
+            self.iex,
+            self.iex_instruments,
+            self.historical_metadata,
+            self.historical_request_bounds,
+            self.historical_rights,
+            self.options,
+        )
     }
 }
 
@@ -985,11 +1015,41 @@ fn prepare_alpaca(
         authorization.clone(),
         input.iex_evidence.coverage_evidence.clone(),
         input.iex_evidence.coverage_effective,
-        iex_mappings,
+        iex_mappings.clone(),
         input.iex_evidence.freshness,
         budget.clone(),
         input.transport_limits,
     )?;
+    let historical_request_bounds = HttpRequestBounds::default();
+    let historical_digest = metadata_digest_for_bindings(
+        HISTORICAL_METADATA_EVIDENCE_DOMAIN,
+        lease,
+        input.configured_at,
+        &account,
+        &budget,
+        &input.iex_evidence,
+        MetadataProfile::AlpacaHistoricalIexDaily,
+        input
+            .iex_instruments
+            .bindings()
+            .iter()
+            .map(MarketDataBindingEvidenceWire::from)
+            .collect::<Vec<_>>(),
+        &historical_request_bounds,
+    )?;
+    let historical_metadata = AlpacaHistoricalEquityConfig::try_parent_metadata(
+        input.iex_evidence.source_id.clone(),
+        revision_evidence(lease, "alpaca-iex-history", historical_digest)?,
+        authorization.clone(),
+        input.iex_evidence.coverage_evidence.clone(),
+        input.iex_evidence.coverage_effective,
+        iex_mappings.clone(),
+        input.iex_evidence.freshness,
+        budget.clone(),
+        historical_request_bounds,
+    )?;
+    let historical_rights =
+        alpaca_historical_research_rights(lease, historical_metadata.source_id())?;
     let options = match (input.options_evidence, input.option_instruments) {
         (Some(evidence), Some(instruments)) => {
             let digest = display_metadata_digest(
@@ -1039,6 +1099,9 @@ fn prepare_alpaca(
         account,
         iex,
         iex_instruments: input.iex_instruments.into_bindings().into_boxed_slice(),
+        historical_metadata,
+        historical_request_bounds,
+        historical_rights,
         options,
     })
 }
@@ -1536,6 +1599,50 @@ fn qualified_budget(
     )
 }
 
+fn alpaca_historical_research_rights(
+    lease: &ProviderActivationLease,
+    source_id: &SourceId,
+) -> Result<ResearchRightsAuthority, MarketProviderConfigurationError> {
+    if !lease.admits(DataUseOperation::Retrieve)
+        || !lease.admits(DataUseOperation::Display)
+        || !lease.admits(DataUseOperation::Persist)
+        || !lease.admits(DataUseOperation::ModelTraining)
+        || lease.admits(DataUseOperation::Export)
+        || lease.admits(DataUseOperation::Redistribute)
+    {
+        return Err(MarketProviderConfigurationError::LeaseBinding);
+    }
+    let evidence = lease
+        .persistence_evidence()
+        .filter(|evidence| !evidence.refresh_required())
+        .ok_or(MarketProviderConfigurationError::LeaseBinding)?;
+    let basis = RightsBasis::reviewed_terms(
+        evidence.official_url(),
+        evidence
+            .content_digest()
+            .ok_or(MarketProviderConfigurationError::LeaseBinding)?,
+    )
+    .map_err(|_error| MarketProviderConfigurationError::LeaseBinding)?;
+    // The settled parent authority permits owner-local private model use, so this child preserves
+    // `Train`. Alpaca history still emits locally-first-observed current-research records rather
+    // than historical availability/revision evidence; the PIT producer therefore cannot admit it
+    // for retrospective training or backtest claims. Evidence eligibility stays separate from
+    // the affirmative source-rights record.
+    ResearchRightsAuthority::try_new_source_wide(
+        source_id.clone(),
+        basis,
+        lease.rights_decision_digest(),
+        lease.verification_expires_at(),
+        vec![
+            SourceOperation::Retrieve,
+            SourceOperation::Display,
+            SourceOperation::Persist,
+            SourceOperation::Train,
+        ],
+    )
+    .map_err(|_error| MarketProviderConfigurationError::LeaseBinding)
+}
+
 fn authorization(
     lease: &ProviderActivationLease,
     account: &ProviderAccountBinding,
@@ -1562,6 +1669,7 @@ enum MetadataProfile {
         boot_snapshot_total_timeout_nanos: u64,
     },
     AlpacaIndicativeOptions,
+    AlpacaHistoricalIexDaily,
     KrakenAuthenticatedLevel3 {
         depth: KrakenL3DepthWire,
         tier: KrakenL3ClientTierWire,

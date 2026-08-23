@@ -206,6 +206,7 @@ impl AccountMarketRuntimeGroup {
             PreparedMarketProviderConfiguration::AlpacaBasic(prepared) => Box::pin(async move {
                 let (runtime, descriptors, currentness) = start_alpaca(
                     prepared,
+                    generation,
                     provider_activation,
                     app_config,
                     provider_rate,
@@ -672,6 +673,7 @@ impl AlpacaRuntimeGroup {
 )]
 async fn start_alpaca(
     prepared: PreparedAlpacaBasicMarketConfiguration,
+    group_generation: MarketRuntimeGroupGeneration,
     provider_activation: &ProviderAdapterActivation,
     app_config: AppConfig,
     provider_rate: ProviderRateAuthority,
@@ -689,7 +691,15 @@ async fn start_alpaca(
     ),
     ServiceError,
 > {
-    let (lease, iex_config, iex_bindings, optional) = prepared.into_parts();
+    let (
+        lease,
+        iex_config,
+        iex_bindings,
+        historical_metadata,
+        historical_request_bounds,
+        historical_rights,
+        optional,
+    ) = prepared.into_parts();
     let iex_descriptor = DisplaySourceDescriptor::try_new(
         AccountMarketSurface::AlpacaBasic.surface_id(),
         iex_config.metadata().clone(),
@@ -731,8 +741,14 @@ async fn start_alpaca(
     .await?;
     activation_guard.disarm();
     let credentials = activation.credentials();
-    let historical =
-        AlpacaHistoricalCapabilityOwner::try_new(&activation, group_cancellation.child_token())?;
+    let historical = AlpacaHistoricalCapabilityOwner::try_new(
+        &activation,
+        group_generation,
+        historical_metadata,
+        historical_request_bounds,
+        historical_rights,
+        group_cancellation.child_token(),
+    )?;
     let iex_config = activation
         .take_iex_config()
         .ok_or(ServiceError::Unavailable)?;

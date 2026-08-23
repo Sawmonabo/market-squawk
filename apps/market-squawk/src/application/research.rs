@@ -51,15 +51,17 @@ pub(crate) use dataset_preparation::{
     DatasetPreparationSelection,
 };
 pub(crate) use forecast_evidence::AnalyticalForecastEvidenceReader;
+pub(crate) use ingest::{
+    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
+    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
+    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+};
 pub use ingest::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
     ProductionResearchIngestCoordinator, ResearchExtractionLimits, ResearchIngestCompositionError,
     ResearchProviderRuntimeGeneration, ResearchRevisionPlanError, ResearchRightsAuthority,
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceDiscoveryRights,
     ResearchSourceObjectListing,
-};
-pub(crate) use ingest::{
-    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
 };
 
 const RESEARCH_LIST_DATASETS: &str = "Research.ListDatasets";
