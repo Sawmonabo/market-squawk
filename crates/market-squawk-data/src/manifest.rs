@@ -27,8 +27,9 @@ pub(crate) use self::catalog::{
 };
 pub(crate) use self::market_history::MarketBarHistoryPublicationCandidate;
 pub use self::market_history::{
-    CompleteMarketBarHistoryRequest, CompleteMarketBarHistorySelection,
-    MarketBarHistoryPublicationReceipt,
+    CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
+    CompleteMarketBarHistorySelection, MarketBarHistoryPublicationReceipt,
+    MarketHistorySelectionPolicy,
 };
 
 /// Fixed maximum number of exact input generations retained by one derived generation.

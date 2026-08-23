@@ -33,12 +33,12 @@ use crate::manifest::{
     CatalogGenerationPage,
 };
 use crate::{
-    AnalyticalManifestCatalog, CompleteMarketBarHistoryRequest, CompleteMarketBarHistorySelection,
-    DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
-    DatasetSplitCounts, FeatureDatasetProductContract, GenerationKind, GenerationParent,
-    ManifestCatalogError, ParquetObjectStore, PinnedDataset, PinnedFeatureMonetaryValue,
-    PinnedMonetaryValue, PinnedQueryOutput, QueryError, QueryLimits, QueryRequest,
-    ResearchArrowBatch, ResearchQueryEngine, Sha256Digest, UniverseId,
+    AnalyticalManifestCatalog, CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
+    CompleteMarketBarHistorySelection, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
+    DatasetSchemaRegistry, DatasetSplitCounts, FeatureDatasetProductContract, GenerationKind,
+    GenerationParent, ManifestCatalogError, ParquetObjectStore, PinnedDataset,
+    PinnedFeatureMonetaryValue, PinnedMonetaryValue, PinnedQueryOutput, QueryError, QueryLimits,
+    QueryRequest, ResearchArrowBatch, ResearchQueryEngine, Sha256Digest, UniverseId,
 };
 use crate::{
     PointInTimeCandidate, PointInTimeLimits, PointInTimePolicy, PointInTimeRequest,
@@ -59,6 +59,8 @@ const OUTCOME_MARKET_BAR_QUERY_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 const COMPLETE_MARKET_BAR_HISTORY_OBJECT_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 const COMPLETE_MARKET_BAR_HISTORY_READ_DOMAIN: &[u8] =
     b"market-squawk/complete-market-bar-history-read/v1";
+const COMPLETE_MARKET_BAR_HISTORY_CONTENT_DOMAIN: &[u8] =
+    b"market-squawk/complete-market-bar-history-content/v1";
 const OBSERVATION_TABLE: &str = "observations";
 
 /// Nonzero caller-selected page size under the analytical service ceiling.
@@ -1383,6 +1385,7 @@ pub struct CompleteMarketBarHistoryReadReceipt {
     object_lineage_digest: Sha256Digest,
     object_row_count: u64,
     object_size_bytes: u64,
+    history_content_digest: Sha256Digest,
     result_digest: Sha256Digest,
 }
 
@@ -1432,6 +1435,13 @@ impl CompleteMarketBarHistoryReadReceipt {
             self.object_row_count,
             self.object_size_bytes,
         )
+    }
+
+    /// Returns the stable origin-publication, object, normalized-bar-set, and typed-bar identity.
+    ///
+    /// This digest deliberately excludes the query cutoff and descendant selection identity.
+    pub const fn history_content_digest(&self) -> Sha256Digest {
+        self.history_content_digest
     }
 
     /// Returns the versioned identity of the verified object read and exact typed result.
@@ -1836,6 +1846,36 @@ impl AnalyticalReadCapability {
         })
     }
 
+    /// Resolves and reads canonical durable daily history without provider coordinates or mapping.
+    ///
+    /// The catalog resolves the sole eligible provider series from immutable publication evidence.
+    /// `None` means the exact canonical window has not been durably materialized at the trusted
+    /// cutoff; ambiguity and integrity failures remain errors.
+    pub async fn read_canonical_market_bar_history(
+        &self,
+        request: CanonicalMarketBarHistoryRequest,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Option<CompleteMarketBarHistoryOutput>, AnalyticalReadError> {
+        let knowledge_cutoff = request.knowledge_cutoff();
+        let Some(selection) = self.manifests.select_canonical_market_bar_history(
+            &request,
+            deadline,
+            &cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        self.read_selected_complete_market_bar_history(
+            selection,
+            knowledge_cutoff,
+            deadline,
+            cancellation,
+        )
+        .await
+        .map(Some)
+    }
+
     /// Selects and reads the code-owned complete Alpaca/IEX daily adjusted history product.
     ///
     /// Selection, publication clocks, exact provider-calendar timestamps, stable series
@@ -1847,12 +1887,30 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<Option<CompleteMarketBarHistoryOutput>, AnalyticalReadError> {
+        let knowledge_cutoff = request.knowledge_cutoff();
         let Some(selection) =
             self.manifests
                 .select_complete_market_bar_history(&request, deadline, &cancellation)?
         else {
             return Ok(None);
         };
+        self.read_selected_complete_market_bar_history(
+            selection,
+            knowledge_cutoff,
+            deadline,
+            cancellation,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn read_selected_complete_market_bar_history(
+        &self,
+        selection: CompleteMarketBarHistorySelection,
+        knowledge_cutoff: Timestamp,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<CompleteMarketBarHistoryOutput, AnalyticalReadError> {
         let receipt = selection.receipt();
         let (origin, origin_source, _) =
             self.manifests
@@ -1902,10 +1960,17 @@ impl AnalyticalReadCapability {
             }
             result = read.as_mut() => result?,
         };
-        let bars = decode_complete_market_bar_history_object(
-            batches,
+        let bars =
+            decode_complete_market_bar_history_object(batches, &selection, knowledge_cutoff)?;
+        let history_content_digest = complete_market_bar_history_content_digest(
             &selection,
-            request.knowledge_cutoff(),
+            origin_artifact_id,
+            receipt.origin_object_ordinal(),
+            object_content_hash,
+            object_lineage_digest,
+            object_row_count,
+            object_size_bytes,
+            &bars,
         )?;
         let result_digest = complete_market_bar_history_read_digest(
             &selection,
@@ -1927,13 +1992,14 @@ impl AnalyticalReadCapability {
             object_lineage_digest,
             object_row_count,
             object_size_bytes,
+            history_content_digest,
             result_digest,
         };
-        Ok(Some(CompleteMarketBarHistoryOutput {
+        Ok(CompleteMarketBarHistoryOutput {
             selection,
             read_receipt,
             bars,
-        }))
+        })
     }
 
     /// Reads bounded exact daily NAV history for one resolved fund/share class.
@@ -2691,14 +2757,73 @@ fn complete_market_bar_history_read_digest(
     bars: &[MarketBarObservation],
 ) -> Result<Sha256Digest, AnalyticalReadError> {
     let receipt = selection.receipt();
-    let origin_manifest = receipt.origin_manifest();
     let mut hash = Sha256::new();
     hash.update(COMPLETE_MARKET_BAR_HISTORY_READ_DOMAIN);
     hash.update(selection.selection_digest().bytes());
+    hash_complete_market_bar_history_content(
+        &mut hash,
+        receipt,
+        origin_artifact_id,
+        origin_object_ordinal,
+        object_content_hash,
+        object_lineage_digest,
+        object_row_count,
+        object_size_bytes,
+        bars,
+    )?;
+    Ok(Sha256Digest::new(hash.finalize().into()))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the stable digest binds every independently verified object coordinate"
+)]
+fn complete_market_bar_history_content_digest(
+    selection: &CompleteMarketBarHistorySelection,
+    origin_artifact_id: uuid::Uuid,
+    origin_object_ordinal: u16,
+    object_content_hash: Sha256Digest,
+    object_lineage_digest: Sha256Digest,
+    object_row_count: u64,
+    object_size_bytes: u64,
+    bars: &[MarketBarObservation],
+) -> Result<Sha256Digest, AnalyticalReadError> {
+    let mut hash = Sha256::new();
+    hash.update(COMPLETE_MARKET_BAR_HISTORY_CONTENT_DOMAIN);
+    hash_complete_market_bar_history_content(
+        &mut hash,
+        selection.receipt(),
+        origin_artifact_id,
+        origin_object_ordinal,
+        object_content_hash,
+        object_lineage_digest,
+        object_row_count,
+        object_size_bytes,
+        bars,
+    )?;
+    Ok(Sha256Digest::new(hash.finalize().into()))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared hash input binds every independently verified object coordinate"
+)]
+fn hash_complete_market_bar_history_content(
+    hash: &mut Sha256,
+    receipt: &crate::MarketBarHistoryPublicationReceipt,
+    origin_artifact_id: uuid::Uuid,
+    origin_object_ordinal: u16,
+    object_content_hash: Sha256Digest,
+    object_lineage_digest: Sha256Digest,
+    object_row_count: u64,
+    object_size_bytes: u64,
+    bars: &[MarketBarObservation],
+) -> Result<(), AnalyticalReadError> {
+    let origin_manifest = receipt.origin_manifest();
     hash.update(receipt.receipt_digest().bytes());
-    hash_str(&mut hash, origin_manifest.dataset_id().as_str());
+    hash_str(hash, origin_manifest.dataset_id().as_str());
     hash.update(origin_manifest.manifest_version().to_be_bytes());
-    hash_str(&mut hash, origin_manifest.schema().name());
+    hash_str(hash, origin_manifest.schema().name());
     hash.update(origin_manifest.schema_version().get().to_be_bytes());
     hash.update(origin_manifest.schema().fingerprint());
     hash.update(origin_manifest.content_hash().bytes());
@@ -2724,9 +2849,9 @@ fn complete_market_bar_history_read_digest(
                 .unix_nanos()
                 .to_be_bytes(),
         );
-        hash_evidence(&mut hash, payload.identity());
+        hash_evidence(hash, payload.identity());
     }
-    Ok(Sha256Digest::new(hash.finalize().into()))
+    Ok(())
 }
 
 fn decode_market_bars(

@@ -21,10 +21,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::market_history::{
-    CompleteMarketBarHistoryRequest, CompleteMarketBarHistorySelection,
-    generation_market_bar_history_candidate_matches,
+    CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
+    CompleteMarketBarHistorySelection, generation_market_bar_history_candidate_matches,
     generation_market_bar_history_inputs_match_manifest,
-    insert_generation_market_bar_history_inputs, select_complete_market_bar_history,
+    insert_generation_market_bar_history_inputs, select_canonical_market_bar_history,
+    select_complete_market_bar_history,
 };
 use super::{
     DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DerivedGenerationCommitAuthority,
@@ -705,6 +706,41 @@ impl AnalyticalManifestCatalog {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
             match select_complete_market_bar_history(
+                &transaction,
+                self.max_objects_per_generation,
+                request,
+                deadline,
+                cancellation,
+            ) {
+                Ok(selection) => {
+                    transaction.commit()?;
+                    Ok(selection)
+                }
+                Err(error) => Err(error),
+            }
+        })();
+        connection.progress_handler::<fn() -> bool>(0, None)?;
+        result.map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
+    }
+
+    /// Resolves exactly one clock-safe durable series from canonical, provider-neutral inputs.
+    pub fn select_canonical_market_bar_history(
+        &self,
+        request: &CanonicalMarketBarHistoryRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CompleteMarketBarHistorySelection>, ManifestCatalogError> {
+        check_read_operation(deadline, cancellation)?;
+        let mut connection = self.lock()?;
+        let token = cancellation.clone();
+        connection.progress_handler(
+            SQLITE_PROGRESS_OPERATIONS,
+            Some(move || token.is_cancelled() || Instant::now() >= deadline),
+        )?;
+        let result = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            match select_canonical_market_bar_history(
                 &transaction,
                 self.max_objects_per_generation,
                 request,

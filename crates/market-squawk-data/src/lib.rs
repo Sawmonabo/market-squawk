@@ -134,13 +134,13 @@ pub use ingest::{
     extraction_provider_payload_digest,
 };
 pub use manifest::{
-    AnalyticalManifestCatalog, CompleteMarketBarHistoryRequest, CompleteMarketBarHistorySelection,
-    DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DerivedGenerationParents,
-    GenerationKind, GenerationParent, GenerationParentRelation, MAX_DERIVED_GENERATION_PARENTS,
-    MAX_RETAINED_FEATURE_DATASET_PRODUCTION_ADMISSIONS,
+    AnalyticalManifestCatalog, CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
+    CompleteMarketBarHistorySelection, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
+    DerivedGenerationParents, GenerationKind, GenerationParent, GenerationParentRelation,
+    MAX_DERIVED_GENERATION_PARENTS, MAX_RETAINED_FEATURE_DATASET_PRODUCTION_ADMISSIONS,
     MAX_RETAINED_FEATURE_DATASET_PRODUCTION_PAYLOAD_BYTES, ManifestCatalogError, ManifestObject,
-    ManifestPlan, ManifestPlanError, MarketBarHistoryPublicationReceipt, PinnedDataset,
-    PinnedManifestObject, Sha256Digest,
+    ManifestPlan, ManifestPlanError, MarketBarHistoryPublicationReceipt,
+    MarketHistorySelectionPolicy, PinnedDataset, PinnedManifestObject, Sha256Digest,
 };
 #[cfg(feature = "release-evidence")]
 pub use manifest::{

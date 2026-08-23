@@ -20,9 +20,9 @@ use market_squawk_data::{
     AnalyticalMacroSeriesAllowlist, AnalyticalManifestCatalog, AnalyticalMarketBarReadLimit,
     AnalyticalMarketBarReadRequest, AnalyticalObservationReadRequest,
     AnalyticalObservationTemplate, AnalyticalReadError, AnalyticalReadLimit, AnalyticalRestoreMode,
-    AnalyticalRestoreTarget, CatalogAuthority, CatalogConfig, CatalogError, CatalogLimit,
-    CatalogResultLimits, ChronologicalSplitPolicy, CommittedDataset, CompactionRequest,
-    CompleteMarketBarHistoryRequest, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
+    AnalyticalRestoreTarget, CanonicalMarketBarHistoryRequest, CatalogAuthority, CatalogConfig,
+    CatalogError, CatalogLimit, CatalogResultLimits, ChronologicalSplitPolicy, CommittedDataset,
+    CompactionRequest, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
     ComponentSelector, ComponentValue, CorporateActionAdjustment, CorporateActionLimits,
     CorporateActionPlan, CorporateActionPolicy, CorporateActionSensitivity, DatasetBuildError,
     DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildPrecommitAuthority,
@@ -32,8 +32,8 @@ use market_squawk_data::{
     FeatureDatasetProductionPublicationDisposition, FeatureDatasetProductionPublisher,
     FeatureLabelComponentInput, FeatureLabelComponentSpec, FeatureLabelDataset,
     ForecastDatasetReadLimits, FundNavDateRange, IngestError, IngestIdentity, ManifestCatalogError,
-    MarketDataInstrumentSynchronization, MissingValuePolicy, ObjectStoreConfig,
-    ObservationFamilyKey, OutcomeMarketBarRequest, OutcomeMarketBarSelection,
+    MarketDataInstrumentSynchronization, MarketHistorySelectionPolicy, MissingValuePolicy,
+    ObjectStoreConfig, ObservationFamilyKey, OutcomeMarketBarRequest, OutcomeMarketBarSelection,
     OutcomeMarketBarSeries, OutcomeMarketBarUnavailableReason, ParquetStoreError,
     PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode, PythonDatasetCatalogError,
     QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, QueryResult,
@@ -2271,10 +2271,10 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     )
     .await?;
 
-    let cutoff = Timestamp::from_unix_nanos(i64::MAX);
+    let cutoff = Timestamp::from_unix_nanos(i64::MAX - 1);
     let reader = service.analytical_reader();
     let older_current = reader
-        .read_complete_market_bar_history(
+        .read_canonical_market_bar_history(
             complete_history_request(
                 instrument_id,
                 COMPLETE_HISTORY_FIRST_BAR_NS,
@@ -2287,6 +2287,15 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         )
         .await?
         .ok_or("missing complete history after publication")?;
+    assert_eq!(older_current.selection().policy_version(), 1);
+    assert_eq!(
+        older_current.selection().policy_digest().bytes(),
+        [
+            0x57, 0x56, 0x23, 0x79, 0xa3, 0x91, 0x67, 0xc9, 0x92, 0x42, 0x6f, 0x8d, 0x54, 0x14,
+            0x58, 0xd2, 0xcd, 0x42, 0x98, 0xe6, 0xa4, 0x2f, 0x3d, 0x72, 0x0b, 0xec, 0x11, 0x1e,
+            0x6f, 0x32, 0x1c, 0x8f,
+        ]
+    );
     assert_eq!(
         older_current.selection().pinned().manifest(),
         older_wide.manifest()
@@ -2317,6 +2326,45 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert!(!older_origin_receipt.backtest_eligible());
     assert!(!older_origin_receipt.retrospective_training_eligible());
     assert_eq!(
+        older_origin_receipt.source_id().as_str(),
+        "alpaca-basic-iex-market-data"
+    );
+    assert_eq!(
+        older_origin_receipt.provider_instrument_id().as_str(),
+        "AAPL"
+    );
+    assert_eq!(older_origin_receipt.venue_id().as_str(), "iex");
+    assert_eq!(older_origin_receipt.feed().as_str(), "iex");
+    assert_eq!(older_origin_receipt.interval().as_str(), "1Day");
+    assert_eq!(older_origin_receipt.adjustment(), MarketBarAdjustment::All);
+    assert_eq!(
+        older_origin_receipt.timestamp_basis(),
+        BarTimestampBasis::PeriodStart
+    );
+    assert_eq!(
+        older_origin_receipt.session_kind(),
+        MarketBarSessionKind::ProviderDefined
+    );
+    assert_eq!(
+        older_origin_receipt.session_ruleset().as_str(),
+        "alpaca-v3-iex-utc-range-returned-dates-v2"
+    );
+    assert_eq!(
+        older_origin_receipt.graph_purpose().as_str(),
+        "alpaca-iex-historical-bars-and-calendar/v1"
+    );
+    assert_eq!(older_origin_receipt.currency(), Currency::try_from("USD")?);
+    assert_ne!(
+        older_origin_receipt.capture_receipt_digest().bytes(),
+        [0; 32]
+    );
+    assert!(
+        older_current
+            .bars()
+            .iter()
+            .all(|bar| { bar.context().provenance().quality() == DataQuality::Aggregated })
+    );
+    assert_eq!(
         older_origin_receipt.expected_provider_timestamps(),
         [
             Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS),
@@ -2334,7 +2382,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     );
     assert!(
         reader
-            .read_complete_market_bar_history(
+            .read_canonical_market_bar_history(
                 complete_history_request(
                     instrument_id,
                     COMPLETE_HISTORY_FIRST_BAR_NS,
@@ -2350,7 +2398,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         "a complete local-first-observed window is unknowable before publication"
     );
     let exact_origin = reader
-        .read_complete_market_bar_history(
+        .read_canonical_market_bar_history(
             complete_history_request(
                 instrument_id,
                 COMPLETE_HISTORY_FIRST_BAR_NS,
@@ -2391,7 +2439,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     .await?;
     let short_result = service
         .analytical_reader()
-        .read_complete_market_bar_history(
+        .read_canonical_market_bar_history(
             complete_history_request(
                 instrument_id,
                 COMPLETE_HISTORY_SECOND_BAR_NS,
@@ -2442,7 +2490,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     .await?;
     let newer_wide_result = service
         .analytical_reader()
-        .read_complete_market_bar_history(
+        .read_canonical_market_bar_history(
             complete_history_request(
                 instrument_id,
                 COMPLETE_HISTORY_FIRST_BAR_NS,
@@ -2494,7 +2542,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
 
     let inherited_older = service
         .analytical_reader()
-        .read_complete_market_bar_history(
+        .read_canonical_market_bar_history(
             complete_history_request(
                 instrument_id,
                 COMPLETE_HISTORY_FIRST_BAR_NS,
@@ -2524,7 +2572,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
 
     let selected = service
         .analytical_reader()
-        .read_complete_market_bar_history(
+        .read_canonical_market_bar_history(
             complete_history_request(
                 instrument_id,
                 COMPLETE_HISTORY_FIRST_BAR_NS,
@@ -2552,11 +2600,12 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert_eq!(selected.bars(), newer_expected_bars);
     let selected_selection_digest = selected.selection().selection_digest();
     let selected_result_digest = selected.read_receipt().result_digest();
+    let selected_history_content_digest = selected.read_receipt().history_content_digest();
     drop(selected);
 
     let short_after_compaction = service
         .analytical_reader()
-        .read_complete_market_bar_history(
+        .read_canonical_market_bar_history(
             complete_history_request(
                 instrument_id,
                 COMPLETE_HISTORY_SECOND_BAR_NS,
@@ -2586,7 +2635,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert!(
         service
             .analytical_reader()
-            .read_complete_market_bar_history(
+            .read_canonical_market_bar_history(
                 complete_history_request(
                     instrument_id,
                     COMPLETE_HISTORY_FIRST_BAR_NS - COMPLETE_HISTORY_DAY_NS,
@@ -2615,14 +2664,15 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     restarted
         .recover_provider_capture_store(&capture_store, &CancellationToken::new())
         .await?;
+    let restart_cutoff = Timestamp::from_unix_nanos(i64::MAX);
     let replayed = restarted
         .analytical_reader()
-        .read_complete_market_bar_history(
+        .read_canonical_market_bar_history(
             complete_history_request(
                 instrument_id,
                 COMPLETE_HISTORY_FIRST_BAR_NS,
                 COMPLETE_HISTORY_REQUEST_END_NS,
-                cutoff,
+                restart_cutoff,
                 None,
             )?,
             Instant::now() + Duration::from_secs(30),
@@ -2638,15 +2688,56 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         replayed.selection().receipt().receipt_digest(),
         newer_origin_receipt_digest
     );
-    assert_eq!(
+    assert_ne!(
         replayed.selection().selection_digest(),
         selected_selection_digest
     );
-    assert_eq!(
+    assert_ne!(
         replayed.read_receipt().result_digest(),
         selected_result_digest
     );
+    assert_eq!(
+        replayed.read_receipt().history_content_digest(),
+        selected_history_content_digest
+    );
     assert_eq!(replayed.bars(), newer_expected_bars);
+    drop(replayed);
+
+    let ambiguity = rusqlite::Connection::open(location.path())?;
+    ambiguity.execute_batch("DROP TRIGGER market_bar_history_publications_immutable_update;")?;
+    let older_origin_receipt_digest = older_origin_receipt_digest.bytes();
+    assert_eq!(
+        ambiguity.execute(
+            "UPDATE market_bar_history_publications
+             SET provider_instrument_id='AAPL.AMBIGUOUS'
+             WHERE publication_receipt_digest=?1",
+            params![older_origin_receipt_digest.as_slice()],
+        )?,
+        1
+    );
+    drop(ambiguity);
+    let ambiguous = restarted
+        .analytical_reader()
+        .read_canonical_market_bar_history(
+            complete_history_request(
+                instrument_id,
+                COMPLETE_HISTORY_FIRST_BAR_NS,
+                COMPLETE_HISTORY_REQUEST_END_NS,
+                restart_cutoff,
+                None,
+            )?,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await;
+    // Selecting the changed row would reach the receipt/row comparison and return CorruptCatalog;
+    // this earlier mismatch proves the canonical exact-one-series gate rejected both coordinates.
+    assert!(matches!(
+        ambiguous,
+        Err(AnalyticalReadError::Manifest(
+            ManifestCatalogError::MarketBarHistoryMismatch
+        ))
+    ));
     Ok(())
 }
 
@@ -3079,47 +3170,24 @@ fn complete_history_request(
     requested_end_ns: i64,
     knowledge_cutoff: Timestamp,
     exact_manifest: Option<&DatasetManifestRef>,
-) -> Result<CompleteMarketBarHistoryRequest, ManifestCatalogError> {
+) -> Result<CanonicalMarketBarHistoryRequest, ManifestCatalogError> {
     let requested_start = Timestamp::from_unix_nanos(requested_start_ns);
     let requested_end = Timestamp::from_unix_nanos(requested_end_ns);
-    let provider_instrument_id = ProviderInstrumentId::try_from("AAPL")
-        .map_err(|_| ManifestCatalogError::MarketBarHistoryMismatch)?;
-    let venue_id =
-        VenueId::try_from("iex").map_err(|_| ManifestCatalogError::MarketBarHistoryMismatch)?;
-    let feed = SourceIdentifier::try_from("iex")
-        .map_err(|_| ManifestCatalogError::MarketBarHistoryMismatch)?;
-    let interval = SourceIdentifier::try_from("1Day")
-        .map_err(|_| ManifestCatalogError::MarketBarHistoryMismatch)?;
-    let session_ruleset = SourceIdentifier::try_from("alpaca-v3-iex-utc-range-returned-dates-v2")
-        .map_err(|_| ManifestCatalogError::MarketBarHistoryMismatch)?;
+    let policy = MarketHistorySelectionPolicy::COMPLETE_DAILY_ADJUSTED_V1;
     match exact_manifest {
-        Some(manifest) => CompleteMarketBarHistoryRequest::try_exact(
+        Some(manifest) => CanonicalMarketBarHistoryRequest::try_exact(
             instrument_id,
             requested_start,
             requested_end,
-            provider_instrument_id,
-            venue_id,
-            feed,
-            interval,
-            MarketBarAdjustment::All,
-            BarTimestampBasis::PeriodStart,
-            MarketBarSessionKind::ProviderDefined,
-            session_ruleset,
+            policy,
             knowledge_cutoff,
             manifest.clone(),
         ),
-        None => CompleteMarketBarHistoryRequest::try_latest(
+        None => CanonicalMarketBarHistoryRequest::try_latest(
             instrument_id,
             requested_start,
             requested_end,
-            provider_instrument_id,
-            venue_id,
-            feed,
-            interval,
-            MarketBarAdjustment::All,
-            BarTimestampBasis::PeriodStart,
-            MarketBarSessionKind::ProviderDefined,
-            session_ruleset,
+            policy,
             knowledge_cutoff,
         ),
     }
