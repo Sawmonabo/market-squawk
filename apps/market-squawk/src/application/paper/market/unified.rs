@@ -1,10 +1,11 @@
 //! Source-preserving unified Markets presentation rows.
 
+use market_squawk_data::MarketDataInstrumentRecord;
 use market_squawk_domain::{
     AssetClass, CaptureIntegrityState, ChecksumIntegrity, CoverageConsolidation, CoverageDelay,
-    CoverageStatus, Currency, DataQuality, DeliveryEvidence, ExecutionEligibility,
-    InstrumentDefinition, InstrumentExecutionTerms, InstrumentId, LiveEventClass,
-    MarketDataInstrumentDefinition, MarketDepth, ProviderChannel, ProviderProduct,
+    CoverageStatus, Currency, DataQuality, DeliveryEvidence, DigestAlgorithm, EvidenceDigest,
+    ExecutionEligibility, InstrumentDefinition, InstrumentExecutionTerms, InstrumentId,
+    LiveEventClass, MarketDataInstrumentDefinition, MarketDepth, ProviderChannel, ProviderProduct,
     SequenceIntegrity, SourceId, SourceIdentifier, StreamIntegrityState, Timestamp,
 };
 use market_squawk_live::{
@@ -200,14 +201,17 @@ pub(super) struct UnifiedInstrumentDefinition<'definition> {
     quote_currency: Currency,
     executable: Option<&'definition InstrumentDefinition>,
     market_data: Option<&'definition MarketDataInstrumentDefinition>,
+    market_data_revision_digest: Option<EvidenceDigest>,
 }
 
 impl<'definition> UnifiedInstrumentDefinition<'definition> {
     pub(super) fn try_new(
         instrument_id: InstrumentId,
         executable: Option<&'definition InstrumentDefinition>,
-        market_data: Option<&'definition MarketDataInstrumentDefinition>,
+        market_data_record: Option<&'definition MarketDataInstrumentRecord>,
+        reference_at: Timestamp,
     ) -> Result<Self, ServiceError> {
+        let market_data = market_data_record.map(MarketDataInstrumentRecord::definition);
         let (asset_class, quote_currency) = match (executable, market_data) {
             (Some(definition), _) => (definition.asset_class(), definition.quote_currency()),
             (None, Some(definition)) => (definition.asset_class(), definition.quote_currency()),
@@ -224,12 +228,31 @@ impl<'definition> UnifiedInstrumentDefinition<'definition> {
         {
             return Err(ServiceError::InvalidResult);
         }
+        let market_data_revision_digest = market_data_record
+            .map(MarketDataInstrumentRecord::revision_digest)
+            .map(|digest| {
+                if digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32] {
+                    return Err(ServiceError::InvalidResult);
+                }
+                Ok(digest)
+            })
+            .transpose()?;
+        if let Some(record) = market_data_record {
+            let interval = record.definition().effective_interval();
+            if record.published_at() > reference_at
+                || interval.starts_at() > reference_at
+                || interval.ends_at().is_some_and(|end| reference_at >= end)
+            {
+                return Err(ServiceError::Unavailable);
+            }
+        }
         Ok(Self {
             instrument_id,
             asset_class,
             quote_currency,
             executable,
             market_data,
+            market_data_revision_digest,
         })
     }
 
@@ -243,6 +266,10 @@ impl<'definition> UnifiedInstrumentDefinition<'definition> {
 
     const fn quote_currency(self) -> Currency {
         self.quote_currency
+    }
+
+    const fn definition_revision_digest(self) -> Option<EvidenceDigest> {
+        self.market_data_revision_digest
     }
 
     pub(super) fn execution_terms(self) -> Result<InstrumentExecutionTerms, ServiceError> {
@@ -261,7 +288,7 @@ pub(super) fn build_unified_market_result(
     streams: &[StreamView<'_>],
     filters: &MarketFilters<'_>,
     definitions: &[InstrumentDefinition],
-    market_data_definitions: &[MarketDataInstrumentDefinition],
+    market_data_records: &[MarketDataInstrumentRecord],
     display_snapshots: &[&MarketDisplaySnapshotLease],
     kraken_projections: &[&MarketKrakenPriceProjectionLease],
     surface_policies: &[MarketSurfaceSelectionPolicy],
@@ -274,15 +301,16 @@ pub(super) fn build_unified_market_result(
     validate_inputs(
         streams,
         definitions,
-        market_data_definitions,
+        market_data_records,
         display_snapshots,
         kraken_projections,
         surface_policies,
         order_level,
+        reference_at,
     )?;
     let selection_policy =
         MarketSelectionPolicy::v1(MAXIMUM_CANDIDATES_PER_INSTRUMENT).map_err(selection_error)?;
-    let instrument_ids = unified_instrument_ids(definitions, market_data_definitions)?;
+    let instrument_ids = unified_instrument_ids(definitions, market_data_records)?;
     let available = instrument_ids
         .iter()
         .filter(|instrument_id| matches_instrument(filters, **instrument_id))
@@ -299,7 +327,12 @@ pub(super) fn build_unified_market_result(
         if rows.len() == build_count {
             break;
         }
-        let definition = unified_definition(instrument_id, definitions, market_data_definitions)?;
+        let definition = unified_definition(
+            instrument_id,
+            definitions,
+            market_data_records,
+            reference_at,
+        )?;
         let instrument_streams = streams
             .iter()
             .copied()
@@ -339,7 +372,11 @@ pub(super) fn build_unified_market_result(
             order_level,
             reference_at,
         )?;
-        let request = presentation_request(definition.asset_class(), reference_at)?;
+        let request = presentation_request(
+            definition.asset_class(),
+            reference_at,
+            definition.definition_revision_digest(),
+        )?;
         let receipt =
             select_market_source(selection_policy, request, candidates).map_err(selection_error)?;
         rows.push(instrument_row(
@@ -399,11 +436,12 @@ pub(super) fn build_unified_market_result(
 pub(super) fn validate_inputs(
     streams: &[StreamView<'_>],
     definitions: &[InstrumentDefinition],
-    market_data_definitions: &[MarketDataInstrumentDefinition],
+    market_data_records: &[MarketDataInstrumentRecord],
     display_snapshots: &[&MarketDisplaySnapshotLease],
     kraken_projections: &[&MarketKrakenPriceProjectionLease],
     surface_policies: &[MarketSurfaceSelectionPolicy],
     order_level: &[MarketOrderLevelSnapshot],
+    reference_at: Timestamp,
 ) -> Result<(), ServiceError> {
     if definitions
         .windows(2)
@@ -411,11 +449,22 @@ pub(super) fn validate_inputs(
     {
         return Err(ServiceError::InvalidResult);
     }
-    if market_data_definitions
+    if market_data_records
         .windows(2)
-        .any(|pair| pair[0].instrument_id() >= pair[1].instrument_id())
+        .any(|pair| pair[0].definition().instrument_id() >= pair[1].definition().instrument_id())
     {
         return Err(ServiceError::InvalidResult);
+    }
+    for record in market_data_records {
+        let interval = record.definition().effective_interval();
+        if record.published_at() > reference_at
+            || interval.starts_at() > reference_at
+            || interval.ends_at().is_some_and(|end| reference_at >= end)
+            || record.revision_digest().algorithm() != DigestAlgorithm::Sha256
+            || record.revision_digest().bytes() == [0; 32]
+        {
+            return Err(ServiceError::Unavailable);
+        }
     }
     for (index, policy) in surface_policies.iter().enumerate() {
         if surface_policies.iter().skip(index + 1).any(|candidate| {
@@ -438,15 +487,16 @@ pub(super) fn validate_inputs(
     for snapshot in display_snapshots {
         let actor = snapshot.lease();
         let key = actor.key();
-        let definition = market_data_definitions
-            .binary_search_by_key(&key.instrument_id(), |definition| {
-                definition.instrument_id()
+        let record = market_data_records
+            .binary_search_by_key(&key.instrument_id(), |record| {
+                record.definition().instrument_id()
             })
             .ok()
-            .and_then(|index| market_data_definitions.get(index))
+            .and_then(|index| market_data_records.get(index))
             .ok_or(ServiceError::Unavailable)?;
         if snapshot.metadata().source_id() != key.source_id()
-            || !snapshot.matches_definition(definition)
+            || !snapshot.matches_definition_record(record)
+            || snapshot.definition_revision_digest() != record.revision_digest()
             || snapshot.provider_symbol().as_str().is_empty()
         {
             return Err(ServiceError::InvalidResult);
@@ -499,11 +549,11 @@ fn matches_instrument(filters: &MarketFilters<'_>, instrument_id: InstrumentId) 
 
 fn unified_instrument_ids(
     definitions: &[InstrumentDefinition],
-    market_data_definitions: &[MarketDataInstrumentDefinition],
+    market_data_records: &[MarketDataInstrumentRecord],
 ) -> Result<Vec<InstrumentId>, ServiceError> {
     let capacity = definitions
         .len()
-        .checked_add(market_data_definitions.len())
+        .checked_add(market_data_records.len())
         .ok_or(ServiceError::ResourceExhausted)?;
     let mut instrument_ids = Vec::new();
     instrument_ids
@@ -511,9 +561,9 @@ fn unified_instrument_ids(
         .map_err(|_error| ServiceError::ResourceExhausted)?;
     instrument_ids.extend(definitions.iter().map(InstrumentDefinition::instrument_id));
     instrument_ids.extend(
-        market_data_definitions
+        market_data_records
             .iter()
-            .map(MarketDataInstrumentDefinition::instrument_id),
+            .map(|record| record.definition().instrument_id()),
     );
     instrument_ids.sort_unstable();
     instrument_ids.dedup();
@@ -523,20 +573,23 @@ fn unified_instrument_ids(
 fn unified_definition<'definition>(
     instrument_id: InstrumentId,
     definitions: &'definition [InstrumentDefinition],
-    market_data_definitions: &'definition [MarketDataInstrumentDefinition],
+    market_data_records: &'definition [MarketDataInstrumentRecord],
+    reference_at: Timestamp,
 ) -> Result<UnifiedInstrumentDefinition<'definition>, ServiceError> {
     let executable = definitions
         .binary_search_by_key(&instrument_id, InstrumentDefinition::instrument_id)
         .ok()
         .and_then(|index| definitions.get(index));
-    let market_data = market_data_definitions
-        .binary_search_by_key(
-            &instrument_id,
-            MarketDataInstrumentDefinition::instrument_id,
-        )
+    let market_data_record = market_data_records
+        .binary_search_by_key(&instrument_id, |record| record.definition().instrument_id())
         .ok()
-        .and_then(|index| market_data_definitions.get(index));
-    UnifiedInstrumentDefinition::try_new(instrument_id, executable, market_data)
+        .and_then(|index| market_data_records.get(index));
+    UnifiedInstrumentDefinition::try_new(
+        instrument_id,
+        executable,
+        market_data_record,
+        reference_at,
+    )
 }
 
 pub(super) fn build_candidates(
@@ -569,6 +622,7 @@ pub(super) fn build_candidates(
             policy,
             exact_order_level_snapshot(order_level, view)?,
             reference_at,
+            definition.definition_revision_digest(),
         )?);
     }
     for snapshot in display_snapshots {
@@ -580,6 +634,7 @@ pub(super) fn build_candidates(
             market_data,
             policy,
             reference_at,
+            definition.definition_revision_digest(),
         )?);
     }
     for snapshot in kraken_projections {
@@ -591,6 +646,7 @@ pub(super) fn build_candidates(
             executable,
             policy,
             reference_at,
+            definition.definition_revision_digest(),
         )?);
     }
     Ok(candidates)
@@ -815,6 +871,7 @@ fn source_candidate(
     policy: &MarketSurfaceSelectionPolicy,
     order_level: Option<&MarketOrderLevelSnapshot>,
     reference_at: Timestamp,
+    definition_revision_digest: Option<EvidenceDigest>,
 ) -> Result<SourceCandidate, ServiceError> {
     let stream = view.stream;
     let quality = super::serialization::current_display_quality(stream, reference_at);
@@ -850,6 +907,7 @@ fn source_candidate(
             Some(view.route.route().venue().clone()),
             definition.instrument_id(),
             view.surface_id.to_owned(),
+            definition_revision_digest,
         ),
         CandidateCapabilities::try_new(
             definition.asset_class(),
@@ -875,16 +933,20 @@ fn display_source_candidate(
     definition: &MarketDataInstrumentDefinition,
     policy: &MarketSurfaceSelectionPolicy,
     reference_at: Timestamp,
+    definition_revision_digest: Option<EvidenceDigest>,
 ) -> Result<SourceCandidate, ServiceError> {
     let actor = snapshot.lease();
     let observation = display_selection_observation(actor).ok_or(ServiceError::Unavailable)?;
     let provenance = observation.observation().provenance();
     let coverage = provenance.coverage();
+    let definition_revision_digest =
+        definition_revision_digest.ok_or(ServiceError::InvalidResult)?;
     if definition.instrument_id() != actor.key().instrument_id()
         || definition.asset_class() != policy.asset_class
         || snapshot.metadata().source_id() != actor.key().source_id()
         || snapshot.metadata().provider() != &policy.provider_id
         || snapshot.surface_id() != &policy.surface_id
+        || snapshot.definition_revision_digest() != definition_revision_digest
     {
         return Err(ServiceError::InvalidResult);
     }
@@ -923,6 +985,7 @@ fn display_source_candidate(
             Some(actor.key().venue_id().clone()),
             definition.instrument_id(),
             snapshot.surface_id().clone(),
+            Some(definition_revision_digest),
         ),
         CandidateCapabilities::try_new(
             definition.asset_class(),
@@ -944,6 +1007,7 @@ fn kraken_source_candidate(
     definition: &InstrumentDefinition,
     policy: &MarketSurfaceSelectionPolicy,
     reference_at: Timestamp,
+    definition_revision_digest: Option<EvidenceDigest>,
 ) -> Result<SourceCandidate, ServiceError> {
     validate_kraken_projection(snapshot, definition)?;
     let projection = snapshot.projection();
@@ -985,6 +1049,7 @@ fn kraken_source_candidate(
             Some(snapshot.key().venue_id().clone()),
             definition.instrument_id(),
             snapshot.surface_id().clone(),
+            definition_revision_digest,
         ),
         CandidateCapabilities::try_new(
             definition.asset_class(),
@@ -1173,6 +1238,7 @@ fn candidate_integrity(stream: &StreamSnapshot) -> CandidateIntegrity {
 fn presentation_request(
     asset_class: AssetClass,
     reference_at: Timestamp,
+    definition_revision_digest: Option<EvidenceDigest>,
 ) -> Result<MarketSelectionRequest, ServiceError> {
     let depth = if matches!(asset_class, AssetClass::Index | AssetClass::Cash) {
         None
@@ -1227,6 +1293,7 @@ fn presentation_request(
             .map_err(selection_error)?,
         RequestPriority::Interactive,
         downgrade,
+        definition_revision_digest,
     )
     .map_err(selection_error)
 }
@@ -1239,6 +1306,11 @@ fn instrument_row(
     order_level: &[MarketOrderLevelSnapshot],
     receipt: &MarketSelectionReceipt,
 ) -> Result<Value, ServiceError> {
+    if receipt.definition_revision_digest() != definition.definition_revision_digest() {
+        return Err(ServiceError::InvalidResult);
+    }
+    let definition_revision_digest =
+        definition_revision_digest_value(definition.definition_revision_digest());
     let selected = receipt.selected();
     let selected_view = selected
         .map(|selected| {
@@ -1325,6 +1397,7 @@ fn instrument_row(
         "lotSize": definition.executable.map(|value| value.lot_size().as_decimal().normalize().to_string()),
         "executionTermsAvailable": definition.executable.is_some(),
         "executionEligible": false,
+        "definitionRevisionDigest": definition_revision_digest.clone(),
         "referenceEvidence": market_data_definition_evidence(definition.market_data),
         "availability": selected.map(availability_label).unwrap_or("Unavailable"),
         "confidence": selected.map(confidence_label).unwrap_or("No eligible source"),
@@ -1345,6 +1418,7 @@ fn instrument_row(
                 "algorithm": receipt.selection_digest().algorithm(),
                 "bytes": encode_hex(receipt.selection_digest().bytes())
             },
+            "definitionRevisionDigest": definition_revision_digest,
             "selectedAt": timestamp_value(receipt.selected_at()),
             "eligibleCount": receipt.eligible().len(),
             "rejectedCount": receipt.rejected().len(),
@@ -1355,6 +1429,15 @@ fn instrument_row(
             "downgradeDimensions": selected_downgrades.iter().map(downgrade_value).collect::<Vec<_>>()
         }
     }))
+}
+
+fn definition_revision_digest_value(digest: Option<EvidenceDigest>) -> Value {
+    digest.map_or(Value::Null, |digest| {
+        json!({
+            "algorithm": digest.algorithm(),
+            "bytes": encode_hex(digest.bytes())
+        })
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1564,6 +1647,7 @@ fn exact_selected_display<'snapshot>(
             && Some(actor.key().venue_id()) == identity.venue_id()
             && actor.key().instrument_id() == identity.instrument_id()
             && snapshot.surface_id() == identity.observation_id()
+            && Some(snapshot.definition_revision_digest()) == identity.definition_revision_digest()
             && Some(actor.key().generation()) == generation
     });
     let selected = matches.next();

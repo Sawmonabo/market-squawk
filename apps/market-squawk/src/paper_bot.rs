@@ -327,6 +327,14 @@ impl ProductionPaperBotComposition {
         self.runtime_config.maximum_message_bytes()
     }
 
+    /// Returns the exact paper-market calendar retained by this test composition.
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) const fn day_session_calendar_for_test(
+        &self,
+    ) -> &market_squawk_adapter_paper::PaperVenueSessionCalendar {
+        &self.execution.paper.input().day_session_calendar
+    }
+
     #[cfg(all(test, debug_assertions))]
     pub(crate) fn with_local_kraken_endpoint_for_test(
         mut self,
@@ -1078,7 +1086,7 @@ impl StartedPaperBotLiveRuntime {
 impl PaperBotLiveRuntime {
     fn is_healthy(&self) -> bool {
         match self {
-            Self::Production(_) => true,
+            Self::Production(runtime) => runtime.is_healthy(),
             Self::Existing(_) => true,
             #[cfg(feature = "release-evidence")]
             Self::ReleaseBenchmark(_) => true,

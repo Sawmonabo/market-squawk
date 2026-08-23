@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 
 use market_squawk_domain::{
-    AssetClass, ConnectionGeneration, DataQuality, ExecutionEligibility, InstrumentId, MarketDepth,
-    ProviderChannel, ProviderProduct, SourceId, SourceIdentifier, Timestamp, VenueId,
+    AssetClass, ConnectionGeneration, DataQuality, DigestAlgorithm, EvidenceDigest,
+    ExecutionEligibility, InstrumentId, MarketDepth, ProviderChannel, ProviderProduct, SourceId,
+    SourceIdentifier, Timestamp, VenueId,
 };
 
 use super::{
@@ -19,6 +20,7 @@ pub(crate) struct CandidateIdentity {
     venue_id: Option<VenueId>,
     instrument_id: InstrumentId,
     observation_id: SourceIdentifier,
+    definition_revision_digest: Option<EvidenceDigest>,
 }
 
 impl CandidateIdentity {
@@ -30,6 +32,7 @@ impl CandidateIdentity {
         venue_id: Option<VenueId>,
         instrument_id: InstrumentId,
         observation_id: SourceIdentifier,
+        definition_revision_digest: Option<EvidenceDigest>,
     ) -> Self {
         Self {
             provider,
@@ -39,6 +42,7 @@ impl CandidateIdentity {
             venue_id,
             instrument_id,
             observation_id,
+            definition_revision_digest,
         }
     }
 
@@ -70,6 +74,11 @@ impl CandidateIdentity {
         &self.observation_id
     }
 
+    /// Returns the exact canonical market-data definition revision, when this row has one.
+    pub(crate) const fn definition_revision_digest(&self) -> Option<EvidenceDigest> {
+        self.definition_revision_digest
+    }
+
     pub(super) fn stable_cmp(&self, other: &Self) -> Ordering {
         self.provider
             .as_str()
@@ -90,6 +99,11 @@ impl CandidateIdentity {
             .then_with(|| self.venue_id.cmp(&other.venue_id))
             .then_with(|| self.instrument_id.cmp(&other.instrument_id))
             .then_with(|| self.observation_id.cmp(&other.observation_id))
+            .then_with(|| {
+                self.definition_revision_digest
+                    .map(EvidenceDigest::bytes)
+                    .cmp(&other.definition_revision_digest.map(EvidenceDigest::bytes))
+            })
     }
 }
 
@@ -514,6 +528,11 @@ impl SourceCandidate {
         timestamps: CandidateTimestamps,
         admission: CandidateAdmissionState,
     ) -> Result<Self, MarketSelectionError> {
+        if identity.definition_revision_digest.is_some_and(|digest| {
+            digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32]
+        }) {
+            return Err(MarketSelectionError::InvalidDefinitionRevisionDigest);
+        }
         if capabilities.coverage == MarketCoverage::SingleVenue && identity.venue_id.is_none() {
             return Err(MarketSelectionError::MissingVenue);
         }

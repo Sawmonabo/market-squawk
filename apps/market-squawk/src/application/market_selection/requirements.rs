@@ -5,16 +5,16 @@ use sha2::{Digest, Sha256};
 
 use super::receipt::MarketSelectionError;
 
-const MARKET_SELECTION_POLICY_REVISION: u32 = 2;
+const MARKET_SELECTION_POLICY_REVISION: u32 = 3;
 const MAXIMUM_POLICY_CANDIDATES: usize = 4_096;
-const POLICY_CANONICAL_IDENTITY: &[u8] = b"market-squawk.market-selection.v2\0\
+const POLICY_CANONICAL_IDENTITY: &[u8] = b"market-squawk.market-selection.v3\0\
 strict-before-downgrade\0fewer-downgrades-first\0\
 quality=direct-verified,direct-unverified,official-delayed,aggregated,indicative,modeled,estimated,stale,quarantined\0\
 depth=order-level,price-level,top-of-book,none\0\
 timing=real-time,delayed,end-of-day,historical,stored\0\
 coverage=consolidated,multi-venue-partial,single-venue,benchmark,reference,user-owned\0\
 freshness=newest-first\0health=healthy,degraded\0budget=not-required,open,interactive-only\0\
-tie=provider,product,feed,source,venue,instrument,observation\0\
+tie=provider,product,feed,source,venue,instrument,observation,definition-revision-digest\0\
 paper-and-live-execution=real-time-direct-verified-no-downgrade\0\
 asset-operation-health-budget-rights-integrity-execution-never-downgrade\0\
 fallback-never-inherits-source-state";
@@ -282,6 +282,7 @@ pub(crate) struct MarketSelectionRequest {
     freshness: FreshnessRequirement,
     priority: RequestPriority,
     downgrade: DowngradePolicy,
+    definition_revision_digest: Option<EvidenceDigest>,
 }
 
 impl MarketSelectionRequest {
@@ -299,7 +300,13 @@ impl MarketSelectionRequest {
         freshness: FreshnessRequirement,
         priority: RequestPriority,
         downgrade: DowngradePolicy,
+        definition_revision_digest: Option<EvidenceDigest>,
     ) -> Result<Self, MarketSelectionError> {
+        if definition_revision_digest.is_some_and(|digest| {
+            digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32]
+        }) {
+            return Err(MarketSelectionError::InvalidDefinitionRevisionDigest);
+        }
         if minimum_quality == DataQuality::Quarantined {
             return Err(MarketSelectionError::InvalidMinimumQuality);
         }
@@ -331,6 +338,7 @@ impl MarketSelectionRequest {
             freshness,
             priority,
             downgrade,
+            definition_revision_digest,
         })
     }
 
@@ -368,6 +376,11 @@ impl MarketSelectionRequest {
 
     pub(crate) const fn downgrade(&self) -> DowngradePolicy {
         self.downgrade
+    }
+
+    /// Returns the exact whole-definition revision required for every candidate in this request.
+    pub(crate) const fn definition_revision_digest(&self) -> Option<EvidenceDigest> {
+        self.definition_revision_digest
     }
 }
 

@@ -8,7 +8,8 @@ use std::{
 
 use market_squawk_domain::{EvidenceDigest, SourceIdentifier};
 use market_squawk_sources::{
-    BudgetDecision, BudgetPermit, BudgetUnavailableReason, BudgetWindowSemantics, ProbeTransport,
+    BudgetDecision, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
+    BudgetReservationDecision, BudgetUnavailableReason, BudgetWindowSemantics, ProbeTransport,
     ProviderBudgetPolicy, ProviderBudgetWindow, ProviderOnboardingProfile, ProviderProfileRegistry,
     ProviderRateAuthority, ProviderRateDeclaration, RatePolicyDescriptor, SharedProviderBudget,
     apply_http_retry_after,
@@ -75,7 +76,8 @@ enum ProbeRatePermitAuthority {
     },
     Aggregate {
         budget: SharedProviderBudget,
-        _permit: BudgetPermit,
+        reservation: Option<BudgetReservation>,
+        permit: Option<BudgetPermit>,
     },
 }
 
@@ -359,6 +361,50 @@ impl ProbeRateState {
 }
 
 impl ProbeRatePermit {
+    pub(super) async fn commit_dispatch(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ProviderOnboardingError> {
+        let ProbeRatePermitAuthority::Aggregate {
+            budget,
+            reservation,
+            permit,
+        } = &mut self.authority
+        else {
+            return Ok(());
+        };
+        if permit.is_some() {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        loop {
+            let candidate = match reservation.take() {
+                Some(candidate) => candidate,
+                None => reserve_aggregate_budget(budget, self.deadline, cancellation).await?,
+            };
+            match candidate.commit_dispatch() {
+                BudgetDispatchDecision::Ready(active) => {
+                    *permit = Some(active);
+                    return Ok(());
+                }
+                BudgetDispatchDecision::WaitUntil(blocked_until) => {
+                    let wait = budget
+                        .remaining_wait(blocked_until)
+                        .map_err(|_| ProviderOnboardingError::ProbeRateLimited)?;
+                    wait_for_aggregate_rate(wait, self.deadline, cancellation).await?;
+                }
+                BudgetDispatchDecision::Unavailable(
+                    BudgetUnavailableReason::ConcurrencyExhausted,
+                ) => {
+                    wait_for_aggregate_rate(Duration::from_millis(25), self.deadline, cancellation)
+                        .await?;
+                }
+                BudgetDispatchDecision::Unavailable(_) => {
+                    return Err(ProviderOnboardingError::ProbeRateLimited);
+                }
+            }
+        }
+    }
+
     pub(super) async fn observe_http_429(
         &self,
         retry_after: Option<&[u8]>,
@@ -385,16 +431,21 @@ impl ProbeRatePermit {
                 );
                 Ok(())
             }
-            ProbeRatePermitAuthority::Aggregate { budget, .. } => {
-                match apply_http_retry_after(budget, retry_after, 0) {
-                    BudgetDecision::WaitUntil(_) => Ok(()),
-                    BudgetDecision::Unavailable(
-                        BudgetUnavailableReason::RetryAfterExceedsPolicy,
-                    ) => Ok(()),
-                    BudgetDecision::Unavailable(_) | BudgetDecision::Ready(_) => {
-                        Err(ProviderOnboardingError::ProbeRateLimited)
-                    }
+            ProbeRatePermitAuthority::Aggregate {
+                budget,
+                reservation: None,
+                permit: Some(_),
+            } => match apply_http_retry_after(budget, retry_after, 0) {
+                BudgetDecision::WaitUntil(_) => Ok(()),
+                BudgetDecision::Unavailable(BudgetUnavailableReason::RetryAfterExceedsPolicy) => {
+                    Ok(())
                 }
+                BudgetDecision::Unavailable(_) | BudgetDecision::Ready(_) => {
+                    Err(ProviderOnboardingError::ProbeRateLimited)
+                }
+            },
+            ProbeRatePermitAuthority::Aggregate { .. } => {
+                Err(ProviderOnboardingError::InvalidSessionState)
             }
         }
     }
@@ -402,9 +453,16 @@ impl ProbeRatePermit {
     pub(super) fn record_success(&self) -> Result<(), ProviderOnboardingError> {
         match &self.authority {
             ProbeRatePermitAuthority::Legacy { .. } => Ok(()),
-            ProbeRatePermitAuthority::Aggregate { budget, .. } => budget
+            ProbeRatePermitAuthority::Aggregate {
+                budget,
+                reservation: None,
+                permit: Some(_),
+            } => budget
                 .record_success()
                 .map_err(|_| ProviderOnboardingError::ProbeRateLimited),
+            ProbeRatePermitAuthority::Aggregate { .. } => {
+                Err(ProviderOnboardingError::InvalidSessionState)
+            }
         }
     }
 }
@@ -413,32 +471,44 @@ async fn acquire_aggregate_budget(
     budget: SharedProviderBudget,
     cancellation: CancellationToken,
 ) -> Result<ProbeRatePermit, ProviderOnboardingError> {
-    const CONCURRENCY_RECHECK: Duration = Duration::from_millis(25);
-
     let deadline = Instant::now()
         .checked_add(PROBE_OPERATION_DURATION)
         .ok_or(ProviderOnboardingError::Clock)?;
+    let reservation = reserve_aggregate_budget(&budget, deadline, &cancellation).await?;
+    Ok(ProbeRatePermit {
+        authority: ProbeRatePermitAuthority::Aggregate {
+            budget,
+            reservation: Some(reservation),
+            permit: None,
+        },
+        deadline,
+    })
+}
+
+async fn reserve_aggregate_budget(
+    budget: &SharedProviderBudget,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<BudgetReservation, ProviderOnboardingError> {
+    const CONCURRENCY_RECHECK: Duration = Duration::from_millis(25);
+
     loop {
-        match budget.try_acquire() {
-            BudgetDecision::Ready(permit) => {
-                return Ok(ProbeRatePermit {
-                    authority: ProbeRatePermitAuthority::Aggregate {
-                        budget,
-                        _permit: permit,
-                    },
-                    deadline,
-                });
+        match budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => {
+                return Ok(reservation);
             }
-            BudgetDecision::WaitUntil(blocked_until) => {
+            BudgetReservationDecision::WaitUntil(blocked_until) => {
                 let wait = budget
                     .remaining_wait(blocked_until)
                     .map_err(|_| ProviderOnboardingError::ProbeRateLimited)?;
                 wait_for_aggregate_rate(wait, deadline, &cancellation).await?;
             }
-            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted) => {
+            BudgetReservationDecision::Unavailable(
+                BudgetUnavailableReason::ConcurrencyExhausted,
+            ) => {
                 wait_for_aggregate_rate(CONCURRENCY_RECHECK, deadline, &cancellation).await?;
             }
-            BudgetDecision::Unavailable(_) => {
+            BudgetReservationDecision::Unavailable(_) => {
                 return Err(ProviderOnboardingError::ProbeRateLimited);
             }
         }

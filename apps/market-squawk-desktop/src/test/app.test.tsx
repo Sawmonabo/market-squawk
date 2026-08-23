@@ -1757,6 +1757,7 @@ const unifiedKrakenMarket: ApplicationResult = {
       lotSize: "0.00000001",
       executionTermsAvailable: true,
       executionEligible: false,
+      definitionRevisionDigest: null,
       referenceEvidence: null,
       availability: "Live",
       confidence: "Direct, unverified",
@@ -1905,6 +1906,7 @@ const unifiedKrakenMarket: ApplicationResult = {
           algorithm: "sha256",
           bytes: "22".repeat(32),
         },
+        definitionRevisionDigest: null,
         selectedAt: krakenAvailableAt,
         eligibleCount: 1,
         rejectedCount: 0,
@@ -2029,6 +2031,7 @@ const krakenTradeResult: ApplicationResult = {
     priceTicks: "680001",
     quantityLots: "25000000",
     aggressorSide: "buy",
+    takerOrderType: "market",
     sourceTimestamp: krakenSourceAt,
     receivedAt: krakenReceivedAt,
     availableAt: krakenAvailableAt,
@@ -2396,10 +2399,15 @@ describe("Market Squawk desktop boundary", () => {
     expect(within(marketCard).getByText("2 of 2")).toBeTruthy()
     expect(
       within(marketCard).getByText(
-        "Live runtime display · not archived/PIT evidence",
+        "Live runtime display · this feed is not PIT evidence",
       ),
     ).toBeTruthy()
-    expect(within(marketCard).getByText("Not available")).toBeTruthy()
+    expect(within(marketCard).getByText("68000.15 USD")).toBeTruthy()
+    expect(
+      within(marketCard).getByText(
+        "Midpoint of current bid and ask · runtime display only · no precise source deadline reported",
+      ),
+    ).toBeTruthy()
     expect(screen.queryByRole("combobox", { name: /provider/i })).toBeNull()
 
     await user.click(
@@ -2463,11 +2471,48 @@ describe("Market Squawk desktop boundary", () => {
     inconsistentCounts.metadata.returnedItems = 0
     expect(() => instrumentQuotes(inconsistentCounts, krakenInstrumentId)).toThrow()
 
-    const falseAnalyticalAuthority = structuredClone(unifiedKrakenMarket)
-    const falseAnalyticalRows = falseAnalyticalAuthority.data as Array<Record<string, unknown>>
+    const mismatchedDefinitionRevision = structuredClone(unifiedKrakenMarket)
+    const mismatchedDefinitionRows =
+      mismatchedDefinitionRevision.data as Array<Record<string, unknown>>
+    if (!mismatchedDefinitionRows[0]) throw new Error("The unified fixture is absent")
+    const inventedDefinitionRevisionDigest = {
+      algorithm: "sha256",
+      bytes: "66".repeat(32),
+    }
+    mismatchedDefinitionRows[0].definitionRevisionDigest = inventedDefinitionRevisionDigest
+    const mismatchedDefinitionReceipt = mismatchedDefinitionRows[0]
+      .selectionReceipt as Record<string, unknown>
+    mismatchedDefinitionReceipt.definitionRevisionDigest = inventedDefinitionRevisionDigest
+    expect(() => parseUnifiedMarketResult(mismatchedDefinitionRevision)).toThrow()
+
+    const falseDurableAnalyticalAuthority = structuredClone(unifiedKrakenMarket)
+    const falseAnalyticalRows =
+      falseDurableAnalyticalAuthority.data as Array<Record<string, unknown>>
     if (!falseAnalyticalRows[0]) throw new Error("The unified fixture is absent")
     falseAnalyticalRows[0].analyticalReadiness = "durable_pit_available"
-    expect(() => parseUnifiedMarketResult(falseAnalyticalAuthority)).toThrow()
+    falseAnalyticalRows[0].marketObservation = {
+      availability: "available",
+      instrumentId: krakenInstrumentId,
+      mark: {
+        value: "68000.15",
+        currency: "USD",
+        basis: "fresh_bid_ask_midpoint",
+        evidenceIdentity: { algorithm: "sha256", bytes: "22".repeat(32) },
+        freshUntil: null,
+      },
+      selectionDigest: { algorithm: "sha256", bytes: "22".repeat(32) },
+      selectedAt: krakenAvailableAt,
+      generation: "1",
+      quality: "direct_unverified",
+      depth: "price_level",
+      coverage: "single_venue",
+      integrity: "verified",
+      features: {
+        availability: "unavailable",
+        reason: "source_does_not_publish_live_features",
+      },
+    }
+    expect(() => parseUnifiedMarketResult(falseDurableAnalyticalAuthority)).toThrow()
   })
 
   it("keeps candidate impact server-resolved and visibly analysis-only", async () => {

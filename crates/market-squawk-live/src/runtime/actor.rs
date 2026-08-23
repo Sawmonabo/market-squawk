@@ -341,7 +341,7 @@ impl ShardActor {
                 FairEvent::Cancelled => break,
                 FairEvent::Control(command) => match command {
                     Some(command) => {
-                        self.control(command);
+                        self.control(command)?;
                     }
                     None => controls_open = false,
                 },
@@ -378,6 +378,7 @@ impl ShardActor {
             }
         }
         self.publish_snapshot(ShardLifecycleSnapshot::Stopped)?;
+        self.publisher.mark_clean_terminal_published();
         self.emit_terminal_health();
         Ok(())
     }

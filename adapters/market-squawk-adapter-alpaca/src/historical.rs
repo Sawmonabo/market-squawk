@@ -16,13 +16,13 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::RawCaptureRecord;
 use market_squawk_sources::{
-    AvailabilityEvidence, BudgetDecision, BudgetPermit, CURRENT_RESEARCH_RECORD_SCHEMA,
-    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRecord,
-    ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
-    HttpRequestBounds, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SharedProviderBudget,
-    SourceError, SourceMetadata, SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
-    apply_http_retry_after,
+    AvailabilityEvidence, BudgetDecision, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
+    BudgetReservationDecision, CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryBatch, DiscoveryRequest,
+    ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest,
+    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HttpRequestBounds,
+    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, SharedProviderBudget, SourceError, SourceMetadata,
+    SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity, apply_http_retry_after,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -397,9 +397,11 @@ impl AlpacaHistoricalEquityPreflightClient {
         cancellation: &CancellationToken,
     ) -> Result<PreflightFetchedPage, AlpacaError> {
         loop {
-            let permit = acquire_preflight_budget(budget, deadline, cancellation).await?;
+            let reservation = acquire_preflight_budget(budget, deadline, cancellation).await?;
             let maximum = usize::try_from(self.bounds.max_response_bytes())
                 .map_err(|_| AlpacaError::InvalidTransportLimits)?;
+            let permit =
+                commit_preflight_budget(reservation, budget, deadline, cancellation).await?;
             let response = authenticated_bounded_get(
                 &self.client,
                 &self.credentials,
@@ -1403,15 +1405,66 @@ async fn acquire_preflight_budget(
     budget: &SharedProviderBudget,
     deadline: std::time::Instant,
     cancellation: &CancellationToken,
+) -> Result<BudgetReservation, AlpacaError> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(AlpacaError::Cancelled);
+        }
+        match budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => return Ok(reservation),
+            BudgetReservationDecision::WaitUntil(wait_until) => {
+                wait_for_budget_deadline(budget, wait_until, deadline, cancellation).await?;
+            }
+            BudgetReservationDecision::Unavailable(_reason) => {
+                return Err(AlpacaError::Network);
+            }
+        }
+    }
+}
+
+async fn commit_preflight_budget(
+    mut reservation: BudgetReservation,
+    budget: &SharedProviderBudget,
+    deadline: std::time::Instant,
+    cancellation: &CancellationToken,
 ) -> Result<BudgetPermit, AlpacaError> {
     loop {
         if cancellation.is_cancelled() {
             return Err(AlpacaError::Cancelled);
         }
-        match budget.try_acquire() {
-            BudgetDecision::Ready(permit) => return Ok(permit),
-            decision => wait_for_budget_decision(budget, decision, deadline, cancellation).await?,
+        if std::time::Instant::now() >= deadline {
+            return Err(AlpacaError::DeadlineExceeded);
         }
+        match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => return Ok(permit),
+            BudgetDispatchDecision::WaitUntil(wait_until) => {
+                wait_for_budget_deadline(budget, wait_until, deadline, cancellation).await?;
+                reservation = acquire_preflight_budget(budget, deadline, cancellation).await?;
+            }
+            BudgetDispatchDecision::Unavailable(_reason) => return Err(AlpacaError::Network),
+        }
+    }
+}
+
+async fn wait_for_budget_deadline(
+    budget: &SharedProviderBudget,
+    wait_until: market_squawk_sources::MonotonicInstant,
+    deadline: std::time::Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), AlpacaError> {
+    let wait = budget
+        .remaining_wait(wait_until)
+        .map_err(|_| AlpacaError::Network)?;
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .ok_or(AlpacaError::DeadlineExceeded)?;
+    if wait > remaining {
+        return Err(AlpacaError::DeadlineExceeded);
+    }
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(AlpacaError::Cancelled),
+        () = tokio::time::sleep(wait) => Ok(()),
     }
 }
 
@@ -1429,20 +1482,7 @@ async fn wait_for_budget_decision(
         }
         BudgetDecision::Unavailable(_reason) => return Err(AlpacaError::Network),
     };
-    let wait = budget
-        .remaining_wait(wait_until)
-        .map_err(|_| AlpacaError::Network)?;
-    let remaining = deadline
-        .checked_duration_since(std::time::Instant::now())
-        .ok_or(AlpacaError::DeadlineExceeded)?;
-    if wait > remaining {
-        return Err(AlpacaError::DeadlineExceeded);
-    }
-    tokio::select! {
-        biased;
-        () = cancellation.cancelled() => Err(AlpacaError::Cancelled),
-        () = tokio::time::sleep(wait) => Ok(()),
-    }
+    wait_for_budget_deadline(budget, wait_until, deadline, cancellation).await
 }
 
 fn enforce_preflight_window(plan: &AlpacaHistoricalEquityPreflightPlan) -> Result<(), AlpacaError> {
@@ -1942,8 +1982,220 @@ fn map_adapter_error(error: AlpacaError) -> ExtractionSourceError {
 
 #[cfg(test)]
 mod capture_tests {
+    use std::error::Error;
+    use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::{Duration, Instant};
+
     use super::*;
     use market_squawk_domain::{AssetClass, MetadataRevision};
+    use market_squawk_sources::{
+        AuthorizationMode, BackoffPolicy, BudgetScope, PreparedProviderRateRegistrationBatch,
+        ProviderBudgetPolicy, ProviderRateAuthority, ProviderRateDeclaration,
+        ProviderRateDispatchDecision, ProviderRateGroupId, ProviderRatePermitId,
+        ProviderRateRegistration, ProviderRateReservationDecision, ProviderRateReservationId,
+        ProviderRateRunId, ProviderRateStore, ProviderRateStoreError, RetryAfter,
+    };
+
+    #[derive(Debug, Default)]
+    struct ReadyRateStore {
+        dispatches: AtomicUsize,
+    }
+
+    impl ReadyRateStore {
+        fn dispatches(&self) -> usize {
+            self.dispatches.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadyPreparedRateBatch {
+        registrations: Box<[ProviderRateRegistration]>,
+    }
+
+    impl PreparedProviderRateRegistrationBatch for ReadyPreparedRateBatch {
+        fn registrations(&self) -> &[ProviderRateRegistration] {
+            &self.registrations
+        }
+
+        fn commit(self: Box<Self>) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+    }
+
+    impl ProviderRateStore for ReadyRateStore {
+        fn start_run(&self, _now: Timestamp) -> Result<ProviderRateRunId, ProviderRateStoreError> {
+            Ok(ProviderRateRunId::from_bytes([1; 16]))
+        }
+
+        fn prepare_registration_batch(
+            &self,
+            _run_id: ProviderRateRunId,
+            declarations: &[ProviderRateDeclaration],
+            _now: Timestamp,
+        ) -> Result<Box<dyn PreparedProviderRateRegistrationBatch>, ProviderRateStoreError>
+        {
+            let registrations = declarations
+                .iter()
+                .map(|declaration| {
+                    ProviderRateRegistration::new(
+                        ProviderRateGroupId::from_bytes([2; 16]),
+                        declaration.policy_digest(),
+                        declaration.declaration_digest(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            Ok(Box::new(ReadyPreparedRateBatch { registrations }))
+        }
+
+        fn try_reserve(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            Ok(ProviderRateReservationDecision::Ready(
+                ProviderRateReservationId::from_bytes([3; 16]),
+            ))
+        }
+
+        fn commit_dispatch(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _reservation_id: ProviderRateReservationId,
+            _now: Timestamp,
+        ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
+            self.dispatches.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ProviderRateDispatchDecision::Ready(
+                ProviderRatePermitId::from_bytes([4; 16]),
+            ))
+        }
+
+        fn cancel_reservation(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _reservation_id: ProviderRateReservationId,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn release(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _permit_id: ProviderRatePermitId,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn apply_retry_after(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+            _retry_after: RetryAfter,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn apply_refusal(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+            _jitter_sample_basis_points: u16,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn record_success(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn bind_authorization_subject(
+            &self,
+            _run_id: ProviderRateRunId,
+            _mode: AuthorizationMode,
+            _evidence: EvidenceDigest,
+            _subject: &SourceIdentifier,
+            _now: Timestamp,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn resolve_authorization_subject(
+            &self,
+            _mode: AuthorizationMode,
+            _evidence: EvidenceDigest,
+        ) -> Result<Option<SourceIdentifier>, ProviderRateStoreError> {
+            Ok(None)
+        }
+    }
+
+    fn one_request_budget(
+        store: Arc<ReadyRateStore>,
+    ) -> Result<SharedProviderBudget, Box<dyn Error>> {
+        const WINDOW_NANOS: u64 = 60_000_000_000;
+        let provider = SourceIdentifier::try_from("alpaca-ready-budget-test")?;
+        let subject = SourceIdentifier::try_from("alpaca-ready-budget-subject")?;
+        let policy = ProviderBudgetPolicy::try_new(
+            BudgetScope::with_authorization_account(provider, subject.clone()),
+            NonZeroU32::MIN,
+            NonZeroU64::new(WINDOW_NANOS).ok_or("budget window must be nonzero")?,
+            NonZeroU16::MIN,
+            BackoffPolicy::try_new(
+                NonZeroU64::MIN,
+                NonZeroU64::new(WINDOW_NANOS).ok_or("backoff maximum must be nonzero")?,
+                0,
+            )?,
+        )?;
+        let declaration = ProviderRateDeclaration::try_for_authorization_subject(policy, &subject)?;
+        Ok(ProviderRateAuthority::try_new(store)?.register_budget(declaration)?)
+    }
+
+    #[tokio::test]
+    async fn ready_preflight_reservation_cancelled_before_commit_is_uncharged()
+    -> Result<(), Box<dyn Error>> {
+        let store = Arc::new(ReadyRateStore::default());
+        let budget = one_request_budget(store.clone())?;
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let reservation = acquire_preflight_budget(&budget, deadline, &cancellation).await?;
+        cancellation.cancel();
+
+        let transport_dispatches = AtomicUsize::new(0);
+        let result =
+            match commit_preflight_budget(reservation, &budget, deadline, &cancellation).await {
+                Ok(permit) => {
+                    transport_dispatches.fetch_add(1, AtomicOrdering::SeqCst);
+                    permit.release();
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            };
+        let durable_dispatches = store.dispatches();
+        let next_reservation = budget.try_reserve_request();
+
+        assert!(
+            matches!(result, Err(AlpacaError::Cancelled)),
+            "cancelled ready reservation reached dispatch: {result:?}"
+        );
+        assert_eq!(transport_dispatches.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(durable_dispatches, 0);
+        assert!(matches!(
+            next_reservation,
+            BudgetReservationDecision::Ready(_)
+        ));
+        Ok(())
+    }
 
     #[test]
     fn historical_capture_preserves_terminal_pages_and_refuses_broken_token_chain() {

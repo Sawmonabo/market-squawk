@@ -367,7 +367,8 @@ impl TiingoQuotaLedger {
             .requests_this_day
             .checked_add(1)
             .ok_or(TiingoQuotaError::Overflow)?;
-        self.snapshot
+        let introduced_monthly_ticker = self
+            .snapshot
             .unique_symbols_this_month
             .insert(ticker.clone());
         self.snapshot.pending_response = Some(TiingoPendingResponseReservation {
@@ -384,7 +385,72 @@ impl TiingoQuotaLedger {
             reserved_response_bytes,
             prior_state_version,
             reserved_state_version: self.snapshot.state_version,
+            introduced_monthly_ticker,
         }))
+    }
+
+    /// Cancels one exact reservation after aggregate authority proves no request was dispatched.
+    ///
+    /// The rollback restores request counters and monthly membership while retaining a monotonic
+    /// state version. Its resulting snapshot must be compare-and-swap persisted before another
+    /// request can be admitted.
+    pub fn cancel_undispatched(
+        &mut self,
+        permit: &TiingoQuotaPermit,
+        ticker: &TiingoTicker,
+    ) -> Result<(), TiingoQuotaError> {
+        if &permit.ticker != ticker {
+            return Err(TiingoQuotaError::SymbolMismatch);
+        }
+        if permit
+            .prior_state_version
+            .checked_add(1)
+            .filter(|version| *version == permit.reserved_state_version)
+            .is_none()
+            || self.snapshot.state_version != permit.reserved_state_version
+        {
+            return Err(TiingoQuotaError::InvalidPersistedState);
+        }
+        let pending = self
+            .snapshot
+            .pending_response
+            .as_ref()
+            .ok_or(TiingoQuotaError::InvalidPersistedState)?;
+        if pending.ticker != permit.ticker
+            || pending.reserved_response_bytes != permit.reserved_response_bytes
+            || !self
+                .snapshot
+                .unique_symbols_this_month
+                .contains(&permit.ticker)
+        {
+            return Err(TiingoQuotaError::InvalidPersistedState);
+        }
+        let requests_this_hour = self
+            .snapshot
+            .requests_this_hour
+            .checked_sub(1)
+            .ok_or(TiingoQuotaError::InvalidPersistedState)?;
+        let requests_this_day = self
+            .snapshot
+            .requests_this_day
+            .checked_sub(1)
+            .ok_or(TiingoQuotaError::InvalidPersistedState)?;
+        let state_version = self
+            .snapshot
+            .state_version
+            .checked_add(1)
+            .ok_or(TiingoQuotaError::Overflow)?;
+
+        self.snapshot.requests_this_hour = requests_this_hour;
+        self.snapshot.requests_this_day = requests_this_day;
+        if permit.introduced_monthly_ticker {
+            self.snapshot
+                .unique_symbols_this_month
+                .remove(&permit.ticker);
+        }
+        self.snapshot.pending_response = None;
+        self.snapshot.state_version = state_version;
+        Ok(())
     }
 
     /// Charges actual response bytes after bounded body receipt.
@@ -512,6 +578,7 @@ pub struct TiingoQuotaPermit {
     reserved_response_bytes: NonZeroU64,
     prior_state_version: u64,
     reserved_state_version: u64,
+    introduced_monthly_ticker: bool,
 }
 
 impl TiingoQuotaPermit {

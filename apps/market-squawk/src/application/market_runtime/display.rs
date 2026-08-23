@@ -198,6 +198,11 @@ impl MarketDisplaySnapshotLease {
         self.definition_identity.matches_definition(definition)
     }
 
+    /// Returns the exact whole-definition digest retained by this configured display route.
+    pub(crate) fn definition_revision_digest(&self) -> EvidenceDigest {
+        self.definition_identity.revision_digest
+    }
+
     pub(super) const fn descriptor(&self) -> &Arc<DisplaySourceDescriptor> {
         &self.descriptor
     }

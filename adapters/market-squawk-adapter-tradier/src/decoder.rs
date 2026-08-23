@@ -277,6 +277,7 @@ impl TradierMarketDecoder {
                     None,
                     self.aggressor_rule.clone(),
                 ),
+                taker_order_type: None,
             },
         )
     }

@@ -398,6 +398,7 @@ impl CoinbaseExchangeDecoder {
                             Some(maker_code),
                             self.aggressor_rule.clone(),
                         ),
+                        taker_order_type: None,
                     },
                 ));
             }

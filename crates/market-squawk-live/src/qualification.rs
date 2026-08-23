@@ -679,8 +679,8 @@ pub(crate) fn canonical_digest_from_sha256(
     Ok(CanonicalStateDigest::new(
         EvidenceDigest::new(DigestAlgorithm::Sha256, digest),
         CanonicalizationRule::new(
-            SourceIdentifier::try_from("market-squawk-live-state-v1")?,
-            RuleVersion::new(1)?,
+            SourceIdentifier::try_from("market-squawk-live-state-v2")?,
+            RuleVersion::new(2)?,
         ),
     ))
 }

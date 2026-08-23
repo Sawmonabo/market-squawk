@@ -247,10 +247,10 @@ impl ExtractionAuthority {
         Ok(())
     }
 
-    /// Atomically authorizes an exact target and reserves the registry-coordinated request budget.
+    /// Atomically authorizes an exact target and reserves registry-coordinated concurrency.
     ///
     /// The returned permit retains this authority and must be revalidated during paged or streamed
-    /// I/O. Dropping it releases concurrency while preserving request-window consumption.
+    /// I/O. Dropping it releases concurrency without consuming request-window capacity.
     ///
     /// # Errors
     ///
@@ -274,12 +274,12 @@ impl ExtractionAuthority {
             .budget
             .as_ref()
             .ok_or(crate::ExtractionAuthorityError::BudgetNotConfigured)?;
-        let budget_permit = match budget.try_acquire() {
-            crate::BudgetDecision::Ready(permit) => permit,
-            crate::BudgetDecision::WaitUntil(deadline) => {
+        let budget_reservation = match budget.try_reserve_request() {
+            crate::BudgetReservationDecision::Ready(reservation) => reservation,
+            crate::BudgetReservationDecision::WaitUntil(deadline) => {
                 return Err(crate::ExtractionAuthorityError::BudgetWaitUntil { deadline });
             }
-            crate::BudgetDecision::Unavailable(reason) => {
+            crate::BudgetReservationDecision::Unavailable(reason) => {
                 return Err(crate::ExtractionAuthorityError::BudgetUnavailable { reason });
             }
         };
@@ -287,7 +287,7 @@ impl ExtractionAuthority {
         Ok(crate::ExtractionRequestPermit::new(
             self.clone(),
             authorization,
-            budget_permit,
+            budget_reservation,
         ))
     }
 
@@ -309,9 +309,9 @@ impl ExtractionAuthority {
             .budget
             .as_ref()
             .ok_or(crate::ExtractionAuthorityError::BudgetNotConfigured)?;
-        budget.remaining_wait(deadline).map_err(|reason| {
-            crate::ExtractionAuthorityError::BudgetUnavailable { reason }
-        })
+        budget
+            .remaining_wait(deadline)
+            .map_err(|reason| crate::ExtractionAuthorityError::BudgetUnavailable { reason })
     }
 
     pub(crate) fn apply_retry_after_header(
@@ -637,7 +637,11 @@ impl HttpResponseReceiptAuthority {
     pub(crate) fn observe(
         self,
     ) -> Result<
-        (FrameSessionBinding, TrustedReceiptObservation, FrameSessionLease),
+        (
+            FrameSessionBinding,
+            TrustedReceiptObservation,
+            FrameSessionLease,
+        ),
         crate::SegmentedHttpCaptureError,
     > {
         match self.0 {
@@ -850,11 +854,9 @@ impl ActiveLiveSourceGeneration {
             _ => false,
         };
         budget_is_exact
-            && self.frames.shares_generation_graph_with(
-                &self.binding,
-                &self.lease,
-                &self.capture,
-            )
+            && self
+                .frames
+                .shares_generation_graph_with(&self.binding, &self.lease, &self.capture)
     }
 
     /// Revalidates the registry lease, capture state, and complete generation authority graph.
@@ -1235,19 +1237,21 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .into_iter()
             .map(|(key, observations)| {
                 let observation_unique_allocations =
-                    observations.iter().try_fold(0_usize, |total, observation| {
-                        let provider = observation
-                            .observation
-                            .dynamic_retained_bytes()
-                            .map_err(|_| RegistryError::RetainedSizeOverflow)?;
-                        total
-                            .checked_add(observation.policy.deep_allocation_charge()?)
-                            .and_then(|bytes| {
-                                bytes.checked_add(observation.key.dynamic_retained_bytes())
-                            })
-                            .and_then(|bytes| bytes.checked_add(provider))
-                            .ok_or(RegistryError::RetainedSizeOverflow)
-                    })?;
+                    observations
+                        .iter()
+                        .try_fold(0_usize, |total, observation| {
+                            let provider = observation
+                                .observation
+                                .dynamic_retained_bytes()
+                                .map_err(|_| RegistryError::RetainedSizeOverflow)?;
+                            total
+                                .checked_add(observation.policy.deep_allocation_charge()?)
+                                .and_then(|bytes| {
+                                    bytes.checked_add(observation.key.dynamic_retained_bytes())
+                                })
+                                .and_then(|bytes| bytes.checked_add(provider))
+                                .ok_or(RegistryError::RetainedSizeOverflow)
+                        })?;
                 let frame_shared_allocation = observations
                     .first()
                     .ok_or(RegistryError::DecoderProfileMismatch)?

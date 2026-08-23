@@ -1420,6 +1420,8 @@ fn map_manifest_error(error: ManifestCatalogError) -> ServiceError {
         | ManifestCatalogError::SchemaIdentity(_)
         | ManifestCatalogError::CorruptCatalog
         | ManifestCatalogError::CaptureInputLimitExceeded { .. }
+        | ManifestCatalogError::MarketBarHistoryMismatch
+        | ManifestCatalogError::MarketBarHistoryInputLimitExceeded { .. }
         | ManifestCatalogError::LockPoisoned
         | ManifestCatalogError::Plan(_)
         | ManifestCatalogError::Path(_)

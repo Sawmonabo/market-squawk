@@ -23,7 +23,7 @@ use market_squawk_domain::{
     AggressorSide, CaptureIntegrityState, ConnectionGeneration, CoverageConsolidation,
     CoverageDelay, CoverageStatus, DataQuality, DeliveryEvidence, EvidenceDigest, HaltTransition,
     InstrumentId, LiveEventClass, MarketDepth, MetadataRevision, RuleVersion, SourceId,
-    SourceIdentifier, Timestamp, TradingStatus, VenueId,
+    SourceIdentifier, Timestamp, TradeTakerOrderType, TradingStatus, VenueId,
 };
 use market_squawk_sources::{
     CoverageHealth, CurrentDecodedProviderBatch, CurrentProviderObservation,
@@ -526,6 +526,7 @@ pub(crate) struct DisplayTrade {
     quantity: DisplayDecimal,
     aggressor: AggressorSide,
     provider_aggressor_code: Option<SourceIdentifier>,
+    taker_order_type: Option<TradeTakerOrderType>,
 }
 
 impl DisplayTrade {
@@ -1634,6 +1635,7 @@ fn project_observation(
             price,
             quantity,
             aggressor,
+            taker_order_type,
         } => DisplayMarketPayload::Trade(DisplayTrade {
             trade_id: try_clone_source_identifier(trade_id)?,
             price: DisplayDecimal::try_from_provider(price.value())?,
@@ -1643,6 +1645,7 @@ fn project_observation(
                 .provider_code()
                 .map(try_clone_source_identifier)
                 .transpose()?,
+            taker_order_type: *taker_order_type,
         }),
         ProviderObservationPayload::Quote { bid, ask } => {
             DisplayMarketPayload::Quote(DisplayQuote {
@@ -2017,6 +2020,7 @@ fn try_clone_observation(
                 .as_ref()
                 .map(try_clone_source_identifier)
                 .transpose()?,
+            taker_order_type: trade.taker_order_type,
         }),
         DisplayMarketPayload::Quote(quote) => DisplayMarketPayload::Quote(DisplayQuote {
             bid: quote

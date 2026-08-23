@@ -10,8 +10,8 @@ use market_squawk_adapter_kraken::{
 };
 use market_squawk_domain::{DataQuality, MarketDepth, SequenceCapability, Timestamp};
 use market_squawk_sources::{
-    BudgetDecision, BudgetPermit, ProviderRateDeclaration, SharedProviderBudget,
-    apply_http_retry_after, install_ring_tls_provider,
+    BudgetDispatchDecision, BudgetReservation, BudgetReservationDecision, ProviderRateDeclaration,
+    SharedProviderBudget, apply_http_retry_after, install_ring_tls_provider,
 };
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, RETRY_AFTER};
 use serde::{Deserialize, Deserializer};
@@ -71,9 +71,15 @@ impl KrakenL3AccountActivation {
         cancellation: CancellationToken,
     ) -> Result<KrakenL3WebSocketTokenMaterial, KrakenL3ActivationError> {
         self.authority.require_current().await?;
-        let permit = acquire_budget(&self.budget, &cancellation).await?;
+        let reservation = reserve_budget(&self.budget, &cancellation).await?;
         let nonce = self.authority.next_persisted_nonce(next_kraken_nonce()?)?;
         let request = self.signer.websocket_token_request(&self.client, nonce)?;
+        let permit = match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => permit,
+            BudgetDispatchDecision::WaitUntil(_) | BudgetDispatchDecision::Unavailable(_) => {
+                return Err(KrakenL3ActivationError::RateLimited);
+            }
+        };
         let response = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
@@ -150,7 +156,7 @@ impl KrakenL3AccountActivation {
         self.budget
             .record_success()
             .map_err(|_reason| KrakenL3ActivationError::RateLimited)?;
-        drop(permit);
+        permit.release();
         let expires_at = timestamp_after_seconds(result.expires)?;
         Ok(KrakenL3WebSocketTokenMaterial {
             token: result.token.0,
@@ -307,17 +313,17 @@ fn validate_configuration(
     Ok(())
 }
 
-async fn acquire_budget(
+async fn reserve_budget(
     budget: &SharedProviderBudget,
     cancellation: &CancellationToken,
-) -> Result<BudgetPermit, KrakenL3ActivationError> {
+) -> Result<BudgetReservation, KrakenL3ActivationError> {
     let deadline = tokio::time::Instant::now()
         .checked_add(TOKEN_REQUEST_DEADLINE)
         .ok_or(KrakenL3ActivationError::Deadline)?;
     loop {
-        match budget.try_acquire() {
-            BudgetDecision::Ready(permit) => return Ok(permit),
-            BudgetDecision::WaitUntil(wait_until) => {
+        match budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => return Ok(reservation),
+            BudgetReservationDecision::WaitUntil(wait_until) => {
                 let wait = budget
                     .remaining_wait(wait_until)
                     .map_err(|_reason| KrakenL3ActivationError::RateLimited)?;
@@ -335,7 +341,7 @@ async fn acquire_budget(
                     () = tokio::time::sleep(wait) => {}
                 }
             }
-            BudgetDecision::Unavailable(_reason) => {
+            BudgetReservationDecision::Unavailable(_reason) => {
                 return Err(KrakenL3ActivationError::RateLimited);
             }
         }

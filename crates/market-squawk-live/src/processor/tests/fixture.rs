@@ -384,6 +384,7 @@ pub(super) fn trade() -> TestResult<ProviderObservationPayload> {
             Some(id("BUY")?),
             rule("coinbase-aggressor")?,
         ),
+        taker_order_type: None,
     })
 }
 

@@ -12,11 +12,12 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_sources::{
-    BackoffPolicy, BudgetDecision, BudgetPoolError, BudgetScope, BudgetUnavailableReason,
-    BudgetWindowSemantics, MonotonicInstant, ProviderBudgetPolicy, ProviderBudgetWindow,
-    ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderRateAuthority,
-    ProviderRateDeclaration, SharedProviderBudget, apply_http_retry_after,
+    BackoffPolicy, BudgetDecision, BudgetDispatchDecision, BudgetPoolError,
+    BudgetReservationDecision, BudgetScope, BudgetUnavailableReason, BudgetWindowSemantics,
+    MonotonicInstant, ProviderBudgetPolicy, ProviderBudgetWindow, ProviderCaptureError,
+    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, ProviderRateAuthority, ProviderRateDeclaration,
+    SharedProviderBudget, apply_http_retry_after,
 };
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER};
 use sha2::{Digest as _, Sha256};
@@ -720,12 +721,12 @@ impl TiingoHttpSource {
         if admission != TiingoQuotaAdmission::Admitted {
             return Err(TiingoHttpSourceError::QuotaDenied(admission));
         }
-        let provider_permit = match self.budget.try_acquire() {
-            BudgetDecision::Ready(permit) => permit,
-            BudgetDecision::WaitUntil(deadline) => {
+        let provider_reservation = match self.budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => reservation,
+            BudgetReservationDecision::WaitUntil(deadline) => {
                 return Err(TiingoHttpSourceError::BudgetWaitUntil(deadline));
             }
-            BudgetDecision::Unavailable(reason) => {
+            BudgetReservationDecision::Unavailable(reason) => {
                 return Err(TiingoHttpSourceError::BudgetUnavailable(reason));
             }
         };
@@ -733,11 +734,33 @@ impl TiingoHttpSource {
         let quota_permit = match runtime.quota.reserve(spec.ticker().clone(), reservation)? {
             Ok(permit) => permit,
             Err(admission) => {
-                provider_permit.release();
+                provider_reservation.release();
                 return Err(TiingoHttpSourceError::QuotaDenied(admission));
             }
         };
         persist_quota_transition(&self.quota_store, runtime, Some(prior.digest()))?;
+
+        let provider_permit = match provider_reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => permit,
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                cancel_undispatched_quota(
+                    &self.quota_store,
+                    runtime,
+                    &quota_permit,
+                    spec.ticker(),
+                )?;
+                return Err(TiingoHttpSourceError::BudgetWaitUntil(deadline));
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                cancel_undispatched_quota(
+                    &self.quota_store,
+                    runtime,
+                    &quota_permit,
+                    spec.ticker(),
+                )?;
+                return Err(TiingoHttpSourceError::BudgetUnavailable(reason));
+            }
+        };
 
         let response = match self
             .transport
@@ -758,7 +781,6 @@ impl TiingoHttpSource {
                     spec.ticker(),
                     failure.quota_charge_bytes,
                 )?;
-                provider_permit.release();
                 return Err(TiingoHttpSourceError::Transport(failure));
             }
         };
@@ -769,8 +791,6 @@ impl TiingoHttpSource {
             spec.ticker(),
             response.response_bytes(),
         )?;
-        provider_permit.release();
-
         if !(200..=299).contains(&response.status) {
             let rate_limit = if matches!(response.status, 429 | 503) {
                 Some(rate_limit_disposition(apply_http_retry_after(
@@ -804,6 +824,7 @@ impl TiingoHttpSource {
         self.budget
             .record_success()
             .map_err(TiingoHttpSourceError::BudgetUnavailable)?;
+        provider_permit.release();
         Ok(raw)
     }
 
@@ -937,6 +958,17 @@ fn settle_response_quota(
         .commit_response(permit, ticker, actual_response_bytes);
     persist_quota_transition(store, runtime, Some(predecessor))?;
     transition.map_err(TiingoHttpSourceError::Quota)
+}
+
+fn cancel_undispatched_quota(
+    store: &Arc<dyn TiingoQuotaStore>,
+    runtime: &mut TiingoRuntime,
+    permit: &crate::TiingoQuotaPermit,
+    ticker: &TiingoTicker,
+) -> Result<(), TiingoHttpSourceError> {
+    let predecessor = runtime.quota.snapshot().digest();
+    runtime.quota.cancel_undispatched(permit, ticker)?;
+    persist_quota_transition(store, runtime, Some(predecessor))
 }
 
 fn rate_limit_disposition(
@@ -1243,15 +1275,17 @@ mod tests {
     use std::collections::VecDeque;
     use std::error::Error;
     use std::num::NonZeroU64;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use market_squawk_domain::{
         CalendarDate, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
     };
     use market_squawk_sources::{
-        AuthorizationMode, ProviderRateDecision, ProviderRateGroupId, ProviderRatePermitId,
-        ProviderRateRegistration, ProviderRateRunId, ProviderRateStore, ProviderRateStoreError,
-        RetryAfter,
+        AuthorizationMode, PreparedProviderRateRegistrationBatch, ProviderRateDispatchDecision,
+        ProviderRateGroupId, ProviderRatePermitId, ProviderRateRegistration,
+        ProviderRateReservationDecision, ProviderRateReservationId, ProviderRateRunId,
+        ProviderRateStore, ProviderRateStoreError, RetryAfter,
     };
     use reqwest::header::AUTHORIZATION;
     use uuid::Uuid;
@@ -1299,6 +1333,31 @@ mod tests {
     #[derive(Debug, Default)]
     struct MemoryRateStore {
         next_permit: Mutex<u128>,
+        dispatch_override: Mutex<Option<ProviderRateDispatchDecision>>,
+    }
+
+    impl MemoryRateStore {
+        fn with_dispatch_override(decision: ProviderRateDispatchDecision) -> Self {
+            Self {
+                next_permit: Mutex::new(0),
+                dispatch_override: Mutex::new(Some(decision)),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct MemoryPreparedRateBatch {
+        registrations: Box<[ProviderRateRegistration]>,
+    }
+
+    impl PreparedProviderRateRegistrationBatch for MemoryPreparedRateBatch {
+        fn registrations(&self) -> &[ProviderRateRegistration] {
+            &self.registrations
+        }
+
+        fn commit(self: Box<Self>) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
     }
 
     impl ProviderRateStore for MemoryRateStore {
@@ -1306,25 +1365,33 @@ mod tests {
             Ok(ProviderRateRunId::from_bytes([1; 16]))
         }
 
-        fn register(
+        fn prepare_registration_batch(
             &self,
             _run_id: ProviderRateRunId,
-            declaration: &ProviderRateDeclaration,
+            declarations: &[ProviderRateDeclaration],
             _now: Timestamp,
-        ) -> Result<ProviderRateRegistration, ProviderRateStoreError> {
-            Ok(ProviderRateRegistration::new(
-                ProviderRateGroupId::from_bytes([2; 16]),
-                declaration.policy_digest(),
-                declaration.declaration_digest(),
-            ))
+        ) -> Result<Box<dyn PreparedProviderRateRegistrationBatch>, ProviderRateStoreError>
+        {
+            let registrations = declarations
+                .iter()
+                .map(|declaration| {
+                    ProviderRateRegistration::new(
+                        ProviderRateGroupId::from_bytes([2; 16]),
+                        declaration.policy_digest(),
+                        declaration.declaration_digest(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            Ok(Box::new(MemoryPreparedRateBatch { registrations }))
         }
 
-        fn try_acquire(
+        fn try_reserve(
             &self,
             _run_id: ProviderRateRunId,
             _registration: ProviderRateRegistration,
             _now: Timestamp,
-        ) -> Result<ProviderRateDecision, ProviderRateStoreError> {
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
             let mut next = self
                 .next_permit
                 .lock()
@@ -1332,9 +1399,38 @@ mod tests {
             *next = next
                 .checked_add(1)
                 .ok_or(ProviderRateStoreError::Capacity)?;
-            Ok(ProviderRateDecision::Ready(
-                ProviderRatePermitId::from_bytes(next.to_be_bytes()),
+            Ok(ProviderRateReservationDecision::Ready(
+                ProviderRateReservationId::from_bytes(next.to_be_bytes()),
             ))
+        }
+
+        fn commit_dispatch(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            reservation_id: ProviderRateReservationId,
+            _now: Timestamp,
+        ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
+            if let Some(decision) = self
+                .dispatch_override
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?
+                .take()
+            {
+                return Ok(decision);
+            }
+            Ok(ProviderRateDispatchDecision::Ready(
+                ProviderRatePermitId::from_bytes(reservation_id.bytes()),
+            ))
+        }
+
+        fn cancel_reservation(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _reservation_id: ProviderRateReservationId,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
         }
 
         fn release(
@@ -1352,8 +1448,8 @@ mod tests {
             _registration: ProviderRateRegistration,
             _now: Timestamp,
             _retry_after: RetryAfter,
-        ) -> Result<ProviderRateDecision, ProviderRateStoreError> {
-            Ok(ProviderRateDecision::Unavailable(
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            Ok(ProviderRateReservationDecision::Unavailable(
                 BudgetUnavailableReason::Disabled,
             ))
         }
@@ -1364,8 +1460,8 @@ mod tests {
             _registration: ProviderRateRegistration,
             _now: Timestamp,
             _jitter_sample_basis_points: u16,
-        ) -> Result<ProviderRateDecision, ProviderRateStoreError> {
-            Ok(ProviderRateDecision::Unavailable(
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            Ok(ProviderRateReservationDecision::Unavailable(
                 BudgetUnavailableReason::Disabled,
             ))
         }
@@ -1402,6 +1498,7 @@ mod tests {
     #[derive(Debug)]
     struct MockTransport {
         replies: Mutex<VecDeque<MockReply>>,
+        calls: AtomicUsize,
     }
 
     #[derive(Debug)]
@@ -1415,7 +1512,12 @@ mod tests {
         fn new(replies: Vec<MockReply>) -> Self {
             Self {
                 replies: Mutex::new(replies.into()),
+                calls: AtomicUsize::new(0),
             }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
         }
     }
 
@@ -1427,6 +1529,7 @@ mod tests {
             _timeout: Duration,
             _cancellation: CancellationToken,
         ) -> BoxFuture<'_, Result<TiingoHttpResponseMaterial, TiingoTransportFailure>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 let started = Instant::now();
                 let Some(authorization) = request.headers().get(AUTHORIZATION) else {
@@ -1477,6 +1580,75 @@ mod tests {
 
     fn identifier(value: &str) -> Result<SourceIdentifier, Box<dyn Error>> {
         Ok(SourceIdentifier::try_from(value)?)
+    }
+
+    #[tokio::test]
+    async fn aggregate_dispatch_rejection_cancels_undispatched_local_quota()
+    -> Result<(), Box<dyn Error>> {
+        let now = system_timestamp()?;
+        let windows = TiingoQuotaWindows::try_new(
+            now,
+            Timestamp::from_unix_nanos(now.unix_nanos() + 3_600_000_000_000),
+            Timestamp::from_unix_nanos(now.unix_nanos() + 86_400_000_000_000),
+            Timestamp::from_unix_nanos(now.unix_nanos() + 2_592_000_000_000_000),
+        )?;
+        let quota_store = Arc::new(MemoryQuotaStore {
+            snapshot: Mutex::new(None),
+        });
+        let rate_authority =
+            ProviderRateAuthority::try_new(Arc::new(MemoryRateStore::with_dispatch_override(
+                ProviderRateDispatchDecision::Unavailable(BudgetUnavailableReason::Disabled),
+            )))?;
+        let transport = Arc::new(MockTransport::new(Vec::new()));
+        let source = TiingoHttpSource::try_new_with_transport(
+            TiingoApiToken::try_new("fixture-token".to_owned())?,
+            &rate_authority,
+            quota_store.clone(),
+            windows,
+            SourceId::try_from("tiingo-starter")?,
+            MetadataRevision::new(identifier("tiingo-source-metadata-v1")?),
+            identifier("tiingo-daily-native-v1")?,
+            transport.clone(),
+        )?;
+        let before = source.quota_snapshot().await;
+        let deadline =
+            Timestamp::from_unix_nanos(system_timestamp()?.unix_nanos() + 60_000_000_000);
+
+        assert!(matches!(
+            source
+                .fetch_latest(
+                    TiingoTicker::try_new("VTSAX")?,
+                    deadline,
+                    &CancellationToken::new(),
+                )
+                .await,
+            Err(TiingoHttpSourceError::BudgetUnavailable(
+                BudgetUnavailableReason::Disabled
+            ))
+        ));
+
+        let after = source.quota_snapshot().await;
+        assert_eq!(after.requests_this_hour(), before.requests_this_hour());
+        assert_eq!(after.requests_this_day(), before.requests_this_day());
+        assert_eq!(
+            after.response_bytes_this_month(),
+            before.response_bytes_this_month()
+        );
+        assert_eq!(
+            after.unique_symbols_this_month(),
+            before.unique_symbols_this_month()
+        );
+        assert_eq!(after.pending_response(), before.pending_response());
+        assert_eq!(
+            after.state_version(),
+            before
+                .state_version()
+                .checked_add(2)
+                .ok_or("quota state version overflow")?
+        );
+        assert_eq!(quota_store.load()?, Some(after));
+        assert_eq!(transport.calls(), 0);
+        Ok(())
     }
 
     #[tokio::test]

@@ -500,18 +500,62 @@ function ReferenceWorkspace({ row }: { row: ReferenceMarketRow }) {
   )
 }
 
+type RuntimeDisplayMark = {
+  value: string
+  currency: string
+  basis: "fresh_last_trade" | "fresh_bid_ask_midpoint"
+  sourceValidUntil: string | null
+}
+
+function runtimeDisplayMark(row: UnifiedMarketRow): RuntimeDisplayMark | null {
+  const source = row.selectedSource
+  if (!source) return null
+  if (
+    row.quote.lastPrice !== null &&
+    row.quote.lastFreshAtSelection === true &&
+    source.freshness.freshAtSelection
+  ) {
+    return {
+      value: row.quote.lastPrice,
+      currency: row.quoteCurrency,
+      basis: "fresh_last_trade",
+      sourceValidUntil: source.freshness.sourceValidUntil,
+    }
+  }
+  if (row.quote.midPrice !== null && source.freshness.freshAtSelection) {
+    return {
+      value: row.quote.midPrice,
+      currency: row.quoteCurrency,
+      basis: "fresh_bid_ask_midpoint",
+      sourceValidUntil: source.freshness.sourceValidUntil,
+    }
+  }
+  return null
+}
+
+function runtimeDisplayMarkSummary(
+  row: UnifiedMarketRow,
+  mark: RuntimeDisplayMark | null,
+): string {
+  if (!mark) {
+    return row.selectedSource
+      ? "The selected runtime source has no fresh completed trade or bid-and-ask midpoint."
+      : marketObservationUnavailableName(row.marketObservation.reason)
+  }
+  const validThrough = mark.sourceValidUntil
+    ? ` · source valid through ${dateTime(mark.sourceValidUntil)}`
+    : " · no precise source deadline reported"
+  return `${markBasisName(mark.basis)} · runtime display only${validThrough}`
+}
+
 function MarketCard({ row, selected, onSelect }: {
   row: UnifiedMarketRow
   selected: boolean
   onSelect: () => void
 }) {
   const source = row.selectedSource
-  const observation = row.marketObservation
-  const mark = observation.availability === "available" ? observation.mark : null
-  const markSummary =
-    observation.availability === "available"
-      ? `${markBasisName(observation.mark.basis)} · ${observation.mark.freshUntil ? `fresh through ${dateTime(observation.mark.freshUntil)}` : "no precise freshness deadline reported"}`
-      : marketObservationUnavailableName(observation.reason)
+  const mark = runtimeDisplayMark(row)
+  const markSummary = runtimeDisplayMarkSummary(row, mark)
   return (
     <button
       type="button"
@@ -546,7 +590,7 @@ function MarketCard({ row, selected, onSelect }: {
       </div>
       <div className="mt-5">
         <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-          Selected market mark
+          Current display price
         </p>
         <p className="mt-1 font-mono text-2xl font-semibold">
           {mark ? `${mark.value} ${mark.currency}` : "Not available"}
@@ -651,7 +695,11 @@ function InstrumentWorkspace({
                   </div>
                   <div className="text-left sm:text-right">
                     <p className="font-mono text-xs">{trade.priceTicks.toLocaleString()} ticks</p>
-                    <p className="mt-1 text-[10px] text-muted-foreground">{trade.quantityLots.toLocaleString()} lots · {dateTime(trade.availableAt)}</p>
+                    <p className="mt-1 text-[10px] text-muted-foreground">
+                      {trade.quantityLots.toLocaleString()} lots
+                      {trade.takerOrderType ? ` · ${trade.takerOrderType === "market" ? "Market" : "Limit"} taker` : ""}
+                      {` · ${dateTime(trade.availableAt)}`}
+                    </p>
                   </div>
                   <p className="text-[10px] text-muted-foreground sm:col-span-2">
                     {qualityName(trade.currentQuality)} · {truth(trade.fresh, "fresh", "stale")}
@@ -755,8 +803,7 @@ function InstrumentWorkspace({
 function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
   const source = row.selectedSource
   const observation = row.marketObservation
-  const mark = observation.availability === "available" ? observation.mark : null
-  const features = observation.availability === "available" ? observation.features : null
+  const mark = runtimeDisplayMark(row)
   const receipt = row.selectionReceipt
 
   return (
@@ -772,8 +819,10 @@ function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
               : `${row.symbol} · no eligible source`}
           </h3>
           <p className="mt-1 max-w-2xl text-[11px] leading-5 text-muted-foreground">
-            {observation.availability === "available"
-              ? "This mark comes from the exact source selected for this instrument. Its timing, coverage, and evidence remain attached below."
+            {source
+              ? mark
+                ? "This current display price comes from the exact selected runtime source. This live-feed response does not establish durable point-in-time evidence for investment analysis."
+                : "The runtime source remains selected, but it has no fresh completed trade or bid-and-ask midpoint to display."
               : marketObservationUnavailableName(observation.reason)}
           </p>
           <p className="mt-2 text-[10px] font-medium text-amber-200">
@@ -782,31 +831,27 @@ function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
         </div>
         <div className="flex flex-wrap justify-end gap-2">
           <EvidenceBadge
-            label={mark ? "Selected mark available" : "Mark unavailable"}
+            label={mark ? "Current display price" : "Display price unavailable"}
             tone={mark ? "good" : "bad"}
           />
           <EvidenceBadge
-            label={
-              row.analyticalReadiness === "runtime_display_only"
-                ? "Runtime display only"
-                : "Durable PIT evidence"
-            }
-            tone={row.analyticalReadiness === "durable_pit_available" ? "good" : "neutral"}
+            label="Runtime display only"
+            tone="neutral"
           />
         </div>
       </div>
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
         <Fact
-          label="Selected mark"
+          label="Current display price"
           value={mark ? `${mark.value} ${mark.currency}` : "Not available"}
         />
-        <Fact label="Mark basis" value={mark ? markBasisName(mark.basis) : "Not available"} />
+        <Fact label="Price basis" value={mark ? markBasisName(mark.basis) : "Not available"} />
         <Fact
-          label="Fresh through"
+          label="Source valid through"
           value={
             mark
-              ? mark.freshUntil
-                ? dateTime(mark.freshUntil)
+              ? mark.sourceValidUntil
+                ? dateTime(mark.sourceValidUntil)
                 : "No precise deadline reported"
               : "Not available"
           }
@@ -826,57 +871,29 @@ function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
           <Fact label="Source health" value={source ? humanize(source.health) : "Not available"} />
           <Fact
             label="Quality"
-            value={
-              observation.availability === "available"
-                ? humanize(observation.quality)
-                : "Not available"
-            }
+            value={source ? humanize(source.quality) : "Not available"}
           />
           <Fact
             label="Market depth"
             value={
-              observation.availability === "available"
-                ? observation.depth
-                  ? humanize(observation.depth)
+              source
+                ? source.depth
+                  ? humanize(source.depth)
                   : "No market book"
                 : "Not available"
             }
           />
           <Fact
             label="Coverage"
-            value={
-              observation.availability === "available"
-                ? humanize(observation.coverage)
-                : "Not available"
-            }
+            value={source ? humanize(source.coverage) : "Not available"}
           />
           <Fact
             label="Integrity"
-            value={
-              observation.availability === "available"
-                ? humanize(observation.integrity)
-                : "Not available"
-            }
+            value={source ? humanize(source.integrity.state) : "Not available"}
           />
           <Fact
             label="Connection generation"
-            value={
-              observation.availability === "available"
-                ? observation.generation ?? "Not reported"
-                : "Not available"
-            }
-          />
-          <Fact
-            label="Feature status"
-            value={features ? marketFeatureAvailabilityName(features) : "Not available"}
-          />
-          <Fact
-            label="Feature observed"
-            value={
-              features?.availability === "available"
-                ? dateTime(features.availableAt)
-                : "Not available"
-            }
+            value={source?.integrity.connectionGeneration ?? "Not available"}
           />
           <Fact
             label="Eligible sources"
@@ -899,18 +916,7 @@ function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
             value={`Revision ${receipt.policyRevision.toLocaleString()} · up to ${receipt.policyCandidateLimit.toLocaleString()} sources`}
           />
           <Fact label="Policy digest" value={digestName(receipt.policyDigest)} />
-          <Fact
-            label="Mark evidence"
-            value={mark ? digestName(mark.evidenceIdentity) : "Not available"}
-          />
-          <Fact
-            label="Feature evidence"
-            value={
-              features?.availability === "available"
-                ? digestName(features.contentDigest)
-                : "Not available"
-            }
-          />
+          <Fact label="Analytical use" value={analyticalReadinessName(row.analyticalReadiness)} />
         </dl>
       </details>
     </section>
@@ -1194,10 +1200,7 @@ function Fact({ label, value }: { label: string; value: string }) {
 }
 
 function markBasisName(
-  value: Extract<
-    UnifiedMarketRow["marketObservation"],
-    { availability: "available" }
-  >["mark"]["basis"],
+  value: RuntimeDisplayMark["basis"],
 ): string {
   switch (value) {
     case "fresh_last_trade":
@@ -1216,42 +1219,15 @@ function marketObservationUnavailableName(
   switch (value) {
     case "no_eligible_source":
       return "No source met the current data requirements."
-    case "no_fresh_last_trade_or_midpoint":
-      return "The selected source has no fresh trade or bid-and-ask midpoint."
     case "durable_pit_evidence_not_established":
-      return "The live source is usable for current display, but no durable point-in-time observation has been archived for investment analysis."
+      return "The live source is usable for current display, but this live-feed response does not establish durable point-in-time evidence for investment analysis."
   }
 }
 
 function analyticalReadinessName(
-  readiness: UnifiedMarketRow["analyticalReadiness"],
+  _readiness: UnifiedMarketRow["analyticalReadiness"],
 ) {
-  return readiness === "runtime_display_only"
-    ? "Live runtime display · not archived/PIT evidence"
-    : "Durable point-in-time evidence is available for analysis"
-}
-
-function marketFeatureAvailabilityName(
-  value: Extract<
-    UnifiedMarketRow["marketObservation"],
-    { availability: "available" }
-  >["features"],
-): string {
-  if (value.availability === "available") {
-    return `${value.valueCount.toLocaleString()} source-matched feature ${value.valueCount === 1 ? "value" : "values"}`
-  }
-  switch (value.reason) {
-    case "source_does_not_publish_live_features":
-      return "This source does not publish live features"
-    case "incomplete_snapshot":
-      return "Feature snapshot is incomplete"
-    case "no_exact_source_generation":
-      return "No features match this exact source connection"
-    case "available_after_selection":
-      return "Features arrived after this mark was selected"
-    case "incomplete_value_set":
-      return "Feature values are incomplete"
-  }
+  return "Live runtime display · this feed is not PIT evidence"
 }
 
 function marketDowngradeSummary(

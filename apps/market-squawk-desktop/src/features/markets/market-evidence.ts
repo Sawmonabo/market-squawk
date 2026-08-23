@@ -157,6 +157,7 @@ const tradeSchema = z
     priceTicks: integerTextSchema,
     quantityLots: unsignedIntegerTextSchema,
     aggressorSide: z.enum(["buy", "sell", "unknown"]),
+    takerOrderType: z.enum(["limit", "market"]).nullable(),
     sourceTimestamp: timestampSchema.nullable(),
     receivedAt: timestampSchema,
     availableAt: timestampSchema,
@@ -512,6 +513,7 @@ export interface InstrumentTrade {
   stableTradeId: string
   priceTicks: string
   quantityLots: string
+  takerOrderType: "limit" | "market" | null
   availableAt: string
   currentQuality: string
   fresh: boolean
@@ -662,6 +664,7 @@ export function instrumentTrades(
       stableTradeId: row.stableTradeId,
       priceTicks: row.priceTicks,
       quantityLots: row.quantityLots,
+      takerOrderType: row.takerOrderType,
       availableAt: row.availableAt,
       currentQuality: row.currentDisplayQuality,
       fresh: row.freshAtReference,

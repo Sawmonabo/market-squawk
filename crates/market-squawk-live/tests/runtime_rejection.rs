@@ -86,8 +86,30 @@ async fn rejected_first_observation_is_quarantined_without_killing_other_routes_
     let (_, rejected) = rejected_source.batch_with_price("inexact-price", 1, "100.001")?;
     let (_, healthy) = healthy_source.batch("healthy-trade", 1)?;
 
-    rejected_ingress.try_publish(rejected)?;
     healthy_ingress.try_publish(healthy)?;
+
+    let healthy_key = route(INSTRUMENT_TWO)?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = runtime.snapshots().try_load_all()?;
+            let healthy = snapshot
+                .snapshots()
+                .flat_map(|shard| shard.routes())
+                .find(|candidate| candidate.route() == &healthy_key)
+                .and_then(|route| route.streams().first())
+                .is_some_and(|stream| {
+                    stream.phase() == StreamPhaseSnapshot::Healthy && stream.generation_current()
+                });
+            if healthy {
+                return Ok::<_, Box<dyn std::error::Error>>(());
+            }
+            drop(snapshot);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+
+    rejected_ingress.try_publish(rejected)?;
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -102,7 +124,6 @@ async fn rejected_first_observation_is_quarantined_without_killing_other_routes_
     .await?;
 
     let rejected_key = route(INSTRUMENT_ONE)?;
-    let healthy_key = route(INSTRUMENT_TWO)?;
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let snapshot = runtime.snapshots().try_load_all()?;
@@ -120,7 +141,9 @@ async fn rejected_first_observation_is_quarantined_without_killing_other_routes_
                 && rejected_route.streams().len() == 1
                 && healthy_route.streams().len() == 1
                 && rejected_route.streams()[0].phase() == StreamPhaseSnapshot::Quarantined
+                && !rejected_route.streams()[0].generation_current()
                 && healthy_route.streams()[0].phase() == StreamPhaseSnapshot::Healthy
+                && healthy_route.streams()[0].generation_current()
             {
                 return Ok::<_, Box<dyn std::error::Error>>(());
             }

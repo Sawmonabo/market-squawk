@@ -27,7 +27,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -36,7 +37,10 @@ use tokio_util::sync::CancellationToken;
 use super::super::live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError};
 use super::super::provider_rate::open_provider_rate_authority;
 use super::instruments::ProductionInstrumentSet;
-use super::kraken::{ProductionKrakenProfile, ProductionKrakenProfileError};
+use super::kraken::{
+    KrakenPublicChannel, KrakenPublicCurrentnessObserver, KrakenPublicSupervisorSet,
+    KrakenPublicSupervisorSetError, ProductionKrakenProfileError, ProductionKrakenProfileSet,
+};
 use super::provider::{ProductionProviderError, ProductionSourceProfile, ProductionSourceProvider};
 use super::route_actor::RouteBufferLimits;
 use super::supervisor::{ProductionSourceSupervisor, ProductionSupervisorError};
@@ -66,9 +70,44 @@ const PRE_ACKNOWLEDGEMENT_DATA_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
 #[derive(Debug)]
 pub struct ProductionLiveSourceComposition {
     config: AppConfig,
-    profile: ProductionSourceProfile,
+    installation: ProductionSourceInstallation,
     routes: Vec<LiveRouteConfig>,
     provider_rate: ProviderRateAuthority,
+}
+
+/// Sealed source topology admitted by one public-provider composition.
+///
+/// Kraken is intentionally not represented as a generic optional companion. Its book and trade
+/// profiles form one required pair with independent metadata, capture authority, and lifecycle.
+#[derive(Debug)]
+enum ProductionSourceInstallation {
+    Single(ProductionSourceProfile),
+    Kraken {
+        book: ProductionSourceProfile,
+        trades: ProductionSourceProfile,
+    },
+}
+
+impl ProductionSourceInstallation {
+    fn primary(&self) -> &ProductionSourceProfile {
+        match self {
+            Self::Single(profile) | Self::Kraken { book: profile, .. } => profile,
+        }
+    }
+
+    #[cfg(all(test, debug_assertions))]
+    fn with_local_kraken_endpoint_for_test(
+        self,
+        endpoint: &str,
+    ) -> Result<Self, ProductionProviderError> {
+        let Self::Kraken { book, trades } = self else {
+            return Err(ProductionProviderError::TestConnectorMismatch);
+        };
+        Ok(Self::Kraken {
+            book: book.with_local_kraken_endpoint_for_test(endpoint)?,
+            trades: trades.with_local_kraken_endpoint_for_test(endpoint)?,
+        })
+    }
 }
 
 impl ProductionLiveSourceComposition {
@@ -107,30 +146,35 @@ impl ProductionLiveSourceComposition {
         provider: ProductionSourceProvider,
         provider_rate: ProviderRateAuthority,
     ) -> Result<Self, ProductionLiveSourceCompositionError> {
-        let profile = match provider {
+        let installation = match provider {
             ProductionSourceProvider::Coinbase => {
                 let source = config
                     .coinbase()
                     .ok_or(ProductionLiveSourceCompositionError::MissingCoinbaseConfiguration)?;
                 validate_coinbase_routes(source, &routes)?;
-                ProductionSourceProfile::coinbase(
+                ProductionSourceInstallation::Single(ProductionSourceProfile::coinbase(
                     ProductionCoinbaseProfile::try_from(source)?,
                     source,
                     PRE_ACKNOWLEDGEMENT_DATA_MESSAGE_CAPACITY,
                     PRE_ACKNOWLEDGEMENT_DATA_BYTE_CAPACITY,
-                )?
+                )?)
             }
             ProductionSourceProvider::Kraken => {
                 let source = config
                     .kraken()
                     .ok_or(ProductionLiveSourceCompositionError::MissingKrakenConfiguration)?;
                 validate_kraken_routes(source, &routes)?;
-                ProductionSourceProfile::kraken(ProductionKrakenProfile::try_from(source)?, source)
+                let [book, trades] =
+                    ProductionKrakenProfileSet::try_from_config(source)?.into_channels();
+                ProductionSourceInstallation::Kraken {
+                    book: ProductionSourceProfile::kraken(book, source),
+                    trades: ProductionSourceProfile::kraken(trades, source),
+                }
             }
         };
         Ok(Self {
             config,
-            profile,
+            installation,
             routes,
             provider_rate,
         })
@@ -138,12 +182,44 @@ impl ProductionLiveSourceComposition {
 
     /// Returns the only provider endpoint accepted by the sealed production adapter.
     pub fn endpoint(&self) -> &str {
-        self.profile.endpoint()
+        self.installation.primary().endpoint()
     }
 
-    /// Returns exact canonical source metadata, including coverage and quality ceiling.
-    pub fn metadata(&self) -> &SourceMetadata {
-        self.profile.metadata()
+    /// Returns every exact source-metadata record installed by this composition.
+    ///
+    /// The ordering is closed and deterministic: a single-source provider contributes one record,
+    /// while Kraken contributes `[book, trades]`. Consumers must retain the complete set when
+    /// joining native stream snapshots to source provenance.
+    pub fn source_metadata(
+        &self,
+    ) -> Result<Arc<[SourceMetadata]>, ProductionLiveSourceCompositionError> {
+        let capacity = match &self.installation {
+            ProductionSourceInstallation::Single(_) => 1,
+            ProductionSourceInstallation::Kraken { .. } => 2,
+        };
+        let mut metadata = Vec::new();
+        metadata
+            .try_reserve_exact(capacity)
+            .map_err(|_error| ProductionLiveSourceCompositionError::SourceMetadataAllocation)?;
+        match &self.installation {
+            ProductionSourceInstallation::Single(profile) => {
+                metadata.push(profile.metadata().clone());
+            }
+            ProductionSourceInstallation::Kraken { book, trades } => {
+                metadata.push(book.metadata().clone());
+                metadata.push(trades.metadata().clone());
+            }
+        }
+        Ok(metadata.into())
+    }
+
+    /// Returns the source whose quote/book observations feed the bounded fair-value export.
+    ///
+    /// This deliberately does not describe the complete installed topology. Public provenance
+    /// consumers must use [`Self::source_metadata`]. Kraken trade observations remain available
+    /// through the native market snapshot rather than the quote/book fair-value export.
+    pub(crate) fn qualified_market_export_source_id(&self) -> &SourceId {
+        self.installation.primary().metadata().source_id()
     }
 
     /// Returns the complete validated route set that will be reserved before network access.
@@ -184,15 +260,17 @@ impl ProductionLiveSourceComposition {
         mut self,
         endpoint: &str,
     ) -> Result<Self, ProductionLiveSourceCompositionError> {
-        self.profile = self.profile.with_local_kraken_endpoint_for_test(endpoint)?;
+        self.installation = self
+            .installation
+            .with_local_kraken_endpoint_for_test(endpoint)?;
         Ok(self)
     }
 
-    /// Starts the bounded live runtime and exact-generation Coinbase supervisor.
+    /// Starts the bounded live runtime and exact sealed provider-supervisor topology.
     ///
     /// The method returns only after durable registry admission, capture-writer startup, and every
-    /// dormant route reservation succeed. The sealed Coinbase source is the only connector that
-    /// can be opened by the returned owner.
+    /// dormant route reservation succeed. Only the connector or required connector set retained
+    /// by this closed composition can be opened by the returned owner.
     ///
     /// # Errors
     ///
@@ -355,35 +433,136 @@ impl ProductionLiveSourceComposition {
         capture_process: CaptureProcessInfrastructure,
         cancellation: CancellationToken,
     ) -> Result<ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError> {
-        let routes = self
-            .routes
+        let Self {
+            config,
+            installation,
+            routes: configured_routes,
+            provider_rate,
+        } = self;
+        let routes = configured_routes
             .iter()
             .map(|route| route.route().clone())
-            .collect();
-        let supervisor = match ProductionSourceSupervisor::try_new_with_provider_rate(
-            &self.config,
-            self.profile,
-            paths,
-            capture_process,
-            live.production_ingress(),
-            routes,
-            route_buffer_limits,
-            self.provider_rate,
-        ) {
-            Ok(supervisor) => supervisor,
-            Err(source) => {
+            .collect::<Vec<_>>();
+        let source_shutdown = config.source_shutdown();
+        let ingress = live.production_ingress();
+        let owner = match installation {
+            ProductionSourceInstallation::Single(profile) => {
+                match ProductionSourceSupervisor::try_new_with_provider_rate(
+                    &config,
+                    profile,
+                    paths,
+                    capture_process,
+                    ingress,
+                    routes,
+                    route_buffer_limits,
+                    provider_rate,
+                ) {
+                    Ok(supervisor) => {
+                        ProductionSupervisorOwner::start_single(supervisor, cancellation).await
+                    }
+                    Err(error) => Err(ProductionLiveSourceRuntimeError::Supervisor(error)),
+                }
+            }
+            ProductionSourceInstallation::Kraken { book, trades } => {
+                match KrakenPublicCurrentnessObserver::try_new(
+                    live.snapshots(),
+                    &routes,
+                    book.metadata().source_id().clone(),
+                    trades.metadata().source_id().clone(),
+                ) {
+                    Err(error) => Err(map_kraken_supervisor_error(error)),
+                    Ok(currentness) => {
+                        let book_supervisor =
+                            ProductionSourceSupervisor::try_new_with_provider_rate(
+                                &config,
+                                book,
+                                paths.clone(),
+                                capture_process,
+                                ingress.clone(),
+                                routes.clone(),
+                                route_buffer_limits,
+                                provider_rate.clone(),
+                            )
+                            .map_err(ProductionLiveSourceRuntimeError::Supervisor);
+                        match book_supervisor {
+                            Err(error) => Err(error),
+                            Ok(book_supervisor) => {
+                                let trade_supervisor =
+                                    ProductionSourceSupervisor::try_new_with_provider_rate(
+                                        &config,
+                                        trades,
+                                        paths,
+                                        capture_process,
+                                        ingress,
+                                        routes,
+                                        route_buffer_limits,
+                                        provider_rate,
+                                    );
+                                match trade_supervisor {
+                                    Ok(trade_supervisor) => KrakenPublicSupervisorSet::start(
+                                        book_supervisor,
+                                        trade_supervisor,
+                                        cancellation,
+                                        source_shutdown,
+                                        currentness,
+                                    )
+                                    .await
+                                    .map(ProductionSupervisorOwner::Kraken)
+                                    .map_err(map_kraken_supervisor_error),
+                                    Err(source) => match book_supervisor.shutdown() {
+                                        Ok(()) => Err(
+                                            ProductionLiveSourceRuntimeError::Supervisor(source),
+                                        ),
+                                        Err(cleanup) => Err(
+                                            ProductionLiveSourceRuntimeError::KrakenConstructionCleanup {
+                                                source: Box::new(source),
+                                                cleanup: Box::new(cleanup),
+                                            },
+                                        ),
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let owner = match owner {
+            Ok(owner) => owner,
+            Err(startup) => {
                 return match live.shutdown().await {
-                    Ok(_shutdown) => Err(ProductionLiveSourceRuntimeError::Supervisor(source)),
-                    Err(rollback) => Err(
-                        ProductionLiveSourceRuntimeError::SupervisorStartupRollback {
-                            source: Box::new(source),
-                            rollback,
-                        },
-                    ),
+                    Ok(_shutdown) => Err(startup),
+                    Err(rollback) => Err(ProductionLiveSourceRuntimeError::SourceStartupRollback {
+                        startup: Box::new(startup),
+                        rollback,
+                    }),
                 };
             }
         };
-        let source_shutdown = self.config.source_shutdown();
+        Ok(ProductionLiveSourceRuntime {
+            supervisor: owner,
+            live,
+            source_shutdown,
+        })
+    }
+}
+
+/// Drop-safe owner for either one source supervisor or Kraken's required book/trade pair.
+#[derive(Debug)]
+enum ProductionSupervisorOwner {
+    Single {
+        // Declared first so cancellation precedes join-handle detachment on drop.
+        cancellation: SupervisorDropCancellation,
+        task: tokio::task::JoinHandle<Result<(), ProductionSupervisorError>>,
+    },
+    Kraken(KrakenPublicSupervisorSet),
+}
+
+impl ProductionSupervisorOwner {
+    async fn start_single(
+        supervisor: ProductionSourceSupervisor,
+        cancellation: CancellationToken,
+    ) -> Result<Self, ProductionLiveSourceRuntimeError> {
         let (startup_sender, startup_receiver) = oneshot::channel();
         let supervisor_cancellation = cancellation.clone();
         let mut supervisor_task = tokio::spawn(async move {
@@ -393,58 +572,126 @@ impl ProductionLiveSourceComposition {
         });
         tokio::select! {
             startup = startup_receiver => match startup {
-                Ok(()) => Ok(ProductionLiveSourceRuntime {
-                    supervisor_cancellation: SupervisorDropCancellation::new(cancellation),
-                    live,
-                    supervisor: supervisor_task,
-                    source_shutdown,
-                }),
-                Err(_closed) => {
-                    let outcome = supervisor_task.await;
-                    let startup_error = match outcome {
-                        Ok(Ok(())) => ProductionLiveSourceRuntimeError::SupervisorExitedBeforeStartup,
-                        Ok(Err(error)) => ProductionLiveSourceRuntimeError::Supervisor(error),
-                        Err(error) => ProductionLiveSourceRuntimeError::SupervisorTask(error),
-                    };
-                    match live.shutdown().await {
-                        Ok(_shutdown) => Err(startup_error),
-                        Err(rollback) => Err(
-                            ProductionLiveSourceRuntimeError::StartupTaskRollback {
-                                startup: Box::new(startup_error),
-                                rollback,
-                            },
-                        ),
+                Ok(()) if !cancellation.is_cancelled() && !supervisor_task.is_finished() => {
+                    Ok(Self::Single {
+                        cancellation: SupervisorDropCancellation::new(cancellation),
+                        task: supervisor_task,
+                    })
+                }
+                Ok(()) | Err(_) => Err(map_single_startup_outcome(supervisor_task.await)),
+            },
+            outcome = &mut supervisor_task => Err(map_single_startup_outcome(outcome)),
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        match self {
+            Self::Single { cancellation, task } => {
+                !cancellation.token.is_cancelled() && !task.is_finished()
+            }
+            Self::Kraken(supervisors) => supervisors.is_healthy(),
+        }
+    }
+
+    async fn shutdown(self, timeout: Duration) -> Result<(), ProductionLiveSourceRuntimeError> {
+        match self {
+            Self::Single {
+                cancellation,
+                mut task,
+            } => {
+                cancellation.cancel();
+                match tokio::time::timeout(timeout, &mut task).await {
+                    Ok(Ok(Ok(()))) => Ok(()),
+                    Ok(Ok(Err(error))) => Err(ProductionLiveSourceRuntimeError::Supervisor(error)),
+                    Ok(Err(error)) => Err(ProductionLiveSourceRuntimeError::SupervisorTask(error)),
+                    Err(_elapsed) => {
+                        task.abort();
+                        let _aborted = task.await;
+                        Err(ProductionLiveSourceRuntimeError::SupervisorShutdownDeadline)
                     }
                 }
-            },
-            outcome = &mut supervisor_task => {
-                let startup_error = match outcome {
-                    Ok(Ok(())) => ProductionLiveSourceRuntimeError::SupervisorExitedBeforeStartup,
-                    Ok(Err(error)) => ProductionLiveSourceRuntimeError::Supervisor(error),
-                    Err(error) => ProductionLiveSourceRuntimeError::SupervisorTask(error),
-                };
-                match live.shutdown().await {
-                    Ok(_shutdown) => Err(startup_error),
-                    Err(rollback) => Err(
-                        ProductionLiveSourceRuntimeError::StartupTaskRollback {
-                            startup: Box::new(startup_error),
-                            rollback,
-                        },
-                    ),
-                }
+            }
+            Self::Kraken(supervisors) => {
+                let deadline = Instant::now()
+                    .checked_add(timeout)
+                    .ok_or(ProductionLiveSourceRuntimeError::SupervisorShutdownDeadline)?;
+                supervisors
+                    .shutdown(deadline)
+                    .await
+                    .map_err(map_kraken_supervisor_error)
             }
         }
+    }
+}
+
+fn map_single_startup_outcome(
+    outcome: Result<Result<(), ProductionSupervisorError>, tokio::task::JoinError>,
+) -> ProductionLiveSourceRuntimeError {
+    match outcome {
+        Ok(Ok(())) => ProductionLiveSourceRuntimeError::SupervisorExitedBeforeStartup,
+        Ok(Err(error)) => ProductionLiveSourceRuntimeError::Supervisor(error),
+        Err(error) => ProductionLiveSourceRuntimeError::SupervisorTask(error),
+    }
+}
+
+fn map_kraken_supervisor_error(
+    error: KrakenPublicSupervisorSetError,
+) -> ProductionLiveSourceRuntimeError {
+    match error {
+        KrakenPublicSupervisorSetError::Allocation => {
+            ProductionLiveSourceRuntimeError::KrakenSupervisorAllocation
+        }
+        KrakenPublicSupervisorSetError::Cancelled => {
+            ProductionLiveSourceRuntimeError::KrakenSupervisorCancelled
+        }
+        KrakenPublicSupervisorSetError::InvalidCleanupTimeout => {
+            ProductionLiveSourceRuntimeError::KrakenSupervisorInvalidCleanupTimeout
+        }
+        KrakenPublicSupervisorSetError::DeadlineRange => {
+            ProductionLiveSourceRuntimeError::KrakenSupervisorDeadlineRange
+        }
+        KrakenPublicSupervisorSetError::InvalidCurrentnessTopology => {
+            ProductionLiveSourceRuntimeError::KrakenSupervisorInvalidCurrentnessTopology
+        }
+        KrakenPublicSupervisorSetError::CurrentnessDeadline => {
+            ProductionLiveSourceRuntimeError::KrakenSupervisorCurrentnessDeadline
+        }
+        KrakenPublicSupervisorSetError::ExitedBeforeReadiness { channel } => {
+            ProductionLiveSourceRuntimeError::KrakenSupervisorExitedBeforeReadiness {
+                channel: kraken_channel_name(channel),
+            }
+        }
+        KrakenPublicSupervisorSetError::Supervisor { channel, source } => {
+            ProductionLiveSourceRuntimeError::KrakenChannelSupervisor {
+                channel: kraken_channel_name(channel),
+                source: Box::new(source),
+            }
+        }
+        KrakenPublicSupervisorSetError::Task { channel, source } => {
+            ProductionLiveSourceRuntimeError::KrakenChannelSupervisorTask {
+                channel: kraken_channel_name(channel),
+                source,
+            }
+        }
+        KrakenPublicSupervisorSetError::ShutdownDeadline => {
+            ProductionLiveSourceRuntimeError::KrakenSupervisorShutdownDeadline
+        }
+    }
+}
+
+const fn kraken_channel_name(channel: KrakenPublicChannel) -> &'static str {
+    match channel {
+        KrakenPublicChannel::Book => "book",
+        KrakenPublicChannel::Trades => "trade",
     }
 }
 
 /// Owned production live runtime with read-only snapshots and bounded coordinated shutdown.
 #[derive(Debug)]
 pub struct ProductionLiveSourceRuntime {
-    // Declared first so owner drop cancels the supervisor before the live runtime and join handle
-    // are dropped. The join handle remains detached only long enough to perform its own cleanup.
-    supervisor_cancellation: SupervisorDropCancellation,
+    // Declared first so owner drop cancels every source before the live runtime is dropped.
+    supervisor: ProductionSupervisorOwner,
     live: LiveRuntimeComposition,
-    supervisor: tokio::task::JoinHandle<Result<(), ProductionSupervisorError>>,
     source_shutdown: Duration,
 }
 
@@ -452,7 +699,7 @@ impl ProductionLiveSourceRuntime {
     /// Reports whether the source supervisor still owns the live producer generation.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
-        !self.supervisor_cancellation.token.is_cancelled() && !self.supervisor.is_finished()
+        self.supervisor.is_healthy()
     }
 
     /// Returns authority-free immutable snapshot access.
@@ -492,20 +739,14 @@ impl ProductionLiveSourceRuntime {
     /// Reports supervisor, deadline, task, or runtime shutdown failures after attempting both
     /// lifecycle barriers. A supervisor deadline aborts the task, making durable authority restart
     /// fail closed rather than detaching a producer.
-    pub async fn shutdown(mut self) -> Result<(), ProductionLiveSourceRuntimeError> {
-        self.supervisor_cancellation.cancel();
-        let supervisor_result =
-            match tokio::time::timeout(self.source_shutdown, &mut self.supervisor).await {
-                Ok(Ok(Ok(()))) => None,
-                Ok(Ok(Err(error))) => Some(ProductionLiveSourceRuntimeError::Supervisor(error)),
-                Ok(Err(error)) => Some(ProductionLiveSourceRuntimeError::SupervisorTask(error)),
-                Err(_elapsed) => {
-                    self.supervisor.abort();
-                    let _aborted = self.supervisor.await;
-                    Some(ProductionLiveSourceRuntimeError::SupervisorShutdownDeadline)
-                }
-            };
-        let live_result = self.live.shutdown().await;
+    pub async fn shutdown(self) -> Result<(), ProductionLiveSourceRuntimeError> {
+        let Self {
+            supervisor,
+            live,
+            source_shutdown,
+        } = self;
+        let supervisor_result = supervisor.shutdown(source_shutdown).await.err();
+        let live_result = live.shutdown().await;
         match (supervisor_result, live_result) {
             (None, Ok(_shutdown)) => Ok(()),
             (Some(error), Ok(_shutdown)) => Err(error),
@@ -668,8 +909,8 @@ impl ProductionCoinbaseProfile {
             freshness_nanos,
             freshness_nanos,
             freshness_nanos,
-            MAX_CLOCK_SKEW_NANOS,
             freshness_nanos,
+            MAX_CLOCK_SKEW_NANOS,
         )?;
         let transport_limits = CoinbaseTransportLimits::try_new(
             config.max_frame_bytes().get(),
@@ -946,6 +1187,8 @@ pub enum ProductionLiveSourceCompositionError {
     RouteSetMismatch,
     #[error("production source route set contains a duplicate route")]
     DuplicateRoute,
+    #[error("production source metadata-set allocation failed")]
+    SourceMetadataAllocation,
     #[error("production source route definition differs from validated source configuration")]
     RouteDefinitionMismatch,
     #[error(transparent)]
@@ -986,16 +1229,45 @@ pub enum ProductionLiveSourceRuntimeError {
     CoinbaseDirect(#[from] super::CoinbaseDirectSupervisorError),
     #[error(transparent)]
     Supervisor(#[from] ProductionSupervisorError),
-    #[error("production source supervisor task failed: {0}")]
-    SupervisorTask(#[from] tokio::task::JoinError),
-    #[error("source supervisor startup failed and live-runtime rollback also failed")]
-    SupervisorStartupRollback {
+    #[error("public Kraken supervisor-set allocation failed")]
+    KrakenSupervisorAllocation,
+    #[error("public Kraken supervisor-set startup was cancelled")]
+    KrakenSupervisorCancelled,
+    #[error("public Kraken supervisor-set cleanup timeout is invalid")]
+    KrakenSupervisorInvalidCleanupTimeout,
+    #[error("public Kraken supervisor-set deadline cannot be represented")]
+    KrakenSupervisorDeadlineRange,
+    #[error("public Kraken currentness-observer topology is invalid")]
+    KrakenSupervisorInvalidCurrentnessTopology,
+    #[error("public Kraken channels did not become atomically current before startup expired")]
+    KrakenSupervisorCurrentnessDeadline,
+    #[error("public Kraken {channel} supervisor exited before atomic readiness")]
+    KrakenSupervisorExitedBeforeReadiness { channel: &'static str },
+    #[error("public Kraken {channel} supervisor failed: {source}")]
+    KrakenChannelSupervisor {
+        channel: &'static str,
         #[source]
         source: Box<ProductionSupervisorError>,
-        rollback: LiveRuntimeCompositionError,
     },
-    #[error("source startup task failed and live-runtime rollback also failed")]
-    StartupTaskRollback {
+    #[error("public Kraken {channel} supervisor task failed: {source}")]
+    KrakenChannelSupervisorTask {
+        channel: &'static str,
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    #[error("public Kraken supervisors exceeded their shared shutdown deadline")]
+    KrakenSupervisorShutdownDeadline,
+    #[error("production source supervisor task failed: {0}")]
+    SupervisorTask(#[from] tokio::task::JoinError),
+    #[error("Kraken trade-supervisor construction and book-supervisor cleanup both failed")]
+    KrakenConstructionCleanup {
+        #[source]
+        source: Box<ProductionSupervisorError>,
+        cleanup: Box<ProductionSupervisorError>,
+    },
+    #[error("source-set startup failed and live-runtime rollback also failed")]
+    SourceStartupRollback {
+        #[source]
         startup: Box<ProductionLiveSourceRuntimeError>,
         rollback: LiveRuntimeCompositionError,
     },

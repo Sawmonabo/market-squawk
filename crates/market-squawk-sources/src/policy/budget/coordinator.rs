@@ -144,7 +144,7 @@ impl SharedProviderBudget {
 mod durability;
 pub(in crate::policy) use durability::CleanShutdownProof;
 pub(crate) use durability::ProviderBudgetPool;
-pub use durability::{BudgetPermit, BudgetPermitLease, BudgetPoolError};
+pub use durability::{BudgetPermit, BudgetPermitLease, BudgetPoolError, BudgetReservation};
 
 pub(super) trait BudgetClock: Send + Sync {
     fn observation(&self) -> Result<ClockObservation, BudgetUnavailableReason>;
@@ -167,23 +167,34 @@ impl SystemBudgetClock {
 
 impl BudgetClock for SystemBudgetClock {
     fn observation(&self) -> Result<ClockObservation, BudgetUnavailableReason> {
-        let elapsed_duration = Instant::now()
-            .checked_duration_since(self.origin)
-            .ok_or(BudgetUnavailableReason::ClockUnavailable)?;
-        let elapsed = u64::try_from(elapsed_duration.as_nanos())
-            .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
-        let wall_duration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
-        let wall_nanos = i64::try_from(wall_duration.as_nanos())
-            .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
-        Ok(ClockObservation::new(
-            Timestamp::from_unix_nanos(wall_nanos),
-            MonotonicInstant::from_nanos(elapsed),
-        ))
+        observe_system_clocks(self.origin, SystemTime::now, Instant::now)
     }
 
     fn shared_allocation_charge(&self) -> usize {
         std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
     }
+}
+
+/// Samples wall time before monotonic time so a scheduling delay can only extend a converted
+/// provider deadline. Sampling in the inverse order could make Retry-After and rate-window
+/// deadlines expire early by the suspension interval between the two reads.
+fn observe_system_clocks(
+    origin: Instant,
+    wall_now: impl FnOnce() -> SystemTime,
+    monotonic_now: impl FnOnce() -> Instant,
+) -> Result<ClockObservation, BudgetUnavailableReason> {
+    let wall_duration = wall_now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
+    let elapsed_duration = monotonic_now()
+        .checked_duration_since(origin)
+        .ok_or(BudgetUnavailableReason::ClockUnavailable)?;
+    let elapsed = u64::try_from(elapsed_duration.as_nanos())
+        .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
+    let wall_nanos = i64::try_from(wall_duration.as_nanos())
+        .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
+    Ok(ClockObservation::new(
+        Timestamp::from_unix_nanos(wall_nanos),
+        MonotonicInstant::from_nanos(elapsed),
+    ))
 }

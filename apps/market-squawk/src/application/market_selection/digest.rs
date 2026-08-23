@@ -13,7 +13,7 @@ use super::{
     SourceCandidate,
 };
 
-const RECEIPT_DIGEST_DOMAIN: &[u8] = b"market-squawk/market-selection-receipt/v1";
+const RECEIPT_DIGEST_DOMAIN: &[u8] = b"market-squawk/market-selection-receipt/v2";
 const ALL_OPERATIONS: [MarketOperation; 10] = [
     MarketOperation::ReferenceLookup,
     MarketOperation::SnapshotDisplay,
@@ -127,7 +127,8 @@ fn hash_request(
     for coverage in ALL_COVERAGES {
         hash_bool(digest, downgrade.allows_coverage(coverage))?;
     }
-    hash_optional_u64(digest, downgrade.maximum_age_nanos())
+    hash_optional_u64(digest, downgrade.maximum_age_nanos())?;
+    hash_optional_evidence_digest(digest, request.definition_revision_digest())
 }
 
 fn hash_eligible(
@@ -213,7 +214,8 @@ fn hash_identity(
         None => hash_tag(digest, 0)?,
     }
     hash_bytes(digest, identity.instrument_id().as_uuid().as_bytes())?;
-    hash_text(digest, identity.observation_id().as_str())
+    hash_text(digest, identity.observation_id().as_str())?;
+    hash_optional_evidence_digest(digest, identity.definition_revision_digest())
 }
 
 fn hash_optional_downgrade(
@@ -373,6 +375,19 @@ fn hash_evidence_digest(
         },
     )?;
     hash_bytes(digest, &evidence.bytes())
+}
+
+fn hash_optional_evidence_digest(
+    digest: &mut Sha256,
+    evidence: Option<EvidenceDigest>,
+) -> Result<(), MarketSelectionError> {
+    match evidence {
+        Some(evidence) => {
+            hash_tag(digest, 1)?;
+            hash_evidence_digest(digest, evidence)
+        }
+        None => hash_tag(digest, 0),
+    }
 }
 
 fn hash_optional_timestamp(

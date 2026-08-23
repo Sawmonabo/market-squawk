@@ -24,6 +24,7 @@ use super::{
 };
 use crate::authority::{RuntimeLeaseOwner, ShardLeaseOwner};
 use crate::processor::{GenerationAdmission, GenerationAuthorityRegistry};
+use crate::snapshot::SnapshotPlaneRevocation;
 use crate::{ShardId, ShardKey};
 
 #[derive(Debug)]
@@ -33,6 +34,7 @@ struct AdmissionHarness {
     receiver: mpsc::Receiver<ShardCommand>,
     health: mpsc::Receiver<LiveRuntimeHealthEvent>,
     byte_budget: Arc<Semaphore>,
+    _controls: mpsc::Receiver<ActorControlCommand>,
     _registry: GenerationAuthorityRegistry,
     _runtime_owner: RuntimeLeaseOwner,
     _shard_owner: ShardLeaseOwner,
@@ -116,7 +118,10 @@ async fn consuming_activation_binds_once_and_cancelled_activation_releases_reser
         let (registry, admission) = admission(&command.source)?;
         command
             .response
-            .send(Ok(RegistrationGrant::new(admission)))
+            .send(Ok(RegistrationGrant::new(
+                admission,
+                SnapshotPlaneRevocation::isolated_for_test(),
+            )))
             .map_err(|_| "activation receiver dropped")?;
         TestResult::Ok(registry)
     };
@@ -145,14 +150,19 @@ fn dropped_buffered_registration_response_invalidates_minted_admission() -> Test
     let source = SourceHarness::try_new("dropped-registration", 1, INSTRUMENT_ONE)?;
     let (_registry, admission) = admission(&source.current_lease()?)?;
     let probe = admission.clone();
+    let snapshot_plane = SnapshotPlaneRevocation::isolated_for_test();
     let (response, receiver) = oneshot::channel::<Result<RegistrationGrant, RegistrationFailure>>();
 
     response
-        .send(Ok(RegistrationGrant::new(admission)))
+        .send(Ok(RegistrationGrant::new(
+            admission,
+            snapshot_plane.clone(),
+        )))
         .map_err(|_| "registration receiver dropped before send")?;
     drop(receiver);
 
     assert!(probe.validate_at(now()?).is_err());
+    assert!(snapshot_plane.is_revoked_for_test());
     Ok(())
 }
 
@@ -175,6 +185,7 @@ fn harness(
     let runtime_owner = RuntimeLeaseOwner::new(1);
     let shard_owner = ShardLeaseOwner::new(1);
     let (mailbox, receiver) = mpsc::channel(mailbox_capacity);
+    let (control, controls) = mpsc::channel(1);
     let (health_sender, health) = mpsc::channel(8);
     let byte_budget = Arc::new(Semaphore::new(usize::try_from(byte_capacity)?));
     let ingress = BoundShardIngress {
@@ -184,6 +195,8 @@ fn harness(
         shard_liveness: shard_owner.lease(),
         mailbox,
         byte_budget: Arc::clone(&byte_budget),
+        control,
+        control_deadline: Duration::from_secs(1),
         maximum_message_bytes,
         admission: admission.clone(),
         health: health_sender,
@@ -194,6 +207,7 @@ fn harness(
         receiver,
         health,
         byte_budget,
+        _controls: controls,
         _registry: registry,
         _runtime_owner: runtime_owner,
         _shard_owner: shard_owner,

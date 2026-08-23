@@ -9,9 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use market_squawk_domain::{
-    ConnectionGeneration, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
-};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::LocalPaths;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -26,7 +24,8 @@ use crate::application::source::{
 };
 use crate::application::{
     AccountMarketSurface, MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration,
-    MarketRuntimeRegistry, PreparedMarketProviderConfigurationRequest,
+    MarketRuntimeRegistry, MarketSourceRuntimeGeneration,
+    PreparedMarketProviderConfigurationRequest,
 };
 use crate::provider_activation::ProviderMarketAccount;
 use crate::{
@@ -584,8 +583,10 @@ impl ProductionSourceLifecycleAuthority {
             state_revision: record.revision(),
             state,
             configuration_session_id,
-            current_generation: live,
-            runtime_generation_digest: account_group_generation.or(research),
+            current_generation: live.and_then(MarketSourceRuntimeGeneration::connection_generation),
+            runtime_generation_digest: account_group_generation
+                .or_else(|| live.and_then(MarketSourceRuntimeGeneration::runtime_generation_digest))
+                .or(research),
             public_configuration_digest,
             doctor,
             start_eligibility,
@@ -788,8 +789,7 @@ impl ProductionSourceLifecycleAuthority {
         }
         match command.action() {
             SourceLifecycleAction::Start | SourceLifecycleAction::Retry => {
-                let evidence = self
-                    .live
+                self.live
                     .start(
                         command.provider(),
                         session_id,
@@ -798,12 +798,6 @@ impl ProductionSourceLifecycleAuthority {
                     )
                     .await
                     .map_err(map_live_error)?;
-                if command
-                    .expected_generation()
-                    .is_some_and(|expected| evidence.generation.get() <= expected.get())
-                {
-                    return Err(SourceLifecycleError::Conflict);
-                }
                 Ok(LifecycleOutcome::active(
                     session_id,
                     public_configuration_digest,
@@ -815,7 +809,7 @@ impl ProductionSourceLifecycleAuthority {
                     .live
                     .stop(
                         command.provider(),
-                        command.expected_generation(),
+                        expected_market_runtime_generation(command)?,
                         command.deadline(),
                         command.cancellation(),
                     )
@@ -828,7 +822,7 @@ impl ProductionSourceLifecycleAuthority {
                 ))
             }
             SourceLifecycleAction::Resynchronize | SourceLifecycleAction::Reconfigure => {
-                let expected = match command.expected_generation() {
+                let expected = match expected_market_runtime_generation(command)? {
                     Some(expected) => expected,
                     None if command.action() == SourceLifecycleAction::Reconfigure => self
                         .live
@@ -1260,7 +1254,7 @@ impl ProductionSourceLifecycleAuthority {
         operation_id: SourceIdentifier,
         disposition: SourceLifecycleDisposition,
         record: &DurableSourceLifecycleRecord,
-        previous_generation: Option<ConnectionGeneration>,
+        previous_generation: Option<MarketSourceRuntimeGeneration>,
     ) -> Result<SourceLifecycleReceipt, SourceLifecycleError> {
         let observed_at = system_timestamp()?;
         let account_group_generation = if record.phase() == DurableSourceLifecyclePhase::Active
@@ -1293,6 +1287,11 @@ impl ProductionSourceLifecycleAuthority {
         };
         let runtime_generation_digest = if let Some(generation) = account_group_generation {
             Some(generation.digest())
+        } else if let Some(generation) = live
+            .as_ref()
+            .and_then(|evidence| evidence.generation.runtime_generation_digest())
+        {
+            Some(generation)
         } else if !LIVE_SURFACES.contains(&command.provider().as_str())
             && record.phase() == DurableSourceLifecyclePhase::Active
         {
@@ -1348,12 +1347,30 @@ impl ProductionSourceLifecycleAuthority {
             disposition,
             state,
             state_revision: record.revision(),
-            previous_generation,
-            current_generation: live.as_ref().map(|evidence| evidence.generation),
+            previous_generation: previous_generation
+                .and_then(MarketSourceRuntimeGeneration::connection_generation),
+            current_generation: live
+                .as_ref()
+                .and_then(|evidence| evidence.generation.connection_generation()),
             runtime_generation_digest,
-            coverage: live.as_ref().map(|evidence| evidence.coverage),
-            integrity: live.as_ref().map(|evidence| evidence.integrity),
-            quality: live.as_ref().map(|evidence| evidence.quality),
+            coverage: live.as_ref().and_then(|evidence| {
+                evidence
+                    .generation
+                    .connection_generation()
+                    .map(|_| evidence.coverage)
+            }),
+            integrity: live.as_ref().and_then(|evidence| {
+                evidence
+                    .generation
+                    .connection_generation()
+                    .map(|_| evidence.integrity)
+            }),
+            quality: live.as_ref().and_then(|evidence| {
+                evidence
+                    .generation
+                    .connection_generation()
+                    .map(|_| evidence.quality)
+            }),
             rate_budget: SourceRateBudgetState::Indeterminate,
             authorization: if lease
                 .as_ref()
@@ -1837,7 +1854,7 @@ struct LifecycleOutcome {
     public_configuration_digest: Option<EvidenceDigest>,
     runtime_verification_receipt_digest: Option<EvidenceDigest>,
     credential_generation: Option<market_squawk_platform::SecretGeneration>,
-    previous_generation: Option<ConnectionGeneration>,
+    previous_generation: Option<MarketSourceRuntimeGeneration>,
     account_group_read_admission: Option<(
         PreparedMarketProviderConfigurationRequest,
         MarketRuntimeGroupGeneration,
@@ -1848,7 +1865,7 @@ impl LifecycleOutcome {
     const fn active(
         session_id: Option<uuid::Uuid>,
         public_configuration_digest: Option<EvidenceDigest>,
-        previous_generation: Option<ConnectionGeneration>,
+        previous_generation: Option<MarketSourceRuntimeGeneration>,
     ) -> Self {
         Self {
             phase: DurableSourceLifecyclePhase::Active,
@@ -1864,7 +1881,7 @@ impl LifecycleOutcome {
     const fn active_account(
         session_id: Option<uuid::Uuid>,
         public_configuration_digest: Option<EvidenceDigest>,
-        previous_generation: Option<ConnectionGeneration>,
+        previous_generation: Option<MarketSourceRuntimeGeneration>,
         request: PreparedMarketProviderConfigurationRequest,
         group_generation: MarketRuntimeGroupGeneration,
     ) -> Self {
@@ -1880,7 +1897,7 @@ impl LifecycleOutcome {
     }
 
     const fn stopped(
-        previous_generation: Option<ConnectionGeneration>,
+        previous_generation: Option<MarketSourceRuntimeGeneration>,
         session_id: Option<uuid::Uuid>,
         public_configuration_digest: Option<EvidenceDigest>,
     ) -> Self {
@@ -1947,7 +1964,7 @@ impl LifecycleOutcome {
         Ok(())
     }
 
-    const fn removed(previous_generation: Option<ConnectionGeneration>) -> Self {
+    const fn removed(previous_generation: Option<MarketSourceRuntimeGeneration>) -> Self {
         Self {
             phase: DurableSourceLifecyclePhase::Removed,
             session_id: None,
@@ -1957,6 +1974,23 @@ impl LifecycleOutcome {
             previous_generation,
             account_group_read_admission: None,
         }
+    }
+}
+
+fn expected_market_runtime_generation(
+    command: &SourceLifecycleCommand,
+) -> Result<Option<MarketSourceRuntimeGeneration>, SourceLifecycleError> {
+    match (
+        command.expected_generation(),
+        command.expected_runtime_generation_digest(),
+    ) {
+        (Some(generation), None) => Ok(Some(MarketSourceRuntimeGeneration::Scalar(generation))),
+        (None, Some(digest)) => MarketRuntimeGroupGeneration::try_from_expected_digest(digest)
+            .map(MarketSourceRuntimeGeneration::Group)
+            .map(Some)
+            .map_err(|_| SourceLifecycleError::InvalidRequest),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(SourceLifecycleError::InvalidRequest),
     }
 }
 

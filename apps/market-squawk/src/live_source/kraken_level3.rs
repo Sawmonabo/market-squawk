@@ -36,11 +36,11 @@ use market_squawk_platform::{
     raw_capture_channel, spawn_capture_writer,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, AuthorizationSubjectResolver, BudgetDecision,
-    BudgetUnavailableReason, CaptureGenerationCapabilities, ChecksumValidationProfile,
-    DecoderEvidence, ProviderBackoffAuthority, ProviderBackoffDecision, ProviderBackoffError,
-    ProviderOrderChangeReason, ProviderRateAuthority, RegistryError, SequenceValidationProfile,
-    SessionId, SourceError, SourceProtocolProfile, TransportFrameKind,
+    AuthoritativeSourceRegistry, AuthorizationSubjectResolver, BudgetDispatchDecision,
+    BudgetReservationDecision, BudgetUnavailableReason, CaptureGenerationCapabilities,
+    ChecksumValidationProfile, DecoderEvidence, ProviderBackoffAuthority, ProviderBackoffDecision,
+    ProviderBackoffError, ProviderOrderChangeReason, ProviderRateAuthority, RegistryError,
+    SequenceValidationProfile, SessionId, SourceError, SourceProtocolProfile, TransportFrameKind,
 };
 use thiserror::Error;
 use tokio::{
@@ -434,7 +434,6 @@ async fn run_generation(
         let budget = source
             .budget()?
             .ok_or(KrakenLevel3RuntimeError::MissingProviderBudget)?;
-        let connection_permit = acquire_connection_budget(budget, &cancellation).await?;
         let socket_config = WebSocketConfig::default()
             .read_buffer_size(READ_BUFFER_BYTES)
             .write_buffer_size(WRITE_BUFFER_BYTES)
@@ -447,6 +446,7 @@ async fn run_generation(
             true,
             None,
         );
+        let connection_permit = commit_connection_budget(budget, &cancellation).await?;
         let (mut socket, response) = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(KrakenLevel3RuntimeError::Cancelled),
@@ -1227,14 +1227,33 @@ where
     let _result = tokio::time::timeout(IO_TIMEOUT, socket.close(None)).await;
 }
 
-async fn acquire_connection_budget(
+async fn commit_connection_budget(
     budget: &market_squawk_sources::SharedProviderBudget,
     cancellation: &CancellationToken,
 ) -> Result<market_squawk_sources::BudgetPermit, KrakenLevel3RuntimeError> {
     loop {
-        match budget.try_acquire() {
-            BudgetDecision::Ready(permit) => return Ok(permit),
-            BudgetDecision::WaitUntil(deadline) => {
+        let reservation = match budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => reservation,
+            BudgetReservationDecision::WaitUntil(deadline) => {
+                let wait = budget
+                    .remaining_wait(deadline)
+                    .map_err(KrakenLevel3RuntimeError::BudgetUnavailable)?;
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        return Err(KrakenLevel3RuntimeError::Cancelled);
+                    }
+                    () = tokio::time::sleep(wait) => {}
+                }
+                continue;
+            }
+            BudgetReservationDecision::Unavailable(reason) => {
+                return Err(KrakenLevel3RuntimeError::BudgetUnavailable(reason));
+            }
+        };
+        match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => return Ok(permit),
+            BudgetDispatchDecision::WaitUntil(deadline) => {
                 let wait = budget
                     .remaining_wait(deadline)
                     .map_err(KrakenLevel3RuntimeError::BudgetUnavailable)?;
@@ -1246,7 +1265,7 @@ async fn acquire_connection_budget(
                     () = tokio::time::sleep(wait) => {}
                 }
             }
-            BudgetDecision::Unavailable(reason) => {
+            BudgetDispatchDecision::Unavailable(reason) => {
                 return Err(KrakenLevel3RuntimeError::BudgetUnavailable(reason));
             }
         }

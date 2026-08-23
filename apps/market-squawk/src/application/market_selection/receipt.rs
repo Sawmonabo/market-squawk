@@ -24,6 +24,8 @@ pub(crate) enum MarketSelectionError {
     InvalidBudgetSnapshot,
     InvalidRightsInterval,
     InvalidRightsState,
+    InvalidDefinitionRevisionDigest,
+    DefinitionRevisionMismatch,
     MissingVenue,
     UnverifiedDirectQuality,
     InvalidExecutionEligibility,
@@ -70,6 +72,12 @@ impl fmt::Display for MarketSelectionError {
             Self::InvalidRightsState => {
                 formatter.write_str("admitted rights require an explicit operation set")
             }
+            Self::InvalidDefinitionRevisionDigest => formatter.write_str(
+                "a canonical definition revision must be a nonzero SHA-256 digest",
+            ),
+            Self::DefinitionRevisionMismatch => formatter.write_str(
+                "every candidate must bind the request's exact canonical definition revision",
+            ),
             Self::MissingVenue => {
                 formatter.write_str("single-venue coverage requires an exact venue")
             }
@@ -353,6 +361,11 @@ impl MarketSelectionReceipt {
 
     pub(crate) const fn request(&self) -> &MarketSelectionRequest {
         &self.request
+    }
+
+    /// Returns the canonical market-data definition revision bound into this complete receipt.
+    pub(crate) const fn definition_revision_digest(&self) -> Option<EvidenceDigest> {
+        self.request.definition_revision_digest()
     }
 
     pub(crate) fn eligible(&self) -> &[EligibleCandidate] {

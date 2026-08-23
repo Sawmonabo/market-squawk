@@ -1027,6 +1027,8 @@ pub enum RouteActivationFailure {
     Bind(LiveIngressBindError),
     #[error("first current batch failed live ingress: {0}")]
     Ingress(LiveIngressError),
+    #[error("live route generation revocation failed: {0}")]
+    Revoke(market_squawk_live::LiveIngressRevokeError),
     #[error("route actor received a command before generation activation")]
     CommandOrder,
 }

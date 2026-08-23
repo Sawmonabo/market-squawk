@@ -37,6 +37,7 @@ pub(crate) use event::{delta_canonical_vector_peak_bytes, snapshot_canonical_vec
 )]
 pub(crate) use generation::{
     GenerationAdmission, GenerationAuthorityRegistry, GenerationRegistryExitHandle,
+    GenerationRevocation,
 };
 use snapshot::build_snapshot_seed;
 pub(crate) use snapshot::{ProcessorSnapshotLimits, ProcessorSnapshotSeed};
@@ -595,6 +596,7 @@ fn retained_trade_snapshot(
         price: trade.price(),
         quantity: trade.quantity(),
         aggressor_side: trade.aggressor_side(),
+        taker_order_type: trade.taker_order_type(),
         source_timestamp: provenance.source_timestamp(),
         received_at: provenance.received_at(),
         available_at: provenance.available_at(),

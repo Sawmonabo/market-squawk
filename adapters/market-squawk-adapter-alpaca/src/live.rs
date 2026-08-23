@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _, future::BoxFuture};
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, LiveMarketSource,
-    LiveSourceGeneration, RawMarketSink, SharedProviderBudget, SourceError, SourceMetadata,
-    SourceMetadataProvider, TransportFrameKind, apply_http_retry_after,
+    ActiveLiveSourceGeneration, BudgetDispatchDecision, BudgetReservation,
+    BudgetReservationDecision, LiveMarketSource, LiveSourceGeneration, RawMarketSink,
+    SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
+    apply_http_retry_after,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -214,7 +215,7 @@ async fn run_transport(
         return Err(SourceError::Cancelled);
     }
     authority.validate_current()?;
-    let permit = acquire_budget(budget)?;
+    let reservation = reserve_budget(budget)?;
     let request = authenticated_request(endpoint, credentials, messagepack)?;
     let websocket_config = WebSocketConfig::default()
         .read_buffer_size(limits.max_frame_bytes().clamp(4 * 1024, 128 * 1024))
@@ -222,6 +223,7 @@ async fn run_transport(
         .max_write_buffer_size(64 * 1024)
         .max_message_size(Some(limits.max_frame_bytes()))
         .max_frame_size(Some(limits.max_frame_bytes()));
+    let permit = commit_budget(reservation)?;
     let connect = connect_async_with_config(request, Some(websocket_config), true);
     let (mut socket, response) =
         await_websocket(&cancellation, limits.connect_timeout(), connect, |error| {
@@ -333,11 +335,29 @@ fn validate_generation(
     Ok(())
 }
 
-fn acquire_budget(budget: &SharedProviderBudget) -> Result<BudgetPermit, SourceError> {
-    match budget.try_acquire() {
-        BudgetDecision::Ready(permit) => Ok(permit),
-        BudgetDecision::WaitUntil(deadline) => Err(SourceError::BudgetWaitUntil { deadline }),
-        BudgetDecision::Unavailable(reason) => Err(SourceError::BudgetUnavailable { reason }),
+fn reserve_budget(budget: &SharedProviderBudget) -> Result<BudgetReservation, SourceError> {
+    match budget.try_reserve_request() {
+        BudgetReservationDecision::Ready(reservation) => Ok(reservation),
+        BudgetReservationDecision::WaitUntil(deadline) => {
+            Err(SourceError::BudgetWaitUntil { deadline })
+        }
+        BudgetReservationDecision::Unavailable(reason) => {
+            Err(SourceError::BudgetUnavailable { reason })
+        }
+    }
+}
+
+fn commit_budget(
+    reservation: BudgetReservation,
+) -> Result<market_squawk_sources::BudgetPermit, SourceError> {
+    match reservation.commit_dispatch() {
+        BudgetDispatchDecision::Ready(permit) => Ok(permit),
+        BudgetDispatchDecision::WaitUntil(deadline) => {
+            Err(SourceError::BudgetWaitUntil { deadline })
+        }
+        BudgetDispatchDecision::Unavailable(reason) => {
+            Err(SourceError::BudgetUnavailable { reason })
+        }
     }
 }
 

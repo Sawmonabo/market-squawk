@@ -2,7 +2,8 @@
 
 use super::super::admission::{
     ActionHookControlFailure, ActionHookInstallCommand, ActionHookRemoveCommand,
-    ActorControlCommand, RegistrationCommand, RegistrationFailure, RegistrationGrant, ShardCommand,
+    ActorControlCommand, GenerationRevocationCommand, LiveIngressRevokeError, RegistrationCommand,
+    RegistrationFailure, RegistrationGrant, ShardCommand,
 };
 use super::super::system_timestamp;
 use super::{ActorError, RouteOwner, ShardActor};
@@ -14,9 +15,14 @@ use crate::{
 };
 
 impl ShardActor {
-    pub(super) fn control(&mut self, command: ActorControlCommand) {
+    pub(super) fn control(&mut self, command: ActorControlCommand) -> Result<(), ActorError> {
         match command {
-            ActorControlCommand::Register(command) => self.register(command),
+            ActorControlCommand::Register(command) => {
+                return self.register(command);
+            }
+            ActorControlCommand::RevokeGeneration(command) => {
+                return self.revoke_generation(command);
+            }
             ActorControlCommand::InstallActionHooks(mut command) => {
                 let result = self.install_action_hooks(&mut command);
                 if result.is_err() {
@@ -34,18 +40,76 @@ impl ShardActor {
                 drop(command.response.send(result));
             }
         }
+        Ok(())
     }
 
-    pub(super) fn register(&mut self, command: RegistrationCommand) {
-        let result = self.register_inner(&command).map(RegistrationGrant::new);
-        if result.is_err() {
+    fn revoke_generation(
+        &mut self,
+        command: GenerationRevocationCommand,
+    ) -> Result<(), ActorError> {
+        let result = match self.routes.get(&command.route) {
+            None => Err(LiveIngressRevokeError::UnknownRoute),
+            Some(owner) if !owner.generations.owns_revocation(&command.revocation) => {
+                Err(LiveIngressRevokeError::AuthorityMismatch)
+            }
+            Some(_owner) => {
+                command.revocation.invalidate();
+                self.dirty = true;
+                match self.publish_snapshot(ShardLifecycleSnapshot::Ready) {
+                    Ok(()) => {
+                        self.snapshot_pending = false;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let _ = command
+                            .response
+                            .send(Err(LiveIngressRevokeError::SnapshotPublication));
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        let _ = command.response.send(result);
+        Ok(())
+    }
+
+    pub(super) fn register(&mut self, command: RegistrationCommand) -> Result<(), ActorError> {
+        let snapshot_plane = self.publisher.plane_revocation();
+        let result = self
+            .register_inner(&command)
+            .map(|admission| RegistrationGrant::new(admission, snapshot_plane));
+        if result.is_ok() {
+            // Registration may revoke an older connection generation before replacement data
+            // arrives. Publish that authority transition promptly so immutable snapshot readers
+            // cannot continue treating the superseded stream as current during resynchronization.
+            self.dirty = true;
+            if let Err(error) = self.publish_snapshot(ShardLifecycleSnapshot::Ready) {
+                let _ = command
+                    .response
+                    .send(Err(RegistrationFailure::SnapshotPublication));
+                return Err(error);
+            }
+            self.snapshot_pending = false;
+        } else {
             self.health_revision = self.health_revision.saturating_add(1);
             self.emit_health(
                 LiveRuntimeHealthKind::GenerationRejected,
                 Some(command.route.clone()),
             );
         }
-        drop(command.response.send(result));
+        if let Err(undelivered) = command.response.send(result)
+            && let Ok(grant) = undelivered
+        {
+            // The receiver can time out or cancel after enqueue. Dropping the transfer guard
+            // invalidates the actor-minted admission; republish that revocation before the actor
+            // accepts more work so the preceding successful registration snapshot cannot remain
+            // falsely current.
+            drop(grant);
+            self.dirty = true;
+            self.publish_snapshot(ShardLifecycleSnapshot::Ready)?;
+            self.snapshot_pending = false;
+        }
+        Ok(())
     }
 
     fn register_inner(
@@ -162,7 +226,13 @@ impl ShardActor {
                 admission.invalidate_on_admission_failure();
                 self.health_revision = self.health_revision.saturating_add(1);
                 self.emit_health(LiveRuntimeHealthKind::ProcessingRejected, None);
-                if error.is_fatal() { Err(error) } else { Ok(()) }
+                if error.is_fatal() {
+                    Err(error)
+                } else {
+                    self.dirty = true;
+                    self.snapshot_pending = false;
+                    self.publish_snapshot(ShardLifecycleSnapshot::Ready)
+                }
             }
         }
     }

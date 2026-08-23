@@ -28,6 +28,7 @@ use market_squawk_sources::{
     ExtractionSourceError, HttpRequestBounds, ProviderCaptureMaterial, ProviderRateDeclaration,
     SharedProviderBudget, SourceError,
 };
+use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

@@ -10,10 +10,12 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
 use market_squawk_sources::{
-    AuthorizationMode, BudgetUnavailableReason, BudgetWindowSemantics, ProviderBudgetPolicy,
-    ProviderRateCollisionKind, ProviderRateDecision, ProviderRateDeclaration, ProviderRateGroupId,
-    ProviderRatePermitId, ProviderRateRegistration, ProviderRateRunId, ProviderRateStore,
-    ProviderRateStoreError, RetryAfter,
+    AuthorizationMode, BudgetUnavailableReason, BudgetWindowSemantics,
+    PreparedProviderRateRegistrationBatch, ProviderBudgetPolicy, ProviderRateCollisionKind,
+    ProviderRateDeclaration, ProviderRateDispatchDecision, ProviderRateGroupId,
+    ProviderRatePermitId, ProviderRateRegistration, ProviderRateReservationDecision,
+    ProviderRateReservationId, ProviderRateRunId, ProviderRateStore, ProviderRateStoreError,
+    RetryAfter,
 };
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
@@ -67,11 +69,13 @@ CREATE TABLE provider_rate_declarations (
     created_at_ns INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE provider_rate_permits (
-    permit_id BLOB PRIMARY KEY CHECK(length(permit_id) = 16),
+CREATE TABLE provider_rate_requests (
+    request_id BLOB PRIMARY KEY CHECK(length(request_id) = 16),
     run_id BLOB NOT NULL REFERENCES provider_rate_runs(run_id) ON DELETE CASCADE,
     group_id BLOB NOT NULL REFERENCES provider_rate_groups(group_id) ON DELETE RESTRICT,
-    acquired_at_ns INTEGER NOT NULL
+    reserved_at_ns INTEGER NOT NULL,
+    dispatched_at_ns INTEGER,
+    CHECK(dispatched_at_ns IS NULL OR dispatched_at_ns >= reserved_at_ns)
 ) STRICT;
 
 CREATE TABLE provider_authorization_subjects (
@@ -86,8 +90,8 @@ CREATE TABLE provider_authorization_subjects (
 
 CREATE INDEX provider_rate_declarations_group
     ON provider_rate_declarations(group_id);
-CREATE INDEX provider_rate_permits_group
-    ON provider_rate_permits(group_id);
+CREATE INDEX provider_rate_requests_group
+    ON provider_rate_requests(group_id);
 "#;
 
 /// Product-owned SQLite implementation of [`ProviderRateStore`].
@@ -205,6 +209,45 @@ struct ProviderRateLogicalCheckpoint {
     authority_revision_sha256: [u8; 32],
     content_sha256: [u8; 32],
     envelope: ProviderRateLogicalCheckpointEnvelope,
+}
+
+struct SqlitePreparedProviderRateRegistrationBatch {
+    connection: Option<Connection>,
+    registrations: Box<[ProviderRateRegistration]>,
+}
+
+impl std::fmt::Debug for SqlitePreparedProviderRateRegistrationBatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SqlitePreparedProviderRateRegistrationBatch")
+            .field("registration_count", &self.registrations.len())
+            .field("writer_transaction", &"[RETAINED]")
+            .finish()
+    }
+}
+
+impl PreparedProviderRateRegistrationBatch for SqlitePreparedProviderRateRegistrationBatch {
+    fn registrations(&self) -> &[ProviderRateRegistration] {
+        &self.registrations
+    }
+
+    fn commit(mut self: Box<Self>) -> Result<(), ProviderRateStoreError> {
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        connection.execute_batch("COMMIT").map_err(map_sql)?;
+        self.connection = None;
+        Ok(())
+    }
+}
+
+impl Drop for SqlitePreparedProviderRateRegistrationBatch {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ignored = connection.execute_batch("ROLLBACK");
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -367,7 +410,7 @@ impl ProviderRateStore for SqliteProviderRateStore {
         validate_global_clock(&transaction, now)?;
         transaction
             .execute(
-                "DELETE FROM provider_rate_permits
+                "DELETE FROM provider_rate_requests
                  WHERE run_id IN (
                     SELECT run_id FROM provider_rate_runs WHERE status = 'active'
                  )",
@@ -410,109 +453,73 @@ impl ProviderRateStore for SqliteProviderRateStore {
         Ok(run_id)
     }
 
-    fn register(
+    fn prepare_registration_batch(
         &self,
         run_id: ProviderRateRunId,
-        declaration: &ProviderRateDeclaration,
+        declarations: &[ProviderRateDeclaration],
         now: Timestamp,
-    ) -> Result<ProviderRateRegistration, ProviderRateStoreError> {
-        declaration
-            .validate()
-            .map_err(|_| ProviderRateStoreError::Corrupt)?;
-        let policy_digest = sha256_bytes(declaration.policy_digest())?;
-        let declaration_digest = sha256_bytes(declaration.declaration_digest())?;
-        let collision_keys = encode_collision_keys(declaration)?;
-        let policy_json = serde_json::to_vec(declaration.policy())
-            .map_err(|_| ProviderRateStoreError::Corrupt)?;
-
-        let mut connection = self.connection()?;
-        let transaction = immediate(&mut connection)?;
-        validate_run(&transaction, run_id, now)?;
-        if let Some(existing) = existing_declaration(&transaction, declaration_digest)? {
-            if existing.policy_digest != policy_digest || existing.collision_keys != collision_keys
-            {
-                return Err(ProviderRateStoreError::Conflict);
-            }
-            validate_group_policy(&transaction, existing.group_id, policy_digest)?;
-            transaction.commit().map_err(map_sql)?;
-            return Ok(ProviderRateRegistration::new(
-                ProviderRateGroupId::from_bytes(existing.group_id),
-                declaration.policy_digest(),
-                declaration.declaration_digest(),
-            ));
+    ) -> Result<Box<dyn PreparedProviderRateRegistrationBatch>, ProviderRateStoreError> {
+        if declarations.is_empty()
+            || i64::try_from(declarations.len()).map_or(true, |count| count > MAXIMUM_DECLARATIONS)
+        {
+            return Err(ProviderRateStoreError::Capacity);
         }
-        enforce_capacity(&transaction)?;
-        let matches = matching_groups(&transaction, &collision_keys)?;
-        let group_id = match matches.as_slice() {
-            [] => {
-                let group_id = *Uuid::new_v4().as_bytes();
-                let state = RateState::new(declaration.policy(), now)?;
-                insert_group(
-                    &transaction,
-                    group_id,
-                    policy_digest,
-                    &policy_json,
-                    state,
-                    now,
-                )?;
-                group_id
-            }
-            [group_id] => {
-                validate_group_policy(&transaction, *group_id, policy_digest)?;
-                *group_id
-            }
-            _ => return Err(ProviderRateStoreError::Conflict),
-        };
-        let row_digest =
-            declaration_row_digest(declaration_digest, group_id, policy_digest, &collision_keys);
-        transaction
-            .execute(
-                "INSERT INTO provider_rate_declarations(
-                    declaration_digest, group_id, policy_digest, collision_keys, row_digest,
-                    created_at_ns
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    declaration_digest,
-                    group_id,
-                    policy_digest,
-                    collision_keys,
-                    row_digest,
-                    now.unix_nanos()
-                ],
-            )
+        for declaration in declarations {
+            declaration
+                .validate()
+                .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        }
+        let connection = self.connection()?;
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
             .map_err(map_sql)?;
-        transaction.commit().map_err(map_sql)?;
-        Ok(ProviderRateRegistration::new(
-            ProviderRateGroupId::from_bytes(group_id),
-            declaration.policy_digest(),
-            declaration.declaration_digest(),
-        ))
+        let prepared = (|| {
+            validate_run(&connection, run_id, now)?;
+            let mut registrations = Vec::new();
+            registrations
+                .try_reserve_exact(declarations.len())
+                .map_err(|_| ProviderRateStoreError::Capacity)?;
+            for declaration in declarations {
+                registrations.push(register_in_open_transaction(&connection, declaration, now)?);
+            }
+            Ok::<_, ProviderRateStoreError>(registrations.into_boxed_slice())
+        })();
+        match prepared {
+            Ok(registrations) => Ok(Box::new(SqlitePreparedProviderRateRegistrationBatch {
+                connection: Some(connection),
+                registrations,
+            })),
+            Err(error) => {
+                let _ignored = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
-    fn try_acquire(
+    fn try_reserve(
         &self,
         run_id: ProviderRateRunId,
         registration: ProviderRateRegistration,
         now: Timestamp,
-    ) -> Result<ProviderRateDecision, ProviderRateStoreError> {
+    ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
         let mut connection = self.connection()?;
         let transaction = immediate(&mut connection)?;
         validate_run(&transaction, run_id, now)?;
         let mut group = load_group(&transaction, registration)?;
         group.state.advance(group.policy.as_ref(), now)?;
         if group.state.disabled {
-            return Ok(ProviderRateDecision::Unavailable(
+            return Ok(ProviderRateReservationDecision::Unavailable(
                 BudgetUnavailableReason::Disabled,
             ));
         }
         if let Some(deadline) = group.state.blocked_until(group.policy.as_ref(), now)? {
             persist_group(&transaction, &mut group, now)?;
             transaction.commit().map_err(map_sql)?;
-            return Ok(ProviderRateDecision::WaitUntil(deadline));
+            return Ok(ProviderRateReservationDecision::WaitUntil(deadline));
         }
         let in_flight: i64 = transaction
             .query_row(
-                "SELECT COUNT(*) FROM provider_rate_permits WHERE group_id = ?1",
+                "SELECT COUNT(*) FROM provider_rate_requests WHERE group_id = ?1",
                 [registration.group_id().bytes()],
                 |row| row.get(0),
             )
@@ -521,18 +528,18 @@ impl ProviderRateStore for SqliteProviderRateStore {
             return Err(ProviderRateStoreError::Corrupt);
         }
         if in_flight == i64::from(group.policy.max_concurrent()) {
-            return Ok(ProviderRateDecision::Unavailable(
+            return Ok(ProviderRateReservationDecision::Unavailable(
                 BudgetUnavailableReason::ConcurrencyExhausted,
             ));
         }
-        group.state.admit(group.policy.as_ref(), now)?;
-        let permit_id = ProviderRatePermitId::from_bytes(*Uuid::new_v4().as_bytes());
+        let reservation_id = ProviderRateReservationId::from_bytes(*Uuid::new_v4().as_bytes());
         transaction
             .execute(
-                "INSERT INTO provider_rate_permits(permit_id, run_id, group_id, acquired_at_ns)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO provider_rate_requests(
+                    request_id, run_id, group_id, reserved_at_ns, dispatched_at_ns
+                 ) VALUES (?1, ?2, ?3, ?4, NULL)",
                 params![
-                    permit_id.bytes(),
+                    reservation_id.bytes(),
                     run_id.bytes(),
                     registration.group_id().bytes(),
                     now.unix_nanos()
@@ -541,7 +548,103 @@ impl ProviderRateStore for SqliteProviderRateStore {
             .map_err(map_sql)?;
         persist_group(&transaction, &mut group, now)?;
         transaction.commit().map_err(map_sql)?;
-        Ok(ProviderRateDecision::Ready(permit_id))
+        Ok(ProviderRateReservationDecision::Ready(reservation_id))
+    }
+
+    fn commit_dispatch(
+        &self,
+        run_id: ProviderRateRunId,
+        registration: ProviderRateRegistration,
+        reservation_id: ProviderRateReservationId,
+        now: Timestamp,
+    ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        validate_run(&transaction, run_id, now)?;
+        let mut group = load_group(&transaction, registration)?;
+        let row: Option<Option<i64>> = transaction
+            .query_row(
+                "SELECT dispatched_at_ns FROM provider_rate_requests
+                 WHERE request_id = ?1 AND run_id = ?2 AND group_id = ?3",
+                params![
+                    reservation_id.bytes(),
+                    run_id.bytes(),
+                    registration.group_id().bytes(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sql)?;
+        if row != Some(None) {
+            return Err(ProviderRateStoreError::Conflict);
+        }
+        group.state.advance(group.policy.as_ref(), now)?;
+        if group.state.disabled {
+            delete_reserved_request(&transaction, run_id, registration, reservation_id)?;
+            persist_group(&transaction, &mut group, now)?;
+            transaction.commit().map_err(map_sql)?;
+            return Ok(ProviderRateDispatchDecision::Unavailable(
+                BudgetUnavailableReason::Disabled,
+            ));
+        }
+        if let Some(deadline) = group.state.blocked_until(group.policy.as_ref(), now)? {
+            delete_reserved_request(&transaction, run_id, registration, reservation_id)?;
+            persist_group(&transaction, &mut group, now)?;
+            transaction.commit().map_err(map_sql)?;
+            return Ok(ProviderRateDispatchDecision::WaitUntil(deadline));
+        }
+        group.state.admit(group.policy.as_ref(), now)?;
+        let dispatched = transaction
+            .execute(
+                "UPDATE provider_rate_requests
+                 SET dispatched_at_ns = ?1
+                 WHERE request_id = ?2 AND run_id = ?3 AND group_id = ?4
+                   AND dispatched_at_ns IS NULL",
+                params![
+                    now.unix_nanos(),
+                    reservation_id.bytes(),
+                    run_id.bytes(),
+                    registration.group_id().bytes(),
+                ],
+            )
+            .map_err(map_sql)?;
+        if dispatched != 1 {
+            return Err(ProviderRateStoreError::Conflict);
+        }
+        persist_group(&transaction, &mut group, now)?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(ProviderRateDispatchDecision::Ready(
+            ProviderRatePermitId::from_bytes(reservation_id.bytes()),
+        ))
+    }
+
+    fn cancel_reservation(
+        &self,
+        run_id: ProviderRateRunId,
+        registration: ProviderRateRegistration,
+        reservation_id: ProviderRateReservationId,
+    ) -> Result<(), ProviderRateStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM provider_rate_requests
+                 WHERE request_id = ?1 AND run_id = ?2 AND group_id = ?3
+                   AND dispatched_at_ns IS NULL",
+                params![
+                    reservation_id.bytes(),
+                    run_id.bytes(),
+                    registration.group_id().bytes(),
+                ],
+            )
+            .map_err(map_sql)?;
+        if deleted > 1 {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        if deleted == 0 && request_row_exists(&transaction, reservation_id.bytes())? {
+            return Err(ProviderRateStoreError::Conflict);
+        }
+        transaction.commit().map_err(map_sql)
     }
 
     fn release(
@@ -554,8 +657,9 @@ impl ProviderRateStore for SqliteProviderRateStore {
         let transaction = immediate(&mut connection)?;
         let deleted = transaction
             .execute(
-                "DELETE FROM provider_rate_permits
-                 WHERE permit_id = ?1 AND run_id = ?2 AND group_id = ?3",
+                "DELETE FROM provider_rate_requests
+                 WHERE request_id = ?1 AND run_id = ?2 AND group_id = ?3
+                   AND dispatched_at_ns IS NOT NULL",
                 params![
                     permit_id.bytes(),
                     run_id.bytes(),
@@ -566,6 +670,9 @@ impl ProviderRateStore for SqliteProviderRateStore {
         if deleted > 1 {
             return Err(ProviderRateStoreError::Corrupt);
         }
+        if deleted == 0 && request_row_exists(&transaction, permit_id.bytes())? {
+            return Err(ProviderRateStoreError::Conflict);
+        }
         transaction.commit().map_err(map_sql)
     }
 
@@ -575,7 +682,7 @@ impl ProviderRateStore for SqliteProviderRateStore {
         registration: ProviderRateRegistration,
         now: Timestamp,
         retry_after: RetryAfter,
-    ) -> Result<ProviderRateDecision, ProviderRateStoreError> {
+    ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
         self.mutate_group(run_id, registration, now, |group| {
             let delay = match retry_after {
                 RetryAfter::Delay(delay) => delay.get(),
@@ -588,7 +695,7 @@ impl ProviderRateStore for SqliteProviderRateStore {
             };
             if delay > group.policy.backoff().maximum_nanos() {
                 group.state.disabled = true;
-                return Ok(ProviderRateDecision::Unavailable(
+                return Ok(ProviderRateReservationDecision::Unavailable(
                     BudgetUnavailableReason::RetryAfterExceedsPolicy,
                 ));
             }
@@ -601,12 +708,14 @@ impl ProviderRateStore for SqliteProviderRateStore {
                         current.max(deadline.unix_nanos())
                     }),
             );
-            Ok(ProviderRateDecision::WaitUntil(Timestamp::from_unix_nanos(
-                group
-                    .state
-                    .cooldown_until_ns
-                    .ok_or(ProviderRateStoreError::Corrupt)?,
-            )))
+            Ok(ProviderRateReservationDecision::WaitUntil(
+                Timestamp::from_unix_nanos(
+                    group
+                        .state
+                        .cooldown_until_ns
+                        .ok_or(ProviderRateStoreError::Corrupt)?,
+                ),
+            ))
         })
     }
 
@@ -616,7 +725,7 @@ impl ProviderRateStore for SqliteProviderRateStore {
         registration: ProviderRateRegistration,
         now: Timestamp,
         jitter_sample_basis_points: u16,
-    ) -> Result<ProviderRateDecision, ProviderRateStoreError> {
+    ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
         self.mutate_group(run_id, registration, now, |group| {
             let delay = group
                 .policy
@@ -636,12 +745,14 @@ impl ProviderRateStore for SqliteProviderRateStore {
                         current.max(deadline.unix_nanos())
                     }),
             );
-            Ok(ProviderRateDecision::WaitUntil(Timestamp::from_unix_nanos(
-                group
-                    .state
-                    .cooldown_until_ns
-                    .ok_or(ProviderRateStoreError::Corrupt)?,
-            )))
+            Ok(ProviderRateReservationDecision::WaitUntil(
+                Timestamp::from_unix_nanos(
+                    group
+                        .state
+                        .cooldown_until_ns
+                        .ok_or(ProviderRateStoreError::Corrupt)?,
+                ),
+            ))
         })
     }
 
@@ -768,6 +879,113 @@ impl ProviderRateStore for SqliteProviderRateStore {
         })
         .transpose()
     }
+}
+
+fn register_in_open_transaction(
+    connection: &Connection,
+    declaration: &ProviderRateDeclaration,
+    now: Timestamp,
+) -> Result<ProviderRateRegistration, ProviderRateStoreError> {
+    let policy_digest = sha256_bytes(declaration.policy_digest())?;
+    let declaration_digest = sha256_bytes(declaration.declaration_digest())?;
+    let collision_keys = encode_collision_keys(declaration)?;
+    let policy_json =
+        serde_json::to_vec(declaration.policy()).map_err(|_| ProviderRateStoreError::Corrupt)?;
+    if let Some(existing) = existing_declaration(connection, declaration_digest)? {
+        if existing.policy_digest != policy_digest || existing.collision_keys != collision_keys {
+            return Err(ProviderRateStoreError::Conflict);
+        }
+        validate_group_policy(connection, existing.group_id, policy_digest)?;
+        return Ok(ProviderRateRegistration::new(
+            ProviderRateGroupId::from_bytes(existing.group_id),
+            declaration.policy_digest(),
+            declaration.declaration_digest(),
+        ));
+    }
+    enforce_capacity(connection)?;
+    let matches = matching_groups(connection, &collision_keys)?;
+    let group_id = match matches.as_slice() {
+        [] => {
+            let group_id = *Uuid::new_v4().as_bytes();
+            let state = RateState::new(declaration.policy(), now)?;
+            insert_group(
+                connection,
+                group_id,
+                policy_digest,
+                &policy_json,
+                state,
+                now,
+            )?;
+            group_id
+        }
+        [group_id] => {
+            validate_group_policy(connection, *group_id, policy_digest)?;
+            *group_id
+        }
+        _ => return Err(ProviderRateStoreError::Conflict),
+    };
+    let row_digest =
+        declaration_row_digest(declaration_digest, group_id, policy_digest, &collision_keys);
+    connection
+        .execute(
+            "INSERT INTO provider_rate_declarations(
+                declaration_digest, group_id, policy_digest, collision_keys, row_digest,
+                created_at_ns
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                declaration_digest,
+                group_id,
+                policy_digest,
+                collision_keys,
+                row_digest,
+                now.unix_nanos()
+            ],
+        )
+        .map_err(map_sql)?;
+    Ok(ProviderRateRegistration::new(
+        ProviderRateGroupId::from_bytes(group_id),
+        declaration.policy_digest(),
+        declaration.declaration_digest(),
+    ))
+}
+
+fn delete_reserved_request(
+    transaction: &Transaction<'_>,
+    run_id: ProviderRateRunId,
+    registration: ProviderRateRegistration,
+    reservation_id: ProviderRateReservationId,
+) -> Result<(), ProviderRateStoreError> {
+    let deleted = transaction
+        .execute(
+            "DELETE FROM provider_rate_requests
+             WHERE request_id = ?1 AND run_id = ?2 AND group_id = ?3
+               AND dispatched_at_ns IS NULL",
+            params![
+                reservation_id.bytes(),
+                run_id.bytes(),
+                registration.group_id().bytes(),
+            ],
+        )
+        .map_err(map_sql)?;
+    if deleted != 1 {
+        return Err(ProviderRateStoreError::Conflict);
+    }
+    Ok(())
+}
+
+fn request_row_exists(
+    transaction: &Transaction<'_>,
+    request_id: [u8; 16],
+) -> Result<bool, ProviderRateStoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM provider_rate_requests WHERE request_id = ?1
+             )",
+            [request_id],
+            |row| row.get(0),
+        )
+        .map_err(map_sql)
 }
 
 fn acquire_owner_lease(path: &Path) -> Result<ProviderRateOwnerLease, ProviderRateStoreError> {
@@ -1448,7 +1666,7 @@ fn restore_checkpoint(
         "provider_rate_runs",
         "provider_rate_groups",
         "provider_rate_declarations",
-        "provider_rate_permits",
+        "provider_rate_requests",
         "provider_authorization_subjects",
     ] {
         let count: i64 = transaction
@@ -1682,7 +1900,7 @@ fn immediate(connection: &mut Connection) -> Result<Transaction<'_>, ProviderRat
 }
 
 fn validate_global_clock(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     now: Timestamp,
 ) -> Result<(), ProviderRateStoreError> {
     let high_water: Option<i64> = transaction
@@ -1699,7 +1917,7 @@ fn validate_global_clock(
 }
 
 fn validate_run(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     run_id: ProviderRateRunId,
     now: Timestamp,
 ) -> Result<(), ProviderRateStoreError> {
@@ -1724,7 +1942,7 @@ fn validate_run(
     Ok(())
 }
 
-fn enforce_capacity(transaction: &Transaction<'_>) -> Result<(), ProviderRateStoreError> {
+fn enforce_capacity(transaction: &Connection) -> Result<(), ProviderRateStoreError> {
     let (groups, declarations): (i64, i64) = transaction
         .query_row(
             "SELECT
@@ -1796,7 +2014,7 @@ fn decode_collision_keys(encoded: &[u8]) -> Result<Vec<[u8; 33]>, ProviderRateSt
 }
 
 fn existing_declaration(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     declaration_digest: [u8; 32],
 ) -> Result<Option<ExistingDeclaration>, ProviderRateStoreError> {
     transaction
@@ -1828,7 +2046,7 @@ fn existing_declaration(
 }
 
 fn matching_groups(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     candidate: &[u8],
 ) -> Result<Vec<[u8; 16]>, ProviderRateStoreError> {
     let candidate = decode_collision_keys(candidate)?;
@@ -1896,7 +2114,7 @@ fn parse_declaration_row(
 }
 
 fn validate_group_policy(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     group_id: [u8; 16],
     expected: [u8; 32],
 ) -> Result<(), ProviderRateStoreError> {
@@ -1915,7 +2133,7 @@ fn validate_group_policy(
 }
 
 fn insert_group(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     group_id: [u8; 16],
     policy_digest: [u8; 32],
     policy_json: &[u8],
@@ -2135,11 +2353,131 @@ mod tests {
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
     use market_squawk_sources::{
-        BackoffPolicy, BudgetScope, EndpointPolicy, ProviderBudgetPolicy, ProviderRateDecision,
+        BackoffPolicy, BudgetScope, EndpointPolicy, ProviderBudgetPolicy,
+        ProviderRateDispatchDecision, ProviderRateReservationDecision,
     };
     use sha2::{Digest as _, Sha256};
 
     use super::*;
+
+    fn test_declaration(
+        scope: &str,
+        requests_per_window: u32,
+        endpoint: &str,
+    ) -> Result<ProviderRateDeclaration, Box<dyn std::error::Error>> {
+        test_declaration_with_concurrency(scope, requests_per_window, 1, endpoint)
+    }
+
+    fn test_declaration_with_concurrency(
+        scope: &str,
+        requests_per_window: u32,
+        max_concurrent: u16,
+        endpoint: &str,
+    ) -> Result<ProviderRateDeclaration, Box<dyn std::error::Error>> {
+        let policy = ProviderBudgetPolicy::try_new(
+            BudgetScope::new(market_squawk_domain::SourceIdentifier::try_from(scope)?),
+            NonZeroU32::new(requests_per_window).ok_or("nonzero request limit")?,
+            NonZeroU64::new(60_000_000_000).ok_or("nonzero window")?,
+            NonZeroU16::new(max_concurrent).ok_or("nonzero concurrency")?,
+            BackoffPolicy::try_new(
+                NonZeroU64::new(1_000_000).ok_or("nonzero backoff")?,
+                NonZeroU64::new(60_000_000_000).ok_or("nonzero backoff maximum")?,
+                0,
+            )?,
+        )?;
+        Ok(ProviderRateDeclaration::try_for_endpoint(
+            policy,
+            &EndpointPolicy::try_new([endpoint])?,
+        )?)
+    }
+
+    #[test]
+    fn delayed_reservation_is_charged_only_at_dispatch() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let store = SqliteProviderRateStore::try_open(root.path().join("provider-rate.sqlite3"))?;
+        let reserved_at = Timestamp::from_unix_nanos(1_000_000_000);
+        let dispatched_at = Timestamp::from_unix_nanos(61_000_000_000);
+        let run_id = store.start_run(reserved_at)?;
+        let declaration = test_declaration_with_concurrency(
+            "dispatch-linearization",
+            2,
+            2,
+            "https://dispatch-linearization.test/request",
+        )?;
+        let registration = store.register(run_id, &declaration, reserved_at)?;
+        let delayed = match store.try_reserve(run_id, registration, reserved_at)? {
+            ProviderRateReservationDecision::Ready(reservation) => reservation,
+            decision => return Err(format!("unexpected delayed reservation: {decision:?}").into()),
+        };
+        let immediate = match store.try_reserve(run_id, registration, dispatched_at)? {
+            ProviderRateReservationDecision::Ready(reservation) => reservation,
+            decision => {
+                return Err(format!("unexpected immediate reservation: {decision:?}").into());
+            }
+        };
+
+        let immediate_permit =
+            match store.commit_dispatch(run_id, registration, immediate, dispatched_at)? {
+                ProviderRateDispatchDecision::Ready(permit) => permit,
+                decision => {
+                    return Err(format!("unexpected immediate dispatch: {decision:?}").into());
+                }
+            };
+        store.release(run_id, registration, immediate_permit)?;
+        let second_immediate = match store.try_reserve(run_id, registration, dispatched_at)? {
+            ProviderRateReservationDecision::Ready(reservation) => reservation,
+            decision => {
+                return Err(format!("unexpected second reservation: {decision:?}").into());
+            }
+        };
+        let second_permit =
+            match store.commit_dispatch(run_id, registration, second_immediate, dispatched_at)? {
+                ProviderRateDispatchDecision::Ready(permit) => permit,
+                decision => return Err(format!("unexpected second dispatch: {decision:?}").into()),
+            };
+        store.release(run_id, registration, second_permit)?;
+        assert_eq!(
+            store.commit_dispatch(run_id, registration, delayed, dispatched_at)?,
+            ProviderRateDispatchDecision::WaitUntil(Timestamp::from_unix_nanos(121_000_000_000))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_registration_batch_rolls_back_every_declaration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let store = SqliteProviderRateStore::try_open(root.path().join("provider-rate.sqlite3"))?;
+        let now = Timestamp::from_unix_nanos(1_000_000_000);
+        let run_id = store.start_run(now)?;
+        let first = test_declaration("atomic-batch-first", 1, "https://atomic-batch.test/first")?;
+        let conflicting = test_declaration(
+            "atomic-batch-conflict",
+            2,
+            "https://atomic-batch.test/second",
+        )?;
+
+        assert!(matches!(
+            store.prepare_registration_batch(run_id, &[first, conflicting.clone()], now),
+            Err(ProviderRateStoreError::Conflict)
+        ));
+
+        let registration = store.register(run_id, &conflicting, now)?;
+        assert_eq!(
+            registration.declaration_digest(),
+            conflicting.declaration_digest()
+        );
+        let connection = store.connection()?;
+        let (groups, declarations): (i64, i64) = connection.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM provider_rate_groups),
+                (SELECT COUNT(*) FROM provider_rate_declarations)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((groups, declarations), (1, 1));
+        Ok(())
+    }
 
     #[test]
     fn logical_checkpoint_restores_durable_budget_without_process_run_or_permit_state()
@@ -2167,9 +2505,13 @@ mod tests {
             &EndpointPolicy::try_new(["https://provider-rate.test/"])?,
         )?;
         let registration = source.register(run_id, &declaration, now)?;
+        let reservation = match source.try_reserve(run_id, registration, now)? {
+            ProviderRateReservationDecision::Ready(reservation) => reservation,
+            decision => return Err(format!("unexpected reservation decision: {decision:?}").into()),
+        };
         assert!(matches!(
-            source.try_acquire(run_id, registration, now)?,
-            ProviderRateDecision::Ready(_)
+            source.commit_dispatch(run_id, registration, reservation, now)?,
+            ProviderRateDispatchDecision::Ready(_)
         ));
 
         let retained = source.retain_logical_checkpoint()?;
@@ -2199,8 +2541,8 @@ mod tests {
         let restored_run = restored.start_run(now)?;
         let restored_registration = restored.register(restored_run, &declaration, now)?;
         assert!(matches!(
-            restored.try_acquire(restored_run, restored_registration, now)?,
-            ProviderRateDecision::WaitUntil(_)
+            restored.try_reserve(restored_run, restored_registration, now)?,
+            ProviderRateReservationDecision::WaitUntil(_)
         ));
         Ok(())
     }

@@ -1683,7 +1683,7 @@ impl ProviderOnboardingService {
             .endpoint_policy()
             .ok_or(ProviderOnboardingError::InvalidProfile)?;
         policy.authorize_request(endpoint)?;
-        let rate_permit = self
+        let mut rate_permit = self
             .probe_rates
             .acquire(
                 profile,
@@ -1697,7 +1697,13 @@ impl ProviderOnboardingService {
             && let Some(executor) = &self.board_doctor_executor
         {
             let body = self
-                .collect_scripted_board_probe_response(executor, endpoint, policy, cancellation)
+                .collect_scripted_board_probe_response(
+                    executor,
+                    endpoint,
+                    policy,
+                    &mut rate_permit,
+                    cancellation,
+                )
                 .await?;
             validate_probe_semantics(profile.id(), &body)?;
             rate_permit.record_success()?;
@@ -1725,7 +1731,14 @@ impl ProviderOnboardingService {
             request
         };
         let body = self
-            .collect_probe_response(request, policy, &rate_permit, false, false, cancellation)
+            .collect_probe_response(
+                request,
+                policy,
+                &mut rate_permit,
+                false,
+                false,
+                cancellation,
+            )
             .await?;
         validate_probe_semantics(profile.id(), &body)?;
         rate_permit.record_success()?;
@@ -1741,6 +1754,7 @@ impl ProviderOnboardingService {
         executor: &BoardScriptedDoctorExecutor,
         endpoint: &str,
         policy: &market_squawk_sources::EndpointPolicy,
+        rate_permit: &mut ProbeRatePermit,
         cancellation: CancellationToken,
     ) -> Result<Vec<u8>, ProviderOnboardingError> {
         let bounds = policy.request_bounds();
@@ -1761,6 +1775,7 @@ impl ProviderOnboardingService {
             deadline,
         )
         .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        rate_permit.commit_dispatch(&cancellation).await?;
         let response = executor
             .execute(request, cancellation)
             .await
@@ -1817,7 +1832,7 @@ impl ProviderOnboardingService {
                 .as_source_identifier(),
         )
         .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
-        let rate_permit = self
+        let mut rate_permit = self
             .probe_rates
             .acquire(
                 profile,
@@ -1893,7 +1908,7 @@ impl ProviderOnboardingService {
             .collect_probe_response(
                 request,
                 policy,
-                &rate_permit,
+                &mut rate_permit,
                 true,
                 profile.id() == "fred-alfred.api-v1-v2",
                 cancellation,
@@ -2023,12 +2038,13 @@ impl ProviderOnboardingService {
         &self,
         request: reqwest::RequestBuilder,
         policy: &market_squawk_sources::EndpointPolicy,
-        rate_permit: &ProbeRatePermit,
+        rate_permit: &mut ProbeRatePermit,
         credential_probe: bool,
         fred_v1_credential: bool,
         cancellation: CancellationToken,
     ) -> Result<Vec<u8>, ProviderOnboardingError> {
         let request_deadline = tokio::time::Instant::from_std(rate_permit.deadline);
+        rate_permit.commit_dispatch(&cancellation).await?;
         let response = tokio::select! {
             biased;
             () = cancellation.cancelled() => {

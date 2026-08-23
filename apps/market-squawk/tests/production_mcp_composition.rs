@@ -1113,6 +1113,16 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
     assert_eq!(row["analyticalReadiness"], "runtime_display_only");
     assert!(row["orderBook"].is_null());
     required_nonempty_string(&row["permanentFigi"], "Alpaca overview permanent FIGI")?;
+    let definition_revision_digest = &row["definitionRevisionDigest"];
+    assert_eq!(definition_revision_digest["algorithm"], "sha256");
+    required_sha256(
+        &definition_revision_digest["bytes"],
+        "Alpaca overview definition revision digest",
+    )?;
+    assert_eq!(
+        &row["selectionReceipt"]["definitionRevisionDigest"],
+        definition_revision_digest
+    );
     let instrument_id =
         required_uuid_string(&row["instrumentId"], "selected Alpaca overview instrument")?;
     let stable_identity = json!({
@@ -1121,6 +1131,7 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
         "assetClass": row["assetClass"],
         "quoteCurrency": row["quoteCurrency"],
         "definitionKind": row["definitionKind"],
+        "definitionRevisionDigest": definition_revision_digest,
         "referenceRevision": row["referenceRevision"],
         "permanentFigi": row["permanentFigi"],
         "executionEligible": row["executionEligible"],
@@ -1189,7 +1200,18 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
     })
 }
 
-fn assert_real_alpaca_mcp_market(data: &Value, expected: &RealAlpacaEvidence) -> TestResult {
+fn assert_real_alpaca_mcp_market(result: &Value, expected: &RealAlpacaEvidence) -> TestResult {
+    let data = &result["data"];
+    let rows = data
+        .as_array()
+        .context("MCP Alpaca Market read omitted the canonical row proven by the native read")?;
+    if rows.len() != 1 {
+        anyhow::bail!(
+            "MCP Alpaca Market exact-instrument read returned {} rows instead of the canonical {} row",
+            rows.len(),
+            REAL_ALPACA_OVERVIEW_SYMBOL,
+        );
+    }
     let observed = real_alpaca_market_observation(data)?;
     assert_eq!(observed.instrument_id, expected.instrument_id);
     if observed.available && expected.market_available {
@@ -2738,7 +2760,7 @@ async fn exercise_installed_relay_with_gate(
         let market = read_message(&mut peer_reader)
             .await
             .context("read installed relay real Alpaca Market response")?;
-        assert_real_alpaca_mcp_market(&market["result"]["structuredContent"]["data"], real_alpaca)
+        assert_real_alpaca_mcp_market(&market["result"]["structuredContent"], real_alpaca)
             .context("verify installed MCP real Alpaca Market evidence")?;
     }
     write_message(

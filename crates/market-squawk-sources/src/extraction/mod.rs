@@ -11,9 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::registry::ExtractionAuthority;
 use crate::{
-    AuthorizedRequest, BudgetPermit, BudgetUnavailableReason, HttpClientProfile, HttpRequestBounds,
-    MonotonicInstant, NetworkPolicyError, RedirectAuthorization, SourceError,
-    SourceMetadataProvider,
+    AuthorizedRequest, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
+    BudgetUnavailableReason, HttpClientProfile, HttpRequestBounds, MonotonicInstant,
+    NetworkPolicyError, RedirectAuthorization, SourceError, SourceMetadataProvider,
 };
 
 pub use batch::{ExtractionBatch, ExtractionBatchAccumulator, ExtractionContentIdentity};
@@ -117,7 +117,7 @@ pub enum ExtractionAuthorityError {
 pub struct ExtractionRequestPermit {
     authority: ExtractionAuthority,
     authorization: AuthorizedRequest,
-    budget: BudgetPermit,
+    budget: BudgetReservation,
     redirects_followed: u8,
 }
 
@@ -138,7 +138,7 @@ impl ExtractionRequestPermit {
     pub(crate) const fn new(
         authority: ExtractionAuthority,
         authorization: AuthorizedRequest,
-        budget: BudgetPermit,
+        budget: BudgetReservation,
     ) -> Self {
         Self {
             authority,
@@ -179,10 +179,20 @@ impl ExtractionRequestPermit {
         if !self.authorization.matches_exact_target(target) {
             return Err(ExtractionAuthorityError::RequestTargetMismatch);
         }
+        let budget = match self.budget.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => permit,
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                return Err(ExtractionAuthorityError::BudgetWaitUntil { deadline });
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                return Err(ExtractionAuthorityError::BudgetUnavailable { reason });
+            }
+        };
+        self.authority.validate_current()?;
         Ok(InFlightExtractionRequest {
             authority: self.authority,
             authorization: self.authorization,
-            budget: self.budget,
+            budget,
             redirects_followed: self.redirects_followed,
         })
     }
@@ -194,7 +204,7 @@ impl ExtractionRequestPermit {
         }
     }
 
-    /// Cancels before send, releasing concurrency while preserving request-window consumption.
+    /// Cancels before send, releasing concurrency without consuming a request window.
     pub fn release(self) {
         self.budget.release();
     }
@@ -371,7 +381,7 @@ impl ExtractionRedirectPermit {
         self.request.authorize_send(target)
     }
 
-    /// Cancels the redirect before send while preserving request-window consumption.
+    /// Cancels the redirect before send without consuming a request window.
     pub fn release(self) {
         self.request.release();
     }

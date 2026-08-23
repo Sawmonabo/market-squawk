@@ -4,8 +4,19 @@ use market_squawk_domain::{
 };
 
 use super::{
-    FixturePolicy, TestResult, current_fixture, provenance, qualify, unsupported_evidence,
+    FixturePolicy, TestResult, canonical_digest, current_fixture, provenance, qualify,
+    unsupported_evidence,
 };
+
+#[test]
+fn canonical_state_digest_declares_v2_encoding_rule() -> TestResult {
+    let digest = canonical_digest(b"current-v2-canonical-state")?;
+    let rule = digest.canonicalization_rule();
+
+    assert_eq!(rule.rule().as_str(), "market-squawk-live-state-v2");
+    assert_eq!(rule.version().get(), 2);
+    Ok(())
+}
 
 #[test]
 fn trading_status_and_coinbase_quality_ceiling_cannot_be_promoted() -> TestResult {
@@ -136,7 +147,7 @@ fn serialized_assessment_rejects_binding_dimension_mutation_and_transplant() -> 
         ),
         (
             "/binding/canonical_state_digest/canonicalization_rule/version",
-            serde_json::json!(2),
+            serde_json::json!(3),
         ),
     ];
     for (path, replacement) in mutations {

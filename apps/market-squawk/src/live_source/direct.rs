@@ -17,7 +17,7 @@ use std::sync::{
 use std::time::Duration;
 
 use market_squawk_adapter_coinbase::{CoinbaseDirectHmacSigner, CoinbaseDirectSigningError};
-use market_squawk_live::{LiveRuntimeConfig, LiveSnapshotReader, RouteActionHook};
+use market_squawk_live::{LiveRuntimeConfig, LiveSnapshotReader, RouteActionHook, ShardKey};
 use market_squawk_platform::{
     CaptureProcessInfrastructureLimits, DestinationFenceRegistryInitializationError,
     initialize_capture_process_infrastructure,
@@ -53,6 +53,7 @@ pub struct CoinbaseDirectLiveRuntime {
     supervisor_live: Arc<AtomicBool>,
     live: LiveRuntimeComposition,
     metadata: Arc<[SourceMetadata]>,
+    routes: Arc<[ShardKey]>,
     supervisor: tokio::task::JoinHandle<Result<(), CoinbaseDirectSupervisorError>>,
     shutdown_deadline: Duration,
 }
@@ -71,6 +72,11 @@ impl CoinbaseDirectLiveRuntime {
     /// Returns every exact source-metadata record retained by this account runtime.
     pub(crate) fn metadata(&self) -> Arc<[SourceMetadata]> {
         Arc::clone(&self.metadata)
+    }
+
+    /// Returns the exact route topology retained by this account runtime.
+    pub(crate) fn routes(&self) -> Arc<[ShardKey]> {
+        Arc::clone(&self.routes)
     }
 
     /// Installs one complete disabled action-hook group without reconnecting the account source.
@@ -209,6 +215,12 @@ async fn start_account(
         .map_err(|_error| CoinbaseDirectSupervisorError::AllocationFailed)?;
     metadata.extend(specs.iter().map(|spec| spec.metadata().clone()));
     let metadata: Arc<[SourceMetadata]> = metadata.into();
+    let mut retained_routes = Vec::new();
+    retained_routes
+        .try_reserve_exact(specs.len())
+        .map_err(|_error| CoinbaseDirectSupervisorError::AllocationFailed)?;
+    retained_routes.extend(specs.iter().map(|spec| spec.route().route().clone()));
+    let retained_routes: Arc<[ShardKey]> = retained_routes.into();
     let routes = specs.iter().map(|spec| spec.route().clone()).collect();
 
     let secret = activation
@@ -241,6 +253,7 @@ async fn start_account(
         activation,
         specs,
         metadata,
+        retained_routes,
         signer,
         app_config,
         admission,
@@ -261,6 +274,7 @@ async fn start_on_live_runtime(
     activation: CoinbaseDirectAccountActivation,
     specs: Vec<ProductRuntimeSpec>,
     metadata: Arc<[SourceMetadata]>,
+    routes: Arc<[ShardKey]>,
     signer: Arc<CoinbaseDirectHmacSigner>,
     app_config: market_squawk_platform::AppConfig,
     admission: crate::provider_activation::CoinbaseDirectRuntimeAdmission,
@@ -303,6 +317,7 @@ async fn start_on_live_runtime(
                 supervisor_live,
                 live,
                 metadata,
+                routes,
                 supervisor,
                 shutdown_deadline,
             }),

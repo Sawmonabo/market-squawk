@@ -11,11 +11,12 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy,
-    BudgetDecision, BudgetScope, DecodeOutcome, FreshnessPolicy, LiveMarketSource,
+    BudgetReservationDecision, BudgetScope, DecodeOutcome, FreshnessPolicy, LiveMarketSource,
     LiveSourceGeneration, MarketDecoder, ProviderBudgetPolicy, RawMarketFrame, RawMarketSink,
     RegistryError, SessionId, SinkError, SourceError, SourceMetadataProvider,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +30,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 struct RecordingSink {
     frames: Vec<RawMarketFrame>,
     limit: usize,
+    terminal_after_capture: bool,
 }
 
 impl Default for RecordingSink {
@@ -36,6 +38,7 @@ impl Default for RecordingSink {
         Self {
             frames: Vec::with_capacity(2),
             limit: 2,
+            terminal_after_capture: false,
         }
     }
 }
@@ -46,11 +49,14 @@ impl RawMarketSink for RecordingSink {
             return Err(SinkError::Saturated);
         }
         self.frames.push(frame);
+        if self.terminal_after_capture {
+            return Err(SinkError::CaptureIncomplete);
+        }
         Ok(())
     }
 }
 
-const BOOK_ACK: &str = r#"{"method":"subscribe","result":{"channel":"book","depth":10,"snapshot":true,"symbol":"BTC/USD","warnings":["advisory"]},"success":true,"time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25Z"}"#;
+const BOOK_ACK: &str = r#"{"method":"subscribe","result":{"channel":"book","depth":10,"snapshot":true,"symbol":"BTC/USD","warnings":["advisory"]},"success":true,"time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25Z","req_id":1}"#;
 const UPDATE_BEFORE_SNAPSHOT: &str = r#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USD","bids":[{"price":"45283.5","qty":"0"}],"asks":[],"checksum":1,"timestamp":"2023-10-04T07:48:26Z"}]}"#;
 
 #[tokio::test]
@@ -194,10 +200,83 @@ async fn successor_generation_requires_a_fresh_snapshot_before_health() -> TestR
         error => return Err(format!("429 mapped to {error:?} instead of a budget wait").into()),
     };
     assert!(matches!(
-        budget.try_acquire(),
-        BudgetDecision::WaitUntil(recorded_deadline) if recorded_deadline == returned_deadline
+        budget.try_reserve_request(),
+        BudgetReservationDecision::WaitUntil(recorded_deadline)
+            if recorded_deadline == returned_deadline
     ));
 
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn subscription_refusal_settles_before_a_captured_sink_terminal_releases_permit() -> TestResult
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (subscription_seen_tx, subscription_seen_rx) = oneshot::channel();
+    let (send_refusal_tx, send_refusal_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_book_source(&listener).await?;
+        subscription_seen_tx
+            .send(())
+            .map_err(|_| "subscription observation receiver dropped")?;
+        send_refusal_rx
+            .await
+            .map_err(|_| "refusal release sender dropped")?;
+        socket
+            .send(Message::Text(
+                r#"{"method":"subscribe","success":false,"error":"rate limit exceeded","time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25Z","req_id":1}"#
+                    .into(),
+            ))
+            .await?;
+        socket.close(None).await?;
+        TestResult::Ok(())
+    });
+
+    let (config, mut registry, registered) =
+        test_source_with_concurrency("kraken-public-book-v2", "kraken-policy-v1", 1)?;
+    let session = registry.begin_session(
+        &registered,
+        SessionId::new(SourceIdentifier::try_from("kraken-session-refused")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let budget = session
+        .budget()
+        .cloned()
+        .ok_or("source session has no coordinated budget")?;
+    let generation = live_generation(&mut registry, &session)?;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
+    let mut source = KrakenSource::try_new(config, generation)?;
+    let mut sink = RecordingSink {
+        terminal_after_capture: true,
+        ..RecordingSink::default()
+    };
+    let run = source.run_established(&mut socket, &mut sink, CancellationToken::new());
+    tokio::pin!(run);
+
+    tokio::select! {
+        result = &mut run => return Err(format!("source completed before provider acknowledgement: {result:?}").into()),
+        result = subscription_seen_rx => result.map_err(|_| "server did not observe subscription")?,
+    }
+    assert!(matches!(
+        budget.try_reserve_request(),
+        BudgetReservationDecision::Unavailable(
+            market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
+        )
+    ));
+    send_refusal_tx
+        .send(())
+        .map_err(|_| "source stopped before provider refusal")?;
+    let refusal_deadline = match run.await {
+        Err(SourceError::BudgetWaitUntil { deadline }) => deadline,
+        result => return Err(format!("provider refusal settled as {result:?}").into()),
+    };
+    assert!(matches!(
+        budget.try_reserve_request(),
+        BudgetReservationDecision::WaitUntil(deadline) if deadline == refusal_deadline
+    ));
     server.await??;
     Ok(())
 }
@@ -211,7 +290,10 @@ async fn accept_book_source(listener: &TcpListener) -> TestResult<WebSocketStrea
         return Err("source did not send a text subscription".into());
     };
     let request: serde_json::Value = serde_json::from_str(&subscription)?;
-    if request["method"] != "subscribe" || request["params"]["channel"] != "book" {
+    if request["method"] != "subscribe"
+        || request["req_id"] != 1
+        || request["params"]["channel"] != "book"
+    {
         return Err("source sent the wrong subscription".into());
     }
     Ok(socket)
@@ -326,6 +408,18 @@ fn test_source(
     AuthoritativeSourceRegistry,
     market_squawk_sources::RegisteredSource,
 )> {
+    test_source_with_concurrency(source_id, metadata_revision, 3)
+}
+
+fn test_source_with_concurrency(
+    source_id: &str,
+    metadata_revision: &str,
+    max_concurrent: u16,
+) -> TestResult<(
+    KrakenConfig,
+    AuthoritativeSourceRegistry,
+    market_squawk_sources::RegisteredSource,
+)> {
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let exact = |byte| {
         ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
@@ -344,7 +438,7 @@ fn test_source(
         BudgetScope::new(provider),
         NonZeroU32::new(20).ok_or("zero request budget")?,
         NonZeroU64::new(1_000_000_000).ok_or("zero budget window")?,
-        NonZeroU16::new(3).ok_or("zero concurrency")?,
+        NonZeroU16::new(max_concurrent).ok_or("zero concurrency")?,
         BackoffPolicy::try_new(
             NonZeroU64::new(10_000_000).ok_or("zero initial backoff")?,
             NonZeroU64::new(1_000_000_000).ok_or("zero maximum backoff")?,

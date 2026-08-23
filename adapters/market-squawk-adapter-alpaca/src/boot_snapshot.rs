@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use market_squawk_domain::SourceIdentifier;
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, ApiEndpointRule, BudgetDecision, HttpRequestBounds, PathScope,
-    QueryParameterRule, QuerySensitivity, RawMarketSink, SharedProviderBudget, SourceError,
-    TransportFrameKind, apply_http_retry_after,
+    ActiveLiveSourceGeneration, ApiEndpointRule, BudgetDispatchDecision, BudgetReservationDecision,
+    HttpRequestBounds, PathScope, QueryParameterRule, QuerySensitivity, RawMarketSink,
+    SharedProviderBudget, SourceError, TransportFrameKind, apply_http_retry_after,
 };
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, RETRY_AFTER};
 use tokio_util::sync::CancellationToken;
@@ -184,12 +184,12 @@ impl AlpacaIexBootSnapshotTransport {
             .authorize(self.contract.target())
             .map_err(|_| SourceError::InvalidProtocolState)?;
         authority.validate_current()?;
-        let permit = match budget.try_acquire() {
-            BudgetDecision::Ready(permit) => permit,
-            BudgetDecision::WaitUntil(deadline) => {
+        let reservation = match budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => reservation,
+            BudgetReservationDecision::WaitUntil(deadline) => {
                 return Err(SourceError::BudgetWaitUntil { deadline });
             }
-            BudgetDecision::Unavailable(reason) => {
+            BudgetReservationDecision::Unavailable(reason) => {
                 return Err(SourceError::BudgetUnavailable { reason });
             }
         };
@@ -202,6 +202,15 @@ impl AlpacaIexBootSnapshotTransport {
         let deadline = sink_deadline.map_or(transport_deadline, |deadline| {
             deadline.min(transport_deadline)
         });
+        let permit = match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => permit,
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                return Err(SourceError::BudgetWaitUntil { deadline });
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                return Err(SourceError::BudgetUnavailable { reason });
+            }
+        };
         let response = authenticated_bounded_get(
             &self.client,
             credentials,
