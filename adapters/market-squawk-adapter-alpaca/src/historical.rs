@@ -35,9 +35,8 @@ use crate::config::{
     ALPACA_HISTORICAL_EXCLUSION_NANOS, ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS,
     ALPACA_STOCKS_BASE_ENDPOINT, AlpacaHistoricalEquityPreflightPlan,
 };
-use crate::historical_calendar::{
-    authenticated_bounded_get, hardened_client, singleton_bounded_header,
-};
+use crate::historical_calendar::singleton_bounded_header;
+use crate::historical_transport::{AlpacaHistoricalEndpoint, AlpacaHistoricalTransport};
 use crate::{
     AlpacaCredentials, AlpacaError, AlpacaHistoricalEquityConfig, AlpacaHistoricalEquityDataset,
 };
@@ -176,7 +175,7 @@ impl AlpacaHistoricalEquityPreflightReceipt {
 /// One-operation credential-bearing client that produces a secret-free preflight receipt.
 pub struct AlpacaHistoricalEquityPreflightClient {
     credentials: Arc<AlpacaCredentials>,
-    client: reqwest::Client,
+    transport: AlpacaHistoricalTransport,
     bounds: HttpRequestBounds,
 }
 
@@ -279,7 +278,23 @@ impl AlpacaHistoricalEquityPreflightClient {
     ) -> Result<Self, AlpacaError> {
         Ok(Self {
             credentials,
-            client: hardened_client(bounds, PREFLIGHT_USER_AGENT)?,
+            transport: AlpacaHistoricalTransport::try_hardened(bounds, PREFLIGHT_USER_AGENT)?,
+            bounds,
+        })
+    }
+
+    #[cfg(any(
+        test,
+        all(feature = "scripted-historical-transport-fixture", debug_assertions)
+    ))]
+    pub(crate) fn try_new_with_transport(
+        credentials: Arc<AlpacaCredentials>,
+        bounds: HttpRequestBounds,
+        transport: AlpacaHistoricalTransport,
+    ) -> Result<Self, AlpacaError> {
+        Ok(Self {
+            credentials,
+            transport,
             bounds,
         })
     }
@@ -402,17 +417,19 @@ impl AlpacaHistoricalEquityPreflightClient {
                 .map_err(|_| AlpacaError::InvalidTransportLimits)?;
             let permit =
                 commit_preflight_budget(reservation, budget, deadline, cancellation).await?;
-            let response = authenticated_bounded_get(
-                &self.client,
-                &self.credentials,
-                url,
-                self.bounds,
-                maximum,
-                deadline,
-                cancellation,
-            )
-            .await?;
-            let received_at = system_timestamp()?;
+            let response = self
+                .transport
+                .authenticated_get(
+                    AlpacaHistoricalEndpoint::Bars,
+                    &self.credentials,
+                    url,
+                    self.bounds,
+                    maximum,
+                    deadline,
+                    cancellation,
+                )
+                .await?;
+            let received_at = response.received_at;
             let retry_after =
                 singleton_bounded_header(&response.headers, reqwest::header::RETRY_AFTER, 128)?;
             if matches!(response.status, 429 | 503) {
@@ -1988,6 +2005,11 @@ mod capture_tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::historical_transport::{
+        AlpacaHistoricalScriptedHeader, AlpacaHistoricalScriptedResponse,
+        AlpacaHistoricalScriptedTransportFactory,
+    };
+    use crate::{AlpacaAuthenticatedCalendarRequest, AlpacaTradingApiEnvironment};
     use market_squawk_domain::{AssetClass, MetadataRevision};
     use market_squawk_sources::{
         AuthorizationMode, BackoffPolicy, BudgetScope, PreparedProviderRateRegistrationBatch,
@@ -2194,6 +2216,108 @@ mod capture_tests {
             next_reservation,
             BudgetReservationDecision::Ready(_)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scripted_historical_transport_is_shared_and_counts_only_dispatches()
+    -> Result<(), Box<dyn Error>> {
+        let mapping = crate::AlpacaInstrumentMapping::try_new(
+            "AAPL".to_owned(),
+            "00000001-0002-0003-0004-000000000001".parse()?,
+            AssetClass::Equity,
+        )?;
+        let plan = AlpacaHistoricalEquityPreflightPlan::try_new(
+            mapping,
+            crate::AlpacaTimeframe::day(),
+            Timestamp::from_unix_nanos(1_735_776_900_000_000_000),
+            crate::AlpacaHistoricalLookback::try_from_days(30)?,
+            crate::AlpacaAdjustment::All,
+        )?;
+        let returned_at = plan.start();
+        let returned_at_text = timestamp_text(returned_at)?;
+        let bar_body = Bytes::from(format!(
+            r#"{{"bars":[{{"t":"{returned_at_text}","o":1,"h":2,"l":1,"c":2,"v":10}}],"symbol":"AAPL","next_page_token":null}}"#,
+        ));
+        let bar_received_at = Timestamp::from_unix_nanos(1_735_800_000_000_000_000);
+        let calendar_received_at = Timestamp::from_unix_nanos(1_735_800_001_000_000_000);
+        let calendar_body = Bytes::from_static(
+            br#"[{"date":"2024-12-02","open":"09:30","close":"16:00","session_open":"04:00","session_close":"20:00"}]"#,
+        );
+        let fixture = AlpacaHistoricalScriptedTransportFactory::try_new(
+            AlpacaHistoricalScriptedResponse::try_new(
+                200,
+                vec![
+                    AlpacaHistoricalScriptedHeader::RateLimitLimit(200),
+                    AlpacaHistoricalScriptedHeader::RateLimitRemaining(199),
+                    AlpacaHistoricalScriptedHeader::RateLimitReset(1_735_800_060),
+                ],
+                bar_body,
+                bar_received_at,
+            )?,
+            AlpacaHistoricalScriptedResponse::try_new(
+                200,
+                Vec::new(),
+                calendar_body.clone(),
+                calendar_received_at,
+            )?,
+        )?;
+        let credentials = Arc::new(AlpacaCredentials::try_new(
+            "alpaca-key".to_owned(),
+            "alpaca-secret".to_owned(),
+        )?);
+        let bounds = HttpRequestBounds::default();
+        let preflight = fixture.preflight_client(Arc::clone(&credentials), bounds)?;
+        let calendar = fixture.calendar_executor(credentials, bounds)?;
+        let rate_store = Arc::new(ReadyRateStore::default());
+        let budget = one_request_budget(rate_store.clone())?;
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let receipt = preflight
+            .fetch(plan.clone(), &budget, deadline, &cancellation)
+            .await?;
+        let session_date = receipt.returned_bar_times()[0].calendar_date();
+        let calendar_request = AlpacaAuthenticatedCalendarRequest::try_new(
+            AlpacaTradingApiEnvironment::Paper,
+            session_date,
+            session_date,
+        )?;
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            calendar
+                .execute(calendar_request.clone(), deadline, &cancelled)
+                .await,
+            Err(AlpacaError::Cancelled)
+        ));
+        assert_eq!(fixture.counters().bar_dispatches(), 1);
+        assert_eq!(fixture.counters().calendar_dispatches(), 0);
+
+        let calendar_response = calendar
+            .execute(calendar_request.clone(), deadline, &cancellation)
+            .await?;
+
+        assert_eq!(receipt.plan(), &plan);
+        assert_eq!(
+            receipt.returned_bar_times()[0].provider_timestamp(),
+            returned_at
+        );
+        assert_eq!(
+            receipt.last_rate_limit_evidence(),
+            AlpacaRateLimitEvidence {
+                limit: Some(200),
+                remaining: Some(199),
+                reset_unix_seconds: Some(1_735_800_060),
+            }
+        );
+        assert_eq!(calendar_response.request(), &calendar_request);
+        assert_eq!(calendar_response.body(), calendar_body);
+        assert_eq!(calendar_response.received_at(), calendar_received_at);
+        assert_eq!(rate_store.dispatches(), 1);
+        assert_eq!(fixture.counters().bar_dispatches(), 1);
+        assert_eq!(fixture.counters().calendar_dispatches(), 1);
         Ok(())
     }
 
