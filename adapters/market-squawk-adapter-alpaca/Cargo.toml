@@ -12,6 +12,7 @@ categories = ["finance", "network-programming"]
 
 [features]
 default = []
+scripted-historical-transport-fixture = []
 
 [dependencies]
 base64.workspace = true

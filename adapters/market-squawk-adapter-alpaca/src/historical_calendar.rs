@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
+use crate::historical_transport::{AlpacaHistoricalEndpoint, AlpacaHistoricalTransport};
 use crate::{ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS, AlpacaCredentials, AlpacaError};
 
 /// Maximum retained raw body for one exact bounded v3 calendar-range response.
@@ -230,7 +231,7 @@ impl AlpacaAuthenticatedCalendarResponse {
 /// Credential-bearing executor that can issue only the exact calendar-range request grammar.
 pub struct AlpacaAuthenticatedCalendarExecutor {
     credentials: Arc<AlpacaCredentials>,
-    client: reqwest::Client,
+    transport: AlpacaHistoricalTransport,
     bounds: HttpRequestBounds,
 }
 
@@ -242,7 +243,23 @@ impl AlpacaAuthenticatedCalendarExecutor {
     ) -> Result<Self, AlpacaError> {
         Ok(Self {
             credentials,
-            client: hardened_client(bounds, USER_AGENT)?,
+            transport: AlpacaHistoricalTransport::try_hardened(bounds, USER_AGENT)?,
+            bounds,
+        })
+    }
+
+    #[cfg(any(
+        test,
+        all(feature = "scripted-historical-transport-fixture", debug_assertions)
+    ))]
+    pub(crate) fn try_new_with_transport(
+        credentials: Arc<AlpacaCredentials>,
+        bounds: HttpRequestBounds,
+        transport: AlpacaHistoricalTransport,
+    ) -> Result<Self, AlpacaError> {
+        Ok(Self {
+            credentials,
+            transport,
             bounds,
         })
     }
@@ -254,16 +271,18 @@ impl AlpacaAuthenticatedCalendarExecutor {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<AlpacaAuthenticatedCalendarResponse, AlpacaError> {
-        let response = authenticated_bounded_get(
-            &self.client,
-            &self.credentials,
-            &request.url,
-            self.bounds,
-            ALPACA_HISTORICAL_CALENDAR_MAX_RESPONSE_BYTES,
-            deadline,
-            cancellation,
-        )
-        .await?;
+        let response = self
+            .transport
+            .authenticated_get(
+                AlpacaHistoricalEndpoint::Calendar,
+                &self.credentials,
+                &request.url,
+                self.bounds,
+                ALPACA_HISTORICAL_CALENDAR_MAX_RESPONSE_BYTES,
+                deadline,
+                cancellation,
+            )
+            .await?;
         let retry_after = singleton_bounded_header(
             &response.headers,
             reqwest::header::RETRY_AFTER,
@@ -448,7 +467,9 @@ fn system_timestamp() -> Result<Timestamp, AlpacaError> {
     ))
 }
 
-fn authorization_headers(credentials: &AlpacaCredentials) -> Result<HeaderMap, AlpacaError> {
+pub(crate) fn authorization_headers(
+    credentials: &AlpacaCredentials,
+) -> Result<HeaderMap, AlpacaError> {
     let mut headers = HeaderMap::new();
     let mut key =
         HeaderValue::from_str(credentials.key_id()).map_err(|_| AlpacaError::InvalidCredentials)?;

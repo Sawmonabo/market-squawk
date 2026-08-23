@@ -13,6 +13,7 @@ mod doctor;
 mod error;
 mod historical;
 mod historical_calendar;
+mod historical_transport;
 mod live;
 
 pub use config::{
@@ -47,6 +48,14 @@ pub use historical_calendar::{
     ALPACA_HISTORICAL_CALENDAR_MAX_RESPONSE_BYTES, AlpacaAuthenticatedCalendarExecutor,
     AlpacaAuthenticatedCalendarRequest, AlpacaAuthenticatedCalendarResponse,
     AlpacaTradingApiEnvironment,
+};
+#[cfg(any(
+    test,
+    all(feature = "scripted-historical-transport-fixture", debug_assertions)
+))]
+pub use historical_transport::{
+    AlpacaHistoricalScriptedHeader, AlpacaHistoricalScriptedResponse,
+    AlpacaHistoricalScriptedTransportCounters, AlpacaHistoricalScriptedTransportFactory,
 };
 pub use live::{AlpacaIexLiveSource, AlpacaOptionsLiveSource};
 
