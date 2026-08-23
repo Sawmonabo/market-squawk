@@ -379,7 +379,7 @@ impl ExtractionRedirectPermit {
         self.request.authorize_send(target)
     }
 
-    /// Cancels the redirect before send while preserving request-window consumption.
+    /// Cancels the redirect before send without consuming a request window.
     pub fn release(self) {
         self.request.release();
     }
