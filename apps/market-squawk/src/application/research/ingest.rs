@@ -53,10 +53,15 @@ mod alpaca_historical;
 mod provider_runtime;
 mod selection;
 
+#[cfg(test)]
+pub(crate) use alpaca_historical::tests::{
+    AlpacaHistoricalHeldPublication, activate_shutdown_successor_publication,
+    active_shutdown_fixture,
+};
 pub(crate) use alpaca_historical::{
-    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
-    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
-    AlpacaHistoricalSourceSlotError,
+    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalDrainReceipt, AlpacaHistoricalParentGeneration,
+    AlpacaHistoricalPlanAdmissionError, AlpacaHistoricalPlanReceipt,
+    AlpacaHistoricalSourceMutationAuthority, AlpacaHistoricalSourceSlotError,
 };
 pub use provider_runtime::ResearchProviderRuntimeGeneration;
 use provider_runtime::{ResearchProviderAdmission, ResearchProviderPublicationLease};
@@ -937,6 +942,7 @@ struct CoordinatorAuthority {
     pending_replacements: BTreeMap<SourceIdentifier, Uuid>,
     selections: RetainedDiscoverySelections,
     alpaca_historical: alpaca_historical::AlpacaHistoricalSourceSlot,
+    alpaca_historical_successor_claim: Option<alpaca_historical::AlpacaHistoricalSuccessorClaim>,
 }
 
 /// Sole production coordinator for source discovery, extraction, and analytical publication.
@@ -965,6 +971,7 @@ impl ProductionResearchIngestCoordinator {
                 pending_replacements: BTreeMap::new(),
                 selections: RetainedDiscoverySelections::new(),
                 alpaca_historical: alpaca_historical::AlpacaHistoricalSourceSlot::absent(),
+                alpaca_historical_successor_claim: None,
             })),
         }
     }

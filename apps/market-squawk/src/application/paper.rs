@@ -1210,7 +1210,9 @@ impl PaperController {
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
             (Err(_paper), Err(_sources)) => Err(ServiceError::Unavailable),
         };
-        *shutdown = Some(result);
+        if result.is_ok() {
+            *shutdown = Some(result);
+        }
         result
     }
 

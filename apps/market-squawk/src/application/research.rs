@@ -52,9 +52,15 @@ pub(crate) use dataset_preparation::{
 };
 pub(crate) use forecast_evidence::AnalyticalForecastEvidenceReader;
 pub(crate) use ingest::{
-    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
-    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
-    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalDrainReceipt, AlpacaHistoricalParentGeneration,
+    AlpacaHistoricalPlanAdmissionError, AlpacaHistoricalPlanReceipt,
+    AlpacaHistoricalSourceMutationAuthority, ResearchProviderRuntimeMutationAuthority,
+    ResearchProviderRuntimeReplacement,
+};
+#[cfg(test)]
+pub(crate) use ingest::{
+    AlpacaHistoricalHeldPublication, activate_shutdown_successor_publication,
+    active_shutdown_fixture,
 };
 pub use ingest::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,

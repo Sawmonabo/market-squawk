@@ -38,7 +38,7 @@ use crate::provider_activation::{
     AlpacaBasicAccountActivation, ProviderAccountBinding, ProviderMarketAccount,
 };
 
-use super::MarketRuntimeGroupGeneration;
+use super::{AlpacaHistoricalPublishedCleanupProof, MarketRuntimeGroupGeneration};
 
 mod calendar;
 pub(crate) use calendar::AlpacaHistoricalCompositeCalendarAuthority;
@@ -546,12 +546,10 @@ impl AlpacaHistoricalCapabilityOwner {
     pub(super) fn begin_shutdown(&self) {
         self.inner.accepting.store(false, Ordering::Release);
         self.inner.cancellation.cancel();
-        if self.inner.active.load(Ordering::Acquire) == 0 {
-            self.inner.clear_authority();
-        }
     }
 
-    pub(super) async fn shutdown(self) -> Result<(), ServiceError> {
+    /// Consumes authority that never crossed the account-group publication boundary.
+    pub(super) async fn shutdown_unpublished(self) -> Result<(), ServiceError> {
         self.begin_shutdown();
         while self.inner.active.load(Ordering::Acquire) != 0 {
             let notified = self.inner.idle.notified();
@@ -559,8 +557,34 @@ impl AlpacaHistoricalCapabilityOwner {
                 notified.await;
             }
         }
-        self.inner.clear_authority();
-        Ok(())
+        self.inner.destroy_authority_once()
+    }
+
+    /// Destroys published credential/rate authority only after the exact B3 ownership barrier.
+    pub(super) async fn finish_published_before(
+        &mut self,
+        parent_claim: Option<crate::application::AlpacaHistoricalParentGeneration>,
+        proof: &AlpacaHistoricalPublishedCleanupProof,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        self.begin_shutdown();
+        match (parent_claim, proof) {
+            (Some(parent), AlpacaHistoricalPublishedCleanupProof::ExactDrain(receipt)) => receipt
+                .validate_runtime_parent(parent, self.inner.group_generation)
+                .map_err(|_error| ServiceError::Unavailable)?,
+            (None, AlpacaHistoricalPublishedCleanupProof::NeverClaimed(proof))
+                if proof.group_generation == self.inner.group_generation => {}
+            (Some(_), AlpacaHistoricalPublishedCleanupProof::NeverClaimed(_))
+            | (None, AlpacaHistoricalPublishedCleanupProof::ExactDrain(_))
+            | (None, AlpacaHistoricalPublishedCleanupProof::NeverClaimed(_)) => {
+                return Err(ServiceError::Unavailable);
+            }
+        }
+        self.inner
+            .wait_for_operations_before(deadline, cancellation)
+            .await?;
+        self.inner.destroy_authority_once()
     }
 
     pub(super) fn owns(&self, capability: &AlpacaHistoricalRuntimeCapability) -> bool {
@@ -651,18 +675,42 @@ impl AlpacaHistoricalInner {
 
     fn finish_operation(&self) {
         if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            if !self.accepting.load(Ordering::Acquire) {
-                self.clear_authority();
-            }
             self.idle.notify_one();
         }
     }
 
-    fn clear_authority(&self) {
-        self.authority
+    async fn wait_for_operations_before(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        while self.active.load(Ordering::Acquire) != 0 {
+            let notified = self.idle.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(ServiceError::Cancelled),
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    return Err(ServiceError::DeadlineExceeded);
+                }
+                () = notified => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn destroy_authority_once(&self) -> Result<(), ServiceError> {
+        let authority = self
+            .authority
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
+        // `None` is the retained terminal phase from an earlier successful attempt. Published
+        // retries must not ask for or destroy this credential/rate authority a second time.
+        drop(authority);
+        Ok(())
     }
 }
 

@@ -1,6 +1,9 @@
 //! Display-only production source composition for authenticated U.S. market data.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use market_squawk_adapter_alpaca::{
     AlpacaCredentials, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig,
@@ -30,7 +33,15 @@ pub(crate) struct ProductionDisplaySourceRuntime {
     // Drop cancellation is declared first so the supervisor cannot outlive its owner uncancelled.
     supervisor_cancellation: DisplaySupervisorCancellation,
     supervisor: tokio::task::JoinHandle<Result<(), ProductionSupervisorError>>,
+    published_shutdown: DisplayPublishedShutdownState,
     source_shutdown: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DisplayPublishedShutdownState {
+    Running,
+    Complete,
+    Failed,
 }
 
 impl ProductionDisplaySourceRuntime {
@@ -141,6 +152,7 @@ impl ProductionDisplaySourceRuntime {
                 Ok(()) => Ok(Self {
                     supervisor_cancellation: DisplaySupervisorCancellation::new(cancellation),
                     supervisor: supervisor_task,
+                    published_shutdown: DisplayPublishedShutdownState::Running,
                     source_shutdown,
                 }),
                 Err(_closed) => Err(map_startup_outcome(supervisor_task.await)),
@@ -154,9 +166,69 @@ impl ProductionDisplaySourceRuntime {
         !self.supervisor_cancellation.token.is_cancelled() && !self.supervisor.is_finished()
     }
 
+    /// Synchronously closes this published runtime to new work without consuming its task owner.
+    pub(crate) fn begin_shutdown(&self) {
+        self.supervisor_cancellation.cancel();
+    }
+
+    /// Waits for published cleanup while retaining the supervisor for an exact retry.
+    pub(crate) async fn finish_shutdown_before(
+        &mut self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ProductionDisplaySourceRuntimeError> {
+        self.begin_shutdown();
+        match self.published_shutdown {
+            DisplayPublishedShutdownState::Complete => return Ok(()),
+            DisplayPublishedShutdownState::Failed => {
+                return Err(ProductionDisplaySourceRuntimeError::SupervisorShutdownFailed);
+            }
+            DisplayPublishedShutdownState::Running => {}
+        }
+        if cancellation.is_cancelled() {
+            return Err(ProductionDisplaySourceRuntimeError::SupervisorShutdownCancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(ProductionDisplaySourceRuntimeError::SupervisorShutdownDeadline);
+        }
+        let outcome = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                return Err(ProductionDisplaySourceRuntimeError::SupervisorShutdownCancelled);
+            }
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                return Err(ProductionDisplaySourceRuntimeError::SupervisorShutdownDeadline);
+            }
+            outcome = &mut self.supervisor => outcome,
+        };
+        match outcome {
+            Ok(Ok(())) => {
+                self.published_shutdown = DisplayPublishedShutdownState::Complete;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "published display source supervisor failed terminally");
+                self.published_shutdown = DisplayPublishedShutdownState::Failed;
+                Err(ProductionDisplaySourceRuntimeError::SupervisorShutdownFailed)
+            }
+            Err(error) => {
+                tracing::error!(%error, "published display source supervisor task failed terminally");
+                self.published_shutdown = DisplayPublishedShutdownState::Failed;
+                Err(ProductionDisplaySourceRuntimeError::SupervisorShutdownFailed)
+            }
+        }
+    }
+
     /// Cancels, unregisters, and reaps this source without shutting down the shared directory.
     pub(crate) async fn shutdown(mut self) -> Result<(), ProductionDisplaySourceRuntimeError> {
-        self.supervisor_cancellation.cancel();
+        self.begin_shutdown();
+        match self.published_shutdown {
+            DisplayPublishedShutdownState::Complete => return Ok(()),
+            DisplayPublishedShutdownState::Failed => {
+                return Err(ProductionDisplaySourceRuntimeError::SupervisorShutdownFailed);
+            }
+            DisplayPublishedShutdownState::Running => {}
+        }
         match tokio::time::timeout(self.source_shutdown, &mut self.supervisor).await {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(error))) => Err(ProductionDisplaySourceRuntimeError::Supervisor(error)),
@@ -250,6 +322,10 @@ pub(crate) enum ProductionDisplaySourceRuntimeError {
     SupervisorExitedBeforeStartup,
     #[error("display source supervisor exceeded its shutdown deadline")]
     SupervisorShutdownDeadline,
+    #[error("display source supervisor shutdown wait was cancelled")]
+    SupervisorShutdownCancelled,
+    #[error("display source supervisor failed terminally during published shutdown")]
+    SupervisorShutdownFailed,
     #[error(transparent)]
     DisplayDirectory(#[from] DisplayMarketDirectoryError),
     #[error(transparent)]

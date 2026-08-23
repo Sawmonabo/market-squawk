@@ -55,9 +55,12 @@ pub use fair_value::{
 };
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
 pub(crate) use market_runtime::{
-    AccountMarketSurface, MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration,
-    MarketRuntimeRegistry, MarketSourceRuntimeGeneration,
-    PreparedMarketProviderConfigurationRequest, PreparedMarketProviderConfigurationResolver,
+    AccountGroupStopAcknowledgementReceipt, AccountGroupStopDurableProof,
+    AccountGroupStopHistoryEvidence, AccountGroupStopKeyEvidence, AccountGroupStopReceipt,
+    AccountGroupStopState, AccountGroupStopTicket, AccountMarketSurface,
+    MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration, MarketRuntimeRegistry,
+    MarketSourceRuntimeGeneration, PreparedMarketProviderConfigurationRequest,
+    PreparedMarketProviderConfigurationResolver,
 };
 pub use paper::PaperApplicationServices;
 pub(crate) use paper::{
@@ -65,12 +68,18 @@ pub(crate) use paper::{
     MarketReferenceSearchPage, PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
 };
 pub(crate) use research::{
-    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
-    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
-    AnalyticalForecastEvidenceReader, DatasetPreparationAuthority, DatasetPreparationError,
-    DatasetPreparationOptions, DatasetPreparationPreview, DatasetPreparationPreviewRequest,
-    DatasetPreparationReceipt, DatasetPreparationSelection,
-    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalDrainReceipt, AlpacaHistoricalParentGeneration,
+    AlpacaHistoricalPlanAdmissionError, AlpacaHistoricalPlanReceipt,
+    AlpacaHistoricalSourceMutationAuthority, AnalyticalForecastEvidenceReader,
+    DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
+    DatasetPreparationPreview, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
+    DatasetPreparationSelection, ResearchProviderRuntimeMutationAuthority,
+    ResearchProviderRuntimeReplacement,
+};
+#[cfg(test)]
+pub(crate) use research::{
+    AlpacaHistoricalHeldPublication, activate_shutdown_successor_publication,
+    active_shutdown_fixture,
 };
 pub use research::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
@@ -368,7 +377,9 @@ impl Application {
                 report.failures[index] = outcome.err();
             }
         }
-        *retained = Some(report);
+        if report.is_complete() {
+            *retained = Some(report);
+        }
         report
     }
 }

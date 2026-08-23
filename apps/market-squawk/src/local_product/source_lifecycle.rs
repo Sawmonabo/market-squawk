@@ -23,9 +23,11 @@ use crate::application::source::{
     SourceStartEligibility,
 };
 use crate::application::{
-    AccountMarketSurface, MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration,
-    MarketRuntimeRegistry, MarketSourceRuntimeGeneration,
-    PreparedMarketProviderConfigurationRequest,
+    AccountGroupStopAcknowledgementReceipt, AccountGroupStopDurableProof,
+    AccountGroupStopHistoryEvidence, AccountGroupStopKeyEvidence, AccountGroupStopReceipt,
+    AccountGroupStopState, AccountGroupStopTicket, AccountMarketSurface,
+    MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration, MarketRuntimeRegistry,
+    MarketSourceRuntimeGeneration, PreparedMarketProviderConfigurationRequest,
 };
 use crate::provider_activation::ProviderMarketAccount;
 use crate::{
@@ -35,9 +37,12 @@ use crate::{
 use super::{
     cli_provider,
     provider_activation_state::{
-        DurableActivationRecipeState, DurableProviderActivationState,
-        DurableProviderActivationStateError, DurableSourceLifecyclePhase,
-        DurableSourceLifecycleRecord, DurableSourceLifecycleTransition,
+        DurableAccountHistoryClaim, DurableAccountShutdownKey, DurableActivationRecipeState,
+        DurableAlpacaHistoricalParent, DurableProviderActivationState,
+        DurableProviderActivationStateError, DurableSourceLifecycleCheckpoint,
+        DurableSourceLifecycleIntent, DurableSourceLifecyclePhase, DurableSourceLifecycleRecord,
+        DurableSourceLifecycleTransition, DurableSourceRuntimeGeneration,
+        source_lifecycle_account_stop_proof_digest, source_lifecycle_runtime_absent_proof_digest,
     },
 };
 
@@ -318,27 +323,35 @@ impl ProductionSourceLifecycleAuthority {
             .durable
             .source_lifecycle_record(&provider)
             .map_err(map_durable_error)?;
-        let (target_session_id, target_public_configuration_digest) =
-            self.lifecycle_transition_target(command, &current)?;
-        self.preflight_runtime_lease(command, &current)?;
-        let transition = self
-            .durable
-            .begin_source_lifecycle_transition(
+        let transition = if command.action() == SourceLifecycleAction::Retry {
+            let expected_transition = current
+                .pending_transition_digest()
+                .ok_or(SourceLifecycleError::ReconciliationRequired)?;
+            let expected_intent = current
+                .pending_intent()
+                .ok_or(SourceLifecycleError::ReconciliationRequired)?;
+            self.durable.resume_source_lifecycle_transition(
+                &provider,
+                command.expected_state_revision(),
+                expected_transition,
+                expected_intent,
+            )
+        } else {
+            let (target_session_id, target_public_configuration_digest) =
+                self.lifecycle_transition_target(command, &current)?;
+            self.preflight_runtime_lease(command, &current)?;
+            self.durable.begin_source_lifecycle_transition(
                 &provider,
                 command.expected_state_revision(),
                 operation_id.clone(),
                 command_digest,
-                matches!(
-                    command.action(),
-                    SourceLifecycleAction::Retry
-                        | SourceLifecycleAction::Stop
-                        | SourceLifecycleAction::Resynchronize
-                        | SourceLifecycleAction::Remove
-                ),
+                durable_intent(command)?,
                 target_session_id,
                 target_public_configuration_digest,
+                expected_durable_runtime_generation(command)?,
             )
-            .map_err(map_durable_error)?;
+        }
+        .map_err(map_durable_error)?;
         if let DurableSourceLifecycleTransition::Replay(record) = transition {
             return self
                 .receipt_for_current(
@@ -350,12 +363,97 @@ impl ProductionSourceLifecycleAuthority {
                 )
                 .await;
         }
-        let transition_digest = transition.transition_digest();
-        let prior_session_id = transition.record().session_id();
-        let prior_public_configuration_digest = transition.record().public_configuration_digest();
+        let transition_digest = transition.transition_digest().map_err(map_durable_error)?;
+        let transition_intent = transition
+            .record()
+            .pending_intent()
+            .ok_or(SourceLifecycleError::ReconciliationRequired)?;
+        let retained_operation_id = transition
+            .record()
+            .pending_operation_id()
+            .cloned()
+            .ok_or(SourceLifecycleError::ReconciliationRequired)?;
+        if AccountMarketSurface::parse(&provider).is_some()
+            && transition_intent == DurableSourceLifecycleIntent::Stop
+        {
+            let result = match account_stop_predecessor(transition.record()) {
+                Ok(AccountStopPredecessor::AccountGroup(previous_generation)) => {
+                    drive_account_group_predecessor(
+                        &self.durable,
+                        &self.live,
+                        &provider,
+                        transition_digest,
+                        command.deadline(),
+                        command.cancellation(),
+                        AccountGroupPredecessorDriveBoundary::ThroughDurableAcknowledgement,
+                    )
+                    .await
+                    .map(|record| {
+                        (
+                            record,
+                            Some(MarketSourceRuntimeGeneration::Group(previous_generation)),
+                        )
+                    })
+                }
+                Ok(AccountStopPredecessor::StoppedRuntimeAbsent) => self
+                    .durable
+                    .complete_retained_account_stop_no_effect(&provider, transition_digest)
+                    .map(|record| (record, None))
+                    .map_err(map_durable_error),
+                Ok(AccountStopPredecessor::DesiredActiveRuntimeAbsent) => {
+                    drive_desired_active_absent_account_stop(
+                        &self.durable,
+                        &self.live,
+                        &provider,
+                        transition_digest,
+                        command.deadline(),
+                        command.cancellation(),
+                    )
+                    .await
+                    .map(|record| (record, None))
+                }
+                Err(error) => Err(error),
+            };
+            let (record, previous_generation) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    let _blocked = self
+                        .durable
+                        .require_source_lifecycle_reconciliation(&provider, transition_digest);
+                    return Err(error);
+                }
+            };
+            return self
+                .receipt_for_current(
+                    command,
+                    retained_operation_id,
+                    SourceLifecycleDisposition::Applied,
+                    &record,
+                    previous_generation,
+                )
+                .await;
+        }
+        if command.action() == SourceLifecycleAction::Retry {
+            let _blocked = self
+                .durable
+                .require_source_lifecycle_reconciliation(&provider, transition_digest);
+            return Err(SourceLifecycleError::ReconciliationRequired);
+        }
+        let (transition_target_session_id, transition_target_public_configuration_digest) = {
+            let pending = transition
+                .record()
+                .pending_view()
+                .ok_or(SourceLifecycleError::ReconciliationRequired)?;
+            (
+                pending.target().session_id(),
+                pending.target().public_configuration_digest(),
+            )
+        };
+        let prior_session_id = current.session_id();
+        let prior_public_configuration_digest = current.public_configuration_digest();
         let prior_runtime_verification_receipt_digest =
-            transition.record().runtime_verification_receipt_digest();
-        let prior_credential_generation = transition.record().credential_generation();
+            current.runtime_verification_receipt_digest();
+        let prior_credential_generation = current.credential_generation();
         let prior_record = current;
         let result = if LIVE_SURFACES.contains(&provider.as_str()) {
             let execution: Pin<
@@ -367,6 +465,9 @@ impl ProductionSourceLifecycleAuthority {
             {
                 Box::pin(self.execute_alpaca_verify(
                     command,
+                    transition_digest,
+                    transition_target_session_id,
+                    transition_target_public_configuration_digest,
                     prior_record.phase(),
                     prior_session_id,
                     prior_public_configuration_digest,
@@ -439,16 +540,17 @@ impl ProductionSourceLifecycleAuthority {
                 Err(cleanup_error) => cleanup_error,
             });
         }
-        let record = match self.durable.complete_source_lifecycle_transition(
+        match self.durable.complete_source_lifecycle_transition(
             &provider,
             transition_digest,
+            transition_intent,
             outcome.phase,
             outcome.session_id,
             outcome.public_configuration_digest,
             outcome.runtime_verification_receipt_digest,
             outcome.credential_generation,
         ) {
-            Ok(record) => record,
+            Ok(_record) => {}
             Err(error) => {
                 let cleanup = match outcome.account_group_read_admission {
                     Some((request, group_generation)) => {
@@ -464,7 +566,7 @@ impl ProductionSourceLifecycleAuthority {
                     Err(cleanup_error) => cleanup_error,
                 });
             }
-        };
+        }
         if let Some((request, group_generation)) = outcome.account_group_read_admission {
             if let Err(error) = self
                 .live
@@ -488,7 +590,29 @@ impl ProductionSourceLifecycleAuthority {
                     Err(cleanup_error) => cleanup_error,
                 });
             }
+            if let Err(error) = self.durable.record_source_lifecycle_reads_admitted(
+                &provider,
+                transition_digest,
+                transition_intent,
+                DurableSourceRuntimeGeneration::AccountGroup(group_generation.digest()),
+            ) {
+                let cleanup = self.cleanup_account_group(request, group_generation).await;
+                let _blocked = self
+                    .durable
+                    .require_completed_source_lifecycle_reconciliation(
+                        &provider,
+                        transition_digest,
+                    );
+                return Err(match cleanup {
+                    Ok(()) => map_durable_error(error),
+                    Err(cleanup_error) => cleanup_error,
+                });
+            }
         }
+        let record = self
+            .durable
+            .confirm_source_lifecycle_transition(&provider, transition_digest, transition_intent)
+            .map_err(map_durable_error)?;
         self.receipt_for_current(
             command,
             operation_id,
@@ -598,6 +722,9 @@ impl ProductionSourceLifecycleAuthority {
     async fn execute_alpaca_verify(
         &self,
         command: &SourceLifecycleCommand,
+        transition_digest: EvidenceDigest,
+        target_session_id: Option<uuid::Uuid>,
+        target_public_configuration_digest: Option<EvidenceDigest>,
         prior_phase: DurableSourceLifecyclePhase,
         prior_session_id: Option<uuid::Uuid>,
         prior_public_configuration_digest: Option<EvidenceDigest>,
@@ -609,7 +736,9 @@ impl ProductionSourceLifecycleAuthority {
         {
             return Err(SourceLifecycleError::InvalidRequest);
         }
-        let session_id = prior_session_id.ok_or(SourceLifecycleError::InvalidRequest)?;
+        let session_id = target_session_id.ok_or(SourceLifecycleError::InvalidRequest)?;
+        let public_configuration_digest =
+            target_public_configuration_digest.ok_or(SourceLifecycleError::InvalidRequest)?;
         let prior_request = if prior_phase == DurableSourceLifecyclePhase::Active {
             Some(account_group_request_from_values(
                 AccountMarketSurface::AlpacaBasic,
@@ -637,10 +766,23 @@ impl ProductionSourceLifecycleAuthority {
         );
         let lease = verification.await.map_err(map_onboarding_error)?;
         if lease.surface_id() != command.provider()
-            || Some(lease.public_configuration_digest()) != prior_public_configuration_digest
+            || lease.session_id() != session_id
+            || lease.public_configuration_digest() != public_configuration_digest
         {
             return Err(SourceLifecycleError::Conflict);
         }
+        let credential_generation = lease
+            .generation()
+            .ok_or(SourceLifecycleError::InvalidResult)?;
+        self.durable
+            .bind_source_lifecycle_verification(
+                command.provider().as_str(),
+                transition_digest,
+                DurableSourceLifecycleIntent::VerifyStop,
+                lease.runtime_evidence_digest(),
+                credential_generation,
+            )
+            .map_err(map_durable_error)?;
         if let Some(request) = prior_request {
             let deadline = self.live.cleanup_deadline().map_err(map_live_error)?;
             let cleanup = CancellationToken::new();
@@ -1057,38 +1199,15 @@ impl ProductionSourceLifecycleAuthority {
         request: PreparedMarketProviderConfigurationRequest,
         require_present: bool,
     ) -> Result<Option<MarketRuntimeGroupGeneration>, SourceLifecycleError> {
-        let expected = match self
-            .live
-            .verify_account_group(request, command.deadline(), command.cancellation())
-            .await
-        {
-            Ok(Some(evidence)) => Some(validate_account_group_evidence(request, &evidence)?),
-            Ok(None) => None,
-            Err(market_squawk_services::ServiceError::Unavailable) if !require_present => None,
-            Err(error) => return Err(map_live_error(error)),
-        };
-        if require_present && expected.is_none() {
-            return Err(SourceLifecycleError::Unavailable);
-        }
-        if let Some(expected_digest) = command.expected_runtime_generation_digest()
-            && expected.map(MarketRuntimeGroupGeneration::digest) != Some(expected_digest)
-        {
-            return Err(SourceLifecycleError::Conflict);
-        }
-        let stopped = self
-            .live
-            .stop_account_group(
-                request,
-                expected,
-                command.deadline(),
-                command.cancellation(),
-            )
-            .await
-            .map_err(map_live_error)?;
-        if expected.is_some() && stopped != expected {
-            return Err(SourceLifecycleError::InvalidResult);
-        }
-        Ok(stopped)
+        stop_account_group_exact_live(
+            &self.live,
+            request,
+            require_present,
+            command.expected_runtime_generation_digest(),
+            command.deadline(),
+            command.cancellation(),
+        )
+        .await
     }
 
     async fn cleanup_account_group(
@@ -1615,6 +1734,20 @@ impl ProductionSourceLifecycleAuthority {
         command: &SourceLifecycleCommand,
         current: &DurableSourceLifecycleRecord,
     ) -> Result<(Option<uuid::Uuid>, Option<EvidenceDigest>), SourceLifecycleError> {
+        if command.action() == SourceLifecycleAction::Reconfigure {
+            return Ok((
+                Some(
+                    command
+                        .onboarding_session_id()
+                        .ok_or(SourceLifecycleError::InvalidRequest)?,
+                ),
+                Some(
+                    command
+                        .public_configuration_digest()
+                        .ok_or(SourceLifecycleError::InvalidRequest)?,
+                ),
+            ));
+        }
         if command.action() != SourceLifecycleAction::Verify
             || !is_session_backed_live_surface(command.provider().as_str())
         {
@@ -1765,6 +1898,1200 @@ fn validate_account_group_evidence(
     Ok(generation)
 }
 
+#[derive(Clone, Copy)]
+enum AccountStopPredecessor {
+    AccountGroup(MarketRuntimeGroupGeneration),
+    StoppedRuntimeAbsent,
+    DesiredActiveRuntimeAbsent,
+}
+
+fn account_stop_predecessor(
+    record: &DurableSourceLifecycleRecord,
+) -> Result<AccountStopPredecessor, SourceLifecycleError> {
+    let pending = record
+        .pending_view()
+        .ok_or(SourceLifecycleError::ReconciliationRequired)?;
+    if pending.intent() != DurableSourceLifecycleIntent::Stop {
+        return Err(SourceLifecycleError::ReconciliationRequired);
+    }
+    let predecessor = pending.predecessor();
+    match (predecessor.phase(), predecessor.runtime_generation()) {
+        (
+            DurableSourceLifecyclePhase::Active,
+            Some(DurableSourceRuntimeGeneration::AccountGroup(digest)),
+        ) if pending.expected_runtime_generation()
+            == Some(DurableSourceRuntimeGeneration::AccountGroup(digest)) =>
+        {
+            MarketRuntimeGroupGeneration::try_from_expected_digest(digest)
+                .map(AccountStopPredecessor::AccountGroup)
+                .map_err(map_live_error)
+        }
+        (DurableSourceLifecyclePhase::Stopped, None)
+            if pending.expected_runtime_generation().is_none() =>
+        {
+            Ok(AccountStopPredecessor::StoppedRuntimeAbsent)
+        }
+        (DurableSourceLifecyclePhase::Active, None)
+            if pending.expected_runtime_generation().is_none() =>
+        {
+            Ok(AccountStopPredecessor::DesiredActiveRuntimeAbsent)
+        }
+        _ => Err(SourceLifecycleError::InvalidResult),
+    }
+}
+
+async fn drive_desired_active_absent_account_stop(
+    durable: &DurableProviderActivationState,
+    live: &Arc<MarketRuntimeRegistry>,
+    surface_id: &str,
+    transition_digest: EvidenceDigest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<DurableSourceLifecycleRecord, SourceLifecycleError> {
+    loop {
+        let current = durable
+            .source_lifecycle_record(surface_id)
+            .map_err(map_durable_error)?;
+        if !matches!(
+            account_stop_predecessor(&current)?,
+            AccountStopPredecessor::DesiredActiveRuntimeAbsent
+        ) {
+            return Err(SourceLifecycleError::InvalidResult);
+        }
+        let pending = current
+            .pending_view()
+            .ok_or(SourceLifecycleError::ReconciliationRequired)?;
+        let predecessor = pending.predecessor();
+        match pending.checkpoint() {
+            DurableSourceLifecycleCheckpoint::Planned => {
+                durable
+                    .bind_source_lifecycle_verification(
+                        surface_id,
+                        transition_digest,
+                        DurableSourceLifecycleIntent::Stop,
+                        predecessor
+                            .runtime_verification_receipt_digest()
+                            .ok_or(SourceLifecycleError::InvalidResult)?,
+                        predecessor
+                            .credential_generation()
+                            .ok_or(SourceLifecycleError::InvalidResult)?,
+                    )
+                    .map_err(map_durable_error)?;
+            }
+            DurableSourceLifecycleCheckpoint::VerificationBound => {
+                let surface = AccountMarketSurface::parse(surface_id)
+                    .ok_or(SourceLifecycleError::InvalidResult)?;
+                let request = account_group_request_from_values(
+                    surface,
+                    predecessor.session_id(),
+                    predecessor.public_configuration_digest(),
+                    predecessor.runtime_verification_receipt_digest(),
+                    predecessor.credential_generation(),
+                )?;
+                if !matches!(
+                    live.account_group_stop_state(request, deadline, cancellation)
+                        .await
+                        .map_err(map_live_error)?,
+                    AccountGroupStopState::Absent
+                ) {
+                    return Err(SourceLifecycleError::Conflict);
+                }
+                let proof = source_lifecycle_runtime_absent_proof_digest(transition_digest)
+                    .map_err(map_durable_error)?;
+                durable
+                    .record_source_lifecycle_runtime_proven_absent(
+                        surface_id,
+                        transition_digest,
+                        DurableSourceLifecycleIntent::Stop,
+                        proof,
+                    )
+                    .map_err(map_durable_error)?;
+            }
+            DurableSourceLifecycleCheckpoint::RuntimeDrained => {
+                let target = pending.target();
+                durable
+                    .complete_source_lifecycle_transition(
+                        surface_id,
+                        transition_digest,
+                        DurableSourceLifecycleIntent::Stop,
+                        target.phase(),
+                        target.session_id(),
+                        target.public_configuration_digest(),
+                        target.runtime_verification_receipt_digest(),
+                        target.credential_generation(),
+                    )
+                    .map_err(map_durable_error)?;
+            }
+            DurableSourceLifecycleCheckpoint::TerminalPublished => {
+                return durable
+                    .confirm_source_lifecycle_transition(
+                        surface_id,
+                        transition_digest,
+                        DurableSourceLifecycleIntent::Stop,
+                    )
+                    .map_err(map_durable_error);
+            }
+            DurableSourceLifecycleCheckpoint::ShutdownKeyPersisted
+            | DurableSourceLifecycleCheckpoint::AccountStopping
+            | DurableSourceLifecycleCheckpoint::PortalCancelled
+            | DurableSourceLifecycleCheckpoint::TombstoneAcknowledged
+            | DurableSourceLifecycleCheckpoint::SuccessorStarted
+            | DurableSourceLifecycleCheckpoint::SuccessorDurable
+            | DurableSourceLifecycleCheckpoint::ReadsAdmitted => {
+                return Err(SourceLifecycleError::InvalidResult);
+            }
+        }
+    }
+}
+
+struct DurableAccountGroupStopContext {
+    request: PreparedMarketProviderConfigurationRequest,
+    expected_generation: MarketRuntimeGroupGeneration,
+    shutdown_key: Option<DurableAccountShutdownKey>,
+    checkpoint: DurableSourceLifecycleCheckpoint,
+}
+
+fn durable_account_group_stop_context(
+    surface_id: &str,
+    record: &DurableSourceLifecycleRecord,
+) -> Result<DurableAccountGroupStopContext, SourceLifecycleError> {
+    let pending = record
+        .pending_view()
+        .ok_or(SourceLifecycleError::ReconciliationRequired)?;
+    if pending.intent() != DurableSourceLifecycleIntent::Stop {
+        return Err(SourceLifecycleError::ReconciliationRequired);
+    }
+    let predecessor = pending.predecessor();
+    if predecessor.phase() != DurableSourceLifecyclePhase::Active {
+        return Err(SourceLifecycleError::InvalidResult);
+    }
+    let predecessor_generation = match predecessor.runtime_generation() {
+        Some(DurableSourceRuntimeGeneration::AccountGroup(digest)) => digest,
+        _ => return Err(SourceLifecycleError::InvalidResult),
+    };
+    if pending.expected_runtime_generation()
+        != Some(DurableSourceRuntimeGeneration::AccountGroup(
+            predecessor_generation,
+        ))
+    {
+        return Err(SourceLifecycleError::InvalidResult);
+    }
+    let surface =
+        AccountMarketSurface::parse(surface_id).ok_or(SourceLifecycleError::InvalidResult)?;
+    let request = account_group_request_from_values(
+        surface,
+        predecessor.session_id(),
+        predecessor.public_configuration_digest(),
+        predecessor.runtime_verification_receipt_digest(),
+        predecessor.credential_generation(),
+    )?;
+    let expected_generation =
+        MarketRuntimeGroupGeneration::try_from_expected_digest(predecessor_generation)
+            .map_err(map_live_error)?;
+    Ok(DurableAccountGroupStopContext {
+        request,
+        expected_generation,
+        shutdown_key: pending.shutdown_key(),
+        checkpoint: pending.checkpoint(),
+    })
+}
+
+fn durable_account_shutdown_key_from_market(
+    evidence: AccountGroupStopKeyEvidence,
+) -> Result<DurableAccountShutdownKey, SourceLifecycleError> {
+    let history = match evidence.history() {
+        AccountGroupStopHistoryEvidence::AlpacaNeverClaimed => {
+            DurableAccountHistoryClaim::AlpacaNeverClaimed
+        }
+        AccountGroupStopHistoryEvidence::Alpaca {
+            parent_group_generation,
+            parent_binding_digest,
+        } => DurableAccountHistoryClaim::Alpaca(
+            DurableAlpacaHistoricalParent::try_new(parent_group_generation, parent_binding_digest)
+                .map_err(map_durable_error)?,
+        ),
+        AccountGroupStopHistoryEvidence::NeverApplicable => {
+            DurableAccountHistoryClaim::NeverApplicable
+        }
+    };
+    DurableAccountShutdownKey::try_new(
+        evidence.registry_incarnation(),
+        evidence.surface(),
+        evidence.onboarding_session_id(),
+        evidence.public_configuration_digest(),
+        evidence.runtime_verification_receipt_digest(),
+        evidence.credential_generation(),
+        evidence.group_generation(),
+        history,
+    )
+    .map_err(map_durable_error)
+}
+
+fn market_account_stop_key_from_durable(
+    key: DurableAccountShutdownKey,
+) -> Result<AccountGroupStopKeyEvidence, SourceLifecycleError> {
+    let history = match key.history_claim() {
+        DurableAccountHistoryClaim::AlpacaNeverClaimed => {
+            AccountGroupStopHistoryEvidence::AlpacaNeverClaimed
+        }
+        DurableAccountHistoryClaim::Alpaca(parent) => AccountGroupStopHistoryEvidence::Alpaca {
+            parent_group_generation: parent.group_generation(),
+            parent_binding_digest: parent.binding_digest(),
+        },
+        DurableAccountHistoryClaim::NeverApplicable => {
+            AccountGroupStopHistoryEvidence::NeverApplicable
+        }
+    };
+    AccountGroupStopKeyEvidence::try_new(
+        key.registry_incarnation(),
+        key.surface_id(),
+        key.onboarding_session_id(),
+        key.public_configuration_digest(),
+        key.runtime_verification_receipt_digest(),
+        key.credential_generation(),
+        key.group_generation(),
+        history,
+    )
+    .map_err(map_live_error)
+}
+
+async fn exact_account_group_stop_ticket(
+    live: &Arc<MarketRuntimeRegistry>,
+    request: PreparedMarketProviderConfigurationRequest,
+    expected_generation: MarketRuntimeGroupGeneration,
+    shutdown_key: DurableAccountShutdownKey,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Option<AccountGroupStopTicket>, SourceLifecycleError> {
+    let Some(prepared) = live
+        .prepare_account_group_stop(request, Some(expected_generation), deadline, cancellation)
+        .await
+        .map_err(map_live_error)?
+    else {
+        return Ok(None);
+    };
+    if durable_account_shutdown_key_from_market(prepared.key_evidence().map_err(map_live_error)?)?
+        != shutdown_key
+    {
+        return Err(SourceLifecycleError::Conflict);
+    }
+    let ticket = live
+        .commit_prepared_account_group_stop(prepared, deadline, cancellation)
+        .await
+        .map_err(map_live_error)?;
+    if durable_account_shutdown_key_from_market(ticket.key_evidence().map_err(map_live_error)?)?
+        != shutdown_key
+    {
+        return Err(SourceLifecycleError::InvalidResult);
+    }
+    Ok(Some(ticket))
+}
+
+async fn exact_account_group_stop_receipt(
+    live: &Arc<MarketRuntimeRegistry>,
+    request: PreparedMarketProviderConfigurationRequest,
+    expected_generation: MarketRuntimeGroupGeneration,
+    shutdown_key: DurableAccountShutdownKey,
+    terminal_proof_digest: EvidenceDigest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(AccountGroupStopReceipt, AccountGroupStopDurableProof), SourceLifecycleError> {
+    let receipt = match exact_account_group_stop_ticket(
+        live,
+        request,
+        expected_generation,
+        shutdown_key,
+        deadline,
+        cancellation,
+    )
+    .await?
+    {
+        Some(ticket) => live
+            .join_account_group_stop(&ticket, deadline, cancellation)
+            .await
+            .map_err(map_live_error)?,
+        None => live
+            .reacquire_acknowledged_account_group_stop_receipt(
+                market_account_stop_key_from_durable(shutdown_key)?,
+                terminal_proof_digest,
+                deadline,
+                cancellation,
+            )
+            .await
+            .map_err(map_live_error)?,
+    };
+    if durable_account_shutdown_key_from_market(receipt.key_evidence().map_err(map_live_error)?)?
+        != shutdown_key
+    {
+        return Err(SourceLifecycleError::InvalidResult);
+    }
+    let durable_proof = receipt
+        .bind_durable_proof(terminal_proof_digest)
+        .map_err(map_live_error)?;
+    Ok((receipt, durable_proof))
+}
+
+#[derive(Clone, Copy)]
+enum AccountGroupPredecessorDriveBoundary {
+    ThroughDurableAcknowledgement,
+    #[cfg(test)]
+    ReturnAfterRegistryAcknowledgement,
+}
+
+fn record_account_group_tombstone_acknowledged(
+    durable: &DurableProviderActivationState,
+    surface_id: &str,
+    transition_digest: EvidenceDigest,
+    shutdown_key: DurableAccountShutdownKey,
+    terminal_proof_digest: EvidenceDigest,
+    acknowledgement: AccountGroupStopAcknowledgementReceipt,
+) -> Result<DurableSourceLifecycleRecord, SourceLifecycleError> {
+    let _disposition = acknowledgement
+        .authorize_checkpoint(
+            market_account_stop_key_from_durable(shutdown_key)?,
+            terminal_proof_digest,
+        )
+        .map_err(map_live_error)?;
+    durable
+        .record_source_lifecycle_tombstone_acknowledged(
+            surface_id,
+            transition_digest,
+            DurableSourceLifecycleIntent::Stop,
+            shutdown_key,
+            terminal_proof_digest,
+        )
+        .map_err(map_durable_error)
+}
+
+async fn drive_account_group_predecessor(
+    durable: &DurableProviderActivationState,
+    live: &Arc<MarketRuntimeRegistry>,
+    surface_id: &str,
+    transition_digest: EvidenceDigest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    _boundary: AccountGroupPredecessorDriveBoundary,
+) -> Result<DurableSourceLifecycleRecord, SourceLifecycleError> {
+    loop {
+        let current = durable
+            .source_lifecycle_record(surface_id)
+            .map_err(map_durable_error)?;
+        let context = durable_account_group_stop_context(surface_id, &current)?;
+        match context.checkpoint {
+            DurableSourceLifecycleCheckpoint::Planned => {
+                let pending = current
+                    .pending_view()
+                    .ok_or(SourceLifecycleError::ReconciliationRequired)?;
+                let predecessor = pending.predecessor();
+                durable
+                    .bind_source_lifecycle_verification(
+                        surface_id,
+                        transition_digest,
+                        DurableSourceLifecycleIntent::Stop,
+                        predecessor
+                            .runtime_verification_receipt_digest()
+                            .ok_or(SourceLifecycleError::InvalidResult)?,
+                        predecessor
+                            .credential_generation()
+                            .ok_or(SourceLifecycleError::InvalidResult)?,
+                    )
+                    .map_err(map_durable_error)?;
+            }
+            DurableSourceLifecycleCheckpoint::VerificationBound => {
+                let prepared = live
+                    .prepare_account_group_stop(
+                        context.request,
+                        Some(context.expected_generation),
+                        deadline,
+                        cancellation,
+                    )
+                    .await
+                    .map_err(map_live_error)?
+                    .ok_or(SourceLifecycleError::Unavailable)?;
+                let shutdown_key = durable_account_shutdown_key_from_market(
+                    prepared.key_evidence().map_err(map_live_error)?,
+                )?;
+                durable
+                    .bind_source_lifecycle_shutdown_key(
+                        surface_id,
+                        transition_digest,
+                        DurableSourceLifecycleIntent::Stop,
+                        shutdown_key,
+                    )
+                    .map_err(map_durable_error)?;
+            }
+            DurableSourceLifecycleCheckpoint::ShutdownKeyPersisted => {
+                let shutdown_key = context
+                    .shutdown_key
+                    .ok_or(SourceLifecycleError::InvalidResult)?;
+                exact_account_group_stop_ticket(
+                    live,
+                    context.request,
+                    context.expected_generation,
+                    shutdown_key,
+                    deadline,
+                    cancellation,
+                )
+                .await?
+                .ok_or(SourceLifecycleError::Unavailable)?;
+                durable
+                    .record_source_lifecycle_account_stopping(
+                        surface_id,
+                        transition_digest,
+                        DurableSourceLifecycleIntent::Stop,
+                        shutdown_key,
+                    )
+                    .map_err(map_durable_error)?;
+            }
+            DurableSourceLifecycleCheckpoint::AccountStopping => {
+                let shutdown_key = context
+                    .shutdown_key
+                    .ok_or(SourceLifecycleError::InvalidResult)?;
+                let ticket = exact_account_group_stop_ticket(
+                    live,
+                    context.request,
+                    context.expected_generation,
+                    shutdown_key,
+                    deadline,
+                    cancellation,
+                )
+                .await?
+                .ok_or(SourceLifecycleError::Unavailable)?;
+                let receipt = live
+                    .join_account_group_stop(&ticket, deadline, cancellation)
+                    .await
+                    .map_err(map_live_error)?;
+                if durable_account_shutdown_key_from_market(
+                    receipt.key_evidence().map_err(map_live_error)?,
+                )? != shutdown_key
+                {
+                    return Err(SourceLifecycleError::InvalidResult);
+                }
+                let terminal_proof_digest =
+                    source_lifecycle_account_stop_proof_digest(transition_digest, shutdown_key)
+                        .map_err(map_durable_error)?;
+                receipt
+                    .bind_durable_proof(terminal_proof_digest)
+                    .map_err(map_live_error)?;
+                durable
+                    .record_source_lifecycle_runtime_drained(
+                        surface_id,
+                        transition_digest,
+                        DurableSourceLifecycleIntent::Stop,
+                        shutdown_key,
+                        terminal_proof_digest,
+                    )
+                    .map_err(map_durable_error)?;
+            }
+            DurableSourceLifecycleCheckpoint::RuntimeDrained => {
+                let pending = current
+                    .pending_view()
+                    .ok_or(SourceLifecycleError::ReconciliationRequired)?;
+                let target = pending.target();
+                durable
+                    .complete_source_lifecycle_transition(
+                        surface_id,
+                        transition_digest,
+                        DurableSourceLifecycleIntent::Stop,
+                        target.phase(),
+                        target.session_id(),
+                        target.public_configuration_digest(),
+                        target.runtime_verification_receipt_digest(),
+                        target.credential_generation(),
+                    )
+                    .map_err(map_durable_error)?;
+            }
+            DurableSourceLifecycleCheckpoint::TerminalPublished => {
+                let shutdown_key = context
+                    .shutdown_key
+                    .ok_or(SourceLifecycleError::InvalidResult)?;
+                let terminal_proof_digest = current
+                    .pending_terminal_proof_digest()
+                    .ok_or(SourceLifecycleError::InvalidResult)?;
+                let (receipt, durable_proof) = exact_account_group_stop_receipt(
+                    live,
+                    context.request,
+                    context.expected_generation,
+                    shutdown_key,
+                    terminal_proof_digest,
+                    deadline,
+                    cancellation,
+                )
+                .await?;
+                let acknowledgement = live
+                    .acknowledge_account_group_stop(
+                        &receipt,
+                        &durable_proof,
+                        deadline,
+                        cancellation,
+                    )
+                    .await
+                    .map_err(map_live_error)?;
+                #[cfg(test)]
+                if matches!(
+                    _boundary,
+                    AccountGroupPredecessorDriveBoundary::ReturnAfterRegistryAcknowledgement
+                ) {
+                    return Err(SourceLifecycleError::ReconciliationRequired);
+                }
+                record_account_group_tombstone_acknowledged(
+                    durable,
+                    surface_id,
+                    transition_digest,
+                    shutdown_key,
+                    terminal_proof_digest,
+                    acknowledgement,
+                )?;
+            }
+            DurableSourceLifecycleCheckpoint::TombstoneAcknowledged => {
+                return durable
+                    .confirm_source_lifecycle_transition(
+                        surface_id,
+                        transition_digest,
+                        DurableSourceLifecycleIntent::Stop,
+                    )
+                    .map_err(map_durable_error);
+            }
+            DurableSourceLifecycleCheckpoint::PortalCancelled
+            | DurableSourceLifecycleCheckpoint::SuccessorStarted
+            | DurableSourceLifecycleCheckpoint::SuccessorDurable
+            | DurableSourceLifecycleCheckpoint::ReadsAdmitted => {
+                return Err(SourceLifecycleError::InvalidResult);
+            }
+        }
+    }
+}
+
+async fn stop_account_group_exact_live(
+    live: &Arc<MarketRuntimeRegistry>,
+    request: PreparedMarketProviderConfigurationRequest,
+    require_present: bool,
+    expected_runtime_generation_digest: Option<EvidenceDigest>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Option<MarketRuntimeGroupGeneration>, SourceLifecycleError> {
+    let expected = match live
+        .account_group_stop_state(request, deadline, cancellation)
+        .await
+        .map_err(map_live_error)?
+    {
+        AccountGroupStopState::Absent => None,
+        AccountGroupStopState::Active(evidence) => {
+            Some(validate_account_group_evidence(request, &evidence)?)
+        }
+        AccountGroupStopState::Stopping(generation) => Some(generation),
+    };
+    if require_present && expected.is_none() {
+        return Err(SourceLifecycleError::Unavailable);
+    }
+    if let Some(expected_digest) = expected_runtime_generation_digest
+        && expected.map(MarketRuntimeGroupGeneration::digest) != Some(expected_digest)
+    {
+        return Err(SourceLifecycleError::Conflict);
+    }
+    let stopped = live
+        .stop_account_group(request, expected, deadline, cancellation)
+        .await
+        .map_err(map_live_error)?;
+    if expected.is_some() && stopped != expected {
+        return Err(SourceLifecycleError::InvalidResult);
+    }
+    Ok(stopped)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        ffi::OsString,
+        time::{Duration, Instant},
+    };
+
+    use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
+    use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources, SecretGeneration};
+    use market_squawk_services::ServiceError;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::application::{MarketRuntimeRegistry, active_shutdown_fixture};
+
+    #[tokio::test]
+    async fn source_lifecycle_stop_deadline_retains_owner_and_retry_completes_exact_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (historical, parent, successor_parent, publication) = active_shutdown_fixture().await?;
+        let request = PreparedMarketProviderConfigurationRequest::try_new(
+            AccountMarketSurface::AlpacaBasic,
+            uuid::Uuid::new_v4(),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [71; 32]),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [72; 32]),
+            SecretGeneration::new(73)?,
+        )?;
+        let generation = parent.group_generation();
+        let (registry, probe) =
+            MarketRuntimeRegistry::shutdown_fixture(historical, parent, request)?;
+        let durable_temporary = tempfile::tempdir()?;
+        let durable = DurableProviderActivationState::new(durable_temporary.path().to_path_buf());
+        let composition_temporary = tempfile::tempdir()?;
+        let composition = crate::LocalProduct::try_new(AppConfig::load(ConfigSources::new(
+            None,
+            &BTreeMap::<OsString, OsString>::new(),
+            ConfigOverrides {
+                data_dir: Some(composition_temporary.path().join("data")),
+                ..ConfigOverrides::default()
+            },
+        ))?)?;
+        let authority = ProductionSourceLifecycleAuthority::new(
+            composition.paths().clone(),
+            composition.provider_onboarding(),
+            composition.provider_activation(),
+            composition.provider_portal_activation(),
+            durable.clone(),
+            Arc::clone(&registry),
+        );
+        let durable_generation =
+            DurableSourceRuntimeGeneration::account_group(generation.digest())?;
+        let start = durable.begin_source_lifecycle_transition(
+            request.surface().surface_id(),
+            NonZeroU64::MIN,
+            SourceIdentifier::try_from("durable-account-start")?,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [75; 32]),
+            DurableSourceLifecycleIntent::Start,
+            Some(request.onboarding_session_id()),
+            Some(request.expected_public_configuration_digest()),
+            None,
+        )?;
+        let start_digest = start.transition_digest()?;
+        durable.bind_source_lifecycle_verification(
+            request.surface().surface_id(),
+            start_digest,
+            DurableSourceLifecycleIntent::Start,
+            request.expected_runtime_verification_receipt_digest(),
+            request.expected_credential_generation(),
+        )?;
+        durable.bind_source_lifecycle_target_generation(
+            request.surface().surface_id(),
+            start_digest,
+            DurableSourceLifecycleIntent::Start,
+            durable_generation,
+        )?;
+        durable.record_source_lifecycle_successor_durable(
+            request.surface().surface_id(),
+            start_digest,
+            DurableSourceLifecycleIntent::Start,
+            durable_generation,
+        )?;
+        durable.complete_source_lifecycle_transition(
+            request.surface().surface_id(),
+            start_digest,
+            DurableSourceLifecycleIntent::Start,
+            DurableSourceLifecyclePhase::Active,
+            Some(request.onboarding_session_id()),
+            Some(request.expected_public_configuration_digest()),
+            Some(request.expected_runtime_verification_receipt_digest()),
+            Some(request.expected_credential_generation()),
+        )?;
+        durable.record_source_lifecycle_reads_admitted(
+            request.surface().surface_id(),
+            start_digest,
+            DurableSourceLifecycleIntent::Start,
+            durable_generation,
+        )?;
+        let active = durable.confirm_source_lifecycle_transition(
+            request.surface().surface_id(),
+            start_digest,
+            DurableSourceLifecycleIntent::Start,
+        )?;
+        assert!(probe.reads_are_admitted());
+        assert!(
+            registry
+                .verify_account_group(
+                    request,
+                    Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new(),
+                )
+                .await?
+                .is_some()
+        );
+
+        let short_cancellation = CancellationToken::new();
+        let stop_command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+            provider: SourceIdentifier::try_from(request.surface().surface_id())?,
+            action: SourceLifecycleAction::Stop,
+            expected_state_revision: active.revision(),
+            expected_generation: None,
+            expected_runtime_generation_digest: Some(generation.digest()),
+            onboarding_session_id: None,
+            public_configuration_digest: None,
+            reason: Some(SourceIdentifier::try_from("durable-account-stop")?),
+            cancellation: short_cancellation,
+            deadline: Instant::now() + Duration::from_millis(100),
+        })?;
+        let stop_operation_id = operation_id(command_digest(&stop_command)?)?;
+        let short = authority.execute(stop_command).await;
+        assert!(matches!(short, Err(SourceLifecycleError::DeadlineExceeded)));
+        let interrupted = durable.source_lifecycle_record(request.surface().surface_id())?;
+        let stop_digest = interrupted
+            .pending_transition_digest()
+            .ok_or(ServiceError::NotFound)?;
+        assert_eq!(
+            interrupted.pending_checkpoint(),
+            Some(
+                crate::local_product::provider_activation_state::DurableSourceLifecycleCheckpoint::AccountStopping
+            )
+        );
+        assert!(interrupted.pending_shutdown_key().is_some());
+        assert!(registry.is_exact_account_stopping_for_test(request).await);
+        assert_eq!(registry.active_source_count()?, 0);
+        assert!(probe.credentials_are_owned());
+        assert_eq!(probe.credential_destructions(), 0);
+        assert_eq!(probe.display_destructions(), 0);
+        assert!(!probe.reads_are_admitted());
+        assert!(!probe.try_readmit());
+
+        assert_eq!(
+            interrupted.phase(),
+            DurableSourceLifecyclePhase::ReconciliationRequired
+        );
+        assert_eq!(
+            interrupted
+                .pending_operation_id()
+                .map(SourceIdentifier::as_str),
+            Some(stop_operation_id.as_str())
+        );
+        drop(durable);
+        let durable = DurableProviderActivationState::new(durable_temporary.path().to_path_buf());
+        drop(authority);
+        let authority = ProductionSourceLifecycleAuthority::new(
+            composition.paths().clone(),
+            composition.provider_onboarding(),
+            composition.provider_activation(),
+            composition.provider_portal_activation(),
+            durable.clone(),
+            Arc::clone(&registry),
+        );
+        let reconciliation = durable.source_lifecycle_record(request.surface().surface_id())?;
+        let resumed = durable.resume_source_lifecycle_transition(
+            request.surface().surface_id(),
+            reconciliation.revision(),
+            stop_digest,
+            DurableSourceLifecycleIntent::Stop,
+        )?;
+        assert_eq!(
+            resumed
+                .record()
+                .pending_operation_id()
+                .map(|value| value.as_str()),
+            Some(stop_operation_id.as_str())
+        );
+        assert_eq!(
+            resumed.record().pending_intent(),
+            Some(DurableSourceLifecycleIntent::Stop)
+        );
+        let successor_generation = successor_parent.group_generation();
+        assert_ne!(successor_generation, generation);
+        assert!(matches!(
+            registry
+                .admit_shutdown_fixture_successor(
+                    successor_parent,
+                    request,
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .await,
+            Err(ServiceError::ResourceExhausted)
+        ));
+
+        let join_cancellation = CancellationToken::new();
+        let shutdown_key = resumed
+            .record()
+            .pending_shutdown_key()
+            .ok_or(ServiceError::NotFound)?;
+        assert_eq!(shutdown_key.group_generation(), generation.digest());
+        let first_ticket = exact_account_group_stop_ticket(
+            &registry,
+            request,
+            generation,
+            shutdown_key,
+            Instant::now() + Duration::from_secs(2),
+            &join_cancellation,
+        )
+        .await?
+        .ok_or(ServiceError::NotFound)?;
+        let second_ticket = exact_account_group_stop_ticket(
+            &registry,
+            request,
+            generation,
+            shutdown_key,
+            Instant::now() + Duration::from_secs(2),
+            &join_cancellation,
+        )
+        .await?
+        .ok_or(ServiceError::NotFound)?;
+        drop(publication);
+        let acknowledgement_gap = drive_account_group_predecessor(
+            &durable,
+            &registry,
+            request.surface().surface_id(),
+            stop_digest,
+            Instant::now() + Duration::from_secs(2),
+            &join_cancellation,
+            AccountGroupPredecessorDriveBoundary::ReturnAfterRegistryAcknowledgement,
+        )
+        .await;
+        assert!(matches!(
+            acknowledgement_gap,
+            Err(SourceLifecycleError::ReconciliationRequired)
+        ));
+        let acknowledgement_gap =
+            durable.source_lifecycle_record(request.surface().surface_id())?;
+        assert_eq!(
+            acknowledgement_gap.pending_checkpoint(),
+            Some(DurableSourceLifecycleCheckpoint::TerminalPublished)
+        );
+        let terminal_proof_digest = acknowledgement_gap
+            .pending_terminal_proof_digest()
+            .ok_or(ServiceError::NotFound)?;
+        assert!(!registry.is_exact_account_stopping_for_test(request).await);
+
+        let join_deadline = Instant::now() + Duration::from_secs(2);
+        let (first_receipt, second_receipt) = tokio::join!(
+            registry.join_account_group_stop(&first_ticket, join_deadline, &join_cancellation),
+            registry.join_account_group_stop(&second_ticket, join_deadline, &join_cancellation),
+        );
+        let first_receipt = first_receipt?;
+        let second_receipt = second_receipt?;
+        let first_durable_proof = first_receipt.bind_durable_proof(terminal_proof_digest)?;
+        let second_durable_proof = second_receipt.bind_durable_proof(terminal_proof_digest)?;
+        let acknowledge_deadline = Instant::now() + Duration::from_secs(2);
+        let (first_acknowledgement, second_acknowledgement) = tokio::join!(
+            registry.acknowledge_account_group_stop(
+                &first_receipt,
+                &first_durable_proof,
+                acknowledge_deadline,
+                &join_cancellation,
+            ),
+            registry.acknowledge_account_group_stop(
+                &second_receipt,
+                &second_durable_proof,
+                acknowledge_deadline,
+                &join_cancellation,
+            ),
+        );
+        let _first_acknowledgement = first_acknowledgement?;
+        let _second_acknowledgement = second_acknowledgement?;
+
+        let exact_key_evidence = market_account_stop_key_from_durable(shutdown_key)?;
+        let wrong_proof = EvidenceDigest::new(DigestAlgorithm::Sha256, [77; 32]);
+        assert!(matches!(
+            registry
+                .reacquire_acknowledged_account_group_stop_receipt(
+                    exact_key_evidence,
+                    wrong_proof,
+                    Instant::now() + Duration::from_secs(2),
+                    &join_cancellation,
+                )
+                .await,
+            Err(ServiceError::NotFound)
+        ));
+        let old_incarnation_key = AccountGroupStopKeyEvidence::try_new(
+            uuid::Uuid::new_v4(),
+            exact_key_evidence.surface(),
+            exact_key_evidence.onboarding_session_id(),
+            exact_key_evidence.public_configuration_digest(),
+            exact_key_evidence.runtime_verification_receipt_digest(),
+            exact_key_evidence.credential_generation(),
+            exact_key_evidence.group_generation(),
+            exact_key_evidence.history(),
+        )?;
+        assert!(matches!(
+            registry
+                .reacquire_acknowledged_account_group_stop_receipt(
+                    old_incarnation_key,
+                    terminal_proof_digest,
+                    Instant::now() + Duration::from_secs(2),
+                    &join_cancellation,
+                )
+                .await,
+            Err(ServiceError::InvalidRequest)
+        ));
+        let wrong_key = AccountGroupStopKeyEvidence::try_new(
+            exact_key_evidence.registry_incarnation(),
+            exact_key_evidence.surface(),
+            exact_key_evidence.onboarding_session_id(),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [78; 32]),
+            exact_key_evidence.runtime_verification_receipt_digest(),
+            exact_key_evidence.credential_generation(),
+            exact_key_evidence.group_generation(),
+            exact_key_evidence.history(),
+        )?;
+        assert!(matches!(
+            registry
+                .reacquire_acknowledged_account_group_stop_receipt(
+                    wrong_key,
+                    terminal_proof_digest,
+                    Instant::now() + Duration::from_secs(2),
+                    &join_cancellation,
+                )
+                .await,
+            Err(ServiceError::NotFound)
+        ));
+
+        let reconciliation = durable
+            .require_source_lifecycle_reconciliation(request.surface().surface_id(), stop_digest)?;
+        let resumed = durable.resume_source_lifecycle_transition(
+            request.surface().surface_id(),
+            reconciliation.revision(),
+            stop_digest,
+            DurableSourceLifecycleIntent::Stop,
+        )?;
+        assert_eq!(
+            resumed
+                .record()
+                .pending_operation_id()
+                .map(|value| value.as_str()),
+            Some(stop_operation_id.as_str())
+        );
+        assert_eq!(
+            resumed
+                .record()
+                .pending_view()
+                .and_then(|pending| pending.predecessor().runtime_generation()),
+            Some(durable_generation)
+        );
+        let retry = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+            provider: SourceIdentifier::try_from(request.surface().surface_id())?,
+            action: SourceLifecycleAction::Retry,
+            expected_state_revision: resumed.record().revision(),
+            expected_generation: None,
+            expected_runtime_generation_digest: None,
+            onboarding_session_id: None,
+            public_configuration_digest: None,
+            reason: Some(SourceIdentifier::try_from("retry-durable-account-stop")?),
+            cancellation: join_cancellation.child_token(),
+            deadline: Instant::now() + Duration::from_secs(2),
+        })?;
+        let completed_receipt = authority.execute(retry).await.map_err(|error| {
+            std::io::Error::other(format!("public Retry failed before completion: {error:?}"))
+        })?;
+        assert_eq!(completed_receipt.fields().operation_id, stop_operation_id);
+        assert_eq!(
+            completed_receipt.fields().action,
+            SourceLifecycleAction::Retry
+        );
+        assert_eq!(
+            completed_receipt.fields().state,
+            SourceLifecycleState::Stopped
+        );
+        let completed = durable.source_lifecycle_record(request.surface().surface_id())?;
+        assert_eq!(completed.phase(), DurableSourceLifecyclePhase::Stopped);
+        assert_eq!(
+            completed.operation_id().map(|value| value.as_str()),
+            Some(stop_operation_id.as_str())
+        );
+        assert!(completed.pending_checkpoint().is_none());
+        assert!(!registry.is_exact_account_stopping_for_test(request).await);
+        assert!(!probe.credentials_are_owned());
+        assert_eq!(probe.credential_destructions(), 1);
+        assert_eq!(probe.display_destructions(), 1);
+        assert!(!probe.try_readmit());
+
+        let no_effect_stop = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+            provider: SourceIdentifier::try_from(request.surface().surface_id())?,
+            action: SourceLifecycleAction::Stop,
+            expected_state_revision: completed.revision(),
+            expected_generation: None,
+            expected_runtime_generation_digest: None,
+            onboarding_session_id: None,
+            public_configuration_digest: None,
+            reason: Some(SourceIdentifier::try_from("stop-already-stopped-account")?),
+            cancellation: CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(2),
+        })?;
+        let no_effect_receipt = authority.execute(no_effect_stop).await.map_err(|error| {
+            std::io::Error::other(format!("public Stop from Stopped failed: {error:?}"))
+        })?;
+        assert_eq!(
+            no_effect_receipt.fields().state,
+            SourceLifecycleState::Stopped
+        );
+        assert_eq!(
+            durable
+                .source_lifecycle_record(request.surface().surface_id())?
+                .phase(),
+            DurableSourceLifecyclePhase::Stopped
+        );
+
+        let retained_no_effect_stop =
+            SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+                provider: SourceIdentifier::try_from(request.surface().surface_id())?,
+                action: SourceLifecycleAction::Stop,
+                expected_state_revision: no_effect_receipt.fields().state_revision,
+                expected_generation: None,
+                expected_runtime_generation_digest: None,
+                onboarding_session_id: None,
+                public_configuration_digest: None,
+                reason: Some(SourceIdentifier::try_from("resume-stopped-account-stop")?),
+                cancellation: CancellationToken::new(),
+                deadline: Instant::now() + Duration::from_secs(2),
+            })?;
+        let retained_no_effect_operation = operation_id(command_digest(&retained_no_effect_stop)?)?;
+        let retained_no_effect = durable.begin_source_lifecycle_transition(
+            request.surface().surface_id(),
+            retained_no_effect_stop.expected_state_revision(),
+            retained_no_effect_operation.clone(),
+            command_digest(&retained_no_effect_stop)?,
+            DurableSourceLifecycleIntent::Stop,
+            Some(request.onboarding_session_id()),
+            Some(request.expected_public_configuration_digest()),
+            None,
+        )?;
+        let retained_no_effect_digest = retained_no_effect.transition_digest()?;
+        let retained_no_effect = durable.require_source_lifecycle_reconciliation(
+            request.surface().surface_id(),
+            retained_no_effect_digest,
+        )?;
+        drop(authority);
+        drop(durable);
+        let durable = DurableProviderActivationState::new(durable_temporary.path().to_path_buf());
+        let authority = ProductionSourceLifecycleAuthority::new(
+            composition.paths().clone(),
+            composition.provider_onboarding(),
+            composition.provider_activation(),
+            composition.provider_portal_activation(),
+            durable.clone(),
+            Arc::clone(&registry),
+        );
+        let retained_no_effect_retry =
+            SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+                provider: SourceIdentifier::try_from(request.surface().surface_id())?,
+                action: SourceLifecycleAction::Retry,
+                expected_state_revision: retained_no_effect.revision(),
+                expected_generation: None,
+                expected_runtime_generation_digest: None,
+                onboarding_session_id: None,
+                public_configuration_digest: None,
+                reason: Some(SourceIdentifier::try_from("retry-stopped-account-stop")?),
+                cancellation: CancellationToken::new(),
+                deadline: Instant::now() + Duration::from_secs(2),
+            })?;
+        let retained_no_effect_receipt = authority
+            .execute(retained_no_effect_retry)
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "public Retry from retained Stopped Stop failed: {error:?}"
+                ))
+            })?;
+        assert_eq!(
+            retained_no_effect_receipt.fields().operation_id,
+            retained_no_effect_operation
+        );
+        assert_eq!(
+            retained_no_effect_receipt.fields().action,
+            SourceLifecycleAction::Retry
+        );
+        assert_eq!(
+            retained_no_effect_receipt.fields().state,
+            SourceLifecycleState::Stopped
+        );
+        let retained_no_effect_completed =
+            durable.source_lifecycle_record(request.surface().surface_id())?;
+        assert_eq!(
+            retained_no_effect_completed.phase(),
+            DurableSourceLifecyclePhase::Stopped
+        );
+        assert_eq!(
+            retained_no_effect_completed
+                .operation_id()
+                .map(SourceIdentifier::as_str),
+            Some(retained_no_effect_operation.as_str())
+        );
+
+        let successor_probe = registry
+            .admit_shutdown_fixture_successor(
+                successor_parent,
+                request,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await?;
+        assert!(successor_probe.reads_are_admitted());
+        let successor_evidence = registry
+            .verify_account_group(
+                request,
+                Instant::now() + Duration::from_secs(2),
+                &CancellationToken::new(),
+            )
+            .await?
+            .ok_or(ServiceError::Unavailable)?;
+        assert_eq!(successor_evidence.group_generation(), successor_generation);
+        assert!(matches!(
+            registry
+                .stop_account_group(
+                    request,
+                    Some(generation),
+                    Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new(),
+                )
+                .await,
+            Err(ServiceError::InvalidRequest)
+        ));
+        assert!(matches!(
+            registry
+                .reacquire_acknowledged_account_group_stop_receipt(
+                    exact_key_evidence,
+                    terminal_proof_digest,
+                    Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new(),
+                )
+                .await,
+            Err(ServiceError::InvalidRequest)
+        ));
+        assert!(matches!(
+            registry
+                .acknowledge_account_group_stop(
+                    &first_receipt,
+                    &first_durable_proof,
+                    Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new(),
+                )
+                .await,
+            Err(ServiceError::InvalidRequest)
+        ));
+        assert_eq!(
+            registry
+                .verify_account_group(
+                    request,
+                    Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new(),
+                )
+                .await?
+                .ok_or(ServiceError::Unavailable)?
+                .group_generation(),
+            successor_generation
+        );
+        assert!(!probe.try_readmit());
+
+        let drop_publication = registry
+            .hold_shutdown_fixture_historical_publication(
+                successor_parent,
+                request,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await?;
+        assert!(drop_publication.validate_precommit());
+        drop(authority);
+        drop(registry);
+        assert!(!drop_publication.validate_precommit());
+        assert!(
+            composition
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
+        Ok(())
+    }
+}
+
 fn is_session_backed_live_surface(surface_id: &str) -> bool {
     surface_id == COINBASE_DIRECT_LIVE_SURFACE
         || ProviderMarketAccount::from_surface_id(surface_id).is_some()
@@ -1854,6 +3181,7 @@ struct LifecycleOutcome {
     public_configuration_digest: Option<EvidenceDigest>,
     runtime_verification_receipt_digest: Option<EvidenceDigest>,
     credential_generation: Option<market_squawk_platform::SecretGeneration>,
+    runtime_generation: Option<DurableSourceRuntimeGeneration>,
     previous_generation: Option<MarketSourceRuntimeGeneration>,
     account_group_read_admission: Option<(
         PreparedMarketProviderConfigurationRequest,
@@ -1873,6 +3201,7 @@ impl LifecycleOutcome {
             public_configuration_digest,
             runtime_verification_receipt_digest: None,
             credential_generation: None,
+            runtime_generation: None,
             previous_generation,
             account_group_read_admission: None,
         }
@@ -1891,6 +3220,9 @@ impl LifecycleOutcome {
             public_configuration_digest,
             runtime_verification_receipt_digest: None,
             credential_generation: None,
+            runtime_generation: Some(DurableSourceRuntimeGeneration::AccountGroup(
+                group_generation.digest(),
+            )),
             previous_generation,
             account_group_read_admission: Some((request, group_generation)),
         }
@@ -1907,6 +3239,7 @@ impl LifecycleOutcome {
             public_configuration_digest,
             runtime_verification_receipt_digest: None,
             credential_generation: None,
+            runtime_generation: None,
             previous_generation,
             account_group_read_admission: None,
         }
@@ -1927,6 +3260,7 @@ impl LifecycleOutcome {
             public_configuration_digest: Some(lease.public_configuration_digest()),
             runtime_verification_receipt_digest: Some(lease.runtime_evidence_digest()),
             credential_generation: Some(generation),
+            runtime_generation: None,
             previous_generation: None,
             account_group_read_admission: None,
         })
@@ -1941,6 +3275,7 @@ impl LifecycleOutcome {
                 request.expected_runtime_verification_receipt_digest(),
             ),
             credential_generation: Some(request.expected_credential_generation()),
+            runtime_generation: None,
             previous_generation: None,
             account_group_read_admission: None,
         }
@@ -1971,9 +3306,53 @@ impl LifecycleOutcome {
             public_configuration_digest: None,
             runtime_verification_receipt_digest: None,
             credential_generation: None,
+            runtime_generation: None,
             previous_generation,
             account_group_read_admission: None,
         }
+    }
+}
+
+fn durable_intent(
+    command: &SourceLifecycleCommand,
+) -> Result<DurableSourceLifecycleIntent, SourceLifecycleError> {
+    Ok(match command.action() {
+        SourceLifecycleAction::Start => DurableSourceLifecycleIntent::Start,
+        SourceLifecycleAction::Stop => DurableSourceLifecycleIntent::Stop,
+        SourceLifecycleAction::Resynchronize => DurableSourceLifecycleIntent::Resynchronize,
+        SourceLifecycleAction::Verify
+            if command.provider().as_str() == ProviderMarketAccount::AlpacaBasic.surface_id() =>
+        {
+            DurableSourceLifecycleIntent::VerifyStop
+        }
+        SourceLifecycleAction::Verify => DurableSourceLifecycleIntent::Verify,
+        SourceLifecycleAction::Reconfigure => DurableSourceLifecycleIntent::Reconfigure,
+        SourceLifecycleAction::Remove => DurableSourceLifecycleIntent::Remove,
+        SourceLifecycleAction::Retry => return Err(SourceLifecycleError::InvalidRequest),
+    })
+}
+
+fn expected_durable_runtime_generation(
+    command: &SourceLifecycleCommand,
+) -> Result<Option<DurableSourceRuntimeGeneration>, SourceLifecycleError> {
+    match (
+        command.expected_generation(),
+        command.expected_runtime_generation_digest(),
+    ) {
+        (Some(generation), None) => NonZeroU64::new(generation.get())
+            .map(DurableSourceRuntimeGeneration::Scalar)
+            .map(Some)
+            .ok_or(SourceLifecycleError::InvalidRequest),
+        (None, Some(digest)) => {
+            let generation = if AccountMarketSurface::parse(command.provider().as_str()).is_some() {
+                DurableSourceRuntimeGeneration::account_group(digest)
+            } else {
+                DurableSourceRuntimeGeneration::non_account_digest(digest)
+            };
+            generation.map(Some).map_err(map_durable_error)
+        }
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(SourceLifecycleError::InvalidRequest),
     }
 }
 

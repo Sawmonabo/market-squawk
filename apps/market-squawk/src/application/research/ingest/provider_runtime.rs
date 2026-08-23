@@ -754,6 +754,7 @@ impl CommittedResearchProviderReplacement {
             pending_replacements,
             selections: _,
             alpaca_historical: _,
+            alpaca_historical_successor_claim: _,
         } = &mut *authority;
         let current = sources
             .get_mut(&self.profile)

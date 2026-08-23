@@ -92,7 +92,15 @@ pub(crate) struct KrakenLevel3LiveRuntime {
     healthy: Arc<AtomicBool>,
     current_keys: watch::Receiver<Arc<[OrderLevelBookKey]>>,
     supervisor: tokio::task::JoinHandle<Result<(), KrakenLevel3RuntimeError>>,
+    published_shutdown: KrakenPublishedShutdownState,
     shutdown_deadline: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KrakenPublishedShutdownState {
+    Running,
+    Complete,
+    Failed,
 }
 
 impl KrakenLevel3LiveRuntime {
@@ -114,9 +122,68 @@ impl KrakenLevel3LiveRuntime {
             .cloned()
     }
 
+    /// Synchronously closes this published runtime to new work without consuming its task owner.
+    pub(crate) fn begin_shutdown(&self) {
+        self.healthy.store(false, Ordering::Release);
+        self.cancellation.cancel();
+    }
+
+    /// Waits for published cleanup while retaining the supervisor for an exact retry.
+    pub(crate) async fn finish_shutdown_before(
+        &mut self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), KrakenLevel3RuntimeError> {
+        self.begin_shutdown();
+        match self.published_shutdown {
+            KrakenPublishedShutdownState::Complete => return Ok(()),
+            KrakenPublishedShutdownState::Failed => {
+                return Err(KrakenLevel3RuntimeError::PublishedShutdownFailed);
+            }
+            KrakenPublishedShutdownState::Running => {}
+        }
+        if cancellation.is_cancelled() {
+            return Err(KrakenLevel3RuntimeError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(KrakenLevel3RuntimeError::ShutdownDeadline);
+        }
+        let outcome = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(KrakenLevel3RuntimeError::Cancelled),
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                return Err(KrakenLevel3RuntimeError::ShutdownDeadline);
+            }
+            outcome = &mut self.supervisor => outcome,
+        };
+        match outcome {
+            Ok(Ok(())) => {
+                self.published_shutdown = KrakenPublishedShutdownState::Complete;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "published Kraken level-3 supervisor failed terminally");
+                self.published_shutdown = KrakenPublishedShutdownState::Failed;
+                Err(KrakenLevel3RuntimeError::PublishedShutdownFailed)
+            }
+            Err(error) => {
+                tracing::error!(%error, "published Kraken level-3 supervisor task failed terminally");
+                self.published_shutdown = KrakenPublishedShutdownState::Failed;
+                Err(KrakenLevel3RuntimeError::PublishedShutdownFailed)
+            }
+        }
+    }
+
     /// Cancels the account owner and waits for exact-generation cleanup.
     pub(crate) async fn shutdown(mut self) -> Result<(), KrakenLevel3RuntimeError> {
-        self.cancellation.cancel();
+        self.begin_shutdown();
+        match self.published_shutdown {
+            KrakenPublishedShutdownState::Complete => return Ok(()),
+            KrakenPublishedShutdownState::Failed => {
+                return Err(KrakenLevel3RuntimeError::PublishedShutdownFailed);
+            }
+            KrakenPublishedShutdownState::Running => {}
+        }
         match tokio::time::timeout(self.shutdown_deadline, &mut self.supervisor).await {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => Err(KrakenLevel3RuntimeError::SupervisorTask(error)),
@@ -131,7 +198,7 @@ impl KrakenLevel3LiveRuntime {
 
 impl Drop for KrakenLevel3LiveRuntime {
     fn drop(&mut self) {
-        self.cancellation.cancel();
+        self.begin_shutdown();
     }
 }
 
@@ -187,6 +254,7 @@ impl KrakenL3AccountActivation {
                     healthy,
                     current_keys: keys_receiver,
                     supervisor,
+                    published_shutdown: KrakenPublishedShutdownState::Running,
                     shutdown_deadline,
                 }),
                 Err(_closed) => map_supervisor_outcome(supervisor.await),
@@ -1407,6 +1475,8 @@ pub(crate) enum KrakenLevel3RuntimeError {
     SupervisorExitedBeforeStartup,
     #[error("Kraken level-3 supervisor shutdown deadline elapsed")]
     ShutdownDeadline,
+    #[error("Kraken level-3 published supervisor failed terminally during shutdown")]
+    PublishedShutdownFailed,
     #[error("Kraken level-3 capture owner is missing")]
     CaptureOwnerMissing,
     #[error("Kraken level-3 capture shutdown was incomplete")]
