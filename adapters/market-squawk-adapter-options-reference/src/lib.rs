@@ -1,8 +1,8 @@
 //! Bounded provider-native option reference contracts for OCC and Cboe.
 //!
 //! This crate builds exact official reference-file requests, streams production responses into a
-//! capability-scoped content-addressed raw store and decodes selected publications into sealed
-//! disk-backed query generations. It does not create
+//! shared logical raw-object authority, and exports exact provider-native rows plus ambiguity
+//! evidence for caller-owned composition. It does not create durable generations, PIT reads, or
 //! canonical [`market_squawk_domain::InstrumentId`] values. A syntactically valid OSI symbol or a
 //! row's presence in a publication is reference evidence, not proof of a current quote,
 //! consolidated coverage, tradability, standard multiplier, or adjusted-contract economics.
@@ -10,18 +10,25 @@
 #![deny(missing_docs)]
 
 mod cboe;
+mod export;
 mod identity;
 mod occ;
+mod payload;
 mod publication;
-mod service;
-mod spool;
-mod store;
 mod transport;
 
 pub use cboe::{
     CBOE_ALL_SERIES_MAX_BYTES, CBOE_ALL_SERIES_MAX_RECORDS, CboeAllSeriesCsvSchema,
     CboeAllSeriesParseReceipt, CboeAllSeriesParser, CboeListingEvidence, CboeParseError,
     CboeSeriesReference, CboeSeriesStatus, CboeSymbolId, CboeVenue,
+};
+pub use export::{
+    OptionsReferenceAliasDisposition, OptionsReferenceCurrentnessDisposition,
+    OptionsReferenceIdentityDisposition, OptionsReferenceValidityDisposition,
+    ReferenceAliasAssertion, ReferenceAliasKey, ReferenceAliasResolution,
+    ReferenceAliasResolutionState, ReferenceAliasSortKey, ReferenceAliasTarget, ReferenceConflict,
+    ReferenceConflictKind, ReferenceConflictReconciler, ReferenceConflictReconciliationReceipt,
+    ReferenceExportError, ReferenceExportRecord,
 };
 pub use identity::{
     ExpirationResolution, MultiplierEvidence, OptionContractIdentity, OptionExpiration,
@@ -35,37 +42,13 @@ pub use occ::{
     OccPositionLimit, OccProductType,
 };
 pub use publication::{
-    CatalogConflict, CatalogConflictKind, CatalogCounts, HttpLastModifiedEvidence,
-    ObjectClockEvidence, PageTerminalState, PublicationCatalog, PublicationCompleteness,
-    PublicationError, PublicationLimits, PublicationRequest, ReferenceConditionalPriorEvidence,
+    HttpLastModifiedEvidence, ObjectClockEvidence, PageTerminalState, PublicationError,
+    PublicationLimits, PublicationRequest, ReferenceConditionalPriorEvidence,
     ReferenceConditionalValidatorEvidence, ReferenceNativeSchemaIdentity, ReferenceObjectContext,
     ReferenceOfficialRequestEvidence, ReferencePageReceipt, ReferenceProvider,
-    ReferenceRequestBodyEvidence, ReferenceRequestMethod, ReferenceResponseDisposition,
-    ReferenceSurface, ReferenceTransportEvidence, SurfaceCompleteness,
-};
-pub use service::{
-    CboeReferenceObjectDoctorEvidence, OccDlpDoctorState, OccDlpRepresentation,
-    OccMemoAcquisitionDisposition, OccMemoAcquisitionState, OccMemoDocumentClosureEvidence,
-    OccMemoRssDiscoveryEvidence, OptionsReferenceActivationReason, OptionsReferenceActivationState,
-    OptionsReferenceCurrentnessDisposition, OptionsReferenceDoctorError,
-    OptionsReferenceDoctorInput, OptionsReferenceDoctorReport, OptionsReferenceGenerationHealth,
-    OptionsReferenceLocalFailure, OptionsReferenceObjectClockEvidence,
-    OptionsReferenceQueryFailure, OptionsReferenceQueryFamily, OptionsReferenceQueryProbe,
-    REQUIRED_CBOE_VENUES,
-};
-pub use spool::{
-    CanonicalReferenceIdentityState, CboeContractReferenceView, CboeVenuePresenceView,
-    OccProductReferenceView, ReferencePageBatch, ReferencePublicationSpool, ReferenceSpoolError,
-    ReferenceSpoolLimits, ReferenceSpoolSealOutcome, RejectedReferenceGeneration,
-    StagedReferenceGeneration,
-};
-pub use store::{
-    AuthenticatedReferencePage, AuthenticatedReferenceQuery, ReferenceArtifactStore,
-    ReferenceCanonicalExportCursor, ReferenceCanonicalExportFamily, ReferenceGeneration,
-    ReferenceGenerationObjectEvidence, ReferenceGenerationReceipt, ReferenceQueryCoordinate,
-    ReferenceQueryEvidence, ReferenceRecoveryFailure, ReferenceRecoveryOutcome,
-    ReferenceRecoveryRejection, ReferenceStoreError, RejectedReferenceGenerationReceipt,
-    SealedReferenceRawObject,
+    ReferenceRequestAccountingReceipt, ReferenceRequestBodyEvidence, ReferenceRequestBudget,
+    ReferenceRequestMethod, ReferenceResponseDisposition, ReferenceSurface,
+    ReferenceTransportEvidence,
 };
 pub use transport::{
     CBOE_OPTIONS_REFERENCE_PROVIDER_ID, CBOE_OPTIONS_REFERENCE_SOURCE_ID, CboeSchemaFreeze,
@@ -76,18 +59,19 @@ pub use transport::{
     OPTIONS_REFERENCE_MINIMUM_CONNECT_TIMEOUT_NANOS, OPTIONS_REFERENCE_MINIMUM_READ_TIMEOUT_NANOS,
     OPTIONS_REFERENCE_MINIMUM_TOTAL_TIMEOUT_NANOS, OfficialPublicationPlan,
     OfficialPublicationPolicy, OfficialReferenceRequest, OfficialReferenceStreamingClient,
-    ReferenceCancellation, ReferenceFetchControl, ReferenceHeaderValue, ReferenceHttpReceipt,
-    ReferenceNotModifiedReceipt, ReferenceTransportError, RetryAfterEvidence,
-    SelectedReferenceDecoder, StreamedReferenceObject, StreamingReferenceFetchOutcome,
-    StrictReferenceParseReceipt, StrictUninterpretedMemoDocumentReceipt,
-    options_reference_application_budget_policy, options_reference_endpoint_policy,
-    options_reference_provider_rate_declaration,
+    PendingReferenceTypedHandoff, PendingUninterpretedMemoHandoff, ReferenceCancellation,
+    ReferenceFetchControl, ReferenceHeaderValue, ReferenceHttpReceipt, ReferenceNotModifiedReceipt,
+    ReferenceTransportError, ReferenceTypedHandoff, ReferenceUninterpretedMemoHandoff,
+    RetryAfterEvidence, SelectedReferenceDecoder, StreamedReferenceObject,
+    StreamingReferenceFetchOutcome, StrictReferenceParseReceipt,
+    StrictUninterpretedMemoDocumentReceipt, options_reference_application_budget_policy,
+    options_reference_endpoint_policy, options_reference_provider_rate_declaration,
 };
 
 #[cfg(all(test, unix))]
 use transport::{
     OfficialReferenceSource, ReferenceFetchOutcome, ReferenceHttpExecutor, ReferenceHttpRequest,
-    ReferenceHttpResponse, RetrievedReferenceObject,
+    ReferenceHttpResponse,
 };
 
 #[cfg(test)]
@@ -96,21 +80,50 @@ mod tests {
     use std::cell::RefCell;
     use std::error::Error;
     #[cfg(unix)]
-    use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::io::Read as _;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
     #[cfg(unix)]
     use std::time::Duration;
 
-    #[cfg(unix)]
-    use cap_std::{ambient_authority, fs::Dir};
     use market_squawk_domain::{
         AvailabilityEvidence, DigestAlgorithm, EvidenceDigest, OptionKind, SourceIdentifier,
         Timestamp,
     };
+    #[cfg(unix)]
+    use market_squawk_platform::{
+        LocalPaths, ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
+    };
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    #[cfg(unix)]
+    struct TestRawObjectControl<'a> {
+        fetch: &'a ReferenceFetchControl,
+        wall_deadline: Timestamp,
+    }
+
+    #[cfg(unix)]
+    impl ResearchObjectControl for TestRawObjectControl<'_> {
+        fn checkpoint(
+            &self,
+            _point: ResearchObjectControlPoint,
+        ) -> Result<(), ResearchObjectControlError> {
+            self.fetch.ensure_open().map_err(|error| match error {
+                ReferenceTransportError::Cancelled => ResearchObjectControlError::Cancelled,
+                ReferenceTransportError::DeadlineExceeded => {
+                    ResearchObjectControlError::DeadlineExceeded
+                }
+                _ => ResearchObjectControlError::Unavailable,
+            })?;
+            match crate::transport::trusted_timestamp() {
+                Ok(now) if now <= self.wall_deadline => Ok(()),
+                Ok(_) => Err(ResearchObjectControlError::DeadlineExceeded),
+                Err(_) => Err(ResearchObjectControlError::Unavailable),
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[derive(Debug)]
@@ -159,7 +172,7 @@ mod tests {
             context,
         )?;
         let mut records = Vec::new();
-        let receipt = parser.parse(bytes, |record| {
+        let receipt = parser.parse(bytes.as_slice(), |record| {
             records.push(record);
             Ok(())
         })?;
@@ -294,11 +307,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg(unix)]
-    fn official_source_mock_proves_complete_core_restart_and_typed_query()
+    async fn official_source_mock_proves_raw_reopen_and_conflict_preserving_typed_handoff()
     -> Result<(), Box<dyn Error>> {
-        let cboe_bytes = b"Cboe Symbol,OSI Symbol,Underlying,Matching Unit,Closing Only\n000u56,ZVZZT 990101C00005000,SPY,25,False\n";
+        let cboe_bytes = b"Cboe Symbol,OSI Symbol,Underlying,Matching Unit,Closing Only\n000u56,ZVZZT 990101C00005000,SPY,25,False\n000u57,ZVZZT 990101C00005000,SPY,25,False\n";
         let occ_bytes = format!(
             "{:<6}\t{:<6}\t{:<50}\tABCIPX\t25000000\tEF\t\r\n",
             "1AAL", "AAL", "American Airlines Group Inc"
@@ -312,18 +325,9 @@ mod tests {
                 ReferenceSurface::CboeAllSeries {
                     venue: CboeVenue::C1,
                 },
-                ReferenceSurface::CboeAllSeries {
-                    venue: CboeVenue::Bzx,
-                },
-                ReferenceSurface::CboeAllSeries {
-                    venue: CboeVenue::C2,
-                },
-                ReferenceSurface::CboeAllSeries {
-                    venue: CboeVenue::Edgx,
-                },
                 ReferenceSurface::OccDlpSelectedText,
             ],
-            PublicationLimits::try_new(5, 5, 5 * 1024 * 1024, 10, 1)?,
+            PublicationLimits::try_new(2, 2, 5 * 1024 * 1024, 3, 4)?,
         )?;
         let plan = OfficialPublicationPlan::try_new(
             request,
@@ -334,39 +338,25 @@ mod tests {
             ),
         )?;
         let artifacts = tempfile::tempdir()?;
-        let store_capability = Dir::open_ambient_dir(artifacts.path(), ambient_authority())?;
-        let store = ReferenceArtifactStore::open(store_capability)?;
-        let storage_activation = store.activation_storage_probe()?;
+        let paths = LocalPaths::prepare(artifacts.path())?;
+        let raw_store = Arc::new(paths.sealed_research_journal_store()?);
         let publication_control = ReferenceFetchControl::for_duration(
             Duration::from_secs(60),
             ReferenceCancellation::new(),
         )?;
-        let mut spool = store.begin_publication(
-            plan.publication_request().clone(),
-            publication_control.clone(),
-            ReferenceSpoolLimits::try_new(64 * 1024 * 1024, 1024 * 1024, 1, 4)?,
-        )?;
-        let mut raw_objects = Vec::new();
-        let mut c1_evidence = None;
-        let mut cboe_query_probe = None;
-        let mut occ_query_probe = None;
+        let mut request_budget =
+            ReferenceRequestBudget::try_for_publication(plan.publication_request())?;
+        let mut exports = Vec::new();
+        let mut alias_assertions = Vec::new();
+        let mut cboe_claim = None;
         for official_request in plan.requests() {
             let (body, content_type, disposition) = match official_request.surface() {
-                ReferenceSurface::CboeAllSeries { venue } => {
-                    let prefix = match venue {
-                        CboeVenue::C1 => "cone",
-                        CboeVenue::Bzx => "opt",
-                        CboeVenue::C2 => "ctwo",
-                        CboeVenue::Edgx => "exo",
-                    };
-                    (
-                        cboe_bytes.to_vec(),
-                        "text/csv; charset=utf-8",
-                        format!(
-                            "attachment; filename={prefix}_listed_symbol_reference_2026_08_14_01_13_36.csv"
-                        ),
-                    )
-                }
+                ReferenceSurface::CboeAllSeries { .. } => (
+                    cboe_bytes.to_vec(),
+                    "text/csv; charset=utf-8",
+                    "attachment; filename=cone_listed_symbol_reference_2026_08_14_01_13_36.csv"
+                        .to_owned(),
+                ),
                 ReferenceSurface::OccDlpSelectedText => (
                     occ_bytes.as_bytes().to_vec(),
                     "text/plain; charset=utf-8",
@@ -405,118 +395,176 @@ mod tests {
                     std::io::Error::other("mock response was not admitted as modified").into(),
                 );
             };
-            raw_objects.push(store.seal_raw_object(&object)?);
+            let mut streamed = crate::transport::capture_retrieved_for_test(
+                Arc::clone(&raw_store),
+                official_request,
+                object,
+                &publication_control,
+            )?;
             match official_request.surface() {
-                ReferenceSurface::CboeAllSeries { venue } => {
-                    let mut decoded = Vec::new();
-                    let receipt = CboeAllSeriesParser::try_new(
-                        *venue,
-                        CboeAllSeriesCsvSchema::DailyAllSeriesV1,
-                        object.context().clone(),
-                    )?
-                    .parse(object.bytes(), |record| {
-                        decoded.push(record);
+                ReferenceSurface::CboeAllSeries { .. } => {
+                    let receipt = streamed.parse_cboe_all_series(|record| {
+                        let export = ReferenceExportRecord::from(record);
+                        export
+                            .visit_alias_assertions(|assertion| {
+                                alias_assertions.push(assertion);
+                                Ok(())
+                            })
+                            .map_err(|_| CboeParseError::SinkRejected)?;
+                        exports.push(export);
                         Ok(())
                     })?;
-                    let record = decoded
-                        .first()
-                        .ok_or_else(|| std::io::Error::other("Cboe fixture row is absent"))?;
-                    if *venue == CboeVenue::C1 {
-                        c1_evidence = Some(record.record_id().clone());
-                        cboe_query_probe = Some(record.clone());
-                    }
-                    let mut page = spool.begin_page(official_request.surface().clone())?;
-                    page.record_cboe(record)?;
-                    page.finish(&receipt.page_receipt())?;
+                    let handoff = streamed
+                        .complete_after_schema_validation(receipt.into())?
+                        .finish()
+                        .await?;
+                    assert_eq!(
+                        handoff.currentness(),
+                        OptionsReferenceCurrentnessDisposition::RequiresApplicationFreshnessClassification
+                    );
+                    assert_eq!(handoff.page_receipt().returned_records(), 2);
+                    request_budget.observe_typed_handoff(&handoff)?;
+                    let (raw, context, http, page) = handoff.into_parts();
+                    assert_eq!(raw.content_digest(), context.payload_digest());
+                    assert_eq!(http.payload_digest(), context.payload_digest());
+                    assert_eq!(page.context(), &context);
+                    cboe_claim = Some(raw.claim().clone());
                 }
                 ReferenceSurface::OccDlpSelectedText => {
-                    let mut decoded = Vec::new();
-                    let receipt = OccDlpParser::try_new(object.context().clone())?.parse(
-                        object.bytes(),
-                        |record| {
-                            decoded.push(record);
-                            Ok(())
-                        },
-                    )?;
-                    let record = decoded
-                        .first()
-                        .ok_or_else(|| std::io::Error::other("OCC fixture row is absent"))?;
-                    occ_query_probe = Some(record.clone());
-                    let mut page = spool.begin_page(official_request.surface().clone())?;
-                    page.record_occ_product(record)?;
-                    page.finish(&receipt.page_receipt())?;
+                    let receipt = streamed.parse_occ_dlp(|record| {
+                        let export = ReferenceExportRecord::from(record);
+                        export
+                            .visit_alias_assertions(|assertion| {
+                                alias_assertions.push(assertion);
+                                Ok(())
+                            })
+                            .map_err(|_| OccParseError::SinkRejected)?;
+                        exports.push(export);
+                        Ok(())
+                    })?;
+                    let handoff = streamed
+                        .complete_after_schema_validation(receipt.into())?
+                        .finish()
+                        .await?;
+                    assert_eq!(handoff.page_receipt().returned_records(), 1);
+                    request_budget.observe_typed_handoff(&handoff)?;
+                    let (raw, context, http, page) = handoff.into_parts();
+                    assert_eq!(raw.content_digest(), context.payload_digest());
+                    assert_eq!(http.payload_digest(), context.payload_digest());
+                    assert_eq!(page.context(), &context);
                 }
                 _ => return Err(std::io::Error::other("unexpected core surface").into()),
             }
         }
-        let ReferenceSpoolSealOutcome::Complete(staged) = spool.seal()? else {
-            return Err(std::io::Error::other("conflict-free fixture was rejected").into());
-        };
-        let generation_receipt = store.publish_generation(staged, &raw_objects)?;
-        let generation = store.open_generation(&generation_receipt)?;
-        let symbol = CboeSymbolId::try_from_provider("000u56")?;
-        let query = generation.cboe_by_symbol(&symbol)?;
+
+        assert_eq!(exports.len(), 3);
+        let cboe = exports
+            .iter()
+            .find_map(ReferenceExportRecord::as_cboe_series)
+            .ok_or_else(|| std::io::Error::other("Cboe typed export is absent"))?;
+        assert_eq!(cboe.venue(), CboeVenue::C1);
+        assert_eq!(cboe.cboe_symbol_id().as_str(), "000u56");
+        assert_eq!(cboe.contract().osi().as_str(), "ZVZZT 990101C00005000");
         assert_eq!(
-            query.evidence().database_digest(),
-            generation_receipt.database_digest()
-        );
-        let view = query
-            .value()
-            .ok_or_else(|| std::io::Error::other("sealed Cboe query row is absent"))?;
-        assert_eq!(view.underlying().as_str(), "SPY");
-        assert_eq!(view.venues().len(), 4);
-        assert!(
-            view.venues()
-                .iter()
-                .all(|venue| venue.matching_unit() == 25)
+            exports[0].validity(),
+            OptionsReferenceValidityDisposition::ExactSourceSnapshotOnly
         );
         assert_eq!(
-            view.venues()[0].evidence(),
-            c1_evidence
-                .as_ref()
-                .ok_or_else(|| std::io::Error::other("C1 evidence is absent"))?
+            exports[0].identity(),
+            OptionsReferenceIdentityDisposition::ProviderNativeReferenceOnly
         );
-        drop(generation);
-        let recovered = store.repair_active()?;
-        assert!(recovered.generation().is_some());
-        assert!(recovered.rejected().is_empty());
-        let memo = OccMemoAcquisitionState::not_selected();
-        let cboe_query_probe = cboe_query_probe
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("Cboe query witness is absent"))?;
-        let occ_query_probe = occ_query_probe
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("OCC query witness is absent"))?;
-        let doctor = OptionsReferenceDoctorReport::evaluate(OptionsReferenceDoctorInput::new(
-            &recovered,
-            Some(&storage_activation),
-            Some(OptionsReferenceQueryProbe::new(
-                cboe_query_probe,
-                occ_query_probe,
-            )),
-            &memo,
-        ))?;
-        assert!(doctor.core_reference_verified());
+        let occ = exports
+            .iter()
+            .find_map(ReferenceExportRecord::as_occ_product)
+            .ok_or_else(|| std::io::Error::other("OCC typed export is absent"))?;
+        assert_eq!(occ.options_symbol().as_str(), "1AAL");
+        assert_eq!(occ.underlying_symbol().as_str(), "AAL");
+
+        alias_assertions.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+        let mut alias_assertions = alias_assertions.into_iter();
+        let mut resolutions = Vec::new();
+        let mut conflicts = Vec::new();
+        let reconciliation =
+            ReferenceConflictReconciler::try_for_publication(plan.publication_request())?
+                .reconcile(
+                    || Ok(alias_assertions.next()),
+                    |resolution| {
+                        resolutions.push(resolution);
+                        Ok(())
+                    },
+                    |conflict| {
+                        conflicts.push(conflict);
+                        Ok(())
+                    },
+                )?;
+        let accounting = request_budget.finish(&reconciliation)?;
+        assert_eq!(accounting.completed_pages(), 2);
+        assert_eq!(accounting.returned_records(), 3);
+        assert_eq!(accounting.conflicts(), 1);
+        assert!(resolutions.iter().any(|resolution| {
+            resolution.state() == ReferenceAliasResolutionState::Ambiguous
+                && matches!(resolution.key(), ReferenceAliasKey::CboeOsi { .. })
+        }));
+        assert_eq!(conflicts.len(), 1);
         assert_eq!(
-            doctor.activation(),
-            OptionsReferenceActivationState::Available
+            conflicts[0].kind(),
+            ReferenceConflictKind::CboeOsiMapsMultipleSymbols
+        );
+        assert_ne!(
+            conflicts[0].first_evidence(),
+            conflicts[0].second_evidence()
         );
 
-        let generation = store.open_generation(&generation_receipt)?;
-        let raw_path = artifacts
-            .path()
-            .join("raw")
-            .join(raw_objects[0].storage_name().as_str());
-        let mut permissions = std::fs::metadata(&raw_path)?.permissions();
-        permissions.set_mode(0o600);
-        std::fs::set_permissions(&raw_path, permissions)?;
-        let mut raw_file = std::fs::OpenOptions::new().write(true).open(raw_path)?;
-        raw_file.seek(SeekFrom::Start(0))?;
-        raw_file.write_all(b"X")?;
-        raw_file.sync_all()?;
+        let claim = cboe_claim
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("Cboe raw claim is absent"))?;
+        let raw_control = TestRawObjectControl {
+            fetch: &publication_control,
+            wall_deadline: plan.publication_request().deadline(),
+        };
+        let mut reopened = raw_store.open_verified_logical_object_claim(claim, &raw_control)?;
+        let mut reopened_bytes = Vec::new();
+        reopened.read_to_end(&mut reopened_bytes)?;
+        assert_eq!(reopened_bytes, cboe_bytes);
+        let reopened_receipt = reopened.reverify_for_commit(&raw_control)?;
+        assert_eq!(reopened_receipt.claim(), claim);
+
+        for (object_id, hostile_name) in [
+            ("occ-xml-oversized-text", ">".repeat(4_097)),
+            (
+                "occ-xml-oversized-cdata",
+                format!("<![CDATA[{}]]>", "<>".repeat(2_049)),
+            ),
+        ] {
+            let hostile_xml = format!(
+                "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><results><record><optionSymbol>1AAL</optionSymbol><underlyingSymbol>AAL</underlyingSymbol><symbolName>{hostile_name}</symbolName><positionLimit>25000000</positionLimit><onnProductType>EF</onnProductType><exchanges>ABCIPX</exchanges></record></results>"
+            );
+            let hostile_context = object_context(
+                ReferenceSurface::OccDlpDailyXml,
+                object_id,
+                OccDlpSchema::DailyXmlV1.media_type(),
+                OccDlpSchema::DailyXmlV1.native_schema(),
+                hostile_xml.as_bytes(),
+            )?;
+            assert!(matches!(
+                OccDlpParser::try_new(hostile_context)?.parse(hostile_xml.as_bytes(), |_| Ok(())),
+                Err(OccParseError::MalformedXml)
+            ));
+        }
+        let hostile_dtd = format!(
+            "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><!DOCTYPE results [{}]><results><record><optionSymbol>1AAL</optionSymbol><underlyingSymbol>AAL</underlyingSymbol><symbolName>American Airlines Group Inc</symbolName><positionLimit>25000000</positionLimit><onnProductType>EF</onnProductType><exchanges>ABCIPX</exchanges></record></results>",
+            "<!-- ] -->".repeat(512)
+        );
+        let hostile_dtd_context = object_context(
+            ReferenceSurface::OccDlpDailyXml,
+            "occ-xml-oversized-dtd",
+            OccDlpSchema::DailyXmlV1.media_type(),
+            OccDlpSchema::DailyXmlV1.native_schema(),
+            hostile_dtd.as_bytes(),
+        )?;
         assert!(matches!(
-            generation.cboe_by_symbol(&symbol),
-            Err(ReferenceStoreError::ObjectCorrupt)
+            OccDlpParser::try_new(hostile_dtd_context)?.parse(hostile_dtd.as_bytes(), |_| Ok(())),
+            Err(OccParseError::MalformedXml)
         ));
         Ok(())
     }

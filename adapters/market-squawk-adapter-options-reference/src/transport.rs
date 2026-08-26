@@ -1,6 +1,7 @@
 //! Exact official-source request planning and bounded HTTP response admission.
 
 use std::fmt::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::{
     Arc,
@@ -12,6 +13,11 @@ use futures_util::StreamExt as _;
 use market_squawk_domain::{
     AssetClass, AvailabilityEvidence, CalendarDate, CoverageDelay, DataQuality, DeliveryEvidence,
     DigestAlgorithm, EvidenceDigest, ResearchTemporalCoordinate, SourceIdentifier, Timestamp,
+};
+use market_squawk_platform::{
+    ResearchObjectAdmission, ResearchObjectClaim, ResearchObjectControl,
+    ResearchObjectControlError, ResearchObjectControlPoint, ResearchObjectReceipt,
+    SealedResearchJournalStore, SealedResearchJournalStoreError, VerifiedResearchObject,
 };
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationMode, BackoffPolicy, BudgetScope, BudgetWindowSemantics,
@@ -25,14 +31,15 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::store::{RawStreamFrame, StreamedRawCaptureReceipt};
+#[cfg(test)]
+use crate::ReferenceRequestMethod;
 use crate::{
     CBOE_ALL_SERIES_MAX_BYTES, CboeAllSeriesCsvSchema, CboeVenue, HttpLastModifiedEvidence,
     OCC_DLP_MAX_BYTES, OCC_MEMO_MAX_BYTES, ObjectClockEvidence, OccDlpSchema, OccMemoCsvSchema,
-    PublicationRequest, ReferenceArtifactStore, ReferenceConditionalPriorEvidence,
+    OptionsReferenceCurrentnessDisposition, PublicationRequest, ReferenceConditionalPriorEvidence,
     ReferenceConditionalValidatorEvidence, ReferenceNativeSchemaIdentity, ReferenceObjectContext,
-    ReferenceOfficialRequestEvidence, ReferenceProvider, ReferenceRequestMethod, ReferenceSurface,
-    ReferenceTransportEvidence, SealedReferenceRawObject,
+    ReferenceOfficialRequestEvidence, ReferenceProvider, ReferenceSurface,
+    ReferenceTransportEvidence, payload::ExactPayloadReader,
 };
 
 const OCC_DLP_SELECTED_LOCATOR: &str = "https://marketdata.theocc.com/delo-download?prodType=ALL&downloadFields=OS;US;SN;EXCH;PL;ONN&format=txt";
@@ -87,6 +94,9 @@ const OPTIONS_REFERENCE_USER_AGENT: &str = concat!(
 );
 const MAX_HEADER_VALUE_BYTES: usize = 1_024;
 const MAX_OPERATION_DURATION: Duration = Duration::from_secs(10 * 60);
+const RAW_STREAM_CHANNEL_CAPACITY: usize = 8;
+const RAW_STREAM_WRITE_CHUNK_BYTES: usize = 64 * 1024;
+const LOGICAL_OBJECT_INTEGRITY_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A closed set of reviewed Cboe `All Series` schemas eligible for one acquisition cycle.
 ///
@@ -284,7 +294,7 @@ pub struct ConditionalCacheRequest {
 }
 
 impl ConditionalCacheRequest {
-    /// Selects the strongest observed validator and binds it to a prior capability-store receipt.
+    /// Selects the strongest observed validator and binds it to one common raw-object claim.
     ///
     /// The exact raw bytes are reverified by the production streaming client before a `304` can
     /// authorize reuse. Constructing this value alone never proves that the raw object is still
@@ -293,10 +303,17 @@ impl ConditionalCacheRequest {
     /// # Errors
     ///
     /// Rejects absent validators, an empty payload, or internally divergent sealed evidence.
-    pub fn try_from_sealed_prior(
-        prior: &SealedReferenceRawObject,
+    pub fn try_from_prior(
+        raw_claim: &ResearchObjectClaim,
+        context: &ReferenceObjectContext,
+        receipt: &ReferenceHttpReceipt,
     ) -> Result<Self, ReferenceTransportError> {
-        Self::try_from_evidence(prior.context(), prior.transport())
+        if raw_claim.content_digest() != context.payload_digest()
+            || raw_claim.size_bytes() != context.payload_bytes()
+        {
+            return Err(ReferenceTransportError::InvalidConditionalEvidence);
+        }
+        Self::try_from_evidence(context, receipt)
     }
 
     fn try_from_evidence(
@@ -569,9 +586,9 @@ impl OfficialPublicationPlan {
     /// Builds each exact official request once in the publication's sorted surface order.
     ///
     /// Supported acquisition surfaces are the four Cboe `All Series` files, OCC selected/daily
-    /// DLP text, the OCC memo CSV export, and a complete memo document by memo number. The closed
-    /// JSON placeholder and attachment surface are rejected because no exact official request is
-    /// established for them here.
+    /// DLP TXT/XML, the OCC memo CSV export, and a complete memo document by memo number. The
+    /// closed JSON placeholder and attachment surface are rejected because no exact official
+    /// request is established for them here.
     ///
     /// # Errors
     ///
@@ -839,6 +856,68 @@ impl ReferenceFetchControl {
             Err(ReferenceTransportError::DeadlineExceeded)
         } else {
             Ok(())
+        }
+    }
+}
+
+struct ReapedBlockingWorker<T> {
+    result: tokio::sync::oneshot::Receiver<Result<T, ReferenceTransportError>>,
+    cancellation: ReferenceCancellation,
+    active: bool,
+}
+
+impl<T> ReapedBlockingWorker<T>
+where
+    T: Send + 'static,
+{
+    fn spawn<F>(operation: F) -> Self
+    where
+        F: FnOnce(ReferenceCancellation) -> Result<T, ReferenceTransportError> + Send + 'static,
+    {
+        let cancellation = ReferenceCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let blocking = tokio::task::spawn_blocking(move || operation(worker_cancellation));
+        let (sender, result) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let terminal = blocking
+                .await
+                .map_err(|_| ReferenceTransportError::RawCaptureWorkerFailed)
+                .and_then(std::convert::identity);
+            let _ = sender.send(terminal);
+        });
+        Self {
+            result,
+            cancellation,
+            active: true,
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    fn complete(
+        &mut self,
+        result: Result<Result<T, ReferenceTransportError>, tokio::sync::oneshot::error::RecvError>,
+    ) -> Result<T, ReferenceTransportError> {
+        match result {
+            Ok(terminal) => {
+                self.active = false;
+                terminal
+            }
+            Err(_) => {
+                self.cancellation.cancel();
+                self.active = false;
+                Err(ReferenceTransportError::RawCaptureWorkerFailed)
+            }
+        }
+    }
+}
+
+impl<T> Drop for ReapedBlockingWorker<T> {
+    fn drop(&mut self) {
+        if self.active {
+            self.cancellation.cancel();
         }
     }
 }
@@ -1120,21 +1199,65 @@ pub(crate) struct RetrievedReferenceObject {
 }
 
 #[cfg(test)]
-impl RetrievedReferenceObject {
-    /// Returns exact retained source bytes.
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
+pub(crate) fn capture_retrieved_for_test(
+    store: Arc<SealedResearchJournalStore>,
+    request: &OfficialReferenceRequest,
+    object: RetrievedReferenceObject,
+    control: &ReferenceFetchControl,
+) -> Result<StreamedReferenceObject, ReferenceTransportError> {
+    control.ensure_open()?;
+    let RetrievedReferenceObject {
+        bytes,
+        decoder,
+        context,
+        receipt,
+    } = object;
+    let maximum_bytes = u64::try_from(request.maximum_decoded_bytes)
+        .map_err(|_| ReferenceTransportError::ResponseTooLarge)?;
+    if bytes.is_empty()
+        || u64::try_from(bytes.len()).ok() != Some(context.payload_bytes())
+        || context.payload_bytes() > maximum_bytes
+        || context.surface() != request.surface()
+        || context.configured_locator() != request.locator()
+        || context.native_schema_identity() != &decoder.native_schema_identity()?
+        || context.transport_evidence() != receipt.transport_evidence()
+    {
+        return Err(ReferenceTransportError::InvalidObjectEvidence);
     }
-
-    /// Returns record-level raw-object context.
-    pub(crate) const fn context(&self) -> &ReferenceObjectContext {
-        &self.context
+    let admission = logical_object_admission(maximum_bytes)?;
+    let mut pending = store
+        .begin_logical_object(admission)
+        .map_err(|_| ReferenceTransportError::RawCaptureFailed)?;
+    for chunk in bytes.chunks(RAW_STREAM_WRITE_CHUNK_BYTES) {
+        control.ensure_open()?;
+        pending
+            .write_all(chunk)
+            .map_err(|_| ReferenceTransportError::RawCaptureFailed)?;
     }
-
-    /// Returns complete transport evidence for raw capture and manifest binding.
-    pub(crate) const fn receipt(&self) -> &ReferenceHttpReceipt {
-        &self.receipt
+    let finish_control = SourceRawObjectControl {
+        control: control.clone(),
+        worker_cancellation: ReferenceCancellation::new(),
+        wall_deadline: request.wall_deadline,
+        authority: SourceRawObjectAuthority::Fixture,
+    };
+    let raw_object = store
+        .finish_logical_object(pending, &finish_control)
+        .map_err(map_logical_object_error)?;
+    if raw_object.content_digest() != context.payload_digest()
+        || raw_object.size_bytes() != context.payload_bytes()
+    {
+        return Err(ReferenceTransportError::InvalidObjectEvidence);
     }
+    Ok(StreamedReferenceObject {
+        raw_object,
+        context,
+        http_receipt: receipt,
+        decoder,
+        maximum_decoded_bytes: maximum_bytes,
+        completion: ReferenceCompletionAuthority::Fixture,
+        wall_deadline: request.wall_deadline,
+        control: control.clone(),
+    })
 }
 
 /// Retry-After evidence preserved without inventing a provider capacity or retry schedule.
@@ -1417,12 +1540,17 @@ where
     }
 }
 
-/// Modified object acquired directly into the capability-scoped raw store.
+/// Modified object captured through the shared logical raw-object authority.
+///
+/// This descriptor is intentionally noncloneable and non-serializable. It must be strictly parsed
+/// and consumed into a pending handoff before shared composition can retain its common raw receipt.
 pub struct StreamedReferenceObject {
-    raw_object: SealedReferenceRawObject,
+    raw_object: VerifiedResearchObject,
+    context: ReferenceObjectContext,
+    http_receipt: ReferenceHttpReceipt,
     decoder: SelectedReferenceDecoder,
     maximum_decoded_bytes: u64,
-    in_flight: Option<InFlightExtractionRequest>,
+    completion: ReferenceCompletionAuthority,
     wall_deadline: Timestamp,
     control: ReferenceFetchControl,
 }
@@ -1431,10 +1559,39 @@ impl std::fmt::Debug for StreamedReferenceObject {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("StreamedReferenceObject")
-            .field("object_id", self.raw_object.context().object_id())
+            .field("object_id", self.context.object_id())
             .field("decoder", &self.decoder)
-            .field("awaiting_schema_completion", &self.in_flight.is_some())
+            .field("awaiting_schema_completion", &true)
             .finish_non_exhaustive()
+    }
+}
+
+enum ReferenceCompletionAuthority {
+    Production(Arc<InFlightExtractionRequest>),
+    #[cfg(test)]
+    Fixture,
+}
+
+impl ReferenceCompletionAuthority {
+    fn validate_current(&self) -> Result<(), ReferenceTransportError> {
+        match self {
+            Self::Production(in_flight) => in_flight
+                .validate_current()
+                .map_err(ReferenceTransportError::Authority),
+            #[cfg(test)]
+            Self::Fixture => Ok(()),
+        }
+    }
+
+    fn record_success(self) -> Result<(), ReferenceTransportError> {
+        match self {
+            Self::Production(in_flight) => Arc::try_unwrap(in_flight)
+                .map_err(|_| ReferenceTransportError::InvalidProtocolState)?
+                .record_success()
+                .map_err(ReferenceTransportError::Authority),
+            #[cfg(test)]
+            Self::Fixture => Ok(()),
+        }
     }
 }
 
@@ -1527,11 +1684,51 @@ impl StrictReferenceParseReceipt {
     }
 }
 
+struct ControlledSchemaReader<'a> {
+    raw_object: &'a mut VerifiedResearchObject,
+    wall_deadline: Timestamp,
+    control: &'a ReferenceFetchControl,
+    completion: &'a ReferenceCompletionAuthority,
+    control_failure: Option<ReferenceTransportError>,
+}
+
+impl ControlledSchemaReader<'_> {
+    fn checkpoint(&mut self) -> std::io::Result<()> {
+        if let Err(error) =
+            ensure_handoff_current(self.wall_deadline, self.control, self.completion)
+        {
+            let message = error.to_string();
+            if self.control_failure.is_none() {
+                self.control_failure = Some(error);
+            }
+            return Err(std::io::Error::other(message));
+        }
+        Ok(())
+    }
+
+    fn take_control_failure(&mut self) -> Option<ReferenceTransportError> {
+        self.control_failure.take()
+    }
+}
+
+impl std::io::Read for ControlledSchemaReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        self.checkpoint()?;
+        let admitted = buffer.len().min(RAW_STREAM_WRITE_CHUNK_BYTES);
+        let read = self.raw_object.read(&mut buffer[..admitted])?;
+        self.checkpoint()?;
+        Ok(read)
+    }
+}
+
 impl StreamedReferenceObject {
     /// Returns provider, surface, schema, digest, and clock evidence needed to bind a strict
-    /// parser. The cloneable sealed raw-store capability remains hidden until parser completion.
+    /// parser. Common raw-object authority remains hidden until parser completion.
     pub const fn context(&self) -> &ReferenceObjectContext {
-        self.raw_object.context()
+        &self.context
     }
 
     /// Returns the exact selected provider-native decoder.
@@ -1539,30 +1736,97 @@ impl StreamedReferenceObject {
         self.decoder
     }
 
-    /// Reads these exact content-addressed bytes solely for strict schema validation.
-    ///
-    /// The sealed raw-object receipt is retained privately. Authority, cancellation, both
-    /// deadlines, the admitted per-object byte ceiling, and the raw digest are rechecked around
-    /// the capability-store read. A caller receives bytes and inspectable context, never a
-    /// cloneable publication capability.
+    /// Strictly stream-parses one exact Cboe `All Series` object to a caller-owned sink.
     ///
     /// # Errors
     ///
-    /// Rejects stale authority, cancellation/deadline expiry, or raw-store evidence drift.
-    pub fn read_for_schema_validation(
-        &self,
-        store: &ReferenceArtifactStore,
-    ) -> Result<Vec<u8>, ReferenceTransportError> {
-        let in_flight = self
-            .in_flight
-            .as_ref()
-            .ok_or(ReferenceTransportError::InvalidProtocolState)?;
-        ensure_pending_completion_current(self.wall_deadline, &self.control, in_flight)?;
-        let bytes = store
-            .read_raw_object(&self.raw_object, self.maximum_decoded_bytes)
-            .map_err(|_| ReferenceTransportError::RawStoreFailed)?;
-        ensure_pending_completion_current(self.wall_deadline, &self.control, in_flight)?;
-        Ok(bytes)
+    /// Rejects any non-Cboe decoder, exact-payload drift, malformed schema, sink failure, stale
+    /// extraction authority, cancellation, or deadline expiry. Caller staging must be discarded
+    /// unless this method and final handoff completion both succeed.
+    pub fn parse_cboe_all_series<F>(
+        &mut self,
+        sink: F,
+    ) -> Result<crate::CboeAllSeriesParseReceipt, ReferenceTransportError>
+    where
+        F: FnMut(crate::CboeSeriesReference) -> Result<(), crate::CboeParseError>,
+    {
+        let (venue, schema) = match (self.context.surface(), self.decoder) {
+            (
+                ReferenceSurface::CboeAllSeries { venue },
+                SelectedReferenceDecoder::CboeAllSeries(schema),
+            ) => (*venue, schema),
+            _ => return Err(ReferenceTransportError::SchemaValidationFailed),
+        };
+        let parser = crate::CboeAllSeriesParser::try_new(venue, schema, self.context.clone())
+            .map_err(|_| ReferenceTransportError::SchemaValidationFailed)?;
+        let mut reader = self.controlled_schema_reader()?;
+        let result = parser.parse(&mut reader, sink);
+        let control_failure = reader.take_control_failure();
+        drop(reader);
+        if let Some(error) = control_failure {
+            return Err(error);
+        }
+        ensure_handoff_current(self.wall_deadline, &self.control, &self.completion)?;
+        result.map_err(|_| ReferenceTransportError::SchemaValidationFailed)
+    }
+
+    /// Strictly stream-parses one exact OCC DLP TXT/XML object to a caller-owned sink.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any non-DLP decoder, exact-payload drift, malformed schema, sink failure, stale
+    /// extraction authority, cancellation, or deadline expiry. Caller staging must be discarded
+    /// unless this method and final handoff completion both succeed.
+    pub fn parse_occ_dlp<F>(
+        &mut self,
+        sink: F,
+    ) -> Result<crate::OccDlpParseReceipt, ReferenceTransportError>
+    where
+        F: FnMut(crate::OccDlpProductReference) -> Result<(), crate::OccParseError>,
+    {
+        if !matches!(self.decoder, SelectedReferenceDecoder::OccDlp(_)) {
+            return Err(ReferenceTransportError::SchemaValidationFailed);
+        }
+        let parser = crate::OccDlpParser::try_new(self.context.clone())
+            .map_err(|_| ReferenceTransportError::SchemaValidationFailed)?;
+        let mut reader = self.controlled_schema_reader()?;
+        let result = parser.parse(&mut reader, sink);
+        let control_failure = reader.take_control_failure();
+        drop(reader);
+        if let Some(error) = control_failure {
+            return Err(error);
+        }
+        ensure_handoff_current(self.wall_deadline, &self.control, &self.completion)?;
+        result.map_err(|_| ReferenceTransportError::SchemaValidationFailed)
+    }
+
+    /// Strictly stream-parses one exact OCC memo CSV export to a caller-owned sink.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any non-memo-CSV decoder, exact-payload drift, malformed schema, sink failure,
+    /// stale extraction authority, cancellation, or deadline expiry. Caller staging must be
+    /// discarded unless this method and final handoff completion both succeed.
+    pub fn parse_occ_memo_csv<F>(
+        &mut self,
+        sink: F,
+    ) -> Result<crate::OccMemoParseReceipt, ReferenceTransportError>
+    where
+        F: FnMut(crate::OccMemoDiscovery) -> Result<(), crate::OccParseError>,
+    {
+        let SelectedReferenceDecoder::OccMemoCsv(schema) = self.decoder else {
+            return Err(ReferenceTransportError::SchemaValidationFailed);
+        };
+        let context = self.context.clone();
+        let mut reader = self.controlled_schema_reader()?;
+        let result = crate::OccMemoParser::parse_csv(schema, context, &mut reader, sink);
+        let control_failure = reader.take_control_failure();
+        drop(reader);
+        if let Some(error) = control_failure {
+            return Err(error);
+        }
+        ensure_handoff_current(self.wall_deadline, &self.control, &self.completion)?;
+        result.map_err(|_| ReferenceTransportError::SchemaValidationFailed)
     }
 
     /// Strictly validates the declared HTML or PDF envelope of one complete OCC memo document.
@@ -1575,21 +1839,73 @@ impl StreamedReferenceObject {
     /// Rejects any non-document surface/decoder, raw evidence drift, or mismatched HTML/PDF
     /// envelope.
     pub fn validate_uninterpreted_memo_document(
-        &self,
-        store: &ReferenceArtifactStore,
+        &mut self,
     ) -> Result<StrictUninterpretedMemoDocumentReceipt, ReferenceTransportError> {
         if self.decoder != SelectedReferenceDecoder::OccMemoDocumentUninterpreted
             || !matches!(
-                self.raw_object.context().surface(),
+                self.context.surface(),
                 ReferenceSurface::OccMemoDocument { .. }
             )
         {
             return Err(ReferenceTransportError::SchemaValidationFailed);
         }
-        let bytes = self.read_for_schema_validation(store)?;
-        validate_uninterpreted_document_envelope(self.raw_object.context(), &bytes)?;
-        Ok(StrictUninterpretedMemoDocumentReceipt {
-            context: self.raw_object.context().clone(),
+        let mut prefix = Vec::with_capacity(4_096);
+        let mut tail = Vec::with_capacity(1_024);
+        let context = self.context.clone();
+        let mut controlled = self.controlled_schema_reader()?;
+        let validation = (|| -> Result<(), ReferenceTransportError> {
+            let mut payload =
+                ExactPayloadReader::try_new(&mut controlled, &context, OCC_MEMO_DOCUMENT_MAX_BYTES)
+                    .map_err(|_| ReferenceTransportError::InvalidObjectEvidence)?;
+            let mut buffer = [0_u8; RAW_STREAM_WRITE_CHUNK_BYTES];
+            loop {
+                let read = payload
+                    .read(&mut buffer)
+                    .map_err(|_| ReferenceTransportError::RawCaptureFailed)?;
+                if read == 0 {
+                    break;
+                }
+                let bytes = &buffer[..read];
+                let prefix_remaining = 4_096_usize.saturating_sub(prefix.len());
+                prefix.extend_from_slice(&bytes[..bytes.len().min(prefix_remaining)]);
+                retain_rolling_tail(&mut tail, bytes, 1_024);
+            }
+            payload
+                .finish()
+                .map_err(|_| ReferenceTransportError::InvalidObjectEvidence)?;
+            Ok(())
+        })();
+        let control_failure = controlled.take_control_failure();
+        drop(controlled);
+        if let Some(error) = control_failure {
+            return Err(error);
+        }
+        validation?;
+        ensure_handoff_current(self.wall_deadline, &self.control, &self.completion)?;
+        validate_uninterpreted_document_envelope(&context, &prefix, &tail)?;
+        Ok(StrictUninterpretedMemoDocumentReceipt { context })
+    }
+
+    fn controlled_schema_reader(
+        &mut self,
+    ) -> Result<ControlledSchemaReader<'_>, ReferenceTransportError> {
+        ensure_handoff_current(self.wall_deadline, &self.control, &self.completion)?;
+        if self.context.payload_bytes() == 0
+            || self.context.payload_bytes() > self.maximum_decoded_bytes
+            || self.raw_object.content_digest() != self.context.payload_digest()
+            || self.raw_object.size_bytes() != self.context.payload_bytes()
+        {
+            return Err(ReferenceTransportError::InvalidObjectEvidence);
+        }
+        self.raw_object
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| ReferenceTransportError::RawCaptureFailed)?;
+        Ok(ControlledSchemaReader {
+            raw_object: &mut self.raw_object,
+            wall_deadline: self.wall_deadline,
+            control: &self.control,
+            completion: &self.completion,
+            control_failure: None,
         })
     }
 
@@ -1601,30 +1917,33 @@ impl StreamedReferenceObject {
     /// Rejects mismatched object context, partial/rejected/empty parser output, a document-only
     /// surface, stale authority, or durable shared-budget terminalization failure.
     pub fn complete_after_schema_validation(
-        mut self,
+        self,
         receipt: StrictReferenceParseReceipt,
-    ) -> Result<SealedReferenceRawObject, ReferenceTransportError> {
+    ) -> Result<PendingReferenceTypedHandoff, ReferenceTransportError> {
         let receipt = receipt.into_page_receipt(self.decoder)?;
-        if receipt.context() != self.raw_object.context()
+        if receipt.context() != &self.context
             || receipt.page_ordinal() != std::num::NonZeroU32::MIN
             || receipt.returned_records() == 0
             || receipt.rejected_records() != 0
             || !matches!(receipt.terminal_state(), crate::PageTerminalState::Terminal)
             || matches!(
-                self.raw_object.context().surface(),
+                self.context.surface(),
                 ReferenceSurface::OccMemoDocument { .. }
                     | ReferenceSurface::OccMemoAttachment { .. }
             )
         {
             return Err(ReferenceTransportError::SchemaValidationFailed);
         }
-        let in_flight = self
-            .in_flight
-            .take()
-            .ok_or(ReferenceTransportError::InvalidProtocolState)?;
-        ensure_pending_completion_current(self.wall_deadline, &self.control, &in_flight)?;
-        in_flight.record_success()?;
-        Ok(self.raw_object)
+        ensure_handoff_current(self.wall_deadline, &self.control, &self.completion)?;
+        Ok(PendingReferenceTypedHandoff {
+            raw_object: self.raw_object,
+            context: self.context,
+            http_receipt: self.http_receipt,
+            page_receipt: receipt,
+            completion: self.completion,
+            wall_deadline: self.wall_deadline,
+            control: self.control,
+        })
     }
 
     /// Completes transport success for a strictly envelope-validated memo document while
@@ -1636,25 +1955,297 @@ impl StreamedReferenceObject {
     /// Rejects non-document decoders/surfaces, mismatched parser proof, stale authority, or
     /// shared-budget failure.
     pub fn complete_uninterpreted_memo_document(
-        mut self,
+        self,
         receipt: StrictUninterpretedMemoDocumentReceipt,
-    ) -> Result<SealedReferenceRawObject, ReferenceTransportError> {
+    ) -> Result<PendingUninterpretedMemoHandoff, ReferenceTransportError> {
         if self.decoder != SelectedReferenceDecoder::OccMemoDocumentUninterpreted
             || !matches!(
-                self.raw_object.context().surface(),
+                self.context.surface(),
                 ReferenceSurface::OccMemoDocument { .. }
             )
-            || receipt.context != *self.raw_object.context()
+            || receipt.context != self.context
         {
             return Err(ReferenceTransportError::SchemaValidationFailed);
         }
-        let in_flight = self
-            .in_flight
-            .take()
-            .ok_or(ReferenceTransportError::InvalidProtocolState)?;
-        ensure_pending_completion_current(self.wall_deadline, &self.control, &in_flight)?;
-        in_flight.record_success()?;
-        Ok(self.raw_object)
+        ensure_handoff_current(self.wall_deadline, &self.control, &self.completion)?;
+        Ok(PendingUninterpretedMemoHandoff {
+            raw_object: self.raw_object,
+            context: self.context,
+            http_receipt: self.http_receipt,
+            completion: self.completion,
+            wall_deadline: self.wall_deadline,
+            control: self.control,
+        })
+    }
+}
+
+/// One-use typed provider-reference handoff awaiting final raw re-verification.
+///
+/// The capability is intentionally noncloneable and non-serializable. Dropping it never reports a
+/// successful provider request and never creates a generation or canonical identity.
+pub struct PendingReferenceTypedHandoff {
+    raw_object: VerifiedResearchObject,
+    context: ReferenceObjectContext,
+    http_receipt: ReferenceHttpReceipt,
+    page_receipt: crate::ReferencePageReceipt,
+    completion: ReferenceCompletionAuthority,
+    wall_deadline: Timestamp,
+    control: ReferenceFetchControl,
+}
+
+struct HandoffRawObjectControl<'a> {
+    wall_deadline: Timestamp,
+    control: &'a ReferenceFetchControl,
+    completion: &'a ReferenceCompletionAuthority,
+    worker_cancellation: &'a ReferenceCancellation,
+}
+
+impl ResearchObjectControl for HandoffRawObjectControl<'_> {
+    fn checkpoint(
+        &self,
+        _point: ResearchObjectControlPoint,
+    ) -> Result<(), ResearchObjectControlError> {
+        if self.worker_cancellation.is_cancelled() {
+            return Err(ResearchObjectControlError::Cancelled);
+        }
+        ensure_handoff_current(self.wall_deadline, self.control, self.completion).map_err(|error| {
+            match error {
+                ReferenceTransportError::Cancelled => ResearchObjectControlError::Cancelled,
+                ReferenceTransportError::DeadlineExceeded => {
+                    ResearchObjectControlError::DeadlineExceeded
+                }
+                _ => ResearchObjectControlError::Unavailable,
+            }
+        })
+    }
+}
+
+async fn reverify_handoff_raw_object(
+    raw_object: VerifiedResearchObject,
+    completion: ReferenceCompletionAuthority,
+    wall_deadline: Timestamp,
+    control: ReferenceFetchControl,
+) -> Result<(ResearchObjectReceipt, ReferenceCompletionAuthority), ReferenceTransportError> {
+    let worker_control = control.clone();
+    let mut worker = ReapedBlockingWorker::spawn(move |worker_cancellation| {
+        let verification_control = HandoffRawObjectControl {
+            wall_deadline,
+            control: &worker_control,
+            completion: &completion,
+            worker_cancellation: &worker_cancellation,
+        };
+        let raw_receipt = raw_object
+            .reverify_for_commit(&verification_control)
+            .map_err(map_logical_object_error)?;
+        Ok((raw_receipt, completion))
+    });
+    loop {
+        tokio::select! {
+            result = &mut worker.result => {
+                return worker.complete(result);
+            }
+            () = tokio::time::sleep(Duration::from_millis(25)) => {
+                let current = control.ensure_open().and_then(|()| {
+                    if trusted_timestamp()? > wall_deadline {
+                        Err(ReferenceTransportError::DeadlineExceeded)
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(error) = current {
+                    worker.cancel();
+                    let result = (&mut worker.result).await;
+                    let _ = worker.complete(result);
+                    return Err(error);
+                }
+            },
+        }
+    }
+}
+
+impl std::fmt::Debug for PendingReferenceTypedHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingReferenceTypedHandoff")
+            .field("object_id", self.context.object_id())
+            .field("records", &self.page_receipt.returned_records())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingReferenceTypedHandoff {
+    /// Re-verifies the same descriptor, completes the provider request, and consumes this
+    /// process-local capability into a shared-raw/provider-typed handoff.
+    ///
+    /// # Errors
+    ///
+    /// Rejects cancellation, expired authority, raw evidence drift, or rate-budget completion
+    /// failure. No product publication, PIT, restart, or currentness authority is created.
+    pub async fn finish(self) -> Result<ReferenceTypedHandoff, ReferenceTransportError> {
+        ensure_handoff_current(self.wall_deadline, &self.control, &self.completion)?;
+        let Self {
+            raw_object,
+            context,
+            http_receipt,
+            page_receipt,
+            completion,
+            wall_deadline,
+            control,
+        } = self;
+        let (raw_receipt, completion) =
+            reverify_handoff_raw_object(raw_object, completion, wall_deadline, control.clone())
+                .await?;
+        validate_common_raw_receipt(&raw_receipt, &context, &http_receipt)?;
+        ensure_handoff_current(wall_deadline, &control, &completion)?;
+        completion.record_success()?;
+        Ok(ReferenceTypedHandoff {
+            raw_receipt,
+            context,
+            http_receipt,
+            page_receipt,
+        })
+    }
+}
+
+/// Completed raw/typed coordinates for caller-owned shared composition.
+///
+/// This object is intentionally noncloneable and non-serializable. It is not an immutable
+/// generation, a catalog publication, a restart proof, or a canonical identity decision.
+pub struct ReferenceTypedHandoff {
+    raw_receipt: ResearchObjectReceipt,
+    context: ReferenceObjectContext,
+    http_receipt: ReferenceHttpReceipt,
+    page_receipt: crate::ReferencePageReceipt,
+}
+
+impl std::fmt::Debug for ReferenceTypedHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReferenceTypedHandoff")
+            .field("object_id", self.context.object_id())
+            .field("records", &self.page_receipt.returned_records())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReferenceTypedHandoff {
+    /// Returns the common non-forgeable raw-object receipt.
+    pub const fn raw_receipt(&self) -> &ResearchObjectReceipt {
+        &self.raw_receipt
+    }
+
+    /// Returns exact provider object, schema, checksum, and clock evidence.
+    pub const fn context(&self) -> &ReferenceObjectContext {
+        &self.context
+    }
+
+    /// Returns the exact modified-response receipt.
+    pub const fn http_receipt(&self) -> &ReferenceHttpReceipt {
+        &self.http_receipt
+    }
+
+    /// Returns strict terminal parse completeness for these exact bytes.
+    pub const fn page_receipt(&self) -> &crate::ReferencePageReceipt {
+        &self.page_receipt
+    }
+
+    /// Returns the explicit requirement for shared freshness classification.
+    pub const fn currentness(&self) -> OptionsReferenceCurrentnessDisposition {
+        OptionsReferenceCurrentnessDisposition::RequiresApplicationFreshnessClassification
+    }
+
+    /// Consumes the handoff into shared raw authority and exact provider-native typed coordinates.
+    pub fn into_parts(
+        self,
+    ) -> (
+        ResearchObjectReceipt,
+        ReferenceObjectContext,
+        ReferenceHttpReceipt,
+        crate::ReferencePageReceipt,
+    ) {
+        (
+            self.raw_receipt,
+            self.context,
+            self.http_receipt,
+            self.page_receipt,
+        )
+    }
+}
+
+/// One-use uninterpreted OCC memo handoff awaiting final raw re-verification.
+pub struct PendingUninterpretedMemoHandoff {
+    raw_object: VerifiedResearchObject,
+    context: ReferenceObjectContext,
+    http_receipt: ReferenceHttpReceipt,
+    completion: ReferenceCompletionAuthority,
+    wall_deadline: Timestamp,
+    control: ReferenceFetchControl,
+}
+
+impl PendingUninterpretedMemoHandoff {
+    /// Consumes the validated envelope into raw evidence without interpreting document economics.
+    ///
+    /// # Errors
+    ///
+    /// Rejects cancellation, expired authority, raw evidence drift, or budget completion failure.
+    pub async fn finish(
+        self,
+    ) -> Result<ReferenceUninterpretedMemoHandoff, ReferenceTransportError> {
+        ensure_handoff_current(self.wall_deadline, &self.control, &self.completion)?;
+        let Self {
+            raw_object,
+            context,
+            http_receipt,
+            completion,
+            wall_deadline,
+            control,
+        } = self;
+        let (raw_receipt, completion) =
+            reverify_handoff_raw_object(raw_object, completion, wall_deadline, control.clone())
+                .await?;
+        validate_common_raw_receipt(&raw_receipt, &context, &http_receipt)?;
+        ensure_handoff_current(wall_deadline, &control, &completion)?;
+        completion.record_success()?;
+        Ok(ReferenceUninterpretedMemoHandoff {
+            raw_receipt,
+            context,
+            http_receipt,
+        })
+    }
+}
+
+/// Raw OCC memo coordinates that remain explicitly uninterpreted.
+pub struct ReferenceUninterpretedMemoHandoff {
+    raw_receipt: ResearchObjectReceipt,
+    context: ReferenceObjectContext,
+    http_receipt: ReferenceHttpReceipt,
+}
+
+impl ReferenceUninterpretedMemoHandoff {
+    /// Returns the common non-forgeable raw-object receipt.
+    pub const fn raw_receipt(&self) -> &ResearchObjectReceipt {
+        &self.raw_receipt
+    }
+
+    /// Returns exact provider object, schema, checksum, and clock evidence.
+    pub const fn context(&self) -> &ReferenceObjectContext {
+        &self.context
+    }
+
+    /// Returns the exact modified-response receipt.
+    pub const fn http_receipt(&self) -> &ReferenceHttpReceipt {
+        &self.http_receipt
+    }
+
+    /// Consumes the handoff into common raw authority and exact uninterpreted memo evidence.
+    pub fn into_parts(
+        self,
+    ) -> (
+        ResearchObjectReceipt,
+        ReferenceObjectContext,
+        ReferenceHttpReceipt,
+    ) {
+        (self.raw_receipt, self.context, self.http_receipt)
     }
 }
 
@@ -1726,13 +2317,13 @@ impl OfficialReferenceStreamingClient {
     }
 
     /// Fetches one exact request and streams a 200 body through a bounded channel to the
-    /// capability-scoped raw store. The network task never owns the complete file in memory.
+    /// shared logical raw-object store. The network task never owns the complete file in memory.
     pub async fn fetch_to_store(
         &self,
-        store: &ReferenceArtifactStore,
+        store: &Arc<SealedResearchJournalStore>,
         authority: &ExtractionAuthority,
         request: &OfficialReferenceRequest,
-        prior_sealed_object: Option<&SealedReferenceRawObject>,
+        prior_raw_claim: Option<&ResearchObjectClaim>,
         control: &ReferenceFetchControl,
     ) -> Result<StreamingReferenceFetchOutcome, ReferenceTransportError> {
         if request.surface().provider() != self.provider {
@@ -1751,7 +2342,7 @@ impl OfficialReferenceStreamingClient {
             permit.release();
             return Err(ReferenceTransportError::InvalidAuthorityMetadata);
         }
-        let in_flight = permit.authorize_send(request.locator.as_str())?;
+        let in_flight = Arc::new(permit.authorize_send(request.locator.as_str())?);
         let request_timeout = admitted_remaining(request, control, self.total_timeout)?;
         let request_evidence = request.seal(
             SourceIdentifier::try_from(self.metadata.source_id().as_str())
@@ -1790,10 +2381,11 @@ impl OfficialReferenceStreamingClient {
         let transport_started = Instant::now();
         let response = await_reqwest_with_control(builder.send(), control, &in_flight).await?;
         control.ensure_open()?;
+        let received_headers_at = trusted_timestamp()?;
+        let headers_transport_elapsed_nanos = elapsed_nanos(transport_started, request_timeout)?;
         if response.url().as_str() != request.locator.as_str() {
             return Err(ReferenceTransportError::InvalidRedirect);
         }
-        let received_headers_at = trusted_timestamp()?;
         if received_headers_at < request.wall_started_at
             || received_headers_at > request.wall_deadline
         {
@@ -1803,7 +2395,9 @@ impl OfficialReferenceStreamingClient {
         let headers = response.headers();
         if matches!(status, 429 | 503) {
             let retry_after = bounded_raw_header(headers, &reqwest::header::RETRY_AFTER);
-            let retry_deadline = in_flight.apply_retry_after_header(retry_after.as_deref(), 0)?;
+            let retry_deadline = Arc::try_unwrap(in_flight)
+                .map_err(|_| ReferenceTransportError::InvalidProtocolState)?
+                .apply_retry_after_header(retry_after.as_deref(), 0)?;
             return Err(ReferenceTransportError::Authority(
                 ExtractionAuthorityError::BudgetWaitUntil {
                     deadline: retry_deadline,
@@ -1823,7 +2417,9 @@ impl OfficialReferenceStreamingClient {
                 b"challenge",
             )
         {
-            let _retry_deadline = in_flight.apply_retry_after_header(None, 0)?;
+            let _retry_deadline = Arc::try_unwrap(in_flight)
+                .map_err(|_| ReferenceTransportError::InvalidProtocolState)?
+                .apply_retry_after_header(None, 0)?;
             return Err(ReferenceTransportError::ProviderAntiBotChallenge);
         }
         let content_type = retained_reqwest_header(headers, &reqwest::header::CONTENT_TYPE)?;
@@ -1841,12 +2437,18 @@ impl OfficialReferenceStreamingClient {
 
         if status == 304 {
             let prior =
-                prior_sealed_object.ok_or(ReferenceTransportError::InvalidConditionalEvidence)?;
-            validate_sealed_conditional_prior(store, request, prior)?;
+                prior_raw_claim.ok_or(ReferenceTransportError::InvalidConditionalEvidence)?;
             if content_length.is_some_and(|length| length != 0) || content_encoding.is_some() {
                 return Err(ReferenceTransportError::InvalidNotModifiedResponse);
             }
-            let transport_elapsed_nanos = elapsed_nanos(transport_started, request_timeout)?;
+            validate_conditional_prior(
+                Arc::clone(store),
+                request,
+                prior,
+                control,
+                Arc::clone(&in_flight),
+            )
+            .await?;
             let receipt = admit_not_modified_evidence(
                 request_evidence.clone(),
                 final_locator,
@@ -1860,11 +2462,13 @@ impl OfficialReferenceStreamingClient {
                     .map(|value| value.as_str().to_owned()),
                 content_length,
                 received_headers_at,
-                transport_elapsed_nanos,
+                headers_transport_elapsed_nanos,
                 cache,
             )?;
             ensure_operation_current(request, control, &in_flight)?;
-            in_flight.record_success()?;
+            Arc::try_unwrap(in_flight)
+                .map_err(|_| ReferenceTransportError::InvalidProtocolState)?
+                .record_success()?;
             return Ok(StreamingReferenceFetchOutcome::NotModified(receipt));
         }
         if status != 200 {
@@ -1889,15 +2493,28 @@ impl OfficialReferenceStreamingClient {
             .ok_or(ReferenceTransportError::MissingContentType)?;
         let source_file = validate_source_file_evidence(request, content_disposition.as_ref())?;
 
-        let (sender, mut worker, worker_cancellation) = store
-            .begin_stream_capture(
-                content_length,
-                u64::try_from(request.maximum_decoded_bytes)
-                    .map_err(|_| ReferenceTransportError::ResponseTooLarge)?
-                    .min(self.maximum_response_bytes),
-                control,
-            )
-            .map_err(|_| ReferenceTransportError::RawStoreFailed)?;
+        let maximum_raw_bytes = u64::try_from(request.maximum_decoded_bytes)
+            .map_err(|_| ReferenceTransportError::ResponseTooLarge)?
+            .min(self.maximum_response_bytes);
+        let RawCaptureWorker {
+            sender,
+            mut readiness,
+            mut worker,
+        } = begin_stream_capture(
+            Arc::clone(store),
+            content_length,
+            maximum_raw_bytes,
+            control,
+            request.wall_deadline,
+            Arc::clone(&in_flight),
+        )?;
+        if let Err(error) =
+            await_raw_capture_readiness(&mut readiness, request, control, &in_flight).await
+        {
+            drop(sender);
+            await_cancelled_raw_capture_worker(&mut worker).await;
+            return Err(error);
+        }
         let mut prefix = Vec::new();
         prefix
             .try_reserve_exact(4_096)
@@ -1906,7 +2523,7 @@ impl OfficialReferenceStreamingClient {
             decoder_without_header(&request.decoder_policy, observed_content_type.as_str())?;
         let mut stream = response.bytes_stream();
         let mut streamed_bytes = 0_u64;
-        let stream_result: Result<(), ReferenceTransportError> = async {
+        let stream_result: Result<(Timestamp, u64), ReferenceTransportError> = async {
             while let Some(chunk) =
                 await_stream_chunk_with_control(&mut stream, control, &in_flight).await?
             {
@@ -1933,11 +2550,21 @@ impl OfficialReferenceStreamingClient {
                         )?);
                     }
                 }
-                sender
-                    .send(RawStreamFrame::Chunk(chunk))
-                    .await
-                    .map_err(|_| ReferenceTransportError::RawStoreFailed)?;
+                send_raw_stream_frame_with_control(
+                    &sender,
+                    RawStreamFrame::Chunk(chunk),
+                    request,
+                    control,
+                    &in_flight,
+                )
+                .await?;
             }
+            let body_completed_at = trusted_timestamp()?;
+            if body_completed_at < received_headers_at || body_completed_at > request.wall_deadline
+            {
+                return Err(ReferenceTransportError::InvalidResponseClock);
+            }
+            let transport_elapsed_nanos = elapsed_nanos(transport_started, request_timeout)?;
             if decoder.is_none() {
                 decoder = Some(select_decoder(
                     &request.decoder_policy,
@@ -1945,33 +2572,32 @@ impl OfficialReferenceStreamingClient {
                     &prefix,
                 )?);
             }
-            sender
-                .send(RawStreamFrame::Complete)
-                .await
-                .map_err(|_| ReferenceTransportError::RawStoreFailed)?;
-            Ok(())
+            send_raw_stream_frame_with_control(
+                &sender,
+                RawStreamFrame::Complete,
+                request,
+                control,
+                &in_flight,
+            )
+            .await?;
+            Ok((body_completed_at, transport_elapsed_nanos))
         }
         .await;
-        let transport_elapsed_nanos = elapsed_nanos(transport_started, request_timeout)?;
         drop(sender);
-        if let Err(error) = stream_result {
-            worker_cancellation.cancel();
-            await_cancelled_raw_capture_worker(&mut worker).await;
-            return Err(error);
-        }
-        let capture =
-            await_raw_capture_worker(worker, &worker_cancellation, request, control, &in_flight)
-                .await?;
+        let (body_completed_at, transport_elapsed_nanos) = match stream_result {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                await_cancelled_raw_capture_worker(&mut worker).await;
+                return Err(error);
+            }
+        };
+        let capture = await_raw_capture_worker(worker, request, control, &in_flight).await?;
         ensure_operation_current(request, control, &in_flight)?;
-        let received_at = trusted_timestamp()?;
-        if received_at > request.wall_deadline {
-            return Err(ReferenceTransportError::DeadlineExceeded);
-        }
-        if content_length.is_some_and(|declared| declared != capture.bytes) {
+        if content_length.is_some_and(|declared| declared != capture.size_bytes()) {
             return Err(ReferenceTransportError::ContentLengthMismatch);
         }
         let decoder = decoder.ok_or(ReferenceTransportError::UnrecognizedSchema)?;
-        let object_id = object_identifier(&request.surface, capture.digest)?;
+        let object_id = object_identifier(&request.surface, capture.content_digest())?;
         let canonical_media_type = decoder.canonical_media_type(observed_content_type.as_str());
         let http_last_modified = cache
             .last_modified()
@@ -1983,8 +2609,8 @@ impl OfficialReferenceStreamingClient {
                 .publication_date
                 .map(ResearchTemporalCoordinate::calendar_date),
             None,
-            AvailabilityEvidence::local_first_observed(received_at),
-            received_at,
+            AvailabilityEvidence::local_first_observed(body_completed_at),
+            body_completed_at,
             transport_elapsed_nanos,
         )
         .map_err(|_| ReferenceTransportError::InvalidObjectEvidence)?;
@@ -2005,10 +2631,10 @@ impl OfficialReferenceStreamingClient {
             cache.etag().map(|value| value.as_str().to_owned()),
             cache.last_modified().map(|value| value.as_str().to_owned()),
             received_headers_at,
-            received_at,
+            body_completed_at,
             transport_elapsed_nanos,
-            capture.digest,
-            capture.bytes,
+            capture.content_digest(),
+            capture.size_bytes(),
             canonical_media_type.clone(),
             native_schema.clone(),
         )
@@ -2028,8 +2654,8 @@ impl OfficialReferenceStreamingClient {
             request.locator.clone(),
             final_locator.clone(),
             canonical_media_type,
-            capture.digest,
-            capture.bytes,
+            capture.content_digest(),
+            capture.size_bytes(),
             native_schema,
             clocks,
             source_file.filename,
@@ -2038,21 +2664,16 @@ impl OfficialReferenceStreamingClient {
             transport,
         )
         .map_err(|_| ReferenceTransportError::InvalidObjectEvidence)?;
-        let raw_object = store
-            .bind_streamed_raw_object(capture, context, receipt)
-            .map_err(|_| ReferenceTransportError::RawStoreFailed)?;
-        ensure_operation_current(request, control, &in_flight)?;
-        store
-            .verify_raw_object(&raw_object)
-            .map_err(|_| ReferenceTransportError::RawStoreFailed)?;
         ensure_operation_current(request, control, &in_flight)?;
         Ok(StreamingReferenceFetchOutcome::Modified(
             StreamedReferenceObject {
-                raw_object,
+                raw_object: capture,
+                context,
+                http_receipt: receipt,
                 decoder,
                 maximum_decoded_bytes: u64::try_from(request.maximum_decoded_bytes)
                     .map_err(|_| ReferenceTransportError::ResponseTooLarge)?,
-                in_flight: Some(in_flight),
+                completion: ReferenceCompletionAuthority::Production(in_flight),
                 wall_deadline: request.wall_deadline,
                 control: control.clone(),
             },
@@ -2363,22 +2984,23 @@ fn exact_cboe_topology(metadata: &SourceMetadata) -> bool {
 
 fn validate_uninterpreted_document_envelope(
     context: &ReferenceObjectContext,
-    bytes: &[u8],
+    prefix: &[u8],
+    tail: &[u8],
 ) -> Result<(), ReferenceTransportError> {
     let valid = match context.media_type().as_str() {
         "application/pdf" => {
-            bytes.starts_with(b"%PDF-")
-                && bytes[bytes.len().saturating_sub(1_024)..]
+            prefix.starts_with(b"%PDF-")
+                && tail
                     .windows(b"%%EOF".len())
                     .any(|window| window == b"%%EOF")
         }
         "text/html" => {
-            let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
-            let first = bytes
+            let prefix = prefix.strip_prefix(b"\xef\xbb\xbf").unwrap_or(prefix);
+            let first = prefix
                 .iter()
                 .position(|byte| !byte.is_ascii_whitespace())
-                .unwrap_or(bytes.len());
-            bytes.get(first..).is_some_and(|document| {
+                .unwrap_or(prefix.len());
+            prefix.get(first..).is_some_and(|document| {
                 document
                     .get(..b"<!doctype html".len())
                     .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"<!doctype html"))
@@ -2394,6 +3016,22 @@ fn validate_uninterpreted_document_envelope(
     } else {
         Err(ReferenceTransportError::SchemaValidationFailed)
     }
+}
+
+fn retain_rolling_tail(tail: &mut Vec<u8>, bytes: &[u8], maximum: usize) {
+    if bytes.len() >= maximum {
+        tail.clear();
+        tail.extend_from_slice(&bytes[bytes.len() - maximum..]);
+        return;
+    }
+    let overflow = tail
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(maximum);
+    if overflow > 0 {
+        tail.drain(..overflow);
+    }
+    tail.extend_from_slice(bytes);
 }
 
 fn decoder_without_header(
@@ -2464,25 +3102,277 @@ where
     }
 }
 
-async fn await_raw_capture_worker(
-    mut worker: tokio::task::JoinHandle<
-        Result<StreamedRawCaptureReceipt, crate::ReferenceStoreError>,
-    >,
-    worker_cancellation: &ReferenceCancellation,
+async fn send_raw_stream_frame_with_control(
+    sender: &tokio::sync::mpsc::Sender<RawStreamFrame>,
+    frame: RawStreamFrame,
     request: &OfficialReferenceRequest,
     control: &ReferenceFetchControl,
     in_flight: &InFlightExtractionRequest,
-) -> Result<StreamedRawCaptureReceipt, ReferenceTransportError> {
+) -> Result<(), ReferenceTransportError> {
+    ensure_operation_current(request, control, in_flight)?;
+    let permit = loop {
+        tokio::select! {
+            permit = sender.reserve() => {
+                break permit.map_err(|_| ReferenceTransportError::RawCaptureFailed)?;
+            }
+            () = tokio::time::sleep(Duration::from_millis(25)) => {
+                ensure_operation_current(request, control, in_flight)?;
+            },
+        }
+    };
+    ensure_operation_current(request, control, in_flight)?;
+    permit.send(frame);
+    Ok(())
+}
+
+enum RawStreamFrame {
+    Chunk(bytes::Bytes),
+    Complete,
+}
+
+enum SourceRawObjectAuthority {
+    Production(Arc<InFlightExtractionRequest>),
+    #[cfg(test)]
+    Fixture,
+}
+
+struct SourceRawObjectControl {
+    control: ReferenceFetchControl,
+    worker_cancellation: ReferenceCancellation,
+    wall_deadline: Timestamp,
+    authority: SourceRawObjectAuthority,
+}
+
+impl SourceRawObjectControl {
+    fn ensure_current(&self) -> Result<(), ResearchObjectControlError> {
+        ensure_raw_stream_worker_open(&self.control, &self.worker_cancellation)?;
+        match &self.authority {
+            SourceRawObjectAuthority::Production(in_flight) => in_flight
+                .validate_current()
+                .map_err(|_| ResearchObjectControlError::Unavailable)?,
+            #[cfg(test)]
+            SourceRawObjectAuthority::Fixture => {}
+        }
+        match trusted_timestamp() {
+            Ok(now) if now <= self.wall_deadline => Ok(()),
+            Ok(_) => Err(ResearchObjectControlError::DeadlineExceeded),
+            Err(_) => Err(ResearchObjectControlError::Unavailable),
+        }
+    }
+}
+
+impl ResearchObjectControl for SourceRawObjectControl {
+    fn checkpoint(
+        &self,
+        _point: ResearchObjectControlPoint,
+    ) -> Result<(), ResearchObjectControlError> {
+        self.ensure_current()
+    }
+}
+
+enum RawCaptureReadiness {
+    Ready,
+    Failed,
+}
+
+struct RawCaptureWorker {
+    sender: tokio::sync::mpsc::Sender<RawStreamFrame>,
+    readiness: tokio::sync::oneshot::Receiver<RawCaptureReadiness>,
+    worker: ReapedBlockingWorker<VerifiedResearchObject>,
+}
+
+fn begin_stream_capture(
+    store: Arc<SealedResearchJournalStore>,
+    expected_bytes: Option<u64>,
+    maximum_bytes: u64,
+    control: &ReferenceFetchControl,
+    wall_deadline: Timestamp,
+    in_flight: Arc<InFlightExtractionRequest>,
+) -> Result<RawCaptureWorker, ReferenceTransportError> {
+    if maximum_bytes == 0 || expected_bytes.is_some_and(|bytes| bytes > maximum_bytes) {
+        return Err(ReferenceTransportError::InvalidObjectEvidence);
+    }
+    let admission = logical_object_admission(maximum_bytes)?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(RAW_STREAM_CHANNEL_CAPACITY);
+    let (readiness_sender, readiness) = tokio::sync::oneshot::channel();
+    let worker_control = control.clone();
+    let worker = ReapedBlockingWorker::spawn(move |worker_cancellation| {
+        persist_raw_stream(
+            store,
+            admission,
+            receiver,
+            readiness_sender,
+            expected_bytes,
+            maximum_bytes,
+            worker_control,
+            worker_cancellation,
+            wall_deadline,
+            in_flight,
+        )
+    });
+    Ok(RawCaptureWorker {
+        sender,
+        readiness,
+        worker,
+    })
+}
+
+fn logical_object_admission(
+    maximum_bytes: u64,
+) -> Result<ResearchObjectAdmission, ReferenceTransportError> {
+    let chunks = maximum_bytes.div_ceil(LOGICAL_OBJECT_INTEGRITY_CHUNK_BYTES);
+    let chunks = usize::try_from(chunks).map_err(|_| ReferenceTransportError::ResponseTooLarge)?;
+    ResearchObjectAdmission::try_new(maximum_bytes, chunks)
+        .map_err(|_| ReferenceTransportError::InvalidObjectEvidence)
+}
+
+fn persist_raw_stream(
+    store: Arc<SealedResearchJournalStore>,
+    admission: ResearchObjectAdmission,
+    mut receiver: tokio::sync::mpsc::Receiver<RawStreamFrame>,
+    readiness: tokio::sync::oneshot::Sender<RawCaptureReadiness>,
+    expected_bytes: Option<u64>,
+    maximum_bytes: u64,
+    control: ReferenceFetchControl,
+    worker_cancellation: ReferenceCancellation,
+    wall_deadline: Timestamp,
+    in_flight: Arc<InFlightExtractionRequest>,
+) -> Result<VerifiedResearchObject, ReferenceTransportError> {
+    let mut pending = match store.begin_logical_object(admission) {
+        Ok(pending) => {
+            readiness
+                .send(RawCaptureReadiness::Ready)
+                .map_err(|_| ReferenceTransportError::Cancelled)?;
+            pending
+        }
+        Err(_) => {
+            let _ = readiness.send(RawCaptureReadiness::Failed);
+            return Err(ReferenceTransportError::RawCaptureFailed);
+        }
+    };
+    let finish_control = SourceRawObjectControl {
+        control,
+        worker_cancellation,
+        wall_deadline,
+        authority: SourceRawObjectAuthority::Production(in_flight),
+    };
+    let mut observed = 0_u64;
+    let mut complete = false;
+    while let Some(frame) = receiver.blocking_recv() {
+        finish_control
+            .ensure_current()
+            .map_err(map_raw_control_error)?;
+        match frame {
+            RawStreamFrame::Chunk(chunk) if !complete => {
+                observed = observed
+                    .checked_add(
+                        u64::try_from(chunk.len())
+                            .map_err(|_| ReferenceTransportError::ResponseTooLarge)?,
+                    )
+                    .ok_or(ReferenceTransportError::ResponseTooLarge)?;
+                if observed > maximum_bytes
+                    || expected_bytes.is_some_and(|expected| observed > expected)
+                {
+                    return Err(ReferenceTransportError::ContentLengthMismatch);
+                }
+                for part in chunk.chunks(RAW_STREAM_WRITE_CHUNK_BYTES) {
+                    finish_control
+                        .ensure_current()
+                        .map_err(map_raw_control_error)?;
+                    pending
+                        .write_all(part)
+                        .map_err(|_| ReferenceTransportError::RawCaptureFailed)?;
+                }
+            }
+            RawStreamFrame::Complete if !complete => complete = true,
+            RawStreamFrame::Chunk(_) | RawStreamFrame::Complete => {
+                return Err(ReferenceTransportError::InvalidProtocolState);
+            }
+        }
+    }
+    if !complete || observed == 0 || expected_bytes.is_some_and(|expected| expected != observed) {
+        return Err(ReferenceTransportError::ContentLengthMismatch);
+    }
+    finish_control
+        .ensure_current()
+        .map_err(map_raw_control_error)?;
+    let raw_object = store
+        .finish_logical_object(pending, &finish_control)
+        .map_err(map_logical_object_error)?;
+    if raw_object.size_bytes() != observed {
+        return Err(ReferenceTransportError::InvalidObjectEvidence);
+    }
+    Ok(raw_object)
+}
+
+fn ensure_raw_stream_worker_open(
+    control: &ReferenceFetchControl,
+    worker_cancellation: &ReferenceCancellation,
+) -> Result<(), ResearchObjectControlError> {
+    if worker_cancellation.is_cancelled() {
+        return Err(ResearchObjectControlError::Cancelled);
+    }
+    match control.ensure_open() {
+        Ok(()) => Ok(()),
+        Err(ReferenceTransportError::Cancelled) => Err(ResearchObjectControlError::Cancelled),
+        Err(ReferenceTransportError::DeadlineExceeded) => {
+            Err(ResearchObjectControlError::DeadlineExceeded)
+        }
+        Err(_) => Err(ResearchObjectControlError::Unavailable),
+    }
+}
+
+fn map_raw_control_error(error: ResearchObjectControlError) -> ReferenceTransportError {
+    match error {
+        ResearchObjectControlError::Cancelled => ReferenceTransportError::Cancelled,
+        ResearchObjectControlError::DeadlineExceeded => ReferenceTransportError::DeadlineExceeded,
+        ResearchObjectControlError::Unavailable => ReferenceTransportError::RawCaptureFailed,
+    }
+}
+
+fn map_logical_object_error(error: SealedResearchJournalStoreError) -> ReferenceTransportError {
+    match error {
+        SealedResearchJournalStoreError::ObjectControl(control) => map_raw_control_error(control),
+        _ => ReferenceTransportError::RawCaptureFailed,
+    }
+}
+
+async fn await_raw_capture_readiness(
+    readiness: &mut tokio::sync::oneshot::Receiver<RawCaptureReadiness>,
+    request: &OfficialReferenceRequest,
+    control: &ReferenceFetchControl,
+    in_flight: &InFlightExtractionRequest,
+) -> Result<(), ReferenceTransportError> {
     loop {
         tokio::select! {
-            result = &mut worker => {
-                return result
-                    .map_err(|_| ReferenceTransportError::RawStoreWorkerFailed)?
-                    .map_err(|_| ReferenceTransportError::RawStoreFailed);
+            state = &mut *readiness => {
+                return match state {
+                    Ok(RawCaptureReadiness::Ready) => Ok(()),
+                    Ok(RawCaptureReadiness::Failed) | Err(_) => {
+                        Err(ReferenceTransportError::RawCaptureFailed)
+                    }
+                };
+            }
+            () = tokio::time::sleep(Duration::from_millis(25)) => {
+                ensure_operation_current(request, control, in_flight)?;
+            },
+        }
+    }
+}
+
+async fn await_raw_capture_worker(
+    mut worker: ReapedBlockingWorker<VerifiedResearchObject>,
+    request: &OfficialReferenceRequest,
+    control: &ReferenceFetchControl,
+    in_flight: &InFlightExtractionRequest,
+) -> Result<VerifiedResearchObject, ReferenceTransportError> {
+    loop {
+        tokio::select! {
+            result = &mut worker.result => {
+                return worker.complete(result);
             }
             () = tokio::time::sleep(Duration::from_millis(25)) => {
                 if let Err(error) = ensure_operation_current(request, control, in_flight) {
-                    worker_cancellation.cancel();
                     await_cancelled_raw_capture_worker(&mut worker).await;
                     return Err(error);
                 }
@@ -2492,15 +3382,15 @@ async fn await_raw_capture_worker(
 }
 
 async fn await_cancelled_raw_capture_worker(
-    worker: &mut tokio::task::JoinHandle<
-        Result<StreamedRawCaptureReceipt, crate::ReferenceStoreError>,
-    >,
+    worker: &mut ReapedBlockingWorker<VerifiedResearchObject>,
 ) {
     // `spawn_blocking` cannot be aborted after it starts. Joining is therefore part of the
-    // operation's terminal boundary: the worker observes its cooperative cancellation between
-    // bounded writes, drops its manifest lock, and removes its private stage before the API
-    // returns. A successful late receipt is dropped here and performs the same cleanup.
-    let _ = worker.await;
+    // operation's terminal boundary: the worker observes cooperative cancellation between
+    // bounded writes before the API returns. A successful late receipt is discarded here; the
+    // shared logical-object authority owns any staging recovery.
+    worker.cancel();
+    let result = (&mut worker.result).await;
+    let _ = worker.complete(result);
 }
 
 fn ensure_operation_current(
@@ -2517,18 +3407,37 @@ fn ensure_operation_current(
     }
 }
 
-fn ensure_pending_completion_current(
+fn ensure_handoff_current(
     wall_deadline: Timestamp,
     control: &ReferenceFetchControl,
-    in_flight: &InFlightExtractionRequest,
+    completion: &ReferenceCompletionAuthority,
 ) -> Result<(), ReferenceTransportError> {
     control.ensure_open()?;
-    in_flight.validate_current()?;
+    completion.validate_current()?;
     if trusted_timestamp()? > wall_deadline {
         Err(ReferenceTransportError::DeadlineExceeded)
     } else {
         Ok(())
     }
+}
+
+fn validate_common_raw_receipt(
+    raw: &ResearchObjectReceipt,
+    context: &ReferenceObjectContext,
+    http: &ReferenceHttpReceipt,
+) -> Result<(), ReferenceTransportError> {
+    if raw.content_digest() != context.payload_digest()
+        || raw.size_bytes() != context.payload_bytes()
+        || http.payload_digest() != context.payload_digest()
+        || http.payload_bytes() != context.payload_bytes()
+        || http.configured_locator() != context.configured_locator()
+        || http.final_locator() != context.final_locator()
+        || http.transport_evidence() != context.transport_evidence()
+        || !http.body_complete()
+    {
+        return Err(ReferenceTransportError::InvalidObjectEvidence);
+    }
+    Ok(())
 }
 
 fn retained_reqwest_header(
@@ -2633,30 +3542,63 @@ fn elapsed_nanos(started: Instant, maximum: Duration) -> Result<u64, ReferenceTr
     Ok(elapsed)
 }
 
-fn validate_sealed_conditional_prior(
-    store: &ReferenceArtifactStore,
+async fn validate_conditional_prior(
+    store: Arc<SealedResearchJournalStore>,
     request: &OfficialReferenceRequest,
-    prior: &SealedReferenceRawObject,
+    prior: &ResearchObjectClaim,
+    control: &ReferenceFetchControl,
+    in_flight: Arc<InFlightExtractionRequest>,
 ) -> Result<(), ReferenceTransportError> {
     let conditional = request
         .conditional
         .as_ref()
+        .cloned()
         .ok_or(ReferenceTransportError::InvalidConditionalEvidence)?;
-    store
-        .verify_raw_object(prior)
-        .map_err(|_| ReferenceTransportError::InvalidConditionalEvidence)?;
-    let context = prior.context();
-    if conditional.surface != *context.surface()
-        || conditional.configured_locator != *context.configured_locator()
-        || conditional.native_schema != *context.native_schema_identity()
-        || conditional.prior_payload_digest != context.payload_digest()
-        || conditional.prior_payload_bytes != context.payload_bytes()
-        || conditional.prior_object_id != *context.object_id()
-        || prior.transport().configured_locator() != request.locator()
-    {
-        return Err(ReferenceTransportError::InvalidConditionalEvidence);
+    let configured_locator = request.locator().clone();
+    let prior = prior.clone();
+    let wall_deadline = request.wall_deadline;
+    let worker_control = control.clone();
+    let worker_in_flight = Arc::clone(&in_flight);
+    let mut worker = ReapedBlockingWorker::spawn(move |worker_cancellation| {
+        let verification_control = SourceRawObjectControl {
+            control: worker_control,
+            worker_cancellation,
+            wall_deadline,
+            authority: SourceRawObjectAuthority::Production(worker_in_flight),
+        };
+        let verified = store
+            .open_verified_logical_object_claim(&prior, &verification_control)
+            .map_err(|error| match error {
+                SealedResearchJournalStoreError::ObjectControl(control) => {
+                    map_raw_control_error(control)
+                }
+                _ => ReferenceTransportError::InvalidConditionalEvidence,
+            })?;
+        if conditional.configured_locator != configured_locator
+            || conditional.prior_payload_digest != verified.content_digest()
+            || conditional.prior_payload_bytes != verified.size_bytes()
+            || conditional.prior_payload_digest != prior.content_digest()
+            || conditional.prior_payload_bytes != prior.size_bytes()
+        {
+            return Err(ReferenceTransportError::InvalidConditionalEvidence);
+        }
+        Ok(())
+    });
+    loop {
+        tokio::select! {
+            result = &mut worker.result => {
+                return worker.complete(result);
+            }
+            () = tokio::time::sleep(Duration::from_millis(25)) => {
+                if let Err(error) = ensure_operation_current(request, control, &in_flight) {
+                    worker.cancel();
+                    let result = (&mut worker.result).await;
+                    let _ = worker.complete(result);
+                    return Err(error);
+                }
+            },
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3181,12 +4123,12 @@ pub enum ReferenceTransportError {
     /// A bounded vector or identifier allocation failed.
     #[error("option-reference bounded allocation failed")]
     AllocationFailed,
-    /// Durable raw capture rejected or could not publish the streamed object.
+    /// Shared logical raw capture rejected or could not finish the streamed object.
     #[error("option-reference durable raw capture failed")]
-    RawStoreFailed,
+    RawCaptureFailed,
     /// The bounded raw-capture worker ended without a durable result.
     #[error("option-reference durable raw-capture worker failed")]
-    RawStoreWorkerFailed,
+    RawCaptureWorkerFailed,
     /// A trusted local wall-clock observation could not be represented.
     #[error("option-reference trusted local time is unavailable")]
     TrustedTimeUnavailable,

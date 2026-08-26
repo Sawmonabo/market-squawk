@@ -1,5 +1,7 @@
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::io::{BufReader, Read};
 use std::num::{NonZeroU32, NonZeroU64};
 
 use csv::{ReaderBuilder, StringRecord};
@@ -8,13 +10,17 @@ use market_squawk_domain::{
 };
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
     PageTerminalState, ReferenceObjectContext, ReferencePageReceipt, ReferenceProvider,
     ReferenceSurface,
+    payload::{BoundedTokenReader, ExactPayloadReader},
 };
 
 /// Application maximum for one OCC DLP text object.
@@ -41,6 +47,7 @@ const MAX_SYMBOL_BYTES: usize = 32;
 const MAX_SYMBOL_NAME_BYTES: usize = 512;
 const MAX_MEMO_TITLE_BYTES: usize = 1_024;
 const MAX_MEMO_CATEGORIES: usize = 16;
+const OCC_PARSER_MAX_TOKEN_BYTES: usize = 4 * 1024;
 
 /// Exact code-owned OCC DLP body contract selected after transport admission.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -153,28 +160,6 @@ impl OccProductType {
         }
     }
 
-    pub(crate) const fn provider_code(self) -> &'static str {
-        match self {
-            Self::EquityUnderlying => "EU",
-            Self::EquityBounds => "EB",
-            Self::EquityLongTerm => "EL",
-            Self::EquityFlex => "EF",
-            Self::CurrencyUnderlying => "CU",
-            Self::CurrencyLongTerm => "CL",
-            Self::CurrencyMonthEnd => "CM",
-            Self::CurrencyFlex => "CF",
-            Self::IndexLongTerm => "IL",
-            Self::IndexUnderlying => "IU",
-            Self::IndexFlex => "IF",
-            Self::InterestRateFutures => "GF",
-            Self::StockFutures => "SF",
-            Self::FuturesCashIndex => "FC",
-            Self::FuturesPhysicalIndex => "FP",
-            Self::TreasuryUnderlying => "TU",
-            Self::TreasuryLongTerm => "TL",
-        }
-    }
-
     const fn is_equity_product(self) -> bool {
         matches!(
             self,
@@ -274,31 +259,6 @@ impl OccExchangeCode {
             _ => Err(OccParseError::InvalidExchangeCode),
         }
     }
-
-    pub(crate) const fn provider_byte(self) -> u8 {
-        match self {
-            Self::Amex => b'A',
-            Self::Box => b'B',
-            Self::Cboe => b'C',
-            Self::Emld => b'D',
-            Self::Edgx => b'E',
-            Self::Cfe => b'F',
-            Self::Gem => b'H',
-            Self::Ise => b'I',
-            Self::Mcry => b'J',
-            Self::Xmfe => b'K',
-            Self::Sphr => b'L',
-            Self::Miax => b'M',
-            Self::Arca => b'P',
-            Self::Nasdaq => b'Q',
-            Self::Mprl => b'R',
-            Self::Nobo => b'T',
-            Self::Memx => b'U',
-            Self::C2 => b'W',
-            Self::Phlx => b'X',
-            Self::Bats => b'Z',
-        }
-    }
 }
 
 /// Position-limit field state retained without converting unavailable to zero.
@@ -335,23 +295,6 @@ pub enum OccExchangeListingEvidence {
     /// The selected-directory wire carried its documented single-blank exchange sentinel.
     /// Directory presence alone must not be promoted to current tradability.
     NotReportedInSelectedDirectory,
-}
-
-impl OccExchangeListingEvidence {
-    pub(crate) const fn stable_label(self) -> &'static str {
-        match self {
-            Self::Reported => "reported",
-            Self::NotReportedInSelectedDirectory => "not_reported_in_selected_directory",
-        }
-    }
-
-    pub(crate) fn try_from_stable_label(value: &str) -> Result<Self, OccParseError> {
-        match value {
-            "reported" => Ok(Self::Reported),
-            "not_reported_in_selected_directory" => Ok(Self::NotReportedInSelectedDirectory),
-            _ => Err(OccParseError::InvalidExchangeCode),
-        }
-    }
 }
 
 /// One provider-native OCC Directory of Listed Products row.
@@ -508,37 +451,46 @@ impl OccDlpParser {
     ///
     /// Rejects payload drift, size/row bounds, malformed rows, unknown provider codes, missing
     /// required position limits, or sink rejection. Any failure suppresses a completion receipt.
-    pub fn parse<F>(&self, bytes: &[u8], sink: F) -> Result<OccDlpParseReceipt, OccParseError>
+    pub fn parse<R, F>(&self, source: R, sink: F) -> Result<OccDlpParseReceipt, OccParseError>
     where
+        R: Read,
         F: FnMut(OccDlpProductReference) -> Result<(), OccParseError>,
     {
-        validate_payload(&self.context, bytes, OCC_DLP_MAX_BYTES)?;
+        if usize::try_from(self.context.payload_bytes())
+            .map_or(true, |bytes| bytes > OCC_DLP_MAX_BYTES)
+        {
+            return Err(OccParseError::BodyTooLarge);
+        }
+        let payload = ExactPayloadReader::try_new(source, &self.context, OCC_DLP_MAX_BYTES)
+            .map_err(|_| OccParseError::PayloadMismatch)?;
         match self.schema {
-            OccDlpSchema::SelectedTextV1 => self.parse_text(bytes, TextWireSchema::Selected, sink),
-            OccDlpSchema::DailyTextV1 => self.parse_text(bytes, TextWireSchema::Daily, sink),
-            OccDlpSchema::DailyXmlV1 => self.parse_xml(bytes, sink),
+            OccDlpSchema::SelectedTextV1 => {
+                self.parse_text(payload, TextWireSchema::Selected, sink)
+            }
+            OccDlpSchema::DailyTextV1 => self.parse_text(payload, TextWireSchema::Daily, sink),
+            OccDlpSchema::DailyXmlV1 => self.parse_xml(payload, sink),
         }
     }
 
-    fn parse_text<F>(
+    fn parse_text<R, F>(
         &self,
-        bytes: &[u8],
+        payload: ExactPayloadReader<R>,
         wire_schema: TextWireSchema,
         mut sink: F,
     ) -> Result<OccDlpParseReceipt, OccParseError>
     where
+        R: Read,
         F: FnMut(OccDlpProductReference) -> Result<(), OccParseError>,
     {
-        if !has_only_complete_crlf_records(bytes) || bytes.contains(&0) {
-            return Err(OccParseError::IncompletePublication);
-        }
+        let mut framed = BoundedTokenReader::lines(payload, OCC_PARSER_MAX_TOKEN_BYTES)
+            .map_err(|_| OccParseError::BodyTooLarge)?;
         let mut reader = ReaderBuilder::new()
             .delimiter(b'\t')
             .has_headers(false)
             .flexible(false)
             .quoting(false)
             .trim(csv::Trim::None)
-            .from_reader(bytes);
+            .from_reader(&mut framed);
         let mut returned = 0_u32;
         for result in reader.records() {
             returned = returned
@@ -555,6 +507,14 @@ impl OccDlpParser {
                 self.context.clone(),
             )?)?;
         }
+        drop(reader);
+        let terminal = framed
+            .into_inner()
+            .finish()
+            .map_err(|_| OccParseError::PayloadMismatch)?;
+        if !terminal.has_only_complete_crlf_records() || terminal.contains_nul() {
+            return Err(OccParseError::IncompletePublication);
+        }
         if returned == 0 {
             return Err(OccParseError::EmptyPublication);
         }
@@ -564,12 +524,20 @@ impl OccDlpParser {
         })
     }
 
-    fn parse_xml<F>(&self, bytes: &[u8], mut sink: F) -> Result<OccDlpParseReceipt, OccParseError>
+    fn parse_xml<R, F>(
+        &self,
+        payload: ExactPayloadReader<R>,
+        mut sink: F,
+    ) -> Result<OccDlpParseReceipt, OccParseError>
     where
+        R: Read,
         F: FnMut(OccDlpProductReference) -> Result<(), OccParseError>,
     {
-        let mut reader = Reader::from_reader(bytes);
+        let mut framed = BoundedTokenReader::markup(payload, OCC_PARSER_MAX_TOKEN_BYTES)
+            .map_err(|_| OccParseError::BodyTooLarge)?;
+        let mut reader = Reader::from_reader(BufReader::new(&mut framed));
         reader.config_mut().trim_text(false);
+        let mut event_buffer = Vec::with_capacity(4_096);
         let mut depth = 0_usize;
         let mut saw_declaration = false;
         let mut saw_root = false;
@@ -579,7 +547,7 @@ impl OccDlpParser {
         let mut returned = 0_u32;
 
         loop {
-            match reader.read_event() {
+            match reader.read_event_into(&mut event_buffer) {
                 Ok(Event::Decl(declaration)) if depth == 0 && !saw_declaration && !saw_root => {
                     if declaration.version().ok().as_deref() != Some(b"1.0")
                         || declaration.encoding().transpose().ok().flatten().as_deref()
@@ -667,13 +635,20 @@ impl OccDlpParser {
                 ) => return Err(OccParseError::UnknownXmlSchema),
                 Err(_) => return Err(OccParseError::MalformedXml),
             }
+            event_buffer.clear();
         }
+        drop(reader);
+        let terminal = framed
+            .into_inner()
+            .finish()
+            .map_err(|_| OccParseError::PayloadMismatch)?;
         if depth != 0
             || !saw_declaration
             || !saw_root
             || !closed_root
             || in_record
             || !record.is_empty()
+            || terminal.contains_nul()
             || returned == 0
         {
             return Err(OccParseError::IncompletePublication);
@@ -994,16 +969,6 @@ fn right_trim_fixed_field(value: &str) -> Result<&str, OccParseError> {
     }
 }
 
-fn has_only_complete_crlf_records(bytes: &[u8]) -> bool {
-    !bytes.is_empty()
-        && bytes.ends_with(b"\r\n")
-        && bytes.iter().enumerate().all(|(index, byte)| match byte {
-            b'\n' => index > 0 && bytes[index - 1] == b'\r',
-            b'\r' => bytes.get(index + 1) == Some(&b'\n'),
-            _ => true,
-        })
-}
-
 /// OCC Information Memo category from the selected search/export surface.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1302,13 +1267,14 @@ impl OccMemoParser {
     ///
     /// Rejects context/payload drift, unknown headers, malformed dates/categories, bounds, or a
     /// sink failure. Titles remain uninterpreted discovery text.
-    pub fn parse_csv<F>(
+    pub fn parse_csv<R, F>(
         schema: OccMemoCsvSchema,
         context: ReferenceObjectContext,
-        bytes: &[u8],
+        source: R,
         mut sink: F,
     ) -> Result<OccMemoParseReceipt, OccParseError>
     where
+        R: Read,
         F: FnMut(OccMemoDiscovery) -> Result<(), OccParseError>,
     {
         validate_memo_context(
@@ -1317,12 +1283,19 @@ impl OccMemoParser {
             "text/csv",
             schema.native_schema(),
         )?;
-        validate_payload(&context, bytes, OCC_MEMO_MAX_BYTES)?;
+        if usize::try_from(context.payload_bytes()).map_or(true, |bytes| bytes > OCC_MEMO_MAX_BYTES)
+        {
+            return Err(OccParseError::BodyTooLarge);
+        }
+        let payload = ExactPayloadReader::try_new(source, &context, OCC_MEMO_MAX_BYTES)
+            .map_err(|_| OccParseError::PayloadMismatch)?;
+        let mut framed = BoundedTokenReader::csv(payload, OCC_PARSER_MAX_TOKEN_BYTES)
+            .map_err(|_| OccParseError::BodyTooLarge)?;
         let mut reader = ReaderBuilder::new()
             .has_headers(true)
             .flexible(false)
             .trim(csv::Trim::None)
-            .from_reader(bytes);
+            .from_reader(&mut framed);
         let headers = reader.headers().map_err(|_| OccParseError::MalformedCsv)?;
         let expected = schema.header();
         if headers.len() != expected.len()
@@ -1348,6 +1321,11 @@ impl OccMemoParser {
                 context.clone(),
             )?)?;
         }
+        drop(reader);
+        framed
+            .into_inner()
+            .finish()
+            .map_err(|_| OccParseError::PayloadMismatch)?;
         Ok(OccMemoParseReceipt {
             context,
             page_ordinal: NonZeroU32::MIN,
@@ -1362,12 +1340,13 @@ impl OccMemoParser {
     ///
     /// Rejects unknown fields, context/payload drift, invalid pagination, malformed records,
     /// bounds, or sink failure. The JSON surface is not a contract-event economics parser.
-    pub fn parse_json<F>(
+    pub fn parse_json<R, F>(
         context: ReferenceObjectContext,
-        bytes: &[u8],
+        source: R,
         mut sink: F,
     ) -> Result<OccMemoParseReceipt, OccParseError>
     where
+        R: Read,
         F: FnMut(OccMemoDiscovery) -> Result<(), OccParseError>,
     {
         validate_memo_context(
@@ -1376,53 +1355,229 @@ impl OccMemoParser {
             "application/json",
             "occ-memo-index-json-page-v1",
         )?;
-        validate_payload(&context, bytes, OCC_MEMO_MAX_BYTES)?;
-        let wire: MemoPageWire =
-            serde_json::from_slice(bytes).map_err(|_| OccParseError::MalformedJson)?;
-        let page = NonZeroU32::new(wire.page).ok_or(OccParseError::InvalidPagination)?;
+        if usize::try_from(context.payload_bytes()).map_or(true, |bytes| bytes > OCC_MEMO_MAX_BYTES)
+        {
+            return Err(OccParseError::BodyTooLarge);
+        }
+        let payload = ExactPayloadReader::try_new(source, &context, OCC_MEMO_MAX_BYTES)
+            .map_err(|_| OccParseError::PayloadMismatch)?;
+        let mut framed = BoundedTokenReader::json(payload, OCC_PARSER_MAX_TOKEN_BYTES)
+            .map_err(|_| OccParseError::BodyTooLarge)?;
+        let sink_error = Cell::new(None);
+        let mut deserializer = serde_json::Deserializer::from_reader(&mut framed);
+        let summary = MemoPageSeed {
+            context: &context,
+            sink: &mut sink,
+            sink_error: &sink_error,
+        }
+        .deserialize(&mut deserializer)
+        .map_err(|_| sink_error.take().unwrap_or(OccParseError::MalformedJson))?;
+        deserializer
+            .end()
+            .map_err(|_| OccParseError::MalformedJson)?;
+        drop(deserializer);
+        framed
+            .into_inner()
+            .finish()
+            .map_err(|_| OccParseError::PayloadMismatch)?;
+        let page = NonZeroU32::new(summary.page).ok_or(OccParseError::InvalidPagination)?;
         let total_pages =
-            NonZeroU32::new(wire.total_pages).ok_or(OccParseError::InvalidPagination)?;
+            NonZeroU32::new(summary.total_pages).ok_or(OccParseError::InvalidPagination)?;
         if page > total_pages
-            || wire.results.len() > OCC_MEMO_MAX_RECORDS as usize
-            || (page < total_pages && wire.next_cursor.is_none())
-            || (page == total_pages && wire.next_cursor.is_some())
+            || (page < total_pages && summary.next_cursor.is_none())
+            || (page == total_pages && summary.next_cursor.is_some())
         {
             return Err(OccParseError::InvalidPagination);
         }
-        let terminal_state = match wire.next_cursor {
+        let terminal_state = match summary.next_cursor {
             Some(cursor) => PageTerminalState::More {
                 next_cursor: SourceIdentifier::try_from(cursor)
                     .map_err(|_| OccParseError::InvalidPagination)?,
             },
             None => PageTerminalState::Terminal,
         };
-        let mut returned = 0_u32;
-        for record in wire.results {
-            returned = returned
-                .checked_add(1)
-                .ok_or(OccParseError::RecordLimitExceeded)?;
-            sink(parse_memo_wire(returned, record, context.clone())?)?;
-        }
         Ok(OccMemoParseReceipt {
             context,
             page_ordinal: page,
-            returned_records: returned,
+            returned_records: summary.returned_records,
             terminal_state,
         })
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MemoPageWire {
+struct MemoPageSummary {
     page: u32,
     total_pages: u32,
     next_cursor: Option<String>,
-    results: Vec<MemoWire>,
+    returned_records: u32,
+}
+
+struct MemoPageSeed<'a, F> {
+    context: &'a ReferenceObjectContext,
+    sink: &'a mut F,
+    sink_error: &'a Cell<Option<OccParseError>>,
+}
+
+impl<'de, F> DeserializeSeed<'de> for MemoPageSeed<'_, F>
+where
+    F: FnMut(OccMemoDiscovery) -> Result<(), OccParseError>,
+{
+    type Value = MemoPageSummary;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(MemoPageVisitor {
+            context: self.context,
+            sink: self.sink,
+            sink_error: self.sink_error,
+        })
+    }
+}
+
+struct MemoPageVisitor<'a, F> {
+    context: &'a ReferenceObjectContext,
+    sink: &'a mut F,
+    sink_error: &'a Cell<Option<OccParseError>>,
+}
+
+impl<'de, F> Visitor<'de> for MemoPageVisitor<'_, F>
+where
+    F: FnMut(OccMemoDiscovery) -> Result<(), OccParseError>,
+{
+    type Value = MemoPageSummary;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the closed OCC memo page object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut page = None;
+        let mut total_pages = None;
+        let mut next_cursor = None;
+        let mut returned_records = None;
+        while let Some(field) = map.next_key::<MemoPageField>()? {
+            match field {
+                MemoPageField::Page => {
+                    if page.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("page"));
+                    }
+                }
+                MemoPageField::TotalPages => {
+                    if total_pages.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("total_pages"));
+                    }
+                }
+                MemoPageField::NextCursor => {
+                    if next_cursor.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("next_cursor"));
+                    }
+                }
+                MemoPageField::Results => {
+                    if returned_records.is_some() {
+                        return Err(de::Error::duplicate_field("results"));
+                    }
+                    returned_records = Some(map.next_value_seed(MemoResultsSeed {
+                        context: self.context,
+                        sink: self.sink,
+                        sink_error: self.sink_error,
+                    })?);
+                }
+            }
+        }
+        Ok(MemoPageSummary {
+            page: page.ok_or_else(|| de::Error::missing_field("page"))?,
+            total_pages: total_pages.ok_or_else(|| de::Error::missing_field("total_pages"))?,
+            next_cursor: next_cursor.ok_or_else(|| de::Error::missing_field("next_cursor"))?,
+            returned_records: returned_records
+                .ok_or_else(|| de::Error::missing_field("results"))?,
+        })
+    }
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum MemoPageField {
+    Page,
+    TotalPages,
+    NextCursor,
+    Results,
+}
+
+struct MemoResultsSeed<'a, F> {
+    context: &'a ReferenceObjectContext,
+    sink: &'a mut F,
+    sink_error: &'a Cell<Option<OccParseError>>,
+}
+
+impl<'de, F> DeserializeSeed<'de> for MemoResultsSeed<'_, F>
+where
+    F: FnMut(OccMemoDiscovery) -> Result<(), OccParseError>,
+{
+    type Value = u32;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(MemoResultsVisitor {
+            context: self.context,
+            sink: self.sink,
+            sink_error: self.sink_error,
+        })
+    }
+}
+
+struct MemoResultsVisitor<'a, F> {
+    context: &'a ReferenceObjectContext,
+    sink: &'a mut F,
+    sink_error: &'a Cell<Option<OccParseError>>,
+}
+
+impl<'de, F> Visitor<'de> for MemoResultsVisitor<'_, F>
+where
+    F: FnMut(OccMemoDiscovery) -> Result<(), OccParseError>,
+{
+    type Value = u32;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded OCC memo result sequence")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut returned = 0_u32;
+        while let Some(wire) = sequence.next_element::<MemoWire>()? {
+            returned = returned.checked_add(1).ok_or_else(|| {
+                self.sink_error
+                    .set(Some(OccParseError::RecordLimitExceeded));
+                de::Error::custom("OCC memo record count overflowed")
+            })?;
+            if returned > OCC_MEMO_MAX_RECORDS {
+                self.sink_error
+                    .set(Some(OccParseError::RecordLimitExceeded));
+                return Err(de::Error::custom("OCC memo record limit exceeded"));
+            }
+            let discovery =
+                parse_memo_wire(returned, wire, self.context.clone()).map_err(|error| {
+                    self.sink_error.set(Some(error));
+                    de::Error::custom("invalid OCC memo discovery")
+                })?;
+            (self.sink)(discovery).map_err(|error| {
+                self.sink_error.set(Some(error));
+                de::Error::custom("OCC memo sink rejected a record")
+            })?;
+        }
+        Ok(returned)
+    }
+}
+
 struct MemoWire {
     number: u64,
     post_date: String,
@@ -1430,6 +1585,127 @@ struct MemoWire {
     title: String,
     categories: Vec<String>,
     memo_url: String,
+}
+
+impl<'de> Deserialize<'de> for MemoWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(MemoWireVisitor)
+    }
+}
+
+struct MemoWireVisitor;
+
+impl<'de> Visitor<'de> for MemoWireVisitor {
+    type Value = MemoWire;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the closed bounded OCC memo record")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut number = None;
+        let mut post_date = None;
+        let mut effective_date = None;
+        let mut title = None;
+        let mut categories = None;
+        let mut memo_url = None;
+        while let Some(field) = map.next_key::<MemoWireField>()? {
+            match field {
+                MemoWireField::Number => {
+                    if number.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("number"));
+                    }
+                }
+                MemoWireField::PostDate => {
+                    if post_date.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("post_date"));
+                    }
+                }
+                MemoWireField::EffectiveDate => {
+                    if effective_date.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("effective_date"));
+                    }
+                }
+                MemoWireField::Title => {
+                    if title.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("title"));
+                    }
+                }
+                MemoWireField::Categories => {
+                    if categories.is_some() {
+                        return Err(de::Error::duplicate_field("categories"));
+                    }
+                    categories = Some(map.next_value::<BoundedMemoCategories>()?.0);
+                }
+                MemoWireField::MemoUrl => {
+                    if memo_url.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("memo_url"));
+                    }
+                }
+            }
+        }
+        Ok(MemoWire {
+            number: number.ok_or_else(|| de::Error::missing_field("number"))?,
+            post_date: post_date.ok_or_else(|| de::Error::missing_field("post_date"))?,
+            effective_date: effective_date
+                .ok_or_else(|| de::Error::missing_field("effective_date"))?,
+            title: title.ok_or_else(|| de::Error::missing_field("title"))?,
+            categories: categories.ok_or_else(|| de::Error::missing_field("categories"))?,
+            memo_url: memo_url.ok_or_else(|| de::Error::missing_field("memo_url"))?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum MemoWireField {
+    Number,
+    PostDate,
+    EffectiveDate,
+    Title,
+    Categories,
+    MemoUrl,
+}
+
+struct BoundedMemoCategories(Vec<String>);
+
+impl<'de> Deserialize<'de> for BoundedMemoCategories {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedMemoCategoriesVisitor)
+    }
+}
+
+struct BoundedMemoCategoriesVisitor;
+
+impl<'de> Visitor<'de> for BoundedMemoCategoriesVisitor {
+    type Value = BoundedMemoCategories;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded OCC memo category sequence")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut categories = Vec::with_capacity(MAX_MEMO_CATEGORIES);
+        while let Some(category) = sequence.next_element::<String>()? {
+            if categories.len() == MAX_MEMO_CATEGORIES {
+                return Err(de::Error::custom("OCC memo category limit exceeded"));
+            }
+            categories.push(category);
+        }
+        Ok(BoundedMemoCategories(categories))
+    }
 }
 
 fn parse_memo_csv_row(
@@ -1560,23 +1836,6 @@ fn validate_memo_context(
         || context.native_schema().as_str() != native_schema
     {
         return Err(OccParseError::InvalidContext);
-    }
-    Ok(())
-}
-
-fn validate_payload(
-    context: &ReferenceObjectContext,
-    bytes: &[u8],
-    maximum: usize,
-) -> Result<(), OccParseError> {
-    if bytes.len() > maximum {
-        return Err(OccParseError::BodyTooLarge);
-    }
-    if usize::try_from(context.payload_bytes()).ok() != Some(bytes.len())
-        || context.payload_digest().algorithm() != DigestAlgorithm::Sha256
-        || context.payload_digest().bytes() != <[u8; 32]>::from(Sha256::digest(bytes))
-    {
-        return Err(OccParseError::PayloadMismatch);
     }
     Ok(())
 }

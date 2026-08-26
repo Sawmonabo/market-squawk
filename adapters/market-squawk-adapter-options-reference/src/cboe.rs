@@ -1,15 +1,16 @@
 use std::fmt;
+use std::io::Read;
 use std::num::{NonZeroU16, NonZeroU32};
 
 use csv::{ReaderBuilder, StringRecord};
-use market_squawk_domain::{DigestAlgorithm, ProviderInstrumentId, SourceIdentifier};
+use market_squawk_domain::{ProviderInstrumentId, SourceIdentifier};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
     OptionContractIdentity, PageTerminalState, ReferenceObjectContext, ReferencePageReceipt,
     ReferenceProvider, ReferenceSurface,
+    payload::{BoundedTokenReader, ExactPayloadReader},
 };
 
 /// Application maximum for one Cboe `All Series` source object.
@@ -23,6 +24,7 @@ pub const CBOE_ALL_SERIES_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const CBOE_ALL_SERIES_MAX_RECORDS: u32 = 2_500_000;
 
 const MAX_UNDERLYING_BYTES: usize = 8;
+const CBOE_ALL_SERIES_MAX_ROW_BYTES: usize = 4 * 1024;
 
 /// One of the four independently published Cboe U.S. option venues.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -63,16 +65,6 @@ impl CboeVenue {
             Self::Bzx => "bzx",
             Self::C2 => "c2",
             Self::Edgx => "edgx",
-        }
-    }
-
-    pub(crate) fn try_from_stable_label(value: &str) -> Result<Self, CboeParseError> {
-        match value {
-            "c1" => Ok(Self::C1),
-            "bzx" => Ok(Self::Bzx),
-            "c2" => Ok(Self::C2),
-            "edgx" => Ok(Self::Edgx),
-            _ => Err(CboeParseError::InvalidEvidence),
         }
     }
 }
@@ -175,21 +167,6 @@ impl CboeSeriesStatus {
         match value {
             "False" => Ok(Self::Normal),
             "True" => Ok(Self::ClosingOnly),
-            _ => Err(CboeParseError::InvalidSeriesStatus),
-        }
-    }
-
-    pub(crate) const fn stable_label(self) -> &'static str {
-        match self {
-            Self::Normal => "normal",
-            Self::ClosingOnly => "closing_only",
-        }
-    }
-
-    pub(crate) fn try_from_stable_label(value: &str) -> Result<Self, CboeParseError> {
-        match value {
-            "normal" => Ok(Self::Normal),
-            "closing_only" => Ok(Self::ClosingOnly),
             _ => Err(CboeParseError::InvalidSeriesStatus),
         }
     }
@@ -388,26 +365,29 @@ impl CboeAllSeriesParser {
     ///
     /// Rejects size/digest drift, unknown headers, malformed CSV, invalid identities/status, row
     /// overflow, or sink failure.
-    pub fn parse<F>(
+    pub fn parse<R, F>(
         &self,
-        bytes: &[u8],
+        source: R,
         mut sink: F,
     ) -> Result<CboeAllSeriesParseReceipt, CboeParseError>
     where
+        R: Read,
         F: FnMut(CboeSeriesReference) -> Result<(), CboeParseError>,
     {
-        validate_payload(&self.context, bytes)?;
-        if bytes.len() > CBOE_ALL_SERIES_MAX_BYTES {
+        if usize::try_from(self.context.payload_bytes())
+            .map_or(true, |bytes| bytes > CBOE_ALL_SERIES_MAX_BYTES)
+        {
             return Err(CboeParseError::BodyTooLarge);
         }
-        if !bytes.ends_with(b"\n") || bytes.contains(&0) {
-            return Err(CboeParseError::IncompletePublication);
-        }
+        let payload = ExactPayloadReader::try_new(source, &self.context, CBOE_ALL_SERIES_MAX_BYTES)
+            .map_err(|_| CboeParseError::PayloadMismatch)?;
+        let mut framed = BoundedTokenReader::csv(payload, CBOE_ALL_SERIES_MAX_ROW_BYTES)
+            .map_err(|_| CboeParseError::BodyTooLarge)?;
         let mut reader = ReaderBuilder::new()
             .has_headers(true)
             .flexible(false)
             .trim(csv::Trim::None)
-            .from_reader(bytes);
+            .from_reader(&mut framed);
         let headers = reader.headers().map_err(|_| CboeParseError::MalformedCsv)?;
         validate_header(self.schema, headers)?;
         let venue = match self.context.surface() {
@@ -432,6 +412,14 @@ impl CboeAllSeriesParser {
                 &record,
                 self.context.clone(),
             )?)?;
+        }
+        drop(reader);
+        let terminal = framed
+            .into_inner()
+            .finish()
+            .map_err(|_| CboeParseError::PayloadMismatch)?;
+        if !terminal.ends_with_lf() || terminal.contains_nul() {
+            return Err(CboeParseError::IncompletePublication);
         }
         if returned == 0 {
             return Err(CboeParseError::EmptyPublication);
@@ -483,16 +471,6 @@ fn parse_record(
     CboeSeriesReference::try_new(
         row_number, venue, symbol, contract, underlying, unit, status, context,
     )
-}
-
-fn validate_payload(context: &ReferenceObjectContext, bytes: &[u8]) -> Result<(), CboeParseError> {
-    if usize::try_from(context.payload_bytes()).ok() != Some(bytes.len())
-        || context.payload_digest().algorithm() != DigestAlgorithm::Sha256
-        || context.payload_digest().bytes() != <[u8; 32]>::from(Sha256::digest(bytes))
-    {
-        return Err(CboeParseError::PayloadMismatch);
-    }
-    Ok(())
 }
 
 /// Cboe header, row, identity, or bounded-stream decoding failure.

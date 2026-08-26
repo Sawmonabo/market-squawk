@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::time::UNIX_EPOCH;
 
@@ -223,7 +224,11 @@ impl PublicationRequest {
         mut surfaces: Vec<ReferenceSurface>,
         limits: PublicationLimits,
     ) -> Result<Self, PublicationError> {
-        if surfaces.is_empty() || surfaces.len() > limits.max_surfaces || deadline <= requested_at {
+        if surfaces.is_empty()
+            || surfaces.len() > limits.max_surfaces
+            || u32::try_from(surfaces.len()).map_or(true, |pages| pages > limits.max_pages)
+            || deadline <= requested_at
+        {
             return Err(PublicationError::InvalidRequest);
         }
         surfaces.sort();
@@ -262,6 +267,215 @@ impl PublicationRequest {
     /// Returns the publication limits.
     pub const fn limits(&self) -> PublicationLimits {
         self.limits
+    }
+}
+
+/// Process-local safety accounting for one exact provider-reference request.
+///
+/// This capability retains only bounded counters and the admitted surface closure. It is not raw
+/// retention, a publication catalog, an immutable generation, a PIT selector, or restart evidence.
+pub struct ReferenceRequestBudget {
+    request_id: SourceIdentifier,
+    requested_surfaces: BTreeSet<ReferenceSurface>,
+    observed_surfaces: BTreeSet<ReferenceSurface>,
+    limits: PublicationLimits,
+    completed_pages: u32,
+    payload_bytes: u64,
+    returned_records: u64,
+    failed: bool,
+}
+
+impl std::fmt::Debug for ReferenceRequestBudget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReferenceRequestBudget")
+            .field("request_id", &self.request_id)
+            .field("requested_surfaces", &self.requested_surfaces.len())
+            .field("observed_surfaces", &self.observed_surfaces.len())
+            .field("completed_pages", &self.completed_pages)
+            .field("payload_bytes", &self.payload_bytes)
+            .field("returned_records", &self.returned_records)
+            .field("failed", &self.failed)
+            .finish()
+    }
+}
+
+impl ReferenceRequestBudget {
+    /// Starts non-durable accounting for one exact request closure.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a request whose declared page ceiling cannot admit its exact surface closure.
+    pub fn try_for_publication(request: &PublicationRequest) -> Result<Self, PublicationError> {
+        if u32::try_from(request.surfaces.len())
+            .map_or(true, |pages| pages > request.limits.max_pages)
+        {
+            return Err(PublicationError::InvalidRequest);
+        }
+        Ok(Self {
+            request_id: request.request_id.clone(),
+            requested_surfaces: request.surfaces.iter().cloned().collect(),
+            observed_surfaces: BTreeSet::new(),
+            limits: request.limits,
+            completed_pages: 0,
+            payload_bytes: 0,
+            returned_records: 0,
+            failed: false,
+        })
+    }
+
+    /// Accounts one completed raw/typed handoff without retaining any decoded row.
+    ///
+    /// # Errors
+    ///
+    /// Rejects cross-request, unrequested, duplicate, or internally inconsistent evidence and any
+    /// checked aggregate that exceeds the request's declared ceilings.
+    pub fn observe_typed_handoff(
+        &mut self,
+        handoff: &crate::ReferenceTypedHandoff,
+    ) -> Result<(), PublicationError> {
+        let raw = handoff.raw_receipt();
+        let context = handoff.context();
+        let page = handoff.page_receipt();
+        if raw.content_digest() != context.payload_digest()
+            || raw.size_bytes() != context.payload_bytes()
+            || page.context() != context
+        {
+            self.failed = true;
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        let result = self.observe_object(context, u64::from(page.returned_records()));
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Accounts one completed explicitly uninterpreted OCC memo handoff.
+    ///
+    /// # Errors
+    ///
+    /// Rejects cross-request, unrequested, duplicate, or internally inconsistent evidence and any
+    /// checked aggregate that exceeds the request's declared ceilings.
+    pub fn observe_uninterpreted_memo_handoff(
+        &mut self,
+        handoff: &crate::ReferenceUninterpretedMemoHandoff,
+    ) -> Result<(), PublicationError> {
+        let raw = handoff.raw_receipt();
+        let context = handoff.context();
+        if raw.content_digest() != context.payload_digest()
+            || raw.size_bytes() != context.payload_bytes()
+        {
+            self.failed = true;
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        let result = self.observe_object(context, 0);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Consumes complete counters after deterministic conflict reconciliation terminates.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incomplete surface closure, cross-request conflict evidence, or any terminal count
+    /// beyond the declared request ceilings. Caller-owned staged output must be discarded on error.
+    pub fn finish(
+        self,
+        reconciliation: &crate::ReferenceConflictReconciliationReceipt,
+    ) -> Result<ReferenceRequestAccountingReceipt, PublicationError> {
+        if self.failed
+            || reconciliation.request_id() != &self.request_id
+            || self.observed_surfaces != self.requested_surfaces
+        {
+            return Err(PublicationError::InvalidRequest);
+        }
+        if self.completed_pages > self.limits.max_pages
+            || self.payload_bytes > self.limits.max_total_bytes
+            || self.returned_records > self.limits.max_total_records
+            || reconciliation.conflicts() > self.limits.max_conflicts
+        {
+            return Err(PublicationError::LimitsExceeded);
+        }
+        Ok(ReferenceRequestAccountingReceipt {
+            request_id: self.request_id,
+            completed_pages: self.completed_pages,
+            payload_bytes: self.payload_bytes,
+            returned_records: self.returned_records,
+            conflicts: reconciliation.conflicts(),
+        })
+    }
+
+    fn observe_object(
+        &mut self,
+        context: &ReferenceObjectContext,
+        returned_records: u64,
+    ) -> Result<(), PublicationError> {
+        if self.failed
+            || context.transport_evidence().request().request_id() != &self.request_id
+            || !self.requested_surfaces.contains(context.surface())
+            || !self.observed_surfaces.insert(context.surface().clone())
+        {
+            return Err(PublicationError::InvalidRequest);
+        }
+        self.completed_pages = self
+            .completed_pages
+            .checked_add(1)
+            .ok_or(PublicationError::LimitsExceeded)?;
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(context.payload_bytes())
+            .ok_or(PublicationError::LimitsExceeded)?;
+        self.returned_records = self
+            .returned_records
+            .checked_add(returned_records)
+            .ok_or(PublicationError::LimitsExceeded)?;
+        if self.completed_pages > self.limits.max_pages
+            || self.payload_bytes > self.limits.max_total_bytes
+            || self.returned_records > self.limits.max_total_records
+        {
+            return Err(PublicationError::LimitsExceeded);
+        }
+        Ok(())
+    }
+}
+
+/// Terminal non-durable request counters safe for caller-owned composition decisions.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ReferenceRequestAccountingReceipt {
+    request_id: SourceIdentifier,
+    completed_pages: u32,
+    payload_bytes: u64,
+    returned_records: u64,
+    conflicts: usize,
+}
+
+impl ReferenceRequestAccountingReceipt {
+    /// Returns the exact publication request identity.
+    pub const fn request_id(&self) -> &SourceIdentifier {
+        &self.request_id
+    }
+
+    /// Returns completed official object/page count.
+    pub const fn completed_pages(&self) -> u32 {
+        self.completed_pages
+    }
+
+    /// Returns exact aggregate raw payload bytes.
+    pub const fn payload_bytes(&self) -> u64 {
+        self.payload_bytes
+    }
+
+    /// Returns exact aggregate strictly decoded record count.
+    pub const fn returned_records(&self) -> u64 {
+        self.returned_records
+    }
+
+    /// Returns exact deterministic conflict count.
+    pub const fn conflicts(&self) -> usize {
+        self.conflicts
     }
 }
 
@@ -445,15 +659,6 @@ impl ReferenceNativeSchemaIdentity {
         hash.digest(3, self.fingerprint);
         hash.finish()
     }
-
-    fn try_revalidated(&self) -> Result<Self, PublicationError> {
-        let validated = Self::try_new(self.name.clone(), self.version, self.fingerprint)?;
-        if validated == *self {
-            Ok(validated)
-        } else {
-            Err(PublicationError::InvalidObjectContext)
-        }
-    }
 }
 
 /// Complete prior-object edge authorizing a conditional GET and exact 304 reuse.
@@ -572,26 +777,6 @@ impl ReferenceConditionalPriorEvidence {
         hash.identifier(9, &self.prior_object_id);
         hash.digest(10, self.prior_transport_receipt_digest);
         hash.finish()
-    }
-
-    fn try_revalidated(&self) -> Result<Self, PublicationError> {
-        let native_schema = self.native_schema.try_revalidated()?;
-        let validated = Self::try_new(
-            self.validator.clone(),
-            self.surface.clone(),
-            self.configured_locator.clone(),
-            self.canonical_media_type.clone(),
-            native_schema,
-            self.prior_payload_digest,
-            self.prior_payload_bytes,
-            self.prior_object_id.clone(),
-            self.prior_transport_receipt_digest,
-        )?;
-        if validated == *self {
-            Ok(validated)
-        } else {
-            Err(PublicationError::InvalidObjectContext)
-        }
     }
 }
 
@@ -852,48 +1037,6 @@ impl ReferenceOfficialRequestEvidence {
                 .map(ReferenceConditionalPriorEvidence::canonical_digest),
         );
         hash.finish()
-    }
-
-    fn try_revalidated(&self) -> Result<Self, PublicationError> {
-        if self.method != ReferenceRequestMethod::Get
-            || !self.accept_encoding_identity
-            || self.body != ReferenceRequestBodyEvidence::absent()
-        {
-            return Err(PublicationError::InvalidObjectContext);
-        }
-        let conditional_prior = self
-            .conditional_prior
-            .as_ref()
-            .map(ReferenceConditionalPriorEvidence::try_revalidated)
-            .transpose()?;
-        let native_schema = self.native_schema.try_revalidated()?;
-        let validated = Self::try_new(
-            self.source_id.clone(),
-            self.provider_id.clone(),
-            self.source_contract_digest,
-            self.provider,
-            self.surface.clone(),
-            self.request_id.clone(),
-            self.configured_locator.clone(),
-            self.accept.clone(),
-            self.user_agent.clone(),
-            self.maximum_decoded_bytes,
-            self.maximum_redirects,
-            self.connect_timeout_nanos,
-            self.read_timeout_nanos,
-            self.total_timeout_nanos,
-            self.operation_timeout_nanos,
-            self.wall_started_at,
-            self.wall_deadline,
-            self.expected_publication_date,
-            native_schema,
-            conditional_prior,
-        )?;
-        if validated == *self {
-            Ok(validated)
-        } else {
-            Err(PublicationError::InvalidObjectContext)
-        }
     }
 }
 
@@ -1302,55 +1445,6 @@ impl ReferenceTransportEvidence {
     pub const fn is_modified(&self) -> bool {
         matches!(&self.disposition, ReferenceResponseDisposition::Modified)
     }
-
-    /// Revalidates deserialized durable evidence through the same closed constructors used at
-    /// acquisition time.
-    pub(crate) fn try_revalidated(&self) -> Result<Self, PublicationError> {
-        let request = self.request.try_revalidated()?;
-        let validated = match &self.disposition {
-            ReferenceResponseDisposition::Modified => Self::try_modified(
-                request,
-                self.status,
-                self.final_locator.clone(),
-                self.redirect_chain.clone(),
-                self.observed_content_type
-                    .clone()
-                    .ok_or(PublicationError::InvalidObjectContext)?,
-                self.observed_content_disposition.clone(),
-                self.observed_content_encoding.clone(),
-                self.declared_content_length,
-                self.etag.clone(),
-                self.cache_last_modified.clone(),
-                self.headers_received_at,
-                self.body_completed_at,
-                self.transport_elapsed_nanos,
-                self.response_body_digest,
-                self.response_body_bytes,
-                self.canonical_media_type.clone(),
-                self.native_schema.clone(),
-            )?,
-            ReferenceResponseDisposition::NotModified { .. } => Self::try_not_modified(
-                request,
-                self.status,
-                self.final_locator.clone(),
-                self.redirect_chain.clone(),
-                self.observed_content_type.clone(),
-                self.observed_content_disposition.clone(),
-                self.observed_content_encoding.clone(),
-                self.declared_content_length,
-                self.etag.clone(),
-                self.cache_last_modified.clone(),
-                self.headers_received_at,
-                self.body_completed_at,
-                self.transport_elapsed_nanos,
-            )?,
-        };
-        if validated == *self {
-            Ok(validated)
-        } else {
-            Err(PublicationError::InvalidObjectContext)
-        }
-    }
 }
 
 /// Exact raw-object and decoder lineage shared by every record decoded from the object.
@@ -1750,226 +1844,7 @@ impl ReferencePageReceipt {
     }
 }
 
-/// Completeness for one exact requested surface.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "state")]
-pub enum SurfaceCompleteness {
-    /// Every page was contiguous, valid, and ended with an observed terminal signal.
-    Complete,
-    /// No page/object was admitted for the requested surface.
-    Missing,
-    /// Pages were noncontiguous or did not end in an observed terminal signal.
-    IncompletePageChain,
-    /// At least one retained page reported rejected records.
-    RejectedRecords {
-        /// Aggregate rejected record count.
-        count: u64,
-    },
-    /// Page receipts and decoded catalog records did not reconcile.
-    ObservationCountMismatch {
-        /// Valid rows claimed by the page receipts.
-        receipt_records: u64,
-        /// Valid rows admitted through the provider-native catalog path.
-        catalog_records: u64,
-    },
-}
-
-/// Whole-request completeness, independent of provider conflicts.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "state")]
-pub enum PublicationCompleteness {
-    /// Every exact requested surface completed without rejected records.
-    Complete,
-    /// At least one requested surface was missing, incomplete, or rejected.
-    Partial {
-        /// Per-surface dispositions in request order.
-        surfaces: Vec<(ReferenceSurface, SurfaceCompleteness)>,
-    },
-}
-
-/// Closed conflict class preserved instead of selecting an arbitrary provider row.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CatalogConflictKind {
-    /// One Cboe Symbol ID mapped to distinct OSI contracts.
-    CboeSymbolMapsMultipleOsi,
-    /// One OSI contract mapped to distinct Cboe Symbol IDs.
-    CboeOsiMapsMultipleSymbols,
-    /// One Cboe Symbol ID mapped to distinct independent underlying aliases.
-    CboeSymbolMapsMultipleUnderlying,
-    /// One page coordinate was observed with different exact objects.
-    PageCoordinateDivergence,
-    /// One exact provider natural key appeared more than once in a supposedly unique surface.
-    DuplicateProviderRecord,
-}
-
-/// Exact conflicting source identities; no implicit winner is selected.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CatalogConflict {
-    kind: CatalogConflictKind,
-    natural_key: SourceIdentifier,
-    first_evidence: SourceIdentifier,
-    second_evidence: SourceIdentifier,
-}
-
-impl CatalogConflict {
-    pub(crate) fn new(
-        kind: CatalogConflictKind,
-        natural_key: SourceIdentifier,
-        first_evidence: SourceIdentifier,
-        second_evidence: SourceIdentifier,
-    ) -> Self {
-        Self {
-            kind,
-            natural_key,
-            first_evidence,
-            second_evidence,
-        }
-    }
-
-    /// Returns the conflict class.
-    pub const fn kind(&self) -> CatalogConflictKind {
-        self.kind
-    }
-
-    /// Returns the conflicting natural key.
-    pub const fn natural_key(&self) -> &SourceIdentifier {
-        &self.natural_key
-    }
-
-    /// Returns the first exact row/object evidence identity.
-    pub const fn first_evidence(&self) -> &SourceIdentifier {
-        &self.first_evidence
-    }
-
-    /// Returns the second exact row/object evidence identity.
-    pub const fn second_evidence(&self) -> &SourceIdentifier {
-        &self.second_evidence
-    }
-}
-
-/// Actual observations and objects admitted for one catalog assembly.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CatalogCounts {
-    pages: u64,
-    bytes: u64,
-    returned_records: u64,
-    rejected_records: u64,
-    cboe_series: u64,
-    occ_dlp_products: u64,
-    duplicate_records: u64,
-}
-
-impl CatalogCounts {
-    pub(crate) fn from_spool(
-        pages: u64,
-        bytes: u64,
-        returned_records: u64,
-        cboe_series: u64,
-        occ_dlp_products: u64,
-    ) -> Self {
-        Self {
-            pages,
-            bytes,
-            returned_records,
-            rejected_records: 0,
-            cboe_series,
-            occ_dlp_products,
-            duplicate_records: 0,
-        }
-    }
-
-    /// Returns admitted exact page/object count.
-    pub const fn pages(self) -> u64 {
-        self.pages
-    }
-
-    /// Returns exact source bytes represented by page receipts.
-    pub const fn bytes(self) -> u64 {
-        self.bytes
-    }
-
-    /// Returns valid decoded records reported by page receipts.
-    pub const fn returned_records(self) -> u64 {
-        self.returned_records
-    }
-
-    /// Returns rejected records reported by page receipts.
-    pub const fn rejected_records(self) -> u64 {
-        self.rejected_records
-    }
-
-    /// Returns admitted Cboe series observations.
-    pub const fn cboe_series(self) -> u64 {
-        self.cboe_series
-    }
-
-    /// Returns admitted OCC DLP product/root observations.
-    pub const fn occ_dlp_products(self) -> u64 {
-        self.occ_dlp_products
-    }
-
-    /// Returns exact duplicate provider records encountered.
-    pub const fn duplicate_records(self) -> u64 {
-        self.duplicate_records
-    }
-}
-
-/// Final bounded catalog evidence for one publication request.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PublicationCatalog {
-    request: PublicationRequest,
-    completeness: PublicationCompleteness,
-    counts: CatalogCounts,
-    conflicts: Vec<CatalogConflict>,
-}
-
-impl PublicationCatalog {
-    pub(crate) fn from_spool(
-        request: PublicationRequest,
-        completeness: PublicationCompleteness,
-        counts: CatalogCounts,
-        conflicts: Vec<CatalogConflict>,
-    ) -> Self {
-        Self {
-            request,
-            completeness,
-            counts,
-            conflicts,
-        }
-    }
-
-    /// Returns the exact request this catalog answers.
-    pub const fn request(&self) -> &PublicationRequest {
-        &self.request
-    }
-
-    /// Returns whole-request completeness.
-    pub const fn completeness(&self) -> &PublicationCompleteness {
-        &self.completeness
-    }
-
-    /// Returns actual object/observation counts.
-    pub const fn counts(&self) -> CatalogCounts {
-        self.counts
-    }
-
-    /// Returns every retained source conflict.
-    pub fn conflicts(&self) -> &[CatalogConflict] {
-        &self.conflicts
-    }
-
-    /// Returns whether the catalog is complete and conflict-free enough for downstream atomic
-    /// publication. This does not assert canonical identity resolution or workflow availability.
-    pub fn publication_eligible(&self) -> bool {
-        matches!(self.completeness, PublicationCompleteness::Complete) && self.conflicts.is_empty()
-    }
-}
-
-/// Publication request, evidence, limit, or reconciliation failure.
+/// Publication request, object evidence, clock, or request-accounting failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum PublicationError {
     /// Caller limits were zero or exceeded code-owned safety ceilings.
@@ -1984,12 +1859,6 @@ pub enum PublicationError {
     /// Source availability was later than local receipt.
     #[error("invalid option-reference object clock order")]
     InvalidClockOrder,
-    /// A decoder or catalog produced a malformed bounded identifier.
-    #[error("invalid option-reference evidence identifier")]
-    InvalidIdentifier,
-    /// The catalog attempted to admit a surface not present in the exact request.
-    #[error("option-reference surface was not requested")]
-    UnrequestedSurface,
     /// Aggregate page, byte, record, or conflict bounds were exceeded.
     #[error("option-reference publication limit exceeded")]
     LimitsExceeded,
