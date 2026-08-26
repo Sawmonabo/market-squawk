@@ -4,9 +4,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::{Bytes, BytesMut};
 use futures_util::future::BoxFuture;
 use futures_util::{Stream, StreamExt};
-use market_squawk_domain::Timestamp;
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
 use market_squawk_sources::{
-    ExtractionAuthority, ExtractionSourceError, NetworkAccessPolicy, SourceError, SourceMetadata,
+    ExtractionAuthority, ExtractionAuthorityError, ExtractionRequestPermit,
+    ExtractionSourceError, NetworkAccessPolicy, SourceError, SourceMetadata,
 };
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER, USER_AGENT,
@@ -26,7 +27,6 @@ const BLS_V2_ENDPOINT: &str = "https://api.bls.gov/publicAPI/v2/timeseries/data/
 const USER_AGENT_VALUE: &str = "market-squawk/0.1 bls-adapter";
 
 /// User-owned BLS v2 registration credential retained only in zeroizing memory.
-#[derive(Clone)]
 pub struct BlsRegistrationKey(Zeroizing<String>);
 
 impl BlsRegistrationKey {
@@ -56,37 +56,113 @@ impl std::fmt::Debug for BlsRegistrationKey {
     }
 }
 
-/// Authorization mode for the public v1 or user-registered v2 BLS interface.
-#[derive(Clone, Debug)]
-pub enum BlsAuthorization {
-    /// Public unregistered v1 access under provider-published limits.
-    PublicV1,
-    /// Registered v2 access using a user-supplied key.
-    RegisteredV2(BlsRegistrationKey),
+/// Secret-free root credential coordinate retained by activation and publication evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "generation_digest")]
+pub enum BlsCredentialRejoin {
+    /// Public v1 intentionally uses no provider credential.
+    PublicNoCredential,
+    /// Registered v2 used the exact protected root credential generation identified here.
+    RegisteredGeneration(EvidenceDigest),
+}
+
+impl BlsCredentialRejoin {
+    fn validate(self) -> Result<(), BlsSourceError> {
+        match self {
+            Self::PublicNoCredential => Ok(()),
+            Self::RegisteredGeneration(digest)
+                if digest.algorithm() == DigestAlgorithm::Sha256
+                    && digest.bytes() != [0; 32] =>
+            {
+                Ok(())
+            }
+            Self::RegisteredGeneration(_) => Err(BlsSourceError::InvalidRegistrationKey),
+        }
+    }
+}
+
+/// Non-cloneable authorization for one exact public or registered BLS runtime instance.
+///
+/// Registered key bytes have one owner, are never included in `Debug`, and cannot be separated
+/// from the protected root generation coordinate used by doctor and publication rejoin evidence.
+pub struct BlsAuthorization {
+    tier: BlsAccessTier,
+    registration_key: Option<BlsRegistrationKey>,
+    credential_rejoin: BlsCredentialRejoin,
 }
 
 impl BlsAuthorization {
+    /// Constructs the explicit no-credential public-v1 mode.
+    pub const fn public_v1() -> Self {
+        Self {
+            tier: BlsAccessTier::PublicV1,
+            registration_key: None,
+            credential_rejoin: BlsCredentialRejoin::PublicNoCredential,
+        }
+    }
+
+    /// Binds one zeroizing registered-v2 key to its exact protected root generation.
+    pub fn registered_v2(
+        registration_key: BlsRegistrationKey,
+        credential_generation_digest: EvidenceDigest,
+    ) -> Result<Self, BlsSourceError> {
+        let credential_rejoin =
+            BlsCredentialRejoin::RegisteredGeneration(credential_generation_digest);
+        credential_rejoin.validate()?;
+        Ok(Self {
+            tier: BlsAccessTier::RegisteredV2,
+            registration_key: Some(registration_key),
+            credential_rejoin,
+        })
+    }
+
     /// Returns the exact provider tier selected by this authorization mode.
     pub const fn tier(&self) -> BlsAccessTier {
-        match self {
-            Self::PublicV1 => BlsAccessTier::PublicV1,
-            Self::RegisteredV2(_) => BlsAccessTier::RegisteredV2,
-        }
+        self.tier
     }
 
     /// Returns the exact official JSON POST endpoint that metadata must allowlist.
     pub const fn endpoint(&self) -> &'static str {
-        match self {
-            Self::PublicV1 => BLS_V1_ENDPOINT,
-            Self::RegisteredV2(_) => BLS_V2_ENDPOINT,
+        match self.tier {
+            BlsAccessTier::PublicV1 => BLS_V1_ENDPOINT,
+            BlsAccessTier::RegisteredV2 => BLS_V2_ENDPOINT,
         }
     }
 
+    /// Returns the explicit no-credential marker or registered root generation coordinate.
+    pub const fn credential_rejoin(&self) -> BlsCredentialRejoin {
+        self.credential_rejoin
+    }
+
     fn registration_key(&self) -> Option<&str> {
-        match self {
-            Self::PublicV1 => None,
-            Self::RegisteredV2(key) => Some(key.expose()),
+        self.registration_key.as_ref().map(BlsRegistrationKey::expose)
+    }
+
+    fn validate(&self) -> Result<(), BlsSourceError> {
+        self.credential_rejoin.validate()?;
+        match (self.tier, &self.registration_key, self.credential_rejoin) {
+            (BlsAccessTier::PublicV1, None, BlsCredentialRejoin::PublicNoCredential)
+            | (
+                BlsAccessTier::RegisteredV2,
+                Some(_),
+                BlsCredentialRejoin::RegisteredGeneration(_),
+            ) => Ok(()),
+            _ => Err(BlsSourceError::InvalidRegistrationKey),
         }
+    }
+}
+
+impl std::fmt::Debug for BlsAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlsAuthorization")
+            .field("tier", &self.tier)
+            .field("credential_rejoin", &self.credential_rejoin)
+            .field(
+                "registration_key",
+                &self.registration_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
     }
 }
 
@@ -99,6 +175,12 @@ pub enum BlsSourceError {
     /// Series, year, or deterministic request-plan configuration is invalid.
     #[error("invalid BLS source configuration")]
     InvalidConfiguration,
+    /// The required owner-authorized private-research policy is absent or uses placeholder evidence.
+    #[error("invalid BLS private-research usage policy")]
+    InvalidUsagePolicy,
+    /// Raw capture or canonical handoff evidence is not publication-safe.
+    #[error("invalid BLS publication evidence")]
+    InvalidPublication,
     /// Exact user-authorized BLS series metadata is missing, malformed, or unverified.
     #[error("invalid BLS series metadata")]
     InvalidSeriesMetadata,
@@ -141,7 +223,8 @@ pub(crate) struct RetrievedBlsPage {
 
 pub(crate) struct BlsHttpClient {
     transport: Arc<dyn BlsTransport>,
-    authorization: BlsAuthorization,
+    tier: BlsAccessTier,
+    endpoint: &'static str,
     max_response_bytes: usize,
     total_timeout: Duration,
 }
@@ -150,7 +233,8 @@ impl std::fmt::Debug for BlsHttpClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BlsHttpClient")
-            .field("authorization", &self.authorization)
+            .field("tier", &self.tier)
+            .field("endpoint", &self.endpoint)
             .field("transport", &self.transport)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("total_timeout", &self.total_timeout)
@@ -161,8 +245,9 @@ impl std::fmt::Debug for BlsHttpClient {
 impl BlsHttpClient {
     pub(crate) fn try_new(
         metadata: &SourceMetadata,
-        authorization: BlsAuthorization,
+        authorization: &BlsAuthorization,
     ) -> Result<Self, BlsSourceError> {
+        authorization.validate()?;
         metadata
             .network_policy()
             .authorize(authorization.endpoint())
@@ -178,7 +263,8 @@ impl BlsHttpClient {
         let transport = Arc::new(ReqwestBlsTransport::try_new(bounds)?);
         Ok(Self {
             transport,
-            authorization,
+            tier: authorization.tier(),
+            endpoint: authorization.endpoint(),
             max_response_bytes,
             total_timeout,
         })
@@ -187,9 +273,10 @@ impl BlsHttpClient {
     #[cfg(test)]
     pub(crate) fn try_new_with_transport(
         metadata: &SourceMetadata,
-        authorization: BlsAuthorization,
+        authorization: &BlsAuthorization,
         transport: Arc<dyn BlsTransport>,
     ) -> Result<Self, BlsSourceError> {
+        authorization.validate()?;
         metadata
             .network_policy()
             .authorize(authorization.endpoint())
@@ -200,7 +287,8 @@ impl BlsHttpClient {
         let bounds = endpoint_policy.request_bounds();
         Ok(Self {
             transport,
-            authorization,
+            tier: authorization.tier(),
+            endpoint: authorization.endpoint(),
             max_response_bytes: usize::try_from(bounds.max_response_bytes())
                 .map_err(|_| BlsSourceError::InvalidMetadata)?
                 .min(MAX_RESPONSE_BYTES),
@@ -211,6 +299,7 @@ impl BlsHttpClient {
     pub(crate) async fn fetch(
         &self,
         metadata: &SourceMetadata,
+        authorization: &BlsAuthorization,
         authority: &ExtractionAuthority,
         chunk: &BlsRequestChunk,
         deadline: Timestamp,
@@ -224,27 +313,41 @@ impl BlsHttpClient {
         if authority.metadata() != metadata || !metadata.is_effective_at(now) {
             return Err(SourceError::InvalidProtocolState.into());
         }
+        authorization
+            .validate()
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        if authorization.tier() != self.tier || authorization.endpoint() != self.endpoint {
+            return Err(SourceError::InvalidProtocolState.into());
+        }
         metadata
             .network_policy()
-            .authorize(self.authorization.endpoint())
+            .authorize(self.endpoint)
             .map_err(|_| SourceError::InvalidProtocolState)?;
-        let timeout = remaining_timeout(deadline, now, self.total_timeout)?;
         let request = BlsProviderRequest {
             seriesid: chunk.series(),
             startyear: chunk.start_year().to_string(),
             endyear: chunk.end_year().to_string(),
-            registration_key: self.authorization.registration_key(),
+            registration_key: authorization.registration_key(),
         };
-        let request_body = serde_json::to_vec(&request)
-            .map(Bytes::from)
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-        let permit = authority.try_network_request(self.authorization.endpoint())?;
-        let in_flight = permit.authorize_send(self.authorization.endpoint())?;
+        let request_body = Zeroizing::new(
+            serde_json::to_vec(&request).map_err(|_| SourceError::InvalidProtocolState)?,
+        );
+        let request_body = Bytes::from_owner(request_body);
+        let permit = acquire_request_permit(
+            authority,
+            self.endpoint,
+            deadline,
+            cancellation.clone(),
+        )
+        .await?;
+        let now = system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
+        let timeout = remaining_timeout(deadline, now, self.total_timeout)?;
+        let in_flight = permit.authorize_send(self.endpoint)?;
         let response = self
             .transport
             .execute(
                 BlsHttpRequest {
-                    url: self.authorization.endpoint().to_owned(),
+                    url: self.endpoint.to_owned(),
                     body: request_body,
                 },
                 self.max_response_bytes,
@@ -281,19 +384,21 @@ impl BlsHttpClient {
             .collect::<Vec<_>>();
         let parsed = BlsResponse::parse_for_request(
             &response.body,
-            self.authorization.tier(),
+            self.tier,
             &requested,
             chunk.start_year(),
             chunk.end_year(),
         )
         .map_err(|_| SourceError::InvalidProtocolState)?;
         let digest = Sha256::digest(&response.body);
-        Ok(RetrievedBlsPage {
+        let page = RetrievedBlsPage {
             bytes: response.body,
             response: parsed,
             received_at: response.received_at,
             sha256_hex: format!("{digest:x}"),
-        })
+        };
+        in_flight.record_success()?;
+        Ok(page)
     }
 }
 
@@ -430,6 +535,40 @@ fn content_type_is_json(value: Option<&[u8]>) -> bool {
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
 }
 
+async fn acquire_request_permit(
+    authority: &ExtractionAuthority,
+    target: &str,
+    deadline: Timestamp,
+    cancellation: CancellationToken,
+) -> Result<ExtractionRequestPermit, ExtractionSourceError> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
+        match authority.try_network_request(target) {
+            Ok(permit) => return Ok(permit),
+            Err(ExtractionAuthorityError::BudgetWaitUntil {
+                deadline: wait_until,
+            }) => {
+                let wait = authority.remaining_budget_wait(wait_until)?;
+                let now = system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
+                let remaining = remaining_timeout(deadline, now, Duration::MAX)?;
+                if wait > remaining {
+                    return Err(ExtractionSourceError::DeadlineExceeded);
+                }
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        return Err(ExtractionSourceError::Cancelled);
+                    }
+                    () = tokio::time::sleep(wait) => {}
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 async fn collect_bounded_stream<S, E>(
     mut stream: S,
     max_bytes: usize,
@@ -460,6 +599,8 @@ fn map_source_error(error: BlsSourceError, max_response_bytes: usize) -> SourceE
         BlsSourceError::Network => SourceError::Network,
         BlsSourceError::InvalidRegistrationKey
         | BlsSourceError::InvalidConfiguration
+        | BlsSourceError::InvalidUsagePolicy
+        | BlsSourceError::InvalidPublication
         | BlsSourceError::InvalidSeriesMetadata
         | BlsSourceError::Protocol
         | BlsSourceError::InvalidMetadata

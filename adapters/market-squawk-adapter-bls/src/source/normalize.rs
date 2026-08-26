@@ -32,9 +32,13 @@ pub(super) fn canonical_records(
     config: &BlsSourceConfig,
     response: &BlsResponse,
     exact_source_payload: &[u8],
-    received_at: Timestamp,
+    first_observed_at: Timestamp,
+    response_received_at: Timestamp,
     ingested_at: Timestamp,
 ) -> Result<Vec<CanonicalBlsRecord>, BlsSourceError> {
+    if first_observed_at > response_received_at || response_received_at > ingested_at {
+        return Err(BlsSourceError::Protocol);
+    }
     let source_digest: [u8; 32] = Sha256::digest(exact_source_payload).into();
     let payload_reference =
         PayloadReference::ContentHash(PayloadHash::new(DigestAlgorithm::Sha256, source_digest));
@@ -53,7 +57,8 @@ pub(super) fn canonical_records(
                     series.series_id(),
                     observation,
                     payload_reference,
-                    received_at,
+                    first_observed_at,
+                    response_received_at,
                     ingested_at,
                     source_digest,
                 )
@@ -72,7 +77,8 @@ fn canonical_record(
     series_id: &str,
     observation: &crate::BlsObservation,
     payload_reference: &PayloadReference,
-    received_at: Timestamp,
+    first_observed_at: Timestamp,
+    response_received_at: Timestamp,
     ingested_at: Timestamp,
     source_digest: [u8; 32],
 ) -> Result<CanonicalBlsRecord, BlsSourceError> {
@@ -102,11 +108,11 @@ fn canonical_record(
         venue_id: None,
         source_identifier: revision.clone(),
         source_timestamp: None,
-        received_at,
+        received_at: response_received_at,
         ingested_at,
         quality: DataQuality::OfficialDelayed,
         payload_reference: payload_reference.clone(),
-        availability: ResearchAvailabilityEvidence::local_first_observed(received_at),
+        availability: ResearchAvailabilityEvidence::local_first_observed(first_observed_at),
     })
     .map_err(|_| BlsSourceError::Protocol)?;
     let time = ResearchTime::try_new_with_coordinates(
@@ -134,7 +140,7 @@ fn canonical_record(
     Ok(CanonicalBlsRecord {
         effective,
         availability: ExtractionAvailabilityEvidence::LocalFirstObserved {
-            observed_at: received_at,
+            observed_at: first_observed_at,
         },
         revision,
         evidence: ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(

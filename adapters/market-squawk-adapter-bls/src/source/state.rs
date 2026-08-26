@@ -6,9 +6,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use market_squawk_domain::{SourceIdentifier, Timestamp};
-use market_squawk_sources::{
-    MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, ProviderCaptureMaterial, SourceError,
-};
+use market_squawk_sources::{MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceError};
 
 use super::normalize::CanonicalBlsRecord;
 use crate::client::RetrievedBlsPage;
@@ -112,7 +110,8 @@ pub struct BlsNormalizedPage {
     pub(super) exact_payload: Bytes,
     pub(super) payloads: Vec<Bytes>,
     pub(super) records: Vec<CanonicalBlsRecord>,
-    pub(super) capture_material: ProviderCaptureMaterial,
+    pub(super) response: crate::BlsResponse,
+    pub(super) canonical_ingested_at: Timestamp,
 }
 
 impl BlsNormalizedPage {
@@ -123,8 +122,8 @@ impl BlsNormalizedPage {
 
     /// Returns the socket-boundary time for the exact response bytes retained by this page.
     ///
-    /// This can be later than [`Self::received_at`] when an evicted discovery response is
-    /// re-fetched under the same exact content identity.
+    /// This equals the earlier physically sealed discovery response time; extraction never
+    /// replaces it with a later byte-identical refetch.
     pub const fn response_received_at(&self) -> Timestamp {
         self.response_received_at
     }
@@ -144,10 +143,6 @@ impl BlsNormalizedPage {
         &self.payloads
     }
 
-    /// Returns the exact bounded provider response material used to normalize this page.
-    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
-        &self.capture_material
-    }
 }
 
 /// Stable local health state for the bounded BLS research producer.

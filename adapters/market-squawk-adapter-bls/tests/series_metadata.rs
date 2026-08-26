@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use market_squawk_adapter_bls::{
-    BlsAuthorization, BlsSeriesMetadata, BlsSourceConfig, BlsSourceError,
+    BlsAuthorization, BlsSeriesMetadata, BlsSourceConfig, BlsSourceError, BlsUsagePolicy,
 };
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, SourceIdentifier,
@@ -23,6 +23,10 @@ fn metadata(payload: &'static [u8]) -> Result<BlsSeriesMetadata, BlsSourceError>
         SourceIdentifier::try_from("user-approved:bls-series-metadata:2026-07-21")
             .map_err(|_| BlsSourceError::InvalidSeriesMetadata)?,
     )
+}
+
+fn usage_policy() -> Result<BlsUsagePolicy, BlsSourceError> {
+    BlsUsagePolicy::try_owner_authorized(EvidenceDigest::new(DigestAlgorithm::Sha256, [42; 32]))
 }
 
 #[test]
@@ -53,12 +57,14 @@ fn exact_user_authorized_metadata_is_required_and_bound_to_the_dataset() -> Test
 
     let percent_config = BlsSourceConfig::try_new(
         BlsAuthorization::PublicV1,
+        usage_policy()?,
         vec![percent.clone()],
         2020,
         2026,
     )?;
     let index_config = BlsSourceConfig::try_new(
         BlsAuthorization::PublicV1,
+        usage_policy()?,
         vec![metadata(INDEX)?],
         2020,
         2026,
@@ -83,6 +89,7 @@ fn exact_user_authorized_metadata_is_required_and_bound_to_the_dataset() -> Test
     assert!(
         BlsSourceConfig::try_new(
             BlsAuthorization::PublicV1,
+            usage_policy()?,
             vec![percent.clone(), percent],
             2020,
             2026,

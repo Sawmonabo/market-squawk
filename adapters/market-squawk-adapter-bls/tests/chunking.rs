@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use market_squawk_adapter_bls::{
     BlsAccessTier, BlsAuthorization, BlsParseError, BlsRegistrationKey, BlsRequestPlan,
-    BlsResponse, BlsSeriesMetadata, BlsSource, BlsSourceConfig, BlsSourceError,
-    BlsVintageCapability,
+    BlsResponse, BlsSeriesMetadata, BlsSource, BlsSourceConfig, BlsSourceError, BlsUsageOperation,
+    BlsUsagePolicy, BlsVintageCapability,
 };
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, SourceIdentifier,
@@ -27,6 +27,10 @@ fn metadata(series_id: &str, unit: &str) -> Result<BlsSeriesMetadata, BlsSourceE
     )
 }
 
+fn usage_policy() -> Result<BlsUsagePolicy, BlsSourceError> {
+    BlsUsagePolicy::try_owner_authorized(EvidenceDigest::new(DigestAlgorithm::Sha256, [42; 32]))
+}
+
 #[test]
 fn public_and_registered_plans_obey_documented_tier_bounds() -> TestResult {
     let series = (0..26)
@@ -43,7 +47,7 @@ fn public_and_registered_plans_obey_documented_tier_bounds() -> TestResult {
     assert!(public.chunks().iter().all(|chunk| chunk.year_count() <= 10));
 
     let registered = BlsRequestPlan::try_new(BlsAccessTier::RegisteredV2, series, 2000, 2021)?;
-    assert_eq!(registered.chunks().len(), 2);
+    assert_eq!(registered.chunks().len(), 3);
     assert!(
         registered
             .chunks()
@@ -54,10 +58,13 @@ fn public_and_registered_plans_obey_documented_tier_bounds() -> TestResult {
         registered
             .chunks()
             .iter()
-            .all(|chunk| chunk.year_count() <= 20)
+            .all(|chunk| chunk.year_count() <= 10)
     );
     assert_eq!(registered.limits().documented_years_per_query(), 20);
-    assert_eq!(registered.limits().enforced_years_per_query(), 20);
+    assert_eq!(registered.limits().enforced_years_per_query(), 10);
+    assert_eq!(registered.limits().documented_daily_queries(), 500);
+    assert_eq!(registered.limits().daily_queries(), 400);
+    assert_eq!(registered.limits().enforced_requests_per_second(), 1);
     Ok(())
 }
 
@@ -196,14 +203,28 @@ fn registered_key_is_validated_and_debug_redacted() -> TestResult {
 
 #[test]
 fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
+    let usage_policy = usage_policy()?;
+    assert!(usage_policy.admits(BlsUsageOperation::ModelTraining));
+    assert!(usage_policy.admits(BlsUsageOperation::Backtest));
+    assert!(!usage_policy.admits(BlsUsageOperation::Export));
+    assert!(!usage_policy.admits(BlsUsageOperation::Sale));
+    assert!(!usage_policy.admits(BlsUsageOperation::Redistribute));
+    assert!(
+        BlsUsagePolicy::try_owner_authorized(
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32],)
+        )
+        .is_err()
+    );
     let public = BlsSourceConfig::try_new(
         BlsAuthorization::PublicV1,
+        usage_policy,
         vec![metadata("LNS14000000", "percent")?],
         2020,
         2026,
     )?;
     let other_series = BlsSourceConfig::try_new(
         BlsAuthorization::PublicV1,
+        usage_policy,
         vec![metadata("CUUR0000SA0", "index")?],
         2020,
         2026,
@@ -212,6 +233,7 @@ fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
         BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
             "fake-fake-fake-fake-fake-fake-fake-fake".to_owned(),
         )?),
+        usage_policy,
         vec![metadata("LNS14000000", "percent")?],
         2020,
         2026,
@@ -231,7 +253,14 @@ fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
         .map(|index| metadata(&format!("SERIES{index:04}"), "count"))
         .collect::<Result<Vec<_>, _>>()?;
     assert!(
-        BlsSourceConfig::try_new(BlsAuthorization::PublicV1, over_daily_plan, 2026, 2026).is_err()
+        BlsSourceConfig::try_new(
+            BlsAuthorization::PublicV1,
+            usage_policy,
+            over_daily_plan,
+            2026,
+            2026,
+        )
+        .is_err()
     );
     Ok(())
 }
