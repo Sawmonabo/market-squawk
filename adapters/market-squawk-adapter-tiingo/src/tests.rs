@@ -341,12 +341,11 @@ fn mutual_fund_nav_maps_exactly_and_defers_revision_authority() -> Result<(), Bo
         sealed_metadata.receipt_digest()
     );
     assert_ne!(mapped.handoff_identity().bytes(), [0; 32]);
+    assert_distinct_eod_missing_nav_and_quota_contracts()?;
     Ok(())
 }
 
-#[test]
-fn unsupported_or_missing_fund_stays_explicit_and_quota_is_conjunctive()
--> Result<(), Box<dyn Error>> {
+fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn Error>> {
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path())?;
     let store = paths.sealed_research_journal_store()?;

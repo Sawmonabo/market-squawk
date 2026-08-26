@@ -1576,9 +1576,10 @@ mod tests {
     };
     use market_squawk_platform::LocalPaths;
     use market_squawk_sources::{
-        AuthorizationMode, ProviderRateDispatchDecision, ProviderRateGroupId, ProviderRatePermitId,
-        ProviderRateRegistration, ProviderRateReservationDecision, ProviderRateReservationId,
-        ProviderRateRunId, ProviderRateStore, ProviderRateStoreError, RetryAfter,
+        AuthorizationMode, PreparedProviderRateRegistrationBatch, ProviderRateDispatchDecision,
+        ProviderRateGroupId, ProviderRatePermitId, ProviderRateRegistration,
+        ProviderRateReservationDecision, ProviderRateReservationId, ProviderRateRunId,
+        ProviderRateStore, ProviderRateStoreError, RetryAfter,
     };
     use reqwest::header::AUTHORIZATION;
     use uuid::Uuid;
@@ -1598,9 +1599,17 @@ mod tests {
     #[derive(Debug, Default)]
     struct MemoryRateStore {
         state: Mutex<MemoryRateSnapshot>,
+        dispatch_override: Mutex<Option<ProviderRateDispatchDecision>>,
     }
 
     impl MemoryRateStore {
+        fn with_dispatch_override(decision: ProviderRateDispatchDecision) -> Self {
+            Self {
+                state: Mutex::new(MemoryRateSnapshot::default()),
+                dispatch_override: Mutex::new(Some(decision)),
+            }
+        }
+
         fn snapshot(&self) -> Result<MemoryRateSnapshot, ProviderRateStoreError> {
             self.state
                 .lock()
@@ -1609,22 +1618,45 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct MemoryPreparedRateBatch {
+        registrations: Box<[ProviderRateRegistration]>,
+    }
+
+    impl PreparedProviderRateRegistrationBatch for MemoryPreparedRateBatch {
+        fn registrations(&self) -> &[ProviderRateRegistration] {
+            &self.registrations
+        }
+
+        fn commit(self: Box<Self>) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+    }
+
     impl ProviderRateStore for MemoryRateStore {
         fn start_run(&self, _now: Timestamp) -> Result<ProviderRateRunId, ProviderRateStoreError> {
             Ok(ProviderRateRunId::from_bytes([1; 16]))
         }
 
-        fn register(
+        fn prepare_registration_batch(
             &self,
             _run_id: ProviderRateRunId,
-            declaration: &ProviderRateDeclaration,
+            declarations: &[ProviderRateDeclaration],
             _now: Timestamp,
-        ) -> Result<ProviderRateRegistration, ProviderRateStoreError> {
-            Ok(ProviderRateRegistration::new(
-                ProviderRateGroupId::from_bytes([2; 16]),
-                declaration.policy_digest(),
-                declaration.declaration_digest(),
-            ))
+        ) -> Result<Box<dyn PreparedProviderRateRegistrationBatch>, ProviderRateStoreError>
+        {
+            let registrations = declarations
+                .iter()
+                .map(|declaration| {
+                    ProviderRateRegistration::new(
+                        ProviderRateGroupId::from_bytes([2; 16]),
+                        declaration.policy_digest(),
+                        declaration.declaration_digest(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            Ok(Box::new(MemoryPreparedRateBatch { registrations }))
         }
 
         fn try_reserve(
@@ -1665,6 +1697,14 @@ mod tests {
                 return Err(ProviderRateStoreError::Conflict);
             }
             state.active_reservation = None;
+            if let Some(decision) = self
+                .dispatch_override
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?
+                .take()
+            {
+                return Ok(decision);
+            }
             state.dispatches = state
                 .dispatches
                 .checked_add(1)
@@ -2468,6 +2508,77 @@ mod tests {
                 dispatches: 5,
                 successes: 4,
                 refusals: 1,
+                active_reservation: None,
+                active_permit: None,
+            }
+        );
+
+        let undispatched_authority = Arc::new(MemoryProviderAuthority::try_new(
+            TiingoQuotaLedger::new(windows),
+            source_id.clone(),
+            source_contract_revision.clone(),
+            contract_revision.clone(),
+            entitlement_generation.clone(),
+        )?);
+        let undispatched_rate_store = Arc::new(MemoryRateStore::with_dispatch_override(
+            ProviderRateDispatchDecision::Unavailable(BudgetUnavailableReason::Disabled),
+        ));
+        let undispatched_rate_authority =
+            ProviderRateAuthority::try_new(undispatched_rate_store.clone())?;
+        let undispatched_source = TiingoHttpSource::try_new_with_transport(
+            TiingoApiToken::try_new("fixture-token".to_owned())?,
+            &undispatched_rate_authority,
+            undispatched_authority.clone(),
+            source_id.clone(),
+            source_contract_revision.clone(),
+            contract_revision.clone(),
+            entitlement_generation.clone(),
+            Arc::new(MockTransport::new(Vec::new())),
+        )?;
+        let before_undispatched = undispatched_authority.snapshot()?;
+        assert!(matches!(
+            undispatched_source
+                .fetch_latest(TiingoTicker::try_new("VTSAX")?, deadline, &cancellation,)
+                .await,
+            Err(TiingoHttpSourceError::BudgetUnavailable(
+                BudgetUnavailableReason::Disabled
+            ))
+        ));
+        let after_undispatched = undispatched_authority.snapshot()?;
+        assert_eq!(
+            after_undispatched.requests_this_hour(),
+            before_undispatched.requests_this_hour()
+        );
+        assert_eq!(
+            after_undispatched.requests_this_day(),
+            before_undispatched.requests_this_day()
+        );
+        assert_eq!(
+            after_undispatched.response_bytes_this_month(),
+            before_undispatched.response_bytes_this_month()
+        );
+        assert_eq!(
+            after_undispatched.unique_symbols_this_month(),
+            before_undispatched.unique_symbols_this_month()
+        );
+        assert_eq!(
+            after_undispatched.pending_response(),
+            before_undispatched.pending_response()
+        );
+        assert_eq!(
+            after_undispatched.state_version(),
+            before_undispatched
+                .state_version()
+                .checked_add(2)
+                .ok_or("undispatched quota state version overflow")?
+        );
+        assert_eq!(
+            undispatched_rate_store.snapshot()?,
+            MemoryRateSnapshot {
+                reservations: 1,
+                dispatches: 0,
+                successes: 0,
+                refusals: 0,
                 active_reservation: None,
                 active_permit: None,
             }
