@@ -1,24 +1,26 @@
-//! Restart-safe provider-local IEX HIST evidence state.
+//! Restart-safe provider-local IEX HIST evidence and exact resumable-transfer claims.
 //!
-//! This state deliberately stops before shared object sealing, canonical mapping, immutable
-//! generation publication, or point-in-time reads. A stored capture or decode summary is audit and
-//! adoption evidence only: restart may reuse it only after the root data plane independently
-//! reverifies the corresponding opaque artifact.
+//! Durable job state records the immutable selected-file plan, exact capture/decode evidence, and
+//! closed recovery outcomes through a shared application checkpoint seam. Resumable claims bind
+//! only an interrupted exact prefix; they become reusable solely after shared-platform physical
+//! adoption and full prefix revalidation. Neither surface grants canonical, generation, PIT, or
+//! publication authority.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::decode::{DecodeError, DecodeSummary};
-use crate::model::Sha256Digest;
+use crate::model::{PcapObjectEncoding, Sha256Digest};
 use crate::planning::{
-    ColdJobPlan, IexHistPlanner, IexHistTrustedClockReading, PlanError,
+    ColdJobPlan, IexHistExecutionAttempt, IexHistPlanner, IexHistTrustedClockReading, PlanError,
 };
 use crate::receipt::{
     CaptureChronologyDisposition, CaptureError, PcapMaterializationReceipt,
 };
 
 // This provider envelope v3 embeds and revalidates the immutable cold-plan envelope v2 and its
-// decoder-contract-bound plan identity v3. Greenfield state rejects every older local envelope.
+// decoder-contract-bound `market-squawk/iex-hist-cold-plan/v4` identity. Greenfield state rejects
+// every older local envelope.
 const DURABLE_SCHEMA_VERSION: u16 = 3;
 const MAX_DURABLE_CHECKPOINT_BYTES: usize = 256 * 1024;
 
@@ -405,7 +407,7 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
                 IexHistTerminalPhase::Capture,
                 IexHistTerminalError::CaptureClockAnomaly,
                 IexHistTerminalCoordinate::try_new(None, None, None)?,
-                Some(capture.attempt_sha256()),
+                Some(capture.attempt().attempt_sha256()),
                 IexHistRetryDisposition::Never,
                 Some(capture),
             );
@@ -477,6 +479,10 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "terminal transition retains complete typed evidence and optional replacement capture"
+    )]
     fn commit_terminal(
         &mut self,
         observed_clock: IexHistTrustedClockReading,
@@ -757,7 +763,7 @@ fn phase_capture(phase: &DurablePhase) -> Option<&PcapMaterializationReceipt> {
 fn phase_attempt_sha256(phase: &DurablePhase) -> Option<Sha256Digest> {
     match phase {
         DurablePhase::Planned => None,
-        DurablePhase::CaptureEvidence { capture } => Some(capture.attempt_sha256()),
+        DurablePhase::CaptureEvidence { capture } => Some(capture.attempt().attempt_sha256()),
         DurablePhase::DecodeEvidence { decode, .. } => Some(decode.decode_attempt_sha256),
         DurablePhase::Terminal { prior, .. } => nonterminal_attempt_sha256(prior),
     }
@@ -767,7 +773,7 @@ fn nonterminal_attempt_sha256(phase: &DurableNonTerminalPhase) -> Option<Sha256D
     match phase {
         DurableNonTerminalPhase::Planned => None,
         DurableNonTerminalPhase::CaptureEvidence { capture } => {
-            Some(capture.attempt_sha256())
+            Some(capture.attempt().attempt_sha256())
         }
         DurableNonTerminalPhase::DecodeEvidence { decode, .. } => {
             Some(decode.decode_attempt_sha256)
@@ -797,6 +803,10 @@ fn nonterminal_identity(phase: &DurableNonTerminalPhase) -> Sha256Digest {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "terminal evidence identity commits every closed recovery coordinate"
+)]
 fn terminal_identity(
     disposition: IexHistTerminalDisposition,
     phase: IexHistTerminalPhase,
@@ -902,4 +912,319 @@ pub enum IexHistCheckpointError {
     /// Exact terminal decode evidence was invalid.
     #[error("IEX HIST durable decode evidence is invalid: {0}")]
     DecodeEvidence(#[from] DecodeError),
+}
+
+const RESUME_CLAIM_SCHEMA_VERSION: u16 = 1;
+const MAX_STRONG_ETAG_BYTES: usize = 256;
+
+/// Exact progress evidence for one incomplete provider object.
+///
+/// The type is serializable so the shared job/control plane can retain it next to its own
+/// physical-object receipt. Serialization is not storage proof: every use revalidates this claim
+/// and independently rehashes the controlled prefix file.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IexHistResumeClaim {
+    schema_version: u16,
+    plan_sha256: Sha256Digest,
+    selected_file_identity: Sha256Digest,
+    object_encoding: PcapObjectEncoding,
+    advertised_bytes: u64,
+    segment_start_bytes: u64,
+    prefix_bytes: u64,
+    prefix_sha256: Sha256Digest,
+    strong_etag: String,
+    segment_attempt: IexHistExecutionAttempt,
+    response_started_clock: IexHistTrustedClockReading,
+    checkpoint_clock: IexHistTrustedClockReading,
+    cumulative_monotonic_duration_nanos: u64,
+    chronology_disposition: CaptureChronologyDisposition,
+    prior_claim_sha256: Option<Sha256Digest>,
+    claim_sha256: Sha256Digest,
+}
+
+impl IexHistResumeClaim {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a resume claim commits every exact range, validator, authority, and clock field"
+    )]
+    pub(crate) fn try_new(
+        plan: &ColdJobPlan,
+        segment_start_bytes: u64,
+        prefix_bytes: u64,
+        prefix_sha256: Sha256Digest,
+        strong_etag: String,
+        segment_attempt: IexHistExecutionAttempt,
+        response_started_clock: IexHistTrustedClockReading,
+        checkpoint_clock: IexHistTrustedClockReading,
+        cumulative_monotonic_duration_nanos: u64,
+        chronology_disposition: CaptureChronologyDisposition,
+        prior_claim: Option<&Self>,
+    ) -> Result<Self, IexHistResumeClaimError> {
+        if let Some(prior) = prior_claim {
+            prior.validate_against(plan)?;
+            if segment_start_bytes != prior.prefix_bytes
+                || cumulative_monotonic_duration_nanos < prior.cumulative_monotonic_duration_nanos
+                || strong_etag != prior.strong_etag
+            {
+                return Err(IexHistResumeClaimError::InvalidClaim);
+            }
+        } else if segment_start_bytes != 0 {
+            return Err(IexHistResumeClaimError::InvalidClaim);
+        }
+        let prior_claim_sha256 = prior_claim.map(Self::claim_sha256);
+        let claim_sha256 = resume_claim_identity(
+            plan.plan_sha256(),
+            plan.selected_file().identity(),
+            plan.object_encoding(),
+            plan.selected_file().advertised_compressed_bytes(),
+            segment_start_bytes,
+            prefix_bytes,
+            prefix_sha256,
+            &strong_etag,
+            segment_attempt,
+            response_started_clock,
+            checkpoint_clock,
+            cumulative_monotonic_duration_nanos,
+            chronology_disposition,
+            prior_claim_sha256,
+        );
+        let claim = Self {
+            schema_version: RESUME_CLAIM_SCHEMA_VERSION,
+            plan_sha256: plan.plan_sha256(),
+            selected_file_identity: plan.selected_file().identity(),
+            object_encoding: plan.object_encoding(),
+            advertised_bytes: plan.selected_file().advertised_compressed_bytes(),
+            segment_start_bytes,
+            prefix_bytes,
+            prefix_sha256,
+            strong_etag,
+            segment_attempt,
+            response_started_clock,
+            checkpoint_clock,
+            cumulative_monotonic_duration_nanos,
+            chronology_disposition,
+            prior_claim_sha256,
+            claim_sha256,
+        };
+        claim.validate_against(plan)?;
+        Ok(claim)
+    }
+
+    /// Revalidates every closed field against the exact selected-file plan.
+    pub fn validate_against(&self, plan: &ColdJobPlan) -> Result<(), IexHistResumeClaimError> {
+        self.segment_attempt
+            .validate()
+            .map_err(|_| IexHistResumeClaimError::InvalidClaim)?;
+        self.response_started_clock
+            .validate()
+            .map_err(|_| IexHistResumeClaimError::InvalidClaim)?;
+        self.checkpoint_clock
+            .validate()
+            .map_err(|_| IexHistResumeClaimError::InvalidClaim)?;
+        if self.schema_version != RESUME_CLAIM_SCHEMA_VERSION
+            || self.plan_sha256 != plan.plan_sha256()
+            || self.selected_file_identity != plan.selected_file().identity()
+            || self.object_encoding != plan.object_encoding()
+            || self.advertised_bytes != plan.selected_file().advertised_compressed_bytes()
+            || self.segment_start_bytes >= self.prefix_bytes
+            || self.prefix_bytes >= self.advertised_bytes
+            || !nonzero_digest(self.prefix_sha256)
+            || !valid_strong_etag(&self.strong_etag)
+            || self.response_started_clock.unix_nanos()
+                >= self.segment_attempt.deadline_unix_nanos()
+            || self.checkpoint_clock.unix_nanos() >= self.segment_attempt.deadline_unix_nanos()
+            || (self.segment_start_bytes == 0) != self.prior_claim_sha256.is_none()
+            || resume_claim_identity(
+                self.plan_sha256,
+                self.selected_file_identity,
+                self.object_encoding,
+                self.advertised_bytes,
+                self.segment_start_bytes,
+                self.prefix_bytes,
+                self.prefix_sha256,
+                &self.strong_etag,
+                self.segment_attempt,
+                self.response_started_clock,
+                self.checkpoint_clock,
+                self.cumulative_monotonic_duration_nanos,
+                self.chronology_disposition,
+                self.prior_claim_sha256,
+            ) != self.claim_sha256
+        {
+            return Err(IexHistResumeClaimError::InvalidClaim);
+        }
+        Ok(())
+    }
+
+    /// Returns the exact immutable plan identity.
+    #[must_use]
+    pub const fn plan_sha256(&self) -> Sha256Digest {
+        self.plan_sha256
+    }
+
+    /// Returns the exact selected catalog-descriptor identity.
+    #[must_use]
+    pub const fn selected_file_identity(&self) -> Sha256Digest {
+        self.selected_file_identity
+    }
+
+    /// Returns the prefix length inherited from the immediately preceding claim, or zero.
+    #[must_use]
+    pub const fn segment_start_bytes(&self) -> u64 {
+        self.segment_start_bytes
+    }
+
+    /// Returns bytes already revalidated and owned by the shared physical boundary.
+    #[must_use]
+    pub const fn prefix_bytes(&self) -> u64 {
+        self.prefix_bytes
+    }
+
+    /// Returns the exact digest of all prefix bytes from byte zero.
+    #[must_use]
+    pub const fn prefix_sha256(&self) -> Sha256Digest {
+        self.prefix_sha256
+    }
+
+    /// Returns the strong entity validator required for `If-Range`.
+    #[must_use]
+    pub fn strong_etag(&self) -> &str {
+        &self.strong_etag
+    }
+
+    /// Returns the identity of the immediately preceding claim, when this is a later segment.
+    #[must_use]
+    pub const fn prior_claim_sha256(&self) -> Option<Sha256Digest> {
+        self.prior_claim_sha256
+    }
+
+    /// Returns total monotonic transfer time accumulated across the exact claim chain.
+    #[must_use]
+    pub const fn cumulative_monotonic_duration_nanos(&self) -> u64 {
+        self.cumulative_monotonic_duration_nanos
+    }
+
+    /// Returns the exact authority-owned attempt that produced this prefix segment.
+    #[must_use]
+    pub const fn segment_attempt(&self) -> IexHistExecutionAttempt {
+        self.segment_attempt
+    }
+
+    /// Returns the trusted response-header clock retained for this prefix segment.
+    #[must_use]
+    pub const fn response_started_clock(&self) -> IexHistTrustedClockReading {
+        self.response_started_clock
+    }
+
+    /// Returns the trusted interruption/checkpoint clock retained for this prefix segment.
+    #[must_use]
+    pub const fn checkpoint_clock(&self) -> IexHistTrustedClockReading {
+        self.checkpoint_clock
+    }
+
+    /// Returns the worst retained chronology disposition across completed prefix segments.
+    #[must_use]
+    pub const fn chronology_disposition(&self) -> CaptureChronologyDisposition {
+        self.chronology_disposition
+    }
+
+    /// Returns this exact checkpoint claim identity.
+    #[must_use]
+    pub const fn claim_sha256(&self) -> Sha256Digest {
+        self.claim_sha256
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the claim identity intentionally commits every terminal checkpoint field"
+)]
+fn resume_claim_identity(
+    plan_sha256: Sha256Digest,
+    selected_file_identity: Sha256Digest,
+    object_encoding: PcapObjectEncoding,
+    advertised_bytes: u64,
+    segment_start_bytes: u64,
+    prefix_bytes: u64,
+    prefix_sha256: Sha256Digest,
+    strong_etag: &str,
+    segment_attempt: IexHistExecutionAttempt,
+    response_started_clock: IexHistTrustedClockReading,
+    checkpoint_clock: IexHistTrustedClockReading,
+    cumulative_monotonic_duration_nanos: u64,
+    chronology_disposition: CaptureChronologyDisposition,
+    prior_claim_sha256: Option<Sha256Digest>,
+) -> Sha256Digest {
+    let prior_present = [u8::from(prior_claim_sha256.is_some())];
+    let prior = prior_claim_sha256.unwrap_or_else(|| Sha256Digest::of(b"no-prior-resume-claim"));
+    crate::catalog::digest_fields(&[
+        b"market-squawk/iex-hist-resume-claim/v1",
+        plan_sha256.as_bytes(),
+        selected_file_identity.as_bytes(),
+        object_encoding.identity_value().as_bytes(),
+        &advertised_bytes.to_le_bytes(),
+        &segment_start_bytes.to_le_bytes(),
+        &prefix_bytes.to_le_bytes(),
+        prefix_sha256.as_bytes(),
+        strong_etag.as_bytes(),
+        segment_attempt.attempt_sha256().as_bytes(),
+        &response_started_clock.unix_nanos().to_le_bytes(),
+        &response_started_clock.utc_offset_seconds().to_le_bytes(),
+        response_started_clock.observed_date().compact().as_bytes(),
+        &checkpoint_clock.unix_nanos().to_le_bytes(),
+        &checkpoint_clock.utc_offset_seconds().to_le_bytes(),
+        checkpoint_clock.observed_date().compact().as_bytes(),
+        &cumulative_monotonic_duration_nanos.to_le_bytes(),
+        chronology_tag(chronology_disposition),
+        &prior_present,
+        prior.as_bytes(),
+    ])
+}
+
+pub(crate) fn valid_strong_etag(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2
+        && bytes.len() <= MAX_STRONG_ETAG_BYTES
+        && bytes.first() == Some(&b'"')
+        && bytes.last() == Some(&b'"')
+        && !value.starts_with("W/")
+        && bytes[1..bytes.len() - 1]
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() && *byte != b'"' && *byte != b'\\')
+}
+
+fn nonzero_digest(value: Sha256Digest) -> bool {
+    value.as_bytes().iter().any(|byte| *byte != 0)
+}
+
+const fn chronology_tag(disposition: CaptureChronologyDisposition) -> &'static [u8] {
+    use crate::receipt::CaptureClockAnomaly;
+
+    match disposition {
+        CaptureChronologyDisposition::Admitted => b"admitted",
+        CaptureChronologyDisposition::Quarantined(CaptureClockAnomaly::ResponseBeforeAttempt) => {
+            b"quarantined_response_before_attempt"
+        }
+        CaptureChronologyDisposition::Quarantined(CaptureClockAnomaly::ResponseBeforeCatalog) => {
+            b"quarantined_response_before_catalog"
+        }
+        CaptureChronologyDisposition::Quarantined(CaptureClockAnomaly::WallClockRegression) => {
+            b"quarantined_wall_clock_regression"
+        }
+        CaptureChronologyDisposition::Quarantined(
+            CaptureClockAnomaly::DownloadDurationExceeded,
+        ) => b"quarantined_download_duration_exceeded",
+        CaptureChronologyDisposition::Quarantined(CaptureClockAnomaly::CalendarRegression) => {
+            b"quarantined_calendar_regression"
+        }
+    }
+}
+
+/// Closed resume-claim refusal; it never implies that a physical checkpoint exists.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum IexHistResumeClaimError {
+    /// Claim fields, validator, clocks, chain, or content identity are invalid.
+    #[error("IEX HIST resumable-prefix claim is invalid")]
+    InvalidClaim,
 }

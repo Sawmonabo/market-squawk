@@ -3,8 +3,10 @@
 //! The adapter fetches one catalog generation or one explicitly selected feed/date file at a time;
 //! it deliberately supplies no archive mirroring loop. Downloads remain behind cancellation,
 //! deadline, byte, disk, checksum, representation, and versioned decode boundaries. Provider-local
-//! durable state retains a restorable immutable plan, exact attempt/capture/decode evidence, and
-//! closed recovery outcomes; no byte-range resume or analytical publication authority is claimed.
+//! durable job state retains exact plan/capture/decode/recovery evidence through a shared
+//! checkpoint seam, while resumable claims support a strong-validator exact range only after
+//! shared physical storage adopts and reopens the rehashed prefix. Neither surface owns
+//! canonical/PIT publication or analytical-generation authority.
 //! Decoded observations are explicitly historical IEX-venue evidence; they are never SIP, NBBO,
 //! or market-wide depth.
 
@@ -20,40 +22,45 @@ pub use catalog::{
     Catalog, CatalogError, CatalogFile, CatalogReceipt, ExactFileRequest, SelectedFileReceipt,
 };
 pub use decode::{
-    DecodeActuals, DecodeChannelContract, DecodeChannelRole, DecodeContract,
-    DecodeError, DecodeFailure, DecodeLimits, DecodeSummary, DecodedIexEventEnvelope,
-    DplcChannelDistributionContract, IexEventSink, IexHistTypedEvent,
-    IexHistTypedHandoff, IexHistTypedHandoffBuilder, PcapStreamDecoder,
+    DecodeActuals, DecodeChannelContract, DecodeChannelRole, DecodeContract, DecodeError,
+    DecodeFailure, DecodeLimits, DecodeSummary, DecodedIexEventEnvelope,
+    DplcChannelDistributionContract, IexEventSink, IexHistBarInterval, IexHistDerivedBarError,
+    IexHistDerivedBarsHandoff, IexHistTypedEvent, IexHistTypedHandoff, IexHistTypedHandoffBuilder,
+    IexHistVenueTradeBar, PcapStreamDecoder,
 };
 pub use durable::{
     IexHistCheckpointError, IexHistCheckpointStore, IexHistCheckpointStoreError,
-    IexHistDurableJob, IexHistJobPhase, IexHistReactivationRequirement,
-    IexHistRecoveryAction, IexHistRetryDisposition, IexHistTerminalDisposition,
-    IexHistTerminalCoordinate, IexHistTerminalError, IexHistTerminalEvidence,
-    IexHistTerminalPhase,
+    IexHistDurableJob, IexHistJobPhase, IexHistReactivationRequirement, IexHistRecoveryAction,
+    IexHistResumeClaim, IexHistResumeClaimError, IexHistRetryDisposition,
+    IexHistTerminalCoordinate, IexHistTerminalDisposition, IexHistTerminalError,
+    IexHistTerminalEvidence, IexHistTerminalPhase,
 };
 pub use model::{
     AuctionImbalanceSide, AuctionType, DecodedIexEvent, EpochNanos, FeedKind, FeedVersion,
-    IexEvent, IexVenueSemantics, LuldTier, OperationalHaltStatus, OrderSide,
-    PcapObjectEncoding, PriceLevelSide, PriceType, PriceUnits1e4,
-    RetailLiquidityIndicator, SecurityEventCode, Sha256Digest, ShortSalePriceTestDetail,
-    SystemEventCode, TradeDate, TradingStatus, TransportVersion,
+    IexEvent, IexVenueSemantics, LuldTier, OperationalHaltStatus, OrderSide, PcapObjectEncoding,
+    PriceLevelSide, PriceType, PriceUnits1e4, RetailLiquidityIndicator, SecurityEventCode,
+    Sha256Digest, ShortSalePriceTestDetail, SystemEventCode, TradeDate, TradingStatus,
+    TransportVersion,
 };
 pub use planning::{
-    ByteAdmissionLimits, ColdJobPlan, ColdJobTrigger, IexHistCapacityAuthority,
-    IexHistAuthorityClockSample, IexHistCapacityCategory, IexHistCapacityDisposition,
-    IexHistCapacityError, IexHistCapacityFootprint, IexHistCapacityLease,
-    IexHistCapacityOperation, IexHistCapacityRequest, IexHistCapacitySettlement,
-    IexHistCapacityUsage, IexHistCatalogObservationReceipt, IexHistDecodeAttemptEvidence,
-    IexHistDplcDistributionAuthority, IexHistDplcDistributionError, IexHistExecutionAttempt,
-    IexHistExecutionPermit, IexHistPlanner, IexHistTerminalReason, IexHistTrustedClockReading,
-    PlanError, ResumePolicy, ScheduleLane, IEX_HIST_PROVIDER_LANE,
+    ByteAdmissionLimits, ColdJobPlan, ColdJobTrigger, IEX_HIST_PROVIDER_LANE,
+    IexHistAuthorityClockSample, IexHistCapacityAuthority, IexHistCapacityCategory,
+    IexHistCapacityDisposition, IexHistCapacityError, IexHistCapacityFootprint,
+    IexHistCapacityLease, IexHistCapacityOperation, IexHistCapacityRequest,
+    IexHistCapacitySettlement, IexHistCapacityUsage, IexHistCatalogObservationReceipt,
+    IexHistDecodeAttemptEvidence, IexHistDplcDistributionAuthority, IexHistDplcDistributionError,
+    IexHistExecutionAttempt, IexHistExecutionPermit, IexHistPlanner, IexHistTerminalReason,
+    IexHistTrustedClockReading, PlanError, ResumePolicy, ScheduleLane,
 };
 pub use receipt::{
     CaptureChronologyDisposition, CaptureClockAnomaly, CaptureError, PcapMaterializationReceipt,
 };
 pub use transport::{
-    CatalogFetch, DecodedIexCapture, IEX_HIST_CATALOG_URL, IexHistColdTransport,
+    CatalogFetch, DecodedIexCapture, IEX_HIST_CATALOG_URL, IexHistAdoptedResume,
+    IexHistColdTransport, IexHistDownloadOutcome, IexHistPendingResume,
+    IexHistResumeAdoptionBindingError, IexHistResumeAdoptionError, IexHistResumeAdoptionReceipt,
+    IexHistResumeAdoptionRequest, IexHistResumeCandidate, IexHistResumeCause,
+    IexHistResumePhysicalAdopter, IexHistResumeTelemetryEvidence, IexHistSharedPhysicalSealReceipt,
     IexHistTransportConfig, IexHistTransportError, MaterializedIexCapture, RetryObservation,
     RetryPolicy, StagedCaptureFiles, TransportErrorKind, TransportTelemetry,
 };

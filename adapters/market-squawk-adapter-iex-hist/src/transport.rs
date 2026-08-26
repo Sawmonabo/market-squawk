@@ -9,10 +9,11 @@ use async_compression::tokio::bufread::GzipDecoder;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, RETRY_AFTER,
-    USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+    IF_RANGE, RANGE, RETRY_AFTER, USER_AGENT,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
@@ -23,7 +24,8 @@ use crate::catalog::{Catalog, CatalogError, CatalogTransportMetadata, MAX_CATALO
 use crate::decode::{
     DecodeActuals, DecodeError, DecodeFailure, DecodeSummary, IexEventSink, PcapStreamDecoder,
 };
-use crate::model::PcapObjectEncoding;
+use crate::durable::IexHistResumeClaim;
+use crate::model::{PcapObjectEncoding, Sha256Digest};
 use crate::planning::{
     ColdJobPlan, IexHistCapacityAuthority, IexHistCapacityCategory, IexHistCapacityError,
     IexHistCapacityFootprint, IexHistCapacityRequest, IexHistExecutionPermit,
@@ -148,7 +150,7 @@ impl Default for IexHistTransportConfig {
 }
 
 /// One status-driven retry decision retained as runtime telemetry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RetryObservation {
     /// One-based HTTP attempt that received the status.
     pub attempt: u8,
@@ -311,10 +313,7 @@ impl TransportTelemetry {
         Ok(())
     }
 
-    fn add_staged_provider_object_bytes(
-        &mut self,
-        bytes: usize,
-    ) -> Result<(), TransportErrorKind> {
+    fn add_staged_provider_object_bytes(&mut self, bytes: usize) -> Result<(), TransportErrorKind> {
         self.staged_provider_object_bytes = self
             .staged_provider_object_bytes
             .checked_add(u64::try_from(bytes).map_err(|_| TransportErrorKind::ByteLimit)?)
@@ -361,9 +360,7 @@ impl CatalogFetch {
 
     /// Consumes the result into the catalog, exact body, and telemetry.
     #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (Catalog, Bytes, TransportTelemetry, IexHistExecutionPermit) {
+    pub fn into_parts(self) -> (Catalog, Bytes, TransportTelemetry, IexHistExecutionPermit) {
         (
             self.catalog,
             self.exact_body,
@@ -424,6 +421,564 @@ impl StagedCaptureFiles {
     }
 }
 
+/// Caller-controlled physical prefix and exact shared-adoption receipt for a later range attempt.
+///
+/// Construction is intentionally cheap and untrusted. [`IexHistColdTransport::resume_materialize`]
+/// revalidates the adoption receipt, claim, exact file length, and SHA-256 before issuing any
+/// request.
+pub struct IexHistResumeCandidate {
+    adoption: IexHistResumeAdoptionReceipt,
+    controlled_provider_object: File,
+}
+
+impl fmt::Debug for IexHistResumeCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IexHistResumeCandidate")
+            .field("claim_sha256", &self.adoption.claim().claim_sha256())
+            .field("adoption_receipt_sha256", &self.adoption.receipt_sha256())
+            .field("controlled_provider_object", &"opaque-controlled-file")
+            .finish()
+    }
+}
+
+impl IexHistResumeCandidate {
+    /// Binds an untrusted reopened controlled file to the shared-adoption receipt.
+    #[must_use]
+    pub const fn new(
+        adoption: IexHistResumeAdoptionReceipt,
+        controlled_provider_object: File,
+    ) -> Self {
+        Self {
+            adoption,
+            controlled_provider_object,
+        }
+    }
+}
+
+/// Why a transfer stopped after yielding a safely claimable nonempty prefix.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IexHistResumeCause {
+    /// The response body stream failed after at least one new byte.
+    Network,
+}
+
+const RESUME_ADOPTION_SCHEMA_VERSION: u16 = 1;
+
+/// Fixed-size interruption telemetry retained across restart without an unbounded retry vector.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IexHistResumeTelemetryEvidence {
+    attempts_total: u8,
+    http_429_total: u8,
+    http_503_total: u8,
+    network_failures_total: u8,
+    response_bytes: u64,
+    expanded_pcap_bytes: u64,
+    staged_provider_object_bytes: u64,
+    staged_pcap_bytes: u64,
+    staged_decoded_event_batch_bytes: u64,
+    last_status: Option<u16>,
+    retry_count: u8,
+    retries: [Option<RetryObservation>; MAX_RETRY_ATTEMPTS as usize],
+}
+
+impl IexHistResumeTelemetryEvidence {
+    fn try_from_runtime(
+        telemetry: &TransportTelemetry,
+    ) -> Result<Self, IexHistResumeAdoptionBindingError> {
+        let retry_count = u8::try_from(telemetry.retries.len())
+            .map_err(|_| IexHistResumeAdoptionBindingError::InvalidBinding)?;
+        if retry_count > MAX_RETRY_ATTEMPTS {
+            return Err(IexHistResumeAdoptionBindingError::InvalidBinding);
+        }
+        let mut retries = [None; MAX_RETRY_ATTEMPTS as usize];
+        for (target, observation) in retries.iter_mut().zip(&telemetry.retries) {
+            *target = Some(*observation);
+        }
+        let evidence = Self {
+            attempts_total: telemetry.attempts_total,
+            http_429_total: telemetry.http_429_total,
+            http_503_total: telemetry.http_503_total,
+            network_failures_total: telemetry.network_failures_total,
+            response_bytes: telemetry.response_bytes,
+            expanded_pcap_bytes: telemetry.expanded_pcap_bytes,
+            staged_provider_object_bytes: telemetry.staged_provider_object_bytes,
+            staged_pcap_bytes: telemetry.staged_pcap_bytes,
+            staged_decoded_event_batch_bytes: telemetry.staged_decoded_event_batch_bytes,
+            last_status: telemetry.last_status,
+            retry_count,
+            retries,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    fn validate(self) -> Result<(), IexHistResumeAdoptionBindingError> {
+        let retry_count = usize::from(self.retry_count);
+        if self.attempts_total == 0
+            || self.attempts_total > MAX_RETRY_ATTEMPTS
+            || self.http_429_total > self.attempts_total
+            || self.http_503_total > self.attempts_total
+            || self.network_failures_total > self.attempts_total
+            || retry_count > self.retries.len()
+            || self.retries[..retry_count].iter().any(Option::is_none)
+            || self.retries[retry_count..].iter().any(Option::is_some)
+            || self.retries[..retry_count]
+                .iter()
+                .flatten()
+                .any(|retry| retry.attempt == 0 || retry.attempt >= self.attempts_total)
+        {
+            return Err(IexHistResumeAdoptionBindingError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    /// Returns exact request or response-stream network failures.
+    #[must_use]
+    pub const fn network_failures_total(self) -> u8 {
+        self.network_failures_total
+    }
+
+    /// Returns exact response bytes received in the interrupted segment.
+    #[must_use]
+    pub const fn response_bytes(self) -> u64 {
+        self.response_bytes
+    }
+
+    /// Returns exact full-prefix bytes written to the controlled staging object.
+    #[must_use]
+    pub const fn staged_provider_object_bytes(self) -> u64 {
+        self.staged_provider_object_bytes
+    }
+}
+
+/// Common-platform physical receipt coordinates required by the adapter rejoin.
+///
+/// The adapter deliberately does not implement this trait for any local storage type. The shared
+/// physical store implements it on its non-forgeable seal receipt (or a composition-owned wrapper)
+/// so the adapter can verify exact bytes without acquiring storage or publication authority.
+pub trait IexHistSharedPhysicalSealReceipt {
+    /// Identity of the shared durable volume that owns the sealed prefix.
+    fn storage_root_sha256(&self) -> Sha256Digest;
+    /// SHA-256 of the exact provider-object prefix from byte zero.
+    fn object_sha256(&self) -> Sha256Digest;
+    /// Exact sealed provider-object prefix bytes.
+    fn object_bytes(&self) -> u64;
+    /// Nonzero identity of the shared platform's physical seal receipt.
+    fn physical_receipt_sha256(&self) -> Sha256Digest;
+}
+
+/// One-use request that transfers an incomplete prefix to shared physical storage.
+///
+/// It carries the exact claim, interruption, and telemetry but no execution permit. Only
+/// [`IexHistPendingResume::try_adopt`] retains and settles that permit.
+pub struct IexHistResumeAdoptionRequest {
+    claim: IexHistResumeClaim,
+    provider_object: NamedTempFile,
+    cause: IexHistResumeCause,
+    telemetry: TransportTelemetry,
+}
+
+impl fmt::Debug for IexHistResumeAdoptionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IexHistResumeAdoptionRequest")
+            .field("claim_sha256", &self.claim.claim_sha256())
+            .field("cause", &self.cause)
+            .field("telemetry", &self.telemetry)
+            .field("provider_object", &"opaque-temporary-file")
+            .finish()
+    }
+}
+
+impl IexHistResumeAdoptionRequest {
+    /// Returns the exact incomplete-prefix claim being physically adopted.
+    #[must_use]
+    pub const fn claim(&self) -> &IexHistResumeClaim {
+        &self.claim
+    }
+
+    /// Returns the exact interruption category bound to this request.
+    #[must_use]
+    pub const fn cause(&self) -> IexHistResumeCause {
+        self.cause
+    }
+
+    /// Returns exact request and byte telemetry bound to this request.
+    #[must_use]
+    pub const fn telemetry(&self) -> &TransportTelemetry {
+        &self.telemetry
+    }
+
+    /// Consumes the request into evidence and the one-use temporary file.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        IexHistResumeClaim,
+        NamedTempFile,
+        IexHistResumeCause,
+        TransportTelemetry,
+    ) {
+        (self.claim, self.provider_object, self.cause, self.telemetry)
+    }
+}
+
+/// Shared-platform adopter invoked while the selected-file capacity permit remains private.
+pub trait IexHistResumePhysicalAdopter {
+    /// Non-forgeable physical receipt returned by the shared storage boundary.
+    type Receipt: IexHistSharedPhysicalSealReceipt;
+    /// Shared adoption failure retained by the caller.
+    type Error;
+
+    /// Consumes and physically seals the exact one-use prefix request.
+    fn adopt(
+        &mut self,
+        request: IexHistResumeAdoptionRequest,
+    ) -> Result<Self::Receipt, Self::Error>;
+}
+
+/// Serializable join between resumable provider evidence and a shared physical seal receipt.
+///
+/// This receipt is composition lineage, not storage authority: its physical coordinates must come
+/// from [`IexHistResumePhysicalAdopter`] and are revalidated before every range request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IexHistResumeAdoptionReceipt {
+    schema_version: u16,
+    claim: IexHistResumeClaim,
+    cause: IexHistResumeCause,
+    telemetry: IexHistResumeTelemetryEvidence,
+    storage_root_sha256: Sha256Digest,
+    object_sha256: Sha256Digest,
+    object_bytes: u64,
+    physical_receipt_sha256: Sha256Digest,
+    receipt_sha256: Sha256Digest,
+}
+
+impl IexHistResumeAdoptionReceipt {
+    fn try_bind<R: IexHistSharedPhysicalSealReceipt>(
+        plan: &ColdJobPlan,
+        claim: IexHistResumeClaim,
+        cause: IexHistResumeCause,
+        telemetry: TransportTelemetry,
+        physical: &R,
+    ) -> Result<Self, IexHistResumeAdoptionBindingError> {
+        let telemetry = IexHistResumeTelemetryEvidence::try_from_runtime(&telemetry)?;
+        let receipt_sha256 = resume_adoption_identity(
+            &claim,
+            cause,
+            &telemetry,
+            physical.storage_root_sha256(),
+            physical.object_sha256(),
+            physical.object_bytes(),
+            physical.physical_receipt_sha256(),
+        );
+        let receipt = Self {
+            schema_version: RESUME_ADOPTION_SCHEMA_VERSION,
+            claim,
+            cause,
+            telemetry,
+            storage_root_sha256: physical.storage_root_sha256(),
+            object_sha256: physical.object_sha256(),
+            object_bytes: physical.object_bytes(),
+            physical_receipt_sha256: physical.physical_receipt_sha256(),
+            receipt_sha256,
+        };
+        receipt.validate_against(plan)?;
+        Ok(receipt)
+    }
+
+    /// Revalidates exact claim, interruption, telemetry, and shared physical coordinates.
+    pub fn validate_against(
+        &self,
+        plan: &ColdJobPlan,
+    ) -> Result<(), IexHistResumeAdoptionBindingError> {
+        self.claim
+            .validate_against(plan)
+            .map_err(|_| IexHistResumeAdoptionBindingError::InvalidBinding)?;
+        self.telemetry.validate()?;
+        let segment_bytes = self
+            .claim
+            .prefix_bytes()
+            .checked_sub(self.claim.segment_start_bytes())
+            .ok_or(IexHistResumeAdoptionBindingError::InvalidBinding)?;
+        if self.schema_version != RESUME_ADOPTION_SCHEMA_VERSION
+            || self.telemetry.network_failures_total() == 0
+            || self.telemetry.response_bytes() != segment_bytes
+            || self.telemetry.staged_provider_object_bytes() != self.claim.prefix_bytes()
+            || self.storage_root_sha256 != self.claim.segment_attempt().storage_root_sha256()
+            || self.object_sha256 != self.claim.prefix_sha256()
+            || self.object_bytes != self.claim.prefix_bytes()
+            || !nonzero_sha256(self.physical_receipt_sha256)
+            || resume_adoption_identity(
+                &self.claim,
+                self.cause,
+                &self.telemetry,
+                self.storage_root_sha256,
+                self.object_sha256,
+                self.object_bytes,
+                self.physical_receipt_sha256,
+            ) != self.receipt_sha256
+        {
+            return Err(IexHistResumeAdoptionBindingError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    /// Returns the exact resumable-prefix claim.
+    #[must_use]
+    pub const fn claim(&self) -> &IexHistResumeClaim {
+        &self.claim
+    }
+
+    /// Returns the exact interruption category.
+    #[must_use]
+    pub const fn cause(&self) -> IexHistResumeCause {
+        self.cause
+    }
+
+    /// Returns exact interruption telemetry.
+    #[must_use]
+    pub const fn telemetry(&self) -> IexHistResumeTelemetryEvidence {
+        self.telemetry
+    }
+
+    /// Returns the shared platform's exact physical receipt identity.
+    #[must_use]
+    pub const fn physical_receipt_sha256(&self) -> Sha256Digest {
+        self.physical_receipt_sha256
+    }
+
+    /// Returns the complete adoption binding identity.
+    #[must_use]
+    pub const fn receipt_sha256(&self) -> Sha256Digest {
+        self.receipt_sha256
+    }
+}
+
+/// Invalid shared physical sidecar for a resumable provider prefix.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum IexHistResumeAdoptionBindingError {
+    /// Claim, interruption telemetry, or physical seal coordinates did not bind exactly.
+    #[error("IEX HIST resumable-prefix shared-adoption binding is invalid")]
+    InvalidBinding,
+}
+
+/// Complete shared adoption, retaining the shared receipt itself beside the serializable join.
+#[derive(Debug)]
+pub struct IexHistAdoptedResume<R> {
+    adoption: IexHistResumeAdoptionReceipt,
+    physical_receipt: R,
+}
+
+impl<R> IexHistAdoptedResume<R> {
+    /// Returns the serializable exact adoption join.
+    #[must_use]
+    pub const fn adoption(&self) -> &IexHistResumeAdoptionReceipt {
+        &self.adoption
+    }
+
+    /// Consumes the rejoin into the adoption evidence and shared physical receipt.
+    #[must_use]
+    pub fn into_parts(self) -> (IexHistResumeAdoptionReceipt, R) {
+        (self.adoption, self.physical_receipt)
+    }
+}
+
+/// Failure while a pending prefix is adopted and the private permit settles interrupted.
+#[derive(Debug)]
+pub enum IexHistResumeAdoptionError<E> {
+    /// Shared physical adoption failed; an optional secondary settlement failure is retained.
+    Shared {
+        /// Original shared-store failure.
+        error: E,
+        /// Secondary failure while releasing the private permit interrupted.
+        settlement_error: Option<IexHistCapacityError>,
+    },
+    /// Shared receipt did not bind to the exact claim; settlement failure is retained separately.
+    InvalidPhysicalReceipt {
+        /// Secondary failure while releasing the private permit interrupted.
+        settlement_error: Option<IexHistCapacityError>,
+    },
+    /// Shared adoption succeeded, but the private permit could not settle interrupted.
+    Settlement(IexHistCapacityError),
+}
+
+/// Incomplete provider-object handoff awaiting adoption by shared physical storage.
+///
+/// Neither the claim nor the temporary file is a durable checkpoint. The caller must consume and
+/// adopt the file and atomically retain its own physical receipt with the claim while the permit
+/// still protects capacity. The current permit has no partial-durability disposition and must be
+/// released as interrupted after adoption; it must never be settled as checkpointed or completed.
+pub struct IexHistPendingResume {
+    claim: IexHistResumeClaim,
+    provider_object: NamedTempFile,
+    cause: IexHistResumeCause,
+    telemetry: TransportTelemetry,
+    capacity_permit: IexHistExecutionPermit,
+}
+
+impl fmt::Debug for IexHistPendingResume {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IexHistPendingResume")
+            .field("claim_sha256", &self.claim.claim_sha256())
+            .field("prefix_bytes", &self.claim.prefix_bytes())
+            .field("cause", &self.cause)
+            .field("telemetry", &self.telemetry)
+            .field("provider_object", &"opaque-temporary-file")
+            .finish_non_exhaustive()
+    }
+}
+
+impl IexHistPendingResume {
+    /// Returns the exact incomplete-prefix claim.
+    #[must_use]
+    pub const fn claim(&self) -> &IexHistResumeClaim {
+        &self.claim
+    }
+
+    /// Returns the terminal interruption category retained with the claim.
+    #[must_use]
+    pub const fn cause(&self) -> IexHistResumeCause {
+        self.cause
+    }
+
+    /// Returns exact attempt and byte telemetry accumulated in this response segment.
+    #[must_use]
+    pub const fn telemetry(&self) -> &TransportTelemetry {
+        &self.telemetry
+    }
+
+    /// Physically adopts the exact prefix while retaining exclusive control of the capacity permit.
+    ///
+    /// Success and every failure path release the permit only as `Interrupted`; callers can never
+    /// settle partial bytes as checkpointed or completed.
+    pub fn try_adopt<A: IexHistResumePhysicalAdopter>(
+        self,
+        plan: &ColdJobPlan,
+        adopter: &mut A,
+    ) -> Result<IexHistAdoptedResume<A::Receipt>, IexHistResumeAdoptionError<A::Error>> {
+        let Self {
+            claim,
+            provider_object,
+            cause,
+            telemetry,
+            capacity_permit,
+        } = self;
+        if claim.validate_against(plan).is_err() {
+            return Err(IexHistResumeAdoptionError::InvalidPhysicalReceipt {
+                settlement_error: capacity_permit
+                    .settle(crate::planning::IexHistCapacityDisposition::Interrupted)
+                    .err(),
+            });
+        }
+        let request = IexHistResumeAdoptionRequest {
+            claim: claim.clone(),
+            provider_object,
+            cause,
+            telemetry: telemetry.clone(),
+        };
+        let physical_receipt = match adopter.adopt(request) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(IexHistResumeAdoptionError::Shared {
+                    error,
+                    settlement_error: capacity_permit
+                        .settle(crate::planning::IexHistCapacityDisposition::Interrupted)
+                        .err(),
+                });
+            }
+        };
+        let adoption = match IexHistResumeAdoptionReceipt::try_bind(
+            plan,
+            claim,
+            cause,
+            telemetry,
+            &physical_receipt,
+        ) {
+            Ok(adoption) => adoption,
+            Err(_) => {
+                return Err(IexHistResumeAdoptionError::InvalidPhysicalReceipt {
+                    settlement_error: capacity_permit
+                        .settle(crate::planning::IexHistCapacityDisposition::Interrupted)
+                        .err(),
+                });
+            }
+        };
+        capacity_permit
+            .settle(crate::planning::IexHistCapacityDisposition::Interrupted)
+            .map_err(IexHistResumeAdoptionError::Settlement)?;
+        Ok(IexHistAdoptedResume {
+            adoption,
+            physical_receipt,
+        })
+    }
+}
+
+fn nonzero_sha256(value: Sha256Digest) -> bool {
+    value.as_bytes().iter().any(|byte| *byte != 0)
+}
+
+fn resume_adoption_identity(
+    claim: &IexHistResumeClaim,
+    cause: IexHistResumeCause,
+    telemetry: &IexHistResumeTelemetryEvidence,
+    storage_root_sha256: Sha256Digest,
+    object_sha256: Sha256Digest,
+    object_bytes: u64,
+    physical_receipt_sha256: Sha256Digest,
+) -> Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/iex-hist-resume-adoption/v1");
+    hasher.update(claim.claim_sha256().as_bytes());
+    hasher.update(match cause {
+        IexHistResumeCause::Network => b"network".as_slice(),
+    });
+    hasher.update([telemetry.attempts_total]);
+    hasher.update([telemetry.http_429_total]);
+    hasher.update([telemetry.http_503_total]);
+    hasher.update([telemetry.network_failures_total]);
+    hasher.update(telemetry.response_bytes.to_le_bytes());
+    hasher.update(telemetry.expanded_pcap_bytes.to_le_bytes());
+    hasher.update(telemetry.staged_provider_object_bytes.to_le_bytes());
+    hasher.update(telemetry.staged_pcap_bytes.to_le_bytes());
+    hasher.update(telemetry.staged_decoded_event_batch_bytes.to_le_bytes());
+    hasher.update([u8::from(telemetry.last_status.is_some())]);
+    hasher.update(telemetry.last_status.unwrap_or_default().to_le_bytes());
+    hasher.update([telemetry.retry_count]);
+    for retry in telemetry.retries.iter().flatten() {
+        hasher.update([retry.attempt]);
+        hasher.update(retry.status.to_le_bytes());
+        hasher.update([u8::from(retry.provider_retry_after_ms.is_some())]);
+        hasher.update(
+            retry
+                .provider_retry_after_ms
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+        hasher.update(retry.applied_wait_ms.to_le_bytes());
+    }
+    hasher.update(storage_root_sha256.as_bytes());
+    hasher.update(object_sha256.as_bytes());
+    hasher.update(object_bytes.to_le_bytes());
+    hasher.update(physical_receipt_sha256.as_bytes());
+    hasher.update(b"capacity-settlement/interrupted");
+    Sha256Digest::from_bytes(hasher.finalize().into())
+}
+
+/// Selected-file transfer outcome: exact complete materialization or an adoptable prefix claim.
+#[derive(Debug)]
+pub enum IexHistDownloadOutcome {
+    /// Exact complete provider object and materialized PCAP.
+    Materialized(Box<MaterializedIexCapture>),
+    /// Incomplete exact prefix awaiting shared physical adoption before resume.
+    ResumePending(Box<IexHistPendingResume>),
+}
+
 /// Complete selected-file transfer, expansion, integrity, and temporary raw-artifact outcome.
 ///
 /// Decode is deliberately a later phase. The application must first seal both artifacts and
@@ -479,14 +1034,21 @@ pub struct DecodedIexCapture<S> {
 
 impl<S> DecodedIexCapture<S> {
     #[must_use]
-    pub const fn summary(&self) -> &DecodeSummary { &self.summary }
+    pub const fn summary(&self) -> &DecodeSummary {
+        &self.summary
+    }
     #[must_use]
-    pub const fn telemetry(&self) -> &TransportTelemetry { &self.telemetry }
+    pub const fn telemetry(&self) -> &TransportTelemetry {
+        &self.telemetry
+    }
     #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (DecodeSummary, S, TransportTelemetry, IexHistExecutionPermit) {
-        (self.summary, self.sink, self.telemetry, self.capacity_permit)
+    pub fn into_parts(self) -> (DecodeSummary, S, TransportTelemetry, IexHistExecutionPermit) {
+        (
+            self.summary,
+            self.sink,
+            self.telemetry,
+            self.capacity_permit,
+        )
     }
 }
 
@@ -550,132 +1112,135 @@ impl IexHistColdTransport {
         .map_err(|error| {
             IexHistTransportError::new(TransportErrorKind::Plan(error), TransportTelemetry::new())
         })?;
-        let request = IexHistCapacityRequest::catalog(footprint, deadline_unix_nanos)
-            .map_err(|error| {
+        let request =
+            IexHistCapacityRequest::catalog(footprint, deadline_unix_nanos).map_err(|error| {
                 IexHistTransportError::new(
                     TransportErrorKind::CapacityAuthority(error),
                     TransportTelemetry::new(),
                 )
             })?;
         let mut capacity_permit =
-            IexHistExecutionPermit::acquire(capacity_authority, request, None).map_err(|error| {
-                IexHistTransportError::new(
-                    TransportErrorKind::CapacityAuthority(error),
-                    TransportTelemetry::new(),
-                )
-            })?;
+            IexHistExecutionPermit::acquire(capacity_authority, request, None).map_err(
+                |error| {
+                    IexHistTransportError::new(
+                        TransportErrorKind::CapacityAuthority(error),
+                        TransportTelemetry::new(),
+                    )
+                },
+            )?;
         let deadline = Deadline::from_permit(&capacity_permit)
             .map_err(|kind| IexHistTransportError::new(kind, TransportTelemetry::new()))?;
         let mut telemetry = TransportTelemetry::new();
         let operation = async {
-          loop {
-            let attempt = telemetry
-                .begin_attempt()
-                .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
-            let send = self
-                .client
-                .get(IEX_HIST_CATALOG_URL)
-                .header(ACCEPT, "application/json")
-                .header(ACCEPT_ENCODING, "identity")
-                .header(USER_AGENT, USER_AGENT_VALUE)
-                .send();
-            let response = match await_deadline(send, deadline, cancellation).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(_)) => {
-                    telemetry
-                        .record_network_failure()
-                        .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+            loop {
+                let attempt = telemetry
+                    .begin_attempt()
+                    .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+                let send = self
+                    .client
+                    .get(IEX_HIST_CATALOG_URL)
+                    .header(ACCEPT, "application/json")
+                    .header(ACCEPT_ENCODING, "identity")
+                    .header(USER_AGENT, USER_AGENT_VALUE)
+                    .send();
+                let response = match await_deadline(send, deadline, cancellation).await {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(_)) => {
+                        telemetry
+                            .record_network_failure()
+                            .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+                        if attempt >= self.config.retry_policy.max_attempts {
+                            return Err(IexHistTransportError::new(
+                                TransportErrorKind::Network,
+                                telemetry.clone(),
+                            ));
+                        }
+                        let wait = self.config.retry_policy.wait_for_attempt(attempt);
+                        wait_retry(wait, deadline, cancellation)
+                            .await
+                            .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+                        continue;
+                    }
+                    Err(kind) => return Err(IexHistTransportError::new(kind, telemetry.clone())),
+                };
+                let status = response.status().as_u16();
+                telemetry
+                    .record_status(status)
+                    .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+                if matches!(status, 429 | 503) {
                     if attempt >= self.config.retry_policy.max_attempts {
                         return Err(IexHistTransportError::new(
-                            TransportErrorKind::Network,
+                            TransportErrorKind::RetryExhausted { status },
                             telemetry.clone(),
                         ));
                     }
-                    let wait = self.config.retry_policy.wait_for_attempt(attempt);
+                    let retry_clock = capacity_permit.trusted_clock().map_err(|error| {
+                        IexHistTransportError::new(
+                            TransportErrorKind::CapacityAuthority(error),
+                            telemetry.clone(),
+                        )
+                    })?;
+                    let provider_wait = parse_retry_after(response.headers(), retry_clock)
+                        .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+                    let wait = provider_wait
+                        .unwrap_or_else(|| self.config.retry_policy.wait_for_attempt(attempt))
+                        .min(self.config.retry_policy.max_delay);
+                    telemetry
+                        .record_retry(RetryObservation {
+                            attempt,
+                            status,
+                            provider_retry_after_ms: provider_wait.map(duration_millis),
+                            applied_wait_ms: duration_millis(wait),
+                        })
+                        .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
                     wait_retry(wait, deadline, cancellation)
                         .await
                         .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
                     continue;
                 }
-                Err(kind) => return Err(IexHistTransportError::new(kind, telemetry.clone())),
-            };
-            let status = response.status().as_u16();
-            telemetry
-                .record_status(status)
-                .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
-            if matches!(status, 429 | 503) {
-                if attempt >= self.config.retry_policy.max_attempts {
+                if status != 200 {
                     return Err(IexHistTransportError::new(
-                        TransportErrorKind::RetryExhausted { status },
+                        TransportErrorKind::HttpStatus { status },
                         telemetry.clone(),
                     ));
                 }
-                let retry_clock = capacity_permit.trusted_clock().map_err(|error| {
-                    IexHistTransportError::new(
-                        TransportErrorKind::CapacityAuthority(error),
-                        telemetry.clone(),
-                    )
-                })?;
-                let provider_wait = parse_retry_after(response.headers(), retry_clock)
+                let headers = catalog_headers(&response)
                     .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
-                let wait = provider_wait
-                    .unwrap_or_else(|| self.config.retry_policy.wait_for_attempt(attempt))
-                    .min(self.config.retry_policy.max_delay);
-                telemetry
-                    .record_retry(RetryObservation {
-                        attempt,
+                let mut stream: ByteStream = Box::pin(
+                    response
+                        .bytes_stream()
+                        .map(|item| item.map_err(|_| StreamFailure::Network)),
+                );
+                let body =
+                    collect_catalog_body(&mut stream, deadline, cancellation, &mut telemetry)
+                        .await
+                        .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+                let observation = capacity_permit
+                    .observe_catalog_body(&body)
+                    .map_err(|error| {
+                        IexHistTransportError::new(
+                            TransportErrorKind::CapacityAuthority(error),
+                            telemetry.clone(),
+                        )
+                    })?;
+                let catalog = Catalog::parse(
+                    &body,
+                    CatalogTransportMetadata {
                         status,
-                        provider_retry_after_ms: provider_wait.map(duration_millis),
-                        applied_wait_ms: duration_millis(wait),
-                    })
-                    .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
-                wait_retry(wait, deadline, cancellation)
-                    .await
-                    .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
-                continue;
-            }
-            if status != 200 {
-                return Err(IexHistTransportError::new(
-                    TransportErrorKind::HttpStatus { status },
-                    telemetry.clone(),
-                ));
-            }
-            let headers = catalog_headers(&response)
-                .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
-            let mut stream: ByteStream = Box::pin(
-                response
-                    .bytes_stream()
-                    .map(|item| item.map_err(|_| StreamFailure::Network)),
-            );
-            let body = collect_catalog_body(&mut stream, deadline, cancellation, &mut telemetry)
-                .await
-                .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
-            let observation = capacity_permit
-                .observe_catalog_body(&body)
+                        content_type: headers.content_type,
+                        content_length: headers.content_length,
+                        etag: headers.etag,
+                        observation,
+                    },
+                )
                 .map_err(|error| {
                     IexHistTransportError::new(
-                        TransportErrorKind::CapacityAuthority(error),
+                        TransportErrorKind::Catalog(error),
                         telemetry.clone(),
                     )
                 })?;
-            let catalog = Catalog::parse(
-                &body,
-                CatalogTransportMetadata {
-                    status,
-                    content_type: headers.content_type,
-                    content_length: headers.content_length,
-                    etag: headers.etag,
-                    observation,
-                },
-            )
-            .map_err(|error| {
-                IexHistTransportError::new(
-                    TransportErrorKind::Catalog(error),
-                    telemetry.clone(),
-                )
-            })?;
-            return Ok((catalog, Bytes::from(body)));
-          }
+                return Ok((catalog, Bytes::from(body)));
+            }
         }
         .await;
         match operation {
@@ -684,22 +1249,27 @@ impl IexHistColdTransport {
                     IexHistCapacityCategory::NetworkResponse,
                     telemetry.response_bytes,
                 ) {
-                    let _ = capacity_permit
-                        .settle(crate::planning::IexHistCapacityDisposition::Failed);
+                    let _ =
+                        capacity_permit.settle(crate::planning::IexHistCapacityDisposition::Failed);
                     return Err(IexHistTransportError::new(
                         TransportErrorKind::CapacityAuthority(error),
                         telemetry,
                     ));
                 }
-                Ok(CatalogFetch { catalog, exact_body, telemetry, capacity_permit })
+                Ok(CatalogFetch {
+                    catalog,
+                    exact_body,
+                    telemetry,
+                    capacity_permit,
+                })
             }
             Err(error) => {
                 let _ = capacity_permit.record_usage(
                     IexHistCapacityCategory::NetworkResponse,
                     telemetry.response_bytes,
                 );
-                let settlement = capacity_permit
-                    .settle(crate::planning::IexHistCapacityDisposition::Failed);
+                let settlement =
+                    capacity_permit.settle(crate::planning::IexHistCapacityDisposition::Failed);
                 Err(IexHistTransportError::new(
                     settlement
                         .err()
@@ -710,12 +1280,12 @@ impl IexHistColdTransport {
         }
     }
 
-    /// Downloads, stages, expands, and receipts one exact selected file.
+    /// Downloads, stages, expands, and receipts one exact selected file from byte zero.
     ///
-    /// No retry occurs after response-body streaming starts. A failure discards temporary objects;
-    /// restart repeats the exact selected-file request from byte zero. Successful temporary files
-    /// still have no durable authority until the application consumes them into its immutable
-    /// provider-object storage and commits the corresponding acquisition evidence.
+    /// No retry occurs after response-body streaming starts. When a nonempty prefix and a strong
+    /// validator exist, interruption returns a pending claim and controlled temporary file for
+    /// shared physical adoption. Successful temporary files still have no durable authority until
+    /// the application consumes them into shared immutable storage.
     ///
     /// # Errors
     ///
@@ -727,62 +1297,151 @@ impl IexHistColdTransport {
         capacity_authority: &dyn IexHistCapacityAuthority,
         deadline_unix_nanos: i64,
         cancellation: &CancellationToken,
-    ) -> Result<MaterializedIexCapture, IexHistTransportError> {
-        let authority_free_reserve_bytes = capacity_authority
-            .required_free_reserve_bytes()
-            .map_err(|error| {
-                IexHistTransportError::new(
-                    TransportErrorKind::CapacityAuthority(error),
-                    TransportTelemetry::new(),
-                )
-            })?;
-        let request = IexHistCapacityRequest::selected_file(
+    ) -> Result<IexHistDownloadOutcome, IexHistTransportError> {
+        let (capacity_permit, staging_directory, deadline) =
+            acquire_materialization_permit(plan, capacity_authority, deadline_unix_nanos)?;
+        let mut telemetry = TransportTelemetry::new();
+        let response = self
+            .request_selected_stream(
+                plan,
+                &capacity_permit,
+                deadline,
+                cancellation,
+                &mut telemetry,
+                None,
+            )
+            .await;
+        let (metadata, stream) = match response {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(settle_transfer_failure(
+                    capacity_permit,
+                    error,
+                    telemetry,
+                    plan.object_encoding,
+                ));
+            }
+        };
+        materialize_selected_stream(
             plan,
-            deadline_unix_nanos,
-            authority_free_reserve_bytes,
+            metadata,
+            stream,
+            &staging_directory,
+            deadline,
+            cancellation,
+            telemetry,
+            capacity_permit,
+            None,
         )
-            .map_err(|error| {
-                IexHistTransportError::new(
-                    TransportErrorKind::CapacityAuthority(error),
-                    TransportTelemetry::new(),
-                )
-            })?;
-        let capacity_permit = IexHistExecutionPermit::acquire(
-            capacity_authority,
-            request,
-            Some(plan),
-        )
-        .map_err(|error| {
+        .await
+    }
+
+    /// Revalidates an application-controlled prefix, then requests only its exact remaining range.
+    ///
+    /// A full response, changed/weak validator, or malformed range fails closed. The caller may
+    /// start a distinct byte-zero attempt; this method never mixes such bytes into the prefix.
+    pub async fn resume_materialize(
+        &self,
+        plan: &ColdJobPlan,
+        capacity_authority: &dyn IexHistCapacityAuthority,
+        deadline_unix_nanos: i64,
+        cancellation: &CancellationToken,
+        candidate: IexHistResumeCandidate,
+    ) -> Result<IexHistDownloadOutcome, IexHistTransportError> {
+        candidate.adoption.validate_against(plan).map_err(|_| {
             IexHistTransportError::new(
-                TransportErrorKind::CapacityAuthority(error),
+                TransportErrorKind::Capture(CaptureError::InvalidResumeClaim),
                 TransportTelemetry::new(),
             )
         })?;
-        let staging_directory = capacity_permit
-            .staging_directory()
-            .map_err(|error| {
-                IexHistTransportError::new(
-                    TransportErrorKind::CapacityAuthority(error),
-                    TransportTelemetry::new(),
-                )
-            })?
-            .to_path_buf();
-        let deadline = Deadline::from_permit(&capacity_permit)
-            .map_err(|kind| IexHistTransportError::new(kind, TransportTelemetry::new()))?;
+        let (capacity_permit, staging_directory, deadline) =
+            acquire_materialization_permit(plan, capacity_authority, deadline_unix_nanos)?;
         let mut telemetry = TransportTelemetry::new();
-        let response = async {
-          loop {
+        let verified = verify_resume_candidate(
+            plan,
+            candidate,
+            &staging_directory,
+            deadline,
+            cancellation,
+            &mut telemetry,
+        )
+        .await;
+        let (resume_adoption, provider_object) = match verified {
+            Ok(value) => value,
+            Err(kind) => {
+                let error = IexHistTransportError::new(kind, telemetry.clone());
+                return Err(settle_transfer_failure(
+                    capacity_permit,
+                    error,
+                    telemetry,
+                    plan.object_encoding,
+                ));
+            }
+        };
+        let response = self
+            .request_selected_stream(
+                plan,
+                &capacity_permit,
+                deadline,
+                cancellation,
+                &mut telemetry,
+                Some(resume_adoption.claim()),
+            )
+            .await;
+        let (metadata, stream) = match response {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(settle_transfer_failure(
+                    capacity_permit,
+                    error,
+                    telemetry,
+                    plan.object_encoding,
+                ));
+            }
+        };
+        materialize_selected_stream(
+            plan,
+            metadata,
+            stream,
+            &staging_directory,
+            deadline,
+            cancellation,
+            telemetry,
+            capacity_permit,
+            Some((resume_adoption, provider_object)),
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the request loop retains its exact plan, permit, deadline, telemetry, and range"
+    )]
+    async fn request_selected_stream(
+        &self,
+        plan: &ColdJobPlan,
+        capacity_permit: &IexHistExecutionPermit,
+        deadline: Deadline,
+        cancellation: &CancellationToken,
+        telemetry: &mut TransportTelemetry,
+        resume_claim: Option<&IexHistResumeClaim>,
+    ) -> Result<(CaptureResponseMetadata, ByteStream), IexHistTransportError> {
+        loop {
             let attempt = telemetry
                 .begin_attempt()
                 .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
-            let send = self
+            let mut request = self
                 .client
                 .get(&plan.selected_file.download_url)
                 .header(ACCEPT, "application/gzip, application/octet-stream")
                 .header(ACCEPT_ENCODING, "identity")
-                .header(USER_AGENT, USER_AGENT_VALUE)
-                .send();
-            let response = match await_deadline(send, deadline, cancellation).await {
+                .header(USER_AGENT, USER_AGENT_VALUE);
+            if let Some(claim) = resume_claim {
+                request = request
+                    .header(RANGE, format!("bytes={}-", claim.prefix_bytes()))
+                    .header(IF_RANGE, claim.strong_etag());
+            }
+            let response = match await_deadline(request.send(), deadline, cancellation).await {
                 Ok(Ok(response)) => response,
                 Ok(Err(_)) => {
                     telemetry
@@ -837,13 +1496,22 @@ impl IexHistColdTransport {
                     .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
                 continue;
             }
-            if status != 200 {
-                return Err(IexHistTransportError::new(
-                    TransportErrorKind::HttpStatus { status },
-                    telemetry.clone(),
-                ));
+            match (resume_claim, status) {
+                (None, 200) | (Some(_), 206) => {}
+                (Some(_), _) => {
+                    return Err(IexHistTransportError::new(
+                        TransportErrorKind::ResumeNotHonored { status },
+                        telemetry.clone(),
+                    ));
+                }
+                (None, _) => {
+                    return Err(IexHistTransportError::new(
+                        TransportErrorKind::HttpStatus { status },
+                        telemetry.clone(),
+                    ));
+                }
             }
-            let metadata = file_response_metadata(plan, &response, &capacity_permit)
+            let metadata = file_response_metadata(plan, &response, capacity_permit, resume_claim)
                 .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
             let stream: ByteStream = Box::pin(
                 response
@@ -851,33 +1519,7 @@ impl IexHistColdTransport {
                     .map(|item| item.map_err(|_| StreamFailure::Network)),
             );
             return Ok((metadata, stream));
-          }
         }
-        .await;
-        let (metadata, stream) = match response {
-            Ok(value) => value,
-            Err(error) => {
-                let settlement = capacity_permit
-                    .settle(crate::planning::IexHistCapacityDisposition::Failed);
-                return Err(IexHistTransportError::new(
-                    settlement
-                        .err()
-                        .map_or(error.kind, TransportErrorKind::CapacityAuthority),
-                    telemetry,
-                ));
-            }
-        };
-        materialize_selected_stream(
-                plan,
-                metadata,
-                stream,
-                &staging_directory,
-                deadline,
-                cancellation,
-                telemetry,
-                capacity_permit,
-            )
-            .await
     }
 
     /// Re-reads and decodes one application-sealed complete PCAP from byte zero.
@@ -886,6 +1528,10 @@ impl IexHistColdTransport {
     /// independently rechecks its exact byte count and SHA-256 against the acquisition receipt.
     /// The decoder owns `sink`: failure aborts its staged transaction, while success returns the
     /// committed sink with the exact [`DecodeSummary`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the decode authority boundary carries its exact plan, capture, file, authority, deadline, cancellation, and sink"
+    )]
     pub async fn decode_sealed_pcap<S: IexEventSink>(
         &self,
         plan: &ColdJobPlan,
@@ -909,23 +1555,21 @@ impl IexHistColdTransport {
             deadline_unix_nanos,
             authority_free_reserve_bytes,
         )
-            .map_err(|error| {
-                IexHistTransportError::new(
-                    TransportErrorKind::CapacityAuthority(error),
-                    TransportTelemetry::new(),
-                )
-            })?;
-        let capacity_permit = IexHistExecutionPermit::acquire(
-            capacity_authority,
-            request,
-            Some(plan),
-        )
         .map_err(|error| {
             IexHistTransportError::new(
                 TransportErrorKind::CapacityAuthority(error),
                 TransportTelemetry::new(),
             )
         })?;
+        let capacity_permit =
+            IexHistExecutionPermit::acquire(capacity_authority, request, Some(plan)).map_err(
+                |error| {
+                    IexHistTransportError::new(
+                        TransportErrorKind::CapacityAuthority(error),
+                        TransportTelemetry::new(),
+                    )
+                },
+            )?;
         let deadline = Deadline::from_permit(&capacity_permit)
             .map_err(|kind| IexHistTransportError::new(kind, TransportTelemetry::new()))?;
         let telemetry = TransportTelemetry::new();
@@ -941,6 +1585,152 @@ impl IexHistColdTransport {
         )
         .await
     }
+}
+
+fn acquire_materialization_permit(
+    plan: &ColdJobPlan,
+    capacity_authority: &dyn IexHistCapacityAuthority,
+    deadline_unix_nanos: i64,
+) -> Result<(IexHistExecutionPermit, std::path::PathBuf, Deadline), IexHistTransportError> {
+    let authority_free_reserve_bytes =
+        capacity_authority
+            .required_free_reserve_bytes()
+            .map_err(|error| {
+                IexHistTransportError::new(
+                    TransportErrorKind::CapacityAuthority(error),
+                    TransportTelemetry::new(),
+                )
+            })?;
+    let request = IexHistCapacityRequest::selected_file(
+        plan,
+        deadline_unix_nanos,
+        authority_free_reserve_bytes,
+    )
+    .map_err(|error| {
+        IexHistTransportError::new(
+            TransportErrorKind::CapacityAuthority(error),
+            TransportTelemetry::new(),
+        )
+    })?;
+    let capacity_permit = IexHistExecutionPermit::acquire(capacity_authority, request, Some(plan))
+        .map_err(|error| {
+            IexHistTransportError::new(
+                TransportErrorKind::CapacityAuthority(error),
+                TransportTelemetry::new(),
+            )
+        })?;
+    let staging_directory = match capacity_permit.staging_directory() {
+        Ok(directory) => directory.to_path_buf(),
+        Err(error) => {
+            let _ = capacity_permit.settle(crate::planning::IexHistCapacityDisposition::Failed);
+            return Err(IexHistTransportError::new(
+                TransportErrorKind::CapacityAuthority(error),
+                TransportTelemetry::new(),
+            ));
+        }
+    };
+    let deadline = match Deadline::from_permit(&capacity_permit) {
+        Ok(deadline) => deadline,
+        Err(kind) => {
+            let _ = capacity_permit.settle(crate::planning::IexHistCapacityDisposition::Failed);
+            return Err(IexHistTransportError::new(kind, TransportTelemetry::new()));
+        }
+    };
+    Ok((capacity_permit, staging_directory, deadline))
+}
+
+fn settle_transfer_failure(
+    mut capacity_permit: IexHistExecutionPermit,
+    error: IexHistTransportError,
+    telemetry: TransportTelemetry,
+    object_encoding: PcapObjectEncoding,
+) -> IexHistTransportError {
+    let usage_error =
+        record_materialization_usage(&mut capacity_permit, object_encoding, &telemetry).err();
+    let disposition = terminal_disposition(&error.kind);
+    let settlement = capacity_permit.settle(disposition);
+    IexHistTransportError::new(
+        usage_error
+            .or_else(|| settlement.err())
+            .map_or(error.kind, TransportErrorKind::CapacityAuthority),
+        telemetry,
+    )
+}
+
+async fn verify_resume_candidate(
+    plan: &ColdJobPlan,
+    candidate: IexHistResumeCandidate,
+    staging_directory: &Path,
+    deadline: Deadline,
+    cancellation: &CancellationToken,
+    telemetry: &mut TransportTelemetry,
+) -> Result<(IexHistResumeAdoptionReceipt, NamedTempFile), TransportErrorKind> {
+    let IexHistResumeCandidate {
+        adoption,
+        controlled_provider_object,
+    } = candidate;
+    adoption
+        .validate_against(plan)
+        .map_err(|_| TransportErrorKind::Capture(CaptureError::InvalidResumeClaim))?;
+    let claim = adoption.claim();
+    let metadata = controlled_provider_object
+        .metadata()
+        .map_err(|_| TransportErrorKind::StagingIo)?;
+    if !metadata.is_file() || metadata.len() != claim.prefix_bytes() {
+        return Err(TransportErrorKind::Capture(
+            CaptureError::ResumePrefixMismatch,
+        ));
+    }
+    let provider_object = create_staged_file(staging_directory)?;
+    let mut reader = tokio::fs::File::from_std(controlled_provider_object);
+    let mut writer = tokio::fs::File::from_std(
+        provider_object
+            .reopen()
+            .map_err(|_| TransportErrorKind::StagingIo)?,
+    );
+    await_deadline(
+        reader.seek(std::io::SeekFrom::Start(0)),
+        deadline,
+        cancellation,
+    )
+    .await?
+    .map_err(|_| TransportErrorKind::StagingIo)?;
+    let mut hasher = Sha256::new();
+    let mut bytes_read = 0_u64;
+    let mut buffer = zeroed_buffer(STREAM_BUFFER_BYTES)?;
+    loop {
+        let read = read_deadline(&mut reader, &mut buffer, deadline, cancellation).await?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read
+            .checked_add(u64::try_from(read).map_err(|_| TransportErrorKind::ByteLimit)?)
+            .ok_or(TransportErrorKind::ByteLimit)?;
+        if bytes_read > claim.prefix_bytes() {
+            return Err(TransportErrorKind::Capture(
+                CaptureError::ResumePrefixMismatch,
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        write_all_deadline(&mut writer, &buffer[..read], deadline, cancellation).await?;
+        telemetry.add_staged_provider_object_bytes(read)?;
+        if plan.object_encoding() == PcapObjectEncoding::Identity {
+            telemetry.add_staged_pcap_bytes(read)?;
+            telemetry.expanded_pcap_bytes = telemetry
+                .expanded_pcap_bytes
+                .checked_add(u64::try_from(read).map_err(|_| TransportErrorKind::ByteLimit)?)
+                .ok_or(TransportErrorKind::ByteLimit)?;
+        }
+    }
+    flush_sync(&mut writer, deadline, cancellation).await?;
+    drop(writer);
+    let prefix_sha256 = Sha256Digest::from_bytes(hasher.finalize().into());
+    if bytes_read != claim.prefix_bytes() || prefix_sha256 != claim.prefix_sha256() {
+        return Err(TransportErrorKind::Capture(
+            CaptureError::ResumePrefixMismatch,
+        ));
+    }
+    Ok((adoption, provider_object))
 }
 
 #[derive(Debug)]
@@ -969,14 +1759,30 @@ fn file_response_metadata(
     plan: &ColdJobPlan,
     response: &reqwest::Response,
     capacity_permit: &IexHistExecutionPermit,
+    resume_claim: Option<&IexHistResumeClaim>,
 ) -> Result<CaptureResponseMetadata, TransportErrorKind> {
     let content_length = parse_content_length(response.headers())?;
-    if content_length != plan.advertised_compressed_bytes {
+    let range_start = resume_claim.map_or(0, IexHistResumeClaim::prefix_bytes);
+    let expected_content_length = plan
+        .advertised_compressed_bytes
+        .checked_sub(range_start)
+        .ok_or(TransportErrorKind::InvalidResponseMetadata)?;
+    let content_range = singleton_header(response.headers(), CONTENT_RANGE)?;
+    let range_matches = match resume_claim {
+        None => content_range.is_none(),
+        Some(_) => exact_content_range_matches(
+            content_range.as_deref(),
+            range_start,
+            plan.advertised_compressed_bytes,
+        ),
+    };
+    if content_length != expected_content_length || !range_matches {
         return Err(TransportErrorKind::InvalidResponseMetadata);
     }
     Ok(CaptureResponseMetadata {
         response_url: response.url().as_str().to_owned(),
         status: response.status().as_u16(),
+        range_start,
         content_length,
         content_encoding: singleton_header(response.headers(), CONTENT_ENCODING)?,
         etag: singleton_header(response.headers(), ETAG)?,
@@ -1029,25 +1835,110 @@ async fn materialize_selected_stream(
     cancellation: &CancellationToken,
     mut telemetry: TransportTelemetry,
     mut capacity_permit: IexHistExecutionPermit,
-) -> Result<MaterializedIexCapture, IexHistTransportError> {
+    resumed: Option<(IexHistResumeAdoptionReceipt, NamedTempFile)>,
+) -> Result<IexHistDownloadOutcome, IexHistTransportError> {
     let capture_started = Instant::now();
     let attempt = capacity_permit.attempt();
     let operation = async {
-        let provider_object = create_staged_file(staging_directory)?;
-        let mut receipt =
-            GzipPcapReceiptBuilder::new(plan, attempt, metadata).map_err(TransportErrorKind::Capture)?;
+        let (mut receipt, provider_object) = match resumed {
+            Some((adoption, provider_object)) => (
+                GzipPcapReceiptBuilder::resume(plan, attempt, metadata, adoption)
+                    .map_err(TransportErrorKind::Capture)?,
+                provider_object,
+            ),
+            None => (
+                GzipPcapReceiptBuilder::new(plan, attempt, metadata)
+                    .map_err(TransportErrorKind::Capture)?,
+                create_staged_file(staging_directory)?,
+            ),
+        };
+        if receipt.segment_start_bytes() > 0 {
+            rehash_staged_prefix(
+                &provider_object,
+                plan.object_encoding,
+                &mut receipt,
+                deadline,
+                cancellation,
+            )
+            .await?;
+        }
         let mut provider_object_writer = tokio::fs::File::from_std(
             provider_object
                 .reopen()
                 .map_err(|_| TransportErrorKind::StagingIo)?,
         );
+        let append_position = await_deadline(
+            provider_object_writer.seek(std::io::SeekFrom::End(0)),
+            deadline,
+            cancellation,
+        )
+        .await?
+        .map_err(|_| TransportErrorKind::StagingIo)?;
+        if append_position != receipt.segment_start_bytes() {
+            return Err(TransportErrorKind::Capture(
+                CaptureError::ResumePrefixMismatch,
+            ));
+        }
 
         loop {
-            let next = next_stream_item(&mut stream, deadline, cancellation).await?;
+            let next = match next_stream_item(&mut stream, deadline, cancellation).await {
+                Ok(next) => next,
+                Err(kind) => return Err(kind),
+            };
             let Some(chunk) = next else {
+                if receipt.compressed_bytes() != plan.advertised_compressed_bytes {
+                    let kind = TransportErrorKind::Network;
+                    telemetry.record_network_failure()?;
+                    if receipt.compressed_bytes() > receipt.segment_start_bytes()
+                        && let Some(claim) = checkpoint_interrupted_stream(
+                            plan,
+                            &receipt,
+                            &mut provider_object_writer,
+                            &capacity_permit,
+                            capture_started,
+                            deadline,
+                            cancellation,
+                        )
+                        .await
+                    {
+                        return Ok(StreamMaterialization::Pending(Box::new(
+                            PendingStreamMaterialization {
+                                claim,
+                                provider_object,
+                                cause: IexHistResumeCause::Network,
+                            },
+                        )));
+                    }
+                    return Err(kind);
+                }
                 break;
             };
-            let chunk = admit_stream_chunk(chunk, &mut telemetry)?;
+            let chunk = match admit_stream_chunk(chunk, &mut telemetry) {
+                Ok(chunk) => chunk,
+                Err(kind) => {
+                    if receipt.compressed_bytes() > receipt.segment_start_bytes()
+                        && let Some(claim) = checkpoint_interrupted_stream(
+                            plan,
+                            &receipt,
+                            &mut provider_object_writer,
+                            &capacity_permit,
+                            capture_started,
+                            deadline,
+                            cancellation,
+                        )
+                        .await
+                    {
+                        return Ok(StreamMaterialization::Pending(Box::new(
+                            PendingStreamMaterialization {
+                                claim,
+                                provider_object,
+                                cause: IexHistResumeCause::Network,
+                            },
+                        )));
+                    }
+                    return Err(kind);
+                }
+            };
             telemetry.add_response_bytes(chunk.len())?;
             receipt
                 .push_compressed(&chunk)
@@ -1063,13 +1954,7 @@ async fn materialize_selected_stream(
                     )
                     .ok_or(TransportErrorKind::ByteLimit)?;
             }
-            write_all_deadline(
-                &mut provider_object_writer,
-                &chunk,
-                deadline,
-                cancellation,
-            )
-            .await?;
+            write_all_deadline(&mut provider_object_writer, &chunk, deadline, cancellation).await?;
             telemetry.add_staged_provider_object_bytes(chunk.len())?;
             if plan.object_encoding == PcapObjectEncoding::Identity {
                 telemetry.add_staged_pcap_bytes(chunk.len())?;
@@ -1091,9 +1976,10 @@ async fn materialize_selected_stream(
                 let mut pcap_writer = tokio::fs::File::from_std(
                     pcap.reopen().map_err(|_| TransportErrorKind::StagingIo)?,
                 );
-                let mut output = vec![0_u8; STREAM_BUFFER_BYTES];
+                let mut output = zeroed_buffer(STREAM_BUFFER_BYTES)?;
                 loop {
-                    let read = read_deadline(&mut gzip, &mut output, deadline, cancellation).await?;
+                    let read =
+                        read_deadline(&mut gzip, &mut output, deadline, cancellation).await?;
                     if read == 0 {
                         break;
                     }
@@ -1106,13 +1992,8 @@ async fn materialize_selected_stream(
                             u64::try_from(read).map_err(|_| TransportErrorKind::ByteLimit)?,
                         )
                         .ok_or(TransportErrorKind::ByteLimit)?;
-                    write_all_deadline(
-                        &mut pcap_writer,
-                        &output[..read],
-                        deadline,
-                        cancellation,
-                    )
-                    .await?;
+                    write_all_deadline(&mut pcap_writer, &output[..read], deadline, cancellation)
+                        .await?;
                     telemetry.add_staged_pcap_bytes(read)?;
                 }
                 let mut provider_object_reader = gzip.into_inner();
@@ -1145,34 +2026,64 @@ async fn materialize_selected_stream(
         let materialization = receipt
             .finish(completed_clock, monotonic_duration_nanos)
             .map_err(TransportErrorKind::Capture)?;
-        Ok((
-            materialization,
-            StagedCaptureFiles {
-                provider_object,
-                expanded_pcap,
+        Ok(StreamMaterialization::Complete(Box::new(
+            CompleteStreamMaterialization {
+                materialization,
+                staged_files: StagedCaptureFiles {
+                    provider_object,
+                    expanded_pcap,
+                },
             },
-        ))
+        )))
     };
     match operation.await {
-        Ok((materialization, staged_files)) => {
-            if let Err(error) = record_materialization_usage(
-                &mut capacity_permit,
-                plan.object_encoding,
-                &telemetry,
-            ) {
-                let _ = capacity_permit
-                    .settle(crate::planning::IexHistCapacityDisposition::Failed);
+        Ok(StreamMaterialization::Complete(complete)) => {
+            let CompleteStreamMaterialization {
+                materialization,
+                staged_files,
+            } = *complete;
+            if let Err(error) =
+                record_materialization_usage(&mut capacity_permit, plan.object_encoding, &telemetry)
+            {
+                let _ = capacity_permit.settle(crate::planning::IexHistCapacityDisposition::Failed);
                 return Err(IexHistTransportError::new(
                     TransportErrorKind::CapacityAuthority(error),
                     telemetry,
                 ));
             }
-            Ok(MaterializedIexCapture {
-                materialization,
-                telemetry,
-                staged_files,
-                capacity_permit,
-            })
+            Ok(IexHistDownloadOutcome::Materialized(Box::new(
+                MaterializedIexCapture {
+                    materialization,
+                    telemetry,
+                    staged_files,
+                    capacity_permit,
+                },
+            )))
+        }
+        Ok(StreamMaterialization::Pending(pending)) => {
+            let PendingStreamMaterialization {
+                claim,
+                provider_object,
+                cause,
+            } = *pending;
+            if let Err(error) =
+                record_materialization_usage(&mut capacity_permit, plan.object_encoding, &telemetry)
+            {
+                let _ = capacity_permit.settle(crate::planning::IexHistCapacityDisposition::Failed);
+                return Err(IexHistTransportError::new(
+                    TransportErrorKind::CapacityAuthority(error),
+                    telemetry,
+                ));
+            }
+            Ok(IexHistDownloadOutcome::ResumePending(Box::new(
+                IexHistPendingResume {
+                    claim,
+                    provider_object,
+                    cause,
+                    telemetry,
+                    capacity_permit,
+                },
+            )))
         }
         Err(kind) => {
             let usage_error = record_materialization_usage(
@@ -1181,8 +2092,7 @@ async fn materialize_selected_stream(
                 &telemetry,
             )
             .err();
-            let settlement = capacity_permit
-                .settle(crate::planning::IexHistCapacityDisposition::Failed);
+            let settlement = capacity_permit.settle(terminal_disposition(&kind));
             Err(IexHistTransportError::new(
                 usage_error
                     .or_else(|| settlement.err())
@@ -1191,6 +2101,73 @@ async fn materialize_selected_stream(
             ))
         }
     }
+}
+
+enum StreamMaterialization {
+    Complete(Box<CompleteStreamMaterialization>),
+    Pending(Box<PendingStreamMaterialization>),
+}
+
+struct CompleteStreamMaterialization {
+    materialization: PcapMaterializationReceipt,
+    staged_files: StagedCaptureFiles,
+}
+
+struct PendingStreamMaterialization {
+    claim: IexHistResumeClaim,
+    provider_object: NamedTempFile,
+    cause: IexHistResumeCause,
+}
+
+async fn checkpoint_interrupted_stream(
+    plan: &ColdJobPlan,
+    receipt: &GzipPcapReceiptBuilder,
+    writer: &mut tokio::fs::File,
+    capacity_permit: &IexHistExecutionPermit,
+    capture_started: Instant,
+    deadline: Deadline,
+    cancellation: &CancellationToken,
+) -> Option<IexHistResumeClaim> {
+    // Checkpointing is opportunistic cleanup after a network interruption. It remains governed by
+    // the original attempt and can never delay or replace that terminal network cause.
+    flush_sync(writer, deadline, cancellation).await.ok()?;
+    let checkpoint_clock = capacity_permit.trusted_clock().ok()?;
+    let segment_duration_nanos = u64::try_from(capture_started.elapsed().as_nanos()).ok()?;
+    receipt
+        .checkpoint(plan, checkpoint_clock, segment_duration_nanos)
+        .ok()
+}
+
+async fn rehash_staged_prefix(
+    provider_object: &NamedTempFile,
+    object_encoding: PcapObjectEncoding,
+    receipt: &mut GzipPcapReceiptBuilder,
+    deadline: Deadline,
+    cancellation: &CancellationToken,
+) -> Result<(), TransportErrorKind> {
+    let mut reader = tokio::fs::File::from_std(
+        provider_object
+            .reopen()
+            .map_err(|_| TransportErrorKind::StagingIo)?,
+    );
+    let mut buffer = zeroed_buffer(STREAM_BUFFER_BYTES)?;
+    loop {
+        let read = read_deadline(&mut reader, &mut buffer, deadline, cancellation).await?;
+        if read == 0 {
+            break;
+        }
+        receipt
+            .push_compressed(&buffer[..read])
+            .map_err(TransportErrorKind::Capture)?;
+        if object_encoding == PcapObjectEncoding::Identity {
+            receipt
+                .push_pcap(&buffer[..read])
+                .map_err(TransportErrorKind::Capture)?;
+        }
+    }
+    receipt
+        .verify_resume_prefix()
+        .map_err(TransportErrorKind::Capture)
 }
 
 fn record_materialization_usage(
@@ -1229,11 +2206,9 @@ async fn decode_sealed_pcap_file<S: IexEventSink>(
     mut capacity_permit: IexHistExecutionPermit,
 ) -> Result<DecodedIexCapture<S>, IexHistTransportError> {
     let operation = async {
-        capture
-            .validate_against(plan)
-            .map_err(|error| DecodeOperationFailure::without_actuals(
-                TransportErrorKind::Capture(error),
-            ))?;
+        capture.validate_against(plan).map_err(|error| {
+            DecodeOperationFailure::without_actuals(TransportErrorKind::Capture(error))
+        })?;
         if capture.chronology_disposition() != CaptureChronologyDisposition::Admitted {
             return Err(DecodeOperationFailure::without_actuals(
                 TransportErrorKind::ChronologyQuarantined,
@@ -1242,9 +2217,11 @@ async fn decode_sealed_pcap_file<S: IexEventSink>(
         let decode_limits = plan.decode_contract().limits();
         let decode_attempt = capacity_permit
             .decode_attempt_evidence(plan)
-            .map_err(|error| DecodeOperationFailure::without_actuals(
-                TransportErrorKind::CapacityAuthority(error),
-            ))?;
+            .map_err(|error| {
+                DecodeOperationFailure::without_actuals(TransportErrorKind::CapacityAuthority(
+                    error,
+                ))
+            })?;
         let mut decoder = PcapStreamDecoder::new(plan, capture, decode_attempt, sink)
             .map_err(DecodeOperationFailure::from_decode)?;
         let mut pcap_reader = tokio::fs::File::from_std(pcap);
@@ -1255,11 +2232,11 @@ async fn decode_sealed_pcap_file<S: IexEventSink>(
         )
         .await
         .map_err(|kind| DecodeOperationFailure::new(kind, decoder.actuals()))?;
-        seek.map_err(|_| DecodeOperationFailure::new(
-            TransportErrorKind::StagingIo,
-            decoder.actuals(),
-        ))?;
-        let mut output = vec![0_u8; decode_limits.max_stream_chunk_bytes];
+        seek.map_err(|_| {
+            DecodeOperationFailure::new(TransportErrorKind::StagingIo, decoder.actuals())
+        })?;
+        let mut output = zeroed_buffer(decode_limits.max_stream_chunk_bytes)
+            .map_err(|kind| DecodeOperationFailure::new(kind, decoder.actuals()))?;
         loop {
             let read = read_deadline(&mut pcap_reader, &mut output, deadline, cancellation)
                 .await
@@ -1270,42 +2247,42 @@ async fn decode_sealed_pcap_file<S: IexEventSink>(
             telemetry.expanded_pcap_bytes = telemetry
                 .expanded_pcap_bytes
                 .checked_add(u64::try_from(read).map_err(|_| {
-                    DecodeOperationFailure::new(
-                        TransportErrorKind::ByteLimit,
-                        decoder.actuals(),
-                    )
+                    DecodeOperationFailure::new(TransportErrorKind::ByteLimit, decoder.actuals())
                 })?)
-                .ok_or_else(|| DecodeOperationFailure::new(
-                    TransportErrorKind::ByteLimit,
-                    decoder.actuals(),
-                ))?;
+                .ok_or_else(|| {
+                    DecodeOperationFailure::new(TransportErrorKind::ByteLimit, decoder.actuals())
+                })?;
             decoder
                 .push(&output[..read])
                 .map_err(DecodeOperationFailure::from_decode)?;
         }
-        let (summary, sink) = decoder.finish().map_err(DecodeOperationFailure::from_decode)?;
+        let (summary, sink) = decoder
+            .finish()
+            .map_err(DecodeOperationFailure::from_decode)?;
         let actuals = summary.actuals();
         summary
             .validate_against(plan, capture, decode_attempt)
-            .map_err(|error| DecodeOperationFailure::new(
-                TransportErrorKind::Decode(error),
-                actuals,
-            ))?;
+            .map_err(|error| {
+                DecodeOperationFailure::new(TransportErrorKind::Decode(error), actuals)
+            })?;
         Ok((summary, sink, actuals))
     };
     match operation.await {
         Ok((summary, sink, actuals)) => {
-            telemetry.staged_decoded_event_batch_bytes =
-                actuals.decoded_event_batch_bytes_staged();
+            telemetry.staged_decoded_event_batch_bytes = actuals.decoded_event_batch_bytes_staged();
             if let Err(error) = record_decode_usage(&mut capacity_permit, actuals) {
-                let _ = capacity_permit
-                    .settle(crate::planning::IexHistCapacityDisposition::Failed);
+                let _ = capacity_permit.settle(crate::planning::IexHistCapacityDisposition::Failed);
                 return Err(IexHistTransportError::new(
                     TransportErrorKind::CapacityAuthority(error),
                     telemetry,
                 ));
             }
-            Ok(DecodedIexCapture { summary, sink, telemetry, capacity_permit })
+            Ok(DecodedIexCapture {
+                summary,
+                sink,
+                telemetry,
+                capacity_permit,
+            })
         }
         Err(failure) => {
             telemetry.staged_decoded_event_batch_bytes =
@@ -1339,10 +2316,7 @@ impl DecodeOperationFailure {
     }
 
     fn from_decode(failure: DecodeFailure) -> Self {
-        Self::new(
-            TransportErrorKind::Decode(failure.error),
-            failure.actuals,
-        )
+        Self::new(TransportErrorKind::Decode(failure.error), failure.actuals)
     }
 }
 
@@ -1360,13 +2334,13 @@ fn record_decode_usage(
     )
 }
 
-fn terminal_disposition(
-    kind: &TransportErrorKind,
-) -> crate::planning::IexHistCapacityDisposition {
+fn terminal_disposition(kind: &TransportErrorKind) -> crate::planning::IexHistCapacityDisposition {
     use crate::planning::IexHistCapacityDisposition::{Failed, Quarantined, Unavailable};
 
     match kind {
-        TransportErrorKind::ChronologyQuarantined => Quarantined(IexHistTerminalReason::ClockAnomaly),
+        TransportErrorKind::ChronologyQuarantined => {
+            Quarantined(IexHistTerminalReason::ClockAnomaly)
+        }
         TransportErrorKind::Decode(error) => decode_terminal_disposition(error),
         TransportErrorKind::CapacityAuthority(
             IexHistCapacityError::Unavailable
@@ -1399,6 +2373,7 @@ fn terminal_disposition(
         | TransportErrorKind::StagingIo => Failed,
         TransportErrorKind::InvalidConfiguration
         | TransportErrorKind::HttpStatus { .. }
+        | TransportErrorKind::ResumeNotHonored { .. }
         | TransportErrorKind::InvalidResponseMetadata
         | TransportErrorKind::InvalidRetryAfter
         | TransportErrorKind::ByteLimit
@@ -1412,9 +2387,7 @@ fn terminal_disposition(
     }
 }
 
-fn decode_terminal_disposition(
-    error: &DecodeError,
-) -> crate::planning::IexHistCapacityDisposition {
+fn decode_terminal_disposition(error: &DecodeError) -> crate::planning::IexHistCapacityDisposition {
     use crate::planning::IexHistCapacityDisposition::{Failed, Quarantined, Unavailable};
 
     match error {
@@ -1509,6 +2482,15 @@ fn create_staged_file(directory: &Path) -> Result<NamedTempFile, TransportErrorK
     NamedTempFile::new_in(directory).map_err(|_| TransportErrorKind::StagingIo)
 }
 
+fn zeroed_buffer(bytes: usize) -> Result<Vec<u8>, TransportErrorKind> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(bytes)
+        .map_err(|_| TransportErrorKind::Capacity)?;
+    buffer.resize(bytes, 0);
+    Ok(buffer)
+}
+
 async fn write_all_deadline(
     writer: &mut tokio::fs::File,
     bytes: &[u8],
@@ -1597,9 +2579,7 @@ struct Deadline {
 }
 
 impl Deadline {
-    fn from_permit(
-        capacity_permit: &IexHistExecutionPermit,
-    ) -> Result<Self, TransportErrorKind> {
+    fn from_permit(capacity_permit: &IexHistExecutionPermit) -> Result<Self, TransportErrorKind> {
         let deadline_unix_nanos = capacity_permit.attempt().deadline_unix_nanos();
         let now_unix_nanos = capacity_permit
             .trusted_clock()
@@ -1648,16 +2628,42 @@ fn singleton_header(
 fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Result<u64, TransportErrorKind> {
     let value = singleton_header(headers, CONTENT_LENGTH)?
         .ok_or(TransportErrorKind::InvalidResponseMetadata)?;
+    parse_canonical_u64(&value).ok_or(TransportErrorKind::InvalidResponseMetadata)
+}
+
+fn parse_canonical_u64(value: &str) -> Option<u64> {
     if value.is_empty()
         || value.len() > 20
         || !value.bytes().all(|byte| byte.is_ascii_digit())
         || (value.len() > 1 && value.starts_with('0'))
     {
-        return Err(TransportErrorKind::InvalidResponseMetadata);
+        return None;
     }
-    value
-        .parse()
-        .map_err(|_| TransportErrorKind::InvalidResponseMetadata)
+    value.parse().ok()
+}
+
+pub(crate) fn exact_content_range_matches(
+    value: Option<&str>,
+    expected_start: u64,
+    total_bytes: u64,
+) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let Some(value) = value.strip_prefix("bytes ") else {
+        return false;
+    };
+    let Some((range, total)) = value.split_once('/') else {
+        return false;
+    };
+    let Some((start, end)) = range.split_once('-') else {
+        return false;
+    };
+    expected_start > 0
+        && expected_start < total_bytes
+        && parse_canonical_u64(start) == Some(expected_start)
+        && parse_canonical_u64(end) == total_bytes.checked_sub(1)
+        && parse_canonical_u64(total) == Some(total_bytes)
 }
 
 fn parse_retry_after(
@@ -1679,8 +2685,8 @@ fn parse_retry_after(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| TransportErrorKind::InvalidRetryAfter)?
         .as_nanos();
-    let retry_unix_nanos = i128::try_from(retry_unix_nanos)
-        .map_err(|_| TransportErrorKind::InvalidRetryAfter)?;
+    let retry_unix_nanos =
+        i128::try_from(retry_unix_nanos).map_err(|_| TransportErrorKind::InvalidRetryAfter)?;
     let now_unix_nanos = i128::from(authority_clock.unix_nanos());
     let wait_nanos = retry_unix_nanos.saturating_sub(now_unix_nanos);
     let wait_nanos = u64::try_from(wait_nanos).unwrap_or(u64::MAX);
@@ -1743,6 +2749,12 @@ pub enum TransportErrorKind {
         /// Exact response status.
         status: u16,
     },
+    /// A range request returned a full or otherwise non-partial status and was rejected unchanged.
+    #[error("IEX HIST did not honor the exact range request (status {status})")]
+    ResumeNotHonored {
+        /// Exact response status.
+        status: u16,
+    },
     /// Bounded retry attempts were exhausted.
     #[error("IEX HIST retry policy was exhausted after status {status}")]
     RetryExhausted {
@@ -1800,13 +2812,18 @@ pub enum TransportErrorKind {
 }
 
 #[cfg(test)]
+pub(crate) enum MockStreamChunk {
+    Bytes(Bytes),
+}
+
+#[cfg(test)]
 pub(crate) async fn materialize_mock_stream(
     plan: &ColdJobPlan,
     metadata: CaptureResponseMetadata,
-    chunks: Vec<Bytes>,
+    chunks: Vec<MockStreamChunk>,
     capacity_permit: IexHistExecutionPermit,
     cancellation: &CancellationToken,
-) -> Result<MaterializedIexCapture, IexHistTransportError> {
+) -> Result<IexHistDownloadOutcome, IexHistTransportError> {
     let staging_directory = capacity_permit
         .staging_directory()
         .map_err(|error| {
@@ -1818,9 +2835,11 @@ pub(crate) async fn materialize_mock_stream(
         .to_path_buf();
     let deadline = Deadline::from_permit(&capacity_permit)
         .map_err(|kind| IexHistTransportError::new(kind, TransportTelemetry::new()))?;
-    let stream: ByteStream = Box::pin(futures_util::stream::iter(
-        chunks.into_iter().map(Ok::<_, StreamFailure>),
-    ));
+    let stream: ByteStream = Box::pin(futures_util::stream::iter(chunks.into_iter().map(
+        |chunk| match chunk {
+            MockStreamChunk::Bytes(bytes) => Ok(bytes),
+        },
+    )));
     let mut telemetry = TransportTelemetry::new();
     telemetry
         .begin_attempt()
@@ -1837,6 +2856,63 @@ pub(crate) async fn materialize_mock_stream(
         cancellation,
         telemetry,
         capacity_permit,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn resume_mock_stream(
+    plan: &ColdJobPlan,
+    metadata: CaptureResponseMetadata,
+    chunks: Vec<MockStreamChunk>,
+    capacity_permit: IexHistExecutionPermit,
+    cancellation: &CancellationToken,
+    candidate: IexHistResumeCandidate,
+) -> Result<IexHistDownloadOutcome, IexHistTransportError> {
+    let staging_directory = capacity_permit
+        .staging_directory()
+        .map_err(|error| {
+            IexHistTransportError::new(
+                TransportErrorKind::CapacityAuthority(error),
+                TransportTelemetry::new(),
+            )
+        })?
+        .to_path_buf();
+    let deadline = Deadline::from_permit(&capacity_permit)
+        .map_err(|kind| IexHistTransportError::new(kind, TransportTelemetry::new()))?;
+    let mut telemetry = TransportTelemetry::new();
+    let (adoption, provider_object) = verify_resume_candidate(
+        plan,
+        candidate,
+        &staging_directory,
+        deadline,
+        cancellation,
+        &mut telemetry,
+    )
+    .await
+    .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+    telemetry
+        .begin_attempt()
+        .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+    telemetry
+        .record_status(metadata.status)
+        .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+    let stream: ByteStream = Box::pin(futures_util::stream::iter(chunks.into_iter().map(
+        |chunk| match chunk {
+            MockStreamChunk::Bytes(bytes) => Ok(bytes),
+        },
+    )));
+    materialize_selected_stream(
+        plan,
+        metadata,
+        stream,
+        &staging_directory,
+        deadline,
+        cancellation,
+        telemetry,
+        capacity_permit,
+        Some((adoption, provider_object)),
     )
     .await
 }

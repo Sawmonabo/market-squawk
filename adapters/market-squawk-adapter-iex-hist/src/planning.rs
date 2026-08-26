@@ -33,8 +33,9 @@ pub enum ColdJobTrigger {
 /// Resume behavior allowed by the core plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum ResumePolicy {
-    /// Whole-file restart or adoption of independently reverified complete durable evidence only.
-    ReverifyCompleteEvidenceOrRestartWholeFile,
+    /// Rehash an adopted exact prefix and require a matching strong-validator byte range;
+    /// otherwise start a separate whole-file attempt from byte zero.
+    VerifiedStrongValidatorRangeOrRestartWholeFile,
 }
 
 /// Independently accounted capacity categories for one complete selected-file pipeline.
@@ -273,6 +274,8 @@ impl ColdJobPlan {
     pub const fn automatic_archive_catch_up(&self) -> bool { self.automatic_archive_catch_up }
     #[must_use]
     pub const fn max_parallel_transfers(&self) -> u8 { self.max_parallel_transfers }
+    #[must_use]
+    pub const fn resume_policy(&self) -> ResumePolicy { self.resume_policy }
     #[must_use]
     pub const fn earliest_available_on(&self) -> TradeDate { self.earliest_available_on }
     #[must_use]
@@ -583,7 +586,7 @@ impl IexHistPlanner {
         let object_encoding = selected_file.object_encoding;
         let identity = selected_file.identity();
         let plan_sha256 = crate::catalog::digest_fields(&[
-            b"market-squawk/iex-hist-cold-plan/v3",
+            b"market-squawk/iex-hist-cold-plan/v4",
             identity.as_bytes(),
             &[match trigger {
                 ColdJobTrigger::Operator => 1,
@@ -591,6 +594,7 @@ impl IexHistPlanner {
             }],
             capacity_footprint.identity().as_bytes(),
             decode_contract.contract_sha256().as_bytes(),
+            b"verified-strong-validator-range-or-restart-whole-file/v1",
             &limits.max_catalog_age_nanos.to_le_bytes(),
             &limits.max_download_duration_nanos.to_le_bytes(),
             &limits.max_clock_regression_nanos.to_le_bytes(),
@@ -602,7 +606,7 @@ impl IexHistPlanner {
             lane: ScheduleLane::Cold,
             automatic_archive_catch_up: false,
             max_parallel_transfers: 1,
-            resume_policy: ResumePolicy::ReverifyCompleteEvidenceOrRestartWholeFile,
+            resume_policy: ResumePolicy::VerifiedStrongValidatorRangeOrRestartWholeFile,
             earliest_available_on,
             rolling_window_start,
             advertised_compressed_bytes: capacity_footprint.network_response,
@@ -935,7 +939,7 @@ impl IexHistTrustedClockReading {
     #[must_use]
     pub const fn observed_date(self) -> TradeDate { self.observed_date }
 
-    fn validate(self) -> Result<(), IexHistCapacityError> {
+    pub(crate) fn validate(self) -> Result<(), IexHistCapacityError> {
         Self::try_new(self.unix_nanos, self.utc_offset_seconds, self.observed_date).map(|_| ())
     }
 }
@@ -1053,8 +1057,6 @@ impl IexHistCapacityUsage {
 pub enum IexHistCapacityDisposition {
     /// Every phase covered by the reservation completed and durable actuals were recorded.
     Completed,
-    /// A complete durable phase was checkpointed; the reservation remains adoptable on restart.
-    Checkpointed,
     /// The attempt failed before complete publication.
     Failed,
     /// Complete evidence exists but an exact quality/clock/version invariant forbids publication.
@@ -1065,7 +1067,7 @@ pub enum IexHistCapacityDisposition {
     Interrupted,
 }
 
-/// Provider-local terminal reason for root-owned durable CAS state.
+/// Typed terminal reason reported to the application-owned capacity authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum IexHistTerminalReason {
     /// Trusted capture or message chronology exceeded its tolerance.
@@ -1177,7 +1179,7 @@ impl IexHistExecutionAttempt {
     #[must_use]
     pub const fn deadline_unix_nanos(self) -> i64 { self.deadline_unix_nanos }
 
-    fn validate(self) -> Result<(), IexHistCapacityError> {
+    pub(crate) fn validate(self) -> Result<(), IexHistCapacityError> {
         self.admitted_clock.validate()?;
         if !nonzero_identity(self.request_sha256)
             || !nonzero_identity(self.reservation_sha256)

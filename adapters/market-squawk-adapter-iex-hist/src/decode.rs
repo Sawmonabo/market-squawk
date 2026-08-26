@@ -772,7 +772,7 @@ impl DecodedIexEventEnvelope {
 
 /// Transactional event staging boundary used by the streaming decoder.
 pub trait IexEventSink {
-    /// Sink-owned failure type; decoder publication always maps it to a closed decode failure.
+    /// Sink-owned failure type; decoder staging always maps it to a closed decode failure.
     type Error;
 
     /// Stages one opaque typed/native event envelope under its zero-based decode ordinal. The
@@ -787,7 +787,8 @@ pub trait IexEventSink {
     fn stage(&mut self, ordinal: u64, envelope: DecodedIexEventEnvelope)
     -> Result<(), Self::Error>;
 
-    /// Atomically publishes every staged event and returns the exact expected commit identity.
+    /// Atomically commits invisible staging and returns the exact expected handoff identity.
+    /// This is not durable, canonical, generation, or point-in-time publication authority.
     fn commit(&mut self, summary: &DecodeSummary) -> Result<Sha256Digest, Self::Error>;
 
     /// Discards every staged event. Implementations must make this idempotent.
@@ -1002,7 +1003,7 @@ impl IexEventSink for IexHistTypedHandoffBuilder {
     ) -> Result<(), Self::Error> {
         if self.aborted
             || self.committed_summary_sha256.is_some()
-            || u64::try_from(self.events.len()).map_or(true, |count| count != ordinal)
+            || u64::try_from(self.events.len()) != Ok(ordinal)
         {
             return Err(DecodeError::SummaryIdentityMismatch);
         }
@@ -1149,6 +1150,174 @@ impl IexHistTypedHandoff {
         self.physical_evidence_sha256
     }
 
+    /// Consumes complete native event evidence into a provider-native IEX trade-bar candidate.
+    ///
+    /// Only exact IEX `Trade` messages are counted; exact same-day `TradeBreak` messages remove
+    /// their referenced prints. No SIP/consolidated inference, session filtering, adjustment,
+    /// canonical generation, revision, or point-in-time authority is added here.
+    pub fn try_into_derived_bars(
+        self,
+        interval: IexHistBarInterval,
+    ) -> Result<IexHistDerivedBarsHandoff, IexHistDerivedBarError> {
+        let calculation_sha256 = derived_bar_calculation_identity(interval);
+        let mut trades = Vec::new();
+        let mut breaks = Vec::new();
+        let trade_count = self
+            .events
+            .iter()
+            .filter(|event| matches!(event.decoded_event.event, IexEvent::Trade { .. }))
+            .count();
+        let break_count = self
+            .events
+            .iter()
+            .filter(|event| matches!(event.decoded_event.event, IexEvent::TradeBreak { .. }))
+            .count();
+        trades
+            .try_reserve_exact(trade_count)
+            .map_err(|_| IexHistDerivedBarError::Capacity)?;
+        breaks
+            .try_reserve_exact(break_count)
+            .map_err(|_| IexHistDerivedBarError::Capacity)?;
+        for event in &self.events {
+            match &event.decoded_event.event {
+                IexEvent::Trade {
+                    symbol,
+                    sale_condition_flags,
+                    size,
+                    price,
+                    trade_id,
+                    source_time,
+                    ..
+                } => trades.push(DerivedTrade {
+                    symbol,
+                    sale_condition_flags: *sale_condition_flags,
+                    size: *size,
+                    price: *price,
+                    trade_id: *trade_id,
+                    source_time: *source_time,
+                    ordinal: event.ordinal,
+                    broken: false,
+                }),
+                IexEvent::TradeBreak {
+                    symbol,
+                    sale_condition_flags,
+                    size,
+                    price,
+                    trade_id,
+                    source_time,
+                    ..
+                } => breaks.push(DerivedTradeBreak {
+                    symbol,
+                    sale_condition_flags: *sale_condition_flags,
+                    size: *size,
+                    price: *price,
+                    trade_id: *trade_id,
+                    source_time: *source_time,
+                    ordinal: event.ordinal,
+                }),
+                _ => {}
+            }
+        }
+        trades.sort_unstable_by_key(|trade| trade.trade_id);
+        breaks.sort_unstable_by_key(|trade_break| trade_break.trade_id);
+        if trades
+            .windows(2)
+            .any(|pair| pair[0].trade_id == pair[1].trade_id)
+        {
+            return Err(IexHistDerivedBarError::DuplicateTradeId);
+        }
+        if breaks
+            .windows(2)
+            .any(|pair| pair[0].trade_id == pair[1].trade_id)
+        {
+            return Err(IexHistDerivedBarError::DuplicateTradeBreak);
+        }
+        let mut trade_index = 0_usize;
+        for trade_break in breaks {
+            while trades
+                .get(trade_index)
+                .is_some_and(|trade| trade.trade_id < trade_break.trade_id)
+            {
+                trade_index += 1;
+            }
+            let trade = trades
+                .get_mut(trade_index)
+                .filter(|trade| trade.trade_id == trade_break.trade_id)
+                .ok_or(IexHistDerivedBarError::UnmatchedTradeBreak)?;
+            if trade.symbol != trade_break.symbol
+                || trade.sale_condition_flags != trade_break.sale_condition_flags
+                || trade.size != trade_break.size
+                || trade.price != trade_break.price
+                || trade_break.ordinal <= trade.ordinal
+                || trade_break.source_time < trade.source_time
+            {
+                return Err(IexHistDerivedBarError::TradeBreakMismatch);
+            }
+            trade.broken = true;
+        }
+        trades.retain(|trade| !trade.broken);
+        trades.sort_unstable_by(|left, right| {
+            (
+                left.symbol,
+                interval.bucket_start(left.source_time),
+                left.ordinal,
+            )
+                .cmp(&(
+                    right.symbol,
+                    interval.bucket_start(right.source_time),
+                    right.ordinal,
+                ))
+        });
+        let mut bars = Vec::new();
+        bars.try_reserve_exact(trades.len())
+            .map_err(|_| IexHistDerivedBarError::Capacity)?;
+        let mut current: Option<DerivedBarAccumulator> = None;
+        for trade in trades {
+            let bucket_start = interval.bucket_start(trade.source_time);
+            let same_bar = current
+                .as_ref()
+                .is_some_and(|bar| bar.symbol == trade.symbol && bar.bucket_start == bucket_start);
+            if same_bar {
+                current
+                    .as_mut()
+                    .ok_or(IexHistDerivedBarError::Arithmetic)?
+                    .push(trade)?;
+                continue;
+            }
+            if let Some(bar) = current.take() {
+                bars.push(bar.finish(
+                    interval,
+                    self.provider_content_sha256,
+                    calculation_sha256,
+                )?);
+            }
+            current = Some(DerivedBarAccumulator::try_new(trade, bucket_start)?);
+        }
+        if let Some(bar) = current {
+            bars.push(bar.finish(interval, self.provider_content_sha256, calculation_sha256)?);
+        }
+        let provider_content_sha256 = derived_bars_content_identity(
+            interval,
+            calculation_sha256,
+            self.provider_content_sha256,
+            &bars,
+        )?;
+        let handoff_sha256 = crate::catalog::digest_fields(&[
+            b"market-squawk/iex-hist-derived-bars-handoff/v1",
+            provider_content_sha256.as_bytes(),
+            self.physical_evidence_sha256.as_bytes(),
+            self.summary.summary_sha256().as_bytes(),
+        ]);
+        Ok(IexHistDerivedBarsHandoff {
+            source: self,
+            interval,
+            bars,
+            calculation_sha256,
+            provider_content_sha256,
+            handoff_sha256,
+        })
+    }
+
     /// Consumes the one-shot handoff into its exact evidence and ordered typed events.
     #[must_use]
     pub fn into_parts(
@@ -1161,6 +1330,420 @@ impl IexHistTypedHandoff {
     ) {
         (self.plan, self.capture, self.summary, self.events)
     }
+}
+
+/// Closed provider-native bar interval supported by this adapter handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IexHistBarInterval {
+    /// Fixed UTC minute containing exact IEX trade source timestamps.
+    OneMinute,
+}
+
+impl IexHistBarInterval {
+    const fn nanos(self) -> i64 {
+        match self {
+            Self::OneMinute => 60_000_000_000,
+        }
+    }
+
+    const fn identity_value(self) -> &'static [u8] {
+        match self {
+            Self::OneMinute => b"one_minute_utc",
+        }
+    }
+
+    fn bucket_start(self, source_time: EpochNanos) -> i64 {
+        let nanos = self.nanos();
+        source_time.value() / nanos * nanos
+    }
+}
+
+/// Exact provider-native IEX venue trade bar candidate.
+#[derive(Debug, Eq, PartialEq)]
+pub struct IexHistVenueTradeBar {
+    symbol: String,
+    bucket_start_unix_nanos: i64,
+    bucket_end_unix_nanos: i64,
+    open: PriceUnits1e4,
+    high: PriceUnits1e4,
+    low: PriceUnits1e4,
+    close: PriceUnits1e4,
+    volume: u64,
+    trade_count: u64,
+    first_source_time: EpochNanos,
+    last_source_time: EpochNanos,
+    first_event_ordinal: u64,
+    last_event_ordinal: u64,
+    source_provider_content_sha256: Sha256Digest,
+    bar_sha256: Sha256Digest,
+}
+
+impl IexHistVenueTradeBar {
+    #[must_use]
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    #[must_use]
+    pub const fn bucket_start_unix_nanos(&self) -> i64 {
+        self.bucket_start_unix_nanos
+    }
+
+    #[must_use]
+    pub const fn bucket_end_unix_nanos(&self) -> i64 {
+        self.bucket_end_unix_nanos
+    }
+
+    #[must_use]
+    pub const fn open(&self) -> PriceUnits1e4 {
+        self.open
+    }
+
+    #[must_use]
+    pub const fn high(&self) -> PriceUnits1e4 {
+        self.high
+    }
+
+    #[must_use]
+    pub const fn low(&self) -> PriceUnits1e4 {
+        self.low
+    }
+
+    #[must_use]
+    pub const fn close(&self) -> PriceUnits1e4 {
+        self.close
+    }
+
+    #[must_use]
+    pub const fn volume(&self) -> u64 {
+        self.volume
+    }
+
+    #[must_use]
+    pub const fn trade_count(&self) -> u64 {
+        self.trade_count
+    }
+
+    #[must_use]
+    pub const fn first_source_time(&self) -> EpochNanos {
+        self.first_source_time
+    }
+
+    #[must_use]
+    pub const fn last_source_time(&self) -> EpochNanos {
+        self.last_source_time
+    }
+
+    #[must_use]
+    pub const fn first_event_ordinal(&self) -> u64 {
+        self.first_event_ordinal
+    }
+
+    #[must_use]
+    pub const fn last_event_ordinal(&self) -> u64 {
+        self.last_event_ordinal
+    }
+
+    #[must_use]
+    pub const fn source_provider_content_sha256(&self) -> Sha256Digest {
+        self.source_provider_content_sha256
+    }
+
+    #[must_use]
+    pub const fn bar_sha256(&self) -> Sha256Digest {
+        self.bar_sha256
+    }
+}
+
+/// Consuming derived-bar candidate plus its complete native source handoff.
+///
+/// This value remains an immediate application handoff. It is not a canonical generation,
+/// revision selector, point-in-time snapshot, or publication receipt.
+pub struct IexHistDerivedBarsHandoff {
+    source: IexHistTypedHandoff,
+    interval: IexHistBarInterval,
+    bars: Vec<IexHistVenueTradeBar>,
+    calculation_sha256: Sha256Digest,
+    provider_content_sha256: Sha256Digest,
+    handoff_sha256: Sha256Digest,
+}
+
+impl std::fmt::Debug for IexHistDerivedBarsHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IexHistDerivedBarsHandoff")
+            .field("interval", &self.interval)
+            .field("bars", &self.bars.len())
+            .field("calculation_sha256", &self.calculation_sha256)
+            .field("provider_content_sha256", &self.provider_content_sha256)
+            .field("handoff_sha256", &self.handoff_sha256)
+            .finish()
+    }
+}
+
+impl IexHistDerivedBarsHandoff {
+    #[must_use]
+    pub const fn source(&self) -> &IexHistTypedHandoff {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn interval(&self) -> IexHistBarInterval {
+        self.interval
+    }
+
+    #[must_use]
+    pub fn bars(&self) -> &[IexHistVenueTradeBar] {
+        &self.bars
+    }
+
+    #[must_use]
+    pub const fn calculation_sha256(&self) -> Sha256Digest {
+        self.calculation_sha256
+    }
+
+    #[must_use]
+    pub const fn provider_content_sha256(&self) -> Sha256Digest {
+        self.provider_content_sha256
+    }
+
+    #[must_use]
+    pub const fn handoff_sha256(&self) -> Sha256Digest {
+        self.handoff_sha256
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (IexHistTypedHandoff, Vec<IexHistVenueTradeBar>) {
+        (self.source, self.bars)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DerivedTrade<'a> {
+    symbol: &'a str,
+    sale_condition_flags: u8,
+    size: u32,
+    price: PriceUnits1e4,
+    trade_id: i64,
+    source_time: EpochNanos,
+    ordinal: u64,
+    broken: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DerivedTradeBreak<'a> {
+    symbol: &'a str,
+    sale_condition_flags: u8,
+    size: u32,
+    price: PriceUnits1e4,
+    trade_id: i64,
+    source_time: EpochNanos,
+    ordinal: u64,
+}
+
+struct DerivedBarAccumulator {
+    symbol: String,
+    bucket_start: i64,
+    open: PriceUnits1e4,
+    high: PriceUnits1e4,
+    low: PriceUnits1e4,
+    close: PriceUnits1e4,
+    volume: u64,
+    trade_count: u64,
+    first_source_time: EpochNanos,
+    last_source_time: EpochNanos,
+    first_event_ordinal: u64,
+    last_event_ordinal: u64,
+}
+
+impl DerivedBarAccumulator {
+    fn try_new(trade: DerivedTrade<'_>, bucket_start: i64) -> Result<Self, IexHistDerivedBarError> {
+        let mut symbol = String::new();
+        symbol
+            .try_reserve_exact(trade.symbol.len())
+            .map_err(|_| IexHistDerivedBarError::Capacity)?;
+        symbol.push_str(trade.symbol);
+        Ok(Self {
+            symbol,
+            bucket_start,
+            open: trade.price,
+            high: trade.price,
+            low: trade.price,
+            close: trade.price,
+            volume: u64::from(trade.size),
+            trade_count: 1,
+            first_source_time: trade.source_time,
+            last_source_time: trade.source_time,
+            first_event_ordinal: trade.ordinal,
+            last_event_ordinal: trade.ordinal,
+        })
+    }
+
+    fn push(&mut self, trade: DerivedTrade<'_>) -> Result<(), IexHistDerivedBarError> {
+        self.high = self.high.max(trade.price);
+        self.low = self.low.min(trade.price);
+        self.close = trade.price;
+        self.volume = self
+            .volume
+            .checked_add(u64::from(trade.size))
+            .ok_or(IexHistDerivedBarError::Arithmetic)?;
+        self.trade_count = self
+            .trade_count
+            .checked_add(1)
+            .ok_or(IexHistDerivedBarError::Arithmetic)?;
+        self.last_source_time = trade.source_time;
+        self.last_event_ordinal = trade.ordinal;
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        interval: IexHistBarInterval,
+        source_provider_content_sha256: Sha256Digest,
+        calculation_sha256: Sha256Digest,
+    ) -> Result<IexHistVenueTradeBar, IexHistDerivedBarError> {
+        let bucket_end_unix_nanos = self
+            .bucket_start
+            .checked_add(interval.nanos())
+            .ok_or(IexHistDerivedBarError::Arithmetic)?;
+        let bar_sha256 = derived_bar_identity(
+            &self.symbol,
+            self.bucket_start,
+            bucket_end_unix_nanos,
+            self.open,
+            self.high,
+            self.low,
+            self.close,
+            self.volume,
+            self.trade_count,
+            self.first_source_time,
+            self.last_source_time,
+            self.first_event_ordinal,
+            self.last_event_ordinal,
+            source_provider_content_sha256,
+            calculation_sha256,
+        );
+        Ok(IexHistVenueTradeBar {
+            symbol: self.symbol,
+            bucket_start_unix_nanos: self.bucket_start,
+            bucket_end_unix_nanos,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            volume: self.volume,
+            trade_count: self.trade_count,
+            first_source_time: self.first_source_time,
+            last_source_time: self.last_source_time,
+            first_event_ordinal: self.first_event_ordinal,
+            last_event_ordinal: self.last_event_ordinal,
+            source_provider_content_sha256,
+            bar_sha256,
+        })
+    }
+}
+
+fn derived_bar_calculation_identity(interval: IexHistBarInterval) -> Sha256Digest {
+    crate::catalog::digest_fields(&[
+        b"market-squawk/iex-hist-derived-trade-bars/v1",
+        interval.identity_value(),
+        b"iex-trade-only",
+        b"exact-trade-break-netting",
+        b"source-time-utc-buckets",
+        b"provider-order-ohlc",
+        b"no-session-filter-no-adjustment",
+    ])
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the provider-native bar identity commits every exact price, volume, and source field"
+)]
+fn derived_bar_identity(
+    symbol: &str,
+    bucket_start_unix_nanos: i64,
+    bucket_end_unix_nanos: i64,
+    open: PriceUnits1e4,
+    high: PriceUnits1e4,
+    low: PriceUnits1e4,
+    close: PriceUnits1e4,
+    volume: u64,
+    trade_count: u64,
+    first_source_time: EpochNanos,
+    last_source_time: EpochNanos,
+    first_event_ordinal: u64,
+    last_event_ordinal: u64,
+    source_provider_content_sha256: Sha256Digest,
+    calculation_sha256: Sha256Digest,
+) -> Sha256Digest {
+    crate::catalog::digest_fields(&[
+        b"market-squawk/iex-hist-derived-trade-bar/v1",
+        symbol.as_bytes(),
+        &bucket_start_unix_nanos.to_le_bytes(),
+        &bucket_end_unix_nanos.to_le_bytes(),
+        &open.value().to_le_bytes(),
+        &high.value().to_le_bytes(),
+        &low.value().to_le_bytes(),
+        &close.value().to_le_bytes(),
+        &volume.to_le_bytes(),
+        &trade_count.to_le_bytes(),
+        &first_source_time.value().to_le_bytes(),
+        &last_source_time.value().to_le_bytes(),
+        &first_event_ordinal.to_le_bytes(),
+        &last_event_ordinal.to_le_bytes(),
+        source_provider_content_sha256.as_bytes(),
+        calculation_sha256.as_bytes(),
+    ])
+}
+
+fn derived_bars_content_identity(
+    interval: IexHistBarInterval,
+    calculation_sha256: Sha256Digest,
+    source_provider_content_sha256: Sha256Digest,
+    bars: &[IexHistVenueTradeBar],
+) -> Result<Sha256Digest, IexHistDerivedBarError> {
+    let mut ordered = Sha256::new();
+    for (index, bar) in bars.iter().enumerate() {
+        ordered.update(
+            u64::try_from(index)
+                .map_err(|_| IexHistDerivedBarError::Arithmetic)?
+                .to_le_bytes(),
+        );
+        ordered.update(bar.bar_sha256.as_bytes());
+    }
+    let count = u64::try_from(bars.len()).map_err(|_| IexHistDerivedBarError::Arithmetic)?;
+    let ordered_sha256 = Sha256Digest::from_bytes(ordered.finalize().into());
+    Ok(crate::catalog::digest_fields(&[
+        b"market-squawk/iex-hist-derived-trade-bars-content/v1",
+        interval.identity_value(),
+        calculation_sha256.as_bytes(),
+        source_provider_content_sha256.as_bytes(),
+        &count.to_le_bytes(),
+        ordered_sha256.as_bytes(),
+    ]))
+}
+
+/// Closed provider-native derived-bar refusal.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum IexHistDerivedBarError {
+    /// Fallible bounded staging allocation failed.
+    #[error("IEX HIST derived-bar staging capacity is unavailable")]
+    Capacity,
+    /// More than one native trade used the same daily IEX trade identifier.
+    #[error("IEX HIST native trades contain a duplicate trade identifier")]
+    DuplicateTradeId,
+    /// More than one trade-break message referenced the same IEX trade identifier.
+    #[error("IEX HIST native trades contain a duplicate trade break")]
+    DuplicateTradeBreak,
+    /// A trade break did not reference an exact retained native trade.
+    #[error("IEX HIST native trade break has no matching trade")]
+    UnmatchedTradeBreak,
+    /// A trade break did not exactly match the referenced trade or followed invalid chronology.
+    #[error("IEX HIST native trade break does not match its referenced trade")]
+    TradeBreakMismatch,
+    /// Bar count, volume, time, or identity arithmetic overflowed.
+    #[error("IEX HIST derived-bar arithmetic overflowed")]
+    Arithmetic,
 }
 
 fn provider_event_content_identity(ordinal: u64, event: &DecodedIexEvent) -> Sha256Digest {
@@ -1238,7 +1821,7 @@ fn physical_evidence_identity(
         plan.plan_sha256().as_bytes(),
         plan.selected_file().identity().as_bytes(),
         capture.receipt_sha256().as_bytes(),
-        capture.attempt_sha256().as_bytes(),
+        capture.attempt().attempt_sha256().as_bytes(),
         summary.decode_attempt_evidence_sha256.as_bytes(),
         summary.decode_attempt_sha256.as_bytes(),
         summary.decoder_contract_sha256.as_bytes(),
@@ -3550,7 +4133,7 @@ pub enum DecodeError {
     #[error("IEX HIST capture does not contain a complete feed session")]
     IncompleteSession,
     /// Downstream event retention refused a validated event.
-    #[error("IEX HIST downstream event sink rejected publication")]
+    #[error("IEX HIST downstream event sink rejected transactional event handoff")]
     SinkRejected,
     /// Canonical native-event serialization failed before staging.
     #[error("IEX HIST native event serialization failed")]
