@@ -825,7 +825,10 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_treasury::Treasur
     ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
         let extracted = self.extract_with_capture(authority, request, cancellation);
         Box::pin(async move {
-            let (batch, capture_material) = extracted.await?.into_parts();
+            let output = extracted.await?;
+            let (batch, capture_material) = output
+                .try_into_common_publication()
+                .map_err(|_error| invalid_capture_protocol())?;
             bind_single_provider_capture(batch, capture_material)
         })
     }

@@ -34,7 +34,7 @@ use market_squawk_adapter_fred::{
 use market_squawk_adapter_schwab::SchwabApplicationCredentialEnvelope;
 use market_squawk_adapter_tiingo::TiingoApiToken;
 use market_squawk_adapter_treasury::{
-    DailyParYieldCurvePage, FiscalDataParseLimits, TreasuryYieldCurveProfile,
+    FiscalDataParseLimits, TreasuryDailyRateFamily, TreasuryDailyRatePage, TreasuryDailyRateQuery,
 };
 use market_squawk_data::{
     CatalogError, CatalogLimit, OnboardingCatalogCapability, OnboardingReservation,
@@ -3000,10 +3000,13 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
         return Err(ProviderOnboardingError::ProbeUnavailable);
     }
     if profile_id == "treasury.daily-rates-xml" {
-        let request = TreasuryYieldCurveProfile::daily_par_yield_curve()
-            .page(TREASURY_DAILY_RATES_PROBE_YEAR, 0)
-            .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
-        let page = DailyParYieldCurvePage::parse(
+        let request = TreasuryDailyRateQuery::year(
+            TreasuryDailyRateFamily::NominalParYieldCurve,
+            TREASURY_DAILY_RATES_PROBE_YEAR,
+        )
+        .and_then(|query| query.page(0))
+        .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        let page = TreasuryDailyRatePage::parse(
             body,
             &request,
             FiscalDataParseLimits::production_defaults(),

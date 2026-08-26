@@ -4297,7 +4297,7 @@ fn treasury_metadata(
         HistoricalCapability::Historical,
         effective,
         network,
-        simple_budget("us-treasury", 100, MINUTE_NANOS, 2, None)?,
+        simple_budget("us-treasury", 1, SECOND_NANOS, 1, None)?,
     )
 }
 
