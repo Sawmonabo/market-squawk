@@ -1,7 +1,10 @@
 //! Zeroizing BEA `UserID` ownership and authenticated request construction.
 
 use std::fmt;
+use std::mem;
 
+use bytes::Bytes;
+use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
@@ -9,6 +12,8 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{BEA_API_ENDPOINT, BeaError, BeaRequest};
 
 const BEA_USER_ID_BYTES: usize = 36;
+pub(crate) const BEA_REDACTED_USER_ID: &[u8; BEA_USER_ID_BYTES] =
+    b"************************************";
 
 /// User-owned 36-character BEA API `UserID` retained in zeroizing memory.
 ///
@@ -24,7 +29,7 @@ impl BeaUserId {
     ///
     /// Rejects a value that is not exactly 36 printable ASCII bytes or that could change URL query
     /// structure.
-    pub fn try_new(value: String) -> Result<Self, BeaError> {
+    pub fn try_new(mut value: String) -> Result<Self, BeaError> {
         if value.len() != BEA_USER_ID_BYTES
             || !value.is_ascii()
             || value.bytes().any(|byte| {
@@ -33,6 +38,7 @@ impl BeaUserId {
                     || matches!(byte, b'&' | b'=' | b'?' | b'#')
             })
         {
+            value.zeroize();
             return Err(BeaError::InvalidCredential);
         }
         Ok(Self(Zeroizing::new(value)))
@@ -91,7 +97,7 @@ impl BeaAuthorizedRequest {
     ///
     /// The returned value contains the credential. Callers must never log, persist, or include it
     /// in an error, receipt, trace, metric label, or raw-evidence request identity.
-    pub fn expose_url(&self) -> &str {
+    pub(crate) fn expose_url(&self) -> &str {
         self.url.as_str()
     }
 
@@ -109,4 +115,72 @@ impl fmt::Debug for BeaAuthorizedRequest {
             .field("request_digest", &self.request_digest)
             .finish()
     }
+}
+
+/// Owned transient response bytes that may still contain BEA's echoed `UserID`.
+///
+/// Every owned byte is zeroized on every error path. A successful parser must first validate the
+/// exact original echo, after which [`Self::sanitize_validated_echo`] overwrites the sole literal
+/// occurrence in place before any raw-capture or journal object can be constructed.
+pub(crate) struct BeaSensitiveBody(Zeroizing<Vec<u8>>);
+
+impl BeaSensitiveBody {
+    pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    pub(crate) fn from_zeroizing(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn into_zeroizing(mut self) -> Zeroizing<Vec<u8>> {
+        mem::take(&mut self.0)
+    }
+}
+
+impl fmt::Debug for BeaSensitiveBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BeaSensitiveBody")
+            .field("bytes", &self.0.len())
+            .field("contents", &"[ZEROIZING REDACTED]")
+            .finish()
+    }
+}
+
+/// Secret-free retained body and commitments to both upstream and sanitized representations.
+pub(crate) struct BeaSanitizedBody {
+    bytes: Bytes,
+    retained_digest: [u8; 32],
+}
+
+impl BeaSanitizedBody {
+    pub(crate) fn from_secret_free_vec(bytes: Vec<u8>) -> Self {
+        let retained_digest = Sha256::digest(&bytes).into();
+        Self {
+            bytes: Bytes::from(bytes),
+            retained_digest,
+        }
+    }
+
+    pub(crate) const fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    pub(crate) const fn retained_digest(&self) -> [u8; 32] {
+        self.retained_digest
+    }
+
 }

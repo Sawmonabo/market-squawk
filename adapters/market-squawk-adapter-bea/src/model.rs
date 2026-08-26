@@ -9,6 +9,14 @@ use sha2::{Digest, Sha256};
 use crate::{BeaError, BeaMethod};
 
 const MAX_IDENTIFIER_BYTES: usize = 128;
+/// Official Regional marker for a suppressed low-level value.
+pub const BEA_REGIONAL_SUPPRESSION_MARKER: &str = "L";
+/// Conservative interpretation retained beside the provider marker and exact provider notes.
+///
+/// No numeric threshold is invented because its unit/table-specific bound is not carried by the
+/// cell itself. Disclosure withholding is a different provider marker and must not be conflated.
+pub const BEA_REGIONAL_SUPPRESSION_REASON: &str =
+    "bea-regional-low-level-value-suppressed-threshold-not-carried-by-cell";
 
 /// One validated provider dataset name discovered through `GetDatasetList`.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -86,9 +94,39 @@ impl BeaMetadataGeneration {
         Ok(Self(hasher.finalize().into()))
     }
 
+    /// Commits to ordered upstream and secret-free retained metadata bodies.
+    pub fn from_page_receipts(receipts: &[&BeaPageReceipt]) -> Result<Self, BeaError> {
+        if receipts.is_empty() {
+            return Err(BeaError::InvalidRequest);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"market-squawk-bea-metadata-generation/v2");
+        hasher.update(
+            u64::try_from(receipts.len())
+                .map_err(|_| BeaError::InvalidRequest)?
+                .to_be_bytes(),
+        );
+        for receipt in receipts {
+            hasher.update(receipt.upstream_response_digest());
+            hasher.update(receipt.response_digest());
+        }
+        Ok(Self(hasher.finalize().into()))
+    }
+
     /// Returns the exact SHA-256 commitment.
     pub const fn digest(self) -> [u8; 32] {
         self.0
+    }
+
+    pub(crate) fn try_from_admitted_digest(
+        digest: market_squawk_domain::EvidenceDigest,
+    ) -> Result<Self, BeaError> {
+        if digest.algorithm() != market_squawk_domain::DigestAlgorithm::Sha256
+            || digest.bytes() == [0; 32]
+        {
+            return Err(BeaError::InvalidRequest);
+        }
+        Ok(Self(digest.bytes()))
     }
 }
 
@@ -279,6 +317,7 @@ pub enum BeaCompleteness {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BeaPageReceipt {
     request_digest: [u8; 32],
+    upstream_response_digest: [u8; 32],
     response_digest: [u8; 32],
     response_bytes: usize,
     page_number: u32,
@@ -307,6 +346,7 @@ impl BeaPageReceipt {
     ) -> Self {
         Self {
             request_digest,
+            upstream_response_digest: response_digest,
             response_digest,
             response_bytes,
             page_number,
@@ -324,8 +364,31 @@ impl BeaPageReceipt {
     }
 
     /// Returns SHA-256 of the exact response body.
+    ///
+    /// After production sanitation this is the retained secret-free body digest.
     pub const fn response_digest(&self) -> [u8; 32] {
         self.response_digest
+    }
+
+    /// Returns SHA-256 of the exact provider body before the validated `UserID` echo was replaced.
+    ///
+    /// This digest is secret-free commitment evidence; the original bytes are never retained.
+    pub const fn upstream_response_digest(&self) -> [u8; 32] {
+        self.upstream_response_digest
+    }
+
+    pub(crate) fn bind_sanitized_capture(
+        mut self,
+        upstream_response_digest: [u8; 32],
+        retained_response_digest: [u8; 32],
+    ) -> Result<Self, BeaError> {
+        if self.upstream_response_digest != upstream_response_digest
+            || upstream_response_digest == retained_response_digest
+        {
+            return Err(BeaError::InvalidField("sanitized response evidence"));
+        }
+        self.response_digest = retained_response_digest;
+        Ok(self)
     }
 
     /// Returns exact received response bytes.
@@ -398,6 +461,20 @@ impl BeaMetadataPage {
     /// Returns request/response/page completeness evidence.
     pub const fn receipt(&self) -> &BeaPageReceipt {
         &self.receipt
+    }
+
+    pub(crate) fn bind_sanitized_capture(
+        self,
+        upstream_response_digest: [u8; 32],
+        retained_response_digest: [u8; 32],
+    ) -> Result<Self, BeaError> {
+        Ok(Self {
+            method: self.method,
+            records: self.records,
+            receipt: self
+                .receipt
+                .bind_sanitized_capture(upstream_response_digest, retained_response_digest)?,
+        })
     }
 }
 
@@ -513,6 +590,8 @@ pub enum BeaMissingValue {
     Absent,
     /// The provider supplied an empty lexical value.
     Blank,
+    /// BEA Regional supplied literal `L`; this is a suppressed low-level value, never zero.
+    SuppressedRegional,
 }
 
 /// Exact observed decimal or explicit provider missing state.
@@ -716,6 +795,11 @@ impl BeaObservation {
             }
             BeaObservationValue::Missing(BeaMissingValue::Absent) => hasher.update([2]),
             BeaObservationValue::Missing(BeaMissingValue::Blank) => hasher.update([3]),
+            BeaObservationValue::Missing(BeaMissingValue::SuppressedRegional) => {
+                hasher.update([4]);
+                hash_text(&mut hasher, BEA_REGIONAL_SUPPRESSION_MARKER)?;
+                hash_text(&mut hasher, BEA_REGIONAL_SUPPRESSION_REASON)?;
+            }
         }
         hash_text(&mut hasher, unit.cl_unit())?;
         hasher.update(unit.unit_multiplier().to_be_bytes());
@@ -854,6 +938,26 @@ impl BeaDataPage {
     /// Returns request/response/page completeness evidence.
     pub const fn receipt(&self) -> &BeaPageReceipt {
         &self.receipt
+    }
+
+    pub(crate) fn bind_sanitized_capture(
+        self,
+        upstream_response_digest: [u8; 32],
+        retained_response_digest: [u8; 32],
+    ) -> Result<Self, BeaError> {
+        Ok(Self {
+            dataset: self.dataset,
+            metadata_generation: self.metadata_generation,
+            result_attributes: self.result_attributes,
+            dimensions: self.dimensions,
+            observations: self.observations,
+            notes: self.notes,
+            result_note_references: self.result_note_references,
+            production_time: self.production_time,
+            receipt: self
+                .receipt
+                .bind_sanitized_capture(upstream_response_digest, retained_response_digest)?,
+        })
     }
 }
 

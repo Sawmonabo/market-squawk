@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::NaiveDateTime;
 use market_squawk_domain::Timestamp;
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
@@ -17,8 +17,9 @@ use crate::{
     BeaObservation, BeaObservationIdentity, BeaObservationValue, BeaPageReceipt,
     BeaParameterDataType, BeaParameterDefinition, BeaParameterIdentity,
     BeaParameterValueDefinition, BeaProductionTime, BeaProviderError, BeaRequest, BeaTimePeriod,
-    BeaUnit, BeaUserId,
+    BeaUnit, BeaUserId, BEA_REGIONAL_SUPPRESSION_MARKER,
 };
+use crate::auth::{BEA_REDACTED_USER_ID, BeaSanitizedBody, BeaSensitiveBody};
 
 const MAX_METADATA_RECORDS: usize = 20_000;
 const MAX_STRING_BYTES: usize = 64 * 1024;
@@ -91,9 +92,29 @@ impl BeaParseLimits {
         self.max_rows
     }
 
+    /// Returns the admitted metadata-record ceiling.
+    pub const fn max_metadata_records(self) -> usize {
+        self.max_metadata_records
+    }
+
     /// Returns the admitted response byte ceiling.
     pub const fn max_bytes(self) -> usize {
         self.max_bytes
+    }
+
+    /// Returns the maximum retained provider string bytes.
+    pub const fn max_string_bytes(self) -> usize {
+        self.max_string_bytes
+    }
+
+    /// Returns the maximum declared response dimensions.
+    pub const fn max_dimensions(self) -> usize {
+        self.max_dimensions
+    }
+
+    /// Returns the maximum retained provider notes.
+    pub const fn max_notes(self) -> usize {
+        self.max_notes
     }
 }
 
@@ -107,6 +128,23 @@ pub fn parse_metadata_page(
     bytes: &[u8],
     request: &BeaRequest,
     user_id: &BeaUserId,
+    limits: BeaParseLimits,
+) -> Result<BeaMetadataPage, BeaError> {
+    parse_metadata_page_with_echo(bytes, request, UserIdEcho::Original(user_id), limits)
+}
+
+pub(crate) fn parse_metadata_page_sanitized(
+    bytes: &[u8],
+    request: &BeaRequest,
+    limits: BeaParseLimits,
+) -> Result<BeaMetadataPage, BeaError> {
+    parse_metadata_page_with_echo(bytes, request, UserIdEcho::Sanitized, limits)
+}
+
+fn parse_metadata_page_with_echo(
+    bytes: &[u8],
+    request: &BeaRequest,
+    user_id: UserIdEcho<'_>,
     limits: BeaParseLimits,
 ) -> Result<BeaMetadataPage, BeaError> {
     if !request.query().method().is_metadata() {
@@ -156,6 +194,23 @@ pub fn parse_data_page(
     bytes: &[u8],
     request: &BeaRequest,
     user_id: &BeaUserId,
+    limits: BeaParseLimits,
+) -> Result<BeaDataPage, BeaError> {
+    parse_data_page_with_echo(bytes, request, UserIdEcho::Original(user_id), limits)
+}
+
+pub(crate) fn parse_data_page_sanitized(
+    bytes: &[u8],
+    request: &BeaRequest,
+    limits: BeaParseLimits,
+) -> Result<BeaDataPage, BeaError> {
+    parse_data_page_with_echo(bytes, request, UserIdEcho::Sanitized, limits)
+}
+
+fn parse_data_page_with_echo(
+    bytes: &[u8],
+    request: &BeaRequest,
+    user_id: UserIdEcho<'_>,
     limits: BeaParseLimits,
 ) -> Result<BeaDataPage, BeaError> {
     if request.query().method() != BeaMethod::GetData {
@@ -240,14 +295,14 @@ fn parse_envelope(bytes: &[u8], limits: BeaParseLimits) -> Result<EnvelopeParts,
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct EnvelopeWire {
     #[serde(rename = "BEAAPI")]
     bea_api: ApiWire,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ApiWire {
     #[serde(rename = "Request")]
@@ -256,14 +311,14 @@ struct ApiWire {
     results: Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RequestWire {
     #[serde(rename = "RequestParam")]
     request_parameters: Vec<RequestParameterWire>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RequestParameterWire {
     #[serde(rename = "ParameterName")]
@@ -272,10 +327,16 @@ struct RequestParameterWire {
     value: String,
 }
 
+impl Drop for RequestParameterWire {
+    fn drop(&mut self) {
+        self.value.zeroize();
+    }
+}
+
 fn validate_request_echo(
     echoed: &mut [RequestParameterWire],
     request: &BeaRequest,
-    user_id: &BeaUserId,
+    user_id: UserIdEcho<'_>,
     limits: BeaParseLimits,
 ) -> Result<(), BeaError> {
     let mut expected = BTreeMap::new();
@@ -295,7 +356,10 @@ fn validate_request_echo(
             return Err(BeaError::RequestEchoMismatch);
         }
         if name == "USERID" {
-            let matches = user_id.matches_echo(&parameter.value);
+            let matches = match user_id {
+                UserIdEcho::Original(user_id) => user_id.matches_echo(&parameter.value),
+                UserIdEcho::Sanitized => parameter.value.as_bytes() == BEA_REDACTED_USER_ID,
+            };
             parameter.value.zeroize();
             if !matches {
                 return Err(BeaError::RequestEchoMismatch);
@@ -314,6 +378,66 @@ fn validate_request_echo(
         return Err(BeaError::RequestEchoMismatch);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum UserIdEcho<'a> {
+    Original(&'a BeaUserId),
+    Sanitized,
+}
+
+/// Structurally validates and replaces the exact echoed `UserID` before typed result parsing.
+pub(crate) fn sanitize_response_body(
+    body: BeaSensitiveBody,
+    request: &BeaRequest,
+    user_id: &BeaUserId,
+    limits: BeaParseLimits,
+) -> Result<BeaSanitizedBody, BeaError> {
+    if body.is_empty() || body.len() > limits.max_bytes() {
+        return Err(BeaError::BodyTooLarge);
+    }
+    let original = body.into_zeroizing();
+    let mut wire: EnvelopeWire = serde_json::from_slice(original.as_slice())?;
+    if wire.bea_api.request.request_parameters.len() > 64 {
+        return Err(BeaError::InvalidField("request echo"));
+    }
+    validate_request_echo(
+        &mut wire.bea_api.request.request_parameters,
+        request,
+        UserIdEcho::Original(user_id),
+        limits,
+    )?;
+    let user_parameter = wire
+        .bea_api
+        .request
+        .request_parameters
+        .iter_mut()
+        .find(|parameter| parameter.name.eq_ignore_ascii_case("USERID"))
+        .ok_or(BeaError::RequestEchoMismatch)?;
+    user_parameter.value.zeroize();
+    user_parameter
+        .value
+        .try_reserve_exact(BEA_REDACTED_USER_ID.len())
+        .map_err(|_| BeaError::Allocation)?;
+    user_parameter.value.push_str(
+        std::str::from_utf8(BEA_REDACTED_USER_ID)
+            .map_err(|_| BeaError::InvalidField("redacted request echo"))?,
+    );
+    let mut sanitized = Vec::new();
+    sanitized
+        .try_reserve(original.len())
+        .map_err(|_| BeaError::Allocation)?;
+    serde_json::to_writer(&mut sanitized, &wire)?;
+    if sanitized.is_empty()
+        || sanitized.len() > limits.max_bytes()
+        || sanitized
+            .windows(user_id.expose_secret().len())
+            .any(|candidate| candidate == user_id.expose_secret().as_bytes())
+    {
+        sanitized.zeroize();
+        return Err(BeaError::RequestEchoMismatch);
+    }
+    Ok(BeaSanitizedBody::from_secret_free_vec(sanitized))
 }
 
 fn echo_value_matches(expected: &str, actual: &str) -> bool {
@@ -347,10 +471,10 @@ fn reject_provider_error(
     if !results.is_empty() {
         return Err(BeaError::InvalidField("provider error result"));
     }
-    let mut error = error
-        .as_object()
-        .cloned()
-        .ok_or(BeaError::InvalidField("Error"))?;
+    let mut error = match error {
+        Value::Object(error) => error,
+        _ => return Err(BeaError::InvalidField("Error")),
+    };
     let code = take_required_scalar_string(&mut error, "APIErrorCode", limits)?
         .parse::<u32>()
         .map_err(|_| BeaError::InvalidField("APIErrorCode"))?;
@@ -377,10 +501,10 @@ fn parse_datasets(
         .map_err(|_| BeaError::Allocation)?;
     let mut identities = BTreeSet::new();
     for value in values {
-        let mut value = value
-            .as_object()
-            .cloned()
-            .ok_or(BeaError::InvalidField("Dataset"))?;
+        let mut value = match value {
+            Value::Object(value) => value,
+            _ => return Err(BeaError::InvalidField("Dataset")),
+        };
         let identity =
             BeaDatasetIdentity::try_new(take_required_string(&mut value, "DatasetName", limits)?)?;
         let description = take_required_string(&mut value, "DatasetDescription", limits)?;
@@ -404,10 +528,10 @@ fn parse_parameters(
         .map_err(|_| BeaError::Allocation)?;
     let mut identities = BTreeSet::new();
     for value in values {
-        let mut value = value
-            .as_object()
-            .cloned()
-            .ok_or(BeaError::InvalidField("Parameter"))?;
+        let mut value = match value {
+            Value::Object(value) => value,
+            _ => return Err(BeaError::InvalidField("Parameter")),
+        };
         let identity = BeaParameterIdentity::try_new(take_required_string(
             &mut value,
             "ParameterName",
@@ -464,10 +588,10 @@ fn parse_parameter_values(
         .map_err(|_| BeaError::Allocation)?;
     let mut keys = BTreeSet::new();
     for value in values {
-        let mut value = value
-            .as_object()
-            .cloned()
-            .ok_or(BeaError::InvalidField("ParamValue"))?;
+        let mut value = match value {
+            Value::Object(value) => value,
+            _ => return Err(BeaError::InvalidField("ParamValue")),
+        };
         let key = take_required_scalar_string(&mut value, "Key", limits)?;
         if key.is_empty() || !keys.insert(key.clone()) {
             return Err(BeaError::InvalidField("parameter value key"));
@@ -499,10 +623,10 @@ fn parse_dimensions(
     let mut ordinal_presence = None;
     let mut value_dimensions = 0usize;
     for value in values {
-        let mut value = value
-            .as_object()
-            .cloned()
-            .ok_or(BeaError::InvalidField("Dimension"))?;
+        let mut value = match value {
+            Value::Object(value) => value,
+            _ => return Err(BeaError::InvalidField("Dimension")),
+        };
         let name = take_required_string(&mut value, "Name", limits)?;
         if name.is_empty() || !names.insert(name.to_ascii_uppercase()) {
             return Err(BeaError::InvalidField("dimension name"));
@@ -592,10 +716,10 @@ fn parse_notes(
         .try_reserve_exact(values.len())
         .map_err(|_| BeaError::Allocation)?;
     for value in values {
-        let mut value = value
-            .as_object()
-            .cloned()
-            .ok_or(BeaError::InvalidField("Note"))?;
+        let mut value = match value {
+            Value::Object(value) => value,
+            _ => return Err(BeaError::InvalidField("Note")),
+        };
         let reference = take_required_string(&mut value, "NoteRef", limits)?;
         let text = take_required_string(&mut value, "NoteText", limits)?;
         if text.is_empty() {
@@ -636,17 +760,22 @@ fn parse_observations(
         .map_err(|_| BeaError::Allocation)?;
     let mut identities = BTreeSet::new();
     for value in values {
-        let mut row = value
-            .as_object()
-            .cloned()
-            .ok_or(BeaError::InvalidField("Data row"))?;
+        let mut row = match value {
+            Value::Object(value) => value,
+            _ => return Err(BeaError::InvalidField("Data row")),
+        };
         let note_references = take_optional_string(&mut row, "NoteRef", limits)?
             .map(|value| split_note_references(&value, limits))
             .transpose()?
             .unwrap_or_default();
         validate_note_references(&note_references, note_index)?;
 
-        let value = take_observation_value(&mut row, semantic_names.value, limits)?;
+        let value = take_observation_value(
+            &mut row,
+            semantic_names.value,
+            dataset,
+            limits,
+        )?;
         let mut members = BTreeMap::new();
         for dimension in dimensions.iter().filter(|dimension| !dimension.is_value()) {
             let member = take_required_dimension_scalar(&mut row, dimension.name(), limits)?;
@@ -658,7 +787,7 @@ fn parse_observations(
                 .ok_or(BeaError::InvalidField("TimePeriod"))?,
         )?;
         let cl_unit = member(&members, semantic_names.cl_unit)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.trim().is_empty())
             .ok_or(BeaError::InvalidField("CL_UNIT"))?
             .to_owned();
         let unit_multiplier = member(&members, semantic_names.unit_multiplier)
@@ -692,6 +821,7 @@ fn parse_observations(
 fn take_observation_value(
     row: &mut Map<String, Value>,
     name: &str,
+    dataset: &BeaDatasetIdentity,
     limits: BeaParseLimits,
 ) -> Result<BeaObservationValue, BeaError> {
     let Some(value) = remove_case_insensitive(row, name)? else {
@@ -703,6 +833,13 @@ fn take_observation_value(
             validate_string(&raw, limits)?;
             if raw.trim().is_empty() {
                 return Ok(BeaObservationValue::Missing(BeaMissingValue::Blank));
+            }
+            if dataset.as_str().eq_ignore_ascii_case("Regional")
+                && raw.trim() == BEA_REGIONAL_SUPPRESSION_MARKER
+            {
+                return Ok(BeaObservationValue::Missing(
+                    BeaMissingValue::SuppressedRegional,
+                ));
             }
             let value = parse_decimal(&raw)?;
             Ok(BeaObservationValue::Observed { value, raw })
@@ -911,23 +1048,21 @@ fn take_required_array(
     values: &mut Map<String, Value>,
     name: &'static str,
 ) -> Result<Vec<Value>, BeaError> {
-    remove_case_insensitive(values, name)?
-        .and_then(|value| value.as_array().cloned())
-        .ok_or(BeaError::InvalidField(name))
+    match remove_case_insensitive(values, name)? {
+        Some(Value::Array(values)) => Ok(values),
+        Some(_) | None => Err(BeaError::InvalidField(name)),
+    }
 }
 
 fn take_optional_array(
     values: &mut Map<String, Value>,
     name: &'static str,
 ) -> Result<Option<Vec<Value>>, BeaError> {
-    remove_case_insensitive(values, name)?
-        .map(|value| {
-            value
-                .as_array()
-                .cloned()
-                .ok_or(BeaError::InvalidField(name))
-        })
-        .transpose()
+    match remove_case_insensitive(values, name)? {
+        Some(Value::Array(values)) => Ok(Some(values)),
+        Some(_) => Err(BeaError::InvalidField(name)),
+        None => Ok(None),
+    }
 }
 
 fn take_required_string(

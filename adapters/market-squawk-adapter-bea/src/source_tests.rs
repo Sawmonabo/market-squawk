@@ -1,39 +1,61 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
-use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
+use market_squawk_platform::LocalPaths;
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
-    Timestamp,
+    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
-    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
-    BudgetWindowSemantics, CoverageDomain, EndpointPolicy, FreshnessPolicy, HistoricalCapability,
-    HttpRequestBounds, NetworkAccessPolicy, ProviderBudgetPolicy, ProviderBudgetWindow,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
-    SourceProtocolProfile,
+    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, CoverageDomain,
+    EndpointPolicy, FreshnessPolicy, HistoricalCapability, HttpRequestBounds, NetworkAccessPolicy,
+    ProviderCaptureTerminalDisposition, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::source::bea_api_endpoint_rule;
 use crate::transport::{BeaHttpResponse, BeaTransport, system_timestamp};
 use crate::{
     BeaAuthorizedRequest, BeaDatasetContract, BeaDatasetIdentity, BeaObservationValue,
-    BeaParseLimits, BeaSource, BeaSourceConfig, BeaSourceError, BeaUserId,
+    BeaParseLimits, BeaPersonalResearchAuthorization, BeaPersonalResearchOperation,
+    BeaPublicationCandidate, BeaRequiredSharedSettlement, BeaSealedAcquisitionReceipt, BeaSource,
+    BeaSourceConfig, BeaSourceError, BeaUserId,
 };
 
 const USER_ID: &str = "11111111-2222-3333-4444-555555555555";
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+struct TemporaryDirectory(PathBuf);
+
+impl TemporaryDirectory {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!("market-squawk-bea-{}", Uuid::new_v4())))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ignored = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[derive(Debug)]
 struct ScriptedTransport {
@@ -124,26 +146,33 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
         metadata.clone(),
         BeaUserId::try_new(USER_ID.to_owned())?,
         config,
+        digest_evidence(b"bea-test-credential-generation-v1"),
+        BeaPersonalResearchAuthorization::try_new(digest_evidence(
+            b"owner-personal-research-attestation-v1",
+        ))?,
         transport.clone(),
     )?;
     let mut registry =
         AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
             Arc::new(TestSubjectResolver {
-                subject: SourceIdentifier::try_from("bea-test-credential")?,
+                subject: market_squawk_sources::ProviderRateDeclaration::governed_provider_subject(
+                    &SourceIdentifier::try_from("bea")?,
+                )?,
             }),
         )?;
     let registered = registry.register(metadata, now)?;
     let authority = registry.extraction_authority(&registered, &source)?;
     let deadline = now.checked_add_nanos(30_000_000_000)?;
 
-    let acquisition = source
-        .acquire_dataset(
+    let run = source
+        .doctor(
             &authority,
             &provider_dataset,
             deadline,
             CancellationToken::new(),
         )
         .await?;
+    let acquisition = run.acquisition();
 
     assert_eq!(acquisition.metadata().pages().len(), 3);
     assert_eq!(acquisition.data().page().observations().len(), 1);
@@ -161,7 +190,85 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     assert_eq!(source.telemetry().requests(), 4);
     assert_eq!(source.telemetry().successful_responses(), 4);
     assert_eq!(source.telemetry().returned_rows(), 1);
-    assert_eq!(acquisition.into_capture_materials()?.len(), 4);
+    assert_eq!(run.receipt().request_count(), 4);
+    assert_eq!(run.receipt().returned_rows(), 1);
+    let (doctor_receipt, evidence, graph) = run.into_sealing_parts()?;
+    assert_eq!(graph.receipt().pages().len(), 4);
+    assert_eq!(graph.receipt().request_graph_components().len(), 4);
+    assert_eq!(
+        graph.receipt().terminal(),
+        ProviderCaptureTerminalDisposition::CompleteRequestGraph
+    );
+    let temporary = TemporaryDirectory::new();
+    let paths = LocalPaths::prepare(temporary.path())?;
+    let store = paths.sealed_research_journal_store()?;
+    let sealed = BeaSealedAcquisitionReceipt::try_new(evidence, graph.seal(&store)?)?;
+    let admission = doctor_receipt.bind_sealed(source.source_binding(), &sealed)?;
+    source.activate_doctor(&admission)?;
+    assert_eq!(source.rights().research_rights().len(), 11);
+    for operation in [
+        BeaPersonalResearchOperation::Transform,
+        BeaPersonalResearchOperation::Backtest,
+        BeaPersonalResearchOperation::Forecast,
+        BeaPersonalResearchOperation::ModelTraining,
+        BeaPersonalResearchOperation::ModelOperation,
+    ] {
+        source.rights().authorize_research(operation)?;
+    }
+    for operation in [
+        BeaPersonalResearchOperation::Export,
+        BeaPersonalResearchOperation::Sale,
+        BeaPersonalResearchOperation::Redistribute,
+    ] {
+        assert!(source.rights().authorize_research(operation).is_err());
+    }
+    assert_eq!(
+        source.quota_declaration().required_shared_settlements(),
+        &[
+            BeaRequiredSharedSettlement::ResponseBytes,
+            BeaRequiredSharedSettlement::ProviderErrors,
+        ]
+    );
+    let candidate = BeaPublicationCandidate::try_new(
+        source.source_binding(),
+        &admission,
+        sealed,
+        source
+            .rights()
+            .authorize(market_squawk_sources::DataUseOperation::Persist)?,
+        NonZeroU32::new(1).ok_or("canonical record bound")?,
+    )?;
+    candidate.validate()?;
+    assert_eq!(candidate.observations().len(), 1);
+    assert_eq!(
+        candidate.observations()[0]
+            .observation()
+            .value()
+            .observed_value(),
+        Some(rust_decimal::Decimal::from(65_000))
+    );
+    assert_eq!(candidate.rejoin_coordinates().row_count(), 1);
+    assert_eq!(candidate.rejoin_coordinates().data_component_ordinal(), 3);
+    assert_eq!(
+        candidate.rejoin_coordinates().candidate_digest(),
+        candidate.candidate_digest()
+    );
+    assert_eq!(candidate.revision_plan().len(), 1);
+    assert!(candidate.revision_plan().is_locally_observed());
+    let research_observations = candidate.research_observations()?;
+    let revision_batch = candidate.revision_plan().clone().into_observed_batch(
+        candidate.rejoin_coordinates().source_id().clone(),
+        &research_observations,
+    )?;
+    assert_eq!(revision_batch.input_len(), 1);
+    assert_eq!(revision_batch.unique_records().len(), 1);
+    let handoff = candidate.into_shared_publication_parts();
+    assert_eq!(handoff.observations().len(), 1);
+    assert_eq!(handoff.revision_plan().len(), handoff.observations().len());
+    assert_eq!(
+        handoff.coordinates().acquisition_capture_receipt_digest(),
+        handoff.sealed_acquisition().sealed_capture().receipt_digest()
+    );
     assert!(
         transport
             .responses
@@ -186,20 +293,7 @@ fn source_metadata(now: Timestamp, config: &BeaSourceConfig) -> TestResult<Sourc
         vec![bea_api_endpoint_rule(config)?],
         HttpRequestBounds::default(),
     )?;
-    let budget = ProviderBudgetPolicy::try_new_conjunctive(
-        BudgetScope::for_authorization(provider.clone(), &authorization)?,
-        &[ProviderBudgetWindow::try_new(
-            NonZeroU32::new(60).ok_or("request budget")?,
-            NonZeroU64::new(60_000_000_000).ok_or("budget window")?,
-            BudgetWindowSemantics::Sliding,
-        )?],
-        NonZeroU16::MIN,
-        BackoffPolicy::try_new(
-            NonZeroU64::new(1_000_000).ok_or("initial backoff")?,
-            NonZeroU64::new(60_000_000_000).ok_or("maximum backoff")?,
-            0,
-        )?,
-    )?;
+    let budget = crate::bea_provider_rate_declaration()?.policy().clone();
     Ok(SourceMetadata::try_new(SourceMetadataInput::new(
         SchemaVersion::CURRENT,
         SourceId::try_from("bea-local-transport-contract")?,
@@ -234,10 +328,11 @@ fn source_metadata(now: Timestamp, config: &BeaSourceConfig) -> TestResult<Sourc
 }
 
 fn exact_evidence(bytes: &[u8]) -> ExactPayloadEvidence {
-    ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
-        DigestAlgorithm::Sha256,
-        Sha256::digest(bytes).into(),
-    ))
+    ExactPayloadEvidence::from_content_digest(digest_evidence(bytes))
+}
+
+fn digest_evidence(bytes: &[u8]) -> EvidenceDigest {
+    EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into())
 }
 
 fn responses() -> Result<Vec<Bytes>, serde_json::Error> {
@@ -303,9 +398,9 @@ fn responses() -> Result<Vec<Bytes>, serde_json::Error> {
                     ],
                     "Data": [{
                         "TimePeriod": "2025",
-                        "DataValue": "65,000",
+                        "DataValue": "65",
                         "CL_UNIT": "Dollars",
-                        "UNIT_MULT": "0"
+                        "UNIT_MULT": "3"
                     }]
                 }
             }

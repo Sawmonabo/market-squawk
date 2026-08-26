@@ -2,13 +2,15 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures_util::StreamExt as _;
 use futures_util::future::BoxFuture;
 use market_squawk_domain::Timestamp;
 use market_squawk_sources::{HttpRequestBounds, InFlightExtractionRequest};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
+use crate::auth::BeaSensitiveBody;
 use crate::{BeaAuthorizedRequest, BeaSourceError};
 
 const USER_AGENT: &str = concat!(
@@ -24,7 +26,7 @@ pub(crate) struct BeaHttpResponse {
     pub(crate) retry_after: Option<Vec<u8>>,
     pub(crate) content_encoding: Option<Vec<u8>>,
     pub(crate) content_type: Option<Vec<u8>>,
-    pub(crate) body: Bytes,
+    pub(crate) body: BeaSensitiveBody,
     pub(crate) received_at: Timestamp,
     pub(crate) latency: Duration,
 }
@@ -144,11 +146,11 @@ async fn collect_bounded<S, E>(
     mut stream: S,
     in_flight: &InFlightExtractionRequest,
     max_bytes: usize,
-) -> Result<Bytes, BeaSourceError>
+) -> Result<BeaSensitiveBody, BeaSourceError>
 where
     S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin,
 {
-    let mut body = BytesMut::new();
+    let mut body = Zeroizing::new(Vec::new());
     while let Some(chunk) = stream.next().await {
         in_flight
             .validate_current()
@@ -164,12 +166,14 @@ where
         in_flight
             .validate_response_size(u64::try_from(next).map_err(|_| BeaSourceError::BodyTooLarge)?)
             .map_err(|_| BeaSourceError::BodyTooLarge)?;
+        body.try_reserve(chunk.len())
+            .map_err(|_| BeaSourceError::Allocation)?;
         body.extend_from_slice(&chunk);
     }
     if body.is_empty() {
         return Err(BeaSourceError::Protocol);
     }
-    Ok(body.freeze())
+    Ok(BeaSensitiveBody::from_zeroizing(body))
 }
 
 pub(crate) fn system_timestamp() -> Result<Timestamp, BeaSourceError> {
