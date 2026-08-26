@@ -35,6 +35,12 @@ pub enum ProviderNativeLineageImplementation {
     CensusTabularV1,
     /// EIA series observation semantics encoder v1.
     EiaSeriesV1,
+    /// Federal Reserve Board H.15 observation semantics encoder v1.
+    FederalReserveH15V1,
+    /// Treasury daily-rate observation semantics encoder v1.
+    TreasuryDailyRateV1,
+    /// Treasury Fiscal Data observation semantics encoder v1.
+    TreasuryFiscalDataV1,
 }
 
 impl ProviderNativeLineageImplementation {
@@ -47,6 +53,15 @@ impl ProviderNativeLineageImplementation {
             Self::BlsTimeseriesV1 => b"market-squawk/bls/provider-native-lineage/v1",
             Self::CensusTabularV1 => b"market-squawk/census/provider-native-lineage/v1",
             Self::EiaSeriesV1 => b"market-squawk/eia/provider-native-lineage/v1",
+            Self::FederalReserveH15V1 => {
+                b"market-squawk/federal-reserve-h15/provider-native-lineage/v1"
+            }
+            Self::TreasuryDailyRateV1 => {
+                b"market-squawk/treasury-daily-rate/provider-native-lineage/v1"
+            }
+            Self::TreasuryFiscalDataV1 => {
+                b"market-squawk/treasury-fiscal-data/provider-native-lineage/v1"
+            }
         }
     }
 
@@ -57,6 +72,9 @@ impl ProviderNativeLineageImplementation {
             Self::BlsTimeseriesV1 => 2,
             Self::CensusTabularV1 => 3,
             Self::EiaSeriesV1 => 4,
+            Self::FederalReserveH15V1 => 6,
+            Self::TreasuryDailyRateV1 => 7,
+            Self::TreasuryFiscalDataV1 => 8,
         }
     }
 }
