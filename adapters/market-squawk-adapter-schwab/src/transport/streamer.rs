@@ -172,10 +172,18 @@ impl StreamerMicrobatchReceipt {
     pub const fn observation_sha256(&self) -> [u8; 32] {
         self.observation_sha256
     }
+
+    #[cfg(test)]
+    pub(crate) fn request_set_identity_for_token_generation(
+        &self,
+        token_generation: AccessTokenGeneration,
+    ) -> EvidenceDigest {
+        stream_request_set_identity_with_token_generation(self, token_generation)
+    }
 }
 
 /// Exact raw Streamer microbatch retained before canonical decoding.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct StreamerMicrobatch {
     receipt: StreamerMicrobatchReceipt,
     frames: Box<[RawStreamerFrame]>,
@@ -292,9 +300,17 @@ impl StreamerMicrobatch {
 }
 
 fn stream_request_set_identity(receipt: &StreamerMicrobatchReceipt) -> EvidenceDigest {
+    stream_request_set_identity_with_token_generation(receipt, receipt.token_generation)
+}
+
+fn stream_request_set_identity_with_token_generation(
+    receipt: &StreamerMicrobatchReceipt,
+    token_generation: AccessTokenGeneration,
+) -> EvidenceDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk/schwab-streamer-microbatch/v1");
+    hasher.update(b"market-squawk/schwab-streamer-microbatch/v2");
     hasher.update(receipt.generation.get().to_be_bytes());
+    hasher.update(token_generation.get().to_be_bytes());
     hasher.update(receipt.first_ordinal.get().to_be_bytes());
     hasher.update(receipt.last_ordinal.get().to_be_bytes());
     hasher.update(receipt.content_sha256);
@@ -553,7 +569,10 @@ impl SchwabStreamerExecutor {
         token_admission: AccessTokenAdmission,
         telemetry: SchwabTransportTelemetry,
     ) -> Result<Self, SchwabTransportError> {
-        if parse_bounds.max_response_bytes() > transport_bounds.max_frame_bytes() {
+        if parse_bounds.max_response_bytes() > transport_bounds.max_frame_bytes()
+            || transport_bounds.max_microbatch_frames()
+                > market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES
+        {
             return Err(SchwabTransportError::InvalidConfiguration);
         }
         Ok(Self {

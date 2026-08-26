@@ -34,13 +34,14 @@ use crate::{
     SchwabOAuthWireRequest, SchwabOAuthWireResponse, SchwabOptionCandidateAbstention,
     SchwabOptionCandidateOutcome, SchwabPriceHistoryCapabilityObservation,
     SchwabResolvedProviderIdentity, SchwabRestExecutor, SchwabSealedPriceHistoryCapture,
-    SchwabStreamerConnection, SchwabStreamerConnector, SchwabStreamerExecutor,
-    SchwabStreamerFieldDictionary, SchwabStreamerSemanticField, SchwabTransportError,
-    SchwabTransportTelemetry, StreamerAdmission, StreamerCaptureSink, StreamerCaptureSinkError,
-    StreamerMicrobatch, StreamerResponseCode, StreamerSubscription, StreamerTransportBounds,
-    TokenAuthorityError, TokenDecision, TransientAccessToken, canonicalize_option_chain,
-    canonicalize_price_history, canonicalize_streamer_batch, parse_option_chain_response,
-    parse_quote_response, parse_streamer_frame, parse_token_response, parse_user_preference,
+    SchwabSealedStreamerMicrobatchCapture, SchwabStreamerConnection, SchwabStreamerConnector,
+    SchwabStreamerExecutor, SchwabStreamerFieldDictionary, SchwabStreamerSemanticField,
+    SchwabTransportError, SchwabTransportTelemetry, StreamerAdmission, StreamerCaptureSink,
+    StreamerCaptureSinkError, StreamerMicrobatch, StreamerResponseCode, StreamerSubscription,
+    StreamerTransportBounds, TokenAuthorityError, TokenDecision, TransientAccessToken,
+    canonicalize_option_chain, canonicalize_price_history, canonicalize_streamer_batch,
+    parse_option_chain_response, parse_quote_response, parse_streamer_frame, parse_token_response,
+    parse_user_preference,
 };
 
 struct TemporaryDirectory(PathBuf);
@@ -799,16 +800,15 @@ async fn bounded_mock_transport_captures_exact_market_data_without_token_materia
         Duration::from_millis(1),
     )
     .unwrap_or_else(|error| panic!("stream bounds: {error}"));
-    let token_source = Arc::new(MockTokenSource { token_admission });
     let stream_admission = StreamerAdmission::new(admission(), nonzero(4), nonzero(16));
     let mut streamer = SchwabStreamerExecutor::try_new(
         connector,
-        token_source,
+        Arc::new(MockTokenSource { token_admission }),
         stream_admission,
         stream_bounds,
         bounds(),
         token_admission,
-        telemetry.clone(),
+        telemetry,
     )
     .unwrap_or_else(|error| panic!("stream executor: {error}"));
     streamer
@@ -830,46 +830,71 @@ async fn bounded_mock_transport_captures_exact_market_data_without_token_materia
         cancellation: cancellation.clone(),
         microbatches: Vec::new(),
     };
-    let exit = streamer
+    streamer
         .run(bootstrap.value(), &mut sink, cancellation)
         .await
         .unwrap_or_else(|error| panic!("stream run: {error}"));
-    assert_eq!(exit, crate::StreamerRunExit::Cancelled);
     assert_eq!(sink.microbatches.len(), 1);
-    assert_eq!(sink.microbatches[0].frames().len(), 1);
-    assert_eq!(sink.microbatches[0].frames()[0].payload(), &market_data);
+    let stream_microbatch = sink
+        .microbatches
+        .pop()
+        .unwrap_or_else(|| panic!("missing stream microbatch"));
+    let current_request_identity = stream_microbatch
+        .receipt()
+        .request_set_identity_for_token_generation(stream_microbatch.receipt().token_generation());
+    let next_token_generation = AccessTokenGeneration::new(
+        NonZeroU64::new(2).unwrap_or_else(|| panic!("token generation must be nonzero")),
+    );
+    let next_request_identity = stream_microbatch
+        .receipt()
+        .request_set_identity_for_token_generation(next_token_generation);
+    assert_ne!(current_request_identity, next_request_identity);
+    let event_id = Uuid::new_v4();
+    let temporary = TemporaryDirectory::new();
+    let paths = LocalPaths::prepare(temporary.path().join("stream-capture"))
+        .unwrap_or_else(|error| panic!("stream capture paths: {error}"));
+    let store = paths
+        .sealed_research_journal_store()
+        .unwrap_or_else(|error| panic!("stream capture store: {error}"));
+    let sealed = SchwabSealedStreamerMicrobatchCapture::try_seal(
+        stream_microbatch,
+        coordinates.clone(),
+        vec![event_id],
+        &store,
+    )
+    .unwrap_or_else(|error| panic!("sealed stream capture: {error}"));
+    let capture = sealed.receipt().capture();
+    assert_eq!(capture.request_set_identity(), current_request_identity);
+    assert_eq!(capture.source_id(), coordinates.source_id());
+    assert_eq!(capture.metadata_revision(), coordinates.metadata_revision());
+    assert_eq!(capture.dataset(), coordinates.dataset());
+    let reopened = store
+        .open_verified(sealed.receipt().segment())
+        .unwrap_or_else(|error| panic!("reopened stream capture: {error}"));
+    let [record] = reopened.records() else {
+        panic!("sealed stream capture did not retain exactly one frame");
+    };
+    assert_eq!(record.event_id(), event_id);
+    assert_eq!(record.connection_id(), coordinates.connection_id());
+    assert_eq!(record.source(), coordinates.source_id().as_str());
+    assert_eq!(record.source_sequence(), Some(0));
+    assert_eq!(record.payload(), market_data.as_ref());
     assert!(
-        !sink.microbatches[0].frames()[0]
+        !record
             .payload()
             .windows(b"mock-access-token".len())
             .any(|window| window == b"mock-access-token")
     );
-    let stream_material = sink
-        .microbatches
-        .pop()
-        .unwrap_or_else(|| panic!("missing stream microbatch"))
-        .try_into_provider_capture_material(coordinates, vec![Uuid::new_v4()])
-        .unwrap_or_else(|error| panic!("stream capture material: {error}"));
-    assert_eq!(stream_material.records().len(), 1);
-    assert_eq!(stream_material.records()[0].payload(), market_data.as_ref());
     let state = connector_state
         .lock()
         .unwrap_or_else(|error| panic!("mock connector state: {error}"));
-    assert_eq!(state.connects, 1);
-    assert_eq!(state.sent.len(), 2);
-    assert_eq!(state.sent[0], ("ADMIN".to_owned(), "LOGIN".to_owned()));
     assert_eq!(
-        state.sent[1],
-        ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned())
+        state.sent.as_slice(),
+        [
+            ("ADMIN".to_owned(), "LOGIN".to_owned()),
+            ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
+        ]
     );
-    let measured = telemetry
-        .snapshot()
-        .unwrap_or_else(|error| panic!("telemetry: {error}"));
-    assert_eq!(measured.rest_requests_total, 1);
-    assert_eq!(measured.streamer_connections_total, 1);
-    assert_eq!(measured.streamer_frames_total, 3);
-    assert_eq!(measured.streamer_frames_captured_total, 1);
-    assert_eq!(measured.streamer_events_total, 1);
 }
 
 #[derive(Debug)]

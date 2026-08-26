@@ -86,7 +86,8 @@ pub use transport::{
 pub use vertical::{
     SchwabCapabilityCurrentness, SchwabObservedCapabilityFamily,
     SchwabPriceHistoryCapabilityObservation, SchwabPriceHistoryLineage,
-    SchwabSealedPriceHistoryCapture, SchwabSealedPriceHistoryPublicationInput, SchwabVerticalError,
+    SchwabSealedPriceHistoryCapture, SchwabSealedPriceHistoryPublicationInput,
+    SchwabSealedStreamerMicrobatchCapture, SchwabVerticalError,
 };
 
 /// Exact Schwab OAuth authorization endpoint.

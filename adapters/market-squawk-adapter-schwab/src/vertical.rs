@@ -1,8 +1,9 @@
-//! Family-scoped observed capability and sealed daily price-history publication input.
+//! Family-scoped observed capability and sealed provider-capture inputs.
 //!
 //! A successful request from one Schwab family never authorizes another family. The only durable
-//! publication input currently exposed by this adapter is daily price history. The shared data
-//! authority remains responsible for Parquet generation and manifest publication.
+//! publication input currently exposed by this adapter is daily price history. Streamer capture
+//! can be sealed without granting canonical-publication authority. The shared data authority
+//! remains responsible for Parquet generation and manifest publication.
 
 use std::fmt;
 use std::time::Duration;
@@ -21,7 +22,7 @@ use thiserror::Error;
 use crate::{
     ACCESS_TOKEN_MAX_LIFETIME_SECONDS, ExecutedRestResponse, ProviderIdentifier,
     RawRestResponseReceipt, ReadOnlyRoute, SchwabCaptureCoordinates, SchwabOAuthAuthorityReceipt,
-    SchwabRestPayload,
+    SchwabRestPayload, StreamerMicrobatch, StreamerMicrobatchReceipt,
 };
 
 /// The sole family for which this adapter can currently mint observed publication capability.
@@ -259,6 +260,68 @@ pub struct SchwabPriceHistoryLineage {
     pub resolution_evidence: EvidenceDigest,
     pub time_semantics: Box<[BarTimeSemantics]>,
     pub ingested_at: Timestamp,
+}
+
+/// One exact Streamer microbatch inseparably bound to its durable raw-capture receipt.
+///
+/// Access-token bytes are absent by construction. The retained token generation is only the
+/// opaque coordinate issued by the protected OAuth authority for the connection generation that
+/// produced these frames.
+#[derive(Debug, Eq, PartialEq)]
+pub struct SchwabSealedStreamerMicrobatchCapture {
+    coordinates: SchwabCaptureCoordinates,
+    microbatch_receipt: StreamerMicrobatchReceipt,
+    receipt: SealedProviderCaptureSetReceipt,
+}
+
+impl SchwabSealedStreamerMicrobatchCapture {
+    /// Consumes and seals one already bounded Streamer microbatch.
+    pub fn try_seal(
+        microbatch: StreamerMicrobatch,
+        coordinates: SchwabCaptureCoordinates,
+        event_ids: Vec<uuid::Uuid>,
+        store: &SealedResearchJournalStore,
+    ) -> Result<Self, SchwabVerticalError> {
+        let microbatch_receipt = microbatch.receipt().clone();
+        let frame_count = usize::try_from(microbatch_receipt.frame_count())
+            .map_err(|_| SchwabVerticalError::StreamerCaptureBindingMismatch)?;
+        if frame_count == 0
+            || frame_count > market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES
+            || event_ids.len() != frame_count
+        {
+            return Err(SchwabVerticalError::StreamerCaptureBindingMismatch);
+        }
+        if event_ids
+            .iter()
+            .enumerate()
+            .any(|(index, event_id)| event_ids[..index].contains(event_id))
+        {
+            return Err(SchwabVerticalError::StreamerCaptureBindingMismatch);
+        }
+        let material = microbatch
+            .try_into_provider_capture_material(coordinates.clone(), event_ids)
+            .map_err(|_| SchwabVerticalError::StreamerCaptureBindingMismatch)?;
+        let receipt = material
+            .seal(store)
+            .map_err(|_| SchwabVerticalError::StreamerCaptureBindingMismatch)?;
+        Ok(Self {
+            coordinates,
+            microbatch_receipt,
+            receipt,
+        })
+    }
+
+    pub const fn coordinates(&self) -> &SchwabCaptureCoordinates {
+        &self.coordinates
+    }
+
+    pub const fn microbatch_receipt(&self) -> &StreamerMicrobatchReceipt {
+        &self.microbatch_receipt
+    }
+
+    pub const fn receipt(&self) -> &SealedProviderCaptureSetReceipt {
+        &self.receipt
+    }
 }
 
 /// An exact daily price-history response sealed with the registered capture coordinates.
@@ -781,6 +844,8 @@ pub enum SchwabVerticalError {
     InvalidCapabilityEvidence,
     #[error("Schwab daily price-history response, capture, canonical records, or clocks differ")]
     PublicationBindingMismatch,
+    #[error("Schwab Streamer microbatch, event coordinates, or sealed receipt differ")]
+    StreamerCaptureBindingMismatch,
     #[error("Schwab provider evidence arithmetic overflowed")]
     Overflow,
 }
