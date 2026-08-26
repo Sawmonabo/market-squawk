@@ -84,13 +84,28 @@ impl fmt::Debug for SchwabHttpWireRequest<'_> {
 }
 
 /// Complete bounded HTTP response returned by an injectable wire implementation.
-#[derive(Clone, Debug)]
+///
+/// This exact raw-body owner is deliberately non-cloneable. Its debug view is metadata-only.
 pub struct SchwabHttpWireResponse {
     status: u16,
     final_url: Box<str>,
     declared_body_bytes: Option<u64>,
     headers: Box<[ResponseHeaderEvidence]>,
     body: Bytes,
+}
+
+impl fmt::Debug for SchwabHttpWireResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabHttpWireResponse")
+            .field("status", &self.status)
+            .field("final_url", &self.final_url)
+            .field("declared_body_bytes", &self.declared_body_bytes)
+            .field("headers", &self.headers)
+            .field("body_bytes", &self.body.len())
+            .field("body", &"[EXACT RAW BODY REDACTED]")
+            .finish()
+    }
 }
 
 impl SchwabHttpWireResponse {
@@ -123,26 +138,6 @@ impl SchwabHttpWireResponse {
             headers: headers.into_boxed_slice(),
             body,
         })
-    }
-
-    pub const fn status(&self) -> u16 {
-        self.status
-    }
-
-    pub fn final_url(&self) -> &str {
-        &self.final_url
-    }
-
-    pub const fn declared_body_bytes(&self) -> Option<u64> {
-        self.declared_body_bytes
-    }
-
-    pub fn headers(&self) -> &[ResponseHeaderEvidence] {
-        &self.headers
-    }
-
-    pub const fn body(&self) -> &Bytes {
-        &self.body
     }
 }
 
@@ -236,79 +231,29 @@ impl SchwabHttpWire for ReqwestSchwabHttpWire {
 }
 
 /// Exact bounded raw response and receipt returned before canonical mapping.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct CapturedRestResponse {
     receipt: RawRestResponseReceipt,
     body: Bytes,
+}
+
+impl fmt::Debug for CapturedRestResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedRestResponse")
+            .field("receipt", &self.receipt)
+            .field("body", &"[EXACT RAW BODY REDACTED]")
+            .finish()
+    }
 }
 
 impl CapturedRestResponse {
     pub const fn receipt(&self) -> &RawRestResponseReceipt {
         &self.receipt
     }
-
-    pub const fn body(&self) -> &Bytes {
-        &self.body
-    }
-
-    /// Converts an accepted exact provider response into the shared source-neutral capture
-    /// material. The registered source/runtime owns all source identities and durable UUIDs.
-    ///
-    /// OAuth errors, bearer tokens, request headers, and `userPreference` bootstrap/account
-    /// material are deliberately ineligible for this conversion.
-    pub fn try_into_provider_capture_material(
-        self,
-        coordinates: SchwabCaptureCoordinates,
-        event_id: Uuid,
-    ) -> Result<ProviderCaptureMaterial, SchwabTransportError> {
-        if self.receipt.route() == ReadOnlyRoute::UserPreference
-            || !(200..=299).contains(&self.receipt.status())
-            || event_id.is_nil()
-        {
-            return Err(SchwabTransportError::CaptureMaterial);
-        }
-        let received_nanos = i64::try_from(self.receipt.received_at_unix_millis())
-            .ok()
-            .and_then(|value| value.checked_mul(1_000_000))
-            .ok_or(SchwabTransportError::CaptureMaterial)?;
-        let received_at = Timestamp::from_unix_nanos(received_nanos);
-        let page = ProviderCapturePageReceipt::try_new(
-            0,
-            EvidenceDigest::new(DigestAlgorithm::Sha256, self.receipt.request_sha256()),
-            None,
-            None,
-            self.receipt.status(),
-            self.receipt.body_bytes(),
-            EvidenceDigest::new(DigestAlgorithm::Sha256, self.receipt.body_sha256()),
-            received_at,
-        )
-        .map_err(|_| SchwabTransportError::CaptureMaterial)?;
-        let receipt = ProviderCaptureSetReceipt::try_new(
-            coordinates.source_id().clone(),
-            coordinates.metadata_revision().clone(),
-            coordinates.dataset().clone(),
-            EvidenceDigest::new(DigestAlgorithm::Sha256, self.receipt.request_sha256()),
-            ProviderCaptureTerminalDisposition::StandaloneResponse,
-            vec![page],
-        )
-        .map_err(|_| SchwabTransportError::CaptureMaterial)?;
-        let received_at = chrono::DateTime::from_timestamp_nanos(received_nanos);
-        let record = RawCaptureRecord::try_new_live(
-            event_id,
-            Arc::from(coordinates.source_id().as_str()),
-            coordinates.connection_id(),
-            Some(0),
-            None,
-            received_at,
-            self.body,
-        )
-        .map_err(|_| SchwabTransportError::CaptureMaterial)?;
-        ProviderCaptureMaterial::try_new(receipt, vec![record])
-            .map_err(|_| SchwabTransportError::CaptureMaterial)
-    }
 }
 
-/// Closed provider-native REST payload selected solely by the allowlisted route.
+/// Closed provider-native market-data REST payload selected solely by the allowlisted route.
 #[derive(Debug)]
 pub enum SchwabRestPayload {
     Quotes(ParsedNative<QuoteResponse>),
@@ -318,7 +263,6 @@ pub enum SchwabRestPayload {
     MarketHours(ParsedNative<Box<[MarketHours]>>),
     Movers(ParsedNative<MoversResponse>),
     Instruments(ParsedNative<InstrumentResponse>),
-    StreamerBootstrap(StreamerBootstrapResponse),
 }
 
 impl SchwabRestPayload {
@@ -332,7 +276,6 @@ impl SchwabRestPayload {
             Self::MarketHours(value) => value.value().len(),
             Self::Movers(value) => value.value().movers.len(),
             Self::Instruments(value) => value.value().instruments().len(),
-            Self::StreamerBootstrap(_) => 1,
         }
     }
 
@@ -345,7 +288,6 @@ impl SchwabRestPayload {
             Self::MarketHours(value) => value.raw_sha256(),
             Self::Movers(value) => value.raw_sha256(),
             Self::Instruments(value) => value.raw_sha256(),
-            Self::StreamerBootstrap(value) => value.raw_sha256(),
         }
     }
 }
@@ -375,12 +317,49 @@ impl RestItemAccounting {
     }
 }
 
-/// Successful captured and provider-native-validated REST operation.
+/// Successful captured and provider-native-validated market-data REST operation.
 #[derive(Debug)]
 pub struct ExecutedRestResponse {
     capture: CapturedRestResponse,
     payload: SchwabRestPayload,
     accounting: RestItemAccounting,
+}
+
+/// Bodyless accepted `userPreference` evidence retained only for Streamer bootstrap/currentness.
+///
+/// The exact provider body is discarded before this value leaves the executor because that body
+/// can contain account-shaped fields unrelated to market-data operation. This value implements
+/// neither `Clone` nor serialization.
+pub struct SchwabUserPreferenceEvidence {
+    receipt: RawRestResponseReceipt,
+    bootstrap: StreamerBootstrapResponse,
+    accounting: RestItemAccounting,
+}
+
+impl fmt::Debug for SchwabUserPreferenceEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabUserPreferenceEvidence")
+            .field("receipt", &self.receipt)
+            .field("bootstrap", &self.bootstrap)
+            .field("accounting", &self.accounting)
+            .field("raw_body", &"[DISCARDED BEFORE RETURN]")
+            .finish()
+    }
+}
+
+impl SchwabUserPreferenceEvidence {
+    pub const fn receipt(&self) -> &RawRestResponseReceipt {
+        &self.receipt
+    }
+
+    pub const fn bootstrap(&self) -> &StreamerBootstrapResponse {
+        &self.bootstrap
+    }
+
+    pub const fn accounting(&self) -> RestItemAccounting {
+        self.accounting
+    }
 }
 
 impl ExecutedRestResponse {
@@ -395,15 +374,224 @@ impl ExecutedRestResponse {
     pub const fn accounting(&self) -> RestItemAccounting {
         self.accounting
     }
+
+    /// Consumes one accepted market-data response into the sole raw-sealing handoff.
+    ///
+    /// The raw body moves into source-neutral [`ProviderCaptureMaterial`]. The opaque continuation
+    /// retains only the exact typed provider payload, bounded receipt/accounting, and externally
+    /// supplied source coordinates. It owns no raw-body clone, store, sealer, publication revision,
+    /// canonical identity, or point-in-time authority. `userPreference` is deliberately excluded
+    /// because its raw response may contain account-shaped material.
+    pub fn into_pending_capture(
+        self,
+        coordinates: SchwabCaptureCoordinates,
+        event_id: Uuid,
+    ) -> Result<SchwabPendingRestCapture, SchwabTransportError> {
+        let Self {
+            capture: CapturedRestResponse { receipt, body },
+            payload,
+            accounting,
+        } = self;
+        if !payload_matches_capturable_route(receipt.route(), &payload) {
+            return Err(SchwabTransportError::CaptureMaterial);
+        }
+        let material = rest_capture_material(&receipt, body, &coordinates, event_id)?;
+        Ok(SchwabPendingRestCapture {
+            rejoin: SchwabRestCaptureSealRejoin {
+                coordinates,
+                receipt,
+                payload,
+                accounting,
+            },
+            material,
+        })
+    }
 }
 
-/// Completed network outcome. Provider rejection and schema failure retain exact raw evidence.
+/// One non-cloneable accepted REST response waiting for the shared raw sealer.
+///
+/// Splitting consumes this value once. Neither half can manufacture a second handoff.
+pub struct SchwabPendingRestCapture {
+    rejoin: SchwabRestCaptureSealRejoin,
+    material: ProviderCaptureMaterial,
+}
+
+impl fmt::Debug for SchwabPendingRestCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabPendingRestCapture")
+            .field("rejoin", &self.rejoin)
+            .field("capture_receipt", self.material.receipt())
+            .finish()
+    }
+}
+
+impl SchwabPendingRestCapture {
+    /// Splits exact source-neutral material from the opaque typed continuation exactly once.
+    pub fn into_sealing_parts(self) -> (SchwabRestCaptureSealRejoin, ProviderCaptureMaterial) {
+        (self.rejoin, self.material)
+    }
+}
+
+/// Opaque typed continuation awaiting the common consuming material-seal witness.
+///
+/// This type intentionally exposes no receipt-equality rejoin. Once the common
+/// `ProviderCaptureSealExpectation` / consuming sealed-material contract is available, the
+/// adapter can add the only transition that consumes both values. Until then the typed payload
+/// remains inaccessible to downstream publication.
+pub struct SchwabRestCaptureSealRejoin {
+    coordinates: SchwabCaptureCoordinates,
+    receipt: RawRestResponseReceipt,
+    payload: SchwabRestPayload,
+    accounting: RestItemAccounting,
+}
+
+impl fmt::Debug for SchwabRestCaptureSealRejoin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabRestCaptureSealRejoin")
+            .field("coordinates", &self.coordinates)
+            .field("route", &self.receipt.route())
+            .field("token_generation", &self.receipt.token_generation())
+            .field("request_sha256", &self.receipt.request_sha256())
+            .field("body_sha256", &self.receipt.body_sha256())
+            .field(
+                "received_at_unix_millis",
+                &self.receipt.received_at_unix_millis(),
+            )
+            .field("payload_family", &rest_payload_family(&self.payload))
+            .field("accounting", &self.accounting)
+            .field("sealed_transition", &"AWAITING_COMMON_MATERIAL_BINDING")
+            .finish()
+    }
+}
+
+impl SchwabRestCaptureSealRejoin {
+    #[cfg(test)]
+    pub(crate) const fn coordinates(&self) -> &SchwabCaptureCoordinates {
+        &self.coordinates
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn receipt(&self) -> &RawRestResponseReceipt {
+        &self.receipt
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn payload(&self) -> &SchwabRestPayload {
+        &self.payload
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn accounting(&self) -> RestItemAccounting {
+        self.accounting
+    }
+}
+
+fn payload_matches_capturable_route(route: ReadOnlyRoute, payload: &SchwabRestPayload) -> bool {
+    matches!(
+        (route, payload),
+        (
+            ReadOnlyRoute::Quotes | ReadOnlyRoute::SingleQuote,
+            SchwabRestPayload::Quotes(_)
+        ) | (ReadOnlyRoute::Chains, SchwabRestPayload::OptionChain(_))
+            | (
+                ReadOnlyRoute::ExpirationChain,
+                SchwabRestPayload::Expirations(_)
+            )
+            | (
+                ReadOnlyRoute::PriceHistory,
+                SchwabRestPayload::PriceHistory(_)
+            )
+            | (
+                ReadOnlyRoute::Markets | ReadOnlyRoute::SingleMarket,
+                SchwabRestPayload::MarketHours(_)
+            )
+            | (ReadOnlyRoute::Movers, SchwabRestPayload::Movers(_))
+            | (
+                ReadOnlyRoute::Instruments | ReadOnlyRoute::InstrumentByCusip,
+                SchwabRestPayload::Instruments(_)
+            )
+    )
+}
+
+fn rest_payload_family(payload: &SchwabRestPayload) -> &'static str {
+    match payload {
+        SchwabRestPayload::Quotes(_) => "quotes",
+        SchwabRestPayload::OptionChain(_) => "option-chain",
+        SchwabRestPayload::Expirations(_) => "expiration-chain",
+        SchwabRestPayload::PriceHistory(_) => "price-history",
+        SchwabRestPayload::MarketHours(_) => "market-hours",
+        SchwabRestPayload::Movers(_) => "movers",
+        SchwabRestPayload::Instruments(_) => "instruments",
+    }
+}
+
+fn rest_capture_material(
+    receipt: &RawRestResponseReceipt,
+    body: Bytes,
+    coordinates: &SchwabCaptureCoordinates,
+    event_id: Uuid,
+) -> Result<ProviderCaptureMaterial, SchwabTransportError> {
+    if !(200..=299).contains(&receipt.status()) || event_id.is_nil() {
+        return Err(SchwabTransportError::CaptureMaterial);
+    }
+    let received_nanos = i64::try_from(receipt.received_at_unix_millis())
+        .ok()
+        .and_then(|value| value.checked_mul(1_000_000))
+        .ok_or(SchwabTransportError::CaptureMaterial)?;
+    let received_at = Timestamp::from_unix_nanos(received_nanos);
+    let request_identity = EvidenceDigest::new(DigestAlgorithm::Sha256, receipt.request_sha256());
+    let page = ProviderCapturePageReceipt::try_new(
+        0,
+        request_identity,
+        None,
+        None,
+        receipt.status(),
+        receipt.body_bytes(),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, receipt.body_sha256()),
+        received_at,
+    )
+    .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+    let capture = ProviderCaptureSetReceipt::try_new(
+        coordinates.source_id().clone(),
+        coordinates.metadata_revision().clone(),
+        coordinates.dataset().clone(),
+        request_identity,
+        ProviderCaptureTerminalDisposition::StandaloneResponse,
+        vec![page],
+    )
+    .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+    let record = RawCaptureRecord::try_new_live(
+        event_id,
+        Arc::from(coordinates.source_id().as_str()),
+        coordinates.connection_id(),
+        Some(0),
+        None,
+        chrono::DateTime::from_timestamp_nanos(received_nanos),
+        body,
+    )
+    .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+    ProviderCaptureMaterial::try_new(capture, vec![record])
+        .map_err(|_| SchwabTransportError::CaptureMaterial)
+}
+
+/// Completed network outcome.
+///
+/// Market-data rejection/schema failure retains exact raw evidence. `userPreference` outcomes
+/// retain only bounded receipt/error/bootstrap evidence and discard the account-shaped body.
 #[derive(Debug)]
 pub enum RestExecutionOutcome {
     Accepted(ExecutedRestResponse),
+    AcceptedUserPreference(SchwabUserPreferenceEvidence),
     ProviderRejected(CapturedRestResponse),
+    UserPreferenceRejected(RawRestResponseReceipt),
     InvalidPayload {
         capture: CapturedRestResponse,
+        error: SchwabAdapterError,
+    },
+    InvalidUserPreference {
+        receipt: RawRestResponseReceipt,
         error: SchwabAdapterError,
     },
 }
@@ -496,49 +684,105 @@ impl SchwabRestExecutor {
                 return Err(error);
             }
         };
-        validate_final_url(request, response.final_url())?;
+        validate_final_url(request, &response.final_url)?;
         let latency_ms = duration_millis(started.elapsed())?;
         let received_at_unix_millis = unix_millis()?;
-        let body_bytes =
-            u64::try_from(response.body().len()).map_err(|_| SchwabTransportError::Overflow)?;
+        let SchwabHttpWireResponse {
+            status,
+            final_url: _,
+            declared_body_bytes,
+            headers,
+            body,
+        } = response;
+        let body_bytes = u64::try_from(body.len()).map_err(|_| SchwabTransportError::Overflow)?;
         self.telemetry
-            .record_rest_response(response.status(), body_bytes, latency_ms)?;
+            .record_rest_response(status, body_bytes, latency_ms)?;
         let receipt = RawRestResponseReceipt::new(
             request.route(),
             token.generation(),
             request.url().to_owned().into_boxed_str(),
-            response.status(),
+            status,
             received_at_unix_millis,
-            response.body(),
-            response.declared_body_bytes(),
+            &body,
+            declared_body_bytes,
             latency_ms,
-            response.headers().to_vec().into_boxed_slice(),
+            headers,
         )?;
-        let capture = CapturedRestResponse {
-            receipt,
-            body: response.body().clone(),
-        };
-        if !(200..=299).contains(&response.status()) {
-            self.telemetry.record_rest_accounting(0, requested, 0, 0)?;
-            return Ok(RestExecutionOutcome::ProviderRejected(capture));
+
+        if request.route() == ReadOnlyRoute::UserPreference {
+            if !(200..=299).contains(&status) {
+                self.telemetry.record_rest_accounting(0, requested, 0, 0)?;
+                return Ok(RestExecutionOutcome::UserPreferenceRejected(receipt));
+            }
+            if !response_is_json(receipt.headers()) {
+                self.telemetry.record_validation_failure()?;
+                self.telemetry.record_rest_accounting(0, requested, 0, 0)?;
+                return Ok(RestExecutionOutcome::InvalidUserPreference {
+                    receipt,
+                    error: SchwabAdapterError::SchemaViolation,
+                });
+            }
+            let bootstrap = match parse_user_preference(&body, self.parse_bounds) {
+                Ok(bootstrap) => bootstrap,
+                Err(error) => {
+                    self.telemetry.record_validation_failure()?;
+                    self.telemetry.record_rest_accounting(0, requested, 0, 0)?;
+                    return Ok(RestExecutionOutcome::InvalidUserPreference { receipt, error });
+                }
+            };
+            if bootstrap.raw_sha256() != receipt.body_sha256() || requested != 1 {
+                self.telemetry.record_validation_failure()?;
+                return Err(SchwabTransportError::Protocol);
+            }
+            let accounting = RestItemAccounting {
+                requested,
+                returned: 1,
+                missing: 0,
+                unexpected: 0,
+                provider_records: 1,
+            }
+            .validate()?;
+            self.telemetry.record_rest_accounting(
+                accounting.returned,
+                accounting.missing,
+                accounting.unexpected,
+                accounting.provider_records,
+            )?;
+            return Ok(RestExecutionOutcome::AcceptedUserPreference(
+                SchwabUserPreferenceEvidence {
+                    receipt,
+                    bootstrap,
+                    accounting,
+                },
+            ));
         }
-        if !response_is_json(response.headers()) {
+
+        if !(200..=299).contains(&status) {
+            self.telemetry.record_rest_accounting(0, requested, 0, 0)?;
+            return Ok(RestExecutionOutcome::ProviderRejected(
+                CapturedRestResponse { receipt, body },
+            ));
+        }
+        if !response_is_json(receipt.headers()) {
             self.telemetry.record_validation_failure()?;
             self.telemetry.record_rest_accounting(0, requested, 0, 0)?;
             return Ok(RestExecutionOutcome::InvalidPayload {
-                capture,
+                capture: CapturedRestResponse { receipt, body },
                 error: SchwabAdapterError::SchemaViolation,
             });
         }
-        let payload = match parse_payload(request.route(), response.body(), self.parse_bounds) {
+        let payload = match parse_payload(request.route(), &body, self.parse_bounds) {
             Ok(payload) => payload,
             Err(error) => {
                 self.telemetry.record_validation_failure()?;
                 self.telemetry.record_rest_accounting(0, requested, 0, 0)?;
-                return Ok(RestExecutionOutcome::InvalidPayload { capture, error });
+                return Ok(RestExecutionOutcome::InvalidPayload {
+                    capture: CapturedRestResponse { receipt, body },
+                    error,
+                });
             }
         };
-        if payload.raw_sha256() != capture.receipt().body_sha256() {
+        if payload.raw_sha256() != receipt.body_sha256() {
             self.telemetry.record_validation_failure()?;
             return Err(SchwabTransportError::Protocol);
         }
@@ -550,7 +794,7 @@ impl SchwabRestExecutor {
             accounting.provider_records,
         )?;
         Ok(RestExecutionOutcome::Accepted(ExecutedRestResponse {
-            capture,
+            capture: CapturedRestResponse { receipt, body },
             payload,
             accounting,
         }))
@@ -584,9 +828,7 @@ fn parse_payload(
         ReadOnlyRoute::Instruments | ReadOnlyRoute::InstrumentByCusip => {
             parse_instrument_response(bytes, bounds).map(SchwabRestPayload::Instruments)
         }
-        ReadOnlyRoute::UserPreference => {
-            parse_user_preference(bytes, bounds).map(SchwabRestPayload::StreamerBootstrap)
-        }
+        ReadOnlyRoute::UserPreference => Err(SchwabAdapterError::RouteNotAllowed),
     }
 }
 
@@ -638,8 +880,7 @@ fn account_items(
         }
         (ReadOnlyRoute::ExpirationChain, SchwabRestPayload::Expirations(_))
         | (ReadOnlyRoute::Instruments, SchwabRestPayload::Instruments(_))
-        | (ReadOnlyRoute::InstrumentByCusip, SchwabRestPayload::Instruments(_))
-        | (ReadOnlyRoute::UserPreference, SchwabRestPayload::StreamerBootstrap(_)) => (1, 0),
+        | (ReadOnlyRoute::InstrumentByCusip, SchwabRestPayload::Instruments(_)) => (1, 0),
         _ => return Err(SchwabTransportError::Protocol),
     };
     if returned > requested {

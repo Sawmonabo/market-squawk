@@ -11,11 +11,11 @@ use bytes::Bytes;
 use market_squawk_domain::{
     BarTimeSemantics, BarTimestampBasis, Currency, DigestAlgorithm, EvidenceDigest, InstrumentId,
     MarketBarAdjustment, MarketBarSessionEvidence, MarketBarSessionKind, MetadataRevision,
-    ProviderInstrumentId, RevisionNumber, SourceId, SourceIdentifier, Timestamp, VenueId,
+    ProviderInstrumentId, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_platform::{
-    EncryptedFileSecretStore, LocalPaths, SecretCancellation, SecretGeneration,
-    SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretStore, SecretValue,
+    EncryptedFileSecretStore, SecretCancellation, SecretGeneration, SecretInteractionPolicy,
+    SecretKey, SecretOperationControl, SecretStore, SecretValue,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -25,24 +25,24 @@ use crate::{
     CallbackOutcome, ChainRequest, ConnectionGeneration, ConnectionState, DesiredStateController,
     HttpMethod, InboundStreamerFrame, MarketDataService, OAuthCallback, ParseBounds,
     PriceHistoryFrequency, PriceHistoryFrequencyType, PriceHistoryRequest,
-    ProtectedSchwabOAuthAuthority, ProviderIdentifier, QuoteRequest, ReadOnlyRoute,
-    RefreshTokenGeneration, RequestAdmission, ResponseHeaderEvidence, RestExecutionOutcome,
-    RestTransportBounds, SchwabAccessTokenSource, SchwabAdapterError, SchwabCanonicalError,
-    SchwabCaptureCoordinates, SchwabDailyPriceHistoryPublicationRequest, SchwabHttpWire,
-    SchwabHttpWireRequest, SchwabHttpWireResponse, SchwabOAuthAuthorityConfiguration,
-    SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire, SchwabOAuthWireError,
-    SchwabOAuthWireRequest, SchwabOAuthWireResponse, SchwabOptionCandidateAbstention,
-    SchwabOptionCandidateOutcome, SchwabPriceHistoryCapabilityObservation,
-    SchwabResolvedProviderIdentity, SchwabRestExecutor, SchwabSealedPriceHistoryCapture,
-    SchwabSealedStreamerMicrobatchCapture, SchwabStreamerConnection, SchwabStreamerConnector,
-    SchwabStreamerExecutor, SchwabStreamerFieldDictionary, SchwabStreamerSemanticField,
-    SchwabTransportError, SchwabTransportTelemetry, StreamerAdmission, StreamerCaptureSink,
-    StreamerCaptureSinkError, StreamerMicrobatch, StreamerResponseCode, StreamerSubscription,
-    StreamerTransportBounds, TokenAuthorityError, TokenDecision, TransientAccessToken,
-    canonicalize_option_chain, canonicalize_price_history, canonicalize_streamer_batch,
-    parse_option_chain_response, parse_quote_response, parse_streamer_frame, parse_token_response,
-    parse_user_preference,
+    ProtectedSchwabOAuthAuthority, ProviderIdentifier, QuoteRequest, RawStreamerFrameKind,
+    ReadOnlyRoute, RefreshTokenGeneration, RequestAdmission, ResponseHeaderEvidence,
+    RestExecutionOutcome, RestTransportBounds, SchwabAccessTokenSource, SchwabAdapterError,
+    SchwabCanonicalError, SchwabCaptureCoordinates, SchwabHttpWire, SchwabHttpWireRequest,
+    SchwabHttpWireResponse, SchwabOAuthAuthorityConfiguration, SchwabOAuthInteraction,
+    SchwabOAuthSecretPolicy, SchwabOAuthWire, SchwabOAuthWireError, SchwabOAuthWireRequest,
+    SchwabOAuthWireResponse, SchwabOptionCandidateAbstention, SchwabOptionCandidateOutcome,
+    SchwabPriceHistoryCapabilityObservation, SchwabResolvedProviderIdentity, SchwabRestExecutor,
+    SchwabRestPayload, SchwabStreamerConnection, SchwabStreamerConnector, SchwabStreamerExecutor,
+    SchwabStreamerFieldDictionary, SchwabStreamerSemanticField, SchwabTransportError,
+    SchwabTransportTelemetry, StreamerAdmission, StreamerCaptureSink, StreamerCaptureSinkError,
+    StreamerMicrobatch, StreamerResponseCode, StreamerSubscription, StreamerTransportBounds,
+    TokenAuthorityError, TokenDecision, TransientAccessToken, canonicalize_option_chain,
+    canonicalize_streamer_batch, parse_option_chain_response, parse_quote_response,
+    parse_streamer_frame, parse_token_response, parse_user_preference,
 };
+
+use crate::canonical::{SchwabDailyPriceHistoryCandidateRequest, prepare_price_history_candidate};
 
 struct TemporaryDirectory(PathBuf);
 
@@ -394,7 +394,7 @@ fn option_contract_missing_required_greek_is_not_counted_complete() {
 }
 
 #[tokio::test]
-async fn daily_price_history_seals_exact_lineage_and_rejects_changed_bootstrap() {
+async fn rest_price_history_moves_once_into_pending_capture_and_excludes_user_preference() {
     let temporary = TemporaryDirectory::new();
     let secrets = Arc::new(
         EncryptedFileSecretStore::try_open(
@@ -464,9 +464,10 @@ async fn daily_price_history_seals_exact_lineage_and_rejects_changed_bootstrap()
     let token = mock_token(token_admission);
     let preference_request = crate::ReadOnlyRequest::user_preference(admission())
         .unwrap_or_else(|error| panic!("preference request: {error}"));
-    let preference = execute_fixture(
+    let preference = execute_user_preference_fixture(
         &preference_request,
         br#"{
+          "accounts":[{"accountNumber":"must-not-enter-raw-capture"}],
           "streamerInfo":[{"streamerSocketUrl":"wss://streamer.example.test/ws","schwabClientCustomerId":"customer","schwabClientCorrelId":"correlation","schwabClientChannel":"channel","schwabClientFunctionId":"function"}],
           "offers":[{"mktDataPermission":"NP"}]
         }"#,
@@ -474,7 +475,7 @@ async fn daily_price_history_seals_exact_lineage_and_rejects_changed_bootstrap()
         token_admission,
     )
     .await;
-    let changed_preference = execute_fixture(
+    let changed_preference = execute_user_preference_fixture(
         &preference_request,
         br#"{
           "streamerInfo":[{"streamerSocketUrl":"wss://streamer.example.test/ws","schwabClientCustomerId":"customer","schwabClientCorrelId":"correlation","schwabClientChannel":"channel","schwabClientFunctionId":"function"}],
@@ -498,16 +499,12 @@ async fn daily_price_history_seals_exact_lineage_and_rejects_changed_bootstrap()
     .unwrap_or_else(|error| panic!("history range: {error}"))
     .build(admission())
     .unwrap_or_else(|error| panic!("history request: {error}"));
-    let history = execute_fixture(
-        &history_request,
-        br#"{
-          "symbol":"SPY","empty":false,
-          "candles":[{"open":475.00,"high":477.00,"low":474.50,"close":476.25,"volume":1000,"datetime":1704067200000}]
-        }"#,
-        &token,
-        token_admission,
-    )
-    .await;
+    let history_body: &'static [u8] = br#"{
+      "symbol":"SPY","empty":false,
+      "candles":[{"open":475.00,"high":477.00,"low":474.50,"close":476.25,"volume":1000,"datetime":1704067200000}]
+    }"#;
+    let history =
+        execute_market_fixture(&history_request, history_body, &token, token_admission).await;
     let observed_at = history.capture().receipt().received_at_unix_millis() / 1_000;
     let capability = SchwabPriceHistoryCapabilityObservation::try_observe(
         oauth_receipt,
@@ -529,31 +526,7 @@ async fn daily_price_history_seals_exact_lineage_and_rejects_changed_bootstrap()
         Err(crate::SchwabVerticalError::InvalidCapabilityEvidence)
     );
 
-    let paths = LocalPaths::prepare(temporary.path().join("capture"))
-        .unwrap_or_else(|error| panic!("temporary paths: {error}"));
-    let store = paths
-        .sealed_research_journal_store()
-        .unwrap_or_else(|error| panic!("sealed research store: {error}"));
     let registered_coordinates = capture_coordinates();
-    let changed_coordinates = SchwabCaptureCoordinates::try_new(
-        registered_coordinates.source_id().clone(),
-        registered_coordinates.metadata_revision().clone(),
-        SourceIdentifier::try_from("schwab-changed-dataset")
-            .unwrap_or_else(|error| panic!("changed dataset: {error}")),
-        Uuid::new_v4(),
-    )
-    .unwrap_or_else(|error| panic!("changed capture coordinates: {error}"));
-    let changed_connection_coordinates = SchwabCaptureCoordinates::try_new(
-        registered_coordinates.source_id().clone(),
-        registered_coordinates.metadata_revision().clone(),
-        registered_coordinates.dataset().clone(),
-        Uuid::new_v4(),
-    )
-    .unwrap_or_else(|error| panic!("changed connection coordinates: {error}"));
-    let seal_history = |coordinates| {
-        SchwabSealedPriceHistoryCapture::try_seal(&history, coordinates, Uuid::new_v4(), &store)
-            .unwrap_or_else(|error| panic!("sealed history capture: {error}"))
-    };
     let provider_timestamp = Timestamp::from_unix_nanos(1_704_067_200_000_000_000);
     let period_end = Timestamp::from_unix_nanos(1_704_153_600_000_000_000);
     let session = MarketBarSessionEvidence::try_new(
@@ -595,171 +568,88 @@ async fn daily_price_history_seals_exact_lineage_and_rejects_changed_bootstrap()
             .unwrap_or_else(|error| panic!("receive clock: {error}"))
             * 1_000_000,
     );
-    let published_at = Timestamp::from_unix_nanos(
-        i64::try_from(observed_at + 1).unwrap_or_else(|error| panic!("publication clock: {error}"))
-            * 1_000_000_000,
-    );
-    let expired_publication_at = Timestamp::from_unix_nanos(
-        i64::try_from(oauth_receipt.access_expires_at_unix_seconds())
-            .unwrap_or_else(|error| panic!("OAuth expiry clock: {error}"))
-            * 1_000_000_000,
-    );
-    let request_for = |user_preference, sealed_capture, publication_at| {
-        SchwabDailyPriceHistoryPublicationRequest {
-            capability,
-            oauth_authority: oauth_receipt,
-            user_preference,
-            response: &history,
-            sealed_capture,
-            capture_coordinates: registered_coordinates.clone(),
-            instrument_id,
-            instrument_revision_digest,
-            admitted_plan_digest,
-            identity: identity.clone(),
-            venue_id: venue_id.clone(),
-            feed: feed.clone(),
-            interval: interval.clone(),
-            adjustment: MarketBarAdjustment::Raw,
-            currency,
-            time_semantics: vec![time_semantics.clone()],
-            completeness_evidence,
-            ingested_at: received_at,
-            published_at: publication_at,
-            revision: RevisionNumber::new(1).unwrap_or_else(|error| panic!("revision: {error}")),
-        }
+    let request_for = |user_preference| SchwabDailyPriceHistoryCandidateRequest {
+        capability,
+        oauth_authority: oauth_receipt,
+        user_preference,
+        response: &history,
+        instrument_id,
+        instrument_revision_digest,
+        admitted_plan_digest,
+        identity: identity.clone(),
+        venue_id: venue_id.clone(),
+        feed: feed.clone(),
+        interval: interval.clone(),
+        adjustment: MarketBarAdjustment::Raw,
+        currency,
+        time_semantics: vec![time_semantics.clone()],
+        completeness_evidence,
+        ingested_at: received_at,
     };
 
+    assert!(matches!(
+        prepare_price_history_candidate(request_for(&changed_preference)),
+        Err(SchwabCanonicalError::PendingHistoryBinding)
+    ));
+    let candidate = prepare_price_history_candidate(request_for(&preference))
+        .unwrap_or_else(|error| panic!("pending history candidate: {error}"));
+    assert_eq!(candidate.instrument_id(), instrument_id);
+    assert_eq!(candidate.provider_instrument_id().as_str(), "SPY");
+    assert_eq!(candidate.provider_symbol().as_str(), "SPY");
+    assert_eq!(candidate.bars().len(), 1);
+    assert_eq!(candidate.bars()[0].provider_timestamp(), provider_timestamp);
+    assert_eq!(candidate.bars()[0].time_semantics(), &time_semantics);
+    assert_eq!(candidate.bars()[0].open().to_string(), "475.00");
+    assert_eq!(candidate.bars()[0].close().to_string(), "476.25");
+    assert_ne!(candidate.mapping_digest().bytes(), [0; 32]);
+
+    let route = history.capture().receipt().route();
+    let token_generation = history.capture().receipt().token_generation();
+    let received_at_unix_millis = history.capture().receipt().received_at_unix_millis();
+    let accounting = history.accounting();
+    let event_id = Uuid::new_v4();
+    let pending = history
+        .into_pending_capture(registered_coordinates.clone(), event_id)
+        .unwrap_or_else(|error| panic!("pending REST capture: {error}"));
+    let (rejoin, material) = pending.into_sealing_parts();
+    assert_eq!(rejoin.coordinates(), &registered_coordinates);
+    assert_eq!(rejoin.receipt().route(), route);
+    assert_eq!(rejoin.receipt().token_generation(), token_generation);
     assert_eq!(
-        canonicalize_price_history(request_for(
-            &changed_preference,
-            seal_history(registered_coordinates.clone()),
-            published_at,
-        )),
-        Err(SchwabCanonicalError::PublicationBinding)
+        rejoin.receipt().received_at_unix_millis(),
+        received_at_unix_millis
+    );
+    assert_eq!(rejoin.accounting(), accounting);
+    let SchwabRestPayload::PriceHistory(parsed) = rejoin.payload() else {
+        panic!("typed price-history payload was not retained")
+    };
+    assert_eq!(parsed.value().symbol.as_str(), "SPY");
+    assert_eq!(parsed.value().candles().len(), 1);
+    assert_eq!(material.records().len(), 1);
+    assert_eq!(material.records()[0].event_id(), event_id);
+    assert_eq!(material.records()[0].payload(), history_body);
+    assert_eq!(
+        material.receipt().source_id(),
+        registered_coordinates.source_id()
     );
     assert_eq!(
-        canonicalize_price_history(request_for(
-            &preference,
-            seal_history(changed_coordinates),
-            published_at,
-        )),
-        Err(SchwabCanonicalError::PublicationBinding)
+        material.receipt().dataset(),
+        registered_coordinates.dataset()
     );
+
+    assert_eq!(preference.receipt().route(), ReadOnlyRoute::UserPreference);
+    assert_eq!(preference.accounting().provider_records, 1);
     assert_eq!(
-        canonicalize_price_history(request_for(
-            &preference,
-            seal_history(changed_connection_coordinates),
-            published_at,
-        )),
-        Err(SchwabCanonicalError::PublicationBinding)
+        preference.bootstrap().value().market_data_permission(),
+        Some("NP")
     );
-    assert_eq!(
-        canonicalize_price_history(request_for(
-            &preference,
-            seal_history(registered_coordinates.clone()),
-            expired_publication_at,
-        )),
-        Err(SchwabCanonicalError::PublicationBinding)
-    );
-    let publication = canonicalize_price_history(request_for(
-        &preference,
-        seal_history(registered_coordinates.clone()),
-        published_at,
-    ))
-    .unwrap_or_else(|error| panic!("history publication: {error}"));
-    assert_eq!(publication.bars().len(), 1);
-    assert_ne!(publication.canonical_digest().bytes(), [0; 32]);
-    let lineage = publication.lineage();
-    assert_eq!(lineage.capability, capability);
-    assert_eq!(lineage.oauth_authority, oauth_receipt);
-    assert_eq!(lineage.capture_coordinates, registered_coordinates);
-    assert_eq!(
-        lineage.user_preference_receipt.route(),
-        ReadOnlyRoute::UserPreference
-    );
-    assert_ne!(lineage.user_preference_observation_sha256, [0; 32]);
-    assert_eq!(
-        lineage.instrument_revision_digest,
-        instrument_revision_digest
-    );
-    assert_eq!(lineage.admitted_plan_digest, admitted_plan_digest);
-    assert_eq!(lineage.provider_symbol.as_str(), "SPY");
-    assert_eq!(lineage.resolution_evidence.bytes(), [22; 32]);
-    assert_eq!(lineage.time_semantics.as_ref(), [time_semantics]);
-    assert_eq!(lineage.ingested_at, received_at);
+    assert!(!format!("{preference:?}").contains("must-not-enter-raw-capture"));
 }
 
 #[tokio::test]
-async fn bounded_mock_transport_captures_exact_market_data_without_token_material() {
-    let quote_request = QuoteRequest::try_new(
-        vec![ProviderIdentifier::try_new("AAPL").unwrap_or_else(|error| panic!("symbol: {error}"))],
-        Vec::new(),
-        None,
-        admission(),
-    )
-    .unwrap_or_else(|error| panic!("quote request: {error}"));
-    let quote_body = Bytes::from_static(
-        br#"{"AAPL":{"assetMainType":"EQUITY","realtime":true,"quote":{"bidPrice":100.125,"askPrice":100.25,"quoteTime":1710000000000}}}"#,
-    );
-    let rest_bounds = RestTransportBounds::try_new(
-        Duration::from_secs(1),
-        Duration::from_secs(1),
-        Duration::from_secs(2),
-        nonzero(64 * 1024),
-        nonzero(8),
-        nonzero(2 * 1024),
-    )
-    .unwrap_or_else(|error| panic!("REST bounds: {error}"));
-    let response = SchwabHttpWireResponse::try_new(
-        200,
-        quote_request.request().url().to_owned(),
-        Some(
-            u64::try_from(quote_body.len()).unwrap_or_else(|error| panic!("body length: {error}")),
-        ),
-        vec![
-            ResponseHeaderEvidence::try_new(
-                "content-type".to_owned(),
-                b"application/json".to_vec(),
-            )
-            .unwrap_or_else(|error| panic!("header evidence: {error}")),
-        ],
-        quote_body.clone(),
-        rest_bounds,
-    )
-    .unwrap_or_else(|error| panic!("mock response: {error}"));
-    let rest_wire = Arc::new(MockHttpWire::new(response, ReadOnlyRoute::Quotes));
+async fn streamer_microbatch_retains_validated_application_frames_without_token_material() {
     let telemetry = SchwabTransportTelemetry::default();
     let token_admission = AccessTokenAdmission::new(nonzero(4 * 1024), Duration::from_secs(1));
-    let rest = SchwabRestExecutor::try_new(
-        rest_wire.clone(),
-        rest_bounds,
-        bounds(),
-        token_admission,
-        telemetry.clone(),
-    )
-    .unwrap_or_else(|error| panic!("REST executor: {error}"));
-    let token = mock_token(token_admission);
-    let outcome = rest
-        .execute(quote_request.request(), &token, CancellationToken::new())
-        .await
-        .unwrap_or_else(|error| panic!("REST execution: {error}"));
-    let accepted = match outcome {
-        RestExecutionOutcome::Accepted(value) => value,
-        other => panic!("unexpected REST outcome: {other:?}"),
-    };
-    assert_eq!(accepted.capture().body(), &quote_body);
-    assert_eq!(accepted.accounting().requested, 1);
-    assert_eq!(accepted.accounting().returned, 1);
-    assert_eq!(accepted.accounting().missing, 0);
-    assert_eq!(rest_wire.calls(), 1);
-    let coordinates = capture_coordinates();
-    let rest_material = accepted
-        .capture()
-        .clone()
-        .try_into_provider_capture_material(coordinates.clone(), Uuid::new_v4())
-        .unwrap_or_else(|error| panic!("REST capture material: {error}"));
-    assert_eq!(rest_material.records().len(), 1);
-    assert_eq!(rest_material.records()[0].payload(), quote_body.as_ref());
 
     let preference = br#"{
       "accounts":[{"accountNumber":"must-not-enter-stream-capture"}],
@@ -774,15 +664,14 @@ async fn bounded_mock_transport_captures_exact_market_data_without_token_materia
     let subscribed = Bytes::from_static(
         br#"{"response":[{"service":"LEVELONE_EQUITIES","command":"SUBS","requestid":"2","timestamp":1710000000001,"content":{"code":0,"msg":"OK"}}]}"#,
     );
-    let market_data = Bytes::from_static(
-        br#"{"data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","timestamp":1710000000002,"content":[{"key":"AAPL","1":100.125,"2":100.25}]}]}"#,
-    );
+    let market_data: &'static [u8] =
+        br#"{"data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","timestamp":1710000000002,"content":[{"key":"AAPL","1":100.125,"2":100.25}]}]}"#;
     let connector_state = Arc::new(Mutex::new(MockStreamerState {
         connects: 0,
         inbound: Some(VecDeque::from([
             InboundStreamerFrame::Text(login),
             InboundStreamerFrame::Text(subscribed),
-            InboundStreamerFrame::Text(market_data.clone()),
+            InboundStreamerFrame::Text(Bytes::from_static(market_data)),
         ])),
         sent: Vec::new(),
     }));
@@ -795,7 +684,7 @@ async fn bounded_mock_transport_captures_exact_market_data_without_token_materia
         Duration::ZERO,
         0,
         nonzero(64 * 1024),
-        nonzero(8),
+        nonzero(65),
         nonzero(64 * 1024),
         Duration::from_millis(1),
     )
@@ -839,48 +728,34 @@ async fn bounded_mock_transport_captures_exact_market_data_without_token_materia
         .microbatches
         .pop()
         .unwrap_or_else(|| panic!("missing stream microbatch"));
-    let current_request_identity = stream_microbatch
-        .receipt()
-        .request_set_identity_for_token_generation(stream_microbatch.receipt().token_generation());
-    let next_token_generation = AccessTokenGeneration::new(
-        NonZeroU64::new(2).unwrap_or_else(|| panic!("token generation must be nonzero")),
+    assert!(!format!("{stream_microbatch:?}").contains("LEVELONE_EQUITIES"));
+    assert_eq!(
+        stream_microbatch.receipt().token_generation(),
+        AccessTokenGeneration::new(NonZeroU64::MIN)
     );
-    let next_request_identity = stream_microbatch
-        .receipt()
-        .request_set_identity_for_token_generation(next_token_generation);
-    assert_ne!(current_request_identity, next_request_identity);
-    let event_id = Uuid::new_v4();
-    let temporary = TemporaryDirectory::new();
-    let paths = LocalPaths::prepare(temporary.path().join("stream-capture"))
-        .unwrap_or_else(|error| panic!("stream capture paths: {error}"));
-    let store = paths
-        .sealed_research_journal_store()
-        .unwrap_or_else(|error| panic!("stream capture store: {error}"));
-    let sealed = SchwabSealedStreamerMicrobatchCapture::try_seal(
-        stream_microbatch,
-        coordinates.clone(),
-        vec![event_id],
-        &store,
-    )
-    .unwrap_or_else(|error| panic!("sealed stream capture: {error}"));
-    let capture = sealed.receipt().capture();
-    assert_eq!(capture.request_set_identity(), current_request_identity);
-    assert_eq!(capture.source_id(), coordinates.source_id());
-    assert_eq!(capture.metadata_revision(), coordinates.metadata_revision());
-    assert_eq!(capture.dataset(), coordinates.dataset());
-    let reopened = store
-        .open_verified(sealed.receipt().segment())
-        .unwrap_or_else(|error| panic!("reopened stream capture: {error}"));
-    let [record] = reopened.records() else {
-        panic!("sealed stream capture did not retain exactly one frame");
+    assert_eq!(stream_microbatch.receipt().frame_count(), 1);
+    assert_ne!(stream_microbatch.receipt().content_sha256(), [0; 32]);
+    assert_ne!(stream_microbatch.receipt().observation_sha256(), [0; 32]);
+    let [frame] = stream_microbatch.frames() else {
+        panic!("validated stream microbatch did not retain exactly one frame");
     };
-    assert_eq!(record.event_id(), event_id);
-    assert_eq!(record.connection_id(), coordinates.connection_id());
-    assert_eq!(record.source(), coordinates.source_id().as_str());
-    assert_eq!(record.source_sequence(), Some(0));
-    assert_eq!(record.payload(), market_data.as_ref());
+    assert!(!format!("{frame:?}").contains("LEVELONE_EQUITIES"));
+    assert_eq!(frame.kind(), RawStreamerFrameKind::Text);
+    assert_eq!(frame.generation(), stream_microbatch.receipt().generation());
+    assert_eq!(frame.ordinal(), stream_microbatch.receipt().first_ordinal());
+    assert_eq!(frame.ordinal(), stream_microbatch.receipt().last_ordinal());
+    assert_eq!(frame.payload(), market_data);
+    assert_ne!(frame.payload_sha256(), [0; 32]);
+    assert_eq!(
+        frame.received_at_unix_millis(),
+        stream_microbatch.receipt().first_received_at_unix_millis()
+    );
+    assert_eq!(
+        frame.received_at_unix_millis(),
+        stream_microbatch.receipt().last_received_at_unix_millis()
+    );
     assert!(
-        !record
+        !frame
             .payload()
             .windows(b"mock-access-token".len())
             .any(|window| window == b"mock-access-token")
@@ -899,7 +774,7 @@ async fn bounded_mock_transport_captures_exact_market_data_without_token_materia
 
 #[derive(Debug)]
 struct MockHttpWire {
-    response: SchwabHttpWireResponse,
+    response: Mutex<Option<SchwabHttpWireResponse>>,
     expected_route: ReadOnlyRoute,
     calls: Mutex<u64>,
 }
@@ -907,17 +782,10 @@ struct MockHttpWire {
 impl MockHttpWire {
     fn new(response: SchwabHttpWireResponse, expected_route: ReadOnlyRoute) -> Self {
         Self {
-            response,
+            response: Mutex::new(Some(response)),
             expected_route,
             calls: Mutex::new(0),
         }
-    }
-
-    fn calls(&self) -> u64 {
-        *self
-            .calls
-            .lock()
-            .unwrap_or_else(|error| panic!("mock HTTP calls: {error}"))
     }
 }
 
@@ -935,8 +803,36 @@ impl SchwabHttpWire for MockHttpWire {
                 .lock()
                 .map_err(|_| SchwabTransportError::Protocol)?;
             *calls = calls.checked_add(1).ok_or(SchwabTransportError::Overflow)?;
-            Ok(self.response.clone())
+            self.response
+                .lock()
+                .map_err(|_| SchwabTransportError::Protocol)?
+                .take()
+                .ok_or(SchwabTransportError::Protocol)
         })
+    }
+}
+
+async fn execute_market_fixture(
+    request: &crate::ReadOnlyRequest,
+    body: &'static [u8],
+    token: &TransientAccessToken,
+    token_admission: AccessTokenAdmission,
+) -> crate::ExecutedRestResponse {
+    match execute_fixture(request, body, token, token_admission).await {
+        RestExecutionOutcome::Accepted(response) => response,
+        other => panic!("unexpected market REST outcome: {other:?}"),
+    }
+}
+
+async fn execute_user_preference_fixture(
+    request: &crate::ReadOnlyRequest,
+    body: &'static [u8],
+    token: &TransientAccessToken,
+    token_admission: AccessTokenAdmission,
+) -> crate::SchwabUserPreferenceEvidence {
+    match execute_fixture(request, body, token, token_admission).await {
+        RestExecutionOutcome::AcceptedUserPreference(response) => response,
+        other => panic!("unexpected User Preference outcome: {other:?}"),
     }
 }
 
@@ -945,7 +841,7 @@ async fn execute_fixture(
     body: &'static [u8],
     token: &TransientAccessToken,
     token_admission: AccessTokenAdmission,
-) -> crate::ExecutedRestResponse {
+) -> RestExecutionOutcome {
     let body = Bytes::from_static(body);
     let rest_bounds = RestTransportBounds::try_new(
         Duration::from_secs(1),
@@ -971,6 +867,7 @@ async fn execute_fixture(
         rest_bounds,
     )
     .unwrap_or_else(|error| panic!("mock response: {error}"));
+    assert!(!format!("{response:?}").contains("must-not-enter-raw-capture"));
     let executor = SchwabRestExecutor::try_new(
         Arc::new(MockHttpWire::new(response, request.route())),
         rest_bounds,
@@ -979,14 +876,10 @@ async fn execute_fixture(
         SchwabTransportTelemetry::default(),
     )
     .unwrap_or_else(|error| panic!("REST executor: {error}"));
-    match executor
+    executor
         .execute(request, token, CancellationToken::new())
         .await
         .unwrap_or_else(|error| panic!("REST execution: {error}"))
-    {
-        RestExecutionOutcome::Accepted(response) => response,
-        other => panic!("unexpected REST outcome: {other:?}"),
-    }
 }
 
 #[derive(Debug)]

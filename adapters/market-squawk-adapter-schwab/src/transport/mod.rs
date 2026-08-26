@@ -25,7 +25,8 @@ use crate::{ConnectionGeneration, ReadOnlyRoute, SchwabAdapterError};
 pub use http::{
     CapturedRestResponse, ExecutedRestResponse, ReqwestSchwabHttpWire, RestExecutionOutcome,
     RestItemAccounting, SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse,
-    SchwabRestExecutor, SchwabRestPayload,
+    SchwabPendingRestCapture, SchwabRestCaptureSealRejoin, SchwabRestExecutor, SchwabRestPayload,
+    SchwabUserPreferenceEvidence,
 };
 pub use streamer::{
     InboundStreamerFrame, ProductionSchwabStreamerConnector, RawStreamerFrame,

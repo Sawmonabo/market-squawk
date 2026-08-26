@@ -10,12 +10,6 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
-use market_squawk_platform::RawCaptureRecord;
-use market_squawk_sources::{
-    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition,
-};
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{
@@ -24,7 +18,6 @@ use tokio_tungstenite::tungstenite::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use uuid::Uuid;
 
 use crate::{
     ConnectionGeneration, ConnectionState, DesiredStateController, ParseBounds, ParsedNative,
@@ -33,9 +26,9 @@ use crate::{
 };
 
 use super::{
-    AccessTokenAdmission, AccessTokenGeneration, SchwabAccessTokenSource, SchwabCaptureCoordinates,
-    SchwabTransportError, SchwabTransportTelemetry, StreamerTransportBounds, TransientAccessToken,
-    hash_frame, hash_observation, unix_millis, unix_seconds,
+    AccessTokenAdmission, AccessTokenGeneration, SchwabAccessTokenSource, SchwabTransportError,
+    SchwabTransportTelemetry, StreamerTransportBounds, TransientAccessToken, hash_frame,
+    hash_observation, unix_millis, unix_seconds,
 };
 
 /// Exact application payload kind delivered by the WebSocket implementation.
@@ -59,7 +52,7 @@ impl RawStreamerFrameKind {
 }
 
 /// One exact bounded WebSocket application payload and local observation receipt.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct RawStreamerFrame {
     generation: ConnectionGeneration,
     ordinal: NonZeroU64,
@@ -67,6 +60,21 @@ pub struct RawStreamerFrame {
     received_at_unix_millis: u64,
     payload_sha256: [u8; 32],
     payload: Bytes,
+}
+
+impl fmt::Debug for RawStreamerFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawStreamerFrame")
+            .field("generation", &self.generation)
+            .field("ordinal", &self.ordinal)
+            .field("kind", &self.kind)
+            .field("received_at_unix_millis", &self.received_at_unix_millis)
+            .field("payload_bytes", &self.payload.len())
+            .field("payload_sha256", &self.payload_sha256)
+            .field("payload", &"[EXACT RAW FRAME REDACTED]")
+            .finish()
+    }
 }
 
 impl RawStreamerFrame {
@@ -110,12 +118,15 @@ impl RawStreamerFrame {
         self.payload_sha256
     }
 
-    pub const fn payload(&self) -> &Bytes {
+    pub fn payload(&self) -> &[u8] {
         &self.payload
     }
 }
 
-/// Exact bounded microbatch receipt suitable for conversion into the shared raw capture writer.
+/// Exact bounded application-microbatch receipt awaiting the shared event-material seam.
+///
+/// This is not an HTTP page set and expresses no provider-completeness terminal state. The future
+/// consuming transition belongs to the common `ProviderEventMicrobatchMaterial` contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamerMicrobatchReceipt {
     generation: ConnectionGeneration,
@@ -172,21 +183,24 @@ impl StreamerMicrobatchReceipt {
     pub const fn observation_sha256(&self) -> [u8; 32] {
         self.observation_sha256
     }
-
-    #[cfg(test)]
-    pub(crate) fn request_set_identity_for_token_generation(
-        &self,
-        token_generation: AccessTokenGeneration,
-    ) -> EvidenceDigest {
-        stream_request_set_identity_with_token_generation(self, token_generation)
-    }
 }
 
 /// Exact raw Streamer microbatch retained before canonical decoding.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct StreamerMicrobatch {
     receipt: StreamerMicrobatchReceipt,
     frames: Box<[RawStreamerFrame]>,
+}
+
+impl fmt::Debug for StreamerMicrobatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamerMicrobatch")
+            .field("receipt", &self.receipt)
+            .field("frame_count", &self.frames.len())
+            .field("frames", &"[EXACT RAW FRAMES REDACTED]")
+            .finish()
+    }
 }
 
 impl StreamerMicrobatch {
@@ -197,135 +211,6 @@ impl StreamerMicrobatch {
     pub fn frames(&self) -> &[RawStreamerFrame] {
         &self.frames
     }
-
-    /// Converts exact ordered market-data/notification frames into shared source-neutral capture
-    /// material. Login responses, subscription acknowledgements, OAuth/token bytes, ping/pong
-    /// control payloads, and `userPreference` account material never enter this microbatch.
-    pub fn try_into_provider_capture_material(
-        self,
-        coordinates: SchwabCaptureCoordinates,
-        event_ids: Vec<Uuid>,
-    ) -> Result<ProviderCaptureMaterial, SchwabTransportError> {
-        let frame_count = self.frames.len();
-        if event_ids.len() != self.frames.len()
-            || self.frames.is_empty()
-            || self.frames.len() > market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES
-        {
-            return Err(SchwabTransportError::CaptureMaterial);
-        }
-        let request_set_identity = stream_request_set_identity(&self.receipt);
-        let mut pages = Vec::new();
-        let mut records = Vec::new();
-        let mut previous_response_identity = None;
-        pages
-            .try_reserve_exact(self.frames.len())
-            .map_err(|_| SchwabTransportError::CaptureMaterial)?;
-        records
-            .try_reserve_exact(self.frames.len())
-            .map_err(|_| SchwabTransportError::CaptureMaterial)?;
-        for (index, (frame, event_id)) in self
-            .frames
-            .into_vec()
-            .into_iter()
-            .zip(event_ids)
-            .enumerate()
-        {
-            if event_id.is_nil()
-                || frame.kind != RawStreamerFrameKind::Text
-                || frame.generation != self.receipt.generation
-            {
-                return Err(SchwabTransportError::CaptureMaterial);
-            }
-            let ordinal =
-                u16::try_from(index).map_err(|_| SchwabTransportError::CaptureMaterial)?;
-            let received_nanos = i64::try_from(frame.received_at_unix_millis)
-                .ok()
-                .and_then(|value| value.checked_mul(1_000_000))
-                .ok_or(SchwabTransportError::CaptureMaterial)?;
-            let received = Timestamp::from_unix_nanos(received_nanos);
-            let frame_identity = stream_frame_request_identity(request_set_identity, frame.ordinal);
-            let next_identity = if index + 1 < frame_count {
-                let next = NonZeroU64::new(
-                    frame
-                        .ordinal
-                        .get()
-                        .checked_add(1)
-                        .ok_or(SchwabTransportError::CaptureMaterial)?,
-                )
-                .ok_or(SchwabTransportError::CaptureMaterial)?;
-                Some(stream_frame_request_identity(request_set_identity, next))
-            } else {
-                None
-            };
-            pages.push(
-                ProviderCapturePageReceipt::try_new(
-                    ordinal,
-                    frame_identity,
-                    previous_response_identity,
-                    next_identity,
-                    200,
-                    u64::try_from(frame.payload.len())
-                        .map_err(|_| SchwabTransportError::CaptureMaterial)?,
-                    EvidenceDigest::new(DigestAlgorithm::Sha256, frame.payload_sha256),
-                    received,
-                )
-                .map_err(|_| SchwabTransportError::CaptureMaterial)?,
-            );
-            previous_response_identity = next_identity;
-            records.push(
-                RawCaptureRecord::try_new_live(
-                    event_id,
-                    Arc::from(coordinates.source_id().as_str()),
-                    coordinates.connection_id(),
-                    Some(u64::from(ordinal)),
-                    None,
-                    chrono::DateTime::from_timestamp_nanos(received_nanos),
-                    frame.payload,
-                )
-                .map_err(|_| SchwabTransportError::CaptureMaterial)?,
-            );
-        }
-        let receipt = ProviderCaptureSetReceipt::try_new(
-            coordinates.source_id().clone(),
-            coordinates.metadata_revision().clone(),
-            coordinates.dataset().clone(),
-            request_set_identity,
-            ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage,
-            pages,
-        )
-        .map_err(|_| SchwabTransportError::CaptureMaterial)?;
-        ProviderCaptureMaterial::try_new(receipt, records)
-            .map_err(|_| SchwabTransportError::CaptureMaterial)
-    }
-}
-
-fn stream_request_set_identity(receipt: &StreamerMicrobatchReceipt) -> EvidenceDigest {
-    stream_request_set_identity_with_token_generation(receipt, receipt.token_generation)
-}
-
-fn stream_request_set_identity_with_token_generation(
-    receipt: &StreamerMicrobatchReceipt,
-    token_generation: AccessTokenGeneration,
-) -> EvidenceDigest {
-    let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk/schwab-streamer-microbatch/v2");
-    hasher.update(receipt.generation.get().to_be_bytes());
-    hasher.update(token_generation.get().to_be_bytes());
-    hasher.update(receipt.first_ordinal.get().to_be_bytes());
-    hasher.update(receipt.last_ordinal.get().to_be_bytes());
-    hasher.update(receipt.content_sha256);
-    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
-}
-
-fn stream_frame_request_identity(
-    request_set_identity: EvidenceDigest,
-    ordinal: NonZeroU64,
-) -> EvidenceDigest {
-    let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk/schwab-streamer-frame/v1");
-    hasher.update(request_set_identity.bytes());
-    hasher.update(ordinal.get().to_be_bytes());
-    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
 }
 
 /// Fail-closed nonblocking sink failure.
@@ -336,7 +221,7 @@ pub enum StreamerCaptureSinkError {
     Integrity,
 }
 
-/// Application-owned nonblocking bridge into the shared raw capture authority.
+/// Application-owned nonblocking bridge to the pre-seal Streamer microbatch seam.
 pub trait StreamerCaptureSink: Send {
     fn try_publish(
         &mut self,
@@ -345,13 +230,31 @@ pub trait StreamerCaptureSink: Send {
 }
 
 /// Provider frame delivered by an injectable connection boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub enum InboundStreamerFrame {
     Text(Bytes),
     Binary(Bytes),
     Ping(Bytes),
     Pong(Bytes),
     Close,
+}
+
+impl fmt::Debug for InboundStreamerFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (kind, payload_bytes) = match self {
+            Self::Text(payload) => ("text", Some(payload.len())),
+            Self::Binary(payload) => ("binary", Some(payload.len())),
+            Self::Ping(payload) => ("ping", Some(payload.len())),
+            Self::Pong(payload) => ("pong", Some(payload.len())),
+            Self::Close => ("close", None),
+        };
+        formatter
+            .debug_struct("InboundStreamerFrame")
+            .field("kind", &kind)
+            .field("payload_bytes", &payload_bytes)
+            .field("payload", &"[RAW FRAME REDACTED]")
+            .finish()
+    }
 }
 
 /// One connected Streamer wire. Implementations must not retain outbound login bytes.
@@ -569,10 +472,7 @@ impl SchwabStreamerExecutor {
         token_admission: AccessTokenAdmission,
         telemetry: SchwabTransportTelemetry,
     ) -> Result<Self, SchwabTransportError> {
-        if parse_bounds.max_response_bytes() > transport_bounds.max_frame_bytes()
-            || transport_bounds.max_microbatch_frames()
-                > market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES
-        {
+        if parse_bounds.max_response_bytes() > transport_bounds.max_frame_bytes() {
             return Err(SchwabTransportError::InvalidConfiguration);
         }
         Ok(Self {

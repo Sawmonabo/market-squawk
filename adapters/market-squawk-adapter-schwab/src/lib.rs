@@ -34,11 +34,10 @@ pub use callback::{
 };
 pub use canonical::{
     SchwabCanonicalError, SchwabCanonicalField, SchwabCanonicalStreamerField,
-    SchwabCanonicalStreamerRecord, SchwabDailyPriceHistoryPublicationRequest,
-    SchwabInstrumentCandidate, SchwabOptionCandidateAbstention, SchwabOptionCandidateOutcome,
-    SchwabOptionSnapshotCandidate, SchwabQuoteAbstention, SchwabQuoteCanonicalOutcome,
-    SchwabResolvedProviderIdentity, SchwabStreamerFieldDictionary, SchwabStreamerSemanticField,
-    canonicalize_instrument_candidates, canonicalize_option_chain, canonicalize_price_history,
+    SchwabCanonicalStreamerRecord, SchwabInstrumentCandidate, SchwabOptionCandidateAbstention,
+    SchwabOptionCandidateOutcome, SchwabOptionSnapshotCandidate, SchwabQuoteAbstention,
+    SchwabQuoteCanonicalOutcome, SchwabResolvedProviderIdentity, SchwabStreamerFieldDictionary,
+    SchwabStreamerSemanticField, canonicalize_instrument_candidates, canonicalize_option_chain,
     canonicalize_quote, canonicalize_streamer_batch, canonicalize_streamer_quote_record,
 };
 pub use error::SchwabAdapterError;
@@ -77,17 +76,16 @@ pub use transport::{
     RawStreamerFrame, RawStreamerFrameKind, ReqwestSchwabHttpWire, ResponseHeaderEvidence,
     RestExecutionOutcome, RestItemAccounting, RestTransportBounds, SchwabAccessTokenSource,
     SchwabCaptureCoordinates, SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse,
-    SchwabRestExecutor, SchwabRestPayload, SchwabStreamerConnection, SchwabStreamerConnector,
-    SchwabStreamerExecutor, SchwabTransportError, SchwabTransportTelemetry,
-    SchwabTransportTelemetrySnapshot, StreamerCaptureSink, StreamerCaptureSinkError,
+    SchwabPendingRestCapture, SchwabRestCaptureSealRejoin, SchwabRestExecutor, SchwabRestPayload,
+    SchwabStreamerConnection, SchwabStreamerConnector, SchwabStreamerExecutor,
+    SchwabTransportError, SchwabTransportTelemetry, SchwabTransportTelemetrySnapshot,
+    SchwabUserPreferenceEvidence, StreamerCaptureSink, StreamerCaptureSinkError,
     StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit, StreamerTransportBounds,
     TokenAuthorityError, TransientAccessToken,
 };
 pub use vertical::{
     SchwabCapabilityCurrentness, SchwabObservedCapabilityFamily,
-    SchwabPriceHistoryCapabilityObservation, SchwabPriceHistoryLineage,
-    SchwabSealedPriceHistoryCapture, SchwabSealedPriceHistoryPublicationInput,
-    SchwabSealedStreamerMicrobatchCapture, SchwabVerticalError,
+    SchwabPriceHistoryCapabilityObservation, SchwabVerticalError,
 };
 
 /// Exact Schwab OAuth authorization endpoint.

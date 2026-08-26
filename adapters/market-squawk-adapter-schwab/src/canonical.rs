@@ -8,21 +8,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use market_squawk_domain::{
-    AvailabilityEvidence, BarTimeSemantics, BookLevel, Currency, DataQuality, DigestAlgorithm,
-    EvidenceDigest, InstrumentId, LiveProvenance, LotSize, MarketBarAdjustment,
-    MarketBarObservation, MarketEvent, Money, PayloadHash, PayloadReference, ProviderInstrumentId,
-    QuoteEvent, ResearchContext, ResearchProvenance, ResearchProvenanceInput, ResearchTime,
-    RevisionNumber, SourceIdentifier, TickSize, Timestamp, VenueId,
+    BarTimeSemantics, BookLevel, Currency, DigestAlgorithm, EvidenceDigest, InstrumentId,
+    LiveProvenance, LotSize, MarketBarAdjustment, MarketEvent, ProviderInstrumentId, QuoteEvent,
+    SourceIdentifier, TickSize, Timestamp, VenueId,
 };
 use rust_decimal::Decimal;
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
     ExecutedRestResponse, FundamentalField, InstrumentResponse, MarketDataService, NativeField,
     NativeFieldEntry, NativeNumber, NativeScalar, OptionChain, OptionContract, OptionContractField,
-    OptionSide, ParsedNative, ProviderIdentifier, QuoteComponentField, SchwabInstrument,
-    SchwabPriceHistoryCapabilityObservation, SchwabQuote, SchwabSealedPriceHistoryCapture,
-    SchwabSealedPriceHistoryPublicationInput, StreamerDataBatch, StreamerNativeValue,
+    OptionSide, ParsedNative, ProviderIdentifier, QuoteComponentField, SchwabCapabilityCurrentness,
+    SchwabInstrument, SchwabOAuthAuthorityReceipt, SchwabPriceHistoryCapabilityObservation,
+    SchwabQuote, SchwabUserPreferenceEvidence, StreamerDataBatch, StreamerNativeValue,
 };
 
 /// Exact Schwab symbol bound to a shared provider-instrument identity by external registry proof.
@@ -204,40 +204,89 @@ fn named_number<K: Eq>(
     }
 }
 
-/// Complete authority input for one exact daily price-history response and sealed capture.
+/// Adapter-private semantic inputs for one price-history response awaiting a common capture seal.
+///
+/// This request deliberately has no source coordinates, sealed receipt, publication revision, or
+/// published clock. Those authority-bearing facts can only arrive through the future consuming
+/// `SealedProviderCaptureMaterial` rejoin.
 #[derive(Debug)]
-pub struct SchwabDailyPriceHistoryPublicationRequest<'a> {
-    pub capability: SchwabPriceHistoryCapabilityObservation,
-    pub oauth_authority: crate::SchwabOAuthAuthorityReceipt,
-    pub user_preference: &'a ExecutedRestResponse,
-    pub response: &'a ExecutedRestResponse,
-    pub sealed_capture: SchwabSealedPriceHistoryCapture,
-    pub capture_coordinates: crate::SchwabCaptureCoordinates,
-    pub instrument_id: InstrumentId,
-    pub instrument_revision_digest: EvidenceDigest,
-    pub admitted_plan_digest: EvidenceDigest,
-    pub identity: SchwabResolvedProviderIdentity,
-    pub venue_id: VenueId,
-    pub feed: SourceIdentifier,
-    pub interval: SourceIdentifier,
-    pub adjustment: MarketBarAdjustment,
-    pub currency: Currency,
-    /// Calendar-authority periods in the exact order expected from the provider response.
-    pub time_semantics: Vec<BarTimeSemantics>,
-    pub completeness_evidence: EvidenceDigest,
-    pub ingested_at: Timestamp,
-    pub published_at: Timestamp,
-    pub revision: RevisionNumber,
+pub(crate) struct SchwabDailyPriceHistoryCandidateRequest<'a> {
+    pub(crate) capability: SchwabPriceHistoryCapabilityObservation,
+    pub(crate) oauth_authority: SchwabOAuthAuthorityReceipt,
+    pub(crate) user_preference: &'a SchwabUserPreferenceEvidence,
+    pub(crate) response: &'a ExecutedRestResponse,
+    pub(crate) instrument_id: InstrumentId,
+    pub(crate) instrument_revision_digest: EvidenceDigest,
+    pub(crate) admitted_plan_digest: EvidenceDigest,
+    pub(crate) identity: SchwabResolvedProviderIdentity,
+    pub(crate) venue_id: VenueId,
+    pub(crate) feed: SourceIdentifier,
+    pub(crate) interval: SourceIdentifier,
+    pub(crate) adjustment: MarketBarAdjustment,
+    pub(crate) currency: Currency,
+    /// Calendar-authority periods in the exact provider-response order.
+    pub(crate) time_semantics: Vec<BarTimeSemantics>,
+    pub(crate) completeness_evidence: EvidenceDigest,
+    pub(crate) ingested_at: Timestamp,
 }
 
-/// Maps and seals only the exact admitted response/capture/range/completeness combination.
-pub fn canonicalize_price_history(
-    request: SchwabDailyPriceHistoryPublicationRequest<'_>,
-) -> Result<SchwabSealedPriceHistoryPublicationInput, SchwabCanonicalError> {
+/// A validated semantic projection that cannot grant publication authority.
+///
+/// It is intentionally crate-private, non-cloneable, and non-serializable. It preserves the pure
+/// identity/calendar/OHLCV work while the final point-in-time record remains unavailable until the
+/// shared consuming capture witness exists.
+#[allow(
+    dead_code,
+    reason = "retained semantic candidate awaits the common sealed-material rejoin"
+)]
+pub(crate) struct SchwabPendingPriceHistoryCandidate {
+    capability: SchwabPriceHistoryCapabilityObservation,
+    oauth_authority: SchwabOAuthAuthorityReceipt,
+    user_preference_observation_sha256: [u8; 32],
+    response_observation_sha256: [u8; 32],
+    requested_start: Timestamp,
+    requested_end: Timestamp,
+    response_received_at: Timestamp,
+    instrument_id: InstrumentId,
+    instrument_revision_digest: EvidenceDigest,
+    admitted_plan_digest: EvidenceDigest,
+    identity: SchwabResolvedProviderIdentity,
+    venue_id: VenueId,
+    feed: SourceIdentifier,
+    interval: SourceIdentifier,
+    adjustment: MarketBarAdjustment,
+    currency: Currency,
+    completeness_evidence: EvidenceDigest,
+    ingested_at: Timestamp,
+    bars: Box<[SchwabPendingPriceHistoryBar]>,
+    mapping_digest: EvidenceDigest,
+}
+
+/// One exact provider bar after pure semantic/calendar validation but before PIT publication.
+#[derive(Serialize)]
+pub(crate) struct SchwabPendingPriceHistoryBar {
+    source_identifier: SourceIdentifier,
+    provider_timestamp: Timestamp,
+    time_semantics: BarTimeSemantics,
+    open: Decimal,
+    high: Decimal,
+    low: Decimal,
+    close: Decimal,
+    volume: Decimal,
+}
+
+/// Retains reusable pure history mapping while withholding final revision/PIT authority.
+#[allow(
+    dead_code,
+    reason = "retained semantic candidate awaits the common sealed-material rejoin"
+)]
+pub(crate) fn prepare_price_history_candidate(
+    request: SchwabDailyPriceHistoryCandidateRequest<'_>,
+) -> Result<SchwabPendingPriceHistoryCandidate, SchwabCanonicalError> {
     let (requested_start, requested_end) = crate::vertical::admitted_daily_range(request.response)
-        .map_err(|_| SchwabCanonicalError::PublicationBinding)?;
+        .map_err(|_| SchwabCanonicalError::PendingHistoryBinding)?;
     let crate::SchwabRestPayload::PriceHistory(parsed) = request.response.payload() else {
-        return Err(SchwabCanonicalError::PublicationBinding);
+        return Err(SchwabCanonicalError::PendingHistoryBinding);
     };
     let history = parsed.value();
     if request.identity.provider_symbol().as_str() != history.symbol.as_str()
@@ -247,104 +296,248 @@ pub fn canonicalize_price_history(
     {
         return Err(SchwabCanonicalError::IdentityMismatch);
     }
-    let sealed = request.sealed_capture.receipt().capture();
-    let [page] = sealed.pages() else {
-        return Err(SchwabCanonicalError::PublicationBinding);
-    };
-    let received_at = page.received_at();
-    let source_id = sealed.source_id().clone();
-    let body_digest = page.body_digest().bytes();
-    let mut expected_provider_timestamps = Vec::with_capacity(request.time_semantics.len());
+    if request.instrument_revision_digest.bytes() == [0; 32]
+        || request.admitted_plan_digest.bytes() == [0; 32]
+        || request.identity.resolution_evidence().bytes() == [0; 32]
+        || request.completeness_evidence.bytes() == [0; 32]
+    {
+        return Err(SchwabCanonicalError::PendingHistoryBinding);
+    }
+    let ingested_seconds = u64::try_from(request.ingested_at.unix_nanos())
+        .ok()
+        .map(|value| value / 1_000_000_000)
+        .ok_or(SchwabCanonicalError::PendingHistoryBinding)?;
+    if request.capability.currentness(
+        request.oauth_authority,
+        request.user_preference,
+        request.response,
+        ingested_seconds,
+    ) != SchwabCapabilityCurrentness::Current
+    {
+        return Err(SchwabCanonicalError::PendingHistoryBinding);
+    }
+    let receipt = request.response.capture().receipt();
+    let response_received_at = millis_to_timestamp(receipt.received_at_unix_millis())?;
+    if request.ingested_at < response_received_at {
+        return Err(SchwabCanonicalError::PendingHistoryBinding);
+    }
+
     let mut bars = Vec::with_capacity(history.candles().len());
-    for (candle, time_semantics) in history.candles().iter().zip(&request.time_semantics) {
+    for (candle, time_semantics) in history.candles().iter().zip(request.time_semantics) {
         let provider_timestamp = millis_to_timestamp(candle.datetime_millis)?;
         if time_semantics.provider_timestamp() != provider_timestamp
             || provider_timestamp < requested_start
             || provider_timestamp >= requested_end
             || time_semantics.period_start() >= time_semantics.period_end_exclusive()
-            || received_at < time_semantics.period_end_exclusive()
+            || response_received_at < time_semantics.period_end_exclusive()
+            || bars
+                .last()
+                .is_some_and(|previous: &SchwabPendingPriceHistoryBar| {
+                    previous.provider_timestamp >= provider_timestamp
+                })
         {
             return Err(SchwabCanonicalError::CompletenessMismatch);
         }
-        expected_provider_timestamps.push(provider_timestamp);
+        let open = parse_decimal(&candle.open)?;
+        let high = parse_decimal(&candle.high)?;
+        let low = parse_decimal(&candle.low)?;
+        let close = parse_decimal(&candle.close)?;
+        let volume = parse_decimal(&candle.volume)?;
+        if [open, high, low, close]
+            .into_iter()
+            .any(|price| price <= Decimal::ZERO)
+            || low > high
+            || open < low
+            || open > high
+            || close < low
+            || close > high
+            || volume.is_sign_negative()
+        {
+            return Err(SchwabCanonicalError::DomainInvariant);
+        }
         let source_identifier = SourceIdentifier::try_from(format!(
             "schwab-daily-history:{}:{}",
             history.symbol.as_str(),
             candle.datetime_millis
         ))
         .map_err(|_| SchwabCanonicalError::DomainInvariant)?;
-        let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
-            source_id: source_id.clone(),
-            instrument_id: Some(request.instrument_id),
-            venue_id: Some(request.venue_id.clone()),
+        bars.push(SchwabPendingPriceHistoryBar {
             source_identifier,
-            source_timestamp: Some(provider_timestamp),
-            received_at,
-            ingested_at: request.ingested_at,
-            quality: DataQuality::Aggregated,
-            payload_reference: PayloadReference::ContentHash(PayloadHash::new(
-                DigestAlgorithm::Sha256,
-                body_digest,
-            )),
-            availability: AvailabilityEvidence::local_first_observed(received_at),
-        })
-        .map_err(|_| SchwabCanonicalError::DomainInvariant)?;
-        let time = ResearchTime::new(provider_timestamp, None, request.revision, None)
-            .map_err(|_| SchwabCanonicalError::DomainInvariant)?;
-        let context = ResearchContext::new(provenance, time)
-            .map_err(|_| SchwabCanonicalError::DomainInvariant)?;
-        let bar = MarketBarObservation::new(
-            context,
-            request.identity.provider_instrument_id().clone(),
-            request.feed.clone(),
-            request.interval.clone(),
-            time_semantics.clone(),
-            request.adjustment,
-            Money::new(parse_decimal(&candle.open)?, request.currency),
-            Money::new(parse_decimal(&candle.high)?, request.currency),
-            Money::new(parse_decimal(&candle.low)?, request.currency),
-            Money::new(parse_decimal(&candle.close)?, request.currency),
-            parse_decimal(&candle.volume)?,
-            None,
-            None,
-        )
-        .map_err(|_| SchwabCanonicalError::DomainInvariant)?;
-        bars.push(bar);
+            provider_timestamp,
+            time_semantics,
+            open,
+            high,
+            low,
+            close,
+            volume: volume.normalize(),
+        });
     }
-    if expected_provider_timestamps
-        .windows(2)
-        .any(|pair| pair[0] >= pair[1])
-    {
-        return Err(SchwabCanonicalError::CompletenessMismatch);
-    }
-    SchwabSealedPriceHistoryPublicationInput::try_new(
-        request.capability,
-        request.oauth_authority,
-        request.user_preference,
-        request.response,
-        request.sealed_capture,
-        request.capture_coordinates,
+
+    let user_preference_observation_sha256 =
+        crate::vertical::user_preference_receipt_digest(request.user_preference);
+    let response_observation_sha256 = crate::vertical::rest_receipt_digest(request.response);
+    let accounting = request.response.accounting();
+    let wire = PendingHistoryDigestWire {
+        version: 1,
+        family: "schwab.pending-daily-price-history",
+        capability_receipt_sha256: request.capability.receipt_sha256(),
+        oauth_generation: request.oauth_authority.generation().get(),
+        oauth_access_issued_at_unix_seconds: request
+            .oauth_authority
+            .access_issued_at_unix_seconds(),
+        oauth_access_expires_at_unix_seconds: request
+            .oauth_authority
+            .access_expires_at_unix_seconds(),
+        oauth_refresh_authorized_at_unix_seconds: request
+            .oauth_authority
+            .refresh_authorized_at_unix_seconds(),
+        oauth_refresh_expires_at_unix_seconds: request
+            .oauth_authority
+            .refresh_expires_at_unix_seconds(),
+        user_preference_observation_sha256,
+        response_observation_sha256,
+        request_url: receipt.request_url(),
+        request_sha256: receipt.request_sha256(),
+        response_sha256: receipt.body_sha256(),
+        response_bytes: receipt.body_bytes(),
+        response_status: receipt.status(),
+        response_received_at_unix_millis: receipt.received_at_unix_millis(),
+        token_generation: receipt.token_generation().get(),
+        requested_items: accounting.requested,
+        returned_items: accounting.returned,
+        missing_items: accounting.missing,
+        unexpected_items: accounting.unexpected,
+        provider_records: accounting.provider_records,
         requested_start,
         requested_end,
-        request.instrument_id,
-        request.instrument_revision_digest,
-        request.admitted_plan_digest,
-        request.identity.provider_symbol().clone(),
-        request.identity.provider_instrument_id().clone(),
-        request.identity.resolution_evidence(),
-        request.venue_id,
-        request.feed,
-        request.interval,
-        request.adjustment,
-        request.currency,
-        request.completeness_evidence,
-        expected_provider_timestamps,
-        &request.time_semantics,
-        request.ingested_at,
-        request.published_at,
-        bars,
-    )
-    .map_err(|_| SchwabCanonicalError::PublicationBinding)
+        instrument_id: request.instrument_id,
+        instrument_revision_digest: request.instrument_revision_digest,
+        admitted_plan_digest: request.admitted_plan_digest,
+        provider_symbol: request.identity.provider_symbol().as_str(),
+        provider_instrument_id: request.identity.provider_instrument_id(),
+        resolution_evidence: request.identity.resolution_evidence(),
+        venue_id: &request.venue_id,
+        feed: &request.feed,
+        interval: &request.interval,
+        adjustment: request.adjustment,
+        currency: request.currency,
+        completeness_evidence: request.completeness_evidence,
+        response_received_at,
+        ingested_at: request.ingested_at,
+        bars: &bars,
+    };
+    let encoded =
+        serde_json::to_vec(&wire).map_err(|_| SchwabCanonicalError::PendingHistoryBinding)?;
+    let mapping_digest =
+        EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(encoded).into());
+
+    Ok(SchwabPendingPriceHistoryCandidate {
+        capability: request.capability,
+        oauth_authority: request.oauth_authority,
+        user_preference_observation_sha256,
+        response_observation_sha256,
+        requested_start,
+        requested_end,
+        response_received_at,
+        instrument_id: request.instrument_id,
+        instrument_revision_digest: request.instrument_revision_digest,
+        admitted_plan_digest: request.admitted_plan_digest,
+        identity: request.identity,
+        venue_id: request.venue_id,
+        feed: request.feed,
+        interval: request.interval,
+        adjustment: request.adjustment,
+        currency: request.currency,
+        completeness_evidence: request.completeness_evidence,
+        ingested_at: request.ingested_at,
+        bars: bars.into_boxed_slice(),
+        mapping_digest,
+    })
+}
+
+#[derive(Serialize)]
+struct PendingHistoryDigestWire<'a> {
+    version: u16,
+    family: &'static str,
+    capability_receipt_sha256: [u8; 32],
+    oauth_generation: u64,
+    oauth_access_issued_at_unix_seconds: u64,
+    oauth_access_expires_at_unix_seconds: u64,
+    oauth_refresh_authorized_at_unix_seconds: u64,
+    oauth_refresh_expires_at_unix_seconds: u64,
+    user_preference_observation_sha256: [u8; 32],
+    response_observation_sha256: [u8; 32],
+    request_url: &'a str,
+    request_sha256: [u8; 32],
+    response_sha256: [u8; 32],
+    response_bytes: u64,
+    response_status: u16,
+    response_received_at_unix_millis: u64,
+    token_generation: u64,
+    requested_items: u64,
+    returned_items: u64,
+    missing_items: u64,
+    unexpected_items: u64,
+    provider_records: u64,
+    requested_start: Timestamp,
+    requested_end: Timestamp,
+    instrument_id: InstrumentId,
+    instrument_revision_digest: EvidenceDigest,
+    admitted_plan_digest: EvidenceDigest,
+    provider_symbol: &'a str,
+    provider_instrument_id: &'a ProviderInstrumentId,
+    resolution_evidence: EvidenceDigest,
+    venue_id: &'a VenueId,
+    feed: &'a SourceIdentifier,
+    interval: &'a SourceIdentifier,
+    adjustment: MarketBarAdjustment,
+    currency: Currency,
+    completeness_evidence: EvidenceDigest,
+    response_received_at: Timestamp,
+    ingested_at: Timestamp,
+    bars: &'a [SchwabPendingPriceHistoryBar],
+}
+
+#[cfg(test)]
+impl SchwabPendingPriceHistoryCandidate {
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    pub(crate) const fn provider_instrument_id(&self) -> &ProviderInstrumentId {
+        self.identity.provider_instrument_id()
+    }
+
+    pub(crate) const fn provider_symbol(&self) -> &ProviderIdentifier {
+        self.identity.provider_symbol()
+    }
+
+    pub(crate) fn bars(&self) -> &[SchwabPendingPriceHistoryBar] {
+        &self.bars
+    }
+
+    pub(crate) const fn mapping_digest(&self) -> EvidenceDigest {
+        self.mapping_digest
+    }
+}
+
+#[cfg(test)]
+impl SchwabPendingPriceHistoryBar {
+    pub(crate) const fn provider_timestamp(&self) -> Timestamp {
+        self.provider_timestamp
+    }
+
+    pub(crate) const fn time_semantics(&self) -> &BarTimeSemantics {
+        &self.time_semantics
+    }
+
+    pub(crate) const fn open(&self) -> Decimal {
+        self.open
+    }
+
+    pub(crate) const fn close(&self) -> Decimal {
+        self.close
+    }
 }
 
 /// Provider-null-aware canonical field used by option and reference candidates.
@@ -911,8 +1104,8 @@ pub enum SchwabCanonicalError {
     CardinalityMismatch,
     #[error("Schwab daily-history calendar completeness does not match the exact response")]
     CompletenessMismatch,
-    #[error("Schwab daily-history response, capture, authority, records, or clocks differ")]
-    PublicationBinding,
+    #[error("Schwab pending daily-history response, authority, semantics, or clocks differ")]
+    PendingHistoryBinding,
     #[error("Schwab named field has an unexpected semantic scalar type")]
     SemanticTypeMismatch,
     #[error("Schwab exact decimal is invalid")]

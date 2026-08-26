@@ -1,31 +1,22 @@
-//! Family-scoped observed capability and sealed provider-capture inputs.
+//! Family-scoped observed capability evidence.
 //!
-//! A successful request from one Schwab family never authorizes another family. The only durable
-//! publication input currently exposed by this adapter is daily price history. Streamer capture
-//! can be sealed without granting canonical-publication authority. The shared data authority
-//! remains responsible for Parquet generation and manifest publication.
+//! A successful request from one Schwab family never authorizes another family. Raw market-data
+//! capture is handed to the shared provider-capture authority; this module retains only the
+//! minimum parsed User Preference evidence needed to establish a price-history capability.
 
 use std::fmt;
 use std::time::Duration;
 
-use market_squawk_domain::{
-    BarTimeSemantics, Currency, EvidenceDigest, InstrumentId, MarketBarAdjustment,
-    MarketBarObservation, MetadataRevision, ProviderInstrumentId, SourceId, SourceIdentifier,
-    Timestamp, VenueId,
-};
-use market_squawk_platform::SealedResearchJournalStore;
-use market_squawk_sources::{ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt};
-use serde::Serialize;
+use market_squawk_domain::Timestamp;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ACCESS_TOKEN_MAX_LIFETIME_SECONDS, ExecutedRestResponse, ProviderIdentifier,
-    RawRestResponseReceipt, ReadOnlyRoute, SchwabCaptureCoordinates, SchwabOAuthAuthorityReceipt,
-    SchwabRestPayload, StreamerMicrobatch, StreamerMicrobatchReceipt,
+    ACCESS_TOKEN_MAX_LIFETIME_SECONDS, ExecutedRestResponse, ReadOnlyRoute,
+    SchwabOAuthAuthorityReceipt, SchwabRestPayload, SchwabUserPreferenceEvidence,
 };
 
-/// The sole family for which this adapter can currently mint observed publication capability.
+/// The sole family for which this adapter currently observes scoped capability evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchwabObservedCapabilityFamily {
     DailyPriceHistory,
@@ -79,17 +70,14 @@ impl SchwabPriceHistoryCapabilityObservation {
     /// Observes only an exact daily, frequency-one, explicit-range price-history probe.
     pub fn try_observe(
         oauth_authority: SchwabOAuthAuthorityReceipt,
-        user_preference_probe: &ExecutedRestResponse,
+        user_preference_probe: &SchwabUserPreferenceEvidence,
         price_history_probe: &ExecutedRestResponse,
         observed_at_unix_seconds: u64,
         valid_for: Duration,
     ) -> Result<Self, SchwabVerticalError> {
-        let preference_receipt = user_preference_probe.capture().receipt();
+        let preference_receipt = user_preference_probe.receipt();
         let history_receipt = price_history_probe.capture().receipt();
-        let SchwabRestPayload::StreamerBootstrap(bootstrap) = user_preference_probe.payload()
-        else {
-            return Err(SchwabVerticalError::InvalidCapabilityEvidence);
-        };
+        let bootstrap = user_preference_probe.bootstrap();
         let SchwabRestPayload::PriceHistory(history) = price_history_probe.payload() else {
             return Err(SchwabVerticalError::InvalidCapabilityEvidence);
         };
@@ -150,7 +138,7 @@ impl SchwabPriceHistoryCapabilityObservation {
             return Err(SchwabVerticalError::InvalidCapabilityEvidence);
         }
         let market_data_principal_sha256 = bootstrap.value().market_data_principal_sha256();
-        let user_preference_receipt_sha256 = rest_receipt_digest(user_preference_probe);
+        let user_preference_receipt_sha256 = user_preference_receipt_digest(user_preference_probe);
         let price_history_receipt_sha256 = rest_receipt_digest(price_history_probe);
         let request_sha256 = history_receipt.request_sha256();
         let response_sha256 = history_receipt.body_sha256();
@@ -193,7 +181,7 @@ impl SchwabPriceHistoryCapabilityObservation {
     pub fn currentness(
         self,
         oauth_authority: SchwabOAuthAuthorityReceipt,
-        user_preference_probe: &ExecutedRestResponse,
+        user_preference_probe: &SchwabUserPreferenceEvidence,
         price_history_probe: &ExecutedRestResponse,
         now_unix_seconds: u64,
     ) -> SchwabCapabilityCurrentness {
@@ -204,7 +192,7 @@ impl SchwabPriceHistoryCapabilityObservation {
         {
             return SchwabCapabilityCurrentness::Expired;
         }
-        let preference_receipt = user_preference_probe.capture().receipt();
+        let preference_receipt = user_preference_probe.receipt();
         let receipt = price_history_probe.capture().receipt();
         if preference_receipt.token_generation() != oauth_authority.generation()
             || receipt.token_generation() != oauth_authority.generation()
@@ -214,10 +202,7 @@ impl SchwabPriceHistoryCapabilityObservation {
         if oauth_authority != self.oauth_authority {
             return SchwabCapabilityCurrentness::OAuthAuthorityChanged;
         }
-        let SchwabRestPayload::StreamerBootstrap(bootstrap) = user_preference_probe.payload()
-        else {
-            return SchwabCapabilityCurrentness::BootstrapChanged;
-        };
+        let bootstrap = user_preference_probe.bootstrap();
         if bootstrap.value().market_data_principal_sha256() != self.market_data_principal_sha256 {
             return SchwabCapabilityCurrentness::PrincipalChanged;
         }
@@ -230,7 +215,8 @@ impl SchwabPriceHistoryCapabilityObservation {
             || accounting.missing != 0
             || accounting.unexpected != 0
             || accounting.provider_records != 1
-            || rest_receipt_digest(user_preference_probe) != self.user_preference_receipt_sha256
+            || user_preference_receipt_digest(user_preference_probe)
+                != self.user_preference_receipt_sha256
             || preference_receipt.received_at_unix_millis() > receipt.received_at_unix_millis()
         {
             return SchwabCapabilityCurrentness::BootstrapChanged;
@@ -244,439 +230,6 @@ impl SchwabPriceHistoryCapabilityObservation {
         }
         SchwabCapabilityCurrentness::Current
     }
-}
-
-/// Typed authority lineage retained for downstream manifest, PIT, and model consumers.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SchwabPriceHistoryLineage {
-    pub capability: SchwabPriceHistoryCapabilityObservation,
-    pub oauth_authority: SchwabOAuthAuthorityReceipt,
-    pub capture_coordinates: SchwabCaptureCoordinates,
-    pub user_preference_receipt: RawRestResponseReceipt,
-    pub user_preference_observation_sha256: [u8; 32],
-    pub instrument_revision_digest: EvidenceDigest,
-    pub admitted_plan_digest: EvidenceDigest,
-    pub provider_symbol: ProviderIdentifier,
-    pub resolution_evidence: EvidenceDigest,
-    pub time_semantics: Box<[BarTimeSemantics]>,
-    pub ingested_at: Timestamp,
-}
-
-/// One exact Streamer microbatch inseparably bound to its durable raw-capture receipt.
-///
-/// Access-token bytes are absent by construction. The retained token generation is only the
-/// opaque coordinate issued by the protected OAuth authority for the connection generation that
-/// produced these frames.
-#[derive(Debug, Eq, PartialEq)]
-pub struct SchwabSealedStreamerMicrobatchCapture {
-    coordinates: SchwabCaptureCoordinates,
-    microbatch_receipt: StreamerMicrobatchReceipt,
-    receipt: SealedProviderCaptureSetReceipt,
-}
-
-impl SchwabSealedStreamerMicrobatchCapture {
-    /// Consumes and seals one already bounded Streamer microbatch.
-    pub fn try_seal(
-        microbatch: StreamerMicrobatch,
-        coordinates: SchwabCaptureCoordinates,
-        event_ids: Vec<uuid::Uuid>,
-        store: &SealedResearchJournalStore,
-    ) -> Result<Self, SchwabVerticalError> {
-        let microbatch_receipt = microbatch.receipt().clone();
-        let frame_count = usize::try_from(microbatch_receipt.frame_count())
-            .map_err(|_| SchwabVerticalError::StreamerCaptureBindingMismatch)?;
-        if frame_count == 0
-            || frame_count > market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES
-            || event_ids.len() != frame_count
-        {
-            return Err(SchwabVerticalError::StreamerCaptureBindingMismatch);
-        }
-        if event_ids
-            .iter()
-            .enumerate()
-            .any(|(index, event_id)| event_ids[..index].contains(event_id))
-        {
-            return Err(SchwabVerticalError::StreamerCaptureBindingMismatch);
-        }
-        let material = microbatch
-            .try_into_provider_capture_material(coordinates.clone(), event_ids)
-            .map_err(|_| SchwabVerticalError::StreamerCaptureBindingMismatch)?;
-        let receipt = material
-            .seal(store)
-            .map_err(|_| SchwabVerticalError::StreamerCaptureBindingMismatch)?;
-        Ok(Self {
-            coordinates,
-            microbatch_receipt,
-            receipt,
-        })
-    }
-
-    pub const fn coordinates(&self) -> &SchwabCaptureCoordinates {
-        &self.coordinates
-    }
-
-    pub const fn microbatch_receipt(&self) -> &StreamerMicrobatchReceipt {
-        &self.microbatch_receipt
-    }
-
-    pub const fn receipt(&self) -> &SealedProviderCaptureSetReceipt {
-        &self.receipt
-    }
-}
-
-/// An exact daily price-history response sealed with the registered capture coordinates.
-///
-/// The private fields make the capture receipt and the coordinates used to create its raw record
-/// inseparable. Publication still requires the independently registered coordinates and compares
-/// them with this evidence before admitting the capture.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SchwabSealedPriceHistoryCapture {
-    coordinates: SchwabCaptureCoordinates,
-    receipt: SealedProviderCaptureSetReceipt,
-}
-
-impl SchwabSealedPriceHistoryCapture {
-    pub fn try_seal(
-        response: &ExecutedRestResponse,
-        coordinates: SchwabCaptureCoordinates,
-        event_id: uuid::Uuid,
-        store: &SealedResearchJournalStore,
-    ) -> Result<Self, SchwabVerticalError> {
-        admitted_daily_range(response)?;
-        if !matches!(response.payload(), SchwabRestPayload::PriceHistory(_)) {
-            return Err(SchwabVerticalError::PublicationBindingMismatch);
-        }
-        let material = response
-            .capture()
-            .clone()
-            .try_into_provider_capture_material(coordinates.clone(), event_id)
-            .map_err(|_| SchwabVerticalError::PublicationBindingMismatch)?;
-        let receipt = material
-            .seal(store)
-            .map_err(|_| SchwabVerticalError::PublicationBindingMismatch)?;
-        Ok(Self {
-            coordinates,
-            receipt,
-        })
-    }
-
-    pub const fn coordinates(&self) -> &SchwabCaptureCoordinates {
-        &self.coordinates
-    }
-
-    pub const fn receipt(&self) -> &SealedProviderCaptureSetReceipt {
-        &self.receipt
-    }
-}
-
-/// Adapter-owned immutable input for the shared daily-history Parquet/manifest authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SchwabSealedPriceHistoryPublicationInput {
-    source_id: SourceId,
-    metadata_revision: MetadataRevision,
-    dataset: SourceIdentifier,
-    requested_start: Timestamp,
-    requested_end: Timestamp,
-    instrument_id: InstrumentId,
-    provider_instrument_id: ProviderInstrumentId,
-    venue_id: VenueId,
-    feed: SourceIdentifier,
-    interval: SourceIdentifier,
-    adjustment: MarketBarAdjustment,
-    currency: Currency,
-    completeness_evidence: EvidenceDigest,
-    expected_provider_timestamps: Box<[Timestamp]>,
-    lineage: SchwabPriceHistoryLineage,
-    canonical_digest: EvidenceDigest,
-    published_at: Timestamp,
-    capture: SealedProviderCaptureSetReceipt,
-    bars: Box<[MarketBarObservation]>,
-}
-
-impl SchwabSealedPriceHistoryPublicationInput {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "all history authority stays explicit"
-    )]
-    pub(crate) fn try_new(
-        capability: SchwabPriceHistoryCapabilityObservation,
-        oauth_authority: SchwabOAuthAuthorityReceipt,
-        user_preference_probe: &ExecutedRestResponse,
-        price_history_probe: &ExecutedRestResponse,
-        capture: SchwabSealedPriceHistoryCapture,
-        capture_coordinates: SchwabCaptureCoordinates,
-        requested_start: Timestamp,
-        requested_end: Timestamp,
-        instrument_id: InstrumentId,
-        instrument_revision_digest: EvidenceDigest,
-        admitted_plan_digest: EvidenceDigest,
-        provider_symbol: ProviderIdentifier,
-        provider_instrument_id: ProviderInstrumentId,
-        resolution_evidence: EvidenceDigest,
-        venue_id: VenueId,
-        feed: SourceIdentifier,
-        interval: SourceIdentifier,
-        adjustment: MarketBarAdjustment,
-        currency: Currency,
-        completeness_evidence: EvidenceDigest,
-        expected_provider_timestamps: Vec<Timestamp>,
-        time_semantics: &[BarTimeSemantics],
-        ingested_at: Timestamp,
-        published_at: Timestamp,
-        bars: Vec<MarketBarObservation>,
-    ) -> Result<Self, SchwabVerticalError> {
-        let receipt = price_history_probe.capture().receipt();
-        let sealed = capture.receipt.capture();
-        let pages = sealed.pages();
-        let Some(page) = pages.first() else {
-            return Err(SchwabVerticalError::PublicationBindingMismatch);
-        };
-        let frames = capture.receipt.segment().frames();
-        let Some(frame) = frames.first() else {
-            return Err(SchwabVerticalError::PublicationBindingMismatch);
-        };
-        let published_seconds = u64::try_from(published_at.unix_nanos())
-            .ok()
-            .map(|value| value / 1_000_000_000)
-            .ok_or(SchwabVerticalError::PublicationBindingMismatch)?;
-        let received_nanos = i64::try_from(receipt.received_at_unix_millis())
-            .ok()
-            .and_then(|value| value.checked_mul(1_000_000))
-            .ok_or(SchwabVerticalError::PublicationBindingMismatch)?;
-        if capability.currentness(
-            oauth_authority,
-            user_preference_probe,
-            price_history_probe,
-            published_seconds,
-        ) != SchwabCapabilityCurrentness::Current
-            || requested_start >= requested_end
-            || pages.len() != 1
-            || frames.len() != 1
-            || sealed.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
-            || capture.coordinates != capture_coordinates
-            || sealed.source_id() != capture_coordinates.source_id()
-            || sealed.metadata_revision() != capture_coordinates.metadata_revision()
-            || sealed.dataset() != capture_coordinates.dataset()
-            || sealed.request_set_identity().bytes() != receipt.request_sha256()
-            || page.request_identity().bytes() != receipt.request_sha256()
-            || page.http_status() != receipt.status()
-            || page.body_bytes() != receipt.body_bytes()
-            || page.body_digest().bytes() != receipt.body_sha256()
-            || page.received_at().unix_nanos() != received_nanos
-            || frame.ordinal() != 0
-            || frame.provider_payload_bytes() != receipt.body_bytes()
-            || frame.provider_payload_digest().bytes() != receipt.body_sha256()
-            || frame.received_at().unix_nanos() != received_nanos
-            || frame.source_sequence() != Some(0)
-            || expected_provider_timestamps.is_empty()
-            || expected_provider_timestamps.len() != bars.len()
-            || expected_provider_timestamps.len() != time_semantics.len()
-            || bars.is_empty()
-            || completeness_evidence.bytes() == [0; 32]
-            || instrument_revision_digest.bytes() == [0; 32]
-            || admitted_plan_digest.bytes() == [0; 32]
-            || resolution_evidence.bytes() == [0; 32]
-            || ingested_at < page.received_at()
-            || published_at < ingested_at
-        {
-            return Err(SchwabVerticalError::PublicationBindingMismatch);
-        }
-        let source_id = sealed.source_id().clone();
-        let metadata_revision = sealed.metadata_revision().clone();
-        let dataset = sealed.dataset().clone();
-        let capture = capture.receipt;
-        let lineage = SchwabPriceHistoryLineage {
-            capability,
-            oauth_authority,
-            capture_coordinates,
-            user_preference_receipt: user_preference_probe.capture().receipt().clone(),
-            user_preference_observation_sha256: rest_receipt_digest(user_preference_probe),
-            instrument_revision_digest,
-            admitted_plan_digest,
-            provider_symbol,
-            resolution_evidence,
-            time_semantics: time_semantics.to_vec().into_boxed_slice(),
-            ingested_at,
-        };
-        let wire = PublicationDigestWire {
-            version: 1,
-            family: "schwab.daily-price-history",
-            capability_receipt_sha256: capability.receipt_sha256,
-            oauth_generation: lineage.oauth_authority.generation().get(),
-            oauth_access_issued_at_unix_seconds: lineage
-                .oauth_authority
-                .access_issued_at_unix_seconds(),
-            oauth_access_expires_at_unix_seconds: lineage
-                .oauth_authority
-                .access_expires_at_unix_seconds(),
-            oauth_refresh_authorized_at_unix_seconds: lineage
-                .oauth_authority
-                .refresh_authorized_at_unix_seconds(),
-            oauth_refresh_expires_at_unix_seconds: lineage
-                .oauth_authority
-                .refresh_expires_at_unix_seconds(),
-            registered_source_id: lineage.capture_coordinates.source_id(),
-            registered_metadata_revision: lineage.capture_coordinates.metadata_revision(),
-            registered_dataset: lineage.capture_coordinates.dataset(),
-            registered_connection_id: lineage.capture_coordinates.connection_id(),
-            request_url: receipt.request_url(),
-            request_sha256: receipt.request_sha256(),
-            response_sha256: receipt.body_sha256(),
-            response_bytes: receipt.body_bytes(),
-            response_received_at_unix_millis: receipt.received_at_unix_millis(),
-            sealed_capture: &capture,
-            source_id: &source_id,
-            metadata_revision: &metadata_revision,
-            dataset: &dataset,
-            requested_start,
-            requested_end,
-            instrument_id,
-            instrument_revision_digest,
-            admitted_plan_digest,
-            user_preference_observation_sha256: lineage.user_preference_observation_sha256,
-            provider_symbol: lineage.provider_symbol.as_str(),
-            provider_instrument_id: &provider_instrument_id,
-            resolution_evidence,
-            venue_id: &venue_id,
-            feed: &feed,
-            interval: &interval,
-            adjustment,
-            currency,
-            completeness_evidence,
-            expected_provider_timestamps: &expected_provider_timestamps,
-            time_semantics: &lineage.time_semantics,
-            ingested_at,
-            published_at,
-            bars: &bars,
-        };
-        let encoded = serde_json::to_vec(&wire)
-            .map_err(|_| SchwabVerticalError::PublicationBindingMismatch)?;
-        let canonical_digest = EvidenceDigest::new(
-            market_squawk_domain::DigestAlgorithm::Sha256,
-            Sha256::digest(encoded).into(),
-        );
-        Ok(Self {
-            source_id,
-            metadata_revision,
-            dataset,
-            requested_start,
-            requested_end,
-            instrument_id,
-            provider_instrument_id,
-            venue_id,
-            feed,
-            interval,
-            adjustment,
-            currency,
-            completeness_evidence,
-            expected_provider_timestamps: expected_provider_timestamps.into_boxed_slice(),
-            lineage,
-            canonical_digest,
-            published_at,
-            capture,
-            bars: bars.into_boxed_slice(),
-        })
-    }
-
-    pub const fn source_id(&self) -> &SourceId {
-        &self.source_id
-    }
-    pub const fn metadata_revision(&self) -> &MetadataRevision {
-        &self.metadata_revision
-    }
-    pub const fn dataset(&self) -> &SourceIdentifier {
-        &self.dataset
-    }
-    pub const fn requested_range(&self) -> (Timestamp, Timestamp) {
-        (self.requested_start, self.requested_end)
-    }
-    pub const fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
-    }
-    pub const fn provider_instrument_id(&self) -> &ProviderInstrumentId {
-        &self.provider_instrument_id
-    }
-    pub const fn venue_id(&self) -> &VenueId {
-        &self.venue_id
-    }
-    pub const fn feed(&self) -> &SourceIdentifier {
-        &self.feed
-    }
-    pub const fn interval(&self) -> &SourceIdentifier {
-        &self.interval
-    }
-    pub const fn adjustment(&self) -> MarketBarAdjustment {
-        self.adjustment
-    }
-    pub const fn currency(&self) -> Currency {
-        self.currency
-    }
-    pub const fn completeness_evidence(&self) -> EvidenceDigest {
-        self.completeness_evidence
-    }
-    pub fn expected_provider_timestamps(&self) -> &[Timestamp] {
-        &self.expected_provider_timestamps
-    }
-    pub const fn lineage(&self) -> &SchwabPriceHistoryLineage {
-        &self.lineage
-    }
-    pub const fn canonical_digest(&self) -> EvidenceDigest {
-        self.canonical_digest
-    }
-    pub const fn published_at(&self) -> Timestamp {
-        self.published_at
-    }
-    pub const fn capture(&self) -> &SealedProviderCaptureSetReceipt {
-        &self.capture
-    }
-    pub fn bars(&self) -> &[MarketBarObservation] {
-        &self.bars
-    }
-}
-
-#[derive(Serialize)]
-struct PublicationDigestWire<'a> {
-    version: u16,
-    family: &'static str,
-    capability_receipt_sha256: [u8; 32],
-    oauth_generation: u64,
-    oauth_access_issued_at_unix_seconds: u64,
-    oauth_access_expires_at_unix_seconds: u64,
-    oauth_refresh_authorized_at_unix_seconds: u64,
-    oauth_refresh_expires_at_unix_seconds: u64,
-    registered_source_id: &'a SourceId,
-    registered_metadata_revision: &'a MetadataRevision,
-    registered_dataset: &'a SourceIdentifier,
-    registered_connection_id: uuid::Uuid,
-    user_preference_observation_sha256: [u8; 32],
-    request_url: &'a str,
-    request_sha256: [u8; 32],
-    response_sha256: [u8; 32],
-    response_bytes: u64,
-    response_received_at_unix_millis: u64,
-    sealed_capture: &'a SealedProviderCaptureSetReceipt,
-    source_id: &'a SourceId,
-    metadata_revision: &'a MetadataRevision,
-    dataset: &'a SourceIdentifier,
-    requested_start: Timestamp,
-    requested_end: Timestamp,
-    instrument_id: InstrumentId,
-    instrument_revision_digest: EvidenceDigest,
-    admitted_plan_digest: EvidenceDigest,
-    provider_symbol: &'a str,
-    provider_instrument_id: &'a ProviderInstrumentId,
-    resolution_evidence: EvidenceDigest,
-    venue_id: &'a VenueId,
-    feed: &'a SourceIdentifier,
-    interval: &'a SourceIdentifier,
-    adjustment: MarketBarAdjustment,
-    currency: Currency,
-    completeness_evidence: EvidenceDigest,
-    expected_provider_timestamps: &'a [Timestamp],
-    time_semantics: &'a [BarTimeSemantics],
-    ingested_at: Timestamp,
-    published_at: Timestamp,
-    bars: &'a [MarketBarObservation],
 }
 
 fn exact_daily_range(url: &str) -> Option<(Timestamp, Timestamp)> {
@@ -748,8 +301,18 @@ fn validate_observed_clock(
     Ok(())
 }
 
-fn rest_receipt_digest(response: &ExecutedRestResponse) -> [u8; 32] {
-    let receipt = response.capture().receipt();
+pub(crate) fn rest_receipt_digest(response: &ExecutedRestResponse) -> [u8; 32] {
+    receipt_digest(response.capture().receipt(), response.accounting())
+}
+
+pub(crate) fn user_preference_receipt_digest(response: &SchwabUserPreferenceEvidence) -> [u8; 32] {
+    receipt_digest(response.receipt(), response.accounting())
+}
+
+fn receipt_digest(
+    receipt: &crate::RawRestResponseReceipt,
+    accounting: crate::RestItemAccounting,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"market-squawk/schwab-rest-observation/v1");
     hasher.update([route_tag(receipt.route())]);
@@ -759,7 +322,6 @@ fn rest_receipt_digest(response: &ExecutedRestResponse) -> [u8; 32] {
     hasher.update(receipt.received_at_unix_millis().to_be_bytes());
     hasher.update(receipt.body_bytes().to_be_bytes());
     hasher.update(receipt.body_sha256());
-    let accounting = response.accounting();
     for value in [
         accounting.requested,
         accounting.returned,
@@ -842,10 +404,6 @@ const fn route_tag(route: ReadOnlyRoute) -> u8 {
 pub enum SchwabVerticalError {
     #[error("Schwab family capability evidence is incomplete or inconsistent")]
     InvalidCapabilityEvidence,
-    #[error("Schwab daily price-history response, capture, canonical records, or clocks differ")]
-    PublicationBindingMismatch,
-    #[error("Schwab Streamer microbatch, event coordinates, or sealed receipt differ")]
-    StreamerCaptureBindingMismatch,
     #[error("Schwab provider evidence arithmetic overflowed")]
     Overflow,
 }
