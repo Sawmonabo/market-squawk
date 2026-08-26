@@ -425,7 +425,7 @@ impl ResearchObjectReceipt {
     }
 }
 
-/// Cooperative control points that can stop finish before immutable publication.
+/// Cooperative control points for bounded logical research-object operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResearchObjectControlPoint {
     /// Before complete stage verification begins.
@@ -435,7 +435,7 @@ pub enum ResearchObjectControlPoint {
         /// Exact verified offset before the read.
         offset_bytes: u64,
     },
-    /// Immediately before the no-replace final-link attempt.
+    /// Immediately before immutable publication or verified authority release.
     BeforeCommit,
     /// Before one catalog claim is verified by a streaming recovery session.
     BeforeRecoveryClaim {
@@ -462,20 +462,20 @@ pub enum ResearchObjectControlPoint {
 /// Caller-owned cancellation, deadline, or trusted-control failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ResearchObjectControlError {
-    /// The caller cancelled before immutable publication.
-    #[error("logical research-object publication was cancelled")]
+    /// The caller cancelled the controlled operation.
+    #[error("logical research-object operation was cancelled")]
     Cancelled,
-    /// The caller's monotonic deadline elapsed before immutable publication.
-    #[error("logical research-object publication deadline was exceeded")]
+    /// The caller's monotonic deadline elapsed during the controlled operation.
+    #[error("logical research-object operation deadline was exceeded")]
     DeadlineExceeded,
-    /// Trusted control state could not be established before immutable publication.
-    #[error("logical research-object publication control is unavailable")]
+    /// Trusted control state could not be established for the operation.
+    #[error("logical research-object operation control is unavailable")]
     Unavailable,
 }
 
-/// Caller-owned cooperative control for long verification and publication.
+/// Caller-owned cooperative control for verification, publication, and recovery.
 pub trait ResearchObjectControl {
-    /// Checks whether finish may continue at this pre-commit control point.
+    /// Checks whether the operation may continue at this control point.
     fn checkpoint(
         &self,
         point: ResearchObjectControlPoint,
@@ -771,14 +771,18 @@ impl VerifiedResearchObject {
     /// again without exposing the file or path.
     pub fn reverify_for_commit(
         mut self,
+        control: &dyn ResearchObjectControl,
     ) -> Result<ResearchObjectReceipt, SealedResearchJournalStoreError> {
-        verify_opened_object(
+        control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
+        verify_opened_object_with_control(
             &self.object_directory,
             &self.filename,
             &mut self.file,
             self.identity,
             &self.receipt.claim,
+            Some(control),
         )?;
+        control.checkpoint(ResearchObjectControlPoint::BeforeCommit)?;
         Ok(self.receipt)
     }
 }
@@ -1155,21 +1159,26 @@ impl SealedResearchJournalStore {
     pub fn open_verified_logical_object(
         &self,
         receipt: &ResearchObjectReceipt,
+        control: &dyn ResearchObjectControl,
     ) -> Result<VerifiedResearchObject, SealedResearchJournalStoreError> {
-        self.open_verified_logical_object_claim(receipt.claim())
+        self.open_verified_logical_object_claim(receipt.claim(), control)
     }
 
     /// Upgrades a bounded value claim only after exact whole-object and chunk verification.
     pub fn open_verified_logical_object_claim(
         &self,
         claim: &ResearchObjectClaim,
+        control: &dyn ResearchObjectControl,
     ) -> Result<VerifiedResearchObject, SealedResearchJournalStoreError> {
         let _operation = self
             .operation
             .lock()
             .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
         self.validate_owner()?;
-        self.open_verified_logical_claim_inner(claim)
+        control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
+        let verified = self.open_verified_logical_claim_inner_with_control(claim, Some(control))?;
+        control.checkpoint(ResearchObjectControlPoint::BeforeCommit)?;
+        Ok(verified)
     }
 
     /// Begins one bounded, streaming recovery scan while retaining exclusive store authority.
@@ -1627,13 +1636,6 @@ impl SealedResearchJournalStore {
             return Err(SealedResearchJournalStoreError::StateConflict);
         }
         Ok(true)
-    }
-
-    pub(super) fn open_verified_logical_claim_inner(
-        &self,
-        claim: &ResearchObjectClaim,
-    ) -> Result<VerifiedResearchObject, SealedResearchJournalStoreError> {
-        self.open_verified_logical_claim_inner_with_control(claim, None)
     }
 
     fn open_verified_logical_claim_inner_with_control(
@@ -2321,16 +2323,6 @@ fn open_verified_object_from_shard_with_control(
     })
 }
 
-fn verify_opened_object(
-    shard: &Dir,
-    filename: &str,
-    file: &mut File,
-    identity: FileIdentity,
-    claim: &ResearchObjectClaim,
-) -> Result<(), SealedResearchJournalStoreError> {
-    verify_opened_object_with_control(shard, filename, file, identity, claim, None)
-}
-
 fn verify_opened_object_with_control(
     shard: &Dir,
     filename: &str,
@@ -2949,6 +2941,21 @@ mod tests {
         }
     }
 
+    struct CancelBeforeCommit;
+
+    impl ResearchObjectControl for CancelBeforeCommit {
+        fn checkpoint(
+            &self,
+            point: ResearchObjectControlPoint,
+        ) -> Result<(), ResearchObjectControlError> {
+            if point == ResearchObjectControlPoint::BeforeCommit {
+                Err(ResearchObjectControlError::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[test]
     fn logical_object_resumes_exact_chunks_and_quarantines_a_changed_prefix()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2985,15 +2992,35 @@ mod tests {
         let mut tail = Vec::new();
         verified.read_to_end(&mut tail)?;
         assert_eq!(tail, b"ijklmn");
-        let receipt = verified.reverify_for_commit()?;
+        let receipt = verified.reverify_for_commit(&Allow)?;
         assert_eq!(receipt.chunks().len(), 4);
+
+        assert!(matches!(
+            store.open_verified_logical_object_claim(receipt.claim(), &CancelVerificationAt(4)),
+            Err(SealedResearchJournalStoreError::ObjectControl(
+                ResearchObjectControlError::Cancelled
+            ))
+        ));
+        let verified = store.open_verified_logical_object(&receipt, &Allow)?;
+        assert!(matches!(
+            verified.reverify_for_commit(&CancelBeforeCommit),
+            Err(SealedResearchJournalStoreError::ObjectControl(
+                ResearchObjectControlError::Cancelled
+            ))
+        ));
+        assert_eq!(
+            store
+                .open_verified_logical_object_claim(receipt.claim(), &Allow)?
+                .reverify_for_commit(&Allow)?,
+            receipt
+        );
 
         let mut duplicate = store.begin_logical_object(admission)?;
         duplicate.write_all(b"abcdefghijklmn")?;
         assert_eq!(
             store
                 .finish_logical_object(duplicate, &Allow)?
-                .reverify_for_commit()?,
+                .reverify_for_commit(&Allow)?,
             receipt
         );
 
