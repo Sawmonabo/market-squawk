@@ -47,6 +47,10 @@ pub enum ProviderNativeLineageImplementation {
     SecNportBulkV1,
     /// SEC N-CEN bulk row semantics encoder v1.
     SecNcenBulkV1,
+    /// Schwab REST market-data response semantics encoder v1.
+    SchwabRestMarketDataV1,
+    /// Schwab Streamer market-data frame semantics encoder v1.
+    SchwabStreamerMarketDataV1,
     /// Treasury daily-rate observation semantics encoder v1.
     TreasuryDailyRateV1,
     /// Treasury Fiscal Data observation semantics encoder v1.
@@ -75,6 +79,12 @@ impl ProviderNativeLineageImplementation {
             Self::SecFilingXbrlV1 => b"market-squawk/sec-filing-xbrl/provider-native-lineage/v1",
             Self::SecNportBulkV1 => b"market-squawk/sec-nport-bulk/provider-native-lineage/v1",
             Self::SecNcenBulkV1 => b"market-squawk/sec-ncen-bulk/provider-native-lineage/v1",
+            Self::SchwabRestMarketDataV1 => {
+                b"market-squawk/schwab-rest-market-data/provider-native-lineage/v1"
+            }
+            Self::SchwabStreamerMarketDataV1 => {
+                b"market-squawk/schwab-streamer-market-data/provider-native-lineage/v1"
+            }
             Self::TreasuryDailyRateV1 => {
                 b"market-squawk/treasury-daily-rate/provider-native-lineage/v1"
             }
@@ -97,6 +107,8 @@ impl ProviderNativeLineageImplementation {
             Self::SecFilingXbrlV1 => 11,
             Self::SecNportBulkV1 => 12,
             Self::SecNcenBulkV1 => 13,
+            Self::SchwabRestMarketDataV1 => 14,
+            Self::SchwabStreamerMarketDataV1 => 15,
             Self::TreasuryDailyRateV1 => 7,
             Self::TreasuryFiscalDataV1 => 8,
         }
