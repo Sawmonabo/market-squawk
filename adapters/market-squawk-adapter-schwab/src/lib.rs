@@ -34,12 +34,12 @@ pub use callback::{
 };
 pub use canonical::{
     SchwabCanonicalError, SchwabCanonicalField, SchwabCanonicalStreamerField,
-    SchwabCanonicalStreamerRecord, SchwabHistoricalBarContext, SchwabInstrumentCandidate,
-    SchwabOptionCandidateAbstention, SchwabOptionCandidateOutcome, SchwabOptionSnapshotCandidate,
-    SchwabQuoteAbstention, SchwabQuoteCanonicalOutcome, SchwabResolvedProviderIdentity,
-    SchwabStreamerFieldDictionary, SchwabStreamerSemanticField, canonicalize_instrument_candidates,
-    canonicalize_option_chain, canonicalize_price_history, canonicalize_quote,
-    canonicalize_streamer_batch, canonicalize_streamer_quote_record,
+    SchwabCanonicalStreamerRecord, SchwabDailyPriceHistoryPublicationRequest,
+    SchwabInstrumentCandidate, SchwabOptionCandidateAbstention, SchwabOptionCandidateOutcome,
+    SchwabOptionSnapshotCandidate, SchwabQuoteAbstention, SchwabQuoteCanonicalOutcome,
+    SchwabResolvedProviderIdentity, SchwabStreamerFieldDictionary, SchwabStreamerSemanticField,
+    canonicalize_instrument_candidates, canonicalize_option_chain, canonicalize_price_history,
+    canonicalize_quote, canonicalize_streamer_batch, canonicalize_streamer_quote_record,
 };
 pub use error::SchwabAdapterError;
 pub use oauth::{
@@ -84,10 +84,9 @@ pub use transport::{
     TokenAuthorityError, TransientAccessToken,
 };
 pub use vertical::{
-    SchwabActivationLease, SchwabDataUsePurpose, SchwabDoctorDisposition, SchwabDoctorObservation,
-    SchwabOwnerUseAuthorization, SchwabProviderCurrentness, SchwabProviderPublication,
-    SchwabProviderQuery, SchwabPublicationFamily, SchwabPublishedRecord,
-    SchwabRestCapacityEvidence, SchwabVerticalError,
+    SchwabCapabilityCurrentness, SchwabObservedCapabilityFamily,
+    SchwabPriceHistoryCapabilityObservation, SchwabPriceHistoryLineage,
+    SchwabSealedPriceHistoryCapture, SchwabSealedPriceHistoryPublicationInput, SchwabVerticalError,
 };
 
 /// Exact Schwab OAuth authorization endpoint.

@@ -1,14 +1,21 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::{Future, pending};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+    BarTimeSemantics, BarTimestampBasis, Currency, DigestAlgorithm, EvidenceDigest, InstrumentId,
+    MarketBarAdjustment, MarketBarSessionEvidence, MarketBarSessionKind, MetadataRevision,
+    ProviderInstrumentId, RevisionNumber, SourceId, SourceIdentifier, Timestamp, VenueId,
+};
+use market_squawk_platform::{
+    EncryptedFileSecretStore, LocalPaths, SecretCancellation, SecretGeneration,
+    SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretStore, SecretValue,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -17,19 +24,62 @@ use crate::{
     ACCESS_TOKEN_MAX_LIFETIME_SECONDS, AccessTokenAdmission, AccessTokenGeneration,
     CallbackOutcome, ChainRequest, ConnectionGeneration, ConnectionState, DesiredStateController,
     HttpMethod, InboundStreamerFrame, MarketDataService, OAuthCallback, ParseBounds,
-    ProviderIdentifier, QuoteRequest, ReadOnlyRoute, RefreshTokenGeneration, RequestAdmission,
-    ResponseHeaderEvidence, RestExecutionOutcome, RestTransportBounds, SchwabAccessTokenSource,
-    SchwabAdapterError, SchwabCanonicalError, SchwabCaptureCoordinates, SchwabDataUsePurpose,
-    SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse, SchwabOptionCandidateOutcome,
-    SchwabOwnerUseAuthorization, SchwabRestExecutor, SchwabStreamerConnection,
-    SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFieldDictionary,
-    SchwabStreamerSemanticField, SchwabTransportError, SchwabTransportTelemetry, StreamerAdmission,
-    StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerResponseCode,
-    StreamerSubscription, StreamerTransportBounds, TokenAuthorityError, TokenDecision,
-    TransientAccessToken, canonicalize_option_chain, canonicalize_streamer_batch,
-    parse_option_chain_response, parse_quote_response, parse_streamer_frame, parse_token_response,
-    parse_user_preference,
+    PriceHistoryFrequency, PriceHistoryFrequencyType, PriceHistoryRequest,
+    ProtectedSchwabOAuthAuthority, ProviderIdentifier, QuoteRequest, ReadOnlyRoute,
+    RefreshTokenGeneration, RequestAdmission, ResponseHeaderEvidence, RestExecutionOutcome,
+    RestTransportBounds, SchwabAccessTokenSource, SchwabAdapterError, SchwabCanonicalError,
+    SchwabCaptureCoordinates, SchwabDailyPriceHistoryPublicationRequest, SchwabHttpWire,
+    SchwabHttpWireRequest, SchwabHttpWireResponse, SchwabOAuthAuthorityConfiguration,
+    SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire, SchwabOAuthWireError,
+    SchwabOAuthWireRequest, SchwabOAuthWireResponse, SchwabOptionCandidateAbstention,
+    SchwabOptionCandidateOutcome, SchwabPriceHistoryCapabilityObservation,
+    SchwabResolvedProviderIdentity, SchwabRestExecutor, SchwabSealedPriceHistoryCapture,
+    SchwabStreamerConnection, SchwabStreamerConnector, SchwabStreamerExecutor,
+    SchwabStreamerFieldDictionary, SchwabStreamerSemanticField, SchwabTransportError,
+    SchwabTransportTelemetry, StreamerAdmission, StreamerCaptureSink, StreamerCaptureSinkError,
+    StreamerMicrobatch, StreamerResponseCode, StreamerSubscription, StreamerTransportBounds,
+    TokenAuthorityError, TokenDecision, TransientAccessToken, canonicalize_option_chain,
+    canonicalize_price_history, canonicalize_streamer_batch, parse_option_chain_response,
+    parse_quote_response, parse_streamer_frame, parse_token_response, parse_user_preference,
 };
+
+struct TemporaryDirectory(PathBuf);
+
+impl TemporaryDirectory {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!("market-squawk-schwab-{}", Uuid::new_v4())))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ignored = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Debug)]
+struct ShortLivedOAuthWire;
+
+impl SchwabOAuthWire for ShortLivedOAuthWire {
+    fn exchange(
+        &self,
+        _request: SchwabOAuthWireRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<SchwabOAuthWireResponse, SchwabOAuthWireError>> + Send + '_>,
+    > {
+        Box::pin(async {
+            SchwabOAuthWireResponse::try_new(
+                200,
+                br#"{"access_token":"short-access","refresh_token":"short-refresh","token_type":"Bearer","expires_in":30,"scope":"market-data"}"#.to_vec(),
+                nonzero(4 * 1024),
+            )
+        })
+    }
+}
 
 fn nonzero(value: usize) -> NonZeroUsize {
     match NonZeroUsize::new(value) {
@@ -180,8 +230,8 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
     let chain = br#"{
       "symbol":"SPY","status":"SUCCESS","strategy":"SINGLE","numberOfContracts":2,
       "underlyingPrice":500.1,
-      "callExpDateMap":{"2026-08-21:10":{"500.0":[{"putCall":"CALL","symbol":"SPY C","bid":1.2,"ask":1.3,"delta":0.51,"openInterest":10}]}},
-      "putExpDateMap":{"2026-08-21:10":{"500.0":[{"putCall":"PUT","symbol":"SPY P","bid":1.1,"ask":1.4,"delta":-0.49,"openInterest":11}]}}
+      "callExpDateMap":{"2026-08-21:10":{"500.0":[{"putCall":"CALL","symbol":"SPY C","bid":1.2,"ask":1.3,"volatility":0.2,"delta":0.51,"gamma":0.03,"theta":-0.02,"vega":0.08,"rho":0.04,"openInterest":10}]}},
+      "putExpDateMap":{"2026-08-21:10":{"500.0":[{"putCall":"PUT","symbol":"SPY P","bid":1.1,"ask":1.4,"volatility":0.21,"delta":-0.49,"gamma":0.03,"theta":-0.02,"vega":0.08,"rho":-0.04,"openInterest":11}]}}
     }"#;
     let parsed_chain = parse_option_chain_response(chain, bounds())
         .unwrap_or_else(|error| panic!("chain payload: {error}"));
@@ -312,18 +362,330 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
         ),
         Err(SchwabAdapterError::RequestNotAdmitted)
     ));
+}
 
-    let use_authorization = SchwabOwnerUseAuthorization::OWNER_PRIVATE_RESEARCH;
-    assert!(use_authorization.private_retrieval());
-    assert!(use_authorization.persistence());
-    assert!(use_authorization.backtesting());
-    assert!(use_authorization.forecasting());
-    assert!(use_authorization.model_training_and_operation());
-    assert!(!use_authorization.sale());
-    assert!(!use_authorization.redistribution());
-    assert!(use_authorization.allows(SchwabDataUsePurpose::Backtesting));
-    assert!(!use_authorization.allows(SchwabDataUsePurpose::Sale));
-    assert!(!use_authorization.allows(SchwabDataUsePurpose::Redistribution));
+#[test]
+fn option_contract_missing_required_greek_is_not_counted_complete() {
+    let chain = br#"{
+      "symbol":"SPY","status":"SUCCESS","strategy":"SINGLE","numberOfContracts":1,
+      "callExpDateMap":{"2026-08-21:10":{"500.0":[{
+        "putCall":"CALL","symbol":"SPY C","bid":1.2,"ask":1.3,
+        "volatility":0.2,"delta":0.51,"gamma":0.03,"theta":-0.02,"vega":0.08
+      }]}}
+    }"#;
+    let parsed = parse_option_chain_response(chain, bounds())
+        .unwrap_or_else(|error| panic!("chain payload: {error}"));
+    let outcomes = canonicalize_option_chain(
+        &parsed,
+        Timestamp::from_unix_nanos(1_710_000_000_000_000_000),
+    )
+    .unwrap_or_else(|error| panic!("option canonicalization: {error}"));
+
+    assert!(matches!(
+        outcomes.as_slice(),
+        [SchwabOptionCandidateOutcome::Abstained {
+            reason: SchwabOptionCandidateAbstention::MissingRequiredGreek(
+                crate::OptionContractField::Rho
+            ),
+            ..
+        }]
+    ));
+}
+
+#[tokio::test]
+async fn daily_price_history_seals_exact_lineage_and_rejects_changed_bootstrap() {
+    let temporary = TemporaryDirectory::new();
+    let secrets = Arc::new(
+        EncryptedFileSecretStore::try_open(
+            temporary.path().join("oauth-secrets"),
+            SecretValue::new("schwab-test-unlock".to_owned())
+                .unwrap_or_else(|error| panic!("OAuth unlock: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("OAuth secret store: {error}")),
+    );
+    let secret_control = SecretOperationControl::try_new(
+        "schwab-test-application",
+        Instant::now() + Duration::from_secs(60),
+        0,
+        SecretInteractionPolicy::Forbid,
+        SecretCancellation::new(),
+    )
+    .unwrap_or_else(|error| panic!("OAuth secret control: {error}"));
+    let application_key = SecretKey::try_new("market-squawk.schwab", "test-application")
+        .unwrap_or_else(|error| panic!("application secret key: {error}"));
+    let application_credential = secrets
+        .create(
+            &application_key,
+            SecretGeneration::new(1)
+                .unwrap_or_else(|error| panic!("application generation: {error}")),
+            SecretValue::new(
+                r#"{"version":1,"app_key":"test-app-key","app_secret":"test-app-secret"}"#
+                    .to_owned(),
+            )
+            .unwrap_or_else(|error| panic!("application secret: {error}")),
+            &secret_control,
+        )
+        .unwrap_or_else(|error| panic!("application credential: {error}"));
+    let token_admission = AccessTokenAdmission::new(nonzero(4 * 1024), Duration::from_secs(1));
+    let oauth_configuration = SchwabOAuthAuthorityConfiguration::try_new(
+        secrets,
+        Arc::new(ShortLivedOAuthWire),
+        application_credential,
+        SchwabOAuthSecretPolicy::try_new(Duration::from_secs(30), 0)
+            .unwrap_or_else(|error| panic!("OAuth secret policy: {error}")),
+        bounds(),
+        token_admission,
+        5,
+    )
+    .unwrap_or_else(|error| panic!("OAuth authority configuration: {error}"));
+    let oauth_authority = ProtectedSchwabOAuthAuthority::try_open(
+        temporary.path().join("oauth-authority"),
+        oauth_configuration,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("OAuth authority: {error}"));
+    let callback = match OAuthCallback::parse(
+        "https://127.0.0.1:8182/?code=one-time&state=short-lived",
+        "short-lived",
+        admission(),
+    ) {
+        Ok(CallbackOutcome::Authorized(callback)) => callback,
+        outcome => panic!("OAuth callback: {outcome:?}"),
+    };
+    let issued_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|error| panic!("OAuth issue clock: {error}"))
+        .as_secs();
+    let oauth_receipt = oauth_authority
+        .complete_authorization(&callback, issued_at, SchwabOAuthInteraction::Background)
+        .await
+        .unwrap_or_else(|error| panic!("OAuth completion: {error}"));
+    let token = mock_token(token_admission);
+    let preference_request = crate::ReadOnlyRequest::user_preference(admission())
+        .unwrap_or_else(|error| panic!("preference request: {error}"));
+    let preference = execute_fixture(
+        &preference_request,
+        br#"{
+          "streamerInfo":[{"streamerSocketUrl":"wss://streamer.example.test/ws","schwabClientCustomerId":"customer","schwabClientCorrelId":"correlation","schwabClientChannel":"channel","schwabClientFunctionId":"function"}],
+          "offers":[{"mktDataPermission":"NP"}]
+        }"#,
+        &token,
+        token_admission,
+    )
+    .await;
+    let changed_preference = execute_fixture(
+        &preference_request,
+        br#"{
+          "streamerInfo":[{"streamerSocketUrl":"wss://streamer.example.test/ws","schwabClientCustomerId":"customer","schwabClientCorrelId":"correlation","schwabClientChannel":"channel","schwabClientFunctionId":"function"}],
+          "offers":[{"mktDataPermission":"NP"}],
+          "changedBootstrapField":true
+        }"#,
+        &token,
+        token_admission,
+    )
+    .await;
+    let start_millis = 1_704_067_200_000;
+    let end_millis = 1_704_153_600_000;
+    let history_request = PriceHistoryRequest::new(
+        ProviderIdentifier::try_new("SPY").unwrap_or_else(|error| panic!("symbol: {error}")),
+    )
+    .frequency(
+        PriceHistoryFrequencyType::Daily,
+        PriceHistoryFrequency::new(NonZeroU16::MIN),
+    )
+    .range_millis(start_millis, end_millis)
+    .unwrap_or_else(|error| panic!("history range: {error}"))
+    .build(admission())
+    .unwrap_or_else(|error| panic!("history request: {error}"));
+    let history = execute_fixture(
+        &history_request,
+        br#"{
+          "symbol":"SPY","empty":false,
+          "candles":[{"open":475.00,"high":477.00,"low":474.50,"close":476.25,"volume":1000,"datetime":1704067200000}]
+        }"#,
+        &token,
+        token_admission,
+    )
+    .await;
+    let observed_at = history.capture().receipt().received_at_unix_millis() / 1_000;
+    let capability = SchwabPriceHistoryCapabilityObservation::try_observe(
+        oauth_receipt,
+        &preference,
+        &history,
+        observed_at,
+        Duration::from_secs(10),
+    )
+    .unwrap_or_else(|error| panic!("history capability: {error}"));
+
+    assert_eq!(
+        SchwabPriceHistoryCapabilityObservation::try_observe(
+            oauth_receipt,
+            &preference,
+            &history,
+            observed_at,
+            Duration::from_secs(60),
+        ),
+        Err(crate::SchwabVerticalError::InvalidCapabilityEvidence)
+    );
+
+    let paths = LocalPaths::prepare(temporary.path().join("capture"))
+        .unwrap_or_else(|error| panic!("temporary paths: {error}"));
+    let store = paths
+        .sealed_research_journal_store()
+        .unwrap_or_else(|error| panic!("sealed research store: {error}"));
+    let registered_coordinates = capture_coordinates();
+    let changed_coordinates = SchwabCaptureCoordinates::try_new(
+        registered_coordinates.source_id().clone(),
+        registered_coordinates.metadata_revision().clone(),
+        SourceIdentifier::try_from("schwab-changed-dataset")
+            .unwrap_or_else(|error| panic!("changed dataset: {error}")),
+        Uuid::new_v4(),
+    )
+    .unwrap_or_else(|error| panic!("changed capture coordinates: {error}"));
+    let changed_connection_coordinates = SchwabCaptureCoordinates::try_new(
+        registered_coordinates.source_id().clone(),
+        registered_coordinates.metadata_revision().clone(),
+        registered_coordinates.dataset().clone(),
+        Uuid::new_v4(),
+    )
+    .unwrap_or_else(|error| panic!("changed connection coordinates: {error}"));
+    let seal_history = |coordinates| {
+        SchwabSealedPriceHistoryCapture::try_seal(&history, coordinates, Uuid::new_v4(), &store)
+            .unwrap_or_else(|error| panic!("sealed history capture: {error}"))
+    };
+    let provider_timestamp = Timestamp::from_unix_nanos(1_704_067_200_000_000_000);
+    let period_end = Timestamp::from_unix_nanos(1_704_153_600_000_000_000);
+    let session = MarketBarSessionEvidence::try_new(
+        MarketBarSessionKind::Regular,
+        SourceIdentifier::try_from("xnys-2024-session-calendar")
+            .unwrap_or_else(|error| panic!("session ruleset: {error}")),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [21; 32]),
+    )
+    .unwrap_or_else(|error| panic!("session evidence: {error}"));
+    let time_semantics = BarTimeSemantics::try_new(
+        provider_timestamp,
+        period_end,
+        BarTimestampBasis::PeriodStart,
+        session,
+    )
+    .unwrap_or_else(|error| panic!("bar time semantics: {error}"));
+    let instrument_id = "06dd06da-ef2d-44dd-bf28-b006da06b24b"
+        .parse::<InstrumentId>()
+        .unwrap_or_else(|error| panic!("instrument: {error}"));
+    let identity = SchwabResolvedProviderIdentity::try_new(
+        ProviderIdentifier::try_new("SPY").unwrap_or_else(|error| panic!("symbol: {error}")),
+        ProviderInstrumentId::try_from("SPY")
+            .unwrap_or_else(|error| panic!("provider instrument: {error}")),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [22; 32]),
+    )
+    .unwrap_or_else(|error| panic!("resolved identity: {error}"));
+    let venue_id =
+        VenueId::try_from("XNYS").unwrap_or_else(|error| panic!("venue identity: {error}"));
+    let feed = SourceIdentifier::try_from("schwab-daily-price-history")
+        .unwrap_or_else(|error| panic!("feed: {error}"));
+    let interval =
+        SourceIdentifier::try_from("1d").unwrap_or_else(|error| panic!("interval: {error}"));
+    let currency = Currency::try_from("USD").unwrap_or_else(|error| panic!("currency: {error}"));
+    let instrument_revision_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [23; 32]);
+    let admitted_plan_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [24; 32]);
+    let completeness_evidence = EvidenceDigest::new(DigestAlgorithm::Sha256, [25; 32]);
+    let received_at = Timestamp::from_unix_nanos(
+        i64::try_from(history.capture().receipt().received_at_unix_millis())
+            .unwrap_or_else(|error| panic!("receive clock: {error}"))
+            * 1_000_000,
+    );
+    let published_at = Timestamp::from_unix_nanos(
+        i64::try_from(observed_at + 1).unwrap_or_else(|error| panic!("publication clock: {error}"))
+            * 1_000_000_000,
+    );
+    let expired_publication_at = Timestamp::from_unix_nanos(
+        i64::try_from(oauth_receipt.access_expires_at_unix_seconds())
+            .unwrap_or_else(|error| panic!("OAuth expiry clock: {error}"))
+            * 1_000_000_000,
+    );
+    let request_for = |user_preference, sealed_capture, publication_at| {
+        SchwabDailyPriceHistoryPublicationRequest {
+            capability,
+            oauth_authority: oauth_receipt,
+            user_preference,
+            response: &history,
+            sealed_capture,
+            capture_coordinates: registered_coordinates.clone(),
+            instrument_id,
+            instrument_revision_digest,
+            admitted_plan_digest,
+            identity: identity.clone(),
+            venue_id: venue_id.clone(),
+            feed: feed.clone(),
+            interval: interval.clone(),
+            adjustment: MarketBarAdjustment::Raw,
+            currency,
+            time_semantics: vec![time_semantics.clone()],
+            completeness_evidence,
+            ingested_at: received_at,
+            published_at: publication_at,
+            revision: RevisionNumber::new(1).unwrap_or_else(|error| panic!("revision: {error}")),
+        }
+    };
+
+    assert_eq!(
+        canonicalize_price_history(request_for(
+            &changed_preference,
+            seal_history(registered_coordinates.clone()),
+            published_at,
+        )),
+        Err(SchwabCanonicalError::PublicationBinding)
+    );
+    assert_eq!(
+        canonicalize_price_history(request_for(
+            &preference,
+            seal_history(changed_coordinates),
+            published_at,
+        )),
+        Err(SchwabCanonicalError::PublicationBinding)
+    );
+    assert_eq!(
+        canonicalize_price_history(request_for(
+            &preference,
+            seal_history(changed_connection_coordinates),
+            published_at,
+        )),
+        Err(SchwabCanonicalError::PublicationBinding)
+    );
+    assert_eq!(
+        canonicalize_price_history(request_for(
+            &preference,
+            seal_history(registered_coordinates.clone()),
+            expired_publication_at,
+        )),
+        Err(SchwabCanonicalError::PublicationBinding)
+    );
+    let publication = canonicalize_price_history(request_for(
+        &preference,
+        seal_history(registered_coordinates.clone()),
+        published_at,
+    ))
+    .unwrap_or_else(|error| panic!("history publication: {error}"));
+    assert_eq!(publication.bars().len(), 1);
+    assert_ne!(publication.canonical_digest().bytes(), [0; 32]);
+    let lineage = publication.lineage();
+    assert_eq!(lineage.capability, capability);
+    assert_eq!(lineage.oauth_authority, oauth_receipt);
+    assert_eq!(lineage.capture_coordinates, registered_coordinates);
+    assert_eq!(
+        lineage.user_preference_receipt.route(),
+        ReadOnlyRoute::UserPreference
+    );
+    assert_ne!(lineage.user_preference_observation_sha256, [0; 32]);
+    assert_eq!(
+        lineage.instrument_revision_digest,
+        instrument_revision_digest
+    );
+    assert_eq!(lineage.admitted_plan_digest, admitted_plan_digest);
+    assert_eq!(lineage.provider_symbol.as_str(), "SPY");
+    assert_eq!(lineage.resolution_evidence.bytes(), [22; 32]);
+    assert_eq!(lineage.time_semantics.as_ref(), [time_semantics]);
+    assert_eq!(lineage.ingested_at, received_at);
 }
 
 #[tokio::test]
@@ -364,7 +726,7 @@ async fn bounded_mock_transport_captures_exact_market_data_without_token_materia
         rest_bounds,
     )
     .unwrap_or_else(|error| panic!("mock response: {error}"));
-    let rest_wire = Arc::new(MockHttpWire::new(response));
+    let rest_wire = Arc::new(MockHttpWire::new(response, ReadOnlyRoute::Quotes));
     let telemetry = SchwabTransportTelemetry::default();
     let token_admission = AccessTokenAdmission::new(nonzero(4 * 1024), Duration::from_secs(1));
     let rest = SchwabRestExecutor::try_new(
@@ -513,13 +875,15 @@ async fn bounded_mock_transport_captures_exact_market_data_without_token_materia
 #[derive(Debug)]
 struct MockHttpWire {
     response: SchwabHttpWireResponse,
+    expected_route: ReadOnlyRoute,
     calls: Mutex<u64>,
 }
 
 impl MockHttpWire {
-    fn new(response: SchwabHttpWireResponse) -> Self {
+    fn new(response: SchwabHttpWireResponse, expected_route: ReadOnlyRoute) -> Self {
         Self {
             response,
+            expected_route,
             calls: Mutex::new(0),
         }
     }
@@ -540,7 +904,7 @@ impl SchwabHttpWire for MockHttpWire {
         Box<dyn Future<Output = Result<SchwabHttpWireResponse, SchwabTransportError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            assert_eq!(request.request().route(), ReadOnlyRoute::Quotes);
+            assert_eq!(request.request().route(), self.expected_route);
             let mut calls = self
                 .calls
                 .lock()
@@ -548,6 +912,55 @@ impl SchwabHttpWire for MockHttpWire {
             *calls = calls.checked_add(1).ok_or(SchwabTransportError::Overflow)?;
             Ok(self.response.clone())
         })
+    }
+}
+
+async fn execute_fixture(
+    request: &crate::ReadOnlyRequest,
+    body: &'static [u8],
+    token: &TransientAccessToken,
+    token_admission: AccessTokenAdmission,
+) -> crate::ExecutedRestResponse {
+    let body = Bytes::from_static(body);
+    let rest_bounds = RestTransportBounds::try_new(
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        nonzero(64 * 1024),
+        nonzero(8),
+        nonzero(2 * 1024),
+    )
+    .unwrap_or_else(|error| panic!("REST bounds: {error}"));
+    let response = SchwabHttpWireResponse::try_new(
+        200,
+        request.url().to_owned(),
+        Some(u64::try_from(body.len()).unwrap_or_else(|error| panic!("body length: {error}"))),
+        vec![
+            ResponseHeaderEvidence::try_new(
+                "content-type".to_owned(),
+                b"application/json".to_vec(),
+            )
+            .unwrap_or_else(|error| panic!("header evidence: {error}")),
+        ],
+        body,
+        rest_bounds,
+    )
+    .unwrap_or_else(|error| panic!("mock response: {error}"));
+    let executor = SchwabRestExecutor::try_new(
+        Arc::new(MockHttpWire::new(response, request.route())),
+        rest_bounds,
+        bounds(),
+        token_admission,
+        SchwabTransportTelemetry::default(),
+    )
+    .unwrap_or_else(|error| panic!("REST executor: {error}"));
+    match executor
+        .execute(request, token, CancellationToken::new())
+        .await
+        .unwrap_or_else(|error| panic!("REST execution: {error}"))
+    {
+        RestExecutionOutcome::Accepted(response) => response,
+        other => panic!("unexpected REST outcome: {other:?}"),
     }
 }
 

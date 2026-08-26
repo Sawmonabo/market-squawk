@@ -8,18 +8,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use market_squawk_domain::{
-    BarTimeSemantics, BookLevel, Currency, EvidenceDigest, LiveProvenance, LotSize,
-    MarketBarAdjustment, MarketBarObservation, MarketEvent, Money, ProviderInstrumentId,
-    QuoteEvent, ResearchContext, SourceIdentifier, TickSize, Timestamp,
+    AvailabilityEvidence, BarTimeSemantics, BookLevel, Currency, DataQuality, DigestAlgorithm,
+    EvidenceDigest, InstrumentId, LiveProvenance, LotSize, MarketBarAdjustment,
+    MarketBarObservation, MarketEvent, Money, PayloadHash, PayloadReference, ProviderInstrumentId,
+    QuoteEvent, ResearchContext, ResearchProvenance, ResearchProvenanceInput, ResearchTime,
+    RevisionNumber, SourceIdentifier, TickSize, Timestamp, VenueId,
 };
 use rust_decimal::Decimal;
 use thiserror::Error;
 
 use crate::{
-    FundamentalField, HistoricalCandle, InstrumentResponse, MarketDataService, NativeField,
+    ExecutedRestResponse, FundamentalField, InstrumentResponse, MarketDataService, NativeField,
     NativeFieldEntry, NativeNumber, NativeScalar, OptionChain, OptionContract, OptionContractField,
-    OptionSide, ParsedNative, PriceHistoryResponse, ProviderIdentifier, QuoteComponentField,
-    SchwabInstrument, SchwabQuote, StreamerDataBatch, StreamerNativeValue,
+    OptionSide, ParsedNative, ProviderIdentifier, QuoteComponentField, SchwabInstrument,
+    SchwabPriceHistoryCapabilityObservation, SchwabQuote, SchwabSealedPriceHistoryCapture,
+    SchwabSealedPriceHistoryPublicationInput, StreamerDataBatch, StreamerNativeValue,
 };
 
 /// Exact Schwab symbol bound to a shared provider-instrument identity by external registry proof.
@@ -201,61 +204,147 @@ fn named_number<K: Eq>(
     }
 }
 
-/// Caller-supplied, identity-resolved context for exactly one historical candle.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SchwabHistoricalBarContext {
-    pub context: ResearchContext,
+/// Complete authority input for one exact daily price-history response and sealed capture.
+#[derive(Debug)]
+pub struct SchwabDailyPriceHistoryPublicationRequest<'a> {
+    pub capability: SchwabPriceHistoryCapabilityObservation,
+    pub oauth_authority: crate::SchwabOAuthAuthorityReceipt,
+    pub user_preference: &'a ExecutedRestResponse,
+    pub response: &'a ExecutedRestResponse,
+    pub sealed_capture: SchwabSealedPriceHistoryCapture,
+    pub capture_coordinates: crate::SchwabCaptureCoordinates,
+    pub instrument_id: InstrumentId,
+    pub instrument_revision_digest: EvidenceDigest,
+    pub admitted_plan_digest: EvidenceDigest,
     pub identity: SchwabResolvedProviderIdentity,
+    pub venue_id: VenueId,
     pub feed: SourceIdentifier,
     pub interval: SourceIdentifier,
-    pub time_semantics: BarTimeSemantics,
     pub adjustment: MarketBarAdjustment,
     pub currency: Currency,
+    /// Calendar-authority periods in the exact order expected from the provider response.
+    pub time_semantics: Vec<BarTimeSemantics>,
+    pub completeness_evidence: EvidenceDigest,
+    pub ingested_at: Timestamp,
+    pub published_at: Timestamp,
+    pub revision: RevisionNumber,
 }
 
-/// Maps a complete price-history response into validated point-in-time market bars.
+/// Maps and seals only the exact admitted response/capture/range/completeness combination.
 pub fn canonicalize_price_history(
-    response: &PriceHistoryResponse,
-    contexts: Vec<SchwabHistoricalBarContext>,
-) -> Result<Vec<MarketBarObservation>, SchwabCanonicalError> {
-    if contexts.len() != response.candles().len() {
-        return Err(SchwabCanonicalError::CardinalityMismatch);
-    }
-    response
-        .candles()
-        .iter()
-        .zip(contexts)
-        .map(|(candle, context)| canonicalize_candle(response, candle, context))
-        .collect()
-}
-
-fn canonicalize_candle(
-    response: &PriceHistoryResponse,
-    candle: &HistoricalCandle,
-    context: SchwabHistoricalBarContext,
-) -> Result<MarketBarObservation, SchwabCanonicalError> {
-    if context.identity.provider_symbol().as_str() != response.symbol.as_str()
-        || context.time_semantics.provider_timestamp().unix_nanos()
-            != millis_to_nanos(candle.datetime_millis)?
+    request: SchwabDailyPriceHistoryPublicationRequest<'_>,
+) -> Result<SchwabSealedPriceHistoryPublicationInput, SchwabCanonicalError> {
+    let (requested_start, requested_end) = crate::vertical::admitted_daily_range(request.response)
+        .map_err(|_| SchwabCanonicalError::PublicationBinding)?;
+    let crate::SchwabRestPayload::PriceHistory(parsed) = request.response.payload() else {
+        return Err(SchwabCanonicalError::PublicationBinding);
+    };
+    let history = parsed.value();
+    if request.identity.provider_symbol().as_str() != history.symbol.as_str()
+        || history.empty
+        || history.candles().is_empty()
+        || request.time_semantics.len() != history.candles().len()
     {
         return Err(SchwabCanonicalError::IdentityMismatch);
     }
-    MarketBarObservation::new(
-        context.context,
-        context.identity.provider_instrument_id,
-        context.feed,
-        context.interval,
-        context.time_semantics,
-        context.adjustment,
-        Money::new(parse_decimal(&candle.open)?, context.currency),
-        Money::new(parse_decimal(&candle.high)?, context.currency),
-        Money::new(parse_decimal(&candle.low)?, context.currency),
-        Money::new(parse_decimal(&candle.close)?, context.currency),
-        parse_decimal(&candle.volume)?,
-        None,
-        None,
+    let sealed = request.sealed_capture.receipt().capture();
+    let [page] = sealed.pages() else {
+        return Err(SchwabCanonicalError::PublicationBinding);
+    };
+    let received_at = page.received_at();
+    let source_id = sealed.source_id().clone();
+    let body_digest = page.body_digest().bytes();
+    let mut expected_provider_timestamps = Vec::with_capacity(request.time_semantics.len());
+    let mut bars = Vec::with_capacity(history.candles().len());
+    for (candle, time_semantics) in history.candles().iter().zip(&request.time_semantics) {
+        let provider_timestamp = millis_to_timestamp(candle.datetime_millis)?;
+        if time_semantics.provider_timestamp() != provider_timestamp
+            || provider_timestamp < requested_start
+            || provider_timestamp >= requested_end
+            || time_semantics.period_start() >= time_semantics.period_end_exclusive()
+            || received_at < time_semantics.period_end_exclusive()
+        {
+            return Err(SchwabCanonicalError::CompletenessMismatch);
+        }
+        expected_provider_timestamps.push(provider_timestamp);
+        let source_identifier = SourceIdentifier::try_from(format!(
+            "schwab-daily-history:{}:{}",
+            history.symbol.as_str(),
+            candle.datetime_millis
+        ))
+        .map_err(|_| SchwabCanonicalError::DomainInvariant)?;
+        let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
+            source_id: source_id.clone(),
+            instrument_id: Some(request.instrument_id),
+            venue_id: Some(request.venue_id.clone()),
+            source_identifier,
+            source_timestamp: Some(provider_timestamp),
+            received_at,
+            ingested_at: request.ingested_at,
+            quality: DataQuality::Aggregated,
+            payload_reference: PayloadReference::ContentHash(PayloadHash::new(
+                DigestAlgorithm::Sha256,
+                body_digest,
+            )),
+            availability: AvailabilityEvidence::local_first_observed(received_at),
+        })
+        .map_err(|_| SchwabCanonicalError::DomainInvariant)?;
+        let time = ResearchTime::new(provider_timestamp, None, request.revision, None)
+            .map_err(|_| SchwabCanonicalError::DomainInvariant)?;
+        let context = ResearchContext::new(provenance, time)
+            .map_err(|_| SchwabCanonicalError::DomainInvariant)?;
+        let bar = MarketBarObservation::new(
+            context,
+            request.identity.provider_instrument_id().clone(),
+            request.feed.clone(),
+            request.interval.clone(),
+            time_semantics.clone(),
+            request.adjustment,
+            Money::new(parse_decimal(&candle.open)?, request.currency),
+            Money::new(parse_decimal(&candle.high)?, request.currency),
+            Money::new(parse_decimal(&candle.low)?, request.currency),
+            Money::new(parse_decimal(&candle.close)?, request.currency),
+            parse_decimal(&candle.volume)?,
+            None,
+            None,
+        )
+        .map_err(|_| SchwabCanonicalError::DomainInvariant)?;
+        bars.push(bar);
+    }
+    if expected_provider_timestamps
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(SchwabCanonicalError::CompletenessMismatch);
+    }
+    SchwabSealedPriceHistoryPublicationInput::try_new(
+        request.capability,
+        request.oauth_authority,
+        request.user_preference,
+        request.response,
+        request.sealed_capture,
+        request.capture_coordinates,
+        requested_start,
+        requested_end,
+        request.instrument_id,
+        request.instrument_revision_digest,
+        request.admitted_plan_digest,
+        request.identity.provider_symbol().clone(),
+        request.identity.provider_instrument_id().clone(),
+        request.identity.resolution_evidence(),
+        request.venue_id,
+        request.feed,
+        request.interval,
+        request.adjustment,
+        request.currency,
+        request.completeness_evidence,
+        expected_provider_timestamps,
+        &request.time_semantics,
+        request.ingested_at,
+        request.published_at,
+        bars,
     )
-    .map_err(|_| SchwabCanonicalError::DomainInvariant)
+    .map_err(|_| SchwabCanonicalError::PublicationBinding)
 }
 
 /// Provider-null-aware canonical field used by option and reference candidates.
@@ -307,6 +396,8 @@ pub enum SchwabOptionCandidateOutcome {
 pub enum SchwabOptionCandidateAbstention {
     MissingContractSymbol,
     CrossedQuote,
+    MissingRequiredGreek(OptionContractField),
+    InvalidRequiredGreek(OptionContractField),
 }
 
 /// Produces provider-qualified option candidates while retaining explicit per-contract abstention.
@@ -339,6 +430,35 @@ fn option_candidate(
     };
     let contract_symbol = ProviderIdentifier::try_new(contract_symbol)
         .map_err(|_| SchwabCanonicalError::InvalidIdentity)?;
+    let implied_volatility = required_greek(contract, OptionContractField::Volatility);
+    let delta = required_greek(contract, OptionContractField::Delta);
+    let gamma = required_greek(contract, OptionContractField::Gamma);
+    let theta = required_greek(contract, OptionContractField::Theta);
+    let vega = required_greek(contract, OptionContractField::Vega);
+    let rho = required_greek(contract, OptionContractField::Rho);
+    let [implied_volatility, delta, gamma, theta, vega, rho] =
+        [implied_volatility, delta, gamma, theta, vega, rho].map(|value| match value {
+            Ok(value) => Ok(SchwabCanonicalField::Value(value)),
+            Err(reason) => Err(reason),
+        });
+    let (implied_volatility, delta, gamma, theta, vega, rho) =
+        match (implied_volatility, delta, gamma, theta, vega, rho) {
+            (Ok(volatility), Ok(delta), Ok(gamma), Ok(theta), Ok(vega), Ok(rho)) => {
+                (volatility, delta, gamma, theta, vega, rho)
+            }
+            values => {
+                let reason = [values.0, values.1, values.2, values.3, values.4, values.5]
+                    .into_iter()
+                    .find_map(Result::err)
+                    .ok_or(SchwabCanonicalError::DomainInvariant)?;
+                return Ok(SchwabOptionCandidateOutcome::Abstained {
+                    expiration_group: contract.expiration_group().into(),
+                    strike_group: contract.strike_group().into(),
+                    side: contract.side(),
+                    reason,
+                });
+            }
+        };
     let bid = option_number(contract, OptionContractField::Bid)?;
     let ask = option_number(contract, OptionContractField::Ask)?;
     if matches!((&bid, &ask), (SchwabCanonicalField::Value(bid), SchwabCanonicalField::Value(ask)) if bid > ask)
@@ -364,16 +484,33 @@ fn option_candidate(
             last: option_number(contract, OptionContractField::Last)?,
             mark: option_number(contract, OptionContractField::Mark)?,
             strike: option_number(contract, OptionContractField::StrikePrice)?,
-            implied_volatility: option_number(contract, OptionContractField::Volatility)?,
-            delta: option_number(contract, OptionContractField::Delta)?,
-            gamma: option_number(contract, OptionContractField::Gamma)?,
-            theta: option_number(contract, OptionContractField::Theta)?,
-            vega: option_number(contract, OptionContractField::Vega)?,
-            rho: option_number(contract, OptionContractField::Rho)?,
+            implied_volatility,
+            delta,
+            gamma,
+            theta,
+            vega,
+            rho,
             volume: option_number(contract, OptionContractField::TotalVolume)?,
             open_interest: option_number(contract, OptionContractField::OpenInterest)?,
         },
     )))
+}
+
+fn required_greek(
+    contract: &OptionContract,
+    name: OptionContractField,
+) -> Result<Decimal, SchwabOptionCandidateAbstention> {
+    match contract.fields().iter().find(|field| field.name() == &name) {
+        None => Err(SchwabOptionCandidateAbstention::MissingRequiredGreek(name)),
+        Some(field) => match field.value() {
+            NativeScalar::Null => Err(SchwabOptionCandidateAbstention::MissingRequiredGreek(name)),
+            NativeScalar::Number(value) => Decimal::from_str_exact(value.as_str())
+                .map_err(|_| SchwabOptionCandidateAbstention::InvalidRequiredGreek(name)),
+            NativeScalar::Bool(_) | NativeScalar::Text(_) => {
+                Err(SchwabOptionCandidateAbstention::InvalidRequiredGreek(name))
+            }
+        },
+    }
 }
 
 fn option_number(
@@ -772,6 +909,10 @@ pub enum SchwabCanonicalError {
     InvalidIdentity,
     #[error("Schwab canonical response/context cardinality differs")]
     CardinalityMismatch,
+    #[error("Schwab daily-history calendar completeness does not match the exact response")]
+    CompletenessMismatch,
+    #[error("Schwab daily-history response, capture, authority, records, or clocks differ")]
+    PublicationBinding,
     #[error("Schwab named field has an unexpected semantic scalar type")]
     SemanticTypeMismatch,
     #[error("Schwab exact decimal is invalid")]
