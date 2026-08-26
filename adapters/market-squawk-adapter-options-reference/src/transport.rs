@@ -2182,6 +2182,15 @@ pub struct PendingUninterpretedMemoHandoff {
     control: ReferenceFetchControl,
 }
 
+impl std::fmt::Debug for PendingUninterpretedMemoHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingUninterpretedMemoHandoff")
+            .field("object_id", self.context.object_id())
+            .finish_non_exhaustive()
+    }
+}
+
 impl PendingUninterpretedMemoHandoff {
     /// Consumes the validated envelope into raw evidence without interpreting document economics.
     ///
@@ -2219,6 +2228,15 @@ pub struct ReferenceUninterpretedMemoHandoff {
     raw_receipt: ResearchObjectReceipt,
     context: ReferenceObjectContext,
     http_receipt: ReferenceHttpReceipt,
+}
+
+impl std::fmt::Debug for ReferenceUninterpretedMemoHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReferenceUninterpretedMemoHandoff")
+            .field("object_id", self.context.object_id())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReferenceUninterpretedMemoHandoff {
