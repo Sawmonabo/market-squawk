@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::error::Error;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,16 +11,17 @@ use bytes::Bytes;
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-    RevisionBoundPayloadEvidence, RevisionNumber, SchemaVersion, SequenceCapability, SourceId,
-    SourceIdentifier, Timestamp,
+    ResearchObservation, RevisionBoundPayloadEvidence, RevisionNumber, SchemaVersion,
+    SequenceCapability, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::LocalPaths;
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
-    CoverageDomain, EndpointPolicy, FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy,
-    ProviderCaptureTerminalDisposition, SourceCapabilities, SourceClass, SourceCoverage,
-    SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    CoverageDomain, DiscoveryRequest, EndpointPolicy, ExtractionContentIdentity, ExtractionRequest,
+    FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy, ProviderCaptureTerminalDisposition,
+    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
+    SourceObject, SourceObjectCaptureIdentity, SourceProtocolProfile,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -647,6 +648,122 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
     publication_candidate
         .rejoin()
         .validate(provider.source_metadata())?;
+
+    let expected_observations = publication_candidate
+        .research_observations()
+        .collect::<Vec<_>>();
+    let source_object_id = publication_candidate.rejoin().source_object_id()?;
+    let discovery_request = DiscoveryRequest::try_new(
+        publication_candidate.rejoin().provider_dataset().clone(),
+        None,
+        NonZeroU16::new(1).ok_or("nonzero discovery bound")?,
+        deadline,
+    )?;
+    let source_object = SourceObject::try_new_with_availability(
+        publication_candidate
+            .rejoin()
+            .source_metadata()
+            .source_id()
+            .clone(),
+        publication_candidate
+            .rejoin()
+            .source_metadata()
+            .revision()
+            .clone(),
+        &discovery_request,
+        source_object_id,
+        SourceIdentifier::try_from("application/json")?,
+        ExactPayloadEvidence::from_content_digest(
+            publication_candidate.rejoin().capture_content_digest(),
+        ),
+        EffectiveInterval::new(
+            publication_candidate
+                .rejoin()
+                .acquisition_receipt()
+                .first_received_at(),
+            None,
+        )?,
+        None,
+        market_squawk_sources::AvailabilityEvidence::LocalFirstObserved {
+            observed_at: publication_candidate
+                .rejoin()
+                .acquisition_receipt()
+                .last_received_at(),
+        },
+        Some(
+            publication_candidate
+                .rejoin()
+                .sealed_capture()
+                .capture()
+                .total_body_bytes(),
+        ),
+    )?;
+    assert_eq!(
+        source_object.capture_identity(),
+        SourceObjectCaptureIdentity::Standalone
+    );
+    let extraction_request = ExtractionRequest::try_new(
+        source_object,
+        NonZeroU32::new(4).ok_or("nonzero record bound")?,
+        NonZeroU64::new(64 * 1024 * 1024).ok_or("nonzero byte bound")?,
+        publication_candidate.rejoin().normalization_admitted_at(),
+    )?;
+    let shared = publication_candidate.try_into_shared_publication(extraction_request)?;
+    assert_eq!(shared.batch().records().len(), 3);
+    assert_eq!(shared.observations().len(), shared.batch().records().len());
+    assert_eq!(shared.series().len(), 1);
+    assert_eq!(shared.revision_plan().len(), shared.batch().records().len());
+    assert!(shared.revision_plan().is_locally_observed());
+    assert_eq!(
+        shared.batch().request().object().capture_identity(),
+        SourceObjectCaptureIdentity::try_from_capture(shared.rejoin().sealed_capture().capture())?
+    );
+    assert_eq!(
+        shared.batch().request().object().expected_bytes(),
+        Some(
+            shared
+                .rejoin()
+                .sealed_capture()
+                .capture()
+                .total_body_bytes()
+        )
+    );
+    let extraction_content_identity = ExtractionContentIdentity::try_from_batch(shared.batch())?;
+    assert_eq!(
+        shared.extraction_content_identity(),
+        extraction_content_identity
+    );
+    assert_eq!(extraction_content_identity.record_count(), 3);
+    assert_eq!(
+        shared.rejoin().sealed_capture().receipt_digest(),
+        sealed_capture_receipt_digest
+    );
+    let (batch, content_identity, rejoin, observations, series, revision_plan) =
+        shared.into_parts();
+    assert_eq!(batch.request().max_records(), 4);
+    assert_eq!(content_identity, extraction_content_identity);
+    assert_eq!(
+        rejoin.sealed_capture().receipt_digest(),
+        sealed_capture_receipt_digest
+    );
+    assert_eq!(observations.len(), batch.records().len());
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0].native(), observations[0].native_series());
+    assert_eq!(
+        series[0].canonical_series(),
+        observations[0].observation().series()
+    );
+    assert_eq!(revision_plan.len(), batch.records().len());
+    assert!(revision_plan.is_locally_observed());
+    let decoded = batch
+        .records()
+        .iter()
+        .map(|record| serde_json::from_slice(record.payload()))
+        .collect::<Result<Vec<ResearchObservation>, _>>()?;
+    assert_eq!(decoded, expected_observations);
+    let revision_batch = revision_plan
+        .into_observed_batch(rejoin.source_metadata().source_id().clone(), &decoded)?;
+    assert_eq!(revision_batch.input_len(), 3);
 
     let safe_urls = transport
         .safe_urls

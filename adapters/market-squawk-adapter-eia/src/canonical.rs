@@ -5,16 +5,20 @@ use std::mem::size_of;
 use std::num::NonZeroU16;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use market_squawk_domain::{
-    AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, MacroMissingValue,
-    MacroObservation, PayloadHash, PayloadReference, ResearchContext, ResearchObservation,
-    ResearchPeriod, ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate,
-    ResearchTime, RevisionNumber, SchemaVersion, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
+    MacroMissingValue, MacroObservation, PayloadHash, PayloadReference, ResearchContext,
+    ResearchObservation, ResearchPeriod, ResearchProvenance, ResearchProvenanceInput,
+    ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SchemaVersion, SourceIdentifier,
+    Timestamp,
 };
 use market_squawk_sources::{
-    CanonicalObservationFamily, CanonicalObservationPayload, ExtractionRevisionEvidence,
-    ExtractionRevisionPlan, MAX_OBSERVED_REVISION_BATCH_BYTES, ObservedRevisionRecord,
-    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt, SourceMetadata,
+    CURRENT_RESEARCH_RECORD_SCHEMA, CanonicalObservationFamily, CanonicalObservationPayload,
+    ExtractionBatch, ExtractionContentIdentity, ExtractionRecord, ExtractionRequest,
+    ExtractionRevisionEvidence, ExtractionRevisionPlan, MAX_OBSERVED_REVISION_BATCH_BYTES,
+    ObservedRevisionRecord, ObservedSemanticPayload, ProviderCaptureTerminalDisposition,
+    SealedProviderCaptureSetReceipt, SourceMetadata, SourceObjectCaptureIdentity,
 };
 
 use crate::types::{digest_bytes, digest_parts};
@@ -97,6 +101,32 @@ struct EiaRootPageRejoinDigestInput<'a> {
 }
 
 impl EiaPublicationRejoin {
+    /// Returns the stable provider-content object identity, excluding local physical rejoin facts.
+    pub fn source_object_id(&self) -> Result<SourceIdentifier, EiaError> {
+        if self.capture_content_digest.algorithm() != DigestAlgorithm::Sha256 {
+            return Err(EiaError::CaptureBinding);
+        }
+        let query_digest = self.query_digest.bytes();
+        let contract_schema_digest = self.contract_schema_digest.bytes();
+        let capture_content_digest = self.capture_content_digest.bytes();
+        let object_digest = digest_parts(
+            b"market-squawk/eia-source-object/v1",
+            [
+                self.source_metadata.source_id().as_str().as_bytes(),
+                self.source_metadata
+                    .revision()
+                    .as_source_identifier()
+                    .as_str()
+                    .as_bytes(),
+                self.provider_dataset.as_str().as_bytes(),
+                query_digest.as_slice(),
+                contract_schema_digest.as_slice(),
+                capture_content_digest.as_slice(),
+            ],
+        );
+        source_identifier_from_digest("eia-object", object_digest)
+    }
+
     /// Returns the exact source metadata generation root must compare to its current registry.
     pub fn source_metadata(&self) -> &SourceMetadata {
         self.source_metadata.as_ref()
@@ -594,6 +624,70 @@ pub struct EiaPublicationCandidate {
     revision_plan: ExtractionRevisionPlan,
 }
 
+/// Owned, capture-bound inputs for the shared extraction and publication spine.
+#[derive(Debug)]
+pub struct EiaSharedPublicationParts {
+    batch: ExtractionBatch,
+    extraction_content_identity: ExtractionContentIdentity,
+    rejoin: EiaPublicationRejoin,
+    observations: Box<[EiaCanonicalObservation]>,
+    series: Box<[EiaPublishedSeries]>,
+    revision_plan: ExtractionRevisionPlan,
+}
+
+impl EiaSharedPublicationParts {
+    /// Returns the standard source-neutral canonical extraction batch.
+    pub const fn batch(&self) -> &ExtractionBatch {
+        &self.batch
+    }
+
+    /// Returns the standard semantic identity recomputed from the capture-bound batch.
+    pub const fn extraction_content_identity(&self) -> ExtractionContentIdentity {
+        self.extraction_content_identity
+    }
+
+    /// Returns the actual sealed-capture rejoin retained beside the batch.
+    pub const fn rejoin(&self) -> &EiaPublicationRejoin {
+        &self.rejoin
+    }
+
+    /// Returns provider-native row lineage aligned one-for-one with the canonical batch.
+    pub fn observations(&self) -> &[EiaCanonicalObservation] {
+        &self.observations
+    }
+
+    /// Returns the lossless provider route and dimension dictionary.
+    pub fn series(&self) -> &[EiaPublishedSeries] {
+        &self.series
+    }
+
+    /// Returns the local-content revision evidence aligned with the canonical batch.
+    pub const fn revision_plan(&self) -> &ExtractionRevisionPlan {
+        &self.revision_plan
+    }
+
+    /// Consumes the handoff into the exact owned inputs required by root publication.
+    pub fn into_parts(
+        self,
+    ) -> (
+        ExtractionBatch,
+        ExtractionContentIdentity,
+        EiaPublicationRejoin,
+        Box<[EiaCanonicalObservation]>,
+        Box<[EiaPublishedSeries]>,
+        ExtractionRevisionPlan,
+    ) {
+        (
+            self.batch,
+            self.extraction_content_identity,
+            self.rejoin,
+            self.observations,
+            self.series,
+            self.revision_plan,
+        )
+    }
+}
+
 impl EiaPublicationCandidate {
     /// Normalizes one complete acquisition only after its exact response chain is physically sealed.
     pub(crate) fn try_new(
@@ -775,21 +869,155 @@ impl EiaPublicationCandidate {
             .map(|observation| ResearchObservation::Macro(observation.observation.clone()))
     }
 
-    /// Consumes the one-shot adapter handoff without minting any publication authority.
-    pub fn into_parts(
+    /// Consumes this one-shot candidate into the shared capture-bound extraction handoff.
+    pub fn try_into_shared_publication(
         self,
-    ) -> (
-        EiaPublicationRejoin,
-        Box<[EiaCanonicalObservation]>,
-        Box<[EiaPublishedSeries]>,
-        ExtractionRevisionPlan,
-    ) {
-        (
-            self.rejoin,
-            self.observations,
-            self.series,
-            self.revision_plan,
-        )
+        request: ExtractionRequest,
+    ) -> Result<EiaSharedPublicationParts, EiaError> {
+        self.validate_shared_request(&request)?;
+        self.validate_canonical_alignment()?;
+        let schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
+            .map_err(|_| EiaError::Canonicalization)?;
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(self.observations.len())
+            .map_err(|_| EiaError::AllocationFailure)?;
+        for observation in &self.observations {
+            let context = observation.observation.context();
+            let page = self
+                .rejoin
+                .sealed_capture
+                .capture()
+                .pages()
+                .iter()
+                .find(|page| page.body_digest().bytes() == observation.raw_page_digest.bytes())
+                .ok_or(EiaError::CaptureBinding)?;
+            if page.received_at() != observation.native_clocks.received_at()
+                || context.provenance().received_at() != observation.native_clocks.received_at()
+                || context.provenance().ingested_at() != self.rejoin.normalization_admitted_at
+                || context.time().published()
+                    != observation
+                        .native_clocks
+                        .released_at()
+                        .map(ResearchTemporalCoordinate::exact)
+                        .as_ref()
+            {
+                return Err(EiaError::CaptureBinding);
+            }
+            let research = ResearchObservation::Macro(observation.observation.clone());
+            let canonical_payload = CanonicalObservationPayload::try_from_observation(&research)
+                .map_err(|_| EiaError::Canonicalization)?;
+            let observed_payload =
+                ObservedSemanticPayload::try_from_bytes(canonical_payload.exact_bytes())
+                    .map_err(|_| EiaError::Canonicalization)?;
+            let revision =
+                source_identifier_from_evidence("eia-local-content", observed_payload.identity())?;
+            let payload = serde_json::to_vec(&research).map_err(|_| EiaError::Canonicalization)?;
+            let evidence = ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                digest_bytes(&payload).bytes(),
+            ));
+            records.push(
+                ExtractionRecord::try_new_with_time(
+                    &request,
+                    schema.clone(),
+                    evidence,
+                    context.time().effective().clone(),
+                    context.time().published().cloned(),
+                    market_squawk_sources::AvailabilityEvidence::LocalFirstObserved {
+                        observed_at: observation.native_clocks.received_at(),
+                    },
+                    revision,
+                    context.time().superseded().cloned(),
+                    Bytes::from(payload),
+                )
+                .map_err(|_| EiaError::Canonicalization)?,
+            );
+        }
+        let batch = ExtractionBatch::try_new(&request, records)
+            .and_then(|batch| batch.try_bind_provider_capture(self.rejoin.sealed_capture.capture()))
+            .map_err(|_| EiaError::CaptureBinding)?;
+        if batch.records().len() != self.observations.len()
+            || batch.request().object().capture_identity()
+                != SourceObjectCaptureIdentity::try_from_capture(
+                    self.rejoin.sealed_capture.capture(),
+                )
+                .map_err(|_| EiaError::CaptureBinding)?
+        {
+            return Err(EiaError::CaptureBinding);
+        }
+        let extraction_content_identity = ExtractionContentIdentity::try_from_batch(&batch)
+            .map_err(|_| EiaError::CaptureBinding)?;
+        Ok(EiaSharedPublicationParts {
+            batch,
+            extraction_content_identity,
+            rejoin: self.rejoin,
+            observations: self.observations,
+            series: self.series,
+            revision_plan: self.revision_plan,
+        })
+    }
+
+    fn validate_shared_request(&self, request: &ExtractionRequest) -> Result<(), EiaError> {
+        self.rejoin.validate(self.rejoin.source_metadata())?;
+        let object = request.object();
+        let receipt = self.rejoin.acquisition_receipt();
+        let capture = self.rejoin.sealed_capture.capture();
+        let effective =
+            market_squawk_domain::EffectiveInterval::new(receipt.first_received_at(), None)
+                .map_err(|_| EiaError::CaptureBinding)?;
+        let availability = market_squawk_sources::AvailabilityEvidence::LocalFirstObserved {
+            observed_at: receipt.last_received_at(),
+        };
+        if object.source_id() != self.rejoin.source_metadata.source_id()
+            || object.metadata_revision() != self.rejoin.source_metadata.revision()
+            || object.dataset() != &self.rejoin.provider_dataset
+            || object.object_id() != &self.rejoin.source_object_id()?
+            || object.media_type().as_str() != "application/json"
+            || object.evidence()
+                != &ExactPayloadEvidence::from_content_digest(self.rejoin.capture_content_digest)
+            || object.capture_identity() != SourceObjectCaptureIdentity::Standalone
+            || object.effective_interval() != effective
+            || object.published_at().is_some()
+            || object.availability() != &availability
+            || object.expected_bytes() != Some(capture.total_body_bytes())
+            || request.max_records() < self.rejoin.canonical_record_count
+        {
+            return Err(EiaError::CaptureBinding);
+        }
+        Ok(())
+    }
+
+    fn validate_canonical_alignment(&self) -> Result<(), EiaError> {
+        if self.observations.is_empty()
+            || self.observations.len()
+                != usize::try_from(self.rejoin.canonical_record_count)
+                    .map_err(|_| EiaError::CaptureBinding)?
+            || self.revision_plan.len() != self.observations.len()
+            || !self.revision_plan.is_locally_observed()
+            || self.series.is_empty()
+            || self.series.len() > self.observations.len()
+        {
+            return Err(EiaError::Canonicalization);
+        }
+        let mut expected = BTreeMap::new();
+        for observation in &self.observations {
+            expected.insert(
+                observation.native_series.digest(),
+                EiaPublishedSeries {
+                    canonical_series: source_identifier_from_digest(
+                        "eia-series",
+                        observation.native_series.digest(),
+                    )?,
+                    native: Arc::clone(&observation.native_series),
+                },
+            );
+        }
+        if expected.into_values().eq(self.series.iter().cloned()) {
+            Ok(())
+        } else {
+            Err(EiaError::Canonicalization)
+        }
     }
 }
 
@@ -990,6 +1218,17 @@ fn source_identifier_from_digest(
     prefix: &str,
     digest: EiaDigest,
 ) -> Result<SourceIdentifier, EiaError> {
+    SourceIdentifier::try_from(format!("{prefix}:{}", lower_hex(digest.bytes())))
+        .map_err(|_| EiaError::Canonicalization)
+}
+
+fn source_identifier_from_evidence(
+    prefix: &str,
+    digest: EvidenceDigest,
+) -> Result<SourceIdentifier, EiaError> {
+    if digest.algorithm() != DigestAlgorithm::Sha256 {
+        return Err(EiaError::Canonicalization);
+    }
     SourceIdentifier::try_from(format!("{prefix}:{}", lower_hex(digest.bytes())))
         .map_err(|_| EiaError::Canonicalization)
 }

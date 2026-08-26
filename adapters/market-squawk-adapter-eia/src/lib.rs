@@ -18,6 +18,7 @@ mod wire;
 
 pub use canonical::{
     EiaCanonicalObservation, EiaPublicationCandidate, EiaPublicationRejoin, EiaPublishedSeries,
+    EiaSharedPublicationParts,
 };
 pub use capacity::{
     EIA_APPLICATION_MAX_CONCURRENT_REQUESTS, EIA_APPLICATION_MIN_REQUEST_INTERVAL,
