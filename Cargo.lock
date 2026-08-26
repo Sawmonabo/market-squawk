@@ -4725,26 +4725,20 @@ name = "market-squawk-adapter-options-reference"
 version = "1.0.0"
 dependencies = [
  "bytes",
- "cap-fs-ext",
- "cap-std",
  "csv",
- "fs2",
  "futures-util",
  "httpdate",
- "libc",
  "market-squawk-domain",
+ "market-squawk-platform",
  "market-squawk-sources",
  "quick-xml",
  "reqwest",
- "rusqlite",
- "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "uuid",
 ]
 
 [[package]]
