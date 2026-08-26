@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use market_squawk_adapter_bls::{
     BlsAccessTier, BlsAuthorization, BlsParseError, BlsRegistrationKey, BlsRequestPlan,
-    BlsResponse, BlsSeriesMetadata, BlsSource, BlsSourceConfig, BlsSourceError, BlsUsageOperation,
-    BlsUsagePolicy, BlsVintageCapability,
+    BlsResponse, BlsSeriesMetadata, BlsSource, BlsSourceConfig, BlsSourceError,
+    BlsVintageCapability,
 };
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, SourceIdentifier,
@@ -25,10 +25,6 @@ fn metadata(series_id: &str, unit: &str) -> Result<BlsSeriesMetadata, BlsSourceE
         SourceIdentifier::try_from("user-approved:test-metadata")
             .map_err(|_| BlsSourceError::InvalidSeriesMetadata)?,
     )
-}
-
-fn usage_policy() -> Result<BlsUsagePolicy, BlsSourceError> {
-    BlsUsagePolicy::try_owner_authorized(EvidenceDigest::new(DigestAlgorithm::Sha256, [42; 32]))
 }
 
 #[test]
@@ -203,37 +199,23 @@ fn registered_key_is_validated_and_debug_redacted() -> TestResult {
 
 #[test]
 fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
-    let usage_policy = usage_policy()?;
-    assert!(usage_policy.admits(BlsUsageOperation::ModelTraining));
-    assert!(usage_policy.admits(BlsUsageOperation::Backtest));
-    assert!(!usage_policy.admits(BlsUsageOperation::Export));
-    assert!(!usage_policy.admits(BlsUsageOperation::Sale));
-    assert!(!usage_policy.admits(BlsUsageOperation::Redistribute));
-    assert!(
-        BlsUsagePolicy::try_owner_authorized(
-            EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32],)
-        )
-        .is_err()
-    );
     let public = BlsSourceConfig::try_new(
-        BlsAuthorization::PublicV1,
-        usage_policy,
+        BlsAuthorization::public_v1(),
         vec![metadata("LNS14000000", "percent")?],
         2020,
         2026,
     )?;
     let other_series = BlsSourceConfig::try_new(
-        BlsAuthorization::PublicV1,
-        usage_policy,
+        BlsAuthorization::public_v1(),
         vec![metadata("CUUR0000SA0", "index")?],
         2020,
         2026,
     )?;
     let registered = BlsSourceConfig::try_new(
-        BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
-            "fake-fake-fake-fake-fake-fake-fake-fake".to_owned(),
-        )?),
-        usage_policy,
+        BlsAuthorization::registered_v2(
+            BlsRegistrationKey::try_new("fake-fake-fake-fake-fake-fake-fake-fake".to_owned())?,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [43; 32]),
+        )?,
         vec![metadata("LNS14000000", "percent")?],
         2020,
         2026,
@@ -253,14 +235,8 @@ fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
         .map(|index| metadata(&format!("SERIES{index:04}"), "count"))
         .collect::<Result<Vec<_>, _>>()?;
     assert!(
-        BlsSourceConfig::try_new(
-            BlsAuthorization::PublicV1,
-            usage_policy,
-            over_daily_plan,
-            2026,
-            2026,
-        )
-        .is_err()
+        BlsSourceConfig::try_new(BlsAuthorization::public_v1(), over_daily_plan, 2026, 2026,)
+            .is_err()
     );
     Ok(())
 }

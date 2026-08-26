@@ -2,10 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::mem::size_of;
-use std::sync::Arc;
 
 use bytes::Bytes;
-use market_squawk_domain::{SourceIdentifier, Timestamp};
+use market_squawk_domain::{EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_sources::{MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceError};
 
 use super::normalize::CanonicalBlsRecord;
@@ -13,16 +12,21 @@ use crate::client::RetrievedBlsPage;
 
 const CACHE_ENTRY_OVERHEAD_BYTES: usize = 512;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct PageCache {
     pub(super) retained_bytes: u64,
     pub(super) pages: BTreeMap<String, CachedBlsPage>,
+    payloads: BTreeMap<String, Bytes>,
     limit: u64,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct CachedBlsPage {
-    pub(super) bytes: Arc<[u8]>,
+    pub(super) object_id: SourceIdentifier,
+    pub(super) request_identity: EvidenceDigest,
+    pub(super) observation_digest: EvidenceDigest,
+    pub(super) source_generation: EvidenceDigest,
+    pub(super) bytes: Bytes,
     pub(super) received_at: Timestamp,
     pub(super) sha256_hex: String,
 }
@@ -37,18 +41,38 @@ impl PageCache {
             limit,
             retained_bytes: 0,
             pages: BTreeMap::new(),
+            payloads: BTreeMap::new(),
         }
     }
 
     pub(super) fn insert(
         &mut self,
+        cache_key: &str,
         object_id: &SourceIdentifier,
+        request_identity: EvidenceDigest,
+        observation_digest: EvidenceDigest,
+        source_generation: EvidenceDigest,
         page: &RetrievedBlsPage,
     ) -> Result<bool, SourceError> {
-        if self.pages.contains_key(object_id.as_str()) {
-            return Ok(true);
+        if let Some(existing) = self.pages.get(cache_key) {
+            return if existing.object_id == *object_id
+                && existing.request_identity == request_identity
+                && existing.observation_digest == observation_digest
+                && existing.source_generation == source_generation
+                && existing.received_at == page.received_at
+                && existing.sha256_hex == page.sha256_hex
+                && existing.bytes == page.bytes
+            {
+                Ok(true)
+            } else {
+                Err(SourceError::InvalidProtocolState)
+            };
         }
-        let bytes = Self::retained_charge(object_id, page)?;
+        let existing_payload = self.payloads.get(&page.sha256_hex);
+        if existing_payload.is_some_and(|payload| payload.as_ref() != page.bytes.as_ref()) {
+            return Err(SourceError::InvalidProtocolState);
+        }
+        let bytes = Self::retained_charge(cache_key, object_id, page, existing_payload.is_none())?;
         let next = self
             .retained_bytes
             .checked_add(bytes)
@@ -58,11 +82,21 @@ impl PageCache {
         if next > self.limit {
             return Ok(false);
         }
+        let payload = existing_payload
+            .cloned()
+            .unwrap_or_else(|| page.bytes.clone());
         self.retained_bytes = next;
+        self.payloads
+            .entry(page.sha256_hex.clone())
+            .or_insert_with(|| payload.clone());
         self.pages.insert(
-            object_id.as_str().to_owned(),
+            cache_key.to_owned(),
             CachedBlsPage {
-                bytes: Arc::from(page.bytes.as_ref()),
+                object_id: object_id.clone(),
+                request_identity,
+                observation_digest,
+                source_generation,
+                bytes: payload,
                 received_at: page.received_at,
                 sha256_hex: page.sha256_hex.clone(),
             },
@@ -71,16 +105,34 @@ impl PageCache {
     }
 
     pub(super) fn retained_charge(
+        cache_key: &str,
         object_id: &SourceIdentifier,
         page: &RetrievedBlsPage,
+        new_payload: bool,
     ) -> Result<u64, SourceError> {
-        let charge = page
-            .bytes
+        let occurrence = cache_key
             .len()
-            .checked_add(object_id.as_str().len())
+            .checked_add(object_id.retained_bytes())
             .and_then(|bytes| bytes.checked_add(page.sha256_hex.len()))
             .and_then(|bytes| bytes.checked_add(size_of::<CachedBlsPage>()))
             .and_then(|bytes| bytes.checked_add(CACHE_ENTRY_OVERHEAD_BYTES))
+            .ok_or(SourceError::FrameTooLarge {
+                max: MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
+            })?;
+        let payload = if new_payload {
+            page.bytes
+                .len()
+                .checked_add(page.sha256_hex.len())
+                .and_then(|bytes| bytes.checked_add(size_of::<Bytes>()))
+                .and_then(|bytes| bytes.checked_add(CACHE_ENTRY_OVERHEAD_BYTES))
+                .ok_or(SourceError::FrameTooLarge {
+                    max: MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
+                })?
+        } else {
+            0
+        };
+        let charge = occurrence
+            .checked_add(payload)
             .ok_or(SourceError::FrameTooLarge {
                 max: MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
             })?;
@@ -142,7 +194,6 @@ impl BlsNormalizedPage {
     pub fn payloads(&self) -> &[Bytes] {
         &self.payloads
     }
-
 }
 
 /// Stable local health state for the bounded BLS research producer.

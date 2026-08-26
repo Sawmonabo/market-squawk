@@ -6,8 +6,8 @@ use futures_util::future::BoxFuture;
 use futures_util::{Stream, StreamExt};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
 use market_squawk_sources::{
-    ExtractionAuthority, ExtractionAuthorityError, ExtractionRequestPermit,
-    ExtractionSourceError, NetworkAccessPolicy, SourceError, SourceMetadata,
+    ExtractionAuthority, ExtractionAuthorityError, ExtractionRequestPermit, ExtractionSourceError,
+    NetworkAccessPolicy, SourceError, SourceMetadata,
 };
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER, USER_AGENT,
@@ -71,8 +71,7 @@ impl BlsCredentialRejoin {
         match self {
             Self::PublicNoCredential => Ok(()),
             Self::RegisteredGeneration(digest)
-                if digest.algorithm() == DigestAlgorithm::Sha256
-                    && digest.bytes() != [0; 32] =>
+                if digest.algorithm() == DigestAlgorithm::Sha256 && digest.bytes() != [0; 32] =>
             {
                 Ok(())
             }
@@ -135,7 +134,9 @@ impl BlsAuthorization {
     }
 
     fn registration_key(&self) -> Option<&str> {
-        self.registration_key.as_ref().map(BlsRegistrationKey::expose)
+        self.registration_key
+            .as_ref()
+            .map(BlsRegistrationKey::expose)
     }
 
     fn validate(&self) -> Result<(), BlsSourceError> {
@@ -175,9 +176,6 @@ pub enum BlsSourceError {
     /// Series, year, or deterministic request-plan configuration is invalid.
     #[error("invalid BLS source configuration")]
     InvalidConfiguration,
-    /// The required owner-authorized private-research policy is absent or uses placeholder evidence.
-    #[error("invalid BLS private-research usage policy")]
-    InvalidUsagePolicy,
     /// Raw capture or canonical handoff evidence is not publication-safe.
     #[error("invalid BLS publication evidence")]
     InvalidPublication,
@@ -333,13 +331,9 @@ impl BlsHttpClient {
             serde_json::to_vec(&request).map_err(|_| SourceError::InvalidProtocolState)?,
         );
         let request_body = Bytes::from_owner(request_body);
-        let permit = acquire_request_permit(
-            authority,
-            self.endpoint,
-            deadline,
-            cancellation.clone(),
-        )
-        .await?;
+        let permit =
+            acquire_request_permit(authority, self.endpoint, deadline, cancellation.clone())
+                .await?;
         let now = system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
         let timeout = remaining_timeout(deadline, now, self.total_timeout)?;
         let in_flight = permit.authorize_send(self.endpoint)?;
@@ -599,7 +593,6 @@ fn map_source_error(error: BlsSourceError, max_response_bytes: usize) -> SourceE
         BlsSourceError::Network => SourceError::Network,
         BlsSourceError::InvalidRegistrationKey
         | BlsSourceError::InvalidConfiguration
-        | BlsSourceError::InvalidUsagePolicy
         | BlsSourceError::InvalidPublication
         | BlsSourceError::InvalidSeriesMetadata
         | BlsSourceError::Protocol

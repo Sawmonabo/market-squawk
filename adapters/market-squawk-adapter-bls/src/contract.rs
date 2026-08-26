@@ -7,16 +7,16 @@ use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    BackoffPolicy, BudgetScope, BudgetWindowSemantics, NetworkAccessPolicy,
-    ProviderBudgetPolicy, ProviderBudgetWindow, ProviderRateDeclaration, SourceMetadata,
-    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
+    BackoffPolicy, BudgetScope, BudgetWindowSemantics, NetworkAccessPolicy, ProviderBudgetPolicy,
+    ProviderBudgetWindow, ProviderCaptureTerminalDisposition, ProviderRateDeclaration,
+    SealedProviderCaptureSetReceipt, SourceMetadata,
 };
 use sha2::{Digest as _, Sha256};
 
 use crate::chunks::limits_for;
 use crate::{
-    BlsAccessTier, BlsCredentialRejoin, BlsDoctorReadiness, BlsDoctorReport,
-    BlsRequestLimits, BlsRootRightsRejoin, BlsSourceError, BlsUsagePolicy,
+    BlsAccessTier, BlsCredentialRejoin, BlsDoctorReadiness, BlsDoctorReport, BlsRequestLimits,
+    BlsSourceError,
 };
 
 const SECOND_NANOS: u64 = 1_000_000_000;
@@ -54,8 +54,8 @@ pub fn bls_application_provider_budget(
     tier: BlsAccessTier,
 ) -> Result<ProviderBudgetPolicy, BlsSourceError> {
     let limits = limits_for(tier);
-    let provider = SourceIdentifier::try_from("us-bls")
-        .map_err(|_| BlsSourceError::InvalidConfiguration)?;
+    let provider =
+        SourceIdentifier::try_from("us-bls").map_err(|_| BlsSourceError::InvalidConfiguration)?;
     let scope = match tier {
         BlsAccessTier::PublicV1 => BudgetScope::new(provider),
         BlsAccessTier::RegisteredV2 => {
@@ -86,8 +86,7 @@ pub fn bls_application_provider_budget(
         NonZeroU16::new(1).ok_or(BlsSourceError::InvalidConfiguration)?,
         BackoffPolicy::try_new(
             NonZeroU64::new(SECOND_NANOS).ok_or(BlsSourceError::InvalidConfiguration)?,
-            NonZeroU64::new(MAXIMUM_BACKOFF_NANOS)
-                .ok_or(BlsSourceError::InvalidConfiguration)?,
+            NonZeroU64::new(MAXIMUM_BACKOFF_NANOS).ok_or(BlsSourceError::InvalidConfiguration)?,
             0,
         )
         .map_err(|_| BlsSourceError::InvalidConfiguration)?,
@@ -125,17 +124,16 @@ impl BlsProviderRateDeclaration {
         let policy = metadata
             .budget_policy()
             .ok_or(BlsSourceError::InvalidMetadata)?;
-        let expected_policy = bls_application_provider_budget(tier)
-            .map_err(|_| BlsSourceError::InvalidMetadata)?;
-        let provider = SourceIdentifier::try_from("us-bls")
-            .map_err(|_| BlsSourceError::InvalidMetadata)?;
+        let expected_policy =
+            bls_application_provider_budget(tier).map_err(|_| BlsSourceError::InvalidMetadata)?;
+        let provider =
+            SourceIdentifier::try_from("us-bls").map_err(|_| BlsSourceError::InvalidMetadata)?;
         let short = policy.window(0).ok_or(BlsSourceError::InvalidMetadata)?;
         let daily = policy.window(1).ok_or(BlsSourceError::InvalidMetadata)?;
         if policy != &expected_policy
             || policy.scope().as_source_identifier() != &provider
             || policy.window_count() != 2
-            || short.requests_per_window()
-                != u32::from(limits.enforced_requests_per_second())
+            || short.requests_per_window() != u32::from(limits.enforced_requests_per_second())
             || short.window_nanos() != SECOND_NANOS
             || short.semantics() != BudgetWindowSemantics::Sliding
             || daily.requests_per_window() != u32::from(limits.daily_queries())
@@ -157,11 +155,9 @@ impl BlsProviderRateDeclaration {
                 let NetworkAccessPolicy::Allowlisted(endpoints) = metadata.network_policy() else {
                     return Err(BlsSourceError::InvalidMetadata);
                 };
-                let declaration = ProviderRateDeclaration::try_for_endpoint(
-                    policy.clone(),
-                    endpoints,
-                )
-                .map_err(|_| BlsSourceError::InvalidMetadata)?;
+                let declaration =
+                    ProviderRateDeclaration::try_for_endpoint(policy.clone(), endpoints)
+                        .map_err(|_| BlsSourceError::InvalidMetadata)?;
                 (None, declaration)
             }
             BlsAccessTier::RegisteredV2 => {
@@ -271,10 +267,7 @@ pub struct BlsActivationPlan {
     metadata_revision: MetadataRevision,
     provider_dataset: SourceIdentifier,
     analytical_dataset: SourceIdentifier,
-    provider_usage_policy_digest: EvidenceDigest,
-    root_rights_rejoin: BlsRootRightsRejoin,
     credential_rejoin: BlsCredentialRejoin,
-    presentation_obligation_digest: EvidenceDigest,
     rate: BlsProviderRateDeclaration,
     plan_digest: EvidenceDigest,
 }
@@ -285,22 +278,15 @@ impl BlsActivationPlan {
         metadata_revision: MetadataRevision,
         provider_dataset: SourceIdentifier,
         analytical_dataset: SourceIdentifier,
-        usage_policy: BlsUsagePolicy,
-        root_rights_rejoin: BlsRootRightsRejoin,
         credential_rejoin: BlsCredentialRejoin,
         rate: BlsProviderRateDeclaration,
     ) -> Result<Self, BlsSourceError> {
-        usage_policy.validate()?;
-        root_rights_rejoin.validate()?;
         let mut plan = Self {
             source_id,
             metadata_revision,
             provider_dataset,
             analytical_dataset,
-            provider_usage_policy_digest: usage_policy.policy_digest(),
-            root_rights_rejoin,
             credential_rejoin,
-            presentation_obligation_digest: usage_policy.presentation_obligation_digest(),
             rate,
             plan_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
         };
@@ -329,24 +315,9 @@ impl BlsActivationPlan {
         &self.analytical_dataset
     }
 
-    /// Returns the fixed adapter private-use/no-distribution policy.
-    pub const fn provider_usage_policy_digest(&self) -> EvidenceDigest {
-        self.provider_usage_policy_digest
-    }
-
-    /// Returns the root-owned rights coordinate application composition must revalidate.
-    pub const fn root_rights_rejoin(&self) -> BlsRootRightsRejoin {
-        self.root_rights_rejoin
-    }
-
     /// Returns the explicit no-credential marker or registered credential-generation coordinate.
     pub const fn credential_rejoin(&self) -> BlsCredentialRejoin {
         self.credential_rejoin
-    }
-
-    /// Returns the exact BLS presentation duties root product reads must join.
-    pub const fn presentation_obligation_digest(&self) -> EvidenceDigest {
-        self.presentation_obligation_digest
     }
 
     /// Returns the exact durable declaration shared composition must register and recover.
@@ -361,9 +332,6 @@ impl BlsActivationPlan {
 
     /// Recomputes the provider-local recipe before any admission decision.
     pub fn validate(&self) -> Result<(), BlsSourceError> {
-        let usage_policy = BlsUsagePolicy::private_personal_research_no_distribution()?;
-        usage_policy.validate()?;
-        self.root_rights_rejoin.validate()?;
         self.rate
             .shared_rate_declaration()
             .validate()
@@ -375,14 +343,14 @@ impl BlsActivationPlan {
         let expected_analytical =
             crate::BlsSource::analytical_dataset_identifier(&self.provider_dataset)?;
         if self.source_id.as_str().is_empty()
-            || self.metadata_revision.as_source_identifier().as_str().is_empty()
+            || self
+                .metadata_revision
+                .as_source_identifier()
+                .as_str()
+                .is_empty()
             || !self.provider_dataset.as_str().starts_with(provider_prefix)
             || self.analytical_dataset != expected_analytical
-            || self.provider_usage_policy_digest != usage_policy.policy_digest()
-            || self.root_rights_rejoin.provider_policy_digest()
-                != self.provider_usage_policy_digest
             || !credential_rejoin_matches_tier(self.credential_rejoin, self.rate.tier())
-            || self.presentation_obligation_digest.bytes() == [0; 32]
             || self.rate.declaration_digest().bytes() == [0; 32]
             || !self.rate.persistent_shared_authority_required()
             || !self.rate.counts_all_started_attempts()
@@ -395,7 +363,7 @@ impl BlsActivationPlan {
 
     fn compute_digest(&self) -> Result<EvidenceDigest, BlsSourceError> {
         let mut digest = Sha256::new();
-        digest.update(b"market-squawk/bls-activation-plan/v2\0");
+        digest.update(b"market-squawk/bls-activation-plan/v3\0");
         hash_contract_field(&mut digest, self.source_id.as_str().as_bytes())?;
         hash_contract_field(
             &mut digest,
@@ -406,15 +374,7 @@ impl BlsActivationPlan {
         )?;
         hash_contract_field(&mut digest, self.provider_dataset.as_str().as_bytes())?;
         hash_contract_field(&mut digest, self.analytical_dataset.as_str().as_bytes())?;
-        for value in [
-            self.provider_usage_policy_digest,
-            self.root_rights_rejoin.root_decision_digest(),
-            self.root_rights_rejoin.provider_policy_digest(),
-            self.presentation_obligation_digest,
-            self.rate.declaration_digest(),
-        ] {
-            hash_contract_digest(&mut digest, value);
-        }
+        hash_contract_digest(&mut digest, self.rate.declaration_digest());
         hash_credential_rejoin(&mut digest, self.credential_rejoin);
         Ok(EvidenceDigest::new(
             DigestAlgorithm::Sha256,
@@ -448,12 +408,7 @@ impl BlsActivationCandidate {
         runtime_instance: Arc<BlsRuntimeInstanceCapability>,
     ) -> Result<Self, BlsSourceError> {
         plan.validate()?;
-        validate_doctor_capture(
-            &plan,
-            &doctor,
-            &sealed_doctor_capture,
-            &runtime_instance,
-        )?;
+        validate_doctor_capture(&plan, &doctor, &sealed_doctor_capture, &runtime_instance)?;
         let expires_at = doctor
             .received_at()
             .checked_add_nanos(BLS_DOCTOR_ACTIVATION_TTL_NANOS)
@@ -568,10 +523,7 @@ fn validate_doctor_capture(
         || doctor.observed_values() != doctor.returned_observations()
         || doctor.missing_values() != 0
         || doctor.provider_messages() != 0
-        || doctor.provider_usage_policy_digest() != plan.provider_usage_policy_digest()
-        || doctor.root_rights_rejoin() != plan.root_rights_rejoin()
         || doctor.credential_rejoin() != plan.credential_rejoin()
-        || doctor.presentation_obligation_digest() != plan.presentation_obligation_digest()
         || doctor.provider_rate_declaration_digest() != plan.rate().declaration_digest()
         || doctor.limits() != plan.rate().limits()
         || capture.source_id() != plan.source_id()

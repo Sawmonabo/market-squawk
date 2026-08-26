@@ -4,25 +4,24 @@ use std::sync::Arc;
 
 use market_squawk_domain::{
     DataQuality, DigestAlgorithm, EvidenceDigest, MetadataRevision, PayloadReference,
-    ResearchObservation, ResearchTemporalCoordinate, SchemaVersion, SourceId,
-    SourceIdentifier, Timestamp,
+    ResearchObservation, ResearchTemporalCoordinate, SchemaVersion, SourceId, SourceIdentifier,
+    Timestamp,
 };
 use market_squawk_sources::{
-    CURRENT_RESEARCH_RECORD_SCHEMA,
-    DiscoveryRequestId, ExtractionBatch, ExtractionContentIdentity, ExtractionRevisionPlan,
-    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
+    CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryRequestId, ExtractionBatch, ExtractionContentIdentity,
+    ExtractionRevisionPlan, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
     SourceMetadata, SourceObjectCaptureIdentity,
 };
 use rust_decimal::Decimal;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::{
-    BlsActivationCandidate, BlsCredentialRejoin, BlsProviderRateDeclaration, BlsResponse,
-    BlsRootRightsRejoin, BlsSource, BlsSourceConfig, BlsSourceError,
-};
 use crate::contract::BlsRuntimeInstanceCapability;
 use crate::source::BlsExtractionOutput;
+use crate::{
+    BlsActivationCandidate, BlsCredentialRejoin, BlsProviderRateDeclaration, BlsResponse,
+    BlsSource, BlsSourceConfig, BlsSourceError,
+};
 
 const PUBLICATION_CANDIDATE_SCHEMA_VERSION: u16 = 1;
 const BLS_PROVIDER_SEMANTICS_SCHEMA: &str = "market-squawk-bls-provider-semantics-v1";
@@ -287,7 +286,7 @@ impl BlsCanonicalProviderSemantics {
                     || canonical.unit() != metadata.unit()
                     || canonical.context().provenance().received_at() != response_received_at
                     || canonical.context().provenance().ingested_at() != canonical_ingested_at
-                    || canonical.value().observed_value().copied() != observation.value()
+                    || canonical.value().observed_value() != observation.value()
                 {
                     return Err(BlsSourceError::InvalidPublication);
                 }
@@ -357,16 +356,20 @@ impl BlsCanonicalProviderSemantics {
         self.schema_requirement.validate()?;
         if self.series.is_empty()
             || self.observations.len() != batch.records().len()
-            || self.observations.iter().enumerate().any(|(index, observation)| {
-                usize::try_from(observation.record_ordinal).ok() != Some(index)
-                    || batch.records().get(index).is_none_or(|record| {
-                        record.revision() != &observation.canonical_revision
-                            || record.effective_time() != &observation.effective_time
-                            || record.evidence().content_digest()
-                                != observation.canonical_payload_digest
-                            || record.available_at() != Some(observation.first_observed_at)
-                    })
-            })
+            || self
+                .observations
+                .iter()
+                .enumerate()
+                .any(|(index, observation)| {
+                    usize::try_from(observation.record_ordinal).ok() != Some(index)
+                        || batch.records().get(index).is_none_or(|record| {
+                            record.revision() != &observation.canonical_revision
+                                || record.effective_time() != &observation.effective_time
+                                || record.evidence().content_digest()
+                                    != observation.canonical_payload_digest
+                                || record.available_at() != Some(observation.first_observed_at)
+                        })
+                })
             || self.semantics_digest != self.compute_digest()?
         {
             return Err(BlsSourceError::InvalidPublication);
@@ -377,11 +380,7 @@ impl BlsCanonicalProviderSemantics {
     fn compute_digest(&self) -> Result<EvidenceDigest, BlsSourceError> {
         digest_serialized(
             b"market-squawk/bls-canonical-provider-semantics/v1",
-            &(
-                &self.schema_requirement,
-                &self.series,
-                &self.observations,
-            ),
+            &(&self.schema_requirement, &self.series, &self.observations),
         )
     }
 }
@@ -417,14 +416,12 @@ pub struct BlsPublicationCandidate {
     component_request_identity: EvidenceDigest,
     component_content_digest: EvidenceDigest,
     component_observation_digest: EvidenceDigest,
+    source_generation_digest: EvidenceDigest,
     sealed_discovery_capture: SealedProviderCaptureSetReceipt,
     extraction_content_digest: EvidenceDigest,
     canonical_content_digest: EvidenceDigest,
     provider_semantics_digest: EvidenceDigest,
-    provider_usage_policy_digest: EvidenceDigest,
-    root_rights_rejoin: BlsRootRightsRejoin,
     credential_rejoin: BlsCredentialRejoin,
-    presentation_obligation_digest: EvidenceDigest,
     provider_rate_declaration_digest: EvidenceDigest,
     doctor_report_digest: EvidenceDigest,
     sealed_doctor_capture_receipt_digest: EvidenceDigest,
@@ -462,10 +459,10 @@ impl BlsPublicationCandidate {
             .ok_or(BlsSourceError::InvalidPublication)?;
         let chunk_index =
             u16::try_from(chunk_index).map_err(|_| BlsSourceError::InvalidPublication)?;
-        let total_chunks = u16::try_from(config.chunk_count())
-            .map_err(|_| BlsSourceError::InvalidPublication)?;
-        let canonical_record_count = u32::try_from(batch.records().len())
-            .map_err(|_| BlsSourceError::InvalidPublication)?;
+        let total_chunks =
+            u16::try_from(config.chunk_count()).map_err(|_| BlsSourceError::InvalidPublication)?;
+        let canonical_record_count =
+            u32::try_from(batch.records().len()).map_err(|_| BlsSourceError::InvalidPublication)?;
         let first_observed_at = object.effective_interval().starts_at();
         let response_received_at = page.received_at();
         let canonical_schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
@@ -481,9 +478,8 @@ impl BlsPublicationCandidate {
             &canonical_schema,
         )?;
         provider_semantics.validate(&batch)?;
-        let schema_extension_requirement_digest = provider_semantics
-            .schema_requirement()
-            .requirement_digest();
+        let schema_extension_requirement_digest =
+            provider_semantics.schema_requirement().requirement_digest();
         let extraction_content = ExtractionContentIdentity::try_from_batch(&batch)
             .map_err(|_| BlsSourceError::InvalidPublication)?;
 
@@ -511,8 +507,7 @@ impl BlsPublicationCandidate {
             || extraction_content.record_count() != batch.records().len()
             || sealed_discovery_capture.receipt_digest().bytes() == [0; 32]
             || activation.candidate_digest().bytes() == [0; 32]
-            || discovery_admission.activation_candidate_digest()
-                != activation.candidate_digest()
+            || discovery_admission.activation_candidate_digest() != activation.candidate_digest()
             || !Arc::ptr_eq(
                 discovery_admission.runtime_instance(),
                 expected_runtime_instance,
@@ -544,16 +539,12 @@ impl BlsPublicationCandidate {
             component_request_identity: discovery_admission.component_request_identity(),
             component_content_digest: discovery_admission.component_content_digest(),
             component_observation_digest: discovery_admission.component_observation_digest(),
+            source_generation_digest: discovery_admission.source_generation_digest(),
             sealed_discovery_capture,
             extraction_content_digest: extraction_content.digest(),
             canonical_content_digest: canonical_content_digest(&batch)?,
             provider_semantics_digest: provider_semantics.semantics_digest(),
-            provider_usage_policy_digest: config.usage_policy().policy_digest(),
-            root_rights_rejoin: config.root_rights_rejoin(),
             credential_rejoin: config.credential_rejoin(),
-            presentation_obligation_digest: config
-                .usage_policy()
-                .presentation_obligation_digest(),
             provider_rate_declaration_digest: rate.declaration_digest(),
             doctor_report_digest: activation.doctor_report().report_digest(),
             sealed_doctor_capture_receipt_digest: activation
@@ -588,8 +579,6 @@ impl BlsPublicationCandidate {
                 metadata.revision().clone(),
                 config.dataset().clone(),
                 BlsSource::analytical_dataset_identifier(config.dataset())?,
-                config.usage_policy(),
-                config.root_rights_rejoin(),
                 config.credential_rejoin(),
                 rate.clone(),
             )?,
@@ -629,15 +618,19 @@ impl BlsPublicationCandidate {
             || self.canonical_schema.as_str() != CURRENT_RESEARCH_RECORD_SCHEMA
             || self.canonical_schema_version != SchemaVersion::CURRENT
             || self.schema_extension_requirement_digest
-                != self.provider_semantics.schema_requirement().requirement_digest()
+                != self
+                    .provider_semantics
+                    .schema_requirement()
+                    .requirement_digest()
             || usize::from(self.total_chunks) != config.chunk_count()
-            || usize::from(self.canonical_record_count) != self.batch.records().len()
+            || usize::try_from(self.canonical_record_count).ok() != Some(self.batch.records().len())
             || self.canonical_record_count == 0
             || self.canonical_ingested_at != canonical_ingested_at
             || self.discovery_request_set_identity != capture.request_set_identity()
             || self.discovery_capture_content_digest != capture.content_digest()
             || self.discovery_capture_observation_digest != capture.observation_digest()
             || self.sealed_discovery_capture.receipt_digest().bytes() == [0; 32]
+            || self.source_generation_digest != activation.plan().plan_digest()
             || !validate_discovery_component(
                 capture,
                 usize::from(self.chunk_index),
@@ -649,11 +642,7 @@ impl BlsPublicationCandidate {
             || extraction.digest() != self.extraction_content_digest
             || canonical_content_digest(&self.batch)? != self.canonical_content_digest
             || self.provider_semantics.semantics_digest() != self.provider_semantics_digest
-            || self.provider_usage_policy_digest != config.usage_policy().policy_digest()
-            || self.root_rights_rejoin != config.root_rights_rejoin()
             || self.credential_rejoin != config.credential_rejoin()
-            || self.presentation_obligation_digest
-                != config.usage_policy().presentation_obligation_digest()
             || self.provider_rate_declaration_digest != rate.declaration_digest()
             || self.doctor_report_digest != activation.doctor_report().report_digest()
             || self.sealed_doctor_capture_receipt_digest
@@ -753,6 +742,11 @@ impl BlsPublicationCandidate {
         self.discovery_capture_observation_digest
     }
 
+    /// Returns the stable source/configuration/rights/credential generation of this receipt.
+    pub const fn source_generation_digest(&self) -> EvidenceDigest {
+        self.source_generation_digest
+    }
+
     /// Returns the actual immutable raw-journal receipt root ingest must attach.
     pub const fn sealed_discovery_capture(&self) -> &SealedProviderCaptureSetReceipt {
         &self.sealed_discovery_capture
@@ -773,24 +767,9 @@ impl BlsPublicationCandidate {
         self.canonical_content_digest
     }
 
-    /// Returns the fixed provider-local private-use/no-distribution policy identity.
-    pub const fn provider_usage_policy_digest(&self) -> EvidenceDigest {
-        self.provider_usage_policy_digest
-    }
-
-    /// Returns the non-authoritative root rights coordinate that must remain current.
-    pub const fn root_rights_rejoin(&self) -> BlsRootRightsRejoin {
-        self.root_rights_rejoin
-    }
-
     /// Returns the explicit public marker or registered credential-generation coordinate.
     pub const fn credential_rejoin(&self) -> BlsCredentialRejoin {
         self.credential_rejoin
-    }
-
-    /// Returns the exact BLS attribution, retrieval-date, and disclaimer duties root must join.
-    pub const fn presentation_obligation_digest(&self) -> EvidenceDigest {
-        self.presentation_obligation_digest
     }
 
     /// Returns the exact shared provider-rate declaration identity.
@@ -894,8 +873,7 @@ fn validate_discovery_component(
                 || usize::from(component.first_page_ordinal()) != chunk_index
                 || component.page_count().get() != 1
                 || component.total_body_bytes() != page.body_bytes()
-                || component.terminal()
-                    != ProviderCaptureTerminalDisposition::StandaloneResponse
+                || component.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
             {
                 return false;
             }
@@ -935,8 +913,8 @@ fn validate_canonical_batch(
 ) -> Result<Timestamp, BlsSourceError> {
     let mut canonical_ingested_at = None;
     for record in batch.records() {
-        let ResearchObservation::Macro(observation) =
-            serde_json::from_slice(record.payload()).map_err(|_| BlsSourceError::InvalidPublication)?
+        let ResearchObservation::Macro(observation) = serde_json::from_slice(record.payload())
+            .map_err(|_| BlsSourceError::InvalidPublication)?
         else {
             return Err(BlsSourceError::InvalidPublication);
         };
@@ -967,8 +945,7 @@ fn validate_canonical_batch(
             || provenance.received_at() != response_received_at
             || ingested_at < response_received_at
             || provenance.quality() != DataQuality::OfficialDelayed
-            || provenance.availability().conservative_available_at()
-                != Some(first_observed_at)
+            || provenance.availability().conservative_available_at() != Some(first_observed_at)
             || !raw_reference_matches
             || context.time().effective() != record.effective_time()
             || context.time().published().is_some()
@@ -1010,7 +987,7 @@ fn canonical_content_digest(batch: &ExtractionBatch) -> Result<EvidenceDigest, B
 
 fn candidate_digest(candidate: &BlsPublicationCandidate) -> Result<EvidenceDigest, BlsSourceError> {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/bls-publication-candidate/v2\0");
+    digest.update(b"market-squawk/bls-publication-candidate/v3\0");
     digest.update(candidate.schema_version.to_be_bytes());
     hash_field(&mut digest, candidate.source_id.as_str().as_bytes())?;
     hash_field(
@@ -1049,14 +1026,11 @@ fn candidate_digest(candidate: &BlsPublicationCandidate) -> Result<EvidenceDiges
         candidate.component_request_identity,
         candidate.component_content_digest,
         candidate.component_observation_digest,
+        candidate.source_generation_digest,
         candidate.sealed_discovery_capture.receipt_digest(),
         candidate.extraction_content_digest,
         candidate.canonical_content_digest,
         candidate.provider_semantics_digest,
-        candidate.provider_usage_policy_digest,
-        candidate.root_rights_rejoin.root_decision_digest(),
-        candidate.root_rights_rejoin.provider_policy_digest(),
-        candidate.presentation_obligation_digest,
         candidate.provider_rate_declaration_digest,
         candidate.doctor_report_digest,
         candidate.sealed_doctor_capture_receipt_digest,

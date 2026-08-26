@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use market_squawk_domain::{EvidenceDigest, Timestamp};
 use market_squawk_sources::{
-    DiscoveryBatch, ExtractionRequest, ProviderCaptureMaterial,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    SealedProviderCaptureSetReceipt, SourceObject, SourceObjectCaptureIdentity,
+    DiscoveryBatch, ExtractionRequest, ProviderCaptureMaterial, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt, SourceObject,
+    SourceObjectCaptureIdentity, payload_matches_exact_evidence,
 };
 
+use crate::client::RetrievedBlsPage;
 use crate::contract::BlsRuntimeInstanceCapability;
 use crate::{BlsActivationCandidate, BlsSourceError};
 
@@ -21,22 +22,22 @@ use crate::{BlsActivationCandidate, BlsSourceError};
 pub struct BlsDiscoveryOutput {
     batch: DiscoveryBatch,
     capture_material: ProviderCaptureMaterial,
-    runtime_instance: Arc<BlsRuntimeInstanceCapability>,
-    activation_candidate_digest: EvidenceDigest,
+    retained_pages: Box<[RetrievedBlsPage]>,
+    source_generation_digest: EvidenceDigest,
 }
 
 impl BlsDiscoveryOutput {
     pub(crate) fn new(
         batch: DiscoveryBatch,
         capture_material: ProviderCaptureMaterial,
-        runtime_instance: Arc<BlsRuntimeInstanceCapability>,
-        activation_candidate_digest: EvidenceDigest,
+        retained_pages: Vec<RetrievedBlsPage>,
+        source_generation_digest: EvidenceDigest,
     ) -> Self {
         Self {
             batch,
             capture_material,
-            runtime_instance,
-            activation_candidate_digest,
+            retained_pages: retained_pages.into_boxed_slice(),
+            source_generation_digest,
         }
     }
 
@@ -50,6 +51,14 @@ impl BlsDiscoveryOutput {
         &self.capture_material
     }
 
+    pub(crate) const fn source_generation_digest(&self) -> EvidenceDigest {
+        self.source_generation_digest
+    }
+
+    pub(crate) fn retained_pages(&self) -> &[RetrievedBlsPage] {
+        &self.retained_pages
+    }
+
     /// Separates root-owned sealing work from the private pending admission coordinate.
     pub fn into_sealing_parts(self) -> (BlsPendingDiscovery, ProviderCaptureMaterial) {
         let capture_receipt = self.capture_material.receipt().clone();
@@ -57,8 +66,8 @@ impl BlsDiscoveryOutput {
             BlsPendingDiscovery {
                 batch: self.batch,
                 capture_receipt,
-                runtime_instance: self.runtime_instance,
-                activation_candidate_digest: self.activation_candidate_digest,
+                retained_pages: self.retained_pages,
+                source_generation_digest: self.source_generation_digest,
             },
             self.capture_material,
         )
@@ -70,8 +79,8 @@ impl BlsDiscoveryOutput {
 pub struct BlsPendingDiscovery {
     batch: DiscoveryBatch,
     capture_receipt: ProviderCaptureSetReceipt,
-    runtime_instance: Arc<BlsRuntimeInstanceCapability>,
-    activation_candidate_digest: EvidenceDigest,
+    retained_pages: Box<[RetrievedBlsPage]>,
+    source_generation_digest: EvidenceDigest,
 }
 
 impl BlsPendingDiscovery {
@@ -93,10 +102,9 @@ impl BlsDiscoveryAdmission {
         sealed_capture: SealedProviderCaptureSetReceipt,
         expected_runtime_instance: &Arc<BlsRuntimeInstanceCapability>,
         activation: &BlsActivationCandidate,
-    ) -> Result<Self, BlsSourceError> {
-        if !Arc::ptr_eq(&pending.runtime_instance, expected_runtime_instance)
-            || !Arc::ptr_eq(activation.runtime_instance(), expected_runtime_instance)
-            || pending.activation_candidate_digest != activation.candidate_digest()
+    ) -> Result<(Self, Box<[RetrievedBlsPage]>), BlsSourceError> {
+        if !Arc::ptr_eq(activation.runtime_instance(), expected_runtime_instance)
+            || pending.source_generation_digest != activation.plan().plan_digest()
             || sealed_capture.capture() != &pending.capture_receipt
             || sealed_capture.receipt_digest().bytes() == [0; 32]
         {
@@ -106,14 +114,13 @@ impl BlsDiscoveryAdmission {
         let capture = sealed_capture.capture();
         let chunk_count = pending.batch.objects().len();
         if chunk_count == 0
+            || pending.retained_pages.len() != chunk_count
             || capture.pages().len() != chunk_count
             || (chunk_count == 1
-                && (capture.terminal()
-                    != ProviderCaptureTerminalDisposition::StandaloneResponse
+                && (capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
                     || !capture.request_graph_components().is_empty()))
             || (chunk_count > 1
-                && (capture.terminal()
-                    != ProviderCaptureTerminalDisposition::CompleteRequestGraph
+                && (capture.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
                     || capture.request_graph_components().len() != chunk_count))
         {
             return Err(BlsSourceError::InvalidPublication);
@@ -123,8 +130,14 @@ impl BlsDiscoveryAdmission {
         objects
             .try_reserve_exact(chunk_count)
             .map_err(|_| BlsSourceError::InvalidPublication)?;
-        for (expected_index, object) in pending.batch.objects().iter().enumerate() {
-            let (object_index, _) = crate::source::parse_object_id(object.object_id())
+        for (expected_index, (object, retained_page)) in pending
+            .batch
+            .objects()
+            .iter()
+            .zip(pending.retained_pages.iter())
+            .enumerate()
+        {
+            let (object_index, object_digest) = crate::source::parse_object_id(object.object_id())
                 .map_err(|_| BlsSourceError::InvalidPublication)?;
             let page = capture
                 .pages()
@@ -174,6 +187,10 @@ impl BlsDiscoveryAdmission {
                 || object.expected_bytes() != Some(page.body_bytes())
                 || object.effective_interval().starts_at() != page.received_at()
                 || component_request_identity != page.request_identity()
+                || retained_page.received_at != page.received_at()
+                || retained_page.sha256_hex != object_digest
+                || u64::try_from(retained_page.bytes.len()).ok() != Some(page.body_bytes())
+                || !payload_matches_exact_evidence(&retained_page.bytes, object.evidence())
             {
                 return Err(BlsSourceError::InvalidPublication);
             }
@@ -188,11 +205,19 @@ impl BlsDiscoveryAdmission {
                 sealed_discovery_capture: sealed_capture.clone(),
                 runtime_instance: Arc::clone(expected_runtime_instance),
                 activation_candidate_digest: activation.candidate_digest(),
+                source_generation_digest: pending.source_generation_digest,
             });
         }
-        Ok(Self {
-            objects: objects.into_boxed_slice(),
-        })
+        Ok((
+            Self {
+                objects: objects.into_boxed_slice(),
+            },
+            pending.retained_pages,
+        ))
+    }
+
+    pub(crate) fn objects(&self) -> &[BlsDiscoveryObjectAdmission] {
+        &self.objects
     }
 
     /// Returns the exact number of one-shot object admissions.
@@ -218,6 +243,7 @@ pub struct BlsDiscoveryObjectAdmission {
     sealed_discovery_capture: SealedProviderCaptureSetReceipt,
     runtime_instance: Arc<BlsRuntimeInstanceCapability>,
     activation_candidate_digest: EvidenceDigest,
+    source_generation_digest: EvidenceDigest,
 }
 
 impl BlsDiscoveryObjectAdmission {
@@ -236,6 +262,7 @@ impl BlsDiscoveryObjectAdmission {
             || !Arc::ptr_eq(&self.runtime_instance, expected_runtime_instance)
             || !Arc::ptr_eq(activation.runtime_instance(), expected_runtime_instance)
             || self.activation_candidate_digest != activation.candidate_digest()
+            || self.source_generation_digest != activation.plan().plan_digest()
             || request.deadline() >= activation.expires_at()
             || self.sealed_discovery_capture.receipt_digest().bytes() == [0; 32]
         {
@@ -252,9 +279,7 @@ impl BlsDiscoveryObjectAdmission {
         self.response_received_at
     }
 
-    pub(crate) const fn sealed_discovery_capture(
-        &self,
-    ) -> &SealedProviderCaptureSetReceipt {
+    pub(crate) const fn sealed_discovery_capture(&self) -> &SealedProviderCaptureSetReceipt {
         &self.sealed_discovery_capture
     }
 
@@ -270,6 +295,10 @@ impl BlsDiscoveryObjectAdmission {
         self.component_observation_digest
     }
 
+    pub(crate) const fn source_generation_digest(&self) -> EvidenceDigest {
+        self.source_generation_digest
+    }
+
     pub(crate) const fn activation_candidate_digest(&self) -> EvidenceDigest {
         self.activation_candidate_digest
     }
@@ -279,32 +308,33 @@ impl BlsDiscoveryObjectAdmission {
     }
 }
 
-fn validate_object_component(admission: &BlsDiscoveryObjectAdmission) -> Result<(), BlsSourceError> {
+fn validate_object_component(
+    admission: &BlsDiscoveryObjectAdmission,
+) -> Result<(), BlsSourceError> {
     let capture = admission.sealed_discovery_capture.capture();
     let index = admission.chunk_index();
     let page = capture
         .pages()
         .get(index)
         .ok_or(BlsSourceError::InvalidPublication)?;
-    let (request, content, observation) = if capture.terminal()
-        == ProviderCaptureTerminalDisposition::CompleteRequestGraph
-    {
-        let component = capture
-            .request_graph_components()
-            .get(index)
-            .ok_or(BlsSourceError::InvalidPublication)?;
-        (
-            component.request_set_identity(),
-            component.content_digest(),
-            component.observation_digest(),
-        )
-    } else {
-        (
-            capture.request_set_identity(),
-            capture.content_digest(),
-            capture.observation_digest(),
-        )
-    };
+    let (request, content, observation) =
+        if capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph {
+            let component = capture
+                .request_graph_components()
+                .get(index)
+                .ok_or(BlsSourceError::InvalidPublication)?;
+            (
+                component.request_set_identity(),
+                component.content_digest(),
+                component.observation_digest(),
+            )
+        } else {
+            (
+                capture.request_set_identity(),
+                capture.content_digest(),
+                capture.observation_digest(),
+            )
+        };
     if request != admission.component_request_identity
         || content != admission.component_content_digest
         || observation != admission.component_observation_digest

@@ -5,16 +5,11 @@ use std::sync::Arc;
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
-use market_squawk_sources::{
-    ProviderCaptureMaterial, ProviderCaptureTerminalDisposition,
-};
+use market_squawk_sources::{ProviderCaptureMaterial, ProviderCaptureTerminalDisposition};
 use sha2::{Digest as _, Sha256};
 
 use crate::contract::BlsRuntimeInstanceCapability;
-use crate::{
-    BlsAccessTier, BlsCredentialRejoin, BlsRequestLimits, BlsRootRightsRejoin,
-    BlsSourceError,
-};
+use crate::{BlsAccessTier, BlsCredentialRejoin, BlsRequestLimits, BlsSourceError};
 
 /// Closed readiness result for one exact BLS doctor request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,10 +50,7 @@ pub struct BlsDoctorReport {
     capture_content_digest: EvidenceDigest,
     capture_observation_digest: EvidenceDigest,
     request_set_identity: EvidenceDigest,
-    provider_usage_policy_digest: EvidenceDigest,
-    root_rights_rejoin: BlsRootRightsRejoin,
     credential_rejoin: BlsCredentialRejoin,
-    presentation_obligation_digest: EvidenceDigest,
     provider_rate_declaration_digest: EvidenceDigest,
     limits: BlsRequestLimits,
     report_digest: EvidenceDigest,
@@ -92,10 +84,7 @@ impl BlsDoctorReport {
         capture_content_digest: EvidenceDigest,
         capture_observation_digest: EvidenceDigest,
         request_set_identity: EvidenceDigest,
-        provider_usage_policy_digest: EvidenceDigest,
-        root_rights_rejoin: BlsRootRightsRejoin,
         credential_rejoin: BlsCredentialRejoin,
-        presentation_obligation_digest: EvidenceDigest,
         provider_rate_declaration_digest: EvidenceDigest,
         limits: BlsRequestLimits,
         runtime_instance: Arc<BlsRuntimeInstanceCapability>,
@@ -122,10 +111,7 @@ impl BlsDoctorReport {
             capture_content_digest,
             capture_observation_digest,
             request_set_identity,
-            provider_usage_policy_digest,
-            root_rights_rejoin,
             credential_rejoin,
-            presentation_obligation_digest,
             provider_rate_declaration_digest,
             limits,
             report_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
@@ -240,24 +226,9 @@ impl BlsDoctorReport {
         self.request_set_identity
     }
 
-    /// Returns the fixed provider-local private-use/no-distribution policy.
-    pub const fn provider_usage_policy_digest(&self) -> EvidenceDigest {
-        self.provider_usage_policy_digest
-    }
-
-    /// Returns the non-authoritative root rights coordinate used by this source instance.
-    pub const fn root_rights_rejoin(&self) -> BlsRootRightsRejoin {
-        self.root_rights_rejoin
-    }
-
     /// Returns the explicit public marker or registered protected-generation coordinate.
     pub const fn credential_rejoin(&self) -> BlsCredentialRejoin {
         self.credential_rejoin
-    }
-
-    /// Returns the exact BLS attribution and disclaimer duties joined by product reads.
-    pub const fn presentation_obligation_digest(&self) -> EvidenceDigest {
-        self.presentation_obligation_digest
     }
 
     /// Returns the exact shared provider-rate declaration used by this attempt.
@@ -277,7 +248,11 @@ impl BlsDoctorReport {
 
     pub(crate) fn validate(&self) -> Result<(), BlsSourceError> {
         if self.source_id.as_str().is_empty()
-            || self.metadata_revision.as_source_identifier().as_str().is_empty()
+            || self
+                .metadata_revision
+                .as_source_identifier()
+                .as_str()
+                .is_empty()
             || self.dataset.as_str().is_empty()
             || self.series_id.as_str().is_empty()
             || self.year == 0
@@ -286,9 +261,6 @@ impl BlsDoctorReport {
             || self.capture_content_digest.bytes() == [0; 32]
             || self.capture_observation_digest.bytes() == [0; 32]
             || self.request_set_identity.bytes() == [0; 32]
-            || self.provider_usage_policy_digest.bytes() == [0; 32]
-            || self.root_rights_rejoin.validate().is_err()
-            || self.presentation_obligation_digest.bytes() == [0; 32]
             || self.provider_rate_declaration_digest.bytes() == [0; 32]
             || self.report_digest != self.compute_digest()?
         {
@@ -299,7 +271,7 @@ impl BlsDoctorReport {
 
     fn compute_digest(&self) -> Result<EvidenceDigest, BlsSourceError> {
         let mut digest = Sha256::new();
-        digest.update(b"market-squawk/bls-doctor-report/v2\0");
+        digest.update(b"market-squawk/bls-doctor-report/v3\0");
         hash_report_field(&mut digest, self.source_id.as_str().as_bytes())?;
         hash_report_field(
             &mut digest,
@@ -341,10 +313,6 @@ impl BlsDoctorReport {
             self.capture_content_digest,
             self.capture_observation_digest,
             self.request_set_identity,
-            self.provider_usage_policy_digest,
-            self.root_rights_rejoin.root_decision_digest(),
-            self.root_rights_rejoin.provider_policy_digest(),
-            self.presentation_obligation_digest,
             self.provider_rate_declaration_digest,
         ] {
             hash_report_digest(&mut digest, value);

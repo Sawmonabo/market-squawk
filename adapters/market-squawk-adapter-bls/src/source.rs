@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use market_squawk_domain::{
@@ -14,14 +13,13 @@ use market_squawk_platform::RawCaptureRecord;
 #[cfg(test)]
 use market_squawk_sources::AuthoritativeSourceRegistry;
 use market_squawk_sources::{
-    AuthorizationMode, AvailabilityEvidence, CoverageDomain, DiscoveryBatch, DiscoveryRequest,
-    ExtractionAuthority, ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan,
-    ExtractionSource, ExtractionSourceError, HistoricalCapability,
-    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt, SourceClass, SourceError,
-    SourceMetadata, SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
-    SourceProtocolProfile, CURRENT_RESEARCH_RECORD_SCHEMA, MAX_PROVIDER_CAPTURE_PAGES,
-    payload_matches_exact_evidence,
+    AuthorizationMode, AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, CoverageDomain,
+    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRequest,
+    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HistoricalCapability,
+    MAX_PROVIDER_CAPTURE_PAGES, ProviderCaptureMaterial, ProviderCapturePageReceipt,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
+    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
+    SourceObjectCaptureIdentity, SourceProtocolProfile, payload_matches_exact_evidence,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -30,14 +28,13 @@ use uuid::Uuid;
 use crate::client::{BlsHttpClient, RetrievedBlsPage, ensure_deadline_open, system_timestamp};
 use crate::contract::BlsRuntimeInstanceCapability;
 use crate::discovery::{
-    BlsDiscoveryAdmission, BlsDiscoveryObjectAdmission, BlsDiscoveryOutput,
-    BlsPendingDiscovery,
+    BlsDiscoveryAdmission, BlsDiscoveryObjectAdmission, BlsDiscoveryOutput, BlsPendingDiscovery,
 };
 use crate::{
-    BlsAccessTier, BlsActivationCandidate, BlsActivationPlan, BlsAuthorization, BlsDoctorOutput,
-    BlsDoctorReadiness, BlsDoctorReport, BlsProviderRateDeclaration, BlsPublicationCandidate,
-    BlsCanonicalProviderSemantics, BlsRequestLimits, BlsRequestPlan, BlsRootRightsRejoin,
-    BlsSeriesMetadata, BlsSourceError, BlsUsagePolicy,
+    BlsAccessTier, BlsActivationCandidate, BlsActivationPlan, BlsAuthorization,
+    BlsCanonicalProviderSemantics, BlsDoctorOutput, BlsDoctorReadiness, BlsDoctorReport,
+    BlsProviderRateDeclaration, BlsPublicationCandidate, BlsRequestLimits, BlsRequestPlan,
+    BlsSeriesMetadata, BlsSourceError,
 };
 
 mod normalize;
@@ -51,8 +48,6 @@ pub use state::{BlsNormalizedPage, BlsSourceHealth};
 #[derive(Debug)]
 pub struct BlsSourceConfig {
     authorization: BlsAuthorization,
-    usage_policy: BlsUsagePolicy,
-    root_rights_rejoin: BlsRootRightsRejoin,
     plan: BlsRequestPlan,
     series_metadata: BTreeMap<String, BlsSeriesMetadata>,
     dataset: SourceIdentifier,
@@ -213,11 +208,8 @@ impl BlsSource {
         transport: Arc<dyn crate::client::BlsTransport>,
     ) -> Result<Self, BlsSourceError> {
         let rate_declaration = Self::validate_metadata(&metadata, &config)?;
-        let http = BlsHttpClient::try_new_with_transport(
-            &metadata,
-            config.authorization(),
-            transport,
-        )?;
+        let http =
+            BlsHttpClient::try_new_with_transport(&metadata, config.authorization(), transport)?;
         Ok(Self {
             metadata,
             config,
@@ -269,8 +261,6 @@ impl BlsSource {
             self.metadata.revision().clone(),
             self.config.dataset().clone(),
             Self::analytical_dataset_identifier(self.config.dataset())?,
-            self.config.usage_policy(),
-            self.config.root_rights_rejoin(),
             self.config.authorization().credential_rejoin(),
             self.rate_declaration.clone(),
         )
@@ -469,17 +459,18 @@ impl BlsSource {
         let request_identity = doctor_capture_request_identity(
             &self.metadata,
             &self.config,
+            self.activation_plan()
+                .map_err(|_| SourceError::InvalidProtocolState)?
+                .plan_digest(),
             &series_id,
             year,
         )?;
         let capture_material = self.capture_material_for_request(request_identity, &page)?;
         let capture = capture_material.receipt();
-        let response_bytes = u64::try_from(page.bytes.len())
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-        let response_content_digest = EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            Sha256::digest(&page.bytes).into(),
-        );
+        let response_bytes =
+            u64::try_from(page.bytes.len()).map_err(|_| SourceError::InvalidProtocolState)?;
+        let response_content_digest =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&page.bytes).into());
         let report = BlsDoctorReport::new(
             self.metadata.source_id().clone(),
             self.metadata.revision().clone(),
@@ -503,12 +494,7 @@ impl BlsSource {
             capture.content_digest(),
             capture.observation_digest(),
             capture.request_set_identity(),
-            self.config.usage_policy().policy_digest(),
-            self.config.root_rights_rejoin(),
             self.config.authorization().credential_rejoin(),
-            self.config
-                .usage_policy()
-                .presentation_obligation_digest(),
             self.rate_declaration.declaration_digest(),
             self.config.limits(),
             Arc::clone(&self.runtime_instance),
@@ -554,6 +540,9 @@ impl BlsSource {
         }
         let mut discovered = Vec::with_capacity(self.config.plan().chunks().len());
         let mut capture_components = Vec::with_capacity(self.config.plan().chunks().len());
+        let mut retained_pages = Vec::with_capacity(self.config.plan().chunks().len());
+        let mut retention_budget = PageCache::new();
+        let source_generation_digest = activation.plan().plan_digest();
         for (index, chunk) in self.config.plan().chunks().iter().enumerate() {
             let page = self
                 .fetch_page(&authority, chunk, request.deadline(), &cancellation)
@@ -568,9 +557,35 @@ impl BlsSource {
                 .map_err(|_| SourceError::InvalidProtocolState)?;
             let expected_bytes =
                 u64::try_from(page.bytes.len()).map_err(|_| SourceError::InvalidProtocolState)?;
-            let request_identity =
-                capture_request_identity(&self.metadata, &self.config, index, chunk)?;
+            let request_identity = capture_request_identity(
+                &self.metadata,
+                &self.config,
+                &request,
+                source_generation_digest,
+                index,
+                chunk,
+            )?;
             let capture_material = self.capture_material_for_request(request_identity, &page)?;
+            let cache_key = page_cache_key(
+                &object_id,
+                request_identity,
+                capture_material.receipt().observation_digest(),
+                source_generation_digest,
+            )
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+            if !retention_budget.insert(
+                &cache_key,
+                &object_id,
+                request_identity,
+                capture_material.receipt().observation_digest(),
+                source_generation_digest,
+                &page,
+            )? {
+                return Err(SourceError::FrameTooLarge {
+                    max: market_squawk_sources::MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
+                }
+                .into());
+            }
             let capture_identity =
                 SourceObjectCaptureIdentity::try_from_capture(capture_material.receipt())
                     .map_err(|_| SourceError::InvalidProtocolState)?;
@@ -591,16 +606,7 @@ impl BlsSource {
                 Some(expected_bytes),
             )?);
             capture_components.push(capture_material);
-            let retained = self.cache
-                .lock()
-                .map_err(|_| SourceError::InvalidProtocolState)?
-                .insert(&object_id, &page)?;
-            if !retained {
-                return Err(SourceError::FrameTooLarge {
-                    max: market_squawk_sources::MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
-                }
-                .into());
-            }
+            retained_pages.push(page);
         }
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
@@ -615,8 +621,12 @@ impl BlsSource {
                 .pop()
                 .ok_or(SourceError::InvalidProtocolState)?
         } else {
-            let graph_identity =
-                discovery_capture_graph_identity(&self.metadata, &self.config, &request)?;
+            let graph_identity = discovery_capture_graph_identity(
+                &self.metadata,
+                &self.config,
+                &request,
+                source_generation_digest,
+            )?;
             ProviderCaptureMaterial::try_combine_request_graph(
                 self.config.dataset().clone(),
                 graph_identity,
@@ -627,8 +637,8 @@ impl BlsSource {
         let output = BlsDiscoveryOutput::new(
             batch,
             capture_material,
-            Arc::clone(&self.runtime_instance),
-            activation.candidate_digest(),
+            retained_pages,
+            source_generation_digest,
         );
         validate_discovery_output(&self.metadata, &self.config, &output)?;
         Ok(output)
@@ -642,12 +652,40 @@ impl BlsSource {
         activation: &BlsActivationCandidate,
     ) -> Result<BlsDiscoveryAdmission, BlsSourceError> {
         self.validate_activation_candidate(activation)?;
-        BlsDiscoveryAdmission::try_new(
+        let (admission, retained_pages) = BlsDiscoveryAdmission::try_new(
             pending,
             sealed_capture,
             &self.runtime_instance,
             activation,
-        )
+        )?;
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
+        let mut staged = cache.clone();
+        for (object, page) in admission.objects().iter().zip(retained_pages.iter()) {
+            let cache_key = page_cache_key(
+                object.object().object_id(),
+                object.component_request_identity(),
+                object.component_observation_digest(),
+                object.source_generation_digest(),
+            )?;
+            let retained = staged
+                .insert(
+                    &cache_key,
+                    object.object().object_id(),
+                    object.component_request_identity(),
+                    object.component_observation_digest(),
+                    object.source_generation_digest(),
+                    page,
+                )
+                .map_err(|_| BlsSourceError::InvalidPublication)?;
+            if !retained {
+                return Err(BlsSourceError::InvalidPublication);
+            }
+        }
+        *cache = staged;
+        Ok(admission)
     }
 
     async fn normalized_admitted_page(
@@ -660,11 +698,7 @@ impl BlsSource {
     ) -> Result<BlsNormalizedPage, ExtractionSourceError> {
         self.validate_authority(authority)?;
         discovery_admission
-            .validate_for_extraction(
-                request,
-                &self.runtime_instance,
-                activation,
-            )
+            .validate_for_extraction(request, &self.runtime_instance, activation)
             .map_err(|_| SourceError::InvalidProtocolState)?;
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
@@ -686,15 +720,29 @@ impl BlsSource {
         if chunk_index != discovery_admission.chunk_index() {
             return Err(SourceError::InvalidProtocolState.into());
         }
+        let cache_key = page_cache_key(
+            request.object().object_id(),
+            discovery_admission.component_request_identity(),
+            discovery_admission.component_observation_digest(),
+            discovery_admission.source_generation_digest(),
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
         let cached = self
             .cache
             .lock()
             .map_err(|_| SourceError::InvalidProtocolState)?
             .pages
-            .get(request.object().object_id().as_str())
+            .get(&cache_key)
             .cloned()
             .ok_or(SourceError::GenerationResynchronizationRequired)?;
-        let bytes = Bytes::from_owner(cached.bytes);
+        if cached.object_id != *request.object().object_id()
+            || cached.request_identity != discovery_admission.component_request_identity()
+            || cached.observation_digest != discovery_admission.component_observation_digest()
+            || cached.source_generation != discovery_admission.source_generation_digest()
+        {
+            return Err(SourceError::GenerationResynchronizationRequired.into());
+        }
+        let bytes = cached.bytes;
         let requested = chunk
             .series()
             .iter()
@@ -779,8 +827,9 @@ impl BlsSource {
     /// Consumes one physically sealed discovery-object admission into canonical BLS records.
     ///
     /// Extraction performs no provider request and never substitutes a byte-identical refetch for
-    /// the earlier first-observed response. Loss of the bounded in-process response cache fails
-    /// closed; restart rejoin belongs to root's sealed-journal reader and a fresh admission.
+    /// the earlier first-observed response. A freshly reconstructed source can repopulate its
+    /// bounded cache only from an exact pending response joined to its physical capture seal and
+    /// the same stable source generation.
     pub async fn extract_sealed_discovery(
         &self,
         authority: ExtractionAuthority,
@@ -1030,11 +1079,13 @@ fn exact_evidence(payload: &[u8]) -> ExactPayloadEvidence {
 fn capture_request_identity(
     metadata: &SourceMetadata,
     config: &BlsSourceConfig,
+    request: &DiscoveryRequest,
+    source_generation_digest: EvidenceDigest,
     chunk_index: usize,
     chunk: &crate::BlsRequestChunk,
 ) -> Result<EvidenceDigest, ExtractionSourceError> {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/bls-provider-capture-request/v1");
+    hash.update(b"market-squawk/bls-provider-capture-request/v2");
     hash_capture_field(&mut hash, metadata.source_id().as_str().as_bytes())?;
     hash_capture_field(
         &mut hash,
@@ -1046,6 +1097,10 @@ fn capture_request_identity(
     )?;
     hash_capture_field(&mut hash, config.dataset().as_str().as_bytes())?;
     hash_capture_field(&mut hash, config.authorization().endpoint().as_bytes())?;
+    let discovery_request_id =
+        serde_json::to_vec(&request.request_id()).map_err(|_| SourceError::InvalidProtocolState)?;
+    hash_capture_field(&mut hash, &discovery_request_id)?;
+    hash_capture_digest(&mut hash, source_generation_digest);
     hash.update(
         u16::try_from(chunk_index)
             .map_err(|_| SourceError::InvalidProtocolState)?
@@ -1071,6 +1126,7 @@ fn discovery_capture_graph_identity(
     metadata: &SourceMetadata,
     config: &BlsSourceConfig,
     request: &DiscoveryRequest,
+    source_generation_digest: EvidenceDigest,
 ) -> Result<EvidenceDigest, ExtractionSourceError> {
     if config.plan().chunks().len() < 2 {
         return Err(SourceError::InvalidProtocolState.into());
@@ -1087,8 +1143,8 @@ fn discovery_capture_graph_identity(
             .as_bytes(),
     )?;
     hash_capture_field(&mut hash, config.dataset().as_str().as_bytes())?;
-    let discovery_request_id = serde_json::to_vec(&request.request_id())
-        .map_err(|_| SourceError::InvalidProtocolState)?;
+    let discovery_request_id =
+        serde_json::to_vec(&request.request_id()).map_err(|_| SourceError::InvalidProtocolState)?;
     hash_capture_field(&mut hash, &discovery_request_id)?;
     hash.update(
         u16::try_from(config.plan().chunks().len())
@@ -1096,7 +1152,14 @@ fn discovery_capture_graph_identity(
             .to_be_bytes(),
     );
     for (index, chunk) in config.plan().chunks().iter().enumerate() {
-        let component = capture_request_identity(metadata, config, index, chunk)?;
+        let component = capture_request_identity(
+            metadata,
+            config,
+            request,
+            source_generation_digest,
+            index,
+            chunk,
+        )?;
         hash.update(component.bytes());
     }
     Ok(EvidenceDigest::new(
@@ -1115,36 +1178,50 @@ fn validate_discovery_output(
     let pages = capture.pages();
     let components = capture.request_graph_components();
     let chunk_count = config.plan().chunks().len();
+    let source_generation_digest = output.source_generation_digest();
     if output.batch().request().dataset() != config.dataset()
         || objects.len() != chunk_count
         || pages.len() != chunk_count
+        || output.retained_pages().len() != chunk_count
+        || source_generation_digest.bytes() == [0; 32]
         || output.capture_material().records().len() != chunk_count
         || capture.source_id() != metadata.source_id()
         || capture.metadata_revision() != metadata.revision()
         || capture.dataset() != config.dataset()
         || (chunk_count == 1
-            && (capture.terminal()
-                != ProviderCaptureTerminalDisposition::StandaloneResponse
+            && (capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
                 || !components.is_empty()))
         || (chunk_count > 1
-            && (capture.terminal()
-                != ProviderCaptureTerminalDisposition::CompleteRequestGraph
+            && (capture.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
                 || components.len() != chunk_count
                 || capture.request_set_identity()
-                    != discovery_capture_graph_identity(metadata, config, output.batch().request())?))
+                    != discovery_capture_graph_identity(
+                        metadata,
+                        config,
+                        output.batch().request(),
+                        source_generation_digest,
+                    )?))
     {
         return Err(SourceError::InvalidProtocolState.into());
     }
 
     let mut total_body_bytes = 0_u64;
-    for (index, ((object, page), chunk)) in objects
+    for (index, (((object, page), retained_page), chunk)) in objects
         .iter()
         .zip(pages)
+        .zip(output.retained_pages())
         .zip(config.plan().chunks())
         .enumerate()
     {
-        let expected_request_identity = capture_request_identity(metadata, config, index, chunk)?;
-        let (object_index, _) = parse_object_id(object.object_id())?;
+        let expected_request_identity = capture_request_identity(
+            metadata,
+            config,
+            output.batch().request(),
+            source_generation_digest,
+            index,
+            chunk,
+        )?;
+        let (object_index, object_digest) = parse_object_id(object.object_id())?;
         let SourceObjectCaptureIdentity::Paged {
             content_digest: object_capture_content_digest,
             page_count: object_capture_page_count,
@@ -1166,13 +1243,17 @@ fn validate_discovery_output(
             || object.effective_interval().starts_at() != page.received_at()
             || object.published_at().is_some()
             || object.availability()
-                != &AvailabilityEvidence::LocalFirstObserved {
+                != &(AvailabilityEvidence::LocalFirstObserved {
                     observed_at: page.received_at(),
-                }
+                })
             || page.request_identity() != expected_request_identity
             || page.request_page_token_digest().is_some()
             || page.response_next_page_token_digest().is_some()
             || page.http_status() != 200
+            || retained_page.received_at != page.received_at()
+            || retained_page.sha256_hex != object_digest
+            || u64::try_from(retained_page.bytes.len()).ok() != Some(page.body_bytes())
+            || !payload_matches_exact_evidence(&retained_page.bytes, object.evidence())
         {
             return Err(SourceError::InvalidProtocolState.into());
         }
@@ -1191,8 +1272,7 @@ fn validate_discovery_output(
             if usize::from(component.ordinal()) != index
                 || component.dataset() != config.dataset()
                 || component.request_set_identity() != expected_request_identity
-                || component.terminal()
-                    != ProviderCaptureTerminalDisposition::StandaloneResponse
+                || component.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
                 || usize::from(component.first_page_ordinal()) != index
                 || component.page_count().get() != 1
                 || component.total_body_bytes() != page.body_bytes()
@@ -1215,11 +1295,12 @@ fn validate_discovery_output(
 fn doctor_capture_request_identity(
     metadata: &SourceMetadata,
     config: &BlsSourceConfig,
+    source_generation_digest: EvidenceDigest,
     series_id: &str,
     year: u16,
 ) -> Result<EvidenceDigest, ExtractionSourceError> {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/bls-provider-doctor-request/v1");
+    hash.update(b"market-squawk/bls-provider-doctor-request/v2");
     hash_capture_field(&mut hash, metadata.source_id().as_str().as_bytes())?;
     hash_capture_field(
         &mut hash,
@@ -1231,6 +1312,7 @@ fn doctor_capture_request_identity(
     )?;
     hash_capture_field(&mut hash, config.dataset().as_str().as_bytes())?;
     hash_capture_field(&mut hash, config.authorization().endpoint().as_bytes())?;
+    hash_capture_digest(&mut hash, source_generation_digest);
     hash_capture_field(&mut hash, b"doctor")?;
     hash_capture_field(&mut hash, series_id.as_bytes())?;
     hash.update(year.to_be_bytes());
@@ -1245,6 +1327,38 @@ fn hash_capture_field(hash: &mut Sha256, value: &[u8]) -> Result<(), ExtractionS
     hash.update(length.to_be_bytes());
     hash.update(value);
     Ok(())
+}
+
+fn hash_capture_digest(hash: &mut Sha256, value: EvidenceDigest) {
+    hash.update(match value.algorithm() {
+        DigestAlgorithm::Sha256 => [1],
+        DigestAlgorithm::Blake3 => [2],
+    });
+    hash.update(value.bytes());
+}
+
+fn page_cache_key(
+    object_id: &SourceIdentifier,
+    request_identity: EvidenceDigest,
+    observation_digest: EvidenceDigest,
+    source_generation_digest: EvidenceDigest,
+) -> Result<String, BlsSourceError> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/bls-receipt-cache-key/v1\0");
+    hash.update(
+        u64::try_from(object_id.as_str().len())
+            .map_err(|_| BlsSourceError::InvalidPublication)?
+            .to_be_bytes(),
+    );
+    hash.update(object_id.as_str().as_bytes());
+    for digest in [
+        request_identity,
+        observation_digest,
+        source_generation_digest,
+    ] {
+        hash_capture_digest(&mut hash, digest);
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 pub(crate) fn parse_object_id(
@@ -1278,14 +1392,10 @@ impl BlsSourceConfig {
     /// Rejects malformed series/year plans or a dataset identity outside domain bounds.
     pub fn try_new(
         authorization: BlsAuthorization,
-        root_rights_rejoin: BlsRootRightsRejoin,
         series_metadata: Vec<BlsSeriesMetadata>,
         start_year: u16,
         end_year: u16,
     ) -> Result<Self, BlsSourceError> {
-        root_rights_rejoin.validate()?;
-        let usage_policy = BlsUsagePolicy::private_personal_research_no_distribution()?;
-        usage_policy.validate()?;
         let tier = authorization.tier();
         let mut metadata_by_series = BTreeMap::new();
         for metadata in series_metadata {
@@ -1307,36 +1417,12 @@ impl BlsSourceConfig {
             return Err(BlsSourceError::InvalidConfiguration);
         }
         let mut hash = Sha256::new();
-        hash.update(b"market-squawk/bls-request-plan/v4");
-        hash_field(&mut hash, BlsUsagePolicy::policy_id().as_bytes())?;
-        let policy_digest = usage_policy.policy_digest();
-        hash.update(match policy_digest.algorithm() {
-            DigestAlgorithm::Sha256 => b"sha256".as_slice(),
-            DigestAlgorithm::Blake3 => b"blake3".as_slice(),
-        });
-        hash.update(policy_digest.bytes());
-        for rejoin_digest in [
-            root_rights_rejoin.root_decision_digest(),
-            root_rights_rejoin.provider_policy_digest(),
-        ] {
-            hash.update(match rejoin_digest.algorithm() {
-                DigestAlgorithm::Sha256 => b"sha256".as_slice(),
-                DigestAlgorithm::Blake3 => b"blake3".as_slice(),
-            });
-            hash.update(rejoin_digest.bytes());
-        }
-        let presentation_obligation = usage_policy.presentation_obligation()?;
-        presentation_obligation.validate()?;
-        let presentation_obligation_digest = presentation_obligation.obligation_digest();
-        hash.update(match presentation_obligation_digest.algorithm() {
-            DigestAlgorithm::Sha256 => b"sha256".as_slice(),
-            DigestAlgorithm::Blake3 => b"blake3".as_slice(),
-        });
-        hash.update(presentation_obligation_digest.bytes());
+        hash.update(b"market-squawk/bls-request-plan/v6");
         hash.update(match tier {
             BlsAccessTier::PublicV1 => b"public-v1".as_slice(),
             BlsAccessTier::RegisteredV2 => b"registered-v2".as_slice(),
         });
+        hash_config_credential_rejoin(&mut hash, authorization.credential_rejoin());
         let chunk_count =
             u16::try_from(plan.chunks().len()).map_err(|_| BlsSourceError::InvalidConfiguration)?;
         hash.update(chunk_count.to_be_bytes());
@@ -1378,8 +1464,6 @@ impl BlsSourceConfig {
             .map_err(|_| BlsSourceError::InvalidConfiguration)?;
         Ok(Self {
             authorization,
-            usage_policy,
-            root_rights_rejoin,
             plan,
             series_metadata: metadata_by_series,
             dataset,
@@ -1399,16 +1483,6 @@ impl BlsSourceConfig {
     /// Returns documented and enforced limits used by metadata and request composition.
     pub const fn limits(&self) -> BlsRequestLimits {
         self.plan.limits()
-    }
-
-    /// Returns the fixed provider-local private-use/no-distribution policy.
-    pub const fn usage_policy(&self) -> BlsUsagePolicy {
-        self.usage_policy
-    }
-
-    /// Returns the non-authoritative root rights coordinate bound into every source rejoin.
-    pub const fn root_rights_rejoin(&self) -> BlsRootRightsRejoin {
-        self.root_rights_rejoin
     }
 
     /// Returns the explicit public marker or protected registered credential generation.
@@ -1440,6 +1514,20 @@ fn hash_field(hash: &mut Sha256, value: &[u8]) -> Result<(), BlsSourceError> {
     hash.update(length.to_be_bytes());
     hash.update(value);
     Ok(())
+}
+
+fn hash_config_credential_rejoin(hash: &mut Sha256, value: crate::BlsCredentialRejoin) {
+    match value {
+        crate::BlsCredentialRejoin::PublicNoCredential => hash.update(b"public-no-credential"),
+        crate::BlsCredentialRejoin::RegisteredGeneration(generation) => {
+            hash.update(b"registered-generation");
+            hash.update(match generation.algorithm() {
+                DigestAlgorithm::Sha256 => b"sha256".as_slice(),
+                DigestAlgorithm::Blake3 => b"blake3".as_slice(),
+            });
+            hash.update(generation.bytes());
+        }
+    }
 }
 
 #[cfg(test)]
