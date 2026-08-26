@@ -13,8 +13,8 @@ use market_squawk_domain::{
 use market_squawk_platform::{RawCaptureRecord, SealedResearchJournalStore};
 use market_squawk_sources::{
     AuthorizationMode, CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
-    ExtractionBatch, ExtractionRequest, ExtractionRevisionEvidence, ExtractionRevisionPlan,
-    ExtractionSource, ExtractionSourceError, HistoricalCapability, ObservedProviderOrder,
+    ExtractionBatch, ExtractionBatchAccumulator, ExtractionRecord, ExtractionRequest,
+    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HistoricalCapability,
     ProviderCaptureMaterial, ProviderCaptureMaterialSealError, ProviderCapturePageReceipt,
     ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SourceClass, SourceError,
     SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
@@ -28,11 +28,11 @@ use crate::client::{JSON_MEDIA_TYPE, TreasuryHttpClient, XML_MEDIA_TYPE, system_
 use crate::{
     FiscalDataPage, FiscalDataParseLimits, TreasuryDailyRateFamily, TreasuryDailyRatePage,
     TreasuryDailyRatePageRequest, TreasuryDailyRateQuery, TreasuryFiscalQuery, TreasuryPageRequest,
-    TreasuryProtocolError, TreasuryYieldCurvePageRequest,
+    TreasuryProtocolError,
 };
 
 mod backfill;
-mod lineage;
+pub(crate) mod lineage;
 pub(crate) mod normalize;
 
 pub use backfill::{
@@ -46,9 +46,13 @@ use crate::vertical::{
     TreasuryExtractionAccounting, TreasuryExtractionAccountingInput,
 };
 use lineage::{
-    ObjectKind, ParsedObjectId, invalid_protocol, lower_hex, source_object, verify_refetched_object,
+    FiscalChainFraming, ObjectKind, ParsedObjectId, fiscal_chain_source_object, invalid_protocol,
+    lower_hex, source_object, verify_refetched_fiscal_chain, verify_refetched_object,
 };
-use normalize::{canonical_daily_rate_records, canonical_fiscal_records};
+use normalize::{
+    CanonicalRecordAdmission, CanonicalTreasuryRecord, canonical_daily_rate_records,
+    canonical_fiscal_records,
+};
 
 const MAX_DAILY_RATE_QUERIES: usize = 1_024;
 const MAX_DAILY_RATE_PAGES: usize = 1_024;
@@ -258,16 +262,6 @@ impl TreasurySourceConfig {
         }
     }
 
-    fn single_dataset(&self) -> Result<SourceIdentifier, TreasurySourceError> {
-        match self {
-            Self::AverageInterestRates(query) => fiscal_provider_dataset(query),
-            Self::DailyRates(config) if config.queries().len() == 1 => {
-                Ok(config.queries()[0].dataset().clone())
-            }
-            Self::DailyRates(_) => Err(TreasurySourceError::InvalidProtocol),
-        }
-    }
-
     fn analytical_dataset(
         &self,
         provider_dataset: &SourceIdentifier,
@@ -426,15 +420,11 @@ impl RetrievedDailyRatePage {
     }
 }
 
-/// Backward-compatible name for one retrieved Treasury daily-rate page.
-pub type RetrievedYieldCurvePage = RetrievedDailyRatePage;
-
-/// Canonical Treasury rows paired with the exact single response that produced them.
+/// Canonical Treasury rows paired with every exact response that produced them.
 ///
-/// Each discovered source object identifies one provider page, so its extraction capture is a
-/// standalone one-response set. Fiscal total pages and daily-rate terminal state remain validated
-/// by the provider-native page before this output is constructed, while the object identity binds
-/// the exact page number, request digest, and response digest.
+/// Fiscal output owns the complete validated page chain; bounded daily output owns its standalone
+/// response. The common capture receipt retains ordered request, payload, byte, and receive-clock
+/// evidence before the one-shot publication handoff can bind the canonical batch.
 #[derive(Debug)]
 pub struct TreasuryExtractionOutput {
     batch: ExtractionBatch,
@@ -501,12 +491,15 @@ impl TreasuryExtractionOutput {
         &self.batch
     }
 
-    /// Returns the exact provider response that must be sealed before publishing the batch.
+    /// Returns exact provider response material for this complete extraction unit.
+    ///
+    /// Daily extraction contains one response; Fiscal extraction contains the complete ordered
+    /// response set. The common publication path must seal all returned material as one unit.
     pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
         &self.capture
     }
 
-    /// Returns exact page, row, canonical-point, byte, request, and terminal accounting.
+    /// Returns aggregate daily-response or complete Fiscal-chain accounting.
     pub const fn accounting(&self) -> &TreasuryExtractionAccounting {
         &self.accounting
     }
@@ -514,7 +507,8 @@ impl TreasuryExtractionOutput {
     /// Consumes this one-shot output for the source-neutral publication path.
     ///
     /// The returned batch is bound to the exact retained capture receipt only after the
-    /// provider-local page, row, byte, request, payload, and clock accounting matches both values.
+    /// provider-local aggregate rows, points, raw bytes, request set, payload, terminal-page count,
+    /// and clocks match both values.
     /// The application remains responsible for sealing and reopening the original capture through
     /// its shared research journal before committing an analytical generation.
     pub fn try_into_common_publication(
@@ -556,16 +550,14 @@ impl std::fmt::Debug for TreasurySource {
 impl TreasurySource {
     /// Builds the most authoritative truthful revision plan supported by this Treasury profile.
     ///
-    /// Daily-rate observations use the provider publication timestamp and exact record token.
-    /// Fiscal Data average-rate rows publish no version chronology, so their revisions are bound to
-    /// exact locally observed canonical content instead of a fabricated provider order.
+    /// Neither Treasury surface exposes an immutable provider revision identifier. Revisions are
+    /// therefore bound to exact locally observed canonical content instead of a fabricated order.
     ///
     /// # Errors
     ///
     /// Returns [`TreasurySourceError::InvalidMetadata`] when the batch belongs to another source
-    /// registration, [`TreasurySourceError::InvalidProtocol`] when a daily-rate record lacks its
-    /// required publication timestamp, and [`TreasurySourceError::RevisionAuthority`] when bounded
-    /// exact evidence construction fails.
+    /// registration or [`TreasurySourceError::RevisionAuthority`] when bounded exact evidence
+    /// construction fails.
     pub fn revision_plan(
         &self,
         batch: &ExtractionBatch,
@@ -575,33 +567,7 @@ impl TreasurySource {
         {
             return Err(TreasurySourceError::InvalidMetadata);
         }
-        match &self.config {
-            TreasurySourceConfig::AverageInterestRates(_) => {
-                ExtractionRevisionPlan::locally_observed(batch.records().len()).map_err(Into::into)
-            }
-            TreasurySourceConfig::DailyRates(_) => {
-                let mut evidence = Vec::new();
-                evidence
-                    .try_reserve_exact(batch.records().len())
-                    .map_err(|_| {
-                        TreasurySourceError::RevisionAuthority(
-                            market_squawk_sources::ObservedRevisionError::AllocationFailure,
-                        )
-                    })?;
-                for record in batch.records() {
-                    let version = record.revision().as_str().as_bytes();
-                    let published = record
-                        .published_time()
-                        .cloned()
-                        .ok_or(TreasurySourceError::InvalidProtocol)?;
-                    let order = ObservedProviderOrder::try_new(published, version)?;
-                    evidence.push(ExtractionRevisionEvidence::provider_supplied(
-                        version, order,
-                    )?);
-                }
-                ExtractionRevisionPlan::try_new(evidence).map_err(Into::into)
-            }
-        }
+        ExtractionRevisionPlan::locally_observed(batch.records().len()).map_err(Into::into)
     }
 
     /// Binds immutable metadata to one official Treasury profile.
@@ -661,8 +627,7 @@ impl TreasurySource {
             || metadata.authorization().mode() != AuthorizationMode::PublicInterface
             || metadata.coverage().domain() != CoverageDomain::Macroeconomic
             || metadata.quality_ceiling() != config.quality()
-            || budget.scope().as_source_identifier().as_str() != "us-treasury"
-            || budget.scope().authorization_account().is_some()
+            || crate::vertical::treasury_rate_policy_digest(budget).is_err()
             || metadata.capabilities().live()
             || !metadata.capabilities().extraction()
             || metadata.capabilities().historical() != HistoricalCapability::Historical
@@ -722,7 +687,7 @@ impl TreasurySource {
             let started = Instant::now();
             let (received_at, body, capture) = if let Some(request) = probe.fiscal_request() {
                 let retrieved = self
-                    .fetch_fiscal_page(
+                    .fetch_fiscal_page_with_budget_wait(
                         &authority,
                         request,
                         FiscalDataParseLimits::production_defaults(),
@@ -734,7 +699,7 @@ impl TreasurySource {
                 (received_at, body, capture)
             } else if let Some(request) = probe.daily_request() {
                 let retrieved = self
-                    .fetch_daily_rate_page(
+                    .fetch_daily_rate_page_with_budget_wait(
                         &authority,
                         request,
                         FiscalDataParseLimits::production_defaults(),
@@ -761,25 +726,15 @@ impl TreasurySource {
             observations.push(observation);
             captures.push(capture);
         }
-        let receipt = plan.close(observations).map_err(|_| invalid_protocol())?;
+        let receipt = plan
+            .close(observations, &self.metadata)
+            .map_err(|_| invalid_protocol())?;
         Ok(TreasuryDoctorRun {
             source_id: self.metadata.source_id().clone(),
             metadata_revision: self.metadata.revision().clone(),
             receipt,
             captures: captures.into_boxed_slice(),
         })
-    }
-
-    /// Returns the exact dataset identity accepted by discovery for this configured source.
-    ///
-    /// This compatibility accessor is available only for a single-dataset source. Multi-dataset
-    /// daily-rate sources are addressed by the dataset supplied to each discovery request.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TreasurySourceError::InvalidProtocol`] for a multi-dataset configuration.
-    pub fn dataset(&self) -> Result<SourceIdentifier, TreasurySourceError> {
-        self.config.single_dataset()
     }
 
     /// Derives the storage-safe analytical identity for one exact configured provider dataset.
@@ -848,21 +803,43 @@ impl TreasurySource {
                     FiscalDataPage::parse(&response.bytes, request, limits).map_err(|_| {
                         ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                     })?;
+                let (bytes, received_at) = response.record_success()?;
                 Ok(RetrievedFiscalDataPage {
-                    received_at: response.received_at,
+                    received_at,
                     capture: capture_material(
                         &self.metadata,
                         fiscal_provider_dataset(query).map_err(map_adapter_error)?,
                         request.request_digest(),
-                        response.received_at,
-                        response.bytes.clone(),
+                        received_at,
+                        bytes.clone(),
                     )?,
-                    bytes: response.bytes,
+                    bytes,
                     page,
                 })
             });
         self.record_extraction_result(&result, |page| page.page.response_payload_digest())?;
         result
+    }
+
+    pub(super) async fn fetch_fiscal_page_with_budget_wait(
+        &self,
+        authority: &ExtractionAuthority,
+        request: &TreasuryPageRequest,
+        limits: FiscalDataParseLimits,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<RetrievedFiscalDataPage, ExtractionSourceError> {
+        loop {
+            let result = self
+                .fetch_fiscal_page(authority, request, limits, deadline, cancellation)
+                .await;
+            match result {
+                Ok(retrieved) => return Ok(retrieved),
+                Err(error) => {
+                    Self::wait_for_shared_budget(authority, error, deadline, cancellation).await?;
+                }
+            }
+        }
     }
 
     /// Fetches and validates one page from an exact configured daily-rate query family.
@@ -904,16 +881,17 @@ impl TreasurySource {
                 let page = TreasuryDailyRatePage::parse(&response.bytes, request, limits).map_err(
                     |_| ExtractionSourceError::Source(SourceError::InvalidProtocolState),
                 )?;
+                let (bytes, received_at) = response.record_success()?;
                 Ok(RetrievedDailyRatePage {
-                    received_at: response.received_at,
+                    received_at,
                     capture: capture_material(
                         &self.metadata,
                         request.dataset().clone(),
                         request.request_digest(),
-                        response.received_at,
-                        response.bytes.clone(),
+                        received_at,
+                        bytes.clone(),
                     )?,
-                    bytes: response.bytes,
+                    bytes,
                     page,
                 })
             });
@@ -921,30 +899,62 @@ impl TreasurySource {
         result
     }
 
-    /// Backward-compatible nominal-yield fetch entry point.
-    pub async fn fetch_yield_curve_page(
+    pub(super) async fn fetch_daily_rate_page_with_budget_wait(
         &self,
         authority: &ExtractionAuthority,
-        request: &TreasuryYieldCurvePageRequest,
+        request: &TreasuryDailyRatePageRequest,
         limits: FiscalDataParseLimits,
         deadline: Timestamp,
         cancellation: &CancellationToken,
-    ) -> Result<RetrievedYieldCurvePage, ExtractionSourceError> {
-        self.fetch_daily_rate_page(
-            authority,
-            request.as_daily_request(),
-            limits,
-            deadline,
-            cancellation,
-        )
-        .await
+    ) -> Result<RetrievedDailyRatePage, ExtractionSourceError> {
+        loop {
+            let result = self
+                .fetch_daily_rate_page(authority, request, limits, deadline, cancellation)
+                .await;
+            match result {
+                Ok(retrieved) => return Ok(retrieved),
+                Err(error) => {
+                    Self::wait_for_shared_budget(authority, error, deadline, cancellation).await?;
+                }
+            }
+        }
     }
 
-    /// Traverses one exact configured query to its provider-defined terminal condition and
-    /// retains complete page, row, point, byte, and raw-terminal accounting.
+    async fn wait_for_shared_budget(
+        authority: &ExtractionAuthority,
+        error: ExtractionSourceError,
+        operation_deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ExtractionSourceError> {
+        let budget_deadline = match &error {
+            ExtractionSourceError::Authority(
+                market_squawk_sources::ExtractionAuthorityError::BudgetWaitUntil { deadline },
+            )
+            | ExtractionSourceError::Source(SourceError::BudgetWaitUntil { deadline }) => *deadline,
+            _ => return Err(error),
+        };
+        let remaining = authority.remaining_budget_wait(budget_deadline)?;
+        let sampled_at = system_timestamp().map_err(map_adapter_error)?;
+        let remaining_nanos = i64::try_from(remaining.as_nanos())
+            .map_err(|_| ExtractionSourceError::DeadlineExceeded)?;
+        if sampled_at
+            .checked_add_nanos(remaining_nanos)
+            .map_err(|_| ExtractionSourceError::DeadlineExceeded)?
+            > operation_deadline
+        {
+            return Err(ExtractionSourceError::DeadlineExceeded);
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => Err(ExtractionSourceError::Cancelled),
+            () = tokio::time::sleep(remaining) => Ok(()),
+        }
+    }
+
+    /// Traverses one ordinary exact query to its provider-defined terminal condition.
     ///
-    /// Source-neutral discovery exposes only results whose terminal response can be represented by
-    /// the discovered source objects; all-history remains a separately checkpointed backfill mode.
+    /// Fiscal discovery emits one aggregate object only after every ordered response in the
+    /// complete page chain has been validated and framed. A bounded daily query emits its one
+    /// standalone response. All-history remains a separately checkpointed backfill mode.
     pub async fn discover_with_accounting(
         &self,
         authority: ExtractionAuthority,
@@ -977,7 +987,7 @@ impl TreasurySource {
         let mut request_count = 0_usize;
         let mut response_count = 0_usize;
         let mut returned_source_rows = 0_usize;
-        let mut canonical_points = 0_usize;
+        let mut canonical_admission = CanonicalRecordAdmission::new();
         let mut raw_body_bytes = 0_u64;
         let mut reported_total_rows = None;
         let mut reported_total_pages = None;
@@ -986,23 +996,28 @@ impl TreasurySource {
         let mut source_payload_digests = Vec::new();
         match &self.config {
             TreasurySourceConfig::AverageInterestRates(query) => {
+                let mut framing = FiscalChainFraming::try_new()?;
                 let mut tracker = crate::TreasuryPaginationTracker::try_new(
                     query,
-                    100_000,
+                    market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES,
                     market_squawk_sources::MAX_EXTRACTION_RECORDS,
                 )
                 .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
                 let mut page_number = 1_usize;
                 loop {
+                    if page_number > market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES {
+                        return Err(invalid_protocol());
+                    }
                     let page_request = query.page(page_number).map_err(|_| {
                         ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                     })?;
+                    let page_limits = fiscal_chain_page_limits(raw_body_bytes)?;
                     request_count = request_count.checked_add(1).ok_or_else(invalid_protocol)?;
                     let retrieved = self
-                        .fetch_fiscal_page(
+                        .fetch_fiscal_page_with_budget_wait(
                             &authority,
                             &page_request,
-                            limits,
+                            page_limits,
                             request.deadline(),
                             &cancellation,
                         )
@@ -1010,15 +1025,30 @@ impl TreasurySource {
                     response_count = response_count.checked_add(1).ok_or_else(invalid_protocol)?;
                     let payload_bytes = u64::try_from(retrieved.exact_payload().len())
                         .map_err(|_| invalid_protocol())?;
-                    raw_body_bytes = raw_body_bytes
+                    let next_raw_body_bytes = raw_body_bytes
                         .checked_add(payload_bytes)
                         .ok_or_else(invalid_protocol)?;
-                    returned_source_rows = returned_source_rows
+                    let next_returned_source_rows = returned_source_rows
                         .checked_add(retrieved.page().records().len())
                         .ok_or_else(invalid_protocol)?;
-                    canonical_points = canonical_points
-                        .checked_add(retrieved.page().records().len())
-                        .ok_or_else(invalid_protocol)?;
+                    validate_fiscal_chain_work(
+                        next_raw_body_bytes,
+                        next_returned_source_rows,
+                        page_number,
+                    )?;
+                    raw_body_bytes = next_raw_body_bytes;
+                    returned_source_rows = next_returned_source_rows;
+                    let ingested_at = system_timestamp().map_err(map_adapter_error)?;
+                    for record in canonical_fiscal_records(
+                        &self.metadata,
+                        retrieved.page(),
+                        retrieved.received_at(),
+                        ingested_at,
+                    ) {
+                        canonical_admission
+                            .admit(record.map_err(map_adapter_error)?)
+                            .map_err(map_adapter_error)?;
+                    }
                     reported_total_rows = Some(retrieved.page().total_count());
                     reported_total_pages = Some(retrieved.page().total_pages());
                     if last_received_at.is_some_and(|previous| retrieved.received_at() < previous) {
@@ -1029,27 +1059,26 @@ impl TreasurySource {
                     let terminal = tracker.accept(retrieved.page()).map_err(|_| {
                         ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                     })?;
-                    let object = source_object(
-                        &self.metadata,
-                        &request,
-                        &page_request,
-                        retrieved.exact_payload(),
-                        retrieved.received_at(),
-                        "application/json",
-                        ObjectKind::Fiscal,
-                    )?;
-                    source_payload_digests.push(object.evidence().content_digest());
-                    objects.push(object);
+                    framing.push(retrieved.exact_payload())?;
                     if terminal {
                         break;
-                    }
-                    if objects.len() == usize::from(request.max_results()) {
-                        return Err(invalid_protocol());
                     }
                     page_number = page_number.checked_add(1).ok_or({
                         ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                     })?;
                 }
+                let framing = framing.finish()?;
+                let first_page = query.page(1).map_err(|_| invalid_protocol())?;
+                let object = fiscal_chain_source_object(
+                    &self.metadata,
+                    &request,
+                    &first_page,
+                    response_count,
+                    &framing,
+                    last_received_at.ok_or_else(invalid_protocol)?,
+                )?;
+                source_payload_digests.push(object.evidence().content_digest());
+                objects.push(object);
             }
             TreasurySourceConfig::DailyRates(config) => {
                 let query = config
@@ -1075,7 +1104,7 @@ impl TreasurySource {
                         ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                     })?;
                     let retrieved = self
-                        .fetch_daily_rate_page(
+                        .fetch_daily_rate_page_with_budget_wait(
                             &authority,
                             &page_request,
                             limits,
@@ -1093,17 +1122,17 @@ impl TreasurySource {
                     returned_source_rows = returned_source_rows
                         .checked_add(retrieved.page().observations().len())
                         .ok_or_else(invalid_protocol)?;
-                    let page_points = retrieved.page().observations().iter().try_fold(
-                        0_usize,
-                        |total, observation| {
-                            total
-                                .checked_add(observation.metric_points().count())
-                                .ok_or_else(invalid_protocol)
-                        },
-                    )?;
-                    canonical_points = canonical_points
-                        .checked_add(page_points)
-                        .ok_or_else(invalid_protocol)?;
+                    let ingested_at = system_timestamp().map_err(map_adapter_error)?;
+                    for record in canonical_daily_rate_records(
+                        &self.metadata,
+                        retrieved.page(),
+                        retrieved.received_at(),
+                        ingested_at,
+                    ) {
+                        canonical_admission
+                            .admit(record.map_err(map_adapter_error)?)
+                            .map_err(map_adapter_error)?;
+                    }
                     if last_received_at.is_some_and(|previous| retrieved.received_at() < previous) {
                         return Err(invalid_protocol());
                     }
@@ -1138,6 +1167,9 @@ impl TreasurySource {
         }
         let first_received_at = first_received_at.ok_or_else(invalid_protocol)?;
         let last_received_at = last_received_at.ok_or_else(invalid_protocol)?;
+        let canonical_points = canonical_admission.record_count();
+        let observed_numeric_points = canonical_admission.observed_numeric_points();
+        let explicit_missing_points = canonical_admission.explicit_missing_points();
         let source_object_count = objects.len();
         let batch = DiscoveryBatch::try_new(&request, objects)?;
         let accounting = TreasuryDiscoveryAccounting::try_new(TreasuryDiscoveryAccountingInput {
@@ -1147,6 +1179,8 @@ impl TreasurySource {
             source_object_count,
             returned_source_rows,
             canonical_points,
+            observed_numeric_points,
+            explicit_missing_points,
             raw_body_bytes,
             terminal_response_observed: true,
             terminal_response_represented_by_source_object: true,
@@ -1160,8 +1194,10 @@ impl TreasurySource {
         TreasuryDiscoveryOutput::try_new(batch, accounting).map_err(|_| invalid_protocol())
     }
 
-    /// Refetches one discovered Treasury page and returns its canonical rows with the exact raw
-    /// response material required by the common raw-capture ingest path.
+    /// Refetches one discovered daily response or one complete Fiscal page chain.
+    ///
+    /// Returns all canonical rows together with the exact ordered raw response material required
+    /// by the common raw-capture publication path.
     pub async fn extract_with_capture(
         &self,
         authority: ExtractionAuthority,
@@ -1189,58 +1225,130 @@ impl TreasurySource {
             .ok_or_else(invalid_protocol)?;
         let parsed = ParsedObjectId::parse(request.object().object_id())?;
         let limits = FiscalDataParseLimits::production_defaults();
-        let (records, capture, accounting) = match (&self.config, parsed.kind) {
-            (TreasurySourceConfig::AverageInterestRates(query), ObjectKind::Fiscal) => {
-                let page_request = query.page(parsed.page_number).map_err(|_| {
-                    ExtractionSourceError::Source(SourceError::InvalidProtocolState)
-                })?;
-                parsed.verify_request(page_request.request_digest())?;
-                let retrieved = self
-                    .fetch_fiscal_page(
-                        &authority,
-                        &page_request,
-                        limits,
-                        request.deadline(),
-                        &cancellation,
-                    )
-                    .await?;
-                verify_refetched_object(
+        let schema =
+            SourceIdentifier::try_from(market_squawk_sources::CURRENT_RESEARCH_RECORD_SCHEMA)
+                .map_err(|_| invalid_protocol())?;
+        let (batch, capture, accounting) = match (&self.config, parsed.kind) {
+            (TreasurySourceConfig::AverageInterestRates(query), ObjectKind::FiscalChain) => {
+                let first_request = query.page(1).map_err(|_| invalid_protocol())?;
+                parsed.verify_request(first_request.request_digest())?;
+                if parsed.page_number > market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES {
+                    return Err(invalid_protocol());
+                }
+                let mut tracker = crate::TreasuryPaginationTracker::try_new(
+                    query,
+                    market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES,
+                    market_squawk_sources::MAX_EXTRACTION_RECORDS,
+                )
+                .map_err(|_| invalid_protocol())?;
+                let mut captured = Vec::new();
+                captured
+                    .try_reserve_exact(parsed.page_number)
+                    .map_err(|_| invalid_protocol())?;
+                let mut framing = FiscalChainFraming::try_new()?;
+                let mut batch = ExtractionBatchAccumulator::try_new(&request)?;
+                let mut canonical_admission = CanonicalRecordAdmission::new();
+                let mut source_rows = 0_usize;
+                let mut raw_body_bytes = 0_u64;
+                let mut received_at = None;
+                for page_number in 1..=parsed.page_number {
+                    let page_request = query.page(page_number).map_err(|_| invalid_protocol())?;
+                    let page_limits = fiscal_chain_page_limits(raw_body_bytes)?;
+                    let retrieved = self
+                        .fetch_fiscal_page_with_budget_wait(
+                            &authority,
+                            &page_request,
+                            page_limits,
+                            request.deadline(),
+                            &cancellation,
+                        )
+                        .await?;
+                    let terminal = tracker
+                        .accept(retrieved.page())
+                        .map_err(|_| invalid_protocol())?;
+                    if terminal != (page_number == parsed.page_number) {
+                        return Err(invalid_protocol());
+                    }
+                    let payload_bytes = u64::try_from(retrieved.exact_payload().len())
+                        .map_err(|_| invalid_protocol())?;
+                    let next_raw_body_bytes = raw_body_bytes
+                        .checked_add(payload_bytes)
+                        .ok_or_else(invalid_protocol)?;
+                    let next_source_rows = source_rows
+                        .checked_add(retrieved.page().records().len())
+                        .ok_or_else(invalid_protocol)?;
+                    validate_fiscal_chain_work(next_raw_body_bytes, next_source_rows, page_number)?;
+                    if received_at.is_some_and(|previous| retrieved.received_at() < previous) {
+                        return Err(invalid_protocol());
+                    }
+                    let ingested_at = system_timestamp().map_err(map_adapter_error)?;
+                    for record in canonical_fiscal_records(
+                        &self.metadata,
+                        retrieved.page(),
+                        retrieved.received_at(),
+                        ingested_at,
+                    ) {
+                        let record = canonical_admission
+                            .admit(record.map_err(map_adapter_error)?)
+                            .map_err(map_adapter_error)?;
+                        batch.push(canonical_extraction_record(&request, &schema, record)?)?;
+                    }
+                    framing.push(retrieved.exact_payload())?;
+                    let request_digest = retrieved.page().request_digest();
+                    let request_page_token = page_request.page_token();
+                    let response_next_page_token =
+                        retrieved.page().next_page_token().map(str::to_owned);
+                    let received = retrieved.received_at();
+                    let (_, body, _decoded, _standalone_capture) = retrieved.into_parts();
+                    captured.push(FiscalCapturedPage {
+                        request_digest,
+                        request_page_token,
+                        response_next_page_token,
+                        received_at: received,
+                        body,
+                    });
+                    raw_body_bytes = next_raw_body_bytes;
+                    source_rows = next_source_rows;
+                    received_at = Some(received);
+                }
+                let framing = framing.finish()?;
+                verify_refetched_fiscal_chain(
                     &request,
                     parsed.payload_digest,
-                    retrieved.exact_payload(),
+                    parsed.page_number,
+                    &framing,
                 )?;
-                let ingested_at = system_timestamp().map_err(map_adapter_error)?;
-                let source_rows = retrieved.page().records().len();
-                let page_number = retrieved.page().page_number();
-                let terminal_for_query = page_number == retrieved.page().total_pages();
-                let raw_body_bytes = retrieved.exact_payload().len();
-                let received_at = retrieved.received_at();
-                let query_digest = retrieved.page().query_digest();
-                let request_digest = retrieved.page().request_digest();
-                let payload_digest = retrieved.page().response_payload_digest();
-                let records = canonical_fiscal_records(
+                let request_digest = fiscal_request_set_digest(&captured)?;
+                let payload_digest = Sha256::digest(&framing).into();
+                let canonical_points = canonical_admission.record_count();
+                let observed_numeric_points = canonical_admission.observed_numeric_points();
+                let explicit_missing_points = canonical_admission.explicit_missing_points();
+                let capture = fiscal_chain_capture_material(
                     &self.metadata,
-                    retrieved.page(),
-                    retrieved.received_at(),
-                    ingested_at,
-                )
-                .map_err(map_adapter_error)?;
+                    request.object().dataset().clone(),
+                    request_digest,
+                    &captured,
+                )?;
                 let accounting =
                     TreasuryExtractionAccounting::try_new(TreasuryExtractionAccountingInput {
                         descriptor,
-                        page_number,
-                        returned_source_rows: source_rows,
-                        canonical_points: records.len(),
-                        raw_body_bytes,
-                        query_digest,
-                        request_digest,
-                        payload_digest,
-                        received_at,
+                        terminal_page_count: parsed.page_number,
+                        aggregate_source_rows: source_rows,
+                        aggregate_canonical_points: canonical_points,
+                        aggregate_observed_numeric_points: observed_numeric_points,
+                        aggregate_explicit_missing_points: explicit_missing_points,
+                        aggregate_raw_body_bytes: usize::try_from(raw_body_bytes)
+                            .map_err(|_| invalid_protocol())?,
+                        source_object_payload_bytes: framing.len(),
+                        query_digest: query.query_digest(),
+                        request_set_digest: request_digest,
+                        source_object_payload_digest: payload_digest,
+                        terminal_received_at: received_at.ok_or_else(invalid_protocol)?,
                         provider_published_at: None,
-                        terminal_for_query,
+                        terminal_for_query: true,
                     })
                     .map_err(|_| invalid_protocol())?;
-                (records, retrieved.capture, accounting)
+                (batch.finish()?, capture, accounting)
             }
             (TreasurySourceConfig::DailyRates(config), ObjectKind::DailyRate) => {
                 let query = config
@@ -1251,7 +1359,7 @@ impl TreasurySource {
                 })?;
                 parsed.verify_request(page_request.request_digest())?;
                 let retrieved = self
-                    .fetch_daily_rate_page(
+                    .fetch_daily_rate_page_with_budget_wait(
                         &authority,
                         &page_request,
                         limits,
@@ -1264,9 +1372,7 @@ impl TreasurySource {
                     parsed.payload_digest,
                     retrieved.exact_payload(),
                 )?;
-                let ingested_at = system_timestamp().map_err(map_adapter_error)?;
                 let source_rows = retrieved.page().observations().len();
-                let page_number = retrieved.page().page_number();
                 let terminal_for_query = !query.is_all_history() || retrieved.page().is_terminal();
                 let raw_body_bytes = retrieved.exact_payload().len();
                 let received_at = retrieved.received_at();
@@ -1274,29 +1380,42 @@ impl TreasurySource {
                 let query_digest = retrieved.page().query_digest();
                 let request_digest = retrieved.page().request_digest();
                 let payload_digest = retrieved.page().response_payload_digest();
-                let records = canonical_daily_rate_records(
+                let mut batch = ExtractionBatchAccumulator::try_new(&request)?;
+                let mut canonical_admission = CanonicalRecordAdmission::new();
+                let ingested_at = system_timestamp().map_err(map_adapter_error)?;
+                for record in canonical_daily_rate_records(
                     &self.metadata,
                     retrieved.page(),
                     retrieved.received_at(),
                     ingested_at,
-                )
-                .map_err(map_adapter_error)?;
+                ) {
+                    let record = canonical_admission
+                        .admit(record.map_err(map_adapter_error)?)
+                        .map_err(map_adapter_error)?;
+                    batch.push(canonical_extraction_record(&request, &schema, record)?)?;
+                }
+                let canonical_points = canonical_admission.record_count();
+                let observed_numeric_points = canonical_admission.observed_numeric_points();
+                let explicit_missing_points = canonical_admission.explicit_missing_points();
                 let accounting =
                     TreasuryExtractionAccounting::try_new(TreasuryExtractionAccountingInput {
                         descriptor,
-                        page_number,
-                        returned_source_rows: source_rows,
-                        canonical_points: records.len(),
-                        raw_body_bytes,
+                        terminal_page_count: 1,
+                        aggregate_source_rows: source_rows,
+                        aggregate_canonical_points: canonical_points,
+                        aggregate_observed_numeric_points: observed_numeric_points,
+                        aggregate_explicit_missing_points: explicit_missing_points,
+                        aggregate_raw_body_bytes: raw_body_bytes,
+                        source_object_payload_bytes: raw_body_bytes,
                         query_digest,
-                        request_digest,
-                        payload_digest,
-                        received_at,
+                        request_set_digest: request_digest,
+                        source_object_payload_digest: payload_digest,
+                        terminal_received_at: received_at,
                         provider_published_at,
                         terminal_for_query,
                     })
                     .map_err(|_| invalid_protocol())?;
-                (records, retrieved.capture, accounting)
+                (batch.finish()?, retrieved.capture, accounting)
             }
             _ => {
                 return Err(ExtractionSourceError::Source(
@@ -1304,32 +1423,6 @@ impl TreasurySource {
                 ));
             }
         };
-        if records.len() > request.max_records() as usize {
-            return Err(ExtractionSourceError::Contract(
-                market_squawk_sources::ExtractionError::RecordLimitExceeded {
-                    requested: request.max_records(),
-                },
-            ));
-        }
-        let schema = SourceIdentifier::try_from("market-squawk-research-v3")
-            .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
-        let records = records
-            .into_iter()
-            .map(|record| {
-                market_squawk_sources::ExtractionRecord::try_new_with_time(
-                    &request,
-                    schema.clone(),
-                    record.evidence,
-                    record.effective,
-                    record.published,
-                    record.availability,
-                    record.revision,
-                    None,
-                    record.payload,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let batch = ExtractionBatch::try_new(&request, records)?;
         Ok(TreasuryExtractionOutput {
             batch,
             capture,
@@ -1459,6 +1552,173 @@ fn capture_material(
     )
     .map_err(|_| invalid_protocol())?;
     ProviderCaptureMaterial::try_new(receipt, vec![record]).map_err(|_| invalid_protocol())
+}
+
+fn fiscal_request_set_digest(
+    captured: &[FiscalCapturedPage],
+) -> Result<[u8; 32], ExtractionSourceError> {
+    if captured.is_empty() {
+        return Err(invalid_protocol());
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/treasury-fiscal-request-set/v1\0");
+    digest.update(
+        u64::try_from(captured.len())
+            .map_err(|_| invalid_protocol())?
+            .to_be_bytes(),
+    );
+    for page in captured {
+        digest.update(page.request_digest);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn canonical_extraction_record(
+    request: &ExtractionRequest,
+    schema: &SourceIdentifier,
+    record: CanonicalTreasuryRecord,
+) -> Result<ExtractionRecord, ExtractionSourceError> {
+    ExtractionRecord::try_new_with_time(
+        request,
+        schema.clone(),
+        record.evidence,
+        record.effective,
+        record.published,
+        record.availability,
+        record.revision,
+        None,
+        record.payload,
+    )
+    .map_err(Into::into)
+}
+
+struct FiscalCapturedPage {
+    request_digest: [u8; 32],
+    request_page_token: String,
+    response_next_page_token: Option<String>,
+    received_at: Timestamp,
+    body: Bytes,
+}
+
+fn fiscal_chain_capture_material(
+    metadata: &SourceMetadata,
+    dataset: SourceIdentifier,
+    request_set_digest: [u8; 32],
+    captured: &[FiscalCapturedPage],
+) -> Result<ProviderCaptureMaterial, ExtractionSourceError> {
+    if captured.is_empty() {
+        return Err(invalid_protocol());
+    }
+    let request_set_identity = EvidenceDigest::new(DigestAlgorithm::Sha256, request_set_digest);
+    let mut pages = Vec::new();
+    pages
+        .try_reserve_exact(captured.len())
+        .map_err(|_| invalid_protocol())?;
+    for (index, captured_page) in captured.iter().enumerate() {
+        let request_identity =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, captured_page.request_digest);
+        let request_page_token_digest = (index > 0).then(|| {
+            EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(captured_page.request_page_token.as_bytes()).into(),
+            )
+        });
+        let response_next_page_token_digest =
+            captured_page
+                .response_next_page_token
+                .as_ref()
+                .map(|token| {
+                    EvidenceDigest::new(
+                        DigestAlgorithm::Sha256,
+                        Sha256::digest(token.as_bytes()).into(),
+                    )
+                });
+        pages.push(
+            ProviderCapturePageReceipt::try_new(
+                u16::try_from(index).map_err(|_| invalid_protocol())?,
+                request_identity,
+                request_page_token_digest,
+                response_next_page_token_digest,
+                200,
+                u64::try_from(captured_page.body.len()).map_err(|_| invalid_protocol())?,
+                EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    Sha256::digest(&captured_page.body).into(),
+                ),
+                captured_page.received_at,
+            )
+            .map_err(|_| invalid_protocol())?,
+        );
+    }
+    let receipt = ProviderCaptureSetReceipt::try_new(
+        metadata.source_id().clone(),
+        metadata.revision().clone(),
+        dataset,
+        request_set_identity,
+        ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage,
+        pages,
+    )
+    .map_err(|_| invalid_protocol())?;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(captured.len())
+        .map_err(|_| invalid_protocol())?;
+    for (index, captured_page) in captured.iter().enumerate() {
+        let ordinal = u64::try_from(index).map_err(|_| invalid_protocol())?;
+        let mut event_tag = b"event".to_vec();
+        event_tag.extend_from_slice(&ordinal.to_be_bytes());
+        let mut connection_tag = b"connection".to_vec();
+        connection_tag.extend_from_slice(&ordinal.to_be_bytes());
+        records.push(
+            RawCaptureRecord::try_new_live(
+                deterministic_capture_uuid(&event_tag, &receipt),
+                Arc::from(metadata.source_id().as_str()),
+                deterministic_capture_uuid(&connection_tag, &receipt),
+                Some(ordinal),
+                None,
+                DateTime::<Utc>::from_timestamp_nanos(captured_page.received_at.unix_nanos()),
+                captured_page.body.clone(),
+            )
+            .map_err(|_| invalid_protocol())?,
+        );
+    }
+    ProviderCaptureMaterial::try_new(receipt, records).map_err(|_| invalid_protocol())
+}
+
+fn validate_fiscal_chain_work(
+    raw_body_bytes: u64,
+    source_rows: usize,
+    page_count: usize,
+) -> Result<(), ExtractionSourceError> {
+    if page_count == 0
+        || page_count > market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES
+        || raw_body_bytes > market_squawk_sources::MAX_PROVIDER_CAPTURE_BYTES
+        || source_rows > market_squawk_sources::MAX_EXTRACTION_RECORDS
+    {
+        return Err(invalid_protocol());
+    }
+    Ok(())
+}
+
+fn fiscal_chain_page_limits(
+    retained_raw_body_bytes: u64,
+) -> Result<FiscalDataParseLimits, ExtractionSourceError> {
+    let remaining = market_squawk_sources::MAX_PROVIDER_CAPTURE_BYTES
+        .checked_sub(retained_raw_body_bytes)
+        .filter(|value| *value > 0)
+        .ok_or_else(invalid_protocol)?;
+    let defaults = FiscalDataParseLimits::production_defaults();
+    let max_bytes = usize::try_from(
+        remaining.min(u64::try_from(defaults.max_bytes()).map_err(|_| invalid_protocol())?),
+    )
+    .map_err(|_| invalid_protocol())?;
+    FiscalDataParseLimits::try_new(
+        max_bytes,
+        defaults.max_records(),
+        defaults.max_fields(),
+        market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES,
+    )
+    .map_err(|_| invalid_protocol())
 }
 
 fn deterministic_capture_uuid(tag: &[u8], receipt: &ProviderCaptureSetReceipt) -> Uuid {

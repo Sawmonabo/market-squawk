@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::future::BoxFuture;
 use market_squawk_domain::{
     AuthorizationBasis, CalendarDate, ChecksumCapability, CoverageDelay, DataQuality,
@@ -15,11 +16,11 @@ use market_squawk_domain::{
 use market_squawk_platform::LocalPaths;
 use market_squawk_sources::{
     ApiEndpointRule, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
-    BackoffPolicy, BudgetScope, CoverageDomain, DiscoveryRequest, EndpointPolicy,
-    ExtractionRequest, ExtractionSource, FreshnessPolicy, HistoricalCapability,
-    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, QueryParameterRule, QuerySensitivity,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
-    SourceProtocolProfile,
+    BackoffPolicy, BudgetScope, BudgetWindowSemantics, CoverageDomain, DiscoveryRequest,
+    EndpointPolicy, ExtractionRequest, ExtractionSource, FreshnessPolicy, HistoricalCapability,
+    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow, QueryParameterRule,
+    QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SourceMetadataInput, SourceProtocolProfile,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -80,11 +81,14 @@ impl TreasuryTransport for ScriptedTransport {
                 .lock()
                 .map_err(|_| super::TreasurySourceError::InvalidProtocol)?
                 .push(request.url);
-            self.responses
+            let mut response = self
+                .responses
                 .lock()
                 .map_err(|_| super::TreasurySourceError::InvalidProtocol)?
                 .pop_front()
-                .ok_or(super::TreasurySourceError::InvalidProtocol)
+                .ok_or(super::TreasurySourceError::InvalidProtocol)?;
+            response.received_at = system_timestamp()?;
+            Ok(response)
         })
     }
 }
@@ -113,23 +117,41 @@ async fn authority_bound_sources_emit_canonical_fiscal_and_daily_rate_records() 
         ),
         Err(super::TreasurySourceError::InvalidMetadata)
     ));
-    let mut fiscal_payload: serde_json::Value =
+    assert!(matches!(
+        TreasurySource::try_new(
+            metadata_with_rate(
+                now,
+                &fiscal_config,
+                DataQuality::OfficialDelayed,
+                100,
+                60_000_000_000,
+                2
+            )?,
+            fiscal_config.clone(),
+        ),
+        Err(super::TreasurySourceError::InvalidMetadata)
+    ));
+    let mut fiscal_page_one: serde_json::Value =
         serde_json::from_slice(include_bytes!("../../fixtures/average_interest_rates.json"))?;
-    fiscal_payload["meta"]["total-count"] = serde_json::json!(1);
-    fiscal_payload["meta"]["total-pages"] = serde_json::json!(1);
-    fiscal_payload["links"]["next"] = serde_json::Value::Null;
-    fiscal_payload["links"]["last"] = serde_json::json!("&page%5Bnumber%5D=1&page%5Bsize%5D=1");
-    let fiscal_payload = serde_json::to_vec(&fiscal_payload)?;
-    let fiscal = exercise_source(
-        now,
-        fiscal_config,
-        DataQuality::OfficialDelayed,
-        true,
-        &fiscal_payload,
-        b"application/json",
-    )
-    .await?;
-    assert_eq!(fiscal.len(), 1);
+    fiscal_page_one["meta"]["total-count"] = serde_json::json!(2);
+    fiscal_page_one["meta"]["total-pages"] = serde_json::json!(2);
+    fiscal_page_one["links"]["next"] = serde_json::json!("&page%5Bnumber%5D=2&page%5Bsize%5D=1");
+    fiscal_page_one["links"]["last"] = serde_json::json!("&page%5Bnumber%5D=2&page%5Bsize%5D=1");
+    let mut fiscal_page_two = fiscal_page_one.clone();
+    fiscal_page_two["links"]["self"] = serde_json::json!("&page%5Bnumber%5D=2&page%5Bsize%5D=1");
+    fiscal_page_two["links"]["prev"] = serde_json::json!("&page%5Bnumber%5D=1&page%5Bsize%5D=1");
+    fiscal_page_two["links"]["next"] = serde_json::Value::Null;
+    fiscal_page_two["data"][0]["record_date"] = serde_json::json!("2026-07-01");
+    fiscal_page_two["data"][0]["src_line_nbr"] = serde_json::json!("2");
+    fiscal_page_two["data"][0]["record_fiscal_quarter"] = serde_json::json!("4");
+    fiscal_page_two["data"][0]["record_calendar_quarter"] = serde_json::json!("3");
+    fiscal_page_two["data"][0]["record_calendar_month"] = serde_json::json!("07");
+    fiscal_page_two["data"][0]["record_calendar_day"] = serde_json::json!("01");
+    let fiscal_page_one = serde_json::to_vec(&fiscal_page_one)?;
+    let fiscal_page_two = serde_json::to_vec(&fiscal_page_two)?;
+    let fiscal =
+        exercise_fiscal_source(now, fiscal_config, &fiscal_page_one, &fiscal_page_two).await?;
+    assert_eq!(fiscal.len(), 2);
     assert_macro_record(
         &fiscal[0],
         "treasury:average-interest-rate:v2:Marketable:Treasury%20Bills",
@@ -138,87 +160,81 @@ async fn authority_bound_sources_emit_canonical_fiscal_and_daily_rate_records() 
         None,
     )?;
 
-    let yield_config = TreasurySourceConfig::daily_par_yield_curve(2026)?;
-    let yield_records = exercise_source(
-        now,
-        yield_config,
-        DataQuality::OfficialDelayed,
-        false,
-        include_bytes!("../../fixtures/daily_par_yield_curve.xml"),
-        b"application/atom+xml",
-    )
-    .await?;
-    assert!(yield_records.len() >= 2);
-    let one_month = yield_records
-        .iter()
-        .find(|record| {
-            serde_json::from_slice::<ResearchObservation>(record.payload())
-                .is_ok_and(|observation| {
-                    matches!(observation, ResearchObservation::Macro(value) if value.series().as_str() == "treasury:daily-par-yield-curve:1m")
-                })
-        })
-        .ok_or("missing one-month canonical yield")?;
-    assert_macro_record(
-        one_month,
-        "treasury:daily-par-yield-curve:1m",
-        "3.72",
-        DataQuality::OfficialDelayed,
-        Some("2026-07-21T06:54:08+00:00"),
-    )?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn fiscal_discovery_rejects_a_result_limit_before_the_provider_terminal_page() -> TestResult {
-    let _provider_rate_guard = TEST_PROVIDER_RATE_SERIAL.lock().await;
-    let now = system_timestamp()?;
-    let query = TreasuryFiscalQuery::average_interest_rates_v2(
-        CalendarDate::new(2026, 1, 1)?,
-        CalendarDate::new(2026, 12, 31)?,
-        NonZeroU16::new(1).ok_or("nonzero page size")?,
-    )?;
-    let config = TreasurySourceConfig::average_interest_rates(query.clone());
-    let source_metadata = metadata(now, &config, DataQuality::OfficialDelayed)?;
-    let transport = Arc::new(ScriptedTransport {
-        responses: Mutex::new(VecDeque::from([TreasuryHttpResponse {
-            status: 200,
-            retry_after: None,
-            content_encoding: None,
-            content_type: Some(b"application/json".to_vec()),
-            body: Bytes::from_static(include_bytes!("../../fixtures/average_interest_rates.json")),
-            received_at: now,
-        }])),
+    let all_family_queries = TreasuryDailyRateFamily::ALL
+        .into_iter()
+        .map(|family| TreasuryDailyRateQuery::year(family, 2026))
+        .collect::<Result<Vec<_>, _>>()?;
+    let all_family_config =
+        TreasurySourceConfig::daily_rates(TreasuryDailyRatesConfig::try_new(all_family_queries)?);
+    let all_family_metadata = metadata(now, &all_family_config, DataQuality::OfficialDelayed)?;
+    let all_family_transport = Arc::new(ScriptedTransport {
+        responses: Mutex::new(VecDeque::from(
+            [
+                include_bytes!("../../fixtures/daily_par_yield_curve.xml").as_slice(),
+                include_bytes!("../../fixtures/daily_bill_rates.xml").as_slice(),
+                include_bytes!("../../fixtures/daily_long_term_rates.xml").as_slice(),
+                include_bytes!("../../fixtures/daily_real_par_yield_curve.xml").as_slice(),
+                include_bytes!("../../fixtures/daily_real_long_term_rates.xml").as_slice(),
+            ]
+            .into_iter()
+            .map(|payload| TreasuryHttpResponse {
+                status: 200,
+                retry_after: None,
+                content_encoding: None,
+                content_type: Some(b"application/atom+xml".to_vec()),
+                body: Bytes::copy_from_slice(payload),
+                received_at: now,
+            })
+            .collect::<Vec<_>>(),
+        )),
         requested_urls: Mutex::new(Vec::new()),
     });
-    let source =
-        TreasurySource::try_new_with_transport(source_metadata.clone(), config, transport.clone())?;
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(source_metadata, now)?;
-    let authority = registry.extraction_authority(&registered, &source)?;
-    let deadline = now.checked_add_nanos(60_000_000_000)?;
-    tokio::time::sleep(TEST_PROVIDER_RATE_SETTLE).await;
+    let all_family_source = TreasurySource::try_new_with_transport(
+        all_family_metadata.clone(),
+        all_family_config,
+        all_family_transport,
+    )?;
+    let mut all_family_registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let all_family_registered = all_family_registry.register(all_family_metadata, now)?;
+    let all_family_authority =
+        all_family_registry.extraction_authority(&all_family_registered, &all_family_source)?;
+    let all_family_doctor = all_family_source
+        .run_doctor(
+            all_family_authority,
+            now.checked_add_nanos(60_000_000_000)?,
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        all_family_doctor.probe_count(),
+        TreasuryDailyRateFamily::ALL.len()
+    );
+    let all_family_temporary = TemporaryDirectory::new();
+    let all_family_store =
+        LocalPaths::prepare(all_family_temporary.path())?.sealed_research_journal_store()?;
+    let all_family_doctor = all_family_doctor.seal(&all_family_store)?;
+    assert!(all_family_doctor.activation_ready());
+    assert_eq!(
+        all_family_doctor.receipt().observations().len(),
+        TreasuryDailyRateFamily::ALL.len()
+    );
     assert!(
-        source
-            .discover_with_accounting(
-                authority,
-                DiscoveryRequest::try_new(
-                    query.dataset()?,
-                    None,
-                    NonZeroU16::new(1).ok_or("nonzero result count")?,
-                    deadline,
-                )?,
-                CancellationToken::new(),
-            )
-            .await
-            .is_err()
+        all_family_doctor
+            .receipt()
+            .observations()
+            .iter()
+            .all(|observation| observation.observed_numeric_points() > 0
+                && observation
+                    .observed_numeric_points()
+                    .checked_add(observation.explicit_missing_points())
+                    == Some(observation.canonical_points()))
     );
     assert_eq!(
-        transport
-            .requested_urls
-            .lock()
-            .map_err(|_| "request log poisoned")?
-            .len(),
-        1
+        all_family_doctor
+            .receipt()
+            .observed_numeric_points()
+            .checked_add(all_family_doctor.receipt().explicit_missing_points()),
+        Some(all_family_doctor.receipt().canonical_points())
     );
     Ok(())
 }
@@ -227,22 +243,29 @@ async fn fiscal_discovery_rejects_a_result_limit_before_the_provider_terminal_pa
 async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() -> TestResult {
     let _provider_rate_guard = TEST_PROVIDER_RATE_SERIAL.lock().await;
     let now = system_timestamp()?;
-    let terminal_at = now.checked_add_nanos(1)?;
     let family = TreasuryDailyRateFamily::NominalParYieldCurve;
     let query = TreasuryDailyRateQuery::all_history(family)?;
     let config =
         TreasurySourceConfig::daily_rates(TreasuryDailyRatesConfig::try_new([query.clone()])?);
     let source_metadata = metadata(now, &config, DataQuality::OfficialDelayed)?;
-    let terminal = format!(
-        r#"<?xml version="1.0"?>
+    let terminal_receipt_clock_floor = system_timestamp()?;
+    let future_terminal_feed_at = terminal_receipt_clock_floor.checked_add_nanos(60_000_000_000)?;
+    let terminal_feed = |feed_published_at: Timestamp| {
+        format!(
+            r#"<?xml version="1.0"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <title>{}</title>
   <id>{}</id>
-  <updated>2026-07-26T16:21:25Z</updated>
+  <updated>{}</updated>
 </feed>"#,
-        family.feed_title(),
-        family.feed_identity(),
-    );
+            family.feed_title(),
+            family.feed_identity(),
+            DateTime::<Utc>::from_timestamp_nanos(feed_published_at.unix_nanos())
+                .to_rfc3339_opts(SecondsFormat::Nanos, true),
+        )
+    };
+    let terminal = terminal_feed(terminal_receipt_clock_floor);
+    let future_terminal = terminal_feed(future_terminal_feed_at);
     let transport = Arc::new(ScriptedTransport {
         responses: Mutex::new(VecDeque::from([
             TreasuryHttpResponse {
@@ -260,8 +283,16 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
                 retry_after: None,
                 content_encoding: None,
                 content_type: Some(b"application/atom+xml".to_vec()),
+                body: Bytes::from(future_terminal),
+                received_at: now,
+            },
+            TreasuryHttpResponse {
+                status: 200,
+                retry_after: None,
+                content_encoding: None,
+                content_type: Some(b"application/atom+xml".to_vec()),
                 body: Bytes::from(terminal),
-                received_at: terminal_at,
+                received_at: now,
             },
         ])),
         requested_urls: Mutex::new(Vec::new()),
@@ -293,7 +324,7 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     assert!(!first.terminal());
     let canonical = first.canonical().ok_or("missing canonical data page")?;
     assert_eq!(
-        canonical.accounting().canonical_points(),
+        canonical.accounting().aggregate_canonical_points(),
         u64::try_from(canonical.batch().records().len())?
     );
     let (_, capture, admission) = first.into_parts();
@@ -305,16 +336,30 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     let encoded = backfill.checkpoint().to_json()?;
     let mut restored = source.restore_all_history_backfill(&encoded, &store)?;
     tokio::time::sleep(TEST_PROVIDER_RATE_SETTLE).await;
+    let terminal_request = DiscoveryRequest::try_new(
+        query.dataset().clone(),
+        None,
+        NonZeroU16::new(1).ok_or("nonzero result count")?,
+        deadline,
+    )?;
+    assert!(matches!(
+        source
+            .fetch_next_all_history_page(
+                &restored,
+                authority.clone(),
+                terminal_request.clone(),
+                CancellationToken::new(),
+            )
+            .await,
+        Err(market_squawk_sources::ExtractionSourceError::Source(
+            market_squawk_sources::SourceError::InvalidProtocolState
+        ))
+    ));
     let terminal = source
         .fetch_next_all_history_page(
             &restored,
             authority,
-            DiscoveryRequest::try_new(
-                query.dataset().clone(),
-                None,
-                NonZeroU16::new(1).ok_or("nonzero result count")?,
-                deadline,
-            )?,
+            terminal_request,
             CancellationToken::new(),
         )
         .await?;
@@ -343,28 +388,28 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     Ok(())
 }
 
-async fn exercise_source(
+async fn exercise_fiscal_source(
     now: Timestamp,
     config: TreasurySourceConfig,
-    quality: DataQuality,
-    expected_locally_observed_revisions: bool,
-    payload: &[u8],
-    content_type: &[u8],
+    first_payload: &[u8],
+    second_payload: &[u8],
 ) -> TestResult<Vec<market_squawk_sources::ExtractionRecord>> {
-    tokio::time::sleep(TEST_PROVIDER_RATE_SETTLE).await;
-    let metadata = metadata(now, &config, quality)?;
-    let response_body = Bytes::copy_from_slice(payload);
-    let response_content_type = content_type.to_vec();
-    let response = || TreasuryHttpResponse {
+    let metadata = metadata(now, &config, DataQuality::OfficialDelayed)?;
+    let response = |payload: &[u8]| TreasuryHttpResponse {
         status: 200,
         retry_after: None,
         content_encoding: None,
-        content_type: Some(response_content_type.clone()),
-        body: response_body.clone(),
+        content_type: Some(b"application/json".to_vec()),
+        body: Bytes::copy_from_slice(payload),
         received_at: now,
     };
     let transport = Arc::new(ScriptedTransport {
-        responses: Mutex::new(VecDeque::from([response(), response(), response()])),
+        responses: Mutex::new(VecDeque::from([
+            response(first_payload),
+            response(second_payload),
+            response(first_payload),
+            response(second_payload),
+        ])),
         requested_urls: Mutex::new(Vec::new()),
     });
     let source =
@@ -374,7 +419,7 @@ async fn exercise_source(
     assert_eq!(activation.catalog(), &catalog);
     assert_eq!(catalog.datasets().len(), 1);
     assert!(!catalog.surface().requires_credential());
-    let provider_dataset = source.dataset()?;
+    let provider_dataset = catalog.datasets()[0].provider_dataset().clone();
     let analytical_dataset = source.analytical_dataset_identifier(&provider_dataset)?;
     assert_ne!(provider_dataset, analytical_dataset);
     assert!(!analytical_dataset.as_str().contains(':'));
@@ -396,7 +441,14 @@ async fn exercise_source(
         .await?;
     assert!(discovery.accounting().extraction_ready());
     assert_eq!(discovery.accounting().source_object_count(), 1);
-    assert!(discovery.accounting().canonical_points() >= 1);
+    assert_eq!(
+        (
+            discovery.accounting().canonical_points(),
+            discovery.accounting().observed_numeric_points(),
+            discovery.accounting().explicit_missing_points(),
+        ),
+        (2, 2, 0)
+    );
     let object = discovery
         .batch()
         .objects()
@@ -421,7 +473,6 @@ async fn exercise_source(
             market_squawk_sources::SourceError::InvalidProtocolState
         ))
     ));
-    tokio::time::sleep(TEST_PROVIDER_RATE_SETTLE).await;
     let output = source
         .extract_with_capture(
             authority.clone(),
@@ -429,16 +480,33 @@ async fn exercise_source(
             CancellationToken::new(),
         )
         .await?;
-    assert_eq!(output.capture_material().records().len(), 1);
-    assert_eq!(output.capture_material().records()[0].payload(), payload);
+    let payloads = [first_payload, second_payload];
+    assert_eq!(output.capture_material().records().len(), payloads.len());
+    for (record, payload) in output.capture_material().records().iter().zip(payloads) {
+        assert_eq!(record.payload(), payload);
+    }
     assert_eq!(
-        output.accounting().canonical_points(),
-        u64::try_from(output.batch().records().len())?
+        output.capture_material().receipt().pages().len(),
+        payloads.len()
+    );
+    assert_eq!(
+        output.capture_material().receipt().terminal(),
+        market_squawk_sources::ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
+    );
+    let canonical_points = u64::try_from(output.batch().records().len())?;
+    assert_eq!(
+        (
+            output.accounting().aggregate_canonical_points(),
+            output.accounting().aggregate_observed_numeric_points(),
+            output.accounting().aggregate_explicit_missing_points(),
+        ),
+        (canonical_points, canonical_points, 0)
     );
     assert!(output.accounting().terminal_for_query());
-    let temporary = TemporaryDirectory::new();
-    let store = LocalPaths::prepare(temporary.path())?.sealed_research_journal_store()?;
-    let distinct_receive_time = output.accounting().received_at().checked_add_nanos(1)?;
+    let distinct_receive_time = output
+        .accounting()
+        .terminal_received_at()
+        .checked_add_nanos(1)?;
     let retry_capture = super::capture_material(
         &metadata,
         provider_dataset.clone(),
@@ -448,12 +516,8 @@ async fn exercise_source(
             .request_set_identity()
             .bytes(),
         distinct_receive_time,
-        Bytes::copy_from_slice(payload),
+        Bytes::copy_from_slice(payloads[0]),
     )?;
-    assert_eq!(
-        retry_capture.receipt().content_digest(),
-        output.capture_material().receipt().content_digest()
-    );
     assert_ne!(
         retry_capture.receipt().observation_digest(),
         output.capture_material().receipt().observation_digest()
@@ -474,35 +538,15 @@ async fn exercise_source(
         )?,
         extraction.request().object().capture_identity()
     );
-    assert_eq!(capture_material.records()[0].payload(), payload);
+    assert_eq!(capture_material.records()[0].payload(), payloads[0]);
     let revisions = source.revision_plan(&extraction)?;
-    assert_eq!(
-        revisions.is_locally_observed(),
-        expected_locally_observed_revisions
-    );
-    tokio::time::sleep(TEST_PROVIDER_RATE_SETTLE).await;
-    let doctor = source
-        .run_doctor(authority, deadline, CancellationToken::new())
-        .await?;
-    assert_eq!(doctor.probe_count(), 1);
-    let doctor = doctor.seal(&store)?;
-    assert_eq!(
-        doctor.activation_ready(),
-        expected_locally_observed_revisions
-    );
-    assert_eq!(doctor.sealed_captures().len(), 1);
+    assert!(revisions.is_locally_observed());
 
     let urls = transport
         .requested_urls
         .lock()
         .map_err(|_| "request log poisoned")?;
-    assert_eq!(urls.len(), 3);
-    assert_eq!(urls[0], urls[1]);
-    assert_eq!(urls[1], urls[2]);
-    if !expected_locally_observed_revisions {
-        assert!(!urls[0].contains("page="));
-        assert!(!urls[0].contains("page%5B"));
-    }
+    assert_eq!(urls.len(), 4);
 
     Ok(extraction.records().to_vec())
 }
@@ -577,6 +621,17 @@ fn metadata(
     config: &TreasurySourceConfig,
     quality: DataQuality,
 ) -> TestResult<SourceMetadata> {
+    metadata_with_rate(now, config, quality, 1, 1_000_000_000, 1)
+}
+
+fn metadata_with_rate(
+    now: Timestamp,
+    config: &TreasurySourceConfig,
+    quality: DataQuality,
+    requests_per_window: u32,
+    window_nanos: u64,
+    max_concurrent: u16,
+) -> TestResult<SourceMetadata> {
     let effective = EffectiveInterval::new(now.checked_sub_nanos(1)?, None)?;
     let evidence = exact_evidence(b"treasury-test-metadata");
     let provider = SourceIdentifier::try_from("us-treasury")?;
@@ -630,11 +685,14 @@ fn metadata(
         vec![endpoint],
         market_squawk_sources::HttpRequestBounds::default(),
     )?;
-    let budget = ProviderBudgetPolicy::try_new(
+    let budget = ProviderBudgetPolicy::try_new_conjunctive(
         BudgetScope::new(provider.clone()),
-        NonZeroU32::new(100).ok_or("nonzero request budget")?,
-        NonZeroU64::new(60_000_000_000).ok_or("nonzero request window")?,
-        NonZeroU16::new(2).ok_or("nonzero concurrency")?,
+        &[ProviderBudgetWindow::try_new(
+            NonZeroU32::new(requests_per_window).ok_or("nonzero request budget")?,
+            NonZeroU64::new(window_nanos).ok_or("nonzero request window")?,
+            BudgetWindowSemantics::Sliding,
+        )?],
+        NonZeroU16::new(max_concurrent).ok_or("nonzero concurrency")?,
         BackoffPolicy::try_new(
             NonZeroU64::new(1_000_000).ok_or("nonzero backoff")?,
             NonZeroU64::new(60_000_000_000).ok_or("nonzero max backoff")?,

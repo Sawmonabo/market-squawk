@@ -1,14 +1,13 @@
 use market_squawk_adapter_treasury::{
-    AverageInterestRate, DailyParYieldCurvePage, FiscalDataPage, FiscalDataParseLimits,
-    TreasuryBillMaturity, TreasuryBillRateMeasure, TreasuryDailyRateFamily,
-    TreasuryDailyRateMetric, TreasuryDailyRatePage, TreasuryDailyRatePaginationTracker,
-    TreasuryDailyRateQuery, TreasuryDailyRatesConfig, TreasuryDashboardReadPlan,
-    TreasuryDatasetFamily, TreasuryDatasetPeriod, TreasuryExtrapolationFactor, TreasuryFiscalQuery,
+    AverageInterestRate, FiscalDataPage, FiscalDataParseLimits, TreasuryBillMaturity,
+    TreasuryBillRateMeasure, TreasuryDailyRateFamily, TreasuryDailyRateMetric,
+    TreasuryDailyRatePage, TreasuryDailyRatePaginationTracker, TreasuryDailyRateQuery,
+    TreasuryDailyRatesConfig, TreasuryDashboardReadPlan, TreasuryDatasetFamily,
+    TreasuryDatasetPeriod, TreasuryExtrapolationFactor, TreasuryFiscalQuery,
     TreasuryLongTermRateType, TreasuryPublicationMode, TreasuryRateProfile, TreasurySourceConfig,
-    TreasurySurface, TreasuryYieldCurveProfile,
+    TreasurySurface,
 };
 use market_squawk_domain::{CalendarDate, DataQuality};
-use sha2::{Digest, Sha256};
 use std::num::NonZeroU16;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -39,130 +38,6 @@ fn official_average_rate_profile_preserves_exact_decimal_and_methodology_evidenc
             .starts_with("https://fiscaldata.treasury.gov/")
     );
     assert_eq!(rate.schema_digest(), page.schema_digest());
-    Ok(())
-}
-
-#[test]
-fn daily_par_yield_curve_is_civil_dated_and_official_delayed() -> TestResult {
-    let profile = TreasuryYieldCurveProfile::daily_par_yield_curve();
-    let request = profile.page(2026, 0)?;
-    assert!(!request.url().contains("page="));
-    assert!(profile.page(2026, 1).is_err());
-    let exact_payload = include_bytes!("../fixtures/daily_par_yield_curve.xml");
-    let page = DailyParYieldCurvePage::parse(
-        exact_payload,
-        &request,
-        FiscalDataParseLimits::production_defaults(),
-    )?;
-
-    let observation = &page.observations()[0];
-    assert_eq!(profile.quality(), DataQuality::OfficialDelayed);
-    assert_eq!(observation.record_date().to_string(), "2026-01-02");
-    assert_eq!(observation.source_record_id(), "140");
-    assert_eq!(
-        observation
-            .one_month_percent()
-            .map(|value| value.to_string())
-            .as_deref(),
-        Some("3.72")
-    );
-    assert_eq!(
-        observation
-            .thirty_year_percent()
-            .map(|value| value.to_string())
-            .as_deref(),
-        Some("4.86")
-    );
-    assert_eq!(
-        observation.source_payload_digest(),
-        page.response_payload_digest()
-    );
-    assert_eq!(
-        page.response_payload_digest(),
-        <[u8; 32]>::from(Sha256::digest(exact_payload))
-    );
-    let payload_without_redundant_ids = std::str::from_utf8(exact_payload)?
-        .replace(
-            "    <id>https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml-item?data=daily_treasury_yield_curve&amp;id=140</id>\n",
-            "",
-        )
-        .replace("        <d:Id m:type=\"Edm.Int32\">140</d:Id>\n", "");
-    let page_without_redundant_ids = DailyParYieldCurvePage::parse(
-        payload_without_redundant_ids.as_bytes(),
-        &request,
-        FiscalDataParseLimits::production_defaults(),
-    )?;
-    assert_eq!(
-        page_without_redundant_ids.observations()[0].source_record_id(),
-        "date:2026-01-02"
-    );
-    assert!(
-        profile
-            .methodology_url()
-            .starts_with("https://home.treasury.gov/")
-    );
-    Ok(())
-}
-
-#[test]
-fn daily_par_yield_curve_rejects_wrong_namespace_and_rows_without_rates() -> TestResult {
-    let profile = TreasuryYieldCurveProfile::daily_par_yield_curve();
-    let request = profile.page(2026, 0)?;
-    let exact_payload =
-        std::str::from_utf8(include_bytes!("../fixtures/daily_par_yield_curve.xml"))?;
-    let wrong_namespace = exact_payload.replace(
-        "http://schemas.microsoft.com/ado/2007/08/dataservices\"",
-        "https://attacker.invalid/dataservices\"",
-    );
-    assert!(
-        DailyParYieldCurvePage::parse(
-            wrong_namespace.as_bytes(),
-            &request,
-            FiscalDataParseLimits::production_defaults(),
-        )
-        .is_err()
-    );
-
-    for invalid in [
-        "not-an-rfc3339-instant",
-        "2026-07-21T06:54:08z",
-        "2026-07-21T06:54:08-00:00",
-    ] {
-        let invalid_atom_date = exact_payload.replace("2026-07-21T06:54:08Z", invalid);
-        assert!(
-            DailyParYieldCurvePage::parse(
-                invalid_atom_date.as_bytes(),
-                &request,
-                FiscalDataParseLimits::production_defaults(),
-            )
-            .is_err()
-        );
-    }
-
-    let no_rates = br#"<?xml version="1.0"?>
-      <feed xmlns="http://www.w3.org/2005/Atom"
-            xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"
-            xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
-        <title>DailyTreasuryYieldCurveRateData</title>
-        <id>https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml-item?data=daily_treasury_yield_curve</id>
-        <updated>2026-07-21T06:54:08Z</updated>
-        <entry>
-          <id>https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml-item?data=daily_treasury_yield_curve&amp;id=140</id>
-          <updated>2026-07-21T06:54:08Z</updated>
-          <content><m:properties>
-            <d:Id m:type="Edm.Int32">140</d:Id>
-            <d:NEW_DATE m:type="Edm.DateTime">2026-01-02T00:00:00</d:NEW_DATE>
-          </m:properties></content>
-        </entry>
-      </feed>"#;
-    assert!(
-        DailyParYieldCurvePage::parse(
-            no_rates,
-            &request,
-            FiscalDataParseLimits::production_defaults(),
-        )
-        .is_err()
-    );
     Ok(())
 }
 
@@ -400,7 +275,8 @@ fn five_daily_rate_schemas_preserve_typed_rates_and_provider_metadata() -> TestR
             .point(TreasuryDailyRateMetric::NominalParYield(
                 market_squawk_adapter_treasury::TreasuryMaturity::ThirtyYears,
             ))
-            .map(|point| point.rate_percent().to_string())
+            .and_then(|point| point.rate_percent())
+            .map(|rate| rate.to_string())
             .as_deref(),
         Some("4.86")
     );
@@ -416,7 +292,12 @@ fn five_daily_rate_schemas_preserve_typed_rates_and_provider_metadata() -> TestR
             measure: TreasuryBillRateMeasure::BankDiscount,
         })
         .ok_or("missing four-week bill discount rate")?;
-    assert_eq!(bill.rate_percent().to_string(), "3.58");
+    assert_eq!(
+        bill.rate_percent()
+            .ok_or("missing four-week bill discount rate")?
+            .to_string(),
+        "3.58"
+    );
     assert_eq!(
         bill.maturity_date().map(|date| date.to_string()).as_deref(),
         Some("2026-02-03")
@@ -428,7 +309,8 @@ fn five_daily_rate_schemas_preserve_typed_rates_and_provider_metadata() -> TestR
                 maturity: TreasuryBillMaturity::FourWeeks,
                 measure: TreasuryBillRateMeasure::CouponEquivalent,
             })
-            .map(|point| point.rate_percent().to_string())
+            .and_then(|point| point.rate_percent())
+            .map(|rate| rate.to_string())
             .as_deref(),
         Some("3.64")
     );
@@ -448,7 +330,13 @@ fn five_daily_rate_schemas_preserve_typed_rates_and_provider_metadata() -> TestR
             ))
         })
         .ok_or("missing typed long-term real rate")?;
-    assert_eq!(real_rate.rate_percent().to_string(), "2.55");
+    assert_eq!(
+        real_rate
+            .rate_percent()
+            .ok_or("missing typed long-term real rate")?
+            .to_string(),
+        "2.55"
+    );
     assert_eq!(
         real_rate.extrapolation_factor(),
         Some(TreasuryExtrapolationFactor::NotApplicable)
@@ -474,7 +362,8 @@ fn five_daily_rate_schemas_preserve_typed_rates_and_provider_metadata() -> TestR
             .point(TreasuryDailyRateMetric::RealParYield(
                 market_squawk_adapter_treasury::TreasuryMaturity::FiveYears,
             ))
-            .map(|point| point.rate_percent().to_string())
+            .and_then(|point| point.rate_percent())
+            .map(|rate| rate.to_string())
             .as_deref(),
         Some("1.46")
     );
@@ -487,7 +376,8 @@ fn five_daily_rate_schemas_preserve_typed_rates_and_provider_metadata() -> TestR
     assert_eq!(
         real_long_term.observations()[0]
             .point(TreasuryDailyRateMetric::RealLongTermAverage)
-            .map(|point| point.rate_percent().to_string())
+            .and_then(|point| point.rate_percent())
+            .map(|rate| rate.to_string())
             .as_deref(),
         Some("2.55")
     );
@@ -504,7 +394,12 @@ fn daily_rate_parser_accepts_nulls_and_terminal_pages_but_rejects_authority_drif
     let month_request = TreasuryDailyRateQuery::month(family, 2026, 1)?.page(0)?;
     let fixture =
         std::str::from_utf8(include_bytes!("../fixtures/daily_real_par_yield_curve.xml"))?;
-    let null_rate = fixture.replace(
+    let earlier_entry_clock = fixture.replacen(
+        "    <updated>2026-07-26T17:30:50Z</updated>",
+        "    <updated>2026-07-26T17:00:00Z</updated>",
+        1,
+    );
+    let null_rate = earlier_entry_clock.replace(
         r#"<d:TC_30YEAR m:type="Edm.Double">2.63</d:TC_30YEAR>"#,
         r#"<d:TC_30YEAR m:type="Edm.Double" m:null="true" />"#,
     );
@@ -513,13 +408,17 @@ fn daily_rate_parser_accepts_nulls_and_terminal_pages_but_rejects_authority_drif
         &month_request,
         FiscalDataParseLimits::production_defaults(),
     )?;
-    assert!(
-        parsed.observations()[0]
-            .point(TreasuryDailyRateMetric::RealParYield(
-                market_squawk_adapter_treasury::TreasuryMaturity::ThirtyYears,
-            ))
-            .is_none()
-    );
+    let missing = parsed.observations()[0]
+        .point(TreasuryDailyRateMetric::RealParYield(
+            market_squawk_adapter_treasury::TreasuryMaturity::ThirtyYears,
+        ))
+        .ok_or("explicit provider null was omitted")?;
+    assert_eq!(missing.rate_percent(), None);
+    assert_eq!(missing.missing_marker(), Some("m:null=true"));
+    assert_eq!(missing.maturity_date(), None);
+    assert_eq!(missing.cusip(), None);
+    assert_eq!(missing.extrapolation_factor(), None);
+    assert!(parsed.observations()[0].source_published_at() < parsed.feed_published_at());
 
     let wrong_month = TreasuryDailyRateQuery::month(family, 2026, 2)?.page(0)?;
     assert!(

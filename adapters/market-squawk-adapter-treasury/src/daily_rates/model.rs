@@ -328,7 +328,8 @@ impl TreasuryDailyRateFamily {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TreasuryDailyRatePoint {
     metric: TreasuryDailyRateMetric,
-    rate_percent: Decimal,
+    rate_percent: Option<Decimal>,
+    missing_marker: Option<String>,
     maturity_date: Option<CalendarDate>,
     cusip: Option<String>,
     extrapolation_factor: Option<TreasuryExtrapolationFactor>,
@@ -344,7 +345,25 @@ impl TreasuryDailyRatePoint {
     ) -> Self {
         Self {
             metric,
-            rate_percent,
+            rate_percent: Some(rate_percent),
+            missing_marker: None,
+            maturity_date,
+            cusip,
+            extrapolation_factor,
+        }
+    }
+
+    pub(super) fn missing(
+        metric: TreasuryDailyRateMetric,
+        marker: &str,
+        maturity_date: Option<CalendarDate>,
+        cusip: Option<String>,
+        extrapolation_factor: Option<TreasuryExtrapolationFactor>,
+    ) -> Self {
+        Self {
+            metric,
+            rate_percent: None,
+            missing_marker: Some(marker.to_owned()),
             maturity_date,
             cusip,
             extrapolation_factor,
@@ -357,8 +376,13 @@ impl TreasuryDailyRatePoint {
     }
 
     /// Returns the exact provider percentage.
-    pub const fn rate_percent(&self) -> Decimal {
+    pub const fn rate_percent(&self) -> Option<Decimal> {
         self.rate_percent
+    }
+
+    /// Returns the provider-native missing marker when no decimal was reported.
+    pub fn missing_marker(&self) -> Option<&str> {
+        self.missing_marker.as_deref()
     }
 
     /// Returns the bill maturity date when supplied.

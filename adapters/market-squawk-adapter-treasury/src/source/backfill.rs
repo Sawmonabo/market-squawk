@@ -7,11 +7,11 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{SealedResearchJournalSegmentClaim, SealedResearchJournalStore};
 use market_squawk_sources::{
-    CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryRequest, ExtractionBatch, ExtractionContentIdentity,
-    ExtractionRecord, ExtractionRequest, ExtractionSourceError, MAX_EXTRACTION_BATCH_BYTES,
-    MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, ProviderCaptureMaterial,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
-    SourceObject,
+    CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryRequest, ExtractionBatch, ExtractionBatchAccumulator,
+    ExtractionContentIdentity, ExtractionRecord, ExtractionRequest, ExtractionSourceError,
+    MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
+    ProviderCaptureMaterial, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    SealedProviderCaptureSetReceipt, SourceObject,
 };
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
@@ -26,7 +26,7 @@ use crate::{
 };
 
 use super::lineage::{ObjectKind, ParsedObjectId, invalid_protocol, source_object};
-use super::normalize::canonical_daily_rate_records;
+use super::normalize::{CanonicalRecordAdmission, canonical_daily_rate_records};
 use super::{TreasurySource, TreasurySourceConfig};
 
 const CHECKPOINT_POLICY_VERSION: &str = "treasury-daily-rate-all-history-checkpoint-v1";
@@ -43,13 +43,15 @@ struct TreasuryAllHistoryPersistedPage {
     page_number: u64,
     returned_source_rows: u64,
     canonical_points: u64,
+    observed_numeric_points: u64,
+    explicit_missing_points: u64,
     raw_body_bytes: u64,
     request_digest: EvidenceDigest,
     payload_digest: EvidenceDigest,
     received_at: Timestamp,
     provider_published_at: Timestamp,
+    validated_at: Timestamp,
     terminal: bool,
-    canonical_normalized_at: Option<Timestamp>,
     canonical_content_digest: Option<EvidenceDigest>,
     discovery_request: DiscoveryRequest,
     source_object: SourceObject,
@@ -74,6 +76,8 @@ pub struct TreasuryAllHistoryCheckpoint {
     next_page: u64,
     accepted_source_rows: u64,
     canonical_points: u64,
+    observed_numeric_points: u64,
+    explicit_missing_points: u64,
     raw_body_bytes: u64,
     first_received_at: Option<Timestamp>,
     last_received_at: Option<Timestamp>,
@@ -93,6 +97,8 @@ struct TreasuryAllHistoryCheckpointWire {
     next_page: u64,
     accepted_source_rows: u64,
     canonical_points: u64,
+    observed_numeric_points: u64,
+    explicit_missing_points: u64,
     raw_body_bytes: u64,
     first_received_at: Option<Timestamp>,
     last_received_at: Option<Timestamp>,
@@ -112,6 +118,8 @@ struct TreasuryAllHistoryCheckpointRef<'a> {
     next_page: u64,
     accepted_source_rows: u64,
     canonical_points: u64,
+    observed_numeric_points: u64,
+    explicit_missing_points: u64,
     raw_body_bytes: u64,
     first_received_at: Option<Timestamp>,
     last_received_at: Option<Timestamp>,
@@ -134,6 +142,8 @@ impl Serialize for TreasuryAllHistoryCheckpoint {
             next_page: self.next_page,
             accepted_source_rows: self.accepted_source_rows,
             canonical_points: self.canonical_points,
+            observed_numeric_points: self.observed_numeric_points,
+            explicit_missing_points: self.explicit_missing_points,
             raw_body_bytes: self.raw_body_bytes,
             first_received_at: self.first_received_at,
             last_received_at: self.last_received_at,
@@ -159,6 +169,8 @@ impl TreasuryAllHistoryCheckpoint {
             next_page: 0,
             accepted_source_rows: 0,
             canonical_points: 0,
+            observed_numeric_points: 0,
+            explicit_missing_points: 0,
             raw_body_bytes: 0,
             first_received_at: None,
             last_received_at: None,
@@ -207,6 +219,8 @@ impl TreasuryAllHistoryCheckpoint {
             next_page: wire.next_page,
             accepted_source_rows: wire.accepted_source_rows,
             canonical_points: wire.canonical_points,
+            observed_numeric_points: wire.observed_numeric_points,
+            explicit_missing_points: wire.explicit_missing_points,
             raw_body_bytes: wire.raw_body_bytes,
             first_received_at: wire.first_received_at,
             last_received_at: wire.last_received_at,
@@ -234,12 +248,18 @@ impl TreasuryAllHistoryCheckpoint {
                     .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?
             || !within_source_row_limit(self.accepted_source_rows)
             || self.canonical_points > MAX_ALL_HISTORY_CANONICAL_POINTS
+            || self
+                .observed_numeric_points
+                .checked_add(self.explicit_missing_points)
+                != Some(self.canonical_points)
             || self.raw_body_bytes > MAX_ALL_HISTORY_RAW_BODY_BYTES
         {
             return Err(TreasurySourceError::InvalidBackfillCheckpoint);
         }
         let mut source_rows = 0_u64;
         let mut canonical_points = 0_u64;
+        let mut observed_numeric_points = 0_u64;
+        let mut explicit_missing_points = 0_u64;
         let mut raw_body_bytes = 0_u64;
         let mut first_received_at = None;
         let mut last_received_at = None;
@@ -258,6 +278,8 @@ impl TreasuryAllHistoryCheckpoint {
                 || page.discovery_request.effective_at().is_some()
                 || page.discovery_request.max_results() != 1
                 || page.received_at > page.discovery_request.deadline()
+                || page.provider_published_at > page.received_at
+                || page.validated_at < page.received_at
                 || page.source_object.source_id() != &self.source_id
                 || page.source_object.metadata_revision() != &self.metadata_revision
                 || page.source_object.dataset() != self.descriptor.provider_dataset()
@@ -294,14 +316,17 @@ impl TreasuryAllHistoryCheckpoint {
                 })
                 || page.terminal != (expected_page + 1 == self.next_page && self.terminal_observed)
                 || (!page.terminal && page.returned_source_rows == 0)
-                || (page.terminal && (page.returned_source_rows != 0 || page.canonical_points != 0))
-                || (!page.terminal && page.canonical_points < page.returned_source_rows)
-                || page.terminal
-                    == (page.canonical_normalized_at.is_some()
-                        && page.canonical_content_digest.is_some())
                 || page
-                    .canonical_normalized_at
-                    .is_some_and(|normalized_at| page.terminal || normalized_at < page.received_at)
+                    .observed_numeric_points
+                    .checked_add(page.explicit_missing_points)
+                    != Some(page.canonical_points)
+                || (page.terminal
+                    && (page.returned_source_rows != 0
+                        || page.canonical_points != 0
+                        || page.observed_numeric_points != 0
+                        || page.explicit_missing_points != 0))
+                || (!page.terminal && page.canonical_points < page.returned_source_rows)
+                || page.terminal == page.canonical_content_digest.is_some()
                 || page.canonical_content_digest.is_some_and(|digest| {
                     page.terminal
                         || digest.algorithm() != DigestAlgorithm::Sha256
@@ -329,6 +354,12 @@ impl TreasuryAllHistoryCheckpoint {
             canonical_points = canonical_points
                 .checked_add(page.canonical_points)
                 .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
+            observed_numeric_points = observed_numeric_points
+                .checked_add(page.observed_numeric_points)
+                .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
+            explicit_missing_points = explicit_missing_points
+                .checked_add(page.explicit_missing_points)
+                .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
             raw_body_bytes = raw_body_bytes
                 .checked_add(page.raw_body_bytes)
                 .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
@@ -338,6 +369,8 @@ impl TreasuryAllHistoryCheckpoint {
         }
         if source_rows != self.accepted_source_rows
             || canonical_points != self.canonical_points
+            || observed_numeric_points != self.observed_numeric_points
+            || explicit_missing_points != self.explicit_missing_points
             || raw_body_bytes != self.raw_body_bytes
             || first_received_at != self.first_received_at
             || last_received_at != self.last_received_at
@@ -359,6 +392,8 @@ impl TreasuryAllHistoryCheckpoint {
             self.next_page,
             self.accepted_source_rows,
             self.canonical_points,
+            self.observed_numeric_points,
+            self.explicit_missing_points,
             self.raw_body_bytes,
             self.first_received_at,
             self.last_received_at,
@@ -390,6 +425,16 @@ impl TreasuryAllHistoryCheckpoint {
     /// Returns canonical scalar observations prepared through the last sealed data page.
     pub const fn canonical_points(&self) -> u64 {
         self.canonical_points
+    }
+
+    /// Returns observed numeric points prepared through the last sealed data page.
+    pub const fn observed_numeric_points(&self) -> u64 {
+        self.observed_numeric_points
+    }
+
+    /// Returns explicit provider-missing points retained through the last sealed data page.
+    pub const fn explicit_missing_points(&self) -> u64 {
+        self.explicit_missing_points
     }
 
     /// Returns checked aggregate raw provider bytes through the last sealed page.
@@ -470,6 +515,21 @@ impl TreasuryAllHistoryBackfill {
             .checked_add(admission.persisted.canonical_points)
             .filter(|value| *value <= MAX_ALL_HISTORY_CANONICAL_POINTS)
             .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
+        let next_observed_numeric_points = self
+            .checkpoint
+            .observed_numeric_points
+            .checked_add(admission.persisted.observed_numeric_points)
+            .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
+        let next_explicit_missing_points = self
+            .checkpoint
+            .explicit_missing_points
+            .checked_add(admission.persisted.explicit_missing_points)
+            .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
+        if next_observed_numeric_points.checked_add(next_explicit_missing_points)
+            != Some(next_points)
+        {
+            return Err(TreasurySourceError::InvalidBackfillCheckpoint);
+        }
         let next_bytes = self
             .checkpoint
             .raw_body_bytes
@@ -484,6 +544,8 @@ impl TreasuryAllHistoryBackfill {
         pages.push(admission.persisted);
         next_checkpoint.accepted_source_rows = next_source_rows;
         next_checkpoint.canonical_points = next_points;
+        next_checkpoint.observed_numeric_points = next_observed_numeric_points;
+        next_checkpoint.explicit_missing_points = next_explicit_missing_points;
         next_checkpoint.raw_body_bytes = next_bytes;
         next_checkpoint.first_received_at.get_or_insert(
             pages
@@ -515,7 +577,7 @@ impl TreasuryAllHistoryBackfill {
 pub struct TreasuryAllHistoryCanonicalPage {
     batch: ExtractionBatch,
     accounting: TreasuryExtractionAccounting,
-    normalized_at: Timestamp,
+    validated_at: Timestamp,
     content_identity: ExtractionContentIdentity,
 }
 
@@ -530,9 +592,9 @@ impl TreasuryAllHistoryCanonicalPage {
         &self.accounting
     }
 
-    /// Returns the exact local normalization clock persisted for deterministic replay.
-    pub const fn normalized_at(&self) -> Timestamp {
-        self.normalized_at
+    /// Returns the exact post-response validation/ingest clock persisted for replay.
+    pub const fn validated_at(&self) -> Timestamp {
+        self.validated_at
     }
 
     /// Returns the request-attempt-independent semantic identity of the canonical page.
@@ -681,6 +743,16 @@ impl TreasuryAllHistoryAcquisitionCompletion {
     /// Returns the exact canonical scalar count prepared across nonterminal pages.
     pub const fn canonical_points(&self) -> u64 {
         self.checkpoint.canonical_points
+    }
+
+    /// Returns the exact observed numeric count prepared across nonterminal pages.
+    pub const fn observed_numeric_points(&self) -> u64 {
+        self.checkpoint.observed_numeric_points
+    }
+
+    /// Returns the exact explicit provider-missing count retained across nonterminal pages.
+    pub const fn explicit_missing_points(&self) -> u64 {
+        self.checkpoint.explicit_missing_points
     }
 
     /// Returns checked aggregate provider response bytes including the empty terminal XML body.
@@ -839,15 +911,10 @@ impl TreasurySource {
                 return Err(TreasurySourceError::InvalidBackfillCheckpoint);
             }
             if persisted.terminal {
-                if persisted.canonical_normalized_at.is_some()
-                    || persisted.canonical_content_digest.is_some()
-                {
+                if persisted.canonical_content_digest.is_some() {
                     return Err(TreasurySourceError::InvalidBackfillCheckpoint);
                 }
             } else {
-                let normalized_at = persisted
-                    .canonical_normalized_at
-                    .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
                 let canonical = prepare_canonical_page(
                     self,
                     CanonicalPagePreparation {
@@ -855,7 +922,7 @@ impl TreasurySource {
                         object: expected_object,
                         page: &page,
                         received_at: persisted.received_at,
-                        normalized_at,
+                        validated_at: persisted.validated_at,
                         raw_body_bytes: raw.payload().len(),
                         deadline: persisted.discovery_request.deadline(),
                         capture: &persisted.capture,
@@ -865,6 +932,10 @@ impl TreasurySource {
                 if Some(canonical.content_identity().digest()) != persisted.canonical_content_digest
                     || u64::try_from(canonical.content_identity().record_count()).ok()
                         != Some(persisted.canonical_points)
+                    || canonical.accounting().aggregate_observed_numeric_points()
+                        != persisted.observed_numeric_points
+                    || canonical.accounting().aggregate_explicit_missing_points()
+                        != persisted.explicit_missing_points
                 {
                     return Err(TreasurySourceError::InvalidBackfillCheckpoint);
                 }
@@ -908,7 +979,7 @@ impl TreasurySource {
             usize::try_from(backfill.checkpoint.next_page).map_err(|_| invalid_protocol())?;
         let page_request = query.page(page_number).map_err(|_| invalid_protocol())?;
         let retrieved = self
-            .fetch_daily_rate_page(
+            .fetch_daily_rate_page_with_budget_wait(
                 &authority,
                 &page_request,
                 FiscalDataParseLimits::production_defaults(),
@@ -920,10 +991,60 @@ impl TreasurySource {
         let terminal = next_tracker
             .accept(retrieved.page())
             .map_err(|_| invalid_protocol())?;
+        let validated_at = system_timestamp().map_err(super::map_adapter_error)?;
+        if retrieved.page().feed_published_at() > retrieved.received_at()
+            || validated_at < retrieved.received_at()
+        {
+            return Err(invalid_protocol());
+        }
         let source_rows = retrieved.page().observations().len();
-        let canonical_points = page_canonical_points(retrieved.page())?;
         let raw_body_bytes =
             u64::try_from(retrieved.exact_payload().len()).map_err(|_| invalid_protocol())?;
+        let object = source_object(
+            &self.metadata,
+            &discovery,
+            &page_request,
+            retrieved.exact_payload(),
+            retrieved.received_at(),
+            "application/atom+xml",
+            ObjectKind::DailyRate,
+        )?;
+        let expected_capture = retrieved.capture_material().receipt().clone();
+        let canonical = if terminal {
+            if source_rows != 0 {
+                return Err(invalid_protocol());
+            }
+            None
+        } else {
+            Some(prepare_canonical_page(
+                self,
+                CanonicalPagePreparation {
+                    descriptor: &backfill.checkpoint.descriptor,
+                    object: object.clone(),
+                    page: retrieved.page(),
+                    received_at: retrieved.received_at(),
+                    validated_at,
+                    raw_body_bytes: retrieved.exact_payload().len(),
+                    deadline: discovery.deadline(),
+                    capture: &expected_capture,
+                },
+            )?)
+        };
+        let (canonical_points, observed_numeric_points, explicit_missing_points) = canonical
+            .as_ref()
+            .map(|page| {
+                Ok::<_, ExtractionSourceError>((
+                    u64::try_from(page.content_identity().record_count())
+                        .map_err(|_| invalid_protocol())?,
+                    page.accounting().aggregate_observed_numeric_points(),
+                    page.accounting().aggregate_explicit_missing_points(),
+                ))
+            })
+            .transpose()?
+            .unwrap_or((0, 0, 0));
+        if observed_numeric_points.checked_add(explicit_missing_points) != Some(canonical_points) {
+            return Err(invalid_protocol());
+        }
         backfill
             .checkpoint
             .accepted_source_rows
@@ -938,49 +1059,33 @@ impl TreasurySource {
             .ok_or_else(invalid_protocol)?;
         backfill
             .checkpoint
+            .observed_numeric_points
+            .checked_add(observed_numeric_points)
+            .ok_or_else(invalid_protocol)?;
+        backfill
+            .checkpoint
+            .explicit_missing_points
+            .checked_add(explicit_missing_points)
+            .ok_or_else(invalid_protocol)?;
+        backfill
+            .checkpoint
             .raw_body_bytes
             .checked_add(raw_body_bytes)
             .filter(|value| *value <= MAX_ALL_HISTORY_RAW_BODY_BYTES)
             .ok_or_else(invalid_protocol)?;
-        let object = source_object(
-            &self.metadata,
-            &discovery,
-            &page_request,
-            retrieved.exact_payload(),
-            retrieved.received_at(),
-            "application/atom+xml",
-            ObjectKind::DailyRate,
-        )?;
-        let expected_capture = retrieved.capture_material().receipt().clone();
-        let canonical = if terminal {
-            None
-        } else {
-            let normalized_at = system_timestamp().map_err(super::map_adapter_error)?;
-            Some(prepare_canonical_page(
-                self,
-                CanonicalPagePreparation {
-                    descriptor: &backfill.checkpoint.descriptor,
-                    object: object.clone(),
-                    page: retrieved.page(),
-                    received_at: retrieved.received_at(),
-                    normalized_at,
-                    raw_body_bytes: retrieved.exact_payload().len(),
-                    deadline: discovery.deadline(),
-                    capture: &expected_capture,
-                },
-            )?)
-        };
         let persisted = TreasuryAllHistoryPersistedPage {
             page_number: backfill.checkpoint.next_page,
             returned_source_rows: u64::try_from(source_rows).map_err(|_| invalid_protocol())?,
             canonical_points,
+            observed_numeric_points,
+            explicit_missing_points,
             raw_body_bytes,
             request_digest: sha256(page_request.request_digest()),
             payload_digest: sha256(retrieved.page().response_payload_digest()),
             received_at: retrieved.received_at(),
             provider_published_at: retrieved.page().feed_published_at(),
+            validated_at,
             terminal,
-            canonical_normalized_at: canonical.as_ref().map(|page| page.normalized_at),
             canonical_content_digest: canonical
                 .as_ref()
                 .map(|page| page.content_identity.digest()),
@@ -1009,7 +1114,7 @@ struct CanonicalPagePreparation<'a> {
     object: SourceObject,
     page: &'a TreasuryDailyRatePage,
     received_at: Timestamp,
-    normalized_at: Timestamp,
+    validated_at: Timestamp,
     raw_body_bytes: usize,
     deadline: Timestamp,
     capture: &'a ProviderCaptureSetReceipt,
@@ -1024,58 +1129,63 @@ fn prepare_canonical_page(
         object,
         page,
         received_at,
-        normalized_at,
+        validated_at,
         raw_body_bytes,
         deadline,
         capture,
     } = input;
-    let canonical =
-        canonical_daily_rate_records(&source.metadata, page, received_at, normalized_at)
-            .map_err(super::map_adapter_error)?;
     let record_limit =
-        NonZeroU32::new(u32::try_from(canonical.len()).map_err(|_| invalid_protocol())?)
+        NonZeroU32::new(u32::try_from(MAX_EXTRACTION_RECORDS).map_err(|_| invalid_protocol())?)
             .ok_or_else(invalid_protocol)?;
     let byte_limit =
         NonZeroU64::new(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES).ok_or_else(invalid_protocol)?;
     let request = ExtractionRequest::try_new(object, record_limit, byte_limit, deadline)?;
     let schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
         .map_err(|_| invalid_protocol())?;
-    let records = canonical
-        .into_iter()
-        .map(|record| {
-            ExtractionRecord::try_new_with_time(
-                &request,
-                schema.clone(),
-                record.evidence,
-                record.effective,
-                record.published,
-                record.availability,
-                record.revision,
-                None,
-                record.payload,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut canonical_admission = CanonicalRecordAdmission::new();
+    let mut batch = ExtractionBatchAccumulator::try_new(&request)?;
+    for record in canonical_daily_rate_records(&source.metadata, page, received_at, validated_at) {
+        let record = canonical_admission
+            .admit(record.map_err(super::map_adapter_error)?)
+            .map_err(super::map_adapter_error)?;
+        batch.push(ExtractionRecord::try_new_with_time(
+            &request,
+            schema.clone(),
+            record.evidence,
+            record.effective,
+            record.published,
+            record.availability,
+            record.revision,
+            None,
+            record.payload,
+        )?)?;
+    }
+    let canonical_points = canonical_admission.record_count();
+    let observed_numeric_points = canonical_admission.observed_numeric_points();
+    let explicit_missing_points = canonical_admission.explicit_missing_points();
     let accounting = TreasuryExtractionAccounting::try_new(TreasuryExtractionAccountingInput {
         descriptor: descriptor.clone(),
-        page_number: page.page_number(),
-        returned_source_rows: page.observations().len(),
-        canonical_points: records.len(),
-        raw_body_bytes,
+        terminal_page_count: 1,
+        aggregate_source_rows: page.observations().len(),
+        aggregate_canonical_points: canonical_points,
+        aggregate_observed_numeric_points: observed_numeric_points,
+        aggregate_explicit_missing_points: explicit_missing_points,
+        aggregate_raw_body_bytes: raw_body_bytes,
+        source_object_payload_bytes: raw_body_bytes,
         query_digest: page.query_digest(),
-        request_digest: page.request_digest(),
-        payload_digest: page.response_payload_digest(),
-        received_at,
+        request_set_digest: page.request_digest(),
+        source_object_payload_digest: page.response_payload_digest(),
+        terminal_received_at: received_at,
         provider_published_at: Some(page.feed_published_at()),
         terminal_for_query: false,
     })
     .map_err(|_| invalid_protocol())?;
-    let batch = ExtractionBatch::try_new(&request, records)?.try_bind_provider_capture(capture)?;
+    let batch = batch.finish()?.try_bind_provider_capture(capture)?;
     let content_identity = ExtractionContentIdentity::try_from_batch(&batch)?;
     Ok(TreasuryAllHistoryCanonicalPage {
         batch,
         accounting,
-        normalized_at,
+        validated_at,
         content_identity,
     })
 }
@@ -1118,14 +1228,21 @@ fn validate_replayed_page(
 ) -> Result<(), TreasurySourceError> {
     let source_rows = u64::try_from(page.observations().len())
         .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
-    let canonical_points =
-        page_canonical_points(page).map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
     if u64::try_from(page.page_number()).ok() != Some(persisted.page_number)
         || source_rows != persisted.returned_source_rows
-        || canonical_points != persisted.canonical_points
+        || persisted
+            .observed_numeric_points
+            .checked_add(persisted.explicit_missing_points)
+            != Some(persisted.canonical_points)
+        || (page.is_terminal()
+            && (persisted.canonical_points != 0
+                || persisted.observed_numeric_points != 0
+                || persisted.explicit_missing_points != 0))
         || sha256(page.request_digest()) != persisted.request_digest
         || sha256(page.response_payload_digest()) != persisted.payload_digest
         || page.feed_published_at() != persisted.provider_published_at
+        || persisted.provider_published_at > persisted.received_at
+        || persisted.validated_at < persisted.received_at
         || page.is_terminal() != persisted.terminal
     {
         return Err(TreasurySourceError::InvalidBackfillCheckpoint);
@@ -1139,16 +1256,6 @@ fn tracker_terminal_matches_checkpoint(
 ) -> bool {
     seals.len() == checkpoint.pages.len()
         && checkpoint.terminal_observed == checkpoint.pages.last().is_some_and(|page| page.terminal)
-}
-
-fn page_canonical_points(page: &TreasuryDailyRatePage) -> Result<u64, ExtractionSourceError> {
-    page.observations()
-        .iter()
-        .try_fold(0_u64, |total, observation| {
-            let points = u64::try_from(observation.metric_points().count())
-                .map_err(|_| invalid_protocol())?;
-            total.checked_add(points).ok_or_else(invalid_protocol)
-        })
 }
 
 fn within_source_row_limit(value: u64) -> bool {

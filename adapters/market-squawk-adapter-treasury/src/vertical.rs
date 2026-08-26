@@ -18,8 +18,8 @@ use market_squawk_domain::{
     Timestamp,
 };
 use market_squawk_sources::{
-    DiscoveryBatch, ExtractionBatch, ProviderCaptureMaterial, SealedProviderCaptureSetReceipt,
-    SourceMetadata,
+    BudgetWindowSemantics, DiscoveryBatch, ExtractionBatch, ProviderBudgetPolicy,
+    ProviderCaptureMaterial, SealedProviderCaptureSetReceipt, SourceMetadata,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -584,6 +584,8 @@ impl TreasuryDoctorProbe {
             response_page,
             returned_source_rows,
             canonical_points,
+            observed_numeric_points,
+            explicit_missing_points,
             reported_total_rows,
             reported_total_pages,
             response_complete_for_query,
@@ -592,19 +594,28 @@ impl TreasuryDoctorProbe {
         ) = match &self.request {
             TreasuryDoctorProbeRequest::Fiscal(request) => {
                 let page = crate::FiscalDataPage::parse(body, request, limits)?;
-                let normalized = crate::source::normalize::canonical_fiscal_records(
+                let mut canonical_admission =
+                    crate::source::normalize::CanonicalRecordAdmission::new();
+                for record in crate::source::normalize::canonical_fiscal_records(
                     metadata,
                     &page,
                     received_at,
                     normalized_at,
-                )
-                .map_err(|_| TreasuryVerticalError::DoctorRejected)?;
+                ) {
+                    canonical_admission
+                        .admit(record.map_err(|_| TreasuryVerticalError::DoctorRejected)?)
+                        .map_err(|_| TreasuryVerticalError::DoctorRejected)?;
+                }
                 (
                     u64::try_from(page.page_number())
                         .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
-                    u64::try_from(normalized.len())
-                        .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
                     u64::try_from(page.records().len())
+                        .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
+                    u64::try_from(canonical_admission.record_count())
+                        .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
+                    u64::try_from(canonical_admission.observed_numeric_points())
+                        .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
+                    u64::try_from(canonical_admission.explicit_missing_points())
                         .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
                     Some(
                         u64::try_from(page.total_count())
@@ -621,21 +632,34 @@ impl TreasuryDoctorProbe {
             }
             TreasuryDoctorProbeRequest::Daily(request) => {
                 let page = TreasuryDailyRatePage::parse(body, request, limits)?;
-                let normalized = crate::source::normalize::canonical_daily_rate_records(
+                let mut canonical_admission =
+                    crate::source::normalize::CanonicalRecordAdmission::new();
+                for record in crate::source::normalize::canonical_daily_rate_records(
                     metadata,
                     &page,
                     received_at,
                     normalized_at,
-                )
-                .map_err(|_| TreasuryVerticalError::DoctorRejected)?;
-                let canonical_points = u64::try_from(normalized.len())
+                ) {
+                    canonical_admission
+                        .admit(record.map_err(|_| TreasuryVerticalError::DoctorRejected)?)
+                        .map_err(|_| TreasuryVerticalError::DoctorRejected)?;
+                }
+                let canonical_points = u64::try_from(canonical_admission.record_count())
                     .map_err(|_| TreasuryVerticalError::AccountingOverflow)?;
+                let observed_numeric_points =
+                    u64::try_from(canonical_admission.observed_numeric_points())
+                        .map_err(|_| TreasuryVerticalError::AccountingOverflow)?;
+                let explicit_missing_points =
+                    u64::try_from(canonical_admission.explicit_missing_points())
+                        .map_err(|_| TreasuryVerticalError::AccountingOverflow)?;
                 (
                     u64::try_from(page.page_number())
                         .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
                     u64::try_from(page.observations().len())
                         .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
                     canonical_points,
+                    observed_numeric_points,
+                    explicit_missing_points,
                     None,
                     None,
                     page.period().kind() != TreasuryDailyRatePeriodKind::AllHistory,
@@ -644,6 +668,9 @@ impl TreasuryDoctorProbe {
                 )
             }
         };
+        if observed_numeric_points.checked_add(explicit_missing_points) != Some(canonical_points) {
+            return Err(TreasuryVerticalError::DoctorRejected);
+        }
         Ok(TreasuryDoctorObservation {
             surface: self.descriptor.surface,
             family: self.descriptor.family,
@@ -657,10 +684,12 @@ impl TreasuryDoctorProbe {
             body_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(body).into()),
             returned_source_rows,
             canonical_points,
+            observed_numeric_points,
+            explicit_missing_points,
             reported_total_rows,
             reported_total_pages,
             response_complete_for_query,
-            producing: canonical_points > 0,
+            producing: observed_numeric_points > 0,
             received_at,
             provider_published_at,
             schema_digest,
@@ -698,7 +727,13 @@ impl TreasuryDoctorPlan {
     pub(crate) fn close(
         &self,
         observations: impl IntoIterator<Item = TreasuryDoctorObservation>,
+        metadata: &SourceMetadata,
     ) -> Result<TreasuryDoctorReceipt, TreasuryVerticalError> {
+        let rate_policy_digest = treasury_rate_policy_digest(
+            metadata
+                .budget_policy()
+                .ok_or(TreasuryVerticalError::DoctorRejected)?,
+        )?;
         let mut accepted_observations = Vec::new();
         for observation in observations {
             if accepted_observations.len() == self.probes.len() {
@@ -727,37 +762,58 @@ impl TreasuryDoctorPlan {
             || expected.iter().any(|digest| !actual.contains(digest))
             || actual.iter().any(|digest| !expected.contains(digest))
             || observations.iter().any(|observation| {
-                self.probes
-                    .iter()
-                    .find(|probe| {
-                        probe.request_digest == observation.request_digest
-                            && probe.descriptor.surface == observation.surface
-                            && probe.descriptor.family == observation.family
-                            && probe.descriptor.provider_dataset == observation.provider_dataset
-                            && probe.descriptor.analytical_dataset == observation.analytical_dataset
-                            && probe.descriptor.query_digest == observation.query_digest
-                    })
-                    .is_none()
+                observation
+                    .observed_numeric_points
+                    .checked_add(observation.explicit_missing_points)
+                    != Some(observation.canonical_points)
+                    || observation.producing != (observation.observed_numeric_points > 0)
+                    || self
+                        .probes
+                        .iter()
+                        .find(|probe| {
+                            probe.request_digest == observation.request_digest
+                                && probe.descriptor.surface == observation.surface
+                                && probe.descriptor.family == observation.family
+                                && probe.descriptor.provider_dataset == observation.provider_dataset
+                                && probe.descriptor.analytical_dataset
+                                    == observation.analytical_dataset
+                                && probe.descriptor.query_digest == observation.query_digest
+                        })
+                        .is_none()
             })
         {
             return Err(TreasuryVerticalError::DoctorRejected);
         }
-        let (total_body_bytes, returned_source_rows, canonical_points) =
-            observations.iter().try_fold(
-                (0_u64, 0_u64, 0_u64),
-                |(bytes, rows, points), observation| {
-                    Ok::<_, TreasuryVerticalError>((
-                        bytes
-                            .checked_add(observation.body_bytes)
-                            .ok_or(TreasuryVerticalError::AccountingOverflow)?,
-                        rows.checked_add(observation.returned_source_rows)
-                            .ok_or(TreasuryVerticalError::AccountingOverflow)?,
-                        points
-                            .checked_add(observation.canonical_points)
-                            .ok_or(TreasuryVerticalError::AccountingOverflow)?,
-                    ))
-                },
-            )?;
+        let (
+            total_body_bytes,
+            returned_source_rows,
+            canonical_points,
+            observed_numeric_points,
+            explicit_missing_points,
+        ) = observations.iter().try_fold(
+            (0_u64, 0_u64, 0_u64, 0_u64, 0_u64),
+            |(bytes, rows, points, observed, missing), observation| {
+                Ok::<_, TreasuryVerticalError>((
+                    bytes
+                        .checked_add(observation.body_bytes)
+                        .ok_or(TreasuryVerticalError::AccountingOverflow)?,
+                    rows.checked_add(observation.returned_source_rows)
+                        .ok_or(TreasuryVerticalError::AccountingOverflow)?,
+                    points
+                        .checked_add(observation.canonical_points)
+                        .ok_or(TreasuryVerticalError::AccountingOverflow)?,
+                    observed
+                        .checked_add(observation.observed_numeric_points)
+                        .ok_or(TreasuryVerticalError::AccountingOverflow)?,
+                    missing
+                        .checked_add(observation.explicit_missing_points)
+                        .ok_or(TreasuryVerticalError::AccountingOverflow)?,
+                ))
+            },
+        )?;
+        if observed_numeric_points.checked_add(explicit_missing_points) != Some(canonical_points) {
+            return Err(TreasuryVerticalError::DoctorRejected);
+        }
         let all_probes_producing = observations.iter().all(|observation| observation.producing);
         let all_probes_complete_for_query = observations
             .iter()
@@ -773,9 +829,12 @@ impl TreasuryDoctorPlan {
             all_probes_producing,
             all_probes_complete_for_query,
             activation_ready: self.complete_selected_family_coverage && all_probes_producing,
+            rate_policy_digest,
             total_body_bytes,
             returned_source_rows,
             canonical_points,
+            observed_numeric_points,
+            explicit_missing_points,
             observations: observations.into_boxed_slice(),
         })
     }
@@ -797,6 +856,8 @@ pub struct TreasuryDoctorObservation {
     body_digest: EvidenceDigest,
     returned_source_rows: u64,
     canonical_points: u64,
+    observed_numeric_points: u64,
+    explicit_missing_points: u64,
     reported_total_rows: Option<u64>,
     reported_total_pages: Option<u64>,
     response_complete_for_query: bool,
@@ -813,7 +874,7 @@ impl TreasuryDoctorObservation {
         self.request_digest
     }
 
-    /// Returns whether at least one canonical value was observed.
+    /// Returns whether at least one canonical point carried an observed numeric value.
     pub const fn producing(&self) -> bool {
         self.producing
     }
@@ -832,6 +893,16 @@ impl TreasuryDoctorObservation {
     pub const fn canonical_points(&self) -> u64 {
         self.canonical_points
     }
+
+    /// Returns canonical points carrying an exact observed numeric value.
+    pub const fn observed_numeric_points(&self) -> u64 {
+        self.observed_numeric_points
+    }
+
+    /// Returns retained canonical points carrying explicit provider missingness.
+    pub const fn explicit_missing_points(&self) -> u64 {
+        self.explicit_missing_points
+    }
 }
 
 /// Closed doctor result retaining exact per-family response and accounting evidence.
@@ -846,9 +917,12 @@ pub struct TreasuryDoctorReceipt {
     all_probes_producing: bool,
     all_probes_complete_for_query: bool,
     activation_ready: bool,
+    rate_policy_digest: EvidenceDigest,
     total_body_bytes: u64,
     returned_source_rows: u64,
     canonical_points: u64,
+    observed_numeric_points: u64,
+    explicit_missing_points: u64,
     observations: Box<[TreasuryDoctorObservation]>,
 }
 
@@ -860,6 +934,11 @@ impl TreasuryDoctorReceipt {
     /// Fiscal success covers Average Interest Rates V2 only, never the broader Fiscal Data catalog.
     pub const fn activation_ready(&self) -> bool {
         self.activation_ready
+    }
+
+    /// Returns the exact shared rate/cooldown policy used by every doctor probe.
+    pub const fn rate_policy_digest(&self) -> EvidenceDigest {
+        self.rate_policy_digest
     }
 
     /// Returns whether every probe happened to cover its entire configured query.
@@ -878,6 +957,21 @@ impl TreasuryDoctorReceipt {
     /// Returns the exact response observations retained by the receipt.
     pub fn observations(&self) -> &[TreasuryDoctorObservation] {
         &self.observations
+    }
+
+    /// Returns every canonical point validated across the doctor probes.
+    pub const fn canonical_points(&self) -> u64 {
+        self.canonical_points
+    }
+
+    /// Returns observed numeric points validated across the doctor probes.
+    pub const fn observed_numeric_points(&self) -> u64 {
+        self.observed_numeric_points
+    }
+
+    /// Returns explicit provider-missing points retained across the doctor probes.
+    pub const fn explicit_missing_points(&self) -> u64 {
+        self.explicit_missing_points
     }
 }
 
@@ -974,9 +1068,11 @@ impl TreasurySealedDoctorReceipt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TreasuryDiscoveryCompleteness {
-    /// The provider query completed and produced at least one canonical value.
+    /// The provider query completed and produced at least one observed numeric value.
     CompleteProducing,
-    /// The provider query completed but produced no canonical value.
+    /// The provider query completed without an observed numeric value.
+    ///
+    /// Explicit provider-missing canonical rows may still be retained and counted.
     CompleteEmpty,
 }
 
@@ -990,6 +1086,8 @@ pub struct TreasuryDiscoveryAccounting {
     source_object_count: u64,
     returned_source_rows: u64,
     canonical_points: u64,
+    observed_numeric_points: u64,
+    explicit_missing_points: u64,
     raw_body_bytes: u64,
     terminal_response_observed: bool,
     terminal_response_represented_by_source_object: bool,
@@ -1010,6 +1108,8 @@ pub(crate) struct TreasuryDiscoveryAccountingInput {
     pub(crate) source_object_count: usize,
     pub(crate) returned_source_rows: usize,
     pub(crate) canonical_points: usize,
+    pub(crate) observed_numeric_points: usize,
+    pub(crate) explicit_missing_points: usize,
     pub(crate) raw_body_bytes: u64,
     pub(crate) terminal_response_observed: bool,
     pub(crate) terminal_response_represented_by_source_object: bool,
@@ -1033,7 +1133,7 @@ impl TreasuryDiscoveryAccounting {
                     && input.reported_total_pages.is_none()
             }
             TreasuryPublicationMode::CompletePageChain => {
-                input.source_object_count == input.response_count
+                input.source_object_count == 1
                     && input.terminal_response_represented_by_source_object
                     && input.reported_total_rows == Some(input.returned_source_rows)
                     && input.reported_total_pages == Some(input.response_count)
@@ -1048,6 +1148,10 @@ impl TreasuryDiscoveryAccounting {
         if input.request_count == 0
             || input.response_count == 0
             || input.request_count != input.response_count
+            || input
+                .observed_numeric_points
+                .checked_add(input.explicit_missing_points)
+                != Some(input.canonical_points)
             || !input.terminal_response_observed
             || !protocol_shape_valid
             || input.last_received_at < input.first_received_at
@@ -1060,7 +1164,11 @@ impl TreasuryDiscoveryAccounting {
             .map_err(|_| TreasuryVerticalError::AccountingOverflow)?;
         let canonical_points = u64::try_from(input.canonical_points)
             .map_err(|_| TreasuryVerticalError::AccountingOverflow)?;
-        let completeness = if canonical_points == 0 {
+        let observed_numeric_points = u64::try_from(input.observed_numeric_points)
+            .map_err(|_| TreasuryVerticalError::AccountingOverflow)?;
+        let explicit_missing_points = u64::try_from(input.explicit_missing_points)
+            .map_err(|_| TreasuryVerticalError::AccountingOverflow)?;
+        let completeness = if observed_numeric_points == 0 {
             TreasuryDiscoveryCompleteness::CompleteEmpty
         } else {
             TreasuryDiscoveryCompleteness::CompleteProducing
@@ -1081,6 +1189,8 @@ impl TreasuryDiscoveryAccounting {
             returned_source_rows: u64::try_from(input.returned_source_rows)
                 .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
             canonical_points,
+            observed_numeric_points,
+            explicit_missing_points,
             raw_body_bytes: input.raw_body_bytes,
             terminal_response_observed: input.terminal_response_observed,
             terminal_response_represented_by_source_object: input
@@ -1132,6 +1242,16 @@ impl TreasuryDiscoveryAccounting {
         self.canonical_points
     }
 
+    /// Returns canonical points carrying an exact observed numeric value.
+    pub const fn observed_numeric_points(&self) -> u64 {
+        self.observed_numeric_points
+    }
+
+    /// Returns retained canonical points carrying explicit provider missingness.
+    pub const fn explicit_missing_points(&self) -> u64 {
+        self.explicit_missing_points
+    }
+
     /// Returns exact discovered provider payload identities in request order.
     pub fn source_payload_digests(&self) -> &[EvidenceDigest] {
         &self.source_payload_digests
@@ -1176,19 +1296,22 @@ impl TreasuryDiscoveryOutput {
     }
 }
 
-/// Page-local accounting retained with one canonical extraction batch and its exact raw capture.
+/// Aggregate accounting for one daily response or one complete Fiscal page chain.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TreasuryExtractionAccounting {
     descriptor: TreasuryDatasetDescriptor,
-    page_number: u64,
-    returned_source_rows: u64,
-    canonical_points: u64,
-    raw_body_bytes: u64,
+    terminal_page_count: u64,
+    aggregate_source_rows: u64,
+    aggregate_canonical_points: u64,
+    aggregate_observed_numeric_points: u64,
+    aggregate_explicit_missing_points: u64,
+    aggregate_raw_body_bytes: u64,
+    source_object_payload_bytes: u64,
     query_digest: EvidenceDigest,
-    request_digest: EvidenceDigest,
-    payload_digest: EvidenceDigest,
-    received_at: Timestamp,
+    request_set_digest: EvidenceDigest,
+    source_object_payload_digest: EvidenceDigest,
+    terminal_received_at: Timestamp,
     provider_published_at: Option<Timestamp>,
     terminal_for_query: bool,
 }
@@ -1196,14 +1319,17 @@ pub struct TreasuryExtractionAccounting {
 /// Checked adapter facts used to construct [`TreasuryExtractionAccounting`].
 pub(crate) struct TreasuryExtractionAccountingInput {
     pub(crate) descriptor: TreasuryDatasetDescriptor,
-    pub(crate) page_number: usize,
-    pub(crate) returned_source_rows: usize,
-    pub(crate) canonical_points: usize,
-    pub(crate) raw_body_bytes: usize,
+    pub(crate) terminal_page_count: usize,
+    pub(crate) aggregate_source_rows: usize,
+    pub(crate) aggregate_canonical_points: usize,
+    pub(crate) aggregate_observed_numeric_points: usize,
+    pub(crate) aggregate_explicit_missing_points: usize,
+    pub(crate) aggregate_raw_body_bytes: usize,
+    pub(crate) source_object_payload_bytes: usize,
     pub(crate) query_digest: [u8; 32],
-    pub(crate) request_digest: [u8; 32],
-    pub(crate) payload_digest: [u8; 32],
-    pub(crate) received_at: Timestamp,
+    pub(crate) request_set_digest: [u8; 32],
+    pub(crate) source_object_payload_digest: [u8; 32],
+    pub(crate) terminal_received_at: Timestamp,
     pub(crate) provider_published_at: Option<Timestamp>,
     pub(crate) terminal_for_query: bool,
 }
@@ -1212,28 +1338,44 @@ impl TreasuryExtractionAccounting {
     pub(crate) fn try_new(
         input: TreasuryExtractionAccountingInput,
     ) -> Result<Self, TreasuryVerticalError> {
-        if input.raw_body_bytes == 0
-            || input.canonical_points == 0
-            || input.returned_source_rows == 0
-            || input.canonical_points < input.returned_source_rows
+        if input.terminal_page_count == 0
+            || input.aggregate_raw_body_bytes == 0
+            || input.source_object_payload_bytes == 0
+            || input.aggregate_canonical_points == 0
+            || input
+                .aggregate_observed_numeric_points
+                .checked_add(input.aggregate_explicit_missing_points)
+                != Some(input.aggregate_canonical_points)
+            || input.aggregate_source_rows == 0
+            || input.aggregate_canonical_points < input.aggregate_source_rows
             || input.descriptor.query_digest != sha256(input.query_digest)
         {
             return Err(TreasuryVerticalError::InvalidDiscoveryAccounting);
         }
         Ok(Self {
             descriptor: input.descriptor,
-            page_number: u64::try_from(input.page_number)
+            terminal_page_count: u64::try_from(input.terminal_page_count)
                 .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
-            returned_source_rows: u64::try_from(input.returned_source_rows)
+            aggregate_source_rows: u64::try_from(input.aggregate_source_rows)
                 .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
-            canonical_points: u64::try_from(input.canonical_points)
+            aggregate_canonical_points: u64::try_from(input.aggregate_canonical_points)
                 .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
-            raw_body_bytes: u64::try_from(input.raw_body_bytes)
+            aggregate_observed_numeric_points: u64::try_from(
+                input.aggregate_observed_numeric_points,
+            )
+            .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
+            aggregate_explicit_missing_points: u64::try_from(
+                input.aggregate_explicit_missing_points,
+            )
+            .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
+            aggregate_raw_body_bytes: u64::try_from(input.aggregate_raw_body_bytes)
+                .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
+            source_object_payload_bytes: u64::try_from(input.source_object_payload_bytes)
                 .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
             query_digest: sha256(input.query_digest),
-            request_digest: sha256(input.request_digest),
-            payload_digest: sha256(input.payload_digest),
-            received_at: input.received_at,
+            request_set_digest: sha256(input.request_set_digest),
+            source_object_payload_digest: sha256(input.source_object_payload_digest),
+            terminal_received_at: input.terminal_received_at,
             provider_published_at: input.provider_published_at,
             terminal_for_query: input.terminal_for_query,
         })
@@ -1248,35 +1390,74 @@ impl TreasuryExtractionAccounting {
             .map_err(|_| TreasuryVerticalError::AccountingOverflow)?;
         let receipt = capture.receipt();
         let object = batch.request().object();
-        if record_count != self.canonical_points
+        let is_chain =
+            self.descriptor.publication_mode == TreasuryPublicationMode::CompletePageChain;
+        let expected_terminal = if is_chain {
+            market_squawk_sources::ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
+        } else {
+            market_squawk_sources::ProviderCaptureTerminalDisposition::StandaloneResponse
+        };
+        let expected_pages = self.terminal_page_count;
+        let capture_payload_evidence = if is_chain {
+            crate::source::lineage::fiscal_chain_framed_evidence(
+                capture.records().iter().map(|record| record.payload()),
+            )
+            .ok()
+        } else {
+            receipt
+                .pages()
+                .first()
+                .map(|page| (page.body_digest(), page.body_bytes()))
+        };
+        let capture_request_digest = if is_chain {
+            fiscal_capture_request_digest(receipt.pages())
+        } else {
+            receipt.pages().first().map(|page| page.request_identity())
+        };
+        if record_count != self.aggregate_canonical_points
+            || self
+                .aggregate_observed_numeric_points
+                .checked_add(self.aggregate_explicit_missing_points)
+                != Some(self.aggregate_canonical_points)
             || object.source_id() != receipt.source_id()
             || object.metadata_revision() != receipt.metadata_revision()
             || object.dataset() != self.descriptor.provider_dataset()
             || object.dataset() != receipt.dataset()
-            || object.evidence().content_digest() != self.payload_digest
-            || object.expected_bytes() != Some(self.raw_body_bytes)
+            || object.evidence().content_digest() != self.source_object_payload_digest
+            || object.expected_bytes() != Some(self.source_object_payload_bytes)
             || market_squawk_sources::SourceObjectCaptureIdentity::try_from_capture(receipt).ok()
                 != Some(object.capture_identity())
-            || receipt.pages().len() != 1
-            || receipt.terminal()
-                != market_squawk_sources::ProviderCaptureTerminalDisposition::StandaloneResponse
-            || receipt.request_set_identity() != self.request_digest
-            || receipt.pages()[0].request_identity() != self.request_digest
-            || receipt.pages()[0].body_digest() != self.payload_digest
-            || receipt.pages()[0].body_bytes() != self.raw_body_bytes
-            || receipt.pages()[0].received_at() != self.received_at
-            || receipt.total_body_bytes() != self.raw_body_bytes
+            || u64::try_from(receipt.pages().len()).ok() != Some(expected_pages)
+            || receipt.terminal() != expected_terminal
+            || receipt.request_set_identity() != self.request_set_digest
+            || capture_request_digest != Some(self.request_set_digest)
+            || capture_payload_evidence
+                != Some((
+                    self.source_object_payload_digest,
+                    self.source_object_payload_bytes,
+                ))
+            || receipt.pages().last().map(|page| page.received_at())
+                != Some(self.terminal_received_at)
+            || receipt.total_body_bytes() != self.aggregate_raw_body_bytes
             || batch.records().iter().any(|record| {
+                let published = record
+                    .published_time()
+                    .and_then(market_squawk_domain::ResearchTemporalCoordinate::exact_timestamp);
                 record.source_id() != receipt.source_id()
                     || record.metadata_revision() != receipt.metadata_revision()
                     || record.dataset() != receipt.dataset()
                     || record.object_id() != object.object_id()
                     || record.object_evidence() != object.evidence()
-                    || record.available_at() != Some(self.received_at)
-                    || record
-                        .published_time()
-                        .and_then(market_squawk_domain::ResearchTemporalCoordinate::exact_timestamp)
-                        != self.provider_published_at
+                    || !receipt
+                        .pages()
+                        .iter()
+                        .any(|page| record.available_at() == Some(page.received_at()))
+                    || match self.provider_published_at {
+                        Some(feed_published_at) => {
+                            published.is_none_or(|value| value > feed_published_at)
+                        }
+                        None => published.is_some(),
+                    }
             })
         {
             return Err(TreasuryVerticalError::InvalidExtractionHandoff);
@@ -1289,39 +1470,54 @@ impl TreasuryExtractionAccounting {
         &self.descriptor
     }
 
-    /// Returns the provider-native page number retained by this extraction.
-    pub const fn page_number(&self) -> u64 {
-        self.page_number
+    /// Returns one for a daily response or the complete terminal Fiscal chain page count.
+    pub const fn terminal_page_count(&self) -> u64 {
+        self.terminal_page_count
     }
 
-    /// Returns the exact number of provider rows represented by this page.
-    pub const fn returned_source_rows(&self) -> u64 {
-        self.returned_source_rows
+    /// Returns aggregate provider rows across the daily response or complete Fiscal chain.
+    pub const fn aggregate_source_rows(&self) -> u64 {
+        self.aggregate_source_rows
     }
 
-    /// Returns the page-local number of canonical scalar observations.
-    pub const fn canonical_points(&self) -> u64 {
-        self.canonical_points
+    /// Returns aggregate canonical observations across the complete extraction unit.
+    pub const fn aggregate_canonical_points(&self) -> u64 {
+        self.aggregate_canonical_points
     }
 
-    /// Returns the exact provider payload identity normalized by this page.
-    pub const fn payload_digest(&self) -> EvidenceDigest {
-        self.payload_digest
+    /// Returns aggregate canonical points carrying an exact observed numeric value.
+    pub const fn aggregate_observed_numeric_points(&self) -> u64 {
+        self.aggregate_observed_numeric_points
     }
 
-    /// Returns the exact authorized provider-request identity for this page.
-    pub const fn request_digest(&self) -> EvidenceDigest {
-        self.request_digest
+    /// Returns aggregate canonical points carrying explicit provider missingness.
+    pub const fn aggregate_explicit_missing_points(&self) -> u64 {
+        self.aggregate_explicit_missing_points
     }
 
-    /// Returns the exact raw provider-body bytes normalized by this page.
-    pub const fn raw_body_bytes(&self) -> u64 {
-        self.raw_body_bytes
+    /// Returns the exact daily body digest or canonical framed Fiscal-chain digest.
+    pub const fn source_object_payload_digest(&self) -> EvidenceDigest {
+        self.source_object_payload_digest
     }
 
-    /// Returns when this installation received the complete exact provider response.
-    pub const fn received_at(&self) -> Timestamp {
-        self.received_at
+    /// Returns the one-request daily identity or ordered complete Fiscal request-set digest.
+    pub const fn request_set_digest(&self) -> EvidenceDigest {
+        self.request_set_digest
+    }
+
+    /// Returns aggregate exact provider-body bytes across the complete extraction unit.
+    pub const fn aggregate_raw_body_bytes(&self) -> u64 {
+        self.aggregate_raw_body_bytes
+    }
+
+    /// Returns exact daily body bytes or canonical framed Fiscal-chain payload bytes.
+    pub const fn source_object_payload_bytes(&self) -> u64 {
+        self.source_object_payload_bytes
+    }
+
+    /// Returns when the daily response or terminal Fiscal-chain page was received.
+    pub const fn terminal_received_at(&self) -> Timestamp {
+        self.terminal_received_at
     }
 
     /// Returns the provider publication clock when the family exposes one.
@@ -1333,6 +1529,46 @@ impl TreasuryExtractionAccounting {
     pub const fn terminal_for_query(&self) -> bool {
         self.terminal_for_query
     }
+}
+
+fn fiscal_capture_request_digest(
+    pages: &[market_squawk_sources::ProviderCapturePageReceipt],
+) -> Option<EvidenceDigest> {
+    if pages.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/treasury-fiscal-request-set/v1\0");
+    digest.update(u64::try_from(pages.len()).ok()?.to_be_bytes());
+    for page in pages {
+        digest.update(page.request_identity().bytes());
+    }
+    Some(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+pub(crate) fn treasury_rate_policy_digest(
+    policy: &ProviderBudgetPolicy,
+) -> Result<EvidenceDigest, TreasuryVerticalError> {
+    if policy.scope().as_source_identifier().as_str() != "us-treasury"
+        || policy.scope().authorization_account().is_some()
+        || policy.window_count() != 1
+        || policy.requests_per_window() != 1
+        || policy.window_nanos() != 1_000_000_000
+        || policy
+            .window(0)
+            .is_none_or(|window| window.semantics() != BudgetWindowSemantics::Sliding)
+        || policy.max_concurrent() != 1
+    {
+        return Err(TreasuryVerticalError::DoctorRejected);
+    }
+    let wire = serde_json::to_vec(policy).map_err(|_| TreasuryVerticalError::DoctorRejected)?;
+    Ok(domain_separated_digest(
+        b"market-squawk/treasury-shared-rate-policy/v1\0",
+        &wire,
+    ))
 }
 
 /// Immutable analytical-read shape required for one Treasury dashboard dataset.

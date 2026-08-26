@@ -10,7 +10,6 @@ mod query;
 mod rates;
 mod source;
 mod vertical;
-mod yield_curve;
 
 pub use daily_rates::{
     TreasuryBillMaturity, TreasuryBillRateMeasure, TreasuryDailyRateFamily,
@@ -26,12 +25,11 @@ pub use fiscal_data::{
 pub use query::{TreasuryDatasetProfile, TreasuryFiscalQuery, TreasuryPageRequest};
 pub use rates::{AverageInterestRate, TreasuryRateError, TreasuryRateProfile};
 pub use source::{
-    RetrievedDailyRatePage, RetrievedFiscalDataPage, RetrievedYieldCurvePage,
-    TreasuryAllHistoryAcquisitionCompletion, TreasuryAllHistoryBackfill,
-    TreasuryAllHistoryCanonicalPage, TreasuryAllHistoryCheckpoint, TreasuryAllHistoryFetchedPage,
-    TreasuryAllHistoryPageAdmission, TreasuryDailyRatesConfig, TreasuryDoctorRun,
-    TreasuryDoctorSealError, TreasuryExtractionOutput, TreasurySource, TreasurySourceConfig,
-    TreasurySourceError, TreasurySourceHealth,
+    RetrievedDailyRatePage, RetrievedFiscalDataPage, TreasuryAllHistoryAcquisitionCompletion,
+    TreasuryAllHistoryBackfill, TreasuryAllHistoryCanonicalPage, TreasuryAllHistoryCheckpoint,
+    TreasuryAllHistoryFetchedPage, TreasuryAllHistoryPageAdmission, TreasuryDailyRatesConfig,
+    TreasuryDoctorRun, TreasuryDoctorSealError, TreasuryExtractionOutput, TreasurySource,
+    TreasurySourceConfig, TreasurySourceError, TreasurySourceHealth,
 };
 pub use vertical::{
     TreasuryActivationIntent, TreasuryDashboardDatasetRead, TreasuryDashboardReadPlan,
@@ -40,8 +38,4 @@ pub use vertical::{
     TreasuryDiscoveryCompleteness, TreasuryDiscoveryOutput, TreasuryDoctorObservation,
     TreasuryDoctorPlan, TreasuryDoctorProbe, TreasuryDoctorReceipt, TreasuryExtractionAccounting,
     TreasuryPublicationMode, TreasurySealedDoctorReceipt, TreasurySurface, TreasuryVerticalError,
-};
-pub use yield_curve::{
-    DailyParYieldCurveObservation, DailyParYieldCurvePage, TreasuryYieldCurvePageRequest,
-    TreasuryYieldCurveProfile,
 };
