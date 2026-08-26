@@ -25,6 +25,8 @@ pub const MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// Closed adapter encoder implementations admitted by the current native-lineage schema.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderNativeLineageImplementation {
+    /// Alpaca historical-bar response semantics encoder v1.
+    AlpacaHistoricalBarV1,
     /// BEA regional/table response semantics encoder v1.
     BeaRegionalV1,
     /// BLS timeseries observation semantics encoder v1.
@@ -38,6 +40,9 @@ pub enum ProviderNativeLineageImplementation {
 impl ProviderNativeLineageImplementation {
     const fn identifier(self) -> &'static [u8] {
         match self {
+            Self::AlpacaHistoricalBarV1 => {
+                b"market-squawk/alpaca-historical/provider-native-lineage/v1"
+            }
             Self::BeaRegionalV1 => b"market-squawk/bea/provider-native-lineage/v1",
             Self::BlsTimeseriesV1 => b"market-squawk/bls/provider-native-lineage/v1",
             Self::CensusTabularV1 => b"market-squawk/census/provider-native-lineage/v1",
@@ -47,6 +52,7 @@ impl ProviderNativeLineageImplementation {
 
     pub(crate) const fn tag(self) -> u8 {
         match self {
+            Self::AlpacaHistoricalBarV1 => 5,
             Self::BeaRegionalV1 => 1,
             Self::BlsTimeseriesV1 => 2,
             Self::CensusTabularV1 => 3,
@@ -64,7 +70,7 @@ pub struct ProviderNativeLineageSchema {
 }
 
 impl ProviderNativeLineageSchema {
-    fn for_implementation(implementation: ProviderNativeLineageImplementation) -> Self {
+    pub(crate) fn for_implementation(implementation: ProviderNativeLineageImplementation) -> Self {
         let version = PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION;
         let mut digest = Sha256::new();
         hash_field(&mut digest, SCHEMA_FINGERPRINT_DOMAIN);
@@ -126,6 +132,67 @@ impl ProviderNativeLineageRow {
     /// Returns SHA-256 of the exact provider-native semantic payload bytes.
     pub const fn semantic_payload_digest(&self) -> EvidenceDigest {
         self.semantic_payload_digest
+    }
+}
+
+/// Checked borrowed restart projection of one exact provider-native lineage row.
+///
+/// This value carries no live authority and cannot construct a native-lineage batch. It exists
+/// only as bounded input to [`verify_provider_native_lineage_batch_evidence`].
+#[derive(Debug)]
+pub struct ProviderNativeLineageRowEvidenceRef<'a> {
+    ordinal: u32,
+    canonical_record_digest: EvidenceDigest,
+    semantic_payload: &'a [u8],
+    semantic_payload_digest: EvidenceDigest,
+}
+
+impl<'a> ProviderNativeLineageRowEvidenceRef<'a> {
+    /// Validates one borrowed persisted row projection without copying its semantic bytes.
+    pub fn try_new(
+        ordinal: u32,
+        canonical_record_digest: EvidenceDigest,
+        semantic_payload: &'a [u8],
+        semantic_payload_digest: EvidenceDigest,
+    ) -> Result<Self, ProviderNativeLineageError> {
+        let ordinal_usize =
+            usize::try_from(ordinal).map_err(|_| ProviderNativeLineageError::ByteCountOverflow)?;
+        if ordinal_usize >= MAX_EXTRACTION_RECORDS {
+            return Err(ProviderNativeLineageError::RecordLimitExceeded {
+                max: MAX_EXTRACTION_RECORDS,
+            });
+        }
+        if semantic_payload.is_empty() {
+            return Err(ProviderNativeLineageError::EmptySemanticPayload {
+                ordinal: ordinal_usize,
+            });
+        }
+        if semantic_payload.len() > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES {
+            return Err(ProviderNativeLineageError::RowByteLimitExceeded {
+                ordinal: ordinal_usize,
+                max: MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
+            });
+        }
+        require_sha256_nonzero(canonical_record_digest)?;
+        require_sha256_nonzero(semantic_payload_digest)?;
+        if semantic_payload_digest != sha256(semantic_payload) {
+            return Err(ProviderNativeLineageError::AlignmentMismatch);
+        }
+        Ok(Self {
+            ordinal,
+            canonical_record_digest,
+            semantic_payload,
+            semantic_payload_digest,
+        })
+    }
+
+    fn digest_row(&self) -> ProviderNativeLineageDigestRow {
+        ProviderNativeLineageDigestRow {
+            ordinal: self.ordinal,
+            canonical_record_digest: self.canonical_record_digest,
+            semantic_payload_bytes: self.semantic_payload.len(),
+            semantic_payload_digest: self.semantic_payload_digest,
+        }
     }
 }
 
@@ -201,6 +268,72 @@ impl ProviderNativeLineageBatch {
         }
         Ok(())
     }
+}
+
+/// Verifies persisted provider-native batch evidence without reconstructing a live batch.
+///
+/// The expected batch digest is caller-supplied restart evidence. Common code independently
+/// revalidates the exact code-owned schema, extraction identity, contiguous row alignment,
+/// semantic payload digests, and retained-byte bounds before comparing the private canonical hash.
+/// No computed digest or reusable verification capability is returned.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "persisted native-lineage evidence remains explicit"
+)]
+pub fn verify_provider_native_lineage_batch_evidence(
+    expected_batch_digest: EvidenceDigest,
+    schema_version: u16,
+    implementation: ProviderNativeLineageImplementation,
+    schema_fingerprint: EvidenceDigest,
+    extraction_content_digest: EvidenceDigest,
+    extraction_record_count: usize,
+    rows: &[ProviderNativeLineageRowEvidenceRef<'_>],
+) -> Result<(), ProviderNativeLineageError> {
+    require_sha256_nonzero(expected_batch_digest)?;
+    require_sha256_nonzero(extraction_content_digest)?;
+    let schema = ProviderNativeLineageSchema::for_implementation(implementation);
+    if schema.version() != schema_version
+        || schema.fingerprint() != schema_fingerprint
+        || rows.len() != extraction_record_count
+        || rows.len() > MAX_EXTRACTION_RECORDS
+    {
+        return Err(ProviderNativeLineageError::AlignmentMismatch);
+    }
+    let mut retained_bytes = size_of::<ProviderNativeLineageBatch>()
+        .checked_add(
+            size_of::<ProviderNativeLineageRow>()
+                .checked_mul(rows.len())
+                .ok_or(ProviderNativeLineageError::ByteCountOverflow)?,
+        )
+        .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
+    for (expected_ordinal, row) in rows.iter().enumerate() {
+        retained_bytes = retained_bytes
+            .checked_add(row.semantic_payload.len())
+            .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
+        if row.ordinal
+            != u32::try_from(expected_ordinal)
+                .map_err(|_| ProviderNativeLineageError::ByteCountOverflow)?
+            || row.semantic_payload.is_empty()
+            || row.semantic_payload.len() > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES
+            || row.semantic_payload_digest != sha256(row.semantic_payload)
+            || retained_bytes > MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES
+        {
+            return Err(ProviderNativeLineageError::AlignmentMismatch);
+        }
+        require_sha256_nonzero(row.canonical_record_digest)?;
+        require_sha256_nonzero(row.semantic_payload_digest)?;
+    }
+    let observed = batch_digest_from_rows(
+        schema,
+        extraction_content_digest,
+        extraction_record_count,
+        rows.iter()
+            .map(ProviderNativeLineageRowEvidenceRef::digest_row),
+    )?;
+    if observed != expected_batch_digest {
+        return Err(ProviderNativeLineageError::AlignmentMismatch);
+    }
+    Ok(())
 }
 
 /// Non-cloneable incremental encoder bound to one exact canonical extraction batch.
@@ -439,19 +572,46 @@ impl Write for BoundedNativeLineageWriter {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ProviderNativeLineageDigestRow {
+    ordinal: u32,
+    canonical_record_digest: EvidenceDigest,
+    semantic_payload_bytes: usize,
+    semantic_payload_digest: EvidenceDigest,
+}
+
 fn batch_digest(
     schema: ProviderNativeLineageSchema,
     content_identity: ExtractionContentIdentity,
     rows: &[ProviderNativeLineageRow],
 ) -> Result<EvidenceDigest, ProviderNativeLineageError> {
+    batch_digest_from_rows(
+        schema,
+        content_identity.digest(),
+        content_identity.record_count(),
+        rows.iter().map(|row| ProviderNativeLineageDigestRow {
+            ordinal: row.ordinal,
+            canonical_record_digest: row.canonical_record_digest,
+            semantic_payload_bytes: row.semantic_payload.len(),
+            semantic_payload_digest: row.semantic_payload_digest,
+        }),
+    )
+}
+
+fn batch_digest_from_rows(
+    schema: ProviderNativeLineageSchema,
+    extraction_content_digest: EvidenceDigest,
+    extraction_record_count: usize,
+    rows: impl ExactSizeIterator<Item = ProviderNativeLineageDigestRow>,
+) -> Result<EvidenceDigest, ProviderNativeLineageError> {
     let mut digest = Sha256::new();
-    hash_field(&mut digest, BATCH_DIGEST_DOMAIN);
+    hash_checked_field(&mut digest, BATCH_DIGEST_DOMAIN)?;
     digest.update(schema.version.to_be_bytes());
-    hash_field(&mut digest, schema.implementation.identifier());
+    hash_checked_field(&mut digest, schema.implementation.identifier())?;
     hash_evidence(&mut digest, schema.fingerprint);
-    hash_evidence(&mut digest, content_identity.digest());
+    hash_evidence(&mut digest, extraction_content_digest);
     digest.update(
-        u64::try_from(content_identity.record_count())
+        u64::try_from(extraction_record_count)
             .map_err(|_| ProviderNativeLineageError::ByteCountOverflow)?
             .to_be_bytes(),
     );
@@ -464,7 +624,7 @@ fn batch_digest(
         digest.update(row.ordinal.to_be_bytes());
         hash_evidence(&mut digest, row.canonical_record_digest);
         digest.update(
-            u64::try_from(row.semantic_payload.len())
+            u64::try_from(row.semantic_payload_bytes)
                 .map_err(|_| ProviderNativeLineageError::ByteCountOverflow)?
                 .to_be_bytes(),
         );
@@ -474,6 +634,25 @@ fn batch_digest(
         DigestAlgorithm::Sha256,
         digest.finalize().into(),
     ))
+}
+
+fn require_sha256_nonzero(evidence: EvidenceDigest) -> Result<(), ProviderNativeLineageError> {
+    if evidence.algorithm() != DigestAlgorithm::Sha256
+        || evidence.bytes().iter().all(|byte| *byte == 0)
+    {
+        return Err(ProviderNativeLineageError::AlignmentMismatch);
+    }
+    Ok(())
+}
+
+fn hash_checked_field(digest: &mut Sha256, value: &[u8]) -> Result<(), ProviderNativeLineageError> {
+    digest.update(
+        u64::try_from(value.len())
+            .map_err(|_| ProviderNativeLineageError::ByteCountOverflow)?
+            .to_be_bytes(),
+    );
+    digest.update(value);
+    Ok(())
 }
 
 fn sha256(bytes: &[u8]) -> EvidenceDigest {
