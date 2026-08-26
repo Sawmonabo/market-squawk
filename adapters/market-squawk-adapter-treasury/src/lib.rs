@@ -30,9 +30,8 @@ pub use source::{
     TreasuryAllHistoryAcquisitionCompletion, TreasuryAllHistoryBackfill,
     TreasuryAllHistoryCanonicalPage, TreasuryAllHistoryCheckpoint, TreasuryAllHistoryFetchedPage,
     TreasuryAllHistoryPageAdmission, TreasuryDailyRatesConfig, TreasuryDoctorRun,
-    TreasuryDoctorSealError, TreasuryExtractionOutput, TreasuryExtractionSealError,
-    TreasurySealedExtraction, TreasurySource, TreasurySourceConfig, TreasurySourceError,
-    TreasurySourceHealth,
+    TreasuryDoctorSealError, TreasuryExtractionOutput, TreasurySource, TreasurySourceConfig,
+    TreasurySourceError, TreasurySourceHealth,
 };
 pub use vertical::{
     TreasuryActivationIntent, TreasuryDashboardDatasetRead, TreasuryDashboardReadPlan,
@@ -40,8 +39,7 @@ pub use vertical::{
     TreasuryDatasetFamily, TreasuryDatasetPeriod, TreasuryDiscoveryAccounting,
     TreasuryDiscoveryCompleteness, TreasuryDiscoveryOutput, TreasuryDoctorObservation,
     TreasuryDoctorPlan, TreasuryDoctorProbe, TreasuryDoctorReceipt, TreasuryExtractionAccounting,
-    TreasuryExtractionCommitment, TreasuryPublicationExpectation, TreasuryPublicationMode,
-    TreasurySealedDoctorReceipt, TreasurySurface, TreasuryVerticalError,
+    TreasuryPublicationMode, TreasurySealedDoctorReceipt, TreasurySurface, TreasuryVerticalError,
 };
 pub use yield_curve::{
     DailyParYieldCurveObservation, DailyParYieldCurvePage, TreasuryYieldCurvePageRequest,

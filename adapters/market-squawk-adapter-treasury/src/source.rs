@@ -13,11 +13,11 @@ use market_squawk_domain::{
 use market_squawk_platform::{RawCaptureRecord, SealedResearchJournalStore};
 use market_squawk_sources::{
     AuthorizationMode, CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
-    ExtractionBatch, ExtractionError, ExtractionRequest, ExtractionRevisionEvidence,
-    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HistoricalCapability,
-    ObservedProviderOrder, ProviderCaptureMaterial, ProviderCaptureMaterialSealError,
-    ProviderCapturePageReceipt, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
+    ExtractionBatch, ExtractionRequest, ExtractionRevisionEvidence, ExtractionRevisionPlan,
+    ExtractionSource, ExtractionSourceError, HistoricalCapability, ObservedProviderOrder,
+    ProviderCaptureMaterial, ProviderCaptureMaterialSealError, ProviderCapturePageReceipt,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SourceClass, SourceError,
+    SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -204,7 +204,7 @@ impl TreasurySourceConfig {
 
     /// Returns every exact provider and analytical dataset carried by this configuration.
     ///
-    /// The catalog is the activation intent used by provider-local doctor, publication, and
+    /// The catalog is the activation intent used by provider-local doctor, acquisition, and
     /// dashboard-read gates. A multi-year daily-rate source therefore exposes every year/family
     /// selector instead of pretending it has one representative dataset.
     pub fn dataset_catalog(
@@ -442,17 +442,6 @@ pub struct TreasuryExtractionOutput {
     accounting: TreasuryExtractionAccounting,
 }
 
-/// Canonical Treasury rows whose exact producing response is durably sealed and identity-bound.
-///
-/// This value can only be produced by consuming [`TreasuryExtractionOutput`]. The canonical batch
-/// and provider-local commitment therefore cross the application boundary together; callers
-/// cannot substitute another retry's same-body capture after normalization.
-#[derive(Debug)]
-pub struct TreasurySealedExtraction {
-    batch: ExtractionBatch,
-    commitment: crate::TreasuryExtractionCommitment,
-}
-
 /// Network-authorized Treasury doctor result paired with every exact raw probe response.
 ///
 /// The receipt can only be minted by [`TreasurySource::run_doctor`], which traverses the normal
@@ -506,20 +495,6 @@ pub enum TreasuryDoctorSealError {
     Contract(#[from] crate::TreasuryVerticalError),
 }
 
-/// Failure while binding and sealing one exact Treasury extraction observation.
-#[derive(Debug, Error)]
-pub enum TreasuryExtractionSealError {
-    /// The canonical batch could not bind to its exact provider-capture lineage.
-    #[error(transparent)]
-    Batch(#[from] ExtractionError),
-    /// The shared sealed research journal rejected the exact raw response.
-    #[error(transparent)]
-    Capture(#[from] ProviderCaptureMaterialSealError),
-    /// Provider-local canonical, accounting, and physical-capture facts did not match exactly.
-    #[error(transparent)]
-    Contract(#[from] crate::TreasuryVerticalError),
-}
-
 impl TreasuryExtractionOutput {
     /// Returns the canonical shared extraction batch.
     pub const fn batch(&self) -> &ExtractionBatch {
@@ -536,42 +511,25 @@ impl TreasuryExtractionOutput {
         &self.accounting
     }
 
-    /// Consumes this one-shot output, seals its exact raw response, and returns the canonical batch
-    /// only alongside the matching provider-local commitment.
-    pub fn seal_for_publication(
+    /// Consumes this one-shot output for the source-neutral publication path.
+    ///
+    /// The returned batch is bound to the exact retained capture receipt only after the
+    /// provider-local page, row, byte, request, payload, and clock accounting matches both values.
+    /// The application remains responsible for sealing and reopening the original capture through
+    /// its shared research journal before committing an analytical generation.
+    pub fn try_into_common_publication(
         self,
-        store: &SealedResearchJournalStore,
-    ) -> Result<TreasurySealedExtraction, TreasuryExtractionSealError> {
+    ) -> Result<(ExtractionBatch, ProviderCaptureMaterial), crate::TreasuryVerticalError> {
         let Self {
             batch,
             capture,
             accounting,
         } = self;
-        let batch = batch.try_bind_provider_capture(capture.receipt())?;
-        let sealed_capture = capture.seal(store)?;
-        let commitment = crate::TreasuryExtractionCommitment::try_from_output(
-            &batch,
-            accounting,
-            sealed_capture,
-        )?;
-        Ok(TreasurySealedExtraction { batch, commitment })
-    }
-}
-
-impl TreasurySealedExtraction {
-    /// Returns the canonical batch bound to the sealed provider response.
-    pub const fn batch(&self) -> &ExtractionBatch {
-        &self.batch
-    }
-
-    /// Returns the exact semantic, observation, and physical-capture commitment.
-    pub const fn commitment(&self) -> &crate::TreasuryExtractionCommitment {
-        &self.commitment
-    }
-
-    /// Consumes the sealed handoff without allowing either side to be replaced before binding.
-    pub fn into_parts(self) -> (ExtractionBatch, crate::TreasuryExtractionCommitment) {
-        (self.batch, self.commitment)
+        let batch = batch
+            .try_bind_provider_capture(capture.receipt())
+            .map_err(|_| crate::TreasuryVerticalError::InvalidExtractionHandoff)?;
+        accounting.validate_common_publication(&batch, &capture)?;
+        Ok((batch, capture))
     }
 }
 
@@ -812,32 +770,6 @@ impl TreasurySource {
         })
     }
 
-    /// Builds exact delta/capture expectations for the root analytical publication authority.
-    pub fn publication_expectation(
-        &self,
-        discovery: &crate::TreasuryDiscoveryAccounting,
-        commitments: impl IntoIterator<Item = crate::TreasuryExtractionCommitment>,
-    ) -> Result<crate::TreasuryPublicationExpectation, crate::TreasuryVerticalError> {
-        crate::TreasuryPublicationExpectation::try_from_discovery(
-            &self.activation,
-            &self.metadata,
-            discovery,
-            commitments,
-        )
-    }
-
-    /// Builds root-publication expectations from a restart-verified all-history acquisition.
-    pub fn all_history_publication_expectation(
-        &self,
-        completion: &TreasuryAllHistoryAcquisitionCompletion,
-    ) -> Result<crate::TreasuryPublicationExpectation, crate::TreasuryVerticalError> {
-        crate::TreasuryPublicationExpectation::try_from_all_history(
-            &self.activation,
-            &self.metadata,
-            completion,
-        )
-    }
-
     /// Returns the exact dataset identity accepted by discovery for this configured source.
     ///
     /// This compatibility accessor is available only for a single-dataset source. Multi-dataset
@@ -1011,9 +943,8 @@ impl TreasurySource {
     /// Traverses one exact configured query to its provider-defined terminal condition and
     /// retains complete page, row, point, byte, and raw-terminal accounting.
     ///
-    /// This provider-local API is used by publication orchestration. Source-neutral discovery
-    /// intentionally exposes only results whose terminal response can be represented by the
-    /// publishable source objects; all-history remains a separately checkpointed backfill mode.
+    /// Source-neutral discovery exposes only results whose terminal response can be represented by
+    /// the discovered source objects; all-history remains a separately checkpointed backfill mode.
     pub async fn discover_with_accounting(
         &self,
         authority: ExtractionAuthority,
@@ -1230,7 +1161,7 @@ impl TreasurySource {
     }
 
     /// Refetches one discovered Treasury page and returns its canonical rows with the exact raw
-    /// response material required before durable publication.
+    /// response material required by the common raw-capture ingest path.
     pub async fn extract_with_capture(
         &self,
         authority: ExtractionAuthority,
@@ -1469,7 +1400,7 @@ impl ExtractionSource for TreasurySource {
             let output = self
                 .discover_with_accounting(authority, request, cancellation)
                 .await?;
-            if !output.accounting().publication_expectation_ready() {
+            if !output.accounting().extraction_ready() {
                 return Err(invalid_protocol());
             }
             Ok(output.into_batch())

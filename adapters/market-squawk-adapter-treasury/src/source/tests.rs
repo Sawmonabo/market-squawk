@@ -29,8 +29,8 @@ use crate::client::{
     TreasuryHttpRequest, TreasuryHttpResponse, TreasuryTransport, system_timestamp,
 };
 use crate::{
-    TreasuryDailyRateFamily, TreasuryDailyRateQuery, TreasuryDailyRatesConfig,
-    TreasuryExtractionCommitment, TreasuryFiscalQuery, TreasurySourceConfig,
+    TreasuryDailyRateFamily, TreasuryDailyRateQuery, TreasuryDailyRatesConfig, TreasuryFiscalQuery,
+    TreasurySourceConfig,
 };
 
 use super::TreasurySource;
@@ -329,13 +329,8 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     assert!(completion.source_rows() > 0);
     assert!(completion.canonical_points() > completion.source_rows());
     assert!(!completion.provider_snapshot_isolation_claimed());
-    let expectation = source.all_history_publication_expectation(&completion)?;
     assert_eq!(
-        expectation.expected_append_rows(),
-        completion.canonical_points()
-    );
-    assert_eq!(
-        expectation.expected_extraction_contents().len(),
+        completion.canonical_content_digests().count(),
         completion.sealed_pages().len() - 1
     );
 
@@ -399,7 +394,7 @@ async fn exercise_source(
             CancellationToken::new(),
         )
         .await?;
-    assert!(discovery.accounting().publication_expectation_ready());
+    assert!(discovery.accounting().extraction_ready());
     assert_eq!(discovery.accounting().source_object_count(), 1);
     assert!(discovery.accounting().canonical_points() >= 1);
     let object = discovery
@@ -463,28 +458,23 @@ async fn exercise_source(
         retry_capture.receipt().observation_digest(),
         output.capture_material().receipt().observation_digest()
     );
-    let mismatched_batch = output
-        .batch()
-        .clone()
-        .try_bind_provider_capture(output.capture_material().receipt())?;
-    let mismatched_accounting = output.accounting().clone();
-    let mismatched_seal = retry_capture.seal(&store)?;
-    assert!(
-        TreasuryExtractionCommitment::try_from_output(
-            &mismatched_batch,
-            mismatched_accounting,
-            mismatched_seal,
-        )
-        .is_err()
-    );
-    let sealed_output = output.seal_for_publication(&store)?;
-    let (extraction, commitment) = sealed_output.into_parts();
-    let expectation = source.publication_expectation(discovery.accounting(), [commitment])?;
+    let mismatched_output = super::TreasuryExtractionOutput {
+        batch: output.batch().clone(),
+        capture: retry_capture,
+        accounting: output.accounting().clone(),
+    };
+    assert!(matches!(
+        mismatched_output.try_into_common_publication(),
+        Err(crate::TreasuryVerticalError::InvalidExtractionHandoff)
+    ));
+    let (extraction, capture_material) = output.try_into_common_publication()?;
     assert_eq!(
-        expectation.expected_append_rows(),
-        u64::try_from(extraction.records().len())?
+        market_squawk_sources::SourceObjectCaptureIdentity::try_from_capture(
+            capture_material.receipt()
+        )?,
+        extraction.request().object().capture_identity()
     );
-    assert_eq!(expectation.expected_extraction_contents().len(), 1);
+    assert_eq!(capture_material.records()[0].payload(), payload);
     let revisions = source.revision_plan(&extraction)?;
     assert_eq!(
         revisions.is_locally_observed(),

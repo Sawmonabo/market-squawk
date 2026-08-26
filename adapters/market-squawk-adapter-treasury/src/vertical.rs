@@ -1,9 +1,8 @@
-//! Provider-local activation, publication, and dashboard-read contracts for U.S. Treasury data.
+//! Provider-local activation, acquisition, accounting, and dashboard-read contracts.
 //!
 //! These types deliberately stop at the provider boundary. The application owns durable catalog
-//! reads and publication transactions; this module supplies the exact dataset inventory and the
-//! evidence predicates those application boundaries must satisfy before calling a Treasury
-//! acquisition complete or attempting an analytical publication/read.
+//! reads and publication transactions; this module supplies the exact dataset inventory and
+//! technical evidence predicates needed to validate Treasury acquisition and normalization.
 //!
 //! `FiscalData` denotes the selected Average Interest Rates V2 family only. Broader auction,
 //! debt, and fiscal datasets require their own closed dictionaries and canonical variants and are
@@ -19,8 +18,8 @@ use market_squawk_domain::{
     Timestamp,
 };
 use market_squawk_sources::{
-    DiscoveryBatch, ExtractionBatch, ExtractionContentIdentity, MAX_DISCOVERY_OBJECTS,
-    SealedProviderCaptureSetReceipt, SourceMetadata,
+    DiscoveryBatch, ExtractionBatch, ProviderCaptureMaterial, SealedProviderCaptureSetReceipt,
+    SourceMetadata,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -112,7 +111,7 @@ pub enum TreasuryDatasetPeriod {
     AllHistory,
 }
 
-/// Publication behavior required for one exact query shape.
+/// Provider acquisition behavior required for one exact query shape.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TreasuryPublicationMode {
@@ -120,7 +119,7 @@ pub enum TreasuryPublicationMode {
     AtomicResponse,
     /// Every one-based page must be captured before the page chain can be marked complete.
     CompletePageChain,
-    /// A separately checkpointed backfill is required; ordinary one-shot publication is closed.
+    /// A separately checkpointed backfill is required; ordinary one-shot extraction is closed.
     ResumableBackfill,
 }
 
@@ -168,7 +167,7 @@ impl TreasuryDatasetDescriptor {
         self.query_digest
     }
 
-    /// Returns the publication protocol required by this query shape.
+    /// Returns the provider acquisition protocol required by this query shape.
     pub const fn publication_mode(&self) -> TreasuryPublicationMode {
         self.publication_mode
     }
@@ -994,7 +993,7 @@ pub struct TreasuryDiscoveryAccounting {
     raw_body_bytes: u64,
     terminal_response_observed: bool,
     terminal_response_represented_by_source_object: bool,
-    publication_expectation_ready: bool,
+    extraction_ready: bool,
     completeness: TreasuryDiscoveryCompleteness,
     reported_total_rows: Option<u64>,
     reported_total_pages: Option<u64>,
@@ -1066,11 +1065,10 @@ impl TreasuryDiscoveryAccounting {
         } else {
             TreasuryDiscoveryCompleteness::CompleteProducing
         };
-        let publication_expectation_ready = matches!(
+        let extraction_ready = matches!(
             completeness,
             TreasuryDiscoveryCompleteness::CompleteProducing
-        ) && input
-            .terminal_response_represented_by_source_object
+        ) && input.terminal_response_represented_by_source_object
             && source_object_count > 0
             && input.descriptor.publication_mode != TreasuryPublicationMode::ResumableBackfill;
         Ok(Self {
@@ -1087,7 +1085,7 @@ impl TreasuryDiscoveryAccounting {
             terminal_response_observed: input.terminal_response_observed,
             terminal_response_represented_by_source_object: input
                 .terminal_response_represented_by_source_object,
-            publication_expectation_ready,
+            extraction_ready,
             completeness,
             reported_total_rows: input
                 .reported_total_rows
@@ -1110,13 +1108,13 @@ impl TreasuryDiscoveryAccounting {
         &self.descriptor
     }
 
-    /// Returns whether a complete provider-local publication expectation may be built.
+    /// Returns whether this complete traversal can enter ordinary page extraction.
     ///
     /// This does not prove staging, an immutable generation, or a successful read. An empty
     /// response and an all-history chain outside its page-sealed acquisition authority both remain
     /// honest non-ready states.
-    pub const fn publication_expectation_ready(&self) -> bool {
-        self.publication_expectation_ready
+    pub const fn extraction_ready(&self) -> bool {
+        self.extraction_ready
     }
 
     /// Returns the complete/empty terminal classification.
@@ -1241,6 +1239,51 @@ impl TreasuryExtractionAccounting {
         })
     }
 
+    pub(crate) fn validate_common_publication(
+        &self,
+        batch: &ExtractionBatch,
+        capture: &ProviderCaptureMaterial,
+    ) -> Result<(), TreasuryVerticalError> {
+        let record_count = u64::try_from(batch.records().len())
+            .map_err(|_| TreasuryVerticalError::AccountingOverflow)?;
+        let receipt = capture.receipt();
+        let object = batch.request().object();
+        if record_count != self.canonical_points
+            || object.source_id() != receipt.source_id()
+            || object.metadata_revision() != receipt.metadata_revision()
+            || object.dataset() != self.descriptor.provider_dataset()
+            || object.dataset() != receipt.dataset()
+            || object.evidence().content_digest() != self.payload_digest
+            || object.expected_bytes() != Some(self.raw_body_bytes)
+            || market_squawk_sources::SourceObjectCaptureIdentity::try_from_capture(receipt).ok()
+                != Some(object.capture_identity())
+            || receipt.pages().len() != 1
+            || receipt.terminal()
+                != market_squawk_sources::ProviderCaptureTerminalDisposition::StandaloneResponse
+            || receipt.request_set_identity() != self.request_digest
+            || receipt.pages()[0].request_identity() != self.request_digest
+            || receipt.pages()[0].body_digest() != self.payload_digest
+            || receipt.pages()[0].body_bytes() != self.raw_body_bytes
+            || receipt.pages()[0].received_at() != self.received_at
+            || receipt.total_body_bytes() != self.raw_body_bytes
+            || batch.records().iter().any(|record| {
+                record.source_id() != receipt.source_id()
+                    || record.metadata_revision() != receipt.metadata_revision()
+                    || record.dataset() != receipt.dataset()
+                    || record.object_id() != object.object_id()
+                    || record.object_evidence() != object.evidence()
+                    || record.available_at() != Some(self.received_at)
+                    || record
+                        .published_time()
+                        .and_then(market_squawk_domain::ResearchTemporalCoordinate::exact_timestamp)
+                        != self.provider_published_at
+            })
+        {
+            return Err(TreasuryVerticalError::InvalidExtractionHandoff);
+        }
+        Ok(())
+    }
+
     /// Returns the exact provider and analytical dataset identity.
     pub const fn descriptor(&self) -> &TreasuryDatasetDescriptor {
         &self.descriptor
@@ -1290,422 +1333,6 @@ impl TreasuryExtractionAccounting {
     pub const fn terminal_for_query(&self) -> bool {
         self.terminal_for_query
     }
-}
-
-/// Output-bound semantic and raw-capture commitment for one normalized extraction page.
-///
-/// This receipt can only be issued while consuming the adapter's one-shot extraction output. It
-/// proves what the adapter produced and which exact observed response was durably sealed; it does
-/// not claim that the canonical batch was committed to an analytical generation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TreasuryExtractionCommitment {
-    accounting: TreasuryExtractionAccounting,
-    content_digest: EvidenceDigest,
-    record_count: u64,
-    sealed_capture: SealedProviderCaptureSetReceipt,
-    commitment_digest: EvidenceDigest,
-}
-
-impl TreasuryExtractionCommitment {
-    pub(crate) fn try_from_output(
-        batch: &ExtractionBatch,
-        accounting: TreasuryExtractionAccounting,
-        sealed_capture: SealedProviderCaptureSetReceipt,
-    ) -> Result<Self, TreasuryVerticalError> {
-        let content_identity = ExtractionContentIdentity::try_from_batch(batch)
-            .map_err(|_| TreasuryVerticalError::InvalidPublication)?;
-        let record_count = u64::try_from(content_identity.record_count())
-            .map_err(|_| TreasuryVerticalError::AccountingOverflow)?;
-        let content_digest = content_identity.digest();
-        let capture = sealed_capture.capture();
-        let object = batch.request().object();
-        if record_count != accounting.canonical_points
-            || object.source_id() != capture.source_id()
-            || object.metadata_revision() != capture.metadata_revision()
-            || object.dataset() != accounting.descriptor.provider_dataset()
-            || object.dataset() != capture.dataset()
-            || object.evidence().content_digest() != accounting.payload_digest
-            || object.expected_bytes() != Some(accounting.raw_body_bytes)
-            || market_squawk_sources::SourceObjectCaptureIdentity::try_from_capture(capture).ok()
-                != Some(object.capture_identity())
-            || capture.pages().len() != 1
-            || capture.terminal()
-                != market_squawk_sources::ProviderCaptureTerminalDisposition::StandaloneResponse
-            || capture.request_set_identity() != accounting.request_digest
-            || capture.pages()[0].request_identity() != accounting.request_digest
-            || capture.pages()[0].body_digest() != accounting.payload_digest
-            || capture.pages()[0].body_bytes() != accounting.raw_body_bytes
-            || capture.pages()[0].received_at() != accounting.received_at
-            || capture.total_body_bytes() != accounting.raw_body_bytes
-            || batch.records().iter().any(|record| {
-                record.source_id() != capture.source_id()
-                    || record.metadata_revision() != capture.metadata_revision()
-                    || record.dataset() != capture.dataset()
-                    || record.object_id() != object.object_id()
-                    || record.object_evidence() != object.evidence()
-                    || record.available_at() != Some(accounting.received_at)
-                    || record
-                        .published_time()
-                        .and_then(market_squawk_domain::ResearchTemporalCoordinate::exact_timestamp)
-                        != accounting.provider_published_at
-            })
-        {
-            return Err(TreasuryVerticalError::InvalidPublication);
-        }
-        let wire = serde_json::to_vec(&(
-            &accounting,
-            content_digest,
-            record_count,
-            sealed_capture.receipt_digest(),
-        ))
-        .map_err(|_| TreasuryVerticalError::InvalidPublication)?;
-        Ok(Self {
-            accounting,
-            content_digest,
-            record_count,
-            sealed_capture,
-            commitment_digest: domain_separated_digest(
-                b"market-squawk/treasury-extraction-commitment/v1\0",
-                &wire,
-            ),
-        })
-    }
-
-    /// Returns provider-local page accounting.
-    pub const fn accounting(&self) -> &TreasuryExtractionAccounting {
-        &self.accounting
-    }
-
-    /// Returns the stable semantic identity of the normalized extraction.
-    pub const fn content_digest(&self) -> EvidenceDigest {
-        self.content_digest
-    }
-
-    /// Returns the exact ordered record count bound into the semantic identity.
-    pub const fn record_count(&self) -> u64 {
-        self.record_count
-    }
-
-    /// Returns the exact verified raw-capture receipt.
-    pub const fn sealed_capture(&self) -> &SealedProviderCaptureSetReceipt {
-        &self.sealed_capture
-    }
-
-    /// Returns the provider-local commitment identity.
-    pub const fn commitment_digest(&self) -> EvidenceDigest {
-        self.commitment_digest
-    }
-}
-
-/// Exact provider-local expectations that a root analytical publication must satisfy.
-///
-/// This type intentionally contains no manifest version, manifest digest, generation row count,
-/// or readiness Boolean. Only the root data authority can reopen an `AnalyticalGeneration`, prove
-/// append/predecessor semantics, bind staged objects to these extraction identities, and issue a
-/// publication or typed-read receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TreasuryPublicationExpectation {
-    descriptor: TreasuryDatasetDescriptor,
-    source_id: SourceId,
-    metadata_revision: MetadataRevision,
-    activation_intent_digest: EvidenceDigest,
-    canonical_schema: SourceIdentifier,
-    expected_append_rows: u64,
-    expected_extraction_contents: Box<[EvidenceDigest]>,
-    expected_provider_payloads: Box<[EvidenceDigest]>,
-    retained_provider_captures: Box<[SealedProviderCaptureSetReceipt]>,
-    retained_capture_receipts: Box<[EvidenceDigest]>,
-    traversal_digest: EvidenceDigest,
-    provider_snapshot_isolation_claimed: bool,
-    expectation_digest: EvidenceDigest,
-}
-
-impl TreasuryPublicationExpectation {
-    pub(crate) fn try_from_discovery(
-        activation: &TreasuryActivationIntent,
-        metadata: &SourceMetadata,
-        discovery: &TreasuryDiscoveryAccounting,
-        commitments: impl IntoIterator<Item = TreasuryExtractionCommitment>,
-    ) -> Result<Self, TreasuryVerticalError> {
-        if !discovery.publication_expectation_ready
-            || activation
-                .catalog
-                .dataset(discovery.descriptor.provider_dataset())
-                != Some(&discovery.descriptor)
-        {
-            return Err(TreasuryVerticalError::InvalidPublication);
-        }
-        let commitments = bounded_commitments(commitments)?;
-        if commitments.len()
-            != usize::try_from(discovery.source_object_count)
-                .map_err(|_| TreasuryVerticalError::AccountingOverflow)?
-        {
-            return Err(TreasuryVerticalError::InvalidPublication);
-        }
-        let mut canonical_points = 0_u64;
-        let mut source_rows = 0_u64;
-        let mut raw_body_bytes = 0_u64;
-        for (index, commitment) in commitments.iter().enumerate() {
-            let accounting = &commitment.accounting;
-            let capture = commitment.sealed_capture.capture();
-            let expected_page = match discovery.descriptor.publication_mode {
-                TreasuryPublicationMode::AtomicResponse => 0,
-                TreasuryPublicationMode::CompletePageChain => u64::try_from(index)
-                    .map_err(|_| TreasuryVerticalError::AccountingOverflow)?
-                    .checked_add(1)
-                    .ok_or(TreasuryVerticalError::AccountingOverflow)?,
-                TreasuryPublicationMode::ResumableBackfill => {
-                    return Err(TreasuryVerticalError::InvalidPublication);
-                }
-            };
-            if accounting.descriptor != discovery.descriptor
-                || accounting.page_number != expected_page
-                || capture.source_id() != metadata.source_id()
-                || capture.metadata_revision() != metadata.revision()
-                || capture.dataset() != discovery.descriptor.provider_dataset()
-                || discovery.source_payload_digests.get(index) != Some(&accounting.payload_digest)
-                || accounting.terminal_for_query != (index + 1 == commitments.len())
-            {
-                return Err(TreasuryVerticalError::InvalidPublication);
-            }
-            canonical_points = canonical_points
-                .checked_add(accounting.canonical_points)
-                .ok_or(TreasuryVerticalError::AccountingOverflow)?;
-            source_rows = source_rows
-                .checked_add(accounting.returned_source_rows)
-                .ok_or(TreasuryVerticalError::AccountingOverflow)?;
-            raw_body_bytes = raw_body_bytes
-                .checked_add(accounting.raw_body_bytes)
-                .ok_or(TreasuryVerticalError::AccountingOverflow)?;
-        }
-        if canonical_points != discovery.canonical_points
-            || source_rows != discovery.returned_source_rows
-            || raw_body_bytes != discovery.raw_body_bytes
-        {
-            return Err(TreasuryVerticalError::InvalidPublication);
-        }
-        let traversal_wire =
-            serde_json::to_vec(discovery).map_err(|_| TreasuryVerticalError::InvalidPublication)?;
-        Self::finish(
-            activation,
-            metadata,
-            discovery.descriptor.clone(),
-            discovery.canonical_points,
-            commitments
-                .iter()
-                .map(|commitment| commitment.content_digest)
-                .collect(),
-            discovery.source_payload_digests.to_vec(),
-            commitments
-                .into_iter()
-                .map(|commitment| commitment.sealed_capture)
-                .collect(),
-            domain_separated_digest(
-                b"market-squawk/treasury-complete-discovery/v1\0",
-                &traversal_wire,
-            ),
-            false,
-        )
-    }
-
-    pub(crate) fn try_from_all_history(
-        activation: &TreasuryActivationIntent,
-        metadata: &SourceMetadata,
-        completion: &crate::TreasuryAllHistoryAcquisitionCompletion,
-    ) -> Result<Self, TreasuryVerticalError> {
-        let descriptor = completion.descriptor();
-        let content_digests = completion.canonical_content_digests().collect::<Vec<_>>();
-        let expected_data_pages = completion
-            .response_count()
-            .checked_sub(1)
-            .ok_or(TreasuryVerticalError::InvalidPublication)?;
-        if descriptor.publication_mode != TreasuryPublicationMode::ResumableBackfill
-            || descriptor.period != TreasuryDatasetPeriod::AllHistory
-            || activation.catalog.dataset(descriptor.provider_dataset()) != Some(descriptor)
-            || completion.activation_intent_digest() != activation.intent_digest
-            || completion.source_id() != metadata.source_id()
-            || completion.metadata_revision() != metadata.revision()
-            || completion.provider_snapshot_isolation_claimed()
-            || completion.canonical_points() == 0
-            || u64::try_from(content_digests.len())
-                .map_err(|_| TreasuryVerticalError::AccountingOverflow)?
-                != expected_data_pages
-        {
-            return Err(TreasuryVerticalError::InvalidPublication);
-        }
-        Self::finish(
-            activation,
-            metadata,
-            descriptor.clone(),
-            completion.canonical_points(),
-            content_digests,
-            completion.payload_digests().collect(),
-            completion.sealed_pages().to_vec(),
-            completion.completion_digest(),
-            false,
-        )
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "publication lineage remains explicit"
-    )]
-    fn finish(
-        activation: &TreasuryActivationIntent,
-        metadata: &SourceMetadata,
-        descriptor: TreasuryDatasetDescriptor,
-        expected_append_rows: u64,
-        expected_extraction_contents: Vec<EvidenceDigest>,
-        expected_provider_payloads: Vec<EvidenceDigest>,
-        retained_provider_captures: Vec<SealedProviderCaptureSetReceipt>,
-        traversal_digest: EvidenceDigest,
-        provider_snapshot_isolation_claimed: bool,
-    ) -> Result<Self, TreasuryVerticalError> {
-        let retained_capture_receipts = retained_provider_captures
-            .iter()
-            .map(SealedProviderCaptureSetReceipt::receipt_digest)
-            .collect::<Vec<_>>();
-        if expected_append_rows == 0
-            || expected_extraction_contents.is_empty()
-            || expected_provider_payloads.is_empty()
-            || retained_provider_captures.is_empty()
-            || expected_provider_payloads.len() != retained_provider_captures.len()
-            || !captures_match_dataset(&retained_provider_captures, descriptor.provider_dataset())
-            || retained_provider_captures.iter().any(|sealed| {
-                sealed.capture().source_id() != metadata.source_id()
-                    || sealed.capture().metadata_revision() != metadata.revision()
-            })
-            || has_duplicate_digests(&expected_extraction_contents)
-            || has_duplicate_digests(&expected_provider_payloads)
-            || has_duplicate_digests(&retained_capture_receipts)
-            || retained_provider_captures
-                .iter()
-                .zip(expected_provider_payloads.iter())
-                .any(|(sealed, expected)| sealed.capture().pages()[0].body_digest() != *expected)
-        {
-            return Err(TreasuryVerticalError::InvalidPublication);
-        }
-        let canonical_schema = SourceIdentifier::try_from("market-squawk-research-v3")
-            .map_err(|_| TreasuryVerticalError::InvalidPublication)?;
-        let wire = serde_json::to_vec(&(
-            &descriptor,
-            metadata.source_id(),
-            metadata.revision(),
-            activation.intent_digest,
-            &canonical_schema,
-            expected_append_rows,
-            &expected_extraction_contents,
-            &expected_provider_payloads,
-            &retained_capture_receipts,
-            traversal_digest,
-            provider_snapshot_isolation_claimed,
-        ))
-        .map_err(|_| TreasuryVerticalError::InvalidPublication)?;
-        Ok(Self {
-            descriptor,
-            source_id: metadata.source_id().clone(),
-            metadata_revision: metadata.revision().clone(),
-            activation_intent_digest: activation.intent_digest,
-            canonical_schema,
-            expected_append_rows,
-            expected_extraction_contents: expected_extraction_contents.into_boxed_slice(),
-            expected_provider_payloads: expected_provider_payloads.into_boxed_slice(),
-            retained_provider_captures: retained_provider_captures.into_boxed_slice(),
-            retained_capture_receipts: retained_capture_receipts.into_boxed_slice(),
-            traversal_digest,
-            provider_snapshot_isolation_claimed,
-            expectation_digest: domain_separated_digest(
-                b"market-squawk/treasury-publication-expectation/v1\0",
-                &wire,
-            ),
-        })
-    }
-
-    /// Returns the exact provider and analytical dataset identities expected at publication.
-    pub const fn descriptor(&self) -> &TreasuryDatasetDescriptor {
-        &self.descriptor
-    }
-
-    /// Returns the exact source generation identity expected at the root boundary.
-    pub const fn source_id(&self) -> &SourceId {
-        &self.source_id
-    }
-
-    /// Returns the exact source-metadata revision expected at the root boundary.
-    pub const fn metadata_revision(&self) -> &MetadataRevision {
-        &self.metadata_revision
-    }
-
-    /// Returns the exact owner-authorized activation identity expected by the generation bridge.
-    pub const fn activation_intent_digest(&self) -> EvidenceDigest {
-        self.activation_intent_digest
-    }
-
-    /// Returns the canonical record schema required for every appended object.
-    pub const fn canonical_schema(&self) -> &SourceIdentifier {
-        &self.canonical_schema
-    }
-
-    /// Returns rows contributed by this traversal, never the whole append-generation row count.
-    pub const fn expected_append_rows(&self) -> u64 {
-        self.expected_append_rows
-    }
-
-    /// Returns ordered semantic extraction identities the committed delta must bind.
-    pub fn expected_extraction_contents(&self) -> &[EvidenceDigest] {
-        &self.expected_extraction_contents
-    }
-
-    /// Returns provider payload identities in exact traversal order, including terminal evidence.
-    pub fn expected_provider_payloads(&self) -> &[EvidenceDigest] {
-        &self.expected_provider_payloads
-    }
-
-    /// Returns exact raw capture receipts the root capture catalog must retain.
-    pub fn retained_provider_captures(&self) -> &[SealedProviderCaptureSetReceipt] {
-        &self.retained_provider_captures
-    }
-
-    /// Returns the exact retained physical capture-receipt identities.
-    pub fn retained_capture_receipts(&self) -> &[EvidenceDigest] {
-        &self.retained_capture_receipts
-    }
-
-    /// Returns the complete provider traversal/acquisition identity.
-    pub const fn traversal_digest(&self) -> EvidenceDigest {
-        self.traversal_digest
-    }
-
-    /// Treasury never claims provider snapshot isolation across an all-history page chain.
-    pub const fn provider_snapshot_isolation_claimed(&self) -> bool {
-        self.provider_snapshot_isolation_claimed
-    }
-
-    /// Returns the stable expectation identity for root generation and typed-read receipts.
-    pub const fn expectation_digest(&self) -> EvidenceDigest {
-        self.expectation_digest
-    }
-}
-
-fn bounded_commitments(
-    commitments: impl IntoIterator<Item = TreasuryExtractionCommitment>,
-) -> Result<Vec<TreasuryExtractionCommitment>, TreasuryVerticalError> {
-    let mut accepted = Vec::new();
-    for commitment in commitments {
-        if accepted.len() == MAX_DISCOVERY_OBJECTS {
-            return Err(TreasuryVerticalError::InvalidPublication);
-        }
-        accepted
-            .try_reserve(1)
-            .map_err(|_| TreasuryVerticalError::AccountingOverflow)?;
-        accepted.push(commitment);
-    }
-    if accepted.is_empty() {
-        return Err(TreasuryVerticalError::InvalidPublication);
-    }
-    Ok(accepted)
 }
 
 /// Immutable analytical-read shape required for one Treasury dashboard dataset.
@@ -1864,26 +1491,7 @@ fn has_duplicate_digests(digests: &[EvidenceDigest]) -> bool {
         .any(|(index, digest)| digests[..index].contains(digest))
 }
 
-fn captures_match_dataset(
-    captures: &[SealedProviderCaptureSetReceipt],
-    dataset: &SourceIdentifier,
-) -> bool {
-    let Some(first) = captures.first() else {
-        return false;
-    };
-    captures.iter().all(|sealed| {
-        sealed.capture().source_id() == first.capture().source_id()
-            && sealed.capture().metadata_revision() == first.capture().metadata_revision()
-            && sealed.capture().dataset() == dataset
-            && sealed.capture().terminal()
-                == market_squawk_sources::ProviderCaptureTerminalDisposition::StandaloneResponse
-            && sealed.capture().pages().len() == 1
-            && sealed.receipt_digest().algorithm() == DigestAlgorithm::Sha256
-            && sealed.receipt_digest().bytes() != [0; 32]
-    })
-}
-
-/// Treasury activation, doctor, accounting, or immutable-publication contract failure.
+/// Treasury activation, doctor, acquisition-accounting, or extraction-handoff failure.
 #[derive(Debug, Error)]
 pub enum TreasuryVerticalError {
     /// The source configuration cannot produce a coherent exact dataset catalog.
@@ -1895,9 +1503,9 @@ pub enum TreasuryVerticalError {
     /// A complete traversal's page, row, byte, terminal, or object accounting is inconsistent.
     #[error("Treasury discovery accounting is invalid")]
     InvalidDiscoveryAccounting,
-    /// Provider-local extraction/capture facts cannot form an exact publication expectation.
-    #[error("Treasury publication expectation evidence is invalid")]
-    InvalidPublication,
+    /// Provider-local extraction and capture facts do not correspond exactly.
+    #[error("Treasury extraction handoff evidence is invalid")]
+    InvalidExtractionHandoff,
     /// Checked accounting exceeded the provider-local receipt representation.
     #[error("Treasury accounting overflowed its bounded representation")]
     AccountingOverflow,

@@ -740,7 +740,7 @@ impl TreasuryAllHistoryAcquisitionCompletion {
         &self.sealed_pages
     }
 
-    /// Returns the stable completion identity used by immutable publication receipts.
+    /// Returns the stable completion identity for the verified acquisition chain.
     pub const fn completion_digest(&self) -> EvidenceDigest {
         self.completion_digest
     }
