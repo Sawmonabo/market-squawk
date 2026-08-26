@@ -924,10 +924,11 @@ impl BeaDatasetAcquisition {
                 telemetry,
             },
         };
-        let capture_refs = materials
-            .iter()
-            .map(ProviderCaptureMaterial::receipt)
-            .collect::<Vec<_>>();
+        let mut capture_refs = Vec::new();
+        capture_refs
+            .try_reserve_exact(materials.len())
+            .map_err(|_| BeaSourceError::Allocation)?;
+        capture_refs.extend(materials.iter().map(ProviderCaptureMaterial::receipt));
         let graph_identity = bea_capture_graph_identity(
             evidence.metadata().dataset_id(),
             evidence.metadata().generation(),
@@ -976,33 +977,34 @@ impl BeaCapturedDiscovery {
     }
 }
 
-/// Rich extraction output requiring raw sealing before any later canonical publication.
+/// Source extraction output requiring raw sealing before any later canonical publication.
 #[derive(Debug)]
-pub struct BeaCapturedExtraction {
+pub struct BeaExtractionOutput {
     batch: ExtractionBatch,
     acquisition: BeaDatasetAcquisition,
+    source_batch_digest: EvidenceDigest,
 }
 
-impl BeaCapturedExtraction {
-    /// Returns the source-native typed extraction batch.
-    pub const fn batch(&self) -> &ExtractionBatch {
-        &self.batch
-    }
-    /// Returns the typed metadata-first acquisition behind this batch.
-    pub const fn acquisition(&self) -> &BeaDatasetAcquisition {
-        &self.acquisition
-    }
-
-    /// Consumes extraction into source-native rows and one exact `MSJ1`-ready request graph.
-    ///
-    /// The batch is not canonical publication authority. App composition must seal every returned
-    /// graph, then map/publish under the shared revision, manifest, and point-in-time contracts.
-    pub fn into_sealing_parts(
+impl BeaExtractionOutput {
+    /// Retains the source output in an opaque token and exposes only its `MSJ1`-ready raw graph.
+    pub fn into_pending_seal(
         self,
-    ) -> Result<(ExtractionBatch, BeaDatasetEvidence, ProviderCaptureMaterial), BeaSourceError>
-    {
+    ) -> Result<
+        (
+            crate::sealed::BeaPendingExtractionSeal,
+            ProviderCaptureMaterial,
+        ),
+        BeaSourceError,
+    > {
         let (evidence, graph) = self.acquisition.into_sealing_parts()?;
-        Ok((self.batch, evidence, graph))
+        Ok((
+            crate::sealed::BeaPendingExtractionSeal::from_source(
+                self.batch,
+                evidence,
+                self.source_batch_digest,
+            ),
+            graph,
+        ))
     }
 }
 
@@ -1348,10 +1350,11 @@ impl BeaSource {
             );
         }
         validate_metadata_bundle(contract, &pages).map_err(map_source_error)?;
-        let response_receipts = pages
-            .iter()
-            .map(|page| page.page.receipt())
-            .collect::<Vec<_>>();
+        let mut response_receipts = Vec::new();
+        response_receipts
+            .try_reserve_exact(pages.len())
+            .map_err(|_| map_source_error(BeaSourceError::Allocation))?;
+        response_receipts.extend(pages.iter().map(|page| page.page.receipt()));
         let generation = BeaMetadataGeneration::from_page_receipts(&response_receipts)
             .map_err(|error| map_source_error(error.into()))?;
         Ok(BeaMetadataBundle {
@@ -1544,7 +1547,7 @@ impl BeaSource {
         authority: ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
-    ) -> Result<BeaCapturedExtraction, ExtractionSourceError> {
+    ) -> Result<BeaExtractionOutput, ExtractionSourceError> {
         self.validate_authority(&authority)?;
         let activation = self.require_activation(request.object().dataset())?;
         if request.deadline() >= activation.expires_at() {
@@ -1581,6 +1584,7 @@ impl BeaSource {
         verify_acquisition(&request, &expected, &acquisition)?;
         let records = native_records(&request, acquisition.data())?;
         let batch = ExtractionBatch::try_new(&request, records)?;
+        let source_batch_digest = source_batch_digest(&batch)?;
         let completed_at = system_timestamp().map_err(map_source_error)?;
         activation
             .validate_current(
@@ -1590,7 +1594,11 @@ impl BeaSource {
                 completed_at,
             )
             .map_err(|_| invalid_protocol())?;
-        Ok(BeaCapturedExtraction { batch, acquisition })
+        Ok(BeaExtractionOutput {
+            batch,
+            acquisition,
+            source_batch_digest,
+        })
     }
 
     async fn fetch(
@@ -2027,29 +2035,98 @@ fn source_object(
 ) -> Result<SourceObject, ExtractionSourceError> {
     let data = acquisition.data();
     let capture = data.material().receipt();
-    let object_id = object_id(contract, acquisition.metadata_generation, capture)?;
     let received_at = capture
         .pages()
         .first()
+        .filter(|_| capture.pages().len() == 1)
         .ok_or_else(invalid_protocol)?
         .received_at();
     let effective = EffectiveInterval::new(received_at, None).map_err(|_| invalid_protocol())?;
+    let media_type =
+        SourceIdentifier::try_from(BEA_JSON_MEDIA_TYPE).map_err(|_| invalid_protocol())?;
+    let evidence = ExactPayloadEvidence::from_content_digest(capture.content_digest());
+    let capture_identity =
+        SourceObjectCaptureIdentity::try_from_capture(capture).map_err(map_capture_error)?;
+    let availability = market_squawk_sources::AvailabilityEvidence::LocalFirstObserved {
+        observed_at: received_at,
+    };
+    let expected_bytes = Some(capture.total_body_bytes());
+    let lineage_digest = source_object_lineage_digest(&SourceObjectLineageWire {
+        source_id: metadata.source_id().as_str(),
+        metadata_revision: metadata.revision().as_source_identifier().as_str(),
+        dataset: request.dataset().as_str(),
+        discovery_request_id: request.request_id(),
+        media_type: media_type.as_str(),
+        evidence: evidence.content_digest(),
+        capture_identity,
+        effective,
+        published_at: None,
+        availability: &availability,
+        expected_bytes,
+    })?;
+    let object_id = object_id(
+        contract,
+        acquisition.metadata_generation,
+        capture,
+        lineage_digest,
+    )?;
     SourceObject::try_new_with_capture_identity(
         metadata.source_id().clone(),
         metadata.revision().clone(),
         request,
         object_id,
-        SourceIdentifier::try_from(BEA_JSON_MEDIA_TYPE).map_err(|_| invalid_protocol())?,
-        ExactPayloadEvidence::from_content_digest(capture.content_digest()),
-        SourceObjectCaptureIdentity::try_from_capture(capture).map_err(map_capture_error)?,
+        media_type,
+        evidence,
+        capture_identity,
         effective,
         None,
-        market_squawk_sources::AvailabilityEvidence::LocalFirstObserved {
-            observed_at: received_at,
-        },
-        Some(capture.total_body_bytes()),
+        availability,
+        expected_bytes,
     )
     .map_err(Into::into)
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceObjectLineageWire<'a> {
+    source_id: &'a str,
+    metadata_revision: &'a str,
+    dataset: &'a str,
+    discovery_request_id: market_squawk_sources::DiscoveryRequestId,
+    media_type: &'a str,
+    evidence: EvidenceDigest,
+    capture_identity: SourceObjectCaptureIdentity,
+    effective: EffectiveInterval,
+    published_at: Option<Timestamp>,
+    availability: &'a market_squawk_sources::AvailabilityEvidence,
+    expected_bytes: Option<u64>,
+}
+
+fn source_object_lineage_digest(
+    lineage: &SourceObjectLineageWire<'_>,
+) -> Result<[u8; 32], ExtractionSourceError> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/bea-source-object-lineage/v1");
+    serde_json::to_writer(Sha256Writer(&mut hash), lineage).map_err(|_| invalid_protocol())?;
+    Ok(hash.finalize().into())
+}
+
+fn existing_source_object_lineage_digest(
+    object: &SourceObject,
+) -> Result<[u8; 32], ExtractionSourceError> {
+    source_object_lineage_digest(&SourceObjectLineageWire {
+        source_id: object.source_id().as_str(),
+        metadata_revision: object.metadata_revision().as_source_identifier().as_str(),
+        dataset: object.dataset().as_str(),
+        discovery_request_id: object.discovery_request_id(),
+        media_type: object.media_type().as_str(),
+        evidence: object.evidence().content_digest(),
+        capture_identity: object.capture_identity(),
+        effective: object.effective_interval(),
+        published_at: object.published_at(),
+        availability: object.availability(),
+        expected_bytes: object.expected_bytes(),
+    })
 }
 
 #[derive(Debug)]
@@ -2057,17 +2134,19 @@ struct ParsedObjectId {
     contract_digest: [u8; 32],
     metadata_digest: [u8; 32],
     capture_digest: [u8; 32],
+    lineage_digest: [u8; 32],
 }
 
 impl ParsedObjectId {
     fn parse(value: &SourceIdentifier) -> Result<Self, ExtractionSourceError> {
         let mut parts = value.as_str().split(':');
-        if parts.next() != Some("bea") || parts.next() != Some("object-v1") {
+        if parts.next() != Some("bea") || parts.next() != Some("object-v2") {
             return Err(invalid_protocol());
         }
         let contract_digest = parse_hex(parts.next().ok_or_else(invalid_protocol)?)?;
         let metadata_digest = parse_hex(parts.next().ok_or_else(invalid_protocol)?)?;
         let capture_digest = parse_hex(parts.next().ok_or_else(invalid_protocol)?)?;
+        let lineage_digest = parse_hex(parts.next().ok_or_else(invalid_protocol)?)?;
         if parts.next().is_some() {
             return Err(invalid_protocol());
         }
@@ -2075,6 +2154,7 @@ impl ParsedObjectId {
             contract_digest,
             metadata_digest,
             capture_digest,
+            lineage_digest,
         })
     }
 }
@@ -2083,6 +2163,7 @@ fn object_id(
     contract: &BeaDatasetContract,
     generation: BeaMetadataGeneration,
     capture: &ProviderCaptureSetReceipt,
+    lineage_digest: [u8; 32],
 ) -> Result<SourceIdentifier, ExtractionSourceError> {
     let contract = contract_digest(
         &contract.dataset,
@@ -2091,10 +2172,11 @@ fn object_id(
     )
     .map_err(map_source_error)?;
     SourceIdentifier::try_from(format!(
-        "bea:object-v1:{}:{}:{}",
+        "bea:object-v2:{}:{}:{}:{}",
         lower_hex(contract),
         lower_hex(generation.digest()),
         lower_hex(capture.content_digest().bytes()),
+        lower_hex(lineage_digest),
     ))
     .map_err(|_| invalid_protocol())
 }
@@ -2107,6 +2189,7 @@ fn verify_acquisition(
     let capture = acquisition.data().material().receipt();
     if expected.metadata_digest != acquisition.metadata().generation().digest()
         || expected.capture_digest != capture.content_digest().bytes()
+        || expected.lineage_digest != existing_source_object_lineage_digest(request.object())?
         || request.object().evidence().content_digest() != capture.content_digest()
         || request.object().expected_bytes() != Some(capture.total_body_bytes())
         || request.object().capture_identity()
@@ -2121,7 +2204,10 @@ fn native_records(
     request: &ExtractionRequest,
     captured: &BeaCapturedDataPage,
 ) -> Result<Vec<ExtractionRecord>, ExtractionSourceError> {
-    if captured.page().observations().len() > request.max_records() as usize {
+    let provider_request = captured.request();
+    let page = captured.page();
+    let capture = captured.material().receipt();
+    if page.observations().len() > request.max_records() as usize {
         return Err(
             market_squawk_sources::ExtractionError::RecordLimitExceeded {
                 requested: request.max_records(),
@@ -2131,49 +2217,76 @@ fn native_records(
     }
     let schema =
         SourceIdentifier::try_from(BEA_NATIVE_EXTRACTION_SCHEMA).map_err(|_| invalid_protocol())?;
-    let received_at = captured
-        .material()
-        .receipt()
+    let received_at = capture
         .pages()
         .first()
+        .filter(|_| capture.pages().len() == 1)
         .ok_or_else(invalid_protocol)?
         .received_at();
-    captured
-        .page()
-        .observations()
-        .iter()
-        .enumerate()
-        .map(|(index, observation)| {
-            let version =
-                crate::BeaObservedVersion::try_from_page(captured.page(), index, received_at)
-                    .map_err(|error| map_source_error(error.into()))?;
-            let payload = native_payload(captured.request(), captured.page(), observation)?;
-            let evidence = ExactPayloadEvidence::from_content_digest(evidence_digest(
-                Sha256::digest(&payload).into(),
-            ));
-            let revision = SourceIdentifier::try_from(format!(
-                "bea-version:{}",
-                lower_hex(version.version_digest())
-            ))
-            .map_err(|_| invalid_protocol())?;
-            ExtractionRecord::try_new_with_time(
-                request,
-                schema.clone(),
-                evidence,
-                effective_coordinate(observation)?,
-                // `UTCProductionTime` is retained as provider response metadata only. BEA does
-                // not define it as the observation's publication/release instant.
-                None,
-                market_squawk_sources::AvailabilityEvidence::LocalFirstObserved {
-                    observed_at: received_at,
-                },
-                revision,
-                None,
-                payload,
-            )
-            .map_err(Into::into)
-        })
-        .collect()
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(page.observations().len())
+        .map_err(|_| invalid_protocol())?;
+    for (index, observation) in page.observations().iter().enumerate() {
+        let version = crate::BeaObservedVersion::try_from_page(page, index, received_at)
+            .map_err(|error| map_source_error(error.into()))?;
+        let payload = native_payload(provider_request, page, observation)?;
+        let evidence = ExactPayloadEvidence::from_content_digest(evidence_digest(
+            Sha256::digest(&payload).into(),
+        ));
+        let revision = SourceIdentifier::try_from(format!(
+            "bea-version:{}",
+            lower_hex(version.version_digest())
+        ))
+        .map_err(|_| invalid_protocol())?;
+        records.push(ExtractionRecord::try_new_with_time(
+            request,
+            schema.clone(),
+            evidence,
+            effective_coordinate(observation)?,
+            // `UTCProductionTime` is retained as provider response metadata only. BEA does
+            // not define it as the observation's publication/release instant.
+            None,
+            market_squawk_sources::AvailabilityEvidence::LocalFirstObserved {
+                observed_at: received_at,
+            },
+            revision,
+            None,
+            payload,
+        )?);
+    }
+    Ok(records)
+}
+
+fn source_batch_digest(batch: &ExtractionBatch) -> Result<EvidenceDigest, ExtractionSourceError> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/bea-source-extraction-output/v1");
+    serde_json::to_writer(Sha256Writer(&mut hash), batch.request())
+        .map_err(|_| invalid_protocol())?;
+    hash.update(
+        u64::try_from(batch.records().len())
+            .map_err(|_| invalid_protocol())?
+            .to_be_bytes(),
+    );
+    for record in batch.records() {
+        hash_text(&mut hash, record.schema().as_str()).map_err(map_source_error)?;
+        hash_text(&mut hash, record.revision().as_str()).map_err(map_source_error)?;
+        hash.update(record.evidence().content_digest().bytes());
+    }
+    Ok(evidence_digest(hash.finalize().into()))
+}
+
+struct Sha256Writer<'a>(&'a mut Sha256);
+
+impl std::io::Write for Sha256Writer<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]

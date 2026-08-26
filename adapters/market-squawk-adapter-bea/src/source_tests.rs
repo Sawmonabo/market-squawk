@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,16 +10,16 @@ use futures_util::future::BoxFuture;
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
-    Timestamp,
+    ResearchObservation, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::LocalPaths;
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, CoverageDomain,
-    EndpointPolicy, FreshnessPolicy, HistoricalCapability, HttpRequestBounds, NetworkAccessPolicy,
-    ProviderCaptureTerminalDisposition, SourceCapabilities, SourceClass, SourceCoverage,
-    SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    DiscoveryRequest, EndpointPolicy, ExtractionRequest, FreshnessPolicy, HistoricalCapability,
+    HttpRequestBounds, NetworkAccessPolicy, ProviderCaptureTerminalDisposition, SourceCapabilities,
+    SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -168,8 +168,16 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             .as_ref()
             .is_some_and(BeaSensitiveHeader::is_zeroized)
     );
+    let mut scripted_responses = upstream_responses.clone();
+    scripted_responses.push(
+        upstream_responses
+            .last()
+            .ok_or("missing discovery data response")?
+            .clone(),
+    );
+    scripted_responses.extend(upstream_responses.iter().cloned());
     let transport = Arc::new(ScriptedTransport {
-        responses: Mutex::new(VecDeque::from(upstream_responses.clone())),
+        responses: Mutex::new(VecDeque::from(scripted_responses)),
     });
     let now = system_timestamp()?;
     let metadata = source_metadata(now, &config)?;
@@ -219,7 +227,7 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     );
     assert!(matches!(
         acquisition.data().page().observations()[0].value(),
-        BeaObservationValue::Observed { .. }
+        BeaObservationValue::Missing(crate::BeaMissingValue::SuppressedRegional)
     ));
     for (captured, upstream) in acquisition
         .metadata()
@@ -271,8 +279,8 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path())?;
     let store = paths.sealed_research_journal_store()?;
-    let sealed = BeaSealedAcquisitionReceipt::try_new(evidence, graph.seal(&store)?)?;
-    let admission = doctor_receipt.bind_sealed(source.source_binding(), &sealed)?;
+    let doctor_sealed = BeaSealedAcquisitionReceipt::try_new(evidence, graph.seal(&store)?)?;
+    let admission = doctor_receipt.bind_sealed(source.source_binding(), &doctor_sealed)?;
     source.activate_doctor(&admission)?;
     assert_eq!(
         source.source_binding().source_id(),
@@ -289,72 +297,95 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             BeaRequiredSharedSettlement::ProviderErrors,
         ]
     );
-    let candidate = BeaPublicationCandidate::try_new(
-        source.source_binding(),
-        &admission,
-        sealed,
-        NonZeroU32::new(1).ok_or("canonical record bound")?,
+    let discovery_request = DiscoveryRequest::try_new(
+        provider_dataset.clone(),
+        None,
+        NonZeroU16::new(1).ok_or("discovery result bound")?,
+        deadline,
     )?;
-    candidate.validate()?;
-    assert_eq!(candidate.observations().len(), 1);
-    assert_eq!(
+    let discovery = source
+        .discover_captured(
+            authority.clone(),
+            discovery_request,
+            CancellationToken::new(),
+        )
+        .await?;
+    let discovered_object = discovery
+        .batch()
+        .objects()
+        .first()
+        .ok_or("missing discovered object")?
+        .clone();
+    let extraction_request = ExtractionRequest::try_new(
+        discovered_object,
+        NonZeroU32::new(1).ok_or("extraction record bound")?,
+        NonZeroU64::new(2 * 1024 * 1024).ok_or("extraction byte bound")?,
+        deadline,
+    )?;
+    let expected_original_request = extraction_request.clone();
+    let extraction = source
+        .extract_captured(
+            authority.clone(),
+            extraction_request,
+            CancellationToken::new(),
+        )
+        .await?;
+    let (pending_seal, graph) = extraction.into_pending_seal()?;
+    assert!(matches!(
+        pending_seal.validate_sealed_capture(doctor_sealed.sealed_capture()),
+        Err(crate::BeaSealedAcquisitionError::InvalidEvidence)
+    ));
+    let sealed_output = pending_seal.try_bind_sealed(graph.seal(&store)?)?;
+    let source_batch = sealed_output.source_batch();
+    assert_eq!(source_batch.request(), &expected_original_request);
+    let provider_content_evidence = source_batch.request().object().evidence().content_digest();
+    let native_record = source_batch
+        .records()
+        .first()
+        .ok_or("missing native source record")?;
+    let native_revision = native_record.revision().clone();
+    assert!(native_revision.as_str().starts_with("bea-version:"));
+    let native_payload: serde_json::Value = serde_json::from_slice(native_record.payload())?;
+    assert_eq!(native_payload["frequency"], "quarterly");
+    assert_eq!(native_payload["missing"], "suppressed_regional");
+    let candidate =
+        BeaPublicationCandidate::try_new(source.source_binding(), &admission, sealed_output)?;
+    assert!(
         candidate.observations()[0]
             .observation()
             .value()
-            .observed_value(),
-        Some(rust_decimal::Decimal::from(65_000))
+            .missing_value()
+            .is_some_and(|missing| missing.marker().as_str() == "bea-regional-suppression-l")
     );
-    assert_eq!(candidate.rejoin_coordinates().row_count(), 1);
-    assert_eq!(candidate.rejoin_coordinates().data_component_ordinal(), 3);
-    assert_eq!(
-        candidate.rejoin_coordinates().dataset_id(),
-        &provider_dataset
-    );
-    assert_eq!(
-        candidate.rejoin_coordinates().provider_dataset().as_str(),
-        "Regional"
-    );
-    assert_eq!(
-        candidate.rejoin_coordinates().metadata_generation(),
-        admission.metadata_generation()
-    );
-    let expected_data_upstream_digest = EvidenceDigest::new(
-        DigestAlgorithm::Sha256,
-        Sha256::digest(upstream_responses.last().ok_or("missing data response")?).into(),
-    );
-    assert_eq!(
-        candidate
-            .rejoin_coordinates()
-            .data_upstream_response_digest(),
-        expected_data_upstream_digest
-    );
-    assert_eq!(
-        candidate.observations()[0].upstream_response_digest(),
-        expected_data_upstream_digest
-    );
-    assert_eq!(
-        candidate.rejoin_coordinates().candidate_digest(),
-        candidate.candidate_digest()
-    );
-    assert_eq!(candidate.revision_plan().len(), 1);
-    assert!(candidate.revision_plan().is_locally_observed());
-    let research_observations = candidate.research_observations()?;
-    let revision_batch = candidate.revision_plan().clone().into_observed_batch(
-        candidate.rejoin_coordinates().source_id().clone(),
-        &research_observations,
-    )?;
-    assert_eq!(revision_batch.input_len(), 1);
-    assert_eq!(revision_batch.unique_records().len(), 1);
     let handoff = candidate.into_shared_publication_parts();
-    assert_eq!(handoff.observations().len(), 1);
-    assert_eq!(handoff.revision_plan().len(), handoff.observations().len());
     assert_eq!(
-        handoff.coordinates().acquisition_capture_receipt_digest(),
         handoff
-            .sealed_acquisition()
-            .sealed_capture()
-            .receipt_digest()
+            .batch()
+            .request()
+            .object()
+            .evidence()
+            .content_digest(),
+        provider_content_evidence
     );
+    assert_eq!(handoff.batch().records()[0].revision(), &native_revision);
+    let (coordinates, batch, revision_plan, sealed_output) = handoff.into_parts();
+    let (source_batch, sealed_acquisition) = sealed_output.into_parts();
+    let (native_evidence, sealed_capture) = sealed_acquisition.into_parts();
+    assert_eq!(
+        coordinates.acquisition_capture_receipt_digest(),
+        sealed_capture.receipt_digest()
+    );
+    assert_eq!(source_batch.request(), &expected_original_request);
+    assert!(matches!(
+        native_evidence.data().page().observations()[0].value(),
+        BeaObservationValue::Missing(crate::BeaMissingValue::SuppressedRegional)
+    ));
+    let research_observation =
+        serde_json::from_slice::<ResearchObservation>(batch.records()[0].payload())?;
+    let research_observations = [research_observation];
+    let revision_batch = revision_plan
+        .into_observed_batch(coordinates.source_id().clone(), &research_observations)?;
+    assert_eq!(revision_batch.input_len(), 1);
     assert!(
         transport
             .responses
@@ -526,8 +557,8 @@ fn responses() -> Result<Vec<Bytes>, serde_json::Error> {
                         {"Ordinal": "4", "Name": "UNIT_MULT", "DataType": "numeric", "IsValue": "0"}
                     ],
                     "Data": [{
-                        "TimePeriod": "2025",
-                        "DataValue": "65",
+                        "TimePeriod": "2025Q1",
+                        "DataValue": "L",
                         "CL_UNIT": "Dollars",
                         "UNIT_MULT": "3"
                     }]

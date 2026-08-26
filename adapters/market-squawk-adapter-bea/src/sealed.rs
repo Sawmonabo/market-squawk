@@ -4,7 +4,8 @@ use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
 };
 use market_squawk_sources::{
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
+    ExtractionBatch, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    SealedProviderCaptureSetReceipt,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -43,103 +44,15 @@ impl BeaSealedAcquisitionReceipt {
         evidence: BeaDatasetEvidence,
         sealed_capture: SealedProviderCaptureSetReceipt,
     ) -> Result<Self, BeaSealedAcquisitionError> {
+        let expected_graph_identity = validate_sealed_capture_sidecar(&evidence, &sealed_capture)?;
         let expected_count = evidence.expected_capture_count();
-        if expected_count < 2 {
-            return Err(BeaSealedAcquisitionError::InvalidEvidence);
-        }
-        let expected = (0..expected_count)
-            .map(|ordinal| {
-                evidence
-                    .expected_capture(ordinal)
-                    .ok_or(BeaSealedAcquisitionError::InvalidEvidence)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let first = expected
-            .first()
-            .copied()
+        let first = evidence
+            .expected_capture(0)
             .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?;
         let source_id = first.source_id().clone();
         let metadata_revision = first.metadata_revision().clone();
-        if expected.iter().any(|capture| {
-            capture.source_id() != &source_id
-                || capture.metadata_revision() != &metadata_revision
-                || capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph
-                || !capture.request_graph_components().is_empty()
-        }) {
-            return Err(BeaSealedAcquisitionError::InvalidEvidence);
-        }
-
         let dataset_id = evidence.metadata().dataset_id().clone();
         let provider_dataset = evidence.data().page().dataset().clone();
-        let expected_graph_identity =
-            bea_capture_graph_identity(&dataset_id, evidence.metadata().generation(), &expected)?;
-        let graph = sealed_capture.capture();
-        if graph.source_id() != &source_id
-            || graph.metadata_revision() != &metadata_revision
-            || graph.dataset() != &dataset_id
-            || graph.request_set_identity() != expected_graph_identity
-            || graph.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
-            || graph.request_graph_components().len() != expected_count
-            || !valid_digest(sealed_capture.receipt_digest())
-            || !valid_digest(sealed_capture.segment().physical_receipt_digest())
-        {
-            return Err(BeaSealedAcquisitionError::InvalidEvidence);
-        }
-
-        let mut flattened_page_ordinal = 0_usize;
-        for (ordinal, (component, expected_capture)) in graph
-            .request_graph_components()
-            .iter()
-            .zip(&expected)
-            .enumerate()
-        {
-            if usize::from(component.ordinal()) != ordinal
-                || component.dataset() != expected_capture.dataset()
-                || component.request_set_identity() != expected_capture.request_set_identity()
-                || component.terminal() != expected_capture.terminal()
-                || usize::from(component.first_page_ordinal()) != flattened_page_ordinal
-                || usize::from(component.page_count().get()) != expected_capture.pages().len()
-                || component.total_body_bytes() != expected_capture.total_body_bytes()
-                || component.content_digest() != expected_capture.content_digest()
-                || component.observation_digest() != expected_capture.observation_digest()
-            {
-                return Err(BeaSealedAcquisitionError::InvalidEvidence);
-            }
-            for expected_page in expected_capture.pages() {
-                let actual_page = graph
-                    .pages()
-                    .get(flattened_page_ordinal)
-                    .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?;
-                if usize::from(actual_page.ordinal()) != flattened_page_ordinal
-                    || actual_page.request_identity() != expected_page.request_identity()
-                    || actual_page.request_page_token_digest()
-                        != expected_page.request_page_token_digest()
-                    || actual_page.response_next_page_token_digest()
-                        != expected_page.response_next_page_token_digest()
-                    || actual_page.http_status() != expected_page.http_status()
-                    || actual_page.body_bytes() != expected_page.body_bytes()
-                    || actual_page.body_digest() != expected_page.body_digest()
-                    || actual_page.received_at() != expected_page.received_at()
-                {
-                    return Err(BeaSealedAcquisitionError::InvalidEvidence);
-                }
-                flattened_page_ordinal = flattened_page_ordinal
-                    .checked_add(1)
-                    .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?;
-            }
-        }
-        if flattened_page_ordinal != graph.pages().len()
-            || graph.total_body_bytes()
-                != expected
-                    .iter()
-                    .try_fold(0_u64, |total, capture| {
-                        total.checked_add(capture.total_body_bytes())
-                    })
-                    .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?
-        {
-            return Err(BeaSealedAcquisitionError::InvalidEvidence);
-        }
-
         let data_component_ordinal = u16::try_from(expected_count.saturating_sub(1))
             .map_err(|_| BeaSealedAcquisitionError::InvalidEvidence)?;
         let mut hasher = Sha256::new();
@@ -244,6 +157,188 @@ impl BeaSealedAcquisitionReceipt {
         }
         Ok(upstream)
     }
+
+    /// Consumes the rejoin into native evidence and its physical sidecar receipt.
+    pub fn into_parts(self) -> (BeaDatasetEvidence, SealedProviderCaptureSetReceipt) {
+        (self.evidence, self.sealed_capture)
+    }
+}
+
+/// Opaque source output waiting for the shared sealer's physical receipt.
+#[derive(Debug)]
+pub struct BeaPendingExtractionSeal {
+    source_batch: ExtractionBatch,
+    evidence: BeaDatasetEvidence,
+    source_batch_digest: EvidenceDigest,
+}
+
+impl BeaPendingExtractionSeal {
+    pub(crate) fn from_source(
+        source_batch: ExtractionBatch,
+        evidence: BeaDatasetEvidence,
+        source_batch_digest: EvidenceDigest,
+    ) -> Self {
+        Self {
+            source_batch,
+            evidence,
+            source_batch_digest,
+        }
+    }
+
+    /// Checks whether a shared physical receipt is the exact sidecar for this source output.
+    pub fn validate_sealed_capture(
+        &self,
+        sealed_capture: &SealedProviderCaptureSetReceipt,
+    ) -> Result<(), BeaSealedAcquisitionError> {
+        validate_sealed_capture_sidecar(&self.evidence, sealed_capture).map(|_| ())
+    }
+
+    /// Consumes the source output and the shared sealer's exact physical receipt.
+    pub fn try_bind_sealed(
+        self,
+        sealed_capture: SealedProviderCaptureSetReceipt,
+    ) -> Result<BeaSealedExtractionOutput, BeaSealedAcquisitionError> {
+        let sealed_acquisition =
+            BeaSealedAcquisitionReceipt::try_new(self.evidence, sealed_capture)?;
+        Ok(BeaSealedExtractionOutput {
+            source_batch: self.source_batch,
+            source_batch_digest: self.source_batch_digest,
+            sealed_acquisition,
+        })
+    }
+}
+
+/// Original source extraction output joined to the physical acquisition sidecar.
+///
+/// The source batch retains provider-content identity and its original request bounds. The sealed
+/// acquisition separately retains the complete native dictionaries and shared physical receipt.
+#[derive(Debug)]
+pub struct BeaSealedExtractionOutput {
+    source_batch: ExtractionBatch,
+    source_batch_digest: EvidenceDigest,
+    sealed_acquisition: BeaSealedAcquisitionReceipt,
+}
+
+impl BeaSealedExtractionOutput {
+    /// Returns the original source-produced extraction batch.
+    pub const fn source_batch(&self) -> &ExtractionBatch {
+        &self.source_batch
+    }
+
+    /// Returns native dictionaries and the physical acquisition sidecar.
+    pub const fn sealed_acquisition(&self) -> &BeaSealedAcquisitionReceipt {
+        &self.sealed_acquisition
+    }
+
+    pub(crate) const fn source_batch_digest(&self) -> EvidenceDigest {
+        self.source_batch_digest
+    }
+
+    /// Consumes the joined unit into its source batch and native/physical rejoin.
+    pub fn into_parts(self) -> (ExtractionBatch, BeaSealedAcquisitionReceipt) {
+        (self.source_batch, self.sealed_acquisition)
+    }
+}
+
+fn validate_sealed_capture_sidecar(
+    evidence: &BeaDatasetEvidence,
+    sealed_capture: &SealedProviderCaptureSetReceipt,
+) -> Result<EvidenceDigest, BeaSealedAcquisitionError> {
+    let expected_count = evidence.expected_capture_count();
+    if expected_count < 2 {
+        return Err(BeaSealedAcquisitionError::InvalidEvidence);
+    }
+    let mut expected = Vec::new();
+    expected
+        .try_reserve_exact(expected_count)
+        .map_err(|_| BeaSealedAcquisitionError::InvalidEvidence)?;
+    for ordinal in 0..expected_count {
+        expected.push(
+            evidence
+                .expected_capture(ordinal)
+                .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?,
+        );
+    }
+    let first = expected
+        .first()
+        .copied()
+        .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?;
+    if expected.iter().any(|capture| {
+        capture.source_id() != first.source_id()
+            || capture.metadata_revision() != first.metadata_revision()
+            || capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph
+            || !capture.request_graph_components().is_empty()
+    }) {
+        return Err(BeaSealedAcquisitionError::InvalidEvidence);
+    }
+    let expected_graph_identity = bea_capture_graph_identity(
+        evidence.metadata().dataset_id(),
+        evidence.metadata().generation(),
+        &expected,
+    )?;
+    let graph = sealed_capture.capture();
+    if graph.source_id() != first.source_id()
+        || graph.metadata_revision() != first.metadata_revision()
+        || graph.dataset() != evidence.metadata().dataset_id()
+        || graph.request_set_identity() != expected_graph_identity
+        || graph.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
+        || graph.request_graph_components().len() != expected_count
+        || !valid_digest(sealed_capture.receipt_digest())
+        || !valid_digest(sealed_capture.segment().physical_receipt_digest())
+    {
+        return Err(BeaSealedAcquisitionError::InvalidEvidence);
+    }
+    let mut page_ordinal = 0_usize;
+    for (ordinal, expected_capture) in expected.iter().enumerate() {
+        let component = graph
+            .request_graph_components()
+            .get(ordinal)
+            .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?;
+        if usize::from(component.ordinal()) != ordinal
+            || component.dataset() != expected_capture.dataset()
+            || component.request_set_identity() != expected_capture.request_set_identity()
+            || component.terminal() != expected_capture.terminal()
+            || usize::from(component.first_page_ordinal()) != page_ordinal
+            || usize::from(component.page_count().get()) != expected_capture.pages().len()
+            || component.total_body_bytes() != expected_capture.total_body_bytes()
+            || component.content_digest() != expected_capture.content_digest()
+            || component.observation_digest() != expected_capture.observation_digest()
+        {
+            return Err(BeaSealedAcquisitionError::InvalidEvidence);
+        }
+        for expected_page in expected_capture.pages() {
+            let actual_page = graph
+                .pages()
+                .get(page_ordinal)
+                .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?;
+            if usize::from(actual_page.ordinal()) != page_ordinal
+                || actual_page.request_identity() != expected_page.request_identity()
+                || actual_page.request_page_token_digest()
+                    != expected_page.request_page_token_digest()
+                || actual_page.response_next_page_token_digest()
+                    != expected_page.response_next_page_token_digest()
+                || actual_page.http_status() != expected_page.http_status()
+                || actual_page.body_bytes() != expected_page.body_bytes()
+                || actual_page.body_digest() != expected_page.body_digest()
+                || actual_page.received_at() != expected_page.received_at()
+            {
+                return Err(BeaSealedAcquisitionError::InvalidEvidence);
+            }
+            page_ordinal = page_ordinal
+                .checked_add(1)
+                .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?;
+        }
+    }
+    let expected_total = expected
+        .iter()
+        .try_fold(0_u64, |total, capture| {
+            total.checked_add(capture.total_body_bytes())
+        })
+        .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?;
+    if page_ordinal != graph.pages().len() || graph.total_body_bytes() != expected_total {
+        return Err(BeaSealedAcquisitionError::InvalidEvidence);
+    }
+    Ok(expected_graph_identity)
 }
 
 pub(crate) fn bea_capture_graph_identity(

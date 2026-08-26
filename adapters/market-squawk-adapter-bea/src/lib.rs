@@ -62,13 +62,17 @@ pub use quota::{
 pub use revision::{
     BeaCorrectionLedgerInput, BeaCorrectionNotice, BeaObservedVersion, BeaRevisionKind,
 };
-pub use sealed::{BeaSealedAcquisitionError, BeaSealedAcquisitionReceipt};
+pub use sealed::{
+    BeaPendingExtractionSeal, BeaSealedAcquisitionError, BeaSealedAcquisitionReceipt,
+    BeaSealedExtractionOutput,
+};
 pub use source::{
-    BEA_NATIVE_EXTRACTION_SCHEMA, BeaCapturedDataPage, BeaCapturedDiscovery, BeaCapturedExtraction,
+    BEA_NATIVE_EXTRACTION_SCHEMA, BeaCapturedDataPage, BeaCapturedDiscovery,
     BeaCapturedMetadataPage, BeaDataEvidencePage, BeaDatasetAcquisition, BeaDatasetContract,
-    BeaDatasetEvidence, BeaMetadataBundle, BeaMetadataEvidenceBundle, BeaMetadataEvidencePage,
-    BeaResponseTelemetry, BeaSource, BeaSourceConfig, BeaSourceError, BeaSourceTelemetry,
-    MAX_BEA_CONFIGURED_DATASETS, bea_api_endpoint_rule, bea_provider_rate_declaration,
+    BeaDatasetEvidence, BeaExtractionOutput, BeaMetadataBundle, BeaMetadataEvidenceBundle,
+    BeaMetadataEvidencePage, BeaResponseTelemetry, BeaSource, BeaSourceConfig, BeaSourceError,
+    BeaSourceTelemetry, MAX_BEA_CONFIGURED_DATASETS, bea_api_endpoint_rule,
+    bea_provider_rate_declaration,
 };
 
 #[cfg(test)]

@@ -3,17 +3,19 @@
 use std::num::NonZeroU32;
 
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, MetadataRevision, ResearchObservation, SourceId,
+    DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, MetadataRevision, SourceId,
     SourceIdentifier,
 };
-use market_squawk_sources::ExtractionRevisionPlan;
+use market_squawk_sources::{
+    CURRENT_RESEARCH_RECORD_SCHEMA, ExtractionBatch, ExtractionRecord, ExtractionRevisionPlan,
+};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::canonical::{BeaCanonicalBatch, BeaCanonicalContext};
 use crate::{
     BeaCanonicalObservation, BeaDatasetIdentity, BeaDoctorAdmissionEvidence,
-    BeaSealedAcquisitionReceipt, BeaSourceBinding,
+    BeaSealedExtractionOutput, BeaSourceBinding,
 };
 
 /// Provider-specific canonical-candidate or rejoin invariant failure.
@@ -152,26 +154,25 @@ impl BeaPublicationRejoinCoordinates {
 /// The shared observed-revision authority must assign and bind durable revisions before Arrow and
 /// immutable dataset publication. This adapter exposes no API that accepts or certifies a caller-
 /// supplied generation, manifest, commit clock, restart checkpoint, or PIT result.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct BeaPublicationCandidate {
     coordinates: BeaPublicationRejoinCoordinates,
     observations: Vec<BeaCanonicalObservation>,
+    batch: ExtractionBatch,
     revision_plan: ExtractionRevisionPlan,
-    sealed_acquisition: BeaSealedAcquisitionReceipt,
+    sealed_output: BeaSealedExtractionOutput,
 }
 
 impl BeaPublicationCandidate {
-    /// Builds one exact shared-publication candidate from actual doctor and acquisition seals.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "doctor, use, physical acquisition, and row bound remain explicit"
-    )]
+    /// Builds a shared-publication candidate from the source output and its acquisition seal.
     pub fn try_new(
         binding: &BeaSourceBinding,
         doctor: &BeaDoctorAdmissionEvidence,
-        sealed_acquisition: BeaSealedAcquisitionReceipt,
-        maximum_records: NonZeroU32,
+        sealed_output: BeaSealedExtractionOutput,
     ) -> Result<Self, BeaPublicationError> {
+        let sealed_acquisition = sealed_output.sealed_acquisition();
+        let maximum_records = NonZeroU32::new(sealed_output.source_batch().request().max_records())
+            .ok_or(BeaPublicationError::InvalidEvidence)?;
         let canonicalized_at = crate::transport::system_timestamp()
             .map_err(|_| BeaPublicationError::InvalidAuthority)?;
         let context =
@@ -251,13 +252,22 @@ impl BeaPublicationCandidate {
             row_count,
             candidate_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
         };
-        coordinates.candidate_digest =
-            candidate_digest(&coordinates, &observations, &revision_plan)?;
+        coordinates.candidate_digest = candidate_digest(
+            &coordinates,
+            &revision_plan,
+            sealed_output.source_batch_digest(),
+        )?;
+        let canonical_batch = canonical_extraction_batch(
+            sealed_output.source_batch(),
+            &observations,
+            sealed_output.sealed_acquisition(),
+        )?;
         let candidate = Self {
             coordinates,
             observations,
+            batch: canonical_batch,
             revision_plan,
-            sealed_acquisition,
+            sealed_output,
         };
         candidate.validate()?;
         Ok(candidate)
@@ -266,40 +276,38 @@ impl BeaPublicationCandidate {
     /// Revalidates every immutable provider/native/canonical/physical coordinate.
     pub fn validate(&self) -> Result<(), BeaPublicationError> {
         let coordinates = &self.coordinates;
+        let sealed_acquisition = self.sealed_output.sealed_acquisition();
         if self.observations.is_empty()
             || self.revision_plan.len() != self.observations.len()
             || !self.revision_plan.is_locally_observed()
             || u64::try_from(self.observations.len())
                 .map_err(|_| BeaPublicationError::InvalidEvidence)?
                 != coordinates.row_count
-            || self.sealed_acquisition.source_id() != &coordinates.source_id
-            || self.sealed_acquisition.metadata_revision() != &coordinates.metadata_revision
-            || self.sealed_acquisition.dataset_id() != &coordinates.dataset_id
-            || self.sealed_acquisition.provider_dataset() != &coordinates.provider_dataset
-            || self.sealed_acquisition.sealed_graph_digest()
+            || self.sealed_output.source_batch().records().len() != self.observations.len()
+            || self.batch.records().len() != self.observations.len()
+            || sealed_acquisition.source_id() != &coordinates.source_id
+            || sealed_acquisition.metadata_revision() != &coordinates.metadata_revision
+            || sealed_acquisition.dataset_id() != &coordinates.dataset_id
+            || sealed_acquisition.provider_dataset() != &coordinates.provider_dataset
+            || sealed_acquisition.sealed_graph_digest()
                 != coordinates.acquisition_sealed_graph_digest
-            || self.sealed_acquisition.sealed_capture().receipt_digest()
+            || sealed_acquisition.sealed_capture().receipt_digest()
                 != coordinates.acquisition_capture_receipt_digest
-            || self
-                .sealed_acquisition
+            || sealed_acquisition
                 .sealed_capture()
                 .segment()
                 .physical_receipt_digest()
                 != coordinates.acquisition_physical_receipt_digest
-            || self.sealed_acquisition.data_component_ordinal()
-                != coordinates.data_component_ordinal
-            || self
-                .sealed_acquisition
+            || sealed_acquisition.data_component_ordinal() != coordinates.data_component_ordinal
+            || sealed_acquisition
                 .data_response_digest()
                 .map_err(|_| BeaPublicationError::InvalidEvidence)?
                 != coordinates.data_response_digest
-            || self
-                .sealed_acquisition
+            || sealed_acquisition
                 .data_upstream_response_digest()
                 .map_err(|_| BeaPublicationError::InvalidEvidence)?
                 != coordinates.data_upstream_response_digest
-            || self
-                .sealed_acquisition
+            || sealed_acquisition
                 .evidence()
                 .metadata()
                 .generation()
@@ -308,42 +316,11 @@ impl BeaPublicationCandidate {
         {
             return Err(BeaPublicationError::InvalidEvidence);
         }
-        for observation in &self.observations {
-            let canonical = serde_json::to_vec(&ResearchObservation::Macro(
-                observation.observation().clone(),
-            ))
-            .map_err(|_| BeaPublicationError::InvalidEvidence)?;
-            if EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&canonical).into())
-                != observation.canonical_payload_digest()
-                || canonical.as_slice() != observation.canonical_payload().as_ref()
-                || observation.observation().context().time().revision().get() != 1
-                || observation
-                    .observation()
-                    .context()
-                    .time()
-                    .published()
-                    .is_some()
-                || observation
-                    .observation()
-                    .context()
-                    .time()
-                    .superseded()
-                    .is_some()
-                || observation.source_binding_digest() != coordinates.source_binding_digest
-                || observation.doctor_admission_digest() != coordinates.doctor_admission_digest
-                || observation.doctor_sealed_graph_digest()
-                    != coordinates.doctor_sealed_graph_digest
-                || observation.raw_seal_digest() != coordinates.acquisition_sealed_graph_digest
-                || observation.metadata_generation() != coordinates.metadata_generation
-                || observation.upstream_response_digest()
-                    != coordinates.data_upstream_response_digest
-                || observation.raw_page_digest() != coordinates.data_response_digest
-            {
-                return Err(BeaPublicationError::InvalidEvidence);
-            }
-        }
-        if candidate_digest(coordinates, &self.observations, &self.revision_plan)?
-            != coordinates.candidate_digest
+        if candidate_digest(
+            coordinates,
+            &self.revision_plan,
+            self.sealed_output.source_batch_digest(),
+        )? != coordinates.candidate_digest
         {
             return Err(BeaPublicationError::InvalidEvidence);
         }
@@ -355,9 +332,9 @@ impl BeaPublicationCandidate {
         &self.coordinates
     }
 
-    /// Returns the actual shared physical raw acquisition receipt.
-    pub const fn sealed_acquisition(&self) -> &BeaSealedAcquisitionReceipt {
-        &self.sealed_acquisition
+    /// Returns the joined source batch, native evidence, and physical acquisition sidecar.
+    pub const fn sealed_output(&self) -> &BeaSealedExtractionOutput {
+        &self.sealed_output
     }
 
     /// Returns canonical rows in deterministic provider response order.
@@ -370,34 +347,36 @@ impl BeaPublicationCandidate {
         &self.revision_plan
     }
 
-    /// Clones the closed canonical payloads paired one-for-one with [`Self::revision_plan`].
-    pub fn research_observations(&self) -> Result<Vec<ResearchObservation>, BeaPublicationError> {
-        clone_research_observations(&self.observations)
-    }
-
     /// Returns the complete provider candidate commitment.
     pub const fn candidate_digest(&self) -> EvidenceDigest {
         self.coordinates.candidate_digest
     }
 
-    /// Consumes the candidate into the only values root composition needs for shared publication.
+    /// Consumes the candidate into a canonical batch and its retained source/physical sidecars.
     pub fn into_shared_publication_parts(self) -> BeaSharedPublicationParts {
+        let Self {
+            coordinates,
+            observations: _,
+            batch,
+            revision_plan,
+            sealed_output,
+        } = self;
         BeaSharedPublicationParts {
-            coordinates: self.coordinates,
-            observations: self.observations,
-            revision_plan: self.revision_plan,
-            sealed_acquisition: self.sealed_acquisition,
+            coordinates,
+            batch,
+            revision_plan,
+            sealed_output,
         }
     }
 }
 
 /// Owned handoff to shared revision, Arrow, immutable-publication, and query composition.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct BeaSharedPublicationParts {
     coordinates: BeaPublicationRejoinCoordinates,
-    observations: Vec<BeaCanonicalObservation>,
+    batch: ExtractionBatch,
     revision_plan: ExtractionRevisionPlan,
-    sealed_acquisition: BeaSealedAcquisitionReceipt,
+    sealed_output: BeaSealedExtractionOutput,
 }
 
 impl BeaSharedPublicationParts {
@@ -406,51 +385,93 @@ impl BeaSharedPublicationParts {
         &self.coordinates
     }
 
-    /// Returns normalized candidate rows requiring durable shared revision assignment.
-    pub fn observations(&self) -> &[BeaCanonicalObservation] {
-        &self.observations
+    /// Returns the exact canonical batch root must submit to shared ingestion.
+    pub const fn batch(&self) -> &ExtractionBatch {
+        &self.batch
     }
 
-    /// Returns the exact bounded revision plan aligned with [`Self::observations`].
+    /// Returns the exact bounded revision plan aligned with [`Self::batch`].
     pub const fn revision_plan(&self) -> &ExtractionRevisionPlan {
         &self.revision_plan
     }
 
-    /// Clones the closed canonical payloads for shared revision and Arrow composition.
-    pub fn research_observations(&self) -> Result<Vec<ResearchObservation>, BeaPublicationError> {
-        clone_research_observations(&self.observations)
+    /// Returns the original source batch, native dictionaries, and physical capture sidecar.
+    pub const fn sealed_output(&self) -> &BeaSealedExtractionOutput {
+        &self.sealed_output
     }
 
-    /// Returns the actual physical request-graph receipt that root must retain in lineage.
-    pub const fn sealed_acquisition(&self) -> &BeaSealedAcquisitionReceipt {
-        &self.sealed_acquisition
-    }
-
-    /// Consumes the handoff without replacing any value by a caller-made digest.
+    /// Consumes the handoff into the only values shared composition needs.
     pub fn into_parts(
         self,
     ) -> (
         BeaPublicationRejoinCoordinates,
-        Vec<BeaCanonicalObservation>,
+        ExtractionBatch,
         ExtractionRevisionPlan,
-        BeaSealedAcquisitionReceipt,
+        BeaSealedExtractionOutput,
     ) {
         (
             self.coordinates,
-            self.observations,
+            self.batch,
             self.revision_plan,
-            self.sealed_acquisition,
+            self.sealed_output,
         )
     }
 }
 
+fn canonical_extraction_batch(
+    source_batch: &ExtractionBatch,
+    observations: &[BeaCanonicalObservation],
+    sealed_acquisition: &crate::BeaSealedAcquisitionReceipt,
+) -> Result<ExtractionBatch, BeaPublicationError> {
+    if source_batch.records().len() != observations.len() || source_batch.records().is_empty() {
+        return Err(BeaPublicationError::InvalidEvidence);
+    }
+    let request = source_batch.request();
+    let schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
+        .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(observations.len())
+        .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    for (source_record, observation) in source_batch.records().iter().zip(observations) {
+        let context = observation.observation().context();
+        let provenance = context.provenance();
+        if source_record.effective_time() != context.time().effective()
+            || source_record.published_time() != context.time().published()
+            || source_record.superseded_time() != context.time().superseded()
+            || source_record.available_at() != provenance.availability().conservative_available_at()
+        {
+            return Err(BeaPublicationError::InvalidEvidence);
+        }
+        records.push(
+            ExtractionRecord::try_new_with_time(
+                request,
+                schema.clone(),
+                ExactPayloadEvidence::from_content_digest(observation.canonical_payload_digest()),
+                source_record.effective_time().clone(),
+                source_record.published_time().cloned(),
+                source_record.availability().clone(),
+                source_record.revision().clone(),
+                source_record.superseded_time().cloned(),
+                observation.canonical_payload().clone(),
+            )
+            .map_err(|_| BeaPublicationError::InvalidEvidence)?,
+        );
+    }
+    let batch = ExtractionBatch::try_new(request, records)
+        .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    batch
+        .try_bind_provider_capture(sealed_acquisition.sealed_capture().capture())
+        .map_err(|_| BeaPublicationError::InvalidEvidence)
+}
+
 fn candidate_digest(
     coordinates: &BeaPublicationRejoinCoordinates,
-    observations: &[BeaCanonicalObservation],
     revision_plan: &ExtractionRevisionPlan,
+    source_batch_digest: EvidenceDigest,
 ) -> Result<EvidenceDigest, BeaPublicationError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk/bea-publication-candidate/v5");
+    hasher.update(b"market-squawk/bea-publication-candidate/v7");
     hash_text(&mut hasher, coordinates.source_id.as_str())?;
     hash_text(
         &mut hasher,
@@ -479,49 +500,22 @@ fn candidate_digest(
     hasher.update(coordinates.data_component_ordinal.to_be_bytes());
     hasher.update(coordinates.row_count.to_be_bytes());
     if coordinates.row_count
-        != u64::try_from(observations.len()).map_err(|_| BeaPublicationError::InvalidEvidence)?
-        || revision_plan.len() != observations.len()
+        != u64::try_from(revision_plan.len()).map_err(|_| BeaPublicationError::InvalidEvidence)?
         || !revision_plan.is_locally_observed()
     {
         return Err(BeaPublicationError::InvalidEvidence);
     }
+    hasher.update(source_batch_digest.bytes());
     hasher.update(
         u64::try_from(revision_plan.len())
             .map_err(|_| BeaPublicationError::InvalidEvidence)?
             .to_be_bytes(),
     );
     hasher.update(b"locally-observed-canonical-content");
-    for (ordinal, observation) in observations.iter().enumerate() {
-        hasher.update(
-            u64::try_from(ordinal)
-                .map_err(|_| BeaPublicationError::InvalidEvidence)?
-                .to_be_bytes(),
-        );
-        hasher.update(observation.canonical_payload_digest().bytes());
-        hasher.update(observation.native_row_digest().bytes());
-        hasher.update(observation.native_series_digest().bytes());
-        hasher.update(observation.upstream_response_digest().bytes());
-        hasher.update(observation.raw_page_digest().bytes());
-    }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
         hasher.finalize().into(),
     ))
-}
-
-fn clone_research_observations(
-    observations: &[BeaCanonicalObservation],
-) -> Result<Vec<ResearchObservation>, BeaPublicationError> {
-    let mut canonical = Vec::new();
-    canonical
-        .try_reserve_exact(observations.len())
-        .map_err(|_| BeaPublicationError::InvalidEvidence)?;
-    canonical.extend(
-        observations
-            .iter()
-            .map(|observation| ResearchObservation::Macro(observation.observation().clone())),
-    );
-    Ok(canonical)
 }
 
 fn hash_text(hasher: &mut Sha256, value: &str) -> Result<(), BeaPublicationError> {
