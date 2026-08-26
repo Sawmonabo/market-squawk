@@ -35,14 +35,13 @@ pub use source::{
     TreasurySourceHealth,
 };
 pub use vertical::{
-    TreasuryActivationIntent, TreasuryAuthorizedUse, TreasuryDashboardDatasetRead,
-    TreasuryDashboardReadPlan, TreasuryDashboardSeriesMode, TreasuryDatasetCatalog,
-    TreasuryDatasetDescriptor, TreasuryDatasetFamily, TreasuryDatasetPeriod,
-    TreasuryDiscoveryAccounting, TreasuryDiscoveryCompleteness, TreasuryDiscoveryOutput,
-    TreasuryDoctorObservation, TreasuryDoctorPlan, TreasuryDoctorProbe, TreasuryDoctorReceipt,
-    TreasuryExtractionAccounting, TreasuryExtractionCommitment, TreasuryOwnerUseAttestation,
-    TreasuryPublicationExpectation, TreasuryPublicationMode, TreasurySealedDoctorReceipt,
-    TreasurySurface, TreasuryVerticalError,
+    TreasuryActivationIntent, TreasuryDashboardDatasetRead, TreasuryDashboardReadPlan,
+    TreasuryDashboardSeriesMode, TreasuryDatasetCatalog, TreasuryDatasetDescriptor,
+    TreasuryDatasetFamily, TreasuryDatasetPeriod, TreasuryDiscoveryAccounting,
+    TreasuryDiscoveryCompleteness, TreasuryDiscoveryOutput, TreasuryDoctorObservation,
+    TreasuryDoctorPlan, TreasuryDoctorProbe, TreasuryDoctorReceipt, TreasuryExtractionAccounting,
+    TreasuryExtractionCommitment, TreasuryPublicationExpectation, TreasuryPublicationMode,
+    TreasurySealedDoctorReceipt, TreasurySurface, TreasuryVerticalError,
 };
 pub use yield_curve::{
     DailyParYieldCurveObservation, DailyParYieldCurvePage, TreasuryYieldCurvePageRequest,

@@ -263,7 +263,6 @@ fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {
         TreasurySourceError::DeadlineExceeded => ExtractionSourceError::DeadlineExceeded,
         TreasurySourceError::Source(error) => ExtractionSourceError::Source(error),
         TreasurySourceError::InvalidMetadata
-        | TreasurySourceError::InvalidOwnerUseAttestation
         | TreasurySourceError::InvalidBackfillCheckpoint
         | TreasurySourceError::BackfillIncomplete
         | TreasurySourceError::QueryBindingMismatch

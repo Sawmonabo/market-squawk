@@ -71,7 +71,6 @@ pub struct TreasuryAllHistoryCheckpoint {
     metadata_revision: MetadataRevision,
     descriptor: TreasuryDatasetDescriptor,
     activation_intent_digest: EvidenceDigest,
-    owner_use_attestation_digest: EvidenceDigest,
     next_page: u64,
     accepted_source_rows: u64,
     canonical_points: u64,
@@ -91,7 +90,6 @@ struct TreasuryAllHistoryCheckpointWire {
     metadata_revision: MetadataRevision,
     provider_dataset: SourceIdentifier,
     activation_intent_digest: EvidenceDigest,
-    owner_use_attestation_digest: EvidenceDigest,
     next_page: u64,
     accepted_source_rows: u64,
     canonical_points: u64,
@@ -111,7 +109,6 @@ struct TreasuryAllHistoryCheckpointRef<'a> {
     metadata_revision: &'a MetadataRevision,
     provider_dataset: &'a SourceIdentifier,
     activation_intent_digest: EvidenceDigest,
-    owner_use_attestation_digest: EvidenceDigest,
     next_page: u64,
     accepted_source_rows: u64,
     canonical_points: u64,
@@ -134,7 +131,6 @@ impl Serialize for TreasuryAllHistoryCheckpoint {
             metadata_revision: &self.metadata_revision,
             provider_dataset: self.descriptor.provider_dataset(),
             activation_intent_digest: self.activation_intent_digest,
-            owner_use_attestation_digest: self.owner_use_attestation_digest,
             next_page: self.next_page,
             accepted_source_rows: self.accepted_source_rows,
             canonical_points: self.canonical_points,
@@ -160,7 +156,6 @@ impl TreasuryAllHistoryCheckpoint {
             metadata_revision: source.metadata.revision().clone(),
             descriptor,
             activation_intent_digest: source.activation.intent_digest(),
-            owner_use_attestation_digest: source.activation.owner_use().attestation_digest(),
             next_page: 0,
             accepted_source_rows: 0,
             canonical_points: 0,
@@ -209,7 +204,6 @@ impl TreasuryAllHistoryCheckpoint {
             metadata_revision: wire.metadata_revision,
             descriptor,
             activation_intent_digest: wire.activation_intent_digest,
-            owner_use_attestation_digest: wire.owner_use_attestation_digest,
             next_page: wire.next_page,
             accepted_source_rows: wire.accepted_source_rows,
             canonical_points: wire.canonical_points,
@@ -233,9 +227,7 @@ impl TreasuryAllHistoryCheckpoint {
                 TreasuryDatasetFamily::DailyRate(_)
             )
             || self.activation_intent_digest.algorithm() != DigestAlgorithm::Sha256
-            || self.owner_use_attestation_digest.algorithm() != DigestAlgorithm::Sha256
             || self.activation_intent_digest.bytes() == [0; 32]
-            || self.owner_use_attestation_digest.bytes() == [0; 32]
             || self.pages.len() > MAX_ALL_HISTORY_PAGES
             || self.next_page
                 != u64::try_from(self.pages.len())
@@ -364,7 +356,6 @@ impl TreasuryAllHistoryCheckpoint {
             &self.metadata_revision,
             &self.descriptor,
             self.activation_intent_digest,
-            self.owner_use_attestation_digest,
             self.next_page,
             self.accepted_source_rows,
             self.canonical_points,
@@ -675,11 +666,6 @@ impl TreasuryAllHistoryAcquisitionCompletion {
     /// Returns the owner-authorized activation identity.
     pub const fn activation_intent_digest(&self) -> EvidenceDigest {
         self.checkpoint.activation_intent_digest
-    }
-
-    /// Returns the owner-use attestation identity enforced during retrieval.
-    pub const fn owner_use_attestation_digest(&self) -> EvidenceDigest {
-        self.checkpoint.owner_use_attestation_digest
     }
 
     /// Returns the count of data pages plus the retained empty terminal page.
@@ -1102,14 +1088,11 @@ fn validate_checkpoint_source(
     if checkpoint.source_id != *source.metadata.source_id()
         || checkpoint.metadata_revision != *source.metadata.revision()
         || checkpoint.activation_intent_digest != source.activation.intent_digest()
-        || checkpoint.owner_use_attestation_digest
-            != source.activation.owner_use().attestation_digest()
         || source
             .activation
             .catalog()
             .dataset(checkpoint.descriptor.provider_dataset())
             != Some(&checkpoint.descriptor)
-        || !source.activation.authorizes_private_research()
     {
         return Err(TreasurySourceError::InvalidBackfillCheckpoint);
     }

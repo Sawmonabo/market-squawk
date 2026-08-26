@@ -12,13 +12,12 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{RawCaptureRecord, SealedResearchJournalStore};
 use market_squawk_sources::{
-    AuthorizationMode, BudgetWindowSemantics, CoverageDomain, DiscoveryBatch, DiscoveryRequest,
-    ExtractionAuthority, ExtractionBatch, ExtractionError, ExtractionRequest,
-    ExtractionRevisionEvidence, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
-    HistoricalCapability, ObservedProviderOrder, ProviderCaptureMaterial,
-    ProviderCaptureMaterialSealError, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition, SourceClass, SourceError, SourceMetadata,
-    SourceMetadataProvider, SourceProtocolProfile,
+    AuthorizationMode, CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
+    ExtractionBatch, ExtractionError, ExtractionRequest, ExtractionRevisionEvidence,
+    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HistoricalCapability,
+    ObservedProviderOrder, ProviderCaptureMaterial, ProviderCaptureMaterialSealError,
+    ProviderCapturePageReceipt, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -214,20 +213,16 @@ impl TreasurySourceConfig {
         crate::TreasuryDatasetCatalog::try_from_config(self)
     }
 
-    /// Binds exact configured datasets to the owner's private-research use authorization.
+    /// Binds the exact configured datasets into one provider-local activation identity.
     pub fn activation_intent(
         &self,
-        owner_use: crate::TreasuryOwnerUseAttestation,
     ) -> Result<crate::TreasuryActivationIntent, crate::TreasuryVerticalError> {
-        crate::TreasuryActivationIntent::try_new(self, owner_use)
+        crate::TreasuryActivationIntent::try_new(self)
     }
 
     /// Builds one bounded representative doctor request per configured Treasury family.
-    pub fn doctor_plan(
-        &self,
-        owner_use: crate::TreasuryOwnerUseAttestation,
-    ) -> Result<crate::TreasuryDoctorPlan, crate::TreasuryVerticalError> {
-        self.activation_intent(owner_use)?.doctor_plan(self)
+    pub fn doctor_plan(&self) -> Result<crate::TreasuryDoctorPlan, crate::TreasuryVerticalError> {
+        self.activation_intent()?.doctor_plan(self)
     }
 
     /// Returns the exact quality ceiling required by this profile.
@@ -656,17 +651,16 @@ impl TreasurySource {
     /// # Errors
     ///
     /// Fails closed unless the metadata authorizes this exact official-agency profile, coverage,
-    /// quality ceiling, network target and public-interface budget, and unless the source is bound
-    /// to the owner's closed private-research/non-sale/non-redistribution attestation.
+    /// quality ceiling, network target, and typed public-interface budget. Application composition
+    /// separately owns the provider lease and research-rights authority.
     pub fn try_new(
         metadata: SourceMetadata,
         config: TreasurySourceConfig,
-        owner_use: crate::TreasuryOwnerUseAttestation,
     ) -> Result<Self, TreasurySourceError> {
         Self::validate_metadata(&metadata, &config)?;
         let activation = config
-            .activation_intent(owner_use)
-            .map_err(|_| TreasurySourceError::InvalidOwnerUseAttestation)?;
+            .activation_intent()
+            .map_err(|_| TreasurySourceError::InvalidProtocol)?;
         let client = TreasuryHttpClient::try_new(&metadata)?;
         Ok(Self {
             metadata,
@@ -681,13 +675,12 @@ impl TreasurySource {
     fn try_new_with_transport(
         metadata: SourceMetadata,
         config: TreasurySourceConfig,
-        owner_use: crate::TreasuryOwnerUseAttestation,
         transport: Arc<dyn crate::client::TreasuryTransport>,
     ) -> Result<Self, TreasurySourceError> {
         Self::validate_metadata(&metadata, &config)?;
         let activation = config
-            .activation_intent(owner_use)
-            .map_err(|_| TreasurySourceError::InvalidOwnerUseAttestation)?;
+            .activation_intent()
+            .map_err(|_| TreasurySourceError::InvalidProtocol)?;
         let client = TreasuryHttpClient::try_new_with_transport(&metadata, transport)?;
         Ok(Self {
             metadata,
@@ -705,9 +698,6 @@ impl TreasurySource {
         let budget = metadata
             .budget_policy()
             .ok_or(TreasurySourceError::InvalidMetadata)?;
-        let budget_window = budget
-            .window(0)
-            .ok_or(TreasurySourceError::InvalidMetadata)?;
         if metadata.source_class() != SourceClass::OfficialAgency
             || metadata.provider().as_str() != "us-treasury"
             || metadata.authorization().mode() != AuthorizationMode::PublicInterface
@@ -715,11 +705,6 @@ impl TreasurySource {
             || metadata.quality_ceiling() != config.quality()
             || budget.scope().as_source_identifier().as_str() != "us-treasury"
             || budget.scope().authorization_account().is_some()
-            || budget.window_count() != 1
-            || budget_window.requests_per_window() != 1
-            || budget_window.window_nanos() != 1_000_000_000
-            || budget_window.semantics() != BudgetWindowSemantics::Sliding
-            || budget.max_concurrent() != 1
             || metadata.capabilities().live()
             || !metadata.capabilities().extraction()
             || metadata.capabilities().historical() != HistoricalCapability::Historical
@@ -748,7 +733,7 @@ impl TreasurySource {
         self.config.dataset_catalog()
     }
 
-    /// Returns the immutable owner-authorized activation bound at source construction.
+    /// Returns the immutable provider-local activation bound at source construction.
     pub const fn activation_intent(&self) -> &crate::TreasuryActivationIntent {
         &self.activation
     }
@@ -1425,11 +1410,6 @@ impl TreasurySource {
         &self,
         authority: &ExtractionAuthority,
     ) -> Result<(), ExtractionSourceError> {
-        if !self.activation.authorizes_private_research() {
-            return Err(ExtractionSourceError::Source(
-                SourceError::InvalidProtocolState,
-            ));
-        }
         authority.validate_current()?;
         if authority.metadata() != &self.metadata {
             return Err(ExtractionSourceError::Source(
@@ -1571,7 +1551,6 @@ fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {
         TreasurySourceError::DeadlineExceeded => ExtractionSourceError::DeadlineExceeded,
         TreasurySourceError::Source(error) => ExtractionSourceError::Source(error),
         TreasurySourceError::InvalidMetadata
-        | TreasurySourceError::InvalidOwnerUseAttestation
         | TreasurySourceError::InvalidBackfillCheckpoint
         | TreasurySourceError::BackfillIncomplete
         | TreasurySourceError::QueryBindingMismatch
@@ -1594,9 +1573,6 @@ pub enum TreasurySourceError {
     /// Metadata or registry authority does not authorize this source profile.
     #[error("Treasury source metadata is incompatible with the configured profile")]
     InvalidMetadata,
-    /// The source was not bound to the owner's closed private-research authorization.
-    #[error("Treasury owner-use attestation is missing or invalid")]
-    InvalidOwnerUseAttestation,
     /// A persisted all-history checkpoint or one of its retained page seals failed validation.
     #[error("Treasury all-history checkpoint is invalid")]
     InvalidBackfillCheckpoint,

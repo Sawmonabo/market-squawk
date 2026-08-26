@@ -42,122 +42,6 @@ pub enum TreasurySurface {
     DailyRatesXml,
 }
 
-/// Closed owner-authorized use set for Treasury data in this private research product.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TreasuryAuthorizedUse {
-    /// Retrieve exact provider responses.
-    Retrieve,
-    /// Display derived research inside the owner's private product.
-    Display,
-    /// Persist exact raw and canonical records.
-    Persist,
-    /// Transform provider records into canonical features and evidence.
-    Transform,
-    /// Run point-in-time-safe backtests.
-    Backtest,
-    /// Produce forecasts for private research.
-    Forecast,
-    /// Train models for the owner's private research.
-    TrainModel,
-    /// Operate trained models for the owner's private research.
-    OperateModel,
-}
-
-const TREASURY_PRIVATE_RESEARCH_USES: [TreasuryAuthorizedUse; 8] = [
-    TreasuryAuthorizedUse::Retrieve,
-    TreasuryAuthorizedUse::Display,
-    TreasuryAuthorizedUse::Persist,
-    TreasuryAuthorizedUse::Transform,
-    TreasuryAuthorizedUse::Backtest,
-    TreasuryAuthorizedUse::Forecast,
-    TreasuryAuthorizedUse::TrainModel,
-    TreasuryAuthorizedUse::OperateModel,
-];
-
-/// Provider-local binding of the owner's private/personal Treasury research decision.
-///
-/// This is not an independent rights lease or request authority. The application must derive its
-/// decision digest/time from the root `ResearchRightsAuthority`; every network request separately
-/// requires the source-bound, live `ExtractionAuthority`. The only constructor fixes the admitted
-/// operations above and fixes commercial sale and redistribution to prohibited, so this adapter
-/// cannot broaden the root decision.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TreasuryOwnerUseAttestation {
-    policy_version: &'static str,
-    owner_authorization_digest: EvidenceDigest,
-    decided_at: Timestamp,
-    permitted_uses: Box<[TreasuryAuthorizedUse]>,
-    commercial_sale_prohibited: bool,
-    redistribution_prohibited: bool,
-    attestation_digest: EvidenceDigest,
-}
-
-impl TreasuryOwnerUseAttestation {
-    /// Binds the owner's private-research decision to a stable, nonzero SHA-256 authority.
-    pub fn try_private_personal_research(
-        owner_authorization_digest: EvidenceDigest,
-        decided_at: Timestamp,
-    ) -> Result<Self, TreasuryVerticalError> {
-        if owner_authorization_digest.algorithm() != DigestAlgorithm::Sha256
-            || owner_authorization_digest.bytes() == [0; 32]
-        {
-            return Err(TreasuryVerticalError::InvalidOwnerUseAttestation);
-        }
-        let policy_version = "treasury-private-personal-research-v1";
-        let commercial_sale_prohibited = true;
-        let redistribution_prohibited = true;
-        let wire = serde_json::to_vec(&(
-            policy_version,
-            owner_authorization_digest,
-            decided_at,
-            TREASURY_PRIVATE_RESEARCH_USES,
-            commercial_sale_prohibited,
-            redistribution_prohibited,
-        ))
-        .map_err(|_| TreasuryVerticalError::InvalidOwnerUseAttestation)?;
-        let attestation_digest =
-            domain_separated_digest(b"market-squawk/treasury-owner-use-attestation/v1\0", &wire);
-        Ok(Self {
-            policy_version,
-            owner_authorization_digest,
-            decided_at,
-            permitted_uses: TREASURY_PRIVATE_RESEARCH_USES.into(),
-            commercial_sale_prohibited,
-            redistribution_prohibited,
-            attestation_digest,
-        })
-    }
-
-    /// Returns whether one private research operation is explicitly admitted.
-    pub fn permits(&self, operation: TreasuryAuthorizedUse) -> bool {
-        self.permitted_uses.contains(&operation)
-    }
-
-    /// Returns whether commercial sale is explicitly prohibited.
-    pub const fn commercial_sale_prohibited(&self) -> bool {
-        self.commercial_sale_prohibited
-    }
-
-    /// Returns whether redistribution is explicitly prohibited.
-    pub const fn redistribution_prohibited(&self) -> bool {
-        self.redistribution_prohibited
-    }
-
-    /// Returns the stable identity of this exact owner authorization and use policy.
-    pub const fn attestation_digest(&self) -> EvidenceDigest {
-        self.attestation_digest
-    }
-
-    fn admits_complete_private_research(&self) -> bool {
-        self.policy_version == "treasury-private-personal-research-v1"
-            && self.commercial_sale_prohibited
-            && self.redistribution_prohibited
-            && self.permitted_uses.as_ref() == TREASURY_PRIVATE_RESEARCH_USES
-    }
-}
-
 impl TreasurySurface {
     /// Returns the exact built-in onboarding/runtime profile identity.
     pub const fn profile_id(self) -> &'static str {
@@ -299,32 +183,24 @@ pub struct TreasuryDatasetCatalog {
     complete_selected_family_coverage: bool,
 }
 
-/// Exact configured Treasury inventory bound to the owner's private-research authority.
+/// Exact configured Treasury inventory bound to one adapter generation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TreasuryActivationIntent {
     catalog: TreasuryDatasetCatalog,
-    owner_use: TreasuryOwnerUseAttestation,
     intent_digest: EvidenceDigest,
 }
 
 impl TreasuryActivationIntent {
-    /// Constructs one provider activation intent without broadening the owner-authorized use set.
-    pub fn try_new(
-        config: &TreasurySourceConfig,
-        owner_use: TreasuryOwnerUseAttestation,
-    ) -> Result<Self, TreasuryVerticalError> {
-        if !owner_use.admits_complete_private_research() {
-            return Err(TreasuryVerticalError::InvalidOwnerUseAttestation);
-        }
+    /// Constructs one provider activation intent from the exact configured dataset inventory.
+    pub fn try_new(config: &TreasurySourceConfig) -> Result<Self, TreasuryVerticalError> {
         let catalog = TreasuryDatasetCatalog::try_from_config(config)?;
-        let wire = serde_json::to_vec(&(&catalog, &owner_use))
+        let wire = serde_json::to_vec(&catalog)
             .map_err(|_| TreasuryVerticalError::InvalidConfiguration)?;
         let intent_digest =
             domain_separated_digest(b"market-squawk/treasury-activation-intent/v1\0", &wire);
         Ok(Self {
             catalog,
-            owner_use,
             intent_digest,
         })
     }
@@ -334,18 +210,9 @@ impl TreasuryActivationIntent {
         &self.catalog
     }
 
-    /// Returns the owner authorization retained by this activation intent.
-    pub const fn owner_use(&self) -> &TreasuryOwnerUseAttestation {
-        &self.owner_use
-    }
-
-    /// Returns the stable identity of the inventory and owner-use authorization together.
+    /// Returns the stable identity of the exact configured inventory.
     pub const fn intent_digest(&self) -> EvidenceDigest {
         self.intent_digest
-    }
-
-    pub(crate) fn authorizes_private_research(&self) -> bool {
-        self.owner_use.admits_complete_private_research()
     }
 
     /// Builds one bounded representative doctor request per configured Treasury family.
@@ -356,11 +223,7 @@ impl TreasuryActivationIntent {
         if TreasuryDatasetCatalog::try_from_config(config)? != self.catalog {
             return Err(TreasuryVerticalError::InvalidConfiguration);
         }
-        self.catalog.doctor_plan(
-            config,
-            self.intent_digest,
-            self.owner_use.attestation_digest,
-        )
+        self.catalog.doctor_plan(config, self.intent_digest)
     }
 }
 
@@ -465,7 +328,6 @@ impl TreasuryDatasetCatalog {
         &self,
         config: &TreasurySourceConfig,
         activation_intent_digest: EvidenceDigest,
-        owner_use_attestation_digest: EvidenceDigest,
     ) -> Result<TreasuryDoctorPlan, TreasuryVerticalError> {
         if Self::try_from_config(config)? != *self {
             return Err(TreasuryVerticalError::InvalidConfiguration);
@@ -521,7 +383,6 @@ impl TreasuryDatasetCatalog {
             surface: self.surface,
             complete_selected_family_coverage: self.complete_selected_family_coverage,
             activation_intent_digest,
-            owner_use_attestation_digest,
             probes: probes.into_boxed_slice(),
         })
     }
@@ -815,7 +676,6 @@ pub struct TreasuryDoctorPlan {
     surface: TreasurySurface,
     complete_selected_family_coverage: bool,
     activation_intent_digest: EvidenceDigest,
-    owner_use_attestation_digest: EvidenceDigest,
     probes: Box<[TreasuryDoctorProbe]>,
 }
 
@@ -906,7 +766,6 @@ impl TreasuryDoctorPlan {
         Ok(TreasuryDoctorReceipt {
             surface: self.surface,
             activation_intent_digest: self.activation_intent_digest,
-            owner_use_attestation_digest: self.owner_use_attestation_digest,
             planned_probe_count: u16::try_from(self.probes.len())
                 .map_err(|_| TreasuryVerticalError::AccountingOverflow)?,
             observed_probe_count: u16::try_from(observations.len())
@@ -982,7 +841,6 @@ impl TreasuryDoctorObservation {
 pub struct TreasuryDoctorReceipt {
     surface: TreasurySurface,
     activation_intent_digest: EvidenceDigest,
-    owner_use_attestation_digest: EvidenceDigest,
     planned_probe_count: u16,
     observed_probe_count: u16,
     complete_selected_family_coverage: bool,
@@ -1553,7 +1411,6 @@ pub struct TreasuryPublicationExpectation {
     source_id: SourceId,
     metadata_revision: MetadataRevision,
     activation_intent_digest: EvidenceDigest,
-    owner_use_attestation_digest: EvidenceDigest,
     canonical_schema: SourceIdentifier,
     expected_append_rows: u64,
     expected_extraction_contents: Box<[EvidenceDigest]>,
@@ -1577,7 +1434,6 @@ impl TreasuryPublicationExpectation {
                 .catalog
                 .dataset(discovery.descriptor.provider_dataset())
                 != Some(&discovery.descriptor)
-            || !activation.owner_use.admits_complete_private_research()
         {
             return Err(TreasuryVerticalError::InvalidPublication);
         }
@@ -1668,9 +1524,7 @@ impl TreasuryPublicationExpectation {
         if descriptor.publication_mode != TreasuryPublicationMode::ResumableBackfill
             || descriptor.period != TreasuryDatasetPeriod::AllHistory
             || activation.catalog.dataset(descriptor.provider_dataset()) != Some(descriptor)
-            || !activation.owner_use.admits_complete_private_research()
             || completion.activation_intent_digest() != activation.intent_digest
-            || completion.owner_use_attestation_digest() != activation.owner_use.attestation_digest
             || completion.source_id() != metadata.source_id()
             || completion.metadata_revision() != metadata.revision()
             || completion.provider_snapshot_isolation_claimed()
@@ -1740,7 +1594,6 @@ impl TreasuryPublicationExpectation {
             metadata.source_id(),
             metadata.revision(),
             activation.intent_digest,
-            activation.owner_use.attestation_digest,
             &canonical_schema,
             expected_append_rows,
             &expected_extraction_contents,
@@ -1755,7 +1608,6 @@ impl TreasuryPublicationExpectation {
             source_id: metadata.source_id().clone(),
             metadata_revision: metadata.revision().clone(),
             activation_intent_digest: activation.intent_digest,
-            owner_use_attestation_digest: activation.owner_use.attestation_digest,
             canonical_schema,
             expected_append_rows,
             expected_extraction_contents: expected_extraction_contents.into_boxed_slice(),
@@ -1789,11 +1641,6 @@ impl TreasuryPublicationExpectation {
     /// Returns the exact owner-authorized activation identity expected by the generation bridge.
     pub const fn activation_intent_digest(&self) -> EvidenceDigest {
         self.activation_intent_digest
-    }
-
-    /// Returns the exact owner-use policy expected by the generation bridge.
-    pub const fn owner_use_attestation_digest(&self) -> EvidenceDigest {
-        self.owner_use_attestation_digest
     }
 
     /// Returns the canonical record schema required for every appended object.
@@ -2039,9 +1886,6 @@ fn captures_match_dataset(
 /// Treasury activation, doctor, accounting, or immutable-publication contract failure.
 #[derive(Debug, Error)]
 pub enum TreasuryVerticalError {
-    /// Owner authority is absent, malformed, or attempts to broaden the private-use policy.
-    #[error("Treasury owner-use attestation is invalid")]
-    InvalidOwnerUseAttestation,
     /// The source configuration cannot produce a coherent exact dataset catalog.
     #[error("Treasury dataset configuration is invalid")]
     InvalidConfiguration,

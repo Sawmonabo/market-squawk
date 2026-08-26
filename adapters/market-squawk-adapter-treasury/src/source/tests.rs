@@ -15,11 +15,11 @@ use market_squawk_domain::{
 use market_squawk_platform::LocalPaths;
 use market_squawk_sources::{
     ApiEndpointRule, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
-    BackoffPolicy, BudgetScope, BudgetWindowSemantics, CoverageDomain, DiscoveryRequest,
-    EndpointPolicy, ExtractionRequest, ExtractionSource, FreshnessPolicy, HistoricalCapability,
-    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow, QueryParameterRule,
-    QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
-    SourceMetadataInput, SourceProtocolProfile,
+    BackoffPolicy, BudgetScope, CoverageDomain, DiscoveryRequest, EndpointPolicy,
+    ExtractionRequest, ExtractionSource, FreshnessPolicy, HistoricalCapability,
+    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, QueryParameterRule, QuerySensitivity,
+    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
+    SourceProtocolProfile,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -30,8 +30,7 @@ use crate::client::{
 };
 use crate::{
     TreasuryDailyRateFamily, TreasuryDailyRateQuery, TreasuryDailyRatesConfig,
-    TreasuryExtractionCommitment, TreasuryFiscalQuery, TreasuryOwnerUseAttestation,
-    TreasurySourceConfig,
+    TreasuryExtractionCommitment, TreasuryFiscalQuery, TreasurySourceConfig,
 };
 
 use super::TreasurySource;
@@ -100,6 +99,20 @@ async fn authority_bound_sources_emit_canonical_fiscal_and_daily_rate_records() 
         NonZeroU16::new(1).ok_or("nonzero page size")?,
     )?;
     let fiscal_config = TreasurySourceConfig::average_interest_rates(fiscal_query);
+    assert!(
+        TreasurySource::try_new(
+            metadata(now, &fiscal_config, DataQuality::OfficialDelayed)?,
+            fiscal_config.clone(),
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        TreasurySource::try_new(
+            metadata(now, &fiscal_config, DataQuality::DirectUnverified)?,
+            fiscal_config.clone(),
+        ),
+        Err(super::TreasurySourceError::InvalidMetadata)
+    ));
     let mut fiscal_payload: serde_json::Value =
         serde_json::from_slice(include_bytes!("../../fixtures/average_interest_rates.json"))?;
     fiscal_payload["meta"]["total-count"] = serde_json::json!(1);
@@ -177,12 +190,8 @@ async fn fiscal_discovery_rejects_a_result_limit_before_the_provider_terminal_pa
         }])),
         requested_urls: Mutex::new(Vec::new()),
     });
-    let source = TreasurySource::try_new_with_transport(
-        source_metadata.clone(),
-        config,
-        owner_use_attestation(now)?,
-        transport.clone(),
-    )?;
+    let source =
+        TreasurySource::try_new_with_transport(source_metadata.clone(), config, transport.clone())?;
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(source_metadata, now)?;
     let authority = registry.extraction_authority(&registered, &source)?;
@@ -257,12 +266,8 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
         ])),
         requested_urls: Mutex::new(Vec::new()),
     });
-    let source = TreasurySource::try_new_with_transport(
-        source_metadata.clone(),
-        config,
-        owner_use_attestation(now)?,
-        transport,
-    )?;
+    let source =
+        TreasurySource::try_new_with_transport(source_metadata.clone(), config, transport)?;
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(source_metadata, now)?;
     let authority = registry.extraction_authority(&registered, &source)?;
@@ -367,12 +372,8 @@ async fn exercise_source(
         responses: Mutex::new(VecDeque::from([response(), response(), response()])),
         requested_urls: Mutex::new(Vec::new()),
     });
-    let source = TreasurySource::try_new_with_transport(
-        metadata.clone(),
-        config,
-        owner_use_attestation(now)?,
-        transport.clone(),
-    )?;
+    let source =
+        TreasurySource::try_new_with_transport(metadata.clone(), config, transport.clone())?;
     let catalog = source.dataset_catalog()?;
     let activation = source.activation_intent();
     assert_eq!(activation.catalog(), &catalog);
@@ -516,16 +517,6 @@ async fn exercise_source(
     Ok(extraction.records().to_vec())
 }
 
-fn owner_use_attestation(now: Timestamp) -> TestResult<TreasuryOwnerUseAttestation> {
-    Ok(TreasuryOwnerUseAttestation::try_private_personal_research(
-        EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            Sha256::digest(b"owner-authorized-private-treasury-research").into(),
-        ),
-        now,
-    )?)
-}
-
 fn assert_macro_record(
     record: &market_squawk_sources::ExtractionRecord,
     series: &str,
@@ -649,14 +640,11 @@ fn metadata(
         vec![endpoint],
         market_squawk_sources::HttpRequestBounds::default(),
     )?;
-    let budget = ProviderBudgetPolicy::try_new_conjunctive(
+    let budget = ProviderBudgetPolicy::try_new(
         BudgetScope::new(provider.clone()),
-        &[ProviderBudgetWindow::try_new(
-            NonZeroU32::new(1).ok_or("nonzero request budget")?,
-            NonZeroU64::new(1_000_000_000).ok_or("nonzero request window")?,
-            BudgetWindowSemantics::Sliding,
-        )?],
-        NonZeroU16::new(1).ok_or("nonzero concurrency")?,
+        NonZeroU32::new(100).ok_or("nonzero request budget")?,
+        NonZeroU64::new(60_000_000_000).ok_or("nonzero request window")?,
+        NonZeroU16::new(2).ok_or("nonzero concurrency")?,
         BackoffPolicy::try_new(
             NonZeroU64::new(1_000_000).ok_or("nonzero backoff")?,
             NonZeroU64::new(60_000_000_000).ok_or("nonzero max backoff")?,
