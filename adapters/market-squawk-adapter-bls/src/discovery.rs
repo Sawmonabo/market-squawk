@@ -4,9 +4,11 @@ use std::sync::Arc;
 
 use market_squawk_domain::{EvidenceDigest, Timestamp};
 use market_squawk_sources::{
-    DiscoveryBatch, ExtractionRequest, ProviderCaptureMaterial, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt, SourceObject,
-    SourceObjectCaptureIdentity, payload_matches_exact_evidence,
+    DiscoveryBatch, ExtractionBatch, ExtractionRequest, ProviderCaptureComponentToken,
+    ProviderCaptureMaterial, ProviderCaptureSealExpectation, ProviderCaptureSealRequest,
+    ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch, ProviderWholeCaptureToken,
+    SealedProviderCaptureBinding, SealedProviderCaptureMaterial, SealedProviderCaptureSetReceipt,
+    SourceObject, SourceObjectCaptureIdentity, payload_matches_exact_evidence,
 };
 
 use crate::client::RetrievedBlsPage;
@@ -60,17 +62,27 @@ impl BlsDiscoveryOutput {
     }
 
     /// Separates root-owned sealing work from the private pending admission coordinate.
-    pub fn into_sealing_parts(self) -> (BlsPendingDiscovery, ProviderCaptureMaterial) {
-        let capture_receipt = self.capture_material.receipt().clone();
-        (
+    pub fn into_sealing_parts(
+        self,
+    ) -> Result<(BlsPendingDiscovery, ProviderCaptureSealRequest), BlsSourceError> {
+        let component_scoped = self.batch.objects().len() > 1;
+        let (capture_expectation, seal_request) = if component_scoped {
+            self.capture_material
+                .into_component_seal_parts()
+                .map_err(|_| BlsSourceError::InvalidPublication)?
+        } else {
+            self.capture_material.into_whole_seal_parts()
+        };
+        Ok((
             BlsPendingDiscovery {
                 batch: self.batch,
-                capture_receipt,
+                capture_expectation,
+                component_scoped,
                 retained_pages: self.retained_pages,
                 source_generation_digest: self.source_generation_digest,
             },
-            self.capture_material,
-        )
+            seal_request,
+        ))
     }
 }
 
@@ -78,9 +90,81 @@ impl BlsDiscoveryOutput {
 #[derive(Debug)]
 pub struct BlsPendingDiscovery {
     batch: DiscoveryBatch,
-    capture_receipt: ProviderCaptureSetReceipt,
+    capture_expectation: ProviderCaptureSealExpectation,
+    component_scoped: bool,
     retained_pages: Box<[RetrievedBlsPage]>,
     source_generation_digest: EvidenceDigest,
+}
+
+#[derive(Debug)]
+pub(crate) enum BlsDiscoveryCaptureToken {
+    Whole(ProviderWholeCaptureToken),
+    Component(ProviderCaptureComponentToken),
+}
+
+impl BlsDiscoveryCaptureToken {
+    fn persisted_receipt(&self) -> &SealedProviderCaptureSetReceipt {
+        match self {
+            Self::Whole(token) => token.persisted_receipt(),
+            Self::Component(token) => token.persisted_receipt(),
+        }
+    }
+
+    fn component_ordinal(&self) -> Option<u16> {
+        match self {
+            Self::Whole(_) => None,
+            Self::Component(token) => Some(token.ordinal()),
+        }
+    }
+
+    pub(crate) fn try_bind(
+        self,
+        batch: ExtractionBatch,
+        native_lineage: ProviderNativeLineageBatch,
+        row_capture_page_ordinals: Vec<u16>,
+    ) -> Result<SealedProviderCaptureBinding, BlsSourceError> {
+        match self {
+            Self::Whole(token) => SealedProviderCaptureBinding::try_whole(
+                token,
+                batch,
+                native_lineage,
+                row_capture_page_ordinals,
+            ),
+            Self::Component(token) => SealedProviderCaptureBinding::try_component(
+                token,
+                batch,
+                native_lineage,
+                row_capture_page_ordinals,
+            ),
+        }
+        .map_err(|_| BlsSourceError::InvalidPublication)
+    }
+}
+
+#[derive(Debug)]
+struct RetainedDiscoverySelections {
+    admissions: Vec<BlsDiscoveryObjectAdmission>,
+}
+
+impl RetainedDiscoverySelections {
+    fn try_new(
+        admissions: Vec<BlsDiscoveryObjectAdmission>,
+        expected: usize,
+    ) -> Result<Self, BlsSourceError> {
+        if admissions.len() != expected
+            || admissions
+                .iter()
+                .enumerate()
+                .any(|(ordinal, admission)| admission.chunk_index() != ordinal)
+        {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        Ok(Self { admissions })
+    }
+
+    fn into_admissions(self) -> Box<[BlsDiscoveryObjectAdmission]> {
+        self.admissions.into_boxed_slice()
+    }
 }
 
 impl BlsPendingDiscovery {
@@ -99,22 +183,64 @@ pub struct BlsDiscoveryAdmission {
 impl BlsDiscoveryAdmission {
     pub(crate) fn try_new(
         pending: BlsPendingDiscovery,
-        sealed_capture: SealedProviderCaptureSetReceipt,
+        sealed_capture: SealedProviderCaptureMaterial,
         expected_runtime_instance: &Arc<BlsRuntimeInstanceCapability>,
         activation: &BlsActivationCandidate,
-    ) -> Result<(Self, Box<[RetrievedBlsPage]>), BlsSourceError> {
+    ) -> Result<Self, BlsSourceError> {
+        let BlsPendingDiscovery {
+            batch,
+            capture_expectation,
+            component_scoped,
+            retained_pages,
+            source_generation_digest,
+        } = pending;
+        let rejoined = capture_expectation
+            .try_rejoin(sealed_capture)
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
+        let capture_tokens = if component_scoped {
+            let tokens = rejoined
+                .try_into_components()
+                .map_err(|_| BlsSourceError::InvalidPublication)?
+                .into_tokens();
+            let mut capture_tokens = Vec::new();
+            capture_tokens
+                .try_reserve_exact(tokens.len())
+                .map_err(|_| BlsSourceError::InvalidPublication)?;
+            capture_tokens.extend(
+                tokens
+                    .into_vec()
+                    .into_iter()
+                    .map(BlsDiscoveryCaptureToken::Component),
+            );
+            capture_tokens
+        } else {
+            let mut capture_tokens = Vec::new();
+            capture_tokens
+                .try_reserve_exact(1)
+                .map_err(|_| BlsSourceError::InvalidPublication)?;
+            capture_tokens.push(BlsDiscoveryCaptureToken::Whole(
+                rejoined
+                    .try_into_whole()
+                    .map_err(|_| BlsSourceError::InvalidPublication)?,
+            ));
+            capture_tokens
+        };
         if !Arc::ptr_eq(activation.runtime_instance(), expected_runtime_instance)
-            || pending.source_generation_digest != activation.plan().plan_digest()
-            || sealed_capture.capture() != &pending.capture_receipt
-            || sealed_capture.receipt_digest().bytes() == [0; 32]
+            || source_generation_digest != activation.plan().plan_digest()
         {
             return Err(BlsSourceError::InvalidPublication);
         }
 
-        let capture = sealed_capture.capture();
-        let chunk_count = pending.batch.objects().len();
+        let chunk_count = batch.objects().len();
+        let root_receipt = capture_tokens
+            .first()
+            .map(BlsDiscoveryCaptureToken::persisted_receipt)
+            .ok_or(BlsSourceError::InvalidPublication)?;
+        let root_receipt_digest = root_receipt.receipt_digest();
+        let capture = root_receipt.capture();
         if chunk_count == 0
-            || pending.retained_pages.len() != chunk_count
+            || retained_pages.len() != chunk_count
+            || capture_tokens.len() != chunk_count
             || capture.pages().len() != chunk_count
             || (chunk_count == 1
                 && (capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
@@ -126,17 +252,19 @@ impl BlsDiscoveryAdmission {
             return Err(BlsSourceError::InvalidPublication);
         }
 
-        let mut objects = Vec::new();
-        objects
+        let mut selections = Vec::new();
+        selections
             .try_reserve_exact(chunk_count)
             .map_err(|_| BlsSourceError::InvalidPublication)?;
-        for (expected_index, (object, retained_page)) in pending
-            .batch
+        for (expected_index, ((object, retained_page), capture_token)) in batch
             .objects()
             .iter()
-            .zip(pending.retained_pages.iter())
+            .zip(retained_pages.into_vec())
+            .zip(capture_tokens)
             .enumerate()
         {
+            let sealed_capture = capture_token.persisted_receipt();
+            let capture = sealed_capture.capture();
             let (object_index, object_digest) = crate::source::parse_object_id(object.object_id())
                 .map_err(|_| BlsSourceError::InvalidPublication)?;
             let page = capture
@@ -181,7 +309,13 @@ impl BlsDiscoveryAdmission {
                 terminal: component_terminal,
             };
             if object_index != expected_index
-                || object.discovery_request_id() != pending.batch.request().request_id()
+                || capture_token.component_ordinal()
+                    != component_scoped.then_some(
+                        u16::try_from(expected_index)
+                            .map_err(|_| BlsSourceError::InvalidPublication)?,
+                    )
+                || sealed_capture.receipt_digest() != root_receipt_digest
+                || object.discovery_request_id() != batch.request().request_id()
                 || object.capture_identity() != expected_capture_identity
                 || object.evidence().content_digest() != page.body_digest()
                 || object.expected_bytes() != Some(page.body_bytes())
@@ -194,7 +328,7 @@ impl BlsDiscoveryAdmission {
             {
                 return Err(BlsSourceError::InvalidPublication);
             }
-            objects.push(BlsDiscoveryObjectAdmission {
+            selections.push(BlsDiscoveryObjectAdmission {
                 object: object.clone(),
                 chunk_index: u16::try_from(expected_index)
                     .map_err(|_| BlsSourceError::InvalidPublication)?,
@@ -202,22 +336,17 @@ impl BlsDiscoveryAdmission {
                 component_content_digest,
                 component_observation_digest,
                 response_received_at: page.received_at(),
-                sealed_discovery_capture: sealed_capture.clone(),
+                capture_token,
+                retained_page,
                 runtime_instance: Arc::clone(expected_runtime_instance),
                 activation_candidate_digest: activation.candidate_digest(),
-                source_generation_digest: pending.source_generation_digest,
+                source_generation_digest,
             });
         }
-        Ok((
-            Self {
-                objects: objects.into_boxed_slice(),
-            },
-            pending.retained_pages,
-        ))
-    }
-
-    pub(crate) fn objects(&self) -> &[BlsDiscoveryObjectAdmission] {
-        &self.objects
+        let retained = RetainedDiscoverySelections::try_new(selections, chunk_count)?;
+        Ok(Self {
+            objects: retained.into_admissions(),
+        })
     }
 
     /// Returns the exact number of one-shot object admissions.
@@ -240,7 +369,8 @@ pub struct BlsDiscoveryObjectAdmission {
     component_content_digest: EvidenceDigest,
     component_observation_digest: EvidenceDigest,
     response_received_at: Timestamp,
-    sealed_discovery_capture: SealedProviderCaptureSetReceipt,
+    capture_token: BlsDiscoveryCaptureToken,
+    retained_page: RetrievedBlsPage,
     runtime_instance: Arc<BlsRuntimeInstanceCapability>,
     activation_candidate_digest: EvidenceDigest,
     source_generation_digest: EvidenceDigest,
@@ -264,7 +394,12 @@ impl BlsDiscoveryObjectAdmission {
             || self.activation_candidate_digest != activation.candidate_digest()
             || self.source_generation_digest != activation.plan().plan_digest()
             || request.deadline() >= activation.expires_at()
-            || self.sealed_discovery_capture.receipt_digest().bytes() == [0; 32]
+            || self
+                .capture_token
+                .persisted_receipt()
+                .receipt_digest()
+                .bytes()
+                == [0; 32]
         {
             return Err(BlsSourceError::InvalidPublication);
         }
@@ -279,8 +414,12 @@ impl BlsDiscoveryObjectAdmission {
         self.response_received_at
     }
 
-    pub(crate) const fn sealed_discovery_capture(&self) -> &SealedProviderCaptureSetReceipt {
-        &self.sealed_discovery_capture
+    pub(crate) fn sealed_discovery_capture(&self) -> &SealedProviderCaptureSetReceipt {
+        self.capture_token.persisted_receipt()
+    }
+
+    pub(crate) const fn retained_page(&self) -> &RetrievedBlsPage {
+        &self.retained_page
     }
 
     pub(crate) const fn component_request_identity(&self) -> EvidenceDigest {
@@ -306,12 +445,16 @@ impl BlsDiscoveryObjectAdmission {
     pub(crate) fn runtime_instance(&self) -> &Arc<BlsRuntimeInstanceCapability> {
         &self.runtime_instance
     }
+
+    pub(crate) fn into_capture_token(self) -> BlsDiscoveryCaptureToken {
+        self.capture_token
+    }
 }
 
 fn validate_object_component(
     admission: &BlsDiscoveryObjectAdmission,
 ) -> Result<(), BlsSourceError> {
-    let capture = admission.sealed_discovery_capture.capture();
+    let capture = admission.capture_token.persisted_receipt().capture();
     let index = admission.chunk_index();
     let page = capture
         .pages()
@@ -342,6 +485,21 @@ fn validate_object_component(
         || page.body_digest() != admission.object.evidence().content_digest()
         || page.received_at() != admission.response_received_at
         || admission.object.effective_interval().starts_at() != admission.response_received_at
+        || admission.retained_page.received_at != admission.response_received_at
+        || admission.retained_page.sha256_hex
+            != admission
+                .object
+                .object_id()
+                .as_str()
+                .rsplit(':')
+                .next()
+                .ok_or(BlsSourceError::InvalidPublication)?
+        || u64::try_from(admission.retained_page.bytes.len()).ok()
+            != admission.object.expected_bytes()
+        || !payload_matches_exact_evidence(
+            &admission.retained_page.bytes,
+            admission.object.evidence(),
+        )
     {
         return Err(BlsSourceError::InvalidPublication);
     }

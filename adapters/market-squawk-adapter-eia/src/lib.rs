@@ -17,8 +17,8 @@ mod types;
 mod wire;
 
 pub use canonical::{
-    EiaCanonicalObservation, EiaPublicationCandidate, EiaPublicationRejoin, EiaPublishedSeries,
-    EiaSharedPublicationParts,
+    EiaCanonicalObservation, EiaPublicationCandidate, EiaPublicationPolicyEvidence,
+    EiaPublicationRejoin, EiaPublishedSeries, EiaSharedPublicationParts,
 };
 pub use capacity::{
     EIA_APPLICATION_MAX_CONCURRENT_REQUESTS, EIA_APPLICATION_MIN_REQUEST_INTERVAL,
@@ -29,14 +29,13 @@ pub use data::{
     EiaClockField, EiaClockKind, EiaDataFieldContract, EiaDataFieldContractInput, EiaDataPage,
     EiaDataPageReceipt, EiaDatasetContract, EiaDatasetContractInput, EiaDescriptor,
     EiaFacetCoordinate, EiaMissingPolicy, EiaNativeMissingValue, EiaNativeValue, EiaObservation,
-    EiaObservationClocks, EiaObservationConflict, EiaObservationFamily, EiaPageCompleteness,
-    EiaPaginationTracker, EiaPeriod, EiaPeriodKind, EiaRevisionDisposition, EiaRevisionHead,
-    EiaRevisionPlanEntry, EiaSeriesIdentity, EiaUnitSource, EiaValueKind, plan_revisions,
+    EiaObservationClocks, EiaObservationFamily, EiaPageCompleteness, EiaPaginationTracker,
+    EiaPeriod, EiaPeriodKind, EiaSeriesIdentity, EiaUnitSource, EiaValueKind,
 };
 pub use error::EiaError;
 pub use lifecycle::{
-    EiaActivatedProvider, EiaActivationCandidate, EiaActivationRequirements, EiaDatasetProfile,
-    EiaDoctorOutput, EiaDoctorReport, EiaLifecycleError, EiaPublicationMode, run_eia_doctor,
+    EiaActivatedProvider, EiaActivationRequirements, EiaDatasetProfile, EiaDoctorOutput,
+    EiaDoctorReport, EiaLifecycleError, EiaPendingActivation, EiaPublicationMode, run_eia_doctor,
 };
 pub use metadata::{
     EiaChildRoute, EiaDataColumnMetadata, EiaFacetCatalog, EiaFacetMetadata,

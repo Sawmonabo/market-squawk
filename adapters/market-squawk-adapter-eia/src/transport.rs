@@ -19,9 +19,11 @@ use market_squawk_sources::{
     HttpRequestBounds, MAX_OBSERVED_REVISION_BATCH_BYTES, MAX_PROVIDER_CAPTURE_BYTES,
     MAX_PROVIDER_CAPTURE_PAGE_BYTES, MAX_PROVIDER_CAPTURE_PAGES, NetworkAccessPolicy,
     NetworkPolicyError, PathScope, ProviderCaptureError, ProviderCaptureMaterial,
-    ProviderCapturePageReceipt, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    QueryParameterRule, QuerySensitivity, SealedProviderCaptureSetReceipt, SourceClass,
-    SourceError, SourceMetadata, SourceMetadataProvider,
+    ProviderCapturePageReceipt, ProviderCaptureSealExpectation, ProviderCaptureSealRequest,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderOrderedCaptureSegments,
+    ProviderWholeCaptureToken, QueryParameterRule, QuerySensitivity, SealedProviderCaptureMaterial,
+    SealedProviderCaptureSetReceipt, SourceClass, SourceError, SourceMetadata,
+    SourceMetadataProvider,
 };
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER, USER_AGENT,
@@ -208,7 +210,7 @@ impl EiaRawPageMaterial {
 }
 
 /// One route-metadata discovery result with complete standalone raw lineage.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct EiaRouteMetadataRetrieval {
     metadata: EiaRouteMetadata,
     raw: EiaRawPageMaterial,
@@ -436,7 +438,7 @@ pub struct EiaDataAcquisitionCursor {
     pagination_tracker: Option<EiaPaginationTracker>,
     typed_pages: Vec<EiaDataPage>,
     page_materials: Vec<EiaDataPageMaterial>,
-    sealed_pages: Vec<SealedProviderCaptureSetReceipt>,
+    sealed_pages: Vec<ProviderWholeCaptureToken>,
 }
 
 impl EiaDataAcquisitionCursor {
@@ -459,14 +461,18 @@ impl EiaDataAcquisitionCursor {
 /// One fetched page whose exact root-journal seal must be rejoined before any next-page request.
 #[derive(Debug)]
 pub struct EiaPendingDataPage {
-    rejoin: EiaDataPageSealRejoin,
+    cursor: EiaDataAcquisitionCursor,
+    typed_page: EiaDataPage,
+    page_material: EiaDataPageMaterial,
+    page_capture_receipt: ProviderCaptureSetReceipt,
+    raw_capture_copy_retained_bytes: usize,
     capture: ProviderCaptureMaterial,
 }
 
 impl EiaPendingDataPage {
     /// Returns the actual typed/raw page and its exact root-journal coordinates before sealing.
     pub const fn page_material(&self) -> &EiaDataPageMaterial {
-        &self.rejoin.page_material
+        &self.page_material
     }
 
     /// Returns the standalone exact page capture root must durably seal.
@@ -475,8 +481,19 @@ impl EiaPendingDataPage {
     }
 
     /// Consumes the pending page into a linear rejoin state and actual shared capture material.
-    pub fn into_parts(self) -> (EiaDataPageSealRejoin, ProviderCaptureMaterial) {
-        (self.rejoin, self.capture)
+    pub fn into_parts(self) -> (EiaDataPageSealRejoin, ProviderCaptureSealRequest) {
+        let (capture_expectation, seal_request) = self.capture.into_whole_seal_parts();
+        (
+            EiaDataPageSealRejoin {
+                cursor: self.cursor,
+                typed_page: self.typed_page,
+                page_material: self.page_material,
+                page_capture_receipt: self.page_capture_receipt,
+                raw_capture_copy_retained_bytes: self.raw_capture_copy_retained_bytes,
+                capture_expectation,
+            },
+            seal_request,
+        )
     }
 }
 
@@ -488,6 +505,7 @@ pub struct EiaDataPageSealRejoin {
     page_material: EiaDataPageMaterial,
     page_capture_receipt: ProviderCaptureSetReceipt,
     raw_capture_copy_retained_bytes: usize,
+    capture_expectation: ProviderCaptureSealExpectation,
 }
 
 impl EiaDataPageSealRejoin {
@@ -503,7 +521,7 @@ pub enum EiaDataPageTransition {
     /// Root sealed the page and the provider total requires one exact next offset.
     More(EiaDataAcquisitionCursor),
     /// Root sealed the terminal page and the complete ordered chain is nonpublishable until its
-    /// assembled capture material is also sealed for canonical candidate construction.
+    /// standalone page seals are consumed into canonical candidate construction.
     Complete(EiaDataRetrieval),
 }
 
@@ -563,28 +581,24 @@ impl EiaDataTransportReceipt {
 }
 
 /// Complete typed EIA acquisition plus bounded raw and terminal capture evidence.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct EiaDataRetrieval {
     dataset: SourceIdentifier,
     acquisition: EiaAcquisition,
     pages: Box<[EiaDataPageMaterial]>,
-    sealed_pages: Box<[SealedProviderCaptureSetReceipt]>,
-    capture: ProviderCaptureMaterial,
+    ordered_capture: ProviderOrderedCaptureSegments,
     transport: EiaDataTransportReceipt,
 }
 
-/// Linear terminal state retained while root seals the complete combined capture material.
+/// Linear terminal state carrying one ordered physical segment per exact logical response page.
 ///
-/// This value has no public constructor or serialization. It preserves the typed acquisition,
-/// ordered page materials, and every already-sealed standalone page while the one-shot combined
-/// [`ProviderCaptureMaterial`] is consumed by the shared immutable store.
-#[derive(Debug, Eq, PartialEq)]
+/// This value has no public constructor or serialization and requires no combined reseal.
+#[derive(Debug)]
 pub struct EiaDataRetrievalSealRejoin {
     dataset: SourceIdentifier,
     acquisition: EiaAcquisition,
     pages: Box<[EiaDataPageMaterial]>,
-    sealed_pages: Box<[SealedProviderCaptureSetReceipt]>,
-    capture_receipt: ProviderCaptureSetReceipt,
+    ordered_capture: ProviderOrderedCaptureSegments,
     transport: EiaDataTransportReceipt,
 }
 
@@ -648,21 +662,19 @@ impl EiaDataRetrieval {
         &self.pages
     }
 
-    /// Returns the actual standalone root-journal seal for every page in exact chain order.
-    pub fn sealed_pages(&self) -> &[SealedProviderCaptureSetReceipt] {
-        &self.sealed_pages
+    /// Returns the exact number of standalone physical page seals retained in chain order.
+    pub fn sealed_page_count(&self) -> usize {
+        self.ordered_capture.segment_count()
+    }
+
+    /// Returns persisted evidence for one standalone physical page seal.
+    pub fn sealed_page_receipt(&self, ordinal: usize) -> Option<&SealedProviderCaptureSetReceipt> {
+        self.ordered_capture.persisted_segment_receipt(ordinal)
     }
 
     /// Returns the terminal source-neutral capture receipt.
     pub const fn capture_receipt(&self) -> &ProviderCaptureSetReceipt {
-        self.capture.receipt()
-    }
-
-    /// Returns the terminal receipt and ordered sanitized raw records ready for `MSJ1` sealing.
-    ///
-    /// Application composition must durably seal this material before canonical publication.
-    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
-        &self.capture
+        self.ordered_capture.root_capture()
     }
 
     /// Returns exact aggregate request, row, byte, missing, and latency metrics.
@@ -670,41 +682,34 @@ impl EiaDataRetrieval {
         self.transport
     }
 
-    /// Splits only at the root sealing boundary. The linear rejoin cannot publish and accepts only
-    /// the exact actual combined seal produced from the returned one-shot capture material.
-    pub fn into_seal_parts(self) -> (EiaDataRetrievalSealRejoin, ProviderCaptureMaterial) {
+    /// Consumes the terminal acquisition into canonical-publication rejoin without resealing.
+    pub fn into_publication_rejoin(self) -> EiaDataRetrievalSealRejoin {
         let Self {
             dataset,
             acquisition,
             pages,
-            sealed_pages,
-            capture,
+            ordered_capture,
             transport,
         } = self;
-        let capture_receipt = capture.receipt().clone();
-        (
-            EiaDataRetrievalSealRejoin {
-                dataset,
-                acquisition,
-                pages,
-                sealed_pages,
-                capture_receipt,
-                transport,
-            },
-            capture,
-        )
+        EiaDataRetrievalSealRejoin {
+            dataset,
+            acquisition,
+            pages,
+            ordered_capture,
+            transport,
+        }
     }
 }
 
 impl EiaDataRetrievalSealRejoin {
-    /// Returns the expected terminal combined capture receipt before physical-seal rejoin.
+    /// Returns the complete logical capture joined to its ordered standalone physical seals.
     pub const fn capture_receipt(&self) -> &ProviderCaptureSetReceipt {
-        &self.capture_receipt
+        self.ordered_capture.root_capture()
     }
 
-    /// Returns the actual standalone root-journal page seals in exact acquisition order.
-    pub fn sealed_pages(&self) -> &[SealedProviderCaptureSetReceipt] {
-        &self.sealed_pages
+    /// Returns persisted evidence for one standalone physical page seal.
+    pub fn sealed_page_receipt(&self, ordinal: usize) -> Option<&SealedProviderCaptureSetReceipt> {
+        self.ordered_capture.persisted_segment_receipt(ordinal)
     }
 
     pub(crate) fn into_parts(
@@ -714,16 +719,14 @@ impl EiaDataRetrievalSealRejoin {
         EiaAcquisition,
         Box<[EiaDataPageMaterial]>,
         EiaDataTransportReceipt,
-        Box<[SealedProviderCaptureSetReceipt]>,
-        ProviderCaptureSetReceipt,
+        ProviderOrderedCaptureSegments,
     ) {
         (
             self.dataset,
             self.acquisition,
             self.pages,
             self.transport,
-            self.sealed_pages,
-            self.capture_receipt,
+            self.ordered_capture,
         )
     }
 }
@@ -1148,13 +1151,11 @@ impl EiaSourceTransport {
         let page_capture = provider_capture_material(page_capture, [&standalone_raw])?;
         let page_capture_receipt = page_capture.receipt().clone();
         Ok(EiaPendingDataPage {
-            rejoin: EiaDataPageSealRejoin {
-                cursor,
-                typed_page: fetched.page,
-                page_material,
-                page_capture_receipt,
-                raw_capture_copy_retained_bytes,
-            },
+            cursor,
+            typed_page: fetched.page,
+            page_material,
+            page_capture_receipt,
+            raw_capture_copy_retained_bytes,
             capture: page_capture,
         })
     }
@@ -1165,9 +1166,14 @@ impl EiaSourceTransport {
         authority: &ExtractionAuthority,
         contract: &EiaDatasetContract,
         rejoin: EiaDataPageSealRejoin,
-        sealed_page: SealedProviderCaptureSetReceipt,
+        sealed_page: SealedProviderCaptureMaterial,
     ) -> Result<EiaDataPageTransition, EiaSourceTransportError> {
         self.validate_data_cursor(authority, contract, &rejoin.cursor)?;
+        let sealed_page = rejoin
+            .capture_expectation
+            .try_rejoin(sealed_page)
+            .and_then(|rejoined| rejoined.try_into_whole())?;
+        let sealed_page_receipt = sealed_page.persisted_receipt();
         rejoin.page_material.root_journal_rejoin().validate(
             &self.metadata,
             contract,
@@ -1177,11 +1183,15 @@ impl EiaSourceTransport {
             rejoin.cursor.query_digest,
             rejoin.cursor.next_ordinal,
             &rejoin.page_material,
-            &sealed_page,
+            sealed_page_receipt,
         )?;
-        if sealed_page.capture() != &rejoin.page_capture_receipt
-            || sealed_page.receipt_digest().bytes() == [0; 32]
-            || sealed_page.segment().physical_receipt_digest().bytes() == [0; 32]
+        if sealed_page_receipt.capture() != &rejoin.page_capture_receipt
+            || sealed_page_receipt.receipt_digest().bytes() == [0; 32]
+            || sealed_page_receipt
+                .segment()
+                .physical_receipt_digest()
+                .bytes()
+                == [0; 32]
         {
             return Err(EiaSourceTransportError::InvalidConfiguration);
         }
@@ -1201,7 +1211,7 @@ impl EiaSourceTransport {
         }
         let mut cursor = rejoin.cursor;
         let page_lineage_retained_bytes =
-            page_lineage_publication_retained_bytes(&rejoin.page_material, &sealed_page)?;
+            page_lineage_publication_retained_bytes(&rejoin.page_material, sealed_page_receipt)?;
         cursor.retained_bytes = cursor
             .retained_bytes
             .checked_add(rejoin.page_material.raw.http.retained_bytes)
@@ -1270,30 +1280,6 @@ impl EiaSourceTransport {
                 Ok(EiaDataPageTransition::More(cursor))
             }
             EiaPageCompleteness::Complete => {
-                let terminal_capture_retained_bytes = raw_capture_copy_working_set_bytes(
-                    &self.metadata,
-                    &cursor.provider_dataset,
-                    cursor
-                        .page_materials
-                        .iter()
-                        .map(EiaDataPageMaterial::raw_page),
-                )?;
-                if terminal_capture_retained_bytes > cursor.raw_capture_copy_retained_bytes {
-                    let additional = terminal_capture_retained_bytes
-                        .checked_sub(cursor.raw_capture_copy_retained_bytes)
-                        .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
-                    cursor.publication_retained_bytes = cursor
-                        .publication_retained_bytes
-                        .checked_add(additional)
-                        .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
-                        .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
-                    cursor
-                        .pagination_tracker
-                        .as_mut()
-                        .ok_or(EiaSourceTransportError::InvalidConfiguration)?
-                        .charge_publication_retained_bytes(additional)?;
-                    cursor.raw_capture_copy_retained_bytes = terminal_capture_retained_bytes;
-                }
                 let tracker = cursor
                     .pagination_tracker
                     .take()
@@ -1319,19 +1305,13 @@ impl EiaSourceTransport {
                     ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage,
                     capture_pages,
                 )?;
-                let capture = provider_capture_material(
-                    capture,
-                    cursor
-                        .page_materials
-                        .iter()
-                        .map(EiaDataPageMaterial::raw_page),
-                )?;
+                let ordered_capture =
+                    ProviderOrderedCaptureSegments::try_rejoin(capture, cursor.sealed_pages)?;
                 Ok(EiaDataPageTransition::Complete(EiaDataRetrieval {
                     dataset: cursor.provider_dataset,
                     acquisition,
                     pages: cursor.page_materials.into_boxed_slice(),
-                    sealed_pages: cursor.sealed_pages.into_boxed_slice(),
-                    capture,
+                    ordered_capture,
                     transport,
                 }))
             }
@@ -1386,6 +1366,7 @@ impl EiaSourceTransport {
         {
             let ordinal = u16::try_from(ordinal)
                 .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?;
+            let sealed = sealed.persisted_receipt();
             if material.data.offset() != expected_offset
                 || typed.receipt() != &material.data
                 || typed.retained_payload() != material.raw.payload()
@@ -1667,7 +1648,7 @@ impl EiaSourceTransport {
         })
     }
 
-    fn validate_authority(
+    pub(crate) fn validate_authority(
         &self,
         authority: &ExtractionAuthority,
     ) -> Result<(), EiaSourceTransportError> {
@@ -2061,11 +2042,10 @@ pub(crate) fn validate_terminal_data_rejoin(
     current_source: &SourceMetadata,
     contract: &EiaDatasetContract,
     retrieval: &EiaDataRetrievalSealRejoin,
-    sealed_capture: &SealedProviderCaptureSetReceipt,
 ) -> Result<(), EiaSourceTransportError> {
     let expected_dataset = eia_data_dataset_identifier(contract)?;
     let acquisition_receipt = retrieval.acquisition.receipt();
-    let full_capture = sealed_capture.capture();
+    let full_capture = retrieval.ordered_capture.root_capture();
     if current_source
         != retrieval
             .pages
@@ -2073,7 +2053,6 @@ pub(crate) fn validate_terminal_data_rejoin(
             .map(|page| page.root_journal_rejoin.source_metadata())
             .ok_or(EiaSourceTransportError::InvalidConfiguration)?
         || &retrieval.dataset != &expected_dataset
-        || &retrieval.capture_receipt != full_capture
         || full_capture.source_id() != current_source.source_id()
         || full_capture.metadata_revision() != current_source.revision()
         || full_capture.dataset() != &expected_dataset
@@ -2082,28 +2061,27 @@ pub(crate) fn validate_terminal_data_rejoin(
         || acquisition_receipt.query_digest() != contract.query().identity()
         || acquisition_receipt.contract_schema_digest() != contract.schema_digest()
         || acquisition_receipt.api_version() != contract.metadata().api_version()
-        || retrieval.pages.len() != retrieval.sealed_pages.len()
+        || retrieval.pages.len() != retrieval.ordered_capture.segment_count()
         || retrieval.pages.len() != full_capture.pages().len()
         || retrieval.pages.len()
             != usize::try_from(acquisition_receipt.page_count())
                 .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?
         || retrieval.transport
             != aggregate_transport_receipt(&retrieval.pages, &retrieval.acquisition)?
-        || sealed_capture.receipt_digest().bytes() == [0; 32]
-        || sealed_capture.segment().physical_receipt_digest().bytes() == [0; 32]
+        || retrieval.ordered_capture.receipt_digest().bytes() == [0; 32]
     {
         return Err(EiaSourceTransportError::InvalidConfiguration);
     }
     let mut previous_received_at = None;
-    for (ordinal, ((material, sealed_page), full_page)) in retrieval
-        .pages
-        .iter()
-        .zip(&retrieval.sealed_pages)
-        .zip(full_capture.pages())
-        .enumerate()
+    for (ordinal, (material, full_page)) in
+        retrieval.pages.iter().zip(full_capture.pages()).enumerate()
     {
         let ordinal =
             u16::try_from(ordinal).map_err(|_| EiaSourceTransportError::InvalidConfiguration)?;
+        let sealed_page = retrieval
+            .ordered_capture
+            .persisted_segment_receipt(usize::from(ordinal))
+            .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
         material
             .root_journal_rejoin()
             .validate(current_source, contract, material)?;

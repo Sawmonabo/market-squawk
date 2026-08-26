@@ -4,8 +4,9 @@ use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
 };
 use market_squawk_sources::{
-    ExtractionBatch, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    SealedProviderCaptureSetReceipt,
+    ExtractionBatch, ProviderCaptureSealExpectation, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, ProviderWholeCaptureToken, RejoinedProviderCapture,
+    SealedProviderCaptureMaterial, SealedProviderCaptureSetReceipt,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -39,11 +40,12 @@ pub struct BeaSealedAcquisitionReceipt {
 }
 
 impl BeaSealedAcquisitionReceipt {
-    /// Rejoins typed native evidence with the physical receipt returned by the shared sealer.
-    pub fn try_new(
+    /// Derives persisted sidecar evidence only while retaining the exact live whole-capture token.
+    pub(crate) fn try_from_token(
         evidence: BeaDatasetEvidence,
-        sealed_capture: SealedProviderCaptureSetReceipt,
+        capture_token: &ProviderWholeCaptureToken,
     ) -> Result<Self, BeaSealedAcquisitionError> {
+        let sealed_capture = capture_token.persisted_receipt().clone();
         let expected_graph_identity = validate_sealed_capture_sidecar(&evidence, &sealed_capture)?;
         let expected_count = evidence.expected_capture_count();
         let first = evidence
@@ -170,6 +172,7 @@ pub struct BeaPendingExtractionSeal {
     source_batch: ExtractionBatch,
     evidence: BeaDatasetEvidence,
     source_batch_digest: EvidenceDigest,
+    expectation: ProviderCaptureSealExpectation,
 }
 
 impl BeaPendingExtractionSeal {
@@ -177,33 +180,38 @@ impl BeaPendingExtractionSeal {
         source_batch: ExtractionBatch,
         evidence: BeaDatasetEvidence,
         source_batch_digest: EvidenceDigest,
+        expectation: ProviderCaptureSealExpectation,
     ) -> Self {
         Self {
             source_batch,
             evidence,
             source_batch_digest,
+            expectation,
         }
     }
 
-    /// Checks whether a shared physical receipt is the exact sidecar for this source output.
-    pub fn validate_sealed_capture(
-        &self,
-        sealed_capture: &SealedProviderCaptureSetReceipt,
-    ) -> Result<(), BeaSealedAcquisitionError> {
-        validate_sealed_capture_sidecar(&self.evidence, sealed_capture).map(|_| ())
-    }
-
-    /// Consumes the source output and the shared sealer's exact physical receipt.
-    pub fn try_bind_sealed(
+    /// Consumes only the opaque physical result split from this exact source output.
+    pub fn try_rejoin(
         self,
-        sealed_capture: SealedProviderCaptureSetReceipt,
+        sealed: SealedProviderCaptureMaterial,
     ) -> Result<BeaSealedExtractionOutput, BeaSealedAcquisitionError> {
+        let capture_token = match self
+            .expectation
+            .try_rejoin(sealed)
+            .map_err(|_| BeaSealedAcquisitionError::InvalidEvidence)?
+        {
+            RejoinedProviderCapture::Whole(token) => token,
+            RejoinedProviderCapture::Components(_) => {
+                return Err(BeaSealedAcquisitionError::InvalidEvidence);
+            }
+        };
         let sealed_acquisition =
-            BeaSealedAcquisitionReceipt::try_new(self.evidence, sealed_capture)?;
+            BeaSealedAcquisitionReceipt::try_from_token(self.evidence, &capture_token)?;
         Ok(BeaSealedExtractionOutput {
             source_batch: self.source_batch,
             source_batch_digest: self.source_batch_digest,
             sealed_acquisition,
+            capture_token,
         })
     }
 }
@@ -217,6 +225,7 @@ pub struct BeaSealedExtractionOutput {
     source_batch: ExtractionBatch,
     source_batch_digest: EvidenceDigest,
     sealed_acquisition: BeaSealedAcquisitionReceipt,
+    capture_token: ProviderWholeCaptureToken,
 }
 
 impl BeaSealedExtractionOutput {
@@ -230,13 +239,20 @@ impl BeaSealedExtractionOutput {
         &self.sealed_acquisition
     }
 
-    pub(crate) const fn source_batch_digest(&self) -> EvidenceDigest {
-        self.source_batch_digest
-    }
-
-    /// Consumes the joined unit into its source batch and native/physical rejoin.
-    pub fn into_parts(self) -> (ExtractionBatch, BeaSealedAcquisitionReceipt) {
-        (self.source_batch, self.sealed_acquisition)
+    pub(crate) fn into_publication_parts(
+        self,
+    ) -> (
+        ExtractionBatch,
+        EvidenceDigest,
+        BeaSealedAcquisitionReceipt,
+        ProviderWholeCaptureToken,
+    ) {
+        (
+            self.source_batch,
+            self.source_batch_digest,
+            self.sealed_acquisition,
+            self.capture_token,
+        )
     }
 }
 
