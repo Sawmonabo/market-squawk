@@ -180,7 +180,6 @@ impl CensusDataset {
 }
 
 /// A Census API key whose debug representation and drop behavior do not expose the secret.
-#[derive(Clone)]
 pub struct CensusApiKey(Zeroizing<String>);
 
 impl CensusApiKey {
@@ -212,44 +211,49 @@ impl fmt::Debug for CensusApiKey {
     }
 }
 
-/// A URL carrying a key, with safe debug/display behavior.
+/// A key-free URL plus an optional separately retained data-query key, with safe debug behavior.
 ///
-/// Callers may borrow the URL only to hand it to the HTTP transport. Logs, traces, receipts, and
-/// errors must use [`Self::redacted_url`] or [`Self::request_digest`].
-#[derive(Clone)]
-pub struct CensusAuthorizedUrl {
+/// Public metadata requests retain no key. Credential-bearing data requests keep the key outside
+/// the URL until transport serialization. Logs, traces, receipts, and errors must use
+/// [`Self::redacted_url`] or [`Self::request_digest`].
+pub(crate) struct CensusAuthorizedUrl<'a> {
     public_url: Url,
-    api_key: CensusApiKey,
+    api_key: Option<&'a CensusApiKey>,
     redacted_url: String,
     request_digest: [u8; 32],
 }
 
-impl CensusAuthorizedUrl {
+impl CensusAuthorizedUrl<'_> {
     /// Returns the key-free URL for transport.
-    pub fn transport_url(&self) -> &Url {
+    pub(crate) fn transport_url(&self) -> &Url {
         &self.public_url
     }
 
-    /// Returns the key query value for direct handoff to a transport's query serializer.
+    /// Returns the optional key query value for direct handoff to a transport's serializer.
     ///
     /// The value must not be placed in a URL, log, trace, error, receipt, or provider status by
     /// the caller. Keeping it separate prevents debug formatting of this request from exposing it.
-    pub fn key_query_value(&self) -> &str {
-        self.api_key.expose()
+    pub(crate) fn key_query_value(&self) -> Option<&str> {
+        self.api_key.as_ref().map(CensusApiKey::expose)
+    }
+
+    /// Returns whether this request carries the separately retained API-key credential.
+    pub(crate) const fn is_credentialed(&self) -> bool {
+        self.api_key.is_some()
     }
 
     /// Returns the key-free URL suitable for diagnostics and retained receipts.
-    pub fn redacted_url(&self) -> &str {
+    pub(crate) fn redacted_url(&self) -> &str {
         &self.redacted_url
     }
 
     /// Returns the SHA-256 identity of the exact key-free request.
-    pub const fn request_digest(&self) -> [u8; 32] {
+    pub(crate) const fn request_digest(&self) -> [u8; 32] {
         self.request_digest
     }
 }
 
-impl fmt::Debug for CensusAuthorizedUrl {
+impl fmt::Debug for CensusAuthorizedUrl<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CensusAuthorizedUrl")
@@ -259,7 +263,7 @@ impl fmt::Debug for CensusAuthorizedUrl {
     }
 }
 
-impl fmt::Display for CensusAuthorizedUrl {
+impl fmt::Display for CensusAuthorizedUrl<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.redacted_url)
     }
@@ -838,6 +842,9 @@ impl CensusDataQuery {
     ) -> Result<Self, CensusAdapterError> {
         validate_selection(&selection)?;
         validate_geography(&geography)?;
+        if time.is_some() && dataset.vintage() != CensusDatasetVintage::TimeSeries {
+            return Err(CensusAdapterError::InvalidQuery);
+        }
         if let Some(time) = time {
             validate_time_predicate(time)?;
         }
@@ -926,8 +933,11 @@ impl CensusDataQuery {
     }
 
     /// Appends a key only to a transport-owned URL wrapper.
-    pub fn authorize(&self, key: &CensusApiKey) -> Result<CensusAuthorizedUrl, CensusAdapterError> {
-        authorize_url(&self.redacted_url, self.request_digest, key)
+    pub(crate) fn authorize<'a>(
+        &self,
+        key: &'a CensusApiKey,
+    ) -> Result<CensusAuthorizedUrl<'a>, CensusAdapterError> {
+        authorize_url(&self.redacted_url, self.request_digest, Some(key))
     }
 }
 
@@ -1002,9 +1012,11 @@ impl CensusDiscoveryRequest {
         self.request_digest
     }
 
-    /// Appends a key only to a transport-owned URL wrapper.
-    pub fn authorize(&self, key: &CensusApiKey) -> Result<CensusAuthorizedUrl, CensusAdapterError> {
-        authorize_url(&self.redacted_url, self.request_digest, key)
+    /// Builds the public metadata request wrapper without attaching the data-query API key.
+    pub(crate) fn public_request(
+        &self,
+    ) -> Result<CensusAuthorizedUrl<'static>, CensusAdapterError> {
+        authorize_url(&self.redacted_url, self.request_digest, None)
     }
 }
 
@@ -1048,15 +1060,15 @@ fn discovery_url(kind: &CensusDiscoveryKind) -> Result<Url, CensusAdapterError> 
     Ok(url)
 }
 
-fn authorize_url(
+fn authorize_url<'a>(
     redacted_url: &str,
     request_digest: [u8; 32],
-    key: &CensusApiKey,
-) -> Result<CensusAuthorizedUrl, CensusAdapterError> {
+    api_key: Option<&'a CensusApiKey>,
+) -> Result<CensusAuthorizedUrl<'a>, CensusAdapterError> {
     let public_url = Url::parse(redacted_url).map_err(|_| CensusAdapterError::InvalidQuery)?;
     Ok(CensusAuthorizedUrl {
         public_url,
-        api_key: key.clone(),
+        api_key,
         redacted_url: redacted_url.to_owned(),
         request_digest,
     })
@@ -1117,7 +1129,12 @@ fn validate_predicate_value(
     predicate_type: &CensusPredicateType,
 ) -> Result<(), CensusAdapterError> {
     match predicate_type {
-        CensusPredicateType::String => Ok(()),
+        CensusPredicateType::String => {
+            if value.contains(':') {
+                return Err(CensusAdapterError::InvalidQuery);
+            }
+            Ok(())
+        }
         CensusPredicateType::Integer => {
             if value.contains('*') || !valid_numeric_predicate(value, true) {
                 return Err(CensusAdapterError::InvalidQuery);
@@ -1204,6 +1221,9 @@ fn validate_selection(selection: &CensusSelection) -> Result<(), CensusAdapterEr
                 || primary.iter().collect::<BTreeSet<_>>().len() != primary.len()
                 || wire.iter().collect::<BTreeSet<_>>().len() != wire.len()
                 || primary.iter().any(|variable| !wire.contains(variable))
+                || wire
+                    .iter()
+                    .any(|variable| is_reserved_query_key(variable.as_str()))
             {
                 return Err(CensusAdapterError::InvalidQuery);
             }
@@ -1230,6 +1250,10 @@ fn validate_geography(geography: &CensusGeography) -> Result<(), CensusAdapterEr
             {
                 return Err(CensusAdapterError::DuplicateIdentity);
             }
+            validate_geography_clause(for_clause)?;
+            for clause in in_clauses {
+                validate_geography_clause(clause)?;
+            }
             Ok(())
         }
         CensusGeography::Uniform { values } => {
@@ -1242,6 +1266,38 @@ fn validate_geography(geography: &CensusGeography) -> Result<(), CensusAdapterEr
             Ok(())
         }
     }
+}
+
+fn validate_geography_clause(clause: &CensusGeographyClause) -> Result<(), CensusAdapterError> {
+    validate_bounded_value(&clause.level)?;
+    if clause.level.contains([':', ',', '&'])
+        || clause.level.chars().any(char::is_whitespace)
+        || clause.codes.is_empty()
+        || clause.codes.len() > MAX_PREDICATE_VALUES
+        || clause.codes.iter().collect::<BTreeSet<_>>().len() != clause.codes.len()
+    {
+        return Err(CensusAdapterError::InvalidQuery);
+    }
+    let wildcard_count = clause
+        .codes
+        .iter()
+        .filter(|code| matches!(code, CensusGeographyCode::Wildcard))
+        .count();
+    if wildcard_count > 0 && (wildcard_count != 1 || clause.codes.len() != 1) {
+        return Err(CensusAdapterError::InvalidQuery);
+    }
+    for code in &clause.codes {
+        if let CensusGeographyCode::Exact(value) = code {
+            validate_bounded_value(value)?;
+            if value == "*"
+                || value.contains(',')
+                || value.chars().any(char::is_whitespace)
+            {
+                return Err(CensusAdapterError::InvalidQuery);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_time_predicate(time: CensusTimePredicate) -> Result<(), CensusAdapterError> {

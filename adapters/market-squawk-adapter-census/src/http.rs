@@ -7,7 +7,8 @@ use market_squawk_domain::Timestamp;
 use market_squawk_sources::{HttpRequestBounds, InFlightExtractionRequest};
 use tokio_util::sync::CancellationToken;
 
-use crate::{CensusAuthorizedUrl, CensusSourceError};
+use crate::CensusSourceError;
+use crate::query::CensusAuthorizedUrl;
 
 const USER_AGENT: &str = concat!(
     "market-squawk/",
@@ -15,26 +16,36 @@ const USER_AGENT: &str = concat!(
     " census-data-api-adapter"
 );
 
-#[derive(Clone, Debug)]
-pub(super) struct CensusHttpRequest {
-    pub(super) authorized: CensusAuthorizedUrl,
+#[derive(Debug)]
+pub(super) struct CensusHttpRequest<'a> {
+    pub(super) authorized: CensusAuthorizedUrl<'a>,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct CensusHttpResponse {
     pub(super) status: u16,
+    pub(super) key_error: bool,
     pub(super) retry_after: Option<Vec<u8>>,
     pub(super) content_encoding: Option<Vec<u8>>,
     pub(super) content_type: Option<Vec<u8>>,
+    pub(super) rate_headers: CensusRateLimitHeaders,
     pub(super) body: Bytes,
     pub(super) received_at: Timestamp,
     pub(super) latency: Duration,
 }
 
+/// Closed set of provider rate headers retained for doctor evidence.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct CensusRateLimitHeaders {
+    pub(super) limit: Option<Vec<u8>>,
+    pub(super) remaining: Option<Vec<u8>>,
+    pub(super) reset: Option<Vec<u8>>,
+}
+
 pub(super) trait CensusTransport: std::fmt::Debug + Send + Sync {
     fn execute<'a>(
         &'a self,
-        request: CensusHttpRequest,
+        request: CensusHttpRequest<'a>,
         in_flight: &'a InFlightExtractionRequest,
         max_bytes: usize,
         timeout: Duration,
@@ -74,7 +85,7 @@ impl ReqwestCensusTransport {
 impl CensusTransport for ReqwestCensusTransport {
     fn execute<'a>(
         &'a self,
-        request: CensusHttpRequest,
+        request: CensusHttpRequest<'a>,
         in_flight: &'a InFlightExtractionRequest,
         max_bytes: usize,
         timeout: Duration,
@@ -86,10 +97,13 @@ impl CensusTransport for ReqwestCensusTransport {
                     .validate_current()
                     .map_err(|_| CensusSourceError::Authority)?;
                 let started = Instant::now();
-                let response = self
+                let mut request_builder = self
                     .client
-                    .get(request.authorized.transport_url().clone())
-                    .query(&[("key", request.authorized.key_query_value())])
+                    .get(request.authorized.transport_url().clone());
+                if let Some(key) = request.authorized.key_query_value() {
+                    request_builder = request_builder.query(&[("key", key)]);
+                }
+                let response = request_builder
                     .header(reqwest::header::ACCEPT, "application/json")
                     .header(reqwest::header::ACCEPT_ENCODING, "identity")
                     .send()
@@ -101,6 +115,7 @@ impl CensusTransport for ReqwestCensusTransport {
                     return Err(CensusSourceError::BodyTooLarge);
                 }
                 let status = response.status().as_u16();
+                let key_error = response.headers().contains_key("x-datawebapi-keyerror");
                 let retry_after = response
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
@@ -113,14 +128,30 @@ impl CensusTransport for ReqwestCensusTransport {
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
                     .map(|value| value.as_bytes().to_vec());
+                let rate_headers = CensusRateLimitHeaders {
+                    limit: supported_rate_header(
+                        response.headers(),
+                        &["x-ratelimit-limit", "x-rate-limit-limit"],
+                    ),
+                    remaining: supported_rate_header(
+                        response.headers(),
+                        &["x-ratelimit-remaining", "x-rate-limit-remaining"],
+                    ),
+                    reset: supported_rate_header(
+                        response.headers(),
+                        &["x-ratelimit-reset", "x-rate-limit-reset"],
+                    ),
+                };
                 let body = collect_bounded(response.bytes_stream(), in_flight, max_bytes).await?;
                 let received_at = system_timestamp()?;
                 let latency = started.elapsed();
                 Ok(CensusHttpResponse {
                     status,
+                    key_error,
                     retry_after,
                     content_encoding,
                     content_type,
+                    rate_headers,
                     body,
                     received_at,
                     latency,
@@ -135,6 +166,16 @@ impl CensusTransport for ReqwestCensusTransport {
             }
         })
     }
+}
+
+fn supported_rate_header(
+    headers: &reqwest::header::HeaderMap,
+    names: &[&str],
+) -> Option<Vec<u8>> {
+    names
+        .iter()
+        .find_map(|name| headers.get(*name))
+        .map(|value| value.as_bytes().to_vec())
 }
 
 async fn collect_bounded<S, E>(

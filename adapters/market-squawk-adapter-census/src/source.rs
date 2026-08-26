@@ -18,12 +18,12 @@ use market_squawk_sources::{
     ApiEndpointRule, AuthorizationMode, CURRENT_RESEARCH_RECORD_SCHEMA, CoverageDomain,
     DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionAuthorityError,
     ExtractionBatch, ExtractionRecord, ExtractionRequest, ExtractionRequestPermit,
-    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HistoricalCapability,
+    ExtractionSource, ExtractionSourceError, HistoricalCapability, InFlightExtractionRequest,
     MAX_PROVIDER_CAPTURE_PAGE_BYTES, NetworkAccessPolicy, NetworkPolicyError, PathScope,
     ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
     ProviderCaptureTerminalDisposition, QueryParameterRule, QuerySensitivity, SourceClass,
-    SourceError, SourceMetadata, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
-    payload_matches_exact_evidence,
+    SourceError, SourceMetadata, SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
+    SourceProtocolProfile, payload_matches_exact_evidence,
 };
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
@@ -33,32 +33,147 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::http::{
-    CensusHttpRequest, CensusHttpResponse, CensusTransport, ReqwestCensusTransport,
-    system_timestamp,
+    CensusHttpRequest, CensusHttpResponse, CensusRateLimitHeaders, CensusTransport,
+    ReqwestCensusTransport, system_timestamp,
 };
+use crate::query::CensusAuthorizedUrl;
 use crate::{
     CENSUS_APPLICATION_REQUESTS_PER_DAY, CENSUS_APPLICATION_REQUESTS_PER_SECOND,
-    CensusAdapterError, CensusApiKey, CensusAuthorizedUrl, CensusClocks, CensusDataPage,
-    CensusDataQuery, CensusDatasetVintage, CensusDiscoveryDocument, CensusDiscoveryKind,
+    CensusAdapterError, CensusApiKey, CensusClocks, CensusDataPage, CensusDataQuery,
+    CensusDatasetVintage, CensusDiscoveryDocument, CensusDiscoveryKind,
     CensusDiscoveryRequest, CensusGeography, CensusMetadataEvidence, CensusMissingReason,
-    CensusParseLimits, CensusPredicateType, CensusSelection, CensusTypedValue, CensusValueState,
-    CensusVariableCatalog,
+    CensusParseLimits, CensusPredicateType, CensusRequiredVariable, CensusSelection,
+    CensusTypedValue, CensusValueState, CensusVariableCatalog,
 };
 
 /// Maximum exact Census query contracts retained by one source instance.
 pub const MAX_CENSUS_CONFIGURED_DATASETS: usize = 64;
+/// Maximum reviewed annotated-missing interpretations retained for one provider variable.
+pub const MAX_CENSUS_ANNOTATED_MISSING_RULES: usize = 64;
+/// Maximum annotation coordinates that may define one exact interpretation rule.
+pub const MAX_CENSUS_ANNOTATIONS_PER_RULE: usize = 32;
+/// Maximum exact provider annotation text retained by one configured rule.
+pub const MAX_CENSUS_ANNOTATION_RULE_BYTES: usize = 4 * 1024;
 const CENSUS_JSON_MEDIA_TYPE: &str = "application/json";
 const CENSUS_DATASET_ID_PREFIX: &str = "census:data-v1:";
 const CENSUS_ANALYTICAL_ID_PREFIX: &str = "census.data-v1.";
 const ONE_SECOND_NANOS: u64 = 1_000_000_000;
 const ONE_DAY_NANOS: u64 = 86_400_000_000_000;
 
+/// One exact provider annotation coordinate used by a reviewed missing-value interpretation.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
+pub struct CensusAnnotationMatch {
+    variable: SourceIdentifier,
+    raw: String,
+}
+
+impl CensusAnnotationMatch {
+    /// Constructs one bounded, nonempty exact annotation coordinate.
+    pub fn try_new(
+        variable: SourceIdentifier,
+        raw: impl Into<String>,
+    ) -> Result<Self, CensusSourceError> {
+        let raw = raw.into();
+        if raw.is_empty()
+            || raw.len() > MAX_CENSUS_ANNOTATION_RULE_BYTES
+            || raw.chars().any(char::is_control)
+        {
+            return Err(CensusSourceError::InvalidConfiguration);
+        }
+        Ok(Self { variable, raw })
+    }
+
+    /// Returns the exact Census annotation-variable identity.
+    pub const fn variable(&self) -> &SourceIdentifier {
+        &self.variable
+    }
+
+    /// Returns the exact provider annotation cell text.
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    fn matches(&self, annotation: &crate::CensusAnnotation) -> bool {
+        &self.variable == annotation.variable() && self.raw == annotation.raw()
+    }
+}
+
+/// One reviewed exact annotation set and its canonical provider-native missing evidence.
+///
+/// The canonical marker must be the exact text of one member annotation and its reason must be
+/// that member's exact annotation-variable identity. Other annotations remain in the publication
+/// binding, so this mapping never erases evidence even when several provider flags are present.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct CensusAnnotatedMissingRule {
+    annotations: Box<[CensusAnnotationMatch]>,
+    missing: MacroMissingValue,
+}
+
+impl CensusAnnotatedMissingRule {
+    /// Constructs one deterministic, duplicate-free exact annotation interpretation.
+    pub fn try_new(
+        annotations: impl IntoIterator<Item = CensusAnnotationMatch>,
+        missing: MacroMissingValue,
+    ) -> Result<Self, CensusSourceError> {
+        let mut annotations = annotations.into_iter().collect::<Vec<_>>();
+        annotations.sort();
+        if annotations.is_empty()
+            || annotations.len() > MAX_CENSUS_ANNOTATIONS_PER_RULE
+            || annotations
+                .windows(2)
+                .any(|pair| pair[0].variable == pair[1].variable)
+        {
+            return Err(CensusSourceError::InvalidConfiguration);
+        }
+        let reason = missing
+            .reason()
+            .ok_or(CensusSourceError::InvalidConfiguration)?;
+        if !annotations.iter().any(|annotation| {
+            annotation.variable() == reason
+                && annotation.raw() == missing.marker().as_str()
+        }) {
+            return Err(CensusSourceError::InvalidConfiguration);
+        }
+        Ok(Self {
+            annotations: annotations.into_boxed_slice(),
+            missing,
+        })
+    }
+
+    /// Returns the complete sorted provider annotation set this rule recognizes.
+    pub fn annotations(&self) -> &[CensusAnnotationMatch] {
+        &self.annotations
+    }
+
+    /// Returns the reviewed exact provider-native canonical missing evidence.
+    pub const fn missing(&self) -> &MacroMissingValue {
+        &self.missing
+    }
+
+    fn matches(&self, annotations: &[crate::CensusAnnotation]) -> bool {
+        if self.annotations.len() != annotations.len() {
+            return false;
+        }
+        let mut actual = annotations.iter().collect::<Vec<_>>();
+        actual.sort_by(|left, right| {
+            left.variable()
+                .cmp(right.variable())
+                .then_with(|| left.raw().cmp(right.raw()))
+        });
+        self.annotations
+            .iter()
+            .zip(actual)
+            .all(|(expected, actual)| expected.matches(actual))
+    }
+}
+
 /// One explicit provider-variable to canonical macro-series mapping.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CensusVariableMapping {
     provider_variable: SourceIdentifier,
     series_namespace: SourceIdentifier,
     unit: SourceIdentifier,
+    annotated_missing_rules: Box<[CensusAnnotatedMissingRule]>,
 }
 
 impl CensusVariableMapping {
@@ -81,7 +196,30 @@ impl CensusVariableMapping {
             provider_variable,
             series_namespace,
             unit,
+            annotated_missing_rules: Vec::new().into_boxed_slice(),
         })
+    }
+
+    /// Constructs a numeric macro mapping with explicit exact interpretations for provider-
+    /// annotated missing values. Unknown annotation combinations remain unavailable.
+    pub fn try_new_with_annotated_missing(
+        provider_variable: SourceIdentifier,
+        series_namespace: SourceIdentifier,
+        unit: SourceIdentifier,
+        rules: impl IntoIterator<Item = CensusAnnotatedMissingRule>,
+    ) -> Result<Self, CensusSourceError> {
+        let mut mapping = Self::try_new(provider_variable, series_namespace, unit)?;
+        let mut rules = rules.into_iter().collect::<Vec<_>>();
+        rules.sort_by(|left, right| left.annotations.cmp(&right.annotations));
+        if rules.len() > MAX_CENSUS_ANNOTATED_MISSING_RULES
+            || rules
+                .windows(2)
+                .any(|pair| pair[0].annotations == pair[1].annotations)
+        {
+            return Err(CensusSourceError::InvalidConfiguration);
+        }
+        mapping.annotated_missing_rules = rules.into_boxed_slice();
+        Ok(mapping)
     }
 
     /// Returns the exact Census variable identity.
@@ -99,10 +237,26 @@ impl CensusVariableMapping {
     pub const fn unit(&self) -> &SourceIdentifier {
         &self.unit
     }
+
+    /// Returns the deterministic exact annotation interpretations admitted for this variable.
+    pub fn annotated_missing_rules(&self) -> &[CensusAnnotatedMissingRule] {
+        &self.annotated_missing_rules
+    }
+
+    fn annotated_missing(
+        &self,
+        annotations: &[crate::CensusAnnotation],
+    ) -> Option<&MacroMissingValue> {
+        self.annotated_missing_rules
+            .iter()
+            .find(|rule| rule.matches(annotations))
+            .map(CensusAnnotatedMissingRule::missing)
+    }
 }
 
 /// Exact rule for obtaining a canonical effective coordinate.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "coordinate")]
 pub enum CensusEffectiveTimePolicy {
     /// Every response row must carry a supported `time` value.
     RequireReportedTime,
@@ -111,7 +265,7 @@ pub enum CensusEffectiveTimePolicy {
 }
 
 /// One immutable metadata-first Census query contract.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CensusDatasetContract {
     dataset_id: SourceIdentifier,
     analytical_dataset_id: SourceIdentifier,
@@ -220,6 +374,11 @@ impl CensusDatasetContract {
         &self.metadata_requests
     }
 
+    /// Returns the exact reviewed effective-time rule for this dataset.
+    pub const fn effective_time_policy(&self) -> &CensusEffectiveTimePolicy {
+        &self.effective_time
+    }
+
     fn mapping(&self, variable: &SourceIdentifier) -> Option<&CensusVariableMapping> {
         self.mappings.get(variable)
     }
@@ -230,14 +389,23 @@ impl CensusDatasetContract {
 pub struct CensusSourceConfig {
     contracts: Vec<CensusDatasetContract>,
     parse_limits: CensusParseLimits,
+    private_research_policy: crate::CensusPrivateResearchPolicy,
+    activation_requirements: crate::CensusActivationRequirements,
+    configuration_digest: EvidenceDigest,
 }
 
 impl CensusSourceConfig {
-    /// Constructs a nonempty, duplicate-free source configuration.
+    /// Constructs a nonempty, duplicate-free source configuration under the sole code-owned
+    /// private-research policy. Root rights and credential leases are deliberately not accepted as
+    /// caller data; application composition must rejoin those opaque authorities separately.
     pub fn try_new(
         contracts: impl IntoIterator<Item = CensusDatasetContract>,
         parse_limits: CensusParseLimits,
     ) -> Result<Self, CensusSourceError> {
+        let private_research_policy = crate::CensusPrivateResearchPolicy::personal_research();
+        private_research_policy.authorize(crate::CensusIntendedUse::PrivateRetrieval)?;
+        private_research_policy.authorize(crate::CensusIntendedUse::PrivatePersistence)?;
+        let activation_requirements = crate::CensusActivationRequirements::production();
         let mut contracts = contracts.into_iter().collect::<Vec<_>>();
         if contracts.is_empty() || contracts.len() > MAX_CENSUS_CONFIGURED_DATASETS {
             return Err(CensusSourceError::InvalidConfiguration);
@@ -249,9 +417,19 @@ impl CensusSourceConfig {
         {
             return Err(CensusSourceError::InvalidConfiguration);
         }
+        let configuration_digest = census_configuration_digest(
+            &contracts,
+            parse_limits,
+            private_research_policy.policy_digest()?,
+            crate::census_presentation_obligation()?.obligation_digest(),
+            activation_requirements.requirements_digest()?,
+        )?;
         Ok(Self {
             contracts,
             parse_limits,
+            private_research_policy,
+            activation_requirements,
+            configuration_digest,
         })
     }
 
@@ -263,6 +441,29 @@ impl CensusSourceConfig {
     /// Returns parser memory and structure limits.
     pub const fn parse_limits(&self) -> CensusParseLimits {
         self.parse_limits
+    }
+
+    /// Returns the fixed provider-local operation matrix. This is not owner-rights proof.
+    pub const fn private_research_policy(&self) -> crate::CensusPrivateResearchPolicy {
+        self.private_research_policy
+    }
+
+    /// Returns root authorities that application composition must rejoin before every use seam.
+    pub const fn activation_requirements(&self) -> crate::CensusActivationRequirements {
+        self.activation_requirements
+    }
+
+    /// Returns the exact fixed display and purpose restriction root presentation must enforce.
+    pub fn presentation_obligation(
+        &self,
+    ) -> Result<crate::CensusPresentationObligation, CensusSourceError> {
+        crate::census_presentation_obligation().map_err(Into::into)
+    }
+
+    /// Returns the exact digest of contracts, parse bounds, credential generation, and owner-use
+    /// authorization.
+    pub const fn configuration_digest(&self) -> EvidenceDigest {
+        self.configuration_digest
     }
 
     fn contract(&self, dataset: &SourceIdentifier) -> Option<&CensusDatasetContract> {
@@ -588,16 +789,65 @@ impl CensusDatasetAcquisition {
     }
 }
 
-/// Indivisible canonical Census result and every exact response needed to seal its raw evidence.
+/// Indivisible Census discovery result and every exact response used to identify its object.
 ///
-/// Capture materials are ordered exactly as the contract's metadata requests, followed by the
-/// data response. Application composition must seal every material before admitting `batch` to
-/// canonical publication.
+/// The ordinary [`ExtractionSource::discover`] return type cannot retain provider bytes, so the
+/// production path returns this value and requires root composition to seal the complete ordered
+/// metadata-plus-data graph. No provider response may be discarded after it influenced discovery.
+#[derive(Debug)]
+pub struct CensusDiscoveryOutput {
+    batch: DiscoveryBatch,
+    acquisition: CensusDatasetAcquisition,
+    capture_material: ProviderCaptureMaterial,
+    telemetry: CensusSourceTelemetry,
+}
+
+impl CensusDiscoveryOutput {
+    /// Returns the exact discovered source object batch.
+    pub const fn batch(&self) -> &DiscoveryBatch {
+        &self.batch
+    }
+
+    /// Returns the typed metadata and data evidence used to identify the object.
+    pub const fn acquisition(&self) -> &CensusDatasetAcquisition {
+        &self.acquisition
+    }
+
+    /// Returns the complete ordered request graph root must seal before retaining discovery.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture_material
+    }
+
+    /// Returns actual request, response, row, byte, and latency accounting.
+    pub const fn telemetry(&self) -> CensusSourceTelemetry {
+        self.telemetry
+    }
+
+    /// Consumes the capture-preserving discovery handoff without replacing physical evidence.
+    pub fn into_parts(
+        self,
+    ) -> (
+        DiscoveryBatch,
+        CensusDatasetAcquisition,
+        ProviderCaptureMaterial,
+        CensusSourceTelemetry,
+    ) {
+        (
+            self.batch,
+            self.acquisition,
+            self.capture_material,
+            self.telemetry,
+        )
+    }
+}
+
+/// Indivisible graph-bound canonical Census result and its exact raw evidence.
 #[derive(Debug)]
 pub struct CensusExtractionOutput {
     batch: ExtractionBatch,
     acquisition: CensusDatasetAcquisition,
-    captures: Box<[ProviderCaptureMaterial]>,
+    capture_material: ProviderCaptureMaterial,
+    publication_plan: crate::CensusPublicationPlan,
     telemetry: CensusSourceTelemetry,
 }
 
@@ -612,20 +862,14 @@ impl CensusExtractionOutput {
         &self.acquisition
     }
 
-    /// Returns every source-neutral exact response material in dependency order.
-    pub fn captures(&self) -> &[ProviderCaptureMaterial] {
-        &self.captures
+    /// Returns one complete metadata-plus-data request graph ready for shared raw sealing.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture_material
     }
 
-    /// Returns metadata response materials in the configured discovery-request order.
-    pub fn metadata_captures(&self) -> &[ProviderCaptureMaterial] {
-        let metadata_count = self.captures.len().saturating_sub(1);
-        &self.captures[..metadata_count]
-    }
-
-    /// Returns the final data-response material that directly backs the source object.
-    pub fn data_capture(&self) -> Option<&ProviderCaptureMaterial> {
-        self.captures.last()
+    /// Returns the exact provider-specific plan that root composition must satisfy atomically.
+    pub const fn publication_plan(&self) -> &crate::CensusPublicationPlan {
+        &self.publication_plan
     }
 
     /// Returns actual request, response, row, missingness, byte, and latency accounting.
@@ -633,16 +877,23 @@ impl CensusExtractionOutput {
         self.telemetry
     }
 
-    /// Consumes the application handoff. Every capture must be sealed before publishing `batch`.
+    /// Consumes the application handoff. The graph must be sealed before publishing `batch`.
     pub fn into_parts(
         self,
     ) -> (
         ExtractionBatch,
         CensusDatasetAcquisition,
-        Box<[ProviderCaptureMaterial]>,
+        ProviderCaptureMaterial,
+        crate::CensusPublicationPlan,
         CensusSourceTelemetry,
     ) {
-        (self.batch, self.acquisition, self.captures, self.telemetry)
+        (
+            self.batch,
+            self.acquisition,
+            self.capture_material,
+            self.publication_plan,
+            self.telemetry,
+        )
     }
 }
 
@@ -675,6 +926,8 @@ pub enum CensusSourceError {
     Capture(#[from] market_squawk_sources::ProviderCaptureError),
     #[error("Census revision evidence failed: {0}")]
     Revision(#[from] market_squawk_sources::ObservedRevisionError),
+    #[error("Census use or shared rate policy failed: {0}")]
+    Policy(#[from] crate::CensusPolicyError),
 }
 
 /// Registry-authorized production Census source.
@@ -768,6 +1021,11 @@ impl CensusSource {
         let budget = metadata
             .budget_policy()
             .ok_or(CensusSourceError::InvalidMetadata)?;
+        let authorization_subject = budget
+            .scope()
+            .authorization_account()
+            .ok_or(CensusSourceError::InvalidMetadata)?;
+        let expected_rate = crate::census_provider_rate_declaration(authorization_subject)?;
         let has_second_window = (0..budget.window_count())
             .filter_map(|index| budget.window(index))
             .any(|window| {
@@ -785,7 +1043,7 @@ impl CensusSource {
             || metadata.authorization().mode() != AuthorizationMode::UserAuthorized
             || metadata.coverage().domain() != CoverageDomain::Macroeconomic
             || metadata.quality_ceiling() != DataQuality::OfficialDelayed
-            || budget.max_concurrent() != 1
+            || expected_rate.policy() != budget
             || !has_second_window
             || !has_daily_window
             || metadata.capabilities().live()
@@ -795,10 +1053,14 @@ impl CensusSource {
         {
             return Err(CensusSourceError::InvalidMetadata);
         }
+        config.owner_authorization().validate()?;
+        config
+            .owner_authorization()
+            .authorize(crate::CensusIntendedUse::PrivateRetrieval)?;
         for contract in config.contracts() {
             authorize_configured_target(metadata, contract.query().redacted_url(), true)?;
             for request in contract.metadata_requests() {
-                authorize_configured_target(metadata, request.redacted_url(), true)?;
+                authorize_configured_target(metadata, request.redacted_url(), false)?;
             }
         }
         Ok(())
@@ -807,6 +1069,95 @@ impl CensusSource {
     /// Returns the exact configured profile.
     pub const fn config(&self) -> &CensusSourceConfig {
         &self.config
+    }
+
+    /// Returns the exact provider-local activation recipe for root composition.
+    pub fn activation_plan(&self) -> Result<crate::CensusActivationPlan, CensusSourceError> {
+        crate::runtime::build_activation_plan(&self.metadata, &self.config)
+    }
+
+    /// Admits one freshly sealed successful doctor using the adapter's trusted local clock.
+    pub fn activation_candidate(
+        &self,
+        doctor: &crate::CensusDoctorReport,
+        sealed_doctor_capture: &market_squawk_sources::SealedProviderCaptureSetReceipt,
+    ) -> Result<crate::CensusActivationCandidate, CensusSourceError> {
+        crate::CensusActivationCandidate::try_new(
+            self.activation_plan()?,
+            doctor,
+            sealed_doctor_capture,
+            system_timestamp()?,
+        )
+    }
+
+    fn validate_activation(
+        &self,
+        activation: &crate::CensusActivationCandidate,
+        doctor: &crate::CensusDoctorReport,
+        sealed_doctor_capture: &market_squawk_sources::SealedProviderCaptureSetReceipt,
+        operation_at: Timestamp,
+    ) -> Result<(), CensusSourceError> {
+        let expected = self.activation_plan()?;
+        if activation.plan() != &expected {
+            return Err(CensusSourceError::InvalidConfiguration);
+        }
+        activation.validate(doctor, sealed_doctor_capture, operation_at)
+    }
+
+    /// Runs one credential-bearing, 16-KiB/10-second, production-path ACS doctor request.
+    ///
+    /// The doctor shares the source's durable request allocation and returns exact raw material
+    /// for root sealing. It proves only the pinned 2024 ACS1 United States population surface,
+    /// never bulk capacity or publication readiness.
+    pub async fn doctor(
+        &self,
+        authority: &ExtractionAuthority,
+        deadline: Timestamp,
+        cancellation: CancellationToken,
+    ) -> Result<crate::CensusDoctorOutput, ExtractionSourceError> {
+        self.validate_authority(authority)?;
+        self.config
+            .owner_authorization()
+            .authorize(crate::CensusIntendedUse::PrivateRetrieval)
+            .map_err(CensusSourceError::from)
+            .map_err(map_source_error)?;
+        let query = crate::doctor::doctor_query().map_err(map_source_error)?;
+        authorize_configured_target(&self.metadata, query.redacted_url(), true)
+            .map_err(map_source_error)?;
+        let provider_dataset = crate::doctor::doctor_dataset_identity().map_err(map_source_error)?;
+        let mut response = self
+            .fetch_authorized_with_limits(
+                authority,
+                query.authorize(&self.api_key).map_err(map_adapter_error)?,
+                query.request_digest(),
+                &provider_dataset,
+                deadline,
+                cancellation,
+                crate::CENSUS_DOCTOR_MAX_RESPONSE_BYTES.min(self.response_limit),
+                crate::CENSUS_DOCTOR_TIMEOUT.min(self.request_timeout),
+            )
+            .await?;
+        let report = crate::doctor::build_doctor_report(
+            &self.metadata,
+            &self.config,
+            &query,
+            &response.body,
+            &response.capture,
+            &response.rate_headers,
+            response.received_at,
+            response.latency,
+        )
+        .map_err(map_source_error)?;
+        let material = capture_material(
+            &self.metadata,
+            &response.capture,
+            response.body.clone(),
+        )?;
+        response.record_success()?;
+        self.telemetry
+            .successful_responses
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(crate::CensusDoctorOutput::new(report, material))
     }
 
     /// Returns a lock-free saturating snapshot of cumulative operational accounting.
@@ -826,7 +1177,7 @@ impl CensusSource {
     }
 
     /// Acquires and validates the complete metadata sequence required by one data query.
-    pub async fn acquire_metadata(
+    pub(crate) async fn acquire_metadata(
         &self,
         authority: &ExtractionAuthority,
         provider_dataset: &SourceIdentifier,
@@ -841,12 +1192,10 @@ impl CensusSource {
         let mut documents = Vec::new();
         let mut telemetry = CensusSourceTelemetry::default();
         for request in contract.metadata_requests() {
-            let response = self
+            let mut response = self
                 .fetch_authorized(
                     authority,
-                    request
-                        .authorize(&self.api_key)
-                        .map_err(map_adapter_error)?,
+                    request.public_request().map_err(map_adapter_error)?,
                     request.request_digest(),
                     provider_dataset,
                     deadline,
@@ -871,6 +1220,10 @@ impl CensusSource {
             telemetry = telemetry
                 .checked_add(response_telemetry)
                 .map_err(map_source_error)?;
+            response.record_success()?;
+            self.telemetry
+                .successful_responses
+                .fetch_add(1, Ordering::Relaxed);
             self.telemetry.add(CensusSourceTelemetry {
                 metadata_entries: checked_u64(metadata_entries).map_err(map_source_error)?,
                 ..CensusSourceTelemetry::default()
@@ -901,7 +1254,7 @@ impl CensusSource {
     /// Fetches and parses one data response against an exact previously acquired metadata bundle.
     /// The result may retain structured partial evidence; callers must require
     /// `page().completeness().is_complete()` before publication.
-    pub async fn acquire_data(
+    pub(crate) async fn acquire_data(
         &self,
         authority: &ExtractionAuthority,
         metadata: &CensusMetadataBundle,
@@ -916,7 +1269,7 @@ impl CensusSource {
         if metadata.query_digest != contract.query().request_digest() {
             return Err(invalid_protocol());
         }
-        let response = self
+        let mut response = self
             .fetch_authorized(
                 authority,
                 contract
@@ -957,6 +1310,10 @@ impl CensusSource {
             accounting.observations(),
             !page.completeness().is_complete(),
         )?;
+        response.record_success()?;
+        self.telemetry
+            .successful_responses
+            .fetch_add(1, Ordering::Relaxed);
         self.telemetry.add(CensusSourceTelemetry {
             requested_variables: checked_u64(accounting.requested_wire_variables())
                 .map_err(map_source_error)?,
@@ -979,7 +1336,7 @@ impl CensusSource {
     }
 
     /// Runs the complete metadata-first acquisition and fails closed on every partial data page.
-    pub async fn acquire_dataset(
+    pub(crate) async fn acquire_dataset(
         &self,
         authority: &ExtractionAuthority,
         provider_dataset: &SourceIdentifier,
@@ -1007,26 +1364,12 @@ impl CensusSource {
         })
     }
 
-    /// Builds locally observed revision evidence for Census responses, which do not supply a
-    /// universal provider revision chronology.
-    pub fn revision_plan(
-        &self,
-        batch: &ExtractionBatch,
-    ) -> Result<ExtractionRevisionPlan, CensusSourceError> {
-        if batch.request().object().source_id() != self.metadata.source_id()
-            || batch.request().object().metadata_revision() != self.metadata.revision()
-        {
-            return Err(CensusSourceError::InvalidMetadata);
-        }
-        ExtractionRevisionPlan::locally_observed(batch.records().len()).map_err(Into::into)
-    }
-
     async fn discover_impl(
         &self,
         authority: ExtractionAuthority,
         request: DiscoveryRequest,
         cancellation: CancellationToken,
-    ) -> Result<DiscoveryBatch, ExtractionSourceError> {
+    ) -> Result<CensusDiscoveryOutput, ExtractionSourceError> {
         self.validate_authority(&authority)?;
         if request.effective_at().is_some() || request.max_results() != 1 {
             return Err(invalid_protocol());
@@ -1044,7 +1387,48 @@ impl CensusSource {
             )
             .await?;
         let object = source_object(&self.metadata, &request, contract, &acquired)?;
-        DiscoveryBatch::try_new(&request, vec![object]).map_err(Into::into)
+        let batch = DiscoveryBatch::try_new(&request, vec![object])?;
+        let capture_material = combined_capture_material(&self.metadata, contract, &acquired)?;
+        let telemetry = acquired.telemetry();
+        Ok(CensusDiscoveryOutput {
+            batch,
+            acquisition: acquired,
+            capture_material,
+            telemetry,
+        })
+    }
+
+    /// Discovers one exact source object and retains every response for raw sealing.
+    pub async fn discover_with_activation(
+        &self,
+        authority: ExtractionAuthority,
+        request: DiscoveryRequest,
+        activation: &crate::CensusActivationCandidate,
+        doctor: &crate::CensusDoctorReport,
+        sealed_doctor_capture: &market_squawk_sources::SealedProviderCaptureSetReceipt,
+        cancellation: CancellationToken,
+    ) -> Result<CensusDiscoveryOutput, ExtractionSourceError> {
+        let operation_at = system_timestamp().map_err(map_source_error)?;
+        self.validate_activation(
+            activation,
+            doctor,
+            sealed_doctor_capture,
+            operation_at,
+        )
+        .map_err(map_source_error)?;
+        if request.deadline() >= activation.expires_at() {
+            return Err(invalid_protocol());
+        }
+        let output = self.discover_impl(authority, request, cancellation).await?;
+        let completed_at = system_timestamp().map_err(map_source_error)?;
+        self.validate_activation(
+            activation,
+            doctor,
+            sealed_doctor_capture,
+            completed_at,
+        )
+        .map_err(map_source_error)?;
+        Ok(output)
     }
 
     /// Produces canonical rows together with every exact metadata and data response required for
@@ -1054,9 +1438,23 @@ impl CensusSource {
         &self,
         authority: ExtractionAuthority,
         request: ExtractionRequest,
+        activation: &crate::CensusActivationCandidate,
+        doctor: &crate::CensusDoctorReport,
+        sealed_doctor_capture: &market_squawk_sources::SealedProviderCaptureSetReceipt,
         cancellation: CancellationToken,
     ) -> Result<CensusExtractionOutput, ExtractionSourceError> {
         self.validate_authority(&authority)?;
+        let operation_at = system_timestamp().map_err(map_source_error)?;
+        self.validate_activation(
+            activation,
+            doctor,
+            sealed_doctor_capture,
+            operation_at,
+        )
+        .map_err(map_source_error)?;
+        if request.deadline() >= activation.expires_at() {
+            return Err(invalid_protocol());
+        }
         if request.object().source_id() != self.metadata.source_id()
             || request.object().metadata_revision() != self.metadata.revision()
         {
@@ -1079,7 +1477,16 @@ impl CensusSource {
             )
             .await?;
         verify_acquisition(&request, &object_identity, &acquired)?;
-        extraction_output(&self.metadata, &request, contract, acquired)
+        let output = extraction_output(&self.metadata, &self.config, &request, contract, acquired)?;
+        let completed_at = system_timestamp().map_err(map_source_error)?;
+        self.validate_activation(
+            activation,
+            doctor,
+            sealed_doctor_capture,
+            completed_at,
+        )
+        .map_err(map_source_error)?;
+        Ok(output)
     }
 
     async fn fetch_authorized(
@@ -1091,10 +1498,46 @@ impl CensusSource {
         deadline: Timestamp,
         cancellation: CancellationToken,
     ) -> Result<FetchedResponse, ExtractionSourceError> {
+        self.fetch_authorized_with_limits(
+            authority,
+            authorized,
+            request_digest,
+            provider_dataset,
+            deadline,
+            cancellation,
+            self.response_limit,
+            self.request_timeout,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "authority, identity, deadline, cancellation, byte, and duration limits stay explicit"
+    )]
+    async fn fetch_authorized_with_limits(
+        &self,
+        authority: &ExtractionAuthority,
+        authorized: CensusAuthorizedUrl,
+        request_digest: [u8; 32],
+        provider_dataset: &SourceIdentifier,
+        deadline: Timestamp,
+        cancellation: CancellationToken,
+        response_limit: usize,
+        request_timeout: Duration,
+    ) -> Result<FetchedResponse, ExtractionSourceError> {
         self.validate_authority(authority)?;
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
         }
+        if response_limit == 0
+            || response_limit > self.response_limit
+            || request_timeout.is_zero()
+            || request_timeout > self.request_timeout
+        {
+            return Err(invalid_protocol());
+        }
+        let credentialed = authorized.is_credentialed();
         let target = secret_target(&authorized).map_err(map_source_error)?;
         let permit =
             acquire_request_permit(authority, target.as_str(), deadline, cancellation.clone())
@@ -1102,13 +1545,13 @@ impl CensusSource {
         let in_flight = permit.authorize_send(target.as_str())?;
         drop(target);
         let now = system_timestamp().map_err(map_source_error)?;
-        let timeout = remaining_timeout(deadline, now, self.request_timeout)?;
+        let timeout = remaining_timeout(deadline, now, request_timeout)?;
         let result = self
             .transport
             .execute(
                 CensusHttpRequest { authorized },
                 &in_flight,
-                self.response_limit,
+                response_limit,
                 timeout,
                 cancellation,
             )
@@ -1132,14 +1575,13 @@ impl CensusSource {
             self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
             return Err(error.into());
         }
-        if response
-            .content_encoding
-            .as_deref()
-            .is_some_and(|value| !value.eq_ignore_ascii_case(b"identity"))
-            || !content_type_is_json(response.content_type.as_deref())
-        {
+        if response.key_error {
             self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-            return Err(invalid_protocol());
+            return Err(if credentialed {
+                SourceError::Unauthorized.into()
+            } else {
+                invalid_protocol()
+            });
         }
         match response.status {
             200 => {}
@@ -1163,6 +1605,15 @@ impl CensusSource {
                 self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
                 return Err(SourceError::ProviderUnavailable.into());
             }
+        }
+        if response
+            .content_encoding
+            .as_deref()
+            .is_some_and(|value| !value.eq_ignore_ascii_case(b"identity"))
+            || !content_type_is_json(response.content_type.as_deref())
+        {
+            self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+            return Err(invalid_protocol());
         }
         if response.body.is_empty() {
             self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
@@ -1200,15 +1651,13 @@ impl CensusSource {
                 return Err(map_source_error(CensusSourceError::Capture(error)));
             }
         };
-        in_flight.release();
-        self.telemetry
-            .successful_responses
-            .fetch_add(1, Ordering::Relaxed);
         Ok(FetchedResponse {
             body: response.body,
             capture,
+            rate_headers: response.rate_headers,
             received_at: response.received_at,
             latency: response.latency,
+            in_flight: Some(in_flight),
         })
     }
 
@@ -1256,7 +1705,8 @@ impl ExtractionSource for CensusSource {
         request: DiscoveryRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<DiscoveryBatch, ExtractionSourceError>> {
-        Box::pin(self.discover_impl(authority, request, cancellation))
+        let _ = (authority, request, cancellation);
+        Box::pin(async { Err(SourceError::InvalidProtocolState.into()) })
     }
 
     fn extract(
@@ -1274,11 +1724,21 @@ impl ExtractionSource for CensusSource {
 struct FetchedResponse {
     body: Bytes,
     capture: ProviderCaptureSetReceipt,
+    rate_headers: CensusRateLimitHeaders,
     received_at: Timestamp,
     latency: Duration,
+    in_flight: Option<InFlightExtractionRequest>,
 }
 
 impl FetchedResponse {
+    fn record_success(&mut self) -> Result<(), ExtractionSourceError> {
+        self.in_flight
+            .take()
+            .ok_or_else(invalid_protocol)?
+            .record_success()
+            .map_err(Into::into)
+    }
+
     fn base_telemetry(&self) -> Result<CensusSourceTelemetry, CensusSourceError> {
         Ok(CensusSourceTelemetry {
             requests: 1,
@@ -1414,9 +1874,129 @@ fn validate_metadata_bundle(
                     }
                     _ => None,
                 })
-                .ok_or(CensusSourceError::Protocol)?
+            .ok_or(CensusSourceError::Protocol)?
         }
     };
+    let mut get_coordinates = BTreeSet::<String>::new();
+    match contract.query().selection() {
+        CensusSelection::Variables { .. } => {
+            get_coordinates.extend(
+                contract
+                    .query()
+                    .selection()
+                    .wire_variables()
+                    .iter()
+                    .map(|variable| variable.as_str().to_owned()),
+            );
+        }
+        CensusSelection::Group { .. } => {
+            get_coordinates.extend(
+                selected_variables
+                    .variables()
+                    .filter(|variable| !variable.is_context())
+                    .map(|variable| variable.name().as_str().to_owned()),
+            );
+        }
+    }
+    let predicate_coordinates = contract
+        .query()
+        .predicates()
+        .iter()
+        .map(|predicate| predicate.variable().as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    if get_coordinates
+        .iter()
+        .any(|coordinate| predicate_coordinates.contains(coordinate))
+    {
+        return Err(CensusSourceError::Protocol);
+    }
+    let is_predicate_coordinate = |variable: &crate::CensusVariableMetadata| match (
+        variable.predicate_type(),
+        contract.query().geography(),
+    ) {
+        (
+            CensusPredicateType::FipsFor,
+            CensusGeography::Standard { for_clause, .. },
+        ) => {
+            variable.name().as_str() == "for"
+                || variable.name().as_str() == for_clause.level()
+        }
+        (
+            CensusPredicateType::FipsIn,
+            CensusGeography::Standard { in_clauses, .. },
+        ) => {
+            !in_clauses.is_empty()
+                && (variable.name().as_str() == "in"
+                    || in_clauses
+                        .iter()
+                        .any(|clause| clause.level() == variable.name().as_str()))
+        }
+        (CensusPredicateType::Ucgid, CensusGeography::Uniform { .. }) => true,
+        (CensusPredicateType::Time, _) => {
+            variable.name().as_str() == "time" && contract.query().time().is_some()
+        }
+        _ => predicate_coordinates.contains(variable.name().as_str()),
+    };
+    for variable in selected_variables.variables() {
+        let in_get = get_coordinates.contains(variable.name().as_str());
+        let in_predicate = is_predicate_coordinate(variable);
+        let referenced = in_get || in_predicate;
+        if referenced && variable.provider_limit().is_some_and(|limit| limit != 0) {
+            return Err(CensusSourceError::Protocol);
+        }
+        match variable.required() {
+            CensusRequiredVariable::Required => {
+                if usize::from(in_get) + usize::from(in_predicate) != 1 {
+                    return Err(CensusSourceError::Protocol);
+                }
+            }
+            CensusRequiredVariable::RequiredPredicateOnly => {
+                if in_get || !in_predicate {
+                    return Err(CensusSourceError::Protocol);
+                }
+            }
+            CensusRequiredVariable::PredicateOnly => {
+                if in_get {
+                    return Err(CensusSourceError::Protocol);
+                }
+            }
+            CensusRequiredVariable::Optional
+            | CensusRequiredVariable::DefaultDisplayed
+            | CensusRequiredVariable::Unspecified => {}
+        }
+    }
+    for variable in full_variables.variables() {
+        let in_get = get_coordinates.contains(variable.name().as_str());
+        let in_predicate = is_predicate_coordinate(variable);
+        if (in_get || in_predicate || matches!(
+            variable.required(),
+            CensusRequiredVariable::Required
+                | CensusRequiredVariable::RequiredPredicateOnly
+        )) && variable.provider_limit().is_some_and(|limit| limit != 0)
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        match variable.required() {
+            CensusRequiredVariable::Required => {
+                if usize::from(in_get) + usize::from(in_predicate) != 1 {
+                    return Err(CensusSourceError::Protocol);
+                }
+            }
+            CensusRequiredVariable::RequiredPredicateOnly => {
+                if in_get || !in_predicate {
+                    return Err(CensusSourceError::Protocol);
+                }
+            }
+            CensusRequiredVariable::PredicateOnly => {
+                if in_get {
+                    return Err(CensusSourceError::Protocol);
+                }
+            }
+            CensusRequiredVariable::Optional
+            | CensusRequiredVariable::DefaultDisplayed
+            | CensusRequiredVariable::Unspecified => {}
+        }
+    }
     for mapping in contract.mappings() {
         let variable = selected_variables
             .get(mapping.provider_variable().as_str())
@@ -1508,8 +2088,9 @@ fn authorize_configured_target(
 
 fn secret_target(authorized: &CensusAuthorizedUrl) -> Result<Zeroizing<String>, CensusSourceError> {
     let mut url = authorized.transport_url().clone();
-    url.query_pairs_mut()
-        .append_pair("key", authorized.key_query_value());
+    if let Some(key) = authorized.key_query_value() {
+        url.query_pairs_mut().append_pair("key", key);
+    }
     Ok(Zeroizing::new(url.to_string()))
 }
 
@@ -1601,13 +2182,15 @@ fn source_object(
         ExactPayloadEvidence::with_version_pinned_locator(evidence_digest(body_digest), locator);
     let received_at = acquired.data().page().clocks().received_at();
     let effective = EffectiveInterval::new(received_at, None).map_err(|_| invalid_protocol())?;
-    SourceObject::try_new_with_availability(
+    SourceObject::try_new_with_capture_identity(
         metadata.source_id().clone(),
         metadata.revision().clone(),
         request,
         object_id,
         SourceIdentifier::try_from(CENSUS_JSON_MEDIA_TYPE).map_err(|_| invalid_protocol())?,
         evidence,
+        SourceObjectCaptureIdentity::try_from_capture(acquired.data().capture())
+            .map_err(|_| invalid_protocol())?,
         effective,
         None,
         market_squawk_sources::AvailabilityEvidence::LocalFirstObserved {
@@ -1652,10 +2235,13 @@ fn verify_acquisition(
 ) -> Result<(), ExtractionSourceError> {
     let body = acquired.data().body();
     let body_bytes = u64::try_from(body.len()).map_err(|_| invalid_protocol())?;
+    let capture_identity = SourceObjectCaptureIdentity::try_from_capture(acquired.data().capture())
+        .map_err(|_| invalid_protocol())?;
     if identity.metadata_digest != acquired.metadata().content_digest()
         || identity.body_digest != acquired.data().page().response_payload_digest()
         || identity.body_digest != sha256(body)
         || !payload_matches_exact_evidence(body, request.object().evidence())
+        || request.object().capture_identity() != capture_identity
         || request
             .object()
             .expected_bytes()
@@ -1668,13 +2254,14 @@ fn verify_acquisition(
 
 fn extraction_output(
     metadata: &SourceMetadata,
+    config: &CensusSourceConfig,
     request: &ExtractionRequest,
     contract: &CensusDatasetContract,
     acquisition: CensusDatasetAcquisition,
 ) -> Result<CensusExtractionOutput, ExtractionSourceError> {
-    let records = canonical_records(metadata, contract, acquisition.data().page())
+    let canonical = canonical_records(metadata, contract, acquisition.data().page())
         .map_err(map_source_error)?;
-    if records.len() > request.max_records() as usize {
+    if canonical.len() > request.max_records() as usize {
         return Err(
             market_squawk_sources::ExtractionError::RecordLimitExceeded {
                 requested: request.max_records(),
@@ -1684,9 +2271,14 @@ fn extraction_output(
     }
     let schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
         .map_err(|_| invalid_protocol())?;
-    let records = records
+    let mut bindings = Vec::new();
+    bindings
+        .try_reserve_exact(canonical.len())
+        .map_err(|_| invalid_protocol())?;
+    let records = canonical
         .into_iter()
         .map(|record| {
+            bindings.push(record.binding);
             ExtractionRecord::try_new_with_time(
                 request,
                 schema.clone(),
@@ -1701,14 +2293,91 @@ fn extraction_output(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let batch = ExtractionBatch::try_new(request, records)?;
-    let captures = capture_materials(metadata, &acquisition)?;
+    let capture_material = combined_capture_material(metadata, contract, &acquisition)?;
+    let batch = batch
+        .try_bind_provider_capture(capture_material.receipt())
+        .map_err(|_| invalid_protocol())?;
+    let publication_plan = crate::runtime::build_publication_plan(
+        metadata,
+        config,
+        contract,
+        &acquisition,
+        &batch,
+        &capture_material,
+        bindings.into_boxed_slice(),
+    )
+    .map_err(map_source_error)?;
     let telemetry = acquisition.telemetry();
     Ok(CensusExtractionOutput {
         batch,
         acquisition,
-        captures,
+        capture_material,
+        publication_plan,
         telemetry,
     })
+}
+
+fn combined_capture_material(
+    metadata: &SourceMetadata,
+    contract: &CensusDatasetContract,
+    acquisition: &CensusDatasetAcquisition,
+) -> Result<ProviderCaptureMaterial, ExtractionSourceError> {
+    let captures = capture_materials(metadata, acquisition)?;
+    let graph_identity = census_capture_graph_identity(metadata, contract, &captures)
+        .map_err(map_source_error)?;
+    ProviderCaptureMaterial::try_combine_request_graph(
+        contract.dataset_id().clone(),
+        graph_identity,
+        captures.into_vec(),
+    )
+    .map_err(|_| invalid_protocol())
+}
+
+fn census_capture_graph_identity(
+    metadata: &SourceMetadata,
+    contract: &CensusDatasetContract,
+    captures: &[ProviderCaptureMaterial],
+) -> Result<EvidenceDigest, CensusSourceError> {
+    if captures.is_empty() {
+        return Err(CensusSourceError::Protocol);
+    }
+    let mut digest = Sha256::new();
+    crate::update_digest_component(
+        &mut digest,
+        b"market-squawk/census-metadata-data-request-graph/v1",
+    );
+    crate::update_digest_component(&mut digest, metadata.source_id().as_str().as_bytes());
+    crate::update_digest_component(
+        &mut digest,
+        metadata
+            .revision()
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    );
+    crate::update_digest_component(&mut digest, contract.dataset_id().as_str().as_bytes());
+    crate::update_digest_component(
+        &mut digest,
+        &u64::try_from(captures.len())
+            .map_err(|_| CensusSourceError::Protocol)?
+            .to_be_bytes(),
+    );
+    for capture in captures {
+        let receipt = capture.receipt();
+        if receipt.source_id() != metadata.source_id()
+            || receipt.metadata_revision() != metadata.revision()
+            || receipt.dataset() != contract.dataset_id()
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        crate::update_digest_component(&mut digest, &receipt.request_set_identity().bytes());
+        crate::update_digest_component(&mut digest, &receipt.content_digest().bytes());
+        crate::update_digest_component(&mut digest, &receipt.observation_digest().bytes());
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
 }
 
 fn capture_materials(
@@ -1773,9 +2442,9 @@ fn deterministic_capture_uuid(tag: &[u8], receipt: &ProviderCaptureSetReceipt) -
     hash.update(tag);
     hash.update(receipt.request_set_identity().bytes());
     hash.update(receipt.observation_digest().bytes());
-    let mut bytes: [u8; 16] = hash.finalize()[..16]
-        .try_into()
-        .expect("SHA-256 prefix has a fixed length");
+    let digest = hash.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
@@ -1787,6 +2456,7 @@ struct CanonicalCensusRecord {
     revision: SourceIdentifier,
     evidence: ExactPayloadEvidence,
     payload: Bytes,
+    binding: crate::CensusCanonicalObservationBinding,
 }
 
 fn canonical_records(
@@ -1807,6 +2477,12 @@ fn canonical_records(
         };
         let effective = effective_coordinate(&contract.effective_time, observation)?;
         let series = scoped_series(mapping, observation.revision_candidate().family_digest())?;
+        let source_identifier = SourceIdentifier::try_from(format!(
+            "census:v1:family:{}:content:{}",
+            lower_hex(observation.revision_candidate().family_digest()),
+            lower_hex(observation.revision_candidate().content_digest()),
+        ))
+        .map_err(|_| CensusSourceError::Protocol)?;
         let revision = SourceIdentifier::try_from(format!(
             "census-observed:{}",
             lower_hex(observation.revision_candidate().content_digest())
@@ -1818,11 +2494,7 @@ fn canonical_records(
             source_id: source.source_id().clone(),
             instrument_id: None,
             venue_id: None,
-            source_identifier: SourceIdentifier::try_from(format!(
-                "census-row:{}",
-                lower_hex(observation.row_digest())
-            ))
-            .map_err(|_| CensusSourceError::Protocol)?,
+            source_identifier: source_identifier.clone(),
             source_timestamp: None,
             received_at,
             ingested_at,
@@ -1846,14 +2518,17 @@ fn canonical_records(
         let macro_observation = match observation.value() {
             CensusValueState::Observed { value } => MacroObservation::new(
                 context,
-                series,
+                series.clone(),
                 canonical_decimal(value)?,
                 mapping.unit().clone(),
             ),
-            CensusValueState::Missing { reason, .. } => MacroObservation::missing(
+            CensusValueState::Missing {
+                reason,
+                annotations,
+            } => MacroObservation::missing(
                 context,
-                series,
-                canonical_missing(*reason)?,
+                series.clone(),
+                canonical_missing(mapping, *reason, annotations)?,
                 mapping.unit().clone(),
             ),
             CensusValueState::Annotated { .. } | CensusValueState::Invalid { .. } => {
@@ -1864,6 +2539,16 @@ fn canonical_records(
             .map(Bytes::from)
             .map_err(|_| CensusSourceError::Protocol)?;
         let payload_digest = sha256(&payload);
+        let canonical_ordinal = u64::try_from(records.len())
+            .map_err(|_| CensusSourceError::Protocol)?;
+        let binding = crate::CensusCanonicalObservationBinding::new(
+            canonical_ordinal,
+            observation,
+            effective.clone(),
+            series,
+            source_identifier,
+            mapping.unit().clone(),
+        );
         records.push(CanonicalCensusRecord {
             effective,
             availability: market_squawk_sources::AvailabilityEvidence::LocalFirstObserved {
@@ -1872,6 +2557,7 @@ fn canonical_records(
             revision,
             evidence: ExactPayloadEvidence::from_content_digest(evidence_digest(payload_digest)),
             payload,
+            binding,
         });
     }
     if records.is_empty() {
@@ -1892,21 +2578,37 @@ fn canonical_decimal(value: &CensusTypedValue) -> Result<Decimal, CensusSourceEr
     }
 }
 
-fn canonical_missing(reason: CensusMissingReason) -> Result<MacroMissingValue, CensusSourceError> {
-    let (marker, reason) = match reason {
-        CensusMissingReason::JsonNull => ("json-null", "census-json-null"),
-        CensusMissingReason::EmptyString => ("empty-string", "census-empty-string"),
-        CensusMissingReason::ProviderAnnotatedMissing => {
-            ("provider-annotated-missing", "census-provider-annotation")
+fn canonical_missing(
+    mapping: &CensusVariableMapping,
+    reason: CensusMissingReason,
+    annotations: &[crate::CensusAnnotation],
+) -> Result<MacroMissingValue, CensusSourceError> {
+    match (reason, annotations.is_empty()) {
+        (CensusMissingReason::JsonNull, true) => Ok(MacroMissingValue::new(
+            SourceIdentifier::try_from("null").map_err(|_| CensusSourceError::Protocol)?,
+            Some(
+                SourceIdentifier::try_from("census-json-null")
+                    .map_err(|_| CensusSourceError::Protocol)?,
+            ),
+        )),
+        (CensusMissingReason::EmptyString, true) => Ok(MacroMissingValue::new(
+            SourceIdentifier::try_from("\"\"").map_err(|_| CensusSourceError::Protocol)?,
+            Some(
+                SourceIdentifier::try_from("census-empty-string")
+                    .map_err(|_| CensusSourceError::Protocol)?,
+            ),
+        )),
+        (CensusMissingReason::ProviderAnnotatedMissing, false) => mapping
+            .annotated_missing(annotations)
+            .cloned()
+            .ok_or(CensusSourceError::Protocol),
+        (CensusMissingReason::JsonNull, false)
+        | (CensusMissingReason::EmptyString, false)
+        | (CensusMissingReason::ProviderAnnotatedMissing, true)
+        | (CensusMissingReason::AnnotationColumnMissing, _) => {
+            Err(CensusSourceError::Protocol)
         }
-        CensusMissingReason::AnnotationColumnMissing => {
-            return Err(CensusSourceError::Protocol);
-        }
-    };
-    Ok(MacroMissingValue::new(
-        SourceIdentifier::try_from(marker).map_err(|_| CensusSourceError::Protocol)?,
-        Some(SourceIdentifier::try_from(reason).map_err(|_| CensusSourceError::Protocol)?),
-    ))
+    }
 }
 
 fn effective_coordinate(
@@ -2040,8 +2742,35 @@ fn map_source_error(error: CensusSourceError) -> ExtractionSourceError {
         | CensusSourceError::TelemetryOverflow
         | CensusSourceError::Adapter(_)
         | CensusSourceError::Capture(_)
-        | CensusSourceError::Revision(_) => invalid_protocol(),
+        | CensusSourceError::Revision(_)
+        | CensusSourceError::Policy(_) => invalid_protocol(),
     }
+}
+
+fn census_configuration_digest(
+    contracts: &[CensusDatasetContract],
+    parse_limits: CensusParseLimits,
+    private_research_policy: EvidenceDigest,
+    presentation_obligation: EvidenceDigest,
+    activation_requirements: EvidenceDigest,
+) -> Result<EvidenceDigest, CensusSourceError> {
+    let wire = serde_json::to_vec(&(
+        contracts,
+        parse_limits,
+        private_research_policy,
+        presentation_obligation,
+        activation_requirements,
+    ))
+        .map_err(|_| CensusSourceError::InvalidConfiguration)?;
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/census-source-config/v3");
+    digest.update(
+        u64::try_from(wire.len())
+            .map_err(|_| CensusSourceError::InvalidConfiguration)?
+            .to_be_bytes(),
+    );
+    digest.update(wire);
+    Ok(evidence_digest(digest.finalize().into()))
 }
 
 #[cfg(test)]

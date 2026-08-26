@@ -1,14 +1,23 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+use std::mem::size_of;
 
 use market_squawk_domain::{AvailabilityEvidence, CalendarDate, SourceIdentifier, Timestamp};
 use rust_decimal::Decimal;
-use serde::Serialize;
-use serde_json::Value;
+use serde::de::{DeserializeSeed, IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::discovery::{CensusPredicateType, CensusVariableCatalog, CensusVariableMetadata};
-use crate::query::{CensusDataQuery, CensusGeography, CensusSelection};
+use crate::query::{CensusDataQuery, CensusGeography, CensusGeographyCode, CensusSelection};
+use crate::CensusGeographyAdmission;
 use crate::{CensusAdapterError, sha256, update_digest_component};
+
+/// Absolute raw + decoded + canonical-output memory ceiling for one Census operation.
+pub const CENSUS_OPERATION_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const CENSUS_MAX_SINGLE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const CENSUS_MAX_DECODED_CELLS: usize = 64 * 1024;
 
 /// Bounded Census JSON parser limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -46,6 +55,9 @@ impl CensusParseLimits {
         .contains(&0)
             || max_cells < max_rows
             || max_cells < max_columns
+            || max_bytes > CENSUS_MAX_SINGLE_RESPONSE_BYTES
+            || max_cells > CENSUS_MAX_DECODED_CELLS
+            || max_string_bytes > max_bytes
         {
             return Err(CensusAdapterError::InvalidQuery);
         }
@@ -93,12 +105,12 @@ impl CensusParseLimits {
 impl Default for CensusParseLimits {
     fn default() -> Self {
         Self {
-            max_bytes: 16 * 1024 * 1024,
-            max_rows: 100_000,
-            max_columns: 4_096,
-            max_cells: 2_000_000,
-            max_metadata_entries: 100_000,
-            max_string_bytes: 64 * 1024,
+            max_bytes: 8 * 1024 * 1024,
+            max_rows: 32_768,
+            max_columns: 2_048,
+            max_cells: CENSUS_MAX_DECODED_CELLS,
+            max_metadata_entries: 65_536,
+            max_string_bytes: 32 * 1024,
         }
     }
 }
@@ -530,6 +542,31 @@ pub enum CensusCompletenessIssue {
     MissingRowGeography { row_number: usize, level: String },
     /// One exact UCGID result did not match any individually requested geography.
     UnexpectedUniformGeography { row_number: usize, geoid: String },
+    /// One exact requested standard geography code did not appear in the response.
+    MissingRequestedGeography { level: String, code: String },
+    /// One returned standard geography code was outside an exact request clause.
+    UnexpectedGeographyCode {
+        row_number: usize,
+        level: String,
+        code: String,
+    },
+    /// One exact requested UCGID did not appear in the response.
+    MissingRequestedUniformGeography { geoid: String },
+    /// A wildcard request produced no safely identified geography.
+    MissingWildcardGeography,
+    /// Returned exact standard geography cardinality did not match the requested Cartesian scope.
+    GeographyCardinalityMismatch { expected: usize, returned: usize },
+    /// The response repeated one geography/time row identity.
+    DuplicateReturnedGeography {
+        row_number: usize,
+        first_row_number: usize,
+    },
+    /// The response repeated one economic variable/geography/time/value identity.
+    DuplicateEconomicObservation {
+        row_number: usize,
+        first_row_number: usize,
+        variable: SourceIdentifier,
+    },
     /// One present cell did not conform to metadata-declared typing.
     InvalidTypedValue {
         /// Provider row number.
@@ -693,6 +730,7 @@ impl CensusDataPage {
     pub fn parse(
         query: &CensusDataQuery,
         metadata: &CensusVariableCatalog,
+        geography_admission: &CensusGeographyAdmission,
         bytes: &[u8],
         limits: CensusParseLimits,
         clocks: CensusClocks,
@@ -708,275 +746,39 @@ impl CensusDataPage {
             }
             (CensusSelection::Variables { .. }, None) => {}
         }
+        geography_admission.validate_query(query.geography())?;
         if bytes.len() > limits.max_bytes {
             return Err(CensusAdapterError::BodyTooLarge);
         }
-        let matrix = serde_json::from_slice::<Value>(bytes)
-            .map_err(|_| CensusAdapterError::InvalidJson)?
-            .as_array()
-            .cloned()
-            .ok_or(CensusAdapterError::SchemaDrift)?;
-        if matrix.is_empty() {
-            return Err(CensusAdapterError::SchemaDrift);
-        }
-        let header_values = matrix[0]
-            .as_array()
-            .ok_or(CensusAdapterError::SchemaDrift)?;
-        if header_values.is_empty() || header_values.len() > limits.max_columns {
-            return Err(CensusAdapterError::ResourceLimitExceeded);
-        }
-        let data_rows = matrix.len() - 1;
-        if data_rows > limits.max_rows
-            || data_rows
-                .checked_mul(header_values.len())
-                .is_none_or(|cells| cells > limits.max_cells)
-        {
-            return Err(CensusAdapterError::ResourceLimitExceeded);
-        }
-        let header = header_values
-            .iter()
-            .map(|value| {
-                bounded_cell_string(value, limits).and_then(|value| {
-                    SourceIdentifier::try_from(value).map_err(|_| CensusAdapterError::SchemaDrift)
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if header.iter().collect::<BTreeSet<_>>().len() != header.len() {
-            return Err(CensusAdapterError::DuplicateIdentity);
-        }
-        let header_index = header
-            .iter()
-            .enumerate()
-            .map(|(index, name)| (name.as_str(), index))
-            .collect::<BTreeMap<_, _>>();
-        let rows = matrix[1..]
-            .iter()
-            .map(|row| {
-                let row = row.as_array().ok_or(CensusAdapterError::SchemaDrift)?;
-                if row.len() != header.len() {
-                    return Err(CensusAdapterError::SchemaDrift);
-                }
-                row.iter()
-                    .map(|value| CensusCell::parse(value, limits))
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
         let response_payload_digest = sha256(bytes);
         let metadata_payload_digest = metadata.evidence().payload_digest();
-        let predicates = query
-            .predicates()
-            .iter()
-            .map(|predicate| CensusPredicateValue {
-                variable: predicate.variable().clone(),
-                predicate_type: predicate.predicate_type().clone(),
-                values: predicate.values().to_vec(),
-            })
-            .collect::<Vec<_>>();
-        let mut issues = BTreeSet::new();
-        let expected_wire = expected_wire_variables(query, metadata)?;
-        let primary = primary_variables(query, metadata, &header)?;
-        let expected_set = expected_wire
-            .iter()
-            .map(SourceIdentifier::as_str)
-            .collect::<BTreeSet<_>>();
-        let geography_levels = query.geography().required_response_levels();
-        let geography_set = geography_levels.iter().copied().collect::<BTreeSet<_>>();
-
-        for variable in &expected_wire {
-            if !header_index.contains_key(variable.as_str()) {
-                issues.insert(match query.selection() {
-                    CensusSelection::Variables { .. } => {
-                        CensusCompletenessIssue::MissingRequestedVariable {
-                            variable: variable.clone(),
-                        }
-                    }
-                    CensusSelection::Group { .. } => {
-                        CensusCompletenessIssue::MissingGroupVariable {
-                            variable: variable.clone(),
-                        }
-                    }
-                });
-            }
-        }
-        for variable in &primary {
-            let variable_metadata = metadata
-                .get(variable.as_str())
-                .ok_or(CensusAdapterError::MetadataMismatch)?;
-            for attribute in variable_metadata.attributes() {
-                if !expected_set.contains(attribute.as_str()) {
-                    issues.insert(CensusCompletenessIssue::UnrequestedDeclaredAttribute {
-                        variable: variable.clone(),
-                        attribute: attribute.clone(),
-                    });
-                } else if !header_index.contains_key(attribute.as_str()) {
-                    issues.insert(CensusCompletenessIssue::MissingDeclaredAttribute {
-                        variable: variable.clone(),
-                        attribute: attribute.clone(),
-                    });
-                }
-            }
-        }
-        for level in &geography_levels {
-            if !header_index.contains_key(level) {
-                issues.insert(CensusCompletenessIssue::MissingGeographyLevel {
-                    level: (*level).to_owned(),
-                });
-            }
-        }
-        if matches!(query.geography(), CensusGeography::Uniform { .. })
-            && !header_index.contains_key("GEO_ID")
-        {
-            issues.insert(CensusCompletenessIssue::MissingUniformGeographyId);
-        }
-        for column in &header {
-            let name = column.as_str();
-            let allowed_context =
-                geography_set.contains(name) || matches!(name, "GEO_ID" | "NAME" | "time");
-            if !expected_set.contains(name) && !allowed_context {
-                issues.insert(CensusCompletenessIssue::UnexpectedColumn {
-                    column: column.clone(),
-                });
-            }
-        }
-
-        let mut observations = Vec::new();
-        let mut usable_rows = 0_usize;
-        let mut skipped_rows = 0_usize;
-        let mut observed_values = 0_usize;
-        let mut missing_values = 0_usize;
-        let mut annotated_values = 0_usize;
-        let mut invalid_values = 0_usize;
-        for (row_index, row) in rows.iter().enumerate() {
-            let row_number = row_index + 1;
-            let Some(geography) =
-                row_geography(query, &header_index, row, row_number, &mut issues)?
-            else {
-                skipped_rows = skipped_rows
-                    .checked_add(1)
-                    .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
-                continue;
-            };
-            usable_rows = usable_rows
-                .checked_add(1)
-                .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
-            let reported_time = header_index
-                .get("time")
-                .and_then(|index| row[*index].nonempty_text())
-                .map(CensusReportedTime::parse)
-                .transpose()?;
-            for variable in &primary {
-                let Some(value_index) = header_index.get(variable.as_str()).copied() else {
-                    continue;
-                };
-                let variable_metadata = metadata
-                    .get(variable.as_str())
-                    .ok_or(CensusAdapterError::MetadataMismatch)?;
-                let (value, missing_attribute) =
-                    value_state(variable_metadata, &header_index, row, metadata)?;
-                if let Some(attribute) = missing_attribute {
-                    issues.insert(CensusCompletenessIssue::MissingDeclaredAttribute {
-                        variable: variable.clone(),
-                        attribute,
-                    });
-                }
-                match &value {
-                    CensusValueState::Observed { .. } => observed_values += 1,
-                    CensusValueState::Missing { .. } => missing_values += 1,
-                    CensusValueState::Annotated { .. } => annotated_values += 1,
-                    CensusValueState::Invalid { .. } => {
-                        invalid_values += 1;
-                        issues.insert(CensusCompletenessIssue::InvalidTypedValue {
-                            row_number,
-                            variable: variable.clone(),
-                        });
-                    }
-                }
-                let row_digest = row_digest(
-                    query,
-                    row_number,
-                    variable,
-                    &value,
-                    &geography,
-                    reported_time.as_ref(),
-                    metadata_payload_digest,
-                )?;
-                let family_digest =
-                    family_digest(query, variable, &geography, reported_time.as_ref())?;
-                let first_observed_at = clocks
-                    .availability()
-                    .conservative_available_at()
-                    .unwrap_or(clocks.received_at());
-                let observation = CensusObservation {
-                    dataset: query.dataset().clone(),
-                    row_number,
-                    variable: variable.clone(),
-                    label: variable_metadata.label().to_owned(),
-                    concept: variable_metadata.concept().map(str::to_owned),
-                    group: variable_metadata.group().cloned(),
-                    value,
-                    geography: geography.clone(),
-                    predicates: predicates.clone(),
-                    reported_time: reported_time.clone(),
-                    request_digest: query.request_digest(),
-                    response_payload_digest,
-                    metadata_payload_digest,
-                    row_digest,
-                    clocks: clocks.clone(),
-                    revision: CensusRevisionCandidate {
-                        family_digest,
-                        content_digest: row_digest,
-                        first_observed_at,
-                    },
-                };
-                let _ = value_index;
-                observations.push(observation);
-            }
-        }
-
-        let returned_requested_variables = expected_wire
-            .iter()
-            .filter(|variable| header_index.contains_key(variable.as_str()))
-            .count();
-        let missing_requested_variables = expected_wire
-            .len()
-            .checked_sub(returned_requested_variables)
-            .ok_or(CensusAdapterError::SchemaDrift)?;
-        let accounting = CensusResponseAccounting {
-            requests: 1,
-            requested_primary_variables: primary.len(),
-            requested_wire_variables: expected_wire.len(),
-            returned_columns: header.len(),
-            returned_requested_variables,
-            missing_requested_variables,
-            returned_rows: rows.len(),
-            usable_rows,
-            skipped_rows,
-            observations: observations.len(),
-            observed_values,
-            missing_values,
-            annotated_values,
-            invalid_values,
-        };
-        let completeness = if issues.is_empty() {
-            CensusCompleteness::Complete
-        } else {
-            CensusCompleteness::Partial {
-                issues: issues.into_iter().collect(),
-            }
-        };
-        Ok(Self {
-            dataset: query.dataset().clone(),
-            request_digest: query.request_digest(),
+        let semantic_failure = RefCell::new(None);
+        let seed = CensusMatrixSeed {
+            query,
+            metadata,
+            geography_admission,
+            limits,
+            clocks,
             response_payload_digest,
             metadata_payload_digest,
-            header,
-            observations,
-            completeness,
-            pagination: CensusPagination::SingleResponse { request_count: 1 },
-            accounting,
-            clocks,
-        })
+            semantic_failure: &semantic_failure,
+        };
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        let page = match seed.deserialize(&mut deserializer) {
+            Ok(page) => page,
+            Err(_) => {
+                return Err(semantic_failure
+                    .into_inner()
+                    .unwrap_or(CensusAdapterError::InvalidJson));
+            }
+        };
+        deserializer
+            .end()
+            .map_err(|_| CensusAdapterError::InvalidJson)?;
+        if page.conservative_retained_bytes()? > CENSUS_OPERATION_MEMORY_LIMIT_BYTES {
+            return Err(CensusAdapterError::ResourceLimitExceeded);
+        }
+        Ok(page)
     }
 
     /// Returns the exact dataset.
@@ -1030,6 +832,723 @@ impl CensusDataPage {
     }
 }
 
+struct CensusMatrixSeed<'a> {
+    query: &'a CensusDataQuery,
+    metadata: &'a CensusVariableCatalog,
+    geography_admission: &'a CensusGeographyAdmission,
+    limits: CensusParseLimits,
+    clocks: CensusClocks,
+    response_payload_digest: [u8; 32],
+    metadata_payload_digest: [u8; 32],
+    semantic_failure: &'a RefCell<Option<CensusAdapterError>>,
+}
+
+impl<'de> DeserializeSeed<'de> for CensusMatrixSeed<'_> {
+    type Value = CensusDataPage;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(CensusMatrixVisitor {
+            query: self.query,
+            metadata: self.metadata,
+            geography_admission: self.geography_admission,
+            limits: self.limits,
+            clocks: self.clocks,
+            response_payload_digest: self.response_payload_digest,
+            metadata_payload_digest: self.metadata_payload_digest,
+            semantic_failure: self.semantic_failure,
+        })
+    }
+}
+
+struct CensusMatrixVisitor<'a> {
+    query: &'a CensusDataQuery,
+    metadata: &'a CensusVariableCatalog,
+    geography_admission: &'a CensusGeographyAdmission,
+    limits: CensusParseLimits,
+    clocks: CensusClocks,
+    response_payload_digest: [u8; 32],
+    metadata_payload_digest: [u8; 32],
+    semantic_failure: &'a RefCell<Option<CensusAdapterError>>,
+}
+
+impl<'de> Visitor<'de> for CensusMatrixVisitor<'_> {
+    type Value = CensusDataPage;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded Census JSON matrix")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let header_cells = sequence
+            .next_element_seed(CensusRowSeed {
+                expected_columns: None,
+                limits: self.limits,
+            })?
+            .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+        let header = header_from_cells(header_cells).map_err(|error| {
+            semantic_decode_error::<A::Error>(self.semantic_failure, error)
+        })?;
+        let mut builder = CensusPageBuilder::try_new(
+            self.query,
+            self.metadata,
+            self.geography_admission,
+            self.limits,
+            self.clocks,
+            self.response_payload_digest,
+            self.metadata_payload_digest,
+            header,
+        )
+        .map_err(|error| semantic_decode_error::<A::Error>(self.semantic_failure, error))?;
+        loop {
+            if builder.returned_rows == self.limits.max_rows {
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(semantic_decode_error::<A::Error>(
+                        self.semantic_failure,
+                        CensusAdapterError::ResourceLimitExceeded,
+                    ));
+                }
+                break;
+            }
+            let Some(row) = sequence.next_element_seed(CensusRowSeed {
+                expected_columns: Some(builder.header.len()),
+                limits: self.limits,
+            })?
+            else {
+                break;
+            };
+            let next_rows = builder
+                .returned_rows
+                .checked_add(1)
+                .ok_or_else(|| {
+                    semantic_decode_error::<A::Error>(
+                        self.semantic_failure,
+                        CensusAdapterError::ResourceLimitExceeded,
+                    )
+                })?;
+            if next_rows
+                .checked_mul(builder.header.len())
+                .is_none_or(|cells| cells > self.limits.max_cells)
+            {
+                return Err(semantic_decode_error::<A::Error>(
+                    self.semantic_failure,
+                    CensusAdapterError::ResourceLimitExceeded,
+                ));
+            }
+            builder
+                .push_row(row)
+                .map_err(|error| semantic_decode_error::<A::Error>(self.semantic_failure, error))?;
+        }
+        builder
+            .finish()
+            .map_err(|error| semantic_decode_error::<A::Error>(self.semantic_failure, error))
+    }
+}
+
+fn semantic_decode_error<E>(
+    failure: &RefCell<Option<CensusAdapterError>>,
+    error: CensusAdapterError,
+) -> E
+where
+    E: serde::de::Error,
+{
+    if failure.borrow().is_none() {
+        *failure.borrow_mut() = Some(error);
+    }
+    E::custom("bounded Census semantic decode failure")
+}
+
+#[derive(Clone, Copy)]
+struct CensusRowSeed {
+    expected_columns: Option<usize>,
+    limits: CensusParseLimits,
+}
+
+impl<'de> DeserializeSeed<'de> for CensusRowSeed {
+    type Value = Vec<CensusCell>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(CensusRowVisitor(self))
+    }
+}
+
+struct CensusRowVisitor(CensusRowSeed);
+
+impl<'de> Visitor<'de> for CensusRowVisitor {
+    type Value = Vec<CensusCell>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("one bounded Census matrix row")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let maximum = self
+            .0
+            .expected_columns
+            .unwrap_or(self.0.limits.max_columns);
+        if maximum == 0 || sequence.size_hint().is_some_and(|hint| hint > maximum) {
+            return Err(serde::de::Error::custom(
+                "Census row exceeds its column bound",
+            ));
+        }
+        let reserve = sequence.size_hint().unwrap_or(maximum).min(maximum);
+        let mut row = Vec::new();
+        row.try_reserve_exact(reserve)
+            .map_err(|_| serde::de::Error::custom("Census row allocation failed"))?;
+        while row.len() < maximum {
+            let Some(cell) = sequence.next_element_seed(CensusCellSeed {
+                limits: self.0.limits,
+            })?
+            else {
+                break;
+            };
+            row.push(cell);
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some()
+            || row.is_empty()
+            || self
+                .0
+                .expected_columns
+                .is_some_and(|expected| row.len() != expected)
+        {
+            return Err(serde::de::Error::custom("invalid Census row width"));
+        }
+        Ok(row)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CensusCellSeed {
+    limits: CensusParseLimits,
+}
+
+impl<'de> DeserializeSeed<'de> for CensusCellSeed {
+    type Value = CensusCell;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(CensusCellVisitor {
+            limits: self.limits,
+        })
+    }
+}
+
+struct CensusCellVisitor {
+    limits: CensusParseLimits,
+}
+
+impl CensusCellVisitor {
+    fn text<E>(self, value: &str) -> Result<CensusCell, E>
+    where
+        E: serde::de::Error,
+    {
+        ensure_string(value, self.limits).map_err(E::custom)?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(value.len())
+            .map_err(|_| E::custom("Census cell allocation failed"))?;
+        owned.push_str(value);
+        Ok(CensusCell::Text(owned))
+    }
+
+    fn number<E, T>(self, value: T) -> Result<CensusCell, E>
+    where
+        E: serde::de::Error,
+        T: ToString,
+    {
+        let value = value.to_string();
+        ensure_string(&value, self.limits).map_err(E::custom)?;
+        Ok(CensusCell::Number(value))
+    }
+}
+
+impl<'de> Visitor<'de> for CensusCellVisitor {
+    type Value = CensusCell;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a null, string, number, or Boolean Census cell")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(CensusCell::Null)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(CensusCell::Null)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(CensusCell::Boolean(value))
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.text(value)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.text(value)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        ensure_string(&value, self.limits).map_err(E::custom)?;
+        Ok(CensusCell::Text(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.number(value)
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.number(value)
+    }
+
+    fn visit_i128<E>(self, value: i128) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.number(value)
+    }
+
+    fn visit_u128<E>(self, value: u128) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.number(value)
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if !value.is_finite() {
+            return Err(E::custom("non-finite Census number"));
+        }
+        self.number(value)
+    }
+}
+
+struct CensusPageBuilder<'a> {
+    query: &'a CensusDataQuery,
+    metadata: &'a CensusVariableCatalog,
+    limits: CensusParseLimits,
+    clocks: CensusClocks,
+    response_payload_digest: [u8; 32],
+    metadata_payload_digest: [u8; 32],
+    header: Vec<SourceIdentifier>,
+    header_index: HashMap<String, usize>,
+    expected_wire: Vec<SourceIdentifier>,
+    primary: Vec<SourceIdentifier>,
+    predicates: Vec<CensusPredicateValue>,
+    issues: BTreeSet<CensusCompletenessIssue>,
+    observations: Vec<CensusObservation>,
+    returned_geographies: HashMap<CensusGeographyValue, usize>,
+    returned_rows: usize,
+    usable_rows: usize,
+    skipped_rows: usize,
+    observed_values: usize,
+    missing_values: usize,
+    annotated_values: usize,
+    invalid_values: usize,
+    row_identities: HashMap<([u8; 32], Option<CensusReportedTime>), usize>,
+    economic_identities: HashMap<[u8; 32], usize>,
+}
+
+impl<'a> CensusPageBuilder<'a> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact query, metadata, grammar, clocks, payload identities, and bounds stay explicit"
+    )]
+    fn try_new(
+        query: &'a CensusDataQuery,
+        metadata: &'a CensusVariableCatalog,
+        geography_admission: &CensusGeographyAdmission,
+        limits: CensusParseLimits,
+        clocks: CensusClocks,
+        response_payload_digest: [u8; 32],
+        metadata_payload_digest: [u8; 32],
+        header: Vec<SourceIdentifier>,
+    ) -> Result<Self, CensusAdapterError> {
+        geography_admission.validate_query(query.geography())?;
+        if header.is_empty() || header.len() > limits.max_columns {
+            return Err(CensusAdapterError::ResourceLimitExceeded);
+        }
+        if header.iter().collect::<BTreeSet<_>>().len() != header.len() {
+            return Err(CensusAdapterError::DuplicateIdentity);
+        }
+        let mut header_index = HashMap::new();
+        header_index
+            .try_reserve(header.len())
+            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+        for (index, name) in header.iter().enumerate() {
+            if header_index.insert(name.as_str().to_owned(), index).is_some() {
+                return Err(CensusAdapterError::DuplicateIdentity);
+            }
+        }
+        let expected_wire = expected_wire_variables(query, metadata)?;
+        let primary = primary_variables(query, metadata, &header)?;
+        let expected_set = expected_wire
+            .iter()
+            .map(SourceIdentifier::as_str)
+            .collect::<BTreeSet<_>>();
+        let geography_levels = query.geography().required_response_levels();
+        let geography_set = geography_levels.iter().copied().collect::<BTreeSet<_>>();
+        let mut issues = BTreeSet::new();
+        for variable in &expected_wire {
+            if !header_index.contains_key(variable.as_str()) {
+                issues.insert(match query.selection() {
+                    CensusSelection::Variables { .. } => {
+                        CensusCompletenessIssue::MissingRequestedVariable {
+                            variable: variable.clone(),
+                        }
+                    }
+                    CensusSelection::Group { .. } => {
+                        CensusCompletenessIssue::MissingGroupVariable {
+                            variable: variable.clone(),
+                        }
+                    }
+                });
+            }
+        }
+        for variable in &primary {
+            let variable_metadata = metadata
+                .get(variable.as_str())
+                .ok_or(CensusAdapterError::MetadataMismatch)?;
+            for attribute in variable_metadata.attributes() {
+                if !expected_set.contains(attribute.as_str()) {
+                    issues.insert(CensusCompletenessIssue::UnrequestedDeclaredAttribute {
+                        variable: variable.clone(),
+                        attribute: attribute.clone(),
+                    });
+                } else if !header_index.contains_key(attribute.as_str()) {
+                    issues.insert(CensusCompletenessIssue::MissingDeclaredAttribute {
+                        variable: variable.clone(),
+                        attribute: attribute.clone(),
+                    });
+                }
+            }
+        }
+        for level in &geography_levels {
+            if !header_index.contains_key(*level) {
+                issues.insert(CensusCompletenessIssue::MissingGeographyLevel {
+                    level: (*level).to_owned(),
+                });
+            }
+        }
+        if matches!(query.geography(), CensusGeography::Uniform { .. })
+            && !header_index.contains_key("GEO_ID")
+        {
+            issues.insert(CensusCompletenessIssue::MissingUniformGeographyId);
+        }
+        for column in &header {
+            let name = column.as_str();
+            let allowed_context =
+                geography_set.contains(name) || matches!(name, "GEO_ID" | "NAME" | "time");
+            if !expected_set.contains(name) && !allowed_context {
+                issues.insert(CensusCompletenessIssue::UnexpectedColumn {
+                    column: column.clone(),
+                });
+            }
+        }
+        let predicates = query
+            .predicates()
+            .iter()
+            .map(|predicate| CensusPredicateValue {
+                variable: predicate.variable().clone(),
+                predicate_type: predicate.predicate_type().clone(),
+                values: predicate.values().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        let maximum_observations = limits.max_cells.min(
+            limits
+                .max_rows
+                .checked_mul(primary.len())
+                .ok_or(CensusAdapterError::ResourceLimitExceeded)?,
+        );
+        let mut observations = Vec::new();
+        observations
+            .try_reserve_exact(maximum_observations)
+            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+        let mut returned_geographies = HashMap::new();
+        returned_geographies
+            .try_reserve(limits.max_rows)
+            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+        let mut row_identities = HashMap::new();
+        row_identities
+            .try_reserve(limits.max_rows)
+            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+        let mut economic_identities = HashMap::new();
+        economic_identities
+            .try_reserve(maximum_observations)
+            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+        Ok(Self {
+            query,
+            metadata,
+            limits,
+            clocks,
+            response_payload_digest,
+            metadata_payload_digest,
+            header,
+            header_index,
+            expected_wire,
+            primary,
+            predicates,
+            issues,
+            observations,
+            returned_geographies,
+            returned_rows: 0,
+            usable_rows: 0,
+            skipped_rows: 0,
+            observed_values: 0,
+            missing_values: 0,
+            annotated_values: 0,
+            invalid_values: 0,
+            row_identities,
+            economic_identities,
+        })
+    }
+
+    fn push_row(&mut self, row: Vec<CensusCell>) -> Result<(), CensusAdapterError> {
+        self.returned_rows = checked_increment(self.returned_rows)?;
+        let row_number = self.returned_rows;
+        let Some(geography) = row_geography(
+            self.query,
+            &self.header_index,
+            &row,
+            row_number,
+            &mut self.issues,
+        )?
+        else {
+            self.skipped_rows = checked_increment(self.skipped_rows)?;
+            return Ok(());
+        };
+        self.usable_rows = checked_increment(self.usable_rows)?;
+        let reported_time = self
+            .header_index
+            .get("time")
+            .and_then(|index| row[*index].nonempty_text())
+            .map(CensusReportedTime::parse)
+            .transpose()?;
+        let geography_digest = semantic_geography_digest(&geography)?;
+        if let Some(first_row_number) = self
+            .row_identities
+            .insert((geography_digest, reported_time.clone()), row_number)
+        {
+            self.issues
+                .insert(CensusCompletenessIssue::DuplicateReturnedGeography {
+                    row_number,
+                    first_row_number,
+                });
+        }
+        self.returned_geographies
+            .entry(geography.clone())
+            .or_insert(row_number);
+        for variable in &self.primary {
+            if !self.header_index.contains_key(variable.as_str()) {
+                continue;
+            }
+            let variable_metadata = self
+                .metadata
+                .get(variable.as_str())
+                .ok_or(CensusAdapterError::MetadataMismatch)?;
+            let (value, missing_attribute) = value_state(
+                variable_metadata,
+                &self.header_index,
+                &row,
+                self.metadata,
+            )?;
+            if let Some(attribute) = missing_attribute {
+                self.issues
+                    .insert(CensusCompletenessIssue::MissingDeclaredAttribute {
+                        variable: variable.clone(),
+                        attribute,
+                    });
+            }
+            match &value {
+                CensusValueState::Observed { .. } => {
+                    self.observed_values = checked_increment(self.observed_values)?;
+                }
+                CensusValueState::Missing { .. } => {
+                    self.missing_values = checked_increment(self.missing_values)?;
+                }
+                CensusValueState::Annotated { .. } => {
+                    self.annotated_values = checked_increment(self.annotated_values)?;
+                }
+                CensusValueState::Invalid { .. } => {
+                    self.invalid_values = checked_increment(self.invalid_values)?;
+                    self.issues
+                        .insert(CensusCompletenessIssue::InvalidTypedValue {
+                            row_number,
+                            variable: variable.clone(),
+                        });
+                }
+            }
+            let row_digest = row_digest(
+                self.query,
+                variable,
+                &value,
+                &geography,
+                reported_time.as_ref(),
+                self.metadata_payload_digest,
+            )?;
+            if let Some(first_row_number) = self.economic_identities.insert(row_digest, row_number)
+            {
+                self.issues
+                    .insert(CensusCompletenessIssue::DuplicateEconomicObservation {
+                        row_number,
+                        first_row_number,
+                        variable: variable.clone(),
+                    });
+            }
+            let family_digest =
+                family_digest(self.query, variable, &geography, reported_time.as_ref())?;
+            let first_observed_at = self
+                .clocks
+                .availability()
+                .conservative_available_at()
+                .unwrap_or(self.clocks.received_at());
+            self.observations.push(CensusObservation {
+                dataset: self.query.dataset().clone(),
+                row_number,
+                variable: variable.clone(),
+                label: variable_metadata.label().to_owned(),
+                concept: variable_metadata.concept().map(str::to_owned),
+                group: variable_metadata.group().cloned(),
+                value,
+                geography: geography.clone(),
+                predicates: self.predicates.clone(),
+                reported_time: reported_time.clone(),
+                request_digest: self.query.request_digest(),
+                response_payload_digest: self.response_payload_digest,
+                metadata_payload_digest: self.metadata_payload_digest,
+                row_digest,
+                clocks: self.clocks.clone(),
+                revision: CensusRevisionCandidate {
+                    family_digest,
+                    content_digest: row_digest,
+                    first_observed_at,
+                },
+            });
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<CensusDataPage, CensusAdapterError> {
+        reconcile_geography_scope(
+            self.query,
+            &self.returned_geographies,
+            &mut self.issues,
+        )?;
+        let returned_requested_variables = self
+            .expected_wire
+            .iter()
+            .filter(|variable| self.header_index.contains_key(variable.as_str()))
+            .count();
+        let missing_requested_variables = self
+            .expected_wire
+            .len()
+            .checked_sub(returned_requested_variables)
+            .ok_or(CensusAdapterError::SchemaDrift)?;
+        let accounting = CensusResponseAccounting {
+            requests: 1,
+            requested_primary_variables: self.primary.len(),
+            requested_wire_variables: self.expected_wire.len(),
+            returned_columns: self.header.len(),
+            returned_requested_variables,
+            missing_requested_variables,
+            returned_rows: self.returned_rows,
+            usable_rows: self.usable_rows,
+            skipped_rows: self.skipped_rows,
+            observations: self.observations.len(),
+            observed_values: self.observed_values,
+            missing_values: self.missing_values,
+            annotated_values: self.annotated_values,
+            invalid_values: self.invalid_values,
+        };
+        let completeness = if self.issues.is_empty() {
+            CensusCompleteness::Complete
+        } else {
+            CensusCompleteness::Partial {
+                issues: self.issues.into_iter().collect(),
+            }
+        };
+        Ok(CensusDataPage {
+            dataset: self.query.dataset().clone(),
+            request_digest: self.query.request_digest(),
+            response_payload_digest: self.response_payload_digest,
+            metadata_payload_digest: self.metadata_payload_digest,
+            header: self.header,
+            observations: self.observations,
+            completeness,
+            pagination: CensusPagination::SingleResponse { request_count: 1 },
+            accounting,
+            clocks: self.clocks,
+        })
+    }
+}
+
+fn header_from_cells(cells: Vec<CensusCell>) -> Result<Vec<SourceIdentifier>, CensusAdapterError> {
+    let mut header = Vec::new();
+    header
+        .try_reserve_exact(cells.len())
+        .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+    for cell in cells {
+        let CensusCell::Text(value) = cell else {
+            return Err(CensusAdapterError::SchemaDrift);
+        };
+        header.push(
+            SourceIdentifier::try_from(value).map_err(|_| CensusAdapterError::SchemaDrift)?,
+        );
+    }
+    Ok(header)
+}
+
+fn checked_increment(value: usize) -> Result<usize, CensusAdapterError> {
+    value
+        .checked_add(1)
+        .ok_or(CensusAdapterError::ResourceLimitExceeded)
+}
+
+fn semantic_geography_digest(
+    geography: &CensusGeographyValue,
+) -> Result<[u8; 32], CensusAdapterError> {
+    let wire = serde_json::to_vec(geography).map_err(|_| CensusAdapterError::SchemaDrift)?;
+    let mut digest = Sha256::new();
+    update_digest_component(
+        &mut digest,
+        b"market-squawk/census-returned-geography/v1",
+    );
+    update_digest_component(&mut digest, &wire);
+    Ok(digest.finalize().into())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CensusCell {
     Null,
@@ -1039,23 +1558,6 @@ enum CensusCell {
 }
 
 impl CensusCell {
-    fn parse(value: &Value, limits: CensusParseLimits) -> Result<Self, CensusAdapterError> {
-        match value {
-            Value::Null => Ok(Self::Null),
-            Value::String(value) => {
-                ensure_string(value, limits)?;
-                Ok(Self::Text(value.clone()))
-            }
-            Value::Number(value) => {
-                let value = value.to_string();
-                ensure_string(&value, limits)?;
-                Ok(Self::Number(value))
-            }
-            Value::Bool(value) => Ok(Self::Boolean(*value)),
-            Value::Array(_) | Value::Object(_) => Err(CensusAdapterError::SchemaDrift),
-        }
-    }
-
     fn nonempty_text(&self) -> Option<&str> {
         match self {
             Self::Text(value) | Self::Number(value) if !value.is_empty() => Some(value),
@@ -1136,7 +1638,7 @@ fn primary_variables(
 
 fn value_state(
     metadata: &CensusVariableMetadata,
-    header: &BTreeMap<&str, usize>,
+    header: &HashMap<String, usize>,
     row: &[CensusCell],
     catalog: &CensusVariableCatalog,
 ) -> Result<(CensusValueState, Option<SourceIdentifier>), CensusAdapterError> {
@@ -1246,7 +1748,7 @@ fn typed_value(
 
 fn row_geography(
     query: &CensusDataQuery,
-    header: &BTreeMap<&str, usize>,
+    header: &HashMap<String, usize>,
     row: &[CensusCell],
     row_number: usize,
     issues: &mut BTreeSet<CensusCompletenessIssue>,
@@ -1260,7 +1762,10 @@ fn row_geography(
         .and_then(|index| row[*index].nonempty_text())
         .map(str::to_owned);
     match query.geography() {
-        CensusGeography::Standard { .. } => {
+        CensusGeography::Standard {
+            for_clause,
+            in_clauses,
+        } => {
             let mut components = Vec::new();
             for level in query.geography().required_response_levels() {
                 let Some(index) = header.get(level).copied() else {
@@ -1273,6 +1778,26 @@ fn row_geography(
                     });
                     return Ok(None);
                 };
+                let clause = in_clauses
+                    .iter()
+                    .find(|clause| clause.level() == level)
+                    .unwrap_or(for_clause);
+                let exact = clause
+                    .codes()
+                    .iter()
+                    .filter_map(|candidate| match candidate {
+                        CensusGeographyCode::Exact(value) => Some(value.as_str()),
+                        CensusGeographyCode::Wildcard => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                if !exact.is_empty() && !exact.contains(code) {
+                    issues.insert(CensusCompletenessIssue::UnexpectedGeographyCode {
+                        row_number,
+                        level: level.to_owned(),
+                        code: code.to_owned(),
+                    });
+                    return Ok(None);
+                }
                 components.push(CensusGeographyComponent {
                     level: level.to_owned(),
                     code: code.to_owned(),
@@ -1306,9 +1831,101 @@ fn row_geography(
     }
 }
 
+fn reconcile_geography_scope(
+    query: &CensusDataQuery,
+    returned: &HashMap<CensusGeographyValue, usize>,
+    issues: &mut BTreeSet<CensusCompletenessIssue>,
+) -> Result<(), CensusAdapterError> {
+    match query.geography() {
+        CensusGeography::Standard {
+            for_clause,
+            in_clauses,
+        } => {
+            let clauses = in_clauses
+                .iter()
+                .chain(std::iter::once(for_clause))
+                .collect::<Vec<_>>();
+            let has_wildcard = clauses.iter().any(|clause| {
+                clause
+                    .codes()
+                    .iter()
+                    .any(|code| matches!(code, CensusGeographyCode::Wildcard))
+            });
+            if has_wildcard && returned.is_empty() {
+                issues.insert(CensusCompletenessIssue::MissingWildcardGeography);
+            }
+            for clause in &clauses {
+                let observed = returned
+                    .keys()
+                    .filter_map(|geography| match geography {
+                        CensusGeographyValue::Standard { components, .. } => components
+                            .iter()
+                            .find(|component| component.level() == clause.level())
+                            .map(CensusGeographyComponent::code),
+                        CensusGeographyValue::Uniform { .. } => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                for code in clause.codes() {
+                    if let CensusGeographyCode::Exact(code) = code
+                        && !observed.contains(code.as_str())
+                    {
+                        issues.insert(CensusCompletenessIssue::MissingRequestedGeography {
+                            level: clause.level().to_owned(),
+                            code: code.clone(),
+                        });
+                    }
+                }
+            }
+            if !has_wildcard {
+                let expected = clauses.iter().try_fold(1_usize, |product, clause| {
+                    product
+                        .checked_mul(clause.codes().len())
+                        .ok_or(CensusAdapterError::ResourceLimitExceeded)
+                })?;
+                if returned.len() != expected {
+                    issues.insert(CensusCompletenessIssue::GeographyCardinalityMismatch {
+                        expected,
+                        returned: returned.len(),
+                    });
+                }
+            }
+        }
+        CensusGeography::Uniform { values } => {
+            let returned_geoids = returned
+                .keys()
+                .filter_map(|geography| match geography {
+                    CensusGeographyValue::Uniform {
+                        fully_qualified_geoid,
+                        ..
+                    } => Some(fully_qualified_geoid.as_str()),
+                    CensusGeographyValue::Standard { .. } => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let has_pseudo = values
+                .iter()
+                .any(|value| value.as_str().starts_with("pseudo("));
+            if has_pseudo && returned_geoids.is_empty() {
+                issues.insert(CensusCompletenessIssue::MissingWildcardGeography);
+            }
+            for value in values
+                .iter()
+                .filter(|value| !value.as_str().starts_with("pseudo("))
+            {
+                if !returned_geoids.contains(value.as_str()) {
+                    issues.insert(
+                        CensusCompletenessIssue::MissingRequestedUniformGeography {
+                            geoid: value.as_str().to_owned(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn row_digest(
     query: &CensusDataQuery,
-    row_number: usize,
     variable: &SourceIdentifier,
     value: &CensusValueState,
     geography: &CensusGeographyValue,
@@ -1318,11 +1935,10 @@ fn row_digest(
     let payload = serde_json::to_vec(&(value, geography, time))
         .map_err(|_| CensusAdapterError::SchemaDrift)?;
     let mut hasher = Sha256::new();
-    update_digest_component(&mut hasher, b"market-squawk-census-native-row-v1");
+    update_digest_component(&mut hasher, b"market-squawk-census-native-row-v2");
     update_digest_component(&mut hasher, &query.request_digest());
     update_digest_component(&mut hasher, &metadata_digest);
     update_digest_component(&mut hasher, variable.as_str().as_bytes());
-    update_digest_component(&mut hasher, &(row_number as u64).to_be_bytes());
     update_digest_component(&mut hasher, &payload);
     Ok(hasher.finalize().into())
 }
@@ -1346,15 +1962,6 @@ fn family_digest(
     update_digest_component(&mut hasher, b"market-squawk-census-family-v1");
     update_digest_component(&mut hasher, &family);
     Ok(hasher.finalize().into())
-}
-
-fn bounded_cell_string(
-    value: &Value,
-    limits: CensusParseLimits,
-) -> Result<&str, CensusAdapterError> {
-    let value = value.as_str().ok_or(CensusAdapterError::SchemaDrift)?;
-    ensure_string(value, limits)?;
-    Ok(value)
 }
 
 fn ensure_string(value: &str, limits: CensusParseLimits) -> Result<(), CensusAdapterError> {

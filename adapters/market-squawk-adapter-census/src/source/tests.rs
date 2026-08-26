@@ -1,10 +1,12 @@
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
+use market_squawk_platform::LocalPaths;
 use market_squawk_domain::{
     AuthorizationBasis, CalendarDate, ChecksumCapability, CoverageDelay, DeliveryEvidence,
     EffectiveInterval, MetadataRevision, ResearchObservation, RevisionBoundPayloadEvidence,
@@ -12,19 +14,43 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationSubjectResolutionError,
-    AuthorizationSubjectResolver, BackoffPolicy, BudgetScope, BudgetWindowSemantics,
-    CoverageDomain, DiscoveryRequest, EndpointPolicy, ExtractionRequest, FreshnessPolicy,
-    HttpRequestBounds, NetworkAccessPolicy, ProviderBudgetPolicy, ProviderBudgetWindow,
+    AuthorizationSubjectResolver, CoverageDomain, DiscoveryRequest, EndpointPolicy,
+    ExtractionRequest, FreshnessPolicy, HttpRequestBounds, NetworkAccessPolicy,
+    ProviderCaptureTerminalDisposition,
     SourceCapabilities, SourceCoverage, SourceMetadataInput,
 };
+use uuid::Uuid;
 
 use super::*;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+struct TemporaryDirectory(PathBuf);
+
+impl TemporaryDirectory {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!("market-squawk-census-{}", Uuid::new_v4())))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ignored = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 const DATA_RESPONSE: &[u8] = br#"[
   ["B01001_001E", "state"],
   ["42", "06"]
+]"#;
+
+const DOCTOR_RESPONSE: &[u8] = br#"[
+  ["NAME", "B01001_001E", "us"],
+  ["United States", "340110988", "1"]
 ]"#;
 
 const DATASET_RESPONSE: &[u8] = br#"{
@@ -46,7 +72,8 @@ const VARIABLES_RESPONSE: &[u8] = br#"{
       "predicateType": "int",
       "group": "B01001",
       "attributes": "",
-      "required": false
+      "required": true,
+      "limit": 0
     },
     "state": {
       "label": "State",
@@ -90,7 +117,7 @@ impl CensusTransport for ScriptedTransport {
             if cancellation.is_cancelled()
                 || timeout.is_zero()
                 || request.authorized.redacted_url() != self.expected_url
-                || request.authorized.key_query_value() != "test-census-key"
+                || request.authorized.key_query_value() != Some("test-census-key")
                 || request
                     .authorized
                     .transport_url()
@@ -135,6 +162,12 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
     let config = CensusSourceConfig::try_new(
         [contract.clone()],
         CensusParseLimits::try_new(1024 * 1024, 100, 100, 10_000, 1_000, 4_096)?,
+        CensusOwnerAuthorization::try_private_personal_research(
+            SourceIdentifier::try_from("census-owner-attestation-test")?,
+            evidence_digest(sha256(b"census-owner-attestation-test")),
+            now,
+        )?,
+        evidence_digest(sha256(b"census-test-credential-generation")),
     )?;
     let subject = SourceIdentifier::try_from("census-test-key-record")?;
     let metadata = source_metadata(now, subject.clone(), &config)?;
@@ -142,9 +175,11 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         expected_url: contract.query().redacted_url().to_owned(),
         response: Mutex::new(Some(CensusHttpResponse {
             status: 200,
+            key_error: false,
             retry_after: None,
             content_encoding: None,
             content_type: Some(b"application/json; charset=utf-8".to_vec()),
+            rate_headers: CensusRateLimitHeaders::default(),
             body: Bytes::from_static(DATA_RESPONSE),
             received_at: now,
             latency: Duration::from_millis(7),
@@ -157,6 +192,9 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         config,
         transport.clone(),
     )?;
+    let public_metadata = contract.metadata_requests()[0].public_request()?;
+    assert!(!public_metadata.is_credentialed());
+    assert_eq!(public_metadata.key_query_value(), None);
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
         Arc::new(TestSubjectResolver { subject }),
     )?;
@@ -195,29 +233,159 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         NonZeroU64::new(1024 * 1024).ok_or("nonzero byte bound")?,
         deadline,
     )?;
-    let output = extraction_output(&metadata, &extraction_request, &contract, acquisition)?;
+    let output = extraction_output(
+        &metadata,
+        source.config(),
+        &extraction_request,
+        &contract,
+        acquisition,
+    )?;
 
     assert_eq!(output.batch().records().len(), 1);
-    assert_eq!(output.metadata_captures().len(), 4);
-    assert_eq!(output.captures().len(), 5);
-    let data_capture = output.data_capture().ok_or("missing data capture")?;
+    assert_eq!(output.publication_plan().observations().len(), 1);
+    assert_eq!(output.publication_plan().captures().len(), 1);
+    assert_eq!(output.publication_plan().captures()[0].component_count(), 5);
+    output.publication_plan().validate()?;
+    let (batch, acquisition, capture_material, publication_plan, telemetry) = output.into_parts();
     assert_eq!(
-        data_capture.receipt(),
-        output.acquisition().data().capture()
+        capture_material.receipt().terminal(),
+        ProviderCaptureTerminalDisposition::CompleteRequestGraph
     );
-    assert_eq!(data_capture.records().len(), 1);
-    assert_eq!(data_capture.records()[0].payload(), DATA_RESPONSE);
-    assert_eq!(output.telemetry().requests(), 1);
-    assert_eq!(output.telemetry().successful_responses(), 1);
+    assert_eq!(capture_material.receipt().request_graph_components().len(), 5);
+    assert_eq!(capture_material.records().len(), 5);
+    assert_eq!(capture_material.records()[4].payload(), DATA_RESPONSE);
+    let temporary = TemporaryDirectory::new();
+    let paths = LocalPaths::prepare(temporary.path())?;
+    let store = paths.sealed_research_journal_store()?;
+    let sealed_capture = capture_material.seal(&store)?;
+    let doctor_query = crate::doctor::doctor_query()?;
+    let doctor_capture = capture_receipt(
+        &metadata,
+        crate::doctor::doctor_dataset_identity()?,
+        doctor_query.request_digest(),
+        DOCTOR_RESPONSE,
+        now,
+    )?;
+    let doctor_report = crate::doctor::build_doctor_report(
+        &metadata,
+        source.config(),
+        &doctor_query,
+        &Bytes::from_static(DOCTOR_RESPONSE),
+        &doctor_capture,
+        &CensusRateLimitHeaders::default(),
+        now,
+        Duration::from_millis(1),
+    )?;
+    let doctor_material = capture_material(
+        &metadata,
+        &doctor_capture,
+        Bytes::from_static(DOCTOR_RESPONSE),
+    )?;
+    let sealed_doctor_capture = doctor_material.seal(&store)?;
+    let activation = CensusActivationCandidate::try_new(
+        source.activation_plan()?,
+        &doctor_report,
+        &sealed_doctor_capture,
+        now,
+    )?;
+    activation.validate(&doctor_report, &sealed_doctor_capture, now)?;
+    let publication_candidate = CensusPublicationCandidate::try_new(
+        publication_plan,
+        &sealed_capture,
+        &activation,
+    )?;
+    publication_candidate.validate(&activation, now)?;
+    publication_candidate.validate_batch(&batch)?;
+    assert_eq!(publication_candidate.revision_plan(&batch)?.len(), 1);
+    assert_eq!(publication_candidate.canonical_record_count(), 1);
+    assert_eq!(
+        publication_candidate.canonical_schema().as_str(),
+        market_squawk_sources::CURRENT_RESEARCH_RECORD_SCHEMA
+    );
+    assert_ne!(
+        publication_candidate.canonical_schema_fingerprint().bytes(),
+        [0; 32]
+    );
+    assert_eq!(
+        publication_candidate.sealed_capture_receipt_digest(),
+        sealed_capture.receipt_digest()
+    );
+    let candidate_wire = serde_json::to_string(&publication_candidate)?;
+    assert!(!candidate_wire.contains("\"generation\""));
+    assert!(!candidate_wire.contains("\"manifest_digest\""));
+    assert!(!candidate_wire.contains("\"published_at\""));
+    let presentation = source
+        .config()
+        .owner_authorization()
+        .presentation_obligation()?;
+    presentation.validate()?;
+    assert_eq!(
+        publication_candidate.presentation_obligation_digest(),
+        presentation.obligation_digest()
+    );
+    assert!(presentation.prominent_display_required());
+    assert!(presentation.reidentification_prohibited());
+    assert_eq!(
+        source
+            .config()
+            .owner_authorization()
+            .authorize(CensusIntendedUse::Sale),
+        Err(CensusPolicyError::ProhibitedUse)
+    );
+    assert_eq!(
+        sealed_capture.capture().request_graph_components()[4].observation_digest(),
+        acquisition.data().capture().observation_digest()
+    );
+    assert_eq!(telemetry.requests(), 1);
+    assert_eq!(telemetry.successful_responses(), 1);
     assert_eq!(source.telemetry().requests(), 1);
     assert_eq!(
         source.telemetry().response_bytes(),
         DATA_RESPONSE.len() as u64
     );
     assert_eq!(transport.attempts.load(Ordering::Relaxed), 1);
+    assert!(
+        CensusPredicate::try_new("NAME", CensusPredicateType::String, ["A:B"]).is_err()
+    );
+    assert!(CensusDataQuery::try_new(
+        CensusDataset::try_new(2024, "acs/acs1")?,
+        CensusSelection::variables(["B01001_001E"])?,
+        Vec::new(),
+        CensusGeography::standard(
+            CensusGeographyClause::try_new(
+                "state",
+                [CensusGeographyCode::try_new("*")?],
+            )?,
+            Vec::new(),
+        )?,
+        Some(CensusTimePredicate::At {
+            point: CensusTimePoint::year(2024)?,
+        }),
+    )
+    .is_err());
+
+    let annotation_variable = SourceIdentifier::try_from("B01001_001EA")?;
+    let exact_annotation = CensusAnnotationMatch::try_new(annotation_variable.clone(), "(X)")?;
+    let exact_missing = MacroMissingValue::new(
+        SourceIdentifier::try_from("(X)")?,
+        Some(annotation_variable.clone()),
+    );
+    let annotation_rule = CensusAnnotatedMissingRule::try_new(
+        [exact_annotation],
+        exact_missing.clone(),
+    )?;
+    assert_eq!(annotation_rule.missing(), &exact_missing);
+    assert!(CensusAnnotatedMissingRule::try_new(
+        [CensusAnnotationMatch::try_new(annotation_variable, "(X)")?],
+        MacroMissingValue::new(
+            SourceIdentifier::try_from("generic-missing")?,
+            Some(SourceIdentifier::try_from("B01001_001EA")?),
+        ),
+    )
+    .is_err());
 
     let ResearchObservation::Macro(observation) =
-        serde_json::from_slice(output.batch().records()[0].payload())?
+        serde_json::from_slice(batch.records()[0].payload())?
     else {
         return Err("expected canonical macro observation".into());
     };
@@ -340,28 +508,7 @@ fn source_metadata(
         evidence.clone(),
         effective,
     );
-    let windows = [
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(1).ok_or("nonzero second budget")?,
-            NonZeroU64::new(ONE_SECOND_NANOS).ok_or("nonzero second window")?,
-            BudgetWindowSemantics::Sliding,
-        )?,
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(400).ok_or("nonzero daily budget")?,
-            NonZeroU64::new(ONE_DAY_NANOS).ok_or("nonzero daily window")?,
-            BudgetWindowSemantics::Sliding,
-        )?,
-    ];
-    let budget = ProviderBudgetPolicy::try_new_conjunctive(
-        BudgetScope::with_authorization_account(provider.clone(), subject),
-        &windows,
-        NonZeroU16::MIN,
-        BackoffPolicy::try_new(
-            NonZeroU64::new(1_000_000).ok_or("nonzero initial backoff")?,
-            NonZeroU64::new(60_000_000_000).ok_or("nonzero maximum backoff")?,
-            0,
-        )?,
-    )?;
+    let budget = census_provider_rate_declaration(&subject)?.policy().clone();
     let network = EndpointPolicy::try_from_api_rules(
         census_api_endpoint_rules(config)?,
         HttpRequestBounds::default(),
