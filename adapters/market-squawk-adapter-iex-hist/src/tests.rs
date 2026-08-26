@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ByteAdmissionLimits, CaptureChronologyDisposition, Catalog, ColdJobPlan, ColdJobTrigger,
-    DecodeError, DecodeLimits, ExactFileRequest, FeedKind, FeedVersion, IexEventSink,
+    DecodeError, DecodeLimits, DecodedIexEventEnvelope, ExactFileRequest, FeedKind,
+    FeedVersion, IexEvent, IexEventSink,
     IexHistAuthorityClockSample, IexHistCapacityAuthority, IexHistCapacityCategory,
     IexHistCapacityDisposition, IexHistCapacityError, IexHistCapacityFootprint,
     IexHistCapacityLease, IexHistCapacityRequest,
@@ -21,8 +22,9 @@ use crate::{
     IexHistDurableJob, IexHistJobPhase, IexHistPlanner, IexHistReactivationRequirement,
     IexHistRecoveryAction, IexHistRetryDisposition, IexHistTerminalCoordinate,
     IexHistTerminalDisposition, IexHistTerminalError, IexHistTerminalPhase,
-    IexHistTrustedClockReading, PcapMaterializationReceipt, PcapObjectEncoding,
-    PcapStreamDecoder, ScheduleLane, Sha256Digest, TradeDate, TransportVersion,
+    IexHistTrustedClockReading, IexHistTypedHandoffBuilder, PcapMaterializationReceipt,
+    PcapObjectEncoding, PcapStreamDecoder, ScheduleLane, Sha256Digest, TradeDate,
+    TransportVersion,
 };
 use crate::catalog::CatalogTransportMetadata;
 use crate::receipt::{CaptureResponseMetadata, GzipPcapReceiptBuilder};
@@ -279,7 +281,6 @@ async fn selected_file_evidence_restores_and_terminal_recovery_is_typed() {
         IexHistRecoveryAction::RequireSharedArtifactAdoptionOrRestartWholeFile
     );
 
-    let committed = Arc::new(Mutex::new(Vec::new()));
     let decode_permit = acquire_permit(&plan, &authority, ATTEMPT_DEADLINE + 1);
     let decoded = crate::transport::decode_mock_pcap(
         &plan,
@@ -287,19 +288,79 @@ async fn selected_file_evidence_restores_and_terminal_recovery_is_typed() {
         files.reopen_pcap().unwrap(),
         decode_permit,
         &CancellationToken::new(),
-        TransactionalSink::new(Arc::clone(&committed)),
+        IexHistTypedHandoffBuilder::try_new(&plan, &capture).unwrap(),
     )
     .await
     .unwrap_or_else(|error| panic!("materialized PCAP decode failed: {error}"));
-    let (summary, sink, decode_telemetry, decode_permit) = decoded.into_parts();
-    assert!(sink.committed);
+    let (summary, handoff_builder, decode_telemetry, decode_permit) = decoded.into_parts();
     assert_eq!(summary.messages, 3);
     assert_eq!(summary.decode_contract, plan.decode_contract());
     assert_eq!(
         decode_telemetry.staged_decoded_event_batch_bytes(),
         summary.decoded_event_batch_bytes
     );
-    assert_eq!(committed.lock().unwrap().len(), 3);
+    let handoff = handoff_builder
+        .try_into_handoff(summary)
+        .unwrap_or_else(|error| panic!("typed IEX handoff failed: {error}"));
+    assert_eq!(handoff.events().len(), 3);
+    assert_eq!(handoff.summary().messages, 3);
+    for event in handoff.events() {
+        assert_eq!(
+            event.native_serialized_sha256(),
+            Sha256Digest::of(event.native_serialized_bytes())
+        );
+    }
+    match &handoff.events()[1].decoded_event().event {
+        IexEvent::Quote { symbol, .. } => assert_eq!(symbol, "AAPL"),
+        event => panic!("expected typed quote event, received {event:?}"),
+    }
+    let summary = handoff.summary().clone();
+
+    let repeated_authority =
+        MemoryCapacityAuthority::new_at(staging.path(), AUTHORITY_NOW + 5_000_000);
+    let repeated_capture = capture_receipt_with_clocks(
+        &plan,
+        &gzip,
+        &pcap,
+        &repeated_authority,
+        AUTHORITY_NOW + 5_000_000,
+        AUTHORITY_NOW + 5_000_001,
+        AUTHORITY_NOW + 5_000_002,
+    );
+    let repeated_decode_permit =
+        acquire_permit(&plan, &repeated_authority, ATTEMPT_DEADLINE + 6_000_000);
+    let repeated = crate::transport::decode_mock_pcap(
+        &plan,
+        &repeated_capture,
+        files.reopen_pcap().unwrap(),
+        repeated_decode_permit,
+        &CancellationToken::new(),
+        IexHistTypedHandoffBuilder::try_new(&plan, &repeated_capture).unwrap(),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("repeated PCAP decode failed: {error}"));
+    let (repeated_summary, repeated_builder, _, repeated_decode_permit) = repeated.into_parts();
+    let repeated_handoff = repeated_builder
+        .try_into_handoff(repeated_summary)
+        .unwrap_or_else(|error| panic!("repeated typed IEX handoff failed: {error}"));
+    assert_eq!(
+        repeated_handoff.provider_content_sha256(),
+        handoff.provider_content_sha256()
+    );
+    assert_ne!(
+        repeated_handoff.physical_evidence_sha256(),
+        handoff.physical_evidence_sha256()
+    );
+    assert_eq!(
+        repeated_handoff.events()[1].provider_content_sha256(),
+        handoff.events()[1].provider_content_sha256()
+    );
+    assert_ne!(
+        repeated_handoff.events()[1].native_serialized_sha256(),
+        handoff.events()[1].native_serialized_sha256()
+    );
+    drop(repeated_decode_permit);
+
     durable
         .record_decoded(&plan, &capture, summary.clone())
         .unwrap();
@@ -328,7 +389,7 @@ async fn selected_file_evidence_restores_and_terminal_recovery_is_typed() {
     );
     drop(durable);
 
-    let mut durable = IexHistDurableJob::restore(store).unwrap();
+    let mut durable = IexHistDurableJob::restore(store.clone()).unwrap();
     assert_eq!(durable.phase(), IexHistJobPhase::DecodeEvidence);
     assert_eq!(durable.decode_evidence(), Some(&summary));
     durable
@@ -354,7 +415,14 @@ async fn selected_file_evidence_restores_and_terminal_recovery_is_typed() {
     assert_eq!(terminal.failed_phase(), IexHistTerminalPhase::Recovery);
     assert_eq!(terminal.error(), IexHistTerminalError::AuthorityUnavailable);
     assert_eq!(terminal.observed_at_unix_nanos(), AUTHORITY_NOW + 1);
+    assert_ne!(capture.attempt_sha256(), summary.decode_attempt_sha256);
     assert_eq!(terminal.attempt_sha256(), Some(summary.decode_attempt_sha256));
+    drop(durable);
+    let durable = IexHistDurableJob::restore(store).unwrap();
+    assert_eq!(
+        durable.terminal_evidence().unwrap().attempt_sha256(),
+        Some(summary.decode_attempt_sha256)
+    );
 
     let quarantine_store = MemoryCheckpointStore::default();
     let mut quarantined = IexHistDurableJob::try_open(&plan, quarantine_store.clone()).unwrap();
@@ -506,11 +574,19 @@ impl TransactionalSink {
 impl IexEventSink for TransactionalSink {
     type Error = ();
 
-    fn stage(&mut self, ordinal: u64, serialized_event: &[u8]) -> Result<(), Self::Error> {
+    fn stage(
+        &mut self,
+        ordinal: u64,
+        envelope: DecodedIexEventEnvelope,
+    ) -> Result<(), Self::Error> {
         if usize::try_from(ordinal).map_err(|_| ())? != self.staged.len() {
             return Err(());
         }
-        self.staged.push(serialized_event.to_vec());
+        let (_, native_serialized_bytes, native_serialized_sha256) = envelope.into_parts();
+        if Sha256Digest::of(&native_serialized_bytes) != native_serialized_sha256 {
+            return Err(());
+        }
+        self.staged.push(native_serialized_bytes);
         Ok(())
     }
 

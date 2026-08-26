@@ -20,9 +20,10 @@ pub use catalog::{
     Catalog, CatalogError, CatalogFile, CatalogReceipt, ExactFileRequest, SelectedFileReceipt,
 };
 pub use decode::{
-    DecodeActuals, DecodeChannelContract, DecodeChannelRole, DecodeContract, DecodeError,
-    DecodeFailure, DecodeLimits, DecodeSummary, DplcChannelDistributionContract, IexEventSink,
-    PcapStreamDecoder,
+    DecodeActuals, DecodeChannelContract, DecodeChannelRole, DecodeContract,
+    DecodeError, DecodeFailure, DecodeLimits, DecodeSummary, DecodedIexEventEnvelope,
+    DplcChannelDistributionContract, IexEventSink, IexHistTypedEvent,
+    IexHistTypedHandoff, IexHistTypedHandoffBuilder, PcapStreamDecoder,
 };
 pub use durable::{
     IexHistCheckpointError, IexHistCheckpointStore, IexHistCheckpointStoreError,

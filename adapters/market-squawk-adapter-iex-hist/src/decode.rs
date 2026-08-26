@@ -11,9 +11,7 @@ use crate::model::{
     Sha256Digest, ShortSalePriceTestDetail, SystemEventCode, TradeDate, TradingStatus,
     TransportVersion,
 };
-use crate::planning::{
-    ColdJobPlan, IexHistCapacityCategory, IexHistDecodeAttemptEvidence,
-};
+use crate::planning::{ColdJobPlan, IexHistCapacityCategory, IexHistDecodeAttemptEvidence};
 use crate::receipt::{CaptureChronologyDisposition, PcapMaterializationReceipt};
 
 const PCAP_GLOBAL_HEADER_BYTES: usize = 24;
@@ -137,16 +135,12 @@ impl DplcChannelDistributionContract {
         roles: [DecodeChannelRole; MAX_DEEP_PLUS_CHANNELS],
         provider_evidence_sha256: Sha256Digest,
     ) -> Result<Self, DecodeError> {
-        if !nonzero_digest(provider_evidence_sha256)
-            || !roles.contains(&DecodeChannelRole::Active)
+        if !nonzero_digest(provider_evidence_sha256) || !roles.contains(&DecodeChannelRole::Active)
         {
             return Err(DecodeError::InvalidDecoderContract);
         }
-        let contract_sha256 = dplc_distribution_identity(
-            trade_date,
-            roles,
-            provider_evidence_sha256,
-        );
+        let contract_sha256 =
+            dplc_distribution_identity(trade_date, roles, provider_evidence_sha256);
         Ok(Self {
             trade_date_year: trade_date.year(),
             trade_date_month: trade_date.month(),
@@ -170,11 +164,8 @@ impl DplcChannelDistributionContract {
         if self.trade_date()? != trade_date
             || !nonzero_digest(self.provider_evidence_sha256)
             || !self.roles.contains(&DecodeChannelRole::Active)
-            || dplc_distribution_identity(
-                trade_date,
-                self.roles,
-                self.provider_evidence_sha256,
-            ) != self.contract_sha256
+            || dplc_distribution_identity(trade_date, self.roles, self.provider_evidence_sha256)
+                != self.contract_sha256
         {
             return Err(DecodeError::InvalidDecoderContract);
         }
@@ -292,10 +283,9 @@ impl DecodeContract {
             (FeedKind::DeepPlusDplc, Some(distribution)) => {
                 DecodeChannelContract::Dplc16(distribution)
             }
-            (
-                FeedKind::Tops | FeedKind::Deep | FeedKind::DeepPlusDpls,
-                None,
-            ) => DecodeChannelContract::SingleActiveChannelOne,
+            (FeedKind::Tops | FeedKind::Deep | FeedKind::DeepPlusDpls, None) => {
+                DecodeChannelContract::SingleActiveChannelOne
+            }
             _ => return Err(DecodeError::InvalidDecoderContract),
         };
         let anomaly_policy =
@@ -627,8 +617,8 @@ impl DecodeSummary {
         receipt: &PcapMaterializationReceipt,
         attempt: IexHistDecodeAttemptEvidence,
     ) -> Result<(), DecodeError> {
-        let trade_date = TradeDate::parse(&self.trade_date)
-            .map_err(|_| DecodeError::SummaryIdentityMismatch)?;
+        let trade_date =
+            TradeDate::parse(&self.trade_date).map_err(|_| DecodeError::SummaryIdentityMismatch)?;
         self.decode_contract.validate_for(trade_date)?;
         attempt
             .validate_against(plan)
@@ -645,8 +635,7 @@ impl DecodeSummary {
         if trade_date != plan.selected_file.trade_date
             || self.decode_contract != plan.decode_contract()
             || self.decoder_contract_sha256 != self.decode_contract.contract_sha256()
-            || self.decoder_implementation_sha256
-                != self.decode_contract.implementation_sha256()
+            || self.decoder_implementation_sha256 != self.decode_contract.implementation_sha256()
             || self.decode_limits_sha256 != self.decode_contract.limits().identity()
             || self.decode_attempt_evidence != attempt
             || self.decode_attempt_evidence_sha256 != attempt.evidence_sha256()
@@ -670,14 +659,12 @@ impl DecodeSummary {
             || self.channels == 0
             || usize::from(self.channels) > MAX_DEEP_PLUS_CHANNELS
             || usize::from(self.channels) != self.channel_sessions.len()
-            || self.feed_specification_version
-                != self.decode_contract.feed_specification_version()
+            || self.feed_specification_version != self.decode_contract.feed_specification_version()
             || self.transport_specification_version
                 != self.decode_contract.transport_specification_version()
             || self.native_schema_version != self.decode_contract.native_schema_version()
             || self.serialization_version != self.decode_contract.serialization_version()
-            || self.decoder_implementation_version
-                != self.decode_contract.implementation_version()
+            || self.decoder_implementation_version != self.decode_contract.implementation_version()
             || self.serialized_event_bytes == 0
             || self.decoded_event_batch_bytes != expected_batch_bytes
             || self.decoded_event_batch_bytes
@@ -693,11 +680,8 @@ impl DecodeSummary {
         {
             return Err(DecodeError::SummaryIdentityMismatch);
         }
-        let expected_channel_identity = validate_channel_summaries(
-            self.decode_contract,
-            trade_date,
-            &self.channel_sessions,
-        )?;
+        let expected_channel_identity =
+            validate_channel_summaries(self.decode_contract, trade_date, &self.channel_sessions)?;
         if expected_channel_identity != self.channel_sessions_sha256 {
             return Err(DecodeError::SummaryIdentityMismatch);
         }
@@ -711,27 +695,557 @@ impl DecodeSummary {
     }
 }
 
+/// Opaque single-serialization envelope minted only by the decoder.
+///
+/// The typed event, canonical adapter-native encoding, and its digest are constructed together.
+/// A sink may inspect the typed event or consume all three parts, but cannot create a conflicting
+/// typed/encoded pair.
+pub struct DecodedIexEventEnvelope {
+    decoded_event: DecodedIexEvent,
+    native_serialized_bytes: Vec<u8>,
+    native_serialized_sha256: Sha256Digest,
+}
+
+impl std::fmt::Debug for DecodedIexEventEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DecodedIexEventEnvelope")
+            .field("decoded_event", &self.decoded_event)
+            .field(
+                "native_serialized_bytes",
+                &self.native_serialized_bytes.len(),
+            )
+            .field("native_serialized_sha256", &self.native_serialized_sha256)
+            .finish()
+    }
+}
+
+impl DecodedIexEventEnvelope {
+    fn try_new(
+        decoded_event: DecodedIexEvent,
+        max_native_serialized_bytes: u64,
+    ) -> Result<Self, DecodeError> {
+        let native_serialized_bytes =
+            serde_json::to_vec(&decoded_event).map_err(|_| DecodeError::Serialization)?;
+        let native_serialized_len = u64::try_from(native_serialized_bytes.len())
+            .map_err(|_| DecodeError::DecodedEventBatchBytesExceeded)?;
+        if native_serialized_bytes.is_empty() || native_serialized_len > max_native_serialized_bytes
+        {
+            return Err(DecodeError::DecodedEventBatchBytesExceeded);
+        }
+        let native_serialized_sha256 = Sha256Digest::of(&native_serialized_bytes);
+        Ok(Self {
+            decoded_event,
+            native_serialized_bytes,
+            native_serialized_sha256,
+        })
+    }
+
+    /// Returns the typed adapter-native event without decoding its serialized representation.
+    #[must_use]
+    pub const fn decoded_event(&self) -> &DecodedIexEvent {
+        &self.decoded_event
+    }
+
+    /// Returns the one canonical adapter-native serialization created by the decoder.
+    #[must_use]
+    pub fn native_serialized_bytes(&self) -> &[u8] {
+        &self.native_serialized_bytes
+    }
+
+    /// Returns the digest of the exact canonical adapter-native serialization.
+    #[must_use]
+    pub const fn native_serialized_sha256(&self) -> Sha256Digest {
+        self.native_serialized_sha256
+    }
+
+    /// Consumes the opaque envelope without parsing or re-encoding the event.
+    #[must_use]
+    pub fn into_parts(self) -> (DecodedIexEvent, Vec<u8>, Sha256Digest) {
+        (
+            self.decoded_event,
+            self.native_serialized_bytes,
+            self.native_serialized_sha256,
+        )
+    }
+}
+
 /// Transactional event staging boundary used by the streaming decoder.
 pub trait IexEventSink {
     /// Sink-owned failure type; decoder publication always maps it to a closed decode failure.
     type Error;
 
-    /// Stages one exact serialized event under its zero-based decode ordinal. The native batch
-    /// representation is the ordinal as little-endian `u64`, serialized length as little-endian
-    /// `u64`, then these exact JSON bytes.
+    /// Stages one opaque typed/native event envelope under its zero-based decode ordinal. The
+    /// native batch representation is the ordinal as little-endian `u64`, serialized length as
+    /// little-endian `u64`, then the envelope's exact bytes.
     ///
     /// # Errors
     ///
     /// Staging is atomic for this event: success retains the complete framed event and failure
     /// retains none of it. Returning an error aborts the complete transaction. Staged bytes must
     /// remain invisible to readers until `commit` accepts the terminal decode receipt.
-    fn stage(&mut self, ordinal: u64, serialized_event: &[u8]) -> Result<(), Self::Error>;
+    fn stage(&mut self, ordinal: u64, envelope: DecodedIexEventEnvelope)
+    -> Result<(), Self::Error>;
 
     /// Atomically publishes every staged event and returns the exact expected commit identity.
     fn commit(&mut self, summary: &DecodeSummary) -> Result<Sha256Digest, Self::Error>;
 
     /// Discards every staged event. Implementations must make this idempotent.
     fn abort(&mut self);
+}
+
+/// One exact typed event and its retained adapter-native serialization.
+pub struct IexHistTypedEvent {
+    ordinal: u64,
+    decoded_event: DecodedIexEvent,
+    native_serialized_bytes: Vec<u8>,
+    native_serialized_sha256: Sha256Digest,
+    provider_content_sha256: Sha256Digest,
+}
+
+impl std::fmt::Debug for IexHistTypedEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IexHistTypedEvent")
+            .field("ordinal", &self.ordinal)
+            .field("decoded_event", &self.decoded_event)
+            .field(
+                "native_serialized_bytes",
+                &self.native_serialized_bytes.len(),
+            )
+            .field("native_serialized_sha256", &self.native_serialized_sha256)
+            .field("provider_content_sha256", &self.provider_content_sha256)
+            .finish()
+    }
+}
+
+impl IexHistTypedEvent {
+    /// Returns the exact zero-based decode ordinal.
+    #[must_use]
+    pub const fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+
+    /// Returns the typed adapter-native event for direct canonical mapping.
+    #[must_use]
+    pub const fn decoded_event(&self) -> &DecodedIexEvent {
+        &self.decoded_event
+    }
+
+    /// Returns the exact retained adapter-native bytes without reparsing them.
+    #[must_use]
+    pub fn native_serialized_bytes(&self) -> &[u8] {
+        &self.native_serialized_bytes
+    }
+
+    /// Returns the digest of the exact retained adapter-native bytes.
+    #[must_use]
+    pub const fn native_serialized_sha256(&self) -> Sha256Digest {
+        self.native_serialized_sha256
+    }
+
+    /// Returns this event's stable provider-content identity.
+    #[must_use]
+    pub const fn provider_content_sha256(&self) -> Sha256Digest {
+        self.provider_content_sha256
+    }
+}
+
+/// Bounded in-memory builder for one immediate adapter-to-application typed handoff.
+///
+/// This is intentionally neither serializable nor a durable store. It must be consumed after the
+/// decoder commits the exact terminal summary.
+pub struct IexHistTypedHandoffBuilder {
+    plan: ColdJobPlan,
+    capture: PcapMaterializationReceipt,
+    events: Vec<IexHistTypedEvent>,
+    serialized_event_bytes: u64,
+    decoded_event_batch_bytes: u64,
+    decode_attempt_evidence_sha256: Option<Sha256Digest>,
+    committed_summary_sha256: Option<Sha256Digest>,
+    aborted: bool,
+}
+
+impl std::fmt::Debug for IexHistTypedHandoffBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IexHistTypedHandoffBuilder")
+            .field("plan_sha256", &self.plan.plan_sha256())
+            .field("capture_receipt_sha256", &self.capture.receipt_sha256())
+            .field("events", &self.events.len())
+            .field("serialized_event_bytes", &self.serialized_event_bytes)
+            .field("decoded_event_batch_bytes", &self.decoded_event_batch_bytes)
+            .field("committed_summary_sha256", &self.committed_summary_sha256)
+            .field("aborted", &self.aborted)
+            .finish()
+    }
+}
+
+impl IexHistTypedHandoffBuilder {
+    /// Creates a one-shot builder for one exact admitted plan and raw capture.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a mismatched or chronology-quarantined capture before any event is retained.
+    pub fn try_new(
+        plan: &ColdJobPlan,
+        capture: &PcapMaterializationReceipt,
+    ) -> Result<Self, DecodeError> {
+        plan.decode_contract()
+            .validate_for(plan.selected_file.trade_date)?;
+        capture
+            .validate_against(plan)
+            .map_err(|_| DecodeError::ReceiptMismatch)?;
+        if capture.chronology_disposition() != CaptureChronologyDisposition::Admitted {
+            return Err(DecodeError::CaptureChronologyQuarantined);
+        }
+        Ok(Self {
+            plan: plan.clone(),
+            capture: capture.clone(),
+            events: Vec::new(),
+            serialized_event_bytes: 0,
+            decoded_event_batch_bytes: 0,
+            decode_attempt_evidence_sha256: None,
+            committed_summary_sha256: None,
+            aborted: false,
+        })
+    }
+
+    /// Consumes a committed builder and its exact terminal summary into one typed handoff.
+    ///
+    /// # Errors
+    ///
+    /// Rejects use before commit and every ordinal, count, byte, digest, plan, capture, or attempt
+    /// mismatch.
+    pub fn try_into_handoff(
+        self,
+        summary: DecodeSummary,
+    ) -> Result<IexHistTypedHandoff, DecodeError> {
+        if self.aborted || self.committed_summary_sha256 != Some(summary.summary_sha256()) {
+            return Err(DecodeError::SummaryIdentityMismatch);
+        }
+        self.validate_summary(&summary)?;
+        let provider_content_sha256 =
+            provider_content_identity(&self.plan, &self.capture, &self.events)?;
+        let physical_evidence_sha256 = physical_evidence_identity(
+            &self.plan,
+            &self.capture,
+            &summary,
+            provider_content_sha256,
+        );
+        Ok(IexHistTypedHandoff {
+            plan: self.plan,
+            capture: self.capture,
+            summary,
+            events: self.events,
+            provider_content_sha256,
+            physical_evidence_sha256,
+        })
+    }
+
+    fn validate_summary(&self, summary: &DecodeSummary) -> Result<(), DecodeError> {
+        summary.validate_against(&self.plan, &self.capture, summary.decode_attempt_evidence)?;
+        let event_count =
+            u64::try_from(self.events.len()).map_err(|_| DecodeError::SummaryIdentityMismatch)?;
+        if event_count != summary.messages
+            || self.serialized_event_bytes != summary.serialized_event_bytes
+            || self.decoded_event_batch_bytes != summary.decoded_event_batch_bytes
+            || self.decode_attempt_evidence_sha256 != Some(summary.decode_attempt_evidence_sha256)
+        {
+            return Err(DecodeError::SummaryIdentityMismatch);
+        }
+        let mut hasher = Sha256::new();
+        let mut serialized_event_bytes = 0_u64;
+        let mut decoded_event_batch_bytes = 0_u64;
+        for (index, event) in self.events.iter().enumerate() {
+            let ordinal = u64::try_from(index).map_err(|_| DecodeError::SummaryIdentityMismatch)?;
+            let native_len = u64::try_from(event.native_serialized_bytes.len())
+                .map_err(|_| DecodeError::SummaryIdentityMismatch)?;
+            serialized_event_bytes = serialized_event_bytes
+                .checked_add(native_len)
+                .ok_or(DecodeError::SummaryIdentityMismatch)?;
+            decoded_event_batch_bytes = decoded_event_batch_bytes
+                .checked_add(SERIALIZED_EVENT_FRAME_BYTES)
+                .and_then(|bytes| bytes.checked_add(native_len))
+                .ok_or(DecodeError::SummaryIdentityMismatch)?;
+            if event.ordinal != ordinal
+                || event.native_serialized_bytes.is_empty()
+                || Sha256Digest::of(&event.native_serialized_bytes)
+                    != event.native_serialized_sha256
+                || provider_event_content_identity(ordinal, &event.decoded_event)
+                    != event.provider_content_sha256
+            {
+                return Err(DecodeError::SummaryIdentityMismatch);
+            }
+            hasher.update(ordinal.to_le_bytes());
+            hasher.update(native_len.to_le_bytes());
+            hasher.update(&event.native_serialized_bytes);
+        }
+        if serialized_event_bytes != summary.serialized_event_bytes
+            || decoded_event_batch_bytes != summary.decoded_event_batch_bytes
+            || Sha256Digest::from_bytes(hasher.finalize().into())
+                != summary.serialized_events_sha256
+        {
+            return Err(DecodeError::SummaryIdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl IexEventSink for IexHistTypedHandoffBuilder {
+    type Error = DecodeError;
+
+    fn stage(
+        &mut self,
+        ordinal: u64,
+        envelope: DecodedIexEventEnvelope,
+    ) -> Result<(), Self::Error> {
+        if self.aborted
+            || self.committed_summary_sha256.is_some()
+            || u64::try_from(self.events.len()).map_or(true, |count| count != ordinal)
+        {
+            return Err(DecodeError::SummaryIdentityMismatch);
+        }
+        let native_len = u64::try_from(envelope.native_serialized_bytes().len())
+            .map_err(|_| DecodeError::DecodedEventBatchBytesExceeded)?;
+        let next_serialized_event_bytes = self
+            .serialized_event_bytes
+            .checked_add(native_len)
+            .ok_or(DecodeError::DecodedEventBatchBytesExceeded)?;
+        let next_decoded_event_batch_bytes = self
+            .decoded_event_batch_bytes
+            .checked_add(SERIALIZED_EVENT_FRAME_BYTES)
+            .and_then(|bytes| bytes.checked_add(native_len))
+            .ok_or(DecodeError::DecodedEventBatchBytesExceeded)?;
+        if next_decoded_event_batch_bytes
+            > self
+                .plan
+                .decode_contract()
+                .limits()
+                .max_decoded_event_batch_bytes
+        {
+            return Err(DecodeError::DecodedEventBatchBytesExceeded);
+        }
+        let decoded = envelope.decoded_event();
+        if decoded.semantics != IexVenueSemantics
+            || decoded.trade_date != self.plan.selected_file.trade_date
+            || decoded.feed != self.plan.selected_file.feed
+            || decoded.feed_version != self.plan.selected_file.feed_version
+            || decoded.transport_version != self.plan.selected_file.transport_version
+            || decoded.source_file_identity != self.capture.receipt_sha256()
+            || decoded.decoder_contract_sha256 != self.plan.decode_contract().contract_sha256()
+            || decoded.message_data_bytes == 0
+            || decoded.sequence <= 0
+            || decoded.stream_offset < 0
+        {
+            return Err(DecodeError::SummaryIdentityMismatch);
+        }
+        if self
+            .decode_attempt_evidence_sha256
+            .is_some_and(|expected| expected != decoded.decode_attempt_evidence_sha256)
+        {
+            return Err(DecodeError::SummaryIdentityMismatch);
+        }
+        let decode_attempt_evidence_sha256 = decoded.decode_attempt_evidence_sha256;
+        let provider_content_sha256 = provider_event_content_identity(ordinal, decoded);
+        let (decoded_event, native_serialized_bytes, native_serialized_sha256) =
+            envelope.into_parts();
+        self.events
+            .try_reserve(1)
+            .map_err(|_| DecodeError::Capacity)?;
+        self.events.push(IexHistTypedEvent {
+            ordinal,
+            decoded_event,
+            native_serialized_bytes,
+            native_serialized_sha256,
+            provider_content_sha256,
+        });
+        self.decode_attempt_evidence_sha256 = Some(decode_attempt_evidence_sha256);
+        self.serialized_event_bytes = next_serialized_event_bytes;
+        self.decoded_event_batch_bytes = next_decoded_event_batch_bytes;
+        Ok(())
+    }
+
+    fn commit(&mut self, summary: &DecodeSummary) -> Result<Sha256Digest, Self::Error> {
+        if self.aborted || self.committed_summary_sha256.is_some() {
+            return Err(DecodeError::SummaryIdentityMismatch);
+        }
+        self.validate_summary(summary)?;
+        self.committed_summary_sha256 = Some(summary.summary_sha256());
+        Ok(summary.sink_commit_sha256)
+    }
+
+    fn abort(&mut self) {
+        self.events.clear();
+        self.serialized_event_bytes = 0;
+        self.decoded_event_batch_bytes = 0;
+        self.decode_attempt_evidence_sha256 = None;
+        self.committed_summary_sha256 = None;
+        self.aborted = true;
+    }
+}
+
+/// One consumed, fully reconciled typed IEX HIST decode handoff.
+///
+/// Provider-content identity is stable across physical retries of identical provider bytes.
+/// Physical evidence separately binds local catalog/capture/decode attempts and normalization.
+pub struct IexHistTypedHandoff {
+    plan: ColdJobPlan,
+    capture: PcapMaterializationReceipt,
+    summary: DecodeSummary,
+    events: Vec<IexHistTypedEvent>,
+    provider_content_sha256: Sha256Digest,
+    physical_evidence_sha256: Sha256Digest,
+}
+
+impl std::fmt::Debug for IexHistTypedHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IexHistTypedHandoff")
+            .field("plan_sha256", &self.plan.plan_sha256())
+            .field("capture_receipt_sha256", &self.capture.receipt_sha256())
+            .field("summary_sha256", &self.summary.summary_sha256())
+            .field("events", &self.events.len())
+            .field("provider_content_sha256", &self.provider_content_sha256)
+            .field("physical_evidence_sha256", &self.physical_evidence_sha256)
+            .finish()
+    }
+}
+
+impl IexHistTypedHandoff {
+    /// Returns the exact immutable cold-job plan.
+    #[must_use]
+    pub const fn plan(&self) -> &ColdJobPlan {
+        &self.plan
+    }
+
+    /// Returns the exact physical provider-object/PCAP receipt.
+    #[must_use]
+    pub const fn capture(&self) -> &PcapMaterializationReceipt {
+        &self.capture
+    }
+
+    /// Returns the exact terminal decode summary.
+    #[must_use]
+    pub const fn summary(&self) -> &DecodeSummary {
+        &self.summary
+    }
+
+    /// Returns exact ordered typed events with their retained native bytes.
+    #[must_use]
+    pub fn events(&self) -> &[IexHistTypedEvent] {
+        &self.events
+    }
+
+    /// Returns stable provider content, excluding local attempts, clocks, and implementations.
+    #[must_use]
+    pub const fn provider_content_sha256(&self) -> Sha256Digest {
+        self.provider_content_sha256
+    }
+
+    /// Returns physical capture and normalization evidence for this exact attempt.
+    #[must_use]
+    pub const fn physical_evidence_sha256(&self) -> Sha256Digest {
+        self.physical_evidence_sha256
+    }
+
+    /// Consumes the one-shot handoff into its exact evidence and ordered typed events.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        ColdJobPlan,
+        PcapMaterializationReceipt,
+        DecodeSummary,
+        Vec<IexHistTypedEvent>,
+    ) {
+        (self.plan, self.capture, self.summary, self.events)
+    }
+}
+
+fn provider_event_content_identity(ordinal: u64, event: &DecodedIexEvent) -> Sha256Digest {
+    crate::catalog::digest_fields(&[
+        b"market-squawk/iex-hist-provider-event-content/v1",
+        &ordinal.to_le_bytes(),
+        event.trade_date.compact().as_bytes(),
+        event.feed.catalog_name().as_bytes(),
+        event.feed_version.catalog_value().as_bytes(),
+        event.transport_version.catalog_value().as_bytes(),
+        &event.channel_id.to_le_bytes(),
+        &event.session_id.to_le_bytes(),
+        &event.sequence.to_le_bytes(),
+        &event.stream_offset.to_le_bytes(),
+        &event.send_time.value().to_le_bytes(),
+        &event.capture_time_unix_nanos.to_le_bytes(),
+        &event.message_data_bytes.to_le_bytes(),
+        event.message_data_sha256.as_bytes(),
+    ])
+}
+
+fn provider_content_identity(
+    plan: &ColdJobPlan,
+    capture: &PcapMaterializationReceipt,
+    events: &[IexHistTypedEvent],
+) -> Result<Sha256Digest, DecodeError> {
+    let mut ordered_events_hasher = Sha256::new();
+    for (index, event) in events.iter().enumerate() {
+        let ordinal = u64::try_from(index).map_err(|_| DecodeError::SummaryIdentityMismatch)?;
+        if event.ordinal != ordinal
+            || provider_event_content_identity(ordinal, &event.decoded_event)
+                != event.provider_content_sha256
+        {
+            return Err(DecodeError::SummaryIdentityMismatch);
+        }
+        ordered_events_hasher.update(ordinal.to_le_bytes());
+        ordered_events_hasher.update(event.provider_content_sha256.as_bytes());
+    }
+    let ordered_events_sha256 = Sha256Digest::from_bytes(ordered_events_hasher.finalize().into());
+    let event_count =
+        u64::try_from(events.len()).map_err(|_| DecodeError::SummaryIdentityMismatch)?;
+    let gzip_crc_present = [u8::from(capture.gzip_crc32().is_some())];
+    let gzip_crc = capture.gzip_crc32().unwrap_or_default().to_le_bytes();
+    let selected = plan.selected_file();
+    Ok(crate::catalog::digest_fields(&[
+        b"market-squawk/iex-hist-provider-content/v1",
+        b"iex-hist",
+        selected.trade_date().compact().as_bytes(),
+        selected.feed().catalog_name().as_bytes(),
+        selected.feed_version().catalog_value().as_bytes(),
+        selected.transport_version().catalog_value().as_bytes(),
+        selected.object_encoding().identity_value().as_bytes(),
+        selected.file_name().as_bytes(),
+        &selected.advertised_compressed_bytes().to_le_bytes(),
+        capture.compressed_sha256().as_bytes(),
+        &capture.compressed_bytes().to_le_bytes(),
+        capture.pcap_sha256().as_bytes(),
+        &capture.pcap_bytes().to_le_bytes(),
+        &gzip_crc_present,
+        &gzip_crc,
+        &event_count.to_le_bytes(),
+        ordered_events_sha256.as_bytes(),
+    ]))
+}
+
+fn physical_evidence_identity(
+    plan: &ColdJobPlan,
+    capture: &PcapMaterializationReceipt,
+    summary: &DecodeSummary,
+    provider_content_sha256: Sha256Digest,
+) -> Sha256Digest {
+    crate::catalog::digest_fields(&[
+        b"market-squawk/iex-hist-physical-normalization-evidence/v1",
+        provider_content_sha256.as_bytes(),
+        plan.plan_sha256().as_bytes(),
+        plan.selected_file().identity().as_bytes(),
+        capture.receipt_sha256().as_bytes(),
+        capture.attempt_sha256().as_bytes(),
+        summary.decode_attempt_evidence_sha256.as_bytes(),
+        summary.decode_attempt_sha256.as_bytes(),
+        summary.decoder_contract_sha256.as_bytes(),
+        summary.decoder_implementation_sha256.as_bytes(),
+        summary.decode_limits_sha256.as_bytes(),
+        summary.summary_sha256().as_bytes(),
+    ])
 }
 
 #[derive(Clone, Copy)]
@@ -819,94 +1333,96 @@ impl<S: IexEventSink> PcapStreamDecoder<S> {
     ) -> Result<Self, DecodeFailure> {
         let mut sink = Some(sink);
         let result = (|| -> Result<Self, DecodeError> {
-        let contract = plan.decode_contract();
-        contract.validate_for(plan.selected_file.trade_date)?;
-        let limits = contract.limits();
-        if contract.feed() != plan.selected_file.feed
-            || contract.feed_version() != plan.selected_file.feed_version
-            || contract.transport_version() != plan.selected_file.transport_version
-            || plan.capacity_footprint().bytes(IexHistCapacityCategory::DecodedEventBatch)
-                != limits.max_decoded_event_batch_bytes
-        {
-            return Err(DecodeError::InvalidDecoderContract);
-        }
-        attempt
-            .validate_against(plan)
-            .map_err(|_| DecodeError::InvalidDecodeAttempt)?;
-        if attempt.decode_contract_sha256() != contract.contract_sha256() {
-            return Err(DecodeError::InvalidDecodeAttempt);
-        }
-        receipt
-            .validate_against(plan)
-            .map_err(|_| DecodeError::ReceiptMismatch)?;
-        if receipt.chronology_disposition() != CaptureChronologyDisposition::Admitted {
-            return Err(DecodeError::CaptureChronologyQuarantined);
-        }
-        let initial_capacity = limits
-            .max_stream_chunk_bytes
-            .min(usize::try_from(limits.max_packet_bytes).unwrap_or(usize::MAX))
-            .max(PCAP_GLOBAL_HEADER_BYTES);
-        let mut buffer = Vec::new();
-        buffer
-            .try_reserve(initial_capacity)
-            .map_err(|_| DecodeError::Capacity)?;
-        let mut provider_timestamps = Vec::new();
-        provider_timestamps
-            .try_reserve_exact(
-                usize::try_from(limits.max_timestamp_keys)
-                    .map_err(|_| DecodeError::InvalidLimits)?,
-            )
-            .map_err(|_| DecodeError::Capacity)?;
-        let admitted_clock = attempt.admitted_clock();
-        Ok(Self {
-            trade_date: plan.selected_file.trade_date,
-            feed: plan.selected_file.feed,
-            feed_version: plan.selected_file.feed_version,
-            transport_version: plan.selected_file.transport_version,
-            source_file_identity: receipt.receipt_sha256,
-            expected_pcap_sha256: receipt.pcap_sha256,
-            expected_pcap_bytes: receipt.pcap_bytes,
-            capture_receipt_sha256: receipt.receipt_sha256,
-            contract,
-            attempt_evidence: attempt,
-            attempt: DecodeAttemptCoordinates {
-                evidence_sha256: attempt.evidence_sha256(),
-                attempt_sha256: attempt.attempt_sha256(),
-                request_sha256: attempt.request_sha256(),
-                reservation_sha256: attempt.reservation_sha256(),
-                authority_generation: attempt.authority_generation(),
-                storage_root_sha256: attempt.storage_root_sha256(),
-                admitted_at_unix_nanos: admitted_clock.unix_nanos(),
-                admitted_utc_offset_seconds: admitted_clock.utc_offset_seconds(),
-                admitted_observed_date: admitted_clock.observed_date(),
-                deadline_unix_nanos: attempt.deadline_unix_nanos(),
-            },
-            limits,
-            pcap_hasher: Sha256::new(),
-            bytes_seen: 0,
-            buffer,
-            pcap_format: None,
-            channels: [None; MAX_DEEP_PLUS_CHANNELS],
-            previous_capture_time: None,
-            first_capture_time: None,
-            first_send_time: None,
-            last_send_time: None,
-            first_source_time: None,
-            last_source_time: None,
-            source_clock_messages: 0,
-            provider_timestamps,
-            max_observed_send_capture_skew_nanos: 0,
-            serialized_event_bytes: 0,
-            decoded_event_batch_bytes: 0,
-            staged_events: 0,
-            serialized_events_hasher: Sha256::new(),
-            packets: 0,
-            segments: 0,
-            messages: 0,
-            unmapped_messages: 0,
-            sink: Some(sink.take().ok_or(DecodeError::SinkRejected)?),
-            poisoned: false,
-        })
+            let contract = plan.decode_contract();
+            contract.validate_for(plan.selected_file.trade_date)?;
+            let limits = contract.limits();
+            if contract.feed() != plan.selected_file.feed
+                || contract.feed_version() != plan.selected_file.feed_version
+                || contract.transport_version() != plan.selected_file.transport_version
+                || plan
+                    .capacity_footprint()
+                    .bytes(IexHistCapacityCategory::DecodedEventBatch)
+                    != limits.max_decoded_event_batch_bytes
+            {
+                return Err(DecodeError::InvalidDecoderContract);
+            }
+            attempt
+                .validate_against(plan)
+                .map_err(|_| DecodeError::InvalidDecodeAttempt)?;
+            if attempt.decode_contract_sha256() != contract.contract_sha256() {
+                return Err(DecodeError::InvalidDecodeAttempt);
+            }
+            receipt
+                .validate_against(plan)
+                .map_err(|_| DecodeError::ReceiptMismatch)?;
+            if receipt.chronology_disposition() != CaptureChronologyDisposition::Admitted {
+                return Err(DecodeError::CaptureChronologyQuarantined);
+            }
+            let initial_capacity = limits
+                .max_stream_chunk_bytes
+                .min(usize::try_from(limits.max_packet_bytes).unwrap_or(usize::MAX))
+                .max(PCAP_GLOBAL_HEADER_BYTES);
+            let mut buffer = Vec::new();
+            buffer
+                .try_reserve(initial_capacity)
+                .map_err(|_| DecodeError::Capacity)?;
+            let mut provider_timestamps = Vec::new();
+            provider_timestamps
+                .try_reserve_exact(
+                    usize::try_from(limits.max_timestamp_keys)
+                        .map_err(|_| DecodeError::InvalidLimits)?,
+                )
+                .map_err(|_| DecodeError::Capacity)?;
+            let admitted_clock = attempt.admitted_clock();
+            Ok(Self {
+                trade_date: plan.selected_file.trade_date,
+                feed: plan.selected_file.feed,
+                feed_version: plan.selected_file.feed_version,
+                transport_version: plan.selected_file.transport_version,
+                source_file_identity: receipt.receipt_sha256,
+                expected_pcap_sha256: receipt.pcap_sha256,
+                expected_pcap_bytes: receipt.pcap_bytes,
+                capture_receipt_sha256: receipt.receipt_sha256,
+                contract,
+                attempt_evidence: attempt,
+                attempt: DecodeAttemptCoordinates {
+                    evidence_sha256: attempt.evidence_sha256(),
+                    attempt_sha256: attempt.attempt_sha256(),
+                    request_sha256: attempt.request_sha256(),
+                    reservation_sha256: attempt.reservation_sha256(),
+                    authority_generation: attempt.authority_generation(),
+                    storage_root_sha256: attempt.storage_root_sha256(),
+                    admitted_at_unix_nanos: admitted_clock.unix_nanos(),
+                    admitted_utc_offset_seconds: admitted_clock.utc_offset_seconds(),
+                    admitted_observed_date: admitted_clock.observed_date(),
+                    deadline_unix_nanos: attempt.deadline_unix_nanos(),
+                },
+                limits,
+                pcap_hasher: Sha256::new(),
+                bytes_seen: 0,
+                buffer,
+                pcap_format: None,
+                channels: [None; MAX_DEEP_PLUS_CHANNELS],
+                previous_capture_time: None,
+                first_capture_time: None,
+                first_send_time: None,
+                last_send_time: None,
+                first_source_time: None,
+                last_source_time: None,
+                source_clock_messages: 0,
+                provider_timestamps,
+                max_observed_send_capture_skew_nanos: 0,
+                serialized_event_bytes: 0,
+                decoded_event_batch_bytes: 0,
+                staged_events: 0,
+                serialized_events_hasher: Sha256::new(),
+                packets: 0,
+                segments: 0,
+                messages: 0,
+                unmapped_messages: 0,
+                sink: Some(sink.take().ok_or(DecodeError::SinkRejected)?),
+                poisoned: false,
+            })
         })();
         match result {
             Ok(decoder) => Ok(decoder),
@@ -970,13 +1486,10 @@ impl<S: IexEventSink> PcapStreamDecoder<S> {
             {
                 return Err(DecodeError::IncompleteSession);
             }
-            let (channel_sessions, channel_sessions_sha256) = terminal_channel_summaries(
-                self.contract,
-                self.trade_date,
-                &self.channels,
-            )?;
-            let channels = u8::try_from(channel_sessions.len())
-                .map_err(|_| DecodeError::IncompleteSession)?;
+            let (channel_sessions, channel_sessions_sha256) =
+                terminal_channel_summaries(self.contract, self.trade_date, &self.channels)?;
+            let channels =
+                u8::try_from(channel_sessions.len()).map_err(|_| DecodeError::IncompleteSession)?;
             let provider_timestamp_keys = u32::try_from(self.provider_timestamps.len())
                 .map_err(|_| DecodeError::ProviderTimestampStateLimit)?;
             let serialized_events_sha256 =
@@ -992,7 +1505,9 @@ impl<S: IexEventSink> PcapStreamDecoder<S> {
             let first_source_time = self
                 .first_source_time
                 .ok_or(DecodeError::IncompleteSession)?;
-            let last_source_time = self.last_source_time.ok_or(DecodeError::IncompleteSession)?;
+            let last_source_time = self
+                .last_source_time
+                .ok_or(DecodeError::IncompleteSession)?;
             let mut summary = DecodeSummary {
                 capture_receipt_sha256: self.capture_receipt_sha256,
                 trade_date: self.trade_date.compact(),
@@ -1038,8 +1553,7 @@ impl<S: IexEventSink> PcapStreamDecoder<S> {
                 last_source_time,
                 source_clock_messages: self.source_clock_messages,
                 provider_timestamp_keys,
-                max_observed_send_capture_skew_nanos: self
-                    .max_observed_send_capture_skew_nanos,
+                max_observed_send_capture_skew_nanos: self.max_observed_send_capture_skew_nanos,
                 anomaly_policy: self.contract.anomaly_policy(),
                 sink_commit_sha256: Sha256Digest::of(b"uncommitted"),
                 summary_sha256: Sha256Digest::of(b"uncommitted"),
@@ -1381,8 +1895,8 @@ fn decode_packet<S: IexEventSink>(
         return Err(DecodeError::TruncatedTransport);
     }
     let header = parse_transport_header(&udp_payload[..IEX_TP_HEADER_BYTES], context)?;
-    let send_time = u64::try_from(header.send_time.value())
-        .map_err(|_| DecodeError::InvalidTimestamp)?;
+    let send_time =
+        u64::try_from(header.send_time.value()).map_err(|_| DecodeError::InvalidTimestamp)?;
     let send_capture_skew_nanos = send_time.abs_diff(context.capture_time_unix_nanos);
     if send_capture_skew_nanos > context.send_capture_skew_limit {
         return Err(DecodeError::SendCaptureClockSkew {
@@ -1551,8 +2065,14 @@ fn decode_packet<S: IexEventSink>(
         let ordinal = messages
             .checked_add(u64::try_from(index).map_err(|_| DecodeError::MessageLimit)?)
             .ok_or(DecodeError::MessageLimit)?;
-        let serialized = serde_json::to_vec(&event).map_err(|_| DecodeError::Serialization)?;
-        let serialized_len = u64::try_from(serialized.len()).map_err(|_| DecodeError::Capacity)?;
+        let remaining_native_bytes = context
+            .decoded_event_batch_limit
+            .checked_sub(*decoded_event_batch_bytes)
+            .and_then(|bytes| bytes.checked_sub(SERIALIZED_EVENT_FRAME_BYTES))
+            .ok_or(DecodeError::DecodedEventBatchBytesExceeded)?;
+        let envelope = DecodedIexEventEnvelope::try_new(event, remaining_native_bytes)?;
+        let serialized_len = u64::try_from(envelope.native_serialized_bytes().len())
+            .map_err(|_| DecodeError::DecodedEventBatchBytesExceeded)?;
         let next_serialized_bytes = serialized_event_bytes
             .checked_add(serialized_len)
             .ok_or(DecodeError::Capacity)?;
@@ -1563,11 +2083,13 @@ fn decode_packet<S: IexEventSink>(
         if next_batch_bytes > context.decoded_event_batch_limit {
             return Err(DecodeError::DecodedEventBatchBytesExceeded);
         }
-        sink.stage(ordinal, &serialized)
+        let mut next_serialized_events_hasher = serialized_events_hasher.clone();
+        next_serialized_events_hasher.update(ordinal.to_le_bytes());
+        next_serialized_events_hasher.update(serialized_len.to_le_bytes());
+        next_serialized_events_hasher.update(envelope.native_serialized_bytes());
+        sink.stage(ordinal, envelope)
             .map_err(|_| DecodeError::SinkRejected)?;
-        serialized_events_hasher.update(ordinal.to_le_bytes());
-        serialized_events_hasher.update(serialized_len.to_le_bytes());
-        serialized_events_hasher.update(&serialized);
+        *serialized_events_hasher = next_serialized_events_hasher;
         *serialized_event_bytes = next_serialized_bytes;
         *decoded_event_batch_bytes = next_batch_bytes;
         *staged_events = staged_events
@@ -2623,9 +3145,7 @@ fn terminal_channel_summaries(
                     || state.continuity.next_sequence <= 1
                     || state.continuity.next_stream_offset <= 0))
             || (role == DecodeChannelRole::ReservedHeartbeatOnly
-                && (state.saw_non_heartbeat
-                    || state.saw_start_messages
-                    || state.saw_end_messages))
+                && (state.saw_non_heartbeat || state.saw_start_messages || state.saw_end_messages))
         {
             return Err(DecodeError::IncompleteSession);
         }
@@ -2674,8 +3194,7 @@ fn validate_channel_summaries(
                 && (summary.next_sequence <= 1 || summary.next_stream_offset <= 0))
             || summary.role != expected_role
             || (summary.role == DecodeChannelRole::Active && summary.heartbeat_only)
-            || (summary.role == DecodeChannelRole::ReservedHeartbeatOnly
-                && !summary.heartbeat_only)
+            || (summary.role == DecodeChannelRole::ReservedHeartbeatOnly && !summary.heartbeat_only)
         {
             return Err(DecodeError::SummaryIdentityMismatch);
         }
@@ -2759,9 +3278,9 @@ fn decode_contract_identity(
     implementation_sha256: Sha256Digest,
 ) -> Sha256Digest {
     let channel_identity = match channel_contract {
-        DecodeChannelContract::SingleActiveChannelOne => crate::catalog::digest_fields(&[
-            b"market-squawk/iex-hist-single-active-channel-one/v1",
-        ]),
+        DecodeChannelContract::SingleActiveChannelOne => {
+            crate::catalog::digest_fields(&[b"market-squawk/iex-hist-single-active-channel-one/v1"])
+        }
         DecodeChannelContract::Dplc16(distribution) => distribution.contract_sha256(),
     };
     crate::catalog::digest_fields(&[
@@ -2817,7 +3336,9 @@ fn dplc_distribution_identity(
 
 const fn anomaly_policy_code(policy: DecodeAnomalyPolicy) -> u8 {
     match policy {
-        DecodeAnomalyPolicy::RejectStructuralClockAndFamilyTimestampAnomaliesRetainExtensionsV2 => 2,
+        DecodeAnomalyPolicy::RejectStructuralClockAndFamilyTimestampAnomaliesRetainExtensionsV2 => {
+            2
+        }
     }
 }
 

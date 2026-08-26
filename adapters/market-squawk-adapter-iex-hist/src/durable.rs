@@ -710,7 +710,9 @@ fn validate_phase(plan: &ColdJobPlan, phase: &DurablePhase) -> Result<(), IexHis
         DurablePhase::Terminal { prior, terminal } => {
             validate_nonterminal(plan, prior)?;
             terminal.validate()?;
-            if terminal.prior_evidence_sha256 != nonterminal_identity(prior) {
+            if terminal.prior_evidence_sha256 != nonterminal_identity(prior)
+                || terminal.attempt_sha256 != nonterminal_attempt_sha256(prior)
+            {
                 return Err(IexHistCheckpointError::InvalidState);
             }
             Ok(())
@@ -757,15 +759,19 @@ fn phase_attempt_sha256(phase: &DurablePhase) -> Option<Sha256Digest> {
         DurablePhase::Planned => None,
         DurablePhase::CaptureEvidence { capture } => Some(capture.attempt_sha256()),
         DurablePhase::DecodeEvidence { decode, .. } => Some(decode.decode_attempt_sha256),
-        DurablePhase::Terminal { prior, .. } => match prior.as_ref() {
-            DurableNonTerminalPhase::Planned => None,
-            DurableNonTerminalPhase::CaptureEvidence { capture } => {
-                Some(capture.attempt_sha256())
-            }
-            DurableNonTerminalPhase::DecodeEvidence { decode, .. } => {
-                Some(decode.decode_attempt_sha256)
-            }
-        },
+        DurablePhase::Terminal { prior, .. } => nonterminal_attempt_sha256(prior),
+    }
+}
+
+fn nonterminal_attempt_sha256(phase: &DurableNonTerminalPhase) -> Option<Sha256Digest> {
+    match phase {
+        DurableNonTerminalPhase::Planned => None,
+        DurableNonTerminalPhase::CaptureEvidence { capture } => {
+            Some(capture.attempt_sha256())
+        }
+        DurableNonTerminalPhase::DecodeEvidence { decode, .. } => {
+            Some(decode.decode_attempt_sha256)
+        }
     }
 }
 

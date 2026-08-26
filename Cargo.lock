@@ -4646,7 +4646,6 @@ dependencies = [
  "async-compression",
  "bytes",
  "crc32fast",
- "fs2",
  "futures-util",
  "httpdate",
  "reqwest",
