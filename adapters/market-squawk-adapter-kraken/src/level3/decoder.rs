@@ -1,24 +1,40 @@
 //! Exact-lexeme, order-identity-preserving Kraken level-3 decoder and book state.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use chrono::DateTime;
 use market_squawk_domain::{
-    DataQuality, InstrumentId, MarketDepth, SourceId, SourceIdentifier, Timestamp, VenueId,
+    DataQuality, InstrumentId, MarketDepth, RawCaptureFrameView, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
 };
 use market_squawk_sources::{
+    ControlFrameKind, DecodeInternalError, DecoderEvidence, FrameSessionBinding,
     MAX_DECODED_BOOK_ITEMS, MAX_RAW_FRAME_BYTES, ProviderBookSide, ProviderDecimalLexeme,
-    ProviderPrice, ProviderQuantity,
+    ProviderPrice, ProviderQuantity, SourceMetadata, SourceProtocolProfile, TransportFrameKind,
+    ValidatedRawMarketFrame,
 };
 use rust_decimal::Decimal;
 use thiserror::Error;
 
-use super::config::{KrakenL3Config, KrakenL3Depth};
+use super::config::{
+    KrakenL3Config, KrakenL3CredentialAuthorityBinding, KrakenL3Depth,
+    KrakenL3SubscriptionRequestEvidence,
+};
 use super::messages::{
     EnvelopeKind, Heartbeat, Level3Envelope, Pong, SnapshotData, SnapshotOrder, StatusEnvelope,
     SubscribeAck, UpdateData, UpdateOrder, WireError, classify, ensure_array_bound, exact_decimal,
 };
+use crate::handoff::{
+    KrakenAuthenticatedDiscontinuity, KrakenConnectionBinding, KrakenControlOrDiscontinuityKind,
+    KrakenDiscontinuityScope, KrakenGenerationRetirement, KrakenInstrumentBinding,
+    KrakenMarketEventHandoff, KrakenProviderText, KrakenSubscriptionAcknowledgementEvidence,
+    KrakenSubscriptionRequestEvidence, authenticated_connection,
+    authenticated_control_or_discontinuity, authenticated_market_handoff, captured_acknowledgement,
+    instrument_binding,
+};
 use crate::messages::validate_warnings;
+use crate::session::KrakenSentSubscriptionReceipt;
 
 const CHECKSUM_PRICE_LEVELS: usize = 10;
 
@@ -31,6 +47,8 @@ pub enum KrakenL3DecoderState {
     Healthy,
     /// Updates are isolated until a fresh checksum-valid snapshot is received.
     Quarantined,
+    /// Subscription authority is terminal; a new decoder and receipt are required.
+    Retired,
 }
 
 /// Exact individual resting order retained from Kraken.
@@ -238,25 +256,78 @@ pub enum KrakenL3Control {
     /// Connection liveness only; never market freshness.
     Heartbeat,
     /// Application ping response; connection liveness only.
-    Pong,
+    Pong {
+        /// Provider request identifier, when supplied.
+        request_id: Option<u64>,
+        /// Provider clock at request receipt.
+        provider_request_received_at: Timestamp,
+        /// Provider clock at response emission.
+        provider_response_sent_at: Timestamp,
+    },
     /// Exchange engine reported `online`.
     Online,
+    /// Exchange engine explicitly reset this authenticated generation.
+    ProviderReset {
+        /// Exact bounded provider status value.
+        system: KrakenProviderText,
+    },
     /// One configured symbol's authenticated subscription was acknowledged.
     Subscribed {
         /// Exact provider symbol.
         symbol: SourceIdentifier,
         /// Stable mapped instrument.
         instrument: InstrumentId,
+        /// Provider request identifier echoed by the exact acknowledgement.
+        request_id: Option<u64>,
+        /// Provider clock at request receipt.
+        provider_request_received_at: Timestamp,
+        /// Provider clock at acknowledgement emission.
+        provider_response_sent_at: Timestamp,
+    },
+    /// Provider refused an exact authenticated subscription; the generation is terminal.
+    SubscriptionRefused {
+        /// Provider request identifier, when supplied.
+        request_id: Option<u64>,
+        /// Provider clock at request receipt.
+        provider_request_received_at: Timestamp,
+        /// Provider clock at response emission.
+        provider_response_sent_at: Timestamp,
+        /// Bounded exact provider error text.
+        error: KrakenProviderText,
     },
 }
 
+impl KrakenL3Control {
+    /// Returns a supplemental shared control classification without discarding typed evidence.
+    pub const fn generic_kind(&self) -> ControlFrameKind {
+        match self {
+            Self::Heartbeat => ControlFrameKind::Heartbeat,
+            Self::Pong { .. } => ControlFrameKind::Pong,
+            Self::Online | Self::ProviderReset { .. } => ControlFrameKind::ProviderFlowControl,
+            Self::Subscribed { .. } | Self::SubscriptionRefused { .. } => {
+                ControlFrameKind::SubscriptionAcknowledgement
+            }
+        }
+    }
+}
+
 /// Fully validated classification of one Kraken L3 application message.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum KrakenL3DecodeOutcome {
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum KrakenL3DecodeOutcome {
     /// One order-level market batch.
-    Book(KrakenL3BookBatch),
+    Book {
+        /// Exact configured product state used during decode.
+        product_index: usize,
+        /// Typed checksum-admitted provider batch.
+        batch: KrakenL3BookBatch,
+    },
     /// Connection/control traffic that does not refresh market data.
-    Control(KrakenL3Control),
+    Control {
+        /// Exact configured product for product-scoped controls.
+        product_index: Option<usize>,
+        /// Typed control.
+        control: KrakenL3Control,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -313,27 +384,25 @@ struct ProductState {
     local_ordinal: u64,
     last_timestamp: Option<Timestamp>,
     last_checksum: Option<u32>,
-}
-
-impl ProductState {
-    fn reset_for_reconnect(&mut self) {
-        self.subscribed = false;
-        self.state = KrakenL3DecoderState::AwaitingSnapshot;
-        self.book.bids.clear();
-        self.book.asks.clear();
-        self.local_ordinal = 0;
-        self.last_timestamp = None;
-        self.last_checksum = None;
-    }
+    instrument_binding: Arc<KrakenInstrumentBinding>,
+    sent_subscription_request: Option<Arc<KrakenL3SubscriptionRequestEvidence>>,
+    subscription_connection: Option<Arc<KrakenConnectionBinding>>,
+    captured_subscription_acknowledgement: Option<KrakenSubscriptionAcknowledgementEvidence>,
 }
 
 /// Stateful multi-product decoder for one authenticated WebSocket connection generation.
 #[derive(Debug)]
 pub struct KrakenL3Decoder {
-    source_id: SourceId,
+    metadata: SourceMetadata,
     venue_id: VenueId,
     depth: KrakenL3Depth,
     max_message_bytes: usize,
+    subscription_batch_size: usize,
+    credential_authority: Arc<KrakenL3CredentialAuthorityBinding>,
+    base_connection: Arc<KrakenConnectionBinding>,
+    active_binding: Option<FrameSessionBinding>,
+    failure_product_index: Option<usize>,
+    retirement_reason: Option<KrakenGenerationRetirement>,
     products: Vec<ProductState>,
 }
 
@@ -344,11 +413,15 @@ impl KrakenL3Decoder {
     ///
     /// Returns an allocation error if bounded generation state cannot be reserved.
     pub fn try_new(config: &KrakenL3Config) -> Result<Self, KrakenL3DecodeError> {
+        let base_connection =
+            authenticated_connection(config.metadata(), None).map_err(map_internal_decode_error)?;
         let mut products = Vec::new();
         products
             .try_reserve_exact(config.products().len())
             .map_err(|_| KrakenL3DecodeError::Allocation)?;
         for mapping in config.products() {
+            let instrument_binding = instrument_binding(mapping.symbol(), mapping.instrument())
+                .map_err(map_internal_decode_error)?;
             products.push(ProductState {
                 symbol: SourceIdentifier::try_from(mapping.symbol())
                     .map_err(|_| KrakenL3DecodeError::MalformedPayload)?,
@@ -359,23 +432,120 @@ impl KrakenL3Decoder {
                 local_ordinal: 0,
                 last_timestamp: None,
                 last_checksum: None,
+                instrument_binding,
+                sent_subscription_request: None,
+                subscription_connection: None,
+                captured_subscription_acknowledgement: None,
             });
         }
         Ok(Self {
-            source_id: config.metadata().source_id().clone(),
+            metadata: config.metadata().clone(),
             venue_id: VenueId::try_from("kraken")
                 .map_err(|_| KrakenL3DecodeError::MalformedPayload)?,
             depth: config.retained_price_levels(),
             max_message_bytes: config.max_message_bytes(),
+            subscription_batch_size: config.max_symbols_per_subscription_batch(),
+            credential_authority: config.credential_authority_binding(),
+            base_connection,
+            active_binding: None,
+            failure_product_index: None,
+            retirement_reason: None,
             products,
         })
     }
 
-    /// Clears all connection-generation state before a reconnect and fresh token/subscription.
-    pub fn reset_for_reconnect(&mut self) {
-        for product in &mut self.products {
-            product.reset_for_reconnect();
+    /// Registers sender-minted proof of one exact subscription write.
+    ///
+    /// Registration is message-atomic. Every symbol must belong to this decoder, the batch must
+    /// match the configured depth, and no product may already have a pending or acknowledged
+    /// subscription in this connection generation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects ambiguous, duplicated, stale, or configuration-inconsistent request evidence.
+    pub fn register_sent_subscription(
+        &mut self,
+        receipt: KrakenSentSubscriptionReceipt,
+    ) -> Result<(), KrakenL3DecodeError> {
+        if self.retirement_reason.is_some() {
+            return self.reject_subscription_authority();
         }
+        let (binding, request) = receipt.into_parts();
+        if binding.source_id() != self.metadata.source_id()
+            || binding.metadata_revision() != self.metadata.revision()
+            || self
+                .active_binding
+                .as_ref()
+                .is_some_and(|active| !active.shares_allocation_with(&binding))
+        {
+            return self.reject_subscription_authority();
+        }
+        if self.active_binding.is_none() {
+            self.active_binding = Some(binding);
+        }
+        let KrakenSubscriptionRequestEvidence::AuthenticatedSecretBearing {
+            request_evidence: request,
+        } = request
+        else {
+            return self.reject_subscription_authority();
+        };
+        if request.source_id() != self.metadata.source_id()
+            || request.metadata_revision() != self.metadata.revision()
+            || request.credential_record_id()
+                != self.metadata.authorization().basis().as_source_identifier()
+            || request.credential_record_id() != self.credential_authority.credential_record_id()
+            || request.authorization_generation()
+                != self.credential_authority.authorization_generation()
+            || !request.shares_credential_authority_with(&self.credential_authority)
+            || request.depth() != self.depth
+            || !request.snapshot()
+            || request.instrument_bindings().is_empty()
+        {
+            return self.reject_subscription_authority();
+        }
+        let Some(start) = request
+            .batch_index()
+            .checked_mul(self.subscription_batch_size)
+            .filter(|start| *start < self.products.len())
+        else {
+            return self.reject_subscription_authority();
+        };
+        let end = start
+            .saturating_add(self.subscription_batch_size)
+            .min(self.products.len());
+        let expected_products = &self.products[start..end];
+        if request.instrument_bindings().len() != expected_products.len()
+            || request
+                .instrument_bindings()
+                .iter()
+                .zip(expected_products)
+                .any(|(binding, product)| {
+                    binding.native_symbol() != &product.symbol
+                        || binding.externally_resolved_instrument() != product.instrument
+                        || product.subscribed
+                        || product.sent_subscription_request.is_some()
+                })
+        {
+            return self.reject_subscription_authority();
+        }
+        if self.products.iter().any(|product| {
+            product
+                .sent_subscription_request
+                .as_ref()
+                .is_some_and(|existing| existing.request_id() == request.request_id())
+        }) {
+            return self.reject_subscription_authority();
+        }
+        let connection = match authenticated_connection(&self.metadata, Some(Arc::clone(&request)))
+        {
+            Ok(connection) => connection,
+            Err(_) => return self.reject_subscription_authority(),
+        };
+        for product in &mut self.products[start..end] {
+            product.sent_subscription_request = Some(Arc::clone(&request));
+            product.subscription_connection = Some(Arc::clone(&connection));
+        }
+        Ok(())
     }
 
     /// Returns the synchronization state for one configured symbol.
@@ -411,28 +581,312 @@ impl KrakenL3Decoder {
         })
     }
 
+    /// Decodes one current validated frame into the consuming provider-owned L3 handoff.
+    ///
+    /// Provider input failures become explicit discontinuity variants retaining the exact native
+    /// bytes. Only internal allocation or impossible metadata relationships use an error return.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal decoder failure if evidence cannot be constructed consistently or a
+    /// bounded allocation fails.
+    pub fn decode_captured(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+    ) -> Result<KrakenMarketEventHandoff, DecodeInternalError> {
+        if frame.frame().source_id() != self.metadata.source_id()
+            || frame.frame().metadata_revision() != self.metadata.revision()
+        {
+            return Err(DecodeInternalError::InvariantViolation);
+        }
+        self.bind_frame(frame.frame().binding())?;
+        let SourceProtocolProfile::Live(protocol) = self.metadata.protocol_profile() else {
+            return Err(DecodeInternalError::InvariantViolation);
+        };
+        let evidence =
+            DecoderEvidence::from_validated_frame(frame, protocol.decoder_rule().clone());
+        let native_payload = frame.frame().capture_payload().clone();
+        let transport = frame.frame().transport();
+        if self.retirement_reason.is_some() {
+            let (connection, instrument, acknowledgement) =
+                self.failure_handoff_context(evidence.binding());
+            return Ok(authenticated_control_or_discontinuity(
+                native_payload,
+                transport,
+                evidence,
+                connection,
+                instrument,
+                acknowledgement,
+                KrakenControlOrDiscontinuityKind::AuthenticatedDiscontinuity(
+                    KrakenAuthenticatedDiscontinuity::GenerationRetired {
+                        reason: KrakenGenerationRetirement::AlreadyRetired,
+                    },
+                ),
+            ));
+        }
+        self.failure_product_index = None;
+        if frame.frame().transport() != TransportFrameKind::Text {
+            self.quarantine_all();
+            let (connection, instrument, acknowledgement) =
+                self.failure_handoff_context(evidence.binding());
+            return Ok(authenticated_control_or_discontinuity(
+                native_payload,
+                transport,
+                evidence,
+                connection,
+                instrument,
+                acknowledgement,
+                KrakenControlOrDiscontinuityKind::AuthenticatedDiscontinuity(
+                    KrakenAuthenticatedDiscontinuity::Decode {
+                        error: KrakenL3DecodeError::MalformedPayload,
+                        scope: KrakenDiscontinuityScope::AllConfiguredProducts,
+                    },
+                ),
+            ));
+        }
+        match self.decode_payload(frame.frame().payload()) {
+            Ok(KrakenL3DecodeOutcome::Book {
+                product_index,
+                batch,
+            }) => {
+                let product = &self.products[product_index];
+                let connection = product
+                    .subscription_connection
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| Arc::clone(&self.base_connection));
+                let instrument = Arc::clone(&product.instrument_binding);
+                let acknowledgement = product
+                    .captured_subscription_acknowledgement
+                    .as_ref()
+                    .filter(|acknowledgement| {
+                        acknowledgement
+                            .binding()
+                            .shares_allocation_with(evidence.binding())
+                    })
+                    .cloned();
+                let Some(acknowledgement) = acknowledgement else {
+                    self.retire_all(KrakenGenerationRetirement::SubscriptionAuthorityRejected);
+                    return Ok(authenticated_control_or_discontinuity(
+                        native_payload,
+                        transport,
+                        evidence,
+                        connection,
+                        Some(instrument),
+                        None,
+                        KrakenControlOrDiscontinuityKind::AuthenticatedDiscontinuity(
+                            KrakenAuthenticatedDiscontinuity::GenerationRetired {
+                                reason: KrakenGenerationRetirement::SubscriptionAuthorityRejected,
+                            },
+                        ),
+                    ));
+                };
+                Ok(authenticated_market_handoff(
+                    native_payload,
+                    transport,
+                    evidence,
+                    connection,
+                    instrument,
+                    batch,
+                    acknowledgement,
+                ))
+            }
+            Ok(KrakenL3DecodeOutcome::Control {
+                product_index,
+                control,
+            }) => {
+                let (connection, instrument, acknowledgement) = match &control {
+                    KrakenL3Control::Subscribed {
+                        symbol: _,
+                        request_id,
+                        provider_request_received_at,
+                        provider_response_sent_at,
+                        ..
+                    } => {
+                        let Some(product_index) = product_index else {
+                            self.retire_all(
+                                KrakenGenerationRetirement::SubscriptionAuthorityRejected,
+                            );
+                            return Ok(authenticated_control_or_discontinuity(
+                                native_payload,
+                                transport,
+                                evidence,
+                                Arc::clone(&self.base_connection),
+                                None,
+                                None,
+                                KrakenControlOrDiscontinuityKind::AuthenticatedDiscontinuity(
+                                    KrakenAuthenticatedDiscontinuity::GenerationRetired {
+                                        reason: KrakenGenerationRetirement::SubscriptionAuthorityRejected,
+                                    },
+                                ),
+                            ));
+                        };
+                        let acknowledgement = captured_acknowledgement(
+                            &evidence,
+                            *request_id,
+                            *provider_request_received_at,
+                            *provider_response_sent_at,
+                        );
+                        let product = &mut self.products[product_index];
+                        let Some(connection) = product.subscription_connection.as_ref().cloned()
+                        else {
+                            let instrument = Arc::clone(&product.instrument_binding);
+                            self.retire_all(
+                                KrakenGenerationRetirement::SubscriptionAuthorityRejected,
+                            );
+                            return Ok(authenticated_control_or_discontinuity(
+                                native_payload,
+                                transport,
+                                evidence,
+                                Arc::clone(&self.base_connection),
+                                Some(instrument),
+                                None,
+                                KrakenControlOrDiscontinuityKind::AuthenticatedDiscontinuity(
+                                    KrakenAuthenticatedDiscontinuity::GenerationRetired {
+                                        reason: KrakenGenerationRetirement::SubscriptionAuthorityRejected,
+                                    },
+                                ),
+                            ));
+                        };
+                        product.captured_subscription_acknowledgement =
+                            Some(acknowledgement.clone());
+                        (
+                            connection,
+                            Some(Arc::clone(&product.instrument_binding)),
+                            Some(acknowledgement),
+                        )
+                    }
+                    KrakenL3Control::SubscriptionRefused { .. } => {
+                        let (connection, instrument, acknowledgement) =
+                            self.failure_handoff_context(evidence.binding());
+                        if product_index.is_some() {
+                            (connection, instrument, acknowledgement)
+                        } else {
+                            (connection, None, None)
+                        }
+                    }
+                    KrakenL3Control::Heartbeat
+                    | KrakenL3Control::Pong { .. }
+                    | KrakenL3Control::Online
+                    | KrakenL3Control::ProviderReset { .. } => {
+                        (Arc::clone(&self.base_connection), None, None)
+                    }
+                };
+                match &control {
+                    KrakenL3Control::SubscriptionRefused { .. } => {
+                        self.retire_all(KrakenGenerationRetirement::SubscriptionRefused);
+                    }
+                    KrakenL3Control::ProviderReset { .. } => {
+                        self.retire_all(KrakenGenerationRetirement::ProviderReset);
+                    }
+                    _ => {}
+                }
+                Ok(authenticated_control_or_discontinuity(
+                    native_payload,
+                    transport,
+                    evidence,
+                    connection,
+                    instrument,
+                    acknowledgement,
+                    KrakenControlOrDiscontinuityKind::AuthenticatedControl(control),
+                ))
+            }
+            Err(KrakenL3DecodeError::Allocation) => Err(DecodeInternalError::Allocation),
+            Err(error) => {
+                let (connection, instrument, acknowledgement) =
+                    self.failure_handoff_context(evidence.binding());
+                if self.retirement_reason.is_some()
+                    || error == KrakenL3DecodeError::SubscriptionRejected
+                {
+                    let duplicate = self
+                        .failure_product_index
+                        .and_then(|index| self.products.get(index))
+                        .is_some_and(|product| product.subscribed);
+                    let reason = if duplicate {
+                        KrakenGenerationRetirement::DuplicateSubscriptionAcknowledgement
+                    } else {
+                        self.retirement_reason
+                            .unwrap_or(KrakenGenerationRetirement::SubscriptionAuthorityRejected)
+                    };
+                    self.retire_all(reason);
+                    return Ok(authenticated_control_or_discontinuity(
+                        native_payload,
+                        transport,
+                        evidence,
+                        connection,
+                        instrument,
+                        acknowledgement,
+                        KrakenControlOrDiscontinuityKind::AuthenticatedDiscontinuity(
+                            KrakenAuthenticatedDiscontinuity::GenerationRetired { reason },
+                        ),
+                    ));
+                }
+                Ok(authenticated_control_or_discontinuity(
+                    native_payload,
+                    transport,
+                    evidence,
+                    connection,
+                    instrument,
+                    acknowledgement,
+                    KrakenControlOrDiscontinuityKind::AuthenticatedDiscontinuity(
+                        KrakenAuthenticatedDiscontinuity::Decode {
+                            error,
+                            scope: KrakenDiscontinuityScope::AllConfiguredProducts,
+                        },
+                    ),
+                ))
+            }
+        }
+    }
+
     /// Parses, validates, and atomically applies one bounded application message.
     ///
     /// Any rejected message quarantines every product on the affected connection generation.
     /// Heartbeats and acknowledgements never update market freshness. A checksum-valid fresh
-    /// snapshot is the only in-generation recovery path; reconnect callers must call
-    /// [`Self::reset_for_reconnect`] and obtain a fresh provider token.
+    /// snapshot is the only in-generation recovery path. A reconnect requires a newly constructed
+    /// decoder, fresh sender-minted subscription receipt, and fresh provider token; generation
+    /// state cannot be reset and reused in place.
     ///
     /// # Errors
     ///
     /// Rejects malformed evidence, unknown products, unsupported state transitions, invalid exact
     /// numbers, crossed books, checksum mismatches, or an exhausted local ordinal.
-    pub fn decode_payload(
+    pub(crate) fn decode_payload(
         &mut self,
         payload: &[u8],
     ) -> Result<KrakenL3DecodeOutcome, KrakenL3DecodeError> {
+        self.failure_product_index = None;
+        if self.retirement_reason.is_some() {
+            return Err(KrakenL3DecodeError::SubscriptionRejected);
+        }
         if payload.len() > self.max_message_bytes || payload.len() > MAX_RAW_FRAME_BYTES {
-            self.quarantine_all();
+            self.retire_all(KrakenGenerationRetirement::ProtocolControlViolation);
             return Err(KrakenL3DecodeError::MessageTooLarge);
         }
-        let outcome = self.decode_inner(payload);
+        let kind = match classify(payload).map_err(map_wire_error) {
+            Ok(kind) => kind,
+            Err(error) => {
+                self.retire_all(KrakenGenerationRetirement::ProtocolControlViolation);
+                return Err(error);
+            }
+        };
+        let outcome = self.decode_inner(payload, kind);
         if outcome.is_err() {
-            self.quarantine_all();
+            if kind == EnvelopeKind::Level3 {
+                self.quarantine_all();
+            } else {
+                let reason = match kind {
+                    EnvelopeKind::SubscribeAck => {
+                        KrakenGenerationRetirement::SubscriptionAuthorityRejected
+                    }
+                    EnvelopeKind::Status => KrakenGenerationRetirement::ProtocolControlViolation,
+                    EnvelopeKind::Heartbeat | EnvelopeKind::Pong => {
+                        KrakenGenerationRetirement::ProtocolControlViolation
+                    }
+                    EnvelopeKind::Level3 => unreachable!(),
+                };
+                self.retire_all(reason);
+            }
         }
         outcome
     }
@@ -440,8 +894,9 @@ impl KrakenL3Decoder {
     fn decode_inner(
         &mut self,
         payload: &[u8],
+        kind: EnvelopeKind,
     ) -> Result<KrakenL3DecodeOutcome, KrakenL3DecodeError> {
-        match classify(payload).map_err(map_wire_error)? {
+        match kind {
             EnvelopeKind::Level3 => self.decode_book(payload),
             EnvelopeKind::Heartbeat => validate_heartbeat(payload),
             EnvelopeKind::Status => validate_status(payload),
@@ -476,6 +931,7 @@ impl KrakenL3Decoder {
         let product_index = self
             .product_index(data.symbol)
             .ok_or(KrakenL3DecodeError::UnknownProduct)?;
+        self.failure_product_index = Some(product_index);
         if !self.products[product_index].subscribed
             || self.products[product_index].state == KrakenL3DecoderState::Healthy
         {
@@ -560,7 +1016,7 @@ impl KrakenL3Decoder {
                     order,
                 }),
         );
-        let source_id = self.source_id.clone();
+        let source_id = self.metadata.source_id().clone();
         let venue_id = self.venue_id.clone();
         let product = &mut self.products[product_index];
         product.book = candidate;
@@ -568,18 +1024,21 @@ impl KrakenL3Decoder {
         product.last_timestamp = Some(message_timestamp);
         product.last_checksum = Some(computed);
         product.state = KrakenL3DecoderState::Healthy;
-        Ok(KrakenL3DecodeOutcome::Book(KrakenL3BookBatch {
-            source_id,
-            venue_id,
-            symbol: product.symbol.clone(),
-            instrument: product.instrument,
-            kind: KrakenL3BatchKind::Snapshot,
-            local_generation_ordinal: next_ordinal,
-            timestamp: message_timestamp,
-            checksum: computed,
-            events,
-            price_projection,
-        }))
+        Ok(KrakenL3DecodeOutcome::Book {
+            product_index,
+            batch: KrakenL3BookBatch {
+                source_id,
+                venue_id,
+                symbol: product.symbol.clone(),
+                instrument: product.instrument,
+                kind: KrakenL3BatchKind::Snapshot,
+                local_generation_ordinal: next_ordinal,
+                timestamp: message_timestamp,
+                checksum: computed,
+                events,
+                price_projection,
+            },
+        })
     }
 
     fn decode_update(
@@ -590,6 +1049,7 @@ impl KrakenL3Decoder {
         let product_index = self
             .product_index(data.symbol)
             .ok_or(KrakenL3DecodeError::UnknownProduct)?;
+        self.failure_product_index = Some(product_index);
         let product = &self.products[product_index];
         if !product.subscribed || product.state != KrakenL3DecoderState::Healthy {
             return Err(KrakenL3DecodeError::ResynchronizationRequired);
@@ -636,7 +1096,7 @@ impl KrakenL3Decoder {
                 max: MAX_DECODED_BOOK_ITEMS,
             })?;
 
-        let source_id = self.source_id.clone();
+        let source_id = self.metadata.source_id().clone();
         let venue_id = self.venue_id.clone();
         let product = &mut self.products[product_index];
         let mut undo = Vec::new();
@@ -691,18 +1151,21 @@ impl KrakenL3Decoder {
         product.local_ordinal = next_ordinal;
         product.last_timestamp = Some(message_timestamp);
         product.last_checksum = Some(computed);
-        Ok(KrakenL3DecodeOutcome::Book(KrakenL3BookBatch {
-            source_id,
-            venue_id,
-            symbol: product.symbol.clone(),
-            instrument: product.instrument,
-            kind: KrakenL3BatchKind::Update,
-            local_generation_ordinal: next_ordinal,
-            timestamp: message_timestamp,
-            checksum: computed,
-            events,
-            price_projection,
-        }))
+        Ok(KrakenL3DecodeOutcome::Book {
+            product_index,
+            batch: KrakenL3BookBatch {
+                source_id,
+                venue_id,
+                symbol: product.symbol.clone(),
+                instrument: product.instrument,
+                kind: KrakenL3BatchKind::Update,
+                local_generation_ordinal: next_ordinal,
+                timestamp: message_timestamp,
+                checksum: computed,
+                events,
+                price_projection,
+            },
+        })
     }
 
     fn validate_ack(
@@ -711,37 +1174,103 @@ impl KrakenL3Decoder {
     ) -> Result<KrakenL3DecodeOutcome, KrakenL3DecodeError> {
         let ack: SubscribeAck<'_> =
             serde_json::from_slice(payload).map_err(|_| KrakenL3DecodeError::MalformedPayload)?;
+        let provider_request_received_at = parse_timestamp(ack.time_in)?;
+        let provider_response_sent_at = parse_timestamp(ack.time_out)?;
+        if ack.method != "subscribe"
+            || ack.req_id == Some(0)
+            || provider_response_sent_at < provider_request_received_at
+        {
+            return Err(KrakenL3DecodeError::SubscriptionRejected);
+        }
+        if !ack.success {
+            let error = ack.error.ok_or(KrakenL3DecodeError::SubscriptionRejected)?;
+            let error = KrakenProviderText::try_new(error)
+                .map_err(|_| KrakenL3DecodeError::SubscriptionRejected)?;
+            let (request_product_index, product_index) = if let Some(result) = ack.result.as_ref() {
+                validate_warnings(result.warnings)
+                    .map_err(|_| KrakenL3DecodeError::MalformedPayload)?;
+                if result.channel != "level3"
+                    || result.depth != self.depth.get()
+                    || !result.snapshot
+                {
+                    return Err(KrakenL3DecodeError::SubscriptionRejected);
+                }
+                let product_index = self
+                    .product_index(result.symbol)
+                    .filter(|index| {
+                        self.products[*index]
+                            .sent_subscription_request
+                            .as_ref()
+                            .is_some_and(|request| request.request_id() == ack.req_id)
+                    })
+                    .ok_or(KrakenL3DecodeError::SubscriptionRejected)?;
+                (product_index, Some(product_index))
+            } else {
+                let request_product_index = self
+                    .products
+                    .iter()
+                    .position(|product| {
+                        product
+                            .sent_subscription_request
+                            .as_ref()
+                            .is_some_and(|request| request.request_id() == ack.req_id)
+                    })
+                    .ok_or(KrakenL3DecodeError::SubscriptionRejected)?;
+                (request_product_index, None)
+            };
+            self.failure_product_index = Some(request_product_index);
+            return Ok(KrakenL3DecodeOutcome::Control {
+                product_index,
+                control: KrakenL3Control::SubscriptionRefused {
+                    request_id: ack.req_id,
+                    provider_request_received_at,
+                    provider_response_sent_at,
+                    error,
+                },
+            });
+        }
+        if ack.error.is_some() {
+            return Err(KrakenL3DecodeError::SubscriptionRejected);
+        }
         let result = ack
             .result
             .as_ref()
             .ok_or(KrakenL3DecodeError::SubscriptionRejected)?;
         validate_warnings(result.warnings).map_err(|_| KrakenL3DecodeError::MalformedPayload)?;
-        parse_timestamp(ack.time_in)?;
-        parse_timestamp(ack.time_out)?;
-        if ack.method != "subscribe"
-            || !ack.success
-            || ack.error.is_some()
-            || ack.req_id == Some(0)
-            || result.channel != "level3"
-            || result.depth != self.depth.get()
-            || !result.snapshot
-        {
+        if result.channel != "level3" || result.depth != self.depth.get() || !result.snapshot {
             return Err(KrakenL3DecodeError::SubscriptionRejected);
         }
         let product_index = self
             .product_index(result.symbol)
             .ok_or(KrakenL3DecodeError::UnknownProduct)?;
+        self.failure_product_index = Some(product_index);
         let product = &mut self.products[product_index];
-        if product.subscribed {
+        let request = product
+            .sent_subscription_request
+            .as_ref()
+            .ok_or(KrakenL3DecodeError::SubscriptionRejected)?;
+        if product.subscribed
+            || request.request_id() != ack.req_id
+            || request.depth() != self.depth
+            || !request.snapshot()
+            || !request.instrument_bindings().iter().any(|binding| {
+                binding.native_symbol() == &product.symbol
+                    && binding.externally_resolved_instrument() == product.instrument
+            })
+        {
             return Err(KrakenL3DecodeError::SubscriptionRejected);
         }
         product.subscribed = true;
-        Ok(KrakenL3DecodeOutcome::Control(
-            KrakenL3Control::Subscribed {
+        Ok(KrakenL3DecodeOutcome::Control {
+            product_index: Some(product_index),
+            control: KrakenL3Control::Subscribed {
                 symbol: product.symbol.clone(),
                 instrument: product.instrument,
+                request_id: ack.req_id,
+                provider_request_received_at,
+                provider_response_sent_at,
             },
-        ))
+        })
     }
 
     fn product(&self, symbol: &str) -> Option<&ProductState> {
@@ -756,6 +1285,57 @@ impl KrakenL3Decoder {
             .position(|product| product.symbol.as_str() == symbol)
     }
 
+    fn bind_frame(&mut self, binding: &FrameSessionBinding) -> Result<(), DecodeInternalError> {
+        match &self.active_binding {
+            Some(active) if !active.shares_allocation_with(binding) => {
+                Err(DecodeInternalError::InvariantViolation)
+            }
+            Some(_) => Ok(()),
+            None => Err(DecodeInternalError::InvariantViolation),
+        }
+    }
+
+    fn failure_handoff_context(
+        &self,
+        current_binding: &FrameSessionBinding,
+    ) -> (
+        Arc<KrakenConnectionBinding>,
+        Option<Arc<KrakenInstrumentBinding>>,
+        Option<KrakenSubscriptionAcknowledgementEvidence>,
+    ) {
+        let product = self
+            .failure_product_index
+            .and_then(|index| self.products.get(index))
+            .or_else(|| {
+                let [product] = self.products.as_slice() else {
+                    return None;
+                };
+                Some(product)
+            });
+        let Some(product) = product else {
+            return (Arc::clone(&self.base_connection), None, None);
+        };
+        let connection = product
+            .subscription_connection
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Arc::clone(&self.base_connection));
+        let acknowledgement = product
+            .captured_subscription_acknowledgement
+            .as_ref()
+            .filter(|acknowledgement| {
+                acknowledgement
+                    .binding()
+                    .shares_allocation_with(current_binding)
+            })
+            .cloned();
+        (
+            connection,
+            Some(Arc::clone(&product.instrument_binding)),
+            acknowledgement,
+        )
+    }
+
     fn orders_outside(&self, product_index: usize) -> usize {
         self.products
             .iter()
@@ -766,9 +1346,23 @@ impl KrakenL3Decoder {
             })
     }
 
+    fn reject_subscription_authority(&mut self) -> Result<(), KrakenL3DecodeError> {
+        self.retire_all(KrakenGenerationRetirement::SubscriptionAuthorityRejected);
+        Err(KrakenL3DecodeError::SubscriptionRejected)
+    }
+
+    fn retire_all(&mut self, reason: KrakenGenerationRetirement) {
+        self.retirement_reason = Some(reason);
+        for product in &mut self.products {
+            product.state = KrakenL3DecoderState::Retired;
+        }
+    }
+
     fn quarantine_all(&mut self) {
         for product in &mut self.products {
-            product.state = KrakenL3DecoderState::Quarantined;
+            if product.state != KrakenL3DecoderState::Retired {
+                product.state = KrakenL3DecoderState::Quarantined;
+            }
         }
     }
 }
@@ -1257,7 +1851,10 @@ fn validate_heartbeat(payload: &[u8]) -> Result<KrakenL3DecodeOutcome, KrakenL3D
     if heartbeat.channel != "heartbeat" {
         return Err(KrakenL3DecodeError::MalformedPayload);
     }
-    Ok(KrakenL3DecodeOutcome::Control(KrakenL3Control::Heartbeat))
+    Ok(KrakenL3DecodeOutcome::Control {
+        product_index: None,
+        control: KrakenL3Control::Heartbeat,
+    })
 }
 
 fn validate_status(payload: &[u8]) -> Result<KrakenL3DecodeOutcome, KrakenL3DecodeError> {
@@ -1270,25 +1867,45 @@ fn validate_status(payload: &[u8]) -> Result<KrakenL3DecodeOutcome, KrakenL3Deco
     if status.channel != "status"
         || status.kind != "update"
         || status.data.len() != 1
-        || value.system != "online"
         || value.api_version.is_empty()
         || value.version.is_empty()
         || value.connection_id == 0
     {
         return Err(KrakenL3DecodeError::ResynchronizationRequired);
     }
-    Ok(KrakenL3DecodeOutcome::Control(KrakenL3Control::Online))
+    let control = if value.system == "online" {
+        KrakenL3Control::Online
+    } else {
+        KrakenL3Control::ProviderReset {
+            system: KrakenProviderText::try_new(value.system)
+                .map_err(|_| KrakenL3DecodeError::ResynchronizationRequired)?,
+        }
+    };
+    Ok(KrakenL3DecodeOutcome::Control {
+        product_index: None,
+        control,
+    })
 }
 
 fn validate_pong(payload: &[u8]) -> Result<KrakenL3DecodeOutcome, KrakenL3DecodeError> {
     let pong: Pong<'_> =
         serde_json::from_slice(payload).map_err(|_| KrakenL3DecodeError::MalformedPayload)?;
-    parse_timestamp(pong.time_in)?;
-    parse_timestamp(pong.time_out)?;
     if pong.method != "pong" || pong.req_id == Some(0) {
         return Err(KrakenL3DecodeError::MalformedPayload);
     }
-    Ok(KrakenL3DecodeOutcome::Control(KrakenL3Control::Pong))
+    let provider_request_received_at = parse_timestamp(pong.time_in)?;
+    let provider_response_sent_at = parse_timestamp(pong.time_out)?;
+    if provider_response_sent_at < provider_request_received_at {
+        return Err(KrakenL3DecodeError::MalformedPayload);
+    }
+    Ok(KrakenL3DecodeOutcome::Control {
+        product_index: None,
+        control: KrakenL3Control::Pong {
+            request_id: pong.req_id,
+            provider_request_received_at,
+            provider_response_sent_at,
+        },
+    })
 }
 
 fn map_wire_error(error: WireError) -> KrakenL3DecodeError {
@@ -1297,6 +1914,15 @@ fn map_wire_error(error: WireError) -> KrakenL3DecodeError {
         WireError::TooManyItems => KrakenL3DecodeError::TooManyOrders {
             max: MAX_DECODED_BOOK_ITEMS,
         },
+    }
+}
+
+fn map_internal_decode_error(error: DecodeInternalError) -> KrakenL3DecodeError {
+    match error {
+        DecodeInternalError::Allocation | DecodeInternalError::RetainedSizeOverflow => {
+            KrakenL3DecodeError::Allocation
+        }
+        DecodeInternalError::InvariantViolation => KrakenL3DecodeError::MalformedPayload,
     }
 }
 

@@ -1,32 +1,42 @@
 //! Exact-lexeme, message-atomic Kraken decoder and book state.
 
 use std::num::NonZeroU16;
+use std::sync::Arc;
 
 use chrono::DateTime;
 use market_squawk_domain::{
-    AggressorSide, InstrumentId, IntegrityRule, MarketDepth, RuleVersion, SourceIdentifier,
-    Timestamp, TradeTakerOrderType, VenueId,
+    AggressorSide, InstrumentId, IntegrityRule, MarketDepth, RawCaptureFrameView, RuleVersion,
+    SourceIdentifier, Timestamp, TradeTakerOrderType, VenueId,
 };
 use market_squawk_sources::{
     ControlFrameKind, DecodeError, DecodeInternalError, DecodeOutcome, DecodedControlFrame,
     DecodedProviderBatch, DecodedQuarantineAction, DecodedRecoveryAction, DecoderEvidence,
-    MAX_DECODED_EVENTS, MAX_RAW_FRAME_BYTES, MarketDecoder, ProviderAggressorEvidence,
-    ProviderBookChange, ProviderBookLevel, ProviderBookSide, ProviderChecksumEvidence,
-    ProviderDecimalLexeme, ProviderNormalizedObservation, ProviderObservationPayload,
-    ProviderPrice, ProviderQuantity, ProviderSequenceEvidence, ProviderSnapshotEvidence,
-    ProviderTimestampEvidence, QuarantineReason, ResolvedChecksumValidator,
-    ResynchronizationReason, SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
-    TransportFrameKind, ValidatedRawMarketFrame, kraken_v2_crc32,
+    FrameSessionBinding, InstrumentCoverageMembership, MAX_DECODED_EVENTS, MAX_RAW_FRAME_BYTES,
+    MarketDecoder, ProviderAggressorEvidence, ProviderBookChange, ProviderBookLevel,
+    ProviderBookSide, ProviderChecksumEvidence, ProviderDecimalLexeme,
+    ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
+    ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence,
+    QuarantineReason, ResolvedChecksumValidator, ResynchronizationReason, SourceMetadata,
+    SourceMetadataProvider, SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame,
+    kraken_v2_crc32,
 };
 use rust_decimal::Decimal;
 
 use crate::config::{KrakenChannel, KrakenDepth};
+use crate::handoff::{
+    KrakenConnectionBinding, KrakenGenerationRetirement, KrakenInstrumentBinding,
+    KrakenMarketEventHandoff, KrakenProviderText, KrakenPublicControl,
+    KrakenSubscriptionAcknowledgementEvidence, KrakenSubscriptionRequestEvidence,
+    captured_acknowledgement, from_public_outcome, instrument_binding, public_connection,
+    public_continuity, public_control_handoff, public_retirement_handoff,
+};
 use crate::messages::{
     BookData, BookEnvelope, EnvelopeKind, Heartbeat, MAX_SUBSCRIPTION_ERROR_BYTES,
     PUBLIC_SUBSCRIPTION_REQUEST_ID, Pong, StatusEnvelope, SubscribeAck, TradeData, TradeEnvelope,
     WireLevel, bounded_trade_count, classify, exact_decimal, validate_warnings,
 };
 use crate::qualification::{KRAKEN_BOOK_SEQUENCE_RULE, KRAKEN_TRADE_SEQUENCE_RULE};
+use crate::session::KrakenSentSubscriptionReceipt;
 
 const VENUE: &str = "kraken";
 
@@ -39,6 +49,15 @@ pub enum KrakenDecoderState {
     Healthy,
     /// The generation is isolated; only a new snapshot may recover state.
     Quarantined,
+    /// Subscription/control authority is terminal; this allocation can never recover in place.
+    Retired,
+}
+
+#[derive(Debug)]
+pub(crate) struct KrakenCapturedFrame {
+    native_payload: market_squawk_domain::CapturePayload,
+    transport: TransportFrameKind,
+    evidence: DecoderEvidence,
 }
 
 /// Source-metadata-bound implementation of the shared synchronous decoder contract.
@@ -46,6 +65,11 @@ pub enum KrakenDecoderState {
 pub struct KrakenMarketDecoder {
     metadata: SourceMetadata,
     decoder: KrakenDecoder,
+    connection: Arc<KrakenConnectionBinding>,
+    instrument_binding: Arc<KrakenInstrumentBinding>,
+    active_binding: Option<FrameSessionBinding>,
+    subscription_acknowledgement: Option<KrakenSubscriptionAcknowledgementEvidence>,
+    retirement_reason: Option<KrakenGenerationRetirement>,
 }
 
 impl KrakenMarketDecoder {
@@ -78,10 +102,32 @@ impl KrakenMarketDecoder {
         instrument: InstrumentId,
         channel: KrakenChannel,
     ) -> Result<Self, DecodeError> {
+        let symbol = symbol.into();
         if metadata.provider().as_str() != VENUE
             || metadata.quality_ceiling() != market_squawk_domain::DataQuality::DirectUnverified
             || metadata.capabilities().sequence()
                 != market_squawk_domain::SequenceCapability::Unsupported
+            || metadata.coverage().instruments().membership(instrument)
+                != InstrumentCoverageMembership::Enumerated
+        {
+            return Err(DecodeError::InvalidProviderEvidence);
+        }
+        let venue = VenueId::try_from(VENUE).map_err(|_| DecodeError::InvalidProviderEvidence)?;
+        if !metadata.coverage().topology().is_single_venue()
+            || !metadata.coverage().topology().contains_venue(&venue)
+        {
+            return Err(DecodeError::InvalidProviderEvidence);
+        }
+        let live = metadata
+            .coverage()
+            .live()
+            .ok_or(DecodeError::InvalidProviderEvidence)?;
+        let expected_channel = match channel {
+            KrakenChannel::Book(_) => "book-v2",
+            KrakenChannel::Trades => "trade-v2",
+        };
+        if live.provider_product().as_source_identifier().as_str() != "kraken-spot"
+            || live.provider_channel().as_source_identifier().as_str() != expected_channel
         {
             return Err(DecodeError::InvalidProviderEvidence);
         }
@@ -102,9 +148,18 @@ impl KrakenMarketDecoder {
                 }
             }
         }
+        let connection = public_connection(&metadata, channel, None)
+            .map_err(|_| DecodeError::InvalidProviderEvidence)?;
+        let instrument_binding = instrument_binding(&symbol, instrument)
+            .map_err(|_| DecodeError::InvalidProviderEvidence)?;
         Ok(Self {
             metadata,
             decoder: KrakenDecoder::try_for_channel(symbol, instrument, channel)?,
+            connection,
+            instrument_binding,
+            active_binding: None,
+            subscription_acknowledgement: None,
+            retirement_reason: None,
         })
     }
 
@@ -113,17 +168,21 @@ impl KrakenMarketDecoder {
         self.decoder.state()
     }
 
-    /// Decodes one stateful Kraken frame exactly once while retaining both application outputs.
+    /// Decodes one stateful Kraken frame exactly once while retaining the generic live result and
+    /// the provider-normalized material needed by the bounded raw-publication lane.
     ///
-    /// The generic outcome continues into the existing live-state pipeline. A successful Kraken
-    /// classification is retained separately so the capture owner can consume it with the exact
-    /// same frame and provider-event capture material to construct a pending durable publication.
-    /// Decoder failures and non-text frames have no typed publication input and remain live-only
-    /// quarantine or recovery outcomes.
+    /// This is the capture-first application boundary. The source-owned transport separately uses
+    /// [`Self::decode_captured`] with sender-minted subscription authority for its connection
+    /// health and recovery state.
     pub fn decode_publication_handoff(
         &mut self,
         frame: &ValidatedRawMarketFrame<'_>,
     ) -> Result<KrakenMarketDecodeHandoff, DecodeInternalError> {
+        if frame.frame().source_id() != self.metadata.source_id()
+            || frame.frame().metadata_revision() != self.metadata.revision()
+        {
+            return Err(DecodeInternalError::InvariantViolation);
+        }
         let SourceProtocolProfile::Live(profile) = self.metadata.protocol_profile() else {
             return Err(DecodeInternalError::InvariantViolation);
         };
@@ -166,8 +225,9 @@ impl KrakenMarketDecoder {
                 }
             }
             Ok(KrakenDecodeOutcome::Control(control)) => {
+                let live = control_outcome(&control, evidence)?;
                 Ok(KrakenMarketDecodeHandoff::publishable(
-                    control_outcome(control, evidence)?,
+                    live,
                     KrakenPublicationDecodeOutcome::control(control),
                 ))
             }
@@ -176,13 +236,294 @@ impl KrakenMarketDecoder {
             )),
         }
     }
+
+    /// Consumes sender-minted proof of the exact public request before any provider frame is
+    /// decoded.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a receipt for another source, metadata revision, product, channel, request ID, or
+    /// exact public wire payload. A decoder accepts exactly one receipt and one frame allocation.
+    pub fn register_sent_subscription(
+        &mut self,
+        receipt: KrakenSentSubscriptionReceipt,
+    ) -> Result<(), DecodeError> {
+        if self.active_binding.is_some()
+            || self.subscription_acknowledgement.is_some()
+            || self.decoder.state == KrakenDecoderState::Retired
+        {
+            return self.reject_subscription_authority();
+        }
+        let (binding, request) = receipt.into_parts();
+        if binding.source_id() != self.metadata.source_id()
+            || binding.metadata_revision() != self.metadata.revision()
+        {
+            return self.reject_subscription_authority();
+        }
+        self.active_binding = Some(binding);
+        let KrakenSubscriptionRequestEvidence::PublicExact {
+            request_id,
+            payload,
+            instrument_binding,
+            channel,
+        } = &request
+        else {
+            return self.reject_subscription_authority();
+        };
+        let expected_payload = match crate::config::public_subscription_payload(
+            &self.decoder.symbol,
+            self.decoder.channel,
+        ) {
+            Ok(payload) => payload,
+            Err(_) => return self.reject_subscription_authority(),
+        };
+        if *request_id != PUBLIC_SUBSCRIPTION_REQUEST_ID
+            || instrument_binding.native_symbol() != self.instrument_binding.native_symbol()
+            || instrument_binding.externally_resolved_instrument()
+                != self.instrument_binding.externally_resolved_instrument()
+            || *channel != self.decoder.channel
+            || payload.as_bytes() != expected_payload.as_bytes()
+        {
+            return self.reject_subscription_authority();
+        }
+        self.connection =
+            match public_connection(&self.metadata, self.decoder.channel, Some(request)) {
+                Ok(connection) => connection,
+                Err(_) => return self.reject_subscription_authority(),
+            };
+        Ok(())
+    }
+
+    fn reject_subscription_authority(&mut self) -> Result<(), DecodeError> {
+        self.retire(KrakenGenerationRetirement::SubscriptionAuthorityRejected);
+        Err(DecodeError::InvalidProviderEvidence)
+    }
+
+    fn retire(&mut self, reason: KrakenGenerationRetirement) {
+        self.decoder.state = KrakenDecoderState::Retired;
+        self.decoder.retirement_reason = Some(reason);
+        self.retirement_reason = Some(reason);
+    }
+
+    /// Decodes one current validated frame into the consuming provider-owned handoff.
+    ///
+    /// Exact captured bytes, frame/session evidence, configured native symbol, provider product,
+    /// channel, depth, and truthful continuity remain bound to the already typed observations.
+    ///
+    /// # Errors
+    ///
+    /// Returns only internal invariant/allocation failures. Provider input failures are closed
+    /// control or discontinuity variants.
+    pub fn decode_captured(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+    ) -> Result<KrakenMarketEventHandoff, DecodeInternalError> {
+        let captured = self.prepare_captured(frame)?;
+        self.decode_admitted(captured)
+    }
+
+    pub(crate) fn prepare_captured(
+        &self,
+        frame: &ValidatedRawMarketFrame<'_>,
+    ) -> Result<KrakenCapturedFrame, DecodeInternalError> {
+        if frame.frame().source_id() != self.metadata.source_id()
+            || frame.frame().metadata_revision() != self.metadata.revision()
+        {
+            return Err(DecodeInternalError::InvariantViolation);
+        }
+        let SourceProtocolProfile::Live(profile) = self.metadata.protocol_profile() else {
+            return Err(DecodeInternalError::InvariantViolation);
+        };
+        Ok(KrakenCapturedFrame {
+            native_payload: frame.frame().capture_payload().clone(),
+            transport: frame.frame().transport(),
+            evidence: DecoderEvidence::from_validated_frame(frame, profile.decoder_rule().clone()),
+        })
+    }
+
+    pub(crate) fn decode_admitted(
+        &mut self,
+        captured: KrakenCapturedFrame,
+    ) -> Result<KrakenMarketEventHandoff, DecodeInternalError> {
+        match &self.active_binding {
+            Some(binding) if !binding.shares_allocation_with(captured.evidence.binding()) => {
+                return Err(DecodeInternalError::InvariantViolation);
+            }
+            Some(_) => {}
+            None => return Err(DecodeInternalError::InvariantViolation),
+        }
+        let KrakenCapturedFrame {
+            native_payload,
+            transport,
+            evidence,
+        } = captured;
+        if self.decoder.state == KrakenDecoderState::Retired {
+            return Ok(public_retirement_handoff(
+                native_payload,
+                transport,
+                evidence,
+                Arc::clone(&self.connection),
+                Arc::clone(&self.instrument_binding),
+                self.subscription_acknowledgement.clone(),
+                KrakenGenerationRetirement::AlreadyRetired,
+            ));
+        }
+        if transport != TransportFrameKind::Text {
+            self.decoder.state = KrakenDecoderState::Quarantined;
+            return Ok(from_public_outcome(
+                native_payload,
+                transport,
+                Arc::clone(&self.connection),
+                Arc::clone(&self.instrument_binding),
+                self.subscription_acknowledgement.clone(),
+                None,
+                DecodeOutcome::Quarantine(DecodedQuarantineAction::new(
+                    evidence,
+                    QuarantineReason::SchemaViolation,
+                    None,
+                )),
+            ));
+        }
+        match self.decoder.decode_payload(native_payload.as_bytes()) {
+            Ok(KrakenDecodeOutcome::Market(observations)) => {
+                match DecodedProviderBatch::try_new(evidence.clone(), observations) {
+                    Ok(batch) => {
+                        let acknowledgement_matches = self
+                            .subscription_acknowledgement
+                            .as_ref()
+                            .is_some_and(|acknowledgement| {
+                                acknowledgement
+                                    .binding()
+                                    .shares_allocation_with(batch.evidence().binding())
+                            });
+                        let continuity = public_continuity(
+                            &batch,
+                            &self.connection,
+                            &self.instrument_binding,
+                            self.decoder.channel,
+                        );
+                        let (outcome, continuity) = match (acknowledgement_matches, continuity) {
+                            (true, Ok(continuity)) => {
+                                (DecodeOutcome::Data(batch), Some(continuity))
+                            }
+                            (false, _) | (_, Err(_)) => {
+                                self.decoder.state = KrakenDecoderState::Quarantined;
+                                (
+                                    DecodeOutcome::Quarantine(DecodedQuarantineAction::new(
+                                        batch.evidence().clone(),
+                                        QuarantineReason::ProtocolInvariantViolation,
+                                        None,
+                                    )),
+                                    None,
+                                )
+                            }
+                        };
+                        Ok(from_public_outcome(
+                            native_payload,
+                            transport,
+                            Arc::clone(&self.connection),
+                            Arc::clone(&self.instrument_binding),
+                            self.subscription_acknowledgement.clone(),
+                            continuity,
+                            outcome,
+                        ))
+                    }
+                    Err(error) => {
+                        self.decoder.state = KrakenDecoderState::Quarantined;
+                        let outcome = decode_failure_outcome(error, evidence)?;
+                        Ok(from_public_outcome(
+                            native_payload,
+                            transport,
+                            Arc::clone(&self.connection),
+                            Arc::clone(&self.instrument_binding),
+                            self.subscription_acknowledgement.clone(),
+                            None,
+                            outcome,
+                        ))
+                    }
+                }
+            }
+            Ok(KrakenDecodeOutcome::Control(control)) => {
+                if let KrakenPublicControl::Subscribed {
+                    request_id,
+                    provider_request_received_at,
+                    provider_response_sent_at,
+                    ..
+                } = &control
+                {
+                    if self.subscription_acknowledgement.is_some() {
+                        self.retire(
+                            KrakenGenerationRetirement::DuplicateSubscriptionAcknowledgement,
+                        );
+                        return Ok(public_retirement_handoff(
+                            native_payload,
+                            transport,
+                            evidence,
+                            Arc::clone(&self.connection),
+                            Arc::clone(&self.instrument_binding),
+                            self.subscription_acknowledgement.clone(),
+                            KrakenGenerationRetirement::DuplicateSubscriptionAcknowledgement,
+                        ));
+                    }
+                    self.subscription_acknowledgement = Some(captured_acknowledgement(
+                        &evidence,
+                        Some(*request_id),
+                        *provider_request_received_at,
+                        *provider_response_sent_at,
+                    ));
+                }
+                match &control {
+                    KrakenPublicControl::SubscriptionRefused { .. } => {
+                        self.retire(KrakenGenerationRetirement::SubscriptionRefused);
+                    }
+                    KrakenPublicControl::ProviderReset { .. } => {
+                        self.retire(KrakenGenerationRetirement::ProviderReset);
+                    }
+                    _ => {}
+                }
+                Ok(public_control_handoff(
+                    native_payload,
+                    transport,
+                    evidence,
+                    Arc::clone(&self.connection),
+                    Arc::clone(&self.instrument_binding),
+                    self.subscription_acknowledgement.clone(),
+                    control,
+                ))
+            }
+            Err(error) => {
+                if self.decoder.state == KrakenDecoderState::Retired {
+                    let reason = self
+                        .retirement_reason
+                        .or(self.decoder.retirement_reason)
+                        .unwrap_or(KrakenGenerationRetirement::SubscriptionAuthorityRejected);
+                    self.retire(reason);
+                    return Ok(public_retirement_handoff(
+                        native_payload,
+                        transport,
+                        evidence,
+                        Arc::clone(&self.connection),
+                        Arc::clone(&self.instrument_binding),
+                        self.subscription_acknowledgement.clone(),
+                        reason,
+                    ));
+                }
+                let outcome = decode_failure_outcome(error, evidence)?;
+                Ok(from_public_outcome(
+                    native_payload,
+                    transport,
+                    Arc::clone(&self.connection),
+                    Arc::clone(&self.instrument_binding),
+                    self.subscription_acknowledgement.clone(),
+                    None,
+                    outcome,
+                ))
+            }
+        }
+    }
 }
 
-/// One-use result of a single stateful Kraken decode.
-///
-/// A typed publication input is present only when the provider message classified successfully.
-/// It carries no capture or publication authority by itself; the capture owner must consume it
-/// with the exact validated frame and sealed-provider capture material.
+/// One-use result of a single stateful Kraken application decode.
 #[derive(Debug)]
 pub struct KrakenMarketDecodeHandoff {
     live: DecodeOutcome,
@@ -215,9 +556,6 @@ impl KrakenMarketDecodeHandoff {
 }
 
 /// One-use typed publication input with the common decoder's exact retained-byte charge.
-///
-/// The memory charge is derived before the generic and publication observation graphs separate,
-/// avoiding a second provider-specific retained-size implementation.
 #[derive(Debug)]
 pub struct KrakenPublicationDecodeOutcome {
     outcome: KrakenDecodeOutcome,
@@ -232,7 +570,7 @@ impl KrakenPublicationDecodeOutcome {
         }
     }
 
-    fn control(control: KrakenControl) -> Self {
+    fn control(control: KrakenPublicControl) -> Self {
         Self {
             outcome: KrakenDecodeOutcome::Control(control),
             decoded_retained_bytes: 0,
@@ -261,21 +599,32 @@ impl MarketDecoder for KrakenMarketDecoder {
 }
 
 fn control_outcome(
-    control: KrakenControl,
+    control: &KrakenPublicControl,
     evidence: DecoderEvidence,
 ) -> Result<DecodeOutcome, DecodeInternalError> {
     let (kind, provider_code) = match control {
-        KrakenControl::Heartbeat => (ControlFrameKind::Heartbeat, None),
-        KrakenControl::Pong => (ControlFrameKind::Pong, None),
-        KrakenControl::Online => (ControlFrameKind::ProviderFlowControl, Some("online")),
-        KrakenControl::Subscribed(KrakenSubscription::Book) => {
-            (ControlFrameKind::SubscriptionAcknowledgement, Some("book"))
-        }
-        KrakenControl::Subscribed(KrakenSubscription::Trade) => {
-            (ControlFrameKind::SubscriptionAcknowledgement, Some("trade"))
-        }
-        KrakenControl::SubscriptionRefused => {
+        KrakenPublicControl::Heartbeat => (ControlFrameKind::Heartbeat, None),
+        KrakenPublicControl::Pong { .. } => (ControlFrameKind::Pong, None),
+        KrakenPublicControl::Online => (ControlFrameKind::ProviderFlowControl, Some("online")),
+        KrakenPublicControl::Subscribed {
+            channel: KrakenChannel::Book(_),
+            ..
+        } => (ControlFrameKind::SubscriptionAcknowledgement, Some("book")),
+        KrakenPublicControl::Subscribed {
+            channel: KrakenChannel::Trades,
+            ..
+        } => (ControlFrameKind::SubscriptionAcknowledgement, Some("trade")),
+        KrakenPublicControl::SubscriptionRefused { .. } => {
             let provider_code = SourceIdentifier::try_from("subscription_refused")
+                .map_err(|_| DecodeInternalError::InvariantViolation)?;
+            return Ok(DecodeOutcome::Resynchronize(DecodedRecoveryAction::new(
+                evidence,
+                ResynchronizationReason::ProviderRequestedReset,
+                Some(provider_code),
+            )));
+        }
+        KrakenPublicControl::ProviderReset { .. } => {
+            let provider_code = SourceIdentifier::try_from("provider_reset")
                 .map_err(|_| DecodeInternalError::InvariantViolation)?;
             return Ok(DecodeOutcome::Resynchronize(DecodedRecoveryAction::new(
                 evidence,
@@ -330,31 +679,7 @@ pub enum KrakenDecodeOutcome {
     /// One or more market observations in provider wire order.
     Market(Vec<ProviderNormalizedObservation>),
     /// A valid connection/control-plane message that does not refresh market data.
-    Control(KrakenControl),
-}
-
-/// Validated connection/control message classification.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KrakenControl {
-    /// Connection liveness only; never market freshness.
-    Heartbeat,
-    /// Application ping response; connection liveness only.
-    Pong,
-    /// Exchange engine reported `online`.
-    Online,
-    /// Successful subscription acknowledgement.
-    Subscribed(KrakenSubscription),
-    /// Structurally valid provider refusal of the exact subscription request.
-    SubscriptionRefused,
-}
-
-/// Acknowledged Kraken channel.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KrakenSubscription {
-    /// Price-level book subscription at the configured depth.
-    Book,
-    /// Trade subscription.
-    Trade,
+    Control(KrakenPublicControl),
 }
 
 #[derive(Clone, Debug)]
@@ -391,6 +716,7 @@ pub struct KrakenDecoder {
     instrument: InstrumentId,
     channel: KrakenChannel,
     state: KrakenDecoderState,
+    retirement_reason: Option<KrakenGenerationRetirement>,
     bids: Vec<ProviderBookLevel>,
     asks: Vec<ProviderBookLevel>,
     last_checksum: Option<u32>,
@@ -398,11 +724,7 @@ pub struct KrakenDecoder {
 }
 
 impl KrakenDecoder {
-    /// Constructs an empty decoder that requires an initializing snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Rejects an invalid provider symbol or an internal rule identity that cannot be represented.
+    /// Constructs an empty price-level decoder that requires an initializing snapshot.
     pub fn try_new(
         symbol: impl Into<String>,
         instrument: InstrumentId,
@@ -433,6 +755,7 @@ impl KrakenDecoder {
             instrument,
             channel,
             state: KrakenDecoderState::AwaitingSnapshot,
+            retirement_reason: None,
             bids: Vec::new(),
             asks: Vec::new(),
             last_checksum: None,
@@ -465,14 +788,19 @@ impl KrakenDecoder {
     /// numbers, crossed books, or checksum mismatches. Any market-message failure quarantines the
     /// generation and leaves committed state unchanged.
     pub fn decode_payload(&mut self, payload: &[u8]) -> Result<KrakenDecodeOutcome, DecodeError> {
+        if self.state == KrakenDecoderState::Retired {
+            return Err(DecodeError::ResynchronizationRequired);
+        }
         if payload.len() > MAX_RAW_FRAME_BYTES {
-            self.state = KrakenDecoderState::Quarantined;
+            self.state = KrakenDecoderState::Retired;
+            self.retirement_reason = Some(KrakenGenerationRetirement::ProtocolControlViolation);
             return Err(DecodeError::MalformedPayload);
         }
         let kind = match classify(payload) {
             Ok(kind) => kind,
             Err(_) => {
-                self.state = KrakenDecoderState::Quarantined;
+                self.state = KrakenDecoderState::Retired;
+                self.retirement_reason = Some(KrakenGenerationRetirement::ProtocolControlViolation);
                 return Err(DecodeError::MalformedPayload);
             }
         };
@@ -484,16 +812,37 @@ impl KrakenDecoder {
             EnvelopeKind::SubscribeAck => validate_ack(payload, &self.symbol, self.channel),
             EnvelopeKind::Pong => validate_pong(payload),
         };
-        if matches!(
-            outcome,
-            Ok(KrakenDecodeOutcome::Control(
-                KrakenControl::SubscriptionRefused
-            ))
-        ) {
-            self.state = KrakenDecoderState::Quarantined;
+        match &outcome {
+            Ok(KrakenDecodeOutcome::Control(KrakenPublicControl::SubscriptionRefused {
+                ..
+            })) => {
+                self.state = KrakenDecoderState::Retired;
+                self.retirement_reason = Some(KrakenGenerationRetirement::SubscriptionRefused);
+            }
+            Ok(KrakenDecodeOutcome::Control(KrakenPublicControl::ProviderReset { .. })) => {
+                self.state = KrakenDecoderState::Retired;
+                self.retirement_reason = Some(KrakenGenerationRetirement::ProviderReset);
+            }
+            _ => {}
         }
         if outcome.is_err() {
-            self.state = KrakenDecoderState::Quarantined;
+            self.state = if matches!(kind, EnvelopeKind::Book | EnvelopeKind::Trade) {
+                KrakenDecoderState::Quarantined
+            } else {
+                KrakenDecoderState::Retired
+            };
+            if self.state == KrakenDecoderState::Retired {
+                self.retirement_reason = Some(match kind {
+                    EnvelopeKind::SubscribeAck => {
+                        KrakenGenerationRetirement::SubscriptionAuthorityRejected
+                    }
+                    EnvelopeKind::Status => KrakenGenerationRetirement::ProtocolControlViolation,
+                    EnvelopeKind::Heartbeat | EnvelopeKind::Pong => {
+                        KrakenGenerationRetirement::ProtocolControlViolation
+                    }
+                    EnvelopeKind::Book | EnvelopeKind::Trade => unreachable!(),
+                });
+            }
         }
         outcome
     }
@@ -879,7 +1228,7 @@ fn validate_heartbeat(payload: &[u8]) -> Result<KrakenDecodeOutcome, DecodeError
     if heartbeat.channel != "heartbeat" {
         return Err(DecodeError::MalformedPayload);
     }
-    Ok(KrakenDecodeOutcome::Control(KrakenControl::Heartbeat))
+    Ok(KrakenDecodeOutcome::Control(KrakenPublicControl::Heartbeat))
 }
 
 fn validate_status(payload: &[u8]) -> Result<KrakenDecodeOutcome, DecodeError> {
@@ -889,14 +1238,20 @@ fn validate_status(payload: &[u8]) -> Result<KrakenDecodeOutcome, DecodeError> {
     if status.channel != "status"
         || status.kind != "update"
         || status.data.len() != 1
-        || value.system != "online"
         || value.api_version.is_empty()
         || value.version.is_empty()
         || value.connection_id == 0
     {
         return Err(DecodeError::ResynchronizationRequired);
     }
-    Ok(KrakenDecodeOutcome::Control(KrakenControl::Online))
+    if value.system == "online" {
+        return Ok(KrakenDecodeOutcome::Control(KrakenPublicControl::Online));
+    }
+    let system = KrakenProviderText::try_new(value.system)
+        .map_err(|_| DecodeError::ResynchronizationRequired)?;
+    Ok(KrakenDecodeOutcome::Control(
+        KrakenPublicControl::ProviderReset { system },
+    ))
 }
 
 fn validate_ack(
@@ -906,11 +1261,12 @@ fn validate_ack(
 ) -> Result<KrakenDecodeOutcome, DecodeError> {
     let ack: SubscribeAck<'_> =
         serde_json::from_slice(payload).map_err(|_| DecodeError::MalformedPayload)?;
-    if ack.method != "subscribe"
-        || ack.time_in.is_empty()
-        || ack.time_out.is_empty()
-        || ack.req_id != Some(PUBLIC_SUBSCRIPTION_REQUEST_ID)
-    {
+    if ack.method != "subscribe" || ack.req_id != Some(PUBLIC_SUBSCRIPTION_REQUEST_ID) {
+        return Err(DecodeError::ResynchronizationRequired);
+    }
+    let provider_request_received_at = parse_timestamp(ack.time_in)?;
+    let provider_response_sent_at = parse_timestamp(ack.time_out)?;
+    if provider_response_sent_at < provider_request_received_at {
         return Err(DecodeError::ResynchronizationRequired);
     }
     if !ack.success {
@@ -921,25 +1277,37 @@ fn validate_ack(
         if let Some(result) = ack.result.as_ref() {
             validate_subscription_result(result, symbol, channel)?;
         }
+        let error = KrakenProviderText::try_new(error)
+            .map_err(|_| DecodeError::ResynchronizationRequired)?;
         return Ok(KrakenDecodeOutcome::Control(
-            KrakenControl::SubscriptionRefused,
+            KrakenPublicControl::SubscriptionRefused {
+                request_id: ack.req_id,
+                provider_request_received_at,
+                provider_response_sent_at,
+                error,
+            },
         ));
     }
     if ack.error.is_some() {
         return Err(DecodeError::ResynchronizationRequired);
     }
     let result = ack.result.as_ref().ok_or(DecodeError::MalformedPayload)?;
-    let subscription = validate_subscription_result(result, symbol, channel)?;
-    Ok(KrakenDecodeOutcome::Control(KrakenControl::Subscribed(
-        subscription,
-    )))
+    let acknowledged_channel = validate_subscription_result(result, symbol, channel)?;
+    Ok(KrakenDecodeOutcome::Control(
+        KrakenPublicControl::Subscribed {
+            channel: acknowledged_channel,
+            request_id: PUBLIC_SUBSCRIPTION_REQUEST_ID,
+            provider_request_received_at,
+            provider_response_sent_at,
+        },
+    ))
 }
 
 fn validate_subscription_result(
     result: &crate::messages::SubscribeResult<'_>,
     symbol: &str,
     channel: KrakenChannel,
-) -> Result<KrakenSubscription, DecodeError> {
+) -> Result<KrakenChannel, DecodeError> {
     validate_warnings(result.warnings).map_err(|_| DecodeError::MalformedPayload)?;
     if !matches!(result.channel, "book" | "trade") || result.symbol != symbol {
         return Err(DecodeError::ResynchronizationRequired);
@@ -950,14 +1318,14 @@ fn validate_subscription_result(
                 && result.depth == Some(depth.get())
                 && result.snapshot == Some(true) =>
         {
-            Ok(KrakenSubscription::Book)
+            Ok(channel)
         }
         KrakenChannel::Trades
             if result.channel == "trade"
                 && result.depth.is_none()
                 && result.snapshot == Some(true) =>
         {
-            Ok(KrakenSubscription::Trade)
+            Ok(channel)
         }
         KrakenChannel::Book(_) | KrakenChannel::Trades => {
             Err(DecodeError::ResynchronizationRequired)
@@ -968,12 +1336,17 @@ fn validate_subscription_result(
 fn validate_pong(payload: &[u8]) -> Result<KrakenDecodeOutcome, DecodeError> {
     let pong: Pong<'_> =
         serde_json::from_slice(payload).map_err(|_| DecodeError::MalformedPayload)?;
-    if pong.method != "pong"
-        || pong.req_id == Some(0)
-        || pong.time_in.is_empty()
-        || pong.time_out.is_empty()
-    {
+    if pong.method != "pong" || pong.req_id == Some(0) {
         return Err(DecodeError::MalformedPayload);
     }
-    Ok(KrakenDecodeOutcome::Control(KrakenControl::Pong))
+    let provider_request_received_at = parse_timestamp(pong.time_in)?;
+    let provider_response_sent_at = parse_timestamp(pong.time_out)?;
+    if provider_response_sent_at < provider_request_received_at {
+        return Err(DecodeError::MalformedPayload);
+    }
+    Ok(KrakenDecodeOutcome::Control(KrakenPublicControl::Pong {
+        request_id: pong.req_id,
+        provider_request_received_at,
+        provider_response_sent_at,
+    }))
 }

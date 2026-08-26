@@ -1,13 +1,15 @@
 //! Evidence-bound authenticated level-3 configuration and secret-safe subscription encoding.
 
 use std::fmt;
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
 
 use market_squawk_domain::{
     AssetClass, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
     EffectiveInterval, ExactPayloadEvidence, InstrumentId, IntegrityRule, LiveEventClass,
-    MarketDepth, ProviderChannel, ProviderProduct, RevisionBoundPayloadEvidence, RuleVersion,
-    SchemaVersion, SequenceCapability, SnapshotApplicability, SourceId, SourceIdentifier, VenueId,
+    MarketDepth, MetadataRevision, ProviderChannel, ProviderProduct, RevisionBoundPayloadEvidence,
+    RuleVersion, SchemaVersion, SequenceCapability, SnapshotApplicability, SourceId,
+    SourceIdentifier, VenueId,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, ChecksumAlgorithm, ChecksumBookScope,
@@ -22,8 +24,10 @@ use serde::Serialize;
 use thiserror::Error;
 use url::Url;
 
+use crate::handoff::{KrakenInstrumentBinding, instrument_binding};
+
 /// Authenticated Kraken Spot WebSocket v2 endpoint used by the `level3` channel.
-pub const KRAKEN_L3_WEBSOCKET_ENDPOINT: &str = "wss://ws.kraken.com/v2";
+pub const KRAKEN_L3_WEBSOCKET_ENDPOINT: &str = "wss://ws-l3.kraken.com/v2";
 /// Private REST endpoint from which the central credential authority obtains a short-lived token.
 pub const KRAKEN_L3_GET_TOKEN_ENDPOINT: &str =
     "https://api.kraken.com/0/private/GetWebSocketsToken";
@@ -131,50 +135,257 @@ impl KrakenL3ProductMapping {
     }
 }
 
-/// Borrowed short-lived Kraken WebSocket token.
+/// Process-local protected authority for one exact Kraken credential authorization generation.
 ///
-/// Token ownership remains with the central secret/token authority. This wrapper is intentionally
-/// non-serializable and its debug representation never contains the token.
-#[derive(Clone, Copy)]
-pub struct KrakenL3WebSocketToken<'a>(&'a str);
+/// This non-cloneable, non-serializable allocation is established before any short-lived provider
+/// token exists. It binds configuration and later token capabilities to the same protected
+/// credential record and authorization generation.
+pub struct KrakenL3CredentialAuthority {
+    binding: Arc<KrakenL3CredentialAuthorityBinding>,
+}
 
-impl<'a> KrakenL3WebSocketToken<'a> {
-    /// Validates one ephemeral token returned by `GetWebSocketsToken`.
+impl KrakenL3CredentialAuthority {
+    /// Establishes one exact protected credential authority.
+    ///
+    /// The coordinates are secret-free. Allocation identity, not reconstructable values alone,
+    /// binds every capability minted by this authority.
+    pub fn new(
+        credential_record_id: SourceIdentifier,
+        authorization_generation: NonZeroU64,
+    ) -> Self {
+        Self {
+            binding: Arc::new(KrakenL3CredentialAuthorityBinding {
+                credential_record_id,
+                authorization_generation,
+            }),
+        }
+    }
+
+    /// Admits one short-lived provider token into a non-forgeable one-use capability.
+    ///
+    /// The caller's `String` allocation moves into adapter ownership without copying. The
+    /// capability is neither cloneable nor serializable and zeroes the token on rejection and
+    /// drop.
     ///
     /// # Errors
     ///
     /// Rejects empty, oversized, non-ASCII, whitespace-bearing, or control-bearing material.
-    pub fn try_new(token: &'a str) -> Result<Self, KrakenL3ConfigError> {
+    pub fn try_mint_subscription_capability(
+        &self,
+        token: String,
+    ) -> Result<KrakenL3TokenCapability, KrakenL3ConfigError> {
+        let mut token = token.into_bytes();
         if token.is_empty()
             || token.len() > MAX_TOKEN_BYTES
             || !token.is_ascii()
             || token
-                .bytes()
+                .iter()
                 .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
         {
+            zeroize_token_buffer(&mut token);
             return Err(KrakenL3ConfigError::InvalidToken);
         }
-        Ok(Self(token))
+        Ok(KrakenL3TokenCapability {
+            binding: Arc::clone(&self.binding),
+            token,
+        })
     }
 
-    fn expose(self) -> &'a str {
-        self.0
+    /// Returns the secret-free credential record identity.
+    pub fn credential_record_id(&self) -> &SourceIdentifier {
+        &self.binding.credential_record_id
+    }
+
+    /// Returns the exact nonzero authorization generation.
+    pub fn authorization_generation(&self) -> NonZeroU64 {
+        self.binding.authorization_generation
     }
 }
 
-impl fmt::Debug for KrakenL3WebSocketToken<'_> {
+impl fmt::Debug for KrakenL3CredentialAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("KrakenL3WebSocketToken([REDACTED])")
+        formatter
+            .debug_struct("KrakenL3CredentialAuthority")
+            .field("credential_record_id", &self.binding.credential_record_id)
+            .field(
+                "authorization_generation",
+                &self.binding.authorization_generation,
+            )
+            .finish()
     }
 }
 
-/// Redacted, zeroed-on-drop authenticated subscription payload.
-pub struct KrakenL3SecretPayload(Vec<u8>);
+/// Non-forgeable one-use authorization to encode one Kraken L3 subscription.
+///
+/// The capability cannot be constructed, cloned, copied, or serialized outside the credential
+/// authority. It owns and zeroes the sole adapter token allocation admitted for this request. Its
+/// secret-free credential coordinates and allocation identity follow the resulting request through
+/// the send receipt, decoder registration, and handoff.
+pub struct KrakenL3TokenCapability {
+    binding: Arc<KrakenL3CredentialAuthorityBinding>,
+    token: Vec<u8>,
+}
+
+impl KrakenL3TokenCapability {
+    /// Returns the secret-free credential record identity.
+    pub fn credential_record_id(&self) -> &SourceIdentifier {
+        &self.binding.credential_record_id
+    }
+
+    /// Returns the exact nonzero authorization generation.
+    pub fn authorization_generation(&self) -> NonZeroU64 {
+        self.binding.authorization_generation
+    }
+}
+
+impl fmt::Debug for KrakenL3TokenCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KrakenL3TokenCapability")
+            .field("credential_record_id", &self.binding.credential_record_id)
+            .field(
+                "authorization_generation",
+                &self.binding.authorization_generation,
+            )
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for KrakenL3TokenCapability {
+    fn drop(&mut self) {
+        zeroize_token_buffer(&mut self.token);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct KrakenL3CredentialAuthorityBinding {
+    credential_record_id: SourceIdentifier,
+    authorization_generation: NonZeroU64,
+}
+
+impl KrakenL3CredentialAuthorityBinding {
+    pub(crate) const fn credential_record_id(&self) -> &SourceIdentifier {
+        &self.credential_record_id
+    }
+
+    pub(crate) const fn authorization_generation(&self) -> NonZeroU64 {
+        self.authorization_generation
+    }
+}
+
+/// Exact secret-free contract encoded beside one authenticated subscription payload.
+///
+/// This value never retains or hashes the short-lived WebSocket token. It is created in the same
+/// operation as the secret-bearing bytes, so its batch, request identifier, depth, snapshot
+/// semantic, and ordered provider symbols cannot drift from what was encoded.
+#[derive(Debug)]
+pub struct KrakenL3SubscriptionRequestEvidence {
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    batch_index: usize,
+    request_id: Option<u64>,
+    depth: KrakenL3Depth,
+    snapshot: bool,
+    instrument_bindings: Vec<Arc<KrakenInstrumentBinding>>,
+    credential_authority: Arc<KrakenL3CredentialAuthorityBinding>,
+}
+
+impl KrakenL3SubscriptionRequestEvidence {
+    /// Returns the immutable source identity used to encode the request.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact metadata revision used to encode the request.
+    pub const fn metadata_revision(&self) -> &MetadataRevision {
+        &self.metadata_revision
+    }
+
+    /// Returns the zero-based configured subscription batch.
+    pub const fn batch_index(&self) -> usize {
+        self.batch_index
+    }
+
+    /// Returns the exact provider request identifier encoded on the wire.
+    pub const fn request_id(&self) -> Option<u64> {
+        self.request_id
+    }
+
+    /// Returns the exact provider depth encoded on the wire.
+    pub const fn depth(&self) -> KrakenL3Depth {
+        self.depth
+    }
+
+    /// Returns whether the exact request asked for initializing snapshots.
+    pub const fn snapshot(&self) -> bool {
+        self.snapshot
+    }
+
+    /// Returns the ordered native-symbol to external-instrument bindings encoded in this batch.
+    pub fn instrument_bindings(&self) -> &[Arc<KrakenInstrumentBinding>] {
+        &self.instrument_bindings
+    }
+
+    /// Returns the exact secret-free credential record identity used by the request.
+    pub fn credential_record_id(&self) -> &SourceIdentifier {
+        &self.credential_authority.credential_record_id
+    }
+
+    /// Returns the exact protected authorization generation used by the request.
+    pub fn authorization_generation(&self) -> NonZeroU64 {
+        self.credential_authority.authorization_generation
+    }
+
+    pub(crate) fn shares_credential_authority_with(
+        &self,
+        binding: &Arc<KrakenL3CredentialAuthorityBinding>,
+    ) -> bool {
+        Arc::ptr_eq(&self.credential_authority, binding)
+    }
+}
+
+impl PartialEq for KrakenL3SubscriptionRequestEvidence {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_id == other.source_id
+            && self.metadata_revision == other.metadata_revision
+            && self.batch_index == other.batch_index
+            && self.request_id == other.request_id
+            && self.depth == other.depth
+            && self.snapshot == other.snapshot
+            && self.instrument_bindings == other.instrument_bindings
+            && Arc::ptr_eq(&self.credential_authority, &other.credential_authority)
+    }
+}
+
+impl Eq for KrakenL3SubscriptionRequestEvidence {}
+
+/// Redacted, zeroed-on-drop authenticated subscription payload and its secret-free contract.
+pub struct KrakenL3SecretPayload {
+    bytes: Vec<u8>,
+    request_evidence: Option<KrakenL3SubscriptionRequestEvidence>,
+}
 
 impl KrakenL3SecretPayload {
-    /// Returns payload bytes for the immediate WebSocket write.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+    #[allow(
+        dead_code,
+        reason = "the selected authenticated L3 session foundation consumes this opaque payload"
+    )]
+    pub(crate) fn into_transport_parts(
+        mut self,
+    ) -> Result<(String, KrakenL3SubscriptionRequestEvidence), KrakenL3ConfigError> {
+        let evidence = self
+            .request_evidence
+            .take()
+            .ok_or(KrakenL3ConfigError::SubscriptionSerialization)?;
+        let bytes = std::mem::take(&mut self.bytes);
+        String::from_utf8(bytes)
+            .map(|wire| (wire, evidence))
+            .map_err(|error| {
+                let mut bytes = error.into_bytes();
+                zeroize_token_buffer(&mut bytes);
+                KrakenL3ConfigError::SubscriptionSerialization
+            })
     }
 }
 
@@ -186,7 +397,7 @@ impl fmt::Debug for KrakenL3SecretPayload {
 
 impl Drop for KrakenL3SecretPayload {
     fn drop(&mut self) {
-        self.0.fill(0);
+        zeroize_token_buffer(&mut self.bytes);
     }
 }
 
@@ -198,15 +409,16 @@ pub struct KrakenL3Config {
     products: Vec<KrakenL3ProductMapping>,
     depth: KrakenL3Depth,
     tier: KrakenL3ClientTier,
-    credential_record_id: SourceIdentifier,
+    credential_authority: Arc<KrakenL3CredentialAuthorityBinding>,
     max_message_bytes: NonZeroUsize,
 }
 
 impl KrakenL3Config {
     /// Constructs an authenticated, order-level Kraken profile.
     ///
-    /// `credential_record_id` is a non-secret stable local record identity. API keys, signing
-    /// secrets, and WebSocket tokens must remain behind the central secret/token authority.
+    /// `credential_authority` owns the non-secret credential record and authorization-generation
+    /// allocation that must later mint each short-lived token capability. API keys and signing
+    /// secrets remain outside this adapter.
     ///
     /// # Errors
     ///
@@ -217,7 +429,7 @@ impl KrakenL3Config {
         products: Vec<KrakenL3ProductMapping>,
         depth: KrakenL3Depth,
         tier: KrakenL3ClientTier,
-        credential_record_id: SourceIdentifier,
+        credential_authority: &KrakenL3CredentialAuthority,
         max_message_bytes: NonZeroUsize,
     ) -> Result<Self, KrakenL3ConfigError> {
         validate_products(&products, depth, tier)?;
@@ -227,7 +439,8 @@ impl KrakenL3Config {
         if metadata.source_class() != SourceClass::Exchange
             || metadata.provider().as_str() != "kraken"
             || metadata.authorization().mode() != AuthorizationMode::UserAuthorized
-            || metadata.authorization().basis().as_source_identifier() != &credential_record_id
+            || metadata.authorization().basis().as_source_identifier()
+                != credential_authority.credential_record_id()
             || metadata.quality_ceiling() != DataQuality::DirectUnverified
             || metadata.capabilities().sequence() != SequenceCapability::Unsupported
             || metadata.capabilities().checksum() != ChecksumCapability::Provided
@@ -283,7 +496,7 @@ impl KrakenL3Config {
             products,
             depth,
             tier,
-            credential_record_id,
+            credential_authority: Arc::clone(&credential_authority.binding),
             max_message_bytes,
         })
     }
@@ -331,8 +544,17 @@ impl KrakenL3Config {
     }
 
     /// Returns the stable non-secret credential-record identity.
-    pub const fn credential_record_id(&self) -> &SourceIdentifier {
-        &self.credential_record_id
+    pub fn credential_record_id(&self) -> &SourceIdentifier {
+        &self.credential_authority.credential_record_id
+    }
+
+    /// Returns the exact protected authorization generation required by this configuration.
+    pub fn authorization_generation(&self) -> NonZeroU64 {
+        self.credential_authority.authorization_generation
+    }
+
+    pub(crate) fn credential_authority_binding(&self) -> Arc<KrakenL3CredentialAuthorityBinding> {
+        Arc::clone(&self.credential_authority)
     }
 
     /// Returns the maximum accepted WebSocket message size.
@@ -359,11 +581,14 @@ impl KrakenL3Config {
     /// Returns an error if bounded serialization cannot be completed.
     pub fn try_subscription_payload(
         &self,
-        token: KrakenL3WebSocketToken<'_>,
+        token: KrakenL3TokenCapability,
         batch_index: usize,
         request_id: Option<u64>,
     ) -> Result<KrakenL3SecretPayload, KrakenL3ConfigError> {
-        if request_id == Some(0) {
+        if !Arc::ptr_eq(&self.credential_authority, &token.binding) {
+            return Err(KrakenL3ConfigError::CredentialAuthorityMismatch);
+        }
+        if request_id == Some(0) || (request_id.is_none() && self.subscription_batch_count() > 1) {
             return Err(KrakenL3ConfigError::InvalidRequestId);
         }
         let batch_size = self.max_symbols_per_subscription_batch();
@@ -376,6 +601,13 @@ impl KrakenL3Config {
             .iter()
             .map(KrakenL3ProductMapping::symbol)
             .collect::<Vec<_>>();
+        let instrument_bindings = self.products[start..end]
+            .iter()
+            .map(|mapping| instrument_binding(mapping.symbol(), mapping.instrument()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| KrakenL3ConfigError::SubscriptionSerialization)?;
+        let token =
+            std::str::from_utf8(&token.token).map_err(|_| KrakenL3ConfigError::InvalidToken)?;
         let request = SubscriptionRequest {
             method: "subscribe",
             params: SubscriptionParams {
@@ -383,16 +615,32 @@ impl KrakenL3Config {
                 symbols,
                 depth: self.depth.get(),
                 snapshot: true,
-                token: token.expose(),
+                token,
             },
             request_id,
         };
-        let payload = serde_json::to_vec(&request)
-            .map_err(|_| KrakenL3ConfigError::SubscriptionSerialization)?;
-        if payload.len() > MAX_SUBSCRIPTION_BYTES {
+        let mut payload = Vec::with_capacity(MAX_TOKEN_BYTES.saturating_add(512));
+        if serde_json::to_writer(&mut payload, &request).is_err() {
+            zeroize_token_buffer(&mut payload);
             return Err(KrakenL3ConfigError::SubscriptionSerialization);
         }
-        Ok(KrakenL3SecretPayload(payload))
+        if payload.len() > MAX_SUBSCRIPTION_BYTES {
+            zeroize_token_buffer(&mut payload);
+            return Err(KrakenL3ConfigError::SubscriptionSerialization);
+        }
+        Ok(KrakenL3SecretPayload {
+            bytes: payload,
+            request_evidence: Some(KrakenL3SubscriptionRequestEvidence {
+                source_id: self.metadata.source_id().clone(),
+                metadata_revision: self.metadata.revision().clone(),
+                batch_index,
+                request_id,
+                depth: self.depth,
+                snapshot: true,
+                instrument_bindings,
+                credential_authority: Arc::clone(&self.credential_authority),
+            }),
+        })
     }
 }
 
@@ -418,6 +666,11 @@ struct SubscriptionParams<'a> {
     depth: usize,
     snapshot: bool,
     token: &'a str,
+}
+
+fn zeroize_token_buffer(bytes: &mut [u8]) {
+    bytes.fill(0);
+    let _ = std::hint::black_box(bytes);
 }
 
 fn validate_products(
@@ -642,7 +895,10 @@ pub enum KrakenL3ConfigError {
     /// The ephemeral provider token is malformed or oversized.
     #[error("Kraken level-3 WebSocket token is invalid")]
     InvalidToken,
-    /// Kraken reserves zero from the accepted client request-identity domain.
+    /// The token capability was minted by a different protected authority allocation.
+    #[error("Kraken level-3 token authority does not match configuration authority")]
+    CredentialAuthorityMismatch,
+    /// Kraken reserves zero, and multi-batch subscriptions require explicit request identity.
     #[error("Kraken level-3 request identifier is invalid")]
     InvalidRequestId,
     /// The requested rate-window subscription batch does not exist.

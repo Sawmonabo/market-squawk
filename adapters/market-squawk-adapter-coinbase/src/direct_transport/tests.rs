@@ -729,7 +729,28 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         complete_session_bytes
     );
     assert_eq!(output.discarded_sequences, [101, 102, 103, 104]);
-    assert!(output.order_level.is_empty());
+    assert_eq!(
+        output.order_level,
+        [RecordedOrderLevel::Snapshot {
+            generation: 1,
+            snapshot_sequence: 104,
+            orders: vec![
+                (
+                    "bid-1".to_owned(),
+                    ProviderBookSide::Bid,
+                    10_000,
+                    100_000_000,
+                ),
+                (
+                    "ask-1".to_owned(),
+                    ProviderBookSide::Ask,
+                    10_100,
+                    200_000_000,
+                ),
+            ],
+            replay_sequences: vec![105, 106],
+        }]
+    );
     assert_eq!(
         output.handoffs,
         [RecordedPendingHandoff {

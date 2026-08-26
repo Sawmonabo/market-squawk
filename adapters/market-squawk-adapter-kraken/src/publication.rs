@@ -28,8 +28,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
-    KrakenChannel, KrakenConfig, KrakenControl, KrakenDecodeOutcome, KrakenDepth,
-    KrakenPublicationDecodeOutcome, KrakenSubscription,
+    KrakenChannel, KrakenConfig, KrakenDecodeOutcome, KrakenDepth, KrakenPublicControl,
+    KrakenPublicationDecodeOutcome,
 };
 
 const KRAKEN_VENUE: &str = "kraken";
@@ -273,23 +273,28 @@ impl KrakenPublicationDecodeOutcome {
                 decoded_retained_bytes,
             },
             KrakenDecodeOutcome::Control(control) => match control {
-                KrakenControl::Heartbeat => {
+                KrakenPublicControl::Heartbeat => {
                     PendingDisposition::Abstained(KrakenPublicationAbstention::Heartbeat)
                 }
-                KrakenControl::Pong => {
+                KrakenPublicControl::Pong { .. } => {
                     PendingDisposition::Abstained(KrakenPublicationAbstention::Pong)
                 }
-                KrakenControl::Online => {
+                KrakenPublicControl::Online => {
                     PendingDisposition::Abstained(KrakenPublicationAbstention::Online)
                 }
-                KrakenControl::Subscribed(KrakenSubscription::Book) => {
-                    PendingDisposition::Abstained(KrakenPublicationAbstention::BookSubscribed)
-                }
-                KrakenControl::Subscribed(KrakenSubscription::Trade) => {
-                    PendingDisposition::Abstained(KrakenPublicationAbstention::TradeSubscribed)
-                }
-                KrakenControl::SubscriptionRefused => PendingDisposition::Unavailable(
+                KrakenPublicControl::Subscribed {
+                    channel: KrakenChannel::Book(_),
+                    ..
+                } => PendingDisposition::Abstained(KrakenPublicationAbstention::BookSubscribed),
+                KrakenPublicControl::Subscribed {
+                    channel: KrakenChannel::Trades,
+                    ..
+                } => PendingDisposition::Abstained(KrakenPublicationAbstention::TradeSubscribed),
+                KrakenPublicControl::SubscriptionRefused { .. } => PendingDisposition::Unavailable(
                     KrakenPublicationUnavailable::SubscriptionRefused,
+                ),
+                KrakenPublicControl::ProviderReset { .. } => PendingDisposition::Unavailable(
+                    KrakenPublicationUnavailable::ResynchronizationRequired,
                 ),
             },
         };
