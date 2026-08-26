@@ -35,6 +35,10 @@ pub enum ProviderNativeLineageImplementation {
     CensusTabularV1,
     /// EIA series observation semantics encoder v1.
     EiaSeriesV1,
+    /// Schwab REST market-data response semantics encoder v1.
+    SchwabRestMarketDataV1,
+    /// Schwab Streamer market-data frame semantics encoder v1.
+    SchwabStreamerMarketDataV1,
 }
 
 impl ProviderNativeLineageImplementation {
@@ -47,6 +51,12 @@ impl ProviderNativeLineageImplementation {
             Self::BlsTimeseriesV1 => b"market-squawk/bls/provider-native-lineage/v1",
             Self::CensusTabularV1 => b"market-squawk/census/provider-native-lineage/v1",
             Self::EiaSeriesV1 => b"market-squawk/eia/provider-native-lineage/v1",
+            Self::SchwabRestMarketDataV1 => {
+                b"market-squawk/schwab-rest-market-data/provider-native-lineage/v1"
+            }
+            Self::SchwabStreamerMarketDataV1 => {
+                b"market-squawk/schwab-streamer-market-data/provider-native-lineage/v1"
+            }
         }
     }
 
@@ -57,6 +67,8 @@ impl ProviderNativeLineageImplementation {
             Self::BlsTimeseriesV1 => 2,
             Self::CensusTabularV1 => 3,
             Self::EiaSeriesV1 => 4,
+            Self::SchwabRestMarketDataV1 => 14,
+            Self::SchwabStreamerMarketDataV1 => 15,
         }
     }
 }
