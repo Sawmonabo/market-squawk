@@ -212,6 +212,41 @@ fn exact_h15_publication_retains_correction_and_replacement_evidence() -> Result
         BoardDatasetProfile::try_new(production, BoardParseLimits::default(), Vec::new())?;
     let rolling_profile =
         BoardDatasetProfile::h15_treasury_constant_maturities_rolling_dashboard()?;
+    let rolling_capability = rolling_profile
+        .h15_analytical_capability()
+        .ok_or("rolling H.15 analytical capability")?;
+    assert_eq!(
+        rolling_capability.dataset_scope(),
+        BoardH15DatasetScope::RollingCurrentDefinition
+    );
+    assert_eq!(
+        rolling_capability.rolling_date_count(),
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT
+    );
+    assert_eq!(
+        rolling_capability.point_in_time_basis(),
+        BoardH15PointInTimeBasis::LocalFirstObservedOnly
+    );
+    assert_eq!(
+        rolling_capability.provider_vintage_history(),
+        BoardH15ProviderVintageHistory::Unavailable
+    );
+    assert_eq!(
+        rolling_capability.historical_use(),
+        BoardH15HistoricalUse::LocallyPublishedGenerationsOnly
+    );
+    assert_eq!(
+        rolling_capability.investment_use(),
+        BoardH15InvestmentUse::SupplementalMacroEvidenceOnly
+    );
+    assert_eq!(
+        rolling_capability.execution_use(),
+        BoardH15ExecutionUse::None
+    );
+    assert_eq!(
+        rolling_capability.admission_boundary(),
+        BoardH15AdmissionBoundary::CommonManifestPitAndResearchUseRequired
+    );
     let doctor_profile =
         BoardDatasetProfile::try_new(doctor, BoardParseLimits::default(), Vec::new())?;
     assert_ne!(production_profile.dataset(), rolling_profile.dataset());

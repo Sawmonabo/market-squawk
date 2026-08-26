@@ -39,9 +39,9 @@ use crate::transport::{BoardScriptedProductionTransport, BoardScriptedTransportF
 use crate::{
     BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
     BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT, BoardAdapterError,
-    BoardArtifactKind, BoardDatasetContract, BoardFileFormat, BoardParseLimits, BoardPeriod,
-    BoardPeriodValue, BoardSeries, BoardValue, ParsedBoardDataset, parse_csv, parse_sdmx_xml,
-    parse_sdmx_zip,
+    BoardArtifactKind, BoardDatasetContract, BoardFileFormat, BoardH15AnalyticalCapability,
+    BoardParseLimits, BoardPeriod, BoardPeriodValue, BoardSeries, BoardValue, ParsedBoardDataset,
+    parse_csv, parse_sdmx_xml, parse_sdmx_zip,
 };
 
 const BOARD_PROVIDER_ID: &str = "federal-reserve-board";
@@ -169,6 +169,13 @@ impl BoardDatasetProfile {
     /// Returns external schema/structure artifacts for XML profiles.
     pub fn structural_artifacts(&self) -> &[BoardStructuralArtifact] {
         &self.structural_artifacts
+    }
+
+    /// Describes the analytical limits of the exact rolling H.15 dashboard profile.
+    /// Concrete use still requires the common manifest, PIT, and research-use authorities.
+    #[must_use]
+    pub fn h15_analytical_capability(&self) -> Option<BoardH15AnalyticalCapability> {
+        BoardH15AnalyticalCapability::for_profile(self)
     }
 
     pub(crate) fn parse(&self, bytes: &[u8]) -> Result<ParsedBoardDataset, BoardAdapterError> {

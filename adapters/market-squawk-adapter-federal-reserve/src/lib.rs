@@ -5,6 +5,7 @@
 //! crate invents no generic API or numeric provider rate, and rich extraction retains exact bytes
 //! for the application's shared raw-capture seal before canonical publication.
 
+mod authority;
 mod contract;
 mod digest;
 mod error;
@@ -14,6 +15,11 @@ mod publication;
 mod source;
 mod transport;
 
+pub use authority::{
+    BoardH15AdmissionBoundary, BoardH15AnalyticalCapability, BoardH15DatasetScope,
+    BoardH15ExecutionUse, BoardH15HistoricalUse, BoardH15InvestmentUse, BoardH15PointInTimeBasis,
+    BoardH15ProviderVintageHistory,
+};
 pub use contract::{
     BOARD_DDP_SOURCE_ID, BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL,
     BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL,
