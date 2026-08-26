@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     RawEvidenceStore, RetrievedCompanyFacts, RetrievedSecBytes, RetrievedSubmissions,
     SecClientError, SecCompositeBounds, SecEdgarSource, SecNormalizationError, SecParserError,
-    SecParserLimits, normalize_company_facts_with_cancellation,
-    normalize_filings_with_cancellation,
+    SecParserLimits, SecResearchDataset, SecResearchDatasetKind,
+    normalize_company_facts_with_cancellation, normalize_filings_with_cancellation,
 };
 
 const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v3";
@@ -103,30 +103,28 @@ impl SecEdgarSource {
                 .map_err(map_client_error)?;
             let child = cancellation.child_token();
             let remaining = deadline_remaining(request.deadline())?;
-            let dataset = DatasetLocator::parse(request.dataset().as_str())?;
+            let dataset = SecResearchDataset::try_from_identifier(request.dataset())
+                .map_err(map_client_error)?;
             let (retrieved, object_id, capture_material) = tokio::time::timeout(remaining, async {
-                match dataset {
-                    DatasetLocator::Submissions(cik) => self
+                match dataset.kind() {
+                    SecResearchDatasetKind::Submissions => self
                         .fetch_complete_submissions(
                             &authority,
-                            cik,
+                            dataset.cik(),
                             SecCompositeBounds::production_defaults(),
                             request.deadline(),
                             child.clone(),
                         )
                         .await
                         .and_then(|value| {
-                            let object_id = SourceIdentifier::try_from(format!(
-                                "sec.submissions.composite.CIK{}",
-                                value.document().cik()
-                            ))?;
+                            let object_id = dataset.source_object_id().clone();
                             let capture_material = value
                                 .capture_material()?
                                 .ok_or(SecClientError::InvalidCaptureMaterial)?;
                             Ok((value.raw().clone(), object_id, capture_material))
                         }),
-                    DatasetLocator::CompanyFacts(cik) => self
-                        .fetch_company_facts(&authority, cik, child.clone())
+                    SecResearchDatasetKind::CompanyFacts => self
+                        .fetch_company_facts(&authority, dataset.cik(), child.clone())
                         .await
                         .and_then(|value| {
                             let object_id = value
@@ -267,23 +265,6 @@ impl SecEdgarSource {
     }
 }
 
-enum DatasetLocator<'a> {
-    Submissions(&'a str),
-    CompanyFacts(&'a str),
-}
-
-impl<'a> DatasetLocator<'a> {
-    fn parse(dataset: &'a str) -> Result<Self, ExtractionSourceError> {
-        if let Some(cik) = dataset.strip_prefix("sec.submissions.cik.") {
-            return Ok(Self::Submissions(cik));
-        }
-        if let Some(cik) = dataset.strip_prefix("sec.company-facts.cik.") {
-            return Ok(Self::CompanyFacts(cik));
-        }
-        Err(invalid_protocol())
-    }
-}
-
 impl ExtractionSource for SecEdgarSource {
     fn discover(
         &self,
@@ -331,10 +312,11 @@ fn extract_blocking(
     let parser_limits = request_parser_limits(&request, bytes.len())?;
     let ingested_at = crate::client::system_timestamp()?;
     let (observations, company_identity) =
-        match DatasetLocator::parse(request.object().dataset().as_str())
+        match SecResearchDataset::try_from_identifier(request.object().dataset())
             .map_err(|_| SecClientError::InvalidCompositeRepresentation)?
+            .kind()
         {
-            DatasetLocator::Submissions(_) => {
+            SecResearchDatasetKind::Submissions => {
                 let retrieved = crate::composite::restore_online_submissions(
                     &raw_store,
                     &bytes,
@@ -359,7 +341,7 @@ fn extract_blocking(
                 )?;
                 (observations, Some(company_identity))
             }
-            DatasetLocator::CompanyFacts(_) => {
+            SecResearchDatasetKind::CompanyFacts => {
                 let retrieved = RetrievedCompanyFacts::restored(
                     bytes,
                     request.object().evidence().content_digest(),

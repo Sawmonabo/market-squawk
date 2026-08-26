@@ -16,13 +16,30 @@ pub enum NasdaqDirectoryKind {
     NasdaqListed,
     /// Securities listed on other represented U.S. exchanges in `otherlisted.txt`.
     OtherListed,
+    /// Nasdaq-listed bonds in `bondslist.txt`.
+    Bonds,
+    /// Nasdaq's current option-series reference file in `options.txt`.
+    Options,
 }
 
 impl NasdaqDirectoryKind {
+    /// All independently fetched and independently clocked admitted official files.
+    pub const ALL: [Self; 4] = [
+        Self::NasdaqListed,
+        Self::OtherListed,
+        Self::Bonds,
+        Self::Options,
+    ];
+
+    /// The two files comprising the existing complete U.S.-listed equity directory graph.
+    pub const EQUITY_DIRECTORIES: [Self; 2] = [Self::NasdaqListed, Self::OtherListed];
+
     pub(crate) const fn object_component(self) -> &'static str {
         match self {
             Self::NasdaqListed => "nasdaq-listed",
             Self::OtherListed => "other-listed",
+            Self::Bonds => "bonds",
+            Self::Options => "options",
         }
     }
 }
@@ -414,6 +431,12 @@ impl NasdaqListingRecord {
         if source_last_modified_at > first_observed_at {
             return Err(NasdaqModelError::InvalidTemporalOrder);
         }
+        let content_digest = source_payload_evidence.content_digest();
+        if content_digest.algorithm() != market_squawk_domain::DigestAlgorithm::Sha256
+            || content_digest.bytes() == [0; 32]
+        {
+            return Err(NasdaqModelError::InvalidPayloadDigest);
+        }
         let primary_symbol = ProviderInstrumentId::try_from(provider_fields.primary_symbol())
             .map_err(|_| NasdaqModelError::InvalidIdentifier)?;
         let listing_venue = provider_fields.venue_id()?;
@@ -648,6 +671,9 @@ pub enum NasdaqModelError {
     /// Serialized derived fields disagreed with the exact provider fields.
     #[error("Nasdaq normalized record derived fields do not match provider fields")]
     DerivedFieldMismatch,
+    /// Exact source-object evidence was not a nonzero SHA-256 identity.
+    #[error("invalid Nasdaq exact source payload digest")]
+    InvalidPayloadDigest,
 }
 
 fn validate_symbol(field: &'static str, value: &str) -> Result<(), NasdaqModelError> {

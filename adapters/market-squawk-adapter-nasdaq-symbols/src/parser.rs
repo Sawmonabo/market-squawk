@@ -47,12 +47,21 @@ pub(crate) fn parse_directory(
             max: MAX_SOURCE_BYTES,
         });
     }
+    if !payload.ends_with(b"\n") {
+        return Err(NasdaqParseError::UnterminatedFile);
+    }
+    if payload.contains(&0) {
+        return Err(NasdaqParseError::InvalidControlByte);
+    }
     let text = std::str::from_utf8(payload).map_err(|_| NasdaqParseError::InvalidUtf8)?;
     let mut lines = text.lines().enumerate();
     let (_, header) = lines.next().ok_or(NasdaqParseError::Empty)?;
     let expected_header = match kind {
         NasdaqDirectoryKind::NasdaqListed => NASDAQ_LISTED_HEADER,
         NasdaqDirectoryKind::OtherListed => OTHER_LISTED_HEADER,
+        NasdaqDirectoryKind::Bonds | NasdaqDirectoryKind::Options => {
+            return Err(NasdaqParseError::UnsupportedDirectoryKind);
+        }
     };
     if header != expected_header {
         return Err(NasdaqParseError::InvalidHeader);
@@ -80,7 +89,7 @@ pub(crate) fn parse_directory(
             if file_creation_time.is_some() {
                 return Err(NasdaqParseError::DuplicateFooter);
             }
-            file_creation_time = Some(parse_footer(value, row_number)?);
+            file_creation_time = Some(parse_footer(kind, value, row_number)?);
             continue;
         }
         if file_creation_time.is_some() {
@@ -94,6 +103,9 @@ pub(crate) fn parse_directory(
         let fields = match kind {
             NasdaqDirectoryKind::NasdaqListed => parse_nasdaq_listed(line, row_number)?,
             NasdaqDirectoryKind::OtherListed => parse_other_listed(line, row_number)?,
+            NasdaqDirectoryKind::Bonds | NasdaqDirectoryKind::Options => {
+                return Err(NasdaqParseError::UnsupportedDirectoryKind);
+            }
         };
         if !seen_symbols.insert(fields.primary_symbol().to_owned()) {
             return Err(NasdaqParseError::DuplicateSymbol { row: row_number });
@@ -116,6 +128,7 @@ pub(crate) fn parse_directory(
 }
 
 fn parse_footer(
+    kind: NasdaqDirectoryKind,
     value_and_delimiters: &str,
     row: u32,
 ) -> Result<NasdaqFileCreationTime, NasdaqParseError> {
@@ -132,7 +145,14 @@ fn parse_footer(
             return Err(NasdaqParseError::InvalidFooter { row });
         }
     }
-    if field_count > 8 {
+    let expected_fields = match kind {
+        NasdaqDirectoryKind::NasdaqListed => 8,
+        NasdaqDirectoryKind::OtherListed => 7,
+        NasdaqDirectoryKind::Bonds | NasdaqDirectoryKind::Options => {
+            return Err(NasdaqParseError::UnsupportedDirectoryKind);
+        }
+    };
+    if field_count != expected_fields {
         return Err(NasdaqParseError::InvalidFooter { row });
     }
     NasdaqFileCreationTime::try_from_provider_value(value)
@@ -249,6 +269,9 @@ fn parse_round_lot(value: &str, row: u32) -> Result<u32, NasdaqParseError> {
 /// Bounded Symbol Directory parse failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum NasdaqParseError {
+    /// The equity batch parser was called for a streamed bond or option family.
+    #[error("Nasdaq directory kind requires the streamed reference parser")]
+    UnsupportedDirectoryKind,
     /// The exact source object was empty.
     #[error("Nasdaq directory is empty")]
     Empty,
@@ -261,6 +284,12 @@ pub enum NasdaqParseError {
     /// The source object was not valid UTF-8.
     #[error("Nasdaq directory is not valid UTF-8")]
     InvalidUtf8,
+    /// The provider object did not end on a complete newline-delimited record.
+    #[error("Nasdaq directory is not newline terminated")]
+    UnterminatedFile,
+    /// The provider object contained a NUL byte outside its text schema.
+    #[error("Nasdaq directory contains an invalid control byte")]
+    InvalidControlByte,
     /// The source header did not match the selected official file schema.
     #[error("Nasdaq directory header is invalid")]
     InvalidHeader,

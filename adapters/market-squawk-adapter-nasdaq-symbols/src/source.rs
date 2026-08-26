@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use market_squawk_domain::{
     AssetClass, CoverageDelay, DataQuality, DeliveryEvidence, DigestAlgorithm, EffectiveInterval,
@@ -9,18 +11,28 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthorizationMode, AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, CoverageDomain,
-    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch,
-    ExtractionBatchAccumulator, ExtractionRecord, ExtractionRequest, ExtractionSource,
-    ExtractionSourceError, HistoricalCapability, SourceClass, SourceError, SourceMetadata,
-    SourceMetadataProvider, SourceObject, SourceProtocolProfile, payload_matches_exact_evidence,
+    DiscoveryBatch, DiscoveryRequest, EndpointPolicy, ExtractionAuthority,
+    ExtractionAuthorityError, ExtractionBatch, ExtractionBatchAccumulator, ExtractionRecord,
+    ExtractionRequest, ExtractionSource, ExtractionSourceError, HistoricalCapability,
+    HttpRequestBounds, MonotonicInstant, NetworkAccessPolicy, ProviderCaptureMaterial,
+    ProviderCapturePageReceipt, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
+    SourceObjectCaptureIdentity, SourceProtocolProfile, payload_matches_exact_evidence,
 };
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
+use crate::archive::validate_footer_clock;
 use crate::client::{NasdaqHttpClient, RetrievedDirectory, ensure_deadline_open, system_timestamp};
 use crate::model::{NasdaqDirectoryKind, NasdaqListingRecord};
 use crate::parser::{NasdaqParseError, ParsedDirectory, parse_directory};
+use crate::{
+    BONDS_LIST_URL, NasdaqHttpResponseEvidence, NasdaqRawObjectStore, NasdaqReferenceDoctorReport,
+    NasdaqReferenceError, NasdaqValidatedObject, OPTIONS_URL,
+};
 
 /// Official current Nasdaq-listed Symbol Directory object.
 pub const NASDAQ_LISTED_URL: &str = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt";
@@ -30,12 +42,85 @@ pub const OTHER_LISTED_URL: &str = "https://www.nasdaqtrader.com/dynamic/SymDir/
 pub const NASDAQ_SYMBOL_DIRECTORY_DATASET: &str = "nasdaq.symbol-directory.us-listed.v1";
 /// Provider identity required by the adapter's immutable source metadata.
 pub const NASDAQ_SYMBOL_DIRECTORY_PROVIDER: &str = "nasdaq-trader-symbol-directory";
-/// Exact listing-venue MICs represented by the two current official files.
+/// Exact listing-venue MICs represented by the admitted equity directory files.
 pub const NASDAQ_SYMBOL_DIRECTORY_VENUES: [&str; 7] =
     ["XNAS", "XASE", "XNYS", "ARCX", "XCHI", "BATS", "IEXG"];
+/// Minimum app-owned total acquisition budget for the bounded large-object path.
+pub const NASDAQ_REFERENCE_MIN_TOTAL_TIMEOUT_NANOS: u64 = 300_000_000_000;
+/// Maximum requests admitted by the shared application queue in its minute window.
+pub const NASDAQ_APPLICATION_REQUESTS_PER_MINUTE: u32 = 8;
+/// Minimum duration of the shared application request window.
+pub const NASDAQ_APPLICATION_BUDGET_WINDOW_NANOS: u64 = 60_000_000_000;
+/// Every Nasdaq reference family shares one single-flight application queue.
+pub const NASDAQ_APPLICATION_MAX_CONCURRENT_REQUESTS: u16 = 1;
+/// Minimum admitted fallback-backoff cap after a provider refusal.
+pub const NASDAQ_APPLICATION_MIN_BACKOFF_MAXIMUM_NANOS: u64 = 60_000_000_000;
+
+/// Builds the exact four-file hardened endpoint allowlist for Nasdaq reference acquisition.
+///
+/// Root composition uses this same policy for `SourceMetadata`, preventing a broader application
+/// allowlist from silently expanding the extraction authority admitted by this adapter.
+///
+/// # Errors
+///
+/// Rejects request bounds or an exact official locator that cannot be represented.
+pub fn nasdaq_reference_endpoint_policy(
+    bounds: HttpRequestBounds,
+) -> Result<EndpointPolicy, NasdaqSymbolDirectorySourceError> {
+    EndpointPolicy::try_new_with_bounds(
+        [
+            NASDAQ_LISTED_URL,
+            OTHER_LISTED_URL,
+            BONDS_LIST_URL,
+            OPTIONS_URL,
+        ],
+        bounds,
+    )
+    .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)
+}
 
 const MAX_CACHED_OBJECTS: usize = 4;
 const MEDIA_TYPE: &str = "text/plain";
+
+/// Indivisible complete-directory discovery and exact provider body handoff.
+///
+/// Application composition must seal [`Self::capture_material`] before it durably publishes or
+/// retains either source object. The two independently complete HTTP responses are framed as one
+/// ordered request graph, so neither file can masquerade as the complete U.S.-listed directory.
+#[derive(Debug)]
+pub struct NasdaqSymbolDirectoryDiscovery {
+    batch: DiscoveryBatch,
+    capture_material: ProviderCaptureMaterial,
+    response_evidence: Box<[NasdaqHttpResponseEvidence]>,
+}
+
+impl NasdaqSymbolDirectoryDiscovery {
+    /// Returns both exact source objects under one discovery request.
+    pub const fn batch(&self) -> &DiscoveryBatch {
+        &self.batch
+    }
+
+    /// Returns the exact two-body complete request graph ready for atomic sealing.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture_material
+    }
+
+    /// Returns independently retained status/media/length/validator/clock evidence for both files.
+    pub fn response_evidence(&self) -> &[NasdaqHttpResponseEvidence] {
+        &self.response_evidence
+    }
+
+    /// Consumes the capture-first application handoff.
+    pub fn into_parts(
+        self,
+    ) -> (
+        DiscoveryBatch,
+        ProviderCaptureMaterial,
+        Box<[NasdaqHttpResponseEvidence]>,
+    ) {
+        (self.batch, self.capture_material, self.response_evidence)
+    }
+}
 
 /// Exact, fixed-endpoint Symbol Directory source configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +156,132 @@ pub struct NasdaqDirectoryHealth {
     consecutive_failures: u32,
 }
 
+/// Typed provider-refusal evidence returned by the fresh family doctor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NasdaqReferenceRetryEvidence {
+    family: NasdaqDirectoryKind,
+    status: u16,
+    retry_after_header_present: bool,
+    transport_elapsed_nanos: u64,
+    observed_at: Timestamp,
+    retry_deadline: MonotonicInstant,
+}
+
+impl NasdaqReferenceRetryEvidence {
+    pub(crate) fn try_new(
+        family: NasdaqDirectoryKind,
+        status: u16,
+        retry_after_header_present: bool,
+        transport_elapsed_nanos: u64,
+        observed_at: Timestamp,
+        retry_deadline: MonotonicInstant,
+    ) -> Result<Self, SourceError> {
+        if !matches!(status, 429 | 503) || transport_elapsed_nanos == 0 {
+            return Err(SourceError::InvalidProtocolState);
+        }
+        Ok(Self {
+            family,
+            status,
+            retry_after_header_present,
+            transport_elapsed_nanos,
+            observed_at,
+            retry_deadline,
+        })
+    }
+
+    /// Returns the exact family whose endpoint refused the request.
+    pub const fn family(&self) -> NasdaqDirectoryKind {
+        self.family
+    }
+
+    /// Returns the exact HTTP refusal status (`429` or `503`).
+    pub const fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Returns whether the provider supplied a `Retry-After` field.
+    pub const fn retry_after_header_present(&self) -> bool {
+        self.retry_after_header_present
+    }
+
+    /// Returns monotonic send-through-response-header elapsed time.
+    pub const fn transport_elapsed_nanos(&self) -> u64 {
+        self.transport_elapsed_nanos
+    }
+
+    /// Returns the local wall-clock observation of the refusal.
+    pub const fn observed_at(&self) -> Timestamp {
+        self.observed_at
+    }
+
+    /// Returns the process-local shared-budget retry deadline.
+    pub const fn retry_deadline(&self) -> MonotonicInstant {
+        self.retry_deadline
+    }
+}
+
+/// Successful source-contract, endpoint, and raw-archive activation receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NasdaqReferenceActivation {
+    source_id: SourceIdentifier,
+    metadata_revision: SourceIdentifier,
+    admitted_families: [NasdaqDirectoryKind; 4],
+    archive_write_and_sync_verified: bool,
+    endpoint_schema_probe_completed: bool,
+}
+
+impl NasdaqReferenceActivation {
+    /// Returns the root-registered source identity activated for this adapter.
+    pub const fn source_id(&self) -> &SourceIdentifier {
+        &self.source_id
+    }
+
+    /// Returns the exact root source-contract generation activated for this adapter.
+    pub const fn metadata_revision(&self) -> &SourceIdentifier {
+        &self.metadata_revision
+    }
+
+    /// Returns all independently clocked admitted provider families.
+    pub const fn admitted_families(&self) -> &[NasdaqDirectoryKind; 4] {
+        &self.admitted_families
+    }
+
+    /// Returns whether private staging, fsync, cleanup, and directory fsync completed.
+    pub const fn archive_write_and_sync_verified(&self) -> bool {
+        self.archive_write_and_sync_verified
+    }
+
+    /// Returns false for local activation; use the live doctor for endpoint/schema proof.
+    pub const fn endpoint_schema_probe_completed(&self) -> bool {
+        self.endpoint_schema_probe_completed
+    }
+}
+
+/// Fresh live provider acquisition plus its validated paging handle and doctor receipt.
+#[derive(Debug)]
+pub struct NasdaqLiveReferenceDoctorResult {
+    object: NasdaqValidatedObject,
+    report: NasdaqReferenceDoctorReport,
+}
+
+impl NasdaqLiveReferenceDoctorResult {
+    /// Returns the exact generation ready for bounded typed pages and indexed queries.
+    pub const fn object(&self) -> &NasdaqValidatedObject {
+        &self.object
+    }
+
+    /// Returns the fresh endpoint/schema/archive/index reconciliation receipt.
+    pub const fn report(&self) -> &NasdaqReferenceDoctorReport {
+        &self.report
+    }
+
+    /// Consumes the result into its paging handle and doctor receipt.
+    pub fn into_parts(self) -> (NasdaqValidatedObject, NasdaqReferenceDoctorReport) {
+        (self.object, self.report)
+    }
+}
+
 impl NasdaqDirectoryHealth {
     /// Returns the most recent attempted request time.
     pub const fn last_attempt_at(self) -> Option<Timestamp> {
@@ -97,6 +308,8 @@ impl NasdaqDirectoryHealth {
 struct HealthState {
     nasdaq_listed: NasdaqDirectoryHealth,
     other_listed: NasdaqDirectoryHealth,
+    bonds: NasdaqDirectoryHealth,
+    options: NasdaqDirectoryHealth,
 }
 
 impl HealthState {
@@ -104,6 +317,8 @@ impl HealthState {
         match kind {
             NasdaqDirectoryKind::NasdaqListed => self.nasdaq_listed,
             NasdaqDirectoryKind::OtherListed => self.other_listed,
+            NasdaqDirectoryKind::Bonds => self.bonds,
+            NasdaqDirectoryKind::Options => self.options,
         }
     }
 
@@ -111,6 +326,8 @@ impl HealthState {
         match kind {
             NasdaqDirectoryKind::NasdaqListed => &mut self.nasdaq_listed,
             NasdaqDirectoryKind::OtherListed => &mut self.other_listed,
+            NasdaqDirectoryKind::Bonds => &mut self.bonds,
+            NasdaqDirectoryKind::Options => &mut self.options,
         }
     }
 }
@@ -169,7 +386,7 @@ impl NasdaqSymbolDirectorySource {
     /// # Errors
     ///
     /// Fails closed unless metadata declares an extraction-only, delayed, official-quality,
-    /// multi-venue reference source and explicitly allowlists both current files.
+    /// multi-venue reference source, one safe shared provider budget, and all four current files.
     pub fn try_new(
         metadata: SourceMetadata,
         config: NasdaqSymbolDirectoryConfig,
@@ -190,6 +407,23 @@ impl NasdaqSymbolDirectorySource {
         self.config.dataset()
     }
 
+    /// Activates the complete four-family source against a concrete private raw-object root.
+    pub fn activate_reference_archive(
+        &self,
+        archive: &NasdaqRawObjectStore,
+    ) -> Result<NasdaqReferenceActivation, NasdaqReferenceIngestError> {
+        Self::validate_metadata(&self.metadata)?;
+        archive.activation_check()?;
+        Ok(NasdaqReferenceActivation {
+            source_id: SourceIdentifier::try_from(self.metadata.source_id().as_str())
+                .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?,
+            metadata_revision: self.metadata.revision().as_source_identifier().clone(),
+            admitted_families: NasdaqDirectoryKind::ALL,
+            archive_write_and_sync_verified: true,
+            endpoint_schema_probe_completed: false,
+        })
+    }
+
     /// Returns a bounded health snapshot for one independent official file.
     ///
     /// # Errors
@@ -205,12 +439,107 @@ impl NasdaqSymbolDirectorySource {
             .map_err(|_| NasdaqSymbolDirectorySourceError::HealthUnavailable)
     }
 
-    async fn discover_impl(
+    /// Discovers the complete two-file current directory together with exact raw provider bodies.
+    ///
+    /// This is the required handoff for durable publication. The ordinary [`ExtractionSource`]
+    /// method remains available to the existing session-scoped search path and
+    /// discards the returned raw material without publishing it.
+    pub fn discover_with_capture(
         &self,
         authority: ExtractionAuthority,
         request: DiscoveryRequest,
         cancellation: CancellationToken,
-    ) -> Result<DiscoveryBatch, ExtractionSourceError> {
+    ) -> BoxFuture<'_, Result<NasdaqSymbolDirectoryDiscovery, ExtractionSourceError>> {
+        Box::pin(self.discover_with_capture_impl(authority, request, cancellation))
+    }
+
+    /// Streams one exact official family into immutable provider-local raw storage and validates
+    /// its complete schema/footer before returning a restartable typed-paging handle.
+    pub async fn ingest_reference_object(
+        &self,
+        authority: &ExtractionAuthority,
+        family: NasdaqDirectoryKind,
+        archive: &NasdaqRawObjectStore,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<NasdaqValidatedObject, NasdaqReferenceIngestError> {
+        self.validate_authority(authority)?;
+        ensure_deadline_open(deadline)?;
+        self.record_attempt(family)?;
+        let result = async {
+            let sealed = self
+                .http
+                .fetch_and_seal(
+                    &self.metadata,
+                    authority,
+                    family,
+                    archive,
+                    deadline,
+                    cancellation,
+                )
+                .await?;
+            let validation_timeout = remaining_reference_timeout(deadline)?;
+            let validated =
+                tokio::time::timeout(validation_timeout, archive.recover(&sealed, cancellation))
+                    .await
+                    .map_err(|_| {
+                        NasdaqReferenceIngestError::Extraction(
+                            ExtractionSourceError::DeadlineExceeded,
+                        )
+                    })??;
+            ensure_deadline_open(deadline)?;
+            Ok::<_, NasdaqReferenceIngestError>((sealed, validated))
+        }
+        .await;
+        match result {
+            Ok((sealed, validated)) => {
+                let mut health = self
+                    .health
+                    .lock()
+                    .map_err(|_| NasdaqSymbolDirectorySourceError::HealthUnavailable)?;
+                let state = health.get_mut(family);
+                state.last_success_at = Some(sealed.first_observed_at());
+                state.last_payload_digest =
+                    Some(sealed.payload_evidence().content_digest().bytes());
+                state.consecutive_failures = 0;
+                Ok(validated)
+            }
+            Err(error) => {
+                if let Ok(mut health) = self.health.lock() {
+                    let state = health.get_mut(family);
+                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Performs a fresh official fetch, exact header/length/body/footer validation, durable seal,
+    /// and provider-key index reconciliation.
+    ///
+    /// The receipt deliberately requires root-owned freshness classification: HTTP success and
+    /// valid file clocks do not establish currentness because Nasdaq publishes no exact interval.
+    pub async fn live_reference_doctor(
+        &self,
+        authority: &ExtractionAuthority,
+        family: NasdaqDirectoryKind,
+        archive: &NasdaqRawObjectStore,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<NasdaqLiveReferenceDoctorResult, NasdaqReferenceIngestError> {
+        let object = self
+            .ingest_reference_object(authority, family, archive, deadline, cancellation)
+            .await?;
+        let report = archive.validated_report(&object)?;
+        Ok(NasdaqLiveReferenceDoctorResult { object, report })
+    }
+
+    async fn discover_with_capture_impl(
+        &self,
+        authority: ExtractionAuthority,
+        request: DiscoveryRequest,
+        cancellation: CancellationToken,
+    ) -> Result<NasdaqSymbolDirectoryDiscovery, ExtractionSourceError> {
         self.validate_authority(&authority)?;
         if request.dataset() != self.config.dataset()
             || request.effective_at().is_some()
@@ -220,6 +549,8 @@ impl NasdaqSymbolDirectorySource {
         }
         ensure_deadline_open(request.deadline())?;
         let mut objects = Vec::with_capacity(2);
+        let mut captures = Vec::with_capacity(2);
+        let mut response_evidence = Vec::with_capacity(2);
         for kind in [
             NasdaqDirectoryKind::NasdaqListed,
             NasdaqDirectoryKind::OtherListed,
@@ -227,18 +558,49 @@ impl NasdaqSymbolDirectorySource {
             let entry = self
                 .fetch_validated(&authority, kind, request.deadline(), &cancellation)
                 .await?;
-            objects.push(self.source_object(&request, &entry)?);
+            captures.push(self.capture_material(&entry)?);
+            response_evidence.push(entry.retrieved.response_evidence.clone());
             self.cache
                 .lock()
                 .map_err(|_| SourceError::InvalidProtocolState)?
                 .insert(entry);
         }
+        let capture_material = ProviderCaptureMaterial::try_combine_request_graph(
+            self.config.dataset().clone(),
+            request_graph_identity(&self.metadata, &self.config)?,
+            captures,
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        let capture_identity =
+            SourceObjectCaptureIdentity::try_from_capture(capture_material.receipt())
+                .map_err(|_| SourceError::InvalidProtocolState)?;
+        let cached = self
+            .cache
+            .lock()
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        for kind in [
+            NasdaqDirectoryKind::NasdaqListed,
+            NasdaqDirectoryKind::OtherListed,
+        ] {
+            let entry = cached
+                .entries
+                .iter()
+                .find(|entry| entry.retrieved.kind == kind)
+                .ok_or(SourceError::InvalidProtocolState)?;
+            objects.push(self.source_object(&request, entry, capture_identity)?);
+        }
+        drop(cached);
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
         }
         ensure_deadline_open(request.deadline())?;
         authority.validate_current()?;
-        DiscoveryBatch::try_new(&request, objects).map_err(Into::into)
+        let batch = DiscoveryBatch::try_new(&request, objects)?;
+        Ok(NasdaqSymbolDirectoryDiscovery {
+            batch,
+            capture_material,
+            response_evidence: response_evidence.into_boxed_slice(),
+        })
     }
 
     async fn extract_impl(
@@ -355,13 +717,14 @@ impl NasdaqSymbolDirectorySource {
         &self,
         request: &DiscoveryRequest,
         entry: &CachedDirectory,
+        capture_identity: SourceObjectCaptureIdentity,
     ) -> Result<SourceObject, ExtractionSourceError> {
         let evidence = exact_evidence(&entry.retrieved.bytes);
         let effective = EffectiveInterval::new(entry.retrieved.last_modified_at, None)
             .map_err(|_| SourceError::InvalidProtocolState)?;
         let expected_bytes = u64::try_from(entry.retrieved.bytes.len())
             .map_err(|_| SourceError::InvalidProtocolState)?;
-        SourceObject::try_new_with_availability(
+        SourceObject::try_new_with_capture_identity(
             self.metadata.source_id().clone(),
             self.metadata.revision().clone(),
             request,
@@ -369,6 +732,7 @@ impl NasdaqSymbolDirectorySource {
             SourceIdentifier::try_from(MEDIA_TYPE)
                 .map_err(|_| SourceError::InvalidProtocolState)?,
             evidence,
+            capture_identity,
             effective,
             Some(entry.retrieved.last_modified_at),
             AvailabilityEvidence::LocalFirstObserved {
@@ -377,6 +741,51 @@ impl NasdaqSymbolDirectorySource {
             Some(expected_bytes),
         )
         .map_err(Into::into)
+    }
+
+    fn capture_material(
+        &self,
+        entry: &CachedDirectory,
+    ) -> Result<ProviderCaptureMaterial, ExtractionSourceError> {
+        let locator = directory_locator(entry.retrieved.kind);
+        let request_identity = capture_request_identity(&self.metadata, entry.retrieved.kind)?;
+        let body_digest = exact_evidence(&entry.retrieved.bytes).content_digest();
+        let body_bytes = u64::try_from(entry.retrieved.bytes.len())
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        let page = ProviderCapturePageReceipt::try_new(
+            0,
+            request_identity,
+            None,
+            None,
+            200,
+            body_bytes,
+            body_digest,
+            entry.retrieved.received_at,
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        let receipt = ProviderCaptureSetReceipt::try_new(
+            self.metadata.source_id().clone(),
+            self.metadata.revision().clone(),
+            SourceIdentifier::try_from(locator).map_err(|_| SourceError::InvalidProtocolState)?,
+            request_identity,
+            ProviderCaptureTerminalDisposition::StandaloneResponse,
+            vec![page],
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        let connection_id = deterministic_capture_uuid(b"connection", &receipt);
+        let event_id = deterministic_capture_uuid(b"event", &receipt);
+        let record = market_squawk_platform::RawCaptureRecord::try_new_live(
+            event_id,
+            Arc::from(self.metadata.source_id().as_str()),
+            connection_id,
+            Some(0),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(entry.retrieved.received_at.unix_nanos()),
+            entry.retrieved.bytes.clone(),
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        ProviderCaptureMaterial::try_new(receipt, vec![record])
+            .map_err(|_| SourceError::InvalidProtocolState.into())
     }
 
     async fn fetch_validated(
@@ -395,6 +804,8 @@ impl NasdaqSymbolDirectorySource {
                 .await?;
             let parsed =
                 parse_directory(kind, &retrieved.bytes, cancellation).map_err(map_parse_error)?;
+            validate_footer_clock(&parsed.file_creation_time, retrieved.last_modified_at)
+                .map_err(|_| SourceError::InvalidProtocolState)?;
             let object_id = SourceIdentifier::try_from(format!(
                 "nasdaq-symbols:{}:{}",
                 kind.object_component(),
@@ -451,9 +862,25 @@ impl NasdaqSymbolDirectorySource {
         metadata: &SourceMetadata,
     ) -> Result<(), NasdaqSymbolDirectorySourceError> {
         let asset_classes = metadata.coverage().asset_classes();
-        let required_assets = asset_classes.len() == 2
+        let budget = metadata
+            .budget_policy()
+            .ok_or(NasdaqSymbolDirectorySourceError::InvalidMetadata)?;
+        let has_safe_minute_window = (0..budget.window_count())
+            .filter_map(|index| budget.window(index))
+            .any(|window| {
+                window.requests_per_window() <= NASDAQ_APPLICATION_REQUESTS_PER_MINUTE
+                    && window.window_nanos() >= NASDAQ_APPLICATION_BUDGET_WINDOW_NANOS
+            });
+        let safe_budget = budget.scope().as_source_identifier() == metadata.provider()
+            && budget.scope().authorization_account().is_none()
+            && budget.max_concurrent() == NASDAQ_APPLICATION_MAX_CONCURRENT_REQUESTS
+            && has_safe_minute_window
+            && budget.backoff().maximum_nanos() >= NASDAQ_APPLICATION_MIN_BACKOFF_MAXIMUM_NANOS;
+        let required_assets = asset_classes.len() == 4
             && asset_classes.contains(&AssetClass::Equity)
-            && asset_classes.contains(&AssetClass::Fund);
+            && asset_classes.contains(&AssetClass::Fund)
+            && asset_classes.contains(&AssetClass::FixedIncome)
+            && asset_classes.contains(&AssetClass::Option);
         let required_venues =
             NASDAQ_SYMBOL_DIRECTORY_VENUES
                 .iter()
@@ -469,6 +896,7 @@ impl NasdaqSymbolDirectorySource {
             || metadata.coverage().domain() != CoverageDomain::Instruments
             || metadata.quality_ceiling() != DataQuality::OfficialDelayed
             || metadata.authorization().mode() != AuthorizationMode::PublicInterface
+            || !safe_budget
             || !required_assets
             || !metadata.coverage().topology().is_consolidated()
             || metadata.coverage().topology().venues().len() != NASDAQ_SYMBOL_DIRECTORY_VENUES.len()
@@ -477,7 +905,10 @@ impl NasdaqSymbolDirectorySource {
             || metadata.coverage().delivery() != DeliveryEvidence::Indirect
             || metadata.capabilities().live()
             || !metadata.capabilities().extraction()
-            || metadata.capabilities().historical() != HistoricalCapability::Historical
+            // Nasdaq exposes only the current directory objects. Market Squawk can retain
+            // successive immutable observations after activation, but that private archive does
+            // not turn the provider surface into a historical extraction API.
+            || metadata.capabilities().historical() != HistoricalCapability::None
             || metadata.capabilities().source_timestamps()
             || !matches!(metadata.protocol_profile(), SourceProtocolProfile::NotLive)
         {
@@ -491,6 +922,30 @@ impl NasdaqSymbolDirectorySource {
             .network_policy()
             .authorize(OTHER_LISTED_URL)
             .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?;
+        metadata
+            .network_policy()
+            .authorize(BONDS_LIST_URL)
+            .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?;
+        metadata
+            .network_policy()
+            .authorize(OPTIONS_URL)
+            .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?;
+        let NetworkAccessPolicy::Allowlisted(policy) = metadata.network_policy() else {
+            return Err(NasdaqSymbolDirectorySourceError::InvalidMetadata);
+        };
+        if policy != &nasdaq_reference_endpoint_policy(policy.request_bounds())? {
+            return Err(NasdaqSymbolDirectorySourceError::InvalidMetadata);
+        }
+        if policy.request_bounds().max_response_bytes()
+            < u64::try_from(crate::MAX_OPTIONS_SOURCE_BYTES)
+                .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?
+        {
+            return Err(NasdaqSymbolDirectorySourceError::InvalidMetadata);
+        }
+        if policy.request_bounds().total_timeout_nanos() < NASDAQ_REFERENCE_MIN_TOTAL_TIMEOUT_NANOS
+        {
+            return Err(NasdaqSymbolDirectorySourceError::InvalidMetadata);
+        }
         Ok(())
     }
 
@@ -544,7 +999,12 @@ impl ExtractionSource for NasdaqSymbolDirectorySource {
         request: DiscoveryRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<DiscoveryBatch, ExtractionSourceError>> {
-        Box::pin(self.discover_impl(authority, request, cancellation))
+        Box::pin(async move {
+            self.discover_with_capture_impl(authority, request, cancellation)
+                .await
+                .map(NasdaqSymbolDirectoryDiscovery::into_parts)
+                .map(|(batch, _capture, _response_evidence)| batch)
+        })
     }
 
     fn extract(
@@ -555,6 +1015,112 @@ impl ExtractionSource for NasdaqSymbolDirectorySource {
     ) -> BoxFuture<'_, Result<ExtractionBatch, ExtractionSourceError>> {
         Box::pin(self.extract_impl(authority, request, cancellation))
     }
+}
+
+pub(crate) fn directory_locator(kind: NasdaqDirectoryKind) -> &'static str {
+    match kind {
+        NasdaqDirectoryKind::NasdaqListed => NASDAQ_LISTED_URL,
+        NasdaqDirectoryKind::OtherListed => OTHER_LISTED_URL,
+        NasdaqDirectoryKind::Bonds => BONDS_LIST_URL,
+        NasdaqDirectoryKind::Options => OPTIONS_URL,
+    }
+}
+
+fn capture_request_identity(
+    metadata: &SourceMetadata,
+    kind: NasdaqDirectoryKind,
+) -> Result<EvidenceDigest, ExtractionSourceError> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/nasdaq-symbol-directory-http-request/v1");
+    hash_capture_field(&mut hash, metadata.source_id().as_str().as_bytes())?;
+    hash_capture_field(
+        &mut hash,
+        metadata
+            .revision()
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
+    hash_capture_field(&mut hash, b"GET")?;
+    hash_capture_field(&mut hash, directory_locator(kind).as_bytes())?;
+    hash_capture_field(&mut hash, b"accept:text/plain")?;
+    hash_capture_field(&mut hash, b"accept-encoding:identity")?;
+    hash_capture_field(
+        &mut hash,
+        concat!(
+            "user-agent:market-squawk/",
+            env!("CARGO_PKG_VERSION"),
+            " nasdaq-symbol-directory-adapter"
+        )
+        .as_bytes(),
+    )?;
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hash.finalize().into(),
+    ))
+}
+
+fn request_graph_identity(
+    metadata: &SourceMetadata,
+    config: &NasdaqSymbolDirectoryConfig,
+) -> Result<EvidenceDigest, ExtractionSourceError> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/nasdaq-symbol-directory-request-graph/v1");
+    hash_capture_field(&mut hash, metadata.source_id().as_str().as_bytes())?;
+    hash_capture_field(
+        &mut hash,
+        metadata
+            .revision()
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
+    hash_capture_field(&mut hash, config.dataset().as_str().as_bytes())?;
+    for kind in [
+        NasdaqDirectoryKind::NasdaqListed,
+        NasdaqDirectoryKind::OtherListed,
+    ] {
+        hash.update(capture_request_identity(metadata, kind)?.bytes());
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hash.finalize().into(),
+    ))
+}
+
+fn hash_capture_field(hash: &mut Sha256, value: &[u8]) -> Result<(), ExtractionSourceError> {
+    let length = u16::try_from(value.len()).map_err(|_| SourceError::InvalidProtocolState)?;
+    hash.update(length.to_be_bytes());
+    hash.update(value);
+    Ok(())
+}
+
+fn deterministic_capture_uuid(tag: &[u8], receipt: &ProviderCaptureSetReceipt) -> Uuid {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/nasdaq-symbol-directory-provider-capture-id/v1");
+    hash.update((tag.len() as u64).to_be_bytes());
+    hash.update(tag);
+    hash.update(receipt.request_set_identity().bytes());
+    hash.update(receipt.observation_digest().bytes());
+    let digest = hash.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+fn remaining_reference_timeout(
+    deadline: Timestamp,
+) -> Result<Duration, NasdaqReferenceIngestError> {
+    let now = system_timestamp()?;
+    let nanos = deadline
+        .unix_nanos()
+        .checked_sub(now.unix_nanos())
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or(NasdaqReferenceIngestError::Extraction(
+            ExtractionSourceError::DeadlineExceeded,
+        ))?;
+    Ok(Duration::from_nanos(nanos))
 }
 
 /// Adapter configuration, metadata, local state, or clock failure.
@@ -574,6 +1140,38 @@ pub enum NasdaqSymbolDirectorySourceError {
     Clock,
 }
 
+/// Network, authority, durable-capture, or validation failure for one family object.
+#[derive(Debug, Error)]
+pub enum NasdaqReferenceIngestError {
+    /// Source-neutral authority, deadline, or transport admission failed.
+    #[error("Nasdaq reference extraction failed: {0}")]
+    Extraction(#[from] ExtractionSourceError),
+    /// Immutable provider-local capture, validation, recovery, or paging failed.
+    #[error("Nasdaq reference archive failed: {0}")]
+    Archive(#[from] NasdaqReferenceError),
+    /// Adapter configuration, health, or clock state was unavailable.
+    #[error("Nasdaq reference source state failed: {0}")]
+    Source(#[from] NasdaqSymbolDirectorySourceError),
+    /// Nasdaq returned a typed `429`/`503` refusal and the shared queue installed its cooldown.
+    #[error("Nasdaq reference provider requested a retry")]
+    RetryRequired {
+        /// Exact provider-family refusal and shared-budget deadline evidence.
+        evidence: NasdaqReferenceRetryEvidence,
+    },
+}
+
+impl From<SourceError> for NasdaqReferenceIngestError {
+    fn from(error: SourceError) -> Self {
+        Self::Extraction(ExtractionSourceError::Source(error))
+    }
+}
+
+impl From<ExtractionAuthorityError> for NasdaqReferenceIngestError {
+    fn from(error: ExtractionAuthorityError) -> Self {
+        Self::Extraction(ExtractionSourceError::Authority(error))
+    }
+}
+
 fn parse_object_id(
     object_id: &SourceIdentifier,
 ) -> Result<(NasdaqDirectoryKind, &str), ExtractionSourceError> {
@@ -584,6 +1182,7 @@ fn parse_object_id(
     let kind = match fields.next() {
         Some("nasdaq-listed") => NasdaqDirectoryKind::NasdaqListed,
         Some("other-listed") => NasdaqDirectoryKind::OtherListed,
+        Some("bonds") | Some("options") => return Err(SourceError::InvalidProtocolState.into()),
         _ => return Err(SourceError::InvalidProtocolState.into()),
     };
     let digest = fields.next().ok_or(SourceError::InvalidProtocolState)?;

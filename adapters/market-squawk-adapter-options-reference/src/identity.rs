@@ -152,50 +152,6 @@ impl OptionContractIdentity {
         })
     }
 
-    /// Attaches a provider-reported full expiration date after matching every OSI date component.
-    ///
-    /// # Errors
-    ///
-    /// Rejects a date whose two-digit year, month, or day conflicts with the OSI symbol.
-    pub fn try_with_provider_expiration(
-        mut self,
-        date: CalendarDate,
-        evidence: SourceIdentifier,
-    ) -> Result<Self, OptionIdentityError> {
-        let year_two_digits =
-            u8::try_from(date.year() % 100).map_err(|_| OptionIdentityError::ExpirationMismatch)?;
-        if year_two_digits != self.expiration.year_two_digits
-            || date.month() != self.expiration.month
-            || date.day() != self.expiration.day
-        {
-            return Err(OptionIdentityError::ExpirationMismatch);
-        }
-        self.expiration.calendar_date = Some(date);
-        self.expiration.resolution = ExpirationResolution::ProviderReported { evidence };
-        Ok(self)
-    }
-
-    /// Attaches an exact nonzero multiplier only when a source field or complete operative
-    /// document supplies it.
-    ///
-    /// # Errors
-    ///
-    /// Rejects zero and refuses to replace already-attached multiplier evidence.
-    pub fn try_with_provider_multiplier(
-        mut self,
-        multiplier: u32,
-        evidence: SourceIdentifier,
-    ) -> Result<Self, OptionIdentityError> {
-        if !matches!(self.multiplier, MultiplierEvidence::NotReported) {
-            return Err(OptionIdentityError::MultiplierAlreadyReported);
-        }
-        self.multiplier = MultiplierEvidence::ProviderReported {
-            multiplier: NonZeroU32::new(multiplier).ok_or(OptionIdentityError::ZeroMultiplier)?,
-            evidence,
-        };
-        Ok(self)
-    }
-
     /// Returns the exact source-preserved OSI identifier.
     pub const fn osi(&self) -> &OccOptionIdentity {
         &self.osi
@@ -233,13 +189,4 @@ pub enum OptionIdentityError {
     /// The 21-character OCC/OSI grammar was invalid.
     #[error("invalid OCC/OSI option identity")]
     InvalidOsiIdentity,
-    /// A separately reported full expiration date contradicted the OSI date fields.
-    #[error("provider expiration contradicts OCC/OSI identity")]
-    ExpirationMismatch,
-    /// A reported multiplier was zero.
-    #[error("option multiplier must be nonzero")]
-    ZeroMultiplier,
-    /// A second source value attempted to overwrite retained multiplier evidence.
-    #[error("option multiplier evidence is already present")]
-    MultiplierAlreadyReported,
 }

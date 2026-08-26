@@ -2,7 +2,12 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use market_squawk_domain::{MetadataRevision, SourceId, SourceIdentifier};
+use market_squawk_domain::{
+    BarTimeSemantics, BarTimestampBasis, Currency, DigestAlgorithm, EvidenceDigest, InstrumentId,
+    MarketBarSessionEvidence, MarketBarSessionKind, MetadataRevision, ProviderInstrumentId,
+    ResearchObservation, RevisionNumber, SourceId, SourceIdentifier, Timestamp, VenueId,
+};
+use market_squawk_platform::LocalPaths;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -13,11 +18,46 @@ use crate::{
     AdapterBounds, AdmissionDecision, AdmissionPolicy, AttemptDisposition, AttemptKind,
     AttemptOutcome, ChartInterval, ChartWindow, CircuitSnapshot, ExplicitDemand,
     ExplicitDemandPurpose, ParseContext, ProviderField, YAHOO_FINANCE_EXPERIMENTAL, YahooAdmission,
-    YahooAssetClass, YahooAttemptTarget, YahooEnrichmentState, YahooExecutionDisposition,
-    YahooExecutionLimits, YahooHttpFailureKind, YahooHttpSession, YahooHttpSessionConfig,
-    YahooLocale, YahooPublicationBinding, YahooPublicationBridgeError, YahooRequestPlanner,
-    YahooSymbol, YahooTarget, parse_quote_response,
+    YahooAssetClass, YahooAttemptTarget, YahooChartInstrumentAuthority, YahooChartMapError,
+    YahooChartMappingInput, YahooDurableStateStore, YahooEnrichmentState,
+    YahooExecutionDisposition, YahooExecutionLimits, YahooHistoricalBarTimeAuthority,
+    YahooHistoricalBarTimeRequest, YahooHttpFailureKind, YahooHttpSession, YahooHttpSessionConfig,
+    YahooLocale, YahooParsedResponse, YahooPublicationBinding, YahooPublicationBridgeError,
+    YahooRequestPlanner, YahooSymbol, YahooTarget, map_chart_bars, parse_quote_response,
 };
+
+#[derive(Debug)]
+struct TestYahooDailyBarTimeAuthority;
+
+impl YahooHistoricalBarTimeAuthority for TestYahooDailyBarTimeAuthority {
+    fn validate_current(&self) -> Result<(), YahooChartMapError> {
+        Ok(())
+    }
+
+    fn resolve(
+        &self,
+        request: &YahooHistoricalBarTimeRequest,
+    ) -> Result<BarTimeSemantics, YahooChartMapError> {
+        let end = request
+            .provider_timestamp()
+            .checked_add_nanos(86_400_000_000_000)
+            .map_err(|_| YahooChartMapError::InvalidTimeAuthority)?;
+        let session = MarketBarSessionEvidence::try_new(
+            MarketBarSessionKind::ProviderDefined,
+            SourceIdentifier::try_from("yahoo-test-daily-session-v1")
+                .map_err(|_| YahooChartMapError::InvalidTimeAuthority)?,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [7; 32]),
+        )
+        .map_err(|_| YahooChartMapError::InvalidTimeAuthority)?;
+        BarTimeSemantics::try_new(
+            request.provider_timestamp(),
+            end,
+            BarTimestampBasis::PeriodStart,
+            session,
+        )
+        .map_err(|_| YahooChartMapError::InvalidTimeAuthority)
+    }
+}
 
 fn bounds(maximum_symbols: usize) -> AdapterBounds {
     AdapterBounds {
@@ -248,20 +288,31 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
     let chart = Bytes::from_static(
         br#"{"chart":{"error":null,"result":[{"meta":{"symbol":"AAPL","instrumentType":"EQUITY","currency":"USD","exchangeName":"NMS","fullExchangeName":"NasdaqGS","market":"us_market","country":"US","exchangeTimezoneName":"America/New_York","exchangeDataDelayedBy":0,"regularMarketTime":1786473650,"dataGranularity":"1d","range":"5d"},"timestamp":[1786473600],"indicators":{"quote":[{"open":[201.0],"high":[202.0],"low":[200.0],"close":[201.5],"volume":[100]}],"adjclose":[{"adjclose":[201.5]}]}}]}}"#,
     );
-    let session = YahooHttpSession::new_for_test(
-        YahooHttpSessionConfig {
-            adapter_bounds: bounds(4),
-            connect_timeout: Duration::from_secs(1),
-            read_timeout: Duration::from_secs(1),
-            total_timeout: Duration::from_secs(3),
-            max_session_response_bytes: 64 * 1_024,
-            max_crumb_bytes: 512,
-            max_cache_entries: 8,
-            max_cache_bytes: 128 * 1_024,
-            max_redirects: 3,
-            max_attempt_receipts: 8,
-            admission_policy: AdmissionPolicy::new(1_000, 3)?,
-        },
+    let config = YahooHttpSessionConfig {
+        adapter_bounds: bounds(4),
+        connect_timeout: Duration::from_secs(1),
+        read_timeout: Duration::from_secs(1),
+        total_timeout: Duration::from_secs(3),
+        max_session_response_bytes: 64 * 1_024,
+        max_crumb_bytes: 512,
+        max_cache_entries: 8,
+        max_cache_bytes: 128 * 1_024,
+        max_redirects: 3,
+        max_attempt_receipts: 8,
+        admission_policy: AdmissionPolicy::new(1_000, 3)?,
+    };
+    let state_root = std::env::temp_dir().join(format!(
+        "market-squawk-yahoo-durable-test-{}",
+        Uuid::new_v4()
+    ));
+    let journal_root = std::env::temp_dir().join(format!(
+        "market-squawk-yahoo-journal-test-{}",
+        Uuid::new_v4()
+    ));
+    let journal_paths = LocalPaths::prepare(&journal_root)?;
+    let journal_store = journal_paths.sealed_research_journal_store()?;
+    let session = YahooHttpSession::new_for_test_with_durable(
+        config,
         Url::parse("http://yahoo.test/")?,
         vec![
             ScriptedHttpResponse {
@@ -289,6 +340,7 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
                 body: Bytes::from_static(b"Too Many Requests"),
             },
         ],
+        Some(YahooDurableStateStore::try_open(&state_root)?),
     )?;
     let plan = planner(4)?.chart_history(
         demand("http-fan-out")?,
@@ -305,6 +357,17 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
     let first = session
         .execute(plan.requests[0].clone(), limits, &cancellation)
         .await?;
+    let YahooParsedResponse::Chart(first_chart) = first.parsed.as_ref() else {
+        return Err("first response must be parsed chart enrichment".into());
+    };
+    assert_eq!(
+        first_chart.provenance.received_at_unix_ms,
+        first.raw.received_at_unix_ms
+    );
+    assert_eq!(
+        first_chart.provenance.available_at_unix_ms,
+        first.raw.available_at_unix_ms
+    );
     assert_eq!(first.raw.attempts.len(), 3);
     assert_eq!(
         first.raw.attempts[0].target,
@@ -321,7 +384,32 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
         Uuid::from_u128(1),
         Uuid::from_u128(2),
     );
+    let publication_clone = first.clone();
+    let invalid_binding = YahooPublicationBinding::new(
+        publication_binding.source_id().clone(),
+        publication_binding.metadata_revision().clone(),
+        Uuid::nil(),
+        Uuid::from_u128(2),
+    );
+    assert!(matches!(
+        first.publication_material(invalid_binding),
+        Err(YahooPublicationBridgeError::RawRecord(_))
+    ));
     let material = first.publication_material(publication_binding.clone())?;
+    assert!(matches!(
+        first.publication_material(publication_binding.clone()),
+        Err(YahooPublicationBridgeError::PublicationAlreadyClaimed)
+    ));
+    let rebound_binding = YahooPublicationBinding::new(
+        publication_binding.source_id().clone(),
+        publication_binding.metadata_revision().clone(),
+        Uuid::from_u128(3),
+        Uuid::from_u128(4),
+    );
+    assert!(matches!(
+        publication_clone.publication_material(rebound_binding),
+        Err(YahooPublicationBridgeError::PublicationAlreadyClaimed)
+    ));
     assert_eq!(material.records().len(), 1);
     assert_eq!(material.records()[0].payload(), first.raw.response_bytes);
     assert_eq!(material.records()[0].source_sequence(), Some(0));
@@ -333,6 +421,41 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
         material.receipt().pages()[0].body_bytes(),
         u64::try_from(first.raw.response_bytes.len())?
     );
+    let sealed = material.seal(&journal_store)?;
+    let chart_authority = YahooChartInstrumentAuthority::try_new(
+        publication_binding.source_id().clone(),
+        publication_binding.metadata_revision().clone(),
+        "06dd06da-ef2d-44dd-bf28-b006da06b24b".parse::<InstrumentId>()?,
+        VenueId::try_from("XNAS")?,
+        ProviderInstrumentId::try_from("AAPL")?,
+        YahooSymbol::parse("AAPL", 512)?,
+        SourceIdentifier::try_from("NMS")?,
+        Currency::try_from("USD")?,
+    )?;
+    let ingested_at = Timestamp::from_unix_nanos(
+        first
+            .raw
+            .available_at_unix_ms
+            .checked_mul(1_000_000)
+            .and_then(|value| value.checked_add(1_000_000))
+            .ok_or("Yahoo canonical ingest time overflow")?,
+    );
+    let mapped = map_chart_bars(YahooChartMappingInput {
+        result: &first,
+        sealed_capture: &sealed,
+        instrument: &chart_authority,
+        bar_time_authority: &TestYahooDailyBarTimeAuthority,
+        adapter_bounds: bounds(4),
+        authority_seed_revision: RevisionNumber::new(1)?,
+        ingested_at,
+    })?;
+    assert_eq!(mapped.observations().len(), 1);
+    assert!(mapped.revision_plan().is_locally_observed());
+    assert!(mapped.provider_events().is_empty());
+    assert!(matches!(
+        mapped.observations(),
+        [ResearchObservation::MarketBar(_)]
+    ));
 
     let second = session
         .execute(plan.requests[1].clone(), limits, &cancellation)
@@ -366,7 +489,17 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
         .await?;
     assert_eq!(cached.disposition, YahooExecutionDisposition::CacheHit);
     assert!(matches!(
-        cached.publication_material(publication_binding),
+        cached.publication_material(publication_binding.clone()),
+        Err(YahooPublicationBridgeError::NonPublicationResult)
+    ));
+    let forged_cache = crate::YahooHttpResult {
+        disposition: YahooExecutionDisposition::Network,
+        raw: std::sync::Arc::clone(&cached.raw),
+        parsed: std::sync::Arc::clone(&cached.parsed),
+        publication: None,
+    };
+    assert!(matches!(
+        forged_cache.publication_material(publication_binding),
         Err(YahooPublicationBridgeError::NonPublicationResult)
     ));
 
@@ -381,5 +514,51 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
     assert_eq!(snapshot.returned_units_total, 1);
     assert_eq!(snapshot.missing_units_total, 1);
     assert_eq!(snapshot.http_429_total, 1);
+
+    drop(session);
+    let restarted = YahooHttpSession::new_for_test_with_durable(
+        config,
+        Url::parse("http://yahoo.test/")?,
+        Vec::new(),
+        Some(YahooDurableStateStore::try_open(&state_root)?),
+    )?;
+    let restart_limits = YahooExecutionLimits {
+        deadline: Instant::now() + Duration::from_secs(5),
+        maximum_cache_age: Duration::from_secs(60),
+    };
+    let restored_cache = restarted
+        .execute(plan.requests[0].clone(), restart_limits, &cancellation)
+        .await?;
+    assert_eq!(
+        restored_cache.disposition,
+        YahooExecutionDisposition::CacheHit
+    );
+    assert!(matches!(
+        map_chart_bars(YahooChartMappingInput {
+            result: &restored_cache,
+            sealed_capture: &sealed,
+            instrument: &chart_authority,
+            bar_time_authority: &TestYahooDailyBarTimeAuthority,
+            adapter_bounds: bounds(4),
+            authority_seed_revision: RevisionNumber::new(1)?,
+            ingested_at,
+        }),
+        Err(YahooChartMapError::NonPublicationResult)
+    ));
+    let restored_circuit = restarted
+        .execute(plan.requests[1].clone(), restart_limits, &cancellation)
+        .await
+        .expect_err("restart must preserve the open provider circuit");
+    assert!(matches!(
+        restored_circuit.kind,
+        YahooHttpFailureKind::CircuitOpen { .. }
+    ));
+    assert!(restarted.scripted_observed_targets().await.is_empty());
+    drop(restarted);
+    drop(sealed);
+    drop(journal_store);
+    drop(journal_paths);
+    std::fs::remove_dir_all(journal_root)?;
+    std::fs::remove_dir_all(state_root)?;
     Ok(())
 }

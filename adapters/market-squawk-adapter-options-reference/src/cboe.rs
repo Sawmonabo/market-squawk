@@ -3,7 +3,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use csv::{ReaderBuilder, StringRecord};
 use market_squawk_domain::{DigestAlgorithm, ProviderInstrumentId, SourceIdentifier};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -25,7 +25,7 @@ pub const CBOE_ALL_SERIES_MAX_RECORDS: u32 = 2_500_000;
 const MAX_UNDERLYING_BYTES: usize = 8;
 
 /// One of the four independently published Cboe U.S. option venues.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CboeVenue {
     /// Cboe Options Exchange (C1).
@@ -57,7 +57,7 @@ impl CboeVenue {
         }
     }
 
-    const fn stable_label(self) -> &'static str {
+    pub(crate) const fn stable_label(self) -> &'static str {
         match self {
             Self::C1 => "c1",
             Self::Bzx => "bzx",
@@ -65,45 +65,45 @@ impl CboeVenue {
             Self::Edgx => "edgx",
         }
     }
+
+    pub(crate) fn try_from_stable_label(value: &str) -> Result<Self, CboeParseError> {
+        match value {
+            "c1" => Ok(Self::C1),
+            "bzx" => Ok(Self::Bzx),
+            "c2" => Ok(Self::C2),
+            "edgx" => Ok(Self::Edgx),
+            _ => Err(CboeParseError::InvalidEvidence),
+        }
+    }
 }
 
-/// Exact code-owned header contract for a selected Cboe `All Series` CSV generation.
+/// Exact code-owned header contract for the selected Cboe `All Series` CSV generation.
 ///
-/// Each variant is closed and order-sensitive. The parser never accepts a generic property map or
-/// silently ignores new columns.
+/// This greenfield contract intentionally admits only the current official layout. The parser
+/// never accepts a generic property map, a historical header alias, or silently ignores columns.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CboeAllSeriesCsvSchema {
-    /// Header names using the website's `Symbol` label.
-    SymbolV1,
-    /// Header names using the feed specification's `Feed Symbol` label.
-    FeedSymbolV1,
-    /// Header names using the symbology specification's `Cboe Symbol ID` label.
-    CboeSymbolIdV1,
+    /// Current daily file: Cboe symbol, OSI symbol, underlying, matching unit, closing-only.
+    DailyAllSeriesV1,
 }
 
 impl CboeAllSeriesCsvSchema {
     const fn header(self) -> [&'static str; 5] {
-        let symbol = match self {
-            Self::SymbolV1 => "Symbol",
-            Self::FeedSymbolV1 => "Feed Symbol",
-            Self::CboeSymbolIdV1 => "Cboe Symbol ID",
-        };
+        let _ = self;
         [
-            symbol,
+            "Cboe Symbol",
             "OSI Symbol",
-            "Symbol Condition",
             "Underlying",
-            "Unit",
+            "Matching Unit",
+            "Closing Only",
         ]
     }
 
     /// Returns the stable provider-native decoder identity required in object evidence.
     pub const fn native_schema(self) -> &'static str {
         match self {
-            Self::SymbolV1 => "cboe-all-series-csv-symbol-v1",
-            Self::FeedSymbolV1 => "cboe-all-series-csv-feed-symbol-v1",
-            Self::CboeSymbolIdV1 => "cboe-all-series-csv-cboe-symbol-id-v1",
+            Self::DailyAllSeriesV1 => "cboe-all-series-csv-daily-v1",
         }
     }
 
@@ -171,10 +171,25 @@ pub enum CboeSeriesStatus {
 }
 
 impl CboeSeriesStatus {
-    fn try_from_provider(value: &str) -> Result<Self, CboeParseError> {
+    fn try_from_closing_only(value: &str) -> Result<Self, CboeParseError> {
         match value {
-            "N" => Ok(Self::Normal),
-            "C" => Ok(Self::ClosingOnly),
+            "False" => Ok(Self::Normal),
+            "True" => Ok(Self::ClosingOnly),
+            _ => Err(CboeParseError::InvalidSeriesStatus),
+        }
+    }
+
+    pub(crate) const fn stable_label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::ClosingOnly => "closing_only",
+        }
+    }
+
+    pub(crate) fn try_from_stable_label(value: &str) -> Result<Self, CboeParseError> {
+        match value {
+            "normal" => Ok(Self::Normal),
+            "closing_only" => Ok(Self::ClosingOnly),
             _ => Err(CboeParseError::InvalidSeriesStatus),
         }
     }
@@ -223,7 +238,9 @@ impl CboeSeriesReference {
         if provider_row_number < 2
             || underlying.is_empty()
             || underlying.len() > MAX_UNDERLYING_BYTES
-            || !underlying.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !underlying
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
         {
             return Err(CboeParseError::InvalidUnderlying);
         }
@@ -383,6 +400,9 @@ impl CboeAllSeriesParser {
         if bytes.len() > CBOE_ALL_SERIES_MAX_BYTES {
             return Err(CboeParseError::BodyTooLarge);
         }
+        if !bytes.ends_with(b"\n") || bytes.contains(&0) {
+            return Err(CboeParseError::IncompletePublication);
+        }
         let mut reader = ReaderBuilder::new()
             .has_headers(true)
             .flexible(false)
@@ -453,13 +473,13 @@ fn parse_record(
     let symbol = CboeSymbolId::try_from_provider(field(0)?)?;
     let contract = OptionContractIdentity::try_from_osi(field(1)?)
         .map_err(|_| CboeParseError::InvalidOsiIdentity)?;
-    let status = CboeSeriesStatus::try_from_provider(field(2)?)?;
-    let underlying = field(3)?;
-    let unit = field(4)?
+    let underlying = field(2)?;
+    let unit = field(3)?
         .parse::<u16>()
         .ok()
         .and_then(NonZeroU16::new)
         .ok_or(CboeParseError::InvalidUnit)?;
+    let status = CboeSeriesStatus::try_from_closing_only(field(4)?)?;
     CboeSeriesReference::try_new(
         row_number, venue, symbol, contract, underlying, unit, status, context,
     )
@@ -496,6 +516,9 @@ pub enum CboeParseError {
     /// The publication contained no series rows.
     #[error("empty Cboe All Series publication")]
     EmptyPublication,
+    /// The file lacked its terminal line boundary or contained a forbidden NUL byte.
+    #[error("incomplete Cboe All Series publication framing")]
+    IncompletePublication,
     /// Valid row count exceeded the application parser bound.
     #[error("Cboe All Series record limit exceeded")]
     RecordLimitExceeded,
@@ -511,8 +534,8 @@ pub enum CboeParseError {
     /// Venue unit was missing, zero, or nonnumeric.
     #[error("invalid Cboe venue unit")]
     InvalidUnit,
-    /// Series status was neither normal nor closing-only.
-    #[error("invalid Cboe series status")]
+    /// Closing-only state was neither exact `True` nor exact `False`.
+    #[error("invalid Cboe closing-only state")]
     InvalidSeriesStatus,
     /// A stable row-evidence identifier could not be constructed.
     #[error("invalid Cboe row evidence")]

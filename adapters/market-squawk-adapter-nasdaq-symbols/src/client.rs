@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
@@ -8,14 +8,21 @@ use market_squawk_sources::{
     SourceError, SourceMetadata,
 };
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, LAST_MODIFIED, RETRY_AFTER, USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HeaderMap,
+    HeaderName, LAST_MODIFIED, RETRY_AFTER, USER_AGENT,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use crate::archive::{
+    BONDS_LIST_URL, NasdaqHttpResponseEvidence, NasdaqRawObjectStore, NasdaqSealedRawObject,
+    OPTIONS_URL,
+};
 use crate::model::NasdaqDirectoryKind;
-use crate::parser::MAX_SOURCE_BYTES;
-use crate::source::{NASDAQ_LISTED_URL, NasdaqSymbolDirectorySourceError, OTHER_LISTED_URL};
+use crate::source::{
+    NASDAQ_LISTED_URL, NasdaqReferenceIngestError, NasdaqReferenceRetryEvidence,
+    NasdaqSymbolDirectorySourceError, OTHER_LISTED_URL,
+};
 
 const USER_AGENT_VALUE: &str = concat!(
     "market-squawk/",
@@ -30,6 +37,7 @@ pub(crate) struct RetrievedDirectory {
     pub(crate) received_at: Timestamp,
     pub(crate) last_modified_at: Timestamp,
     pub(crate) sha256_hex: String,
+    pub(crate) response_evidence: NasdaqHttpResponseEvidence,
 }
 
 #[derive(Debug)]
@@ -51,13 +59,20 @@ impl NasdaqHttpClient {
             .network_policy()
             .authorize(OTHER_LISTED_URL)
             .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?;
+        metadata
+            .network_policy()
+            .authorize(BONDS_LIST_URL)
+            .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?;
+        metadata
+            .network_policy()
+            .authorize(OPTIONS_URL)
+            .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?;
         let NetworkAccessPolicy::Allowlisted(endpoint_policy) = metadata.network_policy() else {
             return Err(NasdaqSymbolDirectorySourceError::InvalidMetadata);
         };
         let bounds = endpoint_policy.request_bounds();
         let max_response_bytes = usize::try_from(bounds.max_response_bytes())
-            .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?
-            .min(MAX_SOURCE_BYTES);
+            .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?;
         let client = build_client(bounds)?;
         Ok(Self {
             client,
@@ -83,6 +98,7 @@ impl NasdaqHttpClient {
             return Err(SourceError::InvalidProtocolState.into());
         }
         let url = endpoint(kind);
+        let max_response_bytes = self.max_response_bytes.min(kind.maximum_source_bytes());
         metadata
             .network_policy()
             .authorize(url)
@@ -91,6 +107,7 @@ impl NasdaqHttpClient {
         let permit = authority.try_network_request(url)?;
         let in_flight = permit.authorize_send(url)?;
         let operation = async {
+            let transport_started = Instant::now();
             let response = self
                 .client
                 .get(url)
@@ -100,26 +117,13 @@ impl NasdaqHttpClient {
                 .send()
                 .await
                 .map_err(|_| ExtractionSourceError::Source(SourceError::Network))?;
-            if response.content_length().is_some_and(|length| {
-                usize::try_from(length).map_or(true, |length| length > self.max_response_bytes)
-            }) {
-                return Err(SourceError::FrameTooLarge {
-                    max: self.max_response_bytes,
-                }
-                .into());
+            if response.url().as_str() != url {
+                return Err(SourceError::InvalidProtocolState.into());
             }
             let status = response.status().as_u16();
             let retry_after = response
                 .headers()
                 .get(RETRY_AFTER)
-                .map(|value| value.as_bytes().to_vec());
-            let content_encoding = response
-                .headers()
-                .get(CONTENT_ENCODING)
-                .map(|value| value.as_bytes().to_vec());
-            let content_type = response
-                .headers()
-                .get(CONTENT_TYPE)
                 .map(|value| value.as_bytes().to_vec());
             if status == 429 || status == 503 {
                 let deadline = in_flight.apply_retry_after_header(retry_after.as_deref(), 0)?;
@@ -131,6 +135,27 @@ impl NasdaqHttpClient {
             if status != 200 {
                 return Err(SourceError::ProviderUnavailable.into());
             }
+            let declared_content_length = declared_content_length(response.headers())?;
+            if declared_content_length.is_some_and(|length| {
+                usize::try_from(length).map_or(true, |length| length > max_response_bytes)
+            }) {
+                return Err(SourceError::FrameTooLarge {
+                    max: max_response_bytes,
+                }
+                .into());
+            }
+            let content_encoding = response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .map(|value| value.as_bytes().to_vec());
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .map(|value| value.as_bytes().to_vec());
+            let retained_content_encoding = retained_header(response.headers(), &CONTENT_ENCODING)?;
+            let retained_content_type = retained_header(response.headers(), &CONTENT_TYPE)?
+                .ok_or(SourceError::InvalidProtocolState)?;
+            let etag = retained_header(response.headers(), &ETAG)?;
             if content_encoding
                 .as_deref()
                 .is_some_and(|value| !value.eq_ignore_ascii_case(b"identity"))
@@ -138,10 +163,8 @@ impl NasdaqHttpClient {
             {
                 return Err(SourceError::InvalidProtocolState.into());
             }
-            let last_modified_at = response
-                .headers()
-                .get(LAST_MODIFIED)
-                .and_then(|value| value.to_str().ok())
+            let last_modified_at = retained_header(response.headers(), &LAST_MODIFIED)?
+                .as_deref()
                 .and_then(|value| httpdate::parse_http_date(value).ok())
                 .and_then(system_time_to_timestamp)
                 .ok_or(SourceError::InvalidProtocolState)?;
@@ -155,11 +178,11 @@ impl NasdaqHttpClient {
                     body.len()
                         .checked_add(chunk.len())
                         .ok_or(SourceError::FrameTooLarge {
-                            max: self.max_response_bytes,
+                            max: max_response_bytes,
                         })?;
-                if next > self.max_response_bytes {
+                if next > max_response_bytes {
                     return Err(SourceError::FrameTooLarge {
-                        max: self.max_response_bytes,
+                        max: max_response_bytes,
                     }
                     .into());
                 }
@@ -168,6 +191,7 @@ impl NasdaqHttpClient {
                 )?;
                 body.extend_from_slice(&chunk);
             }
+            let transport_elapsed_nanos = elapsed_nanos(transport_started, timeout)?;
             let bytes = body.freeze();
             if bytes.is_empty() {
                 return Err(SourceError::InvalidProtocolState.into());
@@ -175,6 +199,11 @@ impl NasdaqHttpClient {
             in_flight.validate_response_size(
                 u64::try_from(bytes.len()).map_err(|_| SourceError::InvalidProtocolState)?,
             )?;
+            if declared_content_length.is_some_and(|declared| {
+                u64::try_from(bytes.len()).map_or(true, |observed| observed != declared)
+            }) {
+                return Err(SourceError::InvalidProtocolState.into());
+            }
             let received_at =
                 system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
             if last_modified_at > received_at {
@@ -182,13 +211,25 @@ impl NasdaqHttpClient {
             }
             let digest = Sha256::digest(&bytes);
             let sha256_hex = format!("{digest:x}");
-            in_flight.release();
+            let response_evidence = NasdaqHttpResponseEvidence::try_new(
+                status,
+                retained_content_type,
+                retained_content_encoding,
+                declared_content_length,
+                etag,
+                transport_elapsed_nanos,
+                last_modified_at,
+                received_at,
+            )
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+            in_flight.record_success()?;
             Ok(RetrievedDirectory {
                 kind,
                 bytes,
                 received_at,
                 last_modified_at,
                 sha256_hex,
+                response_evidence,
             })
         };
         tokio::select! {
@@ -196,6 +237,167 @@ impl NasdaqHttpClient {
             () = cancellation.cancelled() => Err(ExtractionSourceError::Cancelled),
             result = tokio::time::timeout(timeout, operation) => {
                 result.map_err(|_| ExtractionSourceError::DeadlineExceeded)?
+            }
+        }
+    }
+
+    pub(crate) async fn fetch_and_seal(
+        &self,
+        metadata: &SourceMetadata,
+        authority: &ExtractionAuthority,
+        kind: NasdaqDirectoryKind,
+        archive: &NasdaqRawObjectStore,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<NasdaqSealedRawObject, NasdaqReferenceIngestError> {
+        if cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled.into());
+        }
+        let now = system_timestamp()?;
+        authority.validate_current()?;
+        if authority.metadata() != metadata || !metadata.is_effective_at(now) {
+            return Err(SourceError::InvalidProtocolState.into());
+        }
+        let url = endpoint(kind);
+        let max_response_bytes = self.max_response_bytes.min(kind.maximum_source_bytes());
+        metadata
+            .network_policy()
+            .authorize(url)
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        let timeout = remaining_timeout(deadline, now, self.total_timeout)?;
+        let permit = authority.try_network_request(url)?;
+        let in_flight = permit.authorize_send(url)?;
+        let operation = async {
+            let transport_started = Instant::now();
+            let response = self
+                .client
+                .get(url)
+                .header(ACCEPT, "text/plain")
+                .header(ACCEPT_ENCODING, "identity")
+                .header(USER_AGENT, USER_AGENT_VALUE)
+                .send()
+                .await
+                .map_err(|_| SourceError::Network)?;
+            if response.url().as_str() != url {
+                return Err(NasdaqReferenceIngestError::from(
+                    SourceError::InvalidProtocolState,
+                ));
+            }
+            let status = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .map(|value| value.as_bytes().to_vec());
+            if status == 429 || status == 503 {
+                let retry_deadline =
+                    in_flight.apply_retry_after_header(retry_after.as_deref(), 0)?;
+                let evidence = NasdaqReferenceRetryEvidence::try_new(
+                    kind,
+                    status,
+                    retry_after.is_some(),
+                    elapsed_nanos(transport_started, timeout)?,
+                    system_timestamp()?,
+                    retry_deadline,
+                )?;
+                return Err(NasdaqReferenceIngestError::RetryRequired { evidence });
+            }
+            if status == 401 || status == 403 {
+                return Err(SourceError::Unauthorized.into());
+            }
+            if status != 200 {
+                return Err(SourceError::ProviderUnavailable.into());
+            }
+            let declared_content_length = declared_content_length(response.headers())?;
+            if declared_content_length.is_some_and(|length| {
+                usize::try_from(length).map_or(true, |length| length > max_response_bytes)
+            }) {
+                return Err(SourceError::FrameTooLarge {
+                    max: max_response_bytes,
+                }
+                .into());
+            }
+            let content_encoding = response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .map(|value| value.as_bytes().to_vec());
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .map(|value| value.as_bytes().to_vec());
+            let retained_content_encoding = retained_header(response.headers(), &CONTENT_ENCODING)?;
+            let retained_content_type = retained_header(response.headers(), &CONTENT_TYPE)?
+                .ok_or(SourceError::InvalidProtocolState)?;
+            let etag = retained_header(response.headers(), &ETAG)?;
+            if content_encoding
+                .as_deref()
+                .is_some_and(|value| !value.eq_ignore_ascii_case(b"identity"))
+                || !content_type_is_text(content_type.as_deref())
+            {
+                return Err(SourceError::InvalidProtocolState.into());
+            }
+            let last_modified_at = retained_header(response.headers(), &LAST_MODIFIED)?
+                .as_deref()
+                .and_then(|value| httpdate::parse_http_date(value).ok())
+                .and_then(system_time_to_timestamp)
+                .ok_or(SourceError::InvalidProtocolState)?;
+            let mut writer = archive.begin(kind, cancellation)?;
+            let mut body_bytes = 0_usize;
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                in_flight.validate_current()?;
+                let chunk = chunk.map_err(|_| SourceError::Network)?;
+                body_bytes =
+                    body_bytes
+                        .checked_add(chunk.len())
+                        .ok_or(SourceError::FrameTooLarge {
+                            max: max_response_bytes,
+                        })?;
+                if body_bytes > max_response_bytes {
+                    return Err(SourceError::FrameTooLarge {
+                        max: max_response_bytes,
+                    }
+                    .into());
+                }
+                in_flight.validate_response_size(
+                    u64::try_from(body_bytes).map_err(|_| SourceError::InvalidProtocolState)?,
+                )?;
+                writer.write_chunk(&chunk, cancellation).await?;
+            }
+            let transport_elapsed_nanos = elapsed_nanos(transport_started, timeout)?;
+            if body_bytes == 0 {
+                return Err(SourceError::InvalidProtocolState.into());
+            }
+            in_flight.validate_response_size(
+                u64::try_from(body_bytes).map_err(|_| SourceError::InvalidProtocolState)?,
+            )?;
+            if declared_content_length.is_some_and(|declared| {
+                u64::try_from(body_bytes).map_or(true, |observed| observed != declared)
+            }) {
+                return Err(SourceError::InvalidProtocolState.into());
+            }
+            let received_at = system_timestamp()?;
+            if last_modified_at > received_at {
+                return Err(SourceError::InvalidProtocolState.into());
+            }
+            let response_evidence = NasdaqHttpResponseEvidence::try_new(
+                status,
+                retained_content_type,
+                retained_content_encoding,
+                declared_content_length,
+                etag,
+                transport_elapsed_nanos,
+                last_modified_at,
+                received_at,
+            )?;
+            in_flight.record_success()?;
+            let sealed = writer.commit(url, response_evidence, cancellation).await?;
+            Ok(sealed)
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ExtractionSourceError::Cancelled.into()),
+            result = tokio::time::timeout(timeout, operation) => {
+                result.map_err(|_| NasdaqReferenceIngestError::Extraction(ExtractionSourceError::DeadlineExceeded))?
             }
         }
     }
@@ -227,6 +429,8 @@ fn endpoint(kind: NasdaqDirectoryKind) -> &'static str {
     match kind {
         NasdaqDirectoryKind::NasdaqListed => NASDAQ_LISTED_URL,
         NasdaqDirectoryKind::OtherListed => OTHER_LISTED_URL,
+        NasdaqDirectoryKind::Bonds => BONDS_LIST_URL,
+        NasdaqDirectoryKind::Options => OPTIONS_URL,
     }
 }
 
@@ -235,6 +439,47 @@ fn content_type_is_text(value: Option<&[u8]>) -> bool {
         .and_then(|value| std::str::from_utf8(value).ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/plain"))
+}
+
+fn retained_header(headers: &HeaderMap, name: &HeaderName) -> Result<Option<String>, SourceError> {
+    let mut values = headers.get_all(name).iter();
+    let value = values
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| SourceError::InvalidProtocolState)
+        })
+        .transpose()?;
+    if values.next().is_some() {
+        return Err(SourceError::InvalidProtocolState);
+    }
+    Ok(value)
+}
+
+fn declared_content_length(headers: &HeaderMap) -> Result<Option<u64>, SourceError> {
+    retained_header(headers, &CONTENT_LENGTH)?
+        .map(|value| {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(SourceError::InvalidProtocolState);
+            }
+            value
+                .parse::<u64>()
+                .map_err(|_| SourceError::InvalidProtocolState)
+        })
+        .transpose()
+}
+
+fn elapsed_nanos(started: Instant, maximum: Duration) -> Result<u64, SourceError> {
+    let elapsed = u64::try_from(started.elapsed().as_nanos())
+        .ok()
+        .filter(|elapsed| *elapsed > 0)
+        .ok_or(SourceError::InvalidProtocolState)?;
+    if u128::from(elapsed) > maximum.as_nanos() {
+        return Err(SourceError::InvalidProtocolState);
+    }
+    Ok(elapsed)
 }
 
 pub(crate) fn system_timestamp() -> Result<Timestamp, NasdaqSymbolDirectorySourceError> {

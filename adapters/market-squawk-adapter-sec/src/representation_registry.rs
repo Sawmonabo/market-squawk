@@ -27,6 +27,7 @@ const MAX_COMMITTED_SNAPSHOTS: usize = 8;
 const RETAINED_SNAPSHOTS: usize = 2;
 const MAX_VALIDATOR_BYTES: usize = 1_024;
 const MAX_LOCATOR_BYTES: usize = 2_048;
+const MAX_BULK_REPRESENTATION_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Runtime ceilings for durable SEC representation state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,7 +43,7 @@ impl SecRepresentationLimits {
         Self {
             max_representations: MAX_REPRESENTATIONS,
             max_snapshot_bytes: 8 * 1024 * 1024,
-            max_representation_bytes: 64 * 1024 * 1024,
+            max_representation_bytes: MAX_BULK_REPRESENTATION_BYTES,
         }
     }
 

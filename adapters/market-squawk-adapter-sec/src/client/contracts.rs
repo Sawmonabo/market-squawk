@@ -87,6 +87,50 @@ impl SecObjectLocator {
         Self::from_url(format!("{DATA_BASE}/api/xbrl/companyfacts/CIK{cik}.json"))
     }
 
+    /// Locates one exact SEC quarterly N-PORT or N-CEN derived-data archive.
+    pub fn quarterly_bulk_archive(
+        family: crate::SecBulkFamily,
+        quarter: crate::SecQuarter,
+    ) -> Result<Self, SecClientError> {
+        let snapshot = crate::SecBulkCatalogSnapshot::official_2026_08_14()
+            .map_err(|_| SecClientError::InvalidLocator)?;
+        if !quarter.is_catalogued(family, snapshot) {
+            return Err(SecClientError::InvalidLocator);
+        }
+        let dataset = match family {
+            crate::SecBulkFamily::Nport => "form-n-port-data-sets",
+            crate::SecBulkFamily::Ncen => "form-n-cen-data-sets",
+        };
+        Self::from_url(format!(
+            "https://www.sec.gov/files/dera/data/{dataset}/{}q{}_{}.zip",
+            quarter.year(),
+            quarter.quarter(),
+            family.tag(),
+        ))
+    }
+
+    /// Locates the current official readme for one quarterly derived-data family.
+    pub fn quarterly_bulk_readme(family: crate::SecBulkFamily) -> Result<Self, SecClientError> {
+        Self::from_url(format!(
+            "https://www.sec.gov/files/{}_readme.pdf",
+            family.tag(),
+        ))
+    }
+
+    /// Locates the official nightly complete-submissions bootstrap archive.
+    pub fn bulk_submissions() -> Result<Self, SecClientError> {
+        Self::from_url(
+            "https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip".to_owned(),
+        )
+    }
+
+    /// Locates the official nightly Company Facts bootstrap archive.
+    pub fn bulk_company_facts() -> Result<Self, SecClientError> {
+        Self::from_url(
+            "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip".to_owned(),
+        )
+    }
+
     /// Locates a provider-declared submissions companion object.
     pub fn companion(name: &str) -> Result<Self, SecClientError> {
         validate_filename(name, ".json")?;

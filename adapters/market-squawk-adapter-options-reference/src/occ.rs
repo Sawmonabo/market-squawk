@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use csv::{ReaderBuilder, StringRecord};
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EvidenceDigest, ProviderInstrumentId, SourceIdentifier,
 };
+use quick_xml::Reader;
+use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -39,6 +41,37 @@ const MAX_SYMBOL_BYTES: usize = 32;
 const MAX_SYMBOL_NAME_BYTES: usize = 512;
 const MAX_MEMO_TITLE_BYTES: usize = 1_024;
 const MAX_MEMO_CATEGORIES: usize = 16;
+
+/// Exact code-owned OCC DLP body contract selected after transport admission.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OccDlpSchema {
+    /// Current selected-field `delo-download` text: fixed-width fields plus a terminal empty field.
+    SelectedTextV1,
+    /// Current dated `daily-delo-download` headerless six-column text publication.
+    DailyTextV1,
+    /// Current dated `results/record` XML publication with the same six financial fields.
+    DailyXmlV1,
+}
+
+impl OccDlpSchema {
+    /// Returns the stable provider-native decoder identity.
+    pub const fn native_schema(self) -> &'static str {
+        match self {
+            Self::SelectedTextV1 => "occ-dlp-selected-text-os-us-sn-exch-pl-onn-v1",
+            Self::DailyTextV1 => "occ-dlp-daily-text-v1",
+            Self::DailyXmlV1 => "occ-dlp-daily-xml-results-record-v1",
+        }
+    }
+
+    /// Returns the canonical media type retained after exact response admission.
+    pub const fn media_type(self) -> &'static str {
+        match self {
+            Self::SelectedTextV1 | Self::DailyTextV1 => "text/plain",
+            Self::DailyXmlV1 => "application/xml",
+        }
+    }
+}
 
 /// OCC product type from the current DLP download record layout.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -97,7 +130,7 @@ pub enum OccProductType {
 }
 
 impl OccProductType {
-    fn try_from_provider(value: &str) -> Result<Self, OccParseError> {
+    pub(crate) fn try_from_provider(value: &str) -> Result<Self, OccParseError> {
         match value {
             "EU" => Ok(Self::EquityUnderlying),
             "EB" => Ok(Self::EquityBounds),
@@ -120,7 +153,29 @@ impl OccProductType {
         }
     }
 
-    const fn position_limit_required(self) -> bool {
+    pub(crate) const fn provider_code(self) -> &'static str {
+        match self {
+            Self::EquityUnderlying => "EU",
+            Self::EquityBounds => "EB",
+            Self::EquityLongTerm => "EL",
+            Self::EquityFlex => "EF",
+            Self::CurrencyUnderlying => "CU",
+            Self::CurrencyLongTerm => "CL",
+            Self::CurrencyMonthEnd => "CM",
+            Self::CurrencyFlex => "CF",
+            Self::IndexLongTerm => "IL",
+            Self::IndexUnderlying => "IU",
+            Self::IndexFlex => "IF",
+            Self::InterestRateFutures => "GF",
+            Self::StockFutures => "SF",
+            Self::FuturesCashIndex => "FC",
+            Self::FuturesPhysicalIndex => "FP",
+            Self::TreasuryUnderlying => "TU",
+            Self::TreasuryLongTerm => "TL",
+        }
+    }
+
+    const fn is_equity_product(self) -> bool {
         matches!(
             self,
             Self::EquityUnderlying | Self::EquityBounds | Self::EquityLongTerm | Self::EquityFlex
@@ -194,7 +249,7 @@ pub enum OccExchangeCode {
 }
 
 impl OccExchangeCode {
-    fn try_from_byte(value: u8) -> Result<Self, OccParseError> {
+    pub(crate) fn try_from_byte(value: u8) -> Result<Self, OccParseError> {
         match value {
             b'A' => Ok(Self::Amex),
             b'B' => Ok(Self::Box),
@@ -219,16 +274,48 @@ impl OccExchangeCode {
             _ => Err(OccParseError::InvalidExchangeCode),
         }
     }
+
+    pub(crate) const fn provider_byte(self) -> u8 {
+        match self {
+            Self::Amex => b'A',
+            Self::Box => b'B',
+            Self::Cboe => b'C',
+            Self::Emld => b'D',
+            Self::Edgx => b'E',
+            Self::Cfe => b'F',
+            Self::Gem => b'H',
+            Self::Ise => b'I',
+            Self::Mcry => b'J',
+            Self::Xmfe => b'K',
+            Self::Sphr => b'L',
+            Self::Miax => b'M',
+            Self::Arca => b'P',
+            Self::Nasdaq => b'Q',
+            Self::Mprl => b'R',
+            Self::Nobo => b'T',
+            Self::Memx => b'U',
+            Self::C2 => b'W',
+            Self::Phlx => b'X',
+            Self::Bats => b'Z',
+        }
+    }
 }
 
 /// Position-limit field state retained without converting unavailable to zero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "value")]
 pub enum OccPositionLimit {
-    /// OCC reported an exact integral limit.
-    Reported(u64),
-    /// The DLP layout states the field is unavailable for the product type.
-    NotAvailableForProduct,
+    /// A documented equity product carried an exact nonzero position limit.
+    EquityReported(NonZeroU64),
+    /// A non-equity product carried source zero, consistent with the layout's unavailable rule.
+    NonEquityUnavailableZero,
+    /// A non-equity row carried a nonzero source value despite the published layout saying the
+    /// field is unavailable. The raw value is retained but is not promoted to decision-usable
+    /// position-limit authority.
+    NonEquityProviderValueOutsideDocumentedScope {
+        /// Exact unexpected nonzero source value.
+        raw_value: NonZeroU64,
+    },
 }
 
 /// Qualified meaning of presence in one exact OCC DLP publication.
@@ -237,6 +324,34 @@ pub enum OccPositionLimit {
 pub enum OccDlpPresence {
     /// Product/root appeared in this exact reference object.
     PresentInDirectoryPublication,
+}
+
+/// Exact exchange-list evidence carried by an OCC DLP row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OccExchangeListingEvidence {
+    /// One or more exact OCC exchange codes were reported.
+    Reported,
+    /// The selected-directory wire carried its documented single-blank exchange sentinel.
+    /// Directory presence alone must not be promoted to current tradability.
+    NotReportedInSelectedDirectory,
+}
+
+impl OccExchangeListingEvidence {
+    pub(crate) const fn stable_label(self) -> &'static str {
+        match self {
+            Self::Reported => "reported",
+            Self::NotReportedInSelectedDirectory => "not_reported_in_selected_directory",
+        }
+    }
+
+    pub(crate) fn try_from_stable_label(value: &str) -> Result<Self, OccParseError> {
+        match value {
+            "reported" => Ok(Self::Reported),
+            "not_reported_in_selected_directory" => Ok(Self::NotReportedInSelectedDirectory),
+            _ => Err(OccParseError::InvalidExchangeCode),
+        }
+    }
 }
 
 /// One provider-native OCC Directory of Listed Products row.
@@ -253,6 +368,7 @@ pub struct OccDlpProductReference {
     underlying_symbol: ProviderInstrumentId,
     symbol_name: String,
     trading_exchanges: Vec<OccExchangeCode>,
+    exchange_listing_evidence: OccExchangeListingEvidence,
     position_limit: OccPositionLimit,
     product_type: OccProductType,
     presence: OccDlpPresence,
@@ -288,6 +404,12 @@ impl OccDlpProductReference {
     /// Returns every provider-reported trading-exchange code in deterministic order.
     pub fn trading_exchanges(&self) -> &[OccExchangeCode] {
         &self.trading_exchanges
+    }
+
+    /// Returns whether exact exchange codes were present or the selected-directory blank sentinel
+    /// was retained.
+    pub const fn exchange_listing_evidence(&self) -> OccExchangeListingEvidence {
+        self.exchange_listing_evidence
     }
 
     /// Returns exact position-limit state.
@@ -342,6 +464,7 @@ impl OccDlpParseReceipt {
 #[derive(Clone, Debug)]
 pub struct OccDlpParser {
     context: ReferenceObjectContext,
+    schema: OccDlpSchema,
 }
 
 impl OccDlpParser {
@@ -351,17 +474,32 @@ impl OccDlpParser {
     ///
     /// Rejects a non-OCC/non-DLP context, wrong media type, or wrong native schema identity.
     pub fn try_new(context: ReferenceObjectContext) -> Result<Self, OccParseError> {
+        let schema = match context.native_schema().as_str() {
+            "occ-dlp-selected-text-os-us-sn-exch-pl-onn-v1" => OccDlpSchema::SelectedTextV1,
+            "occ-dlp-daily-text-v1" => OccDlpSchema::DailyTextV1,
+            "occ-dlp-daily-xml-results-record-v1" => OccDlpSchema::DailyXmlV1,
+            _ => return Err(OccParseError::InvalidContext),
+        };
         if context.provider() != ReferenceProvider::Occ
             || !matches!(
                 context.surface(),
-                ReferenceSurface::OccDlpSelectedText | ReferenceSurface::OccDlpDailyText
+                ReferenceSurface::OccDlpSelectedText
+                    | ReferenceSurface::OccDlpDailyText
+                    | ReferenceSurface::OccDlpDailyXml
             )
-            || context.media_type().as_str() != "text/plain"
-            || context.native_schema().as_str() != "occ-dlp-text-os-us-sn-exch-pl-onn-v1"
+            || context.media_type().as_str() != schema.media_type()
+            || !matches!(
+                (context.surface(), schema),
+                (
+                    ReferenceSurface::OccDlpSelectedText,
+                    OccDlpSchema::SelectedTextV1
+                ) | (ReferenceSurface::OccDlpDailyText, OccDlpSchema::DailyTextV1)
+                    | (ReferenceSurface::OccDlpDailyXml, OccDlpSchema::DailyXmlV1)
+            )
         {
             return Err(OccParseError::InvalidContext);
         }
-        Ok(Self { context })
+        Ok(Self { context, schema })
     }
 
     /// Decodes strict tab-separated provider text into a caller-owned bounded sink.
@@ -370,15 +508,35 @@ impl OccDlpParser {
     ///
     /// Rejects payload drift, size/row bounds, malformed rows, unknown provider codes, missing
     /// required position limits, or sink rejection. Any failure suppresses a completion receipt.
-    pub fn parse<F>(&self, bytes: &[u8], mut sink: F) -> Result<OccDlpParseReceipt, OccParseError>
+    pub fn parse<F>(&self, bytes: &[u8], sink: F) -> Result<OccDlpParseReceipt, OccParseError>
     where
         F: FnMut(OccDlpProductReference) -> Result<(), OccParseError>,
     {
         validate_payload(&self.context, bytes, OCC_DLP_MAX_BYTES)?;
+        match self.schema {
+            OccDlpSchema::SelectedTextV1 => self.parse_text(bytes, TextWireSchema::Selected, sink),
+            OccDlpSchema::DailyTextV1 => self.parse_text(bytes, TextWireSchema::Daily, sink),
+            OccDlpSchema::DailyXmlV1 => self.parse_xml(bytes, sink),
+        }
+    }
+
+    fn parse_text<F>(
+        &self,
+        bytes: &[u8],
+        wire_schema: TextWireSchema,
+        mut sink: F,
+    ) -> Result<OccDlpParseReceipt, OccParseError>
+    where
+        F: FnMut(OccDlpProductReference) -> Result<(), OccParseError>,
+    {
+        if !has_only_complete_crlf_records(bytes) || bytes.contains(&0) {
+            return Err(OccParseError::IncompletePublication);
+        }
         let mut reader = ReaderBuilder::new()
             .delimiter(b'\t')
             .has_headers(false)
             .flexible(false)
+            .quoting(false)
             .trim(csv::Trim::None)
             .from_reader(bytes);
         let mut returned = 0_u32;
@@ -390,7 +548,12 @@ impl OccDlpParser {
                 return Err(OccParseError::RecordLimitExceeded);
             }
             let row = result.map_err(|_| OccParseError::MalformedText)?;
-            sink(parse_dlp_row(returned, &row, self.context.clone())?)?;
+            sink(parse_dlp_text_row(
+                returned,
+                &row,
+                wire_schema,
+                self.context.clone(),
+            )?)?;
         }
         if returned == 0 {
             return Err(OccParseError::EmptyPublication);
@@ -400,35 +563,358 @@ impl OccDlpParser {
             returned_records: returned,
         })
     }
+
+    fn parse_xml<F>(&self, bytes: &[u8], mut sink: F) -> Result<OccDlpParseReceipt, OccParseError>
+    where
+        F: FnMut(OccDlpProductReference) -> Result<(), OccParseError>,
+    {
+        let mut reader = Reader::from_reader(bytes);
+        reader.config_mut().trim_text(false);
+        let mut depth = 0_usize;
+        let mut saw_declaration = false;
+        let mut saw_root = false;
+        let mut closed_root = false;
+        let mut in_record = false;
+        let mut record = OccXmlRecord::default();
+        let mut returned = 0_u32;
+
+        loop {
+            match reader.read_event() {
+                Ok(Event::Decl(declaration)) if depth == 0 && !saw_declaration && !saw_root => {
+                    if declaration.version().ok().as_deref() != Some(b"1.0")
+                        || declaration.encoding().transpose().ok().flatten().as_deref()
+                            != Some(b"ISO-8859-1")
+                    {
+                        return Err(OccParseError::UnknownXmlSchema);
+                    }
+                    saw_declaration = true;
+                }
+                Ok(Event::Start(start)) => {
+                    if start.attributes().next().is_some() {
+                        return Err(OccParseError::UnknownXmlSchema);
+                    }
+                    depth = depth
+                        .checked_add(1)
+                        .ok_or(OccParseError::UnknownXmlSchema)?;
+                    let name = start.name();
+                    match depth {
+                        1 if name.as_ref() == b"results" && !saw_root => saw_root = true,
+                        2 if name.as_ref() == b"record" && saw_root && !in_record => {
+                            in_record = true;
+                            record = OccXmlRecord::default();
+                        }
+                        3 if in_record => record.begin(name.as_ref())?,
+                        _ => return Err(OccParseError::UnknownXmlSchema),
+                    }
+                }
+                Ok(Event::Text(text)) => {
+                    let decoded = text.decode().map_err(|_| OccParseError::MalformedXml)?;
+                    let value = quick_xml::escape::unescape(&decoded)
+                        .map_err(|_| OccParseError::MalformedXml)?;
+                    if record.active_field.is_none() {
+                        let structural_depth =
+                            depth == 0 || (depth == 1 && !in_record) || (depth == 2 && in_record);
+                        if !structural_depth
+                            || !value.bytes().all(|byte| byte.is_ascii_whitespace())
+                        {
+                            return Err(OccParseError::UnknownXmlSchema);
+                        }
+                    } else if depth == 3 && in_record && record.active_field == Some(2) {
+                        return Err(OccParseError::UnknownXmlSchema);
+                    } else if depth == 3 && in_record {
+                        record.append(value.as_ref())?;
+                    } else {
+                        return Err(OccParseError::UnknownXmlSchema);
+                    }
+                }
+                Ok(Event::CData(text)) if depth == 3 && in_record => {
+                    let value = text.decode().map_err(|_| OccParseError::MalformedXml)?;
+                    record.append_cdata(value.as_ref())?;
+                }
+                Ok(Event::End(end)) => {
+                    let name = end.name();
+                    match depth {
+                        3 if in_record => record.end(name.as_ref())?,
+                        2 if in_record && name.as_ref() == b"record" => {
+                            returned = returned
+                                .checked_add(1)
+                                .ok_or(OccParseError::RecordLimitExceeded)?;
+                            if returned > OCC_DLP_MAX_RECORDS {
+                                return Err(OccParseError::RecordLimitExceeded);
+                            }
+                            sink(record.finish(returned, self.context.clone())?)?;
+                            in_record = false;
+                            record = OccXmlRecord::default();
+                        }
+                        1 if name.as_ref() == b"results" && saw_root && !closed_root => {
+                            closed_root = true;
+                        }
+                        _ => return Err(OccParseError::UnknownXmlSchema),
+                    }
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or(OccParseError::UnknownXmlSchema)?;
+                }
+                Ok(Event::Eof) => break,
+                Ok(
+                    Event::Decl(_)
+                    | Event::Empty(_)
+                    | Event::Comment(_)
+                    | Event::DocType(_)
+                    | Event::PI(_)
+                    | Event::GeneralRef(_)
+                    | Event::CData(_),
+                ) => return Err(OccParseError::UnknownXmlSchema),
+                Err(_) => return Err(OccParseError::MalformedXml),
+            }
+        }
+        if depth != 0
+            || !saw_declaration
+            || !saw_root
+            || !closed_root
+            || in_record
+            || !record.is_empty()
+            || returned == 0
+        {
+            return Err(OccParseError::IncompletePublication);
+        }
+        Ok(OccDlpParseReceipt {
+            context: self.context.clone(),
+            returned_records: returned,
+        })
+    }
 }
 
-fn parse_dlp_row(
+const OCC_XML_FIELDS: [&[u8]; 6] = [
+    b"optionSymbol",
+    b"underlyingSymbol",
+    b"symbolName",
+    b"positionLimit",
+    b"onnProductType",
+    b"exchanges",
+];
+
+struct OccXmlRecord {
+    fields: [Option<String>; 6],
+    next_field: usize,
+    active_field: Option<usize>,
+}
+
+impl Default for OccXmlRecord {
+    fn default() -> Self {
+        Self {
+            fields: std::array::from_fn(|_| None),
+            next_field: 0,
+            active_field: None,
+        }
+    }
+}
+
+impl OccXmlRecord {
+    fn begin(&mut self, name: &[u8]) -> Result<(), OccParseError> {
+        let expected = OCC_XML_FIELDS
+            .get(self.next_field)
+            .ok_or(OccParseError::UnknownXmlSchema)?;
+        if self.active_field.is_some() || name != *expected {
+            return Err(OccParseError::UnknownXmlSchema);
+        }
+        self.fields[self.next_field] = Some(String::new());
+        self.active_field = Some(self.next_field);
+        Ok(())
+    }
+
+    fn append(&mut self, value: &str) -> Result<(), OccParseError> {
+        let index = self.active_field.ok_or(OccParseError::UnknownXmlSchema)?;
+        let maximum = match index {
+            0 | 1 => MAX_SYMBOL_BYTES,
+            2 => MAX_SYMBOL_NAME_BYTES,
+            3 => 20,
+            4 => 2,
+            5 => 32,
+            _ => return Err(OccParseError::UnknownXmlSchema),
+        };
+        let target = self.fields[index]
+            .as_mut()
+            .ok_or(OccParseError::UnknownXmlSchema)?;
+        if target.len().saturating_add(value.len()) > maximum {
+            return Err(OccParseError::FieldTooLarge);
+        }
+        target.push_str(value);
+        Ok(())
+    }
+
+    fn append_cdata(&mut self, value: &str) -> Result<(), OccParseError> {
+        if self.active_field != Some(2) {
+            return Err(OccParseError::UnknownXmlSchema);
+        }
+        self.append(value)
+    }
+
+    fn end(&mut self, name: &[u8]) -> Result<(), OccParseError> {
+        let index = self.active_field.ok_or(OccParseError::UnknownXmlSchema)?;
+        if name != OCC_XML_FIELDS[index] {
+            return Err(OccParseError::UnknownXmlSchema);
+        }
+        self.active_field = None;
+        self.next_field = self
+            .next_field
+            .checked_add(1)
+            .ok_or(OccParseError::UnknownXmlSchema)?;
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        row_number: u32,
+        context: ReferenceObjectContext,
+    ) -> Result<OccDlpProductReference, OccParseError> {
+        if self.next_field != OCC_XML_FIELDS.len() || self.active_field.is_some() {
+            return Err(OccParseError::UnknownXmlSchema);
+        }
+        let mut fields = self.fields.into_iter();
+        let values: [String; 6] =
+            std::array::from_fn(|_| fields.next().flatten().unwrap_or_default());
+        parse_dlp_values(
+            row_number,
+            [
+                values[0].as_str(),
+                values[1].as_str(),
+                values[2].as_str(),
+                values[5].as_str(),
+                values[3].as_str(),
+                values[4].as_str(),
+            ],
+            PositionLimitWireFormat::CanonicalDecimal,
+            ExchangeWireFormat::CodesRequired,
+            context,
+        )
+    }
+
+    fn is_empty(&self) -> bool {
+        self.next_field == 0
+            && self.active_field.is_none()
+            && self.fields.iter().all(Option::is_none)
+    }
+}
+
+fn parse_dlp_text_row(
     row_number: u32,
     row: &StringRecord,
+    wire_schema: TextWireSchema,
     context: ReferenceObjectContext,
 ) -> Result<OccDlpProductReference, OccParseError> {
-    if row.len() != 6 {
-        return Err(OccParseError::MalformedText);
-    }
     let field = |index| row.get(index).ok_or(OccParseError::MalformedText);
-    let options_symbol = parse_provider_symbol(field(0)?)?;
-    let underlying_symbol = parse_provider_symbol(field(1)?)?;
-    let symbol_name = field(2)?;
-    if symbol_name.is_empty() || symbol_name.len() > MAX_SYMBOL_NAME_BYTES {
+    match wire_schema {
+        TextWireSchema::Daily => {
+            if row.len() != 6 {
+                return Err(OccParseError::MalformedText);
+            }
+            parse_dlp_values(
+                row_number,
+                [
+                    field(0)?,
+                    field(1)?,
+                    field(2)?,
+                    field(3)?,
+                    field(4)?,
+                    field(5)?,
+                ],
+                PositionLimitWireFormat::TextFixedTwelveDigits,
+                ExchangeWireFormat::CodesRequired,
+                context,
+            )
+        }
+        TextWireSchema::Selected => {
+            if row.len() != 7
+                || !field(6)?.is_empty()
+                || field(0)?.len() != 6
+                || field(1)?.len() != 6
+                || field(2)?.len() != 50
+            {
+                return Err(OccParseError::MalformedText);
+            }
+            let options_symbol = right_trim_fixed_field(field(0)?)?;
+            let underlying_symbol = right_trim_fixed_field(field(1)?)?;
+            let symbol_name = right_trim_fixed_field(field(2)?)?;
+            parse_dlp_values(
+                row_number,
+                [
+                    options_symbol,
+                    underlying_symbol,
+                    symbol_name,
+                    field(3)?,
+                    field(4)?,
+                    field(5)?,
+                ],
+                PositionLimitWireFormat::CanonicalDecimal,
+                ExchangeWireFormat::SelectedBlankAllowed,
+                context,
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PositionLimitWireFormat {
+    TextFixedTwelveDigits,
+    CanonicalDecimal,
+}
+
+#[derive(Clone, Copy)]
+enum TextWireSchema {
+    Selected,
+    Daily,
+}
+
+#[derive(Clone, Copy)]
+enum ExchangeWireFormat {
+    CodesRequired,
+    SelectedBlankAllowed,
+}
+
+fn parse_dlp_values(
+    row_number: u32,
+    fields: [&str; 6],
+    position_wire_format: PositionLimitWireFormat,
+    exchange_wire_format: ExchangeWireFormat,
+    context: ReferenceObjectContext,
+) -> Result<OccDlpProductReference, OccParseError> {
+    let options_symbol = parse_provider_symbol(fields[0])?;
+    let underlying_symbol = parse_provider_symbol(fields[1])?;
+    let symbol_name = fields[2];
+    if symbol_name.is_empty()
+        || symbol_name.len() > MAX_SYMBOL_NAME_BYTES
+        || symbol_name.chars().any(char::is_control)
+    {
         return Err(OccParseError::InvalidSymbolName);
     }
-    let trading_exchanges = parse_exchange_codes(field(3)?)?;
-    let product_type = OccProductType::try_from_provider(field(5)?)?;
-    let position_limit = match field(4)? {
-        "" if product_type.position_limit_required() => {
-            return Err(OccParseError::InvalidPositionLimit);
+    let (trading_exchanges, exchange_listing_evidence) =
+        parse_exchange_codes(fields[3], exchange_wire_format)?;
+    let product_type = OccProductType::try_from_provider(fields[5])?;
+    let raw_position_limit = fields[4];
+    let valid_position_wire = match position_wire_format {
+        PositionLimitWireFormat::TextFixedTwelveDigits => raw_position_limit.len() == 12,
+        PositionLimitWireFormat::CanonicalDecimal => {
+            !raw_position_limit.is_empty()
+                && raw_position_limit.len() <= 20
+                && (raw_position_limit == "0" || !raw_position_limit.starts_with('0'))
         }
-        "" => OccPositionLimit::NotAvailableForProduct,
-        value => OccPositionLimit::Reported(
-            value
-                .parse::<u64>()
-                .map_err(|_| OccParseError::InvalidPositionLimit)?,
+    } && raw_position_limit.bytes().all(|byte| byte.is_ascii_digit());
+    if !valid_position_wire {
+        return Err(OccParseError::InvalidPositionLimit);
+    }
+    let parsed_position_limit = raw_position_limit
+        .parse::<u64>()
+        .map_err(|_| OccParseError::InvalidPositionLimit)?;
+    let position_limit = match (product_type.is_equity_product(), parsed_position_limit) {
+        (true, 0) => return Err(OccParseError::InvalidPositionLimit),
+        (true, value) => OccPositionLimit::EquityReported(
+            NonZeroU64::new(value).ok_or(OccParseError::InvalidPositionLimit)?,
         ),
+        (false, 0) => OccPositionLimit::NonEquityUnavailableZero,
+        (false, value) => OccPositionLimit::NonEquityProviderValueOutsideDocumentedScope {
+            raw_value: NonZeroU64::new(value).ok_or(OccParseError::InvalidPositionLimit)?,
+        },
     };
     let record_id = SourceIdentifier::try_from(format!(
         "occ-dlp:{}:row-{row_number}",
@@ -443,6 +929,7 @@ fn parse_dlp_row(
         underlying_symbol,
         symbol_name: symbol_name.to_owned(),
         trading_exchanges,
+        exchange_listing_evidence,
         position_limit,
         product_type,
         presence: OccDlpPresence::PresentInDirectoryPublication,
@@ -462,24 +949,63 @@ fn parse_provider_symbol(value: &str) -> Result<ProviderInstrumentId, OccParseEr
     ProviderInstrumentId::try_from(value).map_err(|_| OccParseError::InvalidSymbol)
 }
 
-fn parse_exchange_codes(value: &str) -> Result<Vec<OccExchangeCode>, OccParseError> {
-    if value.is_empty() || value.starts_with(' ') || value.ends_with(' ') || value.contains("  ") {
+fn parse_exchange_codes(
+    value: &str,
+    wire_format: ExchangeWireFormat,
+) -> Result<(Vec<OccExchangeCode>, OccExchangeListingEvidence), OccParseError> {
+    if matches!(wire_format, ExchangeWireFormat::SelectedBlankAllowed) && value == " " {
+        return Ok((
+            Vec::new(),
+            OccExchangeListingEvidence::NotReportedInSelectedDirectory,
+        ));
+    }
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_uppercase()) {
         return Err(OccParseError::InvalidExchangeCode);
     }
     let mut result = BTreeSet::new();
-    for byte in value.bytes().filter(|byte| *byte != b' ') {
+    let mut previous = None;
+    for byte in value.bytes() {
+        if previous.is_some_and(|prior| prior >= byte) {
+            return Err(OccParseError::DuplicateExchangeCode);
+        }
         if !result.insert(OccExchangeCode::try_from_byte(byte)?) {
             return Err(OccParseError::DuplicateExchangeCode);
         }
+        previous = Some(byte);
     }
     if result.is_empty() {
         return Err(OccParseError::InvalidExchangeCode);
     }
-    Ok(result.into_iter().collect())
+    Ok((
+        result.into_iter().collect(),
+        OccExchangeListingEvidence::Reported,
+    ))
+}
+
+fn right_trim_fixed_field(value: &str) -> Result<&str, OccParseError> {
+    let trimmed = value.trim_end_matches(' ');
+    if trimmed.is_empty()
+        || value[..trimmed.len()].contains('\t')
+        || value[trimmed.len()..].bytes().any(|byte| byte != b' ')
+    {
+        Err(OccParseError::MalformedText)
+    } else {
+        Ok(trimmed)
+    }
+}
+
+fn has_only_complete_crlf_records(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes.ends_with(b"\r\n")
+        && bytes.iter().enumerate().all(|(index, byte)| match byte {
+            b'\n' => index > 0 && bytes[index - 1] == b'\r',
+            b'\r' => bytes.get(index + 1) == Some(&b'\n'),
+            _ => true,
+        })
 }
 
 /// OCC Information Memo category from the selected search/export surface.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OccMemoCategory {
     /// Contract Adjustment.
@@ -572,6 +1098,7 @@ impl OccMemoDiscovery {
             || memo_number == 0
             || title.is_empty()
             || title.len() > MAX_MEMO_TITLE_BYTES
+            || title.chars().any(char::is_control)
             || categories.is_empty()
             || categories.len() > MAX_MEMO_CATEGORIES
         {
@@ -951,8 +1478,7 @@ fn parse_memo_wire(
         .map(parse_mm_dd_yyyy)
         .transpose()?;
     let categories = parse_categories(wire.categories.iter().map(String::as_str))?;
-    let memo_locator =
-        SourceIdentifier::try_from(wire.memo_url).map_err(|_| OccParseError::InvalidMemo)?;
+    let memo_locator = parse_occ_memo_locator(&wire.memo_url, wire.number)?;
     OccMemoDiscovery::try_new(
         row_number,
         wire.number,
@@ -963,6 +1489,27 @@ fn parse_memo_wire(
         memo_locator,
         context,
     )
+}
+
+fn parse_occ_memo_locator(
+    value: &str,
+    memo_number: u64,
+) -> Result<SourceIdentifier, OccParseError> {
+    let url = reqwest::Url::parse(value).map_err(|_| OccParseError::InvalidMemo)?;
+    let expected_query = format!("number={memo_number}");
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.host_str() != Some("infomemo.theocc.com")
+        || url.port().is_some()
+        || url.path() != "/infomemos"
+        || url.query() != Some(expected_query.as_str())
+        || url.fragment().is_some()
+        || url.as_str() != value
+    {
+        return Err(OccParseError::InvalidMemo);
+    }
+    SourceIdentifier::try_from(value).map_err(|_| OccParseError::InvalidMemo)
 }
 
 fn parse_categories<'a, I>(values: I) -> Result<Vec<OccMemoCategory>, OccParseError>
@@ -1081,6 +1628,18 @@ pub enum OccParseError {
     /// Text framing or exact field count was malformed.
     #[error("malformed OCC DLP text")]
     MalformedText,
+    /// XML tokenization or declared source encoding was malformed.
+    #[error("malformed OCC DLP XML")]
+    MalformedXml,
+    /// XML root, record, field ordering, or declaration differed from the frozen contract.
+    #[error("unrecognized OCC DLP XML schema")]
+    UnknownXmlSchema,
+    /// The source object did not contain its required terminal framing/root closure.
+    #[error("incomplete OCC DLP publication")]
+    IncompletePublication,
+    /// One provider field exceeded its exact local bound.
+    #[error("OCC DLP provider field exceeds its bound")]
+    FieldTooLarge,
     /// CSV framing or exact field count was malformed.
     #[error("malformed OCC Information Memo CSV")]
     MalformedCsv,

@@ -14,13 +14,14 @@ use market_squawk_domain::{
 use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_sources::{
     ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
 };
 use reqwest::cookie::Jar;
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER,
     USER_AGENT,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, watch};
@@ -29,13 +30,17 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::durable::{
+    MAX_YAHOO_DURABLE_CACHE_BODY_BYTES, YahooDurableCacheEntry, YahooDurableState,
+};
 use crate::{
     AdapterBounds, AdmissionDecision, AdmissionPolicy, AdmissionRejection, AttemptDisposition,
     AttemptKind, AttemptOutcome, AttemptPermit, ParseContext, YahooAdapterError, YahooAdmission,
-    YahooAssetClass, YahooChart, YahooEnrichment, YahooFundData, YahooHttpMethod, YahooHttpRequest,
-    YahooLookupHint, YahooOptionChain, YahooQuote, YahooReference, YahooRequestFamily,
-    YahooRequestPlan, YahooReturnedDisposition, parse_chart_response, parse_fund_response,
-    parse_lookup_response, parse_option_response, parse_quote_response, parse_reference_response,
+    YahooAssetClass, YahooChart, YahooDurableStateStore, YahooEnrichment, YahooFundData,
+    YahooHttpMethod, YahooHttpRequest, YahooLookupHint, YahooOptionChain, YahooQuote,
+    YahooReference, YahooRequestFamily, YahooRequestPlan, YahooReturnedDisposition,
+    parse_chart_response, parse_fund_response, parse_lookup_response, parse_option_response,
+    parse_quote_response, parse_reference_response,
 };
 
 const FALLBACK_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
@@ -108,7 +113,8 @@ pub enum YahooExecutionDisposition {
     Coalesced,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "target", content = "family", rename_all = "kebab-case")]
 pub enum YahooAttemptTarget {
     CookieBootstrap,
     BasicCrumb,
@@ -119,7 +125,8 @@ pub enum YahooAttemptTarget {
     Data(YahooRequestFamily),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct YahooHttpAttemptReceipt {
     pub kind: AttemptKind,
     pub target: YahooAttemptTarget,
@@ -134,9 +141,11 @@ pub struct YahooHttpAttemptReceipt {
 
 #[derive(Clone, Debug)]
 pub struct YahooRawReceipt {
+    pub request: YahooHttpRequest,
     pub request_identity_sha256_hex: String,
     pub request_family: YahooRequestFamily,
     pub request_target_without_crumb: String,
+    pub effective_arguments: BTreeMap<String, String>,
     pub response_status: u16,
     pub response_content_type: Option<String>,
     pub response_sha256_hex: String,
@@ -161,29 +170,72 @@ pub struct YahooHttpResult {
     pub disposition: YahooExecutionDisposition,
     pub raw: Arc<YahooRawReceipt>,
     pub parsed: Arc<YahooParsedResponse>,
+    pub(crate) publication: Option<Arc<YahooPublicationCapability>>,
 }
 
 impl YahooHttpResult {
-    /// Returns exact network-owner material eligible for one raw-capture publication.
-    /// Cache replays and coalesced callers are intentionally non-publication results.
-    pub fn publication_raw(&self) -> Option<&YahooRawReceipt> {
-        (self.disposition == YahooExecutionDisposition::Network).then_some(self.raw.as_ref())
-    }
-
     /// Binds one network-owner response to an exact standalone provider capture.
     ///
-    /// Cache/coalesced results cannot publish again. The material contains only source identity,
-    /// request/body receipts, and the exact response bytes; Yahoo cookies, crumbs, clients, and
-    /// admission/session state are structurally absent.
+    /// The first successful preflight claims the one-shot handoff across every result clone.
+    /// Failed preflight leaves it available; cache/coalesced results have no capability. The
+    /// material contains only source identity, request/body receipts, and the exact response
+    /// bytes; Yahoo cookies, crumbs, clients, and admission/session state are structurally absent.
     pub fn publication_material(
         &self,
         binding: YahooPublicationBinding,
     ) -> Result<ProviderCaptureMaterial, YahooPublicationBridgeError> {
-        let raw = self
-            .publication_raw()
+        let publication = self
+            .publication
+            .as_ref()
             .ok_or(YahooPublicationBridgeError::NonPublicationResult)?;
-        raw.capture_material(binding)
+        let mut claim = publication
+            .claim
+            .lock()
+            .map_err(|_| YahooPublicationBridgeError::PublicationClaimUnavailable)?;
+        if matches!(*claim, YahooPublicationClaim::Claimed(_)) {
+            return Err(YahooPublicationBridgeError::PublicationAlreadyClaimed);
+        }
+        let material = publication.raw.capture_material(binding)?;
+        *claim = YahooPublicationClaim::Claimed(material.receipt().clone());
+        Ok(material)
     }
+
+    pub(crate) fn claimed_publication_raw(
+        &self,
+        sealed_capture: &SealedProviderCaptureSetReceipt,
+    ) -> Result<&YahooRawReceipt, YahooPublicationBridgeError> {
+        let publication = self
+            .publication
+            .as_ref()
+            .ok_or(YahooPublicationBridgeError::NonPublicationResult)?;
+        let claim = publication
+            .claim
+            .lock()
+            .map_err(|_| YahooPublicationBridgeError::PublicationClaimUnavailable)?;
+        match &*claim {
+            YahooPublicationClaim::Available => {
+                Err(YahooPublicationBridgeError::PublicationNotClaimed)
+            }
+            YahooPublicationClaim::Claimed(receipt) if receipt == sealed_capture.capture() => {
+                Ok(publication.raw.as_ref())
+            }
+            YahooPublicationClaim::Claimed(_) => {
+                Err(YahooPublicationBridgeError::PublicationClaimMismatch)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct YahooPublicationCapability {
+    raw: Arc<YahooRawReceipt>,
+    claim: Mutex<YahooPublicationClaim>,
+}
+
+#[derive(Debug)]
+enum YahooPublicationClaim {
+    Available,
+    Claimed(ProviderCaptureSetReceipt),
 }
 
 /// Caller-owned capture identity that is independent of Yahoo cookie/crumb state.
@@ -287,6 +339,14 @@ impl YahooRawReceipt {
 pub enum YahooPublicationBridgeError {
     #[error("cache and coalesced Yahoo results cannot create another publication")]
     NonPublicationResult,
+    #[error("the Yahoo network response publication was already claimed")]
+    PublicationAlreadyClaimed,
+    #[error("the Yahoo network response publication has not been claimed")]
+    PublicationNotClaimed,
+    #[error("the Yahoo publication claim state is unavailable")]
+    PublicationClaimUnavailable,
+    #[error("the sealed Yahoo capture does not match the claimed publication")]
+    PublicationClaimMismatch,
     #[error("Yahoo publication timestamp is outside the canonical range")]
     InvalidTimestamp,
     #[error("Yahoo publication digest is malformed or does not match exact bytes")]
@@ -363,6 +423,7 @@ struct SessionInner {
     config: YahooHttpSessionConfig,
     endpoints: EndpointSet,
     admission: YahooAdmission,
+    durable: Option<YahooDurableStateStore>,
     network: AsyncMutex<NetworkState>,
     shared: Mutex<SharedState>,
 }
@@ -427,12 +488,16 @@ struct SharedState {
     cache: BTreeMap<String, CacheEntry>,
     cache_bytes: usize,
     next_sequence: u64,
+    durable_state_version: u64,
+    durable_healthy: bool,
     in_flight: BTreeMap<String, watch::Sender<Option<SharedOutcome>>>,
 }
 
+#[derive(Clone)]
 struct CacheEntry {
+    request: YahooHttpRequest,
     payload: Arc<ExecutionPayload>,
-    stored_at: Instant,
+    stored_at_unix_ms: i64,
     bytes: usize,
     sequence: u64,
 }
@@ -457,27 +522,45 @@ enum BeginExecution {
 
 impl YahooHttpSession {
     pub fn new(config: YahooHttpSessionConfig) -> Result<Self, YahooHttpFailureKind> {
-        Self::build(config, EndpointSet::production())
+        Self::build(config, EndpointSet::production(), None)
+    }
+
+    /// Constructs one explicit-demand session with crash-safe provider cache and admission state.
+    ///
+    /// The store is consumed so another session cannot independently own the same provider lane.
+    /// Persisted state contains no cookie jar or crumb; those are always re-established in memory.
+    pub fn new_with_durable_state(
+        config: YahooHttpSessionConfig,
+        store: YahooDurableStateStore,
+    ) -> Result<Self, YahooHttpFailureKind> {
+        Self::build(config, EndpointSet::production(), Some(store))
     }
 
     fn build(
         config: YahooHttpSessionConfig,
         endpoints: EndpointSet,
+        durable: Option<YahooDurableStateStore>,
     ) -> Result<Self, YahooHttpFailureKind> {
         let config = config.validate()?;
+        if durable.is_some() && config.max_cache_bytes > MAX_YAHOO_DURABLE_CACHE_BODY_BYTES {
+            return Err(YahooHttpFailureKind::InvalidConfiguration);
+        }
+        let restored = durable
+            .as_ref()
+            .map(YahooDurableStateStore::load)
+            .transpose()
+            .map_err(|_| YahooHttpFailureKind::StateUnavailable)?
+            .flatten();
+        let (admission, shared) = restore_shared_state(&config, &endpoints, restored)?;
         let network = NetworkState::new(CookieStrategy::Basic, &config, &endpoints)?;
         Ok(Self {
             inner: Arc::new(SessionInner {
                 config,
                 endpoints,
-                admission: YahooAdmission::new(config.admission_policy),
+                admission,
+                durable,
                 network: AsyncMutex::new(network),
-                shared: Mutex::new(SharedState {
-                    cache: BTreeMap::new(),
-                    cache_bytes: 0,
-                    next_sequence: 1,
-                    in_flight: BTreeMap::new(),
-                }),
+                shared: Mutex::new(shared),
             }),
         })
     }
@@ -533,14 +616,14 @@ impl YahooHttpSession {
             BeginExecution::Owner { permit, sender } => {
                 let outcome = self
                     .execute_owner(
-                        request,
+                        &request,
                         identity.clone(),
                         permit,
                         limits.deadline,
                         cancellation,
                     )
                     .await;
-                self.publish_outcome(&identity, &sender, &outcome);
+                let outcome = self.publish_outcome(&request, &identity, &sender, outcome);
                 match outcome {
                     Ok(payload) => Ok(result_from_payload(
                         payload,
@@ -561,15 +644,31 @@ impl YahooHttpSession {
         let mut shared = self.inner.shared.lock().map_err(|_| {
             YahooHttpFailure::without_attempts(YahooHttpFailureKind::StateUnavailable)
         })?;
+        if !shared.durable_healthy {
+            return Ok(BeginExecution::Refused(
+                YahooHttpFailureKind::StateUnavailable,
+            ));
+        }
+        let now = wall_time_ms().map_err(|_| {
+            YahooHttpFailure::without_attempts(YahooHttpFailureKind::StateUnavailable)
+        })?;
+        let maximum_cache_age_ms =
+            i64::try_from(duration_ms(maximum_cache_age)).unwrap_or(i64::MAX);
         if !maximum_cache_age.is_zero()
             && let Some(entry) = shared.cache.get(identity)
-            && entry.stored_at.elapsed() <= maximum_cache_age
+            && now
+                .checked_sub(entry.stored_at_unix_ms)
+                .is_some_and(|age| age >= 0 && age <= maximum_cache_age_ms)
         {
             let payload = Arc::clone(&entry.payload);
             self.inner
                 .admission
                 .record_cache_hit()
                 .map_err(YahooHttpFailure::from_admission)?;
+            if let Err(kind) = self.persist_quiescent(&mut shared) {
+                shared.durable_healthy = false;
+                return Err(YahooHttpFailure::without_attempts(kind));
+            }
             return Ok(BeginExecution::Cached(payload));
         }
         if let Some(sender) = shared.in_flight.get(identity) {
@@ -579,9 +678,6 @@ impl YahooHttpSession {
                 .map_err(YahooHttpFailure::from_admission)?;
             return Ok(BeginExecution::Join(sender.subscribe()));
         }
-        let now = wall_time_ms().map_err(|_| {
-            YahooHttpFailure::without_attempts(YahooHttpFailureKind::StateUnavailable)
-        })?;
         match self
             .inner
             .admission
@@ -646,7 +742,7 @@ impl YahooHttpSession {
 
     async fn execute_owner(
         &self,
-        request: YahooHttpRequest,
+        request: &YahooHttpRequest,
         identity: String,
         mut permit: AttemptPermit,
         caller_deadline: Instant,
@@ -659,7 +755,7 @@ impl YahooHttpSession {
         let mut attempts = Vec::new();
         let result = self
             .execute_network(
-                &request,
+                request,
                 &identity,
                 &mut permit,
                 &mut attempts,
@@ -819,12 +915,13 @@ impl YahooHttpSession {
             measure.returned_records,
             disposition,
         )?;
-        let available_at_unix_ms =
-            wall_time_ms().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+        let available_at_unix_ms = parse_context.available_at_unix_ms;
         let raw = Arc::new(YahooRawReceipt {
+            request: request.clone(),
             request_identity_sha256_hex: identity.to_owned(),
             request_family: request.family,
             request_target_without_crumb: request.target.clone(),
+            effective_arguments: request.effective_arguments.clone(),
             response_status,
             response_content_type: content_type,
             response_sha256_hex,
@@ -841,17 +938,62 @@ impl YahooHttpSession {
 
     fn publish_outcome(
         &self,
+        request: &YahooHttpRequest,
         identity: &str,
         sender: &watch::Sender<Option<SharedOutcome>>,
-        outcome: &SharedOutcome,
-    ) {
-        if let Ok(mut shared) = self.inner.shared.lock() {
-            shared.in_flight.remove(identity);
-            if let Ok(payload) = outcome {
-                insert_cache(&mut shared, identity, payload, &self.inner.config);
+        outcome: SharedOutcome,
+    ) -> SharedOutcome {
+        let finalized = match self.inner.shared.lock() {
+            Ok(mut shared) => {
+                shared.in_flight.remove(identity);
+                let result = (|| {
+                    if let Ok(payload) = &outcome {
+                        let stored_at_unix_ms =
+                            wall_time_ms().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+                        insert_cache(
+                            &mut shared,
+                            identity,
+                            request,
+                            payload,
+                            stored_at_unix_ms,
+                            &self.inner.config,
+                        );
+                    }
+                    self.persist_quiescent(&mut shared)
+                })();
+                match result {
+                    Ok(()) => outcome,
+                    Err(_) => {
+                        shared.durable_healthy = false;
+                        state_failure(&outcome)
+                    }
+                }
             }
+            Err(_) => state_failure(&outcome),
+        };
+        sender.send_replace(Some(finalized.clone()));
+        finalized
+    }
+
+    fn persist_quiescent(&self, shared: &mut SharedState) -> Result<(), YahooHttpFailureKind> {
+        let Some(store) = &self.inner.durable else {
+            return Ok(());
+        };
+        let admission = self
+            .inner
+            .admission
+            .snapshot()
+            .map_err(|_| YahooHttpFailureKind::AdmissionUnavailable)?;
+        if admission.active_request_key.is_some()
+            || matches!(admission.circuit, crate::CircuitSnapshot::HalfOpen)
+        {
+            return Ok(());
         }
-        sender.send_replace(Some(outcome.clone()));
+        let cache = durable_cache_snapshot(shared)?;
+        shared.durable_state_version = store
+            .compare_and_store(shared.durable_state_version, admission, cache)
+            .map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+        Ok(())
     }
 
     fn circuit_is_open(&self) -> Result<bool, YahooHttpFailureKind> {
@@ -1728,7 +1870,7 @@ fn request_units(request: &YahooHttpRequest) -> usize {
     }
 }
 
-fn request_identity(request: &YahooHttpRequest) -> String {
+pub(crate) fn request_identity(request: &YahooHttpRequest) -> String {
     let mut digest = Sha256::new();
     digest.update(format!("{:?}\n{}\n", request.family, request.target));
     for (key, value) in &request.effective_arguments {
@@ -1744,17 +1886,26 @@ fn result_from_payload(
     payload: Arc<ExecutionPayload>,
     disposition: YahooExecutionDisposition,
 ) -> YahooHttpResult {
+    let publication = (disposition == YahooExecutionDisposition::Network).then(|| {
+        Arc::new(YahooPublicationCapability {
+            raw: Arc::clone(&payload.raw),
+            claim: Mutex::new(YahooPublicationClaim::Available),
+        })
+    });
     YahooHttpResult {
         disposition,
         raw: Arc::clone(&payload.raw),
         parsed: Arc::clone(&payload.parsed),
+        publication,
     }
 }
 
 fn insert_cache(
     shared: &mut SharedState,
     identity: &str,
+    request: &YahooHttpRequest,
     payload: &Arc<ExecutionPayload>,
+    stored_at_unix_ms: i64,
     config: &YahooHttpSessionConfig,
 ) {
     let bytes = payload.raw.response_bytes.len();
@@ -1784,13 +1935,209 @@ fn insert_cache(
     shared.cache.insert(
         identity.to_owned(),
         CacheEntry {
+            request: request.clone(),
             payload: Arc::clone(payload),
-            stored_at: Instant::now(),
+            stored_at_unix_ms,
             bytes,
             sequence,
         },
     );
     shared.cache_bytes = shared.cache_bytes.saturating_add(bytes);
+}
+
+fn restore_shared_state(
+    config: &YahooHttpSessionConfig,
+    endpoints: &EndpointSet,
+    restored: Option<YahooDurableState>,
+) -> Result<(YahooAdmission, SharedState), YahooHttpFailureKind> {
+    let Some(restored) = restored else {
+        return Ok((
+            YahooAdmission::new(config.admission_policy),
+            SharedState {
+                cache: BTreeMap::new(),
+                cache_bytes: 0,
+                next_sequence: 1,
+                durable_state_version: 0,
+                durable_healthy: true,
+                in_flight: BTreeMap::new(),
+            },
+        ));
+    };
+    if restored.cache.len() > config.max_cache_entries {
+        return Err(YahooHttpFailureKind::StateUnavailable);
+    }
+    let admission = YahooAdmission::try_restore(config.admission_policy, restored.admission)
+        .map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+    let mut cache = BTreeMap::new();
+    let mut cache_bytes = 0_usize;
+    for persisted in restored.cache {
+        let identity = persisted.request_identity_sha256_hex.clone();
+        let entry = restore_cache_entry(config, endpoints, persisted)?;
+        cache_bytes = cache_bytes
+            .checked_add(entry.bytes)
+            .ok_or(YahooHttpFailureKind::StateUnavailable)?;
+        if cache_bytes > config.max_cache_bytes || cache.insert(identity, entry).is_some() {
+            return Err(YahooHttpFailureKind::StateUnavailable);
+        }
+    }
+    let maximum_sequence = cache
+        .values()
+        .map(|entry| entry.sequence)
+        .max()
+        .unwrap_or(0);
+    let next_sequence = maximum_sequence
+        .checked_add(1)
+        .ok_or(YahooHttpFailureKind::StateUnavailable)?;
+    Ok((
+        admission,
+        SharedState {
+            cache,
+            cache_bytes,
+            next_sequence,
+            durable_state_version: restored.state_version,
+            durable_healthy: true,
+            in_flight: BTreeMap::new(),
+        },
+    ))
+}
+
+fn restore_cache_entry(
+    config: &YahooHttpSessionConfig,
+    endpoints: &EndpointSet,
+    persisted: YahooDurableCacheEntry,
+) -> Result<CacheEntry, YahooHttpFailureKind> {
+    validate_selected_request(&persisted.request, endpoints)
+        .map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+    let body_length = persisted.response_bytes.len();
+    if body_length == 0
+        || body_length > config.adapter_bounds.max_response_bytes
+        || body_length > config.max_cache_bytes
+        || request_identity(&persisted.request) != persisted.request_identity_sha256_hex
+        || evidence_digest_from_hex(&persisted.request_identity_sha256_hex).is_err()
+        || sha256_hex(&persisted.response_bytes) != persisted.response_sha256_hex
+        || !(200..300).contains(&persisted.response_status)
+        || !persisted
+            .response_content_type
+            .as_deref()
+            .is_some_and(content_type_is_json)
+        || persisted.received_at_unix_ms > persisted.available_at_unix_ms
+        || persisted.available_at_unix_ms > persisted.stored_at_unix_ms
+        || DateTime::<Utc>::from_timestamp_millis(persisted.received_at_unix_ms).is_none()
+        || DateTime::<Utc>::from_timestamp_millis(persisted.available_at_unix_ms).is_none()
+        || persisted.attempts.is_empty()
+        || persisted.attempts.len() > config.max_attempt_receipts
+        || persisted.attempts.iter().any(|attempt| {
+            attempt.started_at_unix_ms > attempt.completed_at_unix_ms
+                || attempt.completed_at_unix_ms > persisted.received_at_unix_ms
+        })
+    {
+        return Err(YahooHttpFailureKind::StateUnavailable);
+    }
+    let final_attempt = persisted
+        .attempts
+        .iter()
+        .rev()
+        .find(|attempt| attempt.target == YahooAttemptTarget::Data(persisted.request.family))
+        .ok_or(YahooHttpFailureKind::StateUnavailable)?;
+    if final_attempt.status != Some(persisted.response_status)
+        || final_attempt.response_bytes != body_length
+        || final_attempt.response_sha256_hex.as_deref()
+            != Some(persisted.response_sha256_hex.as_str())
+        || final_attempt.completed_at_unix_ms != persisted.received_at_unix_ms
+        || !matches!(
+            final_attempt.disposition,
+            AttemptDisposition::Success | AttemptDisposition::Partial
+        )
+    {
+        return Err(YahooHttpFailureKind::StateUnavailable);
+    }
+    let context = ParseContext {
+        received_at_unix_ms: persisted.received_at_unix_ms,
+        available_at_unix_ms: persisted.available_at_unix_ms,
+    };
+    let parsed = parse_selected_response(
+        &persisted.request,
+        &context,
+        config.adapter_bounds,
+        &persisted.response_bytes,
+    )
+    .map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+    let raw = YahooRawReceipt {
+        request: persisted.request.clone(),
+        request_identity_sha256_hex: persisted.request_identity_sha256_hex,
+        request_family: persisted.request.family,
+        request_target_without_crumb: persisted.request.target.clone(),
+        effective_arguments: persisted.request.effective_arguments.clone(),
+        response_status: persisted.response_status,
+        response_content_type: persisted.response_content_type,
+        response_sha256_hex: persisted.response_sha256_hex,
+        response_bytes: Bytes::from(persisted.response_bytes),
+        received_at_unix_ms: persisted.received_at_unix_ms,
+        available_at_unix_ms: persisted.available_at_unix_ms,
+        attempts: persisted.attempts.into_boxed_slice(),
+    };
+    Ok(CacheEntry {
+        request: persisted.request,
+        payload: Arc::new(ExecutionPayload {
+            raw: Arc::new(raw),
+            parsed: Arc::new(parsed),
+        }),
+        stored_at_unix_ms: persisted.stored_at_unix_ms,
+        bytes: body_length,
+        sequence: persisted.sequence,
+    })
+}
+
+fn durable_cache_snapshot(
+    shared: &SharedState,
+) -> Result<Vec<YahooDurableCacheEntry>, YahooHttpFailureKind> {
+    let mut persisted = Vec::new();
+    persisted
+        .try_reserve_exact(shared.cache.len())
+        .map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+    for (identity, entry) in &shared.cache {
+        let raw = entry.payload.raw.as_ref();
+        if identity != &raw.request_identity_sha256_hex
+            || entry.bytes != raw.response_bytes.len()
+            || raw.request != entry.request
+            || raw.request_family != entry.request.family
+            || raw.request_target_without_crumb != entry.request.target
+            || raw.effective_arguments != entry.request.effective_arguments
+        {
+            return Err(YahooHttpFailureKind::StateUnavailable);
+        }
+        persisted.push(YahooDurableCacheEntry {
+            request_identity_sha256_hex: identity.clone(),
+            request: entry.request.clone(),
+            response_status: raw.response_status,
+            response_content_type: raw.response_content_type.clone(),
+            response_sha256_hex: raw.response_sha256_hex.clone(),
+            response_bytes: raw.response_bytes.to_vec(),
+            received_at_unix_ms: raw.received_at_unix_ms,
+            available_at_unix_ms: raw.available_at_unix_ms,
+            attempts: raw.attempts.to_vec(),
+            stored_at_unix_ms: entry.stored_at_unix_ms,
+            sequence: entry.sequence,
+        });
+    }
+    Ok(persisted)
+}
+
+fn state_failure(outcome: &SharedOutcome) -> SharedOutcome {
+    let attempts = match outcome {
+        Ok(payload) => payload.raw.attempts.to_vec(),
+        Err(failure) => failure.attempts.to_vec(),
+    };
+    Err(Arc::new(YahooHttpFailure::new(
+        YahooHttpFailureKind::StateUnavailable,
+        attempts,
+    )))
+}
+
+fn content_type_is_json(value: &str) -> bool {
+    value.split(';').next().is_some_and(|mime| {
+        mime.trim().eq_ignore_ascii_case("application/json") || mime.trim().ends_with("+json")
+    })
 }
 
 async fn deadline_wait<T>(
@@ -2189,19 +2536,31 @@ fn build_client(
 
 #[cfg(test)]
 impl YahooHttpSession {
-    pub(crate) fn new_for_test(
+    pub(crate) fn new_for_test_with_durable(
         config: YahooHttpSessionConfig,
         base: Url,
         responses: Vec<ScriptedHttpResponse>,
+        durable: Option<YahooDurableStateStore>,
     ) -> Result<Self, YahooHttpFailureKind> {
         let config = config.validate()?;
+        if durable.is_some() && config.max_cache_bytes > MAX_YAHOO_DURABLE_CACHE_BODY_BYTES {
+            return Err(YahooHttpFailureKind::InvalidConfiguration);
+        }
         let endpoints = EndpointSet::local(base);
+        let restored = durable
+            .as_ref()
+            .map(YahooDurableStateStore::load)
+            .transpose()
+            .map_err(|_| YahooHttpFailureKind::StateUnavailable)?
+            .flatten();
+        let (admission, shared) = restore_shared_state(&config, &endpoints, restored)?;
         let cookie_jar = Arc::new(Jar::default());
         Ok(Self {
             inner: Arc::new(SessionInner {
                 config,
                 endpoints,
-                admission: YahooAdmission::new(config.admission_policy),
+                admission,
+                durable,
                 network: AsyncMutex::new(NetworkState {
                     strategy: CookieStrategy::Basic,
                     client: WireClient::Scripted(AsyncMutex::new(ScriptedWireState {
@@ -2211,12 +2570,7 @@ impl YahooHttpSession {
                     _cookie_jar: cookie_jar,
                     crumb: None,
                 }),
-                shared: Mutex::new(SharedState {
-                    cache: BTreeMap::new(),
-                    cache_bytes: 0,
-                    next_sequence: 1,
-                    in_flight: BTreeMap::new(),
-                }),
+                shared: Mutex::new(shared),
             }),
         })
     }

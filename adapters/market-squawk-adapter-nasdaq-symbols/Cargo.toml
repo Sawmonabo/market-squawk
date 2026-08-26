@@ -10,17 +10,26 @@ publish = false
 
 [dependencies]
 bytes.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+chrono.workspace = true
 futures-util.workspace = true
 httpdate.workspace = true
+libc.workspace = true
 market-squawk-domain.workspace = true
+market-squawk-platform.workspace = true
 market-squawk-sources.workspace = true
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tokio-util.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

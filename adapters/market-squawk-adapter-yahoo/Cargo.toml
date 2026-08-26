@@ -9,6 +9,7 @@ repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
 [dependencies]
+base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true

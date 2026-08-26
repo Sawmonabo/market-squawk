@@ -4686,17 +4686,24 @@ name = "market-squawk-adapter-nasdaq-symbols"
 version = "1.0.0"
 dependencies = [
  "bytes",
+ "cap-fs-ext",
+ "cap-std",
+ "chrono",
  "futures-util",
  "httpdate",
+ "libc",
  "market-squawk-domain",
+ "market-squawk-platform",
  "market-squawk-sources",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -4721,12 +4728,27 @@ dependencies = [
 name = "market-squawk-adapter-options-reference"
 version = "1.0.0"
 dependencies = [
+ "bytes",
+ "cap-fs-ext",
+ "cap-std",
  "csv",
+ "fs2",
+ "futures-util",
+ "httpdate",
+ "libc",
  "market-squawk-domain",
+ "market-squawk-sources",
+ "quick-xml",
+ "reqwest",
+ "rusqlite",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4811,6 +4833,7 @@ dependencies = [
  "cap-std",
  "chrono",
  "futures-util",
+ "httpdate",
  "libc",
  "market-squawk-domain",
  "market-squawk-platform",
@@ -4827,6 +4850,7 @@ dependencies = [
  "tokio-util",
  "url",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -4900,6 +4924,7 @@ dependencies = [
 name = "market-squawk-adapter-yahoo"
 version = "1.0.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "futures-util",

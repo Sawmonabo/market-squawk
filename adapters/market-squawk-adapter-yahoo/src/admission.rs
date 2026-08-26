@@ -73,7 +73,7 @@ pub struct AttemptOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, tag = "state", rename_all = "kebab-case")]
 pub enum CircuitSnapshot {
     Closed,
     Open { retry_at_unix_ms: i64 },
@@ -81,6 +81,7 @@ pub enum CircuitSnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdmissionSnapshot {
     pub logical_primary_operations_total: u64,
     pub actual_http_attempts_total: u64,
@@ -114,6 +115,8 @@ pub enum AdmissionRejection {
     StalePermit,
     #[error("admission telemetry counter overflowed")]
     CounterOverflow,
+    #[error("persisted Yahoo admission state is not a complete quiescent snapshot")]
+    InvalidPersistedState,
 }
 
 #[derive(Debug)]
@@ -198,6 +201,38 @@ impl YahooAdmission {
                 snapshot,
             })),
         }
+    }
+
+    /// Restores one complete quiescent provider-wide circuit and telemetry snapshot.
+    ///
+    /// A snapshot taken while a request or half-open probe is active is deliberately rejected:
+    /// request execution is process-local and cannot be resumed after a crash. The application
+    /// persists only snapshots returned after an operation completes, so no request target,
+    /// cookie, crumb, response body, or cache entry becomes durable admission state.
+    pub fn try_restore(
+        policy: AdmissionPolicy,
+        snapshot: AdmissionSnapshot,
+    ) -> Result<Self, AdmissionRejection> {
+        validate_restored_snapshot(policy, &snapshot)?;
+        let circuit = match snapshot.circuit {
+            CircuitSnapshot::Closed => CircuitState::Closed,
+            CircuitSnapshot::Open { retry_at_unix_ms } => CircuitState::Open { retry_at_unix_ms },
+            CircuitSnapshot::HalfOpen => return Err(AdmissionRejection::InvalidPersistedState),
+        };
+        let next_attempt_id = snapshot
+            .logical_primary_operations_total
+            .max(snapshot.actual_http_attempts_total)
+            .checked_add(1)
+            .ok_or(AdmissionRejection::CounterOverflow)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(AdmissionState {
+                policy,
+                next_attempt_id,
+                active: None,
+                circuit,
+                snapshot,
+            })),
+        })
     }
 
     pub fn admit(
@@ -570,4 +605,34 @@ fn request_accounting_units(request: &YahooHttpRequest) -> usize {
 fn checked_add(left: u64, right: u64) -> Result<u64, AdmissionRejection> {
     left.checked_add(right)
         .ok_or(AdmissionRejection::CounterOverflow)
+}
+
+fn validate_restored_snapshot(
+    policy: AdmissionPolicy,
+    snapshot: &AdmissionSnapshot,
+) -> Result<(), AdmissionRejection> {
+    let accounted_units = snapshot
+        .returned_units_total
+        .checked_add(snapshot.missing_units_total)
+        .ok_or(AdmissionRejection::InvalidPersistedState)?;
+    let classified_attempts = snapshot
+        .http_429_total
+        .checked_add(snapshot.transport_failures_total)
+        .and_then(|value| value.checked_add(snapshot.schema_failures_total))
+        .and_then(|value| value.checked_add(snapshot.cancelled_attempts_total))
+        .and_then(|value| value.checked_add(snapshot.deadline_exceeded_attempts_total))
+        .ok_or(AdmissionRejection::InvalidPersistedState)?;
+    if snapshot.active_request_key.is_some()
+        || matches!(snapshot.circuit, CircuitSnapshot::HalfOpen)
+        || accounted_units != snapshot.requested_units_total
+        || snapshot.maximum_observed_response_bytes
+            > usize::try_from(snapshot.response_bytes_total).unwrap_or(usize::MAX)
+        || snapshot.maximum_observed_latency_ms > snapshot.latency_ms_total
+        || classified_attempts > snapshot.actual_http_attempts_total
+        || (matches!(snapshot.circuit, CircuitSnapshot::Closed)
+            && snapshot.consecutive_failures >= policy.repeated_failure_threshold)
+    {
+        return Err(AdmissionRejection::InvalidPersistedState);
+    }
+    Ok(())
 }

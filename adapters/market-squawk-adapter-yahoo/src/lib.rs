@@ -7,6 +7,8 @@
 //! coalescing, and circuit state across every clone in one process.
 
 mod admission;
+mod canonical;
+mod durable;
 mod error;
 mod http;
 mod model;
@@ -16,6 +18,14 @@ mod request;
 pub use admission::{
     AdmissionDecision, AdmissionPolicy, AdmissionRejection, AdmissionSnapshot, AttemptDisposition,
     AttemptKind, AttemptOutcome, AttemptPermit, CircuitSnapshot, YahooAdmission,
+};
+pub use canonical::{
+    YahooChartInstrumentAuthority, YahooChartMapError, YahooChartMappingInput,
+    YahooHistoricalBarTimeAuthority, YahooHistoricalBarTimeRequest, YahooMappedChartHistory,
+    map_chart_bars,
+};
+pub use durable::{
+    MAX_YAHOO_DURABLE_CACHE_BODY_BYTES, YahooDurableStateError, YahooDurableStateStore,
 };
 pub use error::YahooAdapterError;
 pub use http::{

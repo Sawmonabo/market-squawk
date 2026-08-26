@@ -1,22 +1,73 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
+use std::time::UNIX_EPOCH;
 
 use market_squawk_domain::{
-    AvailabilityEvidence, EvidenceDigest, ResearchTemporalCoordinate, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, CalendarDate, DigestAlgorithm, EvidenceDigest,
+    ResearchTemporalCoordinate, SourceIdentifier, Timestamp,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{CboeSeriesReference, CboeVenue, OccDlpProductReference, OccMemoDiscovery};
+use crate::CboeVenue;
 
 const MAX_PUBLICATION_SURFACES: usize = 64;
 const MAX_PUBLICATION_PAGES: u32 = 10_000;
 const MAX_PUBLICATION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_PUBLICATION_RECORDS: u64 = 12_000_000;
 const MAX_PUBLICATION_CONFLICTS: usize = 100_000;
+const MAX_HTTP_DATE_EVIDENCE_BYTES: usize = 128;
+const MAX_TRANSPORT_HEADER_EVIDENCE_BYTES: usize = 1_024;
+const MAX_TRANSPORT_REDIRECTS: usize = 4;
+const MAX_REFERENCE_TRANSPORT_ELAPSED_NANOS: u64 = 10 * 60 * 1_000_000_000;
+const REFERENCE_EVIDENCE_DIGEST_BYTES: usize = 32;
+
+/// Exact bounded HTTP date field retained separately from provider-native and local clocks.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpLastModifiedEvidence {
+    raw: String,
+    instant: Timestamp,
+}
+
+impl HttpLastModifiedEvidence {
+    pub(crate) fn try_from_header(value: &str) -> Result<Self, PublicationError> {
+        if value.is_empty()
+            || value.len() > MAX_HTTP_DATE_EVIDENCE_BYTES
+            || !value.is_ascii()
+            || value.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        let system_time =
+            httpdate::parse_http_date(value).map_err(|_| PublicationError::InvalidObjectContext)?;
+        if httpdate::fmt_http_date(system_time) != value {
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        let nanos = system_time
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .ok_or(PublicationError::InvalidObjectContext)?;
+        Ok(Self {
+            raw: value.to_owned(),
+            instant: Timestamp::from_unix_nanos(nanos),
+        })
+    }
+
+    /// Returns the exact retained HTTP field value.
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// Returns the strictly parsed IMF-fixdate instant.
+    pub const fn instant(&self) -> Timestamp {
+        self.instant
+    }
+}
 
 /// Provider namespace retained by every reference object and record.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceProvider {
     /// The Options Clearing Corporation.
@@ -26,7 +77,7 @@ pub enum ReferenceProvider {
 }
 
 /// Exact selected reference surface represented by one requested publication component.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ReferenceSurface {
     /// One venue-specific Cboe `All Series` CSV file.
@@ -38,6 +89,8 @@ pub enum ReferenceSurface {
     OccDlpSelectedText,
     /// OCC dated DLP HTTP download text.
     OccDlpDailyText,
+    /// OCC dated DLP HTTP download XML.
+    OccDlpDailyXml,
     /// OCC Information Memo export/index CSV.
     OccMemoIndexCsv,
     /// Closed OCC Information Memo index JSON page.
@@ -63,6 +116,7 @@ impl ReferenceSurface {
             Self::CboeAllSeries { .. } => ReferenceProvider::Cboe,
             Self::OccDlpSelectedText
             | Self::OccDlpDailyText
+            | Self::OccDlpDailyXml
             | Self::OccMemoIndexCsv
             | Self::OccMemoIndexJson
             | Self::OccMemoDocument { .. }
@@ -219,6 +273,7 @@ pub struct ObjectClockEvidence {
     effective: Option<ResearchTemporalCoordinate>,
     availability: AvailabilityEvidence,
     received_at: Timestamp,
+    transport_elapsed_nanos: u64,
 }
 
 impl ObjectClockEvidence {
@@ -232,10 +287,13 @@ impl ObjectClockEvidence {
         effective: Option<ResearchTemporalCoordinate>,
         availability: AvailabilityEvidence,
         received_at: Timestamp,
+        transport_elapsed_nanos: u64,
     ) -> Result<Self, PublicationError> {
         if availability
             .reported_at()
             .is_some_and(|available_at| available_at > received_at)
+            || transport_elapsed_nanos == 0
+            || transport_elapsed_nanos > MAX_REFERENCE_TRANSPORT_ELAPSED_NANOS
         {
             return Err(PublicationError::InvalidClockOrder);
         }
@@ -244,6 +302,7 @@ impl ObjectClockEvidence {
             effective,
             availability,
             received_at,
+            transport_elapsed_nanos,
         })
     }
 
@@ -266,6 +325,1032 @@ impl ObjectClockEvidence {
     pub const fn received_at(&self) -> Timestamp {
         self.received_at
     }
+
+    /// Returns monotonic HTTP send through terminal response-body elapsed time.
+    pub const fn transport_elapsed_nanos(&self) -> u64 {
+        self.transport_elapsed_nanos
+    }
+}
+
+/// HTTP method sealed into every official request receipt.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceRequestMethod {
+    /// Idempotent retrieval with no request body.
+    Get,
+}
+
+/// Exact request-body disposition. The selected official surfaces permit no request body.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum ReferenceRequestBodyEvidence {
+    /// The request intentionally carried no body; the digest is SHA-256 of the empty byte string.
+    Absent {
+        /// Digest of the exact empty request body.
+        digest: EvidenceDigest,
+        /// Exact request body length, always zero for this variant.
+        bytes: u64,
+    },
+}
+
+impl ReferenceRequestBodyEvidence {
+    fn absent() -> Self {
+        Self::Absent {
+            digest: sha256_digest(&[]),
+            bytes: 0,
+        }
+    }
+
+    /// Returns the exact request-body digest.
+    pub const fn digest(&self) -> EvidenceDigest {
+        match self {
+            Self::Absent { digest, .. } => *digest,
+        }
+    }
+
+    /// Returns the exact request-body byte count.
+    pub const fn bytes(&self) -> u64 {
+        match self {
+            Self::Absent { bytes, .. } => *bytes,
+        }
+    }
+}
+
+/// Closed conditional-validator field selected from one exact prior receipt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum ReferenceConditionalValidatorEvidence {
+    /// Exact `If-None-Match` entity tag.
+    EntityTag(String),
+    /// Exact `If-Modified-Since` IMF-fixdate.
+    LastModified(String),
+}
+
+impl ReferenceConditionalValidatorEvidence {
+    fn value(&self) -> &str {
+        match self {
+            Self::EntityTag(value) | Self::LastModified(value) => value,
+        }
+    }
+}
+
+/// Exact provider-native decoder identity, version, and semantic contract fingerprint.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceNativeSchemaIdentity {
+    name: SourceIdentifier,
+    version: NonZeroU32,
+    fingerprint: EvidenceDigest,
+}
+
+impl ReferenceNativeSchemaIdentity {
+    /// Constructs a complete native schema identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-SHA-256 or all-zero semantic fingerprint.
+    pub(crate) fn try_new(
+        name: SourceIdentifier,
+        version: NonZeroU32,
+        fingerprint: EvidenceDigest,
+    ) -> Result<Self, PublicationError> {
+        ensure_sha256(fingerprint)?;
+        Ok(Self {
+            name,
+            version,
+            fingerprint,
+        })
+    }
+
+    /// Returns the stable code-owned schema name.
+    pub const fn name(&self) -> &SourceIdentifier {
+        &self.name
+    }
+
+    /// Returns the nonzero native schema version.
+    pub const fn version(&self) -> NonZeroU32 {
+        self.version
+    }
+
+    /// Returns the SHA-256 fingerprint of the complete code-owned native schema contract.
+    pub const fn fingerprint(&self) -> EvidenceDigest {
+        self.fingerprint
+    }
+
+    fn canonical_digest(&self) -> EvidenceDigest {
+        let mut hash =
+            CanonicalEvidenceHasher::new(b"market-squawk:options-reference-native-schema:v1\0");
+        hash.identifier(1, &self.name);
+        hash.u32(2, self.version.get());
+        hash.digest(3, self.fingerprint);
+        hash.finish()
+    }
+
+    fn try_revalidated(&self) -> Result<Self, PublicationError> {
+        let validated = Self::try_new(self.name.clone(), self.version, self.fingerprint)?;
+        if validated == *self {
+            Ok(validated)
+        } else {
+            Err(PublicationError::InvalidObjectContext)
+        }
+    }
+}
+
+/// Complete prior-object edge authorizing a conditional GET and exact 304 reuse.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceConditionalPriorEvidence {
+    validator: ReferenceConditionalValidatorEvidence,
+    surface: ReferenceSurface,
+    configured_locator: SourceIdentifier,
+    canonical_media_type: SourceIdentifier,
+    native_schema: ReferenceNativeSchemaIdentity,
+    prior_payload_digest: EvidenceDigest,
+    prior_payload_bytes: u64,
+    prior_object_id: SourceIdentifier,
+    prior_transport_receipt_digest: EvidenceDigest,
+}
+
+impl ReferenceConditionalPriorEvidence {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "conditional reuse authority is intentionally explicit and closed"
+    )]
+    pub(crate) fn try_new(
+        validator: ReferenceConditionalValidatorEvidence,
+        surface: ReferenceSurface,
+        configured_locator: SourceIdentifier,
+        canonical_media_type: SourceIdentifier,
+        native_schema: ReferenceNativeSchemaIdentity,
+        prior_payload_digest: EvidenceDigest,
+        prior_payload_bytes: u64,
+        prior_object_id: SourceIdentifier,
+        prior_transport_receipt_digest: EvidenceDigest,
+    ) -> Result<Self, PublicationError> {
+        if !valid_transport_header(validator.value()) || prior_payload_bytes == 0 {
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        ensure_sha256(prior_payload_digest)?;
+        ensure_sha256(prior_transport_receipt_digest)?;
+        Ok(Self {
+            validator,
+            surface,
+            configured_locator,
+            canonical_media_type,
+            native_schema,
+            prior_payload_digest,
+            prior_payload_bytes,
+            prior_object_id,
+            prior_transport_receipt_digest,
+        })
+    }
+
+    /// Returns the exact conditional validator.
+    pub const fn validator(&self) -> &ReferenceConditionalValidatorEvidence {
+        &self.validator
+    }
+
+    /// Returns the prior object's selected surface.
+    pub const fn surface(&self) -> &ReferenceSurface {
+        &self.surface
+    }
+
+    /// Returns the prior object's configured official locator.
+    pub const fn configured_locator(&self) -> &SourceIdentifier {
+        &self.configured_locator
+    }
+
+    /// Returns the prior object's canonical media type.
+    pub const fn canonical_media_type(&self) -> &SourceIdentifier {
+        &self.canonical_media_type
+    }
+
+    /// Returns the prior object's exact native schema identity.
+    pub const fn native_schema(&self) -> &ReferenceNativeSchemaIdentity {
+        &self.native_schema
+    }
+
+    /// Returns the prior payload digest authorized for reuse.
+    pub const fn prior_payload_digest(&self) -> EvidenceDigest {
+        self.prior_payload_digest
+    }
+
+    /// Returns the prior payload byte count authorized for reuse.
+    pub const fn prior_payload_bytes(&self) -> u64 {
+        self.prior_payload_bytes
+    }
+
+    /// Returns the exact prior object identity.
+    pub const fn prior_object_id(&self) -> &SourceIdentifier {
+        &self.prior_object_id
+    }
+
+    /// Returns the exact prior transport receipt used to mint this conditional edge.
+    pub const fn prior_transport_receipt_digest(&self) -> EvidenceDigest {
+        self.prior_transport_receipt_digest
+    }
+
+    fn canonical_digest(&self) -> EvidenceDigest {
+        let mut hash =
+            CanonicalEvidenceHasher::new(b"market-squawk:options-reference-conditional-prior:v1\0");
+        match &self.validator {
+            ReferenceConditionalValidatorEvidence::EntityTag(value) => {
+                hash.u8(1, 1);
+                hash.string(2, value);
+            }
+            ReferenceConditionalValidatorEvidence::LastModified(value) => {
+                hash.u8(1, 2);
+                hash.string(2, value);
+            }
+        }
+        hash.surface(3, &self.surface);
+        hash.identifier(4, &self.configured_locator);
+        hash.identifier(5, &self.canonical_media_type);
+        hash.digest(6, self.native_schema.canonical_digest());
+        hash.digest(7, self.prior_payload_digest);
+        hash.u64(8, self.prior_payload_bytes);
+        hash.identifier(9, &self.prior_object_id);
+        hash.digest(10, self.prior_transport_receipt_digest);
+        hash.finish()
+    }
+
+    fn try_revalidated(&self) -> Result<Self, PublicationError> {
+        let native_schema = self.native_schema.try_revalidated()?;
+        let validated = Self::try_new(
+            self.validator.clone(),
+            self.surface.clone(),
+            self.configured_locator.clone(),
+            self.canonical_media_type.clone(),
+            native_schema,
+            self.prior_payload_digest,
+            self.prior_payload_bytes,
+            self.prior_object_id.clone(),
+            self.prior_transport_receipt_digest,
+        )?;
+        if validated == *self {
+            Ok(validated)
+        } else {
+            Err(PublicationError::InvalidObjectContext)
+        }
+    }
+}
+
+/// Secret-free, immutable request seal from which the exact HTTP GET is constructed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceOfficialRequestEvidence {
+    source_id: SourceIdentifier,
+    provider_id: SourceIdentifier,
+    source_contract_digest: EvidenceDigest,
+    provider: ReferenceProvider,
+    surface: ReferenceSurface,
+    request_id: SourceIdentifier,
+    method: ReferenceRequestMethod,
+    configured_locator: SourceIdentifier,
+    accept: String,
+    accept_encoding_identity: bool,
+    user_agent: String,
+    body: ReferenceRequestBodyEvidence,
+    maximum_decoded_bytes: u64,
+    maximum_redirects: u8,
+    connect_timeout_nanos: u64,
+    read_timeout_nanos: u64,
+    total_timeout_nanos: u64,
+    operation_timeout_nanos: u64,
+    wall_started_at: Timestamp,
+    wall_deadline: Timestamp,
+    expected_publication_date: Option<CalendarDate>,
+    native_schema: ReferenceNativeSchemaIdentity,
+    conditional_prior: Option<ReferenceConditionalPriorEvidence>,
+}
+
+impl ReferenceOfficialRequestEvidence {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the complete official request seal is intentionally explicit"
+    )]
+    pub(crate) fn try_new(
+        source_id: SourceIdentifier,
+        provider_id: SourceIdentifier,
+        source_contract_digest: EvidenceDigest,
+        provider: ReferenceProvider,
+        surface: ReferenceSurface,
+        request_id: SourceIdentifier,
+        configured_locator: SourceIdentifier,
+        accept: impl Into<String>,
+        user_agent: impl Into<String>,
+        maximum_decoded_bytes: u64,
+        maximum_redirects: u8,
+        connect_timeout_nanos: u64,
+        read_timeout_nanos: u64,
+        total_timeout_nanos: u64,
+        operation_timeout_nanos: u64,
+        wall_started_at: Timestamp,
+        wall_deadline: Timestamp,
+        expected_publication_date: Option<CalendarDate>,
+        native_schema: ReferenceNativeSchemaIdentity,
+        conditional_prior: Option<ReferenceConditionalPriorEvidence>,
+    ) -> Result<Self, PublicationError> {
+        let accept = accept.into();
+        let user_agent = user_agent.into();
+        ensure_sha256(source_contract_digest)?;
+        if provider != surface.provider()
+            || !valid_transport_header(&accept)
+            || !valid_transport_header(&user_agent)
+            || maximum_decoded_bytes == 0
+            || usize::from(maximum_redirects) > MAX_TRANSPORT_REDIRECTS
+            || connect_timeout_nanos == 0
+            || read_timeout_nanos == 0
+            || total_timeout_nanos == 0
+            || operation_timeout_nanos == 0
+            || connect_timeout_nanos > total_timeout_nanos
+            || read_timeout_nanos > total_timeout_nanos
+            || operation_timeout_nanos > total_timeout_nanos
+            || wall_deadline <= wall_started_at
+            || conditional_prior.as_ref().is_some_and(|prior| {
+                prior.surface != surface
+                    || prior.configured_locator != configured_locator
+                    || prior.native_schema != native_schema
+                    || prior.prior_payload_bytes > maximum_decoded_bytes
+            })
+        {
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        Ok(Self {
+            source_id,
+            provider_id,
+            source_contract_digest,
+            provider,
+            surface,
+            request_id,
+            method: ReferenceRequestMethod::Get,
+            configured_locator,
+            accept,
+            accept_encoding_identity: true,
+            user_agent,
+            body: ReferenceRequestBodyEvidence::absent(),
+            maximum_decoded_bytes,
+            maximum_redirects,
+            connect_timeout_nanos,
+            read_timeout_nanos,
+            total_timeout_nanos,
+            operation_timeout_nanos,
+            wall_started_at,
+            wall_deadline,
+            expected_publication_date,
+            native_schema,
+            conditional_prior,
+        })
+    }
+
+    /// Returns the exact Market Squawk source identity.
+    pub const fn source_id(&self) -> &SourceIdentifier {
+        &self.source_id
+    }
+
+    /// Returns the exact shared-budget provider identity.
+    pub const fn provider_id(&self) -> &SourceIdentifier {
+        &self.provider_id
+    }
+
+    /// Returns the digest of the validated source authority contract.
+    pub const fn source_contract_digest(&self) -> EvidenceDigest {
+        self.source_contract_digest
+    }
+
+    /// Returns the exact provider namespace.
+    pub const fn provider(&self) -> ReferenceProvider {
+        self.provider
+    }
+
+    /// Returns the exact requested provider surface.
+    pub const fn surface(&self) -> &ReferenceSurface {
+        &self.surface
+    }
+
+    /// Returns the parent publication request identity.
+    pub const fn request_id(&self) -> &SourceIdentifier {
+        &self.request_id
+    }
+
+    /// Returns the exact HTTP method.
+    pub const fn method(&self) -> ReferenceRequestMethod {
+        self.method
+    }
+
+    /// Returns the configured code-owned locator.
+    pub const fn configured_locator(&self) -> &SourceIdentifier {
+        &self.configured_locator
+    }
+
+    /// Returns the exact `Accept` field.
+    pub fn accept(&self) -> &str {
+        &self.accept
+    }
+
+    /// Returns whether the request explicitly selected identity transfer encoding.
+    pub const fn accept_encoding_identity(&self) -> bool {
+        self.accept_encoding_identity
+    }
+
+    /// Returns the exact secret-free product User-Agent.
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    /// Returns the exact absent request-body evidence.
+    pub const fn body(&self) -> &ReferenceRequestBodyEvidence {
+        &self.body
+    }
+
+    /// Returns the decoded body safety ceiling.
+    pub const fn maximum_decoded_bytes(&self) -> u64 {
+        self.maximum_decoded_bytes
+    }
+
+    /// Returns the exact redirect ceiling used by the HTTP client.
+    pub const fn maximum_redirects(&self) -> u8 {
+        self.maximum_redirects
+    }
+
+    /// Returns the configured connection timeout.
+    pub const fn connect_timeout_nanos(&self) -> u64 {
+        self.connect_timeout_nanos
+    }
+
+    /// Returns the configured no-progress read timeout.
+    pub const fn read_timeout_nanos(&self) -> u64 {
+        self.read_timeout_nanos
+    }
+
+    /// Returns the configured whole-request timeout.
+    pub const fn total_timeout_nanos(&self) -> u64 {
+        self.total_timeout_nanos
+    }
+
+    /// Returns the exact smaller operation window admitted at send time.
+    pub const fn operation_timeout_nanos(&self) -> u64 {
+        self.operation_timeout_nanos
+    }
+
+    /// Returns the parent request admission time.
+    pub const fn wall_started_at(&self) -> Timestamp {
+        self.wall_started_at
+    }
+
+    /// Returns the hard wall-clock deadline.
+    pub const fn wall_deadline(&self) -> Timestamp {
+        self.wall_deadline
+    }
+
+    /// Returns the exact dated-file coordinate required by the request, when applicable.
+    pub const fn expected_publication_date(&self) -> Option<CalendarDate> {
+        self.expected_publication_date
+    }
+
+    /// Returns the exact native decoder contract selected before request construction.
+    pub const fn native_schema(&self) -> &ReferenceNativeSchemaIdentity {
+        &self.native_schema
+    }
+
+    /// Returns the exact prior-object conditional edge, when supplied.
+    pub const fn conditional_prior(&self) -> Option<&ReferenceConditionalPriorEvidence> {
+        self.conditional_prior.as_ref()
+    }
+
+    /// Returns the code-owned canonical SHA-256 request identity.
+    pub fn evidence_digest(&self) -> EvidenceDigest {
+        let mut hash =
+            CanonicalEvidenceHasher::new(b"market-squawk:options-reference-official-request:v4\0");
+        hash.identifier(1, &self.source_id);
+        hash.identifier(2, &self.provider_id);
+        hash.digest(3, self.source_contract_digest);
+        hash.provider(4, self.provider);
+        hash.surface(5, &self.surface);
+        hash.identifier(6, &self.request_id);
+        hash.u8(7, 1);
+        hash.identifier(8, &self.configured_locator);
+        hash.string(9, &self.accept);
+        hash.bool(10, self.accept_encoding_identity);
+        hash.string(11, &self.user_agent);
+        hash.digest(12, self.body.digest());
+        hash.u64(13, self.body.bytes());
+        hash.u64(14, self.maximum_decoded_bytes);
+        hash.u8(15, self.maximum_redirects);
+        hash.u64(16, self.connect_timeout_nanos);
+        hash.u64(17, self.read_timeout_nanos);
+        hash.u64(18, self.total_timeout_nanos);
+        hash.u64(19, self.operation_timeout_nanos);
+        hash.timestamp(20, self.wall_started_at);
+        hash.timestamp(21, self.wall_deadline);
+        hash.optional_date(22, self.expected_publication_date);
+        hash.digest(23, self.native_schema.canonical_digest());
+        hash.optional_digest(
+            24,
+            self.conditional_prior
+                .as_ref()
+                .map(ReferenceConditionalPriorEvidence::canonical_digest),
+        );
+        hash.finish()
+    }
+
+    fn try_revalidated(&self) -> Result<Self, PublicationError> {
+        if self.method != ReferenceRequestMethod::Get
+            || !self.accept_encoding_identity
+            || self.body != ReferenceRequestBodyEvidence::absent()
+        {
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        let conditional_prior = self
+            .conditional_prior
+            .as_ref()
+            .map(ReferenceConditionalPriorEvidence::try_revalidated)
+            .transpose()?;
+        let native_schema = self.native_schema.try_revalidated()?;
+        let validated = Self::try_new(
+            self.source_id.clone(),
+            self.provider_id.clone(),
+            self.source_contract_digest,
+            self.provider,
+            self.surface.clone(),
+            self.request_id.clone(),
+            self.configured_locator.clone(),
+            self.accept.clone(),
+            self.user_agent.clone(),
+            self.maximum_decoded_bytes,
+            self.maximum_redirects,
+            self.connect_timeout_nanos,
+            self.read_timeout_nanos,
+            self.total_timeout_nanos,
+            self.operation_timeout_nanos,
+            self.wall_started_at,
+            self.wall_deadline,
+            self.expected_publication_date,
+            native_schema,
+            conditional_prior,
+        )?;
+        if validated == *self {
+            Ok(validated)
+        } else {
+            Err(PublicationError::InvalidObjectContext)
+        }
+    }
+}
+
+/// Whether one HTTP receipt supplied new bytes or revalidated one exact prior object.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum ReferenceResponseDisposition {
+    /// HTTP 200 supplied a new, complete representation.
+    Modified,
+    /// HTTP 304 supplied no representation and revalidated this exact prior object.
+    NotModified {
+        /// Prior object identity authorized for reuse.
+        prior_object_id: SourceIdentifier,
+        /// Prior payload digest authorized for reuse.
+        prior_payload_digest: EvidenceDigest,
+        /// Prior payload bytes authorized for reuse.
+        prior_payload_bytes: u64,
+        /// Prior transport receipt that minted the conditional edge.
+        prior_transport_receipt_digest: EvidenceDigest,
+    },
+}
+
+/// Complete secret-free request and HTTP response lineage retained with every acquisition result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceTransportEvidence {
+    request: ReferenceOfficialRequestEvidence,
+    request_digest: EvidenceDigest,
+    status: u16,
+    final_locator: SourceIdentifier,
+    redirect_chain: Vec<SourceIdentifier>,
+    observed_content_type: Option<String>,
+    observed_content_disposition: Option<String>,
+    observed_content_encoding: Option<String>,
+    declared_content_length: Option<u64>,
+    etag: Option<String>,
+    cache_last_modified: Option<String>,
+    headers_received_at: Timestamp,
+    body_completed_at: Timestamp,
+    transport_elapsed_nanos: u64,
+    response_body_digest: EvidenceDigest,
+    response_body_bytes: u64,
+    body_complete: bool,
+    canonical_media_type: SourceIdentifier,
+    native_schema: ReferenceNativeSchemaIdentity,
+    disposition: ReferenceResponseDisposition,
+    receipt_digest: EvidenceDigest,
+}
+
+impl ReferenceTransportEvidence {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the complete modified-response receipt is intentionally explicit"
+    )]
+    pub(crate) fn try_modified(
+        request: ReferenceOfficialRequestEvidence,
+        status: u16,
+        final_locator: SourceIdentifier,
+        redirect_chain: Vec<SourceIdentifier>,
+        observed_content_type: impl Into<String>,
+        observed_content_disposition: Option<String>,
+        observed_content_encoding: Option<String>,
+        declared_content_length: Option<u64>,
+        etag: Option<String>,
+        cache_last_modified: Option<String>,
+        headers_received_at: Timestamp,
+        body_completed_at: Timestamp,
+        transport_elapsed_nanos: u64,
+        response_body_digest: EvidenceDigest,
+        response_body_bytes: u64,
+        canonical_media_type: SourceIdentifier,
+        native_schema: ReferenceNativeSchemaIdentity,
+    ) -> Result<Self, PublicationError> {
+        let evidence = Self::try_common(
+            request,
+            status,
+            final_locator,
+            redirect_chain,
+            Some(observed_content_type.into()),
+            observed_content_disposition,
+            observed_content_encoding,
+            declared_content_length,
+            etag,
+            cache_last_modified,
+            headers_received_at,
+            body_completed_at,
+            transport_elapsed_nanos,
+            response_body_digest,
+            response_body_bytes,
+            canonical_media_type,
+            native_schema,
+            ReferenceResponseDisposition::Modified,
+        )?;
+        if evidence.status != 200
+            || evidence.response_body_bytes == 0
+            || evidence
+                .declared_content_length
+                .is_some_and(|bytes| bytes != evidence.response_body_bytes)
+            || evidence
+                .observed_content_encoding
+                .as_deref()
+                .is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
+        {
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        Ok(evidence)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the complete not-modified receipt is intentionally explicit"
+    )]
+    pub(crate) fn try_not_modified(
+        request: ReferenceOfficialRequestEvidence,
+        status: u16,
+        final_locator: SourceIdentifier,
+        redirect_chain: Vec<SourceIdentifier>,
+        observed_content_type: Option<String>,
+        observed_content_disposition: Option<String>,
+        observed_content_encoding: Option<String>,
+        declared_content_length: Option<u64>,
+        etag: Option<String>,
+        cache_last_modified: Option<String>,
+        headers_received_at: Timestamp,
+        body_completed_at: Timestamp,
+        transport_elapsed_nanos: u64,
+    ) -> Result<Self, PublicationError> {
+        let prior = request
+            .conditional_prior()
+            .ok_or(PublicationError::InvalidObjectContext)?;
+        let disposition = ReferenceResponseDisposition::NotModified {
+            prior_object_id: prior.prior_object_id.clone(),
+            prior_payload_digest: prior.prior_payload_digest,
+            prior_payload_bytes: prior.prior_payload_bytes,
+            prior_transport_receipt_digest: prior.prior_transport_receipt_digest,
+        };
+        let canonical_media_type = prior.canonical_media_type.clone();
+        let native_schema = prior.native_schema.clone();
+        let evidence = Self::try_common(
+            request,
+            status,
+            final_locator,
+            redirect_chain,
+            observed_content_type,
+            observed_content_disposition,
+            observed_content_encoding,
+            declared_content_length,
+            etag,
+            cache_last_modified,
+            headers_received_at,
+            body_completed_at,
+            transport_elapsed_nanos,
+            sha256_digest(&[]),
+            0,
+            canonical_media_type,
+            native_schema,
+            disposition,
+        )?;
+        if evidence.status != 304
+            || evidence
+                .declared_content_length
+                .is_some_and(|bytes| bytes != 0)
+            || evidence.observed_content_encoding.is_some()
+        {
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        Ok(evidence)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared request/response receipt boundary is intentionally explicit"
+    )]
+    fn try_common(
+        request: ReferenceOfficialRequestEvidence,
+        status: u16,
+        final_locator: SourceIdentifier,
+        redirect_chain: Vec<SourceIdentifier>,
+        observed_content_type: Option<String>,
+        observed_content_disposition: Option<String>,
+        observed_content_encoding: Option<String>,
+        declared_content_length: Option<u64>,
+        etag: Option<String>,
+        cache_last_modified: Option<String>,
+        headers_received_at: Timestamp,
+        body_completed_at: Timestamp,
+        transport_elapsed_nanos: u64,
+        response_body_digest: EvidenceDigest,
+        response_body_bytes: u64,
+        canonical_media_type: SourceIdentifier,
+        native_schema: ReferenceNativeSchemaIdentity,
+        disposition: ReferenceResponseDisposition,
+    ) -> Result<Self, PublicationError> {
+        ensure_sha256(response_body_digest)?;
+        if redirect_chain.len() > usize::from(request.maximum_redirects)
+            || redirect_chain.len() > MAX_TRANSPORT_REDIRECTS
+            || (redirect_chain.is_empty() && final_locator != *request.configured_locator())
+            || (!redirect_chain.is_empty()
+                && redirect_chain
+                    .last()
+                    .is_none_or(|last| last != &final_locator))
+            || observed_content_type
+                .as_deref()
+                .is_some_and(|value| !valid_transport_header(value))
+            || observed_content_disposition
+                .as_deref()
+                .is_some_and(|value| !valid_transport_header(value))
+            || observed_content_encoding
+                .as_deref()
+                .is_some_and(|value| !valid_transport_header(value))
+            || etag
+                .as_deref()
+                .is_some_and(|value| !valid_transport_header(value))
+            || cache_last_modified
+                .as_deref()
+                .is_some_and(|value| !valid_transport_header(value))
+            || headers_received_at < request.wall_started_at
+            || body_completed_at < headers_received_at
+            || body_completed_at > request.wall_deadline
+            || transport_elapsed_nanos == 0
+            || transport_elapsed_nanos > MAX_REFERENCE_TRANSPORT_ELAPSED_NANOS
+            || transport_elapsed_nanos > request.operation_timeout_nanos
+            || native_schema != request.native_schema
+        {
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        let request_digest = request.evidence_digest();
+        let mut evidence = Self {
+            request,
+            request_digest,
+            status,
+            final_locator,
+            redirect_chain,
+            observed_content_type,
+            observed_content_disposition,
+            observed_content_encoding,
+            declared_content_length,
+            etag,
+            cache_last_modified,
+            headers_received_at,
+            body_completed_at,
+            transport_elapsed_nanos,
+            response_body_digest,
+            response_body_bytes,
+            body_complete: true,
+            canonical_media_type,
+            native_schema,
+            disposition,
+            receipt_digest: sha256_digest(b"pending-reference-receipt"),
+        };
+        evidence.receipt_digest = evidence.compute_receipt_digest();
+        Ok(evidence)
+    }
+
+    fn compute_receipt_digest(&self) -> EvidenceDigest {
+        let mut hash =
+            CanonicalEvidenceHasher::new(b"market-squawk:options-reference-http-receipt:v4\0");
+        hash.digest(1, self.request_digest);
+        hash.u16(2, self.status);
+        hash.identifier(3, &self.final_locator);
+        hash.u64(
+            4,
+            u64::try_from(self.redirect_chain.len()).unwrap_or(u64::MAX),
+        );
+        for locator in &self.redirect_chain {
+            hash.identifier(5, locator);
+        }
+        hash.optional_string(6, self.observed_content_type.as_deref());
+        hash.optional_string(7, self.observed_content_disposition.as_deref());
+        hash.optional_string(8, self.observed_content_encoding.as_deref());
+        hash.optional_u64(9, self.declared_content_length);
+        hash.optional_string(10, self.etag.as_deref());
+        hash.optional_string(11, self.cache_last_modified.as_deref());
+        hash.timestamp(12, self.headers_received_at);
+        hash.timestamp(13, self.body_completed_at);
+        hash.u64(14, self.transport_elapsed_nanos);
+        hash.digest(15, self.response_body_digest);
+        hash.u64(16, self.response_body_bytes);
+        hash.bool(17, self.body_complete);
+        hash.identifier(18, &self.canonical_media_type);
+        hash.digest(19, self.native_schema.canonical_digest());
+        match &self.disposition {
+            ReferenceResponseDisposition::Modified => hash.u8(20, 1),
+            ReferenceResponseDisposition::NotModified {
+                prior_object_id,
+                prior_payload_digest,
+                prior_payload_bytes,
+                prior_transport_receipt_digest,
+            } => {
+                hash.u8(20, 2);
+                hash.identifier(21, prior_object_id);
+                hash.digest(22, *prior_payload_digest);
+                hash.u64(23, *prior_payload_bytes);
+                hash.digest(24, *prior_transport_receipt_digest);
+            }
+        }
+        hash.finish()
+    }
+
+    /// Returns the exact sealed request this response answered.
+    pub const fn request(&self) -> &ReferenceOfficialRequestEvidence {
+        &self.request
+    }
+
+    /// Returns the SHA-256 identity of the exact official request contract.
+    pub const fn request_digest(&self) -> EvidenceDigest {
+        self.request_digest
+    }
+
+    /// Returns the SHA-256 identity of this complete admitted HTTP receipt.
+    pub const fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
+    }
+
+    /// Returns the admitted HTTP status.
+    pub const fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Returns the final admitted locator.
+    pub const fn final_locator(&self) -> &SourceIdentifier {
+        &self.final_locator
+    }
+
+    /// Returns each exact admitted redirect locator in observation order.
+    pub fn redirect_chain(&self) -> &[SourceIdentifier] {
+        &self.redirect_chain
+    }
+
+    /// Returns the exact observed Content-Type field before canonical media selection.
+    pub fn observed_content_type(&self) -> Option<&str> {
+        self.observed_content_type.as_deref()
+    }
+
+    /// Returns the exact observed Content-Disposition field when supplied.
+    pub fn observed_content_disposition(&self) -> Option<&str> {
+        self.observed_content_disposition.as_deref()
+    }
+
+    /// Returns the exact observed Content-Encoding field when supplied.
+    pub fn observed_content_encoding(&self) -> Option<&str> {
+        self.observed_content_encoding.as_deref()
+    }
+
+    /// Returns the exact declared response length when supplied.
+    pub const fn declared_content_length(&self) -> Option<u64> {
+        self.declared_content_length
+    }
+
+    /// Returns the exact observed ETag when supplied.
+    pub fn etag(&self) -> Option<&str> {
+        self.etag.as_deref()
+    }
+
+    /// Returns the exact observed cache Last-Modified field when supplied.
+    pub fn cache_last_modified(&self) -> Option<&str> {
+        self.cache_last_modified.as_deref()
+    }
+
+    /// Returns the trusted local response-header observation time.
+    pub const fn headers_received_at(&self) -> Timestamp {
+        self.headers_received_at
+    }
+
+    /// Returns the trusted local terminal-body observation time.
+    pub const fn body_completed_at(&self) -> Timestamp {
+        self.body_completed_at
+    }
+
+    /// Returns request-send through terminal-body elapsed time.
+    pub const fn transport_elapsed_nanos(&self) -> u64 {
+        self.transport_elapsed_nanos
+    }
+
+    /// Returns the exact HTTP response-body digest.
+    pub const fn response_body_digest(&self) -> EvidenceDigest {
+        self.response_body_digest
+    }
+
+    /// Returns the exact HTTP response-body byte count.
+    pub const fn response_body_bytes(&self) -> u64 {
+        self.response_body_bytes
+    }
+
+    /// Returns terminal body-completion evidence.
+    pub const fn body_complete(&self) -> bool {
+        self.body_complete
+    }
+
+    /// Returns the canonical media type selected after response admission.
+    pub const fn canonical_media_type(&self) -> &SourceIdentifier {
+        &self.canonical_media_type
+    }
+
+    /// Returns the exact native schema identity used to admit the body.
+    pub const fn native_schema(&self) -> &ReferenceNativeSchemaIdentity {
+        &self.native_schema
+    }
+
+    /// Returns whether the response supplied bytes or revalidated one exact prior object.
+    pub const fn disposition(&self) -> &ReferenceResponseDisposition {
+        &self.disposition
+    }
+
+    /// Returns whether this receipt represents a new complete body.
+    pub const fn is_modified(&self) -> bool {
+        matches!(&self.disposition, ReferenceResponseDisposition::Modified)
+    }
+
+    /// Revalidates deserialized durable evidence through the same closed constructors used at
+    /// acquisition time.
+    pub(crate) fn try_revalidated(&self) -> Result<Self, PublicationError> {
+        let request = self.request.try_revalidated()?;
+        let validated = match &self.disposition {
+            ReferenceResponseDisposition::Modified => Self::try_modified(
+                request,
+                self.status,
+                self.final_locator.clone(),
+                self.redirect_chain.clone(),
+                self.observed_content_type
+                    .clone()
+                    .ok_or(PublicationError::InvalidObjectContext)?,
+                self.observed_content_disposition.clone(),
+                self.observed_content_encoding.clone(),
+                self.declared_content_length,
+                self.etag.clone(),
+                self.cache_last_modified.clone(),
+                self.headers_received_at,
+                self.body_completed_at,
+                self.transport_elapsed_nanos,
+                self.response_body_digest,
+                self.response_body_bytes,
+                self.canonical_media_type.clone(),
+                self.native_schema.clone(),
+            )?,
+            ReferenceResponseDisposition::NotModified { .. } => Self::try_not_modified(
+                request,
+                self.status,
+                self.final_locator.clone(),
+                self.redirect_chain.clone(),
+                self.observed_content_type.clone(),
+                self.observed_content_disposition.clone(),
+                self.observed_content_encoding.clone(),
+                self.declared_content_length,
+                self.etag.clone(),
+                self.cache_last_modified.clone(),
+                self.headers_received_at,
+                self.body_completed_at,
+                self.transport_elapsed_nanos,
+            )?,
+        };
+        if validated == *self {
+            Ok(validated)
+        } else {
+            Err(PublicationError::InvalidObjectContext)
+        }
+    }
 }
 
 /// Exact raw-object and decoder lineage shared by every record decoded from the object.
@@ -280,19 +1365,24 @@ pub struct ReferenceObjectContext {
     media_type: SourceIdentifier,
     payload_digest: EvidenceDigest,
     payload_bytes: u64,
-    native_schema: SourceIdentifier,
+    native_schema: ReferenceNativeSchemaIdentity,
     clocks: ObjectClockEvidence,
+    source_filename: Option<SourceIdentifier>,
+    source_publication_date: Option<CalendarDate>,
+    http_last_modified: Option<HttpLastModifiedEvidence>,
+    transport_evidence: ReferenceTransportEvidence,
 }
 
 impl ReferenceObjectContext {
-    /// Constructs exact provider-native object evidence.
+    /// Constructs a complete exact provider-native object receipt.
     ///
     /// # Errors
     ///
-    /// Rejects a provider/surface mismatch or an empty payload.
+    /// Rejects any mismatch among provider, request, response, body, media, schema, clocks, or
+    /// source-file evidence. A context cannot exist without a complete modified HTTP receipt.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the source-object evidence boundary is intentionally explicit"
+        reason = "the complete source-object evidence boundary is intentionally explicit"
     )]
     pub fn try_new(
         provider: ReferenceProvider,
@@ -303,10 +1393,39 @@ impl ReferenceObjectContext {
         media_type: SourceIdentifier,
         payload_digest: EvidenceDigest,
         payload_bytes: u64,
-        native_schema: SourceIdentifier,
+        native_schema: ReferenceNativeSchemaIdentity,
         clocks: ObjectClockEvidence,
+        source_filename: Option<SourceIdentifier>,
+        source_publication_date: Option<CalendarDate>,
+        http_last_modified: Option<HttpLastModifiedEvidence>,
+        transport_evidence: ReferenceTransportEvidence,
     ) -> Result<Self, PublicationError> {
-        if provider != surface.provider() || payload_bytes == 0 {
+        ensure_sha256(payload_digest)?;
+        let expected_posted =
+            source_publication_date.map(ResearchTemporalCoordinate::calendar_date);
+        if provider != surface.provider()
+            || provider != transport_evidence.request.provider
+            || surface != transport_evidence.request.surface
+            || configured_locator != transport_evidence.request.configured_locator
+            || final_locator != transport_evidence.final_locator
+            || media_type != transport_evidence.canonical_media_type
+            || payload_bytes == 0
+            || payload_digest != transport_evidence.response_body_digest
+            || payload_bytes != transport_evidence.response_body_bytes
+            || native_schema != transport_evidence.native_schema
+            || !transport_evidence.is_modified()
+            || expected_posted.as_ref() != clocks.posted()
+            || source_publication_date.is_some() && source_filename.is_none()
+            || clocks.received_at() != transport_evidence.body_completed_at
+            || clocks.transport_elapsed_nanos() != transport_evidence.transport_elapsed_nanos
+            || http_last_modified
+                .as_ref()
+                .is_some_and(|evidence| evidence.instant() > clocks.received_at())
+            || http_last_modified
+                .as_ref()
+                .map(HttpLastModifiedEvidence::as_str)
+                != transport_evidence.cache_last_modified.as_deref()
+        {
             return Err(PublicationError::InvalidObjectContext);
         }
         Ok(Self {
@@ -320,6 +1439,10 @@ impl ReferenceObjectContext {
             payload_bytes,
             native_schema,
             clocks,
+            source_filename,
+            source_publication_date,
+            http_last_modified,
+            transport_evidence,
         })
     }
 
@@ -348,7 +1471,7 @@ impl ReferenceObjectContext {
         &self.final_locator
     }
 
-    /// Returns the exact media type.
+    /// Returns the exact canonical media type.
     pub const fn media_type(&self) -> &SourceIdentifier {
         &self.media_type
     }
@@ -363,14 +1486,192 @@ impl ReferenceObjectContext {
         self.payload_bytes
     }
 
-    /// Returns the closed provider-native decoder identity.
+    /// Returns the closed provider-native decoder name.
     pub const fn native_schema(&self) -> &SourceIdentifier {
+        self.native_schema.name()
+    }
+
+    /// Returns the complete provider-native decoder identity.
+    pub const fn native_schema_identity(&self) -> &ReferenceNativeSchemaIdentity {
         &self.native_schema
     }
 
     /// Returns the retained clock evidence.
     pub const fn clocks(&self) -> &ObjectClockEvidence {
         &self.clocks
+    }
+
+    /// Returns the exact validated provider filename when this surface publishes one.
+    pub const fn source_filename(&self) -> Option<&SourceIdentifier> {
+        self.source_filename.as_ref()
+    }
+
+    /// Returns the provider filename/report calendar date without an invented time zone.
+    pub const fn source_publication_date(&self) -> Option<CalendarDate> {
+        self.source_publication_date
+    }
+
+    /// Returns the exact HTTP `Last-Modified` field independently of provider/local clocks.
+    pub const fn http_last_modified(&self) -> Option<&HttpLastModifiedEvidence> {
+        self.http_last_modified.as_ref()
+    }
+
+    /// Returns complete retained request/transport evidence.
+    pub const fn transport_evidence(&self) -> &ReferenceTransportEvidence {
+        &self.transport_evidence
+    }
+}
+
+fn valid_transport_header(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TRANSPORT_HEADER_EVIDENCE_BYTES
+        && value.is_ascii()
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn ensure_sha256(digest: EvidenceDigest) -> Result<(), PublicationError> {
+    if digest.algorithm() != DigestAlgorithm::Sha256
+        || digest.bytes().len() != REFERENCE_EVIDENCE_DIGEST_BYTES
+        || digest.bytes().iter().all(|byte| *byte == 0)
+    {
+        Err(PublicationError::InvalidObjectContext)
+    } else {
+        Ok(())
+    }
+}
+
+fn sha256_digest(bytes: &[u8]) -> EvidenceDigest {
+    EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        <[u8; REFERENCE_EVIDENCE_DIGEST_BYTES]>::from(Sha256::digest(bytes)),
+    )
+}
+
+struct CanonicalEvidenceHasher(Sha256);
+
+impl CanonicalEvidenceHasher {
+    fn new(domain: &'static [u8]) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(domain);
+        Self(hash)
+    }
+
+    fn field(&mut self, tag: u16, bytes: &[u8]) {
+        self.0.update(tag.to_be_bytes());
+        self.0
+            .update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        self.0.update(bytes);
+    }
+
+    fn bool(&mut self, tag: u16, value: bool) {
+        self.field(tag, &[u8::from(value)]);
+    }
+
+    fn u8(&mut self, tag: u16, value: u8) {
+        self.field(tag, &[value]);
+    }
+
+    fn u16(&mut self, tag: u16, value: u16) {
+        self.field(tag, &value.to_be_bytes());
+    }
+
+    fn u32(&mut self, tag: u16, value: u32) {
+        self.field(tag, &value.to_be_bytes());
+    }
+
+    fn u64(&mut self, tag: u16, value: u64) {
+        self.field(tag, &value.to_be_bytes());
+    }
+
+    fn string(&mut self, tag: u16, value: &str) {
+        self.field(tag, value.as_bytes());
+    }
+
+    fn identifier(&mut self, tag: u16, value: &SourceIdentifier) {
+        self.string(tag, value.as_str());
+    }
+
+    fn digest(&mut self, tag: u16, value: EvidenceDigest) {
+        self.field(tag, &[1]);
+        self.field(tag.saturating_add(1_000), &value.bytes());
+    }
+
+    fn provider(&mut self, tag: u16, provider: ReferenceProvider) {
+        self.u8(
+            tag,
+            match provider {
+                ReferenceProvider::Occ => 1,
+                ReferenceProvider::Cboe => 2,
+            },
+        );
+    }
+
+    fn surface(&mut self, tag: u16, surface: &ReferenceSurface) {
+        let (kind, coordinate, ordinal) = match surface {
+            ReferenceSurface::CboeAllSeries { venue } => (1, Some(venue.stable_label()), None),
+            ReferenceSurface::OccDlpSelectedText => (2, None, None),
+            ReferenceSurface::OccDlpDailyText => (3, None, None),
+            ReferenceSurface::OccDlpDailyXml => (4, None, None),
+            ReferenceSurface::OccMemoIndexCsv => (5, None, None),
+            ReferenceSurface::OccMemoIndexJson => (6, None, None),
+            ReferenceSurface::OccMemoDocument { memo_number } => (7, None, Some(*memo_number)),
+            ReferenceSurface::OccMemoAttachment {
+                memo_number,
+                ordinal: attachment_ordinal,
+            } => (
+                8,
+                Some(if attachment_ordinal.get() == 0 {
+                    "invalid"
+                } else {
+                    "attachment"
+                }),
+                Some(*memo_number),
+            ),
+        };
+        self.u8(tag, kind);
+        self.optional_string(tag.saturating_add(100), coordinate);
+        self.optional_u64(tag.saturating_add(200), ordinal);
+        if let ReferenceSurface::OccMemoAttachment { ordinal, .. } = surface {
+            self.u32(tag.saturating_add(300), ordinal.get());
+        }
+    }
+
+    fn timestamp(&mut self, tag: u16, value: Timestamp) {
+        self.field(tag, &value.unix_nanos().to_be_bytes());
+    }
+
+    fn optional_string(&mut self, tag: u16, value: Option<&str>) {
+        self.bool(tag, value.is_some());
+        if let Some(value) = value {
+            self.string(tag.saturating_add(500), value);
+        }
+    }
+
+    fn optional_u64(&mut self, tag: u16, value: Option<u64>) {
+        self.bool(tag, value.is_some());
+        if let Some(value) = value {
+            self.u64(tag.saturating_add(500), value);
+        }
+    }
+
+    fn optional_date(&mut self, tag: u16, value: Option<CalendarDate>) {
+        self.bool(tag, value.is_some());
+        if let Some(value) = value {
+            self.u16(tag.saturating_add(500), value.year());
+            self.u8(tag.saturating_add(501), value.month());
+            self.u8(tag.saturating_add(502), value.day());
+        }
+    }
+
+    fn optional_digest(&mut self, tag: u16, value: Option<EvidenceDigest>) {
+        self.bool(tag, value.is_some());
+        if let Some(value) = value {
+            self.digest(tag.saturating_add(500), value);
+        }
+    }
+
+    fn finish(self) -> EvidenceDigest {
+        EvidenceDigest::new(DigestAlgorithm::Sha256, self.0.finalize().into())
     }
 }
 
@@ -401,8 +1702,12 @@ pub struct ReferencePageReceipt {
 }
 
 impl ReferencePageReceipt {
-    /// Constructs one page receipt without upgrading an unknown terminal signal.
-    pub const fn new(
+    /// Constructs parser-owned page evidence without upgrading an unknown terminal signal.
+    ///
+    /// Construction is crate-private because completeness is an authority boundary: external
+    /// callers may inspect and persist a receipt, but only this crate's strict provider parsers
+    /// may mint one.
+    pub(crate) const fn new(
         context: ReferenceObjectContext,
         page_ordinal: NonZeroU32,
         returned_records: u32,
@@ -490,10 +1795,12 @@ pub enum CatalogConflictKind {
     CboeSymbolMapsMultipleOsi,
     /// One OSI contract mapped to distinct Cboe Symbol IDs.
     CboeOsiMapsMultipleSymbols,
+    /// One Cboe Symbol ID mapped to distinct independent underlying aliases.
+    CboeSymbolMapsMultipleUnderlying,
     /// One page coordinate was observed with different exact objects.
     PageCoordinateDivergence,
-    /// One OCC memo number was observed with different discovery content.
-    OccMemoRevisionDivergence,
+    /// One exact provider natural key appeared more than once in a supposedly unique surface.
+    DuplicateProviderRecord,
 }
 
 /// Exact conflicting source identities; no implicit winner is selected.
@@ -507,7 +1814,7 @@ pub struct CatalogConflict {
 }
 
 impl CatalogConflict {
-    fn new(
+    pub(crate) fn new(
         kind: CatalogConflictKind,
         natural_key: SourceIdentifier,
         first_evidence: SourceIdentifier,
@@ -552,11 +1859,28 @@ pub struct CatalogCounts {
     rejected_records: u64,
     cboe_series: u64,
     occ_dlp_products: u64,
-    occ_memo_discoveries: u64,
     duplicate_records: u64,
 }
 
 impl CatalogCounts {
+    pub(crate) fn from_spool(
+        pages: u64,
+        bytes: u64,
+        returned_records: u64,
+        cboe_series: u64,
+        occ_dlp_products: u64,
+    ) -> Self {
+        Self {
+            pages,
+            bytes,
+            returned_records,
+            rejected_records: 0,
+            cboe_series,
+            occ_dlp_products,
+            duplicate_records: 0,
+        }
+    }
+
     /// Returns admitted exact page/object count.
     pub const fn pages(self) -> u64 {
         self.pages
@@ -587,11 +1911,6 @@ impl CatalogCounts {
         self.occ_dlp_products
     }
 
-    /// Returns admitted OCC memo discoveries.
-    pub const fn occ_memo_discoveries(self) -> u64 {
-        self.occ_memo_discoveries
-    }
-
     /// Returns exact duplicate provider records encountered.
     pub const fn duplicate_records(self) -> u64 {
         self.duplicate_records
@@ -609,6 +1928,20 @@ pub struct PublicationCatalog {
 }
 
 impl PublicationCatalog {
+    pub(crate) fn from_spool(
+        request: PublicationRequest,
+        completeness: PublicationCompleteness,
+        counts: CatalogCounts,
+        conflicts: Vec<CatalogConflict>,
+    ) -> Self {
+        Self {
+            request,
+            completeness,
+            counts,
+            conflicts,
+        }
+    }
+
     /// Returns the exact request this catalog answers.
     pub const fn request(&self) -> &PublicationRequest {
         &self.request
@@ -634,370 +1967,6 @@ impl PublicationCatalog {
     pub fn publication_eligible(&self) -> bool {
         matches!(self.completeness, PublicationCompleteness::Complete) && self.conflicts.is_empty()
     }
-}
-
-#[derive(Clone, Debug)]
-struct MappingEvidence {
-    value: String,
-    evidence: SourceIdentifier,
-}
-
-/// Bounded catalog assembler that preserves provider disagreement.
-#[derive(Debug)]
-pub struct PublicationCatalogBuilder {
-    request: PublicationRequest,
-    pages: BTreeMap<(ReferenceSurface, u32), ReferencePageReceipt>,
-    cboe_symbols: BTreeMap<String, MappingEvidence>,
-    cboe_osi: BTreeMap<String, MappingEvidence>,
-    cboe_records: BTreeSet<(ReferenceSurface, String, String, SourceIdentifier)>,
-    occ_dlp_records: BTreeSet<(ReferenceSurface, String, SourceIdentifier)>,
-    occ_memos: BTreeMap<u64, MappingEvidence>,
-    observations_by_surface: BTreeMap<ReferenceSurface, u64>,
-    conflicts: Vec<CatalogConflict>,
-    counts: CatalogCounts,
-}
-
-impl PublicationCatalogBuilder {
-    /// Begins one catalog assembly under the request's fixed limits.
-    pub fn new(request: PublicationRequest) -> Self {
-        Self {
-            request,
-            pages: BTreeMap::new(),
-            cboe_symbols: BTreeMap::new(),
-            cboe_osi: BTreeMap::new(),
-            cboe_records: BTreeSet::new(),
-            occ_dlp_records: BTreeSet::new(),
-            occ_memos: BTreeMap::new(),
-            observations_by_surface: BTreeMap::new(),
-            conflicts: Vec::new(),
-            counts: CatalogCounts::default(),
-        }
-    }
-
-    /// Retains one exact page receipt.
-    ///
-    /// # Errors
-    ///
-    /// Rejects unrequested surfaces or aggregate bounds. A divergent duplicate coordinate is
-    /// preserved as a conflict.
-    pub fn record_page(&mut self, receipt: ReferencePageReceipt) -> Result<(), PublicationError> {
-        if self
-            .request
-            .surfaces
-            .binary_search(receipt.context.surface())
-            .is_err()
-        {
-            return Err(PublicationError::UnrequestedSurface);
-        }
-        let next_pages = self.counts.pages.saturating_add(1);
-        let next_bytes = self
-            .counts
-            .bytes
-            .checked_add(receipt.context.payload_bytes)
-            .ok_or(PublicationError::LimitsExceeded)?;
-        let next_returned = self
-            .counts
-            .returned_records
-            .checked_add(u64::from(receipt.returned_records))
-            .ok_or(PublicationError::LimitsExceeded)?;
-        let next_rejected = self
-            .counts
-            .rejected_records
-            .checked_add(u64::from(receipt.rejected_records))
-            .ok_or(PublicationError::LimitsExceeded)?;
-        if next_pages > u64::from(self.request.limits.max_pages)
-            || next_bytes > self.request.limits.max_total_bytes
-            || next_returned.saturating_add(next_rejected) > self.request.limits.max_total_records
-        {
-            return Err(PublicationError::LimitsExceeded);
-        }
-
-        let key = (receipt.context.surface.clone(), receipt.page_ordinal.get());
-        if let Some(existing) = self.pages.get(&key) {
-            if existing == &receipt {
-                self.counts.duplicate_records = self.counts.duplicate_records.saturating_add(1);
-                return Ok(());
-            }
-            let existing_object = existing.context.object_id.clone();
-            self.push_conflict(CatalogConflict::new(
-                CatalogConflictKind::PageCoordinateDivergence,
-                source_identifier(format!(
-                    "page:{}:{}",
-                    receipt.context.object_id.as_str(),
-                    receipt.page_ordinal.get()
-                ))?,
-                existing_object,
-                receipt.context.object_id.clone(),
-            ))?;
-            return Ok(());
-        }
-        self.counts.pages = next_pages;
-        self.counts.bytes = next_bytes;
-        self.counts.returned_records = next_returned;
-        self.counts.rejected_records = next_rejected;
-        self.pages.insert(key, receipt);
-        Ok(())
-    }
-
-    /// Records one Cboe mapping while preserving cross-venue multiplicity and mapping conflicts.
-    ///
-    /// # Errors
-    ///
-    /// Rejects a record outside the request or any conflict/record bound.
-    pub fn record_cboe_series(
-        &mut self,
-        record: &CboeSeriesReference,
-    ) -> Result<(), PublicationError> {
-        if self
-            .request
-            .surfaces
-            .binary_search(record.object_context().surface())
-            .is_err()
-        {
-            return Err(PublicationError::UnrequestedSurface);
-        }
-        let next_records = self.counts.cboe_series.saturating_add(1);
-        if next_records > self.request.limits.max_total_records {
-            return Err(PublicationError::LimitsExceeded);
-        }
-        let symbol = record.cboe_symbol_id().as_str().to_owned();
-        let osi = record.contract().osi().as_str().to_owned();
-        let evidence = record.record_id().clone();
-        let exact_key = (
-            record.object_context().surface().clone(),
-            symbol.clone(),
-            osi.clone(),
-            evidence.clone(),
-        );
-        if !self.cboe_records.insert(exact_key) {
-            self.counts.duplicate_records = self.counts.duplicate_records.saturating_add(1);
-            return Ok(());
-        }
-
-        if let Some(existing) = self.cboe_symbols.get(&symbol).cloned() {
-            if existing.value != osi {
-                self.push_conflict(CatalogConflict::new(
-                    CatalogConflictKind::CboeSymbolMapsMultipleOsi,
-                    source_identifier(format!("cboe-symbol:{symbol}"))?,
-                    existing.evidence,
-                    evidence.clone(),
-                ))?;
-            }
-        } else {
-            self.cboe_symbols.insert(
-                symbol.clone(),
-                MappingEvidence {
-                    value: osi.clone(),
-                    evidence: evidence.clone(),
-                },
-            );
-        }
-        if let Some(existing) = self.cboe_osi.get(&osi).cloned() {
-            if existing.value != symbol {
-                self.push_conflict(CatalogConflict::new(
-                    CatalogConflictKind::CboeOsiMapsMultipleSymbols,
-                    source_identifier(format!("osi:{osi}"))?,
-                    existing.evidence,
-                    evidence,
-                ))?;
-            }
-        } else {
-            self.cboe_osi.insert(
-                osi,
-                MappingEvidence {
-                    value: symbol,
-                    evidence,
-                },
-            );
-        }
-        self.counts.cboe_series = next_records;
-        self.increment_surface_observations(record.object_context().surface())?;
-        Ok(())
-    }
-
-    /// Records one OCC DLP product/root observation for receipt reconciliation.
-    ///
-    /// # Errors
-    ///
-    /// Rejects records outside the exact request or aggregate record bounds.
-    pub fn record_occ_dlp_product(
-        &mut self,
-        record: &OccDlpProductReference,
-    ) -> Result<(), PublicationError> {
-        if self
-            .request
-            .surfaces
-            .binary_search(record.object_context().surface())
-            .is_err()
-        {
-            return Err(PublicationError::UnrequestedSurface);
-        }
-        let key = (
-            record.object_context().surface().clone(),
-            record.options_symbol().as_str().to_owned(),
-            record.record_id().clone(),
-        );
-        if !self.occ_dlp_records.insert(key) {
-            self.counts.duplicate_records = self.counts.duplicate_records.saturating_add(1);
-            return Ok(());
-        }
-        let next = self.counts.occ_dlp_products.saturating_add(1);
-        if next > self.request.limits.max_total_records {
-            return Err(PublicationError::LimitsExceeded);
-        }
-        self.counts.occ_dlp_products = next;
-        self.increment_surface_observations(record.object_context().surface())?;
-        Ok(())
-    }
-
-    /// Records one OCC memo discovery. A changed title/category/effective-date digest is retained
-    /// as a source revision conflict; it is never interpreted as contract economics.
-    ///
-    /// # Errors
-    ///
-    /// Rejects a record outside the request or any configured bound.
-    pub fn record_occ_memo(&mut self, memo: &OccMemoDiscovery) -> Result<(), PublicationError> {
-        if self
-            .request
-            .surfaces
-            .binary_search(memo.object_context().surface())
-            .is_err()
-        {
-            return Err(PublicationError::UnrequestedSurface);
-        }
-        let next_records = self.counts.occ_memo_discoveries.saturating_add(1);
-        if next_records > self.request.limits.max_total_records {
-            return Err(PublicationError::LimitsExceeded);
-        }
-        let content = memo.discovery_digest_hex();
-        let evidence = memo.record_id().clone();
-        if let Some(existing) = self.occ_memos.get(&memo.memo_number()).cloned() {
-            if existing.value == content {
-                self.counts.duplicate_records = self.counts.duplicate_records.saturating_add(1);
-                return Ok(());
-            }
-            self.push_conflict(CatalogConflict::new(
-                CatalogConflictKind::OccMemoRevisionDivergence,
-                source_identifier(format!("occ-memo:{}", memo.memo_number()))?,
-                existing.evidence,
-                evidence,
-            ))?;
-        } else {
-            self.occ_memos.insert(
-                memo.memo_number(),
-                MappingEvidence {
-                    value: content,
-                    evidence,
-                },
-            );
-        }
-        self.counts.occ_memo_discoveries = next_records;
-        self.increment_surface_observations(memo.object_context().surface())?;
-        Ok(())
-    }
-
-    /// Completes the bounded request and derives per-surface page closure.
-    pub fn finish(self) -> PublicationCatalog {
-        let mut states = Vec::with_capacity(self.request.surfaces.len());
-        let mut all_complete = true;
-        for surface in &self.request.surfaces {
-            let pages: Vec<&ReferencePageReceipt> = self
-                .pages
-                .iter()
-                .filter_map(|((candidate, _), receipt)| (candidate == surface).then_some(receipt))
-                .collect();
-            let catalog_records = self
-                .observations_by_surface
-                .get(surface)
-                .copied()
-                .unwrap_or(0);
-            let state = surface_completeness(&pages, catalog_records);
-            all_complete &= matches!(&state, SurfaceCompleteness::Complete);
-            states.push((surface.clone(), state));
-        }
-        let completeness = if all_complete {
-            PublicationCompleteness::Complete
-        } else {
-            PublicationCompleteness::Partial { surfaces: states }
-        };
-        PublicationCatalog {
-            request: self.request,
-            completeness,
-            counts: self.counts,
-            conflicts: self.conflicts,
-        }
-    }
-
-    fn push_conflict(&mut self, conflict: CatalogConflict) -> Result<(), PublicationError> {
-        if self.conflicts.len() >= self.request.limits.max_conflicts {
-            return Err(PublicationError::LimitsExceeded);
-        }
-        self.conflicts.push(conflict);
-        Ok(())
-    }
-
-    fn increment_surface_observations(
-        &mut self,
-        surface: &ReferenceSurface,
-    ) -> Result<(), PublicationError> {
-        let entry = self
-            .observations_by_surface
-            .entry(surface.clone())
-            .or_default();
-        *entry = entry
-            .checked_add(1)
-            .ok_or(PublicationError::LimitsExceeded)?;
-        if *entry > self.request.limits.max_total_records {
-            return Err(PublicationError::LimitsExceeded);
-        }
-        Ok(())
-    }
-}
-
-fn surface_completeness(
-    pages: &[&ReferencePageReceipt],
-    catalog_records: u64,
-) -> SurfaceCompleteness {
-    if pages.is_empty() {
-        return SurfaceCompleteness::Missing;
-    }
-    let rejected = pages.iter().fold(0_u64, |total, page| {
-        total.saturating_add(u64::from(page.rejected_records))
-    });
-    if rejected > 0 {
-        return SurfaceCompleteness::RejectedRecords { count: rejected };
-    }
-    for (index, page) in pages.iter().enumerate() {
-        let Ok(expected) = u32::try_from(index + 1) else {
-            return SurfaceCompleteness::IncompletePageChain;
-        };
-        if page.page_ordinal.get() != expected {
-            return SurfaceCompleteness::IncompletePageChain;
-        }
-        let last = index + 1 == pages.len();
-        match (&page.terminal_state, last) {
-            (PageTerminalState::More { .. }, false) | (PageTerminalState::Terminal, true) => {}
-            (PageTerminalState::More { .. }, true)
-            | (PageTerminalState::Terminal, false)
-            | (PageTerminalState::Unknown, _) => {
-                return SurfaceCompleteness::IncompletePageChain;
-            }
-        }
-    }
-    let receipt_records = pages.iter().fold(0_u64, |total, page| {
-        total.saturating_add(u64::from(page.returned_records))
-    });
-    if receipt_records != catalog_records {
-        return SurfaceCompleteness::ObservationCountMismatch {
-            receipt_records,
-            catalog_records,
-        };
-    }
-    SurfaceCompleteness::Complete
-}
-
-fn source_identifier(value: String) -> Result<SourceIdentifier, PublicationError> {
-    SourceIdentifier::try_from(value).map_err(|_| PublicationError::InvalidIdentifier)
 }
 
 /// Publication request, evidence, limit, or reconciliation failure.

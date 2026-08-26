@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, ProviderIdentityRegistry, SourceIdentifier,
+    DigestAlgorithm, EvidenceDigest, ProviderIdentityRegistry, ProviderInstrumentId, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
     AuthorizationMode, ExtractionAuthority, ExtractionAuthorityError, ExtractionRedirectPermit,
@@ -23,22 +24,31 @@ use market_squawk_sources::{
     SourceMetadata, SourceMetadataProvider, TlsProviderCapability,
 };
 use reqwest::header::{
-    ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, RETRY_AFTER,
+    ACCEPT_ENCODING, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION,
+    RETRY_AFTER,
 };
 use sha2::{Digest as _, Sha256};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-    CompanyFactsDocument, RawEvidenceStore, SecHttpValidators, SecParserLimits, SecRepresentation,
+    CompanyFactsDocument, RawEvidenceStore, SEC_APPLICATION_MAX_CONCURRENT_REQUESTS,
+    SEC_APPLICATION_REQUESTS_PER_SECOND, SEC_OFFICIAL_REQUEST_CEILING_PER_SECOND,
+    SEC_PROVIDER_RATE_SCOPE, SecAuthoritativeIdentifierNamespace, SecBulkCapture, SecBulkCoverage,
+    SecBulkDoctorReport, SecBulkDoctorState, SecBulkFamily, SecBulkLayoutManifest,
+    SecBulkMediaKind, SecBulkParseLimits, SecBulkSelection, SecBulkTransportEvidence,
+    SecGovernedIdentityReceipt, SecHttpValidators, SecParserLimits, SecRepresentation,
     SecRepresentationRegistry, SubmissionsArchive, SubmissionsDocument, XbrlDocumentContext,
-    XbrlDocumentParser,
+    XbrlDocumentParser, inspect_bulk_archive, recover_bulk_archive,
 };
 
-const SEC_REQUEST_CEILING_PER_SECOND: u32 = 10;
 const ONE_SECOND_NANOS: u64 = 1_000_000_000;
 const MAX_BLOCKING_WORKERS: usize = 4;
+const MAX_NPORT_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_NCEN_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_BULK_README_BYTES: u64 = 16 * 1024 * 1024;
+const STREAM_CHANNEL_CHUNKS: usize = 8;
 
 /// Production SEC source bound to exact metadata and local persistence.
 #[derive(Debug)]
@@ -85,9 +95,13 @@ impl SecEdgarSource {
         let budget_policy = metadata
             .budget_policy()
             .ok_or(SecClientError::MissingSharedBudget)?;
-        if budget_policy.requests_per_window() > SEC_REQUEST_CEILING_PER_SECOND
-            || budget_policy.window_nanos() < ONE_SECOND_NANOS
-            || budget_policy.max_concurrent() > SEC_REQUEST_CEILING_PER_SECOND as u16
+        if budget_policy.requests_per_window() != SEC_APPLICATION_REQUESTS_PER_SECOND
+            || budget_policy.requests_per_window() > SEC_OFFICIAL_REQUEST_CEILING_PER_SECOND
+            || budget_policy.window_nanos() != ONE_SECOND_NANOS
+            || budget_policy.window_count() != 1
+            || budget_policy.max_concurrent() != SEC_APPLICATION_MAX_CONCURRENT_REQUESTS
+            || budget_policy.scope().as_source_identifier().as_str() != SEC_PROVIDER_RATE_SCOPE
+            || budget_policy.scope().authorization_account().is_some()
         {
             return Err(SecClientError::UnsafeBudgetPolicy);
         }
@@ -104,6 +118,18 @@ impl SecEdgarSource {
             SecObjectLocator::company_facts("0")?,
             SecObjectLocator::companion("CIK0000000000-submissions-001.json")?,
             SecObjectLocator::filing_document("0", "0000000000-00-000000", "filing.xml")?,
+            SecObjectLocator::bulk_submissions()?,
+            SecObjectLocator::bulk_company_facts()?,
+            SecObjectLocator::quarterly_bulk_archive(
+                crate::SecBulkFamily::Nport,
+                crate::SecQuarter::try_new(2026, 2).map_err(|_| SecClientError::InvalidLocator)?,
+            )?,
+            SecObjectLocator::quarterly_bulk_archive(
+                crate::SecBulkFamily::Ncen,
+                crate::SecQuarter::try_new(2026, 2).map_err(|_| SecClientError::InvalidLocator)?,
+            )?,
+            SecObjectLocator::quarterly_bulk_readme(crate::SecBulkFamily::Nport)?,
+            SecObjectLocator::quarterly_bulk_readme(crate::SecBulkFamily::Ncen)?,
         ] {
             endpoint_policy.authorize_request(required.url())?;
         }
@@ -278,6 +304,486 @@ impl SecEdgarSource {
         })
     }
 
+    /// Streams one exact quarterly archive directly into the immutable raw store.
+    ///
+    /// Redirects are rejected for bulk artifacts so family/quarter origin cannot drift. The
+    /// bounded channel applies backpressure between transport and the admitted blocking writer;
+    /// neither the compressed archive nor any decoded table is assembled in memory.
+    pub async fn fetch_bulk_archive(
+        &self,
+        authority: &ExtractionAuthority,
+        selection: &SecBulkSelection,
+        deadline: Timestamp,
+        cancellation: CancellationToken,
+    ) -> Result<SecBulkCapture, SecClientError> {
+        let maximum = match selection.family() {
+            SecBulkFamily::Nport => MAX_NPORT_ARCHIVE_BYTES,
+            SecBulkFamily::Ncen => MAX_NCEN_ARCHIVE_BYTES,
+        };
+        self.retrieve_streamed_bulk(
+            authority,
+            selection,
+            SecObjectLocator::quarterly_bulk_archive(selection.family(), selection.quarter())?,
+            maximum,
+            deadline,
+            &cancellation,
+        )
+        .await
+    }
+
+    /// Streams and seals the exact official PDF readme paired with a quarterly archive.
+    pub async fn fetch_bulk_readme(
+        &self,
+        authority: &ExtractionAuthority,
+        selection: &SecBulkSelection,
+        deadline: Timestamp,
+        cancellation: CancellationToken,
+    ) -> Result<SecBulkCapture, SecClientError> {
+        self.retrieve_streamed_bulk(
+            authority,
+            selection,
+            SecObjectLocator::quarterly_bulk_readme(selection.family())?,
+            MAX_BULK_README_BYTES,
+            deadline,
+            &cancellation,
+        )
+        .await
+    }
+
+    /// Retrieves, seals, reopens, and inspects one exact quarterly generation under one absolute
+    /// end-to-end deadline. A timeout cancels both transport and admitted blocking validation.
+    pub async fn fetch_and_inspect_bulk(
+        &self,
+        authority: &ExtractionAuthority,
+        selection: &SecBulkSelection,
+        limits: SecBulkParseLimits,
+        deadline: Timestamp,
+        cancellation: CancellationToken,
+    ) -> Result<SecBulkLayoutManifest, SecClientError> {
+        let remaining = remaining_until(deadline)?;
+        let operation_cancellation = cancellation.child_token();
+        let operation_token = operation_cancellation.clone();
+        tokio::select! {
+            result = async {
+                let archive = self.fetch_bulk_archive(
+                    authority,
+                    selection,
+                    deadline,
+                    operation_token.clone(),
+                ).await?;
+                let readme = self.fetch_bulk_readme(
+                    authority,
+                    selection,
+                    deadline,
+                    operation_token.clone(),
+                ).await?;
+                ensure_before_deadline(deadline)?;
+                let store = Arc::clone(&self.raw_store);
+                self.run_blocking(&operation_token, move |worker_cancellation| {
+                    inspect_bulk_archive(
+                        &store,
+                        archive,
+                        readme,
+                        limits,
+                        deadline,
+                        worker_cancellation,
+                    )
+                    .map_err(|_| SecClientError::InvalidCaptureMaterial)
+                })
+                .await
+            } => {
+                ensure_before_deadline(deadline)?;
+                result
+            }
+            () = tokio::time::sleep(remaining) => {
+                operation_cancellation.cancel();
+                Err(SecClientError::DeadlineExceeded)
+            }
+            () = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                Err(SecClientError::Cancelled)
+            }
+        }
+    }
+
+    /// Produces secret-free root-activation evidence after exact capture and layout inspection.
+    pub async fn doctor_bulk(
+        &self,
+        authority: &ExtractionAuthority,
+        selection: &SecBulkSelection,
+        manifest: Option<&SecBulkLayoutManifest>,
+        limits: SecBulkParseLimits,
+        deadline: Timestamp,
+        cancellation: CancellationToken,
+    ) -> Result<SecBulkDoctorReport, SecClientError> {
+        ensure_before_deadline(deadline)?;
+        self.validate_authority(authority)?;
+        let observed_at = system_timestamp()?;
+        ensure_before_deadline(deadline)?;
+        let Some(manifest) = manifest else {
+            return Ok(SecBulkDoctorReport::new(
+                selection.clone(),
+                SecBulkDoctorState::InvalidEvidence,
+                observed_at,
+                None,
+            ));
+        };
+        if manifest.capture().selection() != selection
+            || manifest.official_readme_capture().selection() != selection
+            || observed_at < manifest.capture().first_observed_at()
+            || observed_at < manifest.official_readme_capture().first_observed_at()
+        {
+            return Ok(SecBulkDoctorReport::new(
+                selection.clone(),
+                SecBulkDoctorState::InvalidEvidence,
+                observed_at,
+                None,
+            ));
+        }
+        let request_bounds = self.request_bounds(authority)?;
+        if manifest.capture().size_bytes() > request_bounds.max_response_bytes()
+            || manifest.official_readme_capture().size_bytes() > request_bounds.max_response_bytes()
+        {
+            return Ok(SecBulkDoctorReport::new(
+                selection.clone(),
+                SecBulkDoctorState::RequestBoundsInsufficient,
+                observed_at,
+                None,
+            ));
+        }
+        let expected = manifest.clone();
+        let store = Arc::clone(&self.raw_store);
+        let operation_cancellation = cancellation.child_token();
+        let operation_token = operation_cancellation.clone();
+        let remaining = remaining_until(deadline)?;
+        let recovered = tokio::select! {
+            result = self.run_blocking(&operation_token, move |worker_cancellation| {
+                match recover_bulk_archive(
+                    &store,
+                    &expected,
+                    limits,
+                    deadline,
+                    worker_cancellation,
+                ) {
+                    Ok(recovered) => Ok(Some(recovered)),
+                    Err(crate::SecBulkError::DeadlineExceeded)
+                    | Err(crate::SecBulkError::RawEvidence(
+                        crate::RawEvidenceError::DeadlineExceeded,
+                    )) => Err(SecClientError::DeadlineExceeded),
+                    Err(crate::SecBulkError::Cancelled)
+                    | Err(crate::SecBulkError::RawEvidence(crate::RawEvidenceError::Cancelled)) => {
+                        Err(SecClientError::Cancelled)
+                    }
+                    Err(_) => Ok(None),
+                }
+            }) => result?,
+            () = tokio::time::sleep(remaining) => {
+                operation_cancellation.cancel();
+                return Err(SecClientError::DeadlineExceeded);
+            }
+            () = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                return Err(SecClientError::Cancelled);
+            }
+        };
+        ensure_before_deadline(deadline)?;
+        self.validate_authority(authority)?;
+        let observed_at = system_timestamp()?;
+        ensure_before_deadline(deadline)?;
+        let Some(recovered) = recovered else {
+            return Ok(SecBulkDoctorReport::new(
+                selection.clone(),
+                SecBulkDoctorState::InvalidEvidence,
+                observed_at,
+                None,
+            ));
+        };
+        let state = match selection.coverage() {
+            SecBulkCoverage::DerivedAsFiledIncludingAmendments => SecBulkDoctorState::Ready,
+            SecBulkCoverage::AcceptedSchemaExcluded { .. } => {
+                SecBulkDoctorState::ReadyWithDeclaredCoverageGap
+            }
+        };
+        Ok(SecBulkDoctorReport::new(
+            selection.clone(),
+            state,
+            observed_at,
+            Some(&recovered),
+        ))
+    }
+
+    async fn retrieve_streamed_bulk(
+        &self,
+        authority: &ExtractionAuthority,
+        selection: &SecBulkSelection,
+        locator: SecObjectLocator,
+        provider_local_maximum: u64,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<SecBulkCapture, SecClientError> {
+        let deadline_wait = tokio::time::sleep(remaining_until(deadline)?);
+        tokio::pin!(deadline_wait);
+        ensure_before_deadline(deadline)?;
+        self.validate_authority(authority)?;
+        let request_bounds = self.request_bounds(authority)?;
+        let effective_maximum = request_bounds
+            .max_response_bytes()
+            .min(provider_local_maximum);
+        if effective_maximum == 0 {
+            return Err(SecClientError::ResponseTooLarge);
+        }
+        let current = locator.url().to_owned();
+        let media_kind = if current == selection.archive_locator().as_str() {
+            SecBulkMediaKind::Zip
+        } else if current == selection.readme_locator().as_str() {
+            SecBulkMediaKind::Pdf
+        } else {
+            return Err(SecClientError::InvalidLocator);
+        };
+        let in_flight = authority
+            .try_network_request(&current)?
+            .authorize_send(&current)?;
+        let response = tokio::select! {
+            response = self.client.get(&current).header(ACCEPT_ENCODING, "identity").send() => {
+                match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.update_health(SecExtractionHealthState::ProviderUnavailable, None)?;
+                        return Err(error.into());
+                    }
+                }
+            }
+            () = cancellation.cancelled() => return Err(SecClientError::Cancelled),
+            () = &mut deadline_wait => return Err(SecClientError::DeadlineExceeded),
+        };
+        in_flight.validate_current()?;
+        let status = response.status();
+        if status.is_redirection() {
+            drop(response);
+            in_flight.release();
+            self.update_health(
+                SecExtractionHealthState::InvalidResponse,
+                Some(status.as_u16()),
+            )?;
+            return Err(SecClientError::InvalidRedirect);
+        }
+        if status.as_u16() == 429 || status.as_u16() == 503 {
+            self.update_health(
+                health_for_http_status(status.as_u16()),
+                Some(status.as_u16()),
+            )?;
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .map(|value| value.as_bytes().to_vec());
+            drop(response);
+            let deadline = in_flight.apply_retry_after_header(retry_after.as_deref(), 5_000)?;
+            return Err(SecClientError::Authority(
+                ExtractionAuthorityError::BudgetWaitUntil { deadline },
+            ));
+        }
+        if !status.is_success() {
+            self.update_health(
+                health_for_http_status(status.as_u16()),
+                Some(status.as_u16()),
+            )?;
+            drop(response);
+            in_flight.release();
+            return Err(SecClientError::HttpStatus(status.as_u16()));
+        }
+        let validators = self.response_validators(response.headers())?;
+        let transport_validators = validators.clone();
+        let media_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .map(|value| value.to_str())
+            .transpose()
+            .map_err(|_| SecClientError::InvalidCaptureMaterial)?
+            .map(str::to_owned);
+        let expected_bytes = response.content_length();
+        if let Some(length) = expected_bytes {
+            in_flight.validate_response_size(length)?;
+            if length == 0 || length > effective_maximum {
+                self.update_health(SecExtractionHealthState::InvalidResponse, None)?;
+                return Err(SecClientError::ResponseTooLarge);
+            }
+        }
+        let admission = Arc::clone(&self.blocking_admission);
+        let permit = tokio::select! {
+            permit = admission.acquire_owned() => {
+                permit.map_err(|_| SecClientError::BlockingAdmissionClosed)?
+            }
+            () = cancellation.cancelled() => return Err(SecClientError::Cancelled),
+            () = &mut deadline_wait => return Err(SecClientError::DeadlineExceeded),
+        };
+        let (sender, receiver) = mpsc::channel(STREAM_CHANNEL_CHUNKS);
+        let raw_store = Arc::clone(&self.raw_store);
+        let representations = Arc::clone(&self.representation_registry);
+        let retained_locator = current.clone();
+        let worker_cancellation = cancellation.child_token();
+        let worker_token = worker_cancellation.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let receipt = raw_store.persist_stream_receiver(
+                receiver,
+                expected_bytes,
+                effective_maximum,
+                &worker_token,
+            )?;
+            representations
+                .record_success_cancellable(
+                    &retained_locator,
+                    receipt.evidence(),
+                    receipt.size_bytes(),
+                    validators,
+                    &worker_token,
+                )
+                .map_err(Into::into)
+        });
+        let read_timeout = Duration::from_nanos(request_bounds.read_timeout_nanos());
+        let mut observed = 0_u64;
+        let mut stream = response.bytes_stream();
+        loop {
+            in_flight.validate_current()?;
+            let next = tokio::select! {
+                result = tokio::time::timeout(read_timeout, stream.next()) => {
+                    match result {
+                        Ok(next) => next,
+                        Err(_) => {
+                            worker_cancellation.cancel();
+                            drop(sender);
+                            let _ = worker.await;
+                            self.update_health(SecExtractionHealthState::ProviderUnavailable, None)?;
+                            return Err(SecClientError::ReadTimeout);
+                        }
+                    }
+                }
+                result = &mut worker => {
+                    return match result {
+                        Ok(Ok(_)) => Err(SecClientError::InvalidCaptureMaterial),
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err(SecClientError::BlockingWorkerFailed),
+                    };
+                }
+                () = cancellation.cancelled() => {
+                    worker_cancellation.cancel();
+                    drop(sender);
+                    let _ = worker.await;
+                    return Err(SecClientError::Cancelled);
+                }
+                () = &mut deadline_wait => {
+                    worker_cancellation.cancel();
+                    drop(sender);
+                    return Err(SecClientError::DeadlineExceeded);
+                }
+            };
+            let Some(chunk) = next else { break };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    worker_cancellation.cancel();
+                    drop(sender);
+                    let _ = worker.await;
+                    self.update_health(SecExtractionHealthState::ProviderUnavailable, None)?;
+                    return Err(error.into());
+                }
+            };
+            observed = observed
+                .checked_add(
+                    u64::try_from(chunk.len()).map_err(|_| SecClientError::ResponseTooLarge)?,
+                )
+                .ok_or(SecClientError::ResponseTooLarge)?;
+            in_flight.validate_response_size(observed)?;
+            if observed > effective_maximum || expected_bytes.is_some_and(|size| observed > size) {
+                worker_cancellation.cancel();
+                drop(sender);
+                let _ = worker.await;
+                self.update_health(SecExtractionHealthState::InvalidResponse, None)?;
+                return Err(SecClientError::ResponseTooLarge);
+            }
+            tokio::select! {
+                result = sender.send(chunk) => {
+                    if result.is_err() {
+                        worker_cancellation.cancel();
+                        drop(sender);
+                        let result = worker.await;
+                        return match result {
+                            Ok(Err(error)) => Err(error),
+                            _ => Err(SecClientError::BlockingWorkerFailed),
+                        };
+                    }
+                }
+                result = &mut worker => {
+                    return match result {
+                        Ok(Ok(_)) => Err(SecClientError::InvalidCaptureMaterial),
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err(SecClientError::BlockingWorkerFailed),
+                    };
+                }
+                () = cancellation.cancelled() => {
+                    worker_cancellation.cancel();
+                    drop(sender);
+                    let _ = worker.await;
+                    return Err(SecClientError::Cancelled);
+                }
+                () = &mut deadline_wait => {
+                    worker_cancellation.cancel();
+                    drop(sender);
+                    return Err(SecClientError::DeadlineExceeded);
+                }
+            }
+        }
+        drop(stream);
+        let body_received_at = system_timestamp()?;
+        drop(sender);
+        let representation = tokio::select! {
+            result = &mut worker => {
+                result.map_err(|_| SecClientError::BlockingWorkerFailed)??
+            }
+            () = cancellation.cancelled() => {
+                worker_cancellation.cancel();
+                let _ = worker.await;
+                return Err(SecClientError::Cancelled);
+            }
+            () = &mut deadline_wait => {
+                worker_cancellation.cancel();
+                return Err(SecClientError::DeadlineExceeded);
+            }
+        };
+        ensure_before_deadline(deadline)?;
+        in_flight.validate_current()?;
+        self.validate_authority(authority)?;
+        if expected_bytes.is_some_and(|length| length != observed)
+            || representation.size_bytes() != observed
+            || representation.locator() != current
+            || body_received_at > representation.first_observed_at()
+            || representation.first_observed_at() > deadline
+        {
+            self.update_health(SecExtractionHealthState::InvalidResponse, None)?;
+            return Err(SecClientError::InvalidCaptureMaterial);
+        }
+        let capture = SecBulkCapture::try_new(
+            selection.clone(),
+            SourceIdentifier::try_from(current)?,
+            representation.evidence(),
+            representation.size_bytes(),
+            representation.first_observed_at(),
+            representation.retrieval_revision(),
+            SecBulkTransportEvidence::try_new(
+                status.as_u16(),
+                media_kind,
+                media_type.as_deref(),
+                transport_validators,
+                body_received_at,
+            )
+            .map_err(|_| SecClientError::InvalidCaptureMaterial)?,
+        )
+        .map_err(|_| SecClientError::InvalidCaptureMaterial)?;
+        self.update_health(SecExtractionHealthState::Ready, None)?;
+        in_flight.record_success()?;
+        Ok(capture)
+    }
+
     async fn retrieve(
         &self,
         authority: &ExtractionAuthority,
@@ -359,11 +865,12 @@ impl SecEdgarSource {
                 drop(response);
                 in_flight.validate_current()?;
                 self.validate_authority(authority)?;
-                in_flight.release();
                 if force_unconditional {
+                    in_flight.release();
                     self.update_health(SecExtractionHealthState::InvalidResponse, Some(304))?;
                     return Err(SecClientError::InvalidCaptureMaterial);
                 }
+                in_flight.record_success()?;
                 // A 304 has no provider body to seal. Repeat once without validators so an exact
                 // successful response body, not a local cache replay, backs publication.
                 force_unconditional = true;
@@ -469,7 +976,6 @@ impl SecEdgarSource {
                 .await;
             in_flight.validate_current()?;
             self.validate_authority(authority)?;
-            in_flight.release();
             let retrieved = retrieved.and_then(|(bytes, retained)| {
                 retrieved_from_representation(
                     bytes,
@@ -480,7 +986,9 @@ impl SecEdgarSource {
                     body_received_at,
                 )
             });
-            return self.finish_local_retrieval(retrieved);
+            let retrieved = self.finish_local_retrieval(retrieved)?;
+            in_flight.record_success()?;
+            return Ok(retrieved);
         }
     }
 
@@ -627,6 +1135,28 @@ impl SecEdgarSource {
         Arc::clone(&self.identities)
     }
 
+    /// Resolves one closed SEC-native identifier through the checked, conflict-quarantining
+    /// provider-identity registry and returns the only receipt accepted by bulk canonical mapping.
+    pub fn resolve_bulk_identity(
+        &self,
+        namespace: SecAuthoritativeIdentifierNamespace,
+        authority_source_id: &SourceId,
+        authoritative_identifier: &SourceIdentifier,
+        at: Timestamp,
+    ) -> Result<SecGovernedIdentityReceipt, crate::SecBulkError> {
+        let provider_identifier =
+            ProviderInstrumentId::try_from(authoritative_identifier.as_str())?;
+        let record = self
+            .identities
+            .provider_identity_at(authority_source_id, &provider_identifier, at)
+            .ok_or(crate::SecBulkError::UnresolvedIdentity)?;
+        SecGovernedIdentityReceipt::from_registry_record(
+            namespace,
+            authoritative_identifier.clone(),
+            record,
+        )
+    }
+
     pub(crate) const fn parser_limits(&self) -> SecParserLimits {
         self.parser_limits
     }
@@ -706,6 +1236,25 @@ fn sec_request_identity(locator: &str, conditional: Option<&SecHttpValidators>) 
         None => hash.update([0]),
     }
     EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn remaining_until(deadline: Timestamp) -> Result<Duration, SecClientError> {
+    let now = system_timestamp()?;
+    let remaining = deadline
+        .unix_nanos()
+        .checked_sub(now.unix_nanos())
+        .filter(|remaining| *remaining > 0)
+        .ok_or(SecClientError::DeadlineExceeded)?;
+    let remaining = u64::try_from(remaining).map_err(|_| SecClientError::DeadlineExceeded)?;
+    Ok(Duration::from_nanos(remaining))
+}
+
+fn ensure_before_deadline(deadline: Timestamp) -> Result<(), SecClientError> {
+    if system_timestamp()? >= deadline {
+        Err(SecClientError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
 }
 
 fn hash_optional_capture_field(hash: &mut Sha256, value: Option<&[u8]>) {
