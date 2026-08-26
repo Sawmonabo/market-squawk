@@ -4685,12 +4685,9 @@ name = "market-squawk-adapter-nasdaq-symbols"
 version = "1.0.0"
 dependencies = [
  "bytes",
- "cap-fs-ext",
- "cap-std",
  "chrono",
  "futures-util",
  "httpdate",
- "libc",
  "market-squawk-domain",
  "market-squawk-platform",
  "market-squawk-sources",
