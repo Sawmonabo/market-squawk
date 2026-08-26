@@ -35,10 +35,10 @@ use crate::durable::{
 };
 use crate::{
     AdapterBounds, AdmissionDecision, AdmissionPolicy, AdmissionRejection, AttemptDisposition,
-    AttemptKind, AttemptOutcome, AttemptPermit, ParseContext, YahooAdapterError, YahooAdmission,
-    YahooAssetClass, YahooChart, YahooDurableStateStore, YahooEnrichment, YahooFundData,
-    YahooHttpMethod, YahooHttpRequest, YahooLookupHint, YahooOptionChain, YahooQuote,
-    YahooReference, YahooRequestFamily, YahooRequestPlan, YahooReturnedDisposition,
+    AttemptKind, AttemptOutcome, AttemptPermit, ParseContext, YAHOO_SOURCE_ID, YahooAdapterError,
+    YahooAdmission, YahooAssetClass, YahooChart, YahooDurableStateStore, YahooEnrichment,
+    YahooFundData, YahooHttpMethod, YahooHttpRequest, YahooLookupHint, YahooOptionChain,
+    YahooQuote, YahooReference, YahooRequestFamily, YahooRequestPlan, YahooReturnedDisposition,
     parse_chart_response, parse_fund_response, parse_lookup_response, parse_option_response,
     parse_quote_response, parse_reference_response,
 };
@@ -165,77 +165,154 @@ pub enum YahooParsedResponse {
     Lookup(YahooReturnedDisposition<YahooLookupHint>),
 }
 
-#[derive(Clone, Debug)]
+/// One typed response served to the explicit caller that requested it.
+///
+/// The value is deliberately not cloneable. Network-owned responses may be consumed once into a
+/// pending raw-publication handoff; cache and coalesced responses remain readable with their
+/// original provider receipt but cannot manufacture another publication.
+#[derive(Debug)]
 pub struct YahooHttpResult {
-    pub disposition: YahooExecutionDisposition,
-    pub raw: Arc<YahooRawReceipt>,
-    pub parsed: Arc<YahooParsedResponse>,
-    pub(crate) publication: Option<Arc<YahooPublicationCapability>>,
+    disposition: YahooExecutionDisposition,
+    raw: Arc<YahooRawReceipt>,
+    parsed: Arc<YahooParsedResponse>,
 }
 
 impl YahooHttpResult {
-    /// Binds one network-owner response to an exact standalone provider capture.
+    /// Returns whether the caller owns a network response or reused existing provider evidence.
+    pub const fn disposition(&self) -> YahooExecutionDisposition {
+        self.disposition
+    }
+
+    /// Returns the exact original provider request, body, clocks, and actual-attempt receipts.
+    pub fn raw_receipt(&self) -> &YahooRawReceipt {
+        self.raw.as_ref()
+    }
+
+    /// Returns the typed response parsed from the exact original provider body.
+    pub fn parsed_response(&self) -> &YahooParsedResponse {
+        self.parsed.as_ref()
+    }
+
+    /// Consumes one network-owned result into a closed, typed raw-publication handoff.
     ///
-    /// The first successful preflight claims the one-shot handoff across every result clone.
-    /// Failed preflight leaves it available; cache/coalesced results have no capability. The
-    /// material contains only source identity, request/body receipts, and the exact response
-    /// bytes; Yahoo cookies, crumbs, clients, and admission/session state are structurally absent.
-    pub fn publication_material(
-        &self,
+    /// Cache and coalesced results keep the original receipt for display and analysis, but cannot
+    /// create another provider receipt. The returned value owns no sealer, store, revision,
+    /// manifest, PIT selector, or application authority.
+    pub fn into_pending_publication(
+        self,
         binding: YahooPublicationBinding,
-    ) -> Result<ProviderCaptureMaterial, YahooPublicationBridgeError> {
-        let publication = self
-            .publication
-            .as_ref()
-            .ok_or(YahooPublicationBridgeError::NonPublicationResult)?;
-        let mut claim = publication
-            .claim
-            .lock()
-            .map_err(|_| YahooPublicationBridgeError::PublicationClaimUnavailable)?;
-        if matches!(*claim, YahooPublicationClaim::Claimed(_)) {
-            return Err(YahooPublicationBridgeError::PublicationAlreadyClaimed);
+    ) -> Result<YahooPendingPublication, YahooPublicationBridgeError> {
+        if self.disposition != YahooExecutionDisposition::Network {
+            return Err(YahooPublicationBridgeError::NonPublicationResult);
         }
-        let material = publication.raw.capture_material(binding)?;
-        *claim = YahooPublicationClaim::Claimed(material.receipt().clone());
-        Ok(material)
-    }
-
-    pub(crate) fn claimed_publication_raw(
-        &self,
-        sealed_capture: &SealedProviderCaptureSetReceipt,
-    ) -> Result<&YahooRawReceipt, YahooPublicationBridgeError> {
-        let publication = self
-            .publication
-            .as_ref()
-            .ok_or(YahooPublicationBridgeError::NonPublicationResult)?;
-        let claim = publication
-            .claim
-            .lock()
-            .map_err(|_| YahooPublicationBridgeError::PublicationClaimUnavailable)?;
-        match &*claim {
-            YahooPublicationClaim::Available => {
-                Err(YahooPublicationBridgeError::PublicationNotClaimed)
-            }
-            YahooPublicationClaim::Claimed(receipt) if receipt == sealed_capture.capture() => {
-                Ok(publication.raw.as_ref())
-            }
-            YahooPublicationClaim::Claimed(_) => {
-                Err(YahooPublicationBridgeError::PublicationClaimMismatch)
-            }
-        }
+        let material = self.raw.capture_material(binding)?;
+        let expected_capture = material.receipt().clone();
+        Ok(YahooPendingPublication {
+            rejoin: YahooPublicationSealRejoin {
+                raw: self.raw,
+                parsed: self.parsed,
+                expected_capture,
+            },
+            material,
+        })
     }
 }
 
+/// One noncloneable network response waiting for the shared raw sealer.
 #[derive(Debug)]
-pub(crate) struct YahooPublicationCapability {
+pub struct YahooPendingPublication {
+    rejoin: YahooPublicationSealRejoin,
+    material: ProviderCaptureMaterial,
+}
+
+impl YahooPendingPublication {
+    /// Splits the one-shot value into shared source-neutral material and an opaque typed rejoin.
+    pub fn into_sealing_parts(self) -> (YahooPublicationSealRejoin, ProviderCaptureMaterial) {
+        (self.rejoin, self.material)
+    }
+}
+
+/// Opaque continuation held until the shared sealer returns a consuming material-bound seal.
+///
+/// There is intentionally no public post-seal transition using
+/// [`SealedProviderCaptureSetReceipt`]. Logical capture equality cannot prove that a physical seal
+/// came from this continuation's exact raw envelope. Integration therefore waits for the common
+/// `SealedProviderCaptureMaterial` returned only by consuming `ProviderCaptureMaterial` in
+/// `ResearchService::seal_provider_capture`; that source-neutral value must remain noncloneable and
+/// nonserializable through the future consuming Yahoo rejoin. The serialized integration seam is:
+///
+/// ```text
+/// ResearchService::seal_provider_capture(
+///     material: ProviderCaptureMaterial,
+///     cancellation: &CancellationToken,
+///     deadline: Instant,
+/// ) -> Result<SealedProviderCaptureMaterial, ResearchServiceError>
+///
+/// YahooPublicationSealRejoin::bind_sealed(
+///     self,
+///     sealed: SealedProviderCaptureMaterial,
+/// ) -> Result<YahooSealedPublication, YahooPublicationBridgeError>
+/// ```
+pub struct YahooPublicationSealRejoin {
     raw: Arc<YahooRawReceipt>,
-    claim: Mutex<YahooPublicationClaim>,
+    parsed: Arc<YahooParsedResponse>,
+    expected_capture: ProviderCaptureSetReceipt,
 }
 
+impl fmt::Debug for YahooPublicationSealRejoin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let parsed_response_family = match self.parsed.as_ref() {
+            YahooParsedResponse::Quote(_) => "quote",
+            YahooParsedResponse::Chart(_) => "chart_history",
+            YahooParsedResponse::Reference(_) => "reference_summary",
+            YahooParsedResponse::Fund(_) => "fund_summary",
+            YahooParsedResponse::OptionChain(_) => "option_chain",
+            YahooParsedResponse::Lookup(_) => "lookup",
+        };
+        formatter
+            .debug_struct("YahooPublicationSealRejoin")
+            .field(
+                "request_identity_sha256_hex",
+                &self.raw.request_identity_sha256_hex,
+            )
+            .field("request_family", &self.raw.request_family)
+            .field("parsed_response_family", &parsed_response_family)
+            .field(
+                "expected_capture_observation_digest",
+                &self.expected_capture.observation_digest(),
+            )
+            .field("sealed_transition", &"AWAITING_COMMON_MATERIAL_BINDING")
+            .finish()
+    }
+}
+
+/// Typed Yahoo evidence bound to an exact shared immutable raw receipt.
 #[derive(Debug)]
-enum YahooPublicationClaim {
-    Available,
-    Claimed(ProviderCaptureSetReceipt),
+pub struct YahooSealedPublication {
+    raw: Arc<YahooRawReceipt>,
+    parsed: Arc<YahooParsedResponse>,
+    sealed_capture: SealedProviderCaptureSetReceipt,
+}
+
+impl YahooSealedPublication {
+    /// Returns the exact provider request/body/attempt receipt retained across cache reuse.
+    pub(crate) fn raw_receipt(&self) -> &YahooRawReceipt {
+        self.raw.as_ref()
+    }
+
+    /// Returns the closed typed response parsed from the exact raw body.
+    pub(crate) fn parsed_response(&self) -> &YahooParsedResponse {
+        self.parsed.as_ref()
+    }
+
+    /// Returns the shared physical receipt that binds the exact provider body.
+    pub(crate) const fn sealed_capture(&self) -> &SealedProviderCaptureSetReceipt {
+        &self.sealed_capture
+    }
+
+    pub(crate) fn into_sealed_capture(self) -> SealedProviderCaptureSetReceipt {
+        self.sealed_capture
+    }
 }
 
 /// Caller-owned capture identity that is independent of Yahoo cookie/crumb state.
@@ -248,18 +325,22 @@ pub struct YahooPublicationBinding {
 }
 
 impl YahooPublicationBinding {
-    pub const fn new(
+    /// Constructs an exact Yahoo source binding owned by the application/capture lifecycle.
+    pub fn try_new(
         source_id: SourceId,
         metadata_revision: MetadataRevision,
         event_id: Uuid,
         connection_id: Uuid,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, YahooPublicationBridgeError> {
+        if source_id.as_str() != YAHOO_SOURCE_ID || event_id.is_nil() || connection_id.is_nil() {
+            return Err(YahooPublicationBridgeError::InvalidPublicationBinding);
+        }
+        Ok(Self {
             source_id,
             metadata_revision,
             event_id,
             connection_id,
-        }
+        })
     }
 
     pub const fn source_id(&self) -> &SourceId {
@@ -284,6 +365,20 @@ impl YahooRawReceipt {
         &self,
         binding: YahooPublicationBinding,
     ) -> Result<ProviderCaptureMaterial, YahooPublicationBridgeError> {
+        if self.request.family != self.request_family
+            || self.request.request_key != self.request_target_without_crumb
+            || self.request.target != self.request_target_without_crumb
+            || self.request.effective_arguments != self.effective_arguments
+            || request_identity(&self.request) != self.request_identity_sha256_hex
+            || !(200..300).contains(&self.response_status)
+            || !self
+                .response_content_type
+                .as_deref()
+                .is_some_and(content_type_is_json)
+            || self.received_at_unix_ms > self.available_at_unix_ms
+        {
+            return Err(YahooPublicationBridgeError::InvalidRawReceipt);
+        }
         let request_identity = evidence_digest_from_hex(&self.request_identity_sha256_hex)?;
         let retained_body_digest = evidence_digest_from_hex(&self.response_sha256_hex)?;
         let computed_body_digest = EvidenceDigest::new(
@@ -339,14 +434,10 @@ impl YahooRawReceipt {
 pub enum YahooPublicationBridgeError {
     #[error("cache and coalesced Yahoo results cannot create another publication")]
     NonPublicationResult,
-    #[error("the Yahoo network response publication was already claimed")]
-    PublicationAlreadyClaimed,
-    #[error("the Yahoo network response publication has not been claimed")]
-    PublicationNotClaimed,
-    #[error("the Yahoo publication claim state is unavailable")]
-    PublicationClaimUnavailable,
-    #[error("the sealed Yahoo capture does not match the claimed publication")]
-    PublicationClaimMismatch,
+    #[error("the Yahoo application publication binding is invalid")]
+    InvalidPublicationBinding,
+    #[error("the Yahoo raw request, body, clocks, or schema receipt is inconsistent")]
+    InvalidRawReceipt,
     #[error("Yahoo publication timestamp is outside the canonical range")]
     InvalidTimestamp,
     #[error("Yahoo publication digest is malformed or does not match exact bytes")]
@@ -522,7 +613,7 @@ enum BeginExecution {
 
 impl YahooHttpSession {
     pub fn new(config: YahooHttpSessionConfig) -> Result<Self, YahooHttpFailureKind> {
-        Self::build(config, EndpointSet::production(), None)
+        Self::build(config, EndpointSet::production()?, None)
     }
 
     /// Constructs one explicit-demand session with crash-safe provider cache and admission state.
@@ -533,7 +624,7 @@ impl YahooHttpSession {
         config: YahooHttpSessionConfig,
         store: YahooDurableStateStore,
     ) -> Result<Self, YahooHttpFailureKind> {
-        Self::build(config, EndpointSet::production(), Some(store))
+        Self::build(config, EndpointSet::production()?, Some(store))
     }
 
     fn build(
@@ -1886,17 +1977,10 @@ fn result_from_payload(
     payload: Arc<ExecutionPayload>,
     disposition: YahooExecutionDisposition,
 ) -> YahooHttpResult {
-    let publication = (disposition == YahooExecutionDisposition::Network).then(|| {
-        Arc::new(YahooPublicationCapability {
-            raw: Arc::clone(&payload.raw),
-            claim: Mutex::new(YahooPublicationClaim::Available),
-        })
-    });
     YahooHttpResult {
         disposition,
         raw: Arc::clone(&payload.raw),
         parsed: Arc::clone(&payload.parsed),
-        publication,
     }
 }
 
@@ -2204,7 +2288,7 @@ const fn hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-const fn dataset_identity(family: YahooRequestFamily) -> &'static str {
+pub(crate) const fn dataset_identity(family: YahooRequestFamily) -> &'static str {
     match family {
         YahooRequestFamily::Quote => "yahoo-finance.experimental.quote",
         YahooRequestFamily::ChartHistory => "yahoo-finance.experimental.chart-history",
@@ -2422,17 +2506,16 @@ enum DataFailure {
 }
 
 impl EndpointSet {
-    fn production() -> Self {
-        Self {
-            cookie: Url::parse(BASIC_COOKIE_URL).expect("static Yahoo cookie URL must parse"),
-            basic_crumb: Url::parse(BASIC_CRUMB_URL).expect("static Yahoo crumb URL must parse"),
-            consent_bootstrap: Url::parse(CONSENT_BOOTSTRAP_URL)
-                .expect("static Yahoo consent URL must parse"),
-            consent_submit: Url::parse(CONSENT_SUBMIT_URL)
-                .expect("static Yahoo consent URL must parse"),
-            consent_copy: Url::parse(CONSENT_COPY_URL)
-                .expect("static Yahoo consent URL must parse"),
-            csrf_crumb: Url::parse(CSRF_CRUMB_URL).expect("static Yahoo crumb URL must parse"),
+    fn production() -> Result<Self, YahooHttpFailureKind> {
+        let parse =
+            |value| Url::parse(value).map_err(|_| YahooHttpFailureKind::InvalidConfiguration);
+        Ok(Self {
+            cookie: parse(BASIC_COOKIE_URL)?,
+            basic_crumb: parse(BASIC_CRUMB_URL)?,
+            consent_bootstrap: parse(CONSENT_BOOTSTRAP_URL)?,
+            consent_submit: parse(CONSENT_SUBMIT_URL)?,
+            consent_copy: parse(CONSENT_COPY_URL)?,
+            csrf_crumb: parse(CSRF_CRUMB_URL)?,
             data_rewrite_base: None,
             allow_plain_http: false,
             allowed_hosts: Arc::from([
@@ -2443,7 +2526,7 @@ impl EndpointSet {
                 "consent.yahoo.com".to_owned(),
                 "finance.yahoo.com".to_owned(),
             ]),
-        }
+        })
     }
 
     #[cfg(test)]

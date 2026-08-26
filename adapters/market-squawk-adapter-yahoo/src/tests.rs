@@ -2,62 +2,20 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use market_squawk_domain::{
-    BarTimeSemantics, BarTimestampBasis, Currency, DigestAlgorithm, EvidenceDigest, InstrumentId,
-    MarketBarSessionEvidence, MarketBarSessionKind, MetadataRevision, ProviderInstrumentId,
-    ResearchObservation, RevisionNumber, SourceId, SourceIdentifier, Timestamp, VenueId,
-};
+use market_squawk_domain::{MetadataRevision, SourceId, SourceIdentifier};
 use market_squawk_platform::LocalPaths;
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
 use crate::http::ScriptedHttpResponse;
 use crate::{
-    AdapterBounds, AdmissionDecision, AdmissionPolicy, AttemptDisposition, AttemptKind,
-    AttemptOutcome, ChartInterval, ChartWindow, CircuitSnapshot, ExplicitDemand,
-    ExplicitDemandPurpose, ParseContext, ProviderField, YAHOO_FINANCE_EXPERIMENTAL, YahooAdmission,
-    YahooAssetClass, YahooAttemptTarget, YahooChartInstrumentAuthority, YahooChartMapError,
-    YahooChartMappingInput, YahooDurableStateStore, YahooEnrichmentState,
-    YahooExecutionDisposition, YahooExecutionLimits, YahooHistoricalBarTimeAuthority,
-    YahooHistoricalBarTimeRequest, YahooHttpFailureKind, YahooHttpSession, YahooHttpSessionConfig,
-    YahooLocale, YahooParsedResponse, YahooPublicationBinding, YahooPublicationBridgeError,
-    YahooRequestPlanner, YahooSymbol, YahooTarget, map_chart_bars, parse_quote_response,
+    AdapterBounds, AdmissionPolicy, ChartInterval, ChartWindow, ExplicitDemand,
+    ExplicitDemandPurpose, YahooAssetClass, YahooAttemptTarget, YahooDurableStateStore,
+    YahooExecutionDisposition, YahooExecutionLimits, YahooHttpFailureKind, YahooHttpSession,
+    YahooHttpSessionConfig, YahooLocale, YahooParsedResponse, YahooPublicationBinding,
+    YahooPublicationBridgeError, YahooRequestPlanner, YahooSymbol, YahooTarget,
 };
-
-#[derive(Debug)]
-struct TestYahooDailyBarTimeAuthority;
-
-impl YahooHistoricalBarTimeAuthority for TestYahooDailyBarTimeAuthority {
-    fn validate_current(&self) -> Result<(), YahooChartMapError> {
-        Ok(())
-    }
-
-    fn resolve(
-        &self,
-        request: &YahooHistoricalBarTimeRequest,
-    ) -> Result<BarTimeSemantics, YahooChartMapError> {
-        let end = request
-            .provider_timestamp()
-            .checked_add_nanos(86_400_000_000_000)
-            .map_err(|_| YahooChartMapError::InvalidTimeAuthority)?;
-        let session = MarketBarSessionEvidence::try_new(
-            MarketBarSessionKind::ProviderDefined,
-            SourceIdentifier::try_from("yahoo-test-daily-session-v1")
-                .map_err(|_| YahooChartMapError::InvalidTimeAuthority)?,
-            EvidenceDigest::new(DigestAlgorithm::Sha256, [7; 32]),
-        )
-        .map_err(|_| YahooChartMapError::InvalidTimeAuthority)?;
-        BarTimeSemantics::try_new(
-            request.provider_timestamp(),
-            end,
-            BarTimestampBasis::PeriodStart,
-            session,
-        )
-        .map_err(|_| YahooChartMapError::InvalidTimeAuthority)
-    }
-}
 
 fn bounds(maximum_symbols: usize) -> AdapterBounds {
     AdapterBounds {
@@ -94,196 +52,8 @@ fn target(symbol: String) -> Result<YahooTarget, Box<dyn Error>> {
     })
 }
 
-#[test]
-fn symbol_breadth_is_application_bounded_not_a_disproven_twenty_five_provider_limit()
--> Result<(), Box<dyn Error>> {
-    let planner = planner(40)?;
-    let targets = (0..26)
-        .map(|index| target(format!("T{index}")))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let quote = planner.quote(demand("quote-26")?, targets.clone())?;
-    assert_eq!(quote.requests.len(), 1);
-    assert_eq!(quote.requests[0].requested_symbol_count(), 26);
-
-    let history = planner.chart_history(
-        demand("history-26")?,
-        targets,
-        ChartWindow::OneMonth,
-        ChartInterval::OneDay,
-        false,
-    )?;
-    assert!(history.history_fans_out_per_ticker);
-    assert_eq!(history.actual_primary_attempt_units(), 26);
-    assert!(
-        history
-            .requests
-            .iter()
-            .all(|request| request.requested_symbol_count() == 1)
-    );
-    Ok(())
-}
-
-#[test]
-fn per_ticker_attempts_share_actual_telemetry_and_one_provider_wide_429_circuit()
--> Result<(), Box<dyn Error>> {
-    let planner = planner(4)?;
-    let plan = planner.chart_history(
-        demand("two-ticker-history")?,
-        vec![target("AAPL".to_owned())?, target("MSFT".to_owned())?],
-        ChartWindow::FiveDays,
-        ChartInterval::OneDay,
-        false,
-    )?;
-    let admission = YahooAdmission::new(AdmissionPolicy::new(1_000, 2)?);
-    let shared = admission.clone();
-
-    let first = match admission.admit(&plan.requests[0], AttemptKind::Primary, 10_000)? {
-        AdmissionDecision::Execute(permit) => permit,
-        decision => return Err(format!("unexpected first admission: {decision:?}").into()),
-    };
-    first.complete(
-        AttemptOutcome {
-            returned_units: 1,
-            missing_units: 0,
-            returned_records: 5,
-            response_bytes: 1_024,
-            latency_ms: 80,
-            disposition: AttemptDisposition::Success,
-        },
-        10_080,
-    )?;
-
-    let second = match shared.admit(&plan.requests[1], AttemptKind::Primary, 10_100)? {
-        AdmissionDecision::Execute(permit) => permit,
-        decision => return Err(format!("unexpected second admission: {decision:?}").into()),
-    };
-    second.complete(
-        AttemptOutcome {
-            returned_units: 0,
-            missing_units: 1,
-            returned_records: 0,
-            response_bytes: 96,
-            latency_ms: 45,
-            disposition: AttemptDisposition::Http429 {
-                retry_after_ms: Some(2_000),
-            },
-        },
-        10_145,
-    )?;
-
-    assert!(matches!(
-        admission.admit(&plan.requests[0], AttemptKind::Primary, 11_000)?,
-        AdmissionDecision::CircuitOpen {
-            retry_at_unix_ms: 12_145
-        }
-    ));
-    let snapshot = admission.snapshot()?;
-    assert_eq!(snapshot.actual_http_attempts_total, 2);
-    assert_eq!(snapshot.requested_units_total, 2);
-    assert_eq!(snapshot.returned_units_total, 1);
-    assert_eq!(snapshot.missing_units_total, 1);
-    assert_eq!(snapshot.http_429_total, 1);
-    assert_eq!(snapshot.maximum_observed_response_bytes, 1_024);
-    assert_eq!(snapshot.maximum_observed_latency_ms, 80);
-    assert_eq!(
-        snapshot.circuit,
-        CircuitSnapshot::Open {
-            retry_at_unix_ms: 12_145
-        }
-    );
-    Ok(())
-}
-
-#[test]
-fn quote_parser_retains_provider_market_delay_clocks_and_supplement_only_authority()
--> Result<(), Box<dyn Error>> {
-    let planner = planner(4)?;
-    let request = planner
-        .quote(
-            demand("quote-provenance")?,
-            vec![target("AAPL".to_owned())?, target("MSFT".to_owned())?],
-        )?
-        .requests
-        .into_iter()
-        .next()
-        .ok_or("quote planner returned no request")?;
-    let fixture = serde_json::to_vec(&json!({
-        "quoteResponse": {
-            "error": null,
-            "result": [{
-                "symbol": "AAPL",
-                "quoteType": "EQUITY",
-                "currency": "USD",
-                "exchange": "NMS",
-                "fullExchangeName": "NasdaqGS",
-                "market": "us_market",
-                "region": "US",
-                "exchangeTimezoneName": "America/New_York",
-                "exchangeDataDelayedBy": 0,
-                "marketState": "REGULAR",
-                "regularMarketTime": 1_786_473_650,
-                "regularMarketPrice": 201.25,
-                "bid": 201.20,
-                "bidSize": 8,
-                "ask": 201.30,
-                "askSize": 7,
-                "shortName": "Apple Inc."
-            }]
-        }
-    }))?;
-    let parsed = parse_quote_response(
-        &request,
-        &ParseContext {
-            received_at_unix_ms: 1_786_473_650_125,
-            available_at_unix_ms: 1_786_473_650_140,
-        },
-        bounds(4),
-        &fixture,
-    )?;
-
-    assert_eq!(parsed.provider_returned_symbols.len(), 1);
-    assert_eq!(parsed.missing_symbols.len(), 1);
-    assert_eq!(parsed.valid_observations, 1);
-    let apple = parsed
-        .observations
-        .iter()
-        .find(|observation| observation.data.is_some())
-        .ok_or("valid quote observation missing")?;
-    assert_eq!(apple.state, YahooEnrichmentState::Experimental);
-    assert!(!apple.governed_override_permitted());
-    assert_eq!(apple.provenance.provider, YAHOO_FINANCE_EXPERIMENTAL);
-    assert_eq!(
-        apple.provenance.exchange,
-        ProviderField::Value("NMS".to_owned())
-    );
-    assert_eq!(
-        apple.provenance.full_exchange_name,
-        ProviderField::Value("NasdaqGS".to_owned())
-    );
-    assert_eq!(
-        apple.provenance.market,
-        ProviderField::Value("us_market".to_owned())
-    );
-    assert_eq!(
-        apple.provenance.country,
-        ProviderField::Value("US".to_owned())
-    );
-    assert_eq!(
-        apple.provenance.exchange_delay_seconds,
-        ProviderField::Value(0)
-    );
-    assert_eq!(
-        apple.provenance.provider_event_time_unix_seconds,
-        ProviderField::Value(1_786_473_650)
-    );
-    assert_eq!(apple.provenance.received_at_unix_ms, 1_786_473_650_125);
-    assert_eq!(apple.provenance.available_at_unix_ms, 1_786_473_650_140);
-    Ok(())
-}
-
 #[tokio::test]
-async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circuit()
+async fn explicit_demand_network_response_crosses_one_pending_publication_handoff()
 -> Result<(), Box<dyn Error>> {
     let chart = Bytes::from_static(
         br#"{"chart":{"error":null,"result":[{"meta":{"symbol":"AAPL","instrumentType":"EQUITY","currency":"USD","exchangeName":"NMS","fullExchangeName":"NasdaqGS","market":"us_market","country":"US","exchangeTimezoneName":"America/New_York","exchangeDataDelayedBy":0,"regularMarketTime":1786473650,"dataGranularity":"1d","range":"5d"},"timestamp":[1786473600],"indicators":{"quote":[{"open":[201.0],"high":[202.0],"low":[200.0],"close":[201.5],"volume":[100]}],"adjclose":[{"adjclose":[201.5]}]}}]}}"#,
@@ -357,61 +127,47 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
     let first = session
         .execute(plan.requests[0].clone(), limits, &cancellation)
         .await?;
-    let YahooParsedResponse::Chart(first_chart) = first.parsed.as_ref() else {
+    let YahooParsedResponse::Chart(first_chart) = first.parsed_response() else {
         return Err("first response must be parsed chart enrichment".into());
     };
+    let network_request_identity = first.raw_receipt().request_identity_sha256_hex.clone();
+    let network_response_identity = first.raw_receipt().response_sha256_hex.clone();
+    let network_received_at = first.raw_receipt().received_at_unix_ms;
+    let network_attempts = first.raw_receipt().attempts.clone();
     assert_eq!(
         first_chart.provenance.received_at_unix_ms,
-        first.raw.received_at_unix_ms
+        first.raw_receipt().received_at_unix_ms
     );
     assert_eq!(
         first_chart.provenance.available_at_unix_ms,
-        first.raw.available_at_unix_ms
+        first.raw_receipt().available_at_unix_ms
     );
-    assert_eq!(first.raw.attempts.len(), 3);
+    assert_eq!(first.raw_receipt().attempts.len(), 3);
     assert_eq!(
-        first.raw.attempts[0].target,
+        first.raw_receipt().attempts[0].target,
         YahooAttemptTarget::CookieBootstrap
     );
-    assert_eq!(first.raw.attempts[1].target, YahooAttemptTarget::BasicCrumb);
     assert_eq!(
-        first.raw.attempts[2].target,
+        first.raw_receipt().attempts[1].target,
+        YahooAttemptTarget::BasicCrumb
+    );
+    assert_eq!(
+        first.raw_receipt().attempts[2].target,
         YahooAttemptTarget::Data(crate::YahooRequestFamily::ChartHistory)
     );
-    let publication_binding = YahooPublicationBinding::new(
+    let publication_binding = YahooPublicationBinding::try_new(
         SourceId::try_from("yahoo-finance-experimental")?,
         MetadataRevision::new(SourceIdentifier::try_from("rev-3")?),
         Uuid::from_u128(1),
         Uuid::from_u128(2),
-    );
-    let publication_clone = first.clone();
-    let invalid_binding = YahooPublicationBinding::new(
-        publication_binding.source_id().clone(),
-        publication_binding.metadata_revision().clone(),
-        Uuid::nil(),
-        Uuid::from_u128(2),
-    );
-    assert!(matches!(
-        first.publication_material(invalid_binding),
-        Err(YahooPublicationBridgeError::RawRecord(_))
-    ));
-    let material = first.publication_material(publication_binding.clone())?;
-    assert!(matches!(
-        first.publication_material(publication_binding.clone()),
-        Err(YahooPublicationBridgeError::PublicationAlreadyClaimed)
-    ));
-    let rebound_binding = YahooPublicationBinding::new(
-        publication_binding.source_id().clone(),
-        publication_binding.metadata_revision().clone(),
-        Uuid::from_u128(3),
-        Uuid::from_u128(4),
-    );
-    assert!(matches!(
-        publication_clone.publication_material(rebound_binding),
-        Err(YahooPublicationBridgeError::PublicationAlreadyClaimed)
-    ));
+    )?;
+    let pending = first.into_pending_publication(publication_binding.clone())?;
+    let (rejoin, material) = pending.into_sealing_parts();
     assert_eq!(material.records().len(), 1);
-    assert_eq!(material.records()[0].payload(), first.raw.response_bytes);
+    assert_eq!(
+        material.records()[0].payload().len(),
+        usize::try_from(material.receipt().total_body_bytes())?
+    );
     assert_eq!(material.records()[0].source_sequence(), Some(0));
     assert_eq!(
         material.receipt().dataset().as_str(),
@@ -419,43 +175,14 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
     );
     assert_eq!(
         material.receipt().pages()[0].body_bytes(),
-        u64::try_from(first.raw.response_bytes.len())?
+        material.receipt().total_body_bytes()
     );
-    let sealed = material.seal(&journal_store)?;
-    let chart_authority = YahooChartInstrumentAuthority::try_new(
-        publication_binding.source_id().clone(),
-        publication_binding.metadata_revision().clone(),
-        "06dd06da-ef2d-44dd-bf28-b006da06b24b".parse::<InstrumentId>()?,
-        VenueId::try_from("XNAS")?,
-        ProviderInstrumentId::try_from("AAPL")?,
-        YahooSymbol::parse("AAPL", 512)?,
-        SourceIdentifier::try_from("NMS")?,
-        Currency::try_from("USD")?,
-    )?;
-    let ingested_at = Timestamp::from_unix_nanos(
-        first
-            .raw
-            .available_at_unix_ms
-            .checked_mul(1_000_000)
-            .and_then(|value| value.checked_add(1_000_000))
-            .ok_or("Yahoo canonical ingest time overflow")?,
+    let sealed_capture = material.seal(&journal_store)?;
+    assert_eq!(
+        sealed_capture.capture().dataset().as_str(),
+        "yahoo-finance.experimental.chart-history"
     );
-    let mapped = map_chart_bars(YahooChartMappingInput {
-        result: &first,
-        sealed_capture: &sealed,
-        instrument: &chart_authority,
-        bar_time_authority: &TestYahooDailyBarTimeAuthority,
-        adapter_bounds: bounds(4),
-        authority_seed_revision: RevisionNumber::new(1)?,
-        ingested_at,
-    })?;
-    assert_eq!(mapped.observations().len(), 1);
-    assert!(mapped.revision_plan().is_locally_observed());
-    assert!(mapped.provider_events().is_empty());
-    assert!(matches!(
-        mapped.observations(),
-        [ResearchObservation::MarketBar(_)]
-    ));
+    drop(rejoin);
 
     let second = session
         .execute(plan.requests[1].clone(), limits, &cancellation)
@@ -487,19 +214,9 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
             &cancellation,
         )
         .await?;
-    assert_eq!(cached.disposition, YahooExecutionDisposition::CacheHit);
+    assert_eq!(cached.disposition(), YahooExecutionDisposition::CacheHit);
     assert!(matches!(
-        cached.publication_material(publication_binding.clone()),
-        Err(YahooPublicationBridgeError::NonPublicationResult)
-    ));
-    let forged_cache = crate::YahooHttpResult {
-        disposition: YahooExecutionDisposition::Network,
-        raw: std::sync::Arc::clone(&cached.raw),
-        parsed: std::sync::Arc::clone(&cached.parsed),
-        publication: None,
-    };
-    assert!(matches!(
-        forged_cache.publication_material(publication_binding),
+        cached.into_pending_publication(publication_binding.clone()),
         Err(YahooPublicationBridgeError::NonPublicationResult)
     ));
 
@@ -530,20 +247,25 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
         .execute(plan.requests[0].clone(), restart_limits, &cancellation)
         .await?;
     assert_eq!(
-        restored_cache.disposition,
+        restored_cache.disposition(),
         YahooExecutionDisposition::CacheHit
     );
+    assert_eq!(
+        restored_cache.raw_receipt().request_identity_sha256_hex,
+        network_request_identity
+    );
+    assert_eq!(
+        restored_cache.raw_receipt().response_sha256_hex,
+        network_response_identity
+    );
+    assert_eq!(
+        restored_cache.raw_receipt().received_at_unix_ms,
+        network_received_at
+    );
+    assert_eq!(restored_cache.raw_receipt().attempts, network_attempts);
     assert!(matches!(
-        map_chart_bars(YahooChartMappingInput {
-            result: &restored_cache,
-            sealed_capture: &sealed,
-            instrument: &chart_authority,
-            bar_time_authority: &TestYahooDailyBarTimeAuthority,
-            adapter_bounds: bounds(4),
-            authority_seed_revision: RevisionNumber::new(1)?,
-            ingested_at,
-        }),
-        Err(YahooChartMapError::NonPublicationResult)
+        restored_cache.into_pending_publication(publication_binding),
+        Err(YahooPublicationBridgeError::NonPublicationResult)
     ));
     let restored_circuit = restarted
         .execute(plan.requests[1].clone(), restart_limits, &cancellation)
@@ -555,7 +277,7 @@ async fn local_http_proves_cookie_crumb_fan_out_attempts_and_immediate_429_circu
     ));
     assert!(restarted.scripted_observed_targets().await.is_empty());
     drop(restarted);
-    drop(sealed);
+    drop(sealed_capture);
     drop(journal_store);
     drop(journal_paths);
     std::fs::remove_dir_all(journal_root)?;

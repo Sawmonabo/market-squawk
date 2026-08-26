@@ -31,8 +31,9 @@ pub use error::YahooAdapterError;
 pub use http::{
     YahooAttemptTarget, YahooExecutionDisposition, YahooExecutionLimits, YahooHttpAttemptReceipt,
     YahooHttpFailure, YahooHttpFailureKind, YahooHttpResult, YahooHttpSession,
-    YahooHttpSessionConfig, YahooParsedResponse, YahooPublicationBinding,
-    YahooPublicationBridgeError, YahooRawReceipt,
+    YahooHttpSessionConfig, YahooParsedResponse, YahooPendingPublication, YahooPublicationBinding,
+    YahooPublicationBridgeError, YahooPublicationSealRejoin, YahooRawReceipt,
+    YahooSealedPublication,
 };
 pub use model::{
     EvidenceAuthority, ExplicitDemand, ExplicitDemandPurpose, ParseContext, ProviderField,
@@ -52,6 +53,9 @@ pub use request::{
 
 /// Stable source identity carried by every parsed observation.
 pub const YAHOO_FINANCE_EXPERIMENTAL: &str = "YAHOO_FINANCE_EXPERIMENTAL";
+
+/// Exact shared source namespace admitted for Yahoo publication receipts.
+pub const YAHOO_SOURCE_ID: &str = "yahoo-finance-experimental";
 
 /// Pinned client release whose request behavior informed this adapter contract.
 pub const PINNED_YFINANCE_VERSION: &str = "1.5.2";

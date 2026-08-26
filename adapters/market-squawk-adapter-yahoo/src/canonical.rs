@@ -18,12 +18,11 @@ use url::Url;
 
 use crate::{
     AdapterBounds, PINNED_YFINANCE_COMMIT, PINNED_YFINANCE_VERSION, ParseContext, ProviderField,
-    QualityIssue, YAHOO_FINANCE_EXPERIMENTAL, YahooBar, YahooChartEvent, YahooHttpResult,
-    YahooParsedResponse, YahooRequestFamily, YahooSymbol, parse_chart_response,
+    QualityIssue, YAHOO_FINANCE_EXPERIMENTAL, YAHOO_SOURCE_ID, YahooBar, YahooChartEvent,
+    YahooParsedResponse, YahooRequestFamily, YahooSealedPublication, YahooSymbol,
+    parse_chart_response,
 };
 
-const YAHOO_SOURCE_ID: &str = "yahoo-finance-experimental";
-const YAHOO_CHART_DATASET: &str = "yahoo-finance.experimental.chart-history";
 const YAHOO_CHART_FEED: &str = "yahoo-finance-experimental-chart";
 
 /// Canonical identity and exact provider-to-venue mapping admitted for one Yahoo chart symbol.
@@ -138,10 +137,8 @@ pub trait YahooHistoricalBarTimeAuthority: Send + Sync {
 
 /// Complete pure mapping input for one already sealed network-owned chart response.
 pub struct YahooChartMappingInput<'a> {
-    /// Exact owner result. Cache and coalesced results cannot publish another generation.
-    pub result: &'a YahooHttpResult,
-    /// Exact raw response already sealed into the shared immutable journal.
-    pub sealed_capture: &'a SealedProviderCaptureSetReceipt,
+    /// Exact typed network response consumed after sealing into the shared immutable journal.
+    pub publication: YahooSealedPublication,
     /// Exact canonical/provider identity mapping for the requested symbol.
     pub instrument: &'a YahooChartInstrumentAuthority,
     /// Independent provider-calendar/session authority.
@@ -158,8 +155,10 @@ impl std::fmt::Debug for YahooChartMappingInput<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("YahooChartMappingInput")
-            .field("result_disposition", &self.result.disposition)
-            .field("sealed_capture", &self.sealed_capture.receipt_digest())
+            .field(
+                "sealed_capture",
+                &self.publication.sealed_capture().receipt_digest(),
+            )
             .field("instrument", self.instrument)
             .field("bar_time_authority", &"[REVOCABLE AUTHORITY]")
             .field("adapter_bounds", &self.adapter_bounds)
@@ -170,42 +169,17 @@ impl std::fmt::Debug for YahooChartMappingInput<'_> {
 }
 
 /// Validated canonical bars plus provider-native events/issues that remain supplemental evidence.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct YahooMappedChartHistory {
     observations: Vec<ResearchObservation>,
     revision_plan: ExtractionRevisionPlan,
     provider_events: Vec<YahooChartEvent>,
     quality_issues: Vec<QualityIssue>,
-    sealed_capture_receipt: EvidenceDigest,
+    sealed_capture: SealedProviderCaptureSetReceipt,
 }
 
 impl YahooMappedChartHistory {
-    /// Returns complete canonical raw-price bars in provider order.
-    pub fn observations(&self) -> &[ResearchObservation] {
-        &self.observations
-    }
-
-    /// Returns aligned local-content revision evidence for shared durable assignment.
-    pub const fn revision_plan(&self) -> &ExtractionRevisionPlan {
-        &self.revision_plan
-    }
-
-    /// Returns provider-native corporate-action events not promoted by this bar-only mapper.
-    pub fn provider_events(&self) -> &[YahooChartEvent] {
-        &self.provider_events
-    }
-
-    /// Returns the explicit experimental/degraded issues retained by the parsed response.
-    pub fn quality_issues(&self) -> &[QualityIssue] {
-        &self.quality_issues
-    }
-
-    /// Returns evidence binding the raw provider response to immutable physical storage.
-    pub const fn sealed_capture_receipt(&self) -> EvidenceDigest {
-        self.sealed_capture_receipt
-    }
-
-    /// Consumes the complete provider-local handoff without discarding events or quality issues.
+    /// Consumes the complete provider-local handoff, including its actual physical raw seal.
     pub fn into_parts(
         self,
     ) -> (
@@ -213,14 +187,14 @@ impl YahooMappedChartHistory {
         ExtractionRevisionPlan,
         Vec<YahooChartEvent>,
         Vec<QualityIssue>,
-        EvidenceDigest,
+        SealedProviderCaptureSetReceipt,
     ) {
         (
             self.observations,
             self.revision_plan,
             self.provider_events,
             self.quality_issues,
-            self.sealed_capture_receipt,
+            self.sealed_capture,
         )
     }
 }
@@ -233,31 +207,8 @@ impl YahooMappedChartHistory {
 pub fn map_chart_bars(
     input: YahooChartMappingInput<'_>,
 ) -> Result<YahooMappedChartHistory, YahooChartMapError> {
-    let raw = input
-        .result
-        .claimed_publication_raw(input.sealed_capture)
-        .map_err(|error| match error {
-            crate::YahooPublicationBridgeError::NonPublicationResult => {
-                YahooChartMapError::NonPublicationResult
-            }
-            crate::YahooPublicationBridgeError::PublicationNotClaimed => {
-                YahooChartMapError::PublicationNotClaimed
-            }
-            crate::YahooPublicationBridgeError::PublicationClaimMismatch => {
-                YahooChartMapError::CaptureMismatch
-            }
-            crate::YahooPublicationBridgeError::PublicationClaimUnavailable
-            | crate::YahooPublicationBridgeError::PublicationAlreadyClaimed
-            | crate::YahooPublicationBridgeError::InvalidTimestamp
-            | crate::YahooPublicationBridgeError::InvalidDigest
-            | crate::YahooPublicationBridgeError::InvalidDataset
-            | crate::YahooPublicationBridgeError::InvalidBodyLength
-            | crate::YahooPublicationBridgeError::RawRecord(_)
-            | crate::YahooPublicationBridgeError::ProviderCapture(_) => {
-                YahooChartMapError::PublicationClaimUnavailable
-            }
-        })?;
-    let YahooParsedResponse::Chart(enrichment) = input.result.parsed.as_ref() else {
+    let raw = input.publication.raw_receipt();
+    let YahooParsedResponse::Chart(enrichment) = input.publication.parsed_response() else {
         return Err(YahooChartMapError::WrongResponseFamily);
     };
     let chart = enrichment
@@ -314,12 +265,15 @@ pub fn map_chart_bars(
         return Err(YahooChartMapError::NoCanonicalBars);
     }
     let revision_plan = ExtractionRevisionPlan::locally_observed(observations.len())?;
+    let provider_events = chart.events.clone();
+    let quality_issues = enrichment.issues.clone();
+    let sealed_capture = input.publication.into_sealed_capture();
     Ok(YahooMappedChartHistory {
         observations,
         revision_plan,
-        provider_events: chart.events.clone(),
-        quality_issues: enrichment.issues.clone(),
-        sealed_capture_receipt: input.sealed_capture.receipt_digest(),
+        provider_events,
+        quality_issues,
+        sealed_capture,
     })
 }
 
@@ -422,7 +376,7 @@ fn validate_capture(
     input: &YahooChartMappingInput<'_>,
     raw: &crate::YahooRawReceipt,
 ) -> Result<(), YahooChartMapError> {
-    let capture = input.sealed_capture.capture();
+    let capture = input.publication.sealed_capture().capture();
     let Some(page) = capture.pages().first() else {
         return Err(YahooChartMapError::CaptureMismatch);
     };
@@ -441,7 +395,8 @@ fn validate_capture(
         || capture.pages().len() != 1
         || capture.source_id() != &input.instrument.source_id
         || capture.metadata_revision() != &input.instrument.source_contract_revision
-        || capture.dataset().as_str() != YAHOO_CHART_DATASET
+        || capture.dataset().as_str()
+            != crate::http::dataset_identity(YahooRequestFamily::ChartHistory)
         || capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
         || capture.request_set_identity() != request_identity
         || capture.total_body_bytes() != u64::try_from(raw.response_bytes.len()).unwrap_or(u64::MAX)
@@ -461,8 +416,8 @@ fn validate_chart_authority(
     input: &YahooChartMappingInput<'_>,
     chart: &crate::YahooChart,
 ) -> Result<(), YahooChartMapError> {
-    let raw = input.result.raw.as_ref();
-    let YahooParsedResponse::Chart(enrichment) = input.result.parsed.as_ref() else {
+    let raw = input.publication.raw_receipt();
+    let YahooParsedResponse::Chart(enrichment) = input.publication.parsed_response() else {
         return Err(YahooChartMapError::WrongResponseFamily);
     };
     let currency_matches = matches!(
@@ -589,12 +544,6 @@ fn identifier(value: &str) -> Result<SourceIdentifier, YahooChartMapError> {
 /// Fail-closed canonical Yahoo chart mapping errors.
 #[derive(Debug, Error)]
 pub enum YahooChartMapError {
-    #[error("cache or coalesced Yahoo results cannot create another canonical publication")]
-    NonPublicationResult,
-    #[error("Yahoo canonical mapping requires a successfully claimed raw publication")]
-    PublicationNotClaimed,
-    #[error("Yahoo publication claim state is unavailable")]
-    PublicationClaimUnavailable,
     #[error("Yahoo canonical chart mapper received another response family")]
     WrongResponseFamily,
     #[error("sealed Yahoo capture does not match the chart response")]

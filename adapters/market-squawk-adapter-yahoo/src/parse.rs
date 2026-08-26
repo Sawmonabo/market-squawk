@@ -1253,7 +1253,7 @@ fn member_object<'a>(
 ) -> Result<&'a Map<String, Value>, YahooAdapterError> {
     object
         .get(key)
-        .ok_or_else(|| YahooAdapterError::MissingEnvelope("object member"))?
+        .ok_or(YahooAdapterError::MissingEnvelope("object member"))?
         .as_object()
         .ok_or_else(|| YahooAdapterError::InvalidSchema {
             path: path.to_owned(),
