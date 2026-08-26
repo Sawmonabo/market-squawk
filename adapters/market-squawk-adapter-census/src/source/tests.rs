@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -367,72 +366,40 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         now,
     )?;
     activation.validate(&doctor_report, &sealed_doctor_capture, now)?;
+    let expected_extraction_content =
+        market_squawk_sources::ExtractionContentIdentity::try_from_batch(&batch)?.digest();
+    let expected_sealed_capture_receipt = sealed_capture.receipt_digest();
     let publication_candidate =
-        CensusPublicationCandidate::try_new(publication_plan, &sealed_capture, &activation)?;
-    publication_candidate.validate(&activation, publication_candidate.plan().prepared_at())?;
-    publication_candidate.validate_batch(&batch)?;
-    assert_eq!(publication_candidate.revision_plan(&batch)?.len(), 1);
+        CensusPublicationCandidate::try_new(publication_plan, batch, sealed_capture, &activation)?;
+    let publication_operation_at = publication_candidate.plan().prepared_at();
     assert_eq!(publication_candidate.canonical_record_count(), 1);
     assert_eq!(
         publication_candidate.canonical_schema().as_str(),
         market_squawk_sources::CURRENT_RESEARCH_RECORD_SCHEMA
     );
-    assert_ne!(
-        publication_candidate.canonical_schema_fingerprint().bytes(),
-        [0; 32]
-    );
     assert_eq!(
         publication_candidate.sealed_capture_receipt_digest(),
-        sealed_capture.receipt_digest()
+        expected_sealed_capture_receipt
     );
-    let candidate_wire = serde_json::to_string(&publication_candidate)?;
-    assert!(!candidate_wire.contains("\"generation\""));
-    assert!(!candidate_wire.contains("\"manifest_digest\""));
-    assert!(!candidate_wire.contains("\"published_at\""));
-    let candidate_value = serde_json::from_str::<serde_json::Value>(&candidate_wire)?;
-    let candidate_keys = candidate_value
-        .as_object()
-        .ok_or("expected publication candidate object")?
-        .keys()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
+    let (batch, sealed_capture, revisions) = publication_candidate
+        .try_into_root_publication_parts(&activation, publication_operation_at)?;
     assert_eq!(
-        candidate_keys,
-        BTreeSet::from([
-            "activation_candidate_digest",
-            "candidate_digest",
-            "canonical_schema",
-            "canonical_schema_fingerprint",
-            "canonical_schema_version",
-            "plan",
-            "sealed_capture",
-        ])
+        market_squawk_sources::ExtractionContentIdentity::try_from_batch(&batch)?.digest(),
+        expected_extraction_content
     );
-    let plan_keys = candidate_value["plan"]
-        .as_object()
-        .ok_or("expected publication plan object")?
-        .keys()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
+    assert_eq!(revisions.len(), batch.records().len());
+    assert!(revisions.is_locally_observed());
     assert_eq!(
-        plan_keys,
-        BTreeSet::from([
-            "analytical_dataset",
-            "captures",
-            "configuration_digest",
-            "data_response_digest",
-            "extraction_content_digest",
-            "metadata_bundle_digest",
-            "metadata_revision",
-            "observations",
-            "prepared_at",
-            "provider_dataset",
-            "provider_rate_declaration_digest",
-            "publication_identity",
-            "query_digest",
-            "schema_version",
-            "source_id",
-        ])
+        sealed_capture.receipt_digest(),
+        expected_sealed_capture_receipt
+    );
+    assert_eq!(
+        batch
+            .request()
+            .object()
+            .capture_identity()
+            .paged_content_digest(),
+        Some(sealed_capture.capture().content_digest())
     );
     assert_eq!(
         sealed_capture.capture().request_graph_components()[4].observation_digest(),

@@ -5,16 +5,16 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     CURRENT_RESEARCH_RECORD_SCHEMA, ExtractionBatch, ExtractionContentIdentity,
     ExtractionRevisionPlan, ProviderCaptureMaterial, ProviderCaptureTerminalDisposition,
-    SealedProviderCaptureSetReceipt, SourceMetadata,
+    SealedProviderCaptureSetReceipt, SourceMetadata, SourceObjectCaptureIdentity,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
     CensusClocks, CensusDataset, CensusDatasetAcquisition, CensusDatasetContract,
-    CensusDoctorReadiness, CensusDoctorReport, CensusDoctorScope, CensusGeographyValue,
-    CensusPredicateValue, CensusReportedTime, CensusSourceConfig, CensusSourceError,
-    CensusValueState, census_provider_rate_declaration, update_digest_component,
+    CensusDoctorReadiness, CensusDoctorReport, CensusDoctorScope, CensusGeographyScope,
+    CensusGeographyValue, CensusPredicateValue, CensusReportedTime, CensusSourceConfig,
+    CensusSourceError, CensusValueState, census_provider_rate_declaration, update_digest_component,
 };
 
 const CENSUS_RUNTIME_SCHEMA_VERSION: u16 = 4;
@@ -621,14 +621,10 @@ impl CensusPublicationPlan {
             || self.data_response_digest.bytes() == [0; 32]
             || self.extraction_content_digest.bytes() == [0; 32]
             || self.publication_identity.bytes() == [0; 32]
-            || self.observations.iter().any(|binding| {
-                binding.family_digest.bytes() == [0; 32]
-                    || binding.content_digest.bytes() == [0; 32]
-                    || binding.row_digest.bytes() == [0; 32]
-                    || binding.request_digest != self.query_digest
-                    || binding.response_digest != self.data_response_digest
-                    || binding.clocks.ingested_at() > self.prepared_at
-            })
+            || self
+                .observations
+                .iter()
+                .any(|binding| !valid_publication_binding(self, binding))
             || self
                 .captures
                 .iter()
@@ -655,14 +651,14 @@ impl CensusPublicationPlan {
 /// This value deliberately carries no generation, manifest, revision assignment, checkpoint, or
 /// query authority. Only the application/data publication authority may consume it, commit an
 /// immutable manifest, and mint restart or point-in-time read receipts.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct CensusPublicationCandidate {
     plan: CensusPublicationPlan,
     activation_candidate_digest: EvidenceDigest,
     canonical_schema: SourceIdentifier,
     canonical_schema_version: SchemaVersion,
     canonical_schema_fingerprint: EvidenceDigest,
+    batch: ExtractionBatch,
     sealed_capture: SealedProviderCaptureSetReceipt,
     candidate_digest: EvidenceDigest,
 }
@@ -671,26 +667,29 @@ impl CensusPublicationCandidate {
     /// Binds canonical evidence to the actual shared sealed-journal receipt.
     pub fn try_new(
         plan: CensusPublicationPlan,
-        sealed_capture: &SealedProviderCaptureSetReceipt,
+        batch: ExtractionBatch,
+        sealed_capture: SealedProviderCaptureSetReceipt,
         activation: &CensusActivationCandidate,
     ) -> Result<Self, CensusSourceError> {
         plan.validate()?;
-        validate_sealed_capture(&plan, sealed_capture)?;
-        validate_publication_activation(&plan, activation, plan.prepared_at)?;
+        validate_publication_activation_binding(&plan, activation)?;
+        validate_sealed_capture(&plan, &sealed_capture, activation)?;
         let canonical_schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
             .map_err(|_| CensusSourceError::Protocol)?;
         let canonical_schema_version = SchemaVersion::CURRENT;
         let canonical_schema_fingerprint =
             canonical_schema_fingerprint(&canonical_schema, canonical_schema_version)?;
+        validate_bound_batch(&plan, &canonical_schema, &batch, &sealed_capture)?;
         let sealed_capture_receipt_digest = sealed_capture.receipt_digest();
         let candidate_digest = digest_serialized(
-            b"market-squawk/census-publication-candidate/v4",
+            b"market-squawk/census-publication-candidate/v5",
             &(
                 plan.publication_identity,
                 activation.candidate_digest,
                 &canonical_schema,
                 canonical_schema_version,
                 canonical_schema_fingerprint,
+                plan.extraction_content_digest,
                 sealed_capture_receipt_digest,
             ),
         )?;
@@ -700,77 +699,36 @@ impl CensusPublicationCandidate {
             canonical_schema,
             canonical_schema_version,
             canonical_schema_fingerprint,
-            sealed_capture: sealed_capture.clone(),
+            batch,
+            sealed_capture,
             candidate_digest,
         })
     }
 
-    /// Reopens every provider-local invariant against the owned shared sealed receipt before
-    /// ingest.
-    pub fn validate(
-        &self,
+    /// Provides one consuming handoff from Census extraction into common ingest inputs.
+    ///
+    /// Activation readiness is rechecked at `operation_at` before ownership leaves this adapter.
+    /// The returned revision plan contains evidence only; shared revision and publication
+    /// authority remain the global components that deduplicate, assign revisions, or commit a
+    /// generation.
+    pub fn try_into_root_publication_parts(
+        self,
         activation: &CensusActivationCandidate,
         operation_at: Timestamp,
-    ) -> Result<(), CensusSourceError> {
-        self.plan.validate()?;
-        validate_sealed_capture(&self.plan, &self.sealed_capture)?;
-        validate_publication_activation(&self.plan, activation, operation_at)?;
-        let expected = digest_serialized(
-            b"market-squawk/census-publication-candidate/v4",
-            &(
-                self.plan.publication_identity,
-                self.activation_candidate_digest,
-                &self.canonical_schema,
-                self.canonical_schema_version,
-                self.canonical_schema_fingerprint,
-                self.sealed_capture.receipt_digest(),
-            ),
-        )?;
-        if self.canonical_schema.as_str() != CURRENT_RESEARCH_RECORD_SCHEMA
-            || self.canonical_schema_version != SchemaVersion::CURRENT
-            || self.canonical_schema_fingerprint
-                != canonical_schema_fingerprint(
-                    &self.canonical_schema,
-                    self.canonical_schema_version,
-                )?
-            || self.activation_candidate_digest != activation.candidate_digest
-            || self.sealed_capture.receipt_digest().bytes() == [0; 32]
-            || expected != self.candidate_digest
-        {
-            return Err(CensusSourceError::Protocol);
+    ) -> Result<
+        (
+            ExtractionBatch,
+            SealedProviderCaptureSetReceipt,
+            ExtractionRevisionPlan,
+        ),
+        CensusSourceError,
+    > {
+        if self.activation_candidate_digest != activation.candidate_digest {
+            return Err(CensusSourceError::InvalidConfiguration);
         }
-        Ok(())
-    }
-
-    /// Rejoins this candidate to the exact graph-bound extraction batch root will ingest.
-    pub fn validate_batch(&self, batch: &ExtractionBatch) -> Result<(), CensusSourceError> {
-        let identity = ExtractionContentIdentity::try_from_batch(batch)
-            .map_err(|_| CensusSourceError::Protocol)?;
-        if identity.digest() != self.plan.extraction_content_digest
-            || identity.record_count() != self.plan.observations.len()
-            || batch.records().iter().any(|record| {
-                record.source_id() != &self.plan.source_id
-                    || record.metadata_revision().as_source_identifier()
-                        != &self.plan.metadata_revision
-                    || record.dataset() != &self.plan.provider_dataset
-                    || record.schema() != &self.canonical_schema
-            })
-        {
-            return Err(CensusSourceError::Protocol);
-        }
-        Ok(())
-    }
-
-    /// Builds input-aligned locally observed revision evidence for root's durable authority.
-    ///
-    /// This is not an assignment receipt: root remains the only component that may assign or
-    /// persist canonical revision numbers.
-    pub fn revision_plan(
-        &self,
-        batch: &ExtractionBatch,
-    ) -> Result<ExtractionRevisionPlan, CensusSourceError> {
-        self.validate_batch(batch)?;
-        ExtractionRevisionPlan::locally_observed(batch.records().len()).map_err(Into::into)
+        validate_publication_readiness(&self.plan, activation, operation_at)?;
+        let revisions = ExtractionRevisionPlan::locally_observed(self.batch.records().len())?;
+        Ok((self.batch, self.sealed_capture, revisions))
     }
 
     /// Returns the full canonical/native publication plan.
@@ -849,6 +807,110 @@ impl CensusPublicationCandidate {
     }
 }
 
+fn valid_publication_binding(
+    plan: &CensusPublicationPlan,
+    binding: &CensusCanonicalObservationBinding,
+) -> bool {
+    let clocks = binding.clocks();
+    plan.observations
+        .first()
+        .is_some_and(|first| binding.dataset() == first.dataset())
+        && binding.geography().scope() != CensusGeographyScope::Unknown
+        && binding.family_digest().algorithm() == DigestAlgorithm::Sha256
+        && binding.family_digest().bytes() != [0; 32]
+        && binding.content_digest().algorithm() == DigestAlgorithm::Sha256
+        && binding.content_digest().bytes() != [0; 32]
+        && binding.row_digest() == binding.content_digest()
+        && binding.request_digest() == plan.query_digest
+        && binding.response_digest() == plan.data_response_digest
+        && binding.metadata_digest().bytes() != [0; 32]
+        && binding.published_time().is_none()
+        && clocks.received_at() <= clocks.decoded_at()
+        && clocks.decoded_at() <= clocks.ingested_at()
+        && clocks.ingested_at() == plan.prepared_at
+        && clocks.availability().conservative_available_at() == Some(clocks.received_at())
+        && reported_time_matches_effective(binding.reported_time(), binding.effective_time())
+        && matches!(
+            binding.value_state(),
+            CensusValueState::Observed { .. } | CensusValueState::Missing { .. }
+        )
+}
+
+fn reported_time_matches_effective(
+    reported: Option<&CensusReportedTime>,
+    effective: &ResearchTemporalCoordinate,
+) -> bool {
+    match reported {
+        None => true,
+        Some(CensusReportedTime::CalendarDate { date }) => {
+            effective.calendar_date_value() == Some(*date)
+        }
+        Some(CensusReportedTime::Year { year }) => {
+            source_period_matches(effective, "census-year", *year, 1, format!("{year:04}"))
+        }
+        Some(CensusReportedTime::Month { year, month }) => source_period_matches(
+            effective,
+            "census-month",
+            *year,
+            u16::from(*month),
+            format!("{year:04}-{month:02}"),
+        ),
+        Some(CensusReportedTime::Quarter { year, quarter }) => source_period_matches(
+            effective,
+            "census-quarter",
+            *year,
+            u16::from(*quarter),
+            format!("{year:04}-Q{quarter}"),
+        ),
+        Some(CensusReportedTime::ProviderPeriod { .. }) => false,
+    }
+}
+
+fn source_period_matches(
+    effective: &ResearchTemporalCoordinate,
+    scheme: &str,
+    year: u16,
+    ordinal: u16,
+    code: String,
+) -> bool {
+    effective.source_period_value().is_some_and(|period| {
+        period.scheme().as_str() == scheme
+            && period.year() == year
+            && period.ordinal().get() == ordinal
+            && period.code().as_str() == code
+    })
+}
+
+fn validate_bound_batch(
+    plan: &CensusPublicationPlan,
+    canonical_schema: &SourceIdentifier,
+    batch: &ExtractionBatch,
+    sealed_capture: &SealedProviderCaptureSetReceipt,
+) -> Result<(), CensusSourceError> {
+    let identity = ExtractionContentIdentity::try_from_batch(batch)
+        .map_err(|_| CensusSourceError::Protocol)?;
+    let capture = sealed_capture.capture();
+    let object = batch.request().object();
+    let expected_capture_identity = SourceObjectCaptureIdentity::try_from_capture(capture)
+        .map_err(|_| CensusSourceError::Protocol)?;
+    if identity.digest() != plan.extraction_content_digest
+        || identity.record_count() != plan.observations.len()
+        || batch.records().len() != plan.observations.len()
+        || object.source_id() != &plan.source_id
+        || object.metadata_revision().as_source_identifier() != &plan.metadata_revision
+        || object.dataset() != &plan.provider_dataset
+        || object.capture_identity() != expected_capture_identity
+        || sealed_capture.receipt_digest().bytes() == [0; 32]
+        || batch
+            .records()
+            .iter()
+            .any(|record| record.schema() != canonical_schema)
+    {
+        return Err(CensusSourceError::Protocol);
+    }
+    Ok(())
+}
+
 fn canonical_schema_fingerprint(
     schema: &SourceIdentifier,
     version: SchemaVersion,
@@ -859,10 +921,9 @@ fn canonical_schema_fingerprint(
     )
 }
 
-fn validate_publication_activation(
+fn validate_publication_activation_binding(
     plan: &CensusPublicationPlan,
     activation: &CensusActivationCandidate,
-    operation_at: Timestamp,
 ) -> Result<(), CensusSourceError> {
     activation.plan.validate()?;
     let dataset = activation
@@ -876,7 +937,18 @@ fn validate_publication_activation(
         || plan.provider_rate_declaration_digest != activation.plan.provider_rate_declaration_digest
         || plan.analytical_dataset != dataset.analytical_dataset
         || plan.query_digest != dataset.query_digest
-        || plan.prepared_at < activation.activated_at
+    {
+        return Err(CensusSourceError::InvalidConfiguration);
+    }
+    Ok(())
+}
+
+fn validate_publication_readiness(
+    plan: &CensusPublicationPlan,
+    activation: &CensusActivationCandidate,
+    operation_at: Timestamp,
+) -> Result<(), CensusSourceError> {
+    if plan.prepared_at < activation.activated_at
         || plan.prepared_at >= activation.expires_at
         || operation_at < plan.prepared_at
         || operation_at >= activation.expires_at
@@ -889,9 +961,19 @@ fn validate_publication_activation(
 fn validate_sealed_capture(
     plan: &CensusPublicationPlan,
     sealed_capture: &SealedProviderCaptureSetReceipt,
+    activation: &CensusActivationCandidate,
 ) -> Result<(), CensusSourceError> {
     let expected = plan.captures.first().ok_or(CensusSourceError::Protocol)?;
     let capture = sealed_capture.capture();
+    let activated_dataset = activation
+        .plan
+        .dataset(&plan.provider_dataset)
+        .ok_or(CensusSourceError::InvalidConfiguration)?;
+    let expected_components = activated_dataset
+        .metadata_request_digests
+        .len()
+        .checked_add(1)
+        .ok_or(CensusSourceError::Protocol)?;
     if plan.captures.len() != 1
         || capture.source_id() != &plan.source_id
         || capture.metadata_revision().as_source_identifier() != &plan.metadata_revision
@@ -901,8 +983,32 @@ fn validate_sealed_capture(
         || capture.content_digest() != expected.content_digest
         || capture.observation_digest() != expected.observation_digest
         || capture.total_body_bytes() != expected.response_bytes
+        || capture.request_graph_components().len() != expected_components
         || capture.request_graph_components().len() != expected.component_count as usize
         || sealed_capture.receipt_digest().bytes() == [0; 32]
+    {
+        return Err(CensusSourceError::Protocol);
+    }
+    for (index, component) in capture.request_graph_components().iter().enumerate() {
+        let expected_request = activated_dataset
+            .metadata_request_digests
+            .get(index)
+            .copied()
+            .unwrap_or(plan.query_digest);
+        if component.dataset() != &plan.provider_dataset
+            || component.request_set_identity() != expected_request
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+    }
+    let data_page = capture.pages().last().ok_or(CensusSourceError::Protocol)?;
+    if data_page.request_identity() != plan.query_digest
+        || data_page.body_digest() != plan.data_response_digest
+        || data_page.received_at() != expected.received_at
+        || plan
+            .observations
+            .iter()
+            .any(|binding| binding.clocks.received_at() != data_page.received_at())
     {
         return Err(CensusSourceError::Protocol);
     }
