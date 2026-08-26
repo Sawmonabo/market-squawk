@@ -11,7 +11,7 @@ use market_squawk_sources::{
     ExtractionContentIdentity, ExtractionRecord, ExtractionRequest, ExtractionSourceError,
     MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
     ProviderCaptureMaterial, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    SealedProviderCaptureSetReceipt, SourceObject,
+    ProviderWholeCaptureToken, SealedProviderCaptureSetReceipt, SourceObject,
 };
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
@@ -463,7 +463,7 @@ impl TreasuryAllHistoryCheckpoint {
 pub struct TreasuryAllHistoryBackfill {
     checkpoint: TreasuryAllHistoryCheckpoint,
     tracker: TreasuryDailyRatePaginationTracker,
-    verified_seals: Vec<SealedProviderCaptureSetReceipt>,
+    verified_seal_digests: Vec<EvidenceDigest>,
 }
 
 impl TreasuryAllHistoryBackfill {
@@ -477,21 +477,25 @@ impl TreasuryAllHistoryBackfill {
         &self,
     ) -> Result<TreasuryAllHistoryAcquisitionCompletion, TreasurySourceError> {
         if !self.checkpoint.terminal_observed
-            || self.verified_seals.len() != self.checkpoint.pages.len()
+            || self.verified_seal_digests.len() != self.checkpoint.pages.len()
         {
             return Err(TreasurySourceError::BackfillIncomplete);
         }
-        TreasuryAllHistoryAcquisitionCompletion::try_new(&self.checkpoint, &self.verified_seals)
+        TreasuryAllHistoryAcquisitionCompletion::try_new(
+            &self.checkpoint,
+            &self.verified_seal_digests,
+        )
     }
 
     /// Advances the checkpoint only when the exact fetched response has a verified durable seal.
     pub fn accept_sealed_page(
         &mut self,
         mut admission: TreasuryAllHistoryPageAdmission,
-        sealed: SealedProviderCaptureSetReceipt,
+        sealed: ProviderWholeCaptureToken,
     ) -> Result<(), TreasurySourceError> {
+        let sealed = sealed.persisted_receipt();
         if self.checkpoint.terminal_observed
-            || self.verified_seals.len() != self.checkpoint.pages.len()
+            || self.verified_seal_digests.len() != self.checkpoint.pages.len()
             || admission.base_checkpoint_digest != self.checkpoint.checkpoint_digest
             || admission.expected_capture != *sealed.capture()
             || admission.persisted.page_number != self.checkpoint.next_page
@@ -562,12 +566,12 @@ impl TreasuryAllHistoryBackfill {
         next_checkpoint.pages = pages.into_boxed_slice();
         next_checkpoint.checkpoint_digest = next_checkpoint.compute_digest()?;
         next_checkpoint.validate_structure()?;
-        self.verified_seals
+        self.verified_seal_digests
             .try_reserve(1)
             .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
         self.checkpoint = next_checkpoint;
         self.tracker = admission.next_tracker;
-        self.verified_seals.push(sealed);
+        self.verified_seal_digests.push(sealed.receipt_digest());
         Ok(())
     }
 }
@@ -668,7 +672,7 @@ pub struct TreasuryAllHistoryPageAdmission {
 #[serde(deny_unknown_fields)]
 pub struct TreasuryAllHistoryAcquisitionCompletion {
     checkpoint: TreasuryAllHistoryCheckpoint,
-    sealed_pages: Box<[SealedProviderCaptureSetReceipt]>,
+    sealed_receipt_digests: Box<[EvidenceDigest]>,
     completion_digest: EvidenceDigest,
     provider_snapshot_isolation_claimed: bool,
 }
@@ -676,32 +680,25 @@ pub struct TreasuryAllHistoryAcquisitionCompletion {
 impl TreasuryAllHistoryAcquisitionCompletion {
     fn try_new(
         checkpoint: &TreasuryAllHistoryCheckpoint,
-        sealed_pages: &[SealedProviderCaptureSetReceipt],
+        sealed_receipt_digests: &[EvidenceDigest],
     ) -> Result<Self, TreasurySourceError> {
         checkpoint.validate_structure()?;
         if !checkpoint.terminal_observed
             || checkpoint.canonical_points == 0
-            || sealed_pages.len() != checkpoint.pages.len()
-            || sealed_pages
+            || sealed_receipt_digests.len() != checkpoint.pages.len()
+            || sealed_receipt_digests
                 .iter()
                 .zip(checkpoint.pages.iter())
-                .any(|(sealed, page)| {
-                    sealed.capture() != &page.capture
-                        || Some(sealed.segment().claim()) != page.sealed_segment_claim.as_ref()
-                        || Some(sealed.receipt_digest()) != page.sealed_receipt_digest
-                })
+                .any(|(digest, page)| Some(*digest) != page.sealed_receipt_digest)
         {
             return Err(TreasurySourceError::BackfillIncomplete);
         }
-        let seal_digests = sealed_pages
-            .iter()
-            .map(SealedProviderCaptureSetReceipt::receipt_digest)
-            .collect::<Vec<_>>();
-        let wire = serde_json::to_vec(&(checkpoint.checkpoint_digest, &seal_digests, false))
-            .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
+        let wire =
+            serde_json::to_vec(&(checkpoint.checkpoint_digest, sealed_receipt_digests, false))
+                .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
         Ok(Self {
             checkpoint: checkpoint.clone(),
-            sealed_pages: sealed_pages.to_vec().into_boxed_slice(),
+            sealed_receipt_digests: sealed_receipt_digests.to_vec().into_boxed_slice(),
             completion_digest: domain_digest(
                 b"market-squawk/treasury-all-history-completion/v1\0",
                 &wire,
@@ -807,9 +804,9 @@ impl TreasuryAllHistoryAcquisitionCompletion {
             .map(|page| &page.source_object)
     }
 
-    /// Returns verified sealed-page receipts for retained-capture catalog admission.
-    pub fn sealed_pages(&self) -> &[SealedProviderCaptureSetReceipt] {
-        &self.sealed_pages
+    /// Returns validation-only identities for every exact durably sealed provider response.
+    pub fn sealed_receipt_digests(&self) -> &[EvidenceDigest] {
+        &self.sealed_receipt_digests
     }
 
     /// Returns the stable completion identity for the verified acquisition chain.
@@ -845,7 +842,7 @@ impl TreasurySource {
         Ok(TreasuryAllHistoryBackfill {
             checkpoint,
             tracker,
-            verified_seals: Vec::new(),
+            verified_seal_digests: Vec::new(),
         })
     }
 
@@ -864,8 +861,8 @@ impl TreasurySource {
             MAX_EXTRACTION_RECORDS,
         )?;
         let limits = FiscalDataParseLimits::production_defaults();
-        let mut verified_seals = Vec::new();
-        verified_seals
+        let mut verified_seal_digests = Vec::new();
+        verified_seal_digests
             .try_reserve_exact(checkpoint.pages.len())
             .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
         for persisted in &checkpoint.pages {
@@ -876,13 +873,16 @@ impl TreasurySource {
             let segment = store
                 .open_verified_claim(claim)
                 .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
-            let sealed = SealedProviderCaptureSetReceipt::try_bind(
-                persisted.capture.clone(),
-                segment.receipt().clone(),
+            let expected_sealed_receipt_digest = persisted
+                .sealed_receipt_digest
+                .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
+            SealedProviderCaptureSetReceipt::verify_persisted_evidence(
+                &persisted.capture,
+                segment.receipt(),
+                expected_sealed_receipt_digest,
             )
             .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
-            if Some(sealed.receipt_digest()) != persisted.sealed_receipt_digest
-                || segment.records().len() != 1
+            if segment.records().len() != 1
                 || ProviderCaptureMaterial::try_new(
                     persisted.capture.clone(),
                     segment.records().to_vec(),
@@ -944,13 +944,13 @@ impl TreasurySource {
             if terminal != persisted.terminal {
                 return Err(TreasurySourceError::InvalidBackfillCheckpoint);
             }
-            verified_seals.push(sealed);
+            verified_seal_digests.push(expected_sealed_receipt_digest);
         }
-        if tracker_terminal_matches_checkpoint(&checkpoint, &verified_seals) {
+        if tracker_terminal_matches_checkpoint(&checkpoint, &verified_seal_digests) {
             Ok(TreasuryAllHistoryBackfill {
                 checkpoint,
                 tracker,
-                verified_seals,
+                verified_seal_digests,
             })
         } else {
             Err(TreasurySourceError::InvalidBackfillCheckpoint)
@@ -967,7 +967,7 @@ impl TreasurySource {
     ) -> Result<TreasuryAllHistoryFetchedPage, ExtractionSourceError> {
         validate_checkpoint_source(self, &backfill.checkpoint).map_err(|_| invalid_protocol())?;
         if backfill.checkpoint.terminal_observed
-            || backfill.verified_seals.len() != backfill.checkpoint.pages.len()
+            || backfill.verified_seal_digests.len() != backfill.checkpoint.pages.len()
             || discovery.effective_at().is_some()
             || discovery.dataset() != backfill.checkpoint.descriptor.provider_dataset()
             || discovery.max_results() != 1
@@ -1252,9 +1252,9 @@ fn validate_replayed_page(
 
 fn tracker_terminal_matches_checkpoint(
     checkpoint: &TreasuryAllHistoryCheckpoint,
-    seals: &[SealedProviderCaptureSetReceipt],
+    sealed_receipt_digests: &[EvidenceDigest],
 ) -> bool {
-    seals.len() == checkpoint.pages.len()
+    sealed_receipt_digests.len() == checkpoint.pages.len()
         && checkpoint.terminal_observed == checkpoint.pages.last().is_some_and(|page| page.terminal)
 }
 

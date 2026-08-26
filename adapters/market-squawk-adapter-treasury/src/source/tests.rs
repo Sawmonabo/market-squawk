@@ -212,7 +212,14 @@ async fn authority_bound_sources_emit_canonical_fiscal_and_daily_rate_records() 
     let all_family_temporary = TemporaryDirectory::new();
     let all_family_store =
         LocalPaths::prepare(all_family_temporary.path())?.sealed_research_journal_store()?;
-    let all_family_doctor = all_family_doctor.seal(&all_family_store)?;
+    let (pending_doctor, seal_requests) = all_family_doctor.into_sealing_parts()?;
+    let sealed_doctor_captures = seal_requests
+        .into_vec()
+        .into_iter()
+        .map(|request| request.seal(&all_family_store))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+    let all_family_doctor = pending_doctor.try_rejoin(sealed_doctor_captures)?;
     assert!(all_family_doctor.activation_ready());
     assert_eq!(
         all_family_doctor.receipt().observations().len(),
@@ -328,7 +335,10 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
         u64::try_from(canonical.batch().records().len())?
     );
     let (_, capture, admission) = first.into_parts();
-    let sealed = capture.seal(&store)?;
+    let (expectation, seal_request) = capture.into_whole_seal_parts();
+    let sealed = expectation
+        .try_rejoin(seal_request.seal(&store)?)?
+        .try_into_whole()?;
     backfill.accept_sealed_page(admission, sealed)?;
     assert_eq!(backfill.checkpoint().next_page(), 1);
     assert!(backfill.acquisition_completion().is_err());
@@ -366,17 +376,20 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     assert!(terminal.terminal());
     assert!(terminal.canonical().is_none());
     let (_, capture, admission) = terminal.into_parts();
-    let sealed = capture.seal(&store)?;
+    let (expectation, seal_request) = capture.into_whole_seal_parts();
+    let sealed = expectation
+        .try_rejoin(seal_request.seal(&store)?)?
+        .try_into_whole()?;
     restored.accept_sealed_page(admission, sealed)?;
     let completion = restored.acquisition_completion()?;
     assert_eq!(completion.response_count(), 2);
-    assert_eq!(completion.sealed_pages().len(), 2);
+    assert_eq!(completion.sealed_receipt_digests().len(), 2);
     assert!(completion.source_rows() > 0);
     assert!(completion.canonical_points() > completion.source_rows());
     assert!(!completion.provider_snapshot_isolation_claimed());
     assert_eq!(
         completion.canonical_content_digests().count(),
-        completion.sealed_pages().len() - 1
+        completion.sealed_receipt_digests().len() - 1
     );
 
     let completed_checkpoint = restored.checkpoint().to_json()?;

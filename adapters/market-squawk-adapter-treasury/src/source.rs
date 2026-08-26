@@ -10,14 +10,15 @@ use market_squawk_domain::{
     DataQuality, DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
     Timestamp,
 };
-use market_squawk_platform::{RawCaptureRecord, SealedResearchJournalStore};
+use market_squawk_platform::RawCaptureRecord;
 use market_squawk_sources::{
     AuthorizationMode, CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
     ExtractionBatch, ExtractionBatchAccumulator, ExtractionRecord, ExtractionRequest,
     ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HistoricalCapability,
-    ProviderCaptureMaterial, ProviderCaptureMaterialSealError, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SourceClass, SourceError,
-    SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
+    ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
+    ProviderCaptureSealExpectation, ProviderCaptureSealRequest, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, RejoinedProviderCapture, SealedProviderCaptureMaterial,
+    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -452,23 +453,82 @@ impl TreasuryDoctorRun {
         self.captures.len()
     }
 
-    /// Seals every exact probe response before exposing an activation receipt.
-    pub fn seal(
+    /// Splits every exact probe response into root-owned seal requests and a private continuation.
+    pub fn into_sealing_parts(
         self,
-        store: &SealedResearchJournalStore,
+    ) -> Result<
+        (TreasuryPendingDoctorSeal, Box<[ProviderCaptureSealRequest]>),
+        TreasuryDoctorSealError,
+    > {
+        let mut expectations = Vec::new();
+        expectations
+            .try_reserve_exact(self.captures.len())
+            .map_err(|_| {
+                TreasuryDoctorSealError::Contract(crate::TreasuryVerticalError::AccountingOverflow)
+            })?;
+        let mut requests = Vec::new();
+        requests
+            .try_reserve_exact(self.captures.len())
+            .map_err(|_| {
+                TreasuryDoctorSealError::Contract(crate::TreasuryVerticalError::AccountingOverflow)
+            })?;
+        for capture in self.captures.into_vec() {
+            let (expectation, request) = capture.into_whole_seal_parts();
+            expectations.push(expectation);
+            requests.push(request);
+        }
+        Ok((
+            TreasuryPendingDoctorSeal {
+                source_id: self.source_id,
+                metadata_revision: self.metadata_revision,
+                receipt: self.receipt,
+                expectations: expectations.into_boxed_slice(),
+            },
+            requests.into_boxed_slice(),
+        ))
+    }
+}
+
+/// Exact doctor evidence and private process-local witnesses awaiting common physical seals.
+#[derive(Debug)]
+pub struct TreasuryPendingDoctorSeal {
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    receipt: crate::TreasuryDoctorReceipt,
+    expectations: Box<[ProviderCaptureSealExpectation]>,
+}
+
+impl TreasuryPendingDoctorSeal {
+    /// Rejoins only the ordered seal results split from this exact doctor run.
+    pub fn try_rejoin(
+        self,
+        sealed: Box<[SealedProviderCaptureMaterial]>,
     ) -> Result<crate::TreasurySealedDoctorReceipt, TreasuryDoctorSealError> {
-        let mut sealed = Vec::new();
-        sealed.try_reserve_exact(self.captures.len()).map_err(|_| {
+        if sealed.len() != self.expectations.len() {
+            return Err(TreasuryDoctorSealError::Contract(
+                crate::TreasuryVerticalError::DoctorRejected,
+            ));
+        }
+        let mut receipts = Vec::new();
+        receipts.try_reserve_exact(sealed.len()).map_err(|_| {
             TreasuryDoctorSealError::Contract(crate::TreasuryVerticalError::AccountingOverflow)
         })?;
-        for capture in self.captures.into_vec() {
-            sealed.push(capture.seal(store)?);
+        for (expectation, physical) in self.expectations.into_vec().into_iter().zip(sealed) {
+            let token = match expectation.try_rejoin(physical)? {
+                RejoinedProviderCapture::Whole(token) => token,
+                RejoinedProviderCapture::Components(_) => {
+                    return Err(TreasuryDoctorSealError::Contract(
+                        crate::TreasuryVerticalError::DoctorRejected,
+                    ));
+                }
+            };
+            receipts.push(token.persisted_receipt().clone());
         }
         crate::TreasurySealedDoctorReceipt::try_new(
             self.source_id,
             self.metadata_revision,
             self.receipt,
-            sealed,
+            receipts,
         )
         .map_err(Into::into)
     }
@@ -477,9 +537,9 @@ impl TreasuryDoctorRun {
 /// Failure while sealing or identity-binding a completed Treasury doctor run.
 #[derive(Debug, Error)]
 pub enum TreasuryDoctorSealError {
-    /// The shared sealed research journal rejected an exact provider response.
+    /// A physical seal result did not rejoin the exact private doctor witness.
     #[error(transparent)]
-    Capture(#[from] ProviderCaptureMaterialSealError),
+    Capture(#[from] ProviderCaptureError),
     /// The sealed response set no longer matches parsed doctor evidence.
     #[error(transparent)]
     Contract(#[from] crate::TreasuryVerticalError),

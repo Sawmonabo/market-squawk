@@ -1740,28 +1740,29 @@ impl SealedProviderCaptureSetReceipt {
         capture: ProviderCaptureSetReceipt,
         segment: SealedResearchJournalSegmentReceipt,
     ) -> Result<Self, ProviderCaptureError> {
-        if capture.pages.len() != segment.frames().len() {
-            return Err(ProviderCaptureError::PhysicalReceiptMismatch);
-        }
-        for (page, frame) in capture.pages.iter().zip(segment.frames()) {
-            if frame.ordinal() != u32::from(page.ordinal)
-                || frame.provider_payload_bytes() != page.body_bytes
-                || frame.provider_payload_digest() != page.body_digest
-                || frame.received_at() != page.received_at
-                || frame.source_sequence() != Some(u64::from(page.ordinal))
-            {
-                return Err(ProviderCaptureError::PhysicalReceiptMismatch);
-            }
-        }
-        let receipt_digest = sealed_provider_capture_receipt_digest(
-            capture.observation_digest,
-            segment.physical_receipt_digest(),
-        );
+        let receipt_digest = validate_sealed_provider_capture_evidence(&capture, &segment)?;
         Ok(Self {
             capture,
             segment,
             receipt_digest,
         })
+    }
+
+    /// Validates persisted capture/segment evidence without recreating live binding authority.
+    ///
+    /// Restart callers supply the digest they persisted beside the segment claim. This method
+    /// returns only success or failure; it cannot mint a [`ProviderWholeCaptureToken`] or be used
+    /// as a substitute for the original process-local seal witness.
+    pub fn verify_persisted_evidence(
+        capture: &ProviderCaptureSetReceipt,
+        segment: &SealedResearchJournalSegmentReceipt,
+        expected_receipt_digest: EvidenceDigest,
+    ) -> Result<(), ProviderCaptureError> {
+        let actual_receipt_digest = validate_sealed_provider_capture_evidence(capture, segment)?;
+        if actual_receipt_digest != expected_receipt_digest {
+            return Err(ProviderCaptureError::PhysicalReceiptMismatch);
+        }
+        Ok(())
     }
 
     /// Returns the provider request/page observation receipt.
@@ -1778,6 +1779,29 @@ impl SealedProviderCaptureSetReceipt {
     pub const fn receipt_digest(&self) -> EvidenceDigest {
         self.receipt_digest
     }
+}
+
+fn validate_sealed_provider_capture_evidence(
+    capture: &ProviderCaptureSetReceipt,
+    segment: &SealedResearchJournalSegmentReceipt,
+) -> Result<EvidenceDigest, ProviderCaptureError> {
+    if capture.pages.len() != segment.frames().len() {
+        return Err(ProviderCaptureError::PhysicalReceiptMismatch);
+    }
+    for (page, frame) in capture.pages.iter().zip(segment.frames()) {
+        if frame.ordinal() != u32::from(page.ordinal)
+            || frame.provider_payload_bytes() != page.body_bytes
+            || frame.provider_payload_digest() != page.body_digest
+            || frame.received_at() != page.received_at
+            || frame.source_sequence() != Some(u64::from(page.ordinal))
+        {
+            return Err(ProviderCaptureError::PhysicalReceiptMismatch);
+        }
+    }
+    Ok(sealed_provider_capture_receipt_digest(
+        capture.observation_digest,
+        segment.physical_receipt_digest(),
+    ))
 }
 
 fn sealed_provider_capture_receipt_digest(
