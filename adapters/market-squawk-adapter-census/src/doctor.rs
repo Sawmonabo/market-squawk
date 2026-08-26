@@ -1,18 +1,20 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
+};
 use market_squawk_sources::{ProviderCaptureMaterial, ProviderCaptureSetReceipt, SourceMetadata};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::{
-    CensusDataQuery, CensusDataset, CensusGeography, CensusGeographyClause,
-    CensusGeographyCode, CensusSelection, CensusSourceConfig, CensusSourceError,
-    census_provider_rate_declaration, update_digest_component,
-};
 use crate::http::CensusRateLimitHeaders;
+use crate::{
+    CensusDataQuery, CensusDataset, CensusGeography, CensusGeographyClause, CensusGeographyCode,
+    CensusSelection, CensusSourceConfig, CensusSourceError, census_provider_rate_declaration,
+    update_digest_component,
+};
 
 /// Maximum credential-bearing response retained by the pinned Census doctor.
 pub const CENSUS_DOCTOR_MAX_RESPONSE_BYTES: usize = 16 * 1024;
@@ -75,9 +77,6 @@ pub struct CensusDoctorReport {
     source_id: SourceId,
     metadata_revision: SourceIdentifier,
     configuration_digest: EvidenceDigest,
-    credential_generation_digest: EvidenceDigest,
-    owner_authorization_digest: EvidenceDigest,
-    presentation_obligation_digest: EvidenceDigest,
     provider_rate_declaration_digest: EvidenceDigest,
     request_digest: EvidenceDigest,
     capture_observation_digest: EvidenceDigest,
@@ -93,7 +92,6 @@ pub struct CensusDoctorReport {
     native_schema: SourceIdentifier,
     native_schema_version: u16,
     native_schema_fingerprint: EvidenceDigest,
-    non_endorsement_notice_required: bool,
     report_digest: EvidenceDigest,
 }
 
@@ -111,11 +109,6 @@ impl CensusDoctorReport {
     /// Returns the exact source configuration exercised by the doctor.
     pub const fn configuration_digest(&self) -> EvidenceDigest {
         self.configuration_digest
-    }
-
-    /// Returns the frozen owner authorization exercised by the doctor.
-    pub const fn owner_authorization_digest(&self) -> EvidenceDigest {
-        self.owner_authorization_digest
     }
 
     /// Returns the exact shared rate declaration exercised by the doctor.
@@ -136,11 +129,6 @@ impl CensusDoctorReport {
     /// Returns the exact key-free request digest.
     pub const fn request_digest(&self) -> EvidenceDigest {
         self.request_digest
-    }
-
-    /// Returns the protected credential-record generation exercised by this doctor run.
-    pub const fn credential_generation_digest(&self) -> EvidenceDigest {
-        self.credential_generation_digest
     }
 
     /// Returns the exact capture receipt identity.
@@ -193,16 +181,6 @@ impl CensusDoctorReport {
         self.report_digest
     }
 
-    /// Returns whether product presentation must include the Census API non-endorsement notice.
-    pub const fn non_endorsement_notice_required(&self) -> bool {
-        self.non_endorsement_notice_required
-    }
-
-    /// Returns the exact presentation and no-reidentification obligation identity.
-    pub const fn presentation_obligation_digest(&self) -> EvidenceDigest {
-        self.presentation_obligation_digest
-    }
-
     /// Returns sanitized provider rate headers or a closed explicit-absence state.
     pub const fn rate_header_evidence(&self) -> CensusDoctorRateHeaderEvidence {
         self.rate_header_evidence
@@ -232,10 +210,7 @@ pub struct CensusDoctorOutput {
 }
 
 impl CensusDoctorOutput {
-    pub(crate) const fn new(
-        report: CensusDoctorReport,
-        capture: ProviderCaptureMaterial,
-    ) -> Self {
+    pub(crate) const fn new(report: CensusDoctorReport, capture: ProviderCaptureMaterial) -> Self {
         Self { report, capture }
     }
 
@@ -261,10 +236,7 @@ pub(crate) fn doctor_query() -> Result<CensusDataQuery, CensusSourceError> {
         CensusSelection::variables(["NAME", "B01001_001E"])?,
         Vec::new(),
         CensusGeography::standard(
-            CensusGeographyClause::try_new(
-                "us",
-                [CensusGeographyCode::try_new("1")?],
-            )?,
+            CensusGeographyClause::try_new("us", [CensusGeographyCode::try_new("1")?])?,
             Vec::new(),
         )?,
         None,
@@ -330,8 +302,8 @@ pub(crate) fn build_doctor_report(
     }
     let response_digest = evidence_digest(crate::sha256(body));
     let response_bytes = u64::try_from(body.len()).map_err(|_| CensusSourceError::Protocol)?;
-    let latency_nanos = u64::try_from(latency.as_nanos())
-        .map_err(|_| CensusSourceError::TelemetryOverflow)?;
+    let latency_nanos =
+        u64::try_from(latency.as_nanos()).map_err(|_| CensusSourceError::TelemetryOverflow)?;
     let rate_header_evidence = CensusDoctorRateHeaderEvidence {
         limit: parse_numeric_header(rate_headers.limit.as_deref())?,
         remaining: parse_numeric_header(rate_headers.remaining.as_deref())?,
@@ -351,11 +323,6 @@ pub(crate) fn build_doctor_report(
         source_id: metadata.source_id().clone(),
         metadata_revision: metadata.revision().as_source_identifier().clone(),
         configuration_digest: config.configuration_digest(),
-        credential_generation_digest: config.credential_generation_digest(),
-        owner_authorization_digest: config.owner_authorization().authorization_digest(),
-        presentation_obligation_digest: config
-            .owner_authorization()
-            .presentation_obligation_digest(),
         provider_rate_declaration_digest: rate.declaration_digest(),
         request_digest: evidence_digest(query.request_digest()),
         capture_observation_digest: capture.observation_digest(),
@@ -371,9 +338,6 @@ pub(crate) fn build_doctor_report(
         native_schema,
         native_schema_version,
         native_schema_fingerprint,
-        non_endorsement_notice_required: config
-            .owner_authorization()
-            .requires_non_endorsement_notice(),
         report_digest: evidence_digest([0; 32]),
     };
     report.report_digest = report_digest(&report)?;
@@ -387,9 +351,6 @@ fn report_digest(report: &CensusDoctorReport) -> Result<EvidenceDigest, CensusSo
         source_id: &report.source_id,
         metadata_revision: &report.metadata_revision,
         configuration_digest: report.configuration_digest,
-        credential_generation_digest: report.credential_generation_digest,
-        owner_authorization_digest: report.owner_authorization_digest,
-        presentation_obligation_digest: report.presentation_obligation_digest,
         provider_rate_declaration_digest: report.provider_rate_declaration_digest,
         request_digest: report.request_digest,
         capture_observation_digest: report.capture_observation_digest,
@@ -405,11 +366,10 @@ fn report_digest(report: &CensusDoctorReport) -> Result<EvidenceDigest, CensusSo
         native_schema: &report.native_schema,
         native_schema_version: report.native_schema_version,
         native_schema_fingerprint: report.native_schema_fingerprint,
-        non_endorsement_notice_required: report.non_endorsement_notice_required,
     })
     .map_err(|_| CensusSourceError::Protocol)?;
     let mut digest = Sha256::new();
-    update_digest_component(&mut digest, b"market-squawk/census-doctor-report/v2");
+    update_digest_component(&mut digest, b"market-squawk/census-doctor-report/v4");
     update_digest_component(&mut digest, &wire);
     Ok(evidence_digest(digest.finalize().into()))
 }
@@ -422,9 +382,6 @@ struct CensusDoctorDigestWire<'a> {
     source_id: &'a SourceId,
     metadata_revision: &'a SourceIdentifier,
     configuration_digest: EvidenceDigest,
-    credential_generation_digest: EvidenceDigest,
-    owner_authorization_digest: EvidenceDigest,
-    presentation_obligation_digest: EvidenceDigest,
     provider_rate_declaration_digest: EvidenceDigest,
     request_digest: EvidenceDigest,
     capture_observation_digest: EvidenceDigest,
@@ -440,7 +397,6 @@ struct CensusDoctorDigestWire<'a> {
     native_schema: &'a SourceIdentifier,
     native_schema_version: u16,
     native_schema_fingerprint: EvidenceDigest,
-    non_endorsement_notice_required: bool,
 }
 
 fn parse_numeric_header(value: Option<&[u8]>) -> Result<Option<u64>, CensusSourceError> {
@@ -459,10 +415,7 @@ fn parse_numeric_header(value: Option<&[u8]>) -> Result<Option<u64>, CensusSourc
 
 fn native_schema_fingerprint() -> EvidenceDigest {
     let mut digest = Sha256::new();
-    update_digest_component(
-        &mut digest,
-        b"market-squawk/census-native-doctor-schema/v1",
-    );
+    update_digest_component(&mut digest, b"market-squawk/census-native-doctor-schema/v1");
     update_digest_component(&mut digest, b"NAME:utf8:exact=United States");
     update_digest_component(&mut digest, b"B01001_001E:u64:positive");
     update_digest_component(&mut digest, b"us:utf8:exact=1");

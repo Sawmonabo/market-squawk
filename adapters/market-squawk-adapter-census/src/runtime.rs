@@ -13,12 +13,11 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     CensusClocks, CensusDataset, CensusDatasetAcquisition, CensusDatasetContract,
     CensusDoctorReadiness, CensusDoctorReport, CensusDoctorScope, CensusGeographyValue,
-    CensusIntendedUse, CensusPredicateValue, CensusReportedTime, CensusSourceConfig,
-    CensusSourceError, CensusValueState, census_provider_rate_declaration,
-    update_digest_component,
+    CensusPredicateValue, CensusReportedTime, CensusSourceConfig, CensusSourceError,
+    CensusValueState, census_provider_rate_declaration, update_digest_component,
 };
 
-const CENSUS_RUNTIME_SCHEMA_VERSION: u16 = 2;
+const CENSUS_RUNTIME_SCHEMA_VERSION: u16 = 4;
 const CENSUS_DOCTOR_ACTIVATION_TTL_NANOS: i64 = 86_400_000_000_000;
 
 /// One exact configured dataset admitted by a Census activation plan.
@@ -61,9 +60,6 @@ pub struct CensusActivationPlan {
     source_id: SourceId,
     metadata_revision: SourceIdentifier,
     configuration_digest: EvidenceDigest,
-    credential_generation_digest: EvidenceDigest,
-    owner_authorization_digest: EvidenceDigest,
-    presentation_obligation_digest: EvidenceDigest,
     provider_rate_declaration_digest: EvidenceDigest,
     datasets: Box<[CensusActivatedDataset]>,
     activation_digest: EvidenceDigest,
@@ -83,21 +79,6 @@ impl CensusActivationPlan {
     /// Returns the complete provider configuration digest.
     pub const fn configuration_digest(&self) -> EvidenceDigest {
         self.configuration_digest
-    }
-
-    /// Returns the protected root credential-record generation used by doctor and production.
-    pub const fn credential_generation_digest(&self) -> EvidenceDigest {
-        self.credential_generation_digest
-    }
-
-    /// Returns the frozen private-use authorization digest.
-    pub const fn owner_authorization_digest(&self) -> EvidenceDigest {
-        self.owner_authorization_digest
-    }
-
-    /// Returns the exact Census presentation and no-reidentification obligation identity.
-    pub const fn presentation_obligation_digest(&self) -> EvidenceDigest {
-        self.presentation_obligation_digest
     }
 
     /// Returns the exact declaration the root must register with durable rate authority.
@@ -120,9 +101,6 @@ impl CensusActivationPlan {
         if self.schema_version != CENSUS_RUNTIME_SCHEMA_VERSION
             || self.datasets.is_empty()
             || self.configuration_digest.bytes() == [0; 32]
-            || self.credential_generation_digest.bytes() == [0; 32]
-            || self.owner_authorization_digest.bytes() == [0; 32]
-            || self.presentation_obligation_digest.bytes() == [0; 32]
             || self.provider_rate_declaration_digest.bytes() == [0; 32]
             || self.activation_digest.bytes() == [0; 32]
             || self.datasets.windows(2).any(|pair| {
@@ -141,15 +119,12 @@ impl CensusActivationPlan {
             return Err(CensusSourceError::InvalidConfiguration);
         }
         let expected = digest_serialized(
-            b"market-squawk/census-activation/v2",
+            b"market-squawk/census-activation/v4",
             &(
                 self.schema_version,
                 &self.source_id,
                 &self.metadata_revision,
                 self.configuration_digest,
-                self.credential_generation_digest,
-                self.owner_authorization_digest,
-                self.presentation_obligation_digest,
                 self.provider_rate_declaration_digest,
                 &self.datasets,
             ),
@@ -168,7 +143,7 @@ impl CensusActivationPlan {
     }
 }
 
-/// Provider readiness candidate bound to the exact doctor capture and credential generation.
+/// Provider readiness candidate bound to the exact doctor capture.
 ///
 /// This is activation evidence only. It grants no manifest, restart, or query authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -202,7 +177,7 @@ impl CensusActivationCandidate {
         let doctor_report_digest = doctor.report_digest();
         let doctor_capture_receipt_digest = sealed_capture.receipt_digest();
         let candidate_digest = digest_serialized(
-            b"market-squawk/census-activation-candidate/v2",
+            b"market-squawk/census-activation-candidate/v4",
             &(
                 plan.activation_digest,
                 doctor_report_digest,
@@ -231,7 +206,7 @@ impl CensusActivationCandidate {
         self.plan.validate()?;
         validate_doctor_capture(&self.plan, doctor, sealed_capture)?;
         let expected = digest_serialized(
-            b"market-squawk/census-activation-candidate/v2",
+            b"market-squawk/census-activation-candidate/v4",
             &(
                 self.plan.activation_digest,
                 self.doctor_report_digest,
@@ -295,11 +270,7 @@ fn validate_doctor_capture(
         || doctor.source_id() != &plan.source_id
         || doctor.metadata_revision() != &plan.metadata_revision
         || doctor.configuration_digest() != plan.configuration_digest
-        || doctor.credential_generation_digest() != plan.credential_generation_digest
-        || doctor.owner_authorization_digest() != plan.owner_authorization_digest
-        || doctor.presentation_obligation_digest() != plan.presentation_obligation_digest
         || doctor.provider_rate_declaration_digest() != plan.provider_rate_declaration_digest
-        || !doctor.non_endorsement_notice_required()
         || doctor.native_schema().as_str() != "census-json-matrix-acs1-us-population"
         || doctor.native_schema_version() == 0
         || doctor.native_schema_fingerprint().bytes() == [0; 32]
@@ -323,7 +294,6 @@ fn validate_doctor_capture(
         return Err(CensusSourceError::Protocol);
     }
     Ok(())
-
 }
 
 /// Exact role and order of one raw response needed by a Census publication.
@@ -401,6 +371,7 @@ pub struct CensusCanonicalObservationBinding {
     predicates: Box<[CensusPredicateValue]>,
     reported_time: Option<CensusReportedTime>,
     effective_time: ResearchTemporalCoordinate,
+    published_time: Option<ResearchTemporalCoordinate>,
     value_state: CensusValueState,
     clocks: CensusClocks,
     family_digest: EvidenceDigest,
@@ -435,6 +406,7 @@ impl CensusCanonicalObservationBinding {
             predicates: observation.predicates().to_vec().into_boxed_slice(),
             reported_time: observation.reported_time().cloned(),
             effective_time,
+            published_time: None,
             value_state: observation.value().clone(),
             clocks: observation.clocks().clone(),
             family_digest: evidence_digest(observation.revision_candidate().family_digest()),
@@ -495,6 +467,11 @@ impl CensusCanonicalObservationBinding {
         &self.effective_time
     }
 
+    /// Returns provider publication time when explicitly supplied; Census rows currently do not.
+    pub const fn published_time(&self) -> Option<&ResearchTemporalCoordinate> {
+        self.published_time.as_ref()
+    }
+
     /// Returns closed observed, missing, annotated, or invalid provider state.
     pub const fn value_state(&self) -> &CensusValueState {
         &self.value_state
@@ -541,7 +518,7 @@ impl CensusCanonicalObservationBinding {
     }
 }
 
-/// All exact raw, native-identity, canonical, authorization, and quota evidence required before
+/// All exact raw, native-identity, canonical, and shared-quota evidence required before
 /// publishing one immutable Census generation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -552,9 +529,6 @@ pub struct CensusPublicationPlan {
     provider_dataset: SourceIdentifier,
     analytical_dataset: SourceIdentifier,
     configuration_digest: EvidenceDigest,
-    credential_generation_digest: EvidenceDigest,
-    owner_authorization_digest: EvidenceDigest,
-    presentation_obligation_digest: EvidenceDigest,
     provider_rate_declaration_digest: EvidenceDigest,
     query_digest: EvidenceDigest,
     metadata_bundle_digest: EvidenceDigest,
@@ -582,24 +556,9 @@ impl CensusPublicationPlan {
         &self.analytical_dataset
     }
 
-    /// Returns the owner authorization digest that must remain current through query use.
-    pub const fn owner_authorization_digest(&self) -> EvidenceDigest {
-        self.owner_authorization_digest
-    }
-
     /// Returns exact configuration identity.
     pub const fn configuration_digest(&self) -> EvidenceDigest {
         self.configuration_digest
-    }
-
-    /// Returns the protected credential generation used by the source request.
-    pub const fn credential_generation_digest(&self) -> EvidenceDigest {
-        self.credential_generation_digest
-    }
-
-    /// Returns the exact display/purpose obligation root must enforce for reads and presentation.
-    pub const fn presentation_obligation_digest(&self) -> EvidenceDigest {
-        self.presentation_obligation_digest
     }
 
     /// Returns exact shared quota declaration identity.
@@ -652,14 +611,10 @@ impl CensusPublicationPlan {
         if self.schema_version != CENSUS_RUNTIME_SCHEMA_VERSION
             || self.captures.len() != 1
             || self.observations.is_empty()
-            || self.captures[0].role
-                != CensusCaptureRole::CompleteMetadataAndDataGraph
+            || self.captures[0].role != CensusCaptureRole::CompleteMetadataAndDataGraph
             || self.captures[0].component_count < 2
             || self.captures[0].response_bytes == 0
             || self.configuration_digest.bytes() == [0; 32]
-            || self.credential_generation_digest.bytes() == [0; 32]
-            || self.owner_authorization_digest.bytes() == [0; 32]
-            || self.presentation_obligation_digest.bytes() == [0; 32]
             || self.provider_rate_declaration_digest.bytes() == [0; 32]
             || self.query_digest.bytes() == [0; 32]
             || self.metadata_bundle_digest.bytes() == [0; 32]
@@ -729,7 +684,7 @@ impl CensusPublicationCandidate {
             canonical_schema_fingerprint(&canonical_schema, canonical_schema_version)?;
         let sealed_capture_receipt_digest = sealed_capture.receipt_digest();
         let candidate_digest = digest_serialized(
-            b"market-squawk/census-publication-candidate/v2",
+            b"market-squawk/census-publication-candidate/v4",
             &(
                 plan.publication_identity,
                 activation.candidate_digest,
@@ -761,7 +716,7 @@ impl CensusPublicationCandidate {
         validate_sealed_capture(&self.plan, &self.sealed_capture)?;
         validate_publication_activation(&self.plan, activation, operation_at)?;
         let expected = digest_serialized(
-            b"market-squawk/census-publication-candidate/v2",
+            b"market-squawk/census-publication-candidate/v4",
             &(
                 self.plan.publication_identity,
                 self.activation_candidate_digest,
@@ -863,21 +818,6 @@ impl CensusPublicationCandidate {
         self.plan.extraction_content_digest
     }
 
-    /// Returns the protected credential generation root must keep current through ingest.
-    pub const fn credential_generation_digest(&self) -> EvidenceDigest {
-        self.plan.credential_generation_digest
-    }
-
-    /// Returns the exact owner-use decision root publication and reads must keep current.
-    pub const fn owner_authorization_digest(&self) -> EvidenceDigest {
-        self.plan.owner_authorization_digest
-    }
-
-    /// Returns the exact Census display and no-reidentification obligation identity.
-    pub const fn presentation_obligation_digest(&self) -> EvidenceDigest {
-        self.plan.presentation_obligation_digest
-    }
-
     /// Returns the exact shared provider-rate declaration identity.
     pub const fn provider_rate_declaration_digest(&self) -> EvidenceDigest {
         self.plan.provider_rate_declaration_digest
@@ -933,11 +873,7 @@ fn validate_publication_activation(
         || plan.source_id != activation.plan.source_id
         || plan.metadata_revision != activation.plan.metadata_revision
         || plan.configuration_digest != activation.plan.configuration_digest
-        || plan.credential_generation_digest != activation.plan.credential_generation_digest
-        || plan.owner_authorization_digest != activation.plan.owner_authorization_digest
-        || plan.presentation_obligation_digest != activation.plan.presentation_obligation_digest
-        || plan.provider_rate_declaration_digest
-            != activation.plan.provider_rate_declaration_digest
+        || plan.provider_rate_declaration_digest != activation.plan.provider_rate_declaration_digest
         || plan.analytical_dataset != dataset.analytical_dataset
         || plan.query_digest != dataset.query_digest
         || plan.prepared_at < activation.activated_at
@@ -977,7 +913,6 @@ pub(crate) fn build_activation_plan(
     metadata: &SourceMetadata,
     config: &CensusSourceConfig,
 ) -> Result<CensusActivationPlan, CensusSourceError> {
-    config.owner_authorization().validate()?;
     let budget = metadata
         .budget_policy()
         .ok_or(CensusSourceError::InvalidMetadata)?;
@@ -1009,22 +944,14 @@ pub(crate) fn build_activation_plan(
     let source_id = metadata.source_id().clone();
     let metadata_revision = metadata.revision().as_source_identifier().clone();
     let configuration_digest = config.configuration_digest();
-    let credential_generation_digest = config.credential_generation_digest();
-    let owner_authorization_digest = config.owner_authorization().authorization_digest();
-    let presentation_obligation_digest = config
-        .owner_authorization()
-        .presentation_obligation_digest();
     let provider_rate_declaration_digest = rate.declaration_digest();
     let activation_digest = digest_serialized(
-        b"market-squawk/census-activation/v2",
+        b"market-squawk/census-activation/v4",
         &(
             schema_version,
             &source_id,
             &metadata_revision,
             configuration_digest,
-            credential_generation_digest,
-            owner_authorization_digest,
-            presentation_obligation_digest,
             provider_rate_declaration_digest,
             &datasets,
         ),
@@ -1034,9 +961,6 @@ pub(crate) fn build_activation_plan(
         source_id,
         metadata_revision,
         configuration_digest,
-        credential_generation_digest,
-        owner_authorization_digest,
-        presentation_obligation_digest,
         provider_rate_declaration_digest,
         datasets,
         activation_digest,
@@ -1052,12 +976,6 @@ pub(crate) fn build_publication_plan(
     capture_material: &ProviderCaptureMaterial,
     observations: Box<[CensusCanonicalObservationBinding]>,
 ) -> Result<CensusPublicationPlan, CensusSourceError> {
-    config
-        .owner_authorization()
-        .authorize(CensusIntendedUse::PrivatePersistence)?;
-    config
-        .owner_authorization()
-        .authorize(CensusIntendedUse::PrivateTransformation)?;
     let activation = build_activation_plan(metadata, config)?;
     let extraction = ExtractionContentIdentity::try_from_batch(batch)
         .map_err(|_| CensusSourceError::Protocol)?;
@@ -1096,11 +1014,6 @@ pub(crate) fn build_publication_plan(
         provider_dataset: contract.dataset_id().clone(),
         analytical_dataset: contract.analytical_dataset_id().clone(),
         configuration_digest: config.configuration_digest(),
-        credential_generation_digest: config.credential_generation_digest(),
-        owner_authorization_digest: config.owner_authorization().authorization_digest(),
-        presentation_obligation_digest: config
-            .owner_authorization()
-            .presentation_obligation_digest(),
         provider_rate_declaration_digest: activation.provider_rate_declaration_digest,
         query_digest: evidence_digest(contract.query().request_digest()),
         metadata_bundle_digest: evidence_digest(acquisition.metadata().content_digest()),
@@ -1117,27 +1030,42 @@ pub(crate) fn build_publication_plan(
 }
 
 fn publication_identity(plan: &CensusPublicationPlan) -> Result<EvidenceDigest, CensusSourceError> {
+    #[derive(Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicationIdentityWire<'a> {
+        schema_version: u16,
+        source_id: &'a SourceId,
+        metadata_revision: &'a SourceIdentifier,
+        provider_dataset: &'a SourceIdentifier,
+        analytical_dataset: &'a SourceIdentifier,
+        configuration_digest: EvidenceDigest,
+        provider_rate_declaration_digest: EvidenceDigest,
+        query_digest: EvidenceDigest,
+        metadata_bundle_digest: EvidenceDigest,
+        data_response_digest: EvidenceDigest,
+        extraction_content_digest: EvidenceDigest,
+        prepared_at: Timestamp,
+        captures: &'a [CensusCaptureBinding],
+        observations: &'a [CensusCanonicalObservationBinding],
+    }
     digest_serialized(
-        b"market-squawk/census-publication-plan/v2",
-        &(
-            plan.schema_version,
-            &plan.source_id,
-            &plan.metadata_revision,
-            &plan.provider_dataset,
-            &plan.analytical_dataset,
-            plan.configuration_digest,
-            plan.credential_generation_digest,
-            plan.owner_authorization_digest,
-            plan.presentation_obligation_digest,
-            plan.provider_rate_declaration_digest,
-            plan.query_digest,
-            plan.metadata_bundle_digest,
-            plan.data_response_digest,
-            plan.extraction_content_digest,
-            plan.prepared_at,
-            &plan.captures,
-            &plan.observations,
-        ),
+        b"market-squawk/census-publication-plan/v4",
+        &PublicationIdentityWire {
+            schema_version: plan.schema_version,
+            source_id: &plan.source_id,
+            metadata_revision: &plan.metadata_revision,
+            provider_dataset: &plan.provider_dataset,
+            analytical_dataset: &plan.analytical_dataset,
+            configuration_digest: plan.configuration_digest,
+            provider_rate_declaration_digest: plan.provider_rate_declaration_digest,
+            query_digest: plan.query_digest,
+            metadata_bundle_digest: plan.metadata_bundle_digest,
+            data_response_digest: plan.data_response_digest,
+            extraction_content_digest: plan.extraction_content_digest,
+            prepared_at: plan.prepared_at,
+            captures: &plan.captures,
+            observations: &plan.observations,
+        },
     )
 }
 

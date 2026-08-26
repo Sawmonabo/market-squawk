@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::mem::size_of;
 
@@ -9,9 +9,12 @@ use serde::de::{DeserializeSeed, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::discovery::{CensusPredicateType, CensusVariableCatalog, CensusVariableMetadata};
-use crate::query::{CensusDataQuery, CensusGeography, CensusGeographyCode, CensusSelection};
 use crate::CensusGeographyAdmission;
+use crate::discovery::{CensusPredicateType, CensusVariableCatalog, CensusVariableMetadata};
+use crate::query::{
+    CensusDataQuery, CensusGeography, CensusGeographyCode, CensusSelection, CensusTimePoint,
+    CensusTimePredicate,
+};
 use crate::{CensusAdapterError, sha256, update_digest_component};
 
 /// Absolute raw + decoded + canonical-output memory ceiling for one Census operation.
@@ -210,20 +213,44 @@ impl CensusReportedTime {
         {
             return Ok(Self::Year { year });
         }
-        if let Some((year, month)) = parse_year_suffix(value, '-')
-            && (1..=12).contains(&month)
-        {
-            return Ok(Self::Month { year, month });
-        }
-        if let Some((year, quarter)) = value
-            .split_once("-Q")
-            .and_then(|(year, quarter)| Some((year.parse().ok()?, quarter.parse().ok()?)))
-            && (1..=4).contains(&quarter)
-        {
-            return Ok(Self::Quarter { year, quarter });
-        }
         if let Some(date) = parse_calendar_date(value)? {
             return Ok(Self::CalendarDate { date });
+        }
+        let value_bytes = value.as_bytes();
+        if value_bytes.len() == 7
+            && value_bytes[4] == b'-'
+            && value_bytes[5] == b'Q'
+            && value_bytes[..4].iter().all(u8::is_ascii_digit)
+            && value_bytes[6].is_ascii_digit()
+        {
+            let year = std::str::from_utf8(&value_bytes[..4])
+                .map_err(|_| CensusAdapterError::InvalidComponent)?
+                .parse::<u16>()
+                .map_err(|_| CensusAdapterError::InvalidComponent)?;
+            let quarter = std::str::from_utf8(&value_bytes[6..])
+                .map_err(|_| CensusAdapterError::InvalidComponent)?
+                .parse::<u8>()
+                .map_err(|_| CensusAdapterError::InvalidComponent)?;
+            if (1000..=9999).contains(&year) && (1..=4).contains(&quarter) {
+                return Ok(Self::Quarter { year, quarter });
+            }
+        }
+        if value_bytes.len() == 7
+            && value_bytes[4] == b'-'
+            && value_bytes[..4].iter().all(u8::is_ascii_digit)
+            && value_bytes[5..].iter().all(u8::is_ascii_digit)
+        {
+            let year = std::str::from_utf8(&value_bytes[..4])
+                .map_err(|_| CensusAdapterError::InvalidComponent)?
+                .parse::<u16>()
+                .map_err(|_| CensusAdapterError::InvalidComponent)?;
+            let month = std::str::from_utf8(&value_bytes[5..])
+                .map_err(|_| CensusAdapterError::InvalidComponent)?
+                .parse::<u8>()
+                .map_err(|_| CensusAdapterError::InvalidComponent)?;
+            if (1000..=9999).contains(&year) && (1..=12).contains(&month) {
+                return Ok(Self::Month { year, month });
+            }
         }
         Ok(Self::ProviderPeriod {
             value: SourceIdentifier::try_from(value)
@@ -357,12 +384,26 @@ impl CensusGeographyComponent {
     }
 }
 
+/// Semantic scope of one safely identified provider geography.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CensusGeographyScope {
+    /// One exact aggregate coordinate.
+    Aggregate,
+    /// One member of an exact multi-geography detail request.
+    Detail,
+    /// Provider result cardinality cannot be proven from the request grammar.
+    Unknown,
+}
+
 /// Exact provider geography attached to one response row.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum CensusGeographyValue {
     /// Standard `for`/`in` hierarchy.
     Standard {
+        /// Request-derived semantic scope.
+        scope: CensusGeographyScope,
         /// Ordered containing/output coordinates.
         components: Vec<CensusGeographyComponent>,
         /// Fully qualified GEOID when explicitly returned.
@@ -372,11 +413,52 @@ pub enum CensusGeographyValue {
     },
     /// UCGID result identified by a returned fully qualified GEOID.
     Uniform {
+        /// Request-derived semantic scope.
+        scope: CensusGeographyScope,
         /// Exact fully qualified provider GEOID.
         fully_qualified_geoid: String,
         /// Provider geography name when explicitly returned.
         name: Option<String>,
     },
+}
+
+impl CensusGeographyValue {
+    /// Returns the request-derived aggregate/detail/unknown state.
+    pub const fn scope(&self) -> CensusGeographyScope {
+        match self {
+            Self::Standard { scope, .. } | Self::Uniform { scope, .. } => *scope,
+        }
+    }
+
+    /// Returns a stable identity digest that excludes mutable display names and optional labels.
+    pub fn identity_digest(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        update_digest_component(&mut digest, b"market-squawk/census-geography-identity/v1");
+        let scope_tag = match self.scope() {
+            CensusGeographyScope::Aggregate => b"aggregate".as_slice(),
+            CensusGeographyScope::Detail => b"detail".as_slice(),
+            CensusGeographyScope::Unknown => b"unknown".as_slice(),
+        };
+        match self {
+            Self::Standard { components, .. } => {
+                update_digest_component(&mut digest, b"standard");
+                update_digest_component(&mut digest, scope_tag);
+                for component in components {
+                    update_digest_component(&mut digest, component.level.as_bytes());
+                    update_digest_component(&mut digest, component.code.as_bytes());
+                }
+            }
+            Self::Uniform {
+                fully_qualified_geoid,
+                ..
+            } => {
+                update_digest_component(&mut digest, b"uniform");
+                update_digest_component(&mut digest, scope_tag);
+                update_digest_component(&mut digest, fully_qualified_geoid.as_bytes());
+            }
+        }
+        digest.finalize().into()
+    }
 }
 
 /// A locally observed source-revision candidate.
@@ -554,6 +636,8 @@ pub enum CensusCompletenessIssue {
     MissingRequestedUniformGeography { geoid: String },
     /// A wildcard request produced no safely identified geography.
     MissingWildcardGeography,
+    /// Wildcard or provider-pseudo geography cardinality cannot be proven from this response.
+    UnverifiedGeographyScope,
     /// Returned exact standard geography cardinality did not match the requested Cartesian scope.
     GeographyCardinalityMismatch { expected: usize, returned: usize },
     /// The response repeated one geography/time row identity.
@@ -573,6 +657,13 @@ pub enum CensusCompletenessIssue {
         row_number: usize,
         /// Variable identity.
         variable: SourceIdentifier,
+    },
+    /// A time-scoped query row omitted its provider period.
+    MissingReportedTime { row_number: usize },
+    /// A returned provider period fell outside the exact requested time predicate.
+    UnexpectedReportedTime {
+        row_number: usize,
+        reported_time: CensusReportedTime,
     },
 }
 
@@ -620,6 +711,8 @@ pub struct CensusResponseAccounting {
     returned_columns: usize,
     returned_requested_variables: usize,
     missing_requested_variables: usize,
+    requested_geographies: Option<usize>,
+    returned_geographies: usize,
     returned_rows: usize,
     usable_rows: usize,
     skipped_rows: usize,
@@ -659,6 +752,16 @@ impl CensusResponseAccounting {
     /// Returns requested variables absent from the response header.
     pub const fn missing_requested_variables(&self) -> usize {
         self.missing_requested_variables
+    }
+
+    /// Returns exact requested geography cardinality, or `None` when provider expansion is open.
+    pub const fn requested_geographies(&self) -> Option<usize> {
+        self.requested_geographies
+    }
+
+    /// Returns distinct stable geography identities safely decoded from rows.
+    pub const fn returned_geographies(&self) -> usize {
+        self.returned_geographies
     }
 
     /// Returns provider data rows excluding the header.
@@ -708,6 +811,7 @@ pub struct CensusDataPage {
     dataset: crate::CensusDataset,
     request_digest: [u8; 32],
     response_payload_digest: [u8; 32],
+    response_payload_bytes: usize,
     metadata_payload_digest: [u8; 32],
     header: Vec<SourceIdentifier>,
     observations: Vec<CensusObservation>,
@@ -750,6 +854,19 @@ impl CensusDataPage {
         if bytes.len() > limits.max_bytes {
             return Err(CensusAdapterError::BodyTooLarge);
         }
+        let predecode_work = bytes
+            .len()
+            .checked_mul(2)
+            .and_then(|bytes| {
+                bytes.checked_add(limits.max_cells.checked_mul(size_of::<CensusCell>())?)
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(limits.max_rows.checked_mul(size_of::<Vec<CensusCell>>())?)
+            })
+            .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
+        if predecode_work > CENSUS_OPERATION_MEMORY_LIMIT_BYTES {
+            return Err(CensusAdapterError::ResourceLimitExceeded);
+        }
         let response_payload_digest = sha256(bytes);
         let metadata_payload_digest = metadata.evidence().payload_digest();
         let semantic_failure = RefCell::new(None);
@@ -760,6 +877,7 @@ impl CensusDataPage {
             limits,
             clocks,
             response_payload_digest,
+            response_payload_bytes: bytes.len(),
             metadata_payload_digest,
             semantic_failure: &semantic_failure,
         };
@@ -794,6 +912,45 @@ impl CensusDataPage {
     /// Returns the exact response payload digest.
     pub const fn response_payload_digest(&self) -> [u8; 32] {
         self.response_payload_digest
+    }
+
+    /// Returns a conservative raw + decoded + canonical-work retained-byte estimate.
+    pub fn conservative_retained_bytes(&self) -> Result<usize, CensusAdapterError> {
+        let mut bytes = size_of::<Self>()
+            .checked_add(
+                self.response_payload_bytes
+                    .checked_mul(2)
+                    .ok_or(CensusAdapterError::ResourceLimitExceeded)?,
+            )
+            .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
+        bytes =
+            checked_capacity_bytes(bytes, self.header.capacity(), size_of::<SourceIdentifier>())?;
+        for column in &self.header {
+            bytes = checked_capacity_bytes(bytes, column.as_str().len(), 1)?;
+        }
+        bytes = checked_capacity_bytes(
+            bytes,
+            self.observations.capacity(),
+            size_of::<CensusObservation>(),
+        )?;
+        for observation in &self.observations {
+            bytes = conservative_observation_bytes(bytes, observation)?;
+            // Publication bindings retain a second exact provider-native identity graph.
+            bytes = conservative_observation_bytes(bytes, observation)?;
+        }
+        if let CensusCompleteness::Partial { issues } = &self.completeness {
+            bytes = checked_capacity_bytes(
+                bytes,
+                issues.capacity(),
+                size_of::<CensusCompletenessIssue>(),
+            )?;
+            for issue in issues {
+                bytes = checked_capacity_bytes(bytes, completeness_issue_string_bytes(issue), 1)?;
+            }
+        }
+        // Canonical publication retains a payload, evidence, and binding per provider-native row.
+        // Reserve a bounded structural floor in addition to every exact retained source string.
+        checked_capacity_bytes(bytes, self.observations.capacity(), 1024)
     }
 
     /// Returns the exact metadata payload digest.
@@ -839,6 +996,7 @@ struct CensusMatrixSeed<'a> {
     limits: CensusParseLimits,
     clocks: CensusClocks,
     response_payload_digest: [u8; 32],
+    response_payload_bytes: usize,
     metadata_payload_digest: [u8; 32],
     semantic_failure: &'a RefCell<Option<CensusAdapterError>>,
 }
@@ -857,6 +1015,7 @@ impl<'de> DeserializeSeed<'de> for CensusMatrixSeed<'_> {
             limits: self.limits,
             clocks: self.clocks,
             response_payload_digest: self.response_payload_digest,
+            response_payload_bytes: self.response_payload_bytes,
             metadata_payload_digest: self.metadata_payload_digest,
             semantic_failure: self.semantic_failure,
         })
@@ -870,6 +1029,7 @@ struct CensusMatrixVisitor<'a> {
     limits: CensusParseLimits,
     clocks: CensusClocks,
     response_payload_digest: [u8; 32],
+    response_payload_bytes: usize,
     metadata_payload_digest: [u8; 32],
     semantic_failure: &'a RefCell<Option<CensusAdapterError>>,
 }
@@ -891,9 +1051,8 @@ impl<'de> Visitor<'de> for CensusMatrixVisitor<'_> {
                 limits: self.limits,
             })?
             .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-        let header = header_from_cells(header_cells).map_err(|error| {
-            semantic_decode_error::<A::Error>(self.semantic_failure, error)
-        })?;
+        let header = header_from_cells(header_cells)
+            .map_err(|error| semantic_decode_error::<A::Error>(self.semantic_failure, error))?;
         let mut builder = CensusPageBuilder::try_new(
             self.query,
             self.metadata,
@@ -901,6 +1060,7 @@ impl<'de> Visitor<'de> for CensusMatrixVisitor<'_> {
             self.limits,
             self.clocks,
             self.response_payload_digest,
+            self.response_payload_bytes,
             self.metadata_payload_digest,
             header,
         )
@@ -922,15 +1082,12 @@ impl<'de> Visitor<'de> for CensusMatrixVisitor<'_> {
             else {
                 break;
             };
-            let next_rows = builder
-                .returned_rows
-                .checked_add(1)
-                .ok_or_else(|| {
-                    semantic_decode_error::<A::Error>(
-                        self.semantic_failure,
-                        CensusAdapterError::ResourceLimitExceeded,
-                    )
-                })?;
+            let next_rows = builder.returned_rows.checked_add(1).ok_or_else(|| {
+                semantic_decode_error::<A::Error>(
+                    self.semantic_failure,
+                    CensusAdapterError::ResourceLimitExceeded,
+                )
+            })?;
             if next_rows
                 .checked_mul(builder.header.len())
                 .is_none_or(|cells| cells > self.limits.max_cells)
@@ -993,10 +1150,7 @@ impl<'de> Visitor<'de> for CensusRowVisitor {
     where
         A: SeqAccess<'de>,
     {
-        let maximum = self
-            .0
-            .expected_columns
-            .unwrap_or(self.0.limits.max_columns);
+        let maximum = self.0.expected_columns.unwrap_or(self.0.limits.max_columns);
         if maximum == 0 || sequence.size_hint().is_some_and(|hint| hint > maximum) {
             return Err(serde::de::Error::custom(
                 "Census row exceeds its column bound",
@@ -1158,9 +1312,9 @@ impl<'de> Visitor<'de> for CensusCellVisitor {
 struct CensusPageBuilder<'a> {
     query: &'a CensusDataQuery,
     metadata: &'a CensusVariableCatalog,
-    limits: CensusParseLimits,
     clocks: CensusClocks,
     response_payload_digest: [u8; 32],
+    response_payload_bytes: usize,
     metadata_payload_digest: [u8; 32],
     header: Vec<SourceIdentifier>,
     header_index: HashMap<String, usize>,
@@ -1169,7 +1323,7 @@ struct CensusPageBuilder<'a> {
     predicates: Vec<CensusPredicateValue>,
     issues: BTreeSet<CensusCompletenessIssue>,
     observations: Vec<CensusObservation>,
-    returned_geographies: HashMap<CensusGeographyValue, usize>,
+    returned_geographies: HashMap<[u8; 32], CensusGeographyValue>,
     returned_rows: usize,
     usable_rows: usize,
     skipped_rows: usize,
@@ -1177,6 +1331,8 @@ struct CensusPageBuilder<'a> {
     missing_values: usize,
     annotated_values: usize,
     invalid_values: usize,
+    retained_observation_bytes: usize,
+    retained_geography_index_bytes: usize,
     row_identities: HashMap<([u8; 32], Option<CensusReportedTime>), usize>,
     economic_identities: HashMap<[u8; 32], usize>,
 }
@@ -1193,6 +1349,7 @@ impl<'a> CensusPageBuilder<'a> {
         limits: CensusParseLimits,
         clocks: CensusClocks,
         response_payload_digest: [u8; 32],
+        response_payload_bytes: usize,
         metadata_payload_digest: [u8; 32],
         header: Vec<SourceIdentifier>,
     ) -> Result<Self, CensusAdapterError> {
@@ -1208,7 +1365,10 @@ impl<'a> CensusPageBuilder<'a> {
             .try_reserve(header.len())
             .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
         for (index, name) in header.iter().enumerate() {
-            if header_index.insert(name.as_str().to_owned(), index).is_some() {
+            if header_index
+                .insert(name.as_str().to_owned(), index)
+                .is_some()
+            {
                 return Err(CensusAdapterError::DuplicateIdentity);
             }
         }
@@ -1292,28 +1452,32 @@ impl<'a> CensusPageBuilder<'a> {
                 .checked_mul(primary.len())
                 .ok_or(CensusAdapterError::ResourceLimitExceeded)?,
         );
-        let mut observations = Vec::new();
-        observations
-            .try_reserve_exact(maximum_observations)
-            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
-        let mut returned_geographies = HashMap::new();
-        returned_geographies
-            .try_reserve(limits.max_rows)
-            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
-        let mut row_identities = HashMap::new();
-        row_identities
-            .try_reserve(limits.max_rows)
-            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
-        let mut economic_identities = HashMap::new();
-        economic_identities
-            .try_reserve(maximum_observations)
-            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+        let minimum_preallocation = response_payload_bytes
+            .checked_add(size_of::<Self>())
+            .and_then(|bytes| {
+                bytes.checked_add(header.len().checked_mul(size_of::<SourceIdentifier>())?)
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    maximum_observations
+                        .min(primary.len())
+                        .checked_mul(size_of::<CensusObservation>().checked_add(1024)?)?,
+                )
+            })
+            .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
+        if minimum_preallocation > CENSUS_OPERATION_MEMORY_LIMIT_BYTES {
+            return Err(CensusAdapterError::ResourceLimitExceeded);
+        }
+        let observations = Vec::new();
+        let returned_geographies = HashMap::new();
+        let row_identities = HashMap::new();
+        let economic_identities = HashMap::new();
         Ok(Self {
             query,
             metadata,
-            limits,
             clocks,
             response_payload_digest,
+            response_payload_bytes,
             metadata_payload_digest,
             header,
             header_index,
@@ -1330,6 +1494,8 @@ impl<'a> CensusPageBuilder<'a> {
             missing_values: 0,
             annotated_values: 0,
             invalid_values: 0,
+            retained_observation_bytes: 0,
+            retained_geography_index_bytes: 0,
             row_identities,
             economic_identities,
         })
@@ -1356,7 +1522,23 @@ impl<'a> CensusPageBuilder<'a> {
             .and_then(|index| row[*index].nonempty_text())
             .map(CensusReportedTime::parse)
             .transpose()?;
-        let geography_digest = semantic_geography_digest(&geography)?;
+        if let Some(predicate) = self.query.time() {
+            match reported_time.as_ref() {
+                None => {
+                    self.issues
+                        .insert(CensusCompletenessIssue::MissingReportedTime { row_number });
+                }
+                Some(reported_time) if !time_predicate_contains(predicate, reported_time) => {
+                    self.issues
+                        .insert(CensusCompletenessIssue::UnexpectedReportedTime {
+                            row_number,
+                            reported_time: reported_time.clone(),
+                        });
+                }
+                Some(_) => {}
+            }
+        }
+        let geography_digest = geography.identity_digest();
         if let Some(first_row_number) = self
             .row_identities
             .insert((geography_digest, reported_time.clone()), row_number)
@@ -1367,9 +1549,21 @@ impl<'a> CensusPageBuilder<'a> {
                     first_row_number,
                 });
         }
-        self.returned_geographies
-            .entry(geography.clone())
-            .or_insert(row_number);
+        if !self.returned_geographies.contains_key(&geography_digest) {
+            let geography_index_bytes = conservative_geography_bytes(
+                size_of::<CensusGeographyValue>()
+                    .checked_add(size_of::<[u8; 32]>())
+                    .and_then(|bytes| bytes.checked_add(4 * size_of::<usize>()))
+                    .ok_or(CensusAdapterError::ResourceLimitExceeded)?,
+                &geography,
+            )?;
+            self.retained_geography_index_bytes = self
+                .retained_geography_index_bytes
+                .checked_add(geography_index_bytes)
+                .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
+            self.returned_geographies
+                .insert(geography_digest, geography.clone());
+        }
         for variable in &self.primary {
             if !self.header_index.contains_key(variable.as_str()) {
                 continue;
@@ -1378,12 +1572,8 @@ impl<'a> CensusPageBuilder<'a> {
                 .metadata
                 .get(variable.as_str())
                 .ok_or(CensusAdapterError::MetadataMismatch)?;
-            let (value, missing_attribute) = value_state(
-                variable_metadata,
-                &self.header_index,
-                &row,
-                self.metadata,
-            )?;
+            let (value, missing_attribute) =
+                value_state(variable_metadata, &self.header_index, &row, self.metadata)?;
             if let Some(attribute) = missing_attribute {
                 self.issues
                     .insert(CensusCompletenessIssue::MissingDeclaredAttribute {
@@ -1429,11 +1619,26 @@ impl<'a> CensusPageBuilder<'a> {
             }
             let family_digest =
                 family_digest(self.query, variable, &geography, reported_time.as_ref())?;
+            let candidate_bytes = conservative_observation_components_bytes(
+                self.query.dataset(),
+                variable,
+                variable_metadata.label(),
+                variable_metadata.concept(),
+                variable_metadata.group(),
+                &value,
+                &geography,
+                &self.predicates,
+                reported_time.as_ref(),
+            )?;
+            self.ensure_next_observation_capacity(candidate_bytes)?;
             let first_observed_at = self
                 .clocks
                 .availability()
                 .conservative_available_at()
                 .unwrap_or(self.clocks.received_at());
+            self.observations
+                .try_reserve_exact(1)
+                .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
             self.observations.push(CensusObservation {
                 dataset: self.query.dataset().clone(),
                 row_number,
@@ -1456,16 +1661,73 @@ impl<'a> CensusPageBuilder<'a> {
                     first_observed_at,
                 },
             });
+            self.retained_observation_bytes = self
+                .retained_observation_bytes
+                .checked_add(candidate_bytes)
+                .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_next_observation_capacity(
+        &self,
+        candidate_bytes: usize,
+    ) -> Result<(), CensusAdapterError> {
+        let row_index_work = self
+            .returned_rows
+            .checked_mul(
+                size_of::<([u8; 32], Option<CensusReportedTime>)>()
+                    .checked_add(4 * size_of::<usize>())
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .ok_or(CensusAdapterError::ResourceLimitExceeded)?,
+            )
+            .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
+        let economic_index_work = self
+            .observations
+            .len()
+            .checked_add(1)
+            .and_then(|count| {
+                count.checked_mul(
+                    size_of::<[u8; 32]>()
+                        .checked_add(4 * size_of::<usize>())?
+                        .checked_mul(2)?,
+                )
+            })
+            .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
+        let issue_work = self
+            .issues
+            .len()
+            .checked_mul(
+                size_of::<CensusCompletenessIssue>()
+                    .checked_add(4 * size_of::<usize>())
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .ok_or(CensusAdapterError::ResourceLimitExceeded)?,
+            )
+            .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
+        let issue_string_work = self.issues.iter().try_fold(0_usize, |bytes, issue| {
+            bytes
+                .checked_add(completeness_issue_string_bytes(issue))
+                .ok_or(CensusAdapterError::ResourceLimitExceeded)
+        })?;
+        let projected = self
+            .response_payload_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(self.retained_observation_bytes))
+            .and_then(|bytes| bytes.checked_add(candidate_bytes))
+            .and_then(|bytes| bytes.checked_add(self.retained_geography_index_bytes))
+            .and_then(|bytes| bytes.checked_add(row_index_work))
+            .and_then(|bytes| bytes.checked_add(economic_index_work))
+            .and_then(|bytes| bytes.checked_add(issue_work))
+            .and_then(|bytes| bytes.checked_add(issue_string_work))
+            .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
+        if projected > CENSUS_OPERATION_MEMORY_LIMIT_BYTES {
+            return Err(CensusAdapterError::ResourceLimitExceeded);
         }
         Ok(())
     }
 
     fn finish(mut self) -> Result<CensusDataPage, CensusAdapterError> {
-        reconcile_geography_scope(
-            self.query,
-            &self.returned_geographies,
-            &mut self.issues,
-        )?;
+        reconcile_geography_scope(self.query, &self.returned_geographies, &mut self.issues)?;
         let returned_requested_variables = self
             .expected_wire
             .iter()
@@ -1483,6 +1745,8 @@ impl<'a> CensusPageBuilder<'a> {
             returned_columns: self.header.len(),
             returned_requested_variables,
             missing_requested_variables,
+            requested_geographies: requested_geography_count(self.query)?,
+            returned_geographies: self.returned_geographies.len(),
             returned_rows: self.returned_rows,
             usable_rows: self.usable_rows,
             skipped_rows: self.skipped_rows,
@@ -1503,6 +1767,7 @@ impl<'a> CensusPageBuilder<'a> {
             dataset: self.query.dataset().clone(),
             request_digest: self.query.request_digest(),
             response_payload_digest: self.response_payload_digest,
+            response_payload_bytes: self.response_payload_bytes,
             metadata_payload_digest: self.metadata_payload_digest,
             header: self.header,
             observations: self.observations,
@@ -1523,9 +1788,8 @@ fn header_from_cells(cells: Vec<CensusCell>) -> Result<Vec<SourceIdentifier>, Ce
         let CensusCell::Text(value) = cell else {
             return Err(CensusAdapterError::SchemaDrift);
         };
-        header.push(
-            SourceIdentifier::try_from(value).map_err(|_| CensusAdapterError::SchemaDrift)?,
-        );
+        header
+            .push(SourceIdentifier::try_from(value).map_err(|_| CensusAdapterError::SchemaDrift)?);
     }
     Ok(header)
 }
@@ -1536,17 +1800,298 @@ fn checked_increment(value: usize) -> Result<usize, CensusAdapterError> {
         .ok_or(CensusAdapterError::ResourceLimitExceeded)
 }
 
-fn semantic_geography_digest(
+fn checked_capacity_bytes(
+    current: usize,
+    capacity: usize,
+    element_bytes: usize,
+) -> Result<usize, CensusAdapterError> {
+    current
+        .checked_add(
+            capacity
+                .checked_mul(element_bytes)
+                .ok_or(CensusAdapterError::ResourceLimitExceeded)?,
+        )
+        .ok_or(CensusAdapterError::ResourceLimitExceeded)
+}
+
+fn conservative_observation_bytes(
+    mut bytes: usize,
+    observation: &CensusObservation,
+) -> Result<usize, CensusAdapterError> {
+    for segment in observation.dataset.path() {
+        bytes = checked_capacity_bytes(bytes, segment.capacity(), 1)?;
+    }
+    bytes = checked_capacity_bytes(bytes, observation.variable.as_str().len(), 1)?;
+    bytes = checked_capacity_bytes(bytes, observation.label.capacity(), 1)?;
+    if let Some(concept) = &observation.concept {
+        bytes = checked_capacity_bytes(bytes, concept.capacity(), 1)?;
+    }
+    if let Some(group) = &observation.group {
+        bytes = checked_capacity_bytes(bytes, group.as_str().len(), 1)?;
+    }
+    bytes = conservative_value_bytes(bytes, &observation.value)?;
+    bytes = conservative_geography_bytes(bytes, &observation.geography)?;
+    bytes = checked_capacity_bytes(
+        bytes,
+        observation.predicates.capacity(),
+        size_of::<CensusPredicateValue>(),
+    )?;
+    for predicate in &observation.predicates {
+        bytes = checked_capacity_bytes(bytes, predicate.variable.as_str().len(), 1)?;
+        bytes = checked_capacity_bytes(bytes, predicate.values.capacity(), size_of::<String>())?;
+        for value in &predicate.values {
+            bytes = checked_capacity_bytes(bytes, value.capacity(), 1)?;
+        }
+    }
+    if let Some(CensusReportedTime::ProviderPeriod { value }) = &observation.reported_time {
+        bytes = checked_capacity_bytes(bytes, value.as_str().len(), 1)?;
+    }
+    Ok(bytes)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every heap-bearing observation component stays explicit for preallocation admission"
+)]
+fn conservative_observation_components_bytes(
+    dataset: &crate::CensusDataset,
+    variable: &SourceIdentifier,
+    label: &str,
+    concept: Option<&str>,
+    group: Option<&SourceIdentifier>,
+    value: &CensusValueState,
     geography: &CensusGeographyValue,
-) -> Result<[u8; 32], CensusAdapterError> {
-    let wire = serde_json::to_vec(geography).map_err(|_| CensusAdapterError::SchemaDrift)?;
-    let mut digest = Sha256::new();
-    update_digest_component(
-        &mut digest,
-        b"market-squawk/census-returned-geography/v1",
-    );
-    update_digest_component(&mut digest, &wire);
-    Ok(digest.finalize().into())
+    predicates: &[CensusPredicateValue],
+    reported_time: Option<&CensusReportedTime>,
+) -> Result<usize, CensusAdapterError> {
+    let mut heap_bytes = 0_usize;
+    for segment in dataset.path() {
+        heap_bytes = checked_capacity_bytes(heap_bytes, segment.capacity(), 1)?;
+    }
+    heap_bytes = checked_capacity_bytes(heap_bytes, variable.as_str().len(), 1)?;
+    heap_bytes = checked_capacity_bytes(heap_bytes, label.len(), 1)?;
+    if let Some(concept) = concept {
+        heap_bytes = checked_capacity_bytes(heap_bytes, concept.len(), 1)?;
+    }
+    if let Some(group) = group {
+        heap_bytes = checked_capacity_bytes(heap_bytes, group.as_str().len(), 1)?;
+    }
+    heap_bytes = conservative_value_bytes(heap_bytes, value)?;
+    heap_bytes = conservative_geography_bytes(heap_bytes, geography)?;
+    heap_bytes = checked_capacity_bytes(
+        heap_bytes,
+        predicates.len(),
+        size_of::<CensusPredicateValue>(),
+    )?;
+    for predicate in predicates {
+        heap_bytes = checked_capacity_bytes(heap_bytes, predicate.variable.as_str().len(), 1)?;
+        heap_bytes =
+            checked_capacity_bytes(heap_bytes, predicate.values.len(), size_of::<String>())?;
+        for value in &predicate.values {
+            heap_bytes = checked_capacity_bytes(heap_bytes, value.capacity(), 1)?;
+        }
+    }
+    if let Some(CensusReportedTime::ProviderPeriod { value }) = reported_time {
+        heap_bytes = checked_capacity_bytes(heap_bytes, value.as_str().len(), 1)?;
+    }
+    size_of::<CensusObservation>()
+        .checked_add(1024)
+        .and_then(|bytes| bytes.checked_add(heap_bytes.checked_mul(2)?))
+        .ok_or(CensusAdapterError::ResourceLimitExceeded)
+}
+
+fn conservative_value_bytes(
+    mut bytes: usize,
+    value: &CensusValueState,
+) -> Result<usize, CensusAdapterError> {
+    let (raw, annotations) = match value {
+        CensusValueState::Observed {
+            value: CensusTypedValue::Text(value),
+        } => {
+            bytes = checked_capacity_bytes(bytes, value.capacity(), 1)?;
+            return Ok(bytes);
+        }
+        CensusValueState::Observed { .. } => return Ok(bytes),
+        CensusValueState::Annotated {
+            raw,
+            typed_candidate,
+            annotations,
+        } => {
+            if let Some(CensusTypedValue::Text(value)) = typed_candidate {
+                bytes = checked_capacity_bytes(bytes, value.capacity(), 1)?;
+            }
+            (Some(raw), annotations)
+        }
+        CensusValueState::Invalid {
+            raw, annotations, ..
+        } => (Some(raw), annotations),
+        CensusValueState::Missing { annotations, .. } => (None, annotations),
+    };
+    if let Some(raw) = raw {
+        bytes = checked_capacity_bytes(bytes, raw.capacity(), 1)?;
+    }
+    bytes = checked_capacity_bytes(bytes, annotations.capacity(), size_of::<CensusAnnotation>())?;
+    for annotation in annotations {
+        bytes = checked_capacity_bytes(bytes, annotation.variable.as_str().len(), 1)?;
+        bytes = checked_capacity_bytes(bytes, annotation.raw.capacity(), 1)?;
+    }
+    Ok(bytes)
+}
+
+fn conservative_geography_bytes(
+    mut bytes: usize,
+    geography: &CensusGeographyValue,
+) -> Result<usize, CensusAdapterError> {
+    match geography {
+        CensusGeographyValue::Standard {
+            components,
+            fully_qualified_geoid,
+            name,
+            ..
+        } => {
+            bytes = checked_capacity_bytes(
+                bytes,
+                components.capacity(),
+                size_of::<CensusGeographyComponent>(),
+            )?;
+            for component in components {
+                bytes = checked_capacity_bytes(bytes, component.level.capacity(), 1)?;
+                bytes = checked_capacity_bytes(bytes, component.code.capacity(), 1)?;
+            }
+            if let Some(geoid) = fully_qualified_geoid {
+                bytes = checked_capacity_bytes(bytes, geoid.capacity(), 1)?;
+            }
+            if let Some(name) = name {
+                bytes = checked_capacity_bytes(bytes, name.capacity(), 1)?;
+            }
+        }
+        CensusGeographyValue::Uniform {
+            fully_qualified_geoid,
+            name,
+            ..
+        } => {
+            bytes = checked_capacity_bytes(bytes, fully_qualified_geoid.capacity(), 1)?;
+            if let Some(name) = name {
+                bytes = checked_capacity_bytes(bytes, name.capacity(), 1)?;
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn completeness_issue_string_bytes(issue: &CensusCompletenessIssue) -> usize {
+    match issue {
+        CensusCompletenessIssue::MissingRequestedVariable { variable }
+        | CensusCompletenessIssue::MissingGroupVariable { variable }
+        | CensusCompletenessIssue::UnexpectedColumn { column: variable }
+        | CensusCompletenessIssue::InvalidTypedValue { variable, .. }
+        | CensusCompletenessIssue::DuplicateEconomicObservation { variable, .. } => {
+            variable.as_str().len()
+        }
+        CensusCompletenessIssue::UnrequestedDeclaredAttribute {
+            variable,
+            attribute,
+        }
+        | CensusCompletenessIssue::MissingDeclaredAttribute {
+            variable,
+            attribute,
+        } => variable
+            .as_str()
+            .len()
+            .saturating_add(attribute.as_str().len()),
+        CensusCompletenessIssue::MissingGeographyLevel { level }
+        | CensusCompletenessIssue::MissingRowGeography { level, .. } => level.len(),
+        CensusCompletenessIssue::UnexpectedUniformGeography { geoid, .. }
+        | CensusCompletenessIssue::MissingRequestedUniformGeography { geoid } => geoid.len(),
+        CensusCompletenessIssue::MissingRequestedGeography { level, code }
+        | CensusCompletenessIssue::UnexpectedGeographyCode { level, code, .. } => {
+            level.len().saturating_add(code.len())
+        }
+        CensusCompletenessIssue::MissingUniformGeographyId
+        | CensusCompletenessIssue::MissingWildcardGeography
+        | CensusCompletenessIssue::UnverifiedGeographyScope
+        | CensusCompletenessIssue::GeographyCardinalityMismatch { .. }
+        | CensusCompletenessIssue::DuplicateReturnedGeography { .. }
+        | CensusCompletenessIssue::MissingReportedTime { .. } => 0,
+        CensusCompletenessIssue::UnexpectedReportedTime {
+            reported_time: CensusReportedTime::ProviderPeriod { value },
+            ..
+        } => value.as_str().len(),
+        CensusCompletenessIssue::UnexpectedReportedTime { .. } => 0,
+    }
+}
+
+fn geography_scope(query: &CensusDataQuery) -> Result<CensusGeographyScope, CensusAdapterError> {
+    match requested_geography_count(query)? {
+        Some(1) => Ok(CensusGeographyScope::Aggregate),
+        Some(_) => Ok(CensusGeographyScope::Detail),
+        None => Ok(CensusGeographyScope::Unknown),
+    }
+}
+
+fn requested_geography_count(query: &CensusDataQuery) -> Result<Option<usize>, CensusAdapterError> {
+    match query.geography() {
+        CensusGeography::Standard {
+            for_clause,
+            in_clauses,
+        } => in_clauses
+            .iter()
+            .chain(std::iter::once(for_clause))
+            .try_fold(Some(1_usize), |count, clause| {
+                if clause
+                    .codes()
+                    .iter()
+                    .any(|code| matches!(code, CensusGeographyCode::Wildcard))
+                {
+                    return Ok(None);
+                }
+                count
+                    .and_then(|count| count.checked_mul(clause.codes().len()))
+                    .map(Some)
+                    .ok_or(CensusAdapterError::ResourceLimitExceeded)
+            }),
+        CensusGeography::Uniform { values } => {
+            if values
+                .iter()
+                .any(|value| value.as_str().starts_with("pseudo("))
+            {
+                Ok(None)
+            } else {
+                Ok(Some(values.len()))
+            }
+        }
+    }
+}
+
+fn time_predicate_contains(predicate: CensusTimePredicate, reported: &CensusReportedTime) -> bool {
+    let reported = match reported {
+        CensusReportedTime::Year { year } => CensusTimePoint::Year { year: *year },
+        CensusReportedTime::Month { year, month } => CensusTimePoint::Month {
+            year: *year,
+            month: *month,
+        },
+        CensusReportedTime::Quarter { year, quarter } => CensusTimePoint::Quarter {
+            year: *year,
+            quarter: *quarter,
+        },
+        CensusReportedTime::CalendarDate { .. } | CensusReportedTime::ProviderPeriod { .. } => {
+            return false;
+        }
+    };
+    match predicate {
+        CensusTimePredicate::At { point } => reported == point,
+        CensusTimePredicate::From { start } => {
+            std::mem::discriminant(&reported) == std::mem::discriminant(&start) && reported >= start
+        }
+        CensusTimePredicate::To { end } => {
+            std::mem::discriminant(&reported) == std::mem::discriminant(&end) && reported <= end
+        }
+        CensusTimePredicate::Range { start, end } => {
+            std::mem::discriminant(&reported) == std::mem::discriminant(&start)
+                && reported >= start
+                && reported <= end
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1753,6 +2298,7 @@ fn row_geography(
     row_number: usize,
     issues: &mut BTreeSet<CensusCompletenessIssue>,
 ) -> Result<Option<CensusGeographyValue>, CensusAdapterError> {
+    let scope = geography_scope(query)?;
     let name = header
         .get("NAME")
         .and_then(|index| row[*index].nonempty_text())
@@ -1804,6 +2350,7 @@ fn row_geography(
                 });
             }
             Ok(Some(CensusGeographyValue::Standard {
+                scope,
                 components,
                 fully_qualified_geoid: returned_geoid,
                 name,
@@ -1824,6 +2371,7 @@ fn row_geography(
                 return Ok(None);
             }
             Ok(Some(CensusGeographyValue::Uniform {
+                scope,
                 fully_qualified_geoid: geoid,
                 name,
             }))
@@ -1833,7 +2381,7 @@ fn row_geography(
 
 fn reconcile_geography_scope(
     query: &CensusDataQuery,
-    returned: &HashMap<CensusGeographyValue, usize>,
+    returned: &HashMap<[u8; 32], CensusGeographyValue>,
     issues: &mut BTreeSet<CensusCompletenessIssue>,
 ) -> Result<(), CensusAdapterError> {
     match query.geography() {
@@ -1854,9 +2402,12 @@ fn reconcile_geography_scope(
             if has_wildcard && returned.is_empty() {
                 issues.insert(CensusCompletenessIssue::MissingWildcardGeography);
             }
+            if has_wildcard {
+                issues.insert(CensusCompletenessIssue::UnverifiedGeographyScope);
+            }
             for clause in &clauses {
                 let observed = returned
-                    .keys()
+                    .values()
                     .filter_map(|geography| match geography {
                         CensusGeographyValue::Standard { components, .. } => components
                             .iter()
@@ -1892,7 +2443,7 @@ fn reconcile_geography_scope(
         }
         CensusGeography::Uniform { values } => {
             let returned_geoids = returned
-                .keys()
+                .values()
                 .filter_map(|geography| match geography {
                     CensusGeographyValue::Uniform {
                         fully_qualified_geoid,
@@ -1907,16 +2458,17 @@ fn reconcile_geography_scope(
             if has_pseudo && returned_geoids.is_empty() {
                 issues.insert(CensusCompletenessIssue::MissingWildcardGeography);
             }
+            if has_pseudo {
+                issues.insert(CensusCompletenessIssue::UnverifiedGeographyScope);
+            }
             for value in values
                 .iter()
                 .filter(|value| !value.as_str().starts_with("pseudo("))
             {
                 if !returned_geoids.contains(value.as_str()) {
-                    issues.insert(
-                        CensusCompletenessIssue::MissingRequestedUniformGeography {
-                            geoid: value.as_str().to_owned(),
-                        },
-                    );
+                    issues.insert(CensusCompletenessIssue::MissingRequestedUniformGeography {
+                        geoid: value.as_str().to_owned(),
+                    });
                 }
             }
         }
@@ -1952,7 +2504,7 @@ fn family_digest(
     let family = serde_json::to_vec(&(
         query.dataset(),
         variable,
-        geography,
+        geography.identity_digest(),
         query.predicates(),
         query.time(),
         time,
@@ -1969,16 +2521,6 @@ fn ensure_string(value: &str, limits: CensusParseLimits) -> Result<(), CensusAda
         return Err(CensusAdapterError::ResourceLimitExceeded);
     }
     Ok(())
-}
-
-fn parse_year_suffix(value: &str, separator: char) -> Option<(u16, u8)> {
-    let (year, suffix) = value.split_once(separator)?;
-    let year = year.parse::<u16>().ok()?;
-    if !(1000..=9999).contains(&year) {
-        return None;
-    }
-    let suffix = suffix.strip_prefix('Q').unwrap_or(suffix);
-    Some((year, suffix.parse::<u8>().ok()?))
 }
 
 fn parse_calendar_date(value: &str) -> Result<Option<CalendarDate>, CensusAdapterError> {
@@ -2004,8 +2546,9 @@ mod tests {
 
     use crate::{
         CensusDataPage, CensusDataQuery, CensusDataset, CensusDiscoveryDocument,
-        CensusDiscoveryKind, CensusDiscoveryRequest, CensusGeography, CensusGeographyClause,
-        CensusGeographyCode, CensusParseLimits, CensusSelection, CensusValueState,
+        CensusDiscoveryKind, CensusDiscoveryRequest, CensusGeography, CensusGeographyAdmission,
+        CensusGeographyClause, CensusGeographyCode, CensusParseLimits, CensusSelection,
+        CensusValueState,
     };
 
     use super::{CensusClocks, CensusCompletenessIssue, CensusTypedValue};
@@ -2070,10 +2613,31 @@ mod tests {
         let selection =
             CensusSelection::variables_with_attributes(["B01001_001E", "NAME"], metadata)?;
         let geography = CensusGeography::standard(
-            CensusGeographyClause::try_new("state", [CensusGeographyCode::try_new("*")?])?,
+            CensusGeographyClause::try_new(
+                "state",
+                [
+                    CensusGeographyCode::try_new("02")?,
+                    CensusGeographyCode::try_new("72")?,
+                    CensusGeographyCode::try_new("99")?,
+                ],
+            )?,
             Vec::new(),
         )?;
         CensusDataQuery::try_new(dataset()?, selection, Vec::new(), geography, None)
+    }
+
+    fn geography_admission() -> Result<CensusGeographyAdmission, crate::CensusAdapterError> {
+        let query = query(&metadata()?)?;
+        Ok(CensusGeographyAdmission::Standard {
+            for_level: "state".to_owned(),
+            geo_level_display: SourceIdentifier::try_from("040")
+                .map_err(|_| crate::CensusAdapterError::InvalidComponent)?,
+            requires: Box::new([]),
+            wildcard_parents: Box::new([]),
+            optional_with_wildcard_for: Box::new([]),
+            for_is_wildcard: false,
+            grammar_digest: query.request_digest(),
+        })
     }
 
     fn clocks() -> Result<CensusClocks, crate::CensusAdapterError> {
@@ -2098,6 +2662,7 @@ mod tests {
         let page = CensusDataPage::parse(
             &query,
             &metadata,
+            &geography_admission()?,
             complete,
             CensusParseLimits::default(),
             clocks()?,
@@ -2130,6 +2695,7 @@ mod tests {
         let page = CensusDataPage::parse(
             &query,
             &metadata,
+            &geography_admission()?,
             partial,
             CensusParseLimits::default(),
             clocks()?,

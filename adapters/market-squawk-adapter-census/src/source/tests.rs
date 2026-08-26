@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,22 +7,27 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
-use market_squawk_platform::LocalPaths;
 use market_squawk_domain::{
-    AuthorizationBasis, CalendarDate, ChecksumCapability, CoverageDelay, DeliveryEvidence,
-    EffectiveInterval, MetadataRevision, ResearchObservation, RevisionBoundPayloadEvidence,
+    AuthorizationBasis, ChecksumCapability, CoverageDelay, DeliveryEvidence, EffectiveInterval,
+    MetadataRevision, ResearchObservation, ResearchTemporalPrecision, RevisionBoundPayloadEvidence,
     SchemaVersion, SequenceCapability, SourceId,
 };
+use market_squawk_platform::LocalPaths;
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationSubjectResolutionError,
     AuthorizationSubjectResolver, CoverageDomain, DiscoveryRequest, EndpointPolicy,
     ExtractionRequest, FreshnessPolicy, HttpRequestBounds, NetworkAccessPolicy,
-    ProviderCaptureTerminalDisposition,
-    SourceCapabilities, SourceCoverage, SourceMetadataInput,
+    ProviderCaptureTerminalDisposition, SourceCapabilities, SourceCoverage, SourceMetadataInput,
 };
 use uuid::Uuid;
 
 use super::*;
+use crate::{
+    CENSUS_OPERATION_MEMORY_LIMIT_BYTES, CensusActivationCandidate, CensusDataset,
+    CensusGeographyClause, CensusGeographyCode, CensusGeographyScope, CensusPredicate,
+    CensusPublicationCandidate, CensusReportedTime, CensusTimePoint, CensusTimePredicate,
+    census_provider_rate_declaration,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -44,8 +50,8 @@ impl Drop for TemporaryDirectory {
 }
 
 const DATA_RESPONSE: &[u8] = br#"[
-  ["B01001_001E", "state"],
-  ["42", "06"]
+  ["CENSUS_VALUE", "time", "us", "NAME", "GEO_ID"],
+  ["42", "2024-Q1", "1", "United States", "0100000US"]
 ]"#;
 
 const DOCTOR_RESPONSE: &[u8] = br#"[
@@ -55,10 +61,12 @@ const DOCTOR_RESPONSE: &[u8] = br#"[
 
 const DATASET_RESPONSE: &[u8] = br#"{
   "dataset": [{
-    "c_vintage": 2024,
-    "c_dataset": ["acs", "acs1"],
-    "title": "ACS one-year fixture",
-    "description": "Exact local transport fixture"
+    "c_vintage": "timeseries",
+    "c_dataset": ["timeseries", "economic", "fixture"],
+    "title": "Quarterly aggregate fixture",
+    "description": "Exact local quarterly transport fixture",
+    "c_isAggregate": true,
+    "c_isTimeseries": true
   }]
 }"#;
 
@@ -66,17 +74,25 @@ const GROUPS_RESPONSE: &[u8] = br#"{"groups": []}"#;
 
 const VARIABLES_RESPONSE: &[u8] = br#"{
   "variables": {
-    "B01001_001E": {
-      "label": "Estimate total",
-      "concept": "Sex by Age",
+    "CENSUS_VALUE": {
+      "label": "Quarterly value",
+      "concept": "Quarterly economic fixture",
       "predicateType": "int",
-      "group": "B01001",
+      "group": "FIXTURE",
       "attributes": "",
       "required": true,
       "limit": 0
     },
-    "state": {
-      "label": "State",
+    "time": {
+      "label": "Time",
+      "concept": "Census API Time Specification",
+      "predicateType": "time",
+      "group": "N/A",
+      "attributes": "",
+      "required": "required, predicate-only"
+    },
+    "us": {
+      "label": "United States",
       "concept": "Census API Geography Specification",
       "predicateType": "fips-for",
       "group": "N/A",
@@ -88,8 +104,8 @@ const VARIABLES_RESPONSE: &[u8] = br#"{
 
 const GEOGRAPHIES_RESPONSE: &[u8] = br#"{
   "fips": [{
-    "name": "state",
-    "geoLevelDisplay": "040",
+    "name": "us",
+    "geoLevelDisplay": "010",
     "referenceDate": "2024-01-01"
   }]
 }"#;
@@ -104,7 +120,7 @@ struct ScriptedTransport {
 impl CensusTransport for ScriptedTransport {
     fn execute<'a>(
         &'a self,
-        request: CensusHttpRequest,
+        request: CensusHttpRequest<'a>,
         in_flight: &'a market_squawk_sources::InFlightExtractionRequest,
         max_bytes: usize,
         timeout: Duration,
@@ -162,12 +178,6 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
     let config = CensusSourceConfig::try_new(
         [contract.clone()],
         CensusParseLimits::try_new(1024 * 1024, 100, 100, 10_000, 1_000, 4_096)?,
-        CensusOwnerAuthorization::try_private_personal_research(
-            SourceIdentifier::try_from("census-owner-attestation-test")?,
-            evidence_digest(sha256(b"census-owner-attestation-test")),
-            now,
-        )?,
-        evidence_digest(sha256(b"census-test-credential-generation")),
     )?;
     let subject = SourceIdentifier::try_from("census-test-key-record")?;
     let metadata = source_metadata(now, subject.clone(), &config)?;
@@ -212,7 +222,24 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         .await?;
     assert!(data.page().completeness().is_complete());
     assert_eq!(data.page().accounting().returned_rows(), 1);
+    assert_eq!(data.page().accounting().usable_rows(), 1);
+    assert_eq!(data.page().accounting().skipped_rows(), 0);
     assert_eq!(data.page().accounting().missing_requested_variables(), 0);
+    assert_eq!(data.page().accounting().requested_geographies(), Some(1));
+    assert_eq!(data.page().accounting().returned_geographies(), 1);
+    assert_eq!(
+        data.page().observations()[0].reported_time(),
+        Some(&CensusReportedTime::Quarter {
+            year: 2024,
+            quarter: 1,
+        })
+    );
+    let geography = data.page().observations()[0].geography();
+    assert_eq!(geography.scope(), CensusGeographyScope::Aggregate);
+    assert_ne!(geography.identity_digest(), [0; 32]);
+    let retained_bytes = data.page().conservative_retained_bytes()?;
+    assert!(retained_bytes > DATA_RESPONSE.len());
+    assert!(retained_bytes <= CENSUS_OPERATION_MEMORY_LIMIT_BYTES);
 
     let acquisition_telemetry = metadata_bundle.telemetry().checked_add(data.telemetry())?;
     let acquisition = CensusDatasetAcquisition {
@@ -226,7 +253,14 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         NonZeroU16::MIN,
         deadline,
     )?;
-    let object = source_object(&metadata, &discovery_request, &contract, &acquisition)?;
+    let discovery_capture_material = combined_capture_material(&metadata, &contract, &acquisition)?;
+    let object = source_object(
+        &metadata,
+        &discovery_request,
+        &contract,
+        &acquisition,
+        discovery_capture_material.receipt(),
+    )?;
     let extraction_request = ExtractionRequest::try_new(
         object,
         NonZeroU32::new(10).ok_or("nonzero record bound")?,
@@ -245,19 +279,63 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
     assert_eq!(output.publication_plan().observations().len(), 1);
     assert_eq!(output.publication_plan().captures().len(), 1);
     assert_eq!(output.publication_plan().captures()[0].component_count(), 5);
-    output.publication_plan().validate()?;
-    let (batch, acquisition, capture_material, publication_plan, telemetry) = output.into_parts();
     assert_eq!(
-        capture_material.receipt().terminal(),
+        output.publication_plan().data_response_digest().bytes(),
+        sha256(DATA_RESPONSE)
+    );
+    let binding = &output.publication_plan().observations()[0];
+    assert_eq!(
+        binding.reported_time(),
+        Some(&CensusReportedTime::Quarter {
+            year: 2024,
+            quarter: 1,
+        })
+    );
+    assert_eq!(
+        binding.effective_time().precision(),
+        ResearchTemporalPrecision::SourcePeriod
+    );
+    let period = binding
+        .effective_time()
+        .source_period_value()
+        .ok_or("expected provider-qualified quarter")?;
+    assert_eq!(period.scheme().as_str(), "census-quarter");
+    assert_eq!(period.year(), 2024);
+    assert_eq!(period.ordinal().get(), 1);
+    assert_eq!(period.code().as_str(), "2024-Q1");
+    assert!(binding.published_time().is_none());
+    assert_eq!(
+        binding.clocks().availability().conservative_available_at(),
+        Some(now)
+    );
+    output.publication_plan().validate()?;
+    let (batch, acquisition, graph_capture_material, publication_plan, telemetry) =
+        output.into_parts();
+    assert_eq!(
+        graph_capture_material.receipt().terminal(),
         ProviderCaptureTerminalDisposition::CompleteRequestGraph
     );
-    assert_eq!(capture_material.receipt().request_graph_components().len(), 5);
-    assert_eq!(capture_material.records().len(), 5);
-    assert_eq!(capture_material.records()[4].payload(), DATA_RESPONSE);
+    assert_eq!(
+        graph_capture_material
+            .receipt()
+            .request_graph_components()
+            .len(),
+        5
+    );
+    assert_eq!(graph_capture_material.records().len(), 5);
+    assert_eq!(graph_capture_material.records()[4].payload(), DATA_RESPONSE);
+    assert_eq!(
+        batch
+            .request()
+            .object()
+            .capture_identity()
+            .paged_content_digest(),
+        Some(graph_capture_material.receipt().content_digest())
+    );
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path())?;
     let store = paths.sealed_research_journal_store()?;
-    let sealed_capture = capture_material.seal(&store)?;
+    let sealed_capture = graph_capture_material.seal(&store)?;
     let doctor_query = crate::doctor::doctor_query()?;
     let doctor_capture = capture_receipt(
         &metadata,
@@ -276,7 +354,7 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         now,
         Duration::from_millis(1),
     )?;
-    let doctor_material = capture_material(
+    let doctor_material = super::capture_material(
         &metadata,
         &doctor_capture,
         Bytes::from_static(DOCTOR_RESPONSE),
@@ -289,12 +367,9 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         now,
     )?;
     activation.validate(&doctor_report, &sealed_doctor_capture, now)?;
-    let publication_candidate = CensusPublicationCandidate::try_new(
-        publication_plan,
-        &sealed_capture,
-        &activation,
-    )?;
-    publication_candidate.validate(&activation, now)?;
+    let publication_candidate =
+        CensusPublicationCandidate::try_new(publication_plan, &sealed_capture, &activation)?;
+    publication_candidate.validate(&activation, publication_candidate.plan().prepared_at())?;
     publication_candidate.validate_batch(&batch)?;
     assert_eq!(publication_candidate.revision_plan(&batch)?.len(), 1);
     assert_eq!(publication_candidate.canonical_record_count(), 1);
@@ -314,23 +389,50 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
     assert!(!candidate_wire.contains("\"generation\""));
     assert!(!candidate_wire.contains("\"manifest_digest\""));
     assert!(!candidate_wire.contains("\"published_at\""));
-    let presentation = source
-        .config()
-        .owner_authorization()
-        .presentation_obligation()?;
-    presentation.validate()?;
+    let candidate_value = serde_json::from_str::<serde_json::Value>(&candidate_wire)?;
+    let candidate_keys = candidate_value
+        .as_object()
+        .ok_or("expected publication candidate object")?
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     assert_eq!(
-        publication_candidate.presentation_obligation_digest(),
-        presentation.obligation_digest()
+        candidate_keys,
+        BTreeSet::from([
+            "activation_candidate_digest",
+            "candidate_digest",
+            "canonical_schema",
+            "canonical_schema_fingerprint",
+            "canonical_schema_version",
+            "plan",
+            "sealed_capture",
+        ])
     );
-    assert!(presentation.prominent_display_required());
-    assert!(presentation.reidentification_prohibited());
+    let plan_keys = candidate_value["plan"]
+        .as_object()
+        .ok_or("expected publication plan object")?
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     assert_eq!(
-        source
-            .config()
-            .owner_authorization()
-            .authorize(CensusIntendedUse::Sale),
-        Err(CensusPolicyError::ProhibitedUse)
+        plan_keys,
+        BTreeSet::from([
+            "analytical_dataset",
+            "captures",
+            "configuration_digest",
+            "data_response_digest",
+            "extraction_content_digest",
+            "metadata_bundle_digest",
+            "metadata_revision",
+            "observations",
+            "prepared_at",
+            "provider_dataset",
+            "provider_rate_declaration_digest",
+            "publication_identity",
+            "query_digest",
+            "schema_version",
+            "source_id",
+        ])
     );
     assert_eq!(
         sealed_capture.capture().request_graph_components()[4].observation_digest(),
@@ -344,25 +446,22 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         DATA_RESPONSE.len() as u64
     );
     assert_eq!(transport.attempts.load(Ordering::Relaxed), 1);
+    assert!(CensusPredicate::try_new("NAME", CensusPredicateType::String, ["A:B"]).is_err());
     assert!(
-        CensusPredicate::try_new("NAME", CensusPredicateType::String, ["A:B"]).is_err()
-    );
-    assert!(CensusDataQuery::try_new(
-        CensusDataset::try_new(2024, "acs/acs1")?,
-        CensusSelection::variables(["B01001_001E"])?,
-        Vec::new(),
-        CensusGeography::standard(
-            CensusGeographyClause::try_new(
-                "state",
-                [CensusGeographyCode::try_new("*")?],
-            )?,
+        CensusDataQuery::try_new(
+            CensusDataset::try_new(2024, "acs/acs1")?,
+            CensusSelection::variables(["B01001_001E"])?,
             Vec::new(),
-        )?,
-        Some(CensusTimePredicate::At {
-            point: CensusTimePoint::year(2024)?,
-        }),
-    )
-    .is_err());
+            CensusGeography::standard(
+                CensusGeographyClause::try_new("state", [CensusGeographyCode::try_new("*")?],)?,
+                Vec::new(),
+            )?,
+            Some(CensusTimePredicate::At {
+                point: CensusTimePoint::year(2024)?,
+            }),
+        )
+        .is_err()
+    );
 
     let annotation_variable = SourceIdentifier::try_from("B01001_001EA")?;
     let exact_annotation = CensusAnnotationMatch::try_new(annotation_variable.clone(), "(X)")?;
@@ -370,26 +469,26 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         SourceIdentifier::try_from("(X)")?,
         Some(annotation_variable.clone()),
     );
-    let annotation_rule = CensusAnnotatedMissingRule::try_new(
-        [exact_annotation],
-        exact_missing.clone(),
-    )?;
+    let annotation_rule =
+        CensusAnnotatedMissingRule::try_new([exact_annotation], exact_missing.clone())?;
     assert_eq!(annotation_rule.missing(), &exact_missing);
-    assert!(CensusAnnotatedMissingRule::try_new(
-        [CensusAnnotationMatch::try_new(annotation_variable, "(X)")?],
-        MacroMissingValue::new(
-            SourceIdentifier::try_from("generic-missing")?,
-            Some(SourceIdentifier::try_from("B01001_001EA")?),
-        ),
-    )
-    .is_err());
+    assert!(
+        CensusAnnotatedMissingRule::try_new(
+            [CensusAnnotationMatch::try_new(annotation_variable, "(X)")?],
+            MacroMissingValue::new(
+                SourceIdentifier::try_from("generic-missing")?,
+                Some(SourceIdentifier::try_from("B01001_001EA")?),
+            ),
+        )
+        .is_err()
+    );
 
     let ResearchObservation::Macro(observation) =
         serde_json::from_slice(batch.records()[0].payload())?
     else {
         return Err("expected canonical macro observation".into());
     };
-    assert_eq!(observation.unit().as_str(), "people");
+    assert_eq!(observation.unit().as_str(), "index_points");
     assert_eq!(
         observation
             .value()
@@ -401,30 +500,27 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
 }
 
 fn contract() -> TestResult<CensusDatasetContract> {
-    let dataset = crate::CensusDataset::try_new(2024, "acs/acs1")?;
+    let dataset = CensusDataset::try_time_series("economic/fixture")?;
     let query = CensusDataQuery::try_new(
         dataset,
-        CensusSelection::variables(["B01001_001E"])?,
+        CensusSelection::variables(["CENSUS_VALUE"])?,
         Vec::new(),
         CensusGeography::standard(
-            crate::CensusGeographyClause::try_new(
-                "state",
-                [crate::CensusGeographyCode::try_new("*")?],
-            )?,
+            CensusGeographyClause::try_new("us", [CensusGeographyCode::try_new("1")?])?,
             Vec::new(),
         )?,
-        None,
+        Some(CensusTimePredicate::At {
+            point: CensusTimePoint::quarter(2024, 1)?,
+        }),
     )?;
     Ok(CensusDatasetContract::try_new(
         query,
         [CensusVariableMapping::try_new(
-            SourceIdentifier::try_from("B01001_001E")?,
-            SourceIdentifier::try_from("census.acs.population")?,
-            SourceIdentifier::try_from("people")?,
+            SourceIdentifier::try_from("CENSUS_VALUE")?,
+            SourceIdentifier::try_from("census.economic.quarterly")?,
+            SourceIdentifier::try_from("index_points")?,
         )?],
-        CensusEffectiveTimePolicy::Fixed(ResearchTemporalCoordinate::calendar_date(
-            CalendarDate::new(2024, 1, 1)?,
-        )),
+        CensusEffectiveTimePolicy::RequireReportedTime,
     )?)
 }
 

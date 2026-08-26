@@ -234,7 +234,7 @@ impl CensusAuthorizedUrl<'_> {
     /// The value must not be placed in a URL, log, trace, error, receipt, or provider status by
     /// the caller. Keeping it separate prevents debug formatting of this request from exposing it.
     pub(crate) fn key_query_value(&self) -> Option<&str> {
-        self.api_key.as_ref().map(CensusApiKey::expose)
+        self.api_key.map(CensusApiKey::expose)
     }
 
     /// Returns whether this request carries the separately retained API-key credential.
@@ -1289,10 +1289,7 @@ fn validate_geography_clause(clause: &CensusGeographyClause) -> Result<(), Censu
     for code in &clause.codes {
         if let CensusGeographyCode::Exact(value) = code {
             validate_bounded_value(value)?;
-            if value == "*"
-                || value.contains(',')
-                || value.chars().any(char::is_whitespace)
-            {
+            if value == "*" || value.contains(',') || value.chars().any(char::is_whitespace) {
                 return Err(CensusAdapterError::InvalidQuery);
             }
         }

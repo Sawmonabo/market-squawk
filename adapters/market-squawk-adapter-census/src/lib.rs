@@ -16,33 +16,29 @@ mod runtime;
 mod source;
 
 pub use discovery::{
-    CensusDatasetCatalog, CensusDatasetMetadata, CensusDiscoveryDocument, CensusGeographyCatalog,
-    CensusGeographyAdmission, CensusGeographyMetadata, CensusGroupCatalog, CensusGroupMetadata,
-    CensusMetadataEvidence,
-    CensusPredicateType, CensusRequiredVariable, CensusVariableCatalog, CensusVariableMetadata,
+    CensusDatasetCatalog, CensusDatasetMetadata, CensusDiscoveryDocument, CensusGeographyAdmission,
+    CensusGeographyCatalog, CensusGeographyMetadata, CensusGroupCatalog, CensusGroupMetadata,
+    CensusMetadataEvidence, CensusPredicateType, CensusRequiredVariable, CensusVariableCatalog,
+    CensusVariableMetadata,
 };
 pub use doctor::{
     CENSUS_DOCTOR_MAX_RESPONSE_BYTES, CENSUS_DOCTOR_TIMEOUT, CensusDoctorOutput,
     CensusDoctorRateHeaderEvidence, CensusDoctorReadiness, CensusDoctorReport, CensusDoctorScope,
 };
+pub use policy::{CensusRateDeclarationError, census_provider_rate_declaration};
 pub use query::{
     CENSUS_APPLICATION_REQUESTS_PER_DAY, CENSUS_APPLICATION_REQUESTS_PER_SECOND,
     CENSUS_PROVIDER_VARIABLE_LIMIT, CensusApiKey, CensusApplicationPacing, CensusDataQuery,
-    CensusDataset, CensusDatasetVintage, CensusDiscoveryKind,
-    CensusDiscoveryRequest, CensusGeography, CensusGeographyClause, CensusGeographyCode,
-    CensusPredicate, CensusSelection, CensusTimePoint, CensusTimePredicate, CensusUcgid,
-};
-pub use policy::{
-    CENSUS_NON_ENDORSEMENT_NOTICE, CensusActivationRequirements, CensusIntendedUse,
-    CensusPolicyError, CensusPresentationObligation, CensusPrivateResearchPolicy,
-    census_presentation_obligation, census_provider_rate_declaration,
+    CensusDataset, CensusDatasetVintage, CensusDiscoveryKind, CensusDiscoveryRequest,
+    CensusGeography, CensusGeographyClause, CensusGeographyCode, CensusPredicate, CensusSelection,
+    CensusTimePoint, CensusTimePredicate, CensusUcgid,
 };
 pub use response::{
-    CensusAnnotation, CensusClocks, CensusCompleteness, CensusCompletenessIssue, CensusDataPage,
-    CensusGeographyValue, CensusMissingReason, CensusObservation, CensusPagination,
-    CensusParseLimits, CensusPredicateValue, CensusReportedTime, CensusResponseAccounting,
-    CensusRevisionCandidate, CensusTypedValue, CensusValueState,
-    CENSUS_OPERATION_MEMORY_LIMIT_BYTES,
+    CENSUS_OPERATION_MEMORY_LIMIT_BYTES, CensusAnnotation, CensusClocks, CensusCompleteness,
+    CensusCompletenessIssue, CensusDataPage, CensusGeographyScope, CensusGeographyValue,
+    CensusMissingReason, CensusObservation, CensusPagination, CensusParseLimits,
+    CensusPredicateValue, CensusReportedTime, CensusResponseAccounting, CensusRevisionCandidate,
+    CensusTypedValue, CensusValueState,
 };
 pub use runtime::{
     CensusActivatedDataset, CensusActivationCandidate, CensusActivationPlan,
@@ -50,14 +46,12 @@ pub use runtime::{
     CensusPublicationCandidate, CensusPublicationPlan,
 };
 pub use source::{
-    CensusAnnotatedMissingRule, CensusAnnotationMatch, CensusCapturedData,
-    CensusCapturedDiscovery, CensusDatasetAcquisition, CensusDatasetContract,
-    CensusDiscoveryOutput,
+    CensusAnnotatedMissingRule, CensusAnnotationMatch, CensusCapturedData, CensusCapturedDiscovery,
+    CensusDatasetAcquisition, CensusDatasetContract, CensusDiscoveryOutput,
     CensusEffectiveTimePolicy, CensusExtractionOutput, CensusMetadataBundle, CensusSource,
     CensusSourceConfig, CensusSourceError, CensusSourceTelemetry, CensusVariableMapping,
-    MAX_CENSUS_ANNOTATED_MISSING_RULES, MAX_CENSUS_ANNOTATIONS_PER_RULE,
-    MAX_CENSUS_ANNOTATION_RULE_BYTES, MAX_CENSUS_CONFIGURED_DATASETS,
-    census_api_endpoint_rules,
+    MAX_CENSUS_ANNOTATED_MISSING_RULES, MAX_CENSUS_ANNOTATION_RULE_BYTES,
+    MAX_CENSUS_ANNOTATIONS_PER_RULE, MAX_CENSUS_CONFIGURED_DATASETS, census_api_endpoint_rules,
 };
 
 /// A Census contract, request, metadata, or response failure.
