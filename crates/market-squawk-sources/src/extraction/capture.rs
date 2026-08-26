@@ -11,15 +11,18 @@ use market_squawk_domain::{
     Timestamp, VenueId,
 };
 use market_squawk_platform::{
-    RawCaptureRecord, SealedResearchJournalSegmentReceipt, SealedResearchJournalStore,
-    SealedResearchJournalStoreError,
+    RawCaptureRecord, SealedResearchJournalSegmentClaim, SealedResearchJournalSegmentReceipt,
+    SealedResearchJournalStore, SealedResearchJournalStoreError,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use super::batch::{ExtractionBatch, ExtractionContentIdentity};
-use super::native_lineage::ProviderNativeLineageBatch;
+use super::contracts::MAX_EXTRACTION_RECORDS;
+use super::native_lineage::{
+    ProviderNativeLineageBatch, ProviderNativeLineageImplementation, ProviderNativeLineageSchema,
+};
 use crate::bounded::BoundedVec;
 
 /// Maximum exact response pages admitted to one provider capture set.
@@ -1750,11 +1753,10 @@ impl SealedProviderCaptureSetReceipt {
                 return Err(ProviderCaptureError::PhysicalReceiptMismatch);
             }
         }
-        let mut hash = Sha256::new();
-        hash.update(b"market-squawk/sealed-provider-capture-receipt/v1");
-        hash_digest(&mut hash, capture.observation_digest);
-        hash_digest(&mut hash, segment.physical_receipt_digest());
-        let receipt_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into());
+        let receipt_digest = sealed_provider_capture_receipt_digest(
+            capture.observation_digest,
+            segment.physical_receipt_digest(),
+        );
         Ok(Self {
             capture,
             segment,
@@ -1776,6 +1778,17 @@ impl SealedProviderCaptureSetReceipt {
     pub const fn receipt_digest(&self) -> EvidenceDigest {
         self.receipt_digest
     }
+}
+
+fn sealed_provider_capture_receipt_digest(
+    capture_observation_digest: EvidenceDigest,
+    physical_receipt_digest: EvidenceDigest,
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/sealed-provider-capture-receipt/v1");
+    hash_digest(&mut hash, capture_observation_digest);
+    hash_digest(&mut hash, physical_receipt_digest);
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
 }
 
 /// Persistable evidence binding one live-event microbatch to one immutable physical segment.
@@ -1925,6 +1938,141 @@ impl ProviderCaptureRowFrame {
     }
 }
 
+/// Checked value-only restart projection of one canonical-row to physical-frame mapping.
+///
+/// This projection cannot construct a sealed binding or live token. It is accepted only by
+/// [`ProviderCaptureBindingDigest::verify_evidence`] as caller-supplied persisted evidence.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ProviderCaptureRowFrameEvidence {
+    canonical_row_ordinal: u32,
+    capture_page_ordinal: u16,
+    segment_ordinal: u16,
+    physical_frame_ordinal: u32,
+    page_body_digest: EvidenceDigest,
+    received_at: Timestamp,
+    source_sequence: Option<u64>,
+}
+
+impl ProviderCaptureRowFrameEvidence {
+    /// Validates exact bounded row, page, segment, frame, digest, clock, and sequence evidence.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "persisted row/frame evidence remains explicit"
+    )]
+    pub fn try_new(
+        canonical_row_ordinal: u32,
+        capture_page_ordinal: u16,
+        segment_ordinal: u16,
+        physical_frame_ordinal: u32,
+        page_body_digest: EvidenceDigest,
+        received_at: Timestamp,
+        source_sequence: Option<u64>,
+    ) -> Result<Self, ProviderCaptureError> {
+        if usize::try_from(canonical_row_ordinal)
+            .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?
+            >= MAX_EXTRACTION_RECORDS
+            || usize::from(capture_page_ordinal) >= MAX_PROVIDER_CAPTURE_PAGES
+            || usize::from(segment_ordinal) >= MAX_PROVIDER_CAPTURE_PAGES
+            || usize::try_from(physical_frame_ordinal)
+                .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?
+                >= MAX_PROVIDER_CAPTURE_PAGES
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        require_sha256_identity(page_body_digest)?;
+        Ok(Self {
+            canonical_row_ordinal,
+            capture_page_ordinal,
+            segment_ordinal,
+            physical_frame_ordinal,
+            page_body_digest,
+            received_at,
+            source_sequence,
+        })
+    }
+
+    fn digest_projection(&self) -> ProviderCaptureRowFrameDigestProjection {
+        ProviderCaptureRowFrameDigestProjection {
+            canonical_row_ordinal: self.canonical_row_ordinal,
+            capture_page_ordinal: self.capture_page_ordinal,
+            segment_ordinal: self.segment_ordinal,
+            physical_frame_ordinal: self.physical_frame_ordinal,
+            page_body_digest: self.page_body_digest,
+            received_at: self.received_at,
+            source_sequence: self.source_sequence,
+        }
+    }
+}
+
+/// Checked borrowed restart projection of one exact sources capture and platform physical claim.
+///
+/// The platform claim remains borrowed and independently non-authoritative. This projection can
+/// only participate in value verification and cannot recreate a sealed receipt or live token.
+#[derive(Debug)]
+pub struct ProviderCapturePhysicalClaimEvidenceRef<'a> {
+    capture_content_digest: EvidenceDigest,
+    capture_observation_digest: EvidenceDigest,
+    sealed_capture_receipt_digest: EvidenceDigest,
+    claim: &'a SealedResearchJournalSegmentClaim,
+}
+
+impl<'a> ProviderCapturePhysicalClaimEvidenceRef<'a> {
+    /// Validates one bounded borrowed physical claim projection without copying frames or bytes.
+    pub fn try_new(
+        capture_content_digest: EvidenceDigest,
+        capture_observation_digest: EvidenceDigest,
+        sealed_capture_receipt_digest: EvidenceDigest,
+        claim: &'a SealedResearchJournalSegmentClaim,
+    ) -> Result<Self, ProviderCaptureError> {
+        require_sha256_identity(capture_content_digest)?;
+        require_sha256_identity(capture_observation_digest)?;
+        require_sha256_identity(sealed_capture_receipt_digest)?;
+        require_sha256_identity(claim.content_digest())?;
+        require_sha256_identity(claim.physical_receipt_digest())?;
+        if claim.relative_reference().is_empty()
+            || claim.size_bytes() == 0
+            || claim.frames().is_empty()
+            || claim.frames().len() > MAX_PROVIDER_CAPTURE_PAGES
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        for (expected_ordinal, frame) in claim.frames().iter().enumerate() {
+            if frame.ordinal()
+                != u32::try_from(expected_ordinal)
+                    .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?
+                || frame.framed_bytes() == 0
+                || frame.provider_payload_bytes() == 0
+                || frame.provider_payload_bytes() > MAX_PROVIDER_CAPTURE_PAGE_BYTES
+            {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+            require_sha256_identity(frame.provider_payload_digest())?;
+        }
+        if sealed_provider_capture_receipt_digest(
+            capture_observation_digest,
+            claim.physical_receipt_digest(),
+        ) != sealed_capture_receipt_digest
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        Ok(Self {
+            capture_content_digest,
+            capture_observation_digest,
+            sealed_capture_receipt_digest,
+            claim,
+        })
+    }
+
+    fn digest_projection(&self) -> ProviderCapturePhysicalClaimDigestProjection<'a> {
+        ProviderCapturePhysicalClaimDigestProjection {
+            capture_content_digest: self.capture_content_digest,
+            capture_observation_digest: self.capture_observation_digest,
+            sealed_capture_receipt_digest: self.sealed_capture_receipt_digest,
+            claim: self.claim,
+        }
+    }
+}
+
 /// Source-neutral one-use authority joining one logical capture to ordered standalone seals.
 #[derive(Debug)]
 pub struct ProviderOrderedCaptureSegments {
@@ -1947,9 +2095,6 @@ impl ProviderOrderedCaptureSegments {
         {
             return Err(ProviderCaptureError::SealedBindingMismatch);
         }
-        let mut digest = Sha256::new();
-        digest.update(b"market-squawk/ordered-provider-capture-segments/v1");
-        hash_digest(&mut digest, root_capture.observation_digest());
         for (ordinal, (root_page, token)) in root_capture.pages().iter().zip(&segments).enumerate()
         {
             let ordinal =
@@ -1981,13 +2126,21 @@ impl ProviderOrderedCaptureSegments {
             {
                 return Err(ProviderCaptureError::SealedBindingMismatch);
             }
-            hash_digest(&mut digest, sealed.receipt_digest());
-            hash_digest(&mut digest, sealed.segment().physical_receipt_digest());
         }
+        let receipt_digest = ordered_provider_capture_segments_digest(
+            root_capture.observation_digest(),
+            segments.iter().map(|token| {
+                let sealed = token.persisted_receipt();
+                (
+                    sealed.receipt_digest(),
+                    sealed.segment().physical_receipt_digest(),
+                )
+            }),
+        );
         Ok(Self {
             root_capture,
             segments: segments.into_boxed_slice(),
-            receipt_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into()),
+            receipt_digest,
         })
     }
 
@@ -2017,11 +2170,111 @@ impl ProviderOrderedCaptureSegments {
     }
 }
 
+fn ordered_provider_capture_segments_digest(
+    root_observation_digest: EvidenceDigest,
+    segments: impl Iterator<Item = (EvidenceDigest, EvidenceDigest)>,
+) -> EvidenceDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/ordered-provider-capture-segments/v1");
+    hash_digest(&mut digest, root_observation_digest);
+    for (sealed_capture_receipt_digest, physical_receipt_digest) in segments {
+        hash_digest(&mut digest, sealed_capture_receipt_digest);
+        hash_digest(&mut digest, physical_receipt_digest);
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
+}
+
 #[derive(Debug)]
 enum ProviderCaptureBindingAuthority {
     Whole(ProviderWholeCaptureToken),
     Component(ProviderCaptureComponentToken),
     Ordered(ProviderOrderedCaptureSegments),
+}
+
+const PROVIDER_CAPTURE_BINDING_DIGEST_DOMAIN: &[u8] =
+    b"market-squawk/sealed-provider-capture-binding/evidence/v1";
+const PROVIDER_CAPTURE_BINDING_DIGEST_VERSION: u16 = 1;
+
+/// Copyable evidence identity of one complete sealed provider-capture binding projection.
+///
+/// This digest is persistable evidence, not live authority. It has no deserialization or public
+/// construction surface and cannot recreate the non-cloneable binding that minted it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProviderCaptureBindingDigest(EvidenceDigest);
+
+impl ProviderCaptureBindingDigest {
+    /// Returns the algorithm-qualified digest for durable evidence persistence.
+    pub const fn evidence(self) -> EvidenceDigest {
+        self.0
+    }
+
+    /// Verifies persisted value evidence without reconstructing a binding or live authority.
+    ///
+    /// The expected digest is loaded by the caller. Common code validates every bounded input and
+    /// compares the same private canonical projection used by live binding construction. It never
+    /// returns a computed replacement digest.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "persisted sealed-binding evidence remains explicit"
+    )]
+    pub fn verify_evidence(
+        expected_digest: EvidenceDigest,
+        root_capture: &ProviderCaptureSetReceipt,
+        sealed_capture_receipt_digest: EvidenceDigest,
+        scope: ProviderCaptureScope,
+        layout: ProviderCaptureBindingLayout,
+        extraction_content_digest: EvidenceDigest,
+        extraction_record_count: usize,
+        record_count: usize,
+        native_schema_version: u16,
+        native_implementation: ProviderNativeLineageImplementation,
+        native_schema_fingerprint: EvidenceDigest,
+        native_batch_digest: EvidenceDigest,
+        native_row_count: usize,
+        row_frames: &[ProviderCaptureRowFrameEvidence],
+        physical_claims: &[ProviderCapturePhysicalClaimEvidenceRef<'_>],
+    ) -> Result<(), ProviderCaptureError> {
+        require_sha256_identity(expected_digest)?;
+        let header = ProviderCaptureBindingDigestHeader {
+            sealed_capture_receipt_digest,
+            scope,
+            layout,
+            extraction_content_digest,
+            extraction_record_count,
+            record_count,
+            native_schema_version,
+            native_implementation,
+            native_schema_fingerprint,
+            native_batch_digest,
+            native_row_count,
+        };
+        validate_provider_capture_binding_evidence(
+            root_capture,
+            header,
+            row_frames,
+            physical_claims,
+        )?;
+        let observed = compute_provider_capture_binding_digest(
+            root_capture,
+            header,
+            row_frames.len(),
+            |ordinal| {
+                row_frames
+                    .get(ordinal)
+                    .map(ProviderCaptureRowFrameEvidence::digest_projection)
+            },
+            physical_claims.len(),
+            |ordinal| {
+                physical_claims
+                    .get(ordinal)
+                    .map(ProviderCapturePhysicalClaimEvidenceRef::digest_projection)
+            },
+        )?;
+        if observed.evidence() != expected_digest {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Non-reusable binding between one normalized extraction batch and its sealed raw evidence.
@@ -2038,6 +2291,7 @@ pub struct SealedProviderCaptureBinding {
     content_identity: ExtractionContentIdentity,
     record_count: usize,
     row_frames: Box<[ProviderCaptureRowFrame]>,
+    evidence_digest: ProviderCaptureBindingDigest,
 }
 
 impl SealedProviderCaptureBinding {
@@ -2119,6 +2373,13 @@ impl SealedProviderCaptureBinding {
         if content_identity.record_count() != record_count || row_frames.len() != record_count {
             return Err(ProviderCaptureError::SealedBindingMismatch);
         }
+        let evidence_digest = provider_capture_binding_digest(
+            &authority,
+            content_identity,
+            record_count,
+            &native_lineage,
+            &row_frames,
+        )?;
         Ok(Self {
             authority,
             batch,
@@ -2126,6 +2387,7 @@ impl SealedProviderCaptureBinding {
             content_identity,
             record_count,
             row_frames,
+            evidence_digest,
         })
     }
 
@@ -2179,6 +2441,16 @@ impl SealedProviderCaptureBinding {
         if expected_row_frames.as_ref() != self.row_frames.as_ref() {
             return Err(ProviderCaptureError::SealedBindingMismatch);
         }
+        if provider_capture_binding_digest(
+            &self.authority,
+            self.content_identity,
+            self.record_count,
+            &self.native_lineage,
+            &self.row_frames,
+        )? != self.evidence_digest
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
         Ok(())
     }
 
@@ -2205,6 +2477,11 @@ impl SealedProviderCaptureBinding {
     /// Returns the contiguous exact canonical-row to logical-page/physical-frame map.
     pub const fn row_frames(&self) -> &[ProviderCaptureRowFrame] {
         &self.row_frames
+    }
+
+    /// Returns the cached, recomputable evidence digest of the complete binding projection.
+    pub const fn evidence_digest(&self) -> ProviderCaptureBindingDigest {
+        self.evidence_digest
     }
 
     /// Returns persisted logical capture evidence; it cannot remint live authority.
@@ -2277,6 +2554,500 @@ impl SealedProviderCaptureBinding {
             ProviderCaptureScope::Whole => None,
             ProviderCaptureScope::RequestGraphComponent { ordinal } => Some(ordinal),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProviderCaptureBindingDigestHeader {
+    sealed_capture_receipt_digest: EvidenceDigest,
+    scope: ProviderCaptureScope,
+    layout: ProviderCaptureBindingLayout,
+    extraction_content_digest: EvidenceDigest,
+    extraction_record_count: usize,
+    record_count: usize,
+    native_schema_version: u16,
+    native_implementation: ProviderNativeLineageImplementation,
+    native_schema_fingerprint: EvidenceDigest,
+    native_batch_digest: EvidenceDigest,
+    native_row_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ProviderCaptureRowFrameDigestProjection {
+    canonical_row_ordinal: u32,
+    capture_page_ordinal: u16,
+    segment_ordinal: u16,
+    physical_frame_ordinal: u32,
+    page_body_digest: EvidenceDigest,
+    received_at: Timestamp,
+    source_sequence: Option<u64>,
+}
+
+impl From<&ProviderCaptureRowFrame> for ProviderCaptureRowFrameDigestProjection {
+    fn from(frame: &ProviderCaptureRowFrame) -> Self {
+        Self {
+            canonical_row_ordinal: frame.canonical_row_ordinal,
+            capture_page_ordinal: frame.capture_page_ordinal,
+            segment_ordinal: frame.segment_ordinal,
+            physical_frame_ordinal: frame.physical_frame_ordinal,
+            page_body_digest: frame.page_body_digest,
+            received_at: frame.received_at,
+            source_sequence: frame.source_sequence,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProviderCapturePhysicalClaimDigestProjection<'a> {
+    capture_content_digest: EvidenceDigest,
+    capture_observation_digest: EvidenceDigest,
+    sealed_capture_receipt_digest: EvidenceDigest,
+    claim: &'a SealedResearchJournalSegmentClaim,
+}
+
+fn provider_capture_binding_digest(
+    authority: &ProviderCaptureBindingAuthority,
+    content_identity: ExtractionContentIdentity,
+    record_count: usize,
+    native_lineage: &ProviderNativeLineageBatch,
+    row_frames: &[ProviderCaptureRowFrame],
+) -> Result<ProviderCaptureBindingDigest, ProviderCaptureError> {
+    let native_schema = native_lineage.schema();
+    let (scope, layout) = binding_scope_layout(authority);
+    let header = ProviderCaptureBindingDigestHeader {
+        sealed_capture_receipt_digest: binding_sealed_capture_digest(authority),
+        scope,
+        layout,
+        extraction_content_digest: content_identity.digest(),
+        extraction_record_count: content_identity.record_count(),
+        record_count,
+        native_schema_version: native_schema.version(),
+        native_implementation: native_schema.implementation(),
+        native_schema_fingerprint: native_schema.fingerprint(),
+        native_batch_digest: native_lineage.batch_digest(),
+        native_row_count: native_lineage.rows().len(),
+    };
+    let segment_count = binding_segment_count(authority);
+    compute_provider_capture_binding_digest(
+        binding_root_capture(authority),
+        header,
+        row_frames.len(),
+        |ordinal| {
+            row_frames
+                .get(ordinal)
+                .map(ProviderCaptureRowFrameDigestProjection::from)
+        },
+        segment_count,
+        |ordinal| {
+            binding_segment_receipt(authority, ordinal).map(|receipt| {
+                ProviderCapturePhysicalClaimDigestProjection {
+                    capture_content_digest: receipt.capture().content_digest(),
+                    capture_observation_digest: receipt.capture().observation_digest(),
+                    sealed_capture_receipt_digest: receipt.receipt_digest(),
+                    claim: receipt.segment().claim(),
+                }
+            })
+        },
+    )
+}
+
+fn compute_provider_capture_binding_digest<'claim, RowAt, ClaimAt>(
+    root_capture: &ProviderCaptureSetReceipt,
+    header: ProviderCaptureBindingDigestHeader,
+    row_frame_count: usize,
+    mut row_frame_at: RowAt,
+    physical_claim_count: usize,
+    mut physical_claim_at: ClaimAt,
+) -> Result<ProviderCaptureBindingDigest, ProviderCaptureError>
+where
+    RowAt: FnMut(usize) -> Option<ProviderCaptureRowFrameDigestProjection>,
+    ClaimAt: FnMut(usize) -> Option<ProviderCapturePhysicalClaimDigestProjection<'claim>>,
+{
+    let mut digest = Sha256::new();
+    hash_binding_field(&mut digest, PROVIDER_CAPTURE_BINDING_DIGEST_DOMAIN)?;
+    digest.update(PROVIDER_CAPTURE_BINDING_DIGEST_VERSION.to_be_bytes());
+
+    hash_binding_field(&mut digest, root_capture.source_id().as_str().as_bytes())?;
+    hash_binding_field(
+        &mut digest,
+        root_capture
+            .metadata_revision()
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
+    hash_binding_field(&mut digest, root_capture.dataset().as_str().as_bytes())?;
+    hash_digest(&mut digest, root_capture.request_set_identity());
+    hash_binding_field(&mut digest, root_capture.terminal().tag())?;
+    digest.update(root_capture.total_body_bytes().to_be_bytes());
+    hash_digest(&mut digest, root_capture.content_digest());
+    hash_digest(&mut digest, root_capture.observation_digest());
+
+    hash_binding_length(&mut digest, root_capture.pages().len())?;
+    for page in root_capture.pages() {
+        digest.update(page.ordinal().to_be_bytes());
+        hash_digest(&mut digest, page.request_identity());
+        hash_optional_digest(&mut digest, page.request_page_token_digest());
+        hash_optional_digest(&mut digest, page.response_next_page_token_digest());
+        digest.update(page.http_status().to_be_bytes());
+        digest.update(page.body_bytes().to_be_bytes());
+        hash_digest(&mut digest, page.body_digest());
+        digest.update(page.received_at().unix_nanos().to_be_bytes());
+    }
+
+    hash_binding_length(&mut digest, root_capture.request_graph_components().len())?;
+    for component in root_capture.request_graph_components() {
+        digest.update(component.ordinal().to_be_bytes());
+        hash_binding_field(&mut digest, component.dataset().as_str().as_bytes())?;
+        hash_digest(&mut digest, component.request_set_identity());
+        hash_binding_field(&mut digest, component.terminal().tag())?;
+        digest.update(component.first_page_ordinal().to_be_bytes());
+        digest.update(component.page_count().get().to_be_bytes());
+        digest.update(component.total_body_bytes().to_be_bytes());
+        hash_digest(&mut digest, component.content_digest());
+        hash_digest(&mut digest, component.observation_digest());
+    }
+
+    hash_digest(&mut digest, header.sealed_capture_receipt_digest);
+    hash_binding_scope_layout(&mut digest, header.scope, header.layout)?;
+    hash_digest(&mut digest, header.extraction_content_digest);
+    hash_binding_length(&mut digest, header.extraction_record_count)?;
+    hash_binding_length(&mut digest, header.record_count)?;
+    digest.update(header.native_schema_version.to_be_bytes());
+    digest.update([header.native_implementation.tag()]);
+    hash_digest(&mut digest, header.native_schema_fingerprint);
+    hash_digest(&mut digest, header.native_batch_digest);
+    hash_binding_length(&mut digest, header.native_row_count)?;
+
+    hash_binding_length(&mut digest, row_frame_count)?;
+    for ordinal in 0..row_frame_count {
+        let frame = row_frame_at(ordinal).ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        digest.update(frame.canonical_row_ordinal.to_be_bytes());
+        digest.update(frame.capture_page_ordinal.to_be_bytes());
+        digest.update(frame.segment_ordinal.to_be_bytes());
+        digest.update(frame.physical_frame_ordinal.to_be_bytes());
+        hash_digest(&mut digest, frame.page_body_digest);
+        digest.update(frame.received_at.unix_nanos().to_be_bytes());
+        hash_binding_optional_u64(&mut digest, frame.source_sequence);
+    }
+
+    hash_binding_length(&mut digest, physical_claim_count)?;
+    for ordinal in 0..physical_claim_count {
+        hash_binding_length(&mut digest, ordinal)?;
+        let physical =
+            physical_claim_at(ordinal).ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        hash_digest(&mut digest, physical.capture_content_digest);
+        hash_digest(&mut digest, physical.capture_observation_digest);
+        hash_digest(&mut digest, physical.sealed_capture_receipt_digest);
+        hash_binding_field(&mut digest, physical.claim.relative_reference().as_bytes())?;
+        hash_digest(&mut digest, physical.claim.content_digest());
+        digest.update(physical.claim.size_bytes().to_be_bytes());
+        hash_digest(&mut digest, physical.claim.physical_receipt_digest());
+        hash_binding_length(&mut digest, physical.claim.frames().len())?;
+        for frame in physical.claim.frames() {
+            digest.update(frame.ordinal().to_be_bytes());
+            digest.update(frame.offset().to_be_bytes());
+            digest.update(frame.framed_bytes().to_be_bytes());
+            digest.update(frame.provider_payload_bytes().to_be_bytes());
+            hash_digest(&mut digest, frame.provider_payload_digest());
+            digest.update(frame.received_at().unix_nanos().to_be_bytes());
+            hash_binding_optional_u64(&mut digest, frame.source_sequence());
+        }
+    }
+
+    Ok(ProviderCaptureBindingDigest(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    )))
+}
+
+fn hash_binding_scope_layout(
+    digest: &mut Sha256,
+    scope: ProviderCaptureScope,
+    layout: ProviderCaptureBindingLayout,
+) -> Result<(), ProviderCaptureError> {
+    match (scope, layout) {
+        (ProviderCaptureScope::Whole, ProviderCaptureBindingLayout::WholeSingleSegment) => {
+            digest.update([1]);
+            digest.update([1]);
+            digest.update([0]);
+        }
+        (
+            ProviderCaptureScope::RequestGraphComponent { ordinal },
+            ProviderCaptureBindingLayout::RequestGraphComponent,
+        ) => {
+            digest.update([2]);
+            digest.update([2]);
+            digest.update([1]);
+            digest.update(ordinal.to_be_bytes());
+        }
+        (ProviderCaptureScope::Whole, ProviderCaptureBindingLayout::OrderedSegments) => {
+            digest.update([1]);
+            digest.update([3]);
+            digest.update([0]);
+        }
+        _ => return Err(ProviderCaptureError::SealedBindingMismatch),
+    }
+    Ok(())
+}
+
+fn validate_provider_capture_binding_evidence(
+    root_capture: &ProviderCaptureSetReceipt,
+    header: ProviderCaptureBindingDigestHeader,
+    row_frames: &[ProviderCaptureRowFrameEvidence],
+    physical_claims: &[ProviderCapturePhysicalClaimEvidenceRef<'_>],
+) -> Result<(), ProviderCaptureError> {
+    require_sha256_identity(header.sealed_capture_receipt_digest)?;
+    require_sha256_identity(header.extraction_content_digest)?;
+    require_sha256_identity(header.native_schema_fingerprint)?;
+    require_sha256_identity(header.native_batch_digest)?;
+    let native_schema =
+        ProviderNativeLineageSchema::for_implementation(header.native_implementation);
+    if native_schema.version() != header.native_schema_version
+        || native_schema.fingerprint() != header.native_schema_fingerprint
+        || header.extraction_record_count != header.record_count
+        || header.native_row_count != header.record_count
+        || row_frames.len() != header.record_count
+        || header.record_count > MAX_EXTRACTION_RECORDS
+        || physical_claims.is_empty()
+        || physical_claims.len() > MAX_PROVIDER_CAPTURE_PAGES
+    {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+
+    let selected_page_range = match (header.scope, header.layout) {
+        (ProviderCaptureScope::Whole, ProviderCaptureBindingLayout::WholeSingleSegment) => {
+            if physical_claims.len() != 1 {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+            None
+        }
+        (
+            ProviderCaptureScope::RequestGraphComponent { ordinal },
+            ProviderCaptureBindingLayout::RequestGraphComponent,
+        ) => {
+            if physical_claims.len() != 1
+                || root_capture.terminal()
+                    != ProviderCaptureTerminalDisposition::CompleteRequestGraph
+            {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+            let component = root_capture
+                .request_graph_components()
+                .get(usize::from(ordinal))
+                .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+            if component.ordinal() != ordinal
+                || component.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph
+            {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+            let first = usize::from(component.first_page_ordinal());
+            let end = first
+                .checked_add(usize::from(component.page_count().get()))
+                .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+            root_capture
+                .pages()
+                .get(first..end)
+                .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+            Some((first, end))
+        }
+        (ProviderCaptureScope::Whole, ProviderCaptureBindingLayout::OrderedSegments) => {
+            if root_capture.terminal()
+                != ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
+                || physical_claims.len() != root_capture.pages().len()
+            {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+            None
+        }
+        _ => return Err(ProviderCaptureError::SealedBindingMismatch),
+    };
+
+    match header.layout {
+        ProviderCaptureBindingLayout::WholeSingleSegment
+        | ProviderCaptureBindingLayout::RequestGraphComponent => {
+            let physical = &physical_claims[0];
+            if physical.capture_content_digest != root_capture.content_digest()
+                || physical.capture_observation_digest != root_capture.observation_digest()
+                || physical.sealed_capture_receipt_digest != header.sealed_capture_receipt_digest
+                || physical.claim.frames().len() != root_capture.pages().len()
+            {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+            for (page, frame) in root_capture.pages().iter().zip(physical.claim.frames()) {
+                if frame.ordinal() != u32::from(page.ordinal())
+                    || frame.provider_payload_bytes() != page.body_bytes()
+                    || frame.provider_payload_digest() != page.body_digest()
+                    || frame.received_at() != page.received_at()
+                    || frame.source_sequence() != Some(u64::from(page.ordinal()))
+                {
+                    return Err(ProviderCaptureError::SealedBindingMismatch);
+                }
+            }
+        }
+        ProviderCaptureBindingLayout::OrderedSegments => {
+            for (page, physical) in root_capture.pages().iter().zip(physical_claims) {
+                let [frame] = physical.claim.frames() else {
+                    return Err(ProviderCaptureError::SealedBindingMismatch);
+                };
+                if frame.ordinal() != 0
+                    || frame.provider_payload_bytes() != page.body_bytes()
+                    || frame.provider_payload_digest() != page.body_digest()
+                    || frame.received_at() != page.received_at()
+                    || frame.source_sequence() != Some(0)
+                {
+                    return Err(ProviderCaptureError::SealedBindingMismatch);
+                }
+            }
+            let ordered_digest = ordered_provider_capture_segments_digest(
+                root_capture.observation_digest(),
+                physical_claims.iter().map(|physical| {
+                    (
+                        physical.sealed_capture_receipt_digest,
+                        physical.claim.physical_receipt_digest(),
+                    )
+                }),
+            );
+            if ordered_digest != header.sealed_capture_receipt_digest {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+        }
+    }
+
+    for (expected_ordinal, row) in row_frames.iter().enumerate() {
+        let expected_ordinal = u32::try_from(expected_ordinal)
+            .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+        let page_index = usize::from(row.capture_page_ordinal);
+        let page = root_capture
+            .pages()
+            .get(page_index)
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        if selected_page_range.is_some_and(|(first, end)| page_index < first || page_index >= end) {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let (expected_segment_ordinal, expected_physical_frame_ordinal, expected_sequence) =
+            match header.layout {
+                ProviderCaptureBindingLayout::WholeSingleSegment
+                | ProviderCaptureBindingLayout::RequestGraphComponent => (
+                    0,
+                    u32::from(row.capture_page_ordinal),
+                    Some(u64::from(row.capture_page_ordinal)),
+                ),
+                ProviderCaptureBindingLayout::OrderedSegments => {
+                    (row.capture_page_ordinal, 0, Some(0))
+                }
+            };
+        let physical = physical_claims
+            .get(usize::from(expected_segment_ordinal))
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        let physical_frame = physical
+            .claim
+            .frames()
+            .get(
+                usize::try_from(expected_physical_frame_ordinal)
+                    .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?,
+            )
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        if row.canonical_row_ordinal != expected_ordinal
+            || row.segment_ordinal != expected_segment_ordinal
+            || row.physical_frame_ordinal != expected_physical_frame_ordinal
+            || row.page_body_digest != page.body_digest()
+            || row.received_at != page.received_at()
+            || row.source_sequence != expected_sequence
+            || physical_frame.ordinal() != expected_physical_frame_ordinal
+            || physical_frame.provider_payload_bytes() != page.body_bytes()
+            || physical_frame.provider_payload_digest() != page.body_digest()
+            || physical_frame.received_at() != page.received_at()
+            || physical_frame.source_sequence() != expected_sequence
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn binding_root_capture(authority: &ProviderCaptureBindingAuthority) -> &ProviderCaptureSetReceipt {
+    match authority {
+        ProviderCaptureBindingAuthority::Whole(token) => token.receipt.capture(),
+        ProviderCaptureBindingAuthority::Component(token) => token.receipt.capture(),
+        ProviderCaptureBindingAuthority::Ordered(token) => token.root_capture(),
+    }
+}
+
+fn binding_scope_layout(
+    authority: &ProviderCaptureBindingAuthority,
+) -> (ProviderCaptureScope, ProviderCaptureBindingLayout) {
+    match authority {
+        ProviderCaptureBindingAuthority::Whole(_) => (
+            ProviderCaptureScope::Whole,
+            ProviderCaptureBindingLayout::WholeSingleSegment,
+        ),
+        ProviderCaptureBindingAuthority::Component(token) => (
+            ProviderCaptureScope::RequestGraphComponent {
+                ordinal: token.ordinal,
+            },
+            ProviderCaptureBindingLayout::RequestGraphComponent,
+        ),
+        ProviderCaptureBindingAuthority::Ordered(_) => (
+            ProviderCaptureScope::Whole,
+            ProviderCaptureBindingLayout::OrderedSegments,
+        ),
+    }
+}
+
+fn binding_sealed_capture_digest(authority: &ProviderCaptureBindingAuthority) -> EvidenceDigest {
+    match authority {
+        ProviderCaptureBindingAuthority::Whole(token) => token.receipt.receipt_digest(),
+        ProviderCaptureBindingAuthority::Component(token) => token.receipt.receipt_digest(),
+        ProviderCaptureBindingAuthority::Ordered(token) => token.receipt_digest(),
+    }
+}
+
+fn binding_segment_count(authority: &ProviderCaptureBindingAuthority) -> usize {
+    match authority {
+        ProviderCaptureBindingAuthority::Whole(_)
+        | ProviderCaptureBindingAuthority::Component(_) => 1,
+        ProviderCaptureBindingAuthority::Ordered(token) => token.segment_count(),
+    }
+}
+
+fn binding_segment_receipt(
+    authority: &ProviderCaptureBindingAuthority,
+    ordinal: usize,
+) -> Option<&SealedProviderCaptureSetReceipt> {
+    match authority {
+        ProviderCaptureBindingAuthority::Whole(token) => {
+            (ordinal == 0).then_some(token.persisted_receipt())
+        }
+        ProviderCaptureBindingAuthority::Component(token) => {
+            (ordinal == 0).then_some(token.persisted_receipt())
+        }
+        ProviderCaptureBindingAuthority::Ordered(token) => token.persisted_segment_receipt(ordinal),
+    }
+}
+
+fn hash_binding_length(digest: &mut Sha256, length: usize) -> Result<(), ProviderCaptureError> {
+    digest.update(
+        u64::try_from(length)
+            .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?
+            .to_be_bytes(),
+    );
+    Ok(())
+}
+
+fn hash_binding_field(digest: &mut Sha256, value: &[u8]) -> Result<(), ProviderCaptureError> {
+    hash_binding_length(digest, value.len())?;
+    digest.update(value);
+    Ok(())
+}
+
+fn hash_binding_optional_u64(digest: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_be_bytes());
+        }
+        None => digest.update([0]),
     }
 }
 
@@ -3160,16 +3931,18 @@ mod tests {
     use static_assertions::assert_not_impl_any;
 
     use super::{
-        ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-        ProviderCaptureScope, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-        SealedProviderCaptureBinding,
+        ProviderCaptureBindingDigest, ProviderCaptureError, ProviderCaptureMaterial,
+        ProviderCapturePageReceipt, ProviderCapturePhysicalClaimEvidenceRef,
+        ProviderCaptureRowFrameEvidence, ProviderCaptureScope, ProviderCaptureSetReceipt,
+        ProviderCaptureTerminalDisposition, SealedProviderCaptureBinding,
     };
     use crate::{
         AvailabilityEvidence, DiscoveryRequest, ExtractionBatch, ExtractionError, ExtractionRecord,
         ExtractionRequest, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES, ProviderEventMicrobatchMaterial,
         ProviderEventMicrobatchToken, ProviderNativeLineageBatch,
         ProviderNativeLineageBatchBuilder, ProviderNativeLineageError,
-        ProviderNativeLineageImplementation, SourceObject,
+        ProviderNativeLineageImplementation, ProviderNativeLineageRowEvidenceRef, SourceObject,
+        verify_provider_native_lineage_batch_evidence,
     };
     use bytes::Bytes;
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
@@ -3528,7 +4301,124 @@ mod tests {
         assert_eq!(component_binding.component_ordinal(), Some(0));
         assert_eq!(component_binding.record_count(), 1);
         assert_eq!(component_binding.row_frames()[0].capture_page_ordinal(), 0);
+        let binding_digest = component_binding.evidence_digest();
+        assert_eq!(binding_digest, component_binding.evidence_digest());
+        assert_eq!(
+            binding_digest.evidence().algorithm(),
+            DigestAlgorithm::Sha256
+        );
+        assert_eq!(
+            binding_digest.evidence().bytes(),
+            [
+                0xf3, 0x03, 0xdc, 0x8f, 0xc1, 0x40, 0xfc, 0x1d, 0x0e, 0x9a, 0x09, 0x58, 0x2b, 0x1d,
+                0x90, 0x06, 0x4a, 0x15, 0xb4, 0x9b, 0x3d, 0x5c, 0xe2, 0x01, 0x97, 0xee, 0x1f, 0x97,
+                0x10, 0x50, 0x37, 0xeb,
+            ]
+        );
+        assert_ne!(
+            binding_digest.evidence(),
+            component_binding.capture_evidence().observation_digest()
+        );
+        assert_ne!(
+            binding_digest.evidence(),
+            component_binding.sealed_capture_receipt_digest()
+        );
+        assert_ne!(
+            binding_digest.evidence(),
+            component_binding.native_lineage().batch_digest()
+        );
+        let persisted_row = &component_binding.row_frames()[0];
+        let persisted_row_frames = [ProviderCaptureRowFrameEvidence::try_new(
+            persisted_row.canonical_row_ordinal(),
+            persisted_row.capture_page_ordinal(),
+            persisted_row.segment_ordinal(),
+            persisted_row.physical_frame_ordinal(),
+            persisted_row.page_body_digest(),
+            persisted_row.received_at(),
+            persisted_row.source_sequence(),
+        )?];
+        let persisted_segment = component_binding
+            .persisted_segment_receipt(0)
+            .ok_or("persisted component segment")?;
+        let persisted_physical_claims = [ProviderCapturePhysicalClaimEvidenceRef::try_new(
+            persisted_segment.capture().content_digest(),
+            persisted_segment.capture().observation_digest(),
+            persisted_segment.receipt_digest(),
+            persisted_segment.segment().claim(),
+        )?];
+        let persisted_content = component_binding.content_identity();
+        let persisted_native = component_binding.native_lineage();
+        let persisted_native_schema = persisted_native.schema();
+        let persisted_native_row = &persisted_native.rows()[0];
+        let persisted_native_rows = [ProviderNativeLineageRowEvidenceRef::try_new(
+            persisted_native_row.ordinal(),
+            persisted_native_row.canonical_record_digest(),
+            persisted_native_row.semantic_payload(),
+            persisted_native_row.semantic_payload_digest(),
+        )?];
+        verify_provider_native_lineage_batch_evidence(
+            persisted_native.batch_digest(),
+            persisted_native_schema.version(),
+            persisted_native_schema.implementation(),
+            persisted_native_schema.fingerprint(),
+            persisted_content.digest(),
+            persisted_content.record_count(),
+            &persisted_native_rows,
+        )?;
+        assert_eq!(
+            verify_provider_native_lineage_batch_evidence(
+                digest(90),
+                persisted_native_schema.version(),
+                persisted_native_schema.implementation(),
+                persisted_native_schema.fingerprint(),
+                persisted_content.digest(),
+                persisted_content.record_count(),
+                &persisted_native_rows,
+            ),
+            Err(ProviderNativeLineageError::AlignmentMismatch)
+        );
+        ProviderCaptureBindingDigest::verify_evidence(
+            binding_digest.evidence(),
+            component_binding.capture_evidence(),
+            component_binding.sealed_capture_receipt_digest(),
+            component_binding.scope(),
+            component_binding.layout(),
+            persisted_content.digest(),
+            persisted_content.record_count(),
+            component_binding.record_count(),
+            persisted_native_schema.version(),
+            persisted_native_schema.implementation(),
+            persisted_native_schema.fingerprint(),
+            persisted_native.batch_digest(),
+            persisted_native.rows().len(),
+            &persisted_row_frames,
+            &persisted_physical_claims,
+        )?;
+        assert_eq!(
+            ProviderCaptureBindingDigest::verify_evidence(
+                digest(91),
+                component_binding.capture_evidence(),
+                component_binding.sealed_capture_receipt_digest(),
+                component_binding.scope(),
+                component_binding.layout(),
+                persisted_content.digest(),
+                persisted_content.record_count(),
+                component_binding.record_count(),
+                persisted_native_schema.version(),
+                persisted_native_schema.implementation(),
+                persisted_native_schema.fingerprint(),
+                persisted_native.batch_digest(),
+                persisted_native.rows().len(),
+                &persisted_row_frames,
+                &persisted_physical_claims,
+            ),
+            Err(ProviderCaptureError::SealedBindingMismatch)
+        );
         component_binding.validate()?;
+        assert_not_impl_any!(ProviderCaptureBindingDigest: serde::Serialize, serde::de::DeserializeOwned);
+        assert_not_impl_any!(ProviderCaptureRowFrameEvidence: Clone, serde::Serialize, serde::de::DeserializeOwned);
+        assert_not_impl_any!(ProviderCapturePhysicalClaimEvidenceRef<'static>: Clone, serde::Serialize, serde::de::DeserializeOwned);
+        assert_not_impl_any!(ProviderNativeLineageRowEvidenceRef<'static>: Clone, serde::Serialize, serde::de::DeserializeOwned);
         assert_not_impl_any!(SealedProviderCaptureBinding: Clone, serde::Serialize);
 
         let native_lineage = build_native_lineage(&component_batch)?;
