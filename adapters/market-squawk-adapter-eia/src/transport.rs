@@ -2,20 +2,26 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{io, mem::size_of};
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use futures_util::{Stream, StreamExt};
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
+    checked_arc_bytes_allocation_bytes, checked_arc_str_allocation_bytes,
+};
 use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_sources::{
-    ApiEndpointRule, BudgetWindowSemantics, ExtractionAuthority, ExtractionAuthorityError,
-    ExtractionRequestPermit, ExtractionSourceError, HttpRequestBounds, MAX_PROVIDER_CAPTURE_BYTES,
+    ApiEndpointRule, AuthorizationMode, BudgetWindowSemantics, CoverageDomain, ExtractionAuthority,
+    ExtractionAuthorityError, ExtractionRequestPermit, ExtractionSourceError, HistoricalCapability,
+    HttpRequestBounds, MAX_OBSERVED_REVISION_BATCH_BYTES, MAX_PROVIDER_CAPTURE_BYTES,
     MAX_PROVIDER_CAPTURE_PAGE_BYTES, MAX_PROVIDER_CAPTURE_PAGES, NetworkAccessPolicy,
     NetworkPolicyError, PathScope, ProviderCaptureError, ProviderCaptureMaterial,
     ProviderCapturePageReceipt, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    QueryParameterRule, QuerySensitivity, SourceError, SourceMetadata, SourceMetadataProvider,
+    QueryParameterRule, QuerySensitivity, SealedProviderCaptureSetReceipt, SourceClass,
+    SourceError, SourceMetadata, SourceMetadataProvider,
 };
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER, USER_AGENT,
@@ -30,7 +36,8 @@ use crate::types::{digest_bytes, digest_parts};
 use crate::{
     EIA_API_ROOT, EiaAcquisition, EiaApiKey, EiaAuthenticatedRequest, EiaDataPage,
     EiaDataPageReceipt, EiaDatasetContract, EiaDigest, EiaError, EiaFacetCatalog,
-    EiaMetadataRequest, EiaPageCompleteness, EiaParseLimits, EiaRouteMetadata,
+    EiaMetadataRequest, EiaPageCompleteness, EiaPaginationTracker, EiaParseLimits,
+    EiaRouteMetadata,
 };
 
 const USER_AGENT_VALUE: &str = concat!(
@@ -278,10 +285,11 @@ impl EiaFacetMetadataRetrieval {
 }
 
 /// Sanitized material and row-count evidence for one ordered data page.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct EiaDataPageMaterial {
     raw: EiaRawPageMaterial,
     data: EiaDataPageReceipt,
+    root_journal_rejoin: EiaRootPageJournalRejoin,
 }
 
 impl EiaDataPageMaterial {
@@ -294,6 +302,209 @@ impl EiaDataPageMaterial {
     pub const fn data_receipt(&self) -> &EiaDataPageReceipt {
         &self.data
     }
+
+    /// Returns exact page coordinates the root-owned SQLite journal must persist before advancing.
+    ///
+    /// This value is deliberately non-serializable and is not a provider checkpoint. Root
+    /// composition owns durable encoding, transactionality, currentness, and restart admission.
+    pub const fn root_journal_rejoin(&self) -> &EiaRootPageJournalRejoin {
+        &self.root_journal_rejoin
+    }
+
+    pub(crate) fn into_root_journal_rejoin(self) -> EiaRootPageJournalRejoin {
+        self.root_journal_rejoin
+    }
+}
+
+/// Non-authoritative exact coordinates for one page in the root-owned durable offset journal.
+///
+/// The accompanying [`EiaDataPageMaterial`] retains the actual sanitized bytes and actual shared
+/// page-capture receipt. This adapter neither persists this value nor claims that a restart is
+/// admitted merely because the coordinates can be constructed.
+#[derive(Debug, Eq, PartialEq)]
+pub struct EiaRootPageJournalRejoin {
+    source_metadata: Arc<SourceMetadata>,
+    provider_dataset: SourceIdentifier,
+    query_digest: EiaDigest,
+    contract_schema_digest: EiaDigest,
+    api_version: crate::EiaApiVersion,
+    page_ordinal: u16,
+    offset: u64,
+    next_offset: Option<u64>,
+    provider_total: u64,
+    capture_receipt: ProviderCapturePageReceipt,
+}
+
+impl EiaRootPageJournalRejoin {
+    /// Returns the exact current source and authorization generation for root comparison.
+    pub fn source_metadata(&self) -> &SourceMetadata {
+        self.source_metadata.as_ref()
+    }
+
+    pub(crate) fn source_metadata_arc(&self) -> &Arc<SourceMetadata> {
+        &self.source_metadata
+    }
+
+    /// Returns the exact provider-query raw dataset.
+    pub const fn provider_dataset(&self) -> &SourceIdentifier {
+        &self.provider_dataset
+    }
+
+    /// Returns the immutable base-query identity shared by every page in the chain.
+    pub const fn query_digest(&self) -> EiaDigest {
+        self.query_digest
+    }
+
+    /// Returns the frozen metadata/query/native-schema identity.
+    pub const fn contract_schema_digest(&self) -> EiaDigest {
+        self.contract_schema_digest
+    }
+
+    /// Returns the provider API version observed by this page.
+    pub const fn api_version(&self) -> &crate::EiaApiVersion {
+        &self.api_version
+    }
+
+    /// Returns the contiguous zero-based page ordinal.
+    pub const fn page_ordinal(&self) -> u16 {
+        self.page_ordinal
+    }
+
+    /// Returns the exact offset used by this request.
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Returns the provider-derived next offset, or `None` only for terminal total closure.
+    pub const fn next_offset(&self) -> Option<u64> {
+        self.next_offset
+    }
+
+    /// Returns the provider total that must remain constant across a resumed chain.
+    pub const fn provider_total(&self) -> u64 {
+        self.provider_total
+    }
+
+    /// Returns the actual source-neutral page receipt, including request/next-token continuity.
+    pub const fn capture_receipt(&self) -> &ProviderCapturePageReceipt {
+        &self.capture_receipt
+    }
+
+    /// Revalidates these coordinates against current root source/contract state and actual bytes.
+    pub fn validate(
+        &self,
+        current_source: &SourceMetadata,
+        contract: &EiaDatasetContract,
+        material: &EiaDataPageMaterial,
+    ) -> Result<(), EiaSourceTransportError> {
+        if current_source != self.source_metadata.as_ref()
+            || contract.query().identity() != self.query_digest
+            || contract.schema_digest() != self.contract_schema_digest
+            || contract.metadata().api_version() != &self.api_version
+            || &material.root_journal_rejoin != self
+        {
+            return Err(EiaSourceTransportError::InvalidConfiguration);
+        }
+        validate_page_journal_rejoin(
+            self.source_metadata.as_ref(),
+            &self.provider_dataset,
+            contract,
+            self.page_ordinal,
+            &material.raw,
+            &material.data,
+            self,
+        )
+    }
+}
+
+/// Linear, non-serializable continuation for one root-controlled EIA offset acquisition.
+///
+/// Construction and transitions remain adapter-owned. Root can obtain the next continuation only
+/// by sealing and rejoining the exact page returned by [`EiaPendingDataPage`].
+#[derive(Debug)]
+pub struct EiaDataAcquisitionCursor {
+    source_metadata: Arc<SourceMetadata>,
+    provider_dataset: SourceIdentifier,
+    query_digest: EiaDigest,
+    contract_schema_digest: EiaDigest,
+    api_version: crate::EiaApiVersion,
+    next_ordinal: u16,
+    next_offset: u64,
+    retained_bytes: u64,
+    publication_retained_bytes: usize,
+    raw_capture_copy_retained_bytes: usize,
+    pagination_tracker: Option<EiaPaginationTracker>,
+    typed_pages: Vec<EiaDataPage>,
+    page_materials: Vec<EiaDataPageMaterial>,
+    sealed_pages: Vec<SealedProviderCaptureSetReceipt>,
+}
+
+impl EiaDataAcquisitionCursor {
+    /// Returns the only offset the next adapter request may use.
+    pub const fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
+    /// Returns the only contiguous ordinal the next adapter request may use.
+    pub const fn next_ordinal(&self) -> u16 {
+        self.next_ordinal
+    }
+
+    /// Returns exact already-sealed page count. No page is added before physical rejoin succeeds.
+    pub fn sealed_page_count(&self) -> usize {
+        self.sealed_pages.len()
+    }
+}
+
+/// One fetched page whose exact root-journal seal must be rejoined before any next-page request.
+#[derive(Debug)]
+pub struct EiaPendingDataPage {
+    rejoin: EiaDataPageSealRejoin,
+    capture: ProviderCaptureMaterial,
+}
+
+impl EiaPendingDataPage {
+    /// Returns the actual typed/raw page and its exact root-journal coordinates before sealing.
+    pub const fn page_material(&self) -> &EiaDataPageMaterial {
+        &self.rejoin.page_material
+    }
+
+    /// Returns the standalone exact page capture root must durably seal.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture
+    }
+
+    /// Consumes the pending page into a linear rejoin state and actual shared capture material.
+    pub fn into_parts(self) -> (EiaDataPageSealRejoin, ProviderCaptureMaterial) {
+        (self.rejoin, self.capture)
+    }
+}
+
+/// Linear page state awaiting one exact actual shared seal.
+#[derive(Debug)]
+pub struct EiaDataPageSealRejoin {
+    cursor: EiaDataAcquisitionCursor,
+    typed_page: EiaDataPage,
+    page_material: EiaDataPageMaterial,
+    page_capture_receipt: ProviderCaptureSetReceipt,
+    raw_capture_copy_retained_bytes: usize,
+}
+
+impl EiaDataPageSealRejoin {
+    /// Returns immutable page coordinates root binds to its durable journal transaction.
+    pub const fn root_journal_rejoin(&self) -> &EiaRootPageJournalRejoin {
+        self.page_material.root_journal_rejoin()
+    }
+}
+
+/// Sole post-seal transition: another exact page or a terminal complete acquisition.
+#[derive(Debug)]
+pub enum EiaDataPageTransition {
+    /// Root sealed the page and the provider total requires one exact next offset.
+    More(EiaDataAcquisitionCursor),
+    /// Root sealed the terminal page and the complete ordered chain is nonpublishable until its
+    /// assembled capture material is also sealed for canonical candidate construction.
+    Complete(EiaDataRetrieval),
 }
 
 /// Exact transport totals for one terminally closed data acquisition.
@@ -357,8 +568,68 @@ pub struct EiaDataRetrieval {
     dataset: SourceIdentifier,
     acquisition: EiaAcquisition,
     pages: Box<[EiaDataPageMaterial]>,
+    sealed_pages: Box<[SealedProviderCaptureSetReceipt]>,
     capture: ProviderCaptureMaterial,
     transport: EiaDataTransportReceipt,
+}
+
+/// Linear terminal state retained while root seals the complete combined capture material.
+///
+/// This value has no public constructor or serialization. It preserves the typed acquisition,
+/// ordered page materials, and every already-sealed standalone page while the one-shot combined
+/// [`ProviderCaptureMaterial`] is consumed by the shared immutable store.
+#[derive(Debug, Eq, PartialEq)]
+pub struct EiaDataRetrievalSealRejoin {
+    dataset: SourceIdentifier,
+    acquisition: EiaAcquisition,
+    pages: Box<[EiaDataPageMaterial]>,
+    sealed_pages: Box<[SealedProviderCaptureSetReceipt]>,
+    capture_receipt: ProviderCaptureSetReceipt,
+    transport: EiaDataTransportReceipt,
+}
+
+/// One offset-zero data response used only to prove credential, request-echo, and frozen-schema
+/// health during activation. It is deliberately not a complete analytical acquisition.
+#[derive(Debug, Eq, PartialEq)]
+pub struct EiaDataProbeRetrieval {
+    dataset: SourceIdentifier,
+    page: EiaDataPage,
+    raw: EiaRawPageMaterial,
+    capture: ProviderCaptureMaterial,
+}
+
+impl EiaDataProbeRetrieval {
+    /// Returns the provider dataset being probed.
+    pub const fn dataset(&self) -> &SourceIdentifier {
+        &self.dataset
+    }
+
+    /// Returns the fully parsed first page, including its real terminal/more disposition.
+    pub const fn page(&self) -> &EiaDataPage {
+        &self.page
+    }
+
+    /// Returns the sanitized exact response material.
+    pub const fn raw_page(&self) -> &EiaRawPageMaterial {
+        &self.raw
+    }
+
+    /// Returns the standalone raw-capture material that must be sealed before activation.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture
+    }
+
+    /// Consumes the probe handoff for capture-first activation.
+    pub fn into_parts(
+        self,
+    ) -> (
+        SourceIdentifier,
+        EiaDataPage,
+        EiaRawPageMaterial,
+        ProviderCaptureMaterial,
+    ) {
+        (self.dataset, self.page, self.raw, self.capture)
+    }
 }
 
 impl EiaDataRetrieval {
@@ -375,6 +646,11 @@ impl EiaDataRetrieval {
     /// Returns ordered sanitized raw pages and per-page metrics.
     pub fn pages(&self) -> &[EiaDataPageMaterial] {
         &self.pages
+    }
+
+    /// Returns the actual standalone root-journal seal for every page in exact chain order.
+    pub fn sealed_pages(&self) -> &[SealedProviderCaptureSetReceipt] {
+        &self.sealed_pages
     }
 
     /// Returns the terminal source-neutral capture receipt.
@@ -394,23 +670,60 @@ impl EiaDataRetrieval {
         self.transport
     }
 
-    /// Consumes the indivisible data handoff. Composition seals `capture` before publishing any
-    /// canonical observations derived from `acquisition`.
-    pub fn into_parts(
+    /// Splits only at the root sealing boundary. The linear rejoin cannot publish and accepts only
+    /// the exact actual combined seal produced from the returned one-shot capture material.
+    pub fn into_seal_parts(self) -> (EiaDataRetrievalSealRejoin, ProviderCaptureMaterial) {
+        let Self {
+            dataset,
+            acquisition,
+            pages,
+            sealed_pages,
+            capture,
+            transport,
+        } = self;
+        let capture_receipt = capture.receipt().clone();
+        (
+            EiaDataRetrievalSealRejoin {
+                dataset,
+                acquisition,
+                pages,
+                sealed_pages,
+                capture_receipt,
+                transport,
+            },
+            capture,
+        )
+    }
+}
+
+impl EiaDataRetrievalSealRejoin {
+    /// Returns the expected terminal combined capture receipt before physical-seal rejoin.
+    pub const fn capture_receipt(&self) -> &ProviderCaptureSetReceipt {
+        &self.capture_receipt
+    }
+
+    /// Returns the actual standalone root-journal page seals in exact acquisition order.
+    pub fn sealed_pages(&self) -> &[SealedProviderCaptureSetReceipt] {
+        &self.sealed_pages
+    }
+
+    pub(crate) fn into_parts(
         self,
     ) -> (
         SourceIdentifier,
         EiaAcquisition,
         Box<[EiaDataPageMaterial]>,
         EiaDataTransportReceipt,
-        ProviderCaptureMaterial,
+        Box<[SealedProviderCaptureSetReceipt]>,
+        ProviderCaptureSetReceipt,
     ) {
         (
             self.dataset,
             self.acquisition,
             self.pages,
             self.transport,
-            self.capture,
+            self.sealed_pages,
+            self.capture_receipt,
         )
     }
 }
@@ -561,6 +874,10 @@ impl std::fmt::Debug for EiaSourceTransport {
 }
 
 impl EiaSourceTransport {
+    pub(crate) const fn max_pages(&self) -> u16 {
+        self.limits.max_pages
+    }
+
     /// Binds one injected key and one immutable source registration to the hardened HTTP client.
     pub fn try_new(
         metadata: SourceMetadata,
@@ -702,96 +1019,476 @@ impl EiaSourceTransport {
         })
     }
 
-    /// Retrieves every offset page and returns only after exact provider-total closure.
-    pub async fn retrieve_data(
+    /// Starts one linear root-controlled acquisition at exact offset zero.
+    pub(crate) fn begin_data_retrieval(
+        &self,
+        authority: &ExtractionAuthority,
+        contract: &EiaDatasetContract,
+    ) -> Result<EiaDataAcquisitionCursor, EiaSourceTransportError> {
+        self.validate_authority(authority)?;
+        let dataset = eia_data_dataset_identifier(contract)?;
+        let publication_retained_bytes = cursor_base_publication_retained_bytes(
+            &self.metadata,
+            &dataset,
+            contract.metadata().api_version(),
+            self.limits.max_pages,
+        )?;
+        let capacity = usize::from(self.limits.max_pages);
+        let mut typed_pages = Vec::new();
+        typed_pages
+            .try_reserve_exact(capacity)
+            .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?;
+        let mut page_materials = Vec::new();
+        page_materials
+            .try_reserve_exact(capacity)
+            .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?;
+        let mut sealed_pages = Vec::new();
+        sealed_pages
+            .try_reserve_exact(capacity)
+            .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?;
+        Ok(EiaDataAcquisitionCursor {
+            source_metadata: Arc::new(self.metadata.clone()),
+            provider_dataset: dataset,
+            query_digest: contract.query().identity(),
+            contract_schema_digest: contract.schema_digest(),
+            api_version: contract.metadata().api_version().clone(),
+            next_ordinal: 0,
+            next_offset: 0,
+            retained_bytes: 0,
+            publication_retained_bytes,
+            raw_capture_copy_retained_bytes: 0,
+            pagination_tracker: None,
+            typed_pages,
+            page_materials,
+            sealed_pages,
+        })
+    }
+
+    /// Fetches exactly one page and withholds every continuation until its actual seal is rejoined.
+    pub(crate) async fn fetch_next_data_page(
+        &self,
+        authority: &ExtractionAuthority,
+        contract: &EiaDatasetContract,
+        cursor: EiaDataAcquisitionCursor,
+        deadline: Timestamp,
+        cancellation: CancellationToken,
+    ) -> Result<EiaPendingDataPage, EiaSourceTransportError> {
+        self.validate_data_cursor(authority, contract, &cursor)?;
+        if cursor.next_ordinal >= self.limits.max_pages {
+            return Err(EiaSourceTransportError::PageLimitExceeded {
+                max: self.limits.max_pages,
+            });
+        }
+        let fetched = self
+            .fetch_data_page(
+                authority,
+                contract,
+                cursor.next_offset,
+                cursor.next_ordinal,
+                MAX_OBSERVED_REVISION_BATCH_BYTES
+                    .checked_sub(cursor.publication_retained_bytes)
+                    .ok_or(EiaSourceTransportError::InvalidConfiguration)?,
+                deadline,
+                cancellation,
+            )
+            .await?;
+        cursor
+            .retained_bytes
+            .checked_add(fetched.raw.http.retained_bytes)
+            .filter(|bytes| *bytes <= self.limits.max_acquisition_bytes)
+            .ok_or(EiaSourceTransportError::AcquisitionTooLarge {
+                max: self.limits.max_acquisition_bytes,
+            })?;
+        let root_journal_rejoin = root_page_journal_rejoin(
+            &cursor.source_metadata,
+            &cursor.provider_dataset,
+            contract,
+            &fetched.raw,
+            &fetched.data_receipt,
+        )?;
+        let page_material = EiaDataPageMaterial {
+            raw: fetched.raw,
+            data: fetched.data_receipt,
+            root_journal_rejoin,
+        };
+        let chain_page = page_material.raw_page().capture_receipt();
+        let page_dataset = root_page_journal_dataset(
+            cursor.query_digest,
+            cursor.next_ordinal,
+            cursor.next_offset,
+            chain_page.body_digest(),
+        )?;
+        let raw_capture_copy_retained_bytes = raw_capture_copy_working_set_bytes(
+            &self.metadata,
+            &page_dataset,
+            [page_material.raw_page()],
+        )?;
+        cursor
+            .publication_retained_bytes
+            .checked_add(fetched.page.receipt().publication_retained_bytes())
+            .and_then(|bytes| bytes.checked_add(raw_capture_copy_retained_bytes))
+            .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+            .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+        let standalone_page = ProviderCapturePageReceipt::try_new(
+            0,
+            chain_page.request_identity(),
+            None,
+            None,
+            chain_page.http_status(),
+            chain_page.body_bytes(),
+            chain_page.body_digest(),
+            chain_page.received_at(),
+        )?;
+        let standalone_raw = EiaRawPageMaterial {
+            payload: Arc::clone(&page_material.raw.payload),
+            http: page_material.raw.http.clone(),
+            capture: standalone_page,
+        };
+        let page_capture = standalone_capture(&self.metadata, page_dataset, &standalone_raw)?;
+        let page_capture = provider_capture_material(page_capture, [&standalone_raw])?;
+        let page_capture_receipt = page_capture.receipt().clone();
+        Ok(EiaPendingDataPage {
+            rejoin: EiaDataPageSealRejoin {
+                cursor,
+                typed_page: fetched.page,
+                page_material,
+                page_capture_receipt,
+                raw_capture_copy_retained_bytes,
+            },
+            capture: page_capture,
+        })
+    }
+
+    /// Rejoins one exact actual page seal and only then exposes the next offset or terminal chain.
+    pub(crate) fn rejoin_data_page(
+        &self,
+        authority: &ExtractionAuthority,
+        contract: &EiaDatasetContract,
+        rejoin: EiaDataPageSealRejoin,
+        sealed_page: SealedProviderCaptureSetReceipt,
+    ) -> Result<EiaDataPageTransition, EiaSourceTransportError> {
+        self.validate_data_cursor(authority, contract, &rejoin.cursor)?;
+        rejoin.page_material.root_journal_rejoin().validate(
+            &self.metadata,
+            contract,
+            &rejoin.page_material,
+        )?;
+        validate_root_page_seal(
+            rejoin.cursor.query_digest,
+            rejoin.cursor.next_ordinal,
+            &rejoin.page_material,
+            &sealed_page,
+        )?;
+        if sealed_page.capture() != &rejoin.page_capture_receipt
+            || sealed_page.receipt_digest().bytes() == [0; 32]
+            || sealed_page.segment().physical_receipt_digest().bytes() == [0; 32]
+        {
+            return Err(EiaSourceTransportError::InvalidConfiguration);
+        }
+        let page_dataset = root_page_journal_dataset(
+            rejoin.cursor.query_digest,
+            rejoin.cursor.next_ordinal,
+            rejoin.cursor.next_offset,
+            rejoin.page_material.raw.capture.body_digest(),
+        )?;
+        let raw_capture_copy_retained_bytes = raw_capture_copy_working_set_bytes(
+            &self.metadata,
+            &page_dataset,
+            [rejoin.page_material.raw_page()],
+        )?;
+        if raw_capture_copy_retained_bytes != rejoin.raw_capture_copy_retained_bytes {
+            return Err(EiaSourceTransportError::InvalidConfiguration);
+        }
+        let mut cursor = rejoin.cursor;
+        let page_lineage_retained_bytes =
+            page_lineage_publication_retained_bytes(&rejoin.page_material, &sealed_page)?;
+        cursor.retained_bytes = cursor
+            .retained_bytes
+            .checked_add(rejoin.page_material.raw.http.retained_bytes)
+            .filter(|bytes| *bytes <= self.limits.max_acquisition_bytes)
+            .ok_or(EiaSourceTransportError::AcquisitionTooLarge {
+                max: self.limits.max_acquisition_bytes,
+            })?;
+        cursor.publication_retained_bytes = cursor
+            .publication_retained_bytes
+            .checked_add(rejoin.typed_page.receipt().publication_retained_bytes())
+            .and_then(|bytes| bytes.checked_add(page_lineage_retained_bytes))
+            .and_then(|bytes| bytes.checked_add(raw_capture_copy_retained_bytes))
+            .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+            .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+        cursor.raw_capture_copy_retained_bytes = cursor
+            .raw_capture_copy_retained_bytes
+            .checked_add(raw_capture_copy_retained_bytes)
+            .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+        let completeness = rejoin.page_material.data.completeness();
+        let tracked_next_offset = match cursor.pagination_tracker.as_mut() {
+            Some(tracker) => {
+                tracker.push(&rejoin.typed_page)?;
+                tracker.charge_publication_retained_bytes(
+                    page_lineage_retained_bytes
+                        .checked_add(raw_capture_copy_retained_bytes)
+                        .ok_or(EiaSourceTransportError::InvalidConfiguration)?,
+                )?;
+                tracker.next_offset()
+            }
+            None if cursor.typed_pages.is_empty() && cursor.next_ordinal == 0 => {
+                let mut tracker = EiaPaginationTracker::start(&rejoin.typed_page)?;
+                let base_and_lineage = cursor_base_publication_retained_bytes(
+                    cursor.source_metadata.as_ref(),
+                    &cursor.provider_dataset,
+                    &cursor.api_version,
+                    self.limits.max_pages,
+                )?
+                .checked_add(page_lineage_retained_bytes)
+                .and_then(|bytes| bytes.checked_add(raw_capture_copy_retained_bytes))
+                .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+                tracker.charge_publication_retained_bytes(base_and_lineage)?;
+                let next_offset = tracker.next_offset();
+                cursor.pagination_tracker = Some(tracker);
+                next_offset
+            }
+            None => return Err(EiaSourceTransportError::InvalidConfiguration),
+        };
+        let receipt_next_offset = match completeness {
+            EiaPageCompleteness::More { next_offset } => Some(next_offset),
+            EiaPageCompleteness::Complete => None,
+        };
+        if tracked_next_offset != receipt_next_offset {
+            return Err(EiaSourceTransportError::InvalidConfiguration);
+        }
+        cursor.typed_pages.push(rejoin.typed_page);
+        cursor.page_materials.push(rejoin.page_material);
+        cursor.sealed_pages.push(sealed_page);
+        match completeness {
+            EiaPageCompleteness::More { next_offset } => {
+                cursor.next_ordinal = cursor.next_ordinal.checked_add(1).ok_or(
+                    EiaSourceTransportError::PageLimitExceeded {
+                        max: self.limits.max_pages,
+                    },
+                )?;
+                cursor.next_offset = next_offset;
+                Ok(EiaDataPageTransition::More(cursor))
+            }
+            EiaPageCompleteness::Complete => {
+                let terminal_capture_retained_bytes = raw_capture_copy_working_set_bytes(
+                    &self.metadata,
+                    &cursor.provider_dataset,
+                    cursor
+                        .page_materials
+                        .iter()
+                        .map(EiaDataPageMaterial::raw_page),
+                )?;
+                if terminal_capture_retained_bytes > cursor.raw_capture_copy_retained_bytes {
+                    let additional = terminal_capture_retained_bytes
+                        .checked_sub(cursor.raw_capture_copy_retained_bytes)
+                        .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+                    cursor.publication_retained_bytes = cursor
+                        .publication_retained_bytes
+                        .checked_add(additional)
+                        .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+                        .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+                    cursor
+                        .pagination_tracker
+                        .as_mut()
+                        .ok_or(EiaSourceTransportError::InvalidConfiguration)?
+                        .charge_publication_retained_bytes(additional)?;
+                    cursor.raw_capture_copy_retained_bytes = terminal_capture_retained_bytes;
+                }
+                let tracker = cursor
+                    .pagination_tracker
+                    .take()
+                    .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+                let typed_pages = std::mem::take(&mut cursor.typed_pages);
+                let acquisition = EiaAcquisition::try_from_tracked_pages(typed_pages, tracker)?;
+                let transport = aggregate_transport_receipt(&cursor.page_materials, &acquisition)?;
+                let mut capture_pages = Vec::new();
+                capture_pages
+                    .try_reserve_exact(cursor.page_materials.len())
+                    .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?;
+                capture_pages.extend(
+                    cursor
+                        .page_materials
+                        .iter()
+                        .map(|page| page.raw.capture.clone()),
+                );
+                let capture = ProviderCaptureSetReceipt::try_new(
+                    self.metadata.source_id().clone(),
+                    self.metadata.revision().clone(),
+                    cursor.provider_dataset.clone(),
+                    evidence_digest(contract.query().identity()),
+                    ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage,
+                    capture_pages,
+                )?;
+                let capture = provider_capture_material(
+                    capture,
+                    cursor
+                        .page_materials
+                        .iter()
+                        .map(EiaDataPageMaterial::raw_page),
+                )?;
+                Ok(EiaDataPageTransition::Complete(EiaDataRetrieval {
+                    dataset: cursor.provider_dataset,
+                    acquisition,
+                    pages: cursor.page_materials.into_boxed_slice(),
+                    sealed_pages: cursor.sealed_pages.into_boxed_slice(),
+                    capture,
+                    transport,
+                }))
+            }
+        }
+    }
+
+    fn validate_data_cursor(
+        &self,
+        authority: &ExtractionAuthority,
+        contract: &EiaDatasetContract,
+        cursor: &EiaDataAcquisitionCursor,
+    ) -> Result<(), EiaSourceTransportError> {
+        self.validate_authority(authority)?;
+        let expected_dataset = eia_data_dataset_identifier(contract)?;
+        let tracker_is_current = match &cursor.pagination_tracker {
+            None => cursor.next_ordinal == 0 && cursor.typed_pages.is_empty(),
+            Some(tracker) => {
+                tracker.admitted_page_count() == u32::from(cursor.next_ordinal)
+                    && tracker.next_offset() == Some(cursor.next_offset)
+                    && tracker.publication_retained_bytes() == cursor.publication_retained_bytes
+            }
+        };
+        if cursor.source_metadata.as_ref() != &self.metadata
+            || &cursor.provider_dataset != &expected_dataset
+            || cursor.query_digest != contract.query().identity()
+            || cursor.contract_schema_digest != contract.schema_digest()
+            || &cursor.api_version != contract.metadata().api_version()
+            || cursor.typed_pages.len() != cursor.page_materials.len()
+            || cursor.page_materials.len() != cursor.sealed_pages.len()
+            || cursor.page_materials.len() != usize::from(cursor.next_ordinal)
+            || !tracker_is_current
+            || (cursor.next_ordinal == 0)
+                != (cursor.next_offset == 0 && cursor.page_materials.is_empty())
+        {
+            return Err(EiaSourceTransportError::InvalidConfiguration);
+        }
+        let mut retained_bytes = 0_u64;
+        let mut publication_retained_bytes = cursor_base_publication_retained_bytes(
+            cursor.source_metadata.as_ref(),
+            &cursor.provider_dataset,
+            &cursor.api_version,
+            self.limits.max_pages,
+        )?;
+        let mut raw_capture_copy_retained_bytes = 0_usize;
+        let mut expected_offset = 0_u64;
+        for (ordinal, ((typed, material), sealed)) in cursor
+            .typed_pages
+            .iter()
+            .zip(&cursor.page_materials)
+            .zip(&cursor.sealed_pages)
+            .enumerate()
+        {
+            let ordinal = u16::try_from(ordinal)
+                .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?;
+            if material.data.offset() != expected_offset
+                || typed.receipt() != &material.data
+                || typed.retained_payload() != material.raw.payload()
+                || material.data.completeness() == EiaPageCompleteness::Complete
+                || material.root_journal_rejoin().page_ordinal() != ordinal
+            {
+                return Err(EiaSourceTransportError::InvalidConfiguration);
+            }
+            material
+                .root_journal_rejoin()
+                .validate(&self.metadata, contract, material)?;
+            validate_root_page_seal(cursor.query_digest, ordinal, material, sealed)?;
+            retained_bytes = retained_bytes
+                .checked_add(material.raw.http.retained_bytes)
+                .filter(|bytes| *bytes <= self.limits.max_acquisition_bytes)
+                .ok_or(EiaSourceTransportError::AcquisitionTooLarge {
+                    max: self.limits.max_acquisition_bytes,
+                })?;
+            let page_lineage_retained_bytes =
+                page_lineage_publication_retained_bytes(material, sealed)?;
+            let page_dataset = root_page_journal_dataset(
+                cursor.query_digest,
+                ordinal,
+                expected_offset,
+                material.raw.capture.body_digest(),
+            )?;
+            let page_raw_capture_copy_retained_bytes = raw_capture_copy_working_set_bytes(
+                &self.metadata,
+                &page_dataset,
+                [material.raw_page()],
+            )?;
+            publication_retained_bytes = publication_retained_bytes
+                .checked_add(typed.receipt().publication_retained_bytes())
+                .and_then(|bytes| bytes.checked_add(page_lineage_retained_bytes))
+                .and_then(|bytes| bytes.checked_add(page_raw_capture_copy_retained_bytes))
+                .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+                .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+            raw_capture_copy_retained_bytes = raw_capture_copy_retained_bytes
+                .checked_add(page_raw_capture_copy_retained_bytes)
+                .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+            let EiaPageCompleteness::More { next_offset } = material.data.completeness() else {
+                return Err(EiaSourceTransportError::InvalidConfiguration);
+            };
+            expected_offset = next_offset;
+        }
+        if retained_bytes != cursor.retained_bytes
+            || publication_retained_bytes != cursor.publication_retained_bytes
+            || raw_capture_copy_retained_bytes != cursor.raw_capture_copy_retained_bytes
+            || expected_offset != cursor.next_offset
+        {
+            return Err(EiaSourceTransportError::InvalidConfiguration);
+        }
+        Ok(())
+    }
+
+    /// Probes the exact offset-zero data request without walking an unbounded provider total.
+    ///
+    /// The returned capture is framed as a standalone diagnostic response. Its parsed data receipt
+    /// still retains whether more rows existed, so it cannot be mistaken for publication evidence.
+    pub async fn probe_data(
         &self,
         authority: &ExtractionAuthority,
         contract: &EiaDatasetContract,
         deadline: Timestamp,
         cancellation: CancellationToken,
-    ) -> Result<EiaDataRetrieval, EiaSourceTransportError> {
+    ) -> Result<EiaDataProbeRetrieval, EiaSourceTransportError> {
         self.validate_authority(authority)?;
         let dataset = eia_data_dataset_identifier(contract)?;
-        let mut offset = 0_u64;
-        let mut ordinal = 0_u16;
-        let mut aggregate_retained_bytes = 0_u64;
-        let mut fetched = Vec::new();
-        loop {
-            if ordinal >= self.limits.max_pages {
-                return Err(EiaSourceTransportError::PageLimitExceeded {
-                    max: self.limits.max_pages,
-                });
-            }
-            let page = self
-                .fetch_data_page(
-                    authority,
-                    contract,
-                    offset,
-                    ordinal,
-                    deadline,
-                    cancellation.clone(),
-                )
-                .await?;
-            aggregate_retained_bytes = aggregate_retained_bytes
-                .checked_add(page.raw.http.retained_bytes)
-                .filter(|bytes| *bytes <= self.limits.max_acquisition_bytes)
-                .ok_or(EiaSourceTransportError::AcquisitionTooLarge {
-                    max: self.limits.max_acquisition_bytes,
-                })?;
-            let completeness = page.page.receipt().completeness();
-            fetched.push(page);
-            match completeness {
-                EiaPageCompleteness::More { next_offset } => {
-                    offset = next_offset;
-                    ordinal = ordinal.checked_add(1).ok_or(
-                        EiaSourceTransportError::PageLimitExceeded {
-                            max: self.limits.max_pages,
-                        },
-                    )?;
-                }
-                EiaPageCompleteness::Complete => break,
-            }
-        }
-        if cancellation.is_cancelled() {
-            return Err(ExtractionSourceError::Cancelled.into());
-        }
-        authority
-            .validate_current()
-            .map_err(ExtractionSourceError::from)?;
-
-        let mut typed_pages = Vec::with_capacity(fetched.len());
-        let mut raw_pages = Vec::with_capacity(fetched.len());
-        for page in fetched {
-            typed_pages.push(page.page);
-            raw_pages.push(EiaDataPageMaterial {
-                raw: page.raw,
-                data: page.data_receipt,
-            });
-        }
-        let acquisition = EiaAcquisition::try_from_pages(typed_pages)?;
-        let transport = aggregate_transport_receipt(&raw_pages, &acquisition)?;
-        let capture_pages = raw_pages
-            .iter()
-            .map(|page| page.raw.capture.clone())
-            .collect();
-        let capture = ProviderCaptureSetReceipt::try_new(
-            self.metadata.source_id().clone(),
-            self.metadata.revision().clone(),
-            dataset.clone(),
-            evidence_digest(contract.query().identity()),
-            ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage,
-            capture_pages,
+        let fetched = self
+            .fetch_data_page(
+                authority,
+                contract,
+                0,
+                0,
+                MAX_OBSERVED_REVISION_BATCH_BYTES,
+                deadline,
+                cancellation,
+            )
+            .await?;
+        let EiaRawPageMaterial { payload, http, .. } = fetched.raw;
+        let standalone_page = ProviderCapturePageReceipt::try_new(
+            0,
+            evidence_digest(http.request_digest),
+            None,
+            None,
+            http.status,
+            http.retained_bytes,
+            evidence_digest(http.retained_payload_digest),
+            http.received_at,
         )?;
-        let capture = provider_capture_material(
-            capture,
-            raw_pages.iter().map(EiaDataPageMaterial::raw_page),
-        )?;
-        Ok(EiaDataRetrieval {
+        let raw = EiaRawPageMaterial {
+            payload,
+            http,
+            capture: standalone_page,
+        };
+        let probe_dataset = digest_identifier("eia-v2-data-probe", contract.query().identity())?;
+        let capture = standalone_capture(&self.metadata, probe_dataset, &raw)?;
+        let capture = provider_capture_material(capture, [&raw])?;
+        Ok(EiaDataProbeRetrieval {
             dataset,
-            acquisition,
-            pages: raw_pages.into_boxed_slice(),
+            page: fetched.page,
+            raw,
             capture,
-            transport,
         })
     }
 
@@ -801,6 +1498,7 @@ impl EiaSourceTransport {
         contract: &EiaDatasetContract,
         offset: u64,
         ordinal: u16,
+        remaining_publication_bytes: usize,
         deadline: Timestamp,
         cancellation: CancellationToken,
     ) -> Result<FetchedDataPage, EiaSourceTransportError> {
@@ -816,12 +1514,13 @@ impl EiaSourceTransport {
                 deadline,
                 cancellation,
                 |bytes, received_at| {
-                    let page = EiaDataPage::parse(
+                    let page = EiaDataPage::parse_with_publication_budget(
                         bytes,
                         request,
                         contract,
                         received_at,
                         self.limits.parse,
+                        remaining_publication_bytes,
                     )?;
                     Ok(ParsedResponse {
                         request_digest: page.receipt().request_digest(),
@@ -834,6 +1533,11 @@ impl EiaSourceTransport {
                 },
             )
             .await?;
+        validate_provider_page_total(
+            parsed.value.receipt().total(),
+            contract.query().length(),
+            self.limits.max_pages,
+        )?;
         let request_token = (offset != 0).then(|| offset_token_digest(offset));
         let next_token = match parsed.value.receipt().completeness() {
             EiaPageCompleteness::More { next_offset } => Some(offset_token_digest(next_offset)),
@@ -945,7 +1649,7 @@ impl EiaSourceTransport {
         authority
             .validate_current()
             .map_err(ExtractionSourceError::from)?;
-        in_flight.release();
+        in_flight.record_success()?;
         Ok(FetchedParsed {
             value: parsed.value,
             retained_payload: parsed.retained_payload,
@@ -1018,6 +1722,149 @@ struct ParsedMaterial {
     http: EiaHttpReceipt,
 }
 
+#[derive(Default)]
+struct EncodedLength {
+    bytes: usize,
+}
+
+impl io::Write for EncodedLength {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("encoded EIA evidence length overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoded_length(value: &impl serde::Serialize) -> Result<usize, EiaSourceTransportError> {
+    let mut counter = EncodedLength::default();
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?;
+    Ok(counter.bytes)
+}
+
+fn cursor_base_publication_retained_bytes(
+    source_metadata: &SourceMetadata,
+    provider_dataset: &SourceIdentifier,
+    api_version: &crate::EiaApiVersion,
+    max_pages: u16,
+) -> Result<usize, EiaSourceTransportError> {
+    let page_capacity = usize::from(max_pages);
+    let source_metadata_encoded_bytes = encoded_length(source_metadata)?;
+    let vector_slots = size_of::<EiaDataPage>()
+        .checked_add(size_of::<EiaDataPageMaterial>())
+        .and_then(|bytes| bytes.checked_add(size_of::<SealedProviderCaptureSetReceipt>()))
+        .and_then(|bytes| bytes.checked_mul(page_capacity))
+        .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+    size_of::<EiaDataAcquisitionCursor>()
+        .checked_add(size_of::<SourceMetadata>())
+        .and_then(|bytes| bytes.checked_add(source_metadata_encoded_bytes))
+        .and_then(|bytes| bytes.checked_add(provider_dataset.retained_bytes()))
+        .and_then(|bytes| bytes.checked_add(api_version.as_str().len()))
+        .and_then(|bytes| bytes.checked_add(vector_slots))
+        .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+        .ok_or(EiaSourceTransportError::InvalidConfiguration)
+}
+
+pub(crate) fn validate_provider_page_total(
+    total: u64,
+    requested_length: u16,
+    max_pages: u16,
+) -> Result<(), EiaSourceTransportError> {
+    let requested_length = u64::from(requested_length);
+    if requested_length == 0 {
+        return Err(EiaSourceTransportError::InvalidConfiguration);
+    }
+    let required_pages = total / requested_length + u64::from(total % requested_length != 0);
+    if required_pages > u64::from(max_pages) {
+        return Err(EiaSourceTransportError::PageLimitExceeded { max: max_pages });
+    }
+    Ok(())
+}
+
+fn raw_capture_copy_working_set_bytes<'a>(
+    metadata: &SourceMetadata,
+    dataset: &SourceIdentifier,
+    pages: impl IntoIterator<Item = &'a EiaRawPageMaterial>,
+) -> Result<usize, EiaSourceTransportError> {
+    let mut page_count = 0_usize;
+    let mut capture_payload_allocations = 0_usize;
+    let mut bytes_owner_allocations = 0_usize;
+    for page in pages {
+        page_count = page_count
+            .checked_add(1)
+            .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+        capture_payload_allocations = capture_payload_allocations
+            .checked_add(
+                checked_arc_bytes_allocation_bytes(page.payload.len())
+                    .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?,
+            )
+            .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+        // `Bytes::from_owner(Arc<[u8]>)` shares the already charged raw page allocation. It owns
+        // only this fixed control block while `CapturePayload::try_from_live` creates the one
+        // duplicate right-sized payload allocation charged above.
+        bytes_owner_allocations = bytes_owner_allocations
+            .checked_add(
+                size_of::<usize>()
+                    .checked_add(size_of::<Arc<[u8]>>())
+                    .ok_or(EiaSourceTransportError::InvalidConfiguration)?,
+            )
+            .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+    }
+    if page_count == 0 {
+        return Err(EiaSourceTransportError::InvalidConfiguration);
+    }
+    let record_slots = page_count
+        .checked_mul(size_of::<RawCaptureRecord>())
+        .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+    let page_receipt_slots = page_count
+        .checked_mul(size_of::<ProviderCapturePageReceipt>())
+        .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
+    let source_allocation = checked_arc_str_allocation_bytes(metadata.source_id().as_str().len())
+        .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?;
+    size_of::<ProviderCaptureMaterial>()
+        .checked_add(size_of::<Vec<RawCaptureRecord>>())
+        .and_then(|bytes| bytes.checked_add(size_of::<Vec<ProviderCapturePageReceipt>>()))
+        .and_then(|bytes| bytes.checked_add(record_slots))
+        .and_then(|bytes| bytes.checked_add(page_receipt_slots))
+        .and_then(|bytes| bytes.checked_add(capture_payload_allocations))
+        .and_then(|bytes| bytes.checked_add(bytes_owner_allocations))
+        .and_then(|bytes| bytes.checked_add(source_allocation))
+        .and_then(|bytes| bytes.checked_add(metadata.source_id().retained_bytes()))
+        .and_then(|bytes| {
+            bytes.checked_add(metadata.revision().as_source_identifier().retained_bytes())
+        })
+        .and_then(|bytes| bytes.checked_add(dataset.retained_bytes()))
+        .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+        .ok_or(EiaSourceTransportError::InvalidConfiguration)
+}
+
+fn page_lineage_publication_retained_bytes(
+    material: &EiaDataPageMaterial,
+    sealed: &SealedProviderCaptureSetReceipt,
+) -> Result<usize, EiaSourceTransportError> {
+    let sealed_encoded_bytes = encoded_length(sealed)?;
+    material
+        .raw
+        .http
+        .secret_free_url
+        .len()
+        .checked_add(material.root_journal_rejoin.provider_dataset.retained_bytes())
+        .and_then(|bytes| {
+            bytes.checked_add(material.root_journal_rejoin.api_version.as_str().len())
+        })
+        // JSON is used only as an allocation-free counter. Its actual field values conservatively
+        // dominate every variable-length string/array retained by the immutable shared seal.
+        .and_then(|bytes| bytes.checked_add(sealed_encoded_bytes))
+        .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+        .ok_or(EiaSourceTransportError::InvalidConfiguration)
+}
+
 fn raw_page(
     parsed: ParsedMaterial,
     ordinal: u16,
@@ -1039,6 +1886,244 @@ fn raw_page(
         http: parsed.http,
         capture,
     })
+}
+
+fn root_page_journal_rejoin(
+    source_metadata: &Arc<SourceMetadata>,
+    provider_dataset: &SourceIdentifier,
+    contract: &EiaDatasetContract,
+    raw: &EiaRawPageMaterial,
+    data: &EiaDataPageReceipt,
+) -> Result<EiaRootPageJournalRejoin, EiaSourceTransportError> {
+    let next_offset = match data.completeness() {
+        EiaPageCompleteness::More { next_offset } => Some(next_offset),
+        EiaPageCompleteness::Complete => None,
+    };
+    let rejoin = EiaRootPageJournalRejoin {
+        source_metadata: Arc::clone(source_metadata),
+        provider_dataset: provider_dataset.clone(),
+        query_digest: contract.query().identity(),
+        contract_schema_digest: contract.schema_digest(),
+        api_version: contract.metadata().api_version().clone(),
+        page_ordinal: raw.capture.ordinal(),
+        offset: data.offset(),
+        next_offset,
+        provider_total: data.total(),
+        capture_receipt: raw.capture.clone(),
+    };
+    validate_page_journal_rejoin(
+        source_metadata.as_ref(),
+        provider_dataset,
+        contract,
+        rejoin.page_ordinal,
+        raw,
+        data,
+        &rejoin,
+    )?;
+    Ok(rejoin)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "root rejoin validation keeps every independent authority coordinate explicit"
+)]
+fn validate_page_journal_rejoin(
+    source_metadata: &SourceMetadata,
+    provider_dataset: &SourceIdentifier,
+    contract: &EiaDatasetContract,
+    page_ordinal: u16,
+    raw: &EiaRawPageMaterial,
+    data: &EiaDataPageReceipt,
+    rejoin: &EiaRootPageJournalRejoin,
+) -> Result<(), EiaSourceTransportError> {
+    let expected_dataset = eia_data_dataset_identifier(contract)?;
+    let expected_request_token = (data.offset() != 0).then(|| offset_token_digest(data.offset()));
+    let (expected_next_offset, expected_next_token) = match data.completeness() {
+        EiaPageCompleteness::More { next_offset } => {
+            (Some(next_offset), Some(offset_token_digest(next_offset)))
+        }
+        EiaPageCompleteness::Complete => (None, None),
+    };
+    if &expected_dataset != provider_dataset
+        || rejoin.source_metadata.as_ref() != source_metadata
+        || &rejoin.provider_dataset != provider_dataset
+        || rejoin.query_digest != contract.query().identity()
+        || rejoin.contract_schema_digest != contract.schema_digest()
+        || &rejoin.api_version != contract.metadata().api_version()
+        || !source_metadata
+            .authorization()
+            .is_effective_at(data.received_at())
+        || rejoin.page_ordinal != page_ordinal
+        || rejoin.offset != data.offset()
+        || rejoin.next_offset != expected_next_offset
+        || rejoin.provider_total != data.total()
+        || &rejoin.capture_receipt != &raw.capture
+        || (page_ordinal == 0) != (data.offset() == 0)
+        || data.query_digest() != contract.query().identity()
+        || data.contract_schema_digest() != contract.schema_digest()
+        || raw.http.request_digest() != data.request_digest()
+        || raw.http.retained_payload_digest() != data.retained_payload_digest()
+        || raw.http.received_at() != data.received_at()
+        || raw.http.status() != 200
+        || raw.capture.request_identity() != evidence_digest(data.request_digest())
+        || raw.capture.request_page_token_digest() != expected_request_token
+        || raw.capture.response_next_page_token_digest() != expected_next_token
+        || raw.capture.body_digest() != evidence_digest(data.retained_payload_digest())
+        || raw.capture.body_bytes() != raw.http.retained_bytes()
+        || raw.capture.received_at() != data.received_at()
+    {
+        return Err(EiaSourceTransportError::InvalidConfiguration);
+    }
+    Ok(())
+}
+
+fn root_page_journal_dataset(
+    query_digest: EiaDigest,
+    ordinal: u16,
+    offset: u64,
+    body_digest: EvidenceDigest,
+) -> Result<SourceIdentifier, EiaSourceTransportError> {
+    let query_bytes = query_digest.bytes();
+    let ordinal_bytes = ordinal.to_be_bytes();
+    let offset_bytes = offset.to_be_bytes();
+    let body_bytes = body_digest.bytes();
+    let identity = digest_parts(
+        b"market-squawk/eia-root-page-journal-capture/v1",
+        [
+            query_bytes.as_slice(),
+            ordinal_bytes.as_slice(),
+            offset_bytes.as_slice(),
+            body_bytes.as_slice(),
+        ],
+    );
+    digest_identifier("eia-v2-root-page", identity)
+}
+
+fn validate_root_page_seal(
+    query_digest: EiaDigest,
+    ordinal: u16,
+    material: &EiaDataPageMaterial,
+    sealed: &SealedProviderCaptureSetReceipt,
+) -> Result<(), EiaSourceTransportError> {
+    if material.root_journal_rejoin.query_digest != query_digest
+        || material.root_journal_rejoin.page_ordinal != ordinal
+    {
+        return Err(EiaSourceTransportError::InvalidConfiguration);
+    }
+    validate_root_page_rejoin_seal(&material.root_journal_rejoin, sealed)
+}
+
+pub(crate) fn validate_root_page_rejoin_seal(
+    rejoin: &EiaRootPageJournalRejoin,
+    sealed: &SealedProviderCaptureSetReceipt,
+) -> Result<(), EiaSourceTransportError> {
+    if rejoin.capture_receipt.ordinal() != rejoin.page_ordinal
+        || rejoin.capture_receipt.body_digest().bytes() == [0; 32]
+    {
+        return Err(EiaSourceTransportError::InvalidConfiguration);
+    }
+    let chain_page = &rejoin.capture_receipt;
+    let standalone_page = ProviderCapturePageReceipt::try_new(
+        0,
+        chain_page.request_identity(),
+        None,
+        None,
+        chain_page.http_status(),
+        chain_page.body_bytes(),
+        chain_page.body_digest(),
+        chain_page.received_at(),
+    )?;
+    let dataset = root_page_journal_dataset(
+        rejoin.query_digest,
+        rejoin.page_ordinal,
+        rejoin.offset,
+        chain_page.body_digest(),
+    )?;
+    let source = &rejoin.source_metadata;
+    let expected = ProviderCaptureSetReceipt::try_new(
+        source.source_id().clone(),
+        source.revision().clone(),
+        dataset,
+        chain_page.request_identity(),
+        ProviderCaptureTerminalDisposition::StandaloneResponse,
+        vec![standalone_page],
+    )?;
+    if sealed.capture() != &expected
+        || sealed.receipt_digest().bytes() == [0; 32]
+        || sealed.segment().physical_receipt_digest().bytes() == [0; 32]
+    {
+        return Err(EiaSourceTransportError::InvalidConfiguration);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_terminal_data_rejoin(
+    current_source: &SourceMetadata,
+    contract: &EiaDatasetContract,
+    retrieval: &EiaDataRetrievalSealRejoin,
+    sealed_capture: &SealedProviderCaptureSetReceipt,
+) -> Result<(), EiaSourceTransportError> {
+    let expected_dataset = eia_data_dataset_identifier(contract)?;
+    let acquisition_receipt = retrieval.acquisition.receipt();
+    let full_capture = sealed_capture.capture();
+    if current_source
+        != retrieval
+            .pages
+            .first()
+            .map(|page| page.root_journal_rejoin.source_metadata())
+            .ok_or(EiaSourceTransportError::InvalidConfiguration)?
+        || &retrieval.dataset != &expected_dataset
+        || &retrieval.capture_receipt != full_capture
+        || full_capture.source_id() != current_source.source_id()
+        || full_capture.metadata_revision() != current_source.revision()
+        || full_capture.dataset() != &expected_dataset
+        || full_capture.request_set_identity().bytes() != contract.query().identity().bytes()
+        || full_capture.terminal() != ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
+        || acquisition_receipt.query_digest() != contract.query().identity()
+        || acquisition_receipt.contract_schema_digest() != contract.schema_digest()
+        || acquisition_receipt.api_version() != contract.metadata().api_version()
+        || retrieval.pages.len() != retrieval.sealed_pages.len()
+        || retrieval.pages.len() != full_capture.pages().len()
+        || retrieval.pages.len()
+            != usize::try_from(acquisition_receipt.page_count())
+                .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?
+        || retrieval.transport
+            != aggregate_transport_receipt(&retrieval.pages, &retrieval.acquisition)?
+        || sealed_capture.receipt_digest().bytes() == [0; 32]
+        || sealed_capture.segment().physical_receipt_digest().bytes() == [0; 32]
+    {
+        return Err(EiaSourceTransportError::InvalidConfiguration);
+    }
+    let mut previous_received_at = None;
+    for (ordinal, ((material, sealed_page), full_page)) in retrieval
+        .pages
+        .iter()
+        .zip(&retrieval.sealed_pages)
+        .zip(full_capture.pages())
+        .enumerate()
+    {
+        let ordinal =
+            u16::try_from(ordinal).map_err(|_| EiaSourceTransportError::InvalidConfiguration)?;
+        material
+            .root_journal_rejoin()
+            .validate(current_source, contract, material)?;
+        validate_root_page_seal(contract.query().identity(), ordinal, material, sealed_page)?;
+        if material.raw.capture_receipt() != full_page
+            || material.root_journal_rejoin.capture_receipt() != full_page
+            || acquisition_receipt
+                .page_digests()
+                .get(usize::from(ordinal))
+                .is_none_or(|digest| digest.bytes() != full_page.body_digest().bytes())
+            || previous_received_at.is_some_and(|received_at| received_at > full_page.received_at())
+            || (ordinal == 0 && full_page.received_at() != acquisition_receipt.first_received_at())
+            || (usize::from(ordinal) + 1 == retrieval.pages.len()
+                && full_page.received_at() != acquisition_receipt.last_received_at())
+        {
+            return Err(EiaSourceTransportError::InvalidConfiguration);
+        }
+        previous_received_at = Some(full_page.received_at());
+    }
+    Ok(())
 }
 
 fn standalone_capture(
@@ -1092,7 +2177,7 @@ fn provider_capture_material<'a>(
             Some(u64::from(ordinal)),
             None,
             DateTime::<Utc>::from_timestamp_nanos(page.http.received_at.unix_nanos()),
-            Bytes::copy_from_slice(&page.payload),
+            Bytes::from_owner(Arc::clone(&page.payload)),
         )?);
     }
     Ok(ProviderCaptureMaterial::try_new(capture, records)?)
@@ -1231,8 +2316,14 @@ fn validate_metadata(metadata: &SourceMetadata) -> Result<(), EiaSourceTransport
     if budget
         .window(0)
         .is_none_or(|window| window.semantics() != BudgetWindowSemantics::Sliding)
+        || metadata.source_class() != SourceClass::OfficialAgency
+        || metadata.provider().as_str() != "us-eia"
+        || metadata.authorization().mode() != AuthorizationMode::UserAuthorized
+        || metadata.coverage().domain() != CoverageDomain::Macroeconomic
+        || metadata.quality_ceiling() != market_squawk_domain::DataQuality::OfficialDelayed
         || !metadata.capabilities().extraction()
         || metadata.capabilities().live()
+        || metadata.capabilities().historical() != HistoricalCapability::RevisionPreserving
     {
         return Err(EiaSourceTransportError::InvalidConfiguration);
     }
@@ -1295,7 +2386,7 @@ fn ensure_deadline(deadline: Timestamp) -> Result<(), EiaSourceTransportError> {
     }
 }
 
-fn system_timestamp() -> Result<Timestamp, EiaSourceTransportError> {
+pub(crate) fn system_timestamp() -> Result<Timestamp, EiaSourceTransportError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| EiaSourceTransportError::ClockUnavailable)?;

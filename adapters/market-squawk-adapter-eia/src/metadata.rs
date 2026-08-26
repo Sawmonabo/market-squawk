@@ -461,7 +461,12 @@ pub fn parse_route_metadata(
         return Err(EiaError::RequestEchoMismatch);
     }
     let secret_free = request.secret_free()?;
-    let envelope = parse_envelope(bytes, &request.expected_command()?, limits)?;
+    let envelope = parse_envelope(
+        bytes,
+        &request.expected_command()?,
+        &request.expected_echo_params(),
+        limits,
+    )?;
     let response_schema = object_schema_digest(&envelope.response)?;
     let mut response = envelope.response;
 
@@ -539,7 +544,12 @@ pub fn parse_facet_metadata(
         return Err(EiaError::RequestEchoMismatch);
     };
     let secret_free = request.secret_free()?;
-    let envelope = parse_envelope(bytes, &request.expected_command()?, limits)?;
+    let envelope = parse_envelope(
+        bytes,
+        &request.expected_command()?,
+        &request.expected_echo_params(),
+        limits,
+    )?;
     let response_schema = object_schema_digest(&envelope.response)?;
     let mut response = envelope.response;
     if response

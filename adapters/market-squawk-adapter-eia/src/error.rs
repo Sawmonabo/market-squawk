@@ -17,6 +17,9 @@ pub enum EiaError {
     /// Parser, page, or application-rate limits are zero or exceed the admitted boundary.
     #[error("invalid EIA admission limit")]
     InvalidLimit,
+    /// A fallible bounded allocation could not be reserved.
+    #[error("bounded EIA allocation failed")]
+    AllocationFailure,
     /// A URL could not be constructed from already validated request coordinates.
     #[error("failed to construct EIA request")]
     RequestConstruction,
@@ -47,6 +50,9 @@ pub enum EiaError {
     /// A provider count, offset, length, or page transition is inconsistent.
     #[error("invalid EIA pagination evidence")]
     Pagination,
+    /// Offset pagination does not carry a deterministic total row ordering.
+    #[error("EIA query does not define a deterministic total sort")]
+    NonTotalSort,
     /// An exact provider value does not satisfy its route-specific value contract.
     #[error("invalid EIA observation value")]
     InvalidValue,
@@ -59,10 +65,16 @@ pub enum EiaError {
     /// Two rows in one acquisition claim the same family and period with different content.
     #[error("conflicting EIA observations in one acquisition")]
     ObservationConflict,
+    /// A response repeated the same natural observation family instead of a disjoint offset row.
+    #[error("replayed EIA observation in one acquisition")]
+    ObservationReplay,
     /// A complete revision plan cannot be produced from the supplied previous heads.
     #[error("invalid EIA revision authority input")]
     InvalidRevision,
     /// A native value cannot enter the canonical macro observation family.
     #[error("EIA value cannot be normalized as a canonical macro observation")]
     Canonicalization,
+    /// Canonical output does not match the exact actual-sealed response chain.
+    #[error("EIA capture evidence does not match the response chain")]
+    CaptureBinding,
 }

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use serde_json::{Map, Value};
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -305,6 +306,79 @@ impl<'a> EiaDataPageRequest<'a> {
         append_query(&mut secret_free, self.query, Some(self.offset), None);
         EiaAuthenticatedRequest::without_credential(secret_free)
     }
+
+    pub(crate) fn expected_echo_params(self) -> Map<String, Value> {
+        let mut params = Map::new();
+        params.insert("api_key".to_owned(), Value::String("[REDACTED]".to_owned()));
+        params.insert(
+            "data".to_owned(),
+            Value::Array(
+                self.query
+                    .data_fields()
+                    .iter()
+                    .map(|field| Value::String(field.as_str().to_owned()))
+                    .collect(),
+            ),
+        );
+        if !self.query.facets().is_empty() {
+            let facets = self
+                .query
+                .facets()
+                .iter()
+                .map(|facet| {
+                    (
+                        facet.facet().as_str().to_owned(),
+                        Value::Array(
+                            facet
+                                .values()
+                                .iter()
+                                .map(|value| Value::String(value.as_str().to_owned()))
+                                .collect(),
+                        ),
+                    )
+                })
+                .collect();
+            params.insert("facets".to_owned(), Value::Object(facets));
+        }
+        params.insert(
+            "frequency".to_owned(),
+            Value::String(self.query.frequency().as_str().to_owned()),
+        );
+        if let Some(start) = self.query.start() {
+            params.insert("start".to_owned(), Value::String(start.to_owned()));
+        }
+        if let Some(end) = self.query.end() {
+            params.insert("end".to_owned(), Value::String(end.to_owned()));
+        }
+        params.insert(
+            "sort".to_owned(),
+            Value::Array(
+                self.query
+                    .sorts()
+                    .iter()
+                    .map(|sort| {
+                        Value::Object(Map::from_iter([
+                            (
+                                "column".to_owned(),
+                                Value::String(sort.column().as_str().to_owned()),
+                            ),
+                            (
+                                "direction".to_owned(),
+                                Value::String(sort.direction().as_query_value().to_owned()),
+                            ),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        );
+        params.insert("offset".to_owned(), Value::String(self.offset.to_string()));
+        params.insert(
+            "length".to_owned(),
+            Value::String(self.query.length().to_string()),
+        );
+        params.insert("out".to_owned(), Value::String("json".to_owned()));
+        params
+    }
 }
 
 /// Metadata request surface.
@@ -366,6 +440,10 @@ impl EiaMetadataRequest {
             .path()
             .trim_end_matches('/')
             .to_owned())
+    }
+
+    pub(crate) fn expected_echo_params(&self) -> Map<String, Value> {
+        Map::from_iter([("api_key".to_owned(), Value::String("[REDACTED]".to_owned()))])
     }
 
     fn secret_free_url(&self) -> Result<Url, EiaError> {

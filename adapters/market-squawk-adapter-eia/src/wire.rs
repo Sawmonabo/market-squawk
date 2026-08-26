@@ -21,6 +21,7 @@ pub(crate) struct EiaEnvelope {
 pub(crate) fn parse_envelope(
     bytes: &[u8],
     expected_command: &str,
+    expected_params: &Map<String, Value>,
     limits: EiaParseLimits,
 ) -> Result<EiaEnvelope, EiaError> {
     if bytes.len() > limits.max_body_bytes() {
@@ -66,11 +67,22 @@ pub(crate) fn parse_envelope(
         limits.max_json_depth(),
         &mut redacted_secret_fields,
     )?;
+    if redacted_secret_fields != 1 {
+        return Err(EiaError::RequestEchoMismatch);
+    }
     let request = root
         .as_object()
         .and_then(|object| object.get("request"))
         .and_then(Value::as_object)
         .ok_or(EiaError::InvalidProtocol)?;
+    if request.len() != 2
+        || request
+            .get("params")
+            .and_then(Value::as_object)
+            .is_none_or(|params| params != expected_params)
+    {
+        return Err(EiaError::RequestEchoMismatch);
+    }
     let request_echo_bytes = serde_json::to_vec(request).map_err(|_| EiaError::InvalidJson)?;
     let request_echo_digest = digest_bytes(&request_echo_bytes);
     let envelope_schema_digest = schema_shape_digest(&root)?;

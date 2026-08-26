@@ -1,27 +1,38 @@
 //! Frozen route contracts, offset pagination, exact native values, clocks, and revisions.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem::size_of;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use market_squawk_domain::{CalendarDate, RevisionNumber, Timestamp};
+use market_squawk_sources::{
+    MAX_OBSERVED_REVISION_BATCH_BYTES, MAX_OBSERVED_REVISION_BATCH_RECORDS,
+};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::metadata::EiaRouteMetadata;
+use crate::metadata::{EiaFacetCatalog, EiaFacetMetadata, EiaRouteMetadata};
 use crate::request::EiaDataPageRequest;
 use crate::types::digest_parts;
 use crate::wire::{parse_bounded_string, parse_count, parse_envelope};
 use crate::{
-    EiaApiVersion, EiaDataQuery, EiaDigest, EiaError, EiaFacetValue, EiaFieldId, EiaParseLimits,
-    EiaRoute,
+    EiaApiVersion, EiaDataQuery, EiaDigest, EiaError, EiaFacetFilter, EiaFacetValue, EiaFieldId,
+    EiaParseLimits, EiaRoute, EiaSortDirection,
 };
 
 const MAX_DESCRIPTOR_FIELDS: usize = 128;
 const MAX_CLOCK_FIELDS: usize = 16;
 const MAX_MISSING_MARKERS: usize = 32;
+
+/// Largest record cardinality accepted before exact deep-byte admission is applied.
+///
+/// This is only the shared record-count ceiling. Every page and terminal canonical candidate is
+/// independently charged from its actual retained fields against the shared 64 MiB byte ceiling.
+pub const EIA_MAX_CANONICAL_PUBLICATION_OBSERVATIONS: usize = MAX_OBSERVED_REVISION_BATCH_RECORDS;
 
 /// Expected native kind of one selected EIA data column.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -216,6 +227,8 @@ pub struct EiaDatasetContractInput {
     pub query: EiaDataQuery,
     /// Frozen selected data fields.
     pub fields: Vec<EiaDataFieldContract>,
+    /// Complete value catalogs for every route facet in the query.
+    pub facet_catalogs: Vec<EiaFacetCatalog>,
     /// Additional non-facet fields retained in series identity.
     pub descriptor_fields: Vec<EiaFieldId>,
     /// Route-specific provider clock fields.
@@ -228,6 +241,7 @@ pub struct EiaDatasetContract {
     metadata: EiaRouteMetadata,
     query: EiaDataQuery,
     fields: Vec<EiaDataFieldContract>,
+    facet_catalogs: Vec<EiaFacetCatalog>,
     descriptor_fields: Vec<EiaFieldId>,
     clock_fields: Vec<EiaClockField>,
     schema_digest: EiaDigest,
@@ -240,6 +254,7 @@ impl EiaDatasetContract {
             metadata,
             query,
             mut fields,
+            mut facet_catalogs,
             mut descriptor_fields,
             mut clock_fields,
         } = input;
@@ -247,15 +262,19 @@ impl EiaDatasetContract {
             || metadata.frequency(query.frequency()).is_none()
             || fields.is_empty()
             || fields.len() != query.data_fields().len()
+            || facet_catalogs.len() != query.facets().len()
+            || metadata.facets().len() != query.facets().len()
             || descriptor_fields.len() > MAX_DESCRIPTOR_FIELDS
             || clock_fields.len() > MAX_CLOCK_FIELDS
         {
             return Err(EiaError::SchemaDrift);
         }
         fields.sort_by(|left, right| left.field.cmp(&right.field));
+        facet_catalogs.sort_by(|left, right| left.facet().cmp(right.facet()));
         descriptor_fields.sort();
         clock_fields.sort_by(|left, right| left.field.cmp(&right.field));
         ensure_unique(fields.iter().map(|field| &field.field))?;
+        ensure_unique(facet_catalogs.iter().map(EiaFacetCatalog::facet))?;
         ensure_unique(descriptor_fields.iter())?;
         ensure_unique(clock_fields.iter().map(|clock| &clock.field))?;
         if fields
@@ -279,26 +298,53 @@ impl EiaDatasetContract {
                 EiaUnitSource::RowField => {}
             }
         }
-        for facet in query.facets() {
-            if metadata.facet(facet.facet()).is_none() {
+        if metadata
+            .facets()
+            .iter()
+            .map(EiaFacetMetadata::id)
+            .ne(query.facets().iter().map(EiaFacetFilter::facet))
+        {
+            return Err(EiaError::SchemaDrift);
+        }
+        for (facet, catalog) in query.facets().iter().zip(&facet_catalogs) {
+            if metadata.facet(facet.facet()).is_none()
+                || catalog.route() != query.route()
+                || catalog.facet() != facet.facet()
+                || catalog.api_version() != metadata.api_version()
+                || catalog.total_facets() == 0
+                || catalog.receipt().retained_payload_digest().bytes() == [0; 32]
+                || facet.values().iter().any(|value| !catalog.contains(value))
+            {
                 return Err(EiaError::SchemaDrift);
             }
         }
+        validate_total_sort(&query, &descriptor_fields)?;
         let semantic = serde_json::to_vec(&(
             metadata.route(),
             metadata.api_version(),
             metadata.schema_digest(),
             query.identity(),
             &fields,
+            facet_catalogs
+                .iter()
+                .map(|catalog| {
+                    (
+                        catalog.facet(),
+                        catalog.schema_digest(),
+                        catalog.receipt().retained_payload_digest(),
+                    )
+                })
+                .collect::<Vec<_>>(),
             &descriptor_fields,
             &clock_fields,
         ))
         .map_err(|_| EiaError::InvalidJson)?;
-        let schema_digest = digest_parts(b"eia-dataset-contract-v1", [semantic.as_slice()]);
+        let schema_digest = digest_parts(b"eia-dataset-contract-v2", [semantic.as_slice()]);
         Ok(Self {
             metadata,
             query,
             fields,
+            facet_catalogs,
             descriptor_fields,
             clock_fields,
             schema_digest,
@@ -318,6 +364,19 @@ impl EiaDatasetContract {
     /// Returns sorted selected field contracts.
     pub fn fields(&self) -> &[EiaDataFieldContract] {
         &self.fields
+    }
+
+    /// Returns the complete frozen value catalogs aligned to the query facets.
+    pub fn facet_catalogs(&self) -> &[EiaFacetCatalog] {
+        &self.facet_catalogs
+    }
+
+    /// Returns the sealed-discovery catalog for one exact route facet.
+    pub fn facet_catalog(&self, facet: &EiaFieldId) -> Option<&EiaFacetCatalog> {
+        self.facet_catalogs
+            .binary_search_by(|catalog| catalog.facet().cmp(facet))
+            .ok()
+            .map(|index| &self.facet_catalogs[index])
     }
 
     /// Returns additional series-descriptor fields.
@@ -438,6 +497,14 @@ impl EiaObservationClocks {
 
     /// Returns the mandatory local receipt clock.
     pub const fn received_at(&self) -> Timestamp {
+        self.received_at
+    }
+
+    /// Returns the conservative knowledge clock used by canonical PIT evidence.
+    ///
+    /// An EIA release/update/availability instant can precede this installation's first receipt,
+    /// but it cannot make the exact response knowable locally before that receipt.
+    pub const fn conservative_available_at(&self) -> Timestamp {
         self.received_at
     }
 }
@@ -569,6 +636,10 @@ impl EiaObservation {
     pub const fn page_payload_digest(&self) -> EiaDigest {
         self.page_payload_digest
     }
+
+    pub(crate) fn into_canonical_lineage(self) -> (EiaSeriesIdentity, EiaPeriod, EiaNativeValue) {
+        (self.series, self.period, self.value)
+    }
 }
 
 /// Page completion state.
@@ -580,10 +651,119 @@ pub enum EiaPageCompleteness {
     Complete,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EiaReturnedSortCoordinate {
+    value: String,
+    direction: EiaSortDirection,
+}
+
+/// Exact provider-returned row coordinates in the query's ordered sort directions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EiaReturnedSortKey {
+    coordinates: Arc<[EiaReturnedSortCoordinate]>,
+}
+
+impl EiaReturnedSortKey {
+    fn try_new(
+        contract: &EiaDatasetContract,
+        period: &EiaPeriod,
+        facets: &[EiaFacetCoordinate],
+        descriptors: &[EiaDescriptor],
+    ) -> Result<Self, EiaError> {
+        let mut coordinates = Vec::new();
+        coordinates
+            .try_reserve_exact(contract.query().sorts().len())
+            .map_err(|_| EiaError::AllocationFailure)?;
+        for sort in contract.query().sorts() {
+            let value = if sort.column().as_str() == "period" {
+                period.raw().to_owned()
+            } else if let Some(facet) = facets.iter().find(|facet| facet.facet() == sort.column()) {
+                facet.value().as_str().to_owned()
+            } else if let Some(descriptor) = descriptors
+                .iter()
+                .find(|descriptor| descriptor.field() == sort.column())
+            {
+                descriptor.value().to_owned()
+            } else {
+                return Err(EiaError::NonTotalSort);
+            };
+            coordinates.push(EiaReturnedSortCoordinate {
+                value,
+                direction: sort.direction(),
+            });
+        }
+        if coordinates.is_empty() {
+            return Err(EiaError::NonTotalSort);
+        }
+        Ok(Self {
+            coordinates: Arc::from(coordinates),
+        })
+    }
+
+    fn retained_bytes(&self) -> Result<usize, EiaError> {
+        self.coordinates
+            .len()
+            .checked_mul(size_of::<EiaReturnedSortCoordinate>())
+            .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
+            .and_then(|bytes| {
+                self.coordinates
+                    .iter()
+                    .try_fold(bytes, |total, coordinate| {
+                        total.checked_add(coordinate.value.len())
+                    })
+            })
+            .ok_or(EiaError::InvalidLimit)
+    }
+}
+
+fn validate_returned_sort_transition(
+    previous: &EiaReturnedSortKey,
+    next: &EiaReturnedSortKey,
+) -> Result<(), EiaError> {
+    if previous.coordinates.len() != next.coordinates.len() {
+        return Err(EiaError::NonTotalSort);
+    }
+    for (previous, next) in previous.coordinates.iter().zip(next.coordinates.iter()) {
+        if previous.direction != next.direction {
+            return Err(EiaError::NonTotalSort);
+        }
+        match previous.value.cmp(&next.value) {
+            Ordering::Equal => {}
+            Ordering::Less if previous.direction == EiaSortDirection::Ascending => return Ok(()),
+            Ordering::Greater if previous.direction == EiaSortDirection::Descending => {
+                return Ok(());
+            }
+            Ordering::Less | Ordering::Greater => return Err(EiaError::NonTotalSort),
+        }
+    }
+    Err(EiaError::NonTotalSort)
+}
+
+fn returned_sort_endpoints_retained_bytes(
+    first: Option<&EiaReturnedSortKey>,
+    last: Option<&EiaReturnedSortKey>,
+) -> Result<usize, EiaError> {
+    match (first, last) {
+        (None, None) => Ok(0),
+        (Some(first), Some(last)) => {
+            let first_bytes = first.retained_bytes()?;
+            if Arc::ptr_eq(&first.coordinates, &last.coordinates) {
+                Ok(first_bytes)
+            } else {
+                first_bytes
+                    .checked_add(last.retained_bytes()?)
+                    .ok_or(EiaError::InvalidLimit)
+            }
+        }
+        _ => Err(EiaError::NonTotalSort),
+    }
+}
+
 /// One secret-free request/page/returned-row receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EiaDataPageReceipt {
     query_digest: EiaDigest,
+    contract_schema_digest: EiaDigest,
     request_digest: EiaDigest,
     transport_payload_digest: EiaDigest,
     retained_payload_digest: EiaDigest,
@@ -597,6 +777,7 @@ pub struct EiaDataPageReceipt {
     observation_count: u64,
     missing_observation_count: u64,
     response_bytes: usize,
+    publication_retained_bytes: usize,
     received_at: Timestamp,
     completeness: EiaPageCompleteness,
     redacted_secret_fields: usize,
@@ -606,6 +787,11 @@ impl EiaDataPageReceipt {
     /// Returns base-query identity.
     pub const fn query_digest(&self) -> EiaDigest {
         self.query_digest
+    }
+
+    /// Returns the exact frozen native route/query schema identity.
+    pub const fn contract_schema_digest(&self) -> EiaDigest {
+        self.contract_schema_digest
     }
 
     /// Returns this page request identity.
@@ -673,6 +859,11 @@ impl EiaDataPageReceipt {
         self.response_bytes
     }
 
+    /// Returns checked native/raw bytes charged to the terminal publication working set.
+    pub const fn publication_retained_bytes(&self) -> usize {
+        self.publication_retained_bytes
+    }
+
     /// Returns the local receipt clock.
     pub const fn received_at(&self) -> Timestamp {
         self.received_at
@@ -695,7 +886,10 @@ pub struct EiaDataPage {
     api_version: EiaApiVersion,
     frequency: EiaFieldId,
     date_format: String,
+    description: Option<String>,
     observations: Vec<EiaObservation>,
+    first_sort_key: Option<EiaReturnedSortKey>,
+    last_sort_key: Option<EiaReturnedSortKey>,
     receipt: EiaDataPageReceipt,
     retained_payload: Arc<[u8]>,
 }
@@ -709,17 +903,46 @@ impl EiaDataPage {
         received_at: Timestamp,
         limits: EiaParseLimits,
     ) -> Result<Self, EiaError> {
+        Self::parse_with_publication_budget(
+            bytes,
+            request,
+            contract,
+            received_at,
+            limits,
+            MAX_OBSERVED_REVISION_BATCH_BYTES,
+        )
+    }
+
+    pub(crate) fn parse_with_publication_budget(
+        bytes: &[u8],
+        request: EiaDataPageRequest<'_>,
+        contract: &EiaDatasetContract,
+        received_at: Timestamp,
+        limits: EiaParseLimits,
+        remaining_publication_bytes: usize,
+    ) -> Result<Self, EiaError> {
+        if remaining_publication_bytes == 0
+            || remaining_publication_bytes > MAX_OBSERVED_REVISION_BATCH_BYTES
+        {
+            return Err(EiaError::InvalidLimit);
+        }
         if request.query() != contract.query() {
             return Err(EiaError::RequestEchoMismatch);
         }
         let secret_free = request.secret_free()?;
         let expected_command = format!("/v2/{}/data", contract.query().route());
-        let envelope = parse_envelope(bytes, &expected_command, limits)?;
+        let envelope = parse_envelope(
+            bytes,
+            &expected_command,
+            &request.expected_echo_params(),
+            limits,
+        )?;
         if &envelope.api_version != contract.metadata().api_version() {
             return Err(EiaError::ApiVersionDrift);
         }
         let mut response = envelope.response;
-        const RESPONSE_FIELDS: &[&str] = &["total", "dateFormat", "frequency", "data"];
+        const RESPONSE_FIELDS: &[&str] =
+            &["total", "dateFormat", "frequency", "description", "data"];
         if response
             .keys()
             .any(|key| !RESPONSE_FIELDS.contains(&key.as_str()))
@@ -731,6 +954,7 @@ impl EiaDataPage {
             .as_ref()
             .ok_or(EiaError::InvalidProtocol)
             .and_then(parse_count)?;
+        validate_publication_cardinality(total, contract.fields().len())?;
         let frequency = EiaFieldId::try_from(
             parse_bounded_string(
                 response
@@ -759,10 +983,14 @@ impl EiaDataPage {
         if date_format != frozen_format {
             return Err(EiaError::SchemaDrift);
         }
-        let rows = response
-            .remove("data")
-            .and_then(|value| value.as_array().cloned())
-            .ok_or(EiaError::InvalidProtocol)?;
+        let description = response
+            .remove("description")
+            .map(|value| parse_bounded_string(&value, limits))
+            .transpose()?;
+        let rows = match response.remove("data") {
+            Some(Value::Array(rows)) => rows,
+            Some(_) | None => return Err(EiaError::InvalidProtocol),
+        };
         if rows.len() > usize::from(contract.query().length()) || rows.len() > limits.max_rows() {
             return Err(EiaError::Pagination);
         }
@@ -788,7 +1016,35 @@ impl EiaDataPage {
         let row_schema_digest = common_row_schema_digest(&rows)?;
         let page_payload_digest = envelope.retained_payload_digest;
         let mut observations = Vec::new();
+        let page_observations = rows
+            .len()
+            .checked_mul(contract.fields().len())
+            .ok_or(EiaError::InvalidLimit)?;
+        let mut publication_budget = PublicationByteBudget::try_new(
+            remaining_publication_bytes,
+            envelope
+                .retained_payload
+                .len()
+                .checked_add(size_of::<EiaDataPage>())
+                .and_then(|bytes| bytes.checked_add(envelope.api_version.as_str().len()))
+                .and_then(|bytes| bytes.checked_add(frequency.as_str().len()))
+                .and_then(|bytes| bytes.checked_add(date_format.len()))
+                .and_then(|bytes| bytes.checked_add(description.as_ref().map_or(0, String::len)))
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        page_observations
+                            .checked_mul(size_of::<EiaObservation>())?
+                            .checked_mul(2)?,
+                    )
+                })
+                .ok_or(EiaError::InvalidLimit)?,
+        )?;
+        observations
+            .try_reserve_exact(page_observations)
+            .map_err(|_| EiaError::AllocationFailure)?;
         let mut families = BTreeMap::new();
+        let mut first_sort_key = None;
+        let mut last_sort_key = None;
         let row_context = RowParseContext {
             contract,
             received_at,
@@ -798,8 +1054,31 @@ impl EiaDataPage {
         };
         for row in rows {
             let object = row.as_object().ok_or(EiaError::InvalidProtocol)?;
-            parse_row(object, &row_context, &mut observations, &mut families)?;
+            let sort_key = parse_row(
+                object,
+                &row_context,
+                &mut observations,
+                &mut families,
+                &mut publication_budget,
+            )?;
+            if let Some(previous) = last_sort_key.as_ref() {
+                validate_returned_sort_transition(previous, &sort_key)?;
+            } else {
+                first_sort_key = Some(sort_key.clone());
+            }
+            last_sort_key = Some(sort_key);
         }
+        if returned_rows == 0 {
+            if first_sort_key.is_some() || last_sort_key.is_some() {
+                return Err(EiaError::NonTotalSort);
+            }
+        } else if first_sort_key.is_none() || last_sort_key.is_none() {
+            return Err(EiaError::NonTotalSort);
+        }
+        publication_budget.charge(returned_sort_endpoints_retained_bytes(
+            first_sort_key.as_ref(),
+            last_sort_key.as_ref(),
+        )?)?;
         let observation_count =
             u64::try_from(observations.len()).map_err(|_| EiaError::InvalidLimit)?;
         let missing_observation_count = u64::try_from(
@@ -811,6 +1090,7 @@ impl EiaDataPage {
         .map_err(|_| EiaError::InvalidLimit)?;
         let receipt = EiaDataPageReceipt {
             query_digest: contract.query().identity(),
+            contract_schema_digest: contract.schema_digest(),
             request_digest: secret_free.request_digest(),
             transport_payload_digest: envelope.transport_payload_digest,
             retained_payload_digest: envelope.retained_payload_digest,
@@ -824,6 +1104,7 @@ impl EiaDataPage {
             observation_count,
             missing_observation_count,
             response_bytes: bytes.len(),
+            publication_retained_bytes: publication_budget.retained(),
             received_at,
             completeness,
             redacted_secret_fields: envelope.redacted_secret_fields,
@@ -832,7 +1113,10 @@ impl EiaDataPage {
             api_version: envelope.api_version,
             frequency,
             date_format,
+            description,
             observations,
+            first_sort_key,
+            last_sort_key,
             receipt,
             retained_payload: Arc::from(envelope.retained_payload),
         })
@@ -851,6 +1135,11 @@ impl EiaDataPage {
     /// Returns provider-confirmed date format.
     pub fn date_format(&self) -> &str {
         &self.date_format
+    }
+
+    /// Returns the provider's bounded route description when supplied on the data surface.
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     /// Returns all emitted field observations.
@@ -877,7 +1166,12 @@ impl EiaDataPage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EiaPaginationTracker {
     query_digest: EiaDigest,
+    contract_schema_digest: EiaDigest,
     api_version: EiaApiVersion,
+    row_schema_digest: EiaDigest,
+    frequency: EiaFieldId,
+    date_format: String,
+    description: Option<String>,
     total: u64,
     next_offset: u64,
     page_count: u32,
@@ -885,8 +1179,14 @@ pub struct EiaPaginationTracker {
     observation_count: u64,
     missing_observation_count: u64,
     response_bytes: u64,
+    publication_retained_bytes: usize,
+    first_received_at: Option<Timestamp>,
+    last_received_at: Option<Timestamp>,
+    last_sort_key: Option<EiaReturnedSortKey>,
     closed: bool,
-    retained_page_digests: BTreeSet<EiaDigest>,
+    seen_page_digests: BTreeSet<EiaDigest>,
+    ordered_page_digests: Vec<EiaDigest>,
+    families: BTreeMap<EiaObservationFamily, EiaDigest>,
 }
 
 impl EiaPaginationTracker {
@@ -897,7 +1197,12 @@ impl EiaPaginationTracker {
         }
         let mut tracker = Self {
             query_digest: page.receipt.query_digest,
+            contract_schema_digest: page.receipt.contract_schema_digest,
             api_version: page.api_version.clone(),
+            row_schema_digest: page.receipt.row_schema_digest,
+            frequency: page.frequency.clone(),
+            date_format: page.date_format.clone(),
+            description: page.description.clone(),
             total: page.receipt.total,
             next_offset: 0,
             page_count: 0,
@@ -905,8 +1210,14 @@ impl EiaPaginationTracker {
             observation_count: 0,
             missing_observation_count: 0,
             response_bytes: 0,
+            publication_retained_bytes: 0,
+            first_received_at: None,
+            last_received_at: None,
+            last_sort_key: None,
             closed: false,
-            retained_page_digests: BTreeSet::new(),
+            seen_page_digests: BTreeSet::new(),
+            ordered_page_digests: Vec::new(),
+            families: BTreeMap::new(),
         };
         tracker.push(page)?;
         Ok(tracker)
@@ -916,15 +1227,67 @@ impl EiaPaginationTracker {
     pub fn push(&mut self, page: &EiaDataPage) -> Result<(), EiaError> {
         if self.closed
             || page.receipt.query_digest != self.query_digest
+            || page.receipt.contract_schema_digest != self.contract_schema_digest
             || page.api_version != self.api_version
+            || page.receipt.row_schema_digest != self.row_schema_digest
+            || page.frequency != self.frequency
+            || page.date_format != self.date_format
+            || page.description != self.description
             || page.receipt.total != self.total
             || page.receipt.offset != self.next_offset
-            || !self
-                .retained_page_digests
-                .insert(page.receipt.retained_payload_digest)
+            || self
+                .seen_page_digests
+                .contains(&page.receipt.retained_payload_digest)
+            || self
+                .last_received_at
+                .is_some_and(|received_at| page.receipt.received_at < received_at)
         {
             return Err(EiaError::Pagination);
         }
+        // Keep each physical, JSON-kind-sensitive envelope digest in its page receipt. It is not
+        // a cross-page semantic invariant: the frozen contract legitimately admits null missing
+        // values and decimal string/number variants. Every page has already proved exact response
+        // and row key sets plus the declared value/missing variants before reaching this tracker.
+        if page.receipt.returned_rows == 0 {
+            if page.first_sort_key.is_some() || page.last_sort_key.is_some() {
+                return Err(EiaError::NonTotalSort);
+            }
+        } else {
+            let first = page.first_sort_key.as_ref().ok_or(EiaError::NonTotalSort)?;
+            let last = page.last_sort_key.as_ref().ok_or(EiaError::NonTotalSort)?;
+            if let Some(previous) = self.last_sort_key.as_ref() {
+                validate_returned_sort_transition(previous, first)?;
+            }
+            if page.receipt.returned_rows == 1 && first != last {
+                return Err(EiaError::NonTotalSort);
+            }
+        }
+        for observation in &page.observations {
+            if let Some(existing) = self.families.get(&observation.family) {
+                return Err(if *existing == observation.semantic_digest {
+                    EiaError::ObservationReplay
+                } else {
+                    EiaError::ObservationConflict
+                });
+            }
+        }
+        for observation in &page.observations {
+            if self
+                .families
+                .insert(observation.family.clone(), observation.semantic_digest)
+                .is_some()
+            {
+                return Err(EiaError::ObservationConflict);
+            }
+        }
+        if !self
+            .seen_page_digests
+            .insert(page.receipt.retained_payload_digest)
+        {
+            return Err(EiaError::Pagination);
+        }
+        self.ordered_page_digests
+            .push(page.receipt.retained_payload_digest);
         self.page_count = self.page_count.checked_add(1).ok_or(EiaError::Pagination)?;
         self.returned_rows = self
             .returned_rows
@@ -944,6 +1307,16 @@ impl EiaPaginationTracker {
                 u64::try_from(page.receipt.response_bytes).map_err(|_| EiaError::Pagination)?,
             )
             .ok_or(EiaError::Pagination)?;
+        self.publication_retained_bytes = self
+            .publication_retained_bytes
+            .checked_add(page.receipt.publication_retained_bytes)
+            .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+            .ok_or(EiaError::InvalidLimit)?;
+        if self.first_received_at.is_none() {
+            self.first_received_at = Some(page.receipt.received_at);
+        }
+        self.last_received_at = Some(page.receipt.received_at);
+        self.last_sort_key = page.last_sort_key.clone();
         match page.receipt.completeness {
             EiaPageCompleteness::More { next_offset } => self.next_offset = next_offset,
             EiaPageCompleteness::Complete => {
@@ -963,14 +1336,54 @@ impl EiaPaginationTracker {
         }
     }
 
+    /// Returns the exact number of pages already admitted by this in-memory verifier.
+    pub(crate) const fn admitted_page_count(&self) -> u32 {
+        self.page_count
+    }
+
+    pub(crate) const fn publication_retained_bytes(&self) -> usize {
+        self.publication_retained_bytes
+    }
+
+    /// Adds actual root-rejoin/seal lineage retained beside the already charged typed page.
+    pub(crate) fn charge_publication_retained_bytes(
+        &mut self,
+        retained_bytes: usize,
+    ) -> Result<(), EiaError> {
+        self.publication_retained_bytes = self
+            .publication_retained_bytes
+            .checked_add(retained_bytes)
+            .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+            .ok_or(EiaError::InvalidLimit)?;
+        Ok(())
+    }
+
     /// Finishes only after the exact returned-row total closes.
     pub fn finish(self) -> Result<EiaAcquisitionReceipt, EiaError> {
+        self.finish_with_families().map(|(receipt, _)| receipt)
+    }
+
+    fn finish_with_families(
+        self,
+    ) -> Result<
+        (
+            EiaAcquisitionReceipt,
+            BTreeMap<EiaObservationFamily, EiaDigest>,
+        ),
+        EiaError,
+    > {
         if !self.closed || self.returned_rows != self.total {
             return Err(EiaError::Pagination);
         }
-        let page_digests: Vec<_> = self.retained_page_digests.into_iter().collect();
+        if self.families.len()
+            != usize::try_from(self.observation_count).map_err(|_| EiaError::InvalidLimit)?
+        {
+            return Err(EiaError::ObservationConflict);
+        }
+        let page_digests = self.ordered_page_digests;
         let digest_material = serde_json::to_vec(&(
             self.query_digest,
+            self.contract_schema_digest,
             &self.api_version,
             self.total,
             self.page_count,
@@ -978,11 +1391,15 @@ impl EiaPaginationTracker {
             self.observation_count,
             self.missing_observation_count,
             self.response_bytes,
+            self.publication_retained_bytes,
+            self.first_received_at,
+            self.last_received_at,
             &page_digests,
         ))
         .map_err(|_| EiaError::InvalidJson)?;
-        Ok(EiaAcquisitionReceipt {
+        let receipt = EiaAcquisitionReceipt {
             query_digest: self.query_digest,
+            contract_schema_digest: self.contract_schema_digest,
             api_version: self.api_version,
             total: self.total,
             page_count: self.page_count,
@@ -990,12 +1407,16 @@ impl EiaPaginationTracker {
             observation_count: self.observation_count,
             missing_observation_count: self.missing_observation_count,
             response_bytes: self.response_bytes,
+            publication_retained_bytes: self.publication_retained_bytes,
+            first_received_at: self.first_received_at.ok_or(EiaError::InvalidClock)?,
+            last_received_at: self.last_received_at.ok_or(EiaError::InvalidClock)?,
             page_digests,
             content_digest: digest_parts(
-                b"eia-acquisition-receipt-v1",
+                b"eia-acquisition-receipt-v2",
                 [digest_material.as_slice()],
             ),
-        })
+        };
+        Ok((receipt, self.families))
     }
 }
 
@@ -1003,6 +1424,7 @@ impl EiaPaginationTracker {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EiaAcquisitionReceipt {
     query_digest: EiaDigest,
+    contract_schema_digest: EiaDigest,
     api_version: EiaApiVersion,
     total: u64,
     page_count: u32,
@@ -1010,11 +1432,29 @@ pub struct EiaAcquisitionReceipt {
     observation_count: u64,
     missing_observation_count: u64,
     response_bytes: u64,
+    publication_retained_bytes: usize,
+    first_received_at: Timestamp,
+    last_received_at: Timestamp,
     page_digests: Vec<EiaDigest>,
     content_digest: EiaDigest,
 }
 
 impl EiaAcquisitionReceipt {
+    /// Returns the exact frozen query identity.
+    pub const fn query_digest(&self) -> EiaDigest {
+        self.query_digest
+    }
+
+    /// Returns the exact frozen native route/query schema identity.
+    pub const fn contract_schema_digest(&self) -> EiaDigest {
+        self.contract_schema_digest
+    }
+
+    /// Returns the exact API version shared by every admitted page.
+    pub const fn api_version(&self) -> &EiaApiVersion {
+        &self.api_version
+    }
+
     /// Returns exact matching-row total.
     pub const fn total(&self) -> u64 {
         self.total
@@ -1045,6 +1485,21 @@ impl EiaAcquisitionReceipt {
         self.response_bytes
     }
 
+    /// Returns the checked native/raw publication working-set charge for the complete chain.
+    pub const fn publication_retained_bytes(&self) -> usize {
+        self.publication_retained_bytes
+    }
+
+    /// Returns the first admitted page receipt clock.
+    pub const fn first_received_at(&self) -> Timestamp {
+        self.first_received_at
+    }
+
+    /// Returns the last admitted page receipt clock after nondecreasing-chain validation.
+    pub const fn last_received_at(&self) -> Timestamp {
+        self.last_received_at
+    }
+
     /// Returns exact unique retained page payload identities.
     pub fn page_digests(&self) -> &[EiaDigest] {
         &self.page_digests
@@ -1071,19 +1526,44 @@ impl EiaAcquisition {
         for page in pages.iter().skip(1) {
             tracker.push(page)?;
         }
-        let receipt = tracker.finish()?;
+        Self::try_from_tracked_pages(pages, tracker)
+    }
+
+    /// Consumes pages already admitted in the same order by the supplied linear verifier.
+    pub(crate) fn try_from_tracked_pages(
+        pages: Vec<EiaDataPage>,
+        tracker: EiaPaginationTracker,
+    ) -> Result<Self, EiaError> {
+        let (receipt, mut families) = tracker.finish_with_families()?;
+        if pages.len() != usize::try_from(receipt.page_count).map_err(|_| EiaError::InvalidLimit)?
+            || pages
+                .iter()
+                .zip(&receipt.page_digests)
+                .any(|(page, digest)| page.receipt.retained_payload_digest != *digest)
+        {
+            return Err(EiaError::Pagination);
+        }
         let mut observations = Vec::new();
-        let mut families = BTreeMap::new();
+        let observation_count =
+            usize::try_from(receipt.observation_count).map_err(|_| EiaError::InvalidLimit)?;
+        if observation_count > EIA_MAX_CANONICAL_PUBLICATION_OBSERVATIONS {
+            return Err(EiaError::InvalidLimit);
+        }
+        observations
+            .try_reserve_exact(observation_count)
+            .map_err(|_| EiaError::AllocationFailure)?;
         for page in pages {
             for observation in page.observations {
-                if let Some(existing) =
-                    families.insert(observation.family.clone(), observation.semantic_digest)
-                    && existing != observation.semantic_digest
-                {
-                    return Err(EiaError::ObservationConflict);
+                match families.remove(&observation.family) {
+                    Some(expected) if expected == observation.semantic_digest => {}
+                    Some(_) => return Err(EiaError::ObservationConflict),
+                    None => return Err(EiaError::ObservationReplay),
                 }
                 observations.push(observation);
             }
+        }
+        if !families.is_empty() {
+            return Err(EiaError::ObservationConflict);
         }
         Ok(Self {
             observations,
@@ -1099,6 +1579,10 @@ impl EiaAcquisition {
     /// Returns complete pagination evidence.
     pub const fn receipt(&self) -> &EiaAcquisitionReceipt {
         &self.receipt
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<EiaObservation>, EiaAcquisitionReceipt) {
+        (self.observations, self.receipt)
     }
 }
 
@@ -1207,13 +1691,18 @@ pub fn plan_revisions(
         }
     }
     let mut current = BTreeMap::new();
-    let mut plan = Vec::with_capacity(observations.len());
+    let mut plan = Vec::new();
+    plan.try_reserve_exact(observations.len())
+        .map_err(|_| EiaError::AllocationFailure)?;
     for (index, observation) in observations.iter().enumerate() {
         if let Some(existing) =
             current.insert(observation.family.clone(), observation.semantic_digest)
-            && existing != observation.semantic_digest
         {
-            return Err(EiaError::ObservationConflict);
+            return Err(if existing == observation.semantic_digest {
+                EiaError::ObservationReplay
+            } else {
+                EiaError::ObservationConflict
+            });
         }
         let entry = match previous_by_family.get(&observation.family) {
             None => EiaRevisionPlanEntry {
@@ -1256,12 +1745,43 @@ struct RowParseContext<'a> {
     limits: EiaParseLimits,
 }
 
+struct PublicationByteBudget {
+    retained: usize,
+    limit: usize,
+}
+
+impl PublicationByteBudget {
+    fn try_new(limit: usize, initial: usize) -> Result<Self, EiaError> {
+        if initial > limit {
+            return Err(EiaError::InvalidLimit);
+        }
+        Ok(Self {
+            retained: initial,
+            limit,
+        })
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), EiaError> {
+        self.retained = self
+            .retained
+            .checked_add(bytes)
+            .filter(|retained| *retained <= self.limit)
+            .ok_or(EiaError::InvalidLimit)?;
+        Ok(())
+    }
+
+    const fn retained(&self) -> usize {
+        self.retained
+    }
+}
+
 fn parse_row(
     row: &Map<String, Value>,
     context: &RowParseContext<'_>,
     observations: &mut Vec<EiaObservation>,
     families: &mut BTreeMap<EiaObservationFamily, EiaDigest>,
-) -> Result<(), EiaError> {
+    publication_budget: &mut PublicationByteBudget,
+) -> Result<EiaReturnedSortKey, EiaError> {
     let RowParseContext {
         contract,
         received_at,
@@ -1294,7 +1814,11 @@ fn parse_row(
                 limits,
             )?;
             let value = EiaFacetValue::try_from(value)?;
-            if !facet.values().contains(&value) {
+            if !facet.values().contains(&value)
+                || !contract
+                    .facet_catalog(facet.facet())
+                    .is_some_and(|catalog| catalog.contains(&value))
+            {
                 return Err(EiaError::SchemaDrift);
             }
             Ok(EiaFacetCoordinate {
@@ -1317,6 +1841,19 @@ fn parse_row(
         })
         .collect::<Result<Vec<_>, EiaError>>()?;
     let clocks = parse_clocks(row, contract, received_at, limits)?;
+    let sort_key = EiaReturnedSortKey::try_new(contract, &period, &facets, &descriptors)?;
+    publication_budget.charge(row_parse_scratch_bytes(&period, &facets, &descriptors)?)?;
+    let row_series_material = serde_json::to_vec(&(
+        contract.query().route(),
+        contract.query().frequency(),
+        &facets,
+        &descriptors,
+    ))
+    .map_err(|_| EiaError::InvalidJson)?;
+    let row_series_coordinates_digest = digest_parts(
+        b"eia-row-series-coordinates-v2",
+        [row_series_material.as_slice()],
+    );
     for field in contract.fields() {
         let value = parse_value(
             row.get(field.field().as_str())
@@ -1325,17 +1862,20 @@ fn parse_row(
             limits,
         )?;
         let unit = parse_unit(row, field, contract.metadata(), limits)?;
-        let series_digest_material = serde_json::to_vec(&(
-            contract.query().route(),
-            field.field(),
-            contract.query().frequency(),
+        publication_budget.charge(native_observation_retained_bytes(
+            contract,
+            field,
+            &period,
             &facets,
             &descriptors,
+            &value,
             &unit,
-        ))
-        .map_err(|_| EiaError::InvalidJson)?;
+        )?)?;
+        let series_digest_material =
+            serde_json::to_vec(&(row_series_coordinates_digest, field.field(), &unit))
+                .map_err(|_| EiaError::InvalidJson)?;
         let series_digest = digest_parts(
-            b"eia-series-identity-v1",
+            b"eia-series-identity-v2",
             [series_digest_material.as_slice()],
         );
         let series = EiaSeriesIdentity {
@@ -1354,8 +1894,7 @@ fn parse_row(
         let semantic_material = serde_json::to_vec(&(
             contract.schema_digest(),
             &family,
-            &series,
-            &period,
+            series.digest,
             &value,
             clocks.released_at,
             clocks.updated_at,
@@ -1363,7 +1902,7 @@ fn parse_row(
         ))
         .map_err(|_| EiaError::InvalidJson)?;
         let semantic_digest = digest_parts(
-            b"eia-native-observation-semantic-v1",
+            b"eia-native-observation-semantic-v2",
             [semantic_material.as_slice()],
         );
         let row_material = serde_json::to_vec(&(
@@ -1375,10 +1914,11 @@ fn parse_row(
         .map_err(|_| EiaError::InvalidJson)?;
         let row_digest = digest_parts(b"eia-native-observation-v1", [row_material.as_slice()]);
         if let Some(existing) = families.insert(family.clone(), semantic_digest) {
-            if existing != semantic_digest {
-                return Err(EiaError::ObservationConflict);
-            }
-            continue;
+            return Err(if existing == semantic_digest {
+                EiaError::ObservationReplay
+            } else {
+                EiaError::ObservationConflict
+            });
         }
         observations.push(EiaObservation {
             family,
@@ -1392,7 +1932,97 @@ fn parse_row(
             page_payload_digest,
         });
     }
-    Ok(())
+    Ok(sort_key)
+}
+
+fn row_parse_scratch_bytes(
+    period: &EiaPeriod,
+    facets: &[EiaFacetCoordinate],
+    descriptors: &[EiaDescriptor],
+) -> Result<usize, EiaError> {
+    period_retained_bytes(period)?
+        .checked_add(facet_coordinates_retained_bytes(facets)?)
+        .and_then(|bytes| bytes.checked_add(descriptor_retained_bytes(descriptors).ok()?))
+        .ok_or(EiaError::InvalidLimit)
+}
+
+fn native_observation_retained_bytes(
+    contract: &EiaDatasetContract,
+    field: &EiaDataFieldContract,
+    period: &EiaPeriod,
+    facets: &[EiaFacetCoordinate],
+    descriptors: &[EiaDescriptor],
+    value: &EiaNativeValue,
+    unit: &str,
+) -> Result<usize, EiaError> {
+    let period_bytes = period_retained_bytes(period)?;
+    let series_bytes = contract
+        .query()
+        .route()
+        .as_str()
+        .len()
+        .checked_add(field.field().as_str().len())
+        .and_then(|bytes| bytes.checked_add(contract.query().frequency().as_str().len()))
+        .and_then(|bytes| bytes.checked_add(unit.len()))
+        .and_then(|bytes| bytes.checked_add(facet_coordinates_retained_bytes(facets).ok()?))
+        .and_then(|bytes| bytes.checked_add(descriptor_retained_bytes(descriptors).ok()?))
+        .ok_or(EiaError::InvalidLimit)?;
+    let value_bytes = match value {
+        EiaNativeValue::Decimal { lexical, .. } | EiaNativeValue::String(lexical) => lexical.len(),
+        EiaNativeValue::Missing(missing) => missing.lexical.as_ref().map_or(0, String::len),
+    };
+    // Two periods are retained by the observation/family and a third is held by the exact-family
+    // conflict verifier until the page closes. The fixed observation slot was charged before any
+    // observation allocation; this adds only actual owned payload plus conservative map scratch.
+    period_bytes
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(series_bytes))
+        .and_then(|bytes| bytes.checked_add(value_bytes))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                size_of::<EiaObservationFamily>()
+                    .checked_add(size_of::<EiaDigest>())?
+                    .checked_add(4 * size_of::<usize>())?,
+            )
+        })
+        .ok_or(EiaError::InvalidLimit)
+}
+
+fn period_retained_bytes(period: &EiaPeriod) -> Result<usize, EiaError> {
+    period
+        .raw
+        .len()
+        .checked_add(period.format.len())
+        .and_then(|bytes| bytes.checked_add(period.frequency.as_str().len()))
+        .ok_or(EiaError::InvalidLimit)
+}
+
+fn facet_coordinates_retained_bytes(facets: &[EiaFacetCoordinate]) -> Result<usize, EiaError> {
+    let mut bytes = facets
+        .len()
+        .checked_mul(size_of::<EiaFacetCoordinate>())
+        .ok_or(EiaError::InvalidLimit)?;
+    for facet in facets {
+        bytes = bytes
+            .checked_add(facet.facet.as_str().len())
+            .and_then(|value| value.checked_add(facet.value.as_str().len()))
+            .ok_or(EiaError::InvalidLimit)?;
+    }
+    Ok(bytes)
+}
+
+fn descriptor_retained_bytes(descriptors: &[EiaDescriptor]) -> Result<usize, EiaError> {
+    let mut bytes = descriptors
+        .len()
+        .checked_mul(size_of::<EiaDescriptor>())
+        .ok_or(EiaError::InvalidLimit)?;
+    for descriptor in descriptors {
+        bytes = bytes
+            .checked_add(descriptor.field.as_str().len())
+            .and_then(|value| value.checked_add(descriptor.value.len()))
+            .ok_or(EiaError::InvalidLimit)?;
+    }
+    Ok(bytes)
 }
 
 fn expected_row_fields(contract: &EiaDatasetContract) -> BTreeSet<String> {
@@ -1434,7 +2064,7 @@ fn parse_period(
             let (year, month) = parse_year_month(&raw)?;
             EiaPeriodKind::Month { year, month }
         }
-        "YYYY-Q" | "YYYY-Q#" => {
+        "YYYY-Q" | "YYYY-Q#" | "YYYY-\"Q\"Q" => {
             let (year, quarter) = parse_quarter(&raw)?;
             EiaPeriodKind::Quarter { year, quarter }
         }
@@ -1545,6 +2175,7 @@ fn parse_clocks(
         || available_at.is_some_and(|value| value > received_at)
         || matches!((released_at, updated_at), (Some(released), Some(updated)) if updated < released)
         || matches!((released_at, available_at), (Some(released), Some(available)) if available < released)
+        || matches!((updated_at, available_at), (Some(updated), Some(available)) if available < updated)
     {
         return Err(EiaError::InvalidClock);
     }
@@ -1636,6 +2267,48 @@ fn ensure_unique<'a, T: Ord + 'a>(values: impl Iterator<Item = &'a T>) -> Result
         }
     }
     Ok(())
+}
+
+fn validate_total_sort(
+    query: &EiaDataQuery,
+    descriptor_fields: &[EiaFieldId],
+) -> Result<(), EiaError> {
+    let period = EiaFieldId::try_from("period")?;
+    let mut required = BTreeSet::new();
+    required.insert(period);
+    for coordinate in query
+        .facets()
+        .iter()
+        .map(|facet| facet.facet())
+        .chain(descriptor_fields)
+    {
+        if !required.insert(coordinate.clone()) {
+            return Err(EiaError::NonTotalSort);
+        }
+    }
+    let actual = query
+        .sorts()
+        .iter()
+        .map(|sort| sort.column().clone())
+        .collect::<BTreeSet<_>>();
+    if actual != required || query.sorts().len() != required.len() {
+        return Err(EiaError::NonTotalSort);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_publication_cardinality(
+    total_rows: u64,
+    selected_fields: usize,
+) -> Result<usize, EiaError> {
+    let rows = usize::try_from(total_rows).map_err(|_| EiaError::InvalidLimit)?;
+    let observations = rows
+        .checked_mul(selected_fields)
+        .ok_or(EiaError::InvalidLimit)?;
+    if observations > EIA_MAX_CANONICAL_PUBLICATION_OBSERVATIONS {
+        return Err(EiaError::InvalidLimit);
+    }
+    Ok(observations)
 }
 
 fn validate_retained_string(value: &str) -> Result<(), EiaError> {

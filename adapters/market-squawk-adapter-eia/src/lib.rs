@@ -9,27 +9,35 @@ mod canonical;
 mod capacity;
 mod data;
 mod error;
+mod lifecycle;
 mod metadata;
 mod request;
 mod transport;
 mod types;
 mod wire;
 
-pub use canonical::{EiaCanonicalContext, EiaCanonicalObservation};
+pub use canonical::{
+    EiaCanonicalObservation, EiaPublicationCandidate, EiaPublicationRejoin, EiaPublishedSeries,
+};
 pub use capacity::{
     EIA_APPLICATION_MAX_CONCURRENT_REQUESTS, EIA_APPLICATION_MIN_REQUEST_INTERVAL,
     EiaApplicationBudget, EiaCapacityGuidance, EiaEvidenceClass, eia_application_provider_budget,
 };
 pub use data::{
-    EiaAcquisition, EiaAcquisitionReceipt, EiaClockField, EiaClockKind, EiaDataFieldContract,
-    EiaDataFieldContractInput, EiaDataPage, EiaDataPageReceipt, EiaDatasetContract,
-    EiaDatasetContractInput, EiaDescriptor, EiaFacetCoordinate, EiaMissingPolicy,
-    EiaNativeMissingValue, EiaNativeValue, EiaObservation, EiaObservationClocks,
-    EiaObservationConflict, EiaObservationFamily, EiaPageCompleteness, EiaPaginationTracker,
-    EiaPeriod, EiaPeriodKind, EiaRevisionDisposition, EiaRevisionHead, EiaRevisionPlanEntry,
-    EiaSeriesIdentity, EiaUnitSource, EiaValueKind, plan_revisions,
+    EIA_MAX_CANONICAL_PUBLICATION_OBSERVATIONS, EiaAcquisition, EiaAcquisitionReceipt,
+    EiaClockField, EiaClockKind, EiaDataFieldContract, EiaDataFieldContractInput, EiaDataPage,
+    EiaDataPageReceipt, EiaDatasetContract, EiaDatasetContractInput, EiaDescriptor,
+    EiaFacetCoordinate, EiaMissingPolicy, EiaNativeMissingValue, EiaNativeValue, EiaObservation,
+    EiaObservationClocks, EiaObservationConflict, EiaObservationFamily, EiaPageCompleteness,
+    EiaPaginationTracker, EiaPeriod, EiaPeriodKind, EiaRevisionDisposition, EiaRevisionHead,
+    EiaRevisionPlanEntry, EiaSeriesIdentity, EiaUnitSource, EiaValueKind, plan_revisions,
 };
 pub use error::EiaError;
+pub use lifecycle::{
+    EiaActivatedProvider, EiaActivationCandidate, EiaActivationRequirements, EiaDatasetProfile,
+    EiaDoctorOutput, EiaDoctorReport, EiaLifecycleError, EiaPrivateResearchPolicy,
+    EiaPublicationMode, EiaResearchOperation, run_eia_doctor,
+};
 pub use metadata::{
     EiaChildRoute, EiaDataColumnMetadata, EiaFacetCatalog, EiaFacetMetadata,
     EiaFacetMetadataReceipt, EiaFacetMetadataValue, EiaFrequencyMetadata, EiaMetadataChange,
@@ -41,8 +49,10 @@ pub use request::{
     EiaFacetFilter, EiaMetadataRequest, EiaMetadataRequestKind, EiaSort, EiaSortDirection,
 };
 pub use transport::{
-    EiaDataPageMaterial, EiaDataRetrieval, EiaDataTransportReceipt, EiaFacetMetadataRetrieval,
-    EiaHttpReceipt, EiaRawPageMaterial, EiaRouteMetadataRetrieval, EiaSourceTransport,
+    EiaDataAcquisitionCursor, EiaDataPageMaterial, EiaDataPageSealRejoin, EiaDataPageTransition,
+    EiaDataProbeRetrieval, EiaDataRetrieval, EiaDataRetrievalSealRejoin, EiaDataTransportReceipt,
+    EiaFacetMetadataRetrieval, EiaHttpReceipt, EiaPendingDataPage, EiaRawPageMaterial,
+    EiaRootPageJournalRejoin, EiaRouteMetadataRetrieval, EiaSourceTransport,
     EiaSourceTransportError, EiaTransportLimits, eia_api_endpoint_rules,
     eia_data_dataset_identifier,
 };
