@@ -16,20 +16,16 @@ pub enum NasdaqDirectoryKind {
     NasdaqListed,
     /// Securities listed on other represented U.S. exchanges in `otherlisted.txt`.
     OtherListed,
-    /// Nasdaq-listed bonds in `bondslist.txt`.
+    /// Nasdaq-listed bond schema; acquisition is unavailable until an HTTPS contract is frozen.
     Bonds,
     /// Nasdaq's current option-series reference file in `options.txt`.
     Options,
 }
 
 impl NasdaqDirectoryKind {
-    /// All independently fetched and independently clocked admitted official files.
-    pub const ALL: [Self; 4] = [
-        Self::NasdaqListed,
-        Self::OtherListed,
-        Self::Bonds,
-        Self::Options,
-    ];
+    /// Independently fetched, independently clocked official files admitted for acquisition.
+    pub const ACQUISITION_ADMITTED: [Self; 3] =
+        [Self::NasdaqListed, Self::OtherListed, Self::Options];
 
     /// The two files comprising the existing complete U.S.-listed equity directory graph.
     pub const EQUITY_DIRECTORIES: [Self; 2] = [Self::NasdaqListed, Self::OtherListed];

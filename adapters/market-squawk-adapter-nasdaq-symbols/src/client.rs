@@ -3,6 +3,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use market_squawk_domain::Timestamp;
+use market_squawk_platform::{SealedResearchJournalStore, VerifiedResearchObject};
 use market_squawk_sources::{
     ExtractionAuthority, ExtractionSourceError, HttpRequestBounds, NetworkAccessPolicy,
     SourceError, SourceMetadata,
@@ -15,8 +16,8 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::archive::{
-    BONDS_LIST_URL, NasdaqHttpResponseEvidence, NasdaqRawObjectStore, NasdaqSealedRawObject,
-    OPTIONS_URL,
+    NasdaqHttpResponseEvidence, NasdaqReferenceOperationControl, OPTIONS_URL,
+    logical_object_admission,
 };
 use crate::model::NasdaqDirectoryKind;
 use crate::source::{
@@ -40,6 +41,22 @@ pub(crate) struct RetrievedDirectory {
     pub(crate) response_evidence: NasdaqHttpResponseEvidence,
 }
 
+/// One exact HTTP body already admitted and verified by the shared logical-object store.
+pub(crate) struct RetrievedReferenceObject {
+    pub(crate) response_evidence: NasdaqHttpResponseEvidence,
+    pub(crate) verified_object: VerifiedResearchObject,
+}
+
+impl std::fmt::Debug for RetrievedReferenceObject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetrievedReferenceObject")
+            .field("response_evidence", &self.response_evidence)
+            .field("verified_object", &self.verified_object)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct NasdaqHttpClient {
     client: reqwest::Client,
@@ -58,10 +75,6 @@ impl NasdaqHttpClient {
         metadata
             .network_policy()
             .authorize(OTHER_LISTED_URL)
-            .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?;
-        metadata
-            .network_policy()
-            .authorize(BONDS_LIST_URL)
             .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)?;
         metadata
             .network_policy()
@@ -97,7 +110,7 @@ impl NasdaqHttpClient {
         if authority.metadata() != metadata || !metadata.is_effective_at(now) {
             return Err(SourceError::InvalidProtocolState.into());
         }
-        let url = endpoint(kind);
+        let url = endpoint(kind).ok_or(SourceError::InvalidProtocolState)?;
         let max_response_bytes = self.max_response_bytes.min(kind.maximum_source_bytes());
         metadata
             .network_policy()
@@ -199,9 +212,9 @@ impl NasdaqHttpClient {
             in_flight.validate_response_size(
                 u64::try_from(bytes.len()).map_err(|_| SourceError::InvalidProtocolState)?,
             )?;
-            if declared_content_length.is_some_and(|declared| {
-                u64::try_from(bytes.len()).map_or(true, |observed| observed != declared)
-            }) {
+            if declared_content_length
+                .is_some_and(|declared| u64::try_from(bytes.len()) != Ok(declared))
+            {
                 return Err(SourceError::InvalidProtocolState.into());
             }
             let received_at =
@@ -241,24 +254,26 @@ impl NasdaqHttpClient {
         }
     }
 
-    pub(crate) async fn fetch_and_seal(
+    pub(crate) async fn fetch_logical_object(
         &self,
         metadata: &SourceMetadata,
         authority: &ExtractionAuthority,
         kind: NasdaqDirectoryKind,
-        archive: &NasdaqRawObjectStore,
+        store: &SealedResearchJournalStore,
         deadline: Timestamp,
         cancellation: &CancellationToken,
-    ) -> Result<NasdaqSealedRawObject, NasdaqReferenceIngestError> {
+    ) -> Result<RetrievedReferenceObject, NasdaqReferenceIngestError> {
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled.into());
         }
+        let control =
+            NasdaqReferenceOperationControl::try_new_for_source(deadline, cancellation, authority)?;
         let now = system_timestamp()?;
         authority.validate_current()?;
         if authority.metadata() != metadata || !metadata.is_effective_at(now) {
             return Err(SourceError::InvalidProtocolState.into());
         }
-        let url = endpoint(kind);
+        let url = endpoint(kind).ok_or(crate::NasdaqReferenceError::ProviderContractUnavailable)?;
         let max_response_bytes = self.max_response_bytes.min(kind.maximum_source_bytes());
         metadata
             .network_policy()
@@ -340,10 +355,13 @@ impl NasdaqHttpClient {
                 .and_then(|value| httpdate::parse_http_date(value).ok())
                 .and_then(system_time_to_timestamp)
                 .ok_or(SourceError::InvalidProtocolState)?;
-            let mut writer = archive.begin(kind, cancellation)?;
+            let mut pending = store
+                .begin_logical_object(logical_object_admission(kind)?)
+                .map_err(crate::NasdaqReferenceError::from)?;
             let mut body_bytes = 0_usize;
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
+                control.checkpoint()?;
                 in_flight.validate_current()?;
                 let chunk = chunk.map_err(|_| SourceError::Network)?;
                 body_bytes =
@@ -361,7 +379,19 @@ impl NasdaqHttpClient {
                 in_flight.validate_response_size(
                     u64::try_from(body_bytes).map_err(|_| SourceError::InvalidProtocolState)?,
                 )?;
-                writer.write_chunk(&chunk, cancellation).await?;
+                let mut remaining = chunk.as_ref();
+                while !remaining.is_empty() {
+                    control.checkpoint()?;
+                    let written = pending
+                        .write_admitted(remaining)
+                        .map_err(crate::NasdaqReferenceError::from)?;
+                    if written == 0 {
+                        return Err(crate::NasdaqReferenceError::InvalidObjectReceipt.into());
+                    }
+                    remaining = remaining
+                        .get(written..)
+                        .ok_or(crate::NasdaqReferenceError::InvalidObjectReceipt)?;
+                }
             }
             let transport_elapsed_nanos = elapsed_nanos(transport_started, timeout)?;
             if body_bytes == 0 {
@@ -370,9 +400,9 @@ impl NasdaqHttpClient {
             in_flight.validate_response_size(
                 u64::try_from(body_bytes).map_err(|_| SourceError::InvalidProtocolState)?,
             )?;
-            if declared_content_length.is_some_and(|declared| {
-                u64::try_from(body_bytes).map_or(true, |observed| observed != declared)
-            }) {
+            if declared_content_length
+                .is_some_and(|declared| u64::try_from(body_bytes) != Ok(declared))
+            {
                 return Err(SourceError::InvalidProtocolState.into());
             }
             let received_at = system_timestamp()?;
@@ -390,8 +420,18 @@ impl NasdaqHttpClient {
                 received_at,
             )?;
             in_flight.record_success()?;
-            let sealed = writer.commit(url, response_evidence, cancellation).await?;
-            Ok(sealed)
+            let verified_object = store
+                .finish_logical_object(pending, &control)
+                .map_err(crate::NasdaqReferenceError::from)?;
+            if verified_object.size_bytes()
+                != u64::try_from(body_bytes).map_err(|_| SourceError::InvalidProtocolState)?
+            {
+                return Err(crate::NasdaqReferenceError::InvalidObjectReceipt.into());
+            }
+            Ok(RetrievedReferenceObject {
+                response_evidence,
+                verified_object,
+            })
         };
         tokio::select! {
             biased;
@@ -425,12 +465,12 @@ fn build_client(
         .map_err(|_| NasdaqSymbolDirectorySourceError::InvalidMetadata)
 }
 
-fn endpoint(kind: NasdaqDirectoryKind) -> &'static str {
+fn endpoint(kind: NasdaqDirectoryKind) -> Option<&'static str> {
     match kind {
-        NasdaqDirectoryKind::NasdaqListed => NASDAQ_LISTED_URL,
-        NasdaqDirectoryKind::OtherListed => OTHER_LISTED_URL,
-        NasdaqDirectoryKind::Bonds => BONDS_LIST_URL,
-        NasdaqDirectoryKind::Options => OPTIONS_URL,
+        NasdaqDirectoryKind::NasdaqListed => Some(NASDAQ_LISTED_URL),
+        NasdaqDirectoryKind::OtherListed => Some(OTHER_LISTED_URL),
+        NasdaqDirectoryKind::Bonds => None,
+        NasdaqDirectoryKind::Options => Some(OPTIONS_URL),
     }
 }
 
