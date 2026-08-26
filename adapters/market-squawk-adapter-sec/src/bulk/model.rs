@@ -11,7 +11,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::{SecHttpValidators, SecObjectLocator};
+use crate::{SecHttpValidators, SecObjectLocator, SecRepresentation};
 
 use super::SecBulkError;
 use super::native_query::{SecBulkNativeGenerationReceipt, SecBulkNativePublishedGeneration};
@@ -472,11 +472,7 @@ impl SecBulkCapture {
         })
     }
 
-    /// Rebinds a representation-registry receipt after restart or controlled exact-byte import.
-    ///
-    /// This constructor does not prove that raw bytes exist; [`super::inspect_bulk_archive`] and
-    /// recovery always reopen and hash the sealed object before admitting a layout.
-    pub fn try_from_sealed_representation(
+    pub(crate) fn try_from_sealed_representation(
         selection: SecBulkSelection,
         locator: SourceIdentifier,
         evidence: EvidenceDigest,
@@ -492,6 +488,31 @@ impl SecBulkCapture {
             size_bytes,
             first_observed_at,
             retrieval_revision,
+            transport,
+        )
+    }
+
+    /// Admits a capture only from a durable representation-registry decision.
+    ///
+    /// The registry-issued value exclusively supplies the locator, exact-byte identity, size,
+    /// first-observed clock, and monotonic retrieval revision. Archive inspection still reopens
+    /// and hashes the corresponding raw object before admitting a layout.
+    pub fn try_from_registry_representation(
+        selection: SecBulkSelection,
+        representation: SecRepresentation,
+        transport: SecBulkTransportEvidence,
+    ) -> Result<Self, SecBulkError> {
+        if representation.validators() != transport.validators() {
+            return Err(SecBulkError::InvalidCapture);
+        }
+        let locator = SourceIdentifier::try_from(representation.locator())?;
+        Self::try_from_sealed_representation(
+            selection,
+            locator,
+            representation.evidence(),
+            representation.size_bytes(),
+            representation.first_observed_at(),
+            representation.retrieval_revision(),
             transport,
         )
     }
@@ -1583,9 +1604,9 @@ impl SecBulkJoinCoordinate {
     }
 }
 
-/// Rich canonical projection available for currently materialized core joins.
+/// Rich provider-native projection available for currently materialized SEC table shapes.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum SecBulkCanonicalProjection {
+pub enum SecBulkProviderProjection {
     /// N-PORT filing metadata.
     NportSubmission(Box<SecNportSubmissionRow>),
     /// N-PORT registrant metadata.
@@ -1608,6 +1629,21 @@ pub enum SecBulkCanonicalProjection {
     NcenSecurityExchange(Box<SecNcenSecurityExchangeRow>),
 }
 
+/// Closed reason why one lossless provider row does or does not have a richer projection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SecBulkProjectionDisposition {
+    /// The source row was projected into a richer provider-native SEC table shape.
+    Projected(SecBulkProviderProjection),
+    /// This official table has no richer projection contract.
+    NotApplicable,
+    /// A source field required by the richer projection is absent.
+    SourceMissing,
+    /// A present source field is malformed for the provider-native projection contract.
+    InvalidSource,
+    /// Source evidence exists, but its identity cannot be resolved under the admitted contract.
+    UnresolvedIdentity,
+}
+
 /// One lossless provider-native row from any current official N-PORT/N-CEN table.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SecBulkNativeRow {
@@ -1615,7 +1651,7 @@ pub struct SecBulkNativeRow {
     pub(crate) primary_key: Vec<SecBulkKeyField>,
     pub(crate) joins: Vec<SecBulkJoinCoordinate>,
     pub(crate) fields: Vec<SecBulkTypedField>,
-    pub(crate) canonical_projection: Option<SecBulkCanonicalProjection>,
+    pub(crate) projection_disposition: SecBulkProjectionDisposition,
     #[serde(skip)]
     pub(crate) membership: Option<SecBulkNativeRowMembership>,
     pub(crate) row_number: u64,
@@ -1643,9 +1679,9 @@ impl SecBulkNativeRow {
         &self.fields
     }
 
-    /// Returns the rich canonical projection for core materialized joins when available.
-    pub const fn canonical_projection(&self) -> Option<&SecBulkCanonicalProjection> {
-        self.canonical_projection.as_ref()
+    /// Returns the closed provider-native projection outcome without discarding source evidence.
+    pub const fn projection_disposition(&self) -> &SecBulkProjectionDisposition {
+        &self.projection_disposition
     }
 
     /// Returns immutable generation/query membership only for a durable query result.
@@ -2400,20 +2436,28 @@ impl SecFundHoldingCandidate {
         supplements: SecNportHoldingSupplementSet,
     ) -> Result<Self, SecBulkError> {
         let generation_evidence = supplements.generation_evidence;
-        let submission = match submission_row.canonical_projection() {
-            Some(SecBulkCanonicalProjection::NportSubmission(row)) => row.as_ref().clone(),
+        let submission = match submission_row.projection_disposition() {
+            SecBulkProjectionDisposition::Projected(
+                SecBulkProviderProjection::NportSubmission(row),
+            ) => row.as_ref().clone(),
             _ => return Err(SecBulkError::InvalidCanonicalMapping),
         };
-        let registrant = match registrant_row.canonical_projection() {
-            Some(SecBulkCanonicalProjection::NportRegistrant(row)) => row.as_ref().clone(),
+        let registrant = match registrant_row.projection_disposition() {
+            SecBulkProjectionDisposition::Projected(
+                SecBulkProviderProjection::NportRegistrant(row),
+            ) => row.as_ref().clone(),
             _ => return Err(SecBulkError::InvalidCanonicalMapping),
         };
-        let fund = match fund_row.canonical_projection() {
-            Some(SecBulkCanonicalProjection::NportFund(row)) => row.as_ref().clone(),
+        let fund = match fund_row.projection_disposition() {
+            SecBulkProjectionDisposition::Projected(SecBulkProviderProjection::NportFund(row)) => {
+                row.as_ref().clone()
+            }
             _ => return Err(SecBulkError::InvalidCanonicalMapping),
         };
-        let holding = match supplements.holding.canonical_projection() {
-            Some(SecBulkCanonicalProjection::NportHolding(row)) => row.as_ref().clone(),
+        let holding = match supplements.holding.projection_disposition() {
+            SecBulkProjectionDisposition::Projected(SecBulkProviderProjection::NportHolding(
+                row,
+            )) => row.as_ref().clone(),
             _ => return Err(SecBulkError::InvalidCanonicalMapping),
         };
         if manifest.capture.selection.family != SecBulkFamily::Nport
@@ -2570,9 +2614,10 @@ fn identifier_resolution_is_generation_bound(
         && resolution.identifier_rows.iter().all(|expected| {
             identifiers.rows.iter().any(|row| {
                 matches!(
-                    row.canonical_projection.as_ref(),
-                    Some(SecBulkCanonicalProjection::NportIdentifier(actual))
-                        if actual.as_ref() == expected
+                    &row.projection_disposition,
+                    SecBulkProjectionDisposition::Projected(
+                        SecBulkProviderProjection::NportIdentifier(actual)
+                    ) if actual.as_ref() == expected
                 ) && row_has_membership(
                     row,
                     supplements.generation_evidence,
@@ -2801,21 +2846,29 @@ impl SecNcenFundMetadataCandidate {
             .membership()
             .ok_or(SecBulkError::InvalidCanonicalMapping)?;
         let generation_evidence = fund_membership.generation_evidence;
-        let submission = match submission_row.canonical_projection() {
-            Some(SecBulkCanonicalProjection::NcenSubmission(row)) => row.as_ref().clone(),
+        let submission = match submission_row.projection_disposition() {
+            SecBulkProjectionDisposition::Projected(SecBulkProviderProjection::NcenSubmission(
+                row,
+            )) => row.as_ref().clone(),
             _ => return Err(SecBulkError::InvalidCanonicalMapping),
         };
-        let registrant = match registrant_row.canonical_projection() {
-            Some(SecBulkCanonicalProjection::NcenRegistrant(row)) => row.as_ref().clone(),
+        let registrant = match registrant_row.projection_disposition() {
+            SecBulkProjectionDisposition::Projected(SecBulkProviderProjection::NcenRegistrant(
+                row,
+            )) => row.as_ref().clone(),
             _ => return Err(SecBulkError::InvalidCanonicalMapping),
         };
-        let fund = match fund_row.canonical_projection() {
-            Some(SecBulkCanonicalProjection::NcenFund(row)) => row.as_ref().clone(),
+        let fund = match fund_row.projection_disposition() {
+            SecBulkProjectionDisposition::Projected(SecBulkProviderProjection::NcenFund(row)) => {
+                row.as_ref().clone()
+            }
             _ => return Err(SecBulkError::InvalidCanonicalMapping),
         };
         let etf = match etf_row {
-            Some(row) => match row.canonical_projection() {
-                Some(SecBulkCanonicalProjection::NcenEtf(etf)) => Some(etf.as_ref().clone()),
+            Some(row) => match row.projection_disposition() {
+                SecBulkProjectionDisposition::Projected(SecBulkProviderProjection::NcenEtf(
+                    etf,
+                )) => Some(etf.as_ref().clone()),
                 _ => return Err(SecBulkError::InvalidCanonicalMapping),
             },
             None => None,
@@ -2825,8 +2878,10 @@ impl SecNcenFundMetadataCandidate {
             .try_reserve_exact(exchange_rows.len())
             .map_err(|_| SecBulkError::AllocationFailed)?;
         for row in exchange_rows {
-            match row.canonical_projection() {
-                Some(SecBulkCanonicalProjection::NcenSecurityExchange(exchange)) => {
+            match row.projection_disposition() {
+                SecBulkProjectionDisposition::Projected(
+                    SecBulkProviderProjection::NcenSecurityExchange(exchange),
+                ) => {
                     exchanges.push(exchange.as_ref().clone());
                 }
                 _ => return Err(SecBulkError::InvalidCanonicalMapping),

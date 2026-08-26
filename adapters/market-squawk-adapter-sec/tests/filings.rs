@@ -4,15 +4,15 @@ mod bulk {
 
     use cap_std::{ambient_authority, fs::Dir};
     use market_squawk_adapter_sec::{
-        RawEvidenceStore, SecBulkCandidatePublicationPermit, SecBulkCanonicalProjection,
-        SecBulkCoverage, SecBulkError, SecBulkFamily, SecBulkKeyField, SecBulkMediaKind,
-        SecBulkNativePublicationSession, SecBulkNativeRow, SecBulkParseLimits, SecBulkQueryLimits,
-        SecBulkRowSink, SecBulkScanReport, SecBulkSelection, SecBulkTableKind,
-        SecBulkTransportEvidence, SecHttpValidators, SecQuarter, inspect_bulk_archive,
-        query_native_rows, recover_bulk_archive, recover_native_generation,
-        recover_native_generation_from_receipt, scan_bulk_archive,
+        RawEvidenceStore, SecBulkCapture, SecBulkCoverage, SecBulkError, SecBulkFamily,
+        SecBulkKeyField, SecBulkMediaKind, SecBulkNativePublicationSession, SecBulkParseLimits,
+        SecBulkProjectionDisposition, SecBulkProviderProjection, SecBulkQueryLimits,
+        SecBulkSelection, SecBulkTableKind, SecBulkTransportEvidence, SecBulkTypedValue,
+        SecHttpValidators, SecQuarter, SecRepresentationLimits, SecRepresentationRegistry,
+        inspect_bulk_archive, query_native_rows, recover_bulk_archive,
+        recover_native_generation_from_receipt, scan_bulk_archive, scan_bulk_archive_typed,
     };
-    use market_squawk_domain::{EvidenceDigest, Timestamp};
+    use market_squawk_domain::Timestamp;
     use tokio_util::sync::CancellationToken;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
@@ -21,11 +21,15 @@ mod bulk {
     fn quarterly_bulk_is_exact_restart_safe_and_keeps_ncen_schema_gap_typed()
     -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::tempdir()?;
-        let store = RawEvidenceStore::new(Dir::open_ambient_dir(
-            temporary.path(),
-            ambient_authority(),
-        )?);
-        let acknowledged_at = Timestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        let raw_path = temporary.path().join("raw");
+        let registry_path = temporary.path().join("representations");
+        std::fs::create_dir(&raw_path)?;
+        std::fs::create_dir(&registry_path)?;
+        let store = RawEvidenceStore::new(Dir::open_ambient_dir(&raw_path, ambient_authority())?);
+        let registry = SecRepresentationRegistry::open(
+            Dir::open_ambient_dir(&registry_path, ambient_authority())?,
+            SecRepresentationLimits::production_defaults(),
+        )?;
         let selection =
             SecBulkSelection::current(SecBulkFamily::Ncen, SecQuarter::try_new(2026, 2)?)?;
         assert!(matches!(
@@ -39,40 +43,44 @@ mod bulk {
         let archive_evidence = store.persist(&archive_bytes)?;
         let readme_bytes = b"official N-CEN readme evidence";
         let readme_evidence = store.persist(readme_bytes)?;
+        let archive_representation = registry.record_success(
+            selection.archive_locator().as_str(),
+            archive_evidence,
+            u64::try_from(archive_bytes.len())?,
+            SecHttpValidators::default(),
+        )?;
+        let readme_representation = registry.record_success(
+            selection.readme_locator().as_str(),
+            readme_evidence,
+            u64::try_from(readme_bytes.len())?,
+            SecHttpValidators::default(),
+        )?;
+        let archive_received_at = archive_representation.first_observed_at();
+        let readme_received_at = readme_representation.first_observed_at();
         let archive_transport = SecBulkTransportEvidence::try_new(
             200,
             SecBulkMediaKind::Zip,
             Some("application/zip"),
             SecHttpValidators::default(),
-            acknowledged_at,
+            archive_received_at,
         )?;
         let readme_transport = SecBulkTransportEvidence::try_new(
             200,
             SecBulkMediaKind::Pdf,
             Some("application/pdf"),
             SecHttpValidators::default(),
-            acknowledged_at,
+            readme_received_at,
         )?;
-        let archive_capture =
-            market_squawk_adapter_sec::SecBulkCapture::try_from_sealed_representation(
-                selection.clone(),
-                selection.archive_locator().clone(),
-                archive_evidence,
-                u64::try_from(archive_bytes.len())?,
-                acknowledged_at,
-                1,
-                archive_transport,
-            )?;
-        let readme_capture =
-            market_squawk_adapter_sec::SecBulkCapture::try_from_sealed_representation(
-                selection.clone(),
-                selection.readme_locator().clone(),
-                readme_evidence,
-                u64::try_from(readme_bytes.len())?,
-                acknowledged_at,
-                1,
-                readme_transport,
-            )?;
+        let archive_capture = SecBulkCapture::try_from_registry_representation(
+            selection.clone(),
+            archive_representation,
+            archive_transport,
+        )?;
+        let readme_capture = SecBulkCapture::try_from_registry_representation(
+            selection.clone(),
+            readme_representation,
+            readme_transport,
+        )?;
         let cancellation = CancellationToken::new();
         let limits = SecBulkParseLimits::production_defaults();
         let deadline = Timestamp::from_unix_nanos(i64::MAX);
@@ -92,30 +100,69 @@ mod bulk {
                 .table("SEC_LENDING_IDEMNITY_PROVIDER.tsv")
                 .is_some()
         );
-        assert_eq!(
-            recover_bulk_archive(&store, &manifest, limits, deadline, &cancellation,)?,
-            manifest
-        );
+        let invalid_registry_path = temporary.path().join("invalid-representations");
+        std::fs::create_dir(&invalid_registry_path)?;
+        let invalid_registry = SecRepresentationRegistry::open(
+            Dir::open_ambient_dir(&invalid_registry_path, ambient_authority())?,
+            SecRepresentationLimits::production_defaults(),
+        )?;
+        let invalid_archive_bytes = with_declared_eocd_entries(archive_bytes.clone(), 65)?;
+        let invalid_archive_evidence = store.persist(&invalid_archive_bytes)?;
+        let invalid_archive_representation = invalid_registry.record_success(
+            selection.archive_locator().as_str(),
+            invalid_archive_evidence,
+            u64::try_from(invalid_archive_bytes.len())?,
+            SecHttpValidators::default(),
+        )?;
+        let invalid_readme_representation = invalid_registry.record_success(
+            selection.readme_locator().as_str(),
+            readme_evidence,
+            u64::try_from(readme_bytes.len())?,
+            SecHttpValidators::default(),
+        )?;
+        let invalid_archive_received_at = invalid_archive_representation.first_observed_at();
+        let invalid_readme_received_at = invalid_readme_representation.first_observed_at();
+        let invalid_archive_capture = SecBulkCapture::try_from_registry_representation(
+            selection.clone(),
+            invalid_archive_representation,
+            SecBulkTransportEvidence::try_new(
+                200,
+                SecBulkMediaKind::Zip,
+                Some("application/zip"),
+                SecHttpValidators::default(),
+                invalid_archive_received_at,
+            )?,
+        )?;
+        let invalid_readme_capture = SecBulkCapture::try_from_registry_representation(
+            selection.clone(),
+            invalid_readme_representation,
+            SecBulkTransportEvidence::try_new(
+                200,
+                SecBulkMediaKind::Pdf,
+                Some("application/pdf"),
+                SecHttpValidators::default(),
+                invalid_readme_received_at,
+            )?,
+        )?;
+        assert!(matches!(
+            inspect_bulk_archive(
+                &store,
+                invalid_archive_capture,
+                invalid_readme_capture,
+                limits,
+                deadline,
+                &cancellation,
+            ),
+            Err(SecBulkError::EntryLimitExceeded)
+        ));
 
-        let mut sink = AtomicTestSink::default();
-        let report = scan_bulk_archive(
-            &store,
-            &manifest,
-            limits,
-            deadline,
-            &cancellation,
-            &mut sink,
-        )
-        .map_err(|error| std::io::Error::other(format!("scan bulk archive: {error:?}")))?;
-        assert_eq!(sink.kinds, ["submission", "registrant", "fund"]);
-        assert_eq!(report.source_rows(), 3);
-        assert_eq!(report.emitted_typed_rows(), 3);
-        assert!(sink.committed);
-
+        let publication_manifest =
+            recover_bulk_archive(&store, &manifest, limits, deadline, &cancellation)?;
+        let published_at = archive_received_at.max(readme_received_at);
         let mut publication = SecBulkNativePublicationSession::new(
             &store,
-            manifest.clone(),
-            acknowledged_at,
+            publication_manifest,
+            published_at,
             deadline,
             cancellation.clone(),
         )?;
@@ -128,26 +175,19 @@ mod bulk {
             &mut publication,
         )
         .map_err(|error| std::io::Error::other(format!("publish native bulk: {error:?}")))?;
-        let generation = publication
+        let generation_receipt = publication
             .published_generation()
-            .ok_or_else(|| std::io::Error::other("native generation was not sealed"))?
-            .clone();
-        assert_eq!(
-            recover_native_generation(&store, &generation, deadline, &cancellation)?,
-            generation
-        );
-        assert_eq!(
-            recover_native_generation_from_receipt(
-                &store,
-                generation.receipt(),
-                deadline,
-                &cancellation,
-            )?,
-            generation
-        );
-        let candidate_permit =
-            SecBulkCandidatePublicationPermit::try_new(&manifest, &generation, acknowledged_at)?;
-        assert_eq!(candidate_permit.source_generation(), generation.receipt());
+            .ok_or_else(|| std::io::Error::other("native generation was not published"))?
+            .receipt();
+        drop(publication);
+        let generation = recover_native_generation_from_receipt(
+            &store,
+            generation_receipt,
+            deadline,
+            &cancellation,
+        )
+        .map_err(|error| std::io::Error::other(format!("recover native receipt: {error:?}")))?;
+        assert_eq!(generation.receipt(), generation_receipt);
         let primary_key = [SecBulkKeyField::try_new(
             "ACCESSION_NUMBER",
             "0001099263-26-004477",
@@ -161,58 +201,122 @@ mod bulk {
             None,
             deadline,
             &cancellation,
-        )?;
+        )
+        .map_err(|error| std::io::Error::other(format!("query native row: {error:?}")))?;
         assert_eq!(page.rows().len(), 1);
         assert!(page.next_cursor().is_none());
+        assert!(matches!(
+            page.rows()[0].projection_disposition(),
+            SecBulkProjectionDisposition::Projected(
+                SecBulkProviderProjection::NcenSubmission(candidate)
+            ) if candidate.accession.as_str() == "0001099263-26-004477"
+        ));
+
+        let typed_manifest =
+            recover_bulk_archive(&store, &manifest, limits, deadline, &cancellation)?;
+        let mut dispositions = Vec::new();
+        let scan = scan_bulk_archive_typed(
+            &store,
+            typed_manifest,
+            limits,
+            deadline,
+            &cancellation,
+            |row| {
+                dispositions.push(match row.projection_disposition() {
+                    SecBulkProjectionDisposition::Projected(
+                        SecBulkProviderProjection::NcenSubmission(candidate),
+                    ) if candidate.accession.as_str() == "0001099263-26-004477" => "submission",
+                    SecBulkProjectionDisposition::Projected(
+                        SecBulkProviderProjection::NcenRegistrant(candidate),
+                    ) if candidate.cik.as_str() == "0001795351" => "registrant",
+                    SecBulkProjectionDisposition::Projected(
+                        SecBulkProviderProjection::NcenFund(candidate),
+                    ) if candidate
+                        .series_id
+                        .as_ref()
+                        .is_some_and(|series| series.as_str() == "S000095886")
+                        && candidate.is_etf == Some(true) =>
+                    {
+                        "fund"
+                    }
+                    SecBulkProjectionDisposition::UnresolvedIdentity
+                        if row.table() == SecBulkTableKind::NcenSecurityExchange =>
+                    {
+                        assert!(row.fields().iter().any(|field| {
+                            field.name().as_str() == "FUND_EXCHANGE"
+                                && matches!(
+                                    field.value(),
+                                    SecBulkTypedValue::Text(value) if value == "NYSE ARCA"
+                                )
+                        }));
+                        assert!(row.fields().iter().any(|field| {
+                            field.name().as_str() == "FUND_TICKER_SYMBOL"
+                                && matches!(
+                                    field.value(),
+                                    SecBulkTypedValue::Text(value) if value == "PRIH"
+                                )
+                        }));
+                        assert!(row.row_evidence().bytes().iter().any(|byte| *byte != 0));
+                        "exchange-unresolved"
+                    }
+                    SecBulkProjectionDisposition::Projected(
+                        SecBulkProviderProjection::NcenEtf(candidate),
+                    ) if candidate
+                        .series_id
+                        .as_ref()
+                        .is_some_and(|series| series.as_str() == "S000095886")
+                        && candidate.collateral_required == Some(false)
+                        && candidate.is_in_kind_etf == Some(true) =>
+                    {
+                        "etf"
+                    }
+                    SecBulkProjectionDisposition::NotApplicable => "not-applicable",
+                    _ => return Err(SecBulkError::InvalidLayout),
+                });
+                Ok(())
+            },
+        )
+        .map_err(|error| std::io::Error::other(format!("consume typed scan: {error:?}")))?;
+        assert_eq!(
+            dispositions,
+            [
+                "submission",
+                "registrant",
+                "not-applicable",
+                "fund",
+                "exchange-unresolved",
+                "etf"
+            ]
+        );
+        assert_eq!(scan.manifest().evidence(), manifest.evidence());
+        assert_eq!(scan.report().source_rows(), 6);
+        assert_eq!(scan.report().emitted_typed_rows(), 6);
+        assert_eq!(
+            scan.archive_capture().first_observed_at(),
+            archive_received_at
+        );
+        assert_eq!(
+            scan.official_readme_capture().first_observed_at(),
+            readme_received_at
+        );
+        assert_ne!(
+            scan.archive_capture().evidence(),
+            scan.official_readme_capture().evidence()
+        );
         Ok(())
     }
 
-    #[derive(Default)]
-    struct AtomicTestSink {
-        begun: Option<EvidenceDigest>,
-        staged: Vec<&'static str>,
-        kinds: Vec<&'static str>,
-        committed: bool,
-    }
-
-    impl SecBulkRowSink for AtomicTestSink {
-        fn begin(&mut self, manifest_evidence: EvidenceDigest) -> Result<(), SecBulkError> {
-            if self.begun.is_some() || self.committed {
-                return Err(SecBulkError::PublicationNotReady);
-            }
-            self.begun = Some(manifest_evidence);
-            Ok(())
-        }
-
-        fn stage(&mut self, row: SecBulkNativeRow) -> Result<(), SecBulkError> {
-            if self.begun.is_none() || self.committed {
-                return Err(SecBulkError::PublicationNotReady);
-            }
-            self.staged.push(match row.canonical_projection() {
-                Some(SecBulkCanonicalProjection::NcenSubmission(_)) => "submission",
-                Some(SecBulkCanonicalProjection::NcenRegistrant(_)) => "registrant",
-                Some(SecBulkCanonicalProjection::NcenFund(_)) => "fund",
-                _ => return Err(SecBulkError::InvalidLayout),
-            });
-            Ok(())
-        }
-
-        fn commit(&mut self, report: SecBulkScanReport) -> Result<(), SecBulkError> {
-            if self.begun != Some(report.manifest_evidence())
-                || usize::try_from(report.emitted_typed_rows()).ok() != Some(self.staged.len())
-            {
-                return Err(SecBulkError::PublicationNotReady);
-            }
-            self.kinds.append(&mut self.staged);
-            self.committed = true;
-            Ok(())
-        }
-
-        fn abort(&mut self) {
-            self.staged.clear();
-            self.begun = None;
-            self.committed = false;
-        }
+    fn with_declared_eocd_entries(
+        mut archive: Vec<u8>,
+        entries: u16,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        let eocd = archive
+            .windows(4)
+            .rposition(|window| window == [0x50, 0x4b, 0x05, 0x06])
+            .ok_or_else(|| std::io::Error::other("fixture ZIP has no EOCD"))?;
+        archive[eocd + 8..eocd + 10].copy_from_slice(&entries.to_le_bytes());
+        archive[eocd + 10..eocd + 12].copy_from_slice(&entries.to_le_bytes());
+        Ok(archive)
     }
 
     fn minimal_ncen_archive() -> Result<Vec<u8>, Box<dyn Error>> {
@@ -276,10 +380,39 @@ mod bulk {
             .as_bytes(),
             options,
         )?;
+        write_member(
+            &mut writer,
+            "SECURITY_EXCHANGE.tsv",
+            format!(
+                "{SECURITY_EXCHANGE_HEADER}\n0001099263-26-004477_0001795351_S000095886\tNYSE ARCA\tPRIH\n"
+            )
+            .as_bytes(),
+            options,
+        )?;
+        write_member(
+            &mut writer,
+            "ETF.tsv",
+            format!(
+                "{ETF_HEADER}\n0001099263-26-004477_0001795351_S000095886\tT. Rowe Price High Income Municipal ETF\tS000095886\tN\t50000\t50000\tY\n"
+            )
+            .as_bytes(),
+            options,
+        )?;
+        write_member(
+            &mut writer,
+            "REGISTRANT_WEBSITE.tsv",
+            b"ROW_ID\nrow-1\n",
+            options,
+        )?;
         for name in NCEN_TABLES.iter().copied().filter(|name| {
             !matches!(
                 *name,
-                "SUBMISSION.tsv" | "REGISTRANT.tsv" | "FUND_REPORTED_INFO.tsv"
+                "SUBMISSION.tsv"
+                    | "REGISTRANT.tsv"
+                    | "REGISTRANT_WEBSITE.tsv"
+                    | "FUND_REPORTED_INFO.tsv"
+                    | "SECURITY_EXCHANGE.tsv"
+                    | "ETF.tsv"
             ) && !NCEN_DECLARED_ABSENT.contains(name)
         }) {
             let header = match name {

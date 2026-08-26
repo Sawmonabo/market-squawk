@@ -1899,8 +1899,8 @@ fn validate_native_row(
     }
     if row.membership().is_some()
         || row.joins() != expected_joins(row.fields())?.as_slice()
-        || row.canonical_projection()
-            != super::archive::canonical_projection_from_native(row)?.as_ref()
+        || row.projection_disposition()
+            != &super::archive::provider_projection_disposition_from_native(row)?
         || row.row_evidence() != native_row_evidence(row)
     {
         return Err(SecBulkError::InvalidCanonicalMapping);
@@ -1951,8 +1951,8 @@ fn validate_recovered_row(
     }
     if row.membership().is_some()
         || row.joins() != expected_joins(row.fields())?.as_slice()
-        || row.canonical_projection()
-            != super::archive::canonical_projection_from_native(row)?.as_ref()
+        || row.projection_disposition()
+            != &super::archive::provider_projection_disposition_from_native(row)?
         || row.row_evidence() != native_row_evidence(row)
     {
         return Err(SecBulkError::RecoveryMismatch);

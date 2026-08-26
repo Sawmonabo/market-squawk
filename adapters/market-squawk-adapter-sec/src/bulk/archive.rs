@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
-use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,17 +20,24 @@ use crate::evidence_store::RawEvidenceScratch;
 
 use super::SecBulkError;
 use super::model::{
-    SecBulkCanonicalProjection, SecBulkCapture, SecBulkColumnContract,
-    SecBulkDeclaredTableContract, SecBulkFamily, SecBulkJoinCoordinate, SecBulkJoinDomain,
-    SecBulkKeyField, SecBulkLayoutManifest, SecBulkNativeRow, SecBulkNumericAttribute,
-    SecBulkTableKind, SecBulkTableReceipt, SecBulkTypedField, SecBulkTypedValue, SecExactNumber,
-    SecNcenEtfRow, SecNcenFundRow, SecNcenRegistrantRow, SecNcenSecurityExchangeRow,
-    SecNcenSubmissionRow, SecNportFundRow, SecNportHoldingRow, SecNportIdentifierRow,
-    SecNportRegistrantRow, SecNportSubmissionRow,
+    SecBulkCapture, SecBulkColumnContract, SecBulkDeclaredTableContract, SecBulkFamily,
+    SecBulkJoinCoordinate, SecBulkJoinDomain, SecBulkKeyField, SecBulkLayoutManifest,
+    SecBulkNativeRow, SecBulkNumericAttribute, SecBulkProjectionDisposition,
+    SecBulkProviderProjection, SecBulkTableKind, SecBulkTableReceipt, SecBulkTypedField,
+    SecBulkTypedValue, SecExactNumber, SecNcenEtfRow, SecNcenFundRow, SecNcenRegistrantRow,
+    SecNcenSecurityExchangeRow, SecNcenSubmissionRow, SecNportFundRow, SecNportHoldingRow,
+    SecNportIdentifierRow, SecNportRegistrantRow, SecNportSubmissionRow,
 };
 
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 64;
+const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ZIP64_EOCD_BYTES: u64 = 4 * 1024;
+const EOCD_MIN_BYTES: usize = 22;
+const EOCD_MAX_COMMENT_BYTES: usize = u16::MAX as usize;
+const EOCD_SEARCH_BYTES: usize = EOCD_MIN_BYTES + EOCD_MAX_COMMENT_BYTES;
+const ZIP64_LOCATOR_BYTES: u64 = 20;
+const ZIP64_EOCD_MIN_BYTES: u64 = 56;
 const MAX_METADATA_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_README_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TABLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -46,6 +53,8 @@ const KEY_DIGEST_BYTES_U64: u64 = 32;
 const KEY_SORT_CHUNK_KEYS_U64: u64 = 131_072;
 const KEY_MERGE_FAN_IN: usize = 16;
 const MAX_VALIDATION_SCRATCH_BYTES: u64 = 96 * 1024 * 1024 * 1024;
+const MAX_VALIDATION_SCRATCH_FILES: usize = 4_096;
+const MAX_SCAN_ROWS: u64 = MAX_ROWS_PER_TABLE * MAX_ARCHIVE_ENTRIES as u64;
 
 /// Hard ceilings for streamed SEC quarterly archive admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +71,7 @@ pub struct SecBulkParseLimits {
     max_field_bytes: usize,
     max_row_bytes: usize,
     max_validation_scratch_bytes: u64,
+    max_validation_scratch_files: usize,
 }
 
 impl SecBulkParseLimits {
@@ -80,6 +90,7 @@ impl SecBulkParseLimits {
             max_field_bytes: MAX_FIELD_BYTES,
             max_row_bytes: MAX_ROW_BYTES,
             max_validation_scratch_bytes: MAX_VALIDATION_SCRATCH_BYTES,
+            max_validation_scratch_files: MAX_VALIDATION_SCRATCH_FILES,
         }
     }
 
@@ -114,6 +125,7 @@ pub struct SecBulkScanReport {
     manifest_evidence: EvidenceDigest,
     source_rows: u64,
     emitted_typed_rows: u64,
+    ordered_typed_rows_evidence: EvidenceDigest,
 }
 
 impl SecBulkScanReport {
@@ -127,10 +139,199 @@ impl SecBulkScanReport {
         self.source_rows
     }
 
-    /// Returns rows emitted through currently typed canonical/provider handoffs.
+    /// Returns rows emitted through the typed provider-row path.
     pub const fn emitted_typed_rows(self) -> u64 {
         self.emitted_typed_rows
     }
+
+    /// Returns one deterministic digest over emitted table, row-number, and row evidence order.
+    pub const fn ordered_typed_rows_evidence(self) -> EvidenceDigest {
+        self.ordered_typed_rows_evidence
+    }
+}
+
+/// Verified, non-published result of consuming one exact archive/readme typed scan.
+///
+/// This descriptor is intentionally neither cloneable, copyable, nor serializable. It records no
+/// sink receipt and makes no publication, durability, or immutability claim about observer-owned
+/// effects. A failed scan returns no descriptor; callers must discard any pending observer state.
+#[derive(Debug)]
+pub struct SecBulkTypedArchiveScan {
+    manifest: SecBulkLayoutManifest,
+    report: SecBulkScanReport,
+}
+
+impl SecBulkTypedArchiveScan {
+    fn try_new(
+        manifest: SecBulkLayoutManifest,
+        report: SecBulkScanReport,
+    ) -> Result<Self, SecBulkError> {
+        if report.manifest_evidence != manifest.evidence()
+            || report.source_rows > MAX_SCAN_ROWS
+            || report.emitted_typed_rows > report.source_rows
+        {
+            return Err(SecBulkError::RecoveryMismatch);
+        }
+        Ok(Self { manifest, report })
+    }
+
+    /// Borrows the verified source layout, coverage, clocks, and ordered table receipts.
+    pub const fn manifest(&self) -> &SecBulkLayoutManifest {
+        &self.manifest
+    }
+
+    /// Returns the archive receipt without conflating it with the readme receipt.
+    pub const fn archive_capture(&self) -> &SecBulkCapture {
+        self.manifest.capture()
+    }
+
+    /// Returns the independently registry-bound official-readme capture and clock.
+    pub const fn official_readme_capture(&self) -> &SecBulkCapture {
+        self.manifest.official_readme_capture()
+    }
+
+    /// Borrows bounded source/emitted counts and ordered row evidence.
+    pub const fn report(&self) -> &SecBulkScanReport {
+        &self.report
+    }
+}
+
+/// Crate-private stand-in for the future common immutable large-object view.
+///
+/// Construction remains inside this module and only follows complete verification by the
+/// capability-scoped raw store. The same open descriptor is retained through terminal
+/// verification, so no public `Read + Seek` plus caller-supplied digest path exists.
+struct ImmutableObjectView<R> {
+    reader: R,
+    expected_evidence: EvidenceDigest,
+    expected_bytes: u64,
+    maximum_bytes: u64,
+}
+
+impl<R> ImmutableObjectView<R> {
+    const fn from_store_verified(
+        reader: R,
+        expected_evidence: EvidenceDigest,
+        expected_bytes: u64,
+        maximum_bytes: u64,
+    ) -> Self {
+        Self {
+            reader,
+            expected_evidence,
+            expected_bytes,
+            maximum_bytes,
+        }
+    }
+}
+
+impl<R: Read + Seek> ImmutableObjectView<R> {
+    fn verify_terminal(
+        &mut self,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SecBulkError> {
+        self.reader.seek(SeekFrom::Start(0))?;
+        let mut digest = Sha256::new();
+        let mut observed = 0_u64;
+        let mut buffer = [0_u8; READ_BUFFER_BYTES];
+        loop {
+            check_cancelled(cancellation, deadline)?;
+            let read = self.reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            observed = observed
+                .checked_add(u64::try_from(read).map_err(|_| SecBulkError::RecoveryMismatch)?)
+                .ok_or(SecBulkError::RecoveryMismatch)?;
+            if observed > self.maximum_bytes {
+                return Err(SecBulkError::RecoveryMismatch);
+            }
+            digest.update(&buffer[..read]);
+        }
+        if observed != self.expected_bytes
+            || digest.finalize().as_slice() != self.expected_evidence.bytes()
+        {
+            return Err(SecBulkError::RecoveryMismatch);
+        }
+        self.reader.seek(SeekFrom::Start(0))?;
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for ImmutableObjectView<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buffer)
+    }
+}
+
+impl<R: Seek> Seek for ImmutableObjectView<R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.reader.seek(position)
+    }
+}
+
+struct ImmutableBulkPair<A, R> {
+    archive: ImmutableObjectView<A>,
+    official_readme: ImmutableObjectView<R>,
+}
+
+fn open_store_verified_pair(
+    store: &RawEvidenceStore,
+    archive_capture: &SecBulkCapture,
+    official_readme_capture: &SecBulkCapture,
+    limits: SecBulkParseLimits,
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+) -> Result<ImmutableBulkPair<std::fs::File, std::fs::File>, SecBulkError> {
+    check_cancelled(cancellation, deadline)?;
+    if archive_capture.selection() != official_readme_capture.selection()
+        || archive_capture.locator() != archive_capture.selection().archive_locator()
+        || official_readme_capture.locator() != archive_capture.selection().readme_locator()
+    {
+        return Err(SecBulkError::InvalidCapture);
+    }
+    let archive = store.open_verified_before(
+        &archive_capture.evidence(),
+        archive_capture.size_bytes(),
+        limits.max_archive_bytes,
+        deadline,
+        cancellation,
+    )?;
+    let archive_metadata = archive.metadata()?;
+    if !archive_metadata.is_file()
+        || archive_metadata.len() != archive_capture.size_bytes()
+        || !archive_metadata.permissions().readonly()
+    {
+        return Err(SecBulkError::RecoveryMismatch);
+    }
+    let official_readme = store.open_verified_before(
+        &official_readme_capture.evidence(),
+        official_readme_capture.size_bytes(),
+        limits.max_readme_bytes,
+        deadline,
+        cancellation,
+    )?;
+    let readme_metadata = official_readme.metadata()?;
+    if !readme_metadata.is_file()
+        || readme_metadata.len() != official_readme_capture.size_bytes()
+        || !readme_metadata.permissions().readonly()
+    {
+        return Err(SecBulkError::RecoveryMismatch);
+    }
+    Ok(ImmutableBulkPair {
+        archive: ImmutableObjectView::from_store_verified(
+            archive,
+            archive_capture.evidence(),
+            archive_capture.size_bytes(),
+            limits.max_archive_bytes,
+        ),
+        official_readme: ImmutableObjectView::from_store_verified(
+            official_readme,
+            official_readme_capture.evidence(),
+            official_readme_capture.size_bytes(),
+            limits.max_readme_bytes,
+        ),
+    })
 }
 
 /// Inspects every member from a disk-backed sealed archive and builds an exact layout manifest.
@@ -142,25 +343,17 @@ pub fn inspect_bulk_archive(
     deadline: market_squawk_domain::Timestamp,
     cancellation: &CancellationToken,
 ) -> Result<SecBulkLayoutManifest, SecBulkError> {
-    check_cancelled(cancellation, deadline)?;
-    let verified_readme = store.open_verified_before(
-        &official_readme_capture.evidence(),
-        official_readme_capture.size_bytes(),
-        limits.max_readme_bytes,
-        deadline,
-        cancellation,
-    )?;
-    drop(verified_readme);
-    let file = store.open_verified_before(
-        &capture.evidence(),
-        capture.size_bytes(),
-        limits.max_archive_bytes,
+    let pair = open_store_verified_pair(
+        store,
+        &capture,
+        &official_readme_capture,
+        limits,
         deadline,
         cancellation,
     )?;
     inspect_file(
         store,
-        file,
+        pair,
         capture,
         official_readme_capture,
         limits,
@@ -200,15 +393,295 @@ pub fn scan_bulk_archive(
     cancellation: &CancellationToken,
     sink: &mut impl SecBulkRowSink,
 ) -> Result<SecBulkScanReport, SecBulkError> {
-    check_cancelled(cancellation, deadline)?;
-    let file = store.open_verified_before(
-        &manifest.capture().evidence(),
-        manifest.capture().size_bytes(),
-        limits.max_archive_bytes,
+    let pair = open_store_verified_pair(
+        store,
+        manifest.capture(),
+        manifest.official_readme_capture(),
+        limits,
         deadline,
         cancellation,
     )?;
-    let mut archive = ZipArchive::new(file).map_err(|_| SecBulkError::UnsafeArchive)?;
+    let mut adapter = LegacyRowSink { sink };
+    let (report, ()) =
+        scan_verified_bulk_pair(pair, manifest, limits, deadline, cancellation, &mut adapter)?;
+    Ok(report)
+}
+
+/// Verifies then consumes one typed provider-row scan into caller-owned pending state.
+///
+/// The observer is deliberately not a publication sink. It is called only after a complete first
+/// validation pass over registry-bound raw evidence. If the observer pass fails, no scan descriptor
+/// is returned and the caller must discard any pending effects. Durable logical-object publication
+/// remains the responsibility of the future common publisher authority.
+pub fn scan_bulk_archive_typed<F>(
+    store: &RawEvidenceStore,
+    manifest: SecBulkLayoutManifest,
+    limits: SecBulkParseLimits,
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+    mut observer: F,
+) -> Result<SecBulkTypedArchiveScan, SecBulkError>
+where
+    F: FnMut(SecBulkNativeRow) -> Result<(), SecBulkError>,
+{
+    let validation_pair = open_store_verified_pair(
+        store,
+        manifest.capture(),
+        manifest.official_readme_capture(),
+        limits,
+        deadline,
+        cancellation,
+    )?;
+    let report =
+        validate_typed_bulk_pair(validation_pair, &manifest, limits, deadline, cancellation)?;
+    let scan = SecBulkTypedArchiveScan::try_new(manifest, report)?;
+    let observer_pair = open_store_verified_pair(
+        store,
+        scan.manifest().capture(),
+        scan.manifest().official_readme_capture(),
+        limits,
+        deadline,
+        cancellation,
+    )?;
+    observe_prevalidated_bulk_pair(
+        observer_pair,
+        scan.manifest(),
+        limits,
+        deadline,
+        cancellation,
+        &mut observer,
+    )?;
+    Ok(scan)
+}
+
+trait StreamingRowSink {
+    type Commit;
+
+    fn begin(&mut self, manifest: &SecBulkLayoutManifest) -> Result<(), SecBulkError>;
+    fn stage(&mut self, row: SecBulkNativeRow) -> Result<(), SecBulkError>;
+    fn commit(&mut self, report: SecBulkScanReport) -> Result<Self::Commit, SecBulkError>;
+    fn abort(&mut self);
+}
+
+struct LegacyRowSink<'a, S> {
+    sink: &'a mut S,
+}
+
+impl<S: SecBulkRowSink> StreamingRowSink for LegacyRowSink<'_, S> {
+    type Commit = ();
+
+    fn begin(&mut self, manifest: &SecBulkLayoutManifest) -> Result<(), SecBulkError> {
+        self.sink.begin(manifest.evidence())
+    }
+
+    fn stage(&mut self, row: SecBulkNativeRow) -> Result<(), SecBulkError> {
+        self.sink.stage(row)
+    }
+
+    fn commit(&mut self, report: SecBulkScanReport) -> Result<Self::Commit, SecBulkError> {
+        self.sink.commit(report)
+    }
+
+    fn abort(&mut self) {
+        self.sink.abort();
+    }
+}
+
+fn validate_typed_bulk_pair<A, R>(
+    pair: ImmutableBulkPair<A, R>,
+    manifest: &SecBulkLayoutManifest,
+    limits: SecBulkParseLimits,
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+) -> Result<SecBulkScanReport, SecBulkError>
+where
+    A: Read + Seek,
+    R: Read + Seek,
+{
+    let ImmutableBulkPair {
+        archive: mut archive_view,
+        mut official_readme,
+    } = pair;
+    preflight_zip_archive(
+        &mut archive_view,
+        manifest.capture().size_bytes(),
+        limits,
+        deadline,
+        cancellation,
+    )?;
+    let mut archive = ZipArchive::new(archive_view).map_err(|_| SecBulkError::UnsafeArchive)?;
+    let report = scan_typed_rows(
+        &mut archive,
+        manifest,
+        limits,
+        deadline,
+        cancellation,
+        &mut |_| Ok(()),
+    )?;
+    let mut archive_view = archive.into_inner();
+    archive_view.verify_terminal(deadline, cancellation)?;
+    official_readme.verify_terminal(deadline, cancellation)?;
+    Ok(report)
+}
+
+fn observe_prevalidated_bulk_pair<A, R, F>(
+    pair: ImmutableBulkPair<A, R>,
+    manifest: &SecBulkLayoutManifest,
+    limits: SecBulkParseLimits,
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+    observer: &mut F,
+) -> Result<(), SecBulkError>
+where
+    A: Read + Seek,
+    R: Read + Seek,
+    F: FnMut(SecBulkNativeRow) -> Result<(), SecBulkError>,
+{
+    let ImmutableBulkPair {
+        archive: mut archive_view,
+        official_readme: _verified_readme,
+    } = pair;
+    preflight_zip_archive(
+        &mut archive_view,
+        manifest.capture().size_bytes(),
+        limits,
+        deadline,
+        cancellation,
+    )?;
+    let mut archive = ZipArchive::new(archive_view).map_err(|_| SecBulkError::UnsafeArchive)?;
+    observe_typed_rows(
+        &mut archive,
+        manifest,
+        limits,
+        deadline,
+        cancellation,
+        observer,
+    )
+}
+
+fn scan_typed_rows<R, F>(
+    archive: &mut ZipArchive<R>,
+    manifest: &SecBulkLayoutManifest,
+    limits: SecBulkParseLimits,
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+    emit: &mut F,
+) -> Result<SecBulkScanReport, SecBulkError>
+where
+    R: Read + Seek,
+    F: FnMut(SecBulkNativeRow) -> Result<(), SecBulkError>,
+{
+    inspect_zip_structure(
+        archive,
+        manifest.capture().selection().family(),
+        limits,
+        deadline,
+        cancellation,
+    )?;
+    let mut emitted = 0_u64;
+    let mut order = OrderedTypedRows::new();
+    for receipt in manifest.tables() {
+        check_cancelled(cancellation, deadline)?;
+        let mut entry = archive
+            .by_name(receipt.name().as_str())
+            .map_err(|_| SecBulkError::RecoveryMismatch)?;
+        let observed = project_typed_table::<true, _, _>(
+            manifest.capture().selection().family(),
+            receipt,
+            &mut entry,
+            limits,
+            deadline,
+            cancellation,
+            &mut |row| {
+                order.observe(&row)?;
+                emit(row)
+            },
+        )
+        .map_err(|error| table_scan_error(receipt, error))?;
+        emitted = emitted
+            .checked_add(observed)
+            .ok_or(SecBulkError::TsvLimitExceeded)?;
+    }
+    let source_rows = manifest.tables().iter().try_fold(0_u64, |total, table| {
+        total
+            .checked_add(table.row_count())
+            .ok_or(SecBulkError::TsvLimitExceeded)
+    })?;
+    if source_rows > MAX_SCAN_ROWS || emitted > source_rows {
+        return Err(SecBulkError::TsvLimitExceeded);
+    }
+    Ok(SecBulkScanReport {
+        manifest_evidence: manifest.evidence(),
+        source_rows,
+        emitted_typed_rows: emitted,
+        ordered_typed_rows_evidence: order.finish(emitted)?,
+    })
+}
+
+fn observe_typed_rows<R, F>(
+    archive: &mut ZipArchive<R>,
+    manifest: &SecBulkLayoutManifest,
+    limits: SecBulkParseLimits,
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+    observer: &mut F,
+) -> Result<(), SecBulkError>
+where
+    R: Read + Seek,
+    F: FnMut(SecBulkNativeRow) -> Result<(), SecBulkError>,
+{
+    inspect_zip_structure(
+        archive,
+        manifest.capture().selection().family(),
+        limits,
+        deadline,
+        cancellation,
+    )?;
+    for receipt in manifest.tables() {
+        check_cancelled(cancellation, deadline)?;
+        let mut entry = archive
+            .by_name(receipt.name().as_str())
+            .map_err(|_| SecBulkError::RecoveryMismatch)?;
+        project_typed_table::<false, _, _>(
+            manifest.capture().selection().family(),
+            receipt,
+            &mut entry,
+            limits,
+            deadline,
+            cancellation,
+            observer,
+        )
+        .map_err(|error| table_scan_error(receipt, error))?;
+    }
+    Ok(())
+}
+
+fn scan_verified_bulk_pair<A, R, S>(
+    pair: ImmutableBulkPair<A, R>,
+    manifest: &SecBulkLayoutManifest,
+    limits: SecBulkParseLimits,
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+    sink: &mut S,
+) -> Result<(SecBulkScanReport, S::Commit), SecBulkError>
+where
+    A: Read + Seek,
+    R: Read + Seek,
+    S: StreamingRowSink,
+{
+    check_cancelled(cancellation, deadline)?;
+    let ImmutableBulkPair {
+        archive: mut archive_view,
+        mut official_readme,
+    } = pair;
+    preflight_zip_archive(
+        &mut archive_view,
+        manifest.capture().size_bytes(),
+        limits,
+        deadline,
+        cancellation,
+    )?;
+    let mut archive = ZipArchive::new(archive_view).map_err(|_| SecBulkError::UnsafeArchive)?;
     inspect_zip_structure(
         &mut archive,
         manifest.capture().selection().family(),
@@ -218,19 +691,20 @@ pub fn scan_bulk_archive(
     )?;
     // Pass one proves all typed value contracts before a sink can even begin staging.
     let mut validated = 0_u64;
+    let mut validated_order = OrderedTypedRows::new();
     for receipt in manifest.tables() {
         check_cancelled(cancellation, deadline)?;
         let mut entry = archive
             .by_name(receipt.name().as_str())
             .map_err(|_| SecBulkError::RecoveryMismatch)?;
-        let observed = project_typed_table(
+        let observed = project_typed_table::<true, _, _>(
             manifest.capture().selection().family(),
             receipt,
             &mut entry,
             limits,
             deadline,
             cancellation,
-            &mut |_row| Ok(()),
+            &mut |row| validated_order.observe(&row),
         )
         .map_err(|error| table_scan_error(receipt, error))?;
         validated = validated
@@ -242,44 +716,98 @@ pub fn scan_bulk_archive(
             .checked_add(table.row_count())
             .ok_or(SecBulkError::TsvLimitExceeded)
     })?;
+    if source_rows > MAX_SCAN_ROWS || validated > source_rows {
+        return Err(SecBulkError::TsvLimitExceeded);
+    }
+    let ordered_typed_rows_evidence = validated_order.finish(validated)?;
     let report = SecBulkScanReport {
         manifest_evidence: manifest.evidence(),
         source_rows,
         emitted_typed_rows: validated,
+        ordered_typed_rows_evidence,
     };
 
-    sink.begin(manifest.evidence())?;
+    sink.begin(manifest)?;
     let staged = (|| {
         let mut emitted = 0_u64;
+        let mut staged_order = OrderedTypedRows::new();
         for receipt in manifest.tables() {
             check_cancelled(cancellation, deadline)?;
             let mut entry = archive
                 .by_name(receipt.name().as_str())
                 .map_err(|_| SecBulkError::RecoveryMismatch)?;
-            let observed = project_typed_table(
+            let observed = project_typed_table::<true, _, _>(
                 manifest.capture().selection().family(),
                 receipt,
                 &mut entry,
                 limits,
                 deadline,
                 cancellation,
-                &mut |row| sink.stage(row),
+                &mut |row| {
+                    staged_order.observe(&row)?;
+                    sink.stage(row)
+                },
             )
             .map_err(|error| table_scan_error(receipt, error))?;
             emitted = emitted
                 .checked_add(observed)
                 .ok_or(SecBulkError::TsvLimitExceeded)?;
         }
-        if emitted != report.emitted_typed_rows {
+        if emitted != report.emitted_typed_rows
+            || staged_order.finish(emitted)? != report.ordered_typed_rows_evidence
+        {
             return Err(SecBulkError::RecoveryMismatch);
         }
+        let mut archive_view = archive.into_inner();
+        archive_view.verify_terminal(deadline, cancellation)?;
+        official_readme.verify_terminal(deadline, cancellation)?;
         sink.commit(report)
     })();
-    if let Err(error) = staged {
-        sink.abort();
-        return Err(error);
+    match staged {
+        Ok(commit) => Ok((report, commit)),
+        Err(error) => {
+            sink.abort();
+            Err(error)
+        }
     }
-    Ok(report)
+}
+
+struct OrderedTypedRows {
+    digest: Sha256,
+    rows: u64,
+}
+
+impl OrderedTypedRows {
+    fn new() -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/sec-bulk-ordered-typed-rows/v1");
+        Self { digest, rows: 0 }
+    }
+
+    fn observe(&mut self, row: &SecBulkNativeRow) -> Result<(), SecBulkError> {
+        self.rows = self
+            .rows
+            .checked_add(1)
+            .ok_or(SecBulkError::TsvLimitExceeded)?;
+        if self.rows > MAX_SCAN_ROWS {
+            return Err(SecBulkError::TsvLimitExceeded);
+        }
+        hash_field(&mut self.digest, &row.table().ordinal().to_be_bytes());
+        hash_field(&mut self.digest, &row.row_number().to_be_bytes());
+        hash_field(&mut self.digest, &row.row_evidence().bytes());
+        Ok(())
+    }
+
+    fn finish(mut self, expected_rows: u64) -> Result<EvidenceDigest, SecBulkError> {
+        if self.rows != expected_rows {
+            return Err(SecBulkError::RecoveryMismatch);
+        }
+        hash_field(&mut self.digest, &self.rows.to_be_bytes());
+        Ok(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            self.digest.finalize().into(),
+        ))
+    }
 }
 
 fn table_scan_error(receipt: &SecBulkTableReceipt, error: SecBulkError) -> SecBulkError {
@@ -290,9 +818,9 @@ fn table_scan_error(receipt: &SecBulkTableReceipt, error: SecBulkError) -> SecBu
     }
 }
 
-fn inspect_file(
+fn inspect_file<A: Read + Seek, R: Read + Seek>(
     store: &RawEvidenceStore,
-    file: std::fs::File,
+    pair: ImmutableBulkPair<A, R>,
     capture: SecBulkCapture,
     official_readme_capture: SecBulkCapture,
     limits: SecBulkParseLimits,
@@ -303,8 +831,19 @@ fn inspect_file(
     if capture.size_bytes() > limits.max_archive_bytes {
         return Err(SecBulkError::ArchiveTooLarge);
     }
+    let ImmutableBulkPair {
+        archive: mut archive_view,
+        mut official_readme,
+    } = pair;
     let family = capture.selection().family();
-    let mut archive = ZipArchive::new(file).map_err(|_| SecBulkError::UnsafeArchive)?;
+    preflight_zip_archive(
+        &mut archive_view,
+        capture.size_bytes(),
+        limits,
+        deadline,
+        cancellation,
+    )?;
+    let mut archive = ZipArchive::new(archive_view).map_err(|_| SecBulkError::UnsafeArchive)?;
     let structure = inspect_zip_structure(&mut archive, family, limits, deadline, cancellation)?;
     let metadata_name = family.metadata_member();
     let readme_name = family.archive_readme_member();
@@ -389,7 +928,7 @@ fn inspect_file(
         )?);
     }
     integrity.finish(deadline, cancellation)?;
-    SecBulkLayoutManifest::try_new(
+    let manifest = SecBulkLayoutManifest::try_new(
         capture,
         official_readme_capture,
         sha256(&metadata_bytes),
@@ -398,12 +937,255 @@ fn inspect_file(
         receipts,
         absent_declared_tables,
         structure.expanded_bytes,
-    )
+    )?;
+    let mut archive_view = archive.into_inner();
+    archive_view.verify_terminal(deadline, cancellation)?;
+    official_readme.verify_terminal(deadline, cancellation)?;
+    Ok(manifest)
 }
 
 struct ArchiveStructure {
     names: BTreeSet<String>,
     expanded_bytes: u64,
+}
+
+fn preflight_zip_archive<R: Read + Seek>(
+    reader: &mut R,
+    expected_bytes: u64,
+    limits: SecBulkParseLimits,
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+) -> Result<(), SecBulkError> {
+    check_cancelled(cancellation, deadline)?;
+    let file_bytes = reader.seek(SeekFrom::End(0))?;
+    if file_bytes != expected_bytes {
+        return Err(SecBulkError::RecoveryMismatch);
+    }
+    if file_bytes > limits.max_archive_bytes {
+        return Err(SecBulkError::ArchiveTooLarge);
+    }
+    if file_bytes < EOCD_MIN_BYTES as u64 {
+        return Err(SecBulkError::UnsafeArchive);
+    }
+
+    let tail_bytes = file_bytes.min(EOCD_SEARCH_BYTES as u64);
+    let tail_start = file_bytes
+        .checked_sub(tail_bytes)
+        .ok_or(SecBulkError::UnsafeArchive)?;
+    let tail_len = usize::try_from(tail_bytes).map_err(|_| SecBulkError::UnsafeArchive)?;
+    let mut tail = [0_u8; EOCD_SEARCH_BYTES];
+    seek_zip(reader, tail_start, deadline, cancellation)?;
+    read_zip_exact(reader, &mut tail[..tail_len], deadline, cancellation)?;
+
+    let mut eocd_relative = None;
+    for offset in (0..=tail_len - EOCD_MIN_BYTES).rev() {
+        if offset % 4096 == 0 {
+            check_cancelled(cancellation, deadline)?;
+        }
+        if tail[offset..offset + 4] != [0x50, 0x4b, 0x05, 0x06] {
+            continue;
+        }
+        let comment_bytes = usize::from(zip_u16(&tail[offset..], 20)?);
+        let valid_end = offset
+            .checked_add(EOCD_MIN_BYTES)
+            .and_then(|end| end.checked_add(comment_bytes))
+            .is_some_and(|end| end == tail_len);
+        if valid_end && eocd_relative.replace(offset).is_some() {
+            return Err(SecBulkError::UnsafeArchive);
+        }
+    }
+    let eocd_relative = eocd_relative.ok_or(SecBulkError::UnsafeArchive)?;
+    let eocd_offset = tail_start
+        .checked_add(u64::try_from(eocd_relative).map_err(|_| SecBulkError::UnsafeArchive)?)
+        .ok_or(SecBulkError::UnsafeArchive)?;
+    let eocd = &tail[eocd_relative..eocd_relative + EOCD_MIN_BYTES];
+    let disk = zip_u16(eocd, 4)?;
+    let central_directory_disk = zip_u16(eocd, 6)?;
+    if disk != 0 || central_directory_disk != 0 {
+        return Err(SecBulkError::UnsafeArchive);
+    }
+    let disk_entries_16 = zip_u16(eocd, 8)?;
+    let total_entries_16 = zip_u16(eocd, 10)?;
+    let central_directory_bytes_32 = zip_u32(eocd, 12)?;
+    let central_directory_offset_32 = zip_u32(eocd, 16)?;
+    let needs_zip64 = disk_entries_16 == u16::MAX
+        || total_entries_16 == u16::MAX
+        || central_directory_bytes_32 == u32::MAX
+        || central_directory_offset_32 == u32::MAX;
+
+    let locator_offset = eocd_offset.checked_sub(ZIP64_LOCATOR_BYTES);
+    let mut locator = [0_u8; ZIP64_LOCATOR_BYTES as usize];
+    let has_zip64_locator = if let Some(offset) = locator_offset {
+        read_zip_at(reader, offset, &mut locator, deadline, cancellation)?;
+        locator[..4] == [0x50, 0x4b, 0x06, 0x07]
+    } else {
+        false
+    };
+    if needs_zip64 && !has_zip64_locator {
+        return Err(SecBulkError::UnsafeArchive);
+    }
+
+    let (entries, central_directory_bytes, central_directory_offset, central_directory_end) =
+        if has_zip64_locator {
+            let locator_offset = locator_offset.ok_or(SecBulkError::UnsafeArchive)?;
+            if zip_u32(&locator, 4)? != 0 || zip_u32(&locator, 16)? != 1 {
+                return Err(SecBulkError::UnsafeArchive);
+            }
+            let zip64_offset = zip_u64(&locator, 8)?;
+            if zip64_offset >= locator_offset {
+                return Err(SecBulkError::UnsafeArchive);
+            }
+            let mut zip64 = [0_u8; ZIP64_EOCD_MIN_BYTES as usize];
+            read_zip_at(reader, zip64_offset, &mut zip64, deadline, cancellation)?;
+            if zip64[..4] != [0x50, 0x4b, 0x06, 0x06] {
+                return Err(SecBulkError::UnsafeArchive);
+            }
+            let zip64_body_bytes = zip_u64(&zip64, 4)?;
+            let zip64_record_bytes = zip64_body_bytes
+                .checked_add(12)
+                .ok_or(SecBulkError::UnsafeArchive)?;
+            if zip64_body_bytes < 44 || zip64_record_bytes > MAX_ZIP64_EOCD_BYTES {
+                return Err(SecBulkError::UnsafeArchive);
+            }
+            if zip64_offset
+                .checked_add(zip64_record_bytes)
+                .is_none_or(|end| end != locator_offset)
+                || zip_u32(&zip64, 16)? != 0
+                || zip_u32(&zip64, 20)? != 0
+            {
+                return Err(SecBulkError::UnsafeArchive);
+            }
+            let disk_entries = zip_u64(&zip64, 24)?;
+            let total_entries = zip_u64(&zip64, 32)?;
+            let central_directory_bytes = zip_u64(&zip64, 40)?;
+            let central_directory_offset = zip_u64(&zip64, 48)?;
+            if disk_entries != total_entries
+                || (disk_entries_16 != u16::MAX && u64::from(disk_entries_16) != disk_entries)
+                || (total_entries_16 != u16::MAX && u64::from(total_entries_16) != total_entries)
+                || (central_directory_bytes_32 != u32::MAX
+                    && u64::from(central_directory_bytes_32) != central_directory_bytes)
+                || (central_directory_offset_32 != u32::MAX
+                    && u64::from(central_directory_offset_32) != central_directory_offset)
+            {
+                return Err(SecBulkError::UnsafeArchive);
+            }
+            (
+                total_entries,
+                central_directory_bytes,
+                central_directory_offset,
+                zip64_offset,
+            )
+        } else {
+            if disk_entries_16 != total_entries_16 {
+                return Err(SecBulkError::UnsafeArchive);
+            }
+            (
+                u64::from(total_entries_16),
+                u64::from(central_directory_bytes_32),
+                u64::from(central_directory_offset_32),
+                eocd_offset,
+            )
+        };
+
+    let maximum_entries = u64::try_from(limits.max_archive_entries)
+        .map_err(|_| SecBulkError::EntryLimitExceeded)?
+        .min(MAX_ARCHIVE_ENTRIES as u64);
+    if entries == 0 || entries > maximum_entries {
+        return Err(SecBulkError::EntryLimitExceeded);
+    }
+    let minimum_central_directory_bytes =
+        entries.checked_mul(46).ok_or(SecBulkError::UnsafeArchive)?;
+    if central_directory_bytes < minimum_central_directory_bytes
+        || central_directory_bytes > MAX_CENTRAL_DIRECTORY_BYTES
+    {
+        return Err(SecBulkError::UnsafeArchive);
+    }
+    if central_directory_offset
+        .checked_add(central_directory_bytes)
+        .is_none_or(|end| end != central_directory_end || end > file_bytes)
+    {
+        return Err(SecBulkError::UnsafeArchive);
+    }
+    let mut signature = [0_u8; 4];
+    read_zip_at(
+        reader,
+        central_directory_offset,
+        &mut signature,
+        deadline,
+        cancellation,
+    )?;
+    if signature != [0x50, 0x4b, 0x01, 0x02] {
+        return Err(SecBulkError::UnsafeArchive);
+    }
+    read_zip_at(reader, 0, &mut signature, deadline, cancellation)?;
+    if signature != [0x50, 0x4b, 0x03, 0x04] {
+        return Err(SecBulkError::UnsafeArchive);
+    }
+    seek_zip(reader, 0, deadline, cancellation)
+}
+
+fn seek_zip<R: Seek>(
+    reader: &mut R,
+    offset: u64,
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+) -> Result<(), SecBulkError> {
+    check_cancelled(cancellation, deadline)?;
+    if reader.seek(SeekFrom::Start(offset))? != offset {
+        return Err(SecBulkError::UnsafeArchive);
+    }
+    check_cancelled(cancellation, deadline)
+}
+
+fn read_zip_at<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    bytes: &mut [u8],
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+) -> Result<(), SecBulkError> {
+    seek_zip(reader, offset, deadline, cancellation)?;
+    read_zip_exact(reader, bytes, deadline, cancellation)
+}
+
+fn read_zip_exact<R: Read>(
+    reader: &mut R,
+    mut bytes: &mut [u8],
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+) -> Result<(), SecBulkError> {
+    while !bytes.is_empty() {
+        check_cancelled(cancellation, deadline)?;
+        let read = reader.read(bytes)?;
+        if read == 0 {
+            return Err(SecBulkError::UnsafeArchive);
+        }
+        bytes = &mut bytes[read..];
+    }
+    check_cancelled(cancellation, deadline)
+}
+
+fn zip_u16(bytes: &[u8], offset: usize) -> Result<u16, SecBulkError> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or(SecBulkError::UnsafeArchive)?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn zip_u32(bytes: &[u8], offset: usize) -> Result<u32, SecBulkError> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or(SecBulkError::UnsafeArchive)?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn zip_u64(bytes: &[u8], offset: usize) -> Result<u64, SecBulkError> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or(SecBulkError::UnsafeArchive)?;
+    Ok(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
 }
 
 fn inspect_zip_structure<R: Read + Seek>(
@@ -1244,13 +2026,17 @@ impl<R: Read> Read for HashingReader<R> {
 struct ScratchBudget {
     used_bytes: Cell<u64>,
     maximum_bytes: u64,
+    used_files: Cell<usize>,
+    maximum_files: usize,
 }
 
 impl ScratchBudget {
-    const fn new(maximum_bytes: u64) -> Self {
+    const fn new(maximum_bytes: u64, maximum_files: usize) -> Self {
         Self {
             used_bytes: Cell::new(0),
             maximum_bytes,
+            used_files: Cell::new(0),
+            maximum_files,
         }
     }
 
@@ -1271,6 +2057,23 @@ impl ScratchBudget {
         self.used_bytes
             .set(self.used_bytes.get().saturating_sub(bytes));
     }
+
+    fn reserve_file(&self) -> Result<(), SecBulkError> {
+        let next = self
+            .used_files
+            .get()
+            .checked_add(1)
+            .ok_or(SecBulkError::ScratchLimitExceeded)?;
+        if next > self.maximum_files {
+            return Err(SecBulkError::ScratchLimitExceeded);
+        }
+        self.used_files.set(next);
+        Ok(())
+    }
+
+    fn release_file(&self) {
+        self.used_files.set(self.used_files.get().saturating_sub(1));
+    }
 }
 
 struct TrackedScratch<'a> {
@@ -1281,8 +2084,16 @@ struct TrackedScratch<'a> {
 
 impl<'a> TrackedScratch<'a> {
     fn new(store: &'a RawEvidenceStore, budget: Rc<ScratchBudget>) -> Result<Self, SecBulkError> {
+        budget.reserve_file()?;
+        let scratch = match store.create_scratch() {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                budget.release_file();
+                return Err(error.into());
+            }
+        };
         Ok(Self {
-            scratch: store.create_scratch()?,
+            scratch,
             budget,
             bytes: 0,
         })
@@ -1321,6 +2132,7 @@ impl<'a> TrackedScratch<'a> {
 impl Drop for TrackedScratch<'_> {
     fn drop(&mut self) {
         self.budget.release(self.bytes);
+        self.budget.release_file();
     }
 }
 
@@ -1624,7 +2436,13 @@ impl<'a> ArchiveIntegrityValidator<'a> {
         if limits.max_validation_scratch_bytes < configured_peak {
             return Err(SecBulkError::ScratchLimitExceeded);
         }
-        let budget = Rc::new(ScratchBudget::new(limits.max_validation_scratch_bytes));
+        if limits.max_validation_scratch_files == 0 {
+            return Err(SecBulkError::ScratchLimitExceeded);
+        }
+        let budget = Rc::new(ScratchBudget::new(
+            limits.max_validation_scratch_bytes,
+            limits.max_validation_scratch_files,
+        ));
         Ok(Self {
             store,
             family,
@@ -1812,7 +2630,7 @@ fn optional_column_value<'a>(
     Ok((!value.is_empty()).then_some(value))
 }
 
-fn has_canonical_projection(family: SecBulkFamily, table: &str) -> bool {
+fn has_provider_projection(family: SecBulkFamily, table: &str) -> bool {
     match family {
         SecBulkFamily::Nport => matches!(
             table,
@@ -1975,7 +2793,7 @@ fn validate_typed_contract(
     Ok(())
 }
 
-fn project_typed_table<R: Read, F>(
+fn project_typed_table<const VERIFY_RECEIPT: bool, R: Read, F>(
     family: SecBulkFamily,
     receipt: &SecBulkTableReceipt,
     reader: R,
@@ -2001,7 +2819,7 @@ where
         return Err(SecBulkError::HeaderMismatch);
     }
     let table = SecBulkTableKind::from_member(family, receipt.name().as_str())?;
-    let has_projection = has_canonical_projection(family, receipt.name().as_str());
+    let has_projection = has_provider_projection(family, receipt.name().as_str());
     if has_projection {
         validate_typed_contract(family, receipt)?;
     }
@@ -2018,17 +2836,23 @@ where
             return Err(SecBulkError::RecoveryMismatch);
         }
         let evidence = row_evidence(receipt.name().as_str(), rows, &record);
-        let canonical_projection = if has_projection {
-            optional_canonical_projection(project_row(
+        let projection_disposition = if has_projection {
+            projection_disposition(
                 family,
                 receipt.name().as_str(),
                 &projector,
                 &record,
-                rows,
-                evidence,
-            ))?
+                project_row(
+                    family,
+                    receipt.name().as_str(),
+                    &projector,
+                    &record,
+                    rows,
+                    evidence,
+                ),
+            )?
         } else {
-            None
+            SecBulkProjectionDisposition::NotApplicable
         };
         let native = project_metadata_governed_row(
             table,
@@ -2036,17 +2860,19 @@ where
             &record,
             rows,
             evidence,
-            canonical_projection,
+            projection_disposition,
         )?;
         emit(native)?;
     }
     let hashing = tsv.into_inner();
-    let (evidence, bytes) = hashing.finish()?;
-    if evidence != receipt.evidence()
-        || bytes != receipt.decoded_bytes()
-        || rows != receipt.row_count()
-    {
-        return Err(SecBulkError::RecoveryMismatch);
+    if VERIFY_RECEIPT {
+        let (evidence, bytes) = hashing.finish()?;
+        if evidence != receipt.evidence()
+            || bytes != receipt.decoded_bytes()
+            || rows != receipt.row_count()
+        {
+            return Err(SecBulkError::RecoveryMismatch);
+        }
     }
     Ok(rows)
 }
@@ -2082,7 +2908,7 @@ fn project_metadata_governed_row(
     record: &TsvRecord,
     row_number: u64,
     row_evidence: EvidenceDigest,
-    canonical_projection: Option<SecBulkCanonicalProjection>,
+    projection_disposition: SecBulkProjectionDisposition,
 ) -> Result<SecBulkNativeRow, SecBulkError> {
     let mut fields = Vec::new();
     fields
@@ -2175,7 +3001,7 @@ fn project_metadata_governed_row(
         primary_key,
         joins,
         fields,
-        canonical_projection,
+        projection_disposition,
         membership: None,
         row_number,
         row_evidence,
@@ -2189,10 +3015,10 @@ fn project_row(
     row: &TsvRecord,
     row_number: u64,
     row_evidence: EvidenceDigest,
-) -> Result<SecBulkCanonicalProjection, SecBulkError> {
+) -> Result<SecBulkProviderProjection, SecBulkError> {
     match (family, table) {
-        (SecBulkFamily::Nport, "SUBMISSION.tsv") => Ok(
-            SecBulkCanonicalProjection::NportSubmission(Box::new(SecNportSubmissionRow {
+        (SecBulkFamily::Nport, "SUBMISSION.tsv") => Ok(SecBulkProviderProjection::NportSubmission(
+            Box::new(SecNportSubmissionRow {
                 accession: accession(columns.get(row, "ACCESSION_NUMBER")?)?,
                 filing_date: optional_date(columns.get(row, "FILING_DATE")?)?,
                 form: required_identifier(columns.get(row, "SUB_TYPE")?)?,
@@ -2201,20 +3027,20 @@ fn project_row(
                 is_last_filing: optional_bool(columns.get(row, "IS_LAST_FILING")?)?,
                 row_number,
                 row_evidence,
-            })),
-        ),
-        (SecBulkFamily::Nport, "REGISTRANT.tsv") => Ok(
-            SecBulkCanonicalProjection::NportRegistrant(Box::new(SecNportRegistrantRow {
+            }),
+        )),
+        (SecBulkFamily::Nport, "REGISTRANT.tsv") => Ok(SecBulkProviderProjection::NportRegistrant(
+            Box::new(SecNportRegistrantRow {
                 accession: accession(columns.get(row, "ACCESSION_NUMBER")?)?,
                 cik: cik(columns.get(row, "CIK")?)?,
                 registrant_name: optional_string(columns.get(row, "REGISTRANT_NAME")?),
                 lei: optional_identifier(columns.get(row, "LEI")?)?,
                 row_number,
                 row_evidence,
-            })),
-        ),
+            }),
+        )),
         (SecBulkFamily::Nport, "FUND_REPORTED_INFO.tsv") => Ok(
-            SecBulkCanonicalProjection::NportFund(Box::new(SecNportFundRow {
+            SecBulkProviderProjection::NportFund(Box::new(SecNportFundRow {
                 accession: accession(columns.get(row, "ACCESSION_NUMBER")?)?,
                 series_name: optional_string(columns.get(row, "SERIES_NAME")?),
                 series_id: series_id(columns.get(row, "SERIES_ID")?)?,
@@ -2227,7 +3053,7 @@ fn project_row(
             })),
         ),
         (SecBulkFamily::Nport, "FUND_REPORTED_HOLDING.tsv") => Ok(
-            SecBulkCanonicalProjection::NportHolding(Box::new(SecNportHoldingRow {
+            SecBulkProviderProjection::NportHolding(Box::new(SecNportHoldingRow {
                 accession: accession(columns.get(row, "ACCESSION_NUMBER")?)?,
                 holding_id: numeric_identifier(columns.get(row, "HOLDING_ID")?, 38)?,
                 issuer_name: optional_string(columns.get(row, "ISSUER_NAME")?),
@@ -2255,7 +3081,7 @@ fn project_row(
             })),
         ),
         (SecBulkFamily::Nport, "IDENTIFIERS.tsv") => Ok(
-            SecBulkCanonicalProjection::NportIdentifier(Box::new(SecNportIdentifierRow {
+            SecBulkProviderProjection::NportIdentifier(Box::new(SecNportIdentifierRow {
                 holding_id: numeric_identifier(columns.get(row, "HOLDING_ID")?, 38)?,
                 identifiers_id: numeric_identifier(columns.get(row, "IDENTIFIERS_ID")?, 38)?,
                 isin: optional_identifier(columns.get(row, "IDENTIFIER_ISIN")?)?,
@@ -2268,7 +3094,7 @@ fn project_row(
                 row_evidence,
             })),
         ),
-        (SecBulkFamily::Ncen, "SUBMISSION.tsv") => Ok(SecBulkCanonicalProjection::NcenSubmission(
+        (SecBulkFamily::Ncen, "SUBMISSION.tsv") => Ok(SecBulkProviderProjection::NcenSubmission(
             Box::new(SecNcenSubmissionRow {
                 accession: accession(columns.get(row, "ACCESSION_NUMBER")?)?,
                 form: required_identifier(columns.get(row, "SUBMISSION_TYPE")?)?,
@@ -2282,7 +3108,7 @@ fn project_row(
                 row_evidence,
             }),
         )),
-        (SecBulkFamily::Ncen, "REGISTRANT.tsv") => Ok(SecBulkCanonicalProjection::NcenRegistrant(
+        (SecBulkFamily::Ncen, "REGISTRANT.tsv") => Ok(SecBulkProviderProjection::NcenRegistrant(
             Box::new(SecNcenRegistrantRow {
                 accession: accession(columns.get(row, "ACCESSION_NUMBER")?)?,
                 cik: cik(columns.get(row, "CIK")?)?,
@@ -2297,8 +3123,8 @@ fn project_row(
                 row_evidence,
             }),
         )),
-        (SecBulkFamily::Ncen, "FUND_REPORTED_INFO.tsv") => Ok(
-            SecBulkCanonicalProjection::NcenFund(Box::new(SecNcenFundRow {
+        (SecBulkFamily::Ncen, "FUND_REPORTED_INFO.tsv") => Ok(SecBulkProviderProjection::NcenFund(
+            Box::new(SecNcenFundRow {
                 fund_id: compound_fund_id(columns.get(row, "FUND_ID")?)?,
                 accession: accession(columns.get(row, "ACCESSION_NUMBER")?)?,
                 fund_name: optional_string(columns.get(row, "FUND_NAME")?),
@@ -2314,9 +3140,9 @@ fn project_row(
                 ),
                 row_number,
                 row_evidence,
-            })),
-        ),
-        (SecBulkFamily::Ncen, "ETF.tsv") => Ok(SecBulkCanonicalProjection::NcenEtf(Box::new(
+            }),
+        )),
+        (SecBulkFamily::Ncen, "ETF.tsv") => Ok(SecBulkProviderProjection::NcenEtf(Box::new(
             SecNcenEtfRow {
                 fund_id: compound_fund_id(columns.get(row, "FUND_ID")?)?,
                 fund_name: optional_string(columns.get(row, "FUND_NAME")?),
@@ -2333,39 +3159,70 @@ fn project_row(
                 row_evidence,
             },
         ))),
-        (SecBulkFamily::Ncen, "SECURITY_EXCHANGE.tsv") => {
-            Ok(SecBulkCanonicalProjection::NcenSecurityExchange(Box::new(
-                SecNcenSecurityExchangeRow {
-                    fund_id: compound_fund_id(columns.get(row, "FUND_ID")?)?,
-                    exchange: optional_identifier(columns.get(row, "FUND_EXCHANGE")?)?,
-                    ticker: optional_identifier(columns.get(row, "FUND_TICKER_SYMBOL")?)?,
-                    row_number,
-                    row_evidence,
-                },
-            )))
-        }
+        (SecBulkFamily::Ncen, "SECURITY_EXCHANGE.tsv") => Ok(
+            SecBulkProviderProjection::NcenSecurityExchange(Box::new(SecNcenSecurityExchangeRow {
+                fund_id: compound_fund_id(columns.get(row, "FUND_ID")?)?,
+                exchange: optional_identifier(columns.get(row, "FUND_EXCHANGE")?)?,
+                ticker: optional_identifier(columns.get(row, "FUND_TICKER_SYMBOL")?)?,
+                row_number,
+                row_evidence,
+            })),
+        ),
         _ => Err(SecBulkError::InvalidLayout),
     }
 }
 
-fn optional_canonical_projection(
-    projection: Result<SecBulkCanonicalProjection, SecBulkError>,
-) -> Result<Option<SecBulkCanonicalProjection>, SecBulkError> {
+fn projection_disposition(
+    family: SecBulkFamily,
+    table: &str,
+    columns: &RowProjector,
+    row: &TsvRecord,
+    projection: Result<SecBulkProviderProjection, SecBulkError>,
+) -> Result<SecBulkProjectionDisposition, SecBulkError> {
     match projection {
-        Ok(projection) => Ok(Some(projection)),
-        // The metadata-governed native row remains valid when a nullable or provider-shaped
-        // display field cannot satisfy the narrower canonical identity contract. That row must
-        // remain queryable and force canonical abstention instead of invalidating the archive.
-        Err(SecBulkError::InvalidTsv | SecBulkError::Identity(_)) => Ok(None),
+        Ok(projection) => Ok(SecBulkProjectionDisposition::Projected(projection)),
+        Err(SecBulkError::InvalidTsv)
+            if required_projection_source_missing(family, table, columns, row)? =>
+        {
+            Ok(SecBulkProjectionDisposition::SourceMissing)
+        }
+        Err(SecBulkError::InvalidTsv) => Ok(SecBulkProjectionDisposition::InvalidSource),
+        Err(SecBulkError::Identity(_)) => Ok(SecBulkProjectionDisposition::UnresolvedIdentity),
         Err(error) => Err(error),
     }
 }
 
-pub(super) fn canonical_projection_from_native(
+fn required_projection_source_missing(
+    family: SecBulkFamily,
+    table: &str,
+    columns: &RowProjector,
+    row: &TsvRecord,
+) -> Result<bool, SecBulkError> {
+    let required: &[&str] = match (family, table) {
+        (SecBulkFamily::Nport, "SUBMISSION.tsv") => &["ACCESSION_NUMBER", "SUB_TYPE"],
+        (SecBulkFamily::Nport, "REGISTRANT.tsv") => &["ACCESSION_NUMBER", "CIK"],
+        (SecBulkFamily::Nport, "FUND_REPORTED_INFO.tsv") => &["ACCESSION_NUMBER", "SERIES_ID"],
+        (SecBulkFamily::Nport, "FUND_REPORTED_HOLDING.tsv") => &["ACCESSION_NUMBER", "HOLDING_ID"],
+        (SecBulkFamily::Nport, "IDENTIFIERS.tsv") => &["HOLDING_ID", "IDENTIFIERS_ID"],
+        (SecBulkFamily::Ncen, "SUBMISSION.tsv") => &["ACCESSION_NUMBER", "SUBMISSION_TYPE", "CIK"],
+        (SecBulkFamily::Ncen, "REGISTRANT.tsv") => &["ACCESSION_NUMBER", "CIK"],
+        (SecBulkFamily::Ncen, "FUND_REPORTED_INFO.tsv") => &["FUND_ID", "ACCESSION_NUMBER"],
+        (SecBulkFamily::Ncen, "ETF.tsv" | "SECURITY_EXCHANGE.tsv") => &["FUND_ID"],
+        _ => return Err(SecBulkError::InvalidLayout),
+    };
+    for name in required {
+        if columns.get(row, name)?.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(super) fn provider_projection_disposition_from_native(
     row: &SecBulkNativeRow,
-) -> Result<Option<SecBulkCanonicalProjection>, SecBulkError> {
-    if !has_canonical_projection(row.table.family(), row.table.member_name()) {
-        return Ok(None);
+) -> Result<SecBulkProjectionDisposition, SecBulkError> {
+    if !has_provider_projection(row.table.family(), row.table.member_name()) {
+        return Ok(SecBulkProjectionDisposition::NotApplicable);
     }
     let mut columns = BTreeMap::new();
     let mut values = Vec::new();
@@ -2386,14 +3243,22 @@ pub(super) fn canonical_projection_from_native(
             SecBulkTypedValue::Number(value) => value.as_str().to_owned(),
         });
     }
-    optional_canonical_projection(project_row(
+    let projector = RowProjector { columns };
+    let values = TsvRecord(values);
+    projection_disposition(
         row.table.family(),
         row.table.member_name(),
-        &RowProjector { columns },
-        &TsvRecord(values),
-        row.row_number,
-        row.row_evidence,
-    ))
+        &projector,
+        &values,
+        project_row(
+            row.table.family(),
+            row.table.member_name(),
+            &projector,
+            &values,
+            row.row_number,
+            row.row_evidence,
+        ),
+    )
 }
 
 fn row_evidence(table: &str, row_number: u64, record: &TsvRecord) -> EvidenceDigest {
