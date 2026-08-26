@@ -24,10 +24,14 @@ use crate::{RawCaptureRecord, RawCaptureRecordError, raw_record::MAX_SERIALIZED_
 mod sealed;
 
 pub use sealed::{
+    PendingResearchObject, ResearchObjectAdmission, ResearchObjectCheckpointClaim,
+    ResearchObjectChunkReceipt, ResearchObjectClaim, ResearchObjectControl,
+    ResearchObjectControlError, ResearchObjectControlPoint, ResearchObjectReceipt,
     SealedResearchJournalFrameReceipt, SealedResearchJournalRecoveryReport,
     SealedResearchJournalSegment, SealedResearchJournalSegmentClaim,
     SealedResearchJournalSegmentReceipt, SealedResearchJournalStore,
-    SealedResearchJournalStoreError,
+    SealedResearchJournalStoreError, SealedResearchRawClaim, SealedResearchRecoveryAdmission,
+    SealedResearchRecoverySession, VerifiedResearchObject,
 };
 
 const CURRENT_MAGIC: &[u8; 4] = b"MSJ1";

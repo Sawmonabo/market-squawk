@@ -55,10 +55,14 @@ pub use input::{
 };
 pub use journal::{
     JournalError, JournalReader, JournalReplayAuthority, JournalSinkConstructionError,
-    JournalSinkLimits, JournalWriter, SealedResearchJournalFrameReceipt,
-    SealedResearchJournalRecoveryReport, SealedResearchJournalSegment,
-    SealedResearchJournalSegmentClaim, SealedResearchJournalSegmentReceipt,
-    SealedResearchJournalStore, SealedResearchJournalStoreError,
+    JournalSinkLimits, JournalWriter, PendingResearchObject, ResearchObjectAdmission,
+    ResearchObjectCheckpointClaim, ResearchObjectChunkReceipt, ResearchObjectClaim,
+    ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
+    ResearchObjectReceipt, SealedResearchJournalFrameReceipt, SealedResearchJournalRecoveryReport,
+    SealedResearchJournalSegment, SealedResearchJournalSegmentClaim,
+    SealedResearchJournalSegmentReceipt, SealedResearchJournalStore,
+    SealedResearchJournalStoreError, SealedResearchRawClaim, SealedResearchRecoveryAdmission,
+    SealedResearchRecoverySession, VerifiedResearchObject,
 };
 pub use paths::{
     ArtifactPathError, ArtifactRoot, CatalogFileGuard, CatalogLocation, CatalogRestoreScanGuard,

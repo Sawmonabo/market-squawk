@@ -6,7 +6,7 @@
 //! hashed, and published without replacement.
 
 use std::{
-    collections::BTreeSet,
+    cell::Cell,
     fmt,
     fs::File,
     io::{BufWriter, Read, Seek, SeekFrom, Write},
@@ -28,6 +28,17 @@ use uuid::Uuid;
 
 use super::{CURRENT_MAGIC, JournalError, JournalReader, write_current_frame};
 use crate::RawCaptureRecord;
+
+#[path = "sealed_object.rs"]
+mod sealed_object;
+
+pub use sealed_object::{
+    PendingResearchObject, ResearchObjectAdmission, ResearchObjectCheckpointClaim,
+    ResearchObjectChunkReceipt, ResearchObjectClaim, ResearchObjectControl,
+    ResearchObjectControlError, ResearchObjectControlPoint, ResearchObjectReceipt,
+    SealedResearchRawClaim, SealedResearchRecoveryAdmission, SealedResearchRecoverySession,
+    VerifiedResearchObject,
+};
 
 const STORE_DIRECTORY: &str = "research-segments";
 const STAGING_DIRECTORY: &str = "staging";
@@ -319,27 +330,51 @@ impl SealedResearchJournalSegment {
 }
 
 /// Conservative startup-recovery result. Quarantine entries are retained, never deleted here.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct SealedResearchJournalRecoveryReport {
-    quarantined_staging: Box<[Box<str>]>,
-    quarantined_objects: Box<[Box<str>]>,
+    quarantined_staging: Vec<String>,
+    quarantined_objects: Vec<String>,
     retained_quarantine_entries: usize,
+    retained_journal_segments: usize,
+    retained_raw_records: usize,
+    retained_logical_objects: usize,
+    retained_logical_object_chunks: usize,
 }
 
 impl SealedResearchJournalRecoveryReport {
     /// Returns staging filenames moved out of the writable namespace.
-    pub fn quarantined_staging(&self) -> &[Box<str>] {
+    pub fn quarantined_staging(&self) -> &[String] {
         &self.quarantined_staging
     }
 
     /// Returns unreferenced immutable object references moved to quarantine.
-    pub fn quarantined_objects(&self) -> &[Box<str>] {
+    pub fn quarantined_objects(&self) -> &[String] {
         &self.quarantined_objects
     }
 
     /// Returns the complete bounded quarantine entry count after recovery.
     pub const fn retained_quarantine_entries(&self) -> usize {
         self.retained_quarantine_entries
+    }
+
+    /// Returns the number of unique catalog-linked `MSJ1` objects retained by recovery.
+    pub const fn retained_journal_segments(&self) -> usize {
+        self.retained_journal_segments
+    }
+
+    /// Returns raw records retained across unique catalog-linked `MSJ1` objects.
+    pub const fn retained_raw_records(&self) -> usize {
+        self.retained_raw_records
+    }
+
+    /// Returns the number of unique catalog-linked logical raw objects retained by recovery.
+    pub const fn retained_logical_objects(&self) -> usize {
+        self.retained_logical_objects
+    }
+
+    /// Returns the complete integrity-chunk count across retained logical raw objects.
+    pub const fn retained_logical_object_chunks(&self) -> usize {
+        self.retained_logical_object_chunks
     }
 }
 
@@ -352,7 +387,7 @@ pub enum SealedResearchJournalStoreError {
     /// Another process already owns the single research-segment store authority.
     #[error("research-segment store already has an active owner")]
     AlreadyOwned,
-    /// A sealed segment must contain at least one exact provider response.
+    /// A sealed segment must contain at least one exact bounded raw record.
     #[error("research-segment store refuses an empty segment")]
     EmptySegment,
     /// A sealed segment exceeded its fixed frame-count ceiling.
@@ -379,12 +414,51 @@ pub enum SealedResearchJournalStoreError {
     /// Startup recovery encountered malformed, ambiguous, or excessive state and stopped.
     #[error("research-segment recovery encountered unrecognized or excessive state")]
     RecoveryStateInvalid,
+    /// A streaming recovery budget is zero, excessive, or internally inconsistent.
+    #[error("sealed research-object recovery admission is invalid")]
+    InvalidRecoveryAdmission,
+    /// A failed claim or control check permanently aborted this recovery session.
+    #[error("sealed research-object recovery session is aborted")]
+    RecoverySessionAborted,
     /// In-process operation serialization was poisoned.
     #[error("research-segment operation lock is poisoned")]
     OperationLockPoisoned,
     /// Existing or newly written bytes are not a valid `MSJ1` journal.
     #[error(transparent)]
     Journal(#[from] JournalError),
+    /// A final hard link exists, but durable publication could not be conclusively completed.
+    #[error("sealed research-object publication is indeterminate after final-link creation")]
+    RawPublicationIndeterminate,
+    /// A logical-object admission is zero, reaches the format ceiling, or is internally invalid.
+    #[error("logical research-object admission is invalid")]
+    InvalidObjectAdmission,
+    /// A logical object exceeded the provider-owned admitted byte ceiling.
+    #[error("logical research-object bytes exceed admitted maximum {max}")]
+    ObjectByteLimitExceeded {
+        /// Provider-owned maximum for this object.
+        max: u64,
+    },
+    /// A logical object exceeded the provider-owned admitted integrity-chunk ceiling.
+    #[error("logical research-object chunks exceed admitted maximum {max}")]
+    ObjectChunkLimitExceeded {
+        /// Provider-owned maximum for this object.
+        max: usize,
+    },
+    /// A bounded logical-object vector could not reserve its complete admitted capacity.
+    #[error("logical research-object bounded allocation failed")]
+    ObjectAllocationFailed,
+    /// A persisted logical-object checkpoint does not match the exact staged prefix.
+    #[error("logical research-object checkpoint does not match the staged prefix")]
+    ObjectCheckpointMismatch,
+    /// Another live pending writer still owns this logical-object stage.
+    #[error("logical research-object stage already has an active writer")]
+    ObjectStageActive,
+    /// A logical-object claim or exact reopened bytes disagree.
+    #[error("logical research-object receipt does not match the sealed object")]
+    ObjectReceiptMismatch,
+    /// Caller cancellation, deadline, or trusted control stopped the operation before commit.
+    #[error(transparent)]
+    ObjectControl(#[from] ResearchObjectControlError),
     /// A capability-confined filesystem operation failed.
     #[error("{context}: {source}")]
     Io {
@@ -448,7 +522,7 @@ impl SealedResearchJournalStore {
         }
         let owner_lock = owner_lock.into_std();
         owner_lock.try_lock_exclusive().map_err(|source| {
-            if source.kind() == std::io::ErrorKind::WouldBlock {
+            if fs_lock_contended(&source) {
                 SealedResearchJournalStoreError::AlreadyOwned
             } else {
                 SealedResearchJournalStoreError::io(
@@ -468,7 +542,7 @@ impl SealedResearchJournalStore {
         })
     }
 
-    /// Seals ordered raw provider responses into an immutable content-addressed `MSJ1` object.
+    /// Seals ordered bounded raw records into an immutable content-addressed `MSJ1` object.
     ///
     /// A returned receipt proves the stage was flushed and synchronized, the complete file was
     /// hashed and replay-validated, and the final name was published without replacement.
@@ -510,121 +584,6 @@ impl SealedResearchJournalStore {
         self.open_verified_claim_inner(claim)
     }
 
-    /// Quarantines all incomplete stages and all final objects absent from the complete catalog.
-    ///
-    /// Every supplied authoritative receipt is verified before any mutation. Quarantine content
-    /// is retained and reported; this recovery boundary never deletes evidence or guesses whether
-    /// malformed entries are safe.
-    pub fn recover_after_catalog_scan(
-        &self,
-        authoritative: &[SealedResearchJournalSegmentClaim],
-    ) -> Result<SealedResearchJournalRecoveryReport, SealedResearchJournalStoreError> {
-        let _operation = self
-            .operation
-            .lock()
-            .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
-        self.validate_owner()?;
-        if authoritative.len() > MAX_RECOVERY_ENTRIES {
-            return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-        }
-        let mut inspected_entries = authoritative.len();
-        let mut retained = BTreeSet::new();
-        for claim in authoritative {
-            let verified = self.open_verified_claim_inner(claim)?;
-            retained.insert(digest_hex(verified.receipt().content_digest()));
-        }
-
-        let mut quarantined_staging = Vec::new();
-        let staging_entries = bounded_entries(&self.staging)?;
-        charge_recovery_entries(&mut inspected_entries, staging_entries.len())?;
-        for entry in staging_entries {
-            let name = portable_name(&entry.file_name())?;
-            if !entry
-                .file_type()
-                .map_err(|source| {
-                    SealedResearchJournalStoreError::io(
-                        "failed to inspect staging entry type",
-                        source,
-                    )
-                })?
-                .is_file()
-            {
-                return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-            }
-            let quarantine_name = format!("staging-{name}");
-            quarantine_no_replace(&self.staging, &name, &self.quarantine, &quarantine_name)?;
-            quarantined_staging.push(Box::<str>::from(name));
-        }
-
-        let mut quarantined_objects = Vec::new();
-        let shard_entries = bounded_entries(&self.objects)?;
-        charge_recovery_entries(&mut inspected_entries, shard_entries.len())?;
-        for shard_entry in shard_entries {
-            let shard = portable_name(&shard_entry.file_name())?;
-            if !is_lower_hex(&shard, 2)
-                || !shard_entry
-                    .file_type()
-                    .map_err(|source| {
-                        SealedResearchJournalStoreError::io(
-                            "failed to inspect object shard type",
-                            source,
-                        )
-                    })?
-                    .is_dir()
-            {
-                return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-            }
-            let shard_directory = self.objects.open_dir_nofollow(&shard).map_err(|source| {
-                SealedResearchJournalStoreError::io("failed to open object shard", source)
-            })?;
-            let file_entries = bounded_entries(&shard_directory)?;
-            charge_recovery_entries(&mut inspected_entries, file_entries.len())?;
-            for file_entry in file_entries {
-                let filename = portable_name(&file_entry.file_name())?;
-                let Some(hex) = filename.strip_suffix(".msj") else {
-                    return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-                };
-                if !is_lower_hex(hex, 64)
-                    || !hex.starts_with(&shard)
-                    || !file_entry
-                        .file_type()
-                        .map_err(|source| {
-                            SealedResearchJournalStoreError::io(
-                                "failed to inspect sealed object type",
-                                source,
-                            )
-                        })?
-                        .is_file()
-                {
-                    return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-                }
-                if retained.contains(hex) {
-                    continue;
-                }
-                let reference = format!("objects/sha256/{shard}/{filename}");
-                let quarantine_name = format!("object-{filename}");
-                quarantine_no_replace(
-                    &shard_directory,
-                    &filename,
-                    &self.quarantine,
-                    &quarantine_name,
-                )?;
-                quarantined_objects.push(Box::<str>::from(reference));
-            }
-            sync_directory(&shard_directory)?;
-        }
-        sync_directory(&self.staging)?;
-        sync_directory(&self.quarantine)?;
-        let quarantine_entries = bounded_entries(&self.quarantine)?;
-        charge_recovery_entries(&mut inspected_entries, quarantine_entries.len())?;
-        let retained_quarantine_entries = quarantine_entries.len();
-        Ok(SealedResearchJournalRecoveryReport {
-            quarantined_staging: quarantined_staging.into_boxed_slice(),
-            quarantined_objects: quarantined_objects.into_boxed_slice(),
-            retained_quarantine_entries,
-        })
-    }
-
     fn validate_owner(&self) -> Result<(), SealedResearchJournalStoreError> {
         let named = self
             .root
@@ -661,7 +620,12 @@ impl SealedResearchJournalStore {
         let stage_name = format!("{}.msj.stage", Uuid::new_v4());
         let stage = open_private_file(&self.staging, &stage_name, true)?;
         let result = self.write_validate_publish_stage(stage, &stage_name, records);
-        if result.is_err() {
+        if result.is_err()
+            && !matches!(
+                &result,
+                Err(SealedResearchJournalStoreError::RawPublicationIndeterminate)
+            )
+        {
             match self.staging.remove_file(&stage_name) {
                 Ok(()) => {
                     let _ignored_sync_failure = sync_directory(&self.staging);
@@ -775,7 +739,7 @@ impl SealedResearchJournalStore {
         {
             return Err(SealedResearchJournalStoreError::StateConflict);
         }
-        let content_digest = hash_file(&mut stage, size_bytes)?;
+        let content_digest = hash_file_bounded(&mut stage, size_bytes, MAX_SEALED_BYTES)?;
         validate_exact_records(&stage, records)?;
 
         let hex = digest_hex(content_digest);
@@ -797,8 +761,24 @@ impl SealedResearchJournalStore {
         };
 
         let shard = ensure_directory(&self.objects, shard_name)?;
-        match self.staging.hard_link(stage_name, &shard, &filename) {
-            Ok(()) => {
+        let published_new = match self.staging.hard_link(stage_name, &shard, &filename) {
+            Ok(()) => true,
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = self.open_verified_from_shard(&shard, &filename, &claim)?;
+                if existing.receipt() != &receipt {
+                    return Err(SealedResearchJournalStoreError::StateConflict);
+                }
+                false
+            }
+            Err(source) => {
+                return Err(SealedResearchJournalStoreError::io(
+                    "failed to publish sealed MSJ1 object without replacement",
+                    source,
+                ));
+            }
+        };
+        if published_new {
+            let completed = (|| {
                 let published = shard.symlink_metadata(&filename).map_err(|source| {
                     SealedResearchJournalStoreError::io(
                         "failed to inspect newly linked MSJ1 object",
@@ -807,25 +787,30 @@ impl SealedResearchJournalStore {
                 })?;
                 if !published.file_type().is_file()
                     || published.len() != size_bytes
+                    || cap_fs_ext::MetadataExt::nlink(&published) != 2
                     || FileIdentity::from_metadata(&published) != stage_identity
                 {
                     return Err(SealedResearchJournalStoreError::StateConflict);
                 }
                 sync_directory(&shard)?;
-            }
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = self.open_verified_from_shard(&shard, &filename, &claim)?;
-                if existing.receipt() != &receipt {
+                drop(stage);
+                self.staging.remove_file(stage_name).map_err(|source| {
+                    SealedResearchJournalStoreError::io(
+                        "failed to retire linked MSJ1 stage",
+                        source,
+                    )
+                })?;
+                sync_directory(&self.staging)?;
+                let verified = self.open_verified_from_shard(&shard, &filename, &claim)?;
+                if verified.receipt() != &receipt {
                     return Err(SealedResearchJournalStoreError::StateConflict);
                 }
-            }
-            Err(source) => {
-                return Err(SealedResearchJournalStoreError::io(
-                    "failed to publish sealed MSJ1 object without replacement",
-                    source,
-                ));
-            }
+                Ok(verified.receipt)
+            })();
+            return completed
+                .map_err(|_error| SealedResearchJournalStoreError::RawPublicationIndeterminate);
         }
+
         drop(stage);
         self.staging.remove_file(stage_name).map_err(|source| {
             SealedResearchJournalStoreError::io("failed to remove published MSJ1 stage", source)
@@ -842,6 +827,14 @@ impl SealedResearchJournalStore {
         &self,
         claim: &SealedResearchJournalSegmentClaim,
     ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
+        self.open_verified_claim_inner_with_control(claim, None)
+    }
+
+    fn open_verified_claim_inner_with_control(
+        &self,
+        claim: &SealedResearchJournalSegmentClaim,
+        control: Option<&dyn ResearchObjectControl>,
+    ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
         validate_claim_shape(claim)?;
         let hex = digest_hex(claim.content_digest);
         let shard = self
@@ -854,7 +847,7 @@ impl SealedResearchJournalStore {
                 )
             })?;
         let filename = format!("{hex}.msj");
-        self.open_verified_from_shard(&shard, &filename, claim)
+        self.open_verified_from_shard_with_control(&shard, &filename, claim, control)
     }
 
     fn open_verified_from_shard(
@@ -862,6 +855,16 @@ impl SealedResearchJournalStore {
         shard: &Dir,
         filename: &str,
         claim: &SealedResearchJournalSegmentClaim,
+    ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
+        self.open_verified_from_shard_with_control(shard, filename, claim, None)
+    }
+
+    fn open_verified_from_shard_with_control(
+        &self,
+        shard: &Dir,
+        filename: &str,
+        claim: &SealedResearchJournalSegmentClaim,
+        control: Option<&dyn ResearchObjectControl>,
     ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
         let named = shard.symlink_metadata(filename).map_err(|source| {
             SealedResearchJournalStoreError::io("failed to inspect sealed MSJ1 object", source)
@@ -891,19 +894,25 @@ impl SealedResearchJournalStore {
             })?
             .len()
             != claim.size_bytes
-            || hash_file(&mut file, claim.size_bytes)? != claim.content_digest
+            || hash_file_bounded_with_control(
+                &mut file,
+                claim.size_bytes,
+                MAX_SEALED_BYTES,
+                control,
+            )? != claim.content_digest
         {
             return Err(SealedResearchJournalStoreError::ReceiptMismatch);
         }
-        validate_current_magic(&mut file)?;
-        let records = JournalReader::new(file).read_all_bounded(
+        let records = read_msj_records_bounded(
+            file,
             claim.frames.len(),
             claim.size_bytes.saturating_sub(CURRENT_MAGIC.len() as u64),
+            control,
         )?;
         if records.len() != claim.frames.len() {
             return Err(SealedResearchJournalStoreError::ReceiptMismatch);
         }
-        validate_frame_receipts(&records, claim)?;
+        validate_frame_receipts(&records, claim, control)?;
         let named_after = shard.symlink_metadata(filename).map_err(|source| {
             SealedResearchJournalStoreError::io("failed to re-inspect sealed MSJ1 object", source)
         })?;
@@ -929,9 +938,11 @@ impl SealedResearchJournalStore {
 fn validate_frame_receipts(
     records: &[RawCaptureRecord],
     claim: &SealedResearchJournalSegmentClaim,
+    control: Option<&dyn ResearchObjectControl>,
 ) -> Result<(), SealedResearchJournalStoreError> {
     let mut offset = u64::try_from(CURRENT_MAGIC.len())
         .map_err(|_| SealedResearchJournalStoreError::ReceiptMismatch)?;
+    let mut verified_payload_bytes = 0_u64;
     for (ordinal, (record, frame)) in records.iter().zip(claim.frames.iter()).enumerate() {
         let serialized = serialized_record_bytes(record)?;
         let framed_bytes = serialized
@@ -942,6 +953,8 @@ fn validate_frame_receipts(
             .timestamp_nanos_opt()
             .map(Timestamp::from_unix_nanos)
             .ok_or(SealedResearchJournalStoreError::InvalidReceiveTimestamp)?;
+        let provider_payload_digest =
+            sha256_with_control(record.payload(), &mut verified_payload_bytes, control)?;
         if frame.ordinal
             != u32::try_from(ordinal).map_err(|_| {
                 SealedResearchJournalStoreError::FrameLimitExceeded {
@@ -953,7 +966,7 @@ fn validate_frame_receipts(
             || frame.provider_payload_bytes
                 != u64::try_from(record.payload().len())
                     .map_err(|_| SealedResearchJournalStoreError::ReceiptMismatch)?
-            || frame.provider_payload_digest != sha256(record.payload())
+            || frame.provider_payload_digest != provider_payload_digest
             || frame.received_at != received_at
             || frame.source_sequence != record.source_sequence()
         {
@@ -1022,16 +1035,14 @@ fn validate_exact_records(
     file: &File,
     expected: &[RawCaptureRecord],
 ) -> Result<(), SealedResearchJournalStoreError> {
-    let mut clone = file.try_clone().map_err(|source| {
+    let clone = file.try_clone().map_err(|source| {
         SealedResearchJournalStoreError::io("failed to clone sealed MSJ1 stage", source)
     })?;
-    clone.seek(SeekFrom::Start(0)).map_err(|source| {
-        SealedResearchJournalStoreError::io("failed to rewind sealed MSJ1 stage", source)
-    })?;
-    validate_current_magic(&mut clone)?;
-    let actual = JournalReader::new(clone).read_all_bounded(
+    let actual = read_msj_records_bounded(
+        clone,
         expected.len(),
         MAX_SEALED_BYTES.saturating_sub(CURRENT_MAGIC.len() as u64),
+        None,
     )?;
     if actual != expected {
         return Err(SealedResearchJournalStoreError::ReceiptMismatch);
@@ -1039,21 +1050,83 @@ fn validate_exact_records(
     Ok(())
 }
 
-fn validate_current_magic(file: &mut File) -> Result<(), SealedResearchJournalStoreError> {
-    file.seek(SeekFrom::Start(0)).map_err(|source| {
-        SealedResearchJournalStoreError::io("failed to rewind sealed MSJ1 header", source)
-    })?;
-    let mut magic = [0_u8; 4];
-    file.read_exact(&mut magic).map_err(|source| {
-        SealedResearchJournalStoreError::io("failed to read sealed MSJ1 header", source)
-    })?;
-    if &magic != CURRENT_MAGIC {
+fn validate_unclaimed_msj_with_control(
+    file: &File,
+    size_bytes: u64,
+    control: Option<&dyn ResearchObjectControl>,
+) -> Result<(), SealedResearchJournalStoreError> {
+    if size_bytes > MAX_SEALED_BYTES {
         return Err(SealedResearchJournalStoreError::ReceiptMismatch);
     }
-    file.seek(SeekFrom::Start(0)).map_err(|source| {
-        SealedResearchJournalStoreError::io("failed to rewind validated MSJ1 object", source)
+    let clone = file.try_clone().map_err(|source| {
+        SealedResearchJournalStoreError::io("failed to clone recovered MSJ1 object", source)
     })?;
+    let records = read_msj_records_bounded(
+        clone,
+        MAX_SEALED_FRAMES,
+        size_bytes.saturating_sub(CURRENT_MAGIC.len() as u64),
+        control,
+    )?;
+    if records.is_empty() {
+        return Err(SealedResearchJournalStoreError::ReceiptMismatch);
+    }
     Ok(())
+}
+
+struct RecoveryControlledReader<'control, 'failure, R> {
+    inner: R,
+    control: &'control dyn ResearchObjectControl,
+    failure: &'failure Cell<Option<ResearchObjectControlError>>,
+    observed_bytes: u64,
+}
+
+impl<R: Read> Read for RecoveryControlledReader<'_, '_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if let Err(error) =
+            self.control
+                .checkpoint(ResearchObjectControlPoint::BeforeVerificationChunk {
+                    offset_bytes: self.observed_bytes,
+                })
+        {
+            self.failure.set(Some(error));
+            return Err(std::io::Error::other(
+                "sealed research recovery control stopped journal replay",
+            ));
+        }
+        let attempt = buffer.len().min(HASH_BUFFER_BYTES);
+        let read = self.inner.read(&mut buffer[..attempt])?;
+        self.observed_bytes = self
+            .observed_bytes
+            .checked_add(u64::try_from(read).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("sealed journal replay offset overflowed"))?;
+        Ok(read)
+    }
+}
+
+fn read_msj_records_bounded(
+    mut file: File,
+    maximum_records: usize,
+    maximum_bytes: u64,
+    control: Option<&dyn ResearchObjectControl>,
+) -> Result<Vec<RawCaptureRecord>, SealedResearchJournalStoreError> {
+    file.seek(SeekFrom::Start(0)).map_err(|source| {
+        SealedResearchJournalStoreError::io("failed to rewind sealed MSJ1 object", source)
+    })?;
+    let Some(control) = control else {
+        return Ok(JournalReader::new(file).read_all_bounded(maximum_records, maximum_bytes)?);
+    };
+    let failure = Cell::new(None);
+    let result = JournalReader::new(RecoveryControlledReader {
+        inner: file,
+        control,
+        failure: &failure,
+        observed_bytes: 0,
+    })
+    .read_all_bounded(maximum_records, maximum_bytes);
+    if let Some(error) = failure.get() {
+        return Err(error.into());
+    }
+    Ok(result?)
 }
 
 fn serialized_record_bytes(
@@ -1099,9 +1172,52 @@ fn sha256(bytes: &[u8]) -> EvidenceDigest {
     EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into())
 }
 
-fn hash_file(
+fn sha256_with_control(
+    bytes: &[u8],
+    verified_bytes: &mut u64,
+    control: Option<&dyn ResearchObjectControl>,
+) -> Result<EvidenceDigest, SealedResearchJournalStoreError> {
+    let Some(control) = control else {
+        *verified_bytes = verified_bytes
+            .checked_add(
+                u64::try_from(bytes.len())
+                    .map_err(|_| SealedResearchJournalStoreError::ReceiptMismatch)?,
+            )
+            .ok_or(SealedResearchJournalStoreError::ReceiptMismatch)?;
+        return Ok(sha256(bytes));
+    };
+    let mut hash = Sha256::new();
+    for chunk in bytes.chunks(HASH_BUFFER_BYTES) {
+        control.checkpoint(ResearchObjectControlPoint::BeforeVerificationChunk {
+            offset_bytes: *verified_bytes,
+        })?;
+        hash.update(chunk);
+        *verified_bytes = verified_bytes
+            .checked_add(
+                u64::try_from(chunk.len())
+                    .map_err(|_| SealedResearchJournalStoreError::ReceiptMismatch)?,
+            )
+            .ok_or(SealedResearchJournalStoreError::ReceiptMismatch)?;
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hash.finalize().into(),
+    ))
+}
+
+fn hash_file_bounded(
     file: &mut File,
     expected_bytes: u64,
+    maximum_bytes: u64,
+) -> Result<EvidenceDigest, SealedResearchJournalStoreError> {
+    hash_file_bounded_with_control(file, expected_bytes, maximum_bytes, None)
+}
+
+fn hash_file_bounded_with_control(
+    file: &mut File,
+    expected_bytes: u64,
+    maximum_bytes: u64,
+    control: Option<&dyn ResearchObjectControl>,
 ) -> Result<EvidenceDigest, SealedResearchJournalStoreError> {
     file.seek(SeekFrom::Start(0)).map_err(|source| {
         SealedResearchJournalStoreError::io("failed to rewind sealed MSJ1 bytes", source)
@@ -1110,6 +1226,11 @@ fn hash_file(
     let mut observed = 0_u64;
     let mut buffer = [0_u8; HASH_BUFFER_BYTES];
     loop {
+        if let Some(control) = control {
+            control.checkpoint(ResearchObjectControlPoint::BeforeVerificationChunk {
+                offset_bytes: observed,
+            })?;
+        }
         let count = file.read(&mut buffer).map_err(|source| {
             SealedResearchJournalStoreError::io("failed to hash sealed MSJ1 bytes", source)
         })?;
@@ -1125,7 +1246,7 @@ fn hash_file(
             .ok_or(SealedResearchJournalStoreError::ByteLimitExceeded {
                 max: MAX_SEALED_BYTES,
             })?;
-        if observed > expected_bytes || observed > MAX_SEALED_BYTES {
+        if observed > expected_bytes || observed > maximum_bytes {
             return Err(SealedResearchJournalStoreError::ReceiptMismatch);
         }
         hash.update(&buffer[..count]);
@@ -1237,44 +1358,77 @@ fn sync_directory(directory: &Dir) -> Result<(), SealedResearchJournalStoreError
     }
 }
 
-fn bounded_entries(
-    directory: &Dir,
-) -> Result<Vec<cap_std::fs::DirEntry>, SealedResearchJournalStoreError> {
-    let mut entries = Vec::new();
-    let iterator = directory.entries().map_err(|source| {
-        SealedResearchJournalStoreError::io("failed to enumerate research-segment state", source)
-    })?;
-    for entry in iterator {
-        if entries.len() >= MAX_RECOVERY_ENTRIES {
-            return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-        }
-        entries.push(entry.map_err(|source| {
-            SealedResearchJournalStoreError::io(
-                "failed to read research-segment directory entry",
-                source,
-            )
-        })?);
-    }
-    entries.sort_by_key(cap_std::fs::DirEntry::file_name);
-    Ok(entries)
+struct BoundedNamedEntry {
+    name: String,
+    entry: cap_std::fs::DirEntry,
 }
 
-fn charge_recovery_entries(
-    observed: &mut usize,
-    additional: usize,
-) -> Result<(), SealedResearchJournalStoreError> {
-    *observed = observed
-        .checked_add(additional)
-        .ok_or(SealedResearchJournalStoreError::RecoveryStateInvalid)?;
-    if *observed > MAX_RECOVERY_ENTRIES {
-        Err(SealedResearchJournalStoreError::RecoveryStateInvalid)
-    } else {
+#[derive(Clone, Copy)]
+struct RecoveryControl<'control> {
+    control: &'control dyn ResearchObjectControl,
+    inspected_entries: usize,
+}
+
+impl RecoveryControl<'_> {
+    fn before_mutation(self) -> Result<(), SealedResearchJournalStoreError> {
+        self.control
+            .checkpoint(ResearchObjectControlPoint::BeforeRecoveryMutation {
+                inspected_entries: self.inspected_entries,
+            })?;
         Ok(())
     }
 }
 
-fn portable_name(name: &std::ffi::OsStr) -> Result<String, SealedResearchJournalStoreError> {
-    name.to_str()
+fn bounded_entries(
+    directory: &Dir,
+    inspected_entries: &mut usize,
+    maximum_entries: usize,
+    control: &dyn ResearchObjectControl,
+) -> Result<Vec<BoundedNamedEntry>, SealedResearchJournalStoreError> {
+    if maximum_entries > MAX_RECOVERY_ENTRIES || *inspected_entries > maximum_entries {
+        return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
+    }
+    let mut entries = Vec::new();
+    let mut iterator = directory.entries().map_err(|source| {
+        SealedResearchJournalStoreError::io("failed to enumerate research-segment state", source)
+    })?;
+    let remaining = maximum_entries - *inspected_entries;
+    entries
+        .try_reserve_exact(iterator.size_hint().0.min(remaining))
+        .map_err(|_| SealedResearchJournalStoreError::ObjectAllocationFailed)?;
+    loop {
+        control.checkpoint(ResearchObjectControlPoint::BeforeRecoveryEntry {
+            inspected_entries: *inspected_entries,
+        })?;
+        let Some(entry) = iterator.next() else {
+            break;
+        };
+        if *inspected_entries >= maximum_entries {
+            return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
+        }
+        let entry = entry.map_err(|source| {
+            SealedResearchJournalStoreError::io(
+                "failed to read research-segment directory entry",
+                source,
+            )
+        })?;
+        entries
+            .try_reserve(1)
+            .map_err(|_| SealedResearchJournalStoreError::ObjectAllocationFailed)?;
+        let file_name = entry.file_name();
+        let name = try_portable_name(&file_name)?;
+        entries.push(BoundedNamedEntry { name, entry });
+        *inspected_entries = inspected_entries
+            .checked_add(1)
+            .ok_or(SealedResearchJournalStoreError::RecoveryStateInvalid)?;
+    }
+    entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries)
+}
+
+fn try_portable_name(name: &std::ffi::OsStr) -> Result<String, SealedResearchJournalStoreError> {
+    let value = name
+        .to_str()
         .filter(|value| {
             !value.is_empty()
                 && *value != "."
@@ -1284,8 +1438,26 @@ fn portable_name(name: &std::ffi::OsStr) -> Result<String, SealedResearchJournal
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
         })
-        .map(str::to_owned)
-        .ok_or(SealedResearchJournalStoreError::RecoveryStateInvalid)
+        .ok_or(SealedResearchJournalStoreError::RecoveryStateInvalid)?;
+    try_string_from_parts(&[value])
+}
+
+fn try_string_from_parts(parts: &[&str]) -> Result<String, SealedResearchJournalStoreError> {
+    let length = parts
+        .iter()
+        .try_fold(0_usize, |length, part| length.checked_add(part.len()));
+    let length = length.ok_or(SealedResearchJournalStoreError::RecoveryStateInvalid)?;
+    if length > 512 {
+        return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
+    }
+    let mut value = String::new();
+    value
+        .try_reserve_exact(length)
+        .map_err(|_| SealedResearchJournalStoreError::ObjectAllocationFailed)?;
+    for part in parts {
+        value.push_str(part);
+    }
+    Ok(value)
 }
 
 fn is_lower_hex(value: &str, exact_length: usize) -> bool {
@@ -1295,18 +1467,229 @@ fn is_lower_hex(value: &str, exact_length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+struct OpenedCollisionFile {
+    file: File,
+    identity: FileIdentity,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ExactFileMatch {
+    source_identity: FileIdentity,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct QuarantineAdmission<'control> {
+    maximum_bytes: u64,
+    expected_source_identity: Option<FileIdentity>,
+    recovery: Option<RecoveryControl<'control>>,
+}
+
+fn open_collision_file(
+    directory: &Dir,
+    name: &str,
+    maximum_bytes: u64,
+    expected_identity: Option<FileIdentity>,
+) -> Result<OpenedCollisionFile, SealedResearchJournalStoreError> {
+    let named = directory.symlink_metadata(name).map_err(|source| {
+        SealedResearchJournalStoreError::io("failed to inspect quarantine file", source)
+    })?;
+    validate_collision_metadata(&named, None, maximum_bytes)?;
+    let identity = FileIdentity::from_metadata(&named);
+    if expected_identity.is_some_and(|expected| expected != identity) {
+        return Err(SealedResearchJournalStoreError::StateConflict);
+    }
+    let file = open_readonly(directory, name)?;
+    let opened = opened_file_metadata(&file)?;
+    validate_collision_metadata(&opened, Some(named.len()), maximum_bytes)?;
+    if FileIdentity::from_metadata(&opened) != identity {
+        return Err(SealedResearchJournalStoreError::StateConflict);
+    }
+    let evidence = OpenedCollisionFile {
+        file,
+        identity,
+        size_bytes: named.len(),
+    };
+    revalidate_collision_file(directory, name, &evidence, maximum_bytes)?;
+    Ok(evidence)
+}
+
+fn revalidate_collision_file(
+    directory: &Dir,
+    name: &str,
+    evidence: &OpenedCollisionFile,
+    maximum_bytes: u64,
+) -> Result<(), SealedResearchJournalStoreError> {
+    let named = directory.symlink_metadata(name).map_err(|source| {
+        SealedResearchJournalStoreError::io("failed to re-inspect quarantine file", source)
+    })?;
+    let opened = opened_file_metadata(&evidence.file)?;
+    validate_collision_metadata(&named, Some(evidence.size_bytes), maximum_bytes)?;
+    validate_collision_metadata(&opened, Some(evidence.size_bytes), maximum_bytes)?;
+    if FileIdentity::from_metadata(&named) != evidence.identity
+        || FileIdentity::from_metadata(&opened) != evidence.identity
+    {
+        return Err(SealedResearchJournalStoreError::StateConflict);
+    }
+    Ok(())
+}
+
+fn validate_named_collision_identity(
+    directory: &Dir,
+    name: &str,
+    evidence: ExactFileMatch,
+    maximum_bytes: u64,
+) -> Result<(), SealedResearchJournalStoreError> {
+    let named = directory.symlink_metadata(name).map_err(|source| {
+        SealedResearchJournalStoreError::io("failed to revalidate quarantine source name", source)
+    })?;
+    validate_collision_metadata(&named, Some(evidence.size_bytes), maximum_bytes)?;
+    if FileIdentity::from_metadata(&named) != evidence.source_identity {
+        return Err(SealedResearchJournalStoreError::StateConflict);
+    }
+    Ok(())
+}
+
+fn validate_collision_metadata(
+    metadata: &cap_std::fs::Metadata,
+    expected_bytes: Option<u64>,
+    maximum_bytes: u64,
+) -> Result<(), SealedResearchJournalStoreError> {
+    if !metadata.is_file()
+        || metadata.len() > maximum_bytes
+        || expected_bytes.is_some_and(|expected| metadata.len() != expected)
+    {
+        return Err(SealedResearchJournalStoreError::StateConflict);
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(SealedResearchJournalStoreError::StateConflict);
+        }
+    }
+    Ok(())
+}
+
 fn quarantine_no_replace(
     source_directory: &Dir,
     source_name: &str,
     quarantine: &Dir,
     quarantine_name: &str,
+    maximum_bytes: u64,
+    recovery: Option<RecoveryControl<'_>>,
 ) -> Result<(), SealedResearchJournalStoreError> {
+    quarantine_no_replace_with_admission(
+        source_directory,
+        source_name,
+        quarantine,
+        quarantine_name,
+        QuarantineAdmission {
+            maximum_bytes,
+            expected_source_identity: None,
+            recovery,
+        },
+    )
+}
+
+fn quarantine_no_replace_with_admission(
+    source_directory: &Dir,
+    source_name: &str,
+    quarantine: &Dir,
+    quarantine_name: &str,
+    admission: QuarantineAdmission<'_>,
+) -> Result<(), SealedResearchJournalStoreError> {
+    let QuarantineAdmission {
+        maximum_bytes,
+        expected_source_identity,
+        recovery,
+    } = admission;
+    let admitted_source = open_collision_file(
+        source_directory,
+        source_name,
+        maximum_bytes,
+        expected_source_identity,
+    )?;
+    let admitted_source_match = ExactFileMatch {
+        source_identity: admitted_source.identity,
+        size_bytes: admitted_source.size_bytes,
+    };
+    drop(admitted_source);
+    if let Some(recovery) = recovery {
+        recovery.before_mutation()?;
+    }
     match source_directory.hard_link(source_name, quarantine, quarantine_name) {
-        Ok(()) => sync_directory(quarantine)?,
+        Ok(()) => {
+            let completed = (|| {
+                let source = open_collision_file(
+                    source_directory,
+                    source_name,
+                    maximum_bytes,
+                    Some(admitted_source_match.source_identity),
+                )?;
+                let target = open_collision_file(
+                    quarantine,
+                    quarantine_name,
+                    maximum_bytes,
+                    Some(admitted_source_match.source_identity),
+                )?;
+                if source.size_bytes != admitted_source_match.size_bytes
+                    || target.size_bytes != admitted_source_match.size_bytes
+                    || source.identity != target.identity
+                {
+                    return Err(SealedResearchJournalStoreError::StateConflict);
+                }
+                drop(source);
+                drop(target);
+                sync_directory(quarantine)?;
+                validate_named_collision_identity(
+                    source_directory,
+                    source_name,
+                    admitted_source_match,
+                    maximum_bytes,
+                )?;
+                source_directory
+                    .remove_file(source_name)
+                    .map_err(|source| {
+                        SealedResearchJournalStoreError::io(
+                            "failed to remove quarantined source entry",
+                            source,
+                        )
+                    })?;
+                sync_directory(source_directory)
+            })();
+            return completed
+                .map_err(|_error| SealedResearchJournalStoreError::RawPublicationIndeterminate);
+        }
         Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-            if !exact_files_match(source_directory, source_name, quarantine, quarantine_name)? {
+            let Some(exact_match) = exact_files_match(
+                source_directory,
+                source_name,
+                quarantine,
+                quarantine_name,
+                maximum_bytes,
+                recovery.map(|recovery| recovery.control),
+            )?
+            else {
+                return Err(SealedResearchJournalStoreError::StateConflict);
+            };
+            if exact_match.source_identity != admitted_source_match.source_identity
+                || exact_match.size_bytes != admitted_source_match.size_bytes
+            {
                 return Err(SealedResearchJournalStoreError::StateConflict);
             }
+            if let Some(recovery) = recovery {
+                recovery.before_mutation()?;
+            }
+            validate_named_collision_identity(
+                source_directory,
+                source_name,
+                exact_match,
+                maximum_bytes,
+            )?;
         }
         Err(source) => {
             return Err(SealedResearchJournalStoreError::io(
@@ -1321,6 +1704,91 @@ fn quarantine_no_replace(
             SealedResearchJournalStoreError::io("failed to remove quarantined source entry", source)
         })?;
     sync_directory(source_directory)
+        .map_err(|_error| SealedResearchJournalStoreError::RawPublicationIndeterminate)
+}
+
+fn quarantine_stage_no_replace(
+    source_directory: &Dir,
+    source_name: &str,
+    quarantine: &Dir,
+    quarantine_name: &str,
+    maximum_bytes: u64,
+    expected_links: u64,
+    recovery: Option<RecoveryControl<'_>>,
+) -> Result<(), SealedResearchJournalStoreError> {
+    let writer_lease = open_locked_private_stage(source_directory, source_name, expected_links)?;
+    let writer_identity = FileIdentity::from_metadata(&opened_file_metadata(&writer_lease)?);
+    quarantine_no_replace_with_admission(
+        source_directory,
+        source_name,
+        quarantine,
+        quarantine_name,
+        QuarantineAdmission {
+            maximum_bytes,
+            expected_source_identity: Some(writer_identity),
+            recovery,
+        },
+    )
+}
+
+fn open_locked_private_stage(
+    directory: &Dir,
+    name: &str,
+    expected_links: u64,
+) -> Result<File, SealedResearchJournalStoreError> {
+    let named = directory.symlink_metadata(name).map_err(|source| {
+        SealedResearchJournalStoreError::io("failed to inspect research-object stage lease", source)
+    })?;
+    validate_private_regular_file_links(&named, None, expected_links)?;
+    let identity = FileIdentity::from_metadata(&named);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).follow(FollowSymlinks::No);
+    let file = directory
+        .open_with(name, &options)
+        .map(cap_std::fs::File::into_std)
+        .map_err(|source| {
+            SealedResearchJournalStoreError::io(
+                "failed to open research-object stage lease",
+                source,
+            )
+        })?;
+    lock_pending_stage(&file)?;
+    let named_after = directory.symlink_metadata(name).map_err(|source| {
+        SealedResearchJournalStoreError::io(
+            "failed to re-inspect research-object stage lease",
+            source,
+        )
+    })?;
+    let opened = opened_file_metadata(&file)?;
+    validate_private_regular_file_links(&named_after, None, expected_links)?;
+    validate_private_regular_file_links(&opened, None, expected_links)?;
+    if FileIdentity::from_metadata(&named_after) != identity
+        || FileIdentity::from_metadata(&opened) != identity
+    {
+        return Err(SealedResearchJournalStoreError::StateConflict);
+    }
+    Ok(file)
+}
+
+fn lock_pending_stage(file: &File) -> Result<(), SealedResearchJournalStoreError> {
+    file.try_lock_exclusive().map_err(|source| {
+        if fs_lock_contended(&source) {
+            SealedResearchJournalStoreError::ObjectStageActive
+        } else {
+            SealedResearchJournalStoreError::io(
+                "failed to acquire logical research-object writer lease",
+                source,
+            )
+        }
+    })
+}
+
+fn fs_lock_contended(source: &std::io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    match (source.raw_os_error(), expected.raw_os_error()) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => source.kind() == expected.kind(),
+    }
 }
 
 fn exact_files_match(
@@ -1328,27 +1796,27 @@ fn exact_files_match(
     left_name: &str,
     right_directory: &Dir,
     right_name: &str,
-) -> Result<bool, SealedResearchJournalStoreError> {
-    let left_metadata = left_directory
-        .symlink_metadata(left_name)
-        .map_err(|source| {
-            SealedResearchJournalStoreError::io("failed to inspect quarantine source", source)
-        })?;
-    let right_metadata = right_directory
-        .symlink_metadata(right_name)
-        .map_err(|source| {
-            SealedResearchJournalStoreError::io("failed to inspect quarantine target", source)
-        })?;
-    if !left_metadata.file_type().is_file()
-        || !right_metadata.file_type().is_file()
-        || left_metadata.len() != right_metadata.len()
-        || left_metadata.len() > MAX_SEALED_BYTES
-    {
-        return Ok(false);
+    maximum_bytes: u64,
+    control: Option<&dyn ResearchObjectControl>,
+) -> Result<Option<ExactFileMatch>, SealedResearchJournalStoreError> {
+    let mut left = open_collision_file(left_directory, left_name, maximum_bytes, None)?;
+    let mut right = open_collision_file(right_directory, right_name, maximum_bytes, None)?;
+    if left.size_bytes != right.size_bytes || left.identity != right.identity {
+        return Ok(None);
     }
-    let mut left = open_readonly(left_directory, left_name)?;
-    let mut right = open_readonly(right_directory, right_name)?;
-    Ok(hash_file(&mut left, left_metadata.len())? == hash_file(&mut right, right_metadata.len())?)
+    let left_hash =
+        hash_file_bounded_with_control(&mut left.file, left.size_bytes, maximum_bytes, control)?;
+    let right_hash =
+        hash_file_bounded_with_control(&mut right.file, right.size_bytes, maximum_bytes, control)?;
+    revalidate_collision_file(left_directory, left_name, &left, maximum_bytes)?;
+    revalidate_collision_file(right_directory, right_name, &right, maximum_bytes)?;
+    if left_hash != right_hash {
+        return Ok(None);
+    }
+    Ok(Some(ExactFileMatch {
+        source_identity: left.identity,
+        size_bytes: left.size_bytes,
+    }))
 }
 
 fn open_readonly(directory: &Dir, name: &str) -> Result<File, SealedResearchJournalStoreError> {
@@ -1378,9 +1846,17 @@ fn validate_private_regular_file(
     metadata: &cap_std::fs::Metadata,
     expected_bytes: Option<u64>,
 ) -> Result<(), SealedResearchJournalStoreError> {
+    validate_private_regular_file_links(metadata, expected_bytes, 1)
+}
+
+fn validate_private_regular_file_links(
+    metadata: &cap_std::fs::Metadata,
+    expected_bytes: Option<u64>,
+    expected_links: u64,
+) -> Result<(), SealedResearchJournalStoreError> {
     if !metadata.is_file()
         || expected_bytes.is_some_and(|expected| metadata.len() != expected)
-        || cap_fs_ext::MetadataExt::nlink(metadata) != 1
+        || cap_fs_ext::MetadataExt::nlink(metadata) != expected_links
     {
         return Err(SealedResearchJournalStoreError::StateConflict);
     }
@@ -1420,8 +1896,22 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
-    use super::SealedResearchJournalStore;
+    use super::{
+        ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
+        SealedResearchJournalStore, SealedResearchRawClaim, SealedResearchRecoveryAdmission,
+    };
     use crate::RawCaptureRecord;
+
+    struct Allow;
+
+    impl ResearchObjectControl for Allow {
+        fn checkpoint(
+            &self,
+            _point: ResearchObjectControlPoint,
+        ) -> Result<(), ResearchObjectControlError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn sealed_segment_reopens_exact_bytes_and_recovery_retains_only_catalog_objects()
@@ -1457,11 +1947,15 @@ mod tests {
             Bytes::from_static(br#"{"page":2}"#),
         )?;
         let orphan = store.seal(std::slice::from_ref(&second))?;
-        let recovery = store.recover_after_catalog_scan(std::slice::from_ref(receipt.claim()))?;
+        let authoritative = SealedResearchRawClaim::JournalSegment(receipt.claim().clone());
+        let mut recovery =
+            store.begin_recovery(SealedResearchRecoveryAdmission::try_new(4, 32)?, &Allow)?;
+        recovery.observe_claim(&authoritative)?;
+        let recovery = recovery.finish()?;
         assert!(recovery.quarantined_staging().is_empty());
         assert_eq!(
             recovery.quarantined_objects(),
-            &[Box::<str>::from(orphan.relative_reference())]
+            &[String::from(orphan.relative_reference())]
         );
         assert_eq!(
             store.open_verified(&receipt)?.records()[0].payload(),
