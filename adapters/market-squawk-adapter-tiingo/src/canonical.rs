@@ -1,16 +1,14 @@
 use std::num::NonZeroU64;
 
 use market_squawk_domain::{
-    CalendarDate, Currency, DataQuality, EvidenceDigest, ExactPayloadEvidence,
-    FundNavCompleteness, FundNavDisposition, FundNavEntitlementEvidence, FundNavLineage,
-    FundNavMissingState, FundNavNativeSchema, FundNavValuationBasis, FundNavValue,
-    MetadataRevision, PayloadHash, PayloadReference, ProviderChannel, ProviderInstrumentId,
-    ProviderProduct, ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate,
-    SourceId, SourceIdentifier, Timestamp, VersionPinnedSourceLocator,
+    CalendarDate, Currency, DataQuality, EvidenceDigest, ExactPayloadEvidence, FundNavCompleteness,
+    FundNavDisposition, FundNavEntitlementEvidence, FundNavLineage, FundNavMissingState,
+    FundNavNativeSchema, FundNavValuationBasis, FundNavValue, MetadataRevision, PayloadHash,
+    PayloadReference, ProviderChannel, ProviderInstrumentId, ProviderProduct, ResearchProvenance,
+    ResearchProvenanceInput, ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp,
+    VersionPinnedSourceLocator,
 };
-use market_squawk_sources::{
-    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
-};
+use market_squawk_sources::{ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -135,13 +133,30 @@ pub struct TiingoFundNavMappingInput<'a> {
     pub ingested_at: Timestamp,
 }
 
+/// One latest-only Tiingo NAV row awaiting the common publication transaction.
+///
+/// The future common transaction must consume this handoff and bind its exact provider handoff
+/// identity, source, FundNav family and semantic payload to a trusted canonical publication clock,
+/// locally assigned observed revision, predecessor/successor evidence, and final domain value.
+/// This adapter supplies none of those common storage or point-in-time facts.
+#[derive(Debug)]
+pub struct TiingoPendingLatestFundNavPublication {
+    candidate: TiingoFundNavCanonicalCandidate,
+}
+
+impl TiingoPendingLatestFundNavPublication {
+    /// Consumes the closed handoff into its exact provider-local canonical candidate.
+    pub fn into_candidate(self) -> TiingoFundNavCanonicalCandidate {
+        self.candidate
+    }
+}
+
 /// Validated provider-local canonical NAV fields awaiting shared revision/publication authority.
 ///
-/// This type intentionally cannot be converted into a [`market_squawk_domain::FundNavObservation`]
-/// inside the adapter. The shared data plane must inject the durable revision, canonical
-/// publication clock, and predecessor/successor evidence in the same transaction that publishes
-/// the immutable generation. That keeps a retry clock from becoming a false semantic correction.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Only a consuming latest or complete-history transition may turn this value into a pending
+/// publication handoff. The adapter never accepts or chooses revision, canonical publication,
+/// correction, manifest, catalog, or point-in-time authority.
+#[derive(Debug, Eq, PartialEq)]
 pub struct TiingoFundNavCanonicalCandidate {
     provenance: ResearchProvenance,
     effective: ResearchTemporalCoordinate,
@@ -259,6 +274,18 @@ impl TiingoFundNavCanonicalCandidate {
         self.handoff_identity
     }
 
+    /// Consumes a latest-only row into the closed pending-publication capability.
+    ///
+    /// A row carrying either historical coordinate is returned unchanged so the caller can place
+    /// it only into the terminal whole-history reconciliation path.
+    pub fn try_into_latest_pending_publication(
+        self,
+    ) -> Result<TiingoPendingLatestFundNavPublication, Self> {
+        if self.history_page_identity.is_some() || self.history_completion_identity.is_some() {
+            return Err(self);
+        }
+        Ok(TiingoPendingLatestFundNavPublication { candidate: self })
+    }
 }
 
 /// Honest financial-date coverage state of a completed provider request graph.
@@ -272,12 +299,48 @@ pub enum TiingoFundNavHistoryFinancialCoverage {
     ExpectedFinancialDatesUnavailable,
 }
 
+/// Entire terminal Tiingo NAV history graph awaiting one common publication transaction.
+///
+/// The future common transaction must consume all parts together and bind the complete provider
+/// handoff identity and each ordered FundNav family/semantic payload to trusted publication,
+/// observed-revision, predecessor/successor, catalog, and point-in-time authority. The provider
+/// adapter neither accepts nor constructs those facts.
+#[derive(Debug)]
+pub struct TiingoPendingFundNavHistoryPublication {
+    completed_capture: TiingoCompletedHistoryCapture,
+    observations: Box<[TiingoFundNavCanonicalCandidate]>,
+    returned_provider_rows: u64,
+    financial_coverage: TiingoFundNavHistoryFinancialCoverage,
+    handoff_identity: EvidenceDigest,
+}
+
+impl TiingoPendingFundNavHistoryPublication {
+    /// Consumes the closed whole-history capability and transfers every retained part together.
+    pub fn into_parts(
+        self,
+    ) -> (
+        TiingoCompletedHistoryCapture,
+        Box<[TiingoFundNavCanonicalCandidate]>,
+        u64,
+        TiingoFundNavHistoryFinancialCoverage,
+        EvidenceDigest,
+    ) {
+        (
+            self.completed_capture,
+            self.observations,
+            self.returned_provider_rows,
+            self.financial_coverage,
+            self.handoff_identity,
+        )
+    }
+}
+
 /// Completed provider-local NAV-history handoff awaiting shared publication and PIT authority.
 ///
 /// Construction consumes the terminal raw request graph and proves that every returned native
 /// row has exactly one mapped canonical candidate. It deliberately does not claim that every
 /// financially expected NAV date was returned.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct TiingoCompletedFundNavHistoryCandidate {
     completed_capture: TiingoCompletedHistoryCapture,
     observations: Box<[TiingoFundNavCanonicalCandidate]>,
@@ -290,9 +353,10 @@ impl TiingoCompletedFundNavHistoryCandidate {
     /// Reconciles the exact terminal raw request graph with all mapped returned NAV rows.
     pub fn try_new(
         completed_capture: TiingoCompletedHistoryCapture,
-        observations: Vec<TiingoFundNavCanonicalCandidate>,
+        mut observations: Vec<TiingoFundNavCanonicalCandidate>,
     ) -> Result<Self, TiingoFundNavMapError> {
         validate_completed_nav_history(&completed_capture, &observations)?;
+        sort_completed_nav_history_rows(&mut observations);
         let returned_provider_rows = completed_capture.total_rows();
         let financial_coverage =
             TiingoFundNavHistoryFinancialCoverage::ExpectedFinancialDatesUnavailable;
@@ -310,16 +374,6 @@ impl TiingoCompletedFundNavHistoryCandidate {
         })
     }
 
-    /// Returns the exact terminal raw/native request-graph evidence consumed by this handoff.
-    pub const fn completed_capture(&self) -> &TiingoCompletedHistoryCapture {
-        &self.completed_capture
-    }
-
-    /// Returns mapped observations supplied by the caller; row alignment is order-independent.
-    pub fn observations(&self) -> &[TiingoFundNavCanonicalCandidate] {
-        &self.observations
-    }
-
     /// Returns the exact number of provider-native rows mapped once.
     pub const fn returned_provider_rows(&self) -> u64 {
         self.returned_provider_rows
@@ -334,6 +388,24 @@ impl TiingoCompletedFundNavHistoryCandidate {
     pub const fn handoff_identity(&self) -> EvidenceDigest {
         self.handoff_identity
     }
+
+    /// Infallibly consumes the already reconciled and deterministically ordered history graph.
+    pub fn into_pending_publication(self) -> TiingoPendingFundNavHistoryPublication {
+        let Self {
+            completed_capture,
+            observations,
+            returned_provider_rows,
+            financial_coverage,
+            handoff_identity,
+        } = self;
+        TiingoPendingFundNavHistoryPublication {
+            completed_capture,
+            observations,
+            returned_provider_rows,
+            financial_coverage,
+            handoff_identity,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -341,6 +413,24 @@ struct TiingoNavHistoryRowCoordinate {
     page_identity: [u8; 32],
     row_index: u32,
     row_digest: [u8; 32],
+}
+
+fn sort_completed_nav_history_rows(observations: &mut [TiingoFundNavCanonicalCandidate]) {
+    observations.sort_unstable_by_key(|observation| {
+        (
+            observation.nav_date(),
+            observation
+                .history_page_identity()
+                .map(|identity| identity.bytes())
+                .unwrap_or([0; 32]),
+            observation.provider_row_index().unwrap_or(u32::MAX),
+            observation
+                .provider_row_digest()
+                .map(|identity| identity.bytes())
+                .unwrap_or([0; 32]),
+            observation.handoff_identity().bytes(),
+        )
+    });
 }
 
 fn validate_completed_nav_history(
@@ -401,7 +491,7 @@ fn validate_completed_nav_history(
         if observation.history_completion_identity() != Some(completed.completion_identity())
             || observation.lineage().page_identity() != Some(page_identity)
             || observation.lineage().checkpoint_identity() != completed.completion_identity()
-            || observation.lineage().completeness() != FundNavCompleteness::Incomplete
+            || observation.lineage().completeness() != FundNavCompleteness::Complete
             || observation.provider_instrument_id().as_str()
                 != completed.plan().ticker().as_str()
             || observation.provenance().source_id() != completed.source_id()
@@ -475,20 +565,10 @@ fn completed_nav_history_handoff_identity(
     observations: &[TiingoFundNavCanonicalCandidate],
     financial_coverage: TiingoFundNavHistoryFinancialCoverage,
 ) -> Result<EvidenceDigest, TiingoFundNavMapError> {
-    let mut observation_identities = Vec::new();
-    observation_identities
-        .try_reserve_exact(observations.len())
-        .map_err(|_| TiingoFundNavMapError::Allocation)?;
-    observation_identities.extend(
-        observations
-            .iter()
-            .map(TiingoFundNavCanonicalCandidate::handoff_identity),
-    );
-    observation_identities.sort_unstable_by_key(|identity| identity.bytes());
     let mut hasher = Sha256::new();
     append_field(
         &mut hasher,
-        b"market-squawk/tiingo/completed-fund-nav-history-candidate/v1",
+        b"market-squawk/tiingo/completed-fund-nav-history-candidate/v2",
     );
     for identity in [
         completed.plan().request_set_identity(),
@@ -501,12 +581,12 @@ fn completed_nav_history_handoff_identity(
     append_field(&mut hasher, &completed.total_response_bytes().to_be_bytes());
     append_field(
         &mut hasher,
-        &u64::try_from(observation_identities.len())
+        &u64::try_from(observations.len())
             .map_err(|_| TiingoFundNavMapError::Allocation)?
             .to_be_bytes(),
     );
-    for identity in observation_identities {
-        append_field(&mut hasher, &identity.bytes());
+    for observation in observations {
+        append_field(&mut hasher, &observation.handoff_identity().bytes());
     }
     append_field(
         &mut hasher,
@@ -598,8 +678,7 @@ pub fn map_fund_nav_candidate(
                 .clone(),
         ),
     );
-    let (value, completeness, disposition) =
-        canonical_value(input.candidate.value(), history_binding.is_some());
+    let (value, completeness, disposition) = canonical_value(input.candidate.value());
     let page_identity = history_binding.map(|binding| binding.page_identity);
     let checkpoint_identity = history_binding.map_or_else(
         || input.sealed_capture.receipt_digest(),
@@ -966,38 +1045,31 @@ fn validate_disposition(
 
 fn canonical_value(
     value: TiingoNavValueState,
-    is_historical: bool,
 ) -> (FundNavValue, FundNavCompleteness, FundNavDisposition) {
-    let complete_response = if is_historical {
-        // A closed HTTP request graph does not prove which financial dates should have a NAV.
-        FundNavCompleteness::Incomplete
-    } else {
-        FundNavCompleteness::Complete
-    };
     match value {
         TiingoNavValueState::Observed(money) => (
             FundNavValue::Observed(money),
-            complete_response,
+            FundNavCompleteness::Complete,
             FundNavDisposition::Returned,
         ),
         TiingoNavValueState::NotYetPublished => (
             FundNavValue::Missing(FundNavMissingState::NotYetPublished),
-            complete_response,
+            FundNavCompleteness::Complete,
             FundNavDisposition::NotYetPublished,
         ),
         TiingoNavValueState::Unsupported => (
             FundNavValue::Missing(FundNavMissingState::Unsupported),
-            complete_response,
+            FundNavCompleteness::Complete,
             FundNavDisposition::Unsupported,
         ),
         TiingoNavValueState::SourceMissing => (
             FundNavValue::Missing(FundNavMissingState::SourceMissing),
-            complete_response,
+            FundNavCompleteness::Complete,
             FundNavDisposition::SourceMissing,
         ),
         TiingoNavValueState::Invalid(_) => (
             FundNavValue::Missing(FundNavMissingState::Invalid),
-            complete_response,
+            FundNavCompleteness::Complete,
             FundNavDisposition::Invalid,
         ),
         TiingoNavValueState::Unavailable => (

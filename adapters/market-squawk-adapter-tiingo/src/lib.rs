@@ -23,7 +23,8 @@ mod request;
 pub use canonical::{
     TiingoCompletedFundNavHistoryCandidate, TiingoFundNavCanonicalCandidate,
     TiingoFundNavContractEvidence, TiingoFundNavHistoryFinancialCoverage, TiingoFundNavMapError,
-    TiingoFundNavMappingInput, map_fund_nav_candidate,
+    TiingoFundNavMappingInput, TiingoPendingFundNavHistoryPublication,
+    TiingoPendingLatestFundNavPublication, map_fund_nav_candidate,
 };
 pub use authority::{
     TiingoCompletedResponseDisposition, TiingoProviderAdmissionDecision,

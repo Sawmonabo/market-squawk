@@ -328,19 +328,173 @@ fn mutual_fund_nav_maps_exactly_and_defers_revision_authority() -> Result<(), Bo
         contract: &contract,
         ingested_at: Timestamp::from_unix_nanos(202),
     })?;
-    assert_eq!(mapped.value(), FundNavValue::Observed(nav));
+    let latest_pending = match mapped.try_into_latest_pending_publication() {
+        Ok(pending) => pending,
+        Err(_) => return Err("latest Tiingo NAV candidate retained history coordinates".into()),
+    };
+    let mapped = latest_pending.into_candidate();
     assert_eq!(
-        mapped.lineage().completeness(),
-        FundNavCompleteness::Complete
-    );
-    assert_eq!(mapped.lineage().disposition(), FundNavDisposition::Returned);
-    assert_eq!(mapped.nav_date(), date(2026, 8, 10)?);
-    assert_eq!(mapped.sealed_capture_receipt(), sealed.receipt_digest());
-    assert_eq!(
-        mapped.sealed_metadata_capture_receipt(),
-        sealed_metadata.receipt_digest()
+        (
+            mapped.value(),
+            mapped.lineage().completeness(),
+            mapped.lineage().disposition(),
+            mapped.nav_date(),
+            mapped.sealed_capture_receipt(),
+            mapped.sealed_metadata_capture_receipt(),
+            mapped.response_request_identity(),
+            mapped.provider_row_index(),
+            mapped.provider_row_digest(),
+            mapped.history_page_identity(),
+            mapped.history_completion_identity(),
+        ),
+        (
+            FundNavValue::Observed(nav),
+            FundNavCompleteness::Complete,
+            FundNavDisposition::Returned,
+            date(2026, 8, 10)?,
+            sealed.receipt_digest(),
+            sealed_metadata.receipt_digest(),
+            latest_response.evidence().request().request_identity(),
+            Some(0),
+            candidate.provider_row_digest(),
+            None,
+            None,
+        )
     );
     assert_ne!(mapped.handoff_identity().bytes(), [0; 32]);
+
+    let history_body = br#"[{"date":"2026-08-07T00:00:00.000Z","open":150.7500,"high":150.7500,"low":150.7500,"close":150.7500,"volume":0,"adjOpen":149.50,"adjHigh":149.50,"adjLow":149.50,"adjClose":149.50,"adjVolume":0,"divCash":0,"splitFactor":1},{"date":"2026-08-10T00:00:00.000Z","open":151.2300,"high":151.2300,"low":151.2300,"close":151.2300,"volume":0,"adjOpen":150.00,"adjHigh":150.00,"adjLow":150.00,"adjClose":150.00,"adjVolume":0,"divCash":0.01,"splitFactor":1}]"#;
+    let history_plan =
+        TiingoHistoryPlan::try_new(ticker.clone(), date(2026, 8, 7)?, date(2026, 8, 10)?)?;
+    let history_response = decoder.decode_eod(
+        history_plan.pages()[0].clone(),
+        200,
+        history_body,
+        Timestamp::from_unix_nanos(203),
+        Timestamp::from_unix_nanos(204),
+    )?;
+    let historical_first =
+        normalize_mutual_fund_row(context(&ticker)?, &metadata, &history_response, 0)?;
+    let historical_second =
+        normalize_mutual_fund_row(context(&ticker)?, &metadata, &history_response, 1)?;
+    let historical_sealed =
+        seal_response(history_body, history_response.evidence(), &contract, &store)?;
+    let completed_history = completed_single_page_history(
+        history_plan,
+        &history_response,
+        &historical_sealed,
+        &contract,
+    )?;
+    let expected_history_request_set_identity = completed_history.plan().request_set_identity();
+    let expected_history_page_identity = completed_history.pages()[0].page_identity();
+    let expected_history_completion_identity = completed_history.completion_identity();
+    let historical_first_mapped = map_fund_nav_candidate(TiingoFundNavMappingInput {
+        candidate: &historical_first,
+        sealed_capture: &historical_sealed,
+        completed_history: Some(&completed_history),
+        sealed_metadata_capture: &sealed_metadata,
+        contract: &contract,
+        ingested_at: Timestamp::from_unix_nanos(205),
+    })?;
+    let historical_first_mapped = match historical_first_mapped
+        .try_into_latest_pending_publication()
+    {
+        Ok(_) => return Err("historical Tiingo NAV entered the latest publication handoff".into()),
+        Err(candidate) => candidate,
+    };
+    let historical_second_mapped = map_fund_nav_candidate(TiingoFundNavMappingInput {
+        candidate: &historical_second,
+        sealed_capture: &historical_sealed,
+        completed_history: Some(&completed_history),
+        sealed_metadata_capture: &sealed_metadata,
+        contract: &contract,
+        ingested_at: Timestamp::from_unix_nanos(205),
+    })?;
+    let expected_first_handoff_identity = historical_first_mapped.handoff_identity();
+    let expected_second_handoff_identity = historical_second_mapped.handoff_identity();
+    let completed_nav_history = TiingoCompletedFundNavHistoryCandidate::try_new(
+        completed_history,
+        vec![historical_second_mapped, historical_first_mapped],
+    )?;
+    let expected_completed_handoff_identity = completed_nav_history.handoff_identity();
+    let (
+        completed_capture,
+        ordered_rows,
+        returned_provider_rows,
+        financial_coverage,
+        completed_handoff_identity,
+    ) = completed_nav_history
+        .into_pending_publication()
+        .into_parts();
+    let [first_row, second_row] = ordered_rows.as_ref() else {
+        return Err("expected exactly two consumed historical Tiingo NAV rows".into());
+    };
+    assert_eq!(
+        (
+            returned_provider_rows,
+            financial_coverage,
+            completed_handoff_identity,
+            completed_capture.plan().request_set_identity(),
+            completed_capture.completion_identity(),
+            [first_row, second_row].into_iter().all(|row| {
+                row.sealed_capture_receipt() == historical_sealed.receipt_digest()
+                    && row.sealed_metadata_capture_receipt() == sealed_metadata.receipt_digest()
+                    && row.response_request_identity()
+                        == history_response.evidence().request().request_identity()
+                    && row.history_page_identity() == Some(expected_history_page_identity)
+                    && row.history_completion_identity()
+                        == Some(expected_history_completion_identity)
+            }),
+            [
+                (
+                    first_row.provider_row_index(),
+                    first_row.provider_row_digest(),
+                    first_row.nav_date(),
+                    matches!(first_row.value(), FundNavValue::Observed(_)),
+                    first_row.lineage().completeness(),
+                    first_row.lineage().disposition(),
+                    first_row.handoff_identity(),
+                ),
+                (
+                    second_row.provider_row_index(),
+                    second_row.provider_row_digest(),
+                    second_row.nav_date(),
+                    matches!(second_row.value(), FundNavValue::Observed(_)),
+                    second_row.lineage().completeness(),
+                    second_row.lineage().disposition(),
+                    second_row.handoff_identity(),
+                ),
+            ],
+        ),
+        (
+            2,
+            TiingoFundNavHistoryFinancialCoverage::ExpectedFinancialDatesUnavailable,
+            expected_completed_handoff_identity,
+            expected_history_request_set_identity,
+            expected_history_completion_identity,
+            true,
+            [
+                (
+                    Some(0),
+                    historical_first.provider_row_digest(),
+                    date(2026, 8, 7)?,
+                    true,
+                    FundNavCompleteness::Complete,
+                    FundNavDisposition::Returned,
+                    expected_first_handoff_identity,
+                ),
+                (
+                    Some(1),
+                    historical_second.provider_row_digest(),
+                    date(2026, 8, 10)?,
+                    true,
+                    FundNavCompleteness::Complete,
+                    FundNavDisposition::Returned,
+                    expected_second_handoff_identity,
+                ),
+            ],
+        )
+    );
     assert_distinct_eod_missing_nav_and_quota_contracts()?;
     Ok(())
 }
@@ -488,7 +642,7 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
     );
     assert_eq!(
         mapped.lineage().completeness(),
-        FundNavCompleteness::Incomplete
+        FundNavCompleteness::Complete
     );
     let completed_nav_history =
         TiingoCompletedFundNavHistoryCandidate::try_new(supported_completed_history, vec![mapped])?;
