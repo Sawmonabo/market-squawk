@@ -1,5 +1,7 @@
 //! Hardened, bounded BEA HTTP transport.
 
+use std::fmt;
+use std::mem;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -8,10 +10,10 @@ use futures_util::future::BoxFuture;
 use market_squawk_domain::Timestamp;
 use market_squawk_sources::{HttpRequestBounds, InFlightExtractionRequest};
 use tokio_util::sync::CancellationToken;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::auth::BeaSensitiveBody;
-use crate::{BeaAuthorizedRequest, BeaSourceError};
+use crate::{BEA_API_ENDPOINT, BeaAuthorizedRequest, BeaSourceError, BeaUserId};
 
 const USER_AGENT: &str = concat!(
     "market-squawk/",
@@ -20,15 +22,160 @@ const USER_AGENT: &str = concat!(
 );
 const MAX_RESPONSE_HEADER_VALUE_BYTES: usize = 1_024;
 
-#[derive(Clone, Debug)]
 pub(crate) struct BeaHttpResponse {
     pub(crate) status: u16,
-    pub(crate) retry_after: Option<Vec<u8>>,
-    pub(crate) content_encoding: Option<Vec<u8>>,
-    pub(crate) content_type: Option<Vec<u8>>,
+    pub(crate) retry_after: Option<BeaSensitiveHeader>,
+    pub(crate) content_encoding: Option<BeaSensitiveHeader>,
+    pub(crate) content_type: Option<BeaSensitiveHeader>,
     pub(crate) body: BeaSensitiveBody,
     pub(crate) received_at: Timestamp,
     pub(crate) latency: Duration,
+}
+
+impl BeaHttpResponse {
+    /// Validates every captured header before releasing any ordinary retained bytes.
+    pub(crate) fn retain_secret_free_headers(
+        &mut self,
+        user_id: &BeaUserId,
+    ) -> Result<BeaRetainedResponseHeaders, BeaSourceError> {
+        let invalid = [
+            &mut self.retry_after,
+            &mut self.content_encoding,
+            &mut self.content_type,
+        ]
+        .into_iter()
+        .filter_map(Option::as_mut)
+        .any(|header| !header.validate_secret_free(user_id));
+        if invalid {
+            self.zeroize_headers();
+            return Err(BeaSourceError::Protocol);
+        }
+        Ok(BeaRetainedResponseHeaders {
+            retry_after: self.retry_after.take().map(BeaSensitiveHeader::into_vec),
+            content_encoding: self
+                .content_encoding
+                .take()
+                .map(BeaSensitiveHeader::into_vec),
+            content_type: self.content_type.take().map(BeaSensitiveHeader::into_vec),
+        })
+    }
+
+    fn zeroize_headers(&mut self) {
+        for header in [
+            &mut self.retry_after,
+            &mut self.content_encoding,
+            &mut self.content_type,
+        ]
+        .into_iter()
+        .filter_map(Option::as_mut)
+        {
+            header.zeroize();
+        }
+    }
+}
+
+impl fmt::Debug for BeaHttpResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BeaHttpResponse")
+            .field("status", &self.status)
+            .field(
+                "retry_after_bytes",
+                &self.retry_after.as_ref().map(BeaSensitiveHeader::len),
+            )
+            .field(
+                "content_encoding_bytes",
+                &self.content_encoding.as_ref().map(BeaSensitiveHeader::len),
+            )
+            .field(
+                "content_type_bytes",
+                &self.content_type.as_ref().map(BeaSensitiveHeader::len),
+            )
+            .field("body_bytes", &self.body.len())
+            .field("received_at", &self.received_at)
+            .field("latency", &self.latency)
+            .finish()
+    }
+}
+
+/// A bounded response header that wipes its storage on every drop path.
+pub(crate) struct BeaSensitiveHeader(Zeroizing<Vec<u8>>);
+
+impl BeaSensitiveHeader {
+    #[cfg(test)]
+    pub(crate) fn try_from_vec(mut value: Vec<u8>) -> Result<Self, BeaSourceError> {
+        if value.len() > MAX_RESPONSE_HEADER_VALUE_BYTES {
+            value.zeroize();
+            return Err(BeaSourceError::Protocol);
+        }
+        Ok(Self(Zeroizing::new(value)))
+    }
+
+    fn try_from_slice(value: &[u8]) -> Result<Self, BeaSourceError> {
+        if value.len() > MAX_RESPONSE_HEADER_VALUE_BYTES {
+            return Err(BeaSourceError::Protocol);
+        }
+        let mut retained = Zeroizing::new(Vec::new());
+        retained
+            .try_reserve_exact(value.len())
+            .map_err(|_| BeaSourceError::Allocation)?;
+        retained.extend_from_slice(value);
+        Ok(Self(retained))
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn validate_secret_free(&mut self, user_id: &BeaUserId) -> bool {
+        let secret = user_id.expose_secret().as_bytes();
+        let endpoint = BEA_API_ENDPOINT.as_bytes();
+        let invalid = self.0.windows(secret.len()).any(|value| value == secret)
+            || self
+                .0
+                .windows(endpoint.len())
+                .any(|value| value == endpoint)
+            || self
+                .0
+                .windows(b"userid".len())
+                .any(|value| value.eq_ignore_ascii_case(b"userid"));
+        if invalid {
+            self.zeroize();
+        }
+        !invalid
+    }
+
+    fn into_vec(mut self) -> Vec<u8> {
+        mem::take(&mut *self.0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_zeroized(&self) -> bool {
+        self.0.iter().all(|byte| *byte == 0)
+    }
+}
+
+impl Zeroize for BeaSensitiveHeader {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for BeaSensitiveHeader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BeaSensitiveHeader")
+            .field("bytes", &self.len())
+            .field("contents", &"[ZEROIZING REDACTED]")
+            .finish()
+    }
+}
+
+/// Header values released only after exact secret, endpoint, and `UserID` scans succeed.
+pub(crate) struct BeaRetainedResponseHeaders {
+    pub(crate) retry_after: Option<Vec<u8>>,
+    pub(crate) content_encoding: Option<Vec<u8>>,
+    pub(crate) content_type: Option<Vec<u8>>,
 }
 
 pub(crate) trait BeaTransport: std::fmt::Debug + Send + Sync {
@@ -130,15 +277,9 @@ impl BeaTransport for ReqwestBeaTransport {
 
 fn bounded_header(
     value: Option<&reqwest::header::HeaderValue>,
-) -> Result<Option<Vec<u8>>, BeaSourceError> {
+) -> Result<Option<BeaSensitiveHeader>, BeaSourceError> {
     value
-        .map(|value| {
-            let bytes = value.as_bytes();
-            if bytes.len() > MAX_RESPONSE_HEADER_VALUE_BYTES {
-                return Err(BeaSourceError::Protocol);
-            }
-            Ok(bytes.to_vec())
-        })
+        .map(|value| BeaSensitiveHeader::try_from_slice(value.as_bytes()))
         .transpose()
 }
 

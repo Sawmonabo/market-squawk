@@ -4,8 +4,7 @@ use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
 };
 use market_squawk_sources::{
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    SealedProviderCaptureSetReceipt,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -72,11 +71,8 @@ impl BeaSealedAcquisitionReceipt {
 
         let dataset_id = evidence.metadata().dataset_id().clone();
         let provider_dataset = evidence.data().page().dataset().clone();
-        let expected_graph_identity = bea_capture_graph_identity(
-            &dataset_id,
-            evidence.metadata().generation(),
-            &expected,
-        )?;
+        let expected_graph_identity =
+            bea_capture_graph_identity(&dataset_id, evidence.metadata().generation(), &expected)?;
         let graph = sealed_capture.capture();
         if graph.source_id() != &source_id
             || graph.metadata_revision() != &metadata_revision
@@ -134,9 +130,12 @@ impl BeaSealedAcquisitionReceipt {
         }
         if flattened_page_ordinal != graph.pages().len()
             || graph.total_body_bytes()
-                != expected.iter().try_fold(0_u64, |total, capture| {
-                    total.checked_add(capture.total_body_bytes())
-                }).ok_or(BeaSealedAcquisitionError::InvalidEvidence)?
+                != expected
+                    .iter()
+                    .try_fold(0_u64, |total, capture| {
+                        total.checked_add(capture.total_body_bytes())
+                    })
+                    .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?
         {
             return Err(BeaSealedAcquisitionError::InvalidEvidence);
         }
@@ -144,7 +143,7 @@ impl BeaSealedAcquisitionReceipt {
         let data_component_ordinal = u16::try_from(expected_count.saturating_sub(1))
             .map_err(|_| BeaSealedAcquisitionError::InvalidEvidence)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"market-squawk/bea-sealed-acquisition/v2");
+        hasher.update(b"market-squawk/bea-sealed-acquisition/v3");
         hash_text(&mut hasher, source_id.as_str())?;
         hash_text(
             &mut hasher,
@@ -153,14 +152,15 @@ impl BeaSealedAcquisitionReceipt {
         hash_text(&mut hasher, dataset_id.as_str())?;
         hash_text(&mut hasher, provider_dataset.as_str())?;
         hasher.update(evidence.metadata().generation().digest());
+        for page in evidence.metadata().pages() {
+            hasher.update(page.page().receipt().upstream_response_digest());
+            hasher.update(page.page().receipt().response_digest());
+        }
+        hasher.update(evidence.data().page().receipt().upstream_response_digest());
+        hasher.update(evidence.data().page().receipt().response_digest());
         hasher.update(expected_graph_identity.bytes());
         hasher.update(sealed_capture.receipt_digest().bytes());
-        hasher.update(
-            sealed_capture
-                .segment()
-                .physical_receipt_digest()
-                .bytes(),
-        );
+        hasher.update(sealed_capture.segment().physical_receipt_digest().bytes());
         let sealed_graph_digest =
             EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
         Ok(Self {
@@ -226,6 +226,24 @@ impl BeaSealedAcquisitionReceipt {
             .map(|page| page.body_digest())
             .ok_or(BeaSealedAcquisitionError::InvalidEvidence)
     }
+
+    /// Returns SHA-256 of the exact final provider body before validated echo redaction.
+    pub fn data_upstream_response_digest(
+        &self,
+    ) -> Result<EvidenceDigest, BeaSealedAcquisitionError> {
+        let upstream = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            self.evidence
+                .data()
+                .page()
+                .receipt()
+                .upstream_response_digest(),
+        );
+        if upstream == self.data_response_digest()? {
+            return Err(BeaSealedAcquisitionError::InvalidEvidence);
+        }
+        Ok(upstream)
+    }
 }
 
 pub(crate) fn bea_capture_graph_identity(
@@ -271,10 +289,7 @@ fn valid_digest(value: EvidenceDigest) -> bool {
     value.algorithm() == DigestAlgorithm::Sha256 && value.bytes() != [0; 32]
 }
 
-fn hash_text(
-    hasher: &mut Sha256,
-    value: &str,
-) -> Result<(), BeaSealedAcquisitionError> {
+fn hash_text(hasher: &mut Sha256, value: &str) -> Result<(), BeaSealedAcquisitionError> {
     hasher.update(
         u64::try_from(value.len())
             .map_err(|_| BeaSealedAcquisitionError::InvalidEvidence)?

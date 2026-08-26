@@ -21,7 +21,7 @@ pub const BEA_DOCTOR_ADMISSION_VALIDITY_NANOS: i64 = 86_400_000_000_000;
 /// Doctor evidence construction failure after transport/parser success.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum BeaDoctorError {
-    /// Rights, source binding, quota, dataset, or capture evidence did not match.
+    /// Source binding, quota, dataset, or capture evidence did not match.
     #[error("invalid BEA doctor authority")]
     InvalidAuthority,
     /// Page clocks, counts, order, completeness, or checked totals were invalid.
@@ -37,6 +37,7 @@ pub enum BeaDoctorError {
 pub struct BeaDoctorPageEvidence {
     method: BeaMethod,
     request_identity: EvidenceDigest,
+    upstream_response_digest: EvidenceDigest,
     response_digest: EvidenceDigest,
     status: u16,
     response_bytes: u64,
@@ -58,7 +59,12 @@ impl BeaDoctorPageEvidence {
         self.request_identity
     }
 
-    /// Returns the exact response-body commitment.
+    /// Returns SHA-256 of the exact provider body before validated echo redaction.
+    pub const fn upstream_response_digest(&self) -> EvidenceDigest {
+        self.upstream_response_digest
+    }
+
+    /// Returns the retained secret-free response-body commitment.
     pub const fn response_digest(&self) -> EvidenceDigest {
         self.response_digest
     }
@@ -108,9 +114,6 @@ pub struct BeaDoctorReceipt {
     dataset_id: SourceIdentifier,
     analytical_dataset_id: SourceIdentifier,
     source_binding_digest: EvidenceDigest,
-    rights_policy_digest: EvidenceDigest,
-    root_rights_decision_digest: EvidenceDigest,
-    rights_rejoin_digest: EvidenceDigest,
     quota_declaration_digest: EvidenceDigest,
     metadata_generation: EvidenceDigest,
     pages: Vec<BeaDoctorPageEvidence>,
@@ -149,12 +152,14 @@ impl BeaDoctorReceipt {
             pages.push(page_evidence(
                 captured.telemetry().method(),
                 captured.telemetry(),
+                captured.page().receipt(),
                 captured.material(),
             )?);
         }
         pages.push(page_evidence(
             acquisition.data().telemetry().method(),
             acquisition.data().telemetry(),
+            acquisition.data().page().receipt(),
             acquisition.data().material(),
         )?);
         if pages.len() != expected_pages
@@ -192,14 +197,11 @@ impl BeaDoctorReceipt {
             .production_time()
             .map(|production| production.timestamp());
         let mut hasher = Sha256::new();
-        hasher.update(b"market-squawk/bea-doctor-receipt/v2");
+        hasher.update(b"market-squawk/bea-doctor-receipt/v4");
         hash_text(&mut hasher, dataset_id.as_str())?;
         hash_text(&mut hasher, analytical_dataset_id.as_str())?;
         for digest in [
             binding.binding_digest(),
-            binding.rights_policy_digest(),
-            binding.root_rights_decision_digest(),
-            binding.rights_rejoin_digest(),
             quota.declaration_digest(),
             metadata_generation,
         ] {
@@ -210,6 +212,7 @@ impl BeaDoctorReceipt {
         for page in &pages {
             hash_text(&mut hasher, page.method.as_str())?;
             hasher.update(page.request_identity.bytes());
+            hasher.update(page.upstream_response_digest.bytes());
             hasher.update(page.response_digest.bytes());
             hasher.update(page.status.to_be_bytes());
             hasher.update(page.response_bytes.to_be_bytes());
@@ -233,15 +236,11 @@ impl BeaDoctorReceipt {
             None => hasher.update([0]),
         }
         hasher.update(verified_at.unix_nanos().to_be_bytes());
-        let receipt_digest =
-            EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
+        let receipt_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
         Ok(Self {
             dataset_id,
             analytical_dataset_id,
             source_binding_digest: binding.binding_digest(),
-            rights_policy_digest: binding.rights_policy_digest(),
-            root_rights_decision_digest: binding.root_rights_decision_digest(),
-            rights_rejoin_digest: binding.rights_rejoin_digest(),
             quota_declaration_digest: quota.declaration_digest(),
             metadata_generation,
             pages,
@@ -266,9 +265,6 @@ impl BeaDoctorReceipt {
         sealed: &BeaSealedAcquisitionReceipt,
     ) -> Result<BeaDoctorAdmissionEvidence, BeaDoctorError> {
         if self.source_binding_digest != binding.binding_digest()
-            || self.rights_policy_digest != binding.rights_policy_digest()
-            || self.root_rights_decision_digest != binding.root_rights_decision_digest()
-            || self.rights_rejoin_digest != binding.rights_rejoin_digest()
             || self.quota_declaration_digest != binding.quota_declaration_digest()
             || sealed.source_id() != binding.source_id()
             || sealed.metadata_revision() != binding.metadata_revision()
@@ -299,6 +295,11 @@ impl BeaDoctorReceipt {
                 .ok_or(BeaDoctorError::InvalidEvidence)?;
             if capture.request_set_identity() != expected.request_identity
                 || page.request_identity() != expected.request_identity
+                || sealed
+                    .evidence()
+                    .expected_upstream_response_digest(ordinal)
+                    .ok_or(BeaDoctorError::InvalidEvidence)?
+                    != expected.upstream_response_digest
                 || page.body_digest() != expected.response_digest
                 || page.http_status() != expected.status
                 || page.body_bytes() != expected.response_bytes
@@ -315,7 +316,7 @@ impl BeaDoctorReceipt {
             .checked_add_nanos(BEA_DOCTOR_ADMISSION_VALIDITY_NANOS)
             .map_err(|_| BeaDoctorError::InvalidEvidence)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"market-squawk/bea-doctor-admission/v1");
+        hasher.update(b"market-squawk/bea-doctor-admission/v2");
         hash_text(&mut hasher, binding.source_id().as_str())?;
         hash_text(
             &mut hasher,
@@ -328,9 +329,6 @@ impl BeaDoctorReceipt {
             self.receipt_digest,
             sealed.sealed_graph_digest(),
             self.metadata_generation,
-            self.rights_policy_digest,
-            self.root_rights_decision_digest,
-            self.rights_rejoin_digest,
             self.quota_declaration_digest,
         ] {
             hasher.update(digest.bytes());
@@ -345,9 +343,6 @@ impl BeaDoctorReceipt {
             dataset_id: self.dataset_id,
             analytical_dataset_id: self.analytical_dataset_id,
             source_binding_digest: binding.binding_digest(),
-            rights_policy_digest: self.rights_policy_digest,
-            root_rights_decision_digest: self.root_rights_decision_digest,
-            rights_rejoin_digest: self.rights_rejoin_digest,
             quota_declaration_digest: self.quota_declaration_digest,
             metadata_generation: self.metadata_generation,
             doctor_receipt_digest: self.receipt_digest,
@@ -428,9 +423,6 @@ pub struct BeaDoctorAdmissionEvidence {
     dataset_id: SourceIdentifier,
     analytical_dataset_id: SourceIdentifier,
     source_binding_digest: EvidenceDigest,
-    rights_policy_digest: EvidenceDigest,
-    root_rights_decision_digest: EvidenceDigest,
-    rights_rejoin_digest: EvidenceDigest,
     quota_declaration_digest: EvidenceDigest,
     metadata_generation: EvidenceDigest,
     doctor_receipt_digest: EvidenceDigest,
@@ -455,9 +447,6 @@ impl BeaDoctorAdmissionEvidence {
         if &self.source_id != binding.source_id()
             || &self.metadata_revision != binding.metadata_revision()
             || self.source_binding_digest != binding.binding_digest()
-            || self.rights_policy_digest != binding.rights_policy_digest()
-            || self.root_rights_decision_digest != binding.root_rights_decision_digest()
-            || self.rights_rejoin_digest != binding.rights_rejoin_digest()
             || self.quota_declaration_digest != binding.quota_declaration_digest()
             || &self.dataset_id != dataset_id
             || &self.analytical_dataset_id != analytical_dataset_id
@@ -493,21 +482,6 @@ impl BeaDoctorAdmissionEvidence {
     /// Returns the exact source binding commitment.
     pub const fn source_binding_digest(&self) -> EvidenceDigest {
         self.source_binding_digest
-    }
-
-    /// Returns the code-owned private-use/no-sale policy commitment.
-    pub const fn rights_policy_digest(&self) -> EvidenceDigest {
-        self.rights_policy_digest
-    }
-
-    /// Returns the root decision coordinate; it is not a lease.
-    pub const fn root_rights_decision_digest(&self) -> EvidenceDigest {
-        self.root_rights_decision_digest
-    }
-
-    /// Returns the policy/root-decision rejoin commitment.
-    pub const fn rights_rejoin_digest(&self) -> EvidenceDigest {
-        self.rights_rejoin_digest
     }
 
     /// Returns the complete quota declaration commitment.
@@ -621,6 +595,7 @@ impl BeaDoctorRun {
 fn page_evidence(
     method: BeaMethod,
     telemetry: &crate::BeaResponseTelemetry,
+    receipt: &crate::BeaPageReceipt,
     material: &ProviderCaptureMaterial,
 ) -> Result<BeaDoctorPageEvidence, BeaDoctorError> {
     let capture = material.receipt();
@@ -632,12 +607,19 @@ fn page_evidence(
     if telemetry.status() != page.http_status()
         || telemetry.response_bytes() != page.body_bytes()
         || telemetry.request_identity() != page.request_identity()
+        || receipt.request_digest() != telemetry.request_identity().bytes()
+        || receipt.response_digest() != page.body_digest().bytes()
+        || receipt.upstream_response_digest() == receipt.response_digest()
     {
         return Err(BeaDoctorError::InvalidEvidence);
     }
     Ok(BeaDoctorPageEvidence {
         method,
         request_identity: telemetry.request_identity(),
+        upstream_response_digest: EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            receipt.upstream_response_digest(),
+        ),
         response_digest: page.body_digest(),
         status: telemetry.status(),
         response_bytes: telemetry.response_bytes(),

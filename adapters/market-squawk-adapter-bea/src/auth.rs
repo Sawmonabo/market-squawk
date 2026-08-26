@@ -9,7 +9,7 @@ use subtle::ConstantTimeEq;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{BEA_API_ENDPOINT, BeaError, BeaRequest};
+use crate::{BEA_API_ENDPOINT, BeaError, BeaParseLimits, BeaRequest};
 
 const BEA_USER_ID_BYTES: usize = 36;
 pub(crate) const BEA_REDACTED_USER_ID: &[u8; BEA_USER_ID_BYTES] =
@@ -32,6 +32,7 @@ impl BeaUserId {
     pub fn try_new(mut value: String) -> Result<Self, BeaError> {
         if value.len() != BEA_USER_ID_BYTES
             || !value.is_ascii()
+            || value.as_bytes() == BEA_REDACTED_USER_ID
             || value.bytes().any(|byte| {
                 byte.is_ascii_whitespace()
                     || byte.is_ascii_control()
@@ -79,6 +80,11 @@ pub struct BeaAuthorizedRequest {
 
 impl BeaAuthorizedRequest {
     pub(crate) fn build(request: &BeaRequest, user_id: &BeaUserId) -> Result<Self, BeaError> {
+        if request.query_pairs().any(|(name, value)| {
+            name.contains(user_id.expose_secret()) || value.contains(user_id.expose_secret())
+        }) {
+            return Err(BeaError::InvalidRequest);
+        }
         let mut url = Url::parse(BEA_API_ENDPOINT).map_err(|_| BeaError::InvalidRequest)?;
         {
             let mut query = url.query_pairs_mut();
@@ -133,16 +139,27 @@ impl BeaSensitiveBody {
         Self(bytes)
     }
 
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        self.0.as_slice()
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Validates the complete request echo and returns only fixed-length redacted bytes.
+    ///
+    /// The upstream body remains zeroizing until the parser has proved that the exact admitted
+    /// request was echoed and that no additional decoded result field contains the credential.
+    /// The retained body replaces the one literal echo in place; it never formats or retains the
+    /// credential or a credential-bearing URL.
+    pub(crate) fn sanitize_validated_echo(
+        self,
+        request: &BeaRequest,
+        user_id: &BeaUserId,
+        limits: BeaParseLimits,
+    ) -> Result<BeaSanitizedBody, BeaError> {
+        crate::parser::sanitize_response_body(self, request, user_id, limits)
     }
 
     pub(crate) fn into_zeroizing(mut self) -> Zeroizing<Vec<u8>> {
@@ -163,14 +180,16 @@ impl fmt::Debug for BeaSensitiveBody {
 /// Secret-free retained body and commitments to both upstream and sanitized representations.
 pub(crate) struct BeaSanitizedBody {
     bytes: Bytes,
+    upstream_digest: [u8; 32],
     retained_digest: [u8; 32],
 }
 
 impl BeaSanitizedBody {
-    pub(crate) fn from_secret_free_vec(bytes: Vec<u8>) -> Self {
+    pub(crate) fn from_secret_free_vec(bytes: Vec<u8>, upstream_digest: [u8; 32]) -> Self {
         let retained_digest = Sha256::digest(&bytes).into();
         Self {
             bytes: Bytes::from(bytes),
+            upstream_digest,
             retained_digest,
         }
     }
@@ -183,4 +202,8 @@ impl BeaSanitizedBody {
         self.retained_digest
     }
 
+    /// Returns SHA-256 of the exact upstream body before fixed-length echo redaction.
+    pub(crate) const fn upstream_digest(&self) -> [u8; 32] {
+        self.upstream_digest
+    }
 }

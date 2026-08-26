@@ -19,7 +19,7 @@ use crate::{
 /// Provider-specific canonical-candidate or rejoin invariant failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum BeaPublicationError {
-    /// Personal-research, doctor, source-binding, or raw-seal evidence did not match.
+    /// Doctor, source-binding, or raw-seal evidence did not match.
     #[error("invalid BEA publication-candidate authority")]
     InvalidAuthority,
     /// Candidate rows, bounds, clocks, or rejoin coordinates were inconsistent.
@@ -47,10 +47,8 @@ pub struct BeaPublicationRejoinCoordinates {
     acquisition_physical_receipt_digest: EvidenceDigest,
     data_component_ordinal: u16,
     metadata_generation: EvidenceDigest,
+    data_upstream_response_digest: EvidenceDigest,
     data_response_digest: EvidenceDigest,
-    rights_policy_digest: EvidenceDigest,
-    root_rights_decision_digest: EvidenceDigest,
-    rights_rejoin_digest: EvidenceDigest,
     canonical_batch_digest: EvidenceDigest,
     row_count: u64,
     candidate_digest: EvidenceDigest,
@@ -122,24 +120,14 @@ impl BeaPublicationRejoinCoordinates {
         self.metadata_generation
     }
 
-    /// Returns the exact `GetData` response-body digest.
+    /// Returns SHA-256 of the exact provider `GetData` body before echo redaction.
+    pub const fn data_upstream_response_digest(&self) -> EvidenceDigest {
+        self.data_upstream_response_digest
+    }
+
+    /// Returns the retained secret-free `GetData` response-body digest.
     pub const fn data_response_digest(&self) -> EvidenceDigest {
         self.data_response_digest
-    }
-
-    /// Returns the fixed provider-local private-use/no-sale policy.
-    pub const fn rights_policy_digest(&self) -> EvidenceDigest {
-        self.rights_policy_digest
-    }
-
-    /// Returns the non-authoritative root decision coordinate.
-    pub const fn root_rights_decision_digest(&self) -> EvidenceDigest {
-        self.root_rights_decision_digest
-    }
-
-    /// Returns the policy/root-decision rejoin commitment.
-    pub const fn rights_rejoin_digest(&self) -> EvidenceDigest {
-        self.rights_rejoin_digest
     }
 
     /// Returns the exact bounded canonical-row batch commitment.
@@ -186,26 +174,14 @@ impl BeaPublicationCandidate {
     ) -> Result<Self, BeaPublicationError> {
         let canonicalized_at = crate::transport::system_timestamp()
             .map_err(|_| BeaPublicationError::InvalidAuthority)?;
-        let context = BeaCanonicalContext::try_new(
-            binding,
-            doctor,
-            &sealed_acquisition,
-            canonicalized_at,
-        )
-        .map_err(|_| BeaPublicationError::InvalidAuthority)?;
-        let batch = BeaCanonicalBatch::try_from_sealed(
-            &sealed_acquisition,
-            &context,
-            maximum_records,
-        )
-        .map_err(|_| BeaPublicationError::InvalidEvidence)?;
-        let (
-            source_id,
-            dataset_id,
-            analytical_dataset_id,
-            observations,
-            canonical_batch_digest,
-        ) = batch.into_parts();
+        let context =
+            BeaCanonicalContext::try_new(binding, doctor, &sealed_acquisition, canonicalized_at)
+                .map_err(|_| BeaPublicationError::InvalidAuthority)?;
+        let batch =
+            BeaCanonicalBatch::try_from_sealed(&sealed_acquisition, &context, maximum_records)
+                .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+        let (source_id, dataset_id, analytical_dataset_id, observations, canonical_batch_digest) =
+            batch.into_parts();
         let first = observations
             .first()
             .ok_or(BeaPublicationError::InvalidEvidence)?;
@@ -215,22 +191,15 @@ impl BeaPublicationCandidate {
             || first.source_binding_digest() != binding.binding_digest()
             || first.doctor_admission_digest() != doctor.admission_digest()
             || first.doctor_sealed_graph_digest() != doctor.doctor_sealed_graph_digest()
-            || first.rights_policy_digest() != binding.rights_policy_digest()
-            || first.root_rights_decision_digest() != binding.root_rights_decision_digest()
-            || first.rights_rejoin_digest() != binding.rights_rejoin_digest()
             || first.raw_seal_digest() != sealed_acquisition.sealed_graph_digest()
             || observations.iter().any(|observation| {
                 observation.source_binding_digest() != first.source_binding_digest()
-                    || observation.doctor_admission_digest()
-                        != first.doctor_admission_digest()
+                    || observation.doctor_admission_digest() != first.doctor_admission_digest()
                     || observation.doctor_sealed_graph_digest()
                         != first.doctor_sealed_graph_digest()
-                    || observation.rights_policy_digest() != first.rights_policy_digest()
-                    || observation.root_rights_decision_digest()
-                        != first.root_rights_decision_digest()
-                    || observation.rights_rejoin_digest() != first.rights_rejoin_digest()
                     || observation.raw_seal_digest() != first.raw_seal_digest()
                     || observation.metadata_generation() != first.metadata_generation()
+                    || observation.upstream_response_digest() != first.upstream_response_digest()
                     || observation.raw_page_digest() != first.raw_page_digest()
             })
         {
@@ -243,8 +212,16 @@ impl BeaPublicationCandidate {
         let data_response_digest = sealed_acquisition
             .data_response_digest()
             .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+        let data_upstream_response_digest = sealed_acquisition
+            .data_upstream_response_digest()
+            .map_err(|_| BeaPublicationError::InvalidEvidence)?;
         if first.metadata_generation().bytes()
-                != sealed_acquisition.evidence().metadata().generation().digest()
+            != sealed_acquisition
+                .evidence()
+                .metadata()
+                .generation()
+                .digest()
+            || first.upstream_response_digest() != data_upstream_response_digest
             || first.raw_page_digest() != data_response_digest
         {
             return Err(BeaPublicationError::InvalidEvidence);
@@ -268,10 +245,8 @@ impl BeaPublicationCandidate {
             acquisition_physical_receipt_digest: physical_receipt_digest,
             data_component_ordinal: sealed_acquisition.data_component_ordinal(),
             metadata_generation: first.metadata_generation(),
+            data_upstream_response_digest,
             data_response_digest,
-            rights_policy_digest: binding.rights_policy_digest(),
-            root_rights_decision_digest: binding.root_rights_decision_digest(),
-            rights_rejoin_digest: binding.rights_rejoin_digest(),
             canonical_batch_digest,
             row_count,
             candidate_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
@@ -318,7 +293,17 @@ impl BeaPublicationCandidate {
                 .data_response_digest()
                 .map_err(|_| BeaPublicationError::InvalidEvidence)?
                 != coordinates.data_response_digest
-            || self.sealed_acquisition.evidence().metadata().generation().digest()
+            || self
+                .sealed_acquisition
+                .data_upstream_response_digest()
+                .map_err(|_| BeaPublicationError::InvalidEvidence)?
+                != coordinates.data_upstream_response_digest
+            || self
+                .sealed_acquisition
+                .evidence()
+                .metadata()
+                .generation()
+                .digest()
                 != coordinates.metadata_generation.bytes()
         {
             return Err(BeaPublicationError::InvalidEvidence);
@@ -332,7 +317,12 @@ impl BeaPublicationCandidate {
                 != observation.canonical_payload_digest()
                 || canonical.as_slice() != observation.canonical_payload().as_ref()
                 || observation.observation().context().time().revision().get() != 1
-                || observation.observation().context().time().published().is_some()
+                || observation
+                    .observation()
+                    .context()
+                    .time()
+                    .published()
+                    .is_some()
                 || observation
                     .observation()
                     .context()
@@ -343,13 +333,10 @@ impl BeaPublicationCandidate {
                 || observation.doctor_admission_digest() != coordinates.doctor_admission_digest
                 || observation.doctor_sealed_graph_digest()
                     != coordinates.doctor_sealed_graph_digest
-                || observation.rights_policy_digest() != coordinates.rights_policy_digest
-                || observation.root_rights_decision_digest()
-                    != coordinates.root_rights_decision_digest
-                || observation.rights_rejoin_digest() != coordinates.rights_rejoin_digest
-                || observation.raw_seal_digest()
-                    != coordinates.acquisition_sealed_graph_digest
+                || observation.raw_seal_digest() != coordinates.acquisition_sealed_graph_digest
                 || observation.metadata_generation() != coordinates.metadata_generation
+                || observation.upstream_response_digest()
+                    != coordinates.data_upstream_response_digest
                 || observation.raw_page_digest() != coordinates.data_response_digest
             {
                 return Err(BeaPublicationError::InvalidEvidence);
@@ -463,11 +450,14 @@ fn candidate_digest(
     revision_plan: &ExtractionRevisionPlan,
 ) -> Result<EvidenceDigest, BeaPublicationError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk/bea-publication-candidate/v3");
+    hasher.update(b"market-squawk/bea-publication-candidate/v5");
     hash_text(&mut hasher, coordinates.source_id.as_str())?;
     hash_text(
         &mut hasher,
-        coordinates.metadata_revision.as_source_identifier().as_str(),
+        coordinates
+            .metadata_revision
+            .as_source_identifier()
+            .as_str(),
     )?;
     hash_text(&mut hasher, coordinates.dataset_id.as_str())?;
     hash_text(&mut hasher, coordinates.provider_dataset.as_str())?;
@@ -480,10 +470,8 @@ fn candidate_digest(
         coordinates.acquisition_capture_receipt_digest,
         coordinates.acquisition_physical_receipt_digest,
         coordinates.metadata_generation,
+        coordinates.data_upstream_response_digest,
         coordinates.data_response_digest,
-        coordinates.rights_policy_digest,
-        coordinates.root_rights_decision_digest,
-        coordinates.rights_rejoin_digest,
         coordinates.canonical_batch_digest,
     ] {
         hasher.update(digest.bytes());
@@ -512,6 +500,8 @@ fn candidate_digest(
         hasher.update(observation.canonical_payload_digest().bytes());
         hasher.update(observation.native_row_digest().bytes());
         hasher.update(observation.native_series_digest().bytes());
+        hasher.update(observation.upstream_response_digest().bytes());
+        hasher.update(observation.raw_page_digest().bytes());
     }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,

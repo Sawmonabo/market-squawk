@@ -2,8 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -20,12 +20,11 @@ use market_squawk_sources::{
     ExtractionAuthorityError, ExtractionBatch, ExtractionRecord, ExtractionRequest,
     ExtractionRequestPermit, ExtractionSource, ExtractionSourceError, HistoricalCapability,
     InFlightExtractionRequest, MAX_PROVIDER_CAPTURE_PAGE_BYTES, NetworkAccessPolicy,
-    NetworkPolicyError, PathScope,
-    ProviderBudgetPolicy, ProviderBudgetWindow, ProviderCaptureError, ProviderCaptureMaterial,
-    ProviderCapturePageReceipt, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    ProviderRateDeclaration, QueryParameterRule, QuerySensitivity, SourceClass, SourceError,
-    SourceMetadata, SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
-    SourceProtocolProfile,
+    NetworkPolicyError, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
+    ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderRateDeclaration,
+    QueryParameterRule, QuerySensitivity, SourceClass, SourceError, SourceMetadata,
+    SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity, SourceProtocolProfile,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -33,17 +32,19 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::transport::{BeaHttpResponse, BeaTransport, ReqwestBeaTransport, system_timestamp};
+use crate::sealed::bea_capture_graph_identity;
+use crate::transport::{
+    BeaHttpResponse, BeaRetainedResponseHeaders, BeaTransport, ReqwestBeaTransport,
+    system_timestamp,
+};
 use crate::{
     BEA_API_ENDPOINT, BEA_APPLICATION_REQUESTS_PER_MINUTE, BEA_MINIMUM_REQUEST_INTERVAL,
-    BeaCompleteness,
-    BeaDataPage, BeaDatasetIdentity, BeaDoctorAdmissionEvidence, BeaDoctorRun, BeaError, BeaFrequency,
-    BeaMetadataGeneration, BeaMetadataPage, BeaMetadataRecords, BeaMethod, BeaMissingValue,
-    BeaObservation, BeaObservationValue, BeaParameterDefinition, BeaParameterIdentity,
-    BeaParseLimits, BeaProviderQuotaDeclaration, BeaQuery, BeaRequest,
-    BeaRightsDecisionRejoin, BeaSourceBinding, BeaUserId, parse_data_page, parse_metadata_page,
+    BeaCompleteness, BeaDataPage, BeaDatasetIdentity, BeaDoctorAdmissionEvidence, BeaDoctorRun,
+    BeaError, BeaFrequency, BeaMetadataGeneration, BeaMetadataPage, BeaMetadataRecords, BeaMethod,
+    BeaMissingValue, BeaObservation, BeaObservationValue, BeaParameterDefinition,
+    BeaParameterIdentity, BeaParseLimits, BeaProviderQuotaDeclaration, BeaQuery, BeaRequest,
+    BeaSourceBinding, BeaUserId, bea_provider_quota_declaration,
 };
-use crate::sealed::bea_capture_graph_identity;
 
 /// Maximum explicit BEA data-query contracts retained by one adapter instance.
 pub const MAX_BEA_CONFIGURED_DATASETS: usize = 64;
@@ -54,8 +55,7 @@ const BEA_DATASET_PREFIX: &str = "bea:data-v1:";
 const BEA_ANALYTICAL_PREFIX: &str = "bea.data-v1.";
 const BEA_JSON_MEDIA_TYPE: &str = "application/json";
 const MAX_RETRY_AFTER_BYTES: usize = 256;
-const BEA_METADATA_DISCOVERY_DAG_SCHEMA: &[u8] =
-    b"market-squawk/bea-metadata-discovery-dag/v2";
+const BEA_METADATA_DISCOVERY_DAG_SCHEMA: &[u8] = b"market-squawk/bea-metadata-discovery-dag/v2";
 
 /// One metadata-first BEA data selection admitted by application composition.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -783,17 +783,27 @@ impl BeaDatasetEvidence {
         self.metadata.pages.len().saturating_add(1)
     }
 
-    pub(crate) fn expected_capture(
-        &self,
-        ordinal: usize,
-    ) -> Option<&ProviderCaptureSetReceipt> {
+    pub(crate) fn expected_capture(&self, ordinal: usize) -> Option<&ProviderCaptureSetReceipt> {
         self.metadata
             .pages
             .get(ordinal)
             .map(BeaMetadataEvidencePage::capture)
+            .or_else(|| (ordinal == self.metadata.pages.len()).then_some(self.data.capture()))
+    }
+
+    pub(crate) fn expected_upstream_response_digest(
+        &self,
+        ordinal: usize,
+    ) -> Option<EvidenceDigest> {
+        self.metadata
+            .pages
+            .get(ordinal)
+            .map(|page| page.page().receipt().upstream_response_digest())
             .or_else(|| {
-                (ordinal == self.metadata.pages.len()).then_some(self.data.capture())
+                (ordinal == self.metadata.pages.len())
+                    .then_some(self.data.page().receipt().upstream_response_digest())
             })
+            .map(evidence_digest)
     }
 }
 
@@ -820,9 +830,7 @@ impl BeaDataAcquisition {
     }
 
     /// Moves the sole production response to the shared sealer without refetch or body cloning.
-    pub fn into_sealing_parts(
-        self,
-    ) -> (BeaDataAcquisitionEvidence, ProviderCaptureMaterial) {
+    pub fn into_sealing_parts(self) -> (BeaDataAcquisitionEvidence, ProviderCaptureMaterial) {
         let Self {
             dataset_id,
             metadata_generation,
@@ -904,18 +912,18 @@ impl BeaDatasetAcquisition {
         let capture = material.receipt().clone();
         materials.push(material);
         let evidence = BeaDatasetEvidence {
-                metadata: BeaMetadataEvidenceBundle {
-                    dataset_id: metadata.dataset_id,
-                    pages: metadata_evidence,
-                    generation: metadata.generation,
-                },
-                data: BeaDataEvidencePage {
-                    request,
-                    page,
-                    capture,
-                    telemetry,
-                },
-            };
+            metadata: BeaMetadataEvidenceBundle {
+                dataset_id: metadata.dataset_id,
+                pages: metadata_evidence,
+                generation: metadata.generation,
+            },
+            data: BeaDataEvidencePage {
+                request,
+                page,
+                capture,
+                telemetry,
+            },
+        };
         let capture_refs = materials
             .iter()
             .map(ProviderCaptureMaterial::receipt)
@@ -991,14 +999,8 @@ impl BeaCapturedExtraction {
     /// graph, then map/publish under the shared revision, manifest, and point-in-time contracts.
     pub fn into_sealing_parts(
         self,
-    ) -> Result<
-        (
-            ExtractionBatch,
-            BeaDatasetEvidence,
-            ProviderCaptureMaterial,
-        ),
-        BeaSourceError,
-    > {
+    ) -> Result<(ExtractionBatch, BeaDatasetEvidence, ProviderCaptureMaterial), BeaSourceError>
+    {
         let (evidence, graph) = self.acquisition.into_sealing_parts()?;
         Ok((self.batch, evidence, graph))
     }
@@ -1040,7 +1042,6 @@ pub struct BeaSource {
     metadata: SourceMetadata,
     user_id: BeaUserId,
     config: BeaSourceConfig,
-    rights_rejoin: BeaRightsDecisionRejoin,
     quota: BeaProviderQuotaDeclaration,
     source_binding: BeaSourceBinding,
     active_datasets: RwLock<BTreeMap<SourceIdentifier, BeaDoctorAdmissionEvidence>>,
@@ -1072,7 +1073,6 @@ impl BeaSource {
         user_id: BeaUserId,
         config: BeaSourceConfig,
         credential_generation_digest: EvidenceDigest,
-        rights_rejoin: BeaRightsDecisionRejoin,
     ) -> Result<Self, BeaSourceError> {
         Self::validate_metadata(&metadata, &config, &user_id)?;
         let bounds = match metadata.network_policy() {
@@ -1085,7 +1085,6 @@ impl BeaSource {
             user_id,
             config,
             credential_generation_digest,
-            rights_rejoin,
             transport,
         )
     }
@@ -1096,7 +1095,6 @@ impl BeaSource {
         user_id: BeaUserId,
         config: BeaSourceConfig,
         credential_generation_digest: EvidenceDigest,
-        rights_rejoin: BeaRightsDecisionRejoin,
         transport: Arc<dyn BeaTransport>,
     ) -> Result<Self, BeaSourceError> {
         Self::validate_metadata(&metadata, &config, &user_id)?;
@@ -1105,7 +1103,6 @@ impl BeaSource {
             user_id,
             config,
             credential_generation_digest,
-            rights_rejoin,
             transport,
         )
     }
@@ -1115,7 +1112,6 @@ impl BeaSource {
         user_id: BeaUserId,
         config: BeaSourceConfig,
         credential_generation_digest: EvidenceDigest,
-        rights_rejoin: BeaRightsDecisionRejoin,
         transport: Arc<dyn BeaTransport>,
     ) -> Result<Self, BeaSourceError> {
         let bounds = match metadata.network_policy() {
@@ -1138,7 +1134,6 @@ impl BeaSource {
             metadata.revision().clone(),
             config.digest()?,
             credential_generation_digest,
-            &rights_rejoin,
             quota.declaration_digest(),
         )
         .map_err(|_| BeaSourceError::InvalidConfiguration)?;
@@ -1146,7 +1141,6 @@ impl BeaSource {
             metadata,
             user_id,
             config,
-            rights_rejoin,
             quota,
             source_binding,
             active_datasets: RwLock::new(BTreeMap::new()),
@@ -1178,9 +1172,8 @@ impl BeaSource {
             .budget_policy()
             .ok_or(BeaSourceError::InvalidMetadata)?;
         let expected_quota = bea_provider_quota_declaration()?;
-        let minimum_request_interval_nanos =
-            u64::try_from(BEA_MINIMUM_REQUEST_INTERVAL.as_nanos())
-                .map_err(|_| BeaSourceError::InvalidMetadata)?;
+        let minimum_request_interval_nanos = u64::try_from(BEA_MINIMUM_REQUEST_INTERVAL.as_nanos())
+            .map_err(|_| BeaSourceError::InvalidMetadata)?;
         let has_pacing_window = (0..budget.window_count()).any(|index| {
             budget.window(index).is_some_and(|window| {
                 window.requests_per_window() == 1
@@ -1205,6 +1198,17 @@ impl BeaSource {
             return Err(BeaSourceError::InvalidMetadata);
         }
         for contract in config.contracts() {
+            if contract
+                .provider_dataset()
+                .as_str()
+                .contains(user_id.expose_secret())
+                || contract.parameters().iter().any(|(name, value)| {
+                    name.as_str().contains(user_id.expose_secret())
+                        || value.contains(user_id.expose_secret())
+                })
+            {
+                return Err(BeaSourceError::InvalidConfiguration);
+            }
             for request in contract.metadata_policy_requests()? {
                 authorize_configured_target(metadata, &request, user_id)?;
             }
@@ -1219,17 +1223,12 @@ impl BeaSource {
         &self.config
     }
 
-    /// Returns non-authoritative coordinates for rejoining to the root rights lease.
-    pub const fn rights_rejoin(&self) -> &BeaRightsDecisionRejoin {
-        &self.rights_rejoin
-    }
-
     /// Returns request admission plus the byte/error settlement requirements for shared authority.
     pub const fn quota_declaration(&self) -> &BeaProviderQuotaDeclaration {
         &self.quota
     }
 
-    /// Returns the non-secret source/config/credential/rights/quota binding.
+    /// Returns the non-secret source/configuration/credential/quota binding.
     pub const fn source_binding(&self) -> &BeaSourceBinding {
         &self.source_binding
     }
@@ -1253,12 +1252,7 @@ impl BeaSource {
             .contract(provider_dataset)
             .ok_or_else(invalid_protocol)?;
         let acquisition = self
-            .acquire_dataset(
-                authority,
-                provider_dataset,
-                deadline,
-                cancellation.clone(),
-            )
+            .acquire_dataset(authority, provider_dataset, deadline, cancellation.clone())
             .await?;
         let verified_at = system_timestamp().map_err(map_source_error)?;
         let run = BeaDoctorRun::try_new(
@@ -1330,15 +1324,13 @@ impl BeaSource {
         pages
             .try_reserve_exact(contract.parameters.len().saturating_add(2))
             .map_err(|_| map_source_error(BeaSourceError::Allocation))?;
-        for request in contract.metadata_root_requests().map_err(map_source_error)? {
+        for request in contract
+            .metadata_root_requests()
+            .map_err(map_source_error)?
+        {
             pages.push(
-                self.acquire_metadata_request(
-                    authority,
-                    request,
-                    deadline,
-                    cancellation.clone(),
-                )
-                .await?,
+                self.acquire_metadata_request(authority, request, deadline, cancellation.clone())
+                    .await?,
             );
         }
         validate_metadata_roots(contract, &pages).map_err(map_source_error)?;
@@ -1351,13 +1343,8 @@ impl BeaSource {
             .map_err(map_source_error)?;
         for request in value_requests {
             pages.push(
-                self.acquire_metadata_request(
-                    authority,
-                    request,
-                    deadline,
-                    cancellation.clone(),
-                )
-                .await?,
+                self.acquire_metadata_request(authority, request, deadline, cancellation.clone())
+                    .await?,
             );
         }
         validate_metadata_bundle(contract, &pages).map_err(map_source_error)?;
@@ -1381,27 +1368,27 @@ impl BeaSource {
         deadline: Timestamp,
         cancellation: CancellationToken,
     ) -> Result<BeaCapturedMetadataPage, ExtractionSourceError> {
-        let mut fetched = self
+        let fetched = self
             .fetch(authority, &request, deadline, cancellation.clone())
             .await?;
-        let page = parse_metadata_page(
-            fetched.response.body.as_slice(),
-            &request,
-            &self.user_id,
-            self.effective_parse_limits(),
-        )
-        .map_err(|error| {
-            self.record_parse_failure(&error);
-            map_source_error(BeaSourceError::Adapter(error))
-        })?;
         self.validate_operation_current(authority, deadline, &cancellation)?;
         let capture_dataset = capture_dataset_identity(&request)?;
         let mut fetched = fetched.sanitize(
             &self.metadata,
             &request,
             &self.user_id,
+            self.effective_parse_limits(),
             capture_dataset,
         )?;
+        let page = crate::parser::parse_metadata_page_sanitized(
+            fetched.retained_body()?,
+            &request,
+            self.effective_parse_limits(),
+        )
+        .map_err(|error| {
+            self.record_parse_failure(&error);
+            map_source_error(BeaSourceError::Adapter(error))
+        })?;
         let page = page
             .bind_sanitized_capture(fetched.upstream_digest, fetched.retained_digest)
             .map_err(|error| map_source_error(BeaSourceError::Adapter(error)))?;
@@ -1434,13 +1421,20 @@ impl BeaSource {
         let request = contract
             .data_request(metadata_generation)
             .map_err(map_source_error)?;
-        let mut fetched = self
-            .fetch(authority, &request, deadline, cancellation)
+        let fetched = self
+            .fetch(authority, &request, deadline, cancellation.clone())
             .await?;
-        let page = parse_data_page(
-            fetched.response.body.as_slice(),
+        self.validate_operation_current(authority, deadline, &cancellation)?;
+        let mut fetched = fetched.sanitize(
+            &self.metadata,
             &request,
             &self.user_id,
+            self.effective_parse_limits(),
+            contract.dataset_id().clone(),
+        )?;
+        let page = crate::parser::parse_data_page_sanitized(
+            fetched.retained_body()?,
+            &request,
             self.effective_parse_limits(),
         )
         .map_err(|error| {
@@ -1450,13 +1444,6 @@ impl BeaSource {
         if page.metadata_generation() != metadata_generation {
             return Err(invalid_protocol());
         }
-        self.validate_operation_current(authority, deadline, &cancellation)?;
-        let mut fetched = fetched.sanitize(
-            &self.metadata,
-            &request,
-            &self.user_id,
-            contract.dataset_id().clone(),
-        )?;
         let page = page
             .bind_sanitized_capture(fetched.upstream_digest, fetched.retained_digest)
             .map_err(|error| map_source_error(BeaSourceError::Adapter(error)))?;
@@ -1517,10 +1504,9 @@ impl BeaSource {
             .config
             .contract(request.dataset())
             .ok_or_else(invalid_protocol)?;
-        let metadata_generation = BeaMetadataGeneration::try_from_admitted_digest(
-            activation.metadata_generation(),
-        )
-        .map_err(|error| map_source_error(BeaSourceError::Adapter(error)))?;
+        let metadata_generation =
+            BeaMetadataGeneration::try_from_admitted_digest(activation.metadata_generation())
+                .map_err(|error| map_source_error(BeaSourceError::Adapter(error)))?;
         let data = self
             .acquire_data(
                 &authority,
@@ -1639,13 +1625,19 @@ impl BeaSource {
             )
             .await;
         self.telemetry.add(&self.telemetry.requests, 1);
-        let response = match result {
+        let mut response = match result {
             Ok(response) => response,
             Err(error) => {
                 self.telemetry.add(&self.telemetry.failures, 1);
                 return Err(map_source_error(error));
             }
         };
+        let headers = response
+            .retain_secret_free_headers(&self.user_id)
+            .map_err(|error| {
+                self.telemetry.add(&self.telemetry.failures, 1);
+                map_source_error(error)
+            })?;
         let response_bytes = u64::try_from(response.body.len()).map_err(|_| invalid_protocol())?;
         in_flight.validate_response_size(response_bytes)?;
         self.telemetry
@@ -1654,10 +1646,10 @@ impl BeaSource {
             &self.telemetry.latency_nanos,
             duration_nanos(response.latency),
         );
-        if response.retry_after.is_some() {
+        if headers.retry_after.is_some() {
             self.telemetry.add(&self.telemetry.retry_after_responses, 1);
         }
-        if response.retry_after.as_ref().is_some_and(|value| {
+        if headers.retry_after.as_ref().is_some_and(|value| {
             value.is_empty()
                 || value.len() > MAX_RETRY_AFTER_BYTES
                 || value.iter().any(u8::is_ascii_control)
@@ -1674,8 +1666,7 @@ impl BeaSource {
             429 | 503 => {
                 self.telemetry
                     .add(&self.telemetry.rate_limited_responses, 1);
-                let wait =
-                    in_flight.apply_retry_after_header(response.retry_after.as_deref(), 0)?;
+                let wait = in_flight.apply_retry_after_header(headers.retry_after.as_deref(), 0)?;
                 return Err(SourceError::BudgetWaitUntil { deadline: wait }.into());
             }
             _ => {
@@ -1683,17 +1674,18 @@ impl BeaSource {
                 return Err(SourceError::ProviderUnavailable.into());
             }
         }
-        if response
+        if headers
             .content_encoding
             .as_deref()
             .is_some_and(|value| !value.eq_ignore_ascii_case(b"identity"))
-            || !content_type_is_json(response.content_type.as_deref())
+            || !content_type_is_json(headers.content_type.as_deref())
         {
             self.telemetry.add(&self.telemetry.failures, 1);
             return Err(invalid_protocol());
         }
         Ok(FetchedResponse {
             response,
+            headers,
             in_flight: Some(in_flight),
         })
     }
@@ -1817,6 +1809,7 @@ impl ExtractionSource for BeaSource {
 
 struct FetchedResponse {
     response: BeaHttpResponse,
+    headers: BeaRetainedResponseHeaders,
     in_flight: Option<InFlightExtractionRequest>,
 }
 
@@ -1826,15 +1819,22 @@ impl FetchedResponse {
         metadata: &SourceMetadata,
         request: &BeaRequest,
         user_id: &BeaUserId,
+        limits: BeaParseLimits,
         capture_dataset: SourceIdentifier,
     ) -> Result<SanitizedFetchedResponse, ExtractionSourceError> {
         let Self {
             response,
+            headers,
             in_flight,
         } = self;
+        let BeaRetainedResponseHeaders {
+            retry_after,
+            content_encoding: _,
+            content_type: _,
+        } = headers;
         let BeaHttpResponse {
             status,
-            retry_after,
+            retry_after: _,
             content_encoding: _,
             content_type: _,
             body,
@@ -1842,10 +1842,9 @@ impl FetchedResponse {
             latency,
         } = response;
         let body = body
-            .sanitize_validated_echo(user_id)
+            .sanitize_validated_echo(request, user_id, limits)
             .map_err(|error| map_source_error(BeaSourceError::Adapter(error)))?;
-        let response_bytes =
-            u64::try_from(body.bytes().len()).map_err(|_| invalid_protocol())?;
+        let response_bytes = u64::try_from(body.bytes().len()).map_err(|_| invalid_protocol())?;
         let request_identity = evidence_digest(request.request_digest());
         let body_digest = evidence_digest(body.retained_digest());
         let capture = ProviderCaptureSetReceipt::try_new(
@@ -1854,17 +1853,19 @@ impl FetchedResponse {
             capture_dataset,
             request_identity,
             ProviderCaptureTerminalDisposition::StandaloneResponse,
-            vec![ProviderCapturePageReceipt::try_new(
-                0,
-                request_identity,
-                None,
-                None,
-                status,
-                response_bytes,
-                body_digest,
-                received_at,
-            )
-            .map_err(map_capture_error)?],
+            vec![
+                ProviderCapturePageReceipt::try_new(
+                    0,
+                    request_identity,
+                    None,
+                    None,
+                    status,
+                    response_bytes,
+                    body_digest,
+                    received_at,
+                )
+                .map_err(map_capture_error)?,
+            ],
         )
         .map_err(map_capture_error)?;
         let received = DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos());
@@ -1884,7 +1885,6 @@ impl FetchedResponse {
             status,
             retry_after,
             response_bytes,
-            received_at,
             latency,
             upstream_digest: body.upstream_digest(),
             retained_digest: body.retained_digest(),
@@ -1898,7 +1898,6 @@ struct SanitizedFetchedResponse {
     status: u16,
     retry_after: Option<Vec<u8>>,
     response_bytes: u64,
-    received_at: Timestamp,
     latency: Duration,
     upstream_digest: [u8; 32],
     retained_digest: [u8; 32],
@@ -1907,6 +1906,15 @@ struct SanitizedFetchedResponse {
 }
 
 impl SanitizedFetchedResponse {
+    fn retained_body(&self) -> Result<&[u8], ExtractionSourceError> {
+        self.material
+            .records()
+            .first()
+            .filter(|_| self.material.records().len() == 1)
+            .map(|record| record.payload().as_ref())
+            .ok_or_else(invalid_protocol)
+    }
+
     fn record_success(&mut self) -> Result<(), ExtractionSourceError> {
         self.in_flight
             .take()
@@ -2217,24 +2225,34 @@ fn native_payload(
     observation: &BeaObservation,
 ) -> Result<Bytes, ExtractionSourceError> {
     let (value, raw_value, missing, missing_marker, missing_reason) = match observation.value() {
-        BeaObservationValue::Observed { value, raw } => {
-            (Some(value.to_string()), Some(raw.as_str()), None, None, None)
-        }
-        BeaObservationValue::Missing(BeaMissingValue::Absent) => {
-            (None, None, Some("absent"), None, Some("value-dimension-absent-or-null"))
-        }
-        BeaObservationValue::Missing(BeaMissingValue::Blank) => {
-            (None, None, Some("blank"), Some(""), Some("provider-empty-lexical-value"))
-        }
-        BeaObservationValue::Missing(BeaMissingValue::SuppressedRegional) => {
-            (
-                None,
-                None,
-                Some("suppressed_regional"),
-                Some(crate::BEA_REGIONAL_SUPPRESSION_MARKER),
-                Some(crate::BEA_REGIONAL_SUPPRESSION_REASON),
-            )
-        }
+        BeaObservationValue::Observed { value, raw } => (
+            Some(value.to_string()),
+            Some(raw.as_str()),
+            None,
+            None,
+            None,
+        ),
+        BeaObservationValue::Missing(BeaMissingValue::Absent) => (
+            None,
+            None,
+            Some("absent"),
+            None,
+            Some("value-dimension-absent-or-null"),
+        ),
+        BeaObservationValue::Missing(BeaMissingValue::Blank) => (
+            None,
+            None,
+            Some("blank"),
+            Some(""),
+            Some("provider-empty-lexical-value"),
+        ),
+        BeaObservationValue::Missing(BeaMissingValue::SuppressedRegional) => (
+            None,
+            None,
+            Some("suppressed_regional"),
+            Some(crate::BEA_REGIONAL_SUPPRESSION_MARKER),
+            Some(crate::BEA_REGIONAL_SUPPRESSION_REASON),
+        ),
     };
     let mut parameters = Vec::new();
     parameters

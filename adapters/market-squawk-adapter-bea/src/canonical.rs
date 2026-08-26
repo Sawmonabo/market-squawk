@@ -16,14 +16,14 @@ use thiserror::Error;
 
 use crate::{
     BeaCompleteness, BeaDataEvidencePage, BeaDoctorAdmissionEvidence, BeaFrequency,
-    BeaMissingValue, BeaObservation, BeaObservationValue,
-    BeaSealedAcquisitionReceipt, BeaSourceBinding,
+    BeaMissingValue, BeaObservation, BeaObservationValue, BeaSealedAcquisitionReceipt,
+    BeaSourceBinding,
 };
 
 /// Canonical BEA mapping or evidence invariant failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum BeaCanonicalError {
-    /// Source/config/doctor/rights/raw-seal evidence did not match.
+    /// Source/configuration/doctor/raw-seal evidence did not match.
     #[error("invalid BEA canonicalization authority")]
     InvalidAuthority,
     /// Provider and local clocks cannot establish conservative point-in-time ordering.
@@ -46,16 +46,13 @@ pub enum BeaCanonicalError {
 /// rows carry revision one only as the shared revision authority's required input shape; root
 /// composition must replace it with its durable assignment before immutable publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BeaCanonicalContext {
+pub(crate) struct BeaCanonicalContext {
     source_id: SourceId,
     provider_dataset_id: SourceIdentifier,
     analytical_dataset_id: SourceIdentifier,
     source_binding_digest: EvidenceDigest,
     doctor_admission_digest: EvidenceDigest,
     doctor_sealed_graph_digest: EvidenceDigest,
-    rights_policy_digest: EvidenceDigest,
-    root_rights_decision_digest: EvidenceDigest,
-    rights_rejoin_digest: EvidenceDigest,
     raw_seal_digest: EvidenceDigest,
     ingested_at: Timestamp,
 }
@@ -80,9 +77,6 @@ impl BeaCanonicalContext {
             || sealed_acquisition.metadata_revision() != binding.metadata_revision()
             || doctor.dataset_id() != sealed_acquisition.dataset_id()
             || doctor.source_binding_digest() != binding.binding_digest()
-            || doctor.rights_policy_digest() != binding.rights_policy_digest()
-            || doctor.root_rights_decision_digest() != binding.root_rights_decision_digest()
-            || doctor.rights_rejoin_digest() != binding.rights_rejoin_digest()
         {
             return Err(BeaCanonicalError::InvalidAuthority);
         }
@@ -93,29 +87,9 @@ impl BeaCanonicalContext {
             source_binding_digest: binding.binding_digest(),
             doctor_admission_digest: doctor.admission_digest(),
             doctor_sealed_graph_digest: doctor.doctor_sealed_graph_digest(),
-            rights_policy_digest: binding.rights_policy_digest(),
-            root_rights_decision_digest: binding.root_rights_decision_digest(),
-            rights_rejoin_digest: binding.rights_rejoin_digest(),
             raw_seal_digest: sealed_acquisition.sealed_graph_digest(),
             ingested_at,
         })
-    }
-
-    /// Returns the configured provider-query identity.
-    pub const fn provider_dataset_id(&self) -> &SourceIdentifier {
-        &self.provider_dataset_id
-    }
-    /// Returns the canonical analytical dataset identity.
-    pub const fn analytical_dataset_id(&self) -> &SourceIdentifier {
-        &self.analytical_dataset_id
-    }
-    /// Returns the exact sealed raw-record commitment.
-    pub const fn raw_seal_digest(&self) -> EvidenceDigest {
-        self.raw_seal_digest
-    }
-    /// Returns the candidate's local canonicalization instant.
-    pub const fn ingested_at(&self) -> Timestamp {
-        self.ingested_at
     }
 }
 
@@ -128,14 +102,12 @@ pub struct BeaCanonicalObservation {
     native_row_digest: EvidenceDigest,
     native_series_digest: EvidenceDigest,
     metadata_generation: EvidenceDigest,
+    upstream_response_digest: EvidenceDigest,
     raw_page_digest: EvidenceDigest,
     raw_seal_digest: EvidenceDigest,
     source_binding_digest: EvidenceDigest,
     doctor_admission_digest: EvidenceDigest,
     doctor_sealed_graph_digest: EvidenceDigest,
-    rights_policy_digest: EvidenceDigest,
-    root_rights_decision_digest: EvidenceDigest,
-    rights_rejoin_digest: EvidenceDigest,
 }
 
 impl BeaCanonicalObservation {
@@ -169,8 +141,11 @@ impl BeaCanonicalObservation {
             return Err(BeaCanonicalError::InvalidClock);
         }
         let raw_page_digest = capture_page.body_digest();
+        let upstream_response_digest = digest(captured.page().receipt().upstream_response_digest());
         if raw_page_digest.algorithm() != DigestAlgorithm::Sha256
             || raw_page_digest.bytes() != captured.page().receipt().response_digest()
+            || upstream_response_digest.algorithm() != DigestAlgorithm::Sha256
+            || upstream_response_digest == raw_page_digest
         {
             return Err(BeaCanonicalError::InvalidObservation);
         }
@@ -244,9 +219,10 @@ impl BeaCanonicalObservation {
                 unit,
             ),
         };
-        let canonical_payload = serde_json::to_vec(&ResearchObservation::Macro(observation.clone()))
-            .map(Bytes::from)
-            .map_err(|_| BeaCanonicalError::Encoding)?;
+        let canonical_payload =
+            serde_json::to_vec(&ResearchObservation::Macro(observation.clone()))
+                .map(Bytes::from)
+                .map_err(|_| BeaCanonicalError::Encoding)?;
         let canonical_payload_digest = digest_bytes(&canonical_payload);
         Ok(Self {
             observation,
@@ -255,14 +231,12 @@ impl BeaCanonicalObservation {
             native_row_digest: digest(native.digest()),
             native_series_digest,
             metadata_generation: digest(captured.page().metadata_generation().digest()),
+            upstream_response_digest,
             raw_page_digest,
             raw_seal_digest: context.raw_seal_digest,
             source_binding_digest: context.source_binding_digest,
             doctor_admission_digest: context.doctor_admission_digest,
             doctor_sealed_graph_digest: context.doctor_sealed_graph_digest,
-            rights_policy_digest: context.rights_policy_digest,
-            root_rights_decision_digest: context.root_rights_decision_digest,
-            rights_rejoin_digest: context.rights_rejoin_digest,
         })
     }
 
@@ -290,6 +264,10 @@ impl BeaCanonicalObservation {
     pub const fn metadata_generation(&self) -> EvidenceDigest {
         self.metadata_generation
     }
+    /// Returns SHA-256 of the exact provider body before validated echo redaction.
+    pub const fn upstream_response_digest(&self) -> EvidenceDigest {
+        self.upstream_response_digest
+    }
     /// Returns the exact raw response-body commitment.
     pub const fn raw_page_digest(&self) -> EvidenceDigest {
         self.raw_page_digest
@@ -298,7 +276,7 @@ impl BeaCanonicalObservation {
     pub const fn raw_seal_digest(&self) -> EvidenceDigest {
         self.raw_seal_digest
     }
-    /// Returns the exact source/config/credential/rights/quota binding.
+    /// Returns the exact source/configuration/credential/quota binding.
     pub const fn source_binding_digest(&self) -> EvidenceDigest {
         self.source_binding_digest
     }
@@ -310,23 +288,11 @@ impl BeaCanonicalObservation {
     pub const fn doctor_sealed_graph_digest(&self) -> EvidenceDigest {
         self.doctor_sealed_graph_digest
     }
-    /// Returns the fixed private-use/no-sale policy commitment.
-    pub const fn rights_policy_digest(&self) -> EvidenceDigest {
-        self.rights_policy_digest
-    }
-    /// Returns the non-authoritative root decision coordinate.
-    pub const fn root_rights_decision_digest(&self) -> EvidenceDigest {
-        self.root_rights_decision_digest
-    }
-    /// Returns the policy/root-decision rejoin commitment.
-    pub const fn rights_rejoin_digest(&self) -> EvidenceDigest {
-        self.rights_rejoin_digest
-    }
 }
 
 /// One bounded canonical BEA dataset batch ready for a shared immutable publisher.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BeaCanonicalBatch {
+pub(crate) struct BeaCanonicalBatch {
     source_id: SourceId,
     provider_dataset_id: SourceIdentifier,
     analytical_dataset_id: SourceIdentifier,
@@ -363,16 +329,13 @@ impl BeaCanonicalBatch {
             )?);
         }
         let mut hasher = Sha256::new();
-        hasher.update(b"market-squawk/bea-canonical-batch/v1");
+        hasher.update(b"market-squawk/bea-canonical-batch/v3");
         hash_text(&mut hasher, context.source_id.as_str())?;
         hash_text(&mut hasher, context.provider_dataset_id.as_str())?;
         hash_text(&mut hasher, context.analytical_dataset_id.as_str())?;
         hasher.update(context.source_binding_digest.bytes());
         hasher.update(context.doctor_admission_digest.bytes());
         hasher.update(context.doctor_sealed_graph_digest.bytes());
-        hasher.update(context.rights_policy_digest.bytes());
-        hasher.update(context.root_rights_decision_digest.bytes());
-        hasher.update(context.rights_rejoin_digest.bytes());
         hasher.update(context.raw_seal_digest.bytes());
         hasher.update(
             u64::try_from(observations.len())
@@ -382,9 +345,10 @@ impl BeaCanonicalBatch {
         for observation in &observations {
             hasher.update(observation.canonical_payload_digest.bytes());
             hasher.update(observation.native_row_digest.bytes());
+            hasher.update(observation.upstream_response_digest.bytes());
+            hasher.update(observation.raw_page_digest.bytes());
         }
-        let batch_digest =
-            EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
+        let batch_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
         Ok(Self {
             source_id: context.source_id.clone(),
             provider_dataset_id: context.provider_dataset_id.clone(),
@@ -392,27 +356,6 @@ impl BeaCanonicalBatch {
             observations,
             batch_digest,
         })
-    }
-
-    /// Returns the configured provider-query identity.
-    pub const fn source_id(&self) -> &SourceId {
-        &self.source_id
-    }
-    /// Returns the configured provider-query identity.
-    pub const fn provider_dataset_id(&self) -> &SourceIdentifier {
-        &self.provider_dataset_id
-    }
-    /// Returns the immutable analytical dataset target.
-    pub const fn analytical_dataset_id(&self) -> &SourceIdentifier {
-        &self.analytical_dataset_id
-    }
-    /// Returns canonical rows in provider response order.
-    pub fn observations(&self) -> &[BeaCanonicalObservation] {
-        &self.observations
-    }
-    /// Returns the full provider/native/canonical/authority graph commitment.
-    pub const fn batch_digest(&self) -> EvidenceDigest {
-        self.batch_digest
     }
 
     pub(crate) fn into_parts(
@@ -563,10 +506,7 @@ fn hash_text(hasher: &mut Sha256, value: &str) -> Result<(), BeaCanonicalError> 
     Ok(())
 }
 
-fn hash_optional_text(
-    hasher: &mut Sha256,
-    value: Option<&str>,
-) -> Result<(), BeaCanonicalError> {
+fn hash_optional_text(hasher: &mut Sha256, value: Option<&str>) -> Result<(), BeaCanonicalError> {
     match value {
         Some(value) => {
             hasher.update([1]);

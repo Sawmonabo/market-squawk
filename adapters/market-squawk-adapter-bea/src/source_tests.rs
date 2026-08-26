@@ -7,13 +7,13 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
-use market_squawk_platform::LocalPaths;
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
-    SourceIdentifier, Timestamp,
+    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
+    Timestamp,
 };
+use market_squawk_platform::LocalPaths;
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, CoverageDomain,
@@ -26,13 +26,13 @@ use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::auth::BeaSensitiveBody;
 use crate::source::bea_api_endpoint_rule;
-use crate::transport::{BeaHttpResponse, BeaTransport, system_timestamp};
+use crate::transport::{BeaHttpResponse, BeaSensitiveHeader, BeaTransport, system_timestamp};
 use crate::{
     BeaAuthorizedRequest, BeaDatasetContract, BeaDatasetIdentity, BeaObservationValue,
-    BeaParseLimits, BeaPersonalResearchAuthorization, BeaPersonalResearchOperation,
-    BeaPublicationCandidate, BeaRequiredSharedSettlement, BeaSealedAcquisitionReceipt, BeaSource,
-    BeaSourceConfig, BeaSourceError, BeaUserId,
+    BeaParseLimits, BeaPublicationCandidate, BeaRequiredSharedSettlement,
+    BeaSealedAcquisitionReceipt, BeaSource, BeaSourceConfig, BeaSourceError, BeaUserId,
 };
 
 const USER_ID: &str = "11111111-2222-3333-4444-555555555555";
@@ -117,8 +117,10 @@ impl BeaTransport for ScriptedTransport {
                 status: 200,
                 retry_after: None,
                 content_encoding: None,
-                content_type: Some(b"application/json; charset=utf-8".to_vec()),
-                body,
+                content_type: Some(BeaSensitiveHeader::try_from_vec(
+                    b"application/json; charset=utf-8".to_vec(),
+                )?),
+                body: BeaSensitiveBody::from_vec(body.to_vec()),
                 received_at: system_timestamp()?,
                 latency: Duration::from_millis(1),
             })
@@ -137,19 +139,45 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     let contract = BeaDatasetContract::try_new(dataset, parameters, Some(1))?;
     let provider_dataset = contract.dataset_id().clone();
     let config = BeaSourceConfig::try_new(vec![contract], BeaParseLimits::production_defaults())?;
+    let upstream_responses = responses()?;
+    let user_id = BeaUserId::try_new(USER_ID.to_owned())?;
+    let malicious_header = format!("{}?UserID={USER_ID}", crate::BEA_API_ENDPOINT);
+    let mut malicious_response = BeaHttpResponse {
+        status: 200,
+        retry_after: None,
+        content_encoding: None,
+        content_type: Some(BeaSensitiveHeader::try_from_vec(
+            malicious_header.into_bytes(),
+        )?),
+        body: BeaSensitiveBody::from_vec(upstream_responses[0].to_vec()),
+        received_at: system_timestamp()?,
+        latency: Duration::from_millis(1),
+    };
+    let malicious_debug = format!("{malicious_response:?}");
+    assert!(!malicious_debug.contains(USER_ID));
+    assert!(!malicious_debug.contains(crate::BEA_API_ENDPOINT));
+    assert!(!malicious_debug.contains("UserID"));
+    assert!(
+        malicious_response
+            .retain_secret_free_headers(&user_id)
+            .is_err()
+    );
+    assert!(
+        malicious_response
+            .content_type
+            .as_ref()
+            .is_some_and(BeaSensitiveHeader::is_zeroized)
+    );
     let transport = Arc::new(ScriptedTransport {
-        responses: Mutex::new(VecDeque::from(responses()?)),
+        responses: Mutex::new(VecDeque::from(upstream_responses.clone())),
     });
     let now = system_timestamp()?;
     let metadata = source_metadata(now, &config)?;
     let source = BeaSource::try_new_with_transport(
         metadata.clone(),
-        BeaUserId::try_new(USER_ID.to_owned())?,
+        user_id,
         config,
         digest_evidence(b"bea-test-credential-generation-v1"),
-        BeaPersonalResearchAuthorization::try_new(digest_evidence(
-            b"owner-personal-research-attestation-v1",
-        ))?,
         transport.clone(),
     )?;
     let mut registry =
@@ -176,11 +204,37 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
 
     assert_eq!(acquisition.metadata().pages().len(), 3);
     assert_eq!(acquisition.data().page().observations().len(), 1);
+    assert_eq!(
+        acquisition.data().request().query().supplied_parameters(),
+        &BTreeMap::from([(
+            crate::BeaParameterIdentity::try_new("TableName")?,
+            "SAINC1".to_owned(),
+        )])
+    );
+    assert_eq!(
+        acquisition.data().page().observations()[0]
+            .identity()
+            .table(),
+        Some("SAINC1")
+    );
     assert!(matches!(
         acquisition.data().page().observations()[0].value(),
         BeaObservationValue::Observed { .. }
     ));
+    for (captured, upstream) in acquisition
+        .metadata()
+        .pages()
+        .iter()
+        .zip(upstream_responses.iter())
+    {
+        assert_secret_free_capture(captured.page().receipt(), captured.material(), upstream)?;
+    }
     let data_material = acquisition.data().material();
+    assert_secret_free_capture(
+        acquisition.data().page().receipt(),
+        data_material,
+        upstream_responses.last().ok_or("missing data response")?,
+    )?;
     assert_eq!(data_material.receipt().pages().len(), 1);
     assert_eq!(data_material.records().len(), 1);
     assert_eq!(
@@ -192,6 +246,21 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     assert_eq!(source.telemetry().returned_rows(), 1);
     assert_eq!(run.receipt().request_count(), 4);
     assert_eq!(run.receipt().returned_rows(), 1);
+    let provider_production_time = acquisition
+        .data()
+        .page()
+        .production_time()
+        .ok_or("missing provider production time")?
+        .timestamp();
+    let received_at = data_material.receipt().pages()[0].received_at();
+    assert!(provider_production_time <= received_at);
+    assert_eq!(
+        run.receipt().source_production_time(),
+        Some(provider_production_time)
+    );
+    assert!(!format!("{source:?}").contains(USER_ID));
+    assert!(!format!("{run:?}").contains(USER_ID));
+    assert!(!format!("{run:?}").contains(crate::BEA_API_ENDPOINT));
     let (doctor_receipt, evidence, graph) = run.into_sealing_parts()?;
     assert_eq!(graph.receipt().pages().len(), 4);
     assert_eq!(graph.receipt().request_graph_components().len(), 4);
@@ -205,23 +274,14 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     let sealed = BeaSealedAcquisitionReceipt::try_new(evidence, graph.seal(&store)?)?;
     let admission = doctor_receipt.bind_sealed(source.source_binding(), &sealed)?;
     source.activate_doctor(&admission)?;
-    assert_eq!(source.rights().research_rights().len(), 11);
-    for operation in [
-        BeaPersonalResearchOperation::Transform,
-        BeaPersonalResearchOperation::Backtest,
-        BeaPersonalResearchOperation::Forecast,
-        BeaPersonalResearchOperation::ModelTraining,
-        BeaPersonalResearchOperation::ModelOperation,
-    ] {
-        source.rights().authorize_research(operation)?;
-    }
-    for operation in [
-        BeaPersonalResearchOperation::Export,
-        BeaPersonalResearchOperation::Sale,
-        BeaPersonalResearchOperation::Redistribute,
-    ] {
-        assert!(source.rights().authorize_research(operation).is_err());
-    }
+    assert_eq!(
+        source.source_binding().source_id(),
+        authority.metadata().source_id()
+    );
+    assert_eq!(
+        source.source_binding().metadata_revision(),
+        authority.metadata().revision()
+    );
     assert_eq!(
         source.quota_declaration().required_shared_settlements(),
         &[
@@ -233,9 +293,6 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
         source.source_binding(),
         &admission,
         sealed,
-        source
-            .rights()
-            .authorize(market_squawk_sources::DataUseOperation::Persist)?,
         NonZeroU32::new(1).ok_or("canonical record bound")?,
     )?;
     candidate.validate()?;
@@ -249,6 +306,32 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     );
     assert_eq!(candidate.rejoin_coordinates().row_count(), 1);
     assert_eq!(candidate.rejoin_coordinates().data_component_ordinal(), 3);
+    assert_eq!(
+        candidate.rejoin_coordinates().dataset_id(),
+        &provider_dataset
+    );
+    assert_eq!(
+        candidate.rejoin_coordinates().provider_dataset().as_str(),
+        "Regional"
+    );
+    assert_eq!(
+        candidate.rejoin_coordinates().metadata_generation(),
+        admission.metadata_generation()
+    );
+    let expected_data_upstream_digest = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256::digest(upstream_responses.last().ok_or("missing data response")?).into(),
+    );
+    assert_eq!(
+        candidate
+            .rejoin_coordinates()
+            .data_upstream_response_digest(),
+        expected_data_upstream_digest
+    );
+    assert_eq!(
+        candidate.observations()[0].upstream_response_digest(),
+        expected_data_upstream_digest
+    );
     assert_eq!(
         candidate.rejoin_coordinates().candidate_digest(),
         candidate.candidate_digest()
@@ -267,7 +350,10 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     assert_eq!(handoff.revision_plan().len(), handoff.observations().len());
     assert_eq!(
         handoff.coordinates().acquisition_capture_receipt_digest(),
-        handoff.sealed_acquisition().sealed_capture().receipt_digest()
+        handoff
+            .sealed_acquisition()
+            .sealed_capture()
+            .receipt_digest()
     );
     assert!(
         transport
@@ -279,13 +365,56 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     Ok(())
 }
 
+fn assert_secret_free_capture(
+    receipt: &crate::BeaPageReceipt,
+    material: &market_squawk_sources::ProviderCaptureMaterial,
+    upstream: &Bytes,
+) -> TestResult {
+    let retained = material
+        .records()
+        .first()
+        .ok_or("missing retained response")?
+        .payload();
+    assert_eq!(material.records().len(), 1);
+    assert_eq!(
+        receipt.upstream_response_digest(),
+        <[u8; 32]>::from(Sha256::digest(upstream))
+    );
+    assert_eq!(
+        receipt.response_digest(),
+        material.receipt().pages()[0].body_digest().bytes()
+    );
+    assert_ne!(
+        receipt.upstream_response_digest(),
+        receipt.response_digest()
+    );
+    assert!(
+        !retained
+            .windows(USER_ID.len())
+            .any(|value| value == USER_ID.as_bytes())
+    );
+    assert!(
+        retained
+            .windows(36)
+            .any(|value| value == b"************************************")
+    );
+    assert!(
+        !retained
+            .windows(crate::BEA_API_ENDPOINT.len())
+            .any(|value| value == crate::BEA_API_ENDPOINT.as_bytes())
+    );
+    Ok(())
+}
+
 fn source_metadata(now: Timestamp, config: &BeaSourceConfig) -> TestResult<SourceMetadata> {
     let effective = EffectiveInterval::new(now.checked_sub_nanos(1)?, None)?;
     let provider = SourceIdentifier::try_from("bea")?;
     let evidence = exact_evidence(b"bea-local-transport-contract-metadata-v1");
     let authorization = AuthorizationGrant::new(
         AuthorizationMode::UserAuthorized,
-        AuthorizationBasis::new(SourceIdentifier::try_from("user-supplied-bea-user-id")?),
+        AuthorizationBasis::new(
+            market_squawk_sources::ProviderRateDeclaration::governed_provider_subject(&provider)?,
+        ),
         evidence.clone(),
         effective,
     );

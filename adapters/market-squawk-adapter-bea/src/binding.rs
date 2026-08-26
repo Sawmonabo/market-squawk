@@ -1,14 +1,10 @@
 //! Exact non-secret BEA source/configuration binding.
 
-use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
-};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::BeaRightsDecisionRejoin;
-
-/// Invalid source, credential-generation, rights, or quota binding evidence.
+/// Invalid source, credential-generation, or quota binding evidence.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum BeaSourceBindingError {
     /// A required SHA-256 commitment was absent or invalid.
@@ -19,17 +15,15 @@ pub enum BeaSourceBindingError {
 /// Exact non-secret coordinates shared by doctor and canonical-candidate construction.
 ///
 /// This is a configuration identity, not activation, restart, publication, or query authority.
-/// It contains only commitments to the protected credential generation and owner decision; the
-/// BEA `UserID` is never retained here.
+/// It contains only commitments to the source contract, configured datasets, protected credential
+/// generation, and shared quota declaration; the BEA `UserID` is never retained here. Common
+/// application rights and activation leases remain composition authority and are not duplicated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BeaSourceBinding {
     source_id: SourceId,
     metadata_revision: MetadataRevision,
     config_digest: EvidenceDigest,
     credential_generation_digest: EvidenceDigest,
-    rights_policy_digest: EvidenceDigest,
-    root_rights_decision_digest: EvidenceDigest,
-    rights_rejoin_digest: EvidenceDigest,
     quota_declaration_digest: EvidenceDigest,
     binding_digest: EvidenceDigest,
 }
@@ -41,15 +35,11 @@ impl BeaSourceBinding {
         metadata_revision: MetadataRevision,
         config_digest: EvidenceDigest,
         credential_generation_digest: EvidenceDigest,
-        rights: &BeaRightsDecisionRejoin,
         quota_declaration_digest: EvidenceDigest,
     ) -> Result<Self, BeaSourceBindingError> {
         if [
             config_digest,
             credential_generation_digest,
-            rights.policy_digest(),
-            rights.root_decision_digest(),
-            rights.rejoin_digest(),
             quota_declaration_digest,
         ]
         .iter()
@@ -58,7 +48,7 @@ impl BeaSourceBinding {
             return Err(BeaSourceBindingError::InvalidBinding);
         }
         let mut hasher = Sha256::new();
-        hasher.update(b"market-squawk/bea-source-binding/v1");
+        hasher.update(b"market-squawk/bea-source-binding/v2");
         hash_text(&mut hasher, source_id.as_str());
         hash_text(
             &mut hasher,
@@ -67,23 +57,16 @@ impl BeaSourceBinding {
         for digest in [
             config_digest,
             credential_generation_digest,
-            rights.policy_digest(),
-            rights.root_decision_digest(),
-            rights.rejoin_digest(),
             quota_declaration_digest,
         ] {
             hasher.update(digest.bytes());
         }
-        let binding_digest =
-            EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
+        let binding_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
         Ok(Self {
             source_id,
             metadata_revision,
             config_digest,
             credential_generation_digest,
-            rights_policy_digest: rights.policy_digest(),
-            root_rights_decision_digest: rights.root_decision_digest(),
-            rights_rejoin_digest: rights.rejoin_digest(),
             quota_declaration_digest,
             binding_digest,
         })
@@ -107,21 +90,6 @@ impl BeaSourceBinding {
     /// Returns the protected credential-generation commitment, never the credential.
     pub const fn credential_generation_digest(&self) -> EvidenceDigest {
         self.credential_generation_digest
-    }
-
-    /// Returns the fixed code-owned private-use/no-sale policy commitment.
-    pub const fn rights_policy_digest(&self) -> EvidenceDigest {
-        self.rights_policy_digest
-    }
-
-    /// Returns the root rights-decision coordinate. It is not authorization.
-    pub const fn root_rights_decision_digest(&self) -> EvidenceDigest {
-        self.root_rights_decision_digest
-    }
-
-    /// Returns the policy/root-decision rejoin commitment.
-    pub const fn rights_rejoin_digest(&self) -> EvidenceDigest {
-        self.rights_rejoin_digest
     }
 
     /// Returns the complete request/byte/error declaration commitment.

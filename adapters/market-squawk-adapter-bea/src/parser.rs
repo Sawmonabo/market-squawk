@@ -1,25 +1,26 @@
 //! Bounded BEA JSON envelope, metadata, dimension, and observation parsing.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem;
 
 use chrono::NaiveDateTime;
 use market_squawk_domain::Timestamp;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use crate::{
-    BEA_APPLICATION_RESPONSE_BYTES_PER_MINUTE, BEA_MAX_APPLICATION_ROWS_PER_PAGE, BeaCompleteness,
-    BeaDataPage, BeaDataType, BeaDatasetDefinition, BeaDatasetIdentity, BeaDimension, BeaError,
-    BeaFrequency, BeaMetadataPage, BeaMetadataRecords, BeaMethod, BeaMissingValue, BeaNote,
-    BeaObservation, BeaObservationIdentity, BeaObservationValue, BeaPageReceipt,
-    BeaParameterDataType, BeaParameterDefinition, BeaParameterIdentity,
-    BeaParameterValueDefinition, BeaProductionTime, BeaProviderError, BeaRequest, BeaTimePeriod,
-    BeaUnit, BeaUserId, BEA_REGIONAL_SUPPRESSION_MARKER,
-};
 use crate::auth::{BEA_REDACTED_USER_ID, BeaSanitizedBody, BeaSensitiveBody};
+use crate::{
+    BEA_APPLICATION_RESPONSE_BYTES_PER_MINUTE, BEA_MAX_APPLICATION_ROWS_PER_PAGE,
+    BEA_REGIONAL_SUPPRESSION_MARKER, BeaCompleteness, BeaDataPage, BeaDataType,
+    BeaDatasetDefinition, BeaDatasetIdentity, BeaDimension, BeaError, BeaFrequency,
+    BeaMetadataPage, BeaMetadataRecords, BeaMethod, BeaMissingValue, BeaNote, BeaObservation,
+    BeaObservationIdentity, BeaObservationValue, BeaPageReceipt, BeaParameterDataType,
+    BeaParameterDefinition, BeaParameterIdentity, BeaParameterValueDefinition, BeaProductionTime,
+    BeaProviderError, BeaRequest, BeaTimePeriod, BeaUnit, BeaUserId,
+};
 
 const MAX_METADATA_RECORDS: usize = 20_000;
 const MAX_STRING_BYTES: usize = 64 * 1024;
@@ -118,7 +119,7 @@ impl BeaParseLimits {
     }
 }
 
-/// Parses one exact metadata response and validates the complete echoed request.
+/// Parses one exact metadata response after validating and redacting the complete echoed request.
 ///
 /// # Errors
 ///
@@ -130,7 +131,9 @@ pub fn parse_metadata_page(
     user_id: &BeaUserId,
     limits: BeaParseLimits,
 ) -> Result<BeaMetadataPage, BeaError> {
-    parse_metadata_page_with_echo(bytes, request, UserIdEcho::Original(user_id), limits)
+    let body = sanitize_borrowed_response(bytes, request, user_id, limits)?;
+    parse_metadata_page_sanitized(body.bytes(), request, limits)?
+        .bind_sanitized_capture(body.upstream_digest(), body.retained_digest())
 }
 
 pub(crate) fn parse_metadata_page_sanitized(
@@ -183,7 +186,7 @@ fn parse_metadata_page_with_echo(
     ))
 }
 
-/// Parses one exact `GetData` response under its metadata generation and local page scope.
+/// Parses one exact `GetData` response after validated echo redaction.
 ///
 /// # Errors
 ///
@@ -196,7 +199,9 @@ pub fn parse_data_page(
     user_id: &BeaUserId,
     limits: BeaParseLimits,
 ) -> Result<BeaDataPage, BeaError> {
-    parse_data_page_with_echo(bytes, request, UserIdEcho::Original(user_id), limits)
+    let body = sanitize_borrowed_response(bytes, request, user_id, limits)?;
+    parse_data_page_sanitized(body.bytes(), request, limits)?
+        .bind_sanitized_capture(body.upstream_digest(), body.retained_digest())
 }
 
 pub(crate) fn parse_data_page_sanitized(
@@ -295,14 +300,14 @@ fn parse_envelope(bytes: &[u8], limits: BeaParseLimits) -> Result<EnvelopeParts,
     })
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnvelopeWire {
     #[serde(rename = "BEAAPI")]
     bea_api: ApiWire,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApiWire {
     #[serde(rename = "Request")]
@@ -311,14 +316,14 @@ struct ApiWire {
     results: Value,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequestWire {
     #[serde(rename = "RequestParam")]
     request_parameters: Vec<RequestParameterWire>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequestParameterWire {
     #[serde(rename = "ParameterName")]
@@ -386,6 +391,23 @@ enum UserIdEcho<'a> {
     Sanitized,
 }
 
+fn sanitize_borrowed_response(
+    bytes: &[u8],
+    request: &BeaRequest,
+    user_id: &BeaUserId,
+    limits: BeaParseLimits,
+) -> Result<BeaSanitizedBody, BeaError> {
+    if bytes.is_empty() || bytes.len() > limits.max_bytes() {
+        return Err(BeaError::BodyTooLarge);
+    }
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| BeaError::Allocation)?;
+    owned.extend_from_slice(bytes);
+    sanitize_response_body(BeaSensitiveBody::from_vec(owned), request, user_id, limits)
+}
+
 /// Structurally validates and replaces the exact echoed `UserID` before typed result parsing.
 pub(crate) fn sanitize_response_body(
     body: BeaSensitiveBody,
@@ -396,10 +418,21 @@ pub(crate) fn sanitize_response_body(
     if body.is_empty() || body.len() > limits.max_bytes() {
         return Err(BeaError::BodyTooLarge);
     }
-    let original = body.into_zeroizing();
+    let mut original = body.into_zeroizing();
+    let upstream_digest = Sha256::digest(original.as_slice()).into();
     let mut wire: EnvelopeWire = serde_json::from_slice(original.as_slice())?;
     if wire.bea_api.request.request_parameters.len() > 64 {
         return Err(BeaError::InvalidField("request echo"));
+    }
+    let mut secret_in_name = false;
+    for parameter in &mut wire.bea_api.request.request_parameters {
+        if parameter.name.contains(user_id.expose_secret()) {
+            parameter.name.zeroize();
+            secret_in_name = true;
+        }
+    }
+    if secret_in_name {
+        return Err(BeaError::RequestEchoMismatch);
     }
     validate_request_echo(
         &mut wire.bea_api.request.request_parameters,
@@ -407,37 +440,66 @@ pub(crate) fn sanitize_response_body(
         UserIdEcho::Original(user_id),
         limits,
     )?;
-    let user_parameter = wire
-        .bea_api
-        .request
-        .request_parameters
-        .iter_mut()
-        .find(|parameter| parameter.name.eq_ignore_ascii_case("USERID"))
-        .ok_or(BeaError::RequestEchoMismatch)?;
-    user_parameter.value.zeroize();
-    user_parameter
-        .value
-        .try_reserve_exact(BEA_REDACTED_USER_ID.len())
-        .map_err(|_| BeaError::Allocation)?;
-    user_parameter.value.push_str(
-        std::str::from_utf8(BEA_REDACTED_USER_ID)
-            .map_err(|_| BeaError::InvalidField("redacted request echo"))?,
-    );
-    let mut sanitized = Vec::new();
-    sanitized
-        .try_reserve(original.len())
-        .map_err(|_| BeaError::Allocation)?;
-    serde_json::to_writer(&mut sanitized, &wire)?;
-    if sanitized.is_empty()
-        || sanitized.len() > limits.max_bytes()
-        || sanitized
-            .windows(user_id.expose_secret().len())
-            .any(|candidate| candidate == user_id.expose_secret().as_bytes())
-    {
-        sanitized.zeroize();
+    if scrub_unexpected_secret(&mut wire.bea_api.results, user_id) {
         return Err(BeaError::RequestEchoMismatch);
     }
-    Ok(BeaSanitizedBody::from_secret_free_vec(sanitized))
+    let secret = user_id.expose_secret().as_bytes();
+    let mut matches = original
+        .windows(secret.len())
+        .enumerate()
+        .filter_map(|(offset, candidate)| (candidate == secret).then_some(offset));
+    let offset = matches.next().ok_or(BeaError::RequestEchoMismatch)?;
+    if matches.next().is_some() {
+        return Err(BeaError::RequestEchoMismatch);
+    }
+    original[offset..offset + secret.len()].copy_from_slice(BEA_REDACTED_USER_ID);
+    let sanitized = mem::take(&mut *original);
+    Ok(BeaSanitizedBody::from_secret_free_vec(
+        sanitized,
+        upstream_digest,
+    ))
+}
+
+/// Removes every decoded result-field occurrence before rejecting an unexpected credential echo.
+///
+/// This cleanup prevents a hostile or malformed provider response from leaving a credential copy
+/// in an ordinary `serde_json::Value` string while ensuring no such response can reach parsing,
+/// capture, telemetry, doctor evidence, or canonicalization.
+fn scrub_unexpected_secret(value: &mut Value, user_id: &BeaUserId) -> bool {
+    match value {
+        Value::String(value) => {
+            if value.contains(user_id.expose_secret()) {
+                value.zeroize();
+                true
+            } else {
+                false
+            }
+        }
+        Value::Array(values) => values.iter_mut().fold(false, |found, value| {
+            scrub_unexpected_secret(value, user_id) || found
+        }),
+        Value::Object(values) => {
+            let secret_in_name = values
+                .keys()
+                .any(|name| name.contains(user_id.expose_secret()));
+            if secret_in_name {
+                let original = mem::take(values);
+                let mut found = true;
+                for (mut name, mut value) in original {
+                    if name.contains(user_id.expose_secret()) {
+                        name.zeroize();
+                    }
+                    found = scrub_unexpected_secret(&mut value, user_id) || found;
+                }
+                found
+            } else {
+                values.iter_mut().fold(false, |found, (_, value)| {
+                    scrub_unexpected_secret(value, user_id) || found
+                })
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
 }
 
 fn echo_value_matches(expected: &str, actual: &str) -> bool {
@@ -462,7 +524,7 @@ fn result_object(value: Value) -> Result<Map<String, Value>, BeaError> {
 fn reject_provider_error(
     results: &mut Map<String, Value>,
     method: BeaMethod,
-    user_id: &BeaUserId,
+    user_id: UserIdEcho<'_>,
     limits: BeaParseLimits,
 ) -> Result<(), BeaError> {
     let Some(error) = remove_case_insensitive(results, "Error")? else {
@@ -478,11 +540,11 @@ fn reject_provider_error(
     let code = take_required_scalar_string(&mut error, "APIErrorCode", limits)?
         .parse::<u32>()
         .map_err(|_| BeaError::InvalidField("APIErrorCode"))?;
-    let description = user_id.redact_from(take_required_string(
-        &mut error,
-        "APIErrorDescription",
-        limits,
-    )?);
+    let description = take_required_string(&mut error, "APIErrorDescription", limits)?;
+    let description = match user_id {
+        UserIdEcho::Original(user_id) => user_id.redact_from(description),
+        UserIdEcho::Sanitized => description,
+    };
     ensure_empty(&error, "provider error")?;
     if code == 34 && method == BeaMethod::GetParameterValuesFiltered {
         return Err(BeaError::FilteredParameterValuesUnsupported);
@@ -770,12 +832,7 @@ fn parse_observations(
             .unwrap_or_default();
         validate_note_references(&note_references, note_index)?;
 
-        let value = take_observation_value(
-            &mut row,
-            semantic_names.value,
-            dataset,
-            limits,
-        )?;
+        let value = take_observation_value(&mut row, semantic_names.value, dataset, limits)?;
         let mut members = BTreeMap::new();
         for dimension in dimensions.iter().filter(|dimension| !dimension.is_value()) {
             let member = take_required_dimension_scalar(&mut row, dimension.name(), limits)?;

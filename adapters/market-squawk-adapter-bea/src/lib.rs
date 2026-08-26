@@ -20,7 +20,6 @@ mod publication;
 mod query;
 mod quota;
 mod revision;
-mod rights;
 mod sealed;
 mod source;
 mod transport;
@@ -34,12 +33,12 @@ pub use doctor::{
 };
 pub use error::{BeaError, BeaProviderError};
 pub use model::{
-    BeaCompleteness, BeaDataPage, BeaDataType, BeaDatasetDefinition, BeaDatasetIdentity,
-    BeaDimension, BeaFrequency, BeaMetadataGeneration, BeaMetadataPage, BeaMetadataRecords,
-    BeaMissingValue, BeaNote, BeaObservation, BeaObservationIdentity, BeaObservationValue,
-    BeaPageReceipt, BeaParameterDataType, BeaParameterDefinition, BeaParameterIdentity,
+    BEA_REGIONAL_SUPPRESSION_MARKER, BEA_REGIONAL_SUPPRESSION_REASON, BeaCompleteness, BeaDataPage,
+    BeaDataType, BeaDatasetDefinition, BeaDatasetIdentity, BeaDimension, BeaFrequency,
+    BeaMetadataGeneration, BeaMetadataPage, BeaMetadataRecords, BeaMissingValue, BeaNote,
+    BeaObservation, BeaObservationIdentity, BeaObservationValue, BeaPageReceipt,
+    BeaParameterDataType, BeaParameterDefinition, BeaParameterIdentity,
     BeaParameterValueDefinition, BeaProductionTime, BeaTimePeriod, BeaUnit,
-    BEA_REGIONAL_SUPPRESSION_MARKER, BEA_REGIONAL_SUPPRESSION_REASON,
 };
 pub use pacing::{
     BEA_APPLICATION_ERRORS_PER_MINUTE, BEA_APPLICATION_MAX_IN_FLIGHT,
@@ -56,20 +55,14 @@ pub use query::{
     BEA_API_ENDPOINT, BEA_MAX_APPLICATION_PAGES, BEA_MAX_APPLICATION_ROWS_PER_PAGE, BeaMethod,
     BeaPageScope, BeaQuery, BeaRequest,
 };
-pub use revision::{
-    BeaCorrectionLedgerInput, BeaCorrectionNotice, BeaObservedVersion, BeaRevisionKind,
-};
-pub use rights::{
-    BeaPersonalResearchOperation, BeaPersonalResearchPolicy, BeaPersonalResearchRight,
-    BeaRightsDecisionRejoin, BeaRightsError,
-};
-pub use sealed::{
-    BeaSealedAcquisitionError, BeaSealedAcquisitionReceipt,
-};
 pub use quota::{
     BeaProviderQuotaDeclaration, BeaQuotaDeclarationError, BeaQuotaWindowDeclaration,
     BeaRequiredSharedSettlement, bea_provider_quota_declaration,
 };
+pub use revision::{
+    BeaCorrectionLedgerInput, BeaCorrectionNotice, BeaObservedVersion, BeaRevisionKind,
+};
+pub use sealed::{BeaSealedAcquisitionError, BeaSealedAcquisitionReceipt};
 pub use source::{
     BEA_NATIVE_EXTRACTION_SCHEMA, BeaCapturedDataPage, BeaCapturedDiscovery, BeaCapturedExtraction,
     BeaCapturedMetadataPage, BeaDataEvidencePage, BeaDatasetAcquisition, BeaDatasetContract,

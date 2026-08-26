@@ -12,6 +12,7 @@ const MAX_NOTICE_ID_BYTES: usize = 256;
 pub struct BeaObservedVersion {
     series_digest: [u8; 32],
     observation_digest: [u8; 32],
+    upstream_response_digest: [u8; 32],
     response_digest: [u8; 32],
     metadata_generation: BeaMetadataGeneration,
     period: BeaTimePeriod,
@@ -43,13 +44,18 @@ impl BeaObservedVersion {
         }
         let series_digest = observation.identity().digest();
         let observation_digest = observation.digest();
+        let upstream_response_digest = page.receipt().upstream_response_digest();
         let response_digest = page.receipt().response_digest();
+        if upstream_response_digest == response_digest {
+            return Err(BeaError::InvalidRevision);
+        }
         let metadata_generation = page.metadata_generation();
         let period = observation.period().clone();
         let mut hasher = Sha256::new();
-        hasher.update(b"market-squawk-bea-observed-version-v1");
+        hasher.update(b"market-squawk-bea-observed-version-v2");
         hasher.update(series_digest);
         hasher.update(observation_digest);
+        hasher.update(upstream_response_digest);
         hasher.update(response_digest);
         hasher.update(metadata_generation.digest());
         hash_text(&mut hasher, period.raw())?;
@@ -64,6 +70,7 @@ impl BeaObservedVersion {
         Ok(Self {
             series_digest,
             observation_digest,
+            upstream_response_digest,
             response_digest,
             metadata_generation,
             period,
@@ -83,7 +90,12 @@ impl BeaObservedVersion {
         self.observation_digest
     }
 
-    /// Returns the exact response-object digest.
+    /// Returns SHA-256 of the exact upstream body before validated echo redaction.
+    pub const fn upstream_response_digest(&self) -> [u8; 32] {
+        self.upstream_response_digest
+    }
+
+    /// Returns the retained secret-free response-object digest.
     pub const fn response_digest(&self) -> [u8; 32] {
         self.response_digest
     }

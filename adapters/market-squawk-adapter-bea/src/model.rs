@@ -382,12 +382,12 @@ impl BeaPageReceipt {
         upstream_response_digest: [u8; 32],
         retained_response_digest: [u8; 32],
     ) -> Result<Self, BeaError> {
-        if self.upstream_response_digest != upstream_response_digest
+        if self.response_digest != retained_response_digest
             || upstream_response_digest == retained_response_digest
         {
             return Err(BeaError::InvalidField("sanitized response evidence"));
         }
-        self.response_digest = retained_response_digest;
+        self.upstream_response_digest = upstream_response_digest;
         Ok(self)
     }
 
