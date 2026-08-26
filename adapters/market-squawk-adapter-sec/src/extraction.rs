@@ -1,4 +1,4 @@
-//! Canonical `ExtractionSource` composition for SEC submissions and Company Facts.
+//! Canonical `ExtractionSource` composition for SEC filings and facts.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -9,24 +9,28 @@ use futures_util::future::BoxFuture;
 use market_squawk_domain::{
     AvailabilityEvidence, CompanyIdentityObservation, CompanyIdentityObservationInput,
     CompanyIdentitySurface, DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
-    FormerCompanyName, ProviderIdentityRegistry, ProviderReportedSecurityAssociation,
-    ResearchContext, ResearchObservation, SchemaVersion, SourceId, SourceIdentifier, Timestamp,
-    VersionPinnedSourceLocator,
+    FormerCompanyName, MetadataRevision, ProviderIdentityRegistry,
+    ProviderReportedSecurityAssociation, ResearchContext, ResearchObservation, SchemaVersion,
+    SourceId, SourceIdentifier, Timestamp, VersionPinnedSourceLocator,
 };
 use market_squawk_sources::{
     AvailabilityEvidence as ExtractionAvailabilityEvidence, DiscoveryBatch, DiscoveryRequest,
-    ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest,
-    ExtractionRevisionEvidence, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
-    MAX_EXTRACTION_RECORD_BYTES, ObservedProviderOrder, ProviderCaptureMaterial, SourceError,
-    SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
+    ExtractionAuthority, ExtractionBatch, ExtractionBatchAccumulator, ExtractionError,
+    ExtractionRecord, ExtractionRequest, ExtractionRevisionEvidence, ExtractionRevisionPlan,
+    ExtractionSource, ExtractionSourceError, MAX_EXTRACTION_RECORD_BYTES,
+    MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, ObservedProviderOrder, ProviderCaptureMaterial,
+    SourceError, SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use crate::normalize::SecXbrlNativeLineage;
+use crate::product::{SEC_FILING_XBRL_DATASET_PREFIX, SecFilingXbrlCoordinates};
+use crate::xbrl::{SecPendingValidatedXbrlTaxonomySet, SecXbrlTaxonomyRegistry};
 use crate::{
     RawEvidenceStore, RetrievedCompanyFacts, RetrievedSecBytes, RetrievedSubmissions,
-    SecClientError, SecCompositeBounds, SecEdgarSource, SecNormalizationError, SecParserError,
-    SecParserLimits, SecResearchDataset, SecResearchDatasetKind,
+    SecClientError, SecCompositeBounds, SecEdgarSource, SecNormalizationError, SecObjectLocator,
+    SecParserError, SecParserLimits, SecRepresentation, SecResearchDataset, SecResearchDatasetKind,
     normalize_company_facts_with_cancellation, normalize_filings_with_cancellation,
 };
 
@@ -40,6 +44,26 @@ const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v3";
 pub struct SecExtractionResult {
     batch: ExtractionBatch,
     company_identity: Option<CompanyIdentityObservation>,
+    native_lineage: SecNativeLineageBatch,
+}
+
+/// Provider-native evidence that has no lossless canonical research-observation representation.
+#[derive(Debug, Eq, PartialEq)]
+pub enum SecNativeLineageBatch {
+    /// The selected SEC family produced no separate provider-native lineage.
+    None,
+    /// Mandatory nil and nonnumeric occurrence lineage from one filing XBRL document.
+    FilingXbrl(SecXbrlNativeLineage),
+}
+
+impl SecNativeLineageBatch {
+    /// Returns the checked conservative deep-retained size of the provider-native sidecar.
+    pub const fn total_retained_bytes(&self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::FilingXbrl(lineage) => lineage.total_retained_bytes(),
+        }
+    }
 }
 
 /// Indivisible SEC discovery handoff containing one source object and its exact HTTP body set.
@@ -50,6 +74,117 @@ pub struct SecExtractionResult {
 pub struct SecDiscoveryResult {
     batch: DiscoveryBatch,
     capture_material: ProviderCaptureMaterial,
+}
+
+struct DiscoveredSecMaterial {
+    raw: RetrievedSecBytes,
+    object_id: SourceIdentifier,
+    capture_material: ProviderCaptureMaterial,
+    media_type: SourceIdentifier,
+    published_at: Option<Timestamp>,
+    availability: ExtractionAvailabilityEvidence,
+}
+
+/// Process-local filing-XBRL admission awaiting the shared physical-seal binding.
+///
+/// This capability is intentionally private, non-cloneable, and non-serializable. Public SEC
+/// discovery/extraction remains fail-closed until the common manager can carry the sealed opaque
+/// admission into extraction.
+struct SecPendingFilingXbrlAdmission {
+    dataset: SecResearchDataset,
+    filing: SecFilingXbrlCoordinates,
+    current_submissions: RetrievedSecBytes,
+    filing_document: RetrievedSecBytes,
+    filing_representation: SecRepresentation,
+    taxonomy: SecPendingValidatedXbrlTaxonomySet,
+    raw_store: Arc<RawEvidenceStore>,
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    parser_limits: SecParserLimits,
+}
+
+impl SecPendingFilingXbrlAdmission {
+    fn revalidate(&self, cancellation: &CancellationToken) -> Result<(), SecClientError> {
+        self.filing.revalidate_current_submissions(
+            &self.current_submissions,
+            &self.raw_store,
+            &self.source_id,
+            &self.metadata_revision,
+            self.parser_limits,
+            cancellation,
+        )?;
+        validate_captured_filing_document(
+            &self.filing,
+            &self.filing_document,
+            &self.filing_representation,
+            &self.raw_store,
+            &self.source_id,
+            &self.metadata_revision,
+            cancellation,
+        )?;
+        self.taxonomy.revalidate(cancellation)?;
+        Ok(())
+    }
+
+    /// Produces the one ordered request graph while preserving the opaque pending half for the
+    /// later exact `SealedProviderCaptureSetReceipt` rejoin.
+    fn into_sealing_parts(
+        self,
+        cancellation: &CancellationToken,
+    ) -> Result<(Self, ProviderCaptureMaterial), SecClientError> {
+        self.revalidate(cancellation)?;
+        let Self {
+            dataset,
+            filing,
+            current_submissions,
+            filing_document,
+            filing_representation,
+            taxonomy,
+            raw_store,
+            source_id,
+            metadata_revision,
+            parser_limits,
+        } = self;
+        let current_material = current_submissions
+            .capture_material()?
+            .ok_or(SecClientError::InvalidCaptureMaterial)?;
+        let filing_material = filing_document
+            .capture_material()?
+            .ok_or(SecClientError::InvalidCaptureMaterial)?;
+        let (taxonomy, taxonomy_materials) = taxonomy.into_sealing_parts(cancellation)?;
+        let material_count = taxonomy_materials
+            .len()
+            .checked_add(2)
+            .ok_or(SecClientError::InvalidCaptureMaterial)?;
+        let mut components = Vec::new();
+        components
+            .try_reserve_exact(material_count)
+            .map_err(|_| SecClientError::AllocationFailed)?;
+        components.push(current_material);
+        components.push(filing_material);
+        components.extend(taxonomy_materials);
+        let graph_identity = filing_xbrl_request_graph_identity(&dataset, &components)?;
+        let material = ProviderCaptureMaterial::try_combine_request_graph(
+            dataset.dataset().clone(),
+            graph_identity,
+            components,
+        )?;
+        Ok((
+            Self {
+                dataset,
+                filing,
+                current_submissions,
+                filing_document,
+                filing_representation,
+                taxonomy,
+                raw_store,
+                source_id,
+                metadata_revision,
+                parser_limits,
+            },
+            material,
+        ))
+    }
 }
 
 impl SecDiscoveryResult {
@@ -80,13 +215,85 @@ impl SecExtractionResult {
         self.company_identity.as_ref()
     }
 
-    /// Consumes this result into its analytical and identity components.
-    pub fn into_parts(self) -> (ExtractionBatch, Option<CompanyIdentityObservation>) {
-        (self.batch, self.company_identity)
+    /// Returns mandatory provider-native lineage beside the canonical batch.
+    pub const fn native_lineage(&self) -> &SecNativeLineageBatch {
+        &self.native_lineage
+    }
+
+    /// Consumes this result into its canonical, identity, and provider-native components.
+    pub fn into_parts(
+        self,
+    ) -> (
+        ExtractionBatch,
+        Option<CompanyIdentityObservation>,
+        SecNativeLineageBatch,
+    ) {
+        (self.batch, self.company_identity, self.native_lineage)
     }
 }
 
 impl SecEdgarSource {
+    fn prepare_filing_xbrl_admission(
+        &self,
+        submissions: RetrievedSubmissions,
+        accession: &str,
+        filing_document: RetrievedSecBytes,
+        taxonomy_artifacts: Vec<RetrievedSecBytes>,
+        cancellation: &CancellationToken,
+    ) -> Result<SecPendingFilingXbrlAdmission, SecClientError> {
+        let raw_store = self.raw_store();
+        let source_id = self.metadata().source_id().clone();
+        let metadata_revision = self.metadata().revision().clone();
+        let filing = SecFilingXbrlCoordinates::from_captured_current_submissions(
+            &submissions,
+            accession,
+            &raw_store,
+            &source_id,
+            &metadata_revision,
+            self.parser_limits(),
+            cancellation,
+        )?;
+        let locator = SecObjectLocator::filing_document(
+            filing.cik(),
+            filing.accession().as_str(),
+            filing.document().as_str(),
+        )?;
+        let filing_representation = self
+            .retained_representation(&locator)?
+            .ok_or(SecClientError::InvalidCompositeRepresentation)?;
+        validate_captured_filing_document(
+            &filing,
+            &filing_document,
+            &filing_representation,
+            &raw_store,
+            &source_id,
+            &metadata_revision,
+            cancellation,
+        )?;
+        let taxonomy = SecXbrlTaxonomyRegistry::code_owned().try_admit_captured(
+            Arc::clone(&raw_store),
+            &source_id,
+            &metadata_revision,
+            taxonomy_artifacts,
+            cancellation,
+        )?;
+        let dataset =
+            SecResearchDataset::filing_xbrl(filing.clone(), taxonomy.validated().clone())?;
+        let current_submissions = submissions.current_component().clone();
+        Ok(SecPendingFilingXbrlAdmission {
+            dataset,
+            filing,
+            current_submissions,
+            filing_document,
+            filing_representation,
+            taxonomy,
+            raw_store,
+            source_id,
+            metadata_revision,
+            parser_limits: self.parser_limits(),
+        })
+    }
+
     /// Discovers one SEC source object together with every exact HTTP body required for raw
     /// publication.
     ///
@@ -105,7 +312,7 @@ impl SecEdgarSource {
             let remaining = deadline_remaining(request.deadline())?;
             let dataset = SecResearchDataset::try_from_identifier(request.dataset())
                 .map_err(map_client_error)?;
-            let (retrieved, object_id, capture_material) = tokio::time::timeout(remaining, async {
+            let discovered = tokio::time::timeout(remaining, async {
                 match dataset.kind() {
                     SecResearchDatasetKind::Submissions => self
                         .fetch_complete_submissions(
@@ -117,11 +324,17 @@ impl SecEdgarSource {
                         )
                         .await
                         .and_then(|value| {
-                            let object_id = dataset.source_object_id().clone();
                             let capture_material = value
                                 .capture_material()?
                                 .ok_or(SecClientError::InvalidCaptureMaterial)?;
-                            Ok((value.raw().clone(), object_id, capture_material))
+                            Ok(DiscoveredSecMaterial {
+                                raw: value.raw().clone(),
+                                object_id: dataset.source_object_id().clone(),
+                                capture_material,
+                                media_type: SourceIdentifier::try_from("application/json")?,
+                                published_at: None,
+                                availability: extraction_availability(value.raw().availability()),
+                            })
                         }),
                     SecResearchDatasetKind::CompanyFacts => self
                         .fetch_company_facts(&authority, dataset.cik(), child.clone())
@@ -137,8 +350,18 @@ impl SecEdgarSource {
                             let capture_material = value
                                 .capture_material()?
                                 .ok_or(SecClientError::InvalidCaptureMaterial)?;
-                            Ok((value.raw().clone(), object_id, capture_material))
+                            Ok(DiscoveredSecMaterial {
+                                raw: value.raw().clone(),
+                                object_id,
+                                capture_material,
+                                media_type: SourceIdentifier::try_from("application/json")?,
+                                published_at: None,
+                                availability: extraction_availability(value.raw().availability()),
+                            })
                         }),
+                    SecResearchDatasetKind::FilingXbrl => {
+                        Err(SecClientError::InvalidCompositeRepresentation)
+                    }
                 }
             })
             .await
@@ -149,44 +372,45 @@ impl SecEdgarSource {
             .map_err(map_client_error)?;
             self.validate_authority(&authority)
                 .map_err(map_client_error)?;
-            let capture_identity =
-                SourceObjectCaptureIdentity::try_from_capture(capture_material.receipt())
-                    .map_err(|_| invalid_protocol())?;
+            let capture_identity = SourceObjectCaptureIdentity::try_from_capture(
+                discovered.capture_material.receipt(),
+            )
+            .map_err(|_| invalid_protocol())?;
             let object = SourceObject::try_new_with_capture_identity(
                 self.metadata().source_id().clone(),
                 self.metadata().revision().clone(),
                 &request,
-                object_id,
-                SourceIdentifier::try_from("application/json").map_err(|_| invalid_protocol())?,
-                ExactPayloadEvidence::from_content_digest(retrieved.evidence()),
+                discovered.object_id,
+                discovered.media_type,
+                retrieved_payload_evidence(&discovered.raw).map_err(|_| invalid_protocol())?,
                 capture_identity,
-                market_squawk_domain::EffectiveInterval::new(retrieved.received_at(), None)
+                market_squawk_domain::EffectiveInterval::new(discovered.raw.received_at(), None)
                     .map_err(|_| invalid_protocol())?,
-                None,
-                extraction_availability(retrieved.availability()),
-                Some(u64::try_from(retrieved.bytes().len()).map_err(|_| invalid_protocol())?),
+                discovered.published_at,
+                discovered.availability,
+                Some(u64::try_from(discovered.raw.bytes().len()).map_err(|_| invalid_protocol())?),
             )?;
             let batch = DiscoveryBatch::try_new(&request, vec![object])?;
             self.validate_authority(&authority)
                 .map_err(map_client_error)?;
             Ok(SecDiscoveryResult {
                 batch,
-                capture_material,
+                capture_material: discovered.capture_material,
             })
         })
     }
 
     /// Builds provider-owned revision evidence aligned to one extracted SEC batch.
     ///
-    /// Exact canonical source-record identity is the version token. The SEC acceptance timestamp,
-    /// or filing civil date when no acceptance timestamp is published, is the provider order.
-    /// Neither coordinate is promoted to first-public-availability evidence.
+    /// Exact canonical source-record identity is the version token. Conservative availability is
+    /// the ordering coordinate; filing civil dates never become knowledge time. Final immutable
+    /// revision numbers remain owned by the shared publication plan.
     ///
     /// # Errors
     ///
     /// Returns [`SecClientError::RegistrationMismatch`] when the batch belongs to another source
     /// metadata revision. Returns [`SecClientError::InvalidCompositeRepresentation`] when a record
-    /// lacks provider publication order, and [`SecClientError::RevisionAuthority`] when bounded
+    /// lacks conservative availability, and [`SecClientError::RevisionAuthority`] when bounded
     /// exact-evidence invariants fail.
     pub fn revision_plan(
         &self,
@@ -196,6 +420,16 @@ impl SecEdgarSource {
             || batch.request().object().metadata_revision() != self.metadata().revision()
         {
             return Err(SecClientError::RegistrationMismatch);
+        }
+        if batch
+            .request()
+            .object()
+            .dataset()
+            .as_str()
+            .starts_with(SEC_FILING_XBRL_DATASET_PREFIX)
+        {
+            return ExtractionRevisionPlan::locally_observed(batch.records().len())
+                .map_err(Into::into);
         }
         let mut evidence = Vec::new();
         evidence
@@ -299,9 +533,12 @@ fn extract_blocking(
     if cancellation.is_cancelled() {
         return Err(SecClientError::Cancelled);
     }
+    let working_set_limit = request
+        .max_bytes()
+        .min(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES);
     let bytes = raw_store.read_verified_bounded_cancellable(
         &request.object().evidence().content_digest(),
-        request.max_bytes(),
+        working_set_limit,
         cancellation,
     )?;
     authority.validate_current()?;
@@ -309,88 +546,97 @@ fn extract_blocking(
     let availability = AvailabilityEvidence::LocalFirstObserved {
         observed_at: received_at,
     };
-    let parser_limits = request_parser_limits(&request, bytes.len())?;
+    let parser_limits = request_parser_limits(&request, bytes.len(), bytes.capacity())?;
     let ingested_at = crate::client::system_timestamp()?;
-    let (observations, company_identity) =
-        match SecResearchDataset::try_from_identifier(request.object().dataset())
-            .map_err(|_| SecClientError::InvalidCompositeRepresentation)?
-            .kind()
-        {
-            SecResearchDatasetKind::Submissions => {
-                let retrieved = crate::composite::restore_online_submissions(
-                    &raw_store,
-                    &bytes,
-                    request.object().evidence().content_digest(),
-                    SecCompositeBounds::production_defaults(),
-                    parser_limits,
-                    cancellation,
-                )?;
-                let observations = normalize_filings_with_cancellation(
-                    &source_id,
-                    &identities,
-                    &retrieved,
-                    ingested_at,
-                    cancellation,
-                )?;
-                let company_identity = company_identity_from_submissions(
-                    &request,
-                    &source_id,
-                    &retrieved,
-                    ingested_at,
-                    cancellation,
-                )?;
-                (observations, Some(company_identity))
-            }
-            SecResearchDatasetKind::CompanyFacts => {
-                let retrieved = RetrievedCompanyFacts::restored(
-                    bytes,
-                    request.object().evidence().content_digest(),
-                    received_at,
-                    availability,
-                    parser_limits,
-                    cancellation,
-                )?;
-                let observations = normalize_company_facts_with_cancellation(
-                    &source_id,
-                    &identities,
-                    &retrieved,
-                    ingested_at,
-                    cancellation,
-                )?;
-                let company_identity = company_identity_from_company_facts(
-                    &request,
-                    &source_id,
-                    &retrieved,
-                    ingested_at,
-                    cancellation,
-                )?;
-                (observations, Some(company_identity))
-            }
-        };
+    let dataset = SecResearchDataset::try_from_identifier(request.object().dataset())
+        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    let (observations, company_identity, native_lineage) = match dataset.kind() {
+        SecResearchDatasetKind::Submissions => {
+            let retrieved = crate::composite::restore_online_submissions(
+                &raw_store,
+                &bytes,
+                request.object().evidence().content_digest(),
+                SecCompositeBounds::production_defaults(),
+                parser_limits,
+                cancellation,
+            )?;
+            let observations = normalize_filings_with_cancellation(
+                &source_id,
+                &identities,
+                &retrieved,
+                ingested_at,
+                cancellation,
+            )?;
+            let company_identity = company_identity_from_submissions(
+                &request,
+                &source_id,
+                &retrieved,
+                ingested_at,
+                cancellation,
+            )?;
+            (
+                observations,
+                Some(company_identity),
+                SecNativeLineageBatch::None,
+            )
+        }
+        SecResearchDatasetKind::CompanyFacts => {
+            let retrieved = RetrievedCompanyFacts::restored(
+                bytes,
+                request.object().evidence().content_digest(),
+                received_at,
+                availability,
+                parser_limits,
+                cancellation,
+            )?;
+            let observations = normalize_company_facts_with_cancellation(
+                &source_id,
+                &identities,
+                &retrieved,
+                ingested_at,
+                cancellation,
+            )?;
+            let company_identity = company_identity_from_company_facts(
+                &request,
+                &source_id,
+                &retrieved,
+                ingested_at,
+                cancellation,
+            )?;
+            (
+                observations,
+                Some(company_identity),
+                SecNativeLineageBatch::None,
+            )
+        }
+        SecResearchDatasetKind::FilingXbrl => {
+            return Err(SecClientError::InvalidCompositeRepresentation);
+        }
+    };
     authority.validate_current()?;
-    let mut records = Vec::new();
-    records
-        .try_reserve(observations.len())
-        .map_err(|_| SecClientError::AllocationFailed)?;
+    let mut records =
+        ExtractionBatchAccumulator::try_new(&request).map_err(map_extraction_contract_error)?;
     for observation in observations {
         authority.validate_current()?;
         if cancellation.is_cancelled() {
             return Err(SecClientError::Cancelled);
         }
-        records.push(canonical_record(
-            &request,
-            observation,
-            &authority,
-            cancellation,
-        )?);
+        records
+            .push(canonical_record(
+                &request,
+                observation,
+                &authority,
+                cancellation,
+            )?)
+            .map_err(map_extraction_contract_error)?;
     }
     authority.validate_current()?;
-    let batch = ExtractionBatch::try_new(&request, records)
-        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    let batch = records.finish().map_err(map_extraction_contract_error)?;
     authority.validate_current()?;
     Ok(SecExtractionResult {
         batch,
         company_identity,
+        native_lineage,
     })
 }
 
@@ -547,6 +793,148 @@ fn canonical_record(
     .map_err(|_| SecClientError::InvalidCompositeRepresentation)
 }
 
+fn filing_discovery_availability(
+    filing: &SecFilingXbrlCoordinates,
+    received_at: Timestamp,
+) -> Result<(Option<Timestamp>, ExtractionAvailabilityEvidence), SecClientError> {
+    match filing.acceptance() {
+        Some(acceptance) => {
+            if acceptance.accepted_at() > received_at {
+                return Err(SecClientError::InvalidCompositeRepresentation);
+            }
+            Ok((
+                Some(acceptance.accepted_at()),
+                ExtractionAvailabilityEvidence::Observed {
+                    available_at: acceptance.accepted_at(),
+                    evidence: acceptance.evidence().clone(),
+                },
+            ))
+        }
+        None => Ok((
+            None,
+            ExtractionAvailabilityEvidence::LocalFirstObserved {
+                observed_at: received_at,
+            },
+        )),
+    }
+}
+
+fn validate_captured_filing_document(
+    filing: &SecFilingXbrlCoordinates,
+    retrieved: &RetrievedSecBytes,
+    representation: &SecRepresentation,
+    raw_store: &RawEvidenceStore,
+    source_id: &SourceId,
+    metadata_revision: &MetadataRevision,
+    cancellation: &CancellationToken,
+) -> Result<(), SecClientError> {
+    if cancellation.is_cancelled() {
+        return Err(SecClientError::Cancelled);
+    }
+    let locator = SecObjectLocator::filing_document(
+        filing.cik(),
+        filing.accession().as_str(),
+        filing.document().as_str(),
+    )?;
+    let receipt = retrieved
+        .capture_receipt()
+        .ok_or(SecClientError::InvalidCaptureMaterial)?;
+    if receipt.source_id() != source_id
+        || receipt.metadata_revision() != metadata_revision
+        || receipt.dataset().as_str() != locator.url()
+        || retrieved.locator() != Some(locator.url())
+    {
+        return Err(SecClientError::InvalidCaptureMaterial);
+    }
+    retrieved
+        .capture_material()?
+        .ok_or(SecClientError::InvalidCaptureMaterial)?;
+    let size_bytes =
+        u64::try_from(retrieved.bytes().len()).map_err(|_| SecClientError::ResponseTooLarge)?;
+    if representation.locator() != locator.url()
+        || representation.evidence() != retrieved.evidence()
+        || representation.size_bytes() != size_bytes
+        || representation.first_observed_at() != retrieved.received_at()
+        || Some(representation.retrieval_revision()) != retrieved.retrieval_revision()
+    {
+        return Err(SecClientError::InvalidCompositeRepresentation);
+    }
+    let reopened = raw_store.read_verified_bounded_cancellable(
+        &retrieved.evidence(),
+        size_bytes,
+        cancellation,
+    )?;
+    if reopened.len() != retrieved.bytes().len()
+        || reopened.as_slice() != retrieved.bytes().as_ref()
+    {
+        return Err(SecClientError::RawEvidenceMismatch);
+    }
+    Ok(())
+}
+
+fn filing_xbrl_request_graph_identity(
+    dataset: &SecResearchDataset,
+    components: &[ProviderCaptureMaterial],
+) -> Result<EvidenceDigest, SecClientError> {
+    let first = components
+        .first()
+        .ok_or(SecClientError::InvalidCaptureMaterial)?;
+    let mut digest = Sha256::new();
+    hash_request_graph_field(
+        &mut digest,
+        b"market-squawk/sec-filing-xbrl-request-graph/v1",
+    )?;
+    hash_request_graph_field(&mut digest, first.receipt().source_id().as_str().as_bytes())?;
+    hash_request_graph_field(
+        &mut digest,
+        first
+            .receipt()
+            .metadata_revision()
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
+    hash_request_graph_field(&mut digest, dataset.dataset().as_str().as_bytes())?;
+    digest.update(
+        u64::try_from(components.len())
+            .map_err(|_| SecClientError::InvalidCaptureMaterial)?
+            .to_be_bytes(),
+    );
+    for component in components {
+        let receipt = component.receipt();
+        hash_request_graph_field(&mut digest, receipt.dataset().as_str().as_bytes())?;
+        digest.update(receipt.request_set_identity().bytes());
+        digest.update(receipt.content_digest().bytes());
+        digest.update(receipt.observation_digest().bytes());
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn hash_request_graph_field(digest: &mut Sha256, value: &[u8]) -> Result<(), SecClientError> {
+    digest.update(
+        u64::try_from(value.len())
+            .map_err(|_| SecClientError::InvalidCaptureMaterial)?
+            .to_be_bytes(),
+    );
+    digest.update(value);
+    Ok(())
+}
+
+fn filing_media_type(document: &SourceIdentifier) -> Result<SourceIdentifier, SecClientError> {
+    let media_type = if document.as_str().ends_with(".htm") || document.as_str().ends_with(".html")
+    {
+        "text/html"
+    } else if document.as_str().ends_with(".xml") {
+        "application/xml"
+    } else {
+        return Err(SecClientError::InvalidLocator);
+    };
+    SourceIdentifier::try_from(media_type).map_err(Into::into)
+}
+
 fn extraction_availability(availability: &AvailabilityEvidence) -> ExtractionAvailabilityEvidence {
     match availability {
         AvailabilityEvidence::Evidenced {
@@ -631,15 +1019,24 @@ fn observation_context(
 fn request_parser_limits(
     request: &ExtractionRequest,
     decoded_bytes: usize,
+    decoded_capacity: usize,
 ) -> Result<SecParserLimits, SecClientError> {
+    let working_set_limit = usize::try_from(
+        request
+            .max_bytes()
+            .min(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES),
+    )
+    .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    let retained_output_limit = working_set_limit
+        .checked_sub(decoded_capacity)
+        .filter(|remaining| *remaining > 0)
+        .ok_or(SecClientError::ResponseTooLarge)?;
     let decoded_limit = decoded_bytes.max(1);
-    let string_limit = decoded_limit.min(256 * 1024);
-    let total_string_limit = decoded_limit.min(24 * 1024 * 1024).max(string_limit);
-    let retained_output_limit = decoded_limit
-        .checked_mul(4)
-        .ok_or(SecClientError::InvalidCompositeRepresentation)?
-        .min(128 * 1024 * 1024)
-        .max(total_string_limit);
+    let total_string_limit = decoded_limit
+        .min(24 * 1024 * 1024)
+        .min(retained_output_limit)
+        .max(1);
+    let string_limit = decoded_limit.min(256 * 1024).min(total_string_limit).max(1);
     SecParserLimits::try_new(
         decoded_limit,
         usize::try_from(request.max_records())
@@ -692,6 +1089,13 @@ fn map_client_error(error: SecClientError) -> ExtractionSourceError {
         _ => SourceError::Network,
     };
     ExtractionSourceError::Source(source)
+}
+
+fn map_extraction_contract_error(error: ExtractionError) -> SecClientError {
+    match error {
+        ExtractionError::AllocationFailed => SecClientError::AllocationFailed,
+        _ => SecClientError::InvalidCompositeRepresentation,
+    }
 }
 
 fn invalid_protocol() -> ExtractionSourceError {

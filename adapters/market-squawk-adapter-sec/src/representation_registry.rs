@@ -303,6 +303,22 @@ impl SecRepresentationRegistry {
             .and_then(|entry| (!entry.validators.is_empty()).then(|| entry.validators.clone())))
     }
 
+    /// Returns the retained value for one exact locator without granting publication authority.
+    ///
+    /// This lookup does not recreate a provider capture receipt or a physical seal. Consumers must
+    /// still rejoin the returned coordinates to the exact captured and sealed response.
+    pub fn representation(
+        &self,
+        locator: &str,
+    ) -> Result<Option<SecRepresentation>, SecRepresentationError> {
+        validate_locator(locator)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| SecRepresentationError::StatePoisoned)?;
+        Ok(state.entries.get(locator).cloned())
+    }
+
     /// Records a successful decoded response under trusted local receipt time.
     ///
     /// Identical bytes preserve object identity and first availability. Changed bytes advance the

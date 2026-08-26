@@ -1,12 +1,20 @@
 use std::error::Error;
 
 use market_squawk_adapter_sec::{
-    SecParserLimits, SecXbrlError, XbrlDocumentContext, XbrlDocumentParser,
+    SecFilingAcceptanceEvidence, SecFilingXbrlCoordinates, SecParserLimits, SecResearchDataset,
+    SecXbrlError, SecXbrlTaxonomyRegistry, XbrlDocumentContext, XbrlDocumentParser,
+    normalize_filing_xbrl,
 };
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, CalendarDate, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
+    ExactPayloadEvidence, FundamentalAmendmentStatus, InstrumentId, MetadataRevision,
+    ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    ProviderIdentityRegistry, ProviderInstrumentId, ResearchObservation,
+    ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp, VersionPinnedSourceLocator,
     XbrlDimensionLocation, XbrlTaxonomySet,
 };
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 fn document_context() -> Result<XbrlDocumentContext, Box<dyn Error>> {
     Ok(XbrlDocumentContext::new(
@@ -26,6 +34,38 @@ fn document_context() -> Result<XbrlDocumentContext, Box<dyn Error>> {
 #[test]
 fn inline_xbrl_preserves_authoritative_names_graph_units_and_duplicate_accuracy()
 -> Result<(), Box<dyn Error>> {
+    let taxonomy = SecXbrlTaxonomyRegistry::code_owned().try_admit(vec![
+        ExactPayloadEvidence::with_version_pinned_locator(
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [3; 32]),
+            VersionPinnedSourceLocator::new(
+                SourceIdentifier::try_from("https://xbrl.sec.gov/dei/2025/dei-2025.xsd")?,
+                SourceIdentifier::try_from("us-gaap-2025")?,
+            ),
+        ),
+    ])?;
+    let acceptance = SecFilingAcceptanceEvidence::try_new(
+        Timestamp::from_unix_nanos(40),
+        ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            [8; 32],
+        )),
+    )?;
+    let dataset = SecResearchDataset::filing_xbrl(
+        SecFilingXbrlCoordinates::try_new(
+            "0000320193",
+            "0000320193-25-000079",
+            "aapl-20250628.htm",
+            "10-Q/A",
+            CalendarDate::new(2025, 8, 1)?,
+            Some(acceptance),
+        )?,
+        taxonomy,
+    )?;
+    assert_eq!(
+        SecResearchDataset::try_from_identifier(dataset.dataset())?,
+        dataset
+    );
+
     let bytes = br#"<html xmlns="http://www.w3.org/1999/xhtml"
       xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
       xmlns:xbrli="http://www.xbrl.org/2003/instance"
@@ -92,10 +132,22 @@ fn inline_xbrl_preserves_authoritative_names_graph_units_and_duplicate_accuracy(
       <ix:relationship arcrole="http://www.xbrl.org/2003/arcrole/fact-explanatoryFact"
         fromRefs="amount-1" toRefs="note"/>
     </body></html>"#;
-    let document = XbrlDocumentParser::parse(
+    let cancellation = CancellationToken::new();
+    let document = XbrlDocumentParser::parse_with_cancellation(
         bytes,
         SecParserLimits::production_defaults(),
-        document_context()?,
+        XbrlDocumentContext::from_validated_taxonomy(
+            SourceIdentifier::try_from("0000320193-25-000079")?,
+            SourceIdentifier::try_from("0000320193")?,
+            dataset.xbrl_taxonomy().ok_or("missing taxonomy binding")?,
+            ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                [7; 32],
+            )),
+            Timestamp::from_unix_nanos(42),
+            &cancellation,
+        )?,
+        &cancellation,
     )?;
 
     assert_eq!(document.numeric_facts().len(), 10);
@@ -167,6 +219,113 @@ fn inline_xbrl_preserves_authoritative_names_graph_units_and_duplicate_accuracy(
         .ok_or("missing parent note")?;
     let note_wire = serde_json::to_value(note.occurrence_relationships())?;
     assert_eq!(note_wire["child_occurrence_ids"][0], "note-child");
+
+    let source_id = SourceId::try_from("sec-edgar")?;
+    let instrument_id = InstrumentId::try_from(Uuid::from_u128(7))?;
+    let identities =
+        ProviderIdentityRegistry::try_from_records(vec![ProviderIdentityRecord::new(
+            ProviderIdentityRecordInput {
+                instrument_id,
+                source_id: source_id.clone(),
+                provider_instrument_id: ProviderInstrumentId::try_from("0000320193")?,
+                evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    [9; 32],
+                )),
+                source_timestamp: None,
+                observed_at: Timestamp::from_unix_nanos(1),
+                metadata_revision: MetadataRevision::new(SourceIdentifier::try_from("sec-id-v1")?),
+                validity: EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
+                supersedes: None,
+            },
+        )])?;
+    let normalized = normalize_filing_xbrl(
+        &source_id,
+        &identities,
+        &dataset,
+        &document,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [7; 32]),
+        Timestamp::from_unix_nanos(42),
+        Timestamp::from_unix_nanos(43),
+    )?;
+    let (observations, native_lineage) = normalized.into_parts();
+    assert_eq!(observations.len(), 10);
+    assert_eq!(native_lineage.nonnumeric_occurrences().len(), 2);
+    assert_eq!(
+        native_lineage.nonnumeric_occurrences()[0]
+            .accession()
+            .as_str(),
+        "0000320193-25-000079"
+    );
+    let amount = observations
+        .iter()
+        .find_map(|observation| match observation {
+            ResearchObservation::Fundamental(fact) if fact.concept().as_str() == "gaap:Amount" => {
+                Some(fact)
+            }
+            _ => None,
+        })
+        .ok_or("missing canonical amount")?;
+    assert_eq!(
+        amount.context().provenance().instrument_id(),
+        Some(instrument_id)
+    );
+    assert_eq!(
+        amount.context().provenance().source_timestamp(),
+        Some(Timestamp::from_unix_nanos(40))
+    );
+    assert!(matches!(
+        amount.context().provenance().availability(),
+        AvailabilityEvidence::Evidenced { available_at, .. }
+            if available_at == Timestamp::from_unix_nanos(40)
+    ));
+    assert_eq!(
+        amount
+            .context()
+            .time()
+            .published()
+            .and_then(ResearchTemporalCoordinate::calendar_date_value),
+        Some(CalendarDate::new(2025, 8, 1)?)
+    );
+    assert_eq!(
+        amount
+            .fact_context()
+            .filing_form()
+            .map(SourceIdentifier::as_str),
+        Some("10-Q/A")
+    );
+    assert_eq!(
+        amount.fact_context().amendment_status(),
+        FundamentalAmendmentStatus::Amendment
+    );
+    assert_eq!(
+        amount.fact_context().filed_on(),
+        Some(CalendarDate::new(2025, 8, 1)?)
+    );
+    assert_eq!(
+        amount
+            .fact_context()
+            .xbrl_context_id()
+            .map(SourceIdentifier::as_str),
+        Some("C1")
+    );
+    assert_eq!(
+        amount
+            .fact_context()
+            .dimensions()
+            .dimensions()
+            .map(<[_]>::len),
+        Some(2)
+    );
+    let canonical_evidence = serde_json::to_value(
+        amount
+            .xbrl_evidence()
+            .ok_or("missing canonical XBRL evidence")?,
+    )?;
+    assert_eq!(
+        canonical_evidence["duplicate"]["classification"],
+        "consistent_numeric"
+    );
     Ok(())
 }
 
@@ -191,10 +350,11 @@ fn non_dimensional_context_content_prevents_false_duplicate_grouping() -> Result
       <gaap:Amount id="south" contextRef="C2" unitRef="U" decimals="0">10</gaap:Amount>
     </root>"#;
 
-    let document = XbrlDocumentParser::parse(
+    let document = XbrlDocumentParser::parse_with_cancellation(
         bytes,
         SecParserLimits::production_defaults(),
         document_context()?,
+        &CancellationToken::new(),
     )?;
     assert_eq!(document.numeric_facts().len(), 2);
     for fact in document.numeric_facts() {
@@ -213,10 +373,11 @@ fn xbrl_rejects_namespace_spoofing_attribute_ambiguity_and_invalid_divide_units(
       </xbrli:entity><xbrli:period><xbrli:instant>2025-01-01</xbrli:instant></xbrli:period>
       </fake:context><gaap:Amount contextRef="C" unitRef="U">1</gaap:Amount></root>"#;
     assert!(matches!(
-        XbrlDocumentParser::parse(
+        XbrlDocumentParser::parse_with_cancellation(
             spoofed_context,
             SecParserLimits::production_defaults(),
             document_context()?,
+            &CancellationToken::new(),
         ),
         Err(SecXbrlError::UnknownContext)
     ));
@@ -224,10 +385,11 @@ fn xbrl_rejects_namespace_spoofing_attribute_ambiguity_and_invalid_divide_units(
     let ambiguous_attribute = br#"<root xmlns:xbrli="http://www.xbrl.org/2003/instance"
       xmlns:evil="https://attacker.test"><xbrli:context id="C" evil:id="shadow"/></root>"#;
     assert!(matches!(
-        XbrlDocumentParser::parse(
+        XbrlDocumentParser::parse_with_cancellation(
             ambiguous_attribute,
             SecParserLimits::production_defaults(),
             document_context()?,
+            &CancellationToken::new(),
         ),
         Err(SecXbrlError::AmbiguousSemanticAttribute)
     ));
@@ -241,10 +403,11 @@ fn xbrl_rejects_namespace_spoofing_attribute_ambiguity_and_invalid_divide_units(
       <ix:nonFraction name="gaap:Amount" contextRef="C" unitRef="U" decimals="0"
         format="evil:num-dot-decimal">1,000</ix:nonFraction></root>"#;
     assert!(matches!(
-        XbrlDocumentParser::parse(
+        XbrlDocumentParser::parse_with_cancellation(
             spoofed_transform,
             SecParserLimits::production_defaults(),
             document_context()?,
+            &CancellationToken::new(),
         ),
         Err(SecXbrlError::UnsupportedTransform)
     ));
@@ -255,10 +418,11 @@ fn xbrl_rejects_namespace_spoofing_attribute_ambiguity_and_invalid_divide_units(
       </xbrli:unitNumerator><xbrli:unitDenominator><xbrli:measure>iso4217:USD</xbrli:measure>
       </xbrli:unitDenominator></xbrli:divide></xbrli:unit></root>"#;
     assert!(matches!(
-        XbrlDocumentParser::parse(
+        XbrlDocumentParser::parse_with_cancellation(
             invalid_divide,
             SecParserLimits::production_defaults(),
             document_context()?,
+            &CancellationToken::new(),
         ),
         Err(SecXbrlError::InvalidUnitExpression)
     ));
@@ -268,16 +432,23 @@ fn xbrl_rejects_namespace_spoofing_attribute_ambiguity_and_invalid_divide_units(
 #[test]
 fn xbrl_rejects_doctype_and_depth_exhaustion() -> Result<(), Box<dyn Error>> {
     assert!(
-        XbrlDocumentParser::parse(
+        XbrlDocumentParser::parse_with_cancellation(
             b"<!DOCTYPE x [<!ENTITY ex SYSTEM 'file:///etc/passwd'>]><x>&ex;</x>",
             SecParserLimits::production_defaults(),
             document_context()?,
+            &CancellationToken::new(),
         )
         .is_err()
     );
     let shallow = SecParserLimits::try_new(1024, 10, 2, 128, 512, 4096)?;
     assert!(
-        XbrlDocumentParser::parse(b"<a><b><c/></b></a>", shallow, document_context()?).is_err()
+        XbrlDocumentParser::parse_with_cancellation(
+            b"<a><b><c/></b></a>",
+            shallow,
+            document_context()?,
+            &CancellationToken::new(),
+        )
+        .is_err()
     );
     let _typed_location = XbrlDimensionLocation::Segment;
     Ok(())
@@ -328,7 +499,12 @@ fn xbrl_rejects_aggregate_retained_output_amplification() -> Result<(), Box<dyn 
     )?;
 
     assert!(matches!(
-        XbrlDocumentParser::parse(document.as_bytes(), limits, document_context()?),
+        XbrlDocumentParser::parse_with_cancellation(
+            document.as_bytes(),
+            limits,
+            document_context()?,
+            &CancellationToken::new(),
+        ),
         Err(SecXbrlError::RetainedOutputLimitExceeded)
     ));
     Ok(())

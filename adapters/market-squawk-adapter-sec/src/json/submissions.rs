@@ -144,6 +144,22 @@ impl SecFiling {
     pub const fn report_date(&self) -> Option<CalendarDate> {
         self.report_date
     }
+    /// Returns the provider-declared primary filing document when present.
+    pub const fn primary_document(&self) -> Option<&SourceIdentifier> {
+        self.primary_document.as_ref()
+    }
+    /// Returns the provider-declared filing size in bytes when present.
+    pub const fn size_bytes(&self) -> Option<u64> {
+        self.size_bytes
+    }
+    /// Returns whether SEC marks the filing as containing XBRL.
+    pub const fn is_xbrl(&self) -> bool {
+        self.is_xbrl
+    }
+    /// Returns whether SEC marks the filing as containing Inline XBRL.
+    pub const fn is_inline_xbrl(&self) -> bool {
+        self.is_inline_xbrl
+    }
 }
 
 /// Reconciled SEC submissions document with recent and historical accessions.

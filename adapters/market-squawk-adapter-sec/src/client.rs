@@ -285,9 +285,9 @@ impl SecEdgarSource {
     ) -> Result<RetrievedXbrlDocument, SecClientError> {
         self.validate_authority(authority)?;
         let raw = self
-            .fetch_filing_document(authority, cik, accession, document, cancellation)
+            .fetch_filing_document(authority, cik, accession, document, cancellation.clone())
             .await?;
-        let parsed = XbrlDocumentParser::parse(
+        let parsed = XbrlDocumentParser::parse_with_cancellation(
             raw.bytes(),
             self.parser_limits,
             XbrlDocumentContext::new(
@@ -296,6 +296,7 @@ impl SecEdgarSource {
                 market_squawk_domain::ExactPayloadEvidence::from_content_digest(raw.evidence()),
                 raw.received_at(),
             ),
+            &cancellation,
         )?;
         self.validate_authority(authority)?;
         Ok(RetrievedXbrlDocument {
@@ -1129,6 +1130,15 @@ impl SecEdgarSource {
 
     pub(crate) fn raw_store(&self) -> Arc<RawEvidenceStore> {
         Arc::clone(&self.raw_store)
+    }
+
+    pub(crate) fn retained_representation(
+        &self,
+        locator: &SecObjectLocator,
+    ) -> Result<Option<SecRepresentation>, SecClientError> {
+        self.representation_registry
+            .representation(locator.url())
+            .map_err(Into::into)
     }
 
     pub(crate) fn identity_registry(&self) -> Arc<ProviderIdentityRegistry> {
