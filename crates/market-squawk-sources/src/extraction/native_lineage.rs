@@ -39,6 +39,14 @@ pub enum ProviderNativeLineageImplementation {
     FederalReserveH15V1,
     /// FRED/ALFRED series and vintage-observation semantics encoder v1.
     FredAlfredSeriesObservationV1,
+    /// SEC Company Facts occurrence semantics encoder v1.
+    SecCompanyFactsV1,
+    /// SEC filing Inline XBRL occurrence semantics encoder v1.
+    SecFilingXbrlV1,
+    /// SEC N-PORT bulk row semantics encoder v1.
+    SecNportBulkV1,
+    /// SEC N-CEN bulk row semantics encoder v1.
+    SecNcenBulkV1,
     /// Treasury daily-rate observation semantics encoder v1.
     TreasuryDailyRateV1,
     /// Treasury Fiscal Data observation semantics encoder v1.
@@ -61,6 +69,12 @@ impl ProviderNativeLineageImplementation {
             Self::FredAlfredSeriesObservationV1 => {
                 b"market-squawk/fred-alfred/provider-native-lineage/v1"
             }
+            Self::SecCompanyFactsV1 => {
+                b"market-squawk/sec-company-facts/provider-native-lineage/v1"
+            }
+            Self::SecFilingXbrlV1 => b"market-squawk/sec-filing-xbrl/provider-native-lineage/v1",
+            Self::SecNportBulkV1 => b"market-squawk/sec-nport-bulk/provider-native-lineage/v1",
+            Self::SecNcenBulkV1 => b"market-squawk/sec-ncen-bulk/provider-native-lineage/v1",
             Self::TreasuryDailyRateV1 => {
                 b"market-squawk/treasury-daily-rate/provider-native-lineage/v1"
             }
@@ -79,6 +93,10 @@ impl ProviderNativeLineageImplementation {
             Self::EiaSeriesV1 => 4,
             Self::FederalReserveH15V1 => 6,
             Self::FredAlfredSeriesObservationV1 => 9,
+            Self::SecCompanyFactsV1 => 10,
+            Self::SecFilingXbrlV1 => 11,
+            Self::SecNportBulkV1 => 12,
+            Self::SecNcenBulkV1 => 13,
             Self::TreasuryDailyRateV1 => 7,
             Self::TreasuryFiscalDataV1 => 8,
         }
