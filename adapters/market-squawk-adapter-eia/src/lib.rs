@@ -35,8 +35,7 @@ pub use data::{
 pub use error::EiaError;
 pub use lifecycle::{
     EiaActivatedProvider, EiaActivationCandidate, EiaActivationRequirements, EiaDatasetProfile,
-    EiaDoctorOutput, EiaDoctorReport, EiaLifecycleError, EiaPrivateResearchPolicy,
-    EiaPublicationMode, EiaResearchOperation, run_eia_doctor,
+    EiaDoctorOutput, EiaDoctorReport, EiaLifecycleError, EiaPublicationMode, run_eia_doctor,
 };
 pub use metadata::{
     EiaChildRoute, EiaDataColumnMetadata, EiaFacetCatalog, EiaFacetMetadata,

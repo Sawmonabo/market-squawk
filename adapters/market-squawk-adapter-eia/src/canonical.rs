@@ -102,11 +102,6 @@ impl EiaPublicationRejoin {
         self.source_metadata.as_ref()
     }
 
-    /// Returns the non-authoritative fixed policy matrix root must rejoin to its rights decision.
-    pub const fn private_use_policy_digest(&self) -> EiaDigest {
-        self.doctor_report.private_use_policy_digest()
-    }
-
     /// Returns the exact redacted doctor evidence identity.
     pub const fn doctor_report(&self) -> &EiaDoctorReport {
         &self.doctor_report
@@ -258,7 +253,6 @@ impl EiaPublicationRejoin {
                         || sealed.receipt_digest().bytes() == [0; 32]
                         || sealed.segment().physical_receipt_digest().bytes() == [0; 32]
                 })
-            || self.private_use_policy_digest().bytes() == [0; 32]
             || self.acquisition_receipt.query_digest() != self.query_digest
             || self.acquisition_receipt.contract_schema_digest() != self.contract_schema_digest
             || self.acquisition_receipt.api_version() != &self.api_version
@@ -402,7 +396,7 @@ impl EiaPublicationRejoin {
         })
         .map_err(|_| EiaError::Canonicalization)?;
         Ok(digest_parts(
-            b"market-squawk/eia-publication-rejoin/v4",
+            b"market-squawk/eia-publication-rejoin/v5",
             [semantic.as_slice()],
         ))
     }

@@ -1,4 +1,4 @@
-//! Capture-first doctor, fixed private-use policy, and finite exact-generation activation.
+//! Capture-first doctor and finite exact-generation activation.
 
 use market_squawk_domain::{
     EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
@@ -7,7 +7,7 @@ use market_squawk_sources::{
     ExtractionAuthority, ProviderCaptureMaterial, ProviderCaptureSetReceipt,
     SealedProviderCaptureSetReceipt, SourceMetadata, SourceMetadataProvider,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -32,98 +32,6 @@ fn required_data_pages(total: u64, page_length: u16) -> Result<u64, EiaLifecycle
         )
         .ok_or(EiaLifecycleError::InvalidEvidence)
         .map(|rounded| rounded / page_length)
-}
-
-/// Closed operations in the adapter's fixed private-research matrix.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EiaResearchOperation {
-    /// Retrieve official provider responses for private research.
-    Retrieve,
-    /// Display results inside the owner's private application.
-    PrivateDisplay,
-    /// Persist exact responses and derived data inside owner-controlled storage.
-    PrivatePersist,
-    /// Transform data into private features or derived research artifacts.
-    PrivateTransform,
-    /// Run private point-in-time backtests.
-    PrivateBacktest,
-    /// Run private forecasts.
-    PrivateForecast,
-    /// Train private models.
-    PrivateModelTraining,
-    /// Operate private models and signals.
-    PrivateModelOperation,
-    /// Sell EIA data or a data substitute.
-    Sale,
-    /// Redistribute EIA data outside the owner's private research boundary.
-    Redistribution,
-}
-
-/// Immutable provider-local policy matrix; this is not evidence that root granted those rights.
-///
-/// This type intentionally has no configurable commerce flags: retrieval, private display,
-/// persistence, transformation, backtesting, forecasting, and model work are admitted; sale and
-/// redistribution are permanently denied at this adapter boundary.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct EiaPrivateResearchPolicy {}
-
-impl EiaPrivateResearchPolicy {
-    /// Returns the sole provider-local usage policy.
-    pub const fn personal_research() -> Self {
-        Self {}
-    }
-
-    /// Admits an exact operation or fails closed for sale/redistribution.
-    pub const fn authorize(self, operation: EiaResearchOperation) -> Result<(), EiaLifecycleError> {
-        match operation {
-            EiaResearchOperation::Retrieve
-            | EiaResearchOperation::PrivateDisplay
-            | EiaResearchOperation::PrivatePersist
-            | EiaResearchOperation::PrivateTransform
-            | EiaResearchOperation::PrivateBacktest
-            | EiaResearchOperation::PrivateForecast
-            | EiaResearchOperation::PrivateModelTraining
-            | EiaResearchOperation::PrivateModelOperation => Ok(()),
-            EiaResearchOperation::Sale | EiaResearchOperation::Redistribution => {
-                Err(EiaLifecycleError::UseDenied)
-            }
-        }
-    }
-
-    /// Returns whether sale is ever admitted by this policy.
-    pub const fn sale_allowed(self) -> bool {
-        false
-    }
-
-    /// Returns whether redistribution is ever admitted by this policy.
-    pub const fn redistribution_allowed(self) -> bool {
-        false
-    }
-
-    /// Returns the deterministic non-authoritative operation matrix root must rejoin to rights.
-    pub fn operation_matrix_digest(self) -> Result<EiaDigest, EiaLifecycleError> {
-        let operations = [
-            EiaResearchOperation::Retrieve,
-            EiaResearchOperation::PrivateDisplay,
-            EiaResearchOperation::PrivatePersist,
-            EiaResearchOperation::PrivateTransform,
-            EiaResearchOperation::PrivateBacktest,
-            EiaResearchOperation::PrivateForecast,
-            EiaResearchOperation::PrivateModelTraining,
-            EiaResearchOperation::PrivateModelOperation,
-            EiaResearchOperation::Sale,
-            EiaResearchOperation::Redistribution,
-        ];
-        let matrix = operations.map(|operation| (operation, self.authorize(operation).is_ok()));
-        let semantic =
-            serde_json::to_vec(&matrix).map_err(|_| EiaLifecycleError::InvalidEvidence)?;
-        Ok(digest_parts(
-            b"market-squawk/eia-private-use-operation-matrix/v1",
-            [semantic.as_slice()],
-        ))
-    }
 }
 
 /// Adapter-local declaration of durable services that composition must bind before activation.
@@ -168,7 +76,7 @@ impl EiaActivationRequirements {
         self.shared_publication_authority
     }
 
-    /// Returns whether root must rejoin its nonforgeable rights decision before use/publication.
+    /// Returns whether composition must retain the existing common rights decision.
     pub const fn root_rights_decision_rejoin_required(self) -> bool {
         self.root_rights_decision_rejoin
     }
@@ -284,7 +192,6 @@ pub struct EiaDoctorReport {
     authorization_evidence: EvidenceDigest,
     authorization_starts_at: Timestamp,
     authorization_ends_at: Option<Timestamp>,
-    private_use_policy_digest: EiaDigest,
     route: crate::EiaRoute,
     api_version: EiaApiVersion,
     query_digest: EiaDigest,
@@ -318,7 +225,6 @@ struct EiaDoctorReportDigestInput<'a> {
     authorization_evidence: EvidenceDigest,
     authorization_starts_at: Timestamp,
     authorization_ends_at: Option<Timestamp>,
-    private_use_policy_digest: EiaDigest,
     route: &'a crate::EiaRoute,
     api_version: &'a EiaApiVersion,
     query_digest: EiaDigest,
@@ -376,11 +282,6 @@ impl EiaDoctorReport {
     /// Returns the exclusive end of the authorization generation, when finite.
     pub const fn authorization_ends_at(&self) -> Option<Timestamp> {
         self.authorization_ends_at
-    }
-
-    /// Returns the non-authoritative fixed policy digest root must rejoin to its rights decision.
-    pub const fn private_use_policy_digest(&self) -> EiaDigest {
-        self.private_use_policy_digest
     }
 
     /// Returns the exact provider route.
@@ -502,7 +403,6 @@ impl EiaDoctorReport {
             authorization_evidence: self.authorization_evidence,
             authorization_starts_at: self.authorization_starts_at,
             authorization_ends_at: self.authorization_ends_at,
-            private_use_policy_digest: self.private_use_policy_digest,
             route: &self.route,
             api_version: &self.api_version,
             query_digest: self.query_digest,
@@ -527,7 +427,7 @@ impl EiaDoctorReport {
         })
         .map_err(|_| EiaLifecycleError::InvalidEvidence)?;
         Ok(digest_parts(
-            b"market-squawk/eia-doctor-report/v2",
+            b"market-squawk/eia-doctor-report/v3",
             [semantic.as_slice()],
         ))
     }
@@ -535,7 +435,6 @@ impl EiaDoctorReport {
     pub(crate) fn validate(&self) -> Result<(), EiaLifecycleError> {
         if self.source_metadata_payload_digest.bytes() == [0; 32]
             || self.authorization_evidence.bytes() == [0; 32]
-            || self.private_use_policy_digest.bytes() == [0; 32]
             || self.query_digest.bytes() == [0; 32]
             || self.contract_schema_digest.bytes() == [0; 32]
             || self
@@ -586,7 +485,6 @@ impl EiaDoctorOutput {
 pub struct EiaActivationCandidate {
     transport: EiaSourceTransport,
     contract: EiaDatasetContract,
-    policy: EiaPrivateResearchPolicy,
     report: EiaDoctorReport,
 }
 
@@ -598,9 +496,6 @@ pub async fn run_eia_doctor(
     deadline: Timestamp,
     cancellation: CancellationToken,
 ) -> Result<EiaDoctorOutput, EiaLifecycleError> {
-    let policy = EiaPrivateResearchPolicy::personal_research();
-    policy.authorize(EiaResearchOperation::Retrieve)?;
-    let private_use_policy_digest = policy.operation_matrix_digest()?;
     let source_metadata = transport.metadata();
     let metadata_request = EiaMetadataRequest::route(profile.query().route().clone());
     let metadata = transport
@@ -719,7 +614,6 @@ pub async fn run_eia_doctor(
         authorization_evidence: authorization.evidence().content_digest(),
         authorization_starts_at: effective.starts_at(),
         authorization_ends_at: effective.ends_at(),
-        private_use_policy_digest,
         route: contract.query().route().clone(),
         api_version: contract.metadata().api_version().clone(),
         query_digest: contract.query().identity(),
@@ -747,7 +641,6 @@ pub async fn run_eia_doctor(
     let candidate = EiaActivationCandidate {
         transport,
         contract,
-        policy,
         report,
     };
     Ok(EiaDoctorOutput {
@@ -760,7 +653,6 @@ pub async fn run_eia_doctor(
 pub struct EiaActivatedProvider {
     transport: EiaSourceTransport,
     contract: EiaDatasetContract,
-    policy: EiaPrivateResearchPolicy,
     report: EiaDoctorReport,
     sealed_doctor_captures: Box<[SealedProviderCaptureSetReceipt]>,
 }
@@ -772,10 +664,6 @@ impl std::fmt::Debug for EiaActivatedProvider {
             .field("source_id", self.transport.metadata().source_id())
             .field("metadata_revision", self.transport.metadata().revision())
             .field("query_digest", &self.contract.query().identity())
-            .field(
-                "private_use_policy_digest",
-                &self.report.private_use_policy_digest(),
-            )
             .finish_non_exhaustive()
     }
 }
@@ -839,8 +727,6 @@ impl EiaActivatedProvider {
                 .metadata()
                 .authorization()
                 .is_effective_at(activated_at)
-            || candidate.policy.operation_matrix_digest()?
-                != candidate.report.private_use_policy_digest()
             || required_data_pages(
                 candidate.report.provider_total(),
                 candidate.contract.query().length(),
@@ -850,9 +736,6 @@ impl EiaActivatedProvider {
         {
             return Err(EiaLifecycleError::InvalidEvidence);
         }
-        candidate
-            .policy
-            .authorize(EiaResearchOperation::PrivatePersist)?;
         let mut retained_doctor_seals = Vec::new();
         retained_doctor_seals
             .try_reserve_exact(sealed_doctor_captures.len())
@@ -861,7 +744,6 @@ impl EiaActivatedProvider {
         let activated = Self {
             transport: candidate.transport,
             contract: candidate.contract,
-            policy: candidate.policy,
             report: candidate.report,
             sealed_doctor_captures: retained_doctor_seals.into_boxed_slice(),
         };
@@ -889,11 +771,6 @@ impl EiaActivatedProvider {
         &self.sealed_doctor_captures
     }
 
-    /// Returns the fixed usage policy.
-    pub const fn usage_policy(&self) -> EiaPrivateResearchPolicy {
-        self.policy
-    }
-
     /// Returns whether the selected fields were admitted for canonical macro publication.
     pub const fn publication_mode(&self) -> EiaPublicationMode {
         self.report.publication_mode()
@@ -908,8 +785,6 @@ impl EiaActivatedProvider {
         authority: &ExtractionAuthority,
         deadline: Timestamp,
     ) -> Result<EiaDataAcquisitionCursor, EiaLifecycleError> {
-        self.policy
-            .authorize(EiaResearchOperation::PrivatePersist)?;
         let observed_at = crate::transport::system_timestamp()?;
         self.ensure_transition_deadline(observed_at, deadline)?;
         Ok(self
@@ -925,8 +800,6 @@ impl EiaActivatedProvider {
         deadline: Timestamp,
         cancellation: CancellationToken,
     ) -> Result<EiaPendingDataPage, EiaLifecycleError> {
-        self.policy
-            .authorize(EiaResearchOperation::PrivatePersist)?;
         self.ensure_transition_deadline(crate::transport::system_timestamp()?, deadline)?;
         let pending = self
             .transport
@@ -950,8 +823,6 @@ impl EiaActivatedProvider {
         sealed_page: SealedProviderCaptureSetReceipt,
         deadline: Timestamp,
     ) -> Result<EiaDataPageTransition, EiaLifecycleError> {
-        self.policy
-            .authorize(EiaResearchOperation::PrivatePersist)?;
         let observed_at = crate::transport::system_timestamp()?;
         self.ensure_transition_deadline(observed_at, deadline)?;
         self.ensure_current_at(rejoin.root_journal_rejoin().capture_receipt().received_at())?;
@@ -962,20 +833,12 @@ impl EiaActivatedProvider {
         Ok(transition)
     }
 
-    /// Validates an exact operation against the frozen non-sale/non-redistribution policy.
-    pub fn authorize_use(&self, operation: EiaResearchOperation) -> Result<(), EiaLifecycleError> {
-        self.policy.authorize(operation)?;
-        self.ensure_current_at(crate::transport::system_timestamp()?)
-    }
-
     /// Consumes the complete terminal retrieval and its actual combined shared-journal seal.
     pub fn publication_candidate(
         &self,
         retrieval: EiaDataRetrievalSealRejoin,
         sealed_capture: SealedProviderCaptureSetReceipt,
     ) -> Result<crate::EiaPublicationCandidate, EiaLifecycleError> {
-        self.policy
-            .authorize(EiaResearchOperation::PrivatePersist)?;
         let normalization_admitted_at = crate::transport::system_timestamp()?;
         self.ensure_current_at(normalization_admitted_at)?;
         let capture_pages = sealed_capture.capture().pages();
@@ -1063,7 +926,6 @@ impl EiaActivatedProvider {
                 .is_effective_at(observed_at)
             || observed_at < self.report.observed_at()
             || observed_at >= self.report.expires_at()
-            || self.policy.operation_matrix_digest()? != self.report.private_use_policy_digest()
             || required_data_pages(self.report.provider_total(), self.contract.query().length())?
                 > u64::from(self.transport.max_pages())
             || self.sealed_doctor_captures.len() != self.report.doctor_capture_receipts().len()
@@ -1092,13 +954,10 @@ impl SourceMetadataProvider for EiaActivatedProvider {
 /// Provider-local activation failure with no credential-bearing context.
 #[derive(Debug, Error)]
 pub enum EiaLifecycleError {
-    /// The fixed private-use policy rejected sale or redistribution.
-    #[error("EIA use is outside the frozen private/personal research authorization")]
-    UseDenied,
     /// Doctor, capture, or activation evidence did not bind exactly.
     #[error("invalid EIA activation evidence")]
     InvalidEvidence,
-    /// Doctor, policy, authorization, source metadata, or actual doctor seals are no longer current.
+    /// Doctor, authorization, source metadata, or actual doctor seals are no longer current.
     #[error("EIA activation is no longer current")]
     StaleActivation,
     /// Provider request/response or capture transport failed.

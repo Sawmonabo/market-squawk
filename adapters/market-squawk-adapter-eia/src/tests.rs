@@ -33,10 +33,10 @@ use crate::{
     EiaDataFieldContractInput, EiaDataPage, EiaDataPageTransition, EiaDataQuery, EiaDataQueryInput,
     EiaDatasetContract, EiaDatasetContractInput, EiaDatasetProfile, EiaError, EiaFacetFilter,
     EiaFacetValue, EiaFieldId, EiaMetadataRequest, EiaMissingPolicy, EiaNativeValue,
-    EiaParseLimits, EiaResearchOperation, EiaRevisionDisposition, EiaRevisionHead, EiaRoute,
-    EiaSort, EiaSortDirection, EiaSourceTransport, EiaTransportLimits, EiaUnitSource, EiaValueKind,
-    eia_api_endpoint_rules, eia_application_provider_budget, parse_facet_metadata,
-    parse_route_metadata, plan_revisions, run_eia_doctor,
+    EiaParseLimits, EiaRevisionDisposition, EiaRevisionHead, EiaRoute, EiaSort, EiaSortDirection,
+    EiaSourceTransport, EiaTransportLimits, EiaUnitSource, EiaValueKind, eia_api_endpoint_rules,
+    eia_application_provider_budget, parse_facet_metadata, parse_route_metadata, plan_revisions,
+    run_eia_doctor,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -492,10 +492,6 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
             .requirements()
             .root_rights_decision_rejoin_required()
     );
-    assert_eq!(
-        doctor.report().private_use_policy_digest(),
-        crate::EiaPrivateResearchPolicy::personal_research().operation_matrix_digest()?
-    );
     let (candidate, doctor_captures) = doctor.into_parts();
     assert_eq!(doctor_captures.len(), 3);
     assert!(
@@ -515,18 +511,6 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
         .map(|capture| capture.seal(&store))
         .collect::<Result<Vec<_>, _>>()?;
     let provider = crate::EiaActivatedProvider::try_activate(candidate, &sealed_doctor)?;
-    assert!(
-        provider
-            .authorize_use(EiaResearchOperation::PrivateModelTraining)
-            .is_ok()
-    );
-    assert!(provider.authorize_use(EiaResearchOperation::Sale).is_err());
-    assert!(
-        provider
-            .authorize_use(EiaResearchOperation::Redistribution)
-            .is_err()
-    );
-
     let mut cursor = provider.begin_retrieval(&authority, deadline)?;
     let retrieval = loop {
         let pending = provider
