@@ -3,6 +3,7 @@
 mod batch;
 mod capture;
 mod contracts;
+mod native_lineage;
 mod revisions;
 
 use futures_util::future::BoxFuture;
@@ -20,10 +21,18 @@ pub use batch::{ExtractionBatch, ExtractionBatchAccumulator, ExtractionContentId
 pub use capture::{
     CompleteMarketBarHistoryV1, MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMP_BYTES,
     MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS, MAX_PROVIDER_CAPTURE_BYTES,
-    MAX_PROVIDER_CAPTURE_PAGE_BYTES, MAX_PROVIDER_CAPTURE_PAGES, ProviderCaptureError,
-    ProviderCaptureMaterial, ProviderCaptureMaterialSealError, ProviderCapturePageReceipt,
-    ProviderCaptureRequestGraphComponent, ProviderCaptureSemanticBinding,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
+    MAX_PROVIDER_CAPTURE_PAGE_BYTES, MAX_PROVIDER_CAPTURE_PAGES,
+    MAX_PROVIDER_EVENT_MICROBATCH_BYTES, MAX_PROVIDER_EVENT_MICROBATCH_FRAMES,
+    ProviderCaptureBindingLayout, ProviderCaptureComponentToken, ProviderCaptureComponentTokenSet,
+    ProviderCaptureError, ProviderCaptureMaterial, ProviderCaptureMaterialSealError,
+    ProviderCapturePageReceipt, ProviderCaptureRequestGraphComponent, ProviderCaptureRowFrame,
+    ProviderCaptureScope, ProviderCaptureSealExpectation, ProviderCaptureSealRequest,
+    ProviderCaptureSemanticBinding, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    ProviderEventMicrobatchFrameReceipt, ProviderEventMicrobatchMaterial,
+    ProviderEventMicrobatchReceipt, ProviderEventMicrobatchSealExpectation,
+    ProviderEventMicrobatchToken, ProviderOrderedCaptureSegments, ProviderWholeCaptureToken,
+    RejoinedProviderCapture, SealedProviderCaptureBinding, SealedProviderCaptureMaterial,
+    SealedProviderCaptureSetReceipt, SealedProviderEventMicrobatchReceipt,
     SourceObjectCaptureIdentity,
 };
 pub use contracts::{
@@ -32,6 +41,12 @@ pub use contracts::{
     MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORD_BYTES,
     MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceObject,
     payload_matches_exact_evidence,
+};
+pub use native_lineage::{
+    MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
+    PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION, ProviderNativeLineageBatch,
+    ProviderNativeLineageBatchBuilder, ProviderNativeLineageError,
+    ProviderNativeLineageImplementation, ProviderNativeLineageRow, ProviderNativeLineageSchema,
 };
 pub use revisions::{
     CanonicalObservationFamily, CanonicalObservationPayload, ExtractionRevisionEvidence,

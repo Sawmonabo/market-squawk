@@ -8,7 +8,10 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     CURRENT_RESEARCH_RECORD_SCHEMA, ExtractionBatch, ExtractionRecord, ExtractionRevisionPlan,
+    ProviderCaptureScope, ProviderNativeLineageBatch, ProviderNativeLineageBatchBuilder,
+    ProviderNativeLineageImplementation, SealedProviderCaptureBinding,
 };
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -52,6 +55,7 @@ pub struct BeaPublicationRejoinCoordinates {
     data_upstream_response_digest: EvidenceDigest,
     data_response_digest: EvidenceDigest,
     canonical_batch_digest: EvidenceDigest,
+    native_lineage_digest: EvidenceDigest,
     row_count: u64,
     candidate_digest: EvidenceDigest,
 }
@@ -137,6 +141,11 @@ impl BeaPublicationRejoinCoordinates {
         self.canonical_batch_digest
     }
 
+    /// Returns the exact bounded provider-native lineage batch commitment.
+    pub const fn native_lineage_digest(&self) -> EvidenceDigest {
+        self.native_lineage_digest
+    }
+
     /// Returns the exact number of canonical rows awaiting shared publication.
     pub const fn row_count(&self) -> u64 {
         self.row_count
@@ -158,9 +167,9 @@ impl BeaPublicationRejoinCoordinates {
 pub struct BeaPublicationCandidate {
     coordinates: BeaPublicationRejoinCoordinates,
     observations: Vec<BeaCanonicalObservation>,
-    batch: ExtractionBatch,
     revision_plan: ExtractionRevisionPlan,
-    sealed_output: BeaSealedExtractionOutput,
+    sealed_capture_binding: SealedProviderCaptureBinding,
+    source_batch_digest: EvidenceDigest,
 }
 
 impl BeaPublicationCandidate {
@@ -170,8 +179,9 @@ impl BeaPublicationCandidate {
         doctor: &BeaDoctorAdmissionEvidence,
         sealed_output: BeaSealedExtractionOutput,
     ) -> Result<Self, BeaPublicationError> {
-        let sealed_acquisition = sealed_output.sealed_acquisition();
-        let maximum_records = NonZeroU32::new(sealed_output.source_batch().request().max_records())
+        let (source_batch, source_batch_digest, sealed_acquisition, capture_token) =
+            sealed_output.into_publication_parts();
+        let maximum_records = NonZeroU32::new(source_batch.request().max_records())
             .ok_or(BeaPublicationError::InvalidEvidence)?;
         let canonicalized_at = crate::transport::system_timestamp()
             .map_err(|_| BeaPublicationError::InvalidAuthority)?;
@@ -208,8 +218,9 @@ impl BeaPublicationCandidate {
         }
         let row_count =
             u64::try_from(observations.len()).map_err(|_| BeaPublicationError::InvalidEvidence)?;
-        let revision_plan = ExtractionRevisionPlan::locally_observed(observations.len())
-            .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+        let revision_plan =
+            ExtractionRevisionPlan::locally_observed_with_native_lineage(observations.len())
+                .map_err(|_| BeaPublicationError::InvalidEvidence)?;
         let data_response_digest = sealed_acquisition
             .data_response_digest()
             .map_err(|_| BeaPublicationError::InvalidEvidence)?;
@@ -249,25 +260,49 @@ impl BeaPublicationCandidate {
             data_upstream_response_digest,
             data_response_digest,
             canonical_batch_digest,
+            native_lineage_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
             row_count,
             candidate_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
         };
-        coordinates.candidate_digest = candidate_digest(
-            &coordinates,
-            &revision_plan,
-            sealed_output.source_batch_digest(),
-        )?;
-        let canonical_batch = canonical_extraction_batch(
-            sealed_output.source_batch(),
-            &observations,
-            sealed_output.sealed_acquisition(),
-        )?;
+        let canonical_batch =
+            canonical_extraction_batch(&source_batch, &observations, &sealed_acquisition)?;
+        let native_lineage = native_lineage(&sealed_acquisition, &canonical_batch)?;
+        coordinates.native_lineage_digest = native_lineage.batch_digest();
+        if capture_token.persisted_receipt() != sealed_acquisition.sealed_capture() {
+            return Err(BeaPublicationError::InvalidAuthority);
+        }
+        let data_component = capture_token
+            .persisted_receipt()
+            .capture()
+            .request_graph_components()
+            .get(usize::from(coordinates.data_component_ordinal))
+            .ok_or(BeaPublicationError::InvalidEvidence)?;
+        if data_component.page_count().get() != 1 {
+            return Err(BeaPublicationError::InvalidEvidence);
+        }
+        let mut row_capture_page_ordinals = Vec::new();
+        row_capture_page_ordinals
+            .try_reserve_exact(canonical_batch.records().len())
+            .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+        row_capture_page_ordinals.extend(
+            std::iter::repeat(data_component.first_page_ordinal())
+                .take(canonical_batch.records().len()),
+        );
+        let sealed_capture_binding = SealedProviderCaptureBinding::try_whole(
+            capture_token,
+            canonical_batch,
+            native_lineage,
+            row_capture_page_ordinals,
+        )
+        .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+        coordinates.candidate_digest =
+            candidate_digest(&coordinates, &revision_plan, source_batch_digest)?;
         let candidate = Self {
             coordinates,
             observations,
-            batch: canonical_batch,
             revision_plan,
-            sealed_output,
+            sealed_capture_binding,
+            source_batch_digest,
         };
         candidate.validate()?;
         Ok(candidate)
@@ -276,51 +311,38 @@ impl BeaPublicationCandidate {
     /// Revalidates every immutable provider/native/canonical/physical coordinate.
     pub fn validate(&self) -> Result<(), BeaPublicationError> {
         let coordinates = &self.coordinates;
-        let sealed_acquisition = self.sealed_output.sealed_acquisition();
+        let sealed_capture = self
+            .sealed_capture_binding
+            .persisted_segment_receipt(0)
+            .ok_or(BeaPublicationError::InvalidEvidence)?;
         if self.observations.is_empty()
             || self.revision_plan.len() != self.observations.len()
             || !self.revision_plan.is_locally_observed()
+            || !self.revision_plan.native_lineage_required()
             || u64::try_from(self.observations.len())
                 .map_err(|_| BeaPublicationError::InvalidEvidence)?
                 != coordinates.row_count
-            || self.sealed_output.source_batch().records().len() != self.observations.len()
-            || self.batch.records().len() != self.observations.len()
-            || sealed_acquisition.source_id() != &coordinates.source_id
-            || sealed_acquisition.metadata_revision() != &coordinates.metadata_revision
-            || sealed_acquisition.dataset_id() != &coordinates.dataset_id
-            || sealed_acquisition.provider_dataset() != &coordinates.provider_dataset
-            || sealed_acquisition.sealed_graph_digest()
-                != coordinates.acquisition_sealed_graph_digest
-            || sealed_acquisition.sealed_capture().receipt_digest()
-                != coordinates.acquisition_capture_receipt_digest
-            || sealed_acquisition
-                .sealed_capture()
-                .segment()
-                .physical_receipt_digest()
+            || self.sealed_capture_binding.batch().records().len() != self.observations.len()
+            || self.sealed_capture_binding.native_lineage().batch_digest()
+                != coordinates.native_lineage_digest
+            || self.sealed_capture_binding.validate().is_err()
+            || self.sealed_capture_binding.scope() != ProviderCaptureScope::Whole
+            || sealed_capture.capture().source_id() != &coordinates.source_id
+            || sealed_capture.capture().metadata_revision() != &coordinates.metadata_revision
+            || sealed_capture.capture().dataset() != &coordinates.dataset_id
+            || sealed_capture.receipt_digest() != coordinates.acquisition_capture_receipt_digest
+            || sealed_capture.segment().physical_receipt_digest()
                 != coordinates.acquisition_physical_receipt_digest
-            || sealed_acquisition.data_component_ordinal() != coordinates.data_component_ordinal
-            || sealed_acquisition
-                .data_response_digest()
-                .map_err(|_| BeaPublicationError::InvalidEvidence)?
-                != coordinates.data_response_digest
-            || sealed_acquisition
-                .data_upstream_response_digest()
-                .map_err(|_| BeaPublicationError::InvalidEvidence)?
-                != coordinates.data_upstream_response_digest
-            || sealed_acquisition
-                .evidence()
-                .metadata()
-                .generation()
-                .digest()
-                != coordinates.metadata_generation.bytes()
+            || self
+                .sealed_capture_binding
+                .capture_evidence()
+                .content_digest()
+                != sealed_capture.capture().content_digest()
         {
             return Err(BeaPublicationError::InvalidEvidence);
         }
-        if candidate_digest(
-            coordinates,
-            &self.revision_plan,
-            self.sealed_output.source_batch_digest(),
-        )? != coordinates.candidate_digest
+        if candidate_digest(coordinates, &self.revision_plan, self.source_batch_digest)?
+            != coordinates.candidate_digest
         {
             return Err(BeaPublicationError::InvalidEvidence);
         }
@@ -330,11 +352,6 @@ impl BeaPublicationCandidate {
     /// Returns exact root-owned publication rejoin coordinates.
     pub const fn rejoin_coordinates(&self) -> &BeaPublicationRejoinCoordinates {
         &self.coordinates
-    }
-
-    /// Returns the joined source batch, native evidence, and physical acquisition sidecar.
-    pub const fn sealed_output(&self) -> &BeaSealedExtractionOutput {
-        &self.sealed_output
     }
 
     /// Returns canonical rows in deterministic provider response order.
@@ -357,15 +374,14 @@ impl BeaPublicationCandidate {
         let Self {
             coordinates,
             observations: _,
-            batch,
             revision_plan,
-            sealed_output,
+            sealed_capture_binding,
+            source_batch_digest: _,
         } = self;
         BeaSharedPublicationParts {
             coordinates,
-            batch,
             revision_plan,
-            sealed_output,
+            sealed_capture_binding,
         }
     }
 }
@@ -374,9 +390,8 @@ impl BeaPublicationCandidate {
 #[derive(Debug)]
 pub struct BeaSharedPublicationParts {
     coordinates: BeaPublicationRejoinCoordinates,
-    batch: ExtractionBatch,
     revision_plan: ExtractionRevisionPlan,
-    sealed_output: BeaSealedExtractionOutput,
+    sealed_capture_binding: SealedProviderCaptureBinding,
 }
 
 impl BeaSharedPublicationParts {
@@ -387,7 +402,7 @@ impl BeaSharedPublicationParts {
 
     /// Returns the exact canonical batch root must submit to shared ingestion.
     pub const fn batch(&self) -> &ExtractionBatch {
-        &self.batch
+        self.sealed_capture_binding.batch()
     }
 
     /// Returns the exact bounded revision plan aligned with [`Self::batch`].
@@ -395,9 +410,14 @@ impl BeaSharedPublicationParts {
         &self.revision_plan
     }
 
-    /// Returns the original source batch, native dictionaries, and physical capture sidecar.
-    pub const fn sealed_output(&self) -> &BeaSealedExtractionOutput {
-        &self.sealed_output
+    /// Returns exact bounded BEA-native rows aligned to the canonical batch.
+    pub const fn native_lineage(&self) -> &ProviderNativeLineageBatch {
+        self.sealed_capture_binding.native_lineage()
+    }
+
+    /// Returns the validated whole-graph physical capture binding.
+    pub const fn sealed_capture_binding(&self) -> &SealedProviderCaptureBinding {
+        &self.sealed_capture_binding
     }
 
     /// Consumes the handoff into the only values shared composition needs.
@@ -405,17 +425,117 @@ impl BeaSharedPublicationParts {
         self,
     ) -> (
         BeaPublicationRejoinCoordinates,
-        ExtractionBatch,
         ExtractionRevisionPlan,
-        BeaSealedExtractionOutput,
+        SealedProviderCaptureBinding,
     ) {
         (
             self.coordinates,
-            self.batch,
             self.revision_plan,
-            self.sealed_output,
+            self.sealed_capture_binding,
         )
     }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BeaNativeLineageRowV1<'a> {
+    dataset: &'a str,
+    table: Option<&'a str>,
+    line: Option<&'a str>,
+    dimensions: &'a std::collections::BTreeMap<String, String>,
+    period: &'a str,
+    frequency: &'static str,
+    value: Option<String>,
+    raw_value: Option<&'a str>,
+    missing: Option<&'static str>,
+    missing_marker: Option<&'static str>,
+    cl_unit: &'a str,
+    unit_multiplier: i16,
+    note_references: &'a [String],
+    notes: Vec<BeaNativeNoteV1<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BeaNativeNoteV1<'a> {
+    reference: &'a str,
+    text: &'a str,
+}
+
+fn native_lineage(
+    sealed_acquisition: &crate::BeaSealedAcquisitionReceipt,
+    canonical_batch: &ExtractionBatch,
+) -> Result<ProviderNativeLineageBatch, BeaPublicationError> {
+    let page = sealed_acquisition.evidence().data().page();
+    if page.observations().len() != canonical_batch.records().len()
+        || page.observations().is_empty()
+    {
+        return Err(BeaPublicationError::InvalidEvidence);
+    }
+    let mut native_lineage = ProviderNativeLineageBatchBuilder::try_new(
+        ProviderNativeLineageImplementation::BeaRegionalV1,
+        canonical_batch,
+    )
+    .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    for observation in page.observations() {
+        let (value, raw_value, missing, missing_marker) = match observation.value() {
+            crate::BeaObservationValue::Observed { value, raw } => {
+                (Some(value.to_string()), Some(raw.as_str()), None, None)
+            }
+            crate::BeaObservationValue::Missing(crate::BeaMissingValue::Absent) => {
+                (None, None, Some("absent"), None)
+            }
+            crate::BeaObservationValue::Missing(crate::BeaMissingValue::Blank) => {
+                (None, None, Some("blank"), Some(""))
+            }
+            crate::BeaObservationValue::Missing(crate::BeaMissingValue::SuppressedRegional) => (
+                None,
+                None,
+                Some("suppressed_regional"),
+                Some(crate::BEA_REGIONAL_SUPPRESSION_MARKER),
+            ),
+        };
+        let mut notes = Vec::new();
+        notes
+            .try_reserve_exact(page.notes().len())
+            .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+        notes.extend(page.notes().iter().filter_map(|note| {
+            (note.reference().is_empty()
+                || observation
+                    .note_references()
+                    .iter()
+                    .any(|reference| reference == note.reference()))
+            .then_some(BeaNativeNoteV1 {
+                reference: note.reference(),
+                text: note.text(),
+            })
+        }));
+        native_lineage
+            .try_push(&BeaNativeLineageRowV1 {
+                dataset: observation.identity().dataset().as_str(),
+                table: observation.identity().table(),
+                line: observation.identity().line(),
+                dimensions: observation.identity().dimensions(),
+                period: observation.period().raw(),
+                frequency: match observation.period().frequency() {
+                    crate::BeaFrequency::Annual => "annual",
+                    crate::BeaFrequency::Quarterly => "quarterly",
+                    crate::BeaFrequency::Monthly => "monthly",
+                },
+                value,
+                raw_value,
+                missing,
+                missing_marker,
+                cl_unit: observation.unit().cl_unit(),
+                unit_multiplier: observation.unit().unit_multiplier(),
+                note_references: observation.note_references(),
+                notes,
+            })
+            .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    }
+    native_lineage
+        .finish()
+        .map_err(|_| BeaPublicationError::InvalidEvidence)
 }
 
 fn canonical_extraction_batch(
@@ -471,7 +591,7 @@ fn candidate_digest(
     source_batch_digest: EvidenceDigest,
 ) -> Result<EvidenceDigest, BeaPublicationError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk/bea-publication-candidate/v7");
+    hasher.update(b"market-squawk/bea-publication-candidate/v8");
     hash_text(&mut hasher, coordinates.source_id.as_str())?;
     hash_text(
         &mut hasher,
@@ -494,6 +614,7 @@ fn candidate_digest(
         coordinates.data_upstream_response_digest,
         coordinates.data_response_digest,
         coordinates.canonical_batch_digest,
+        coordinates.native_lineage_digest,
     ] {
         hasher.update(digest.bytes());
     }
@@ -502,6 +623,7 @@ fn candidate_digest(
     if coordinates.row_count
         != u64::try_from(revision_plan.len()).map_err(|_| BeaPublicationError::InvalidEvidence)?
         || !revision_plan.is_locally_observed()
+        || !revision_plan.native_lineage_required()
     {
         return Err(BeaPublicationError::InvalidEvidence);
     }

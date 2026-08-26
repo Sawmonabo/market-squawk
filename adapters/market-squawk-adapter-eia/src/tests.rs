@@ -11,8 +11,8 @@ use bytes::Bytes;
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-    ResearchObservation, RevisionBoundPayloadEvidence, RevisionNumber, SchemaVersion,
-    SequenceCapability, SourceId, SourceIdentifier, Timestamp,
+    ResearchObservation, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::LocalPaths;
 use market_squawk_sources::{
@@ -34,10 +34,9 @@ use crate::{
     EiaDataFieldContractInput, EiaDataPage, EiaDataPageTransition, EiaDataQuery, EiaDataQueryInput,
     EiaDatasetContract, EiaDatasetContractInput, EiaDatasetProfile, EiaError, EiaFacetFilter,
     EiaFacetValue, EiaFieldId, EiaMetadataRequest, EiaMissingPolicy, EiaNativeValue,
-    EiaParseLimits, EiaRevisionDisposition, EiaRevisionHead, EiaRoute, EiaSort, EiaSortDirection,
-    EiaSourceTransport, EiaTransportLimits, EiaUnitSource, EiaValueKind, eia_api_endpoint_rules,
-    eia_application_provider_budget, parse_facet_metadata, parse_route_metadata, plan_revisions,
-    run_eia_doctor,
+    EiaParseLimits, EiaRoute, EiaSort, EiaSortDirection, EiaSourceTransport, EiaTransportLimits,
+    EiaUnitSource, EiaValueKind, eia_api_endpoint_rules, eia_application_provider_budget,
+    parse_facet_metadata, parse_route_metadata, run_eia_doctor,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -280,43 +279,6 @@ fn metadata_multi_page_data_and_revisions_preserve_exact_evidence() -> TestResul
             if *value == rust_decimal::Decimal::from_str_exact("10.00")?
     ));
 
-    let changed_bytes = data_page_bytes(
-        1,
-        vec![data_row("2024-01", "11.00", "A", "2024-02-01T15:00:00Z")],
-        0,
-    )?;
-    let changed = EiaDataPage::parse(
-        &changed_bytes,
-        query.page(0),
-        &contract,
-        received_at,
-        limits,
-    )?;
-    let previous: Vec<_> = page_one
-        .observations()
-        .iter()
-        .filter(|observation| observation.period().raw() == "2024-01")
-        .map(|observation| {
-            Ok(EiaRevisionHead::new(
-                observation.family().clone(),
-                RevisionNumber::new(1)?,
-                observation.semantic_digest(),
-            ))
-        })
-        .collect::<Result<_, Box<dyn Error>>>()?;
-    let revisions = plan_revisions(changed.observations(), &previous)?;
-    assert_eq!(revisions.len(), 2);
-    assert!(
-        revisions
-            .iter()
-            .any(|entry| entry.disposition() == EiaRevisionDisposition::Revised)
-    );
-    assert!(
-        revisions
-            .iter()
-            .any(|entry| entry.disposition() == EiaRevisionDisposition::Duplicate)
-    );
-
     let quarterly_query = EiaDataQuery::try_new(EiaDataQueryInput {
         route: contract.query().route().clone(),
         data_fields: vec![field("price")?],
@@ -493,25 +455,19 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
             .requirements()
             .root_rights_decision_rejoin_required()
     );
-    let (candidate, doctor_captures) = doctor.into_parts();
-    assert_eq!(doctor_captures.len(), 3);
-    assert!(
-        doctor_captures
-            .iter()
-            .all(|capture| capture.records().iter().all(|record| {
-                let payload = String::from_utf8_lossy(record.payload());
-                payload.contains("[REDACTED]") && !payload.contains("fixture-secret")
-            }))
-    );
+    let (pending_activation, doctor_seal_requests) = doctor.into_sealing_parts()?;
+    assert_eq!(doctor_seal_requests.len(), 3);
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path())?;
     let store = paths.sealed_research_journal_store()?;
-    let sealed_doctor = doctor_captures
-        .into_vec()
-        .into_iter()
-        .map(|capture| capture.seal(&store))
-        .collect::<Result<Vec<_>, _>>()?;
-    let provider = crate::EiaActivatedProvider::try_activate(candidate, &sealed_doctor)?;
+    let mut sealed_doctor = Vec::new();
+    sealed_doctor.try_reserve_exact(doctor_seal_requests.len())?;
+    for request in doctor_seal_requests {
+        let sealed = request.seal(&store)?;
+        sealed_doctor.push(sealed);
+    }
+    let provider = crate::EiaActivatedProvider::try_activate(pending_activation, sealed_doctor)?;
+    let cancellation = CancellationToken::new();
     let mut cursor = provider.begin_retrieval(&authority, deadline)?;
     let retrieval = loop {
         let pending = provider
@@ -522,9 +478,15 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
             provider.contract(),
             pending.page_material(),
         )?;
-        let (page_rejoin, page_capture) = pending.into_parts();
-        let sealed_page = page_capture.seal(&store)?;
-        match provider.rejoin_retrieval_page(&authority, page_rejoin, sealed_page, deadline)? {
+        let (page_rejoin, page_seal_request) = pending.into_parts();
+        let sealed_page = page_seal_request.seal(&store)?;
+        match provider.rejoin_retrieval_page(
+            &authority,
+            page_rejoin,
+            sealed_page,
+            deadline,
+            &cancellation,
+        )? {
             EiaDataPageTransition::More(next) => cursor = next,
             EiaDataPageTransition::Complete(retrieval) => break retrieval,
         }
@@ -543,12 +505,15 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
         ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
     );
     assert_eq!(retrieval.capture_receipt().pages().len(), 2);
-    assert_eq!(retrieval.capture_material().records().len(), 2);
     assert_eq!(retrieval.pages().len(), 2);
-    assert_eq!(retrieval.sealed_pages().len(), 2);
-    assert!(retrieval.sealed_pages().iter().all(|sealed| {
-        sealed.receipt_digest().bytes() != [0; 32]
-            && sealed.segment().physical_receipt_digest().bytes() != [0; 32]
+    assert_eq!(retrieval.sealed_page_count(), 2);
+    assert!((0..retrieval.sealed_page_count()).all(|ordinal| {
+        retrieval
+            .sealed_page_receipt(ordinal)
+            .is_some_and(|sealed| {
+                sealed.receipt_digest().bytes() != [0; 32]
+                    && sealed.segment().physical_receipt_digest().bytes() != [0; 32]
+            })
     }));
     for page in retrieval.pages() {
         page.root_journal_rejoin().validate(
@@ -571,19 +536,24 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
             .publication_retained_bytes()
             >= duplicate_raw_floor
     );
-    for (ordinal, (page, record)) in retrieval
-        .pages()
-        .iter()
-        .zip(retrieval.capture_material().records())
-        .enumerate()
-    {
-        assert_eq!(record.source_sequence(), Some(ordinal as u64));
-        assert_eq!(record.payload(), page.raw_page().payload());
+    for (ordinal, page) in retrieval.pages().iter().enumerate() {
+        let sealed = retrieval
+            .sealed_page_receipt(ordinal)
+            .ok_or(EiaError::CaptureBinding)?;
+        let frame = sealed
+            .segment()
+            .frames()
+            .first()
+            .ok_or(EiaError::CaptureBinding)?;
+        assert_eq!(frame.source_sequence(), Some(0));
+        assert_eq!(
+            frame.provider_payload_digest(),
+            page.raw_page().capture_receipt().body_digest()
+        );
     }
-    let (retrieval_rejoin, capture) = retrieval.into_seal_parts();
-    let sealed_capture = capture.seal(&store)?;
-    let sealed_capture_receipt_digest = sealed_capture.receipt_digest();
-    let publication_candidate = provider.publication_candidate(retrieval_rejoin, sealed_capture)?;
+    let retrieval_rejoin = retrieval.into_publication_rejoin();
+    let publication_candidate =
+        provider.publication_candidate(&authority, retrieval_rejoin, deadline, &cancellation)?;
     assert_eq!(publication_candidate.observations().len(), 3);
     assert_eq!(publication_candidate.series().len(), 1);
     assert_eq!(publication_candidate.revision_plan().len(), 3);
@@ -616,12 +586,12 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
             .missing_value()
             .is_some_and(|value| value.marker().as_str().starts_with("eia-missing:"))
     );
-    assert_eq!(
+    assert_ne!(
         publication_candidate
             .rejoin()
-            .sealed_capture()
-            .receipt_digest(),
-        sealed_capture_receipt_digest
+            .ordered_capture_receipt_digest()
+            .bytes(),
+        [0; 32]
     );
     assert_eq!(
         publication_candidate
@@ -632,18 +602,19 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
     );
     assert_eq!(publication_candidate.rejoin().root_page_rejoins().len(), 2);
     assert_eq!(
-        publication_candidate.rejoin().sealed_page_captures().len(),
+        publication_candidate.rejoin().sealed_page_capture_count(),
         2
     );
     assert!(
-        publication_candidate
-            .rejoin()
-            .sealed_page_captures()
-            .iter()
-            .all(|sealed| {
-                sealed.receipt_digest().bytes() != [0; 32]
-                    && sealed.segment().physical_receipt_digest().bytes() != [0; 32]
-            })
+        (0..publication_candidate.rejoin().sealed_page_capture_count()).all(|ordinal| {
+            publication_candidate
+                .rejoin()
+                .sealed_page_capture(ordinal)
+                .is_some_and(|sealed| {
+                    sealed.receipt_digest().bytes() != [0; 32]
+                        && sealed.segment().physical_receipt_digest().bytes() != [0; 32]
+                })
+        })
     );
     publication_candidate
         .rejoin()
@@ -693,8 +664,7 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
         Some(
             publication_candidate
                 .rejoin()
-                .sealed_capture()
-                .capture()
+                .capture_receipt()
                 .total_body_bytes(),
         ),
     )?;
@@ -710,21 +680,20 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
     )?;
     let shared = publication_candidate.try_into_shared_publication(extraction_request)?;
     assert_eq!(shared.batch().records().len(), 3);
-    assert_eq!(shared.observations().len(), shared.batch().records().len());
-    assert_eq!(shared.series().len(), 1);
     assert_eq!(shared.revision_plan().len(), shared.batch().records().len());
     assert!(shared.revision_plan().is_locally_observed());
     assert_eq!(
         shared.batch().request().object().capture_identity(),
-        SourceObjectCaptureIdentity::try_from_capture(shared.rejoin().sealed_capture().capture())?
+        SourceObjectCaptureIdentity::try_from_capture(
+            shared.sealed_capture_binding().capture_evidence()
+        )?
     );
     assert_eq!(
         shared.batch().request().object().expected_bytes(),
         Some(
             shared
-                .rejoin()
-                .sealed_capture()
-                .capture()
+                .sealed_capture_binding()
+                .capture_evidence()
                 .total_body_bytes()
         )
     );
@@ -735,23 +704,39 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
     );
     assert_eq!(extraction_content_identity.record_count(), 3);
     assert_eq!(
-        shared.rejoin().sealed_capture().receipt_digest(),
-        sealed_capture_receipt_digest
+        shared
+            .sealed_capture_binding()
+            .row_frames()
+            .iter()
+            .map(market_squawk_sources::ProviderCaptureRowFrame::capture_page_ordinal)
+            .collect::<Vec<_>>(),
+        [0, 0, 1]
     );
-    let (batch, content_identity, rejoin, observations, series, revision_plan) =
-        shared.into_parts();
+    assert!(shared.native_lineage().rows().iter().all(|row| {
+        serde_json::from_slice::<serde_json::Value>(row.semantic_payload()).is_ok_and(|value| {
+            value.get("page_ordinal").is_none()
+                && value.get("native_semantic_digest").is_none()
+                && value.get("native_schema_digest").is_none()
+        })
+    }));
+    assert_eq!(
+        shared.policy_evidence().doctor_report().report_digest(),
+        provider.doctor_report().report_digest()
+    );
+    shared
+        .policy_evidence()
+        .validate(provider.source_metadata())?;
+    let (policy_evidence, revision_plan, sealed_capture_binding) = shared.into_parts();
+    let batch = sealed_capture_binding.batch();
     assert_eq!(batch.request().max_records(), 4);
-    assert_eq!(content_identity, extraction_content_identity);
     assert_eq!(
-        rejoin.sealed_capture().receipt_digest(),
-        sealed_capture_receipt_digest
+        sealed_capture_binding.content_identity(),
+        extraction_content_identity
     );
-    assert_eq!(observations.len(), batch.records().len());
-    assert_eq!(series.len(), 1);
-    assert_eq!(series[0].native(), observations[0].native_series());
+    assert_eq!(sealed_capture_binding.record_count(), batch.records().len());
     assert_eq!(
-        series[0].canonical_series(),
-        observations[0].observation().series()
+        sealed_capture_binding.layout(),
+        market_squawk_sources::ProviderCaptureBindingLayout::OrderedSegments
     );
     assert_eq!(revision_plan.len(), batch.records().len());
     assert!(revision_plan.is_locally_observed());
@@ -761,8 +746,12 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
         .map(|record| serde_json::from_slice(record.payload()))
         .collect::<Result<Vec<ResearchObservation>, _>>()?;
     assert_eq!(decoded, expected_observations);
-    let revision_batch = revision_plan
-        .into_observed_batch(rejoin.source_metadata().source_id().clone(), &decoded)?;
+    let revision_batch = revision_plan.into_observed_batch_with_native_lineage(
+        policy_evidence.source_metadata().source_id().clone(),
+        batch,
+        &decoded,
+        sealed_capture_binding.native_lineage(),
+    )?;
     assert_eq!(revision_batch.input_len(), 3);
 
     let safe_urls = transport

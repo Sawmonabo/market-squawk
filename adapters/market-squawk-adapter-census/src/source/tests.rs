@@ -272,6 +272,7 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         &extraction_request,
         &contract,
         acquisition,
+        discovery_capture_material.receipt(),
     )?;
 
     assert_eq!(output.batch().records().len(), 1);
@@ -308,33 +309,39 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         Some(now)
     );
     output.publication_plan().validate()?;
-    let (batch, acquisition, graph_capture_material, publication_plan, telemetry) =
-        output.into_parts();
+    let (batch, acquisition, publication_plan, telemetry) = output.into_parts();
     assert_eq!(
-        graph_capture_material.receipt().terminal(),
+        discovery_capture_material.receipt().terminal(),
         ProviderCaptureTerminalDisposition::CompleteRequestGraph
     );
     assert_eq!(
-        graph_capture_material
+        discovery_capture_material
             .receipt()
             .request_graph_components()
             .len(),
         5
     );
-    assert_eq!(graph_capture_material.records().len(), 5);
-    assert_eq!(graph_capture_material.records()[4].payload(), DATA_RESPONSE);
+    assert_eq!(discovery_capture_material.records().len(), 5);
+    assert_eq!(
+        discovery_capture_material.records()[4].payload(),
+        DATA_RESPONSE
+    );
     assert_eq!(
         batch
             .request()
             .object()
             .capture_identity()
             .paged_content_digest(),
-        Some(graph_capture_material.receipt().content_digest())
+        Some(discovery_capture_material.receipt().content_digest())
     );
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path())?;
     let store = paths.sealed_research_journal_store()?;
-    let sealed_capture = graph_capture_material.seal(&store)?;
+    let (capture_expectation, seal_request) = discovery_capture_material.into_whole_seal_parts();
+    let sealed_capture = seal_request.seal(&store)?;
+    let capture_token = capture_expectation
+        .try_rejoin(sealed_capture)?
+        .try_into_whole()?;
     let doctor_query = crate::doctor::doctor_query()?;
     let doctor_capture = capture_receipt(
         &metadata,
@@ -358,20 +365,51 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         &doctor_capture,
         Bytes::from_static(DOCTOR_RESPONSE),
     )?;
-    let sealed_doctor_capture = doctor_material.seal(&store)?;
+    let (doctor_expectation, doctor_seal_request) = doctor_material.into_whole_seal_parts();
+    let sealed_doctor_material = doctor_seal_request.seal(&store)?;
+    let doctor_token = doctor_expectation
+        .try_rejoin(sealed_doctor_material)?
+        .try_into_whole()?;
     let activation = CensusActivationCandidate::try_new(
         source.activation_plan()?,
-        &doctor_report,
-        &sealed_doctor_capture,
+        doctor_report,
+        doctor_token,
         now,
     )?;
-    activation.validate(&doctor_report, &sealed_doctor_capture, now)?;
+    activation.validate(now)?;
     let expected_extraction_content =
         market_squawk_sources::ExtractionContentIdentity::try_from_batch(&batch)?.digest();
-    let expected_sealed_capture_receipt = sealed_capture.receipt_digest();
+    let expected_sealed_capture_receipt = capture_token.persisted_receipt().receipt_digest();
+    let native_lineage = census_native_lineage(&publication_plan, &batch)?;
+    let mut row_capture_page_ordinals = Vec::new();
+    row_capture_page_ordinals.try_reserve_exact(batch.records().len())?;
+    row_capture_page_ordinals.extend(std::iter::repeat(4).take(batch.records().len()));
+    let sealed_capture_binding = SealedProviderCaptureBinding::try_whole(
+        capture_token,
+        batch,
+        native_lineage,
+        row_capture_page_ordinals,
+    )?;
     let publication_candidate =
-        CensusPublicationCandidate::try_new(publication_plan, batch, sealed_capture, &activation)?;
-    let publication_operation_at = publication_candidate.plan().prepared_at();
+        CensusPublicationCandidate::try_new(publication_plan, sealed_capture_binding, activation)?;
+    let native_semantics: serde_json::Value = serde_json::from_slice(
+        publication_candidate.native_lineage().rows()[0].semantic_payload(),
+    )?;
+    assert_eq!(native_semantics["provider_variable"], "CENSUS_VALUE");
+    assert_eq!(native_semantics["label"], "Quarterly value");
+    assert_eq!(native_semantics["concept"], "Quarterly economic fixture");
+    assert_eq!(native_semantics["group"], "FIXTURE");
+    for forbidden in [
+        "family_digest",
+        "content_digest",
+        "row_digest",
+        "metadata_digest",
+        "canonical_series",
+        "canonical_source_identifier",
+        "canonical_unit",
+    ] {
+        assert!(native_semantics.get(forbidden).is_none());
+    }
     assert_eq!(publication_candidate.canonical_record_count(), 1);
     assert_eq!(
         publication_candidate.canonical_schema().as_str(),
@@ -381,8 +419,11 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         publication_candidate.sealed_capture_receipt_digest(),
         expected_sealed_capture_receipt
     );
-    let (batch, sealed_capture, revisions) = publication_candidate
-        .try_into_root_publication_parts(&activation, publication_operation_at)?;
+    let (sealed_capture_binding, revisions, activation) =
+        publication_candidate.try_into_root_publication_parts()?;
+    activation.validate(crate::http::system_timestamp()?)?;
+    let batch = sealed_capture_binding.batch();
+    let native_lineage = sealed_capture_binding.native_lineage();
     assert_eq!(
         market_squawk_sources::ExtractionContentIdentity::try_from_batch(&batch)?.digest(),
         expected_extraction_content
@@ -390,7 +431,7 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
     assert_eq!(revisions.len(), batch.records().len());
     assert!(revisions.is_locally_observed());
     assert_eq!(
-        sealed_capture.receipt_digest(),
+        sealed_capture_binding.sealed_capture_receipt_digest(),
         expected_sealed_capture_receipt
     );
     assert_eq!(
@@ -399,12 +440,26 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
             .object()
             .capture_identity()
             .paged_content_digest(),
-        Some(sealed_capture.capture().content_digest())
+        Some(sealed_capture_binding.capture_evidence().content_digest())
     );
     assert_eq!(
-        sealed_capture.capture().request_graph_components()[4].observation_digest(),
+        sealed_capture_binding
+            .capture_evidence()
+            .request_graph_components()[4]
+            .observation_digest(),
         acquisition.data().capture().observation_digest()
     );
+    assert_eq!(native_lineage.rows().len(), batch.records().len());
+    let decoded = [serde_json::from_slice::<ResearchObservation>(
+        batch.records()[0].payload(),
+    )?];
+    let revision_batch = revisions.into_observed_batch_with_native_lineage(
+        metadata.source_id().clone(),
+        batch,
+        &decoded,
+        native_lineage,
+    )?;
+    assert_eq!(revision_batch.input_len(), 1);
     assert_eq!(telemetry.requests(), 1);
     assert_eq!(telemetry.successful_responses(), 1);
     assert_eq!(source.telemetry().requests(), 1);

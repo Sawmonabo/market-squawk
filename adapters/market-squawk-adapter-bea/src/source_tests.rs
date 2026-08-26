@@ -18,8 +18,8 @@ use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, CoverageDomain,
     DiscoveryRequest, EndpointPolicy, ExtractionRequest, FreshnessPolicy, HistoricalCapability,
-    HttpRequestBounds, NetworkAccessPolicy, ProviderCaptureTerminalDisposition, SourceCapabilities,
-    SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    HttpRequestBounds, NetworkAccessPolicy, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -31,8 +31,8 @@ use crate::source::bea_api_endpoint_rule;
 use crate::transport::{BeaHttpResponse, BeaSensitiveHeader, BeaTransport, system_timestamp};
 use crate::{
     BeaAuthorizedRequest, BeaDatasetContract, BeaDatasetIdentity, BeaObservationValue,
-    BeaParseLimits, BeaPublicationCandidate, BeaRequiredSharedSettlement,
-    BeaSealedAcquisitionReceipt, BeaSource, BeaSourceConfig, BeaSourceError, BeaUserId,
+    BeaParseLimits, BeaPublicationCandidate, BeaRequiredSharedSettlement, BeaSource,
+    BeaSourceConfig, BeaSourceError, BeaUserId,
 };
 
 const USER_ID: &str = "11111111-2222-3333-4444-555555555555";
@@ -269,19 +269,14 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     assert!(!format!("{source:?}").contains(USER_ID));
     assert!(!format!("{run:?}").contains(USER_ID));
     assert!(!format!("{run:?}").contains(crate::BEA_API_ENDPOINT));
-    let (doctor_receipt, evidence, graph) = run.into_sealing_parts()?;
-    assert_eq!(graph.receipt().pages().len(), 4);
-    assert_eq!(graph.receipt().request_graph_components().len(), 4);
-    assert_eq!(
-        graph.receipt().terminal(),
-        ProviderCaptureTerminalDisposition::CompleteRequestGraph
-    );
+    let (pending_doctor, doctor_seal_request) = run.into_sealing_parts()?;
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path())?;
     let store = paths.sealed_research_journal_store()?;
-    let doctor_sealed = BeaSealedAcquisitionReceipt::try_new(evidence, graph.seal(&store)?)?;
-    let admission = doctor_receipt.bind_sealed(source.source_binding(), &doctor_sealed)?;
-    source.activate_doctor(&admission)?;
+    let admission = Arc::new(
+        pending_doctor.try_rejoin(source.source_binding(), doctor_seal_request.seal(&store)?)?,
+    );
+    source.activate_doctor(Arc::clone(&admission))?;
     assert_eq!(
         source.source_binding().source_id(),
         authority.metadata().source_id()
@@ -330,12 +325,8 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             CancellationToken::new(),
         )
         .await?;
-    let (pending_seal, graph) = extraction.into_pending_seal()?;
-    assert!(matches!(
-        pending_seal.validate_sealed_capture(doctor_sealed.sealed_capture()),
-        Err(crate::BeaSealedAcquisitionError::InvalidEvidence)
-    ));
-    let sealed_output = pending_seal.try_bind_sealed(graph.seal(&store)?)?;
+    let (pending_seal, seal_request) = extraction.into_pending_seal()?;
+    let sealed_output = pending_seal.try_rejoin(seal_request.seal(&store)?)?;
     let source_batch = sealed_output.source_batch();
     assert_eq!(source_batch.request(), &expected_original_request);
     let provider_content_evidence = source_batch.request().object().evidence().content_digest();
@@ -358,6 +349,22 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             .is_some_and(|missing| missing.marker().as_str() == "bea-regional-suppression-l")
     );
     let handoff = candidate.into_shared_publication_parts();
+    let native_semantics: serde_json::Value =
+        serde_json::from_slice(handoff.native_lineage().rows()[0].semantic_payload())?;
+    assert_eq!(native_semantics["dataset"], "Regional");
+    assert_eq!(native_semantics["period"], "2025Q1");
+    assert_eq!(native_semantics["missing"], "suppressed_regional");
+    assert!(native_semantics.get("production_time").is_none());
+    for forbidden in [
+        "parameters",
+        "request_identity",
+        "metadata_generation",
+        "completeness",
+        "result_attributes",
+        "observation_digest",
+    ] {
+        assert!(native_semantics.get(forbidden).is_none());
+    }
     assert_eq!(
         handoff
             .batch()
@@ -368,23 +375,23 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
         provider_content_evidence
     );
     assert_eq!(handoff.batch().records()[0].revision(), &native_revision);
-    let (coordinates, batch, revision_plan, sealed_output) = handoff.into_parts();
-    let (source_batch, sealed_acquisition) = sealed_output.into_parts();
-    let (native_evidence, sealed_capture) = sealed_acquisition.into_parts();
+    let (coordinates, revision_plan, sealed_capture_binding) = handoff.into_parts();
+    let batch = sealed_capture_binding.batch();
+    let native_lineage = sealed_capture_binding.native_lineage();
     assert_eq!(
         coordinates.acquisition_capture_receipt_digest(),
-        sealed_capture.receipt_digest()
+        sealed_capture_binding.sealed_capture_receipt_digest()
     );
-    assert_eq!(source_batch.request(), &expected_original_request);
-    assert!(matches!(
-        native_evidence.data().page().observations()[0].value(),
-        BeaObservationValue::Missing(crate::BeaMissingValue::SuppressedRegional)
-    ));
+    assert_eq!(native_lineage.rows().len(), 1);
     let research_observation =
         serde_json::from_slice::<ResearchObservation>(batch.records()[0].payload())?;
     let research_observations = [research_observation];
-    let revision_batch = revision_plan
-        .into_observed_batch(coordinates.source_id().clone(), &research_observations)?;
+    let revision_batch = revision_plan.into_observed_batch_with_native_lineage(
+        coordinates.source_id().clone(),
+        batch,
+        &research_observations,
+        native_lineage,
+    )?;
     assert_eq!(revision_batch.input_len(), 1);
     assert!(
         transport

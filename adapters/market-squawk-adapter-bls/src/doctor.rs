@@ -5,7 +5,11 @@ use std::sync::Arc;
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
-use market_squawk_sources::{ProviderCaptureMaterial, ProviderCaptureTerminalDisposition};
+use market_squawk_sources::{
+    ProviderCaptureMaterial, ProviderCaptureSealExpectation, ProviderCaptureSealRequest,
+    ProviderCaptureTerminalDisposition, ProviderWholeCaptureToken, RejoinedProviderCapture,
+    SealedProviderCaptureMaterial,
+};
 use sha2::{Digest as _, Sha256};
 
 use crate::contract::BlsRuntimeInstanceCapability;
@@ -349,6 +353,32 @@ pub struct BlsDoctorOutput {
     capture_material: ProviderCaptureMaterial,
 }
 
+/// Exact doctor report and private witness awaiting the common physical seal result.
+#[derive(Debug)]
+pub struct BlsPendingDoctorSeal {
+    report: BlsDoctorReport,
+    expectation: ProviderCaptureSealExpectation,
+}
+
+impl BlsPendingDoctorSeal {
+    pub(crate) fn try_rejoin(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<(BlsDoctorReport, ProviderWholeCaptureToken), BlsSourceError> {
+        let token = match self
+            .expectation
+            .try_rejoin(sealed)
+            .map_err(|_| BlsSourceError::InvalidPublication)?
+        {
+            RejoinedProviderCapture::Whole(token) => token,
+            RejoinedProviderCapture::Components(_) => {
+                return Err(BlsSourceError::InvalidPublication);
+            }
+        };
+        Ok((self.report, token))
+    }
+}
+
 impl BlsDoctorOutput {
     pub(crate) fn try_new(
         report: BlsDoctorReport,
@@ -392,9 +422,16 @@ impl BlsDoctorOutput {
         &self.capture_material
     }
 
-    /// Consumes the indivisible doctor result into semantic and raw-capture parts.
-    pub fn into_parts(self) -> (BlsDoctorReport, ProviderCaptureMaterial) {
-        (self.report, self.capture_material)
+    /// Splits the doctor result into its private witness and sole common seal request.
+    pub fn into_sealing_parts(self) -> (BlsPendingDoctorSeal, ProviderCaptureSealRequest) {
+        let (expectation, request) = self.capture_material.into_whole_seal_parts();
+        (
+            BlsPendingDoctorSeal {
+                report: self.report,
+                expectation,
+            },
+            request,
+        )
     }
 }
 

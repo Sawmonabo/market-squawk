@@ -22,9 +22,10 @@ use market_squawk_sources::{
     InFlightExtractionRequest, MAX_PROVIDER_CAPTURE_PAGE_BYTES, NetworkAccessPolicy,
     NetworkPolicyError, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
     ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderRateDeclaration,
-    QueryParameterRule, QuerySensitivity, SourceClass, SourceError, SourceMetadata,
-    SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity, SourceProtocolProfile,
+    ProviderCaptureSealRequest, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    ProviderRateDeclaration, QueryParameterRule, QuerySensitivity, SourceClass, SourceError,
+    SourceMetadata, SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
+    SourceProtocolProfile,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -727,9 +728,9 @@ impl BeaMetadataEvidenceBundle {
 
 /// Complete typed BEA acquisition evidence whose exact raw bytes are no longer clonable.
 ///
-/// Root composition receives this value beside one combined request-graph material, seals that
-/// graph, then rejoins it through `BeaSealedAcquisitionReceipt::try_new`. Canonical candidate
-/// construction accepts only that rejoined proof.
+/// Root composition receives this value inside a pending seal continuation, seals the combined
+/// request graph, then rejoins the exact opaque seal result. Canonical candidate construction
+/// accepts only that one-use rejoined proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BeaDatasetEvidence {
     metadata: BeaMetadataEvidenceBundle,
@@ -992,18 +993,20 @@ impl BeaExtractionOutput {
     ) -> Result<
         (
             crate::sealed::BeaPendingExtractionSeal,
-            ProviderCaptureMaterial,
+            ProviderCaptureSealRequest,
         ),
         BeaSourceError,
     > {
         let (evidence, graph) = self.acquisition.into_sealing_parts()?;
+        let (expectation, request) = graph.into_whole_seal_parts();
         Ok((
             crate::sealed::BeaPendingExtractionSeal::from_source(
                 self.batch,
                 evidence,
                 self.source_batch_digest,
+                expectation,
             ),
-            graph,
+            request,
         ))
     }
 }
@@ -1046,7 +1049,7 @@ pub struct BeaSource {
     config: BeaSourceConfig,
     quota: BeaProviderQuotaDeclaration,
     source_binding: BeaSourceBinding,
-    active_datasets: RwLock<BTreeMap<SourceIdentifier, BeaDoctorAdmissionEvidence>>,
+    active_datasets: RwLock<BTreeMap<SourceIdentifier, Arc<BeaDoctorAdmissionEvidence>>>,
     transport: Arc<dyn BeaTransport>,
     response_limit: usize,
     request_timeout: Duration,
@@ -1276,7 +1279,7 @@ impl BeaSource {
     /// owner of durable provider state and must re-establish readiness after process restart.
     pub fn activate_doctor(
         &self,
-        admission: &BeaDoctorAdmissionEvidence,
+        admission: Arc<BeaDoctorAdmissionEvidence>,
     ) -> Result<(), BeaSourceError> {
         let observed_at = system_timestamp()?;
         let contract = self
@@ -1294,7 +1297,7 @@ impl BeaSource {
         self.active_datasets
             .write()
             .map_err(|_| BeaSourceError::Authority)?
-            .insert(contract.dataset_id().clone(), admission.clone());
+            .insert(contract.dataset_id().clone(), admission);
         Ok(())
     }
 
@@ -1578,7 +1581,7 @@ impl BeaSource {
                 &authority,
                 request.object().dataset(),
                 request.deadline(),
-                cancellation,
+                cancellation.clone(),
             )
             .await?;
         verify_acquisition(&request, &expected, &acquisition)?;
@@ -1594,6 +1597,7 @@ impl BeaSource {
                 completed_at,
             )
             .map_err(|_| invalid_protocol())?;
+        self.validate_operation_current(&authority, request.deadline(), &cancellation)?;
         Ok(BeaExtractionOutput {
             batch,
             acquisition,
@@ -1762,7 +1766,7 @@ impl BeaSource {
     fn require_activation(
         &self,
         provider_dataset: &SourceIdentifier,
-    ) -> Result<BeaDoctorAdmissionEvidence, ExtractionSourceError> {
+    ) -> Result<Arc<BeaDoctorAdmissionEvidence>, ExtractionSourceError> {
         let now = system_timestamp().map_err(map_source_error)?;
         let admission = self
             .active_datasets

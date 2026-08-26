@@ -20,8 +20,11 @@ use market_squawk_sources::{
     ExtractionBatch, ExtractionRecord, ExtractionRequest, ExtractionRequestPermit,
     ExtractionSource, ExtractionSourceError, HistoricalCapability, InFlightExtractionRequest,
     MAX_PROVIDER_CAPTURE_PAGE_BYTES, NetworkAccessPolicy, NetworkPolicyError, PathScope,
-    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition, QueryParameterRule, QuerySensitivity, SourceClass,
+    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSealExpectation,
+    ProviderCaptureSealRequest, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    ProviderNativeLineageBatch, ProviderNativeLineageBatchBuilder,
+    ProviderNativeLineageImplementation, ProviderWholeCaptureToken, QueryParameterRule,
+    QuerySensitivity, SealedProviderCaptureBinding, SealedProviderCaptureMaterial, SourceClass,
     SourceError, SourceMetadata, SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
     SourceProtocolProfile, payload_matches_exact_evidence,
 };
@@ -781,6 +784,7 @@ pub struct CensusDiscoveryOutput {
     acquisition: CensusDatasetAcquisition,
     capture_material: ProviderCaptureMaterial,
     telemetry: CensusSourceTelemetry,
+    activation: crate::CensusActivationCandidate,
 }
 
 impl CensusDiscoveryOutput {
@@ -804,74 +808,146 @@ impl CensusDiscoveryOutput {
         self.telemetry
     }
 
-    /// Consumes the capture-preserving discovery handoff without replacing physical evidence.
-    pub fn into_parts(
-        self,
-    ) -> (
-        DiscoveryBatch,
-        CensusDatasetAcquisition,
-        ProviderCaptureMaterial,
-        CensusSourceTelemetry,
-    ) {
+    /// Separates root-owned physical sealing from the opaque no-refetch continuation.
+    pub fn into_sealing_parts(self) -> (CensusPendingDiscovery, ProviderCaptureSealRequest) {
+        let (capture_expectation, seal_request) = self.capture_material.into_whole_seal_parts();
         (
-            self.batch,
-            self.acquisition,
-            self.capture_material,
-            self.telemetry,
+            CensusPendingDiscovery {
+                batch: self.batch,
+                acquisition: self.acquisition,
+                capture_expectation,
+                telemetry: self.telemetry,
+                activation: self.activation,
+            },
+            seal_request,
         )
     }
 }
 
-/// Indivisible graph-bound canonical Census result and its exact raw evidence.
+/// Non-cloneable discovery state awaiting the exact metadata-plus-data graph seal.
 #[derive(Debug)]
-pub struct CensusExtractionOutput {
-    batch: ExtractionBatch,
+pub struct CensusPendingDiscovery {
+    batch: DiscoveryBatch,
     acquisition: CensusDatasetAcquisition,
-    capture_material: ProviderCaptureMaterial,
-    publication_plan: crate::CensusPublicationPlan,
+    capture_expectation: ProviderCaptureSealExpectation,
     telemetry: CensusSourceTelemetry,
+    activation: crate::CensusActivationCandidate,
 }
 
-impl CensusExtractionOutput {
-    /// Returns the canonical shared extraction batch.
-    pub const fn batch(&self) -> &ExtractionBatch {
+impl CensusPendingDiscovery {
+    /// Returns the unpublishable discovery batch for root scheduling inspection.
+    pub const fn batch(&self) -> &DiscoveryBatch {
         &self.batch
     }
 
-    /// Returns the exact typed metadata and data response used to build the canonical batch.
-    pub const fn acquisition(&self) -> &CensusDatasetAcquisition {
-        &self.acquisition
+    /// Consumes this continuation only when the physical receipt binds the exact original graph.
+    pub fn try_bind_sealed(
+        self,
+        sealed_capture: SealedProviderCaptureMaterial,
+    ) -> Result<CensusSealedDiscoveryAdmission, CensusSourceError> {
+        let capture_token = self
+            .capture_expectation
+            .try_rejoin(sealed_capture)
+            .and_then(|rejoined| rejoined.try_into_whole())
+            .map_err(|_| CensusSourceError::Protocol)?;
+        let sealed_capture = capture_token.persisted_receipt();
+        let [object] = self.batch.objects() else {
+            return Err(CensusSourceError::Protocol);
+        };
+        if sealed_capture.receipt_digest().bytes() == [0; 32]
+            || !SourceObjectCaptureIdentity::try_from_capture(sealed_capture.capture())
+                .is_ok_and(|identity| identity == object.capture_identity())
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        Ok(CensusSealedDiscoveryAdmission {
+            batch: self.batch,
+            acquisition: self.acquisition,
+            capture_token,
+            telemetry: self.telemetry,
+            activation: self.activation,
+        })
+    }
+}
+
+/// One non-reusable, physically sealed Census discovery admitted for extraction without refetch.
+#[derive(Debug)]
+pub struct CensusSealedDiscoveryAdmission {
+    batch: DiscoveryBatch,
+    acquisition: CensusDatasetAcquisition,
+    capture_token: ProviderWholeCaptureToken,
+    telemetry: CensusSourceTelemetry,
+    activation: crate::CensusActivationCandidate,
+}
+
+impl CensusSealedDiscoveryAdmission {
+    /// Returns the sole exact object from which root must build the extraction request.
+    pub fn object(&self) -> Result<&SourceObject, CensusSourceError> {
+        let [object] = self.batch.objects() else {
+            return Err(CensusSourceError::Protocol);
+        };
+        Ok(object)
+    }
+}
+
+/// Sealed no-refetch extraction ready to become one provider-neutral publication candidate.
+#[derive(Debug)]
+pub struct CensusSealedExtractionOutput {
+    candidate: crate::CensusPublicationCandidate,
+    telemetry: CensusSourceTelemetry,
+}
+
+impl CensusSealedExtractionOutput {
+    /// Returns the validated provider-neutral candidate.
+    pub const fn candidate(&self) -> &crate::CensusPublicationCandidate {
+        &self.candidate
     }
 
-    /// Returns one complete metadata-plus-data request graph ready for shared raw sealing.
-    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
-        &self.capture_material
-    }
-
-    /// Returns the exact provider-specific plan that root composition must satisfy atomically.
-    pub const fn publication_plan(&self) -> &crate::CensusPublicationPlan {
-        &self.publication_plan
-    }
-
-    /// Returns actual request, response, row, missingness, byte, and latency accounting.
+    /// Returns discovery/acquisition telemetry retained through the seal continuation.
     pub const fn telemetry(&self) -> CensusSourceTelemetry {
         self.telemetry
     }
 
+    /// Consumes the sealed adapter output without exposing any provider-local store.
+    pub fn into_parts(self) -> (crate::CensusPublicationCandidate, CensusSourceTelemetry) {
+        (self.candidate, self.telemetry)
+    }
+}
+
+/// Internal graph-bound canonical Census result used to revalidate the retained acquisition.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct CensusExtractionOutput {
+    batch: ExtractionBatch,
+    acquisition: CensusDatasetAcquisition,
+    publication_plan: crate::CensusPublicationPlan,
+    telemetry: CensusSourceTelemetry,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CensusExtractionOutput {
+    /// Returns the canonical shared extraction batch.
+    pub(crate) const fn batch(&self) -> &ExtractionBatch {
+        &self.batch
+    }
+
+    /// Returns the exact provider-specific plan that root composition must satisfy atomically.
+    pub(crate) const fn publication_plan(&self) -> &crate::CensusPublicationPlan {
+        &self.publication_plan
+    }
+
     /// Consumes the application handoff. The graph must be sealed before publishing `batch`.
-    pub fn into_parts(
+    pub(crate) fn into_parts(
         self,
     ) -> (
         ExtractionBatch,
         CensusDatasetAcquisition,
-        ProviderCaptureMaterial,
         crate::CensusPublicationPlan,
         CensusSourceTelemetry,
     ) {
         (
             self.batch,
             self.acquisition,
-            self.capture_material,
             self.publication_plan,
             self.telemetry,
         )
@@ -1056,13 +1132,14 @@ impl CensusSource {
     /// Admits one freshly sealed successful doctor using the adapter's trusted local clock.
     pub fn activation_candidate(
         &self,
-        doctor: &crate::CensusDoctorReport,
-        sealed_doctor_capture: &market_squawk_sources::SealedProviderCaptureSetReceipt,
+        pending: crate::CensusPendingDoctorSeal,
+        sealed_doctor_capture: SealedProviderCaptureMaterial,
     ) -> Result<crate::CensusActivationCandidate, CensusSourceError> {
+        let (doctor, capture_token) = pending.try_rejoin(sealed_doctor_capture)?;
         crate::CensusActivationCandidate::try_new(
             self.activation_plan()?,
             doctor,
-            sealed_doctor_capture,
+            capture_token,
             system_timestamp()?,
         )
     }
@@ -1070,15 +1147,13 @@ impl CensusSource {
     fn validate_activation(
         &self,
         activation: &crate::CensusActivationCandidate,
-        doctor: &crate::CensusDoctorReport,
-        sealed_doctor_capture: &market_squawk_sources::SealedProviderCaptureSetReceipt,
         operation_at: Timestamp,
     ) -> Result<(), CensusSourceError> {
         let expected = self.activation_plan()?;
         if activation.plan() != &expected {
             return Err(CensusSourceError::InvalidConfiguration);
         }
-        activation.validate(doctor, sealed_doctor_capture, operation_at)
+        activation.validate(operation_at)
     }
 
     /// Runs one credential-bearing, 16-KiB/10-second, production-path ACS doctor request.
@@ -1105,7 +1180,7 @@ impl CensusSource {
                 query.request_digest(),
                 &provider_dataset,
                 deadline,
-                cancellation,
+                cancellation.clone(),
                 crate::CENSUS_DOCTOR_MAX_RESPONSE_BYTES.min(self.response_limit),
                 crate::CENSUS_DOCTOR_TIMEOUT.min(self.request_timeout),
             )
@@ -1126,7 +1201,16 @@ impl CensusSource {
         self.telemetry
             .successful_responses
             .fetch_add(1, Ordering::Relaxed);
-        Ok(crate::CensusDoctorOutput::new(report, material))
+        let output = crate::CensusDoctorOutput::new(report, material);
+        if cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
+        let completed_at = system_timestamp().map_err(map_source_error)?;
+        if completed_at >= deadline {
+            return Err(ExtractionSourceError::DeadlineExceeded);
+        }
+        self.validate_authority(authority)?;
+        Ok(output)
     }
 
     /// Returns a lock-free saturating snapshot of cumulative operational accounting.
@@ -1340,6 +1424,7 @@ impl CensusSource {
         &self,
         authority: ExtractionAuthority,
         request: DiscoveryRequest,
+        activation: crate::CensusActivationCandidate,
         cancellation: CancellationToken,
     ) -> Result<CensusDiscoveryOutput, ExtractionSourceError> {
         self.validate_authority(&authority)?;
@@ -1350,6 +1435,7 @@ impl CensusSource {
             .config
             .contract(request.dataset())
             .ok_or_else(invalid_protocol)?;
+        let final_cancellation = cancellation.clone();
         let acquired = self
             .acquire_dataset(
                 &authority,
@@ -1368,11 +1454,20 @@ impl CensusSource {
         )?;
         let batch = DiscoveryBatch::try_new(&request, vec![object])?;
         let telemetry = acquired.telemetry();
+        if final_cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
+        let completed_at = system_timestamp().map_err(map_source_error)?;
+        remaining_timeout(request.deadline(), completed_at, Duration::MAX)?;
+        self.validate_authority(&authority)?;
+        self.validate_activation(&activation, completed_at)
+            .map_err(map_source_error)?;
         Ok(CensusDiscoveryOutput {
             batch,
             acquisition: acquired,
             capture_material,
             telemetry,
+            activation,
         })
     }
 
@@ -1381,44 +1476,46 @@ impl CensusSource {
         &self,
         authority: ExtractionAuthority,
         request: DiscoveryRequest,
-        activation: &crate::CensusActivationCandidate,
-        doctor: &crate::CensusDoctorReport,
-        sealed_doctor_capture: &market_squawk_sources::SealedProviderCaptureSetReceipt,
+        activation: crate::CensusActivationCandidate,
         cancellation: CancellationToken,
     ) -> Result<CensusDiscoveryOutput, ExtractionSourceError> {
         let operation_at = system_timestamp().map_err(map_source_error)?;
-        self.validate_activation(activation, doctor, sealed_doctor_capture, operation_at)
+        self.validate_activation(&activation, operation_at)
             .map_err(map_source_error)?;
-        if request.deadline() >= activation.expires_at() {
-            return Err(invalid_protocol());
-        }
-        let output = self.discover_impl(authority, request, cancellation).await?;
-        let completed_at = system_timestamp().map_err(map_source_error)?;
-        self.validate_activation(activation, doctor, sealed_doctor_capture, completed_at)
-            .map_err(map_source_error)?;
-        Ok(output)
+        self.discover_impl(authority, request, activation, cancellation)
+            .await
     }
 
-    /// Produces canonical rows together with every exact metadata and data response required for
-    /// raw `MSJ1` sealing. The ordinary [`ExtractionSource::extract`] path is deliberately closed
-    /// because its return type cannot carry this required material.
-    pub async fn extract_with_capture(
+    /// Consumes one physically sealed discovery and canonicalizes its retained acquisition without
+    /// another provider request. The ordinary [`ExtractionSource::extract`] path is deliberately
+    /// closed because its return type cannot enforce this seal-first admission.
+    pub async fn extract_sealed_discovery(
         &self,
         authority: ExtractionAuthority,
         request: ExtractionRequest,
-        activation: &crate::CensusActivationCandidate,
-        doctor: &crate::CensusDoctorReport,
-        sealed_doctor_capture: &market_squawk_sources::SealedProviderCaptureSetReceipt,
+        admission: CensusSealedDiscoveryAdmission,
         cancellation: CancellationToken,
-    ) -> Result<CensusExtractionOutput, ExtractionSourceError> {
+    ) -> Result<CensusSealedExtractionOutput, ExtractionSourceError> {
         self.validate_authority(&authority)?;
-        let operation_at = system_timestamp().map_err(map_source_error)?;
-        self.validate_activation(activation, doctor, sealed_doctor_capture, operation_at)
-            .map_err(map_source_error)?;
-        if request.deadline() >= activation.expires_at() {
-            return Err(invalid_protocol());
+        if cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
         }
-        if request.object().source_id() != self.metadata.source_id()
+        let operation_at = system_timestamp().map_err(map_source_error)?;
+        remaining_timeout(request.deadline(), operation_at, Duration::MAX)?;
+        let CensusSealedDiscoveryAdmission {
+            batch: discovery_batch,
+            acquisition,
+            capture_token,
+            telemetry,
+            activation,
+        } = admission;
+        self.validate_activation(&activation, operation_at)
+            .map_err(map_source_error)?;
+        let [discovered_object] = discovery_batch.objects() else {
+            return Err(invalid_protocol());
+        };
+        if request.object() != discovered_object
+            || request.object().source_id() != self.metadata.source_id()
             || request.object().metadata_revision() != self.metadata.revision()
         {
             return Err(invalid_protocol());
@@ -1431,26 +1528,83 @@ impl CensusSource {
         if object_identity.query_digest != contract.query().request_digest() {
             return Err(invalid_protocol());
         }
-        let acquired = self
-            .acquire_dataset(
-                &authority,
-                request.object().dataset(),
-                request.deadline(),
-                cancellation,
-            )
-            .await?;
         verify_acquisition(
             &self.metadata,
             contract,
             &request,
             &object_identity,
-            &acquired,
+            &acquisition,
+            capture_token.persisted_receipt().capture(),
         )?;
-        let output = extraction_output(&self.metadata, &self.config, &request, contract, acquired)?;
+        let output = extraction_output(
+            &self.metadata,
+            &self.config,
+            &request,
+            contract,
+            acquisition,
+            capture_token.persisted_receipt().capture(),
+        )?;
+        let CensusExtractionOutput {
+            batch,
+            acquisition: _,
+            publication_plan,
+            telemetry: extraction_telemetry,
+        } = output;
+        if telemetry != extraction_telemetry {
+            return Err(invalid_protocol());
+        }
+        let native_lineage = census_native_lineage(&publication_plan, &batch)?;
+        let data_component = capture_token
+            .persisted_receipt()
+            .capture()
+            .request_graph_components()
+            .last()
+            .ok_or_else(invalid_protocol)?;
+        let data_page = capture_token
+            .persisted_receipt()
+            .capture()
+            .pages()
+            .get(usize::from(data_component.first_page_ordinal()))
+            .ok_or_else(invalid_protocol)?;
+        if data_component.dataset() != publication_plan.provider_dataset()
+            || data_component.page_count().get() != 1
+            || data_page.body_digest() != publication_plan.data_response_digest()
+        {
+            return Err(invalid_protocol());
+        }
+        let mut row_capture_page_ordinals = Vec::new();
+        row_capture_page_ordinals
+            .try_reserve_exact(batch.records().len())
+            .map_err(|_| invalid_protocol())?;
+        row_capture_page_ordinals.extend(
+            std::iter::repeat(data_component.first_page_ordinal()).take(batch.records().len()),
+        );
+        let sealed_capture_binding = SealedProviderCaptureBinding::try_whole(
+            capture_token,
+            batch,
+            native_lineage,
+            row_capture_page_ordinals,
+        )
+        .map_err(|_| invalid_protocol())?;
+        let candidate = crate::CensusPublicationCandidate::try_new(
+            publication_plan,
+            sealed_capture_binding,
+            activation,
+        )
+        .map_err(map_source_error)?;
+        if cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
         let completed_at = system_timestamp().map_err(map_source_error)?;
-        self.validate_activation(activation, doctor, sealed_doctor_capture, completed_at)
+        remaining_timeout(request.deadline(), completed_at, Duration::MAX)?;
+        self.validate_authority(&authority)?;
+        candidate
+            .validate_activation_at(completed_at)
             .map_err(map_source_error)?;
-        Ok(output)
+        Ok(CensusSealedExtractionOutput {
+            candidate,
+            telemetry,
+        })
     }
 
     async fn fetch_authorized(
@@ -2199,11 +2353,13 @@ fn verify_acquisition(
     request: &ExtractionRequest,
     identity: &ParsedObjectId,
     acquired: &CensusDatasetAcquisition,
+    graph_capture: &ProviderCaptureSetReceipt,
 ) -> Result<(), ExtractionSourceError> {
     let body = acquired.data().body();
     let body_bytes = u64::try_from(body.len()).map_err(|_| invalid_protocol())?;
-    let graph_capture = combined_capture_material(metadata, contract, acquired)?;
-    let capture_identity = SourceObjectCaptureIdentity::try_from_capture(graph_capture.receipt())
+    validate_acquisition_capture_graph(metadata, contract, acquired, graph_capture)
+        .map_err(map_source_error)?;
+    let capture_identity = SourceObjectCaptureIdentity::try_from_capture(graph_capture)
         .map_err(|_| invalid_protocol())?;
     if identity.metadata_digest != acquired.metadata().content_digest()
         || identity.body_digest != acquired.data().page().response_payload_digest()
@@ -2220,12 +2376,108 @@ fn verify_acquisition(
     Ok(())
 }
 
+fn validate_acquisition_capture_graph(
+    metadata: &SourceMetadata,
+    contract: &CensusDatasetContract,
+    acquired: &CensusDatasetAcquisition,
+    graph_capture: &ProviderCaptureSetReceipt,
+) -> Result<(), CensusSourceError> {
+    let component_count = acquired
+        .metadata()
+        .documents()
+        .len()
+        .checked_add(1)
+        .ok_or(CensusSourceError::Protocol)?;
+    if graph_capture.source_id() != metadata.source_id()
+        || graph_capture.metadata_revision() != metadata.revision()
+        || graph_capture.dataset() != contract.dataset_id()
+        || graph_capture.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
+        || graph_capture.request_graph_components().len() != component_count
+        || graph_capture.semantic_binding().is_some()
+    {
+        return Err(CensusSourceError::Protocol);
+    }
+
+    let mut receipts = Vec::new();
+    receipts
+        .try_reserve_exact(component_count)
+        .map_err(|_| CensusSourceError::Protocol)?;
+    receipts.extend(
+        acquired
+            .metadata()
+            .documents()
+            .iter()
+            .map(CensusCapturedDiscovery::capture),
+    );
+    receipts.push(acquired.data().capture());
+    let expected_graph_identity =
+        census_capture_graph_identity_from_receipts(metadata, contract, &receipts)?;
+    if graph_capture.request_set_identity() != expected_graph_identity {
+        return Err(CensusSourceError::Protocol);
+    }
+
+    let mut flattened_page_ordinal = 0_usize;
+    for (component_ordinal, (component, receipt)) in graph_capture
+        .request_graph_components()
+        .iter()
+        .zip(&receipts)
+        .enumerate()
+    {
+        if receipt.source_id() != metadata.source_id()
+            || receipt.metadata_revision() != metadata.revision()
+            || receipt.dataset() != contract.dataset_id()
+            || receipt.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph
+            || receipt.semantic_binding().is_some()
+            || component.ordinal() as usize != component_ordinal
+            || component.dataset() != receipt.dataset()
+            || component.request_set_identity() != receipt.request_set_identity()
+            || component.terminal() != receipt.terminal()
+            || usize::from(component.first_page_ordinal()) != flattened_page_ordinal
+            || usize::from(component.page_count().get()) != receipt.pages().len()
+            || component.total_body_bytes() != receipt.total_body_bytes()
+            || component.content_digest() != receipt.content_digest()
+            || component.observation_digest() != receipt.observation_digest()
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        for standalone_page in receipt.pages() {
+            let graph_page = graph_capture
+                .pages()
+                .get(flattened_page_ordinal)
+                .ok_or(CensusSourceError::Protocol)?;
+            let flattened_ordinal =
+                u16::try_from(flattened_page_ordinal).map_err(|_| CensusSourceError::Protocol)?;
+            if graph_page.ordinal() != flattened_ordinal
+                || graph_page.request_identity() != standalone_page.request_identity()
+                || graph_page.request_page_token_digest()
+                    != standalone_page.request_page_token_digest()
+                || graph_page.response_next_page_token_digest()
+                    != standalone_page.response_next_page_token_digest()
+                || graph_page.http_status() != standalone_page.http_status()
+                || graph_page.body_bytes() != standalone_page.body_bytes()
+                || graph_page.body_digest() != standalone_page.body_digest()
+                || graph_page.received_at() != standalone_page.received_at()
+            {
+                return Err(CensusSourceError::Protocol);
+            }
+            flattened_page_ordinal = flattened_page_ordinal
+                .checked_add(1)
+                .ok_or(CensusSourceError::Protocol)?;
+        }
+    }
+    if flattened_page_ordinal != graph_capture.pages().len() {
+        return Err(CensusSourceError::Protocol);
+    }
+    Ok(())
+}
+
 fn extraction_output(
     metadata: &SourceMetadata,
     config: &CensusSourceConfig,
     request: &ExtractionRequest,
     contract: &CensusDatasetContract,
     acquisition: CensusDatasetAcquisition,
+    capture_receipt: &ProviderCaptureSetReceipt,
 ) -> Result<CensusExtractionOutput, ExtractionSourceError> {
     let canonical = canonical_records(metadata, contract, acquisition.data().page())
         .map_err(map_source_error)?;
@@ -2261,9 +2513,8 @@ fn extraction_output(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let batch = ExtractionBatch::try_new(request, records)?;
-    let capture_material = combined_capture_material(metadata, contract, &acquisition)?;
     let batch = batch
-        .try_bind_provider_capture(capture_material.receipt())
+        .try_bind_provider_capture(capture_receipt)
         .map_err(|_| invalid_protocol())?;
     let publication_plan = crate::runtime::build_publication_plan(
         metadata,
@@ -2271,7 +2522,7 @@ fn extraction_output(
         contract,
         &acquisition,
         &batch,
-        &capture_material,
+        capture_receipt,
         bindings.into_boxed_slice(),
     )
     .map_err(map_source_error)?;
@@ -2279,10 +2530,53 @@ fn extraction_output(
     Ok(CensusExtractionOutput {
         batch,
         acquisition,
-        capture_material,
         publication_plan,
         telemetry,
     })
+}
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CensusNativeLineageRowV1<'a> {
+    dataset: &'a crate::CensusDataset,
+    provider_variable: &'a SourceIdentifier,
+    label: &'a str,
+    concept: Option<&'a str>,
+    group: Option<&'a SourceIdentifier>,
+    geography: &'a crate::CensusGeographyValue,
+    predicates: &'a [crate::CensusPredicateValue],
+    reported_time: Option<&'a crate::CensusReportedTime>,
+    value_state: &'a CensusValueState,
+}
+
+fn census_native_lineage(
+    plan: &crate::CensusPublicationPlan,
+    batch: &ExtractionBatch,
+) -> Result<ProviderNativeLineageBatch, ExtractionSourceError> {
+    if plan.observations().len() != batch.records().len() || plan.observations().is_empty() {
+        return Err(invalid_protocol());
+    }
+    let mut native_lineage = ProviderNativeLineageBatchBuilder::try_new(
+        ProviderNativeLineageImplementation::CensusTabularV1,
+        batch,
+    )
+    .map_err(|_| invalid_protocol())?;
+    for observation in plan.observations() {
+        native_lineage
+            .try_push(&CensusNativeLineageRowV1 {
+                dataset: observation.dataset(),
+                provider_variable: observation.provider_variable(),
+                label: observation.variable_label(),
+                concept: observation.concept(),
+                group: observation.group(),
+                geography: observation.geography(),
+                predicates: observation.predicates(),
+                reported_time: observation.reported_time(),
+                value_state: observation.value_state(),
+            })
+            .map_err(|_| invalid_protocol())?;
+    }
+    native_lineage.finish().map_err(|_| invalid_protocol())
 }
 
 fn combined_capture_material(
@@ -2306,7 +2600,20 @@ fn census_capture_graph_identity(
     contract: &CensusDatasetContract,
     captures: &[ProviderCaptureMaterial],
 ) -> Result<EvidenceDigest, CensusSourceError> {
-    if captures.is_empty() {
+    let mut receipts = Vec::new();
+    receipts
+        .try_reserve_exact(captures.len())
+        .map_err(|_| CensusSourceError::Protocol)?;
+    receipts.extend(captures.iter().map(ProviderCaptureMaterial::receipt));
+    census_capture_graph_identity_from_receipts(metadata, contract, &receipts)
+}
+
+fn census_capture_graph_identity_from_receipts(
+    metadata: &SourceMetadata,
+    contract: &CensusDatasetContract,
+    receipts: &[&ProviderCaptureSetReceipt],
+) -> Result<EvidenceDigest, CensusSourceError> {
+    if receipts.is_empty() {
         return Err(CensusSourceError::Protocol);
     }
     let mut digest = Sha256::new();
@@ -2326,12 +2633,11 @@ fn census_capture_graph_identity(
     crate::update_digest_component(&mut digest, contract.dataset_id().as_str().as_bytes());
     crate::update_digest_component(
         &mut digest,
-        &u64::try_from(captures.len())
+        &u64::try_from(receipts.len())
             .map_err(|_| CensusSourceError::Protocol)?
             .to_be_bytes(),
     );
-    for capture in captures {
-        let receipt = capture.receipt();
+    for receipt in receipts {
         if receipt.source_id() != metadata.source_id()
             || receipt.metadata_revision() != metadata.revision()
             || receipt.dataset() != contract.dataset_id()

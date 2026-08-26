@@ -18,6 +18,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use super::batch::{ExtractionBatch, ExtractionContentIdentity};
+use super::native_lineage::ProviderNativeLineageBatch;
 use crate::bounded::BoundedVec;
 
 /// Maximum exact response pages admitted to one provider capture set.
@@ -30,6 +32,10 @@ pub const MAX_PROVIDER_CAPTURE_PAGE_BYTES: u64 =
 /// This remains conservatively sealable below the 512 MiB `MSJ1` bound even under worst-case JSON
 /// byte-array expansion in the committed raw-envelope wire.
 pub const MAX_PROVIDER_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum exact event frames admitted to one application-defined live microbatch.
+pub const MAX_PROVIDER_EVENT_MICROBATCH_FRAMES: usize = 4_096;
+/// Maximum aggregate source-frame bytes admitted to one live event microbatch.
+pub const MAX_PROVIDER_EVENT_MICROBATCH_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum exact expected provider timestamps retained by one complete market-bar history graph.
 pub const MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS: usize = 10_000;
 /// Maximum architecture-independent timestamp bytes retained by that exact expected set.
@@ -1058,13 +1064,650 @@ impl ProviderCaptureMaterial {
         &self.records
     }
 
-    /// Consumes and durably seals the already validated exact provider response material.
+    /// Splits this one-use material into a whole-capture expectation and its physical seal request.
+    pub fn into_whole_seal_parts(
+        self,
+    ) -> (ProviderCaptureSealExpectation, ProviderCaptureSealRequest) {
+        self.into_seal_parts(ProviderCaptureSealDisposition::Whole)
+    }
+
+    /// Splits a complete request graph into a component-token expectation and physical seal request.
+    pub fn into_component_seal_parts(
+        self,
+    ) -> Result<(ProviderCaptureSealExpectation, ProviderCaptureSealRequest), ProviderCaptureError>
+    {
+        if self.receipt.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
+            || self.receipt.request_graph_components().is_empty()
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        Ok(self.into_seal_parts(ProviderCaptureSealDisposition::Components))
+    }
+
+    fn into_seal_parts(
+        self,
+        disposition: ProviderCaptureSealDisposition,
+    ) -> (ProviderCaptureSealExpectation, ProviderCaptureSealRequest) {
+        let witness = Arc::new(ProviderCaptureSealWitness(()));
+        (
+            ProviderCaptureSealExpectation {
+                witness: Arc::clone(&witness),
+                disposition,
+            },
+            ProviderCaptureSealRequest {
+                witness,
+                payload: ProviderCaptureSealPayload::ResponseSet {
+                    receipt: self.receipt,
+                    records: self.records,
+                },
+            },
+        )
+    }
+}
+
+/// Exact source event evidence for one frame in an application-defined live microbatch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderEventMicrobatchFrameReceipt {
+    ordinal: u16,
+    event_id: [u8; 16],
+    connection_id: [u8; 16],
+    source_sequence: Option<u64>,
+    exchange_at: Option<Timestamp>,
+    received_at: Timestamp,
+    payload_bytes: u64,
+    payload_digest: EvidenceDigest,
+}
+
+impl ProviderEventMicrobatchFrameReceipt {
+    /// Returns the exact contiguous physical-order ordinal inside this microbatch.
+    pub const fn ordinal(&self) -> u16 {
+        self.ordinal
+    }
+
+    /// Returns the exact locally assigned event UUID bytes retained in the raw envelope.
+    pub const fn event_id(&self) -> [u8; 16] {
+        self.event_id
+    }
+
+    /// Returns the exact connection UUID bytes retained in the raw envelope.
+    pub const fn connection_id(&self) -> [u8; 16] {
+        self.connection_id
+    }
+
+    /// Returns the provider/source sequence when the stream supplied one.
+    pub const fn source_sequence(&self) -> Option<u64> {
+        self.source_sequence
+    }
+
+    /// Returns the source-authored event time when the stream supplied one.
+    pub const fn exchange_at(&self) -> Option<Timestamp> {
+        self.exchange_at
+    }
+
+    /// Returns the exact socket-boundary receive time.
+    pub const fn received_at(&self) -> Timestamp {
+        self.received_at
+    }
+
+    /// Returns the exact provider frame byte count.
+    pub const fn payload_bytes(&self) -> u64 {
+        self.payload_bytes
+    }
+
+    /// Returns the SHA-256 digest of the exact provider frame bytes.
+    pub const fn payload_digest(&self) -> EvidenceDigest {
+        self.payload_digest
+    }
+
+    fn validate(&self, expected_ordinal: usize) -> Result<(), ProviderCaptureError> {
+        if usize::from(self.ordinal) != expected_ordinal
+            || self.event_id == [0; 16]
+            || self.connection_id == [0; 16]
+            || self.payload_bytes == 0
+            || self.payload_bytes > MAX_PROVIDER_CAPTURE_PAGE_BYTES
+        {
+            return Err(ProviderCaptureError::MaterialBindingMismatch);
+        }
+        require_sha256_identity(self.payload_digest)
+    }
+}
+
+/// Bounded evidence for one application-defined unit of ordered live source events.
+///
+/// This receipt deliberately has no HTTP status, pagination token, terminal disposition, or
+/// provider-completeness claim. Its boundary is chosen by application scheduling and is bound into
+/// `stream_identity`; frame order is exact evidence, not an assertion that the source stream was
+/// complete before or after the microbatch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderEventMicrobatchReceipt {
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    dataset: SourceIdentifier,
+    stream_identity: SourceIdentifier,
+    total_payload_bytes: u64,
+    frames: Box<[ProviderEventMicrobatchFrameReceipt]>,
+    content_digest: EvidenceDigest,
+    observation_digest: EvidenceDigest,
+}
+
+impl ProviderEventMicrobatchReceipt {
+    fn try_from_parts(
+        source_id: SourceId,
+        metadata_revision: MetadataRevision,
+        dataset: SourceIdentifier,
+        stream_identity: SourceIdentifier,
+        frames: Vec<ProviderEventMicrobatchFrameReceipt>,
+    ) -> Result<Self, ProviderCaptureError> {
+        if frames.is_empty() {
+            return Err(ProviderCaptureError::EmptyCaptureSet);
+        }
+        if frames.len() > MAX_PROVIDER_EVENT_MICROBATCH_FRAMES {
+            return Err(ProviderCaptureError::PageLimitExceeded {
+                max: MAX_PROVIDER_EVENT_MICROBATCH_FRAMES,
+            });
+        }
+        let mut total_payload_bytes = 0_u64;
+        for (ordinal, frame) in frames.iter().enumerate() {
+            frame.validate(ordinal)?;
+            total_payload_bytes = total_payload_bytes.checked_add(frame.payload_bytes).ok_or(
+                ProviderCaptureError::ByteLimitExceeded {
+                    max: MAX_PROVIDER_EVENT_MICROBATCH_BYTES,
+                },
+            )?;
+            if total_payload_bytes > MAX_PROVIDER_EVENT_MICROBATCH_BYTES {
+                return Err(ProviderCaptureError::ByteLimitExceeded {
+                    max: MAX_PROVIDER_EVENT_MICROBATCH_BYTES,
+                });
+            }
+        }
+        let content_digest = event_microbatch_content_digest(
+            &source_id,
+            &metadata_revision,
+            &dataset,
+            &stream_identity,
+            total_payload_bytes,
+            &frames,
+        );
+        let observation_digest = event_microbatch_observation_digest(content_digest, &frames);
+        Ok(Self {
+            source_id,
+            metadata_revision,
+            dataset,
+            stream_identity,
+            total_payload_bytes,
+            frames: frames.into_boxed_slice(),
+            content_digest,
+            observation_digest,
+        })
+    }
+
+    /// Returns the exact source authority identity.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact source-metadata revision used to interpret these frames.
+    pub const fn metadata_revision(&self) -> &MetadataRevision {
+        &self.metadata_revision
+    }
+
+    /// Returns the canonical provider dataset addressed by this stream.
+    pub const fn dataset(&self) -> &SourceIdentifier {
+        &self.dataset
+    }
+
+    /// Returns the exact adapter/application-defined stream boundary identity.
+    pub const fn stream_identity(&self) -> &SourceIdentifier {
+        &self.stream_identity
+    }
+
+    /// Returns the checked aggregate exact provider-frame bytes.
+    pub const fn total_payload_bytes(&self) -> u64 {
+        self.total_payload_bytes
+    }
+
+    /// Returns the ordered exact frame receipts.
+    pub fn frames(&self) -> &[ProviderEventMicrobatchFrameReceipt] {
+        &self.frames
+    }
+
+    /// Returns stable source-content identity excluding local event/connection/receive evidence.
+    pub const fn content_digest(&self) -> EvidenceDigest {
+        self.content_digest
+    }
+
+    /// Returns identity over content plus exact event, connection, and receive evidence.
+    pub const fn observation_digest(&self) -> EvidenceDigest {
+        self.observation_digest
+    }
+
+    fn validate(&self) -> Result<(), ProviderCaptureError> {
+        if self.frames.is_empty() {
+            return Err(ProviderCaptureError::EmptyCaptureSet);
+        }
+        if self.frames.len() > MAX_PROVIDER_EVENT_MICROBATCH_FRAMES {
+            return Err(ProviderCaptureError::PageLimitExceeded {
+                max: MAX_PROVIDER_EVENT_MICROBATCH_FRAMES,
+            });
+        }
+        let mut total_payload_bytes = 0_u64;
+        for (ordinal, frame) in self.frames.iter().enumerate() {
+            frame.validate(ordinal)?;
+            total_payload_bytes = total_payload_bytes.checked_add(frame.payload_bytes).ok_or(
+                ProviderCaptureError::ByteLimitExceeded {
+                    max: MAX_PROVIDER_EVENT_MICROBATCH_BYTES,
+                },
+            )?;
+            if total_payload_bytes > MAX_PROVIDER_EVENT_MICROBATCH_BYTES {
+                return Err(ProviderCaptureError::ByteLimitExceeded {
+                    max: MAX_PROVIDER_EVENT_MICROBATCH_BYTES,
+                });
+            }
+        }
+        let content_digest = event_microbatch_content_digest(
+            &self.source_id,
+            &self.metadata_revision,
+            &self.dataset,
+            &self.stream_identity,
+            total_payload_bytes,
+            &self.frames,
+        );
+        let observation_digest = event_microbatch_observation_digest(content_digest, &self.frames);
+        if total_payload_bytes != self.total_payload_bytes
+            || content_digest != self.content_digest
+            || observation_digest != self.observation_digest
+        {
+            return Err(ProviderCaptureError::ReceiptBindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderEventMicrobatchReceiptWire {
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    dataset: SourceIdentifier,
+    stream_identity: SourceIdentifier,
+    total_payload_bytes: u64,
+    frames: crate::bounded::BoundedVec<
+        ProviderEventMicrobatchFrameReceipt,
+        MAX_PROVIDER_EVENT_MICROBATCH_FRAMES,
+    >,
+    content_digest: EvidenceDigest,
+    observation_digest: EvidenceDigest,
+}
+
+impl<'de> Deserialize<'de> for ProviderEventMicrobatchReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ProviderEventMicrobatchReceiptWire::deserialize(deserializer)?;
+        let rebuilt = Self::try_from_parts(
+            wire.source_id,
+            wire.metadata_revision,
+            wire.dataset,
+            wire.stream_identity,
+            wire.frames.into_vec(),
+        )
+        .map_err(serde::de::Error::custom)?;
+        if rebuilt.total_payload_bytes != wire.total_payload_bytes
+            || rebuilt.content_digest != wire.content_digest
+            || rebuilt.observation_digest != wire.observation_digest
+        {
+            return Err(serde::de::Error::custom(
+                ProviderCaptureError::ReceiptBindingMismatch,
+            ));
+        }
+        Ok(rebuilt)
+    }
+}
+
+/// Complete bounded live-event microbatch ready for the common durable seal operation.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ProviderEventMicrobatchMaterial {
+    receipt: ProviderEventMicrobatchReceipt,
+    records: Box<[RawCaptureRecord]>,
+}
+
+impl ProviderEventMicrobatchMaterial {
+    /// Binds exact source frames to a non-HTTP application-defined microbatch receipt.
+    pub fn try_new(
+        source_id: SourceId,
+        metadata_revision: MetadataRevision,
+        dataset: SourceIdentifier,
+        stream_identity: SourceIdentifier,
+        records: Vec<RawCaptureRecord>,
+    ) -> Result<Self, ProviderCaptureError> {
+        if records.is_empty() {
+            return Err(ProviderCaptureError::EmptyCaptureSet);
+        }
+        if records.len() > MAX_PROVIDER_EVENT_MICROBATCH_FRAMES {
+            return Err(ProviderCaptureError::PageLimitExceeded {
+                max: MAX_PROVIDER_EVENT_MICROBATCH_FRAMES,
+            });
+        }
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(records.len())
+            .map_err(|_| ProviderCaptureError::AllocationFailed)?;
+        for (ordinal, record) in records.iter().enumerate() {
+            if record.source() != source_id.as_str() {
+                return Err(ProviderCaptureError::MaterialBindingMismatch);
+            }
+            let payload_bytes = u64::try_from(record.payload().len())
+                .map_err(|_| ProviderCaptureError::MaterialBindingMismatch)?;
+            let exchange_at = record
+                .exchange_at()
+                .map(|timestamp| {
+                    timestamp
+                        .timestamp_nanos_opt()
+                        .map(Timestamp::from_unix_nanos)
+                        .ok_or(ProviderCaptureError::MaterialBindingMismatch)
+                })
+                .transpose()?;
+            let received_at = record
+                .received_at()
+                .timestamp_nanos_opt()
+                .map(Timestamp::from_unix_nanos)
+                .ok_or(ProviderCaptureError::MaterialBindingMismatch)?;
+            frames.push(ProviderEventMicrobatchFrameReceipt {
+                ordinal: u16::try_from(ordinal)
+                    .map_err(|_| ProviderCaptureError::MaterialBindingMismatch)?,
+                event_id: *record.event_id().as_bytes(),
+                connection_id: *record.connection_id().as_bytes(),
+                source_sequence: record.source_sequence(),
+                exchange_at,
+                received_at,
+                payload_bytes,
+                payload_digest: EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    Sha256::digest(record.payload()).into(),
+                ),
+            });
+        }
+        let receipt = ProviderEventMicrobatchReceipt::try_from_parts(
+            source_id,
+            metadata_revision,
+            dataset,
+            stream_identity,
+            frames,
+        )?;
+        Ok(Self {
+            receipt,
+            records: records.into_boxed_slice(),
+        })
+    }
+
+    /// Returns cloneable logical evidence before this material is consumed into its seal request.
+    pub const fn receipt(&self) -> &ProviderEventMicrobatchReceipt {
+        &self.receipt
+    }
+
+    /// Returns the exact bounded source frames before this material is consumed.
+    pub fn records(&self) -> &[RawCaptureRecord] {
+        &self.records
+    }
+
+    /// Splits this one-use material into its typed expectation and the common physical request.
+    pub fn into_sealing_parts(
+        self,
+    ) -> (
+        ProviderEventMicrobatchSealExpectation,
+        ProviderCaptureSealRequest,
+    ) {
+        let witness = Arc::new(ProviderCaptureSealWitness(()));
+        (
+            ProviderEventMicrobatchSealExpectation {
+                witness: Arc::clone(&witness),
+            },
+            ProviderCaptureSealRequest {
+                witness,
+                payload: ProviderCaptureSealPayload::EventMicrobatch {
+                    receipt: self.receipt,
+                    records: self.records,
+                },
+            },
+        )
+    }
+}
+
+#[derive(Debug)]
+struct ProviderCaptureSealWitness(());
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderCaptureSealDisposition {
+    Whole,
+    Components,
+}
+
+/// Opaque one-use expectation for the exact physical seal request split from capture material.
+///
+/// This value is deliberately non-cloneable and non-serializable. It shares only a private
+/// process-local witness with its request; no logical receipt comparison can substitute another
+/// successfully sealed capture.
+#[derive(Debug)]
+pub struct ProviderCaptureSealExpectation {
+    witness: Arc<ProviderCaptureSealWitness>,
+    disposition: ProviderCaptureSealDisposition,
+}
+
+impl ProviderCaptureSealExpectation {
+    /// Consumes this expectation and the sealer's opaque result into one exclusive live authority.
+    pub fn try_rejoin(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<RejoinedProviderCapture, ProviderCaptureError> {
+        if !Arc::ptr_eq(&self.witness, &sealed.witness) {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let SealedProviderCapturePayload::ResponseSet(receipt) = sealed.payload else {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        };
+        match self.disposition {
+            ProviderCaptureSealDisposition::Whole => {
+                Ok(RejoinedProviderCapture::Whole(ProviderWholeCaptureToken {
+                    receipt,
+                }))
+            }
+            ProviderCaptureSealDisposition::Components => {
+                let capture = receipt.capture();
+                if capture.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
+                    || capture.request_graph_components().is_empty()
+                {
+                    return Err(ProviderCaptureError::SealedBindingMismatch);
+                }
+                let receipt = Arc::new(receipt);
+                let mut tokens = Vec::new();
+                tokens
+                    .try_reserve_exact(receipt.capture().request_graph_components().len())
+                    .map_err(|_| ProviderCaptureError::AllocationFailed)?;
+                for component in receipt.capture().request_graph_components() {
+                    tokens.push(ProviderCaptureComponentToken {
+                        receipt: Arc::clone(&receipt),
+                        ordinal: component.ordinal(),
+                    });
+                }
+                Ok(RejoinedProviderCapture::Components(
+                    ProviderCaptureComponentTokenSet {
+                        tokens: tokens.into_boxed_slice(),
+                    },
+                ))
+            }
+        }
+    }
+}
+
+/// Opaque one-use expectation for the exact live-event microbatch seal request.
+#[derive(Debug)]
+pub struct ProviderEventMicrobatchSealExpectation {
+    witness: Arc<ProviderCaptureSealWitness>,
+}
+
+impl ProviderEventMicrobatchSealExpectation {
+    /// Consumes the sealer result only when it carries this exact process-local witness and kind.
+    pub fn try_rejoin(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<ProviderEventMicrobatchToken, ProviderCaptureError> {
+        if !Arc::ptr_eq(&self.witness, &sealed.witness) {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let SealedProviderCapturePayload::EventMicrobatch(receipt) = sealed.payload else {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        };
+        receipt.capture().validate()?;
+        Ok(ProviderEventMicrobatchToken { receipt })
+    }
+}
+
+#[derive(Debug)]
+enum ProviderCaptureSealPayload {
+    ResponseSet {
+        receipt: ProviderCaptureSetReceipt,
+        records: Box<[RawCaptureRecord]>,
+    },
+    EventMicrobatch {
+        receipt: ProviderEventMicrobatchReceipt,
+        records: Box<[RawCaptureRecord]>,
+    },
+}
+
+/// Opaque one-use request consumed only by the application-owned physical sealer.
+#[derive(Debug)]
+pub struct ProviderCaptureSealRequest {
+    witness: Arc<ProviderCaptureSealWitness>,
+    payload: ProviderCaptureSealPayload,
+}
+
+impl ProviderCaptureSealRequest {
+    /// Seals the exact records and moves the private process-local witness into the result.
+    ///
+    /// Production composition exposes this operation only through `ResearchService`; adapter tests
+    /// exercise the same consuming capability directly against an ephemeral store.
     pub fn seal(
         self,
         store: &SealedResearchJournalStore,
-    ) -> Result<SealedProviderCaptureSetReceipt, ProviderCaptureMaterialSealError> {
-        let segment = store.seal(&self.records)?;
-        SealedProviderCaptureSetReceipt::try_bind(self.receipt, segment).map_err(Into::into)
+    ) -> Result<SealedProviderCaptureMaterial, ProviderCaptureMaterialSealError> {
+        let payload = match self.payload {
+            ProviderCaptureSealPayload::ResponseSet { receipt, records } => {
+                let segment = store.seal(&records)?;
+                SealedProviderCapturePayload::ResponseSet(
+                    SealedProviderCaptureSetReceipt::try_bind(receipt, segment)?,
+                )
+            }
+            ProviderCaptureSealPayload::EventMicrobatch { receipt, records } => {
+                let segment = store.seal(&records)?;
+                SealedProviderCapturePayload::EventMicrobatch(
+                    SealedProviderEventMicrobatchReceipt::try_bind(receipt, segment)?,
+                )
+            }
+        };
+        Ok(SealedProviderCaptureMaterial {
+            witness: self.witness,
+            payload,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum SealedProviderCapturePayload {
+    ResponseSet(SealedProviderCaptureSetReceipt),
+    EventMicrobatch(SealedProviderEventMicrobatchReceipt),
+}
+
+/// Opaque one-use physical result returned by the sole seal operation.
+#[derive(Debug)]
+pub struct SealedProviderCaptureMaterial {
+    witness: Arc<ProviderCaptureSealWitness>,
+    payload: SealedProviderCapturePayload,
+}
+
+/// Exclusive post-seal authority: either the whole capture or its closed component token set.
+#[derive(Debug)]
+pub enum RejoinedProviderCapture {
+    /// One indivisible whole-capture authority.
+    Whole(ProviderWholeCaptureToken),
+    /// One exact non-reusable token per complete request-graph component.
+    Components(ProviderCaptureComponentTokenSet),
+}
+
+impl RejoinedProviderCapture {
+    /// Consumes this closed result as a whole-capture token.
+    pub fn try_into_whole(self) -> Result<ProviderWholeCaptureToken, ProviderCaptureError> {
+        match self {
+            Self::Whole(token) => Ok(token),
+            Self::Components(_) => Err(ProviderCaptureError::SealedBindingMismatch),
+        }
+    }
+
+    /// Consumes this closed result as a request-graph component token set.
+    pub fn try_into_components(
+        self,
+    ) -> Result<ProviderCaptureComponentTokenSet, ProviderCaptureError> {
+        match self {
+            Self::Components(tokens) => Ok(tokens),
+            Self::Whole(_) => Err(ProviderCaptureError::SealedBindingMismatch),
+        }
+    }
+}
+
+/// Exclusive one-use authority for one complete sealed capture.
+#[derive(Debug)]
+pub struct ProviderWholeCaptureToken {
+    receipt: SealedProviderCaptureSetReceipt,
+}
+
+impl ProviderWholeCaptureToken {
+    /// Returns cloneable persisted/restart evidence; this value cannot authorize another binding.
+    pub fn persisted_receipt(&self) -> &SealedProviderCaptureSetReceipt {
+        &self.receipt
+    }
+}
+
+/// Closed exact ordinal-indexed component authorities for one complete sealed request graph.
+#[derive(Debug)]
+pub struct ProviderCaptureComponentTokenSet {
+    tokens: Box<[ProviderCaptureComponentToken]>,
+}
+
+impl ProviderCaptureComponentTokenSet {
+    /// Returns the exact number of complete graph components.
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Returns whether the graph unexpectedly contained no components.
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// Consumes the set into one non-cloneable token per exact component ordinal.
+    pub fn into_tokens(self) -> Box<[ProviderCaptureComponentToken]> {
+        self.tokens
+    }
+}
+
+/// Exclusive one-use authority for one exact complete request-graph component.
+#[derive(Debug)]
+pub struct ProviderCaptureComponentToken {
+    receipt: Arc<SealedProviderCaptureSetReceipt>,
+    ordinal: u16,
+}
+
+impl ProviderCaptureComponentToken {
+    /// Returns the adapter-selected exact component ordinal carried by this token.
+    pub const fn ordinal(&self) -> u16 {
+        self.ordinal
+    }
+
+    /// Returns persisted/restart evidence without cloning the complete graph receipt.
+    pub fn persisted_receipt(&self) -> &SealedProviderCaptureSetReceipt {
+        &self.receipt
     }
 }
 
@@ -1090,7 +1733,7 @@ pub struct SealedProviderCaptureSetReceipt {
 
 impl SealedProviderCaptureSetReceipt {
     /// Binds one completed capture to the exact sealed frame mapping.
-    pub fn try_bind(
+    fn try_bind(
         capture: ProviderCaptureSetReceipt,
         segment: SealedResearchJournalSegmentReceipt,
     ) -> Result<Self, ProviderCaptureError> {
@@ -1102,6 +1745,7 @@ impl SealedProviderCaptureSetReceipt {
                 || frame.provider_payload_bytes() != page.body_bytes
                 || frame.provider_payload_digest() != page.body_digest
                 || frame.received_at() != page.received_at
+                || frame.source_sequence() != Some(u64::from(page.ordinal))
             {
                 return Err(ProviderCaptureError::PhysicalReceiptMismatch);
             }
@@ -1132,6 +1776,753 @@ impl SealedProviderCaptureSetReceipt {
     pub const fn receipt_digest(&self) -> EvidenceDigest {
         self.receipt_digest
     }
+}
+
+/// Persistable evidence binding one live-event microbatch to one immutable physical segment.
+///
+/// This cloneable receipt is restart evidence only. The non-cloneable
+/// [`ProviderEventMicrobatchToken`] remains the sole live authority for downstream admission.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealedProviderEventMicrobatchReceipt {
+    capture: ProviderEventMicrobatchReceipt,
+    segment: SealedResearchJournalSegmentReceipt,
+    receipt_digest: EvidenceDigest,
+}
+
+impl SealedProviderEventMicrobatchReceipt {
+    fn try_bind(
+        capture: ProviderEventMicrobatchReceipt,
+        segment: SealedResearchJournalSegmentReceipt,
+    ) -> Result<Self, ProviderCaptureError> {
+        capture.validate()?;
+        if capture.frames().len() != segment.frames().len() {
+            return Err(ProviderCaptureError::PhysicalReceiptMismatch);
+        }
+        for (event, frame) in capture.frames().iter().zip(segment.frames()) {
+            if frame.ordinal() != u32::from(event.ordinal())
+                || frame.provider_payload_bytes() != event.payload_bytes()
+                || frame.provider_payload_digest() != event.payload_digest()
+                || frame.received_at() != event.received_at()
+                || frame.source_sequence() != event.source_sequence()
+            {
+                return Err(ProviderCaptureError::PhysicalReceiptMismatch);
+            }
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"market-squawk/sealed-provider-event-microbatch-receipt/v1");
+        hash_digest(&mut hash, capture.observation_digest());
+        hash_digest(&mut hash, segment.physical_receipt_digest());
+        let receipt_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into());
+        Ok(Self {
+            capture,
+            segment,
+            receipt_digest,
+        })
+    }
+
+    /// Returns the exact bounded logical event-microbatch evidence.
+    pub const fn capture(&self) -> &ProviderEventMicrobatchReceipt {
+        &self.capture
+    }
+
+    /// Returns the verified immutable physical journal receipt.
+    pub const fn segment(&self) -> &SealedResearchJournalSegmentReceipt {
+        &self.segment
+    }
+
+    /// Returns the digest joining logical observations to the physical object.
+    pub const fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
+    }
+}
+
+/// Exclusive one-use live authority for one exact sealed event microbatch.
+#[derive(Debug)]
+pub struct ProviderEventMicrobatchToken {
+    receipt: SealedProviderEventMicrobatchReceipt,
+}
+
+impl ProviderEventMicrobatchToken {
+    /// Returns cloneable persisted/restart evidence; it cannot authorize another live admission.
+    pub const fn persisted_receipt(&self) -> &SealedProviderEventMicrobatchReceipt {
+        &self.receipt
+    }
+}
+
+/// Exact portion of one sealed provider capture consumed by a normalized extraction batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderCaptureScope {
+    /// The extraction consumes the complete sealed response or request graph.
+    Whole,
+    /// The extraction consumes one exact component of a complete sealed request graph.
+    RequestGraphComponent {
+        /// Adapter-supplied zero-based graph component ordinal.
+        ordinal: u16,
+    },
+}
+
+/// Physical layout retained by one consuming sealed-provider binding.
+///
+/// This is deliberately orthogonal to the durable capture-unit kind and the platform raw-object
+/// kind. It says only how this binding selects and maps the already sealed physical evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderCaptureBindingLayout {
+    /// One physical journal segment contains the whole logical capture.
+    WholeSingleSegment,
+    /// One physical journal segment contains the graph from which one component is selected.
+    RequestGraphComponent,
+    /// One ordered physical segment per logical capture page, with no combined reseal.
+    OrderedSegments,
+}
+
+/// Exact canonical-row mapping to one logical capture page and immutable physical frame.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ProviderCaptureRowFrame {
+    canonical_row_ordinal: u32,
+    capture_page_ordinal: u16,
+    segment_ordinal: u16,
+    physical_frame_ordinal: u32,
+    page_body_digest: EvidenceDigest,
+    received_at: Timestamp,
+    source_sequence: Option<u64>,
+}
+
+impl ProviderCaptureRowFrame {
+    /// Returns the contiguous zero-based canonical row ordinal.
+    pub const fn canonical_row_ordinal(&self) -> u32 {
+        self.canonical_row_ordinal
+    }
+
+    /// Returns the exact page ordinal in the complete logical capture.
+    pub const fn capture_page_ordinal(&self) -> u16 {
+        self.capture_page_ordinal
+    }
+
+    /// Returns the ordered immutable physical segment ordinal.
+    pub const fn segment_ordinal(&self) -> u16 {
+        self.segment_ordinal
+    }
+
+    /// Returns the exact frame ordinal inside that immutable physical segment.
+    pub const fn physical_frame_ordinal(&self) -> u32 {
+        self.physical_frame_ordinal
+    }
+
+    /// Returns the exact provider-body digest shared by logical page and physical frame.
+    pub const fn page_body_digest(&self) -> EvidenceDigest {
+        self.page_body_digest
+    }
+
+    /// Returns the exact socket-boundary receive time shared by page and frame.
+    pub const fn received_at(&self) -> Timestamp {
+        self.received_at
+    }
+
+    /// Returns the exact source sequence retained in the immutable raw frame.
+    pub const fn source_sequence(&self) -> Option<u64> {
+        self.source_sequence
+    }
+}
+
+/// Source-neutral one-use authority joining one logical capture to ordered standalone seals.
+#[derive(Debug)]
+pub struct ProviderOrderedCaptureSegments {
+    root_capture: ProviderCaptureSetReceipt,
+    segments: Box<[ProviderWholeCaptureToken]>,
+    receipt_digest: EvidenceDigest,
+}
+
+impl ProviderOrderedCaptureSegments {
+    /// Consumes exact standalone page tokens into one ordered logical multi-segment capture.
+    pub fn try_rejoin(
+        root_capture: ProviderCaptureSetReceipt,
+        segments: Vec<ProviderWholeCaptureToken>,
+    ) -> Result<Self, ProviderCaptureError> {
+        if segments.is_empty()
+            || segments.len() != root_capture.pages().len()
+            || segments.len() > MAX_PROVIDER_CAPTURE_PAGES
+            || root_capture.terminal()
+                != ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/ordered-provider-capture-segments/v1");
+        hash_digest(&mut digest, root_capture.observation_digest());
+        for (ordinal, (root_page, token)) in root_capture.pages().iter().zip(&segments).enumerate()
+        {
+            let ordinal =
+                u16::try_from(ordinal).map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+            let sealed = token.persisted_receipt();
+            let [segment_page] = sealed.capture().pages() else {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            };
+            let [frame] = sealed.segment().frames() else {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            };
+            if root_page.ordinal() != ordinal
+                || sealed.capture().source_id() != root_capture.source_id()
+                || sealed.capture().metadata_revision() != root_capture.metadata_revision()
+                || sealed.capture().request_set_identity() != root_page.request_identity()
+                || sealed.capture().terminal()
+                    != ProviderCaptureTerminalDisposition::StandaloneResponse
+                || segment_page.ordinal() != 0
+                || segment_page.request_identity() != root_page.request_identity()
+                || segment_page.http_status() != root_page.http_status()
+                || segment_page.body_bytes() != root_page.body_bytes()
+                || segment_page.body_digest() != root_page.body_digest()
+                || segment_page.received_at() != root_page.received_at()
+                || frame.ordinal() != 0
+                || frame.provider_payload_bytes() != root_page.body_bytes()
+                || frame.provider_payload_digest() != root_page.body_digest()
+                || frame.received_at() != root_page.received_at()
+                || frame.source_sequence() != Some(0)
+            {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+            hash_digest(&mut digest, sealed.receipt_digest());
+            hash_digest(&mut digest, sealed.segment().physical_receipt_digest());
+        }
+        Ok(Self {
+            root_capture,
+            segments: segments.into_boxed_slice(),
+            receipt_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into()),
+        })
+    }
+
+    /// Returns the complete logical capture spanned by the ordered physical segments.
+    pub const fn root_capture(&self) -> &ProviderCaptureSetReceipt {
+        &self.root_capture
+    }
+
+    /// Returns the digest binding root observation identity and all ordered physical receipts.
+    pub const fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
+    }
+
+    /// Returns the exact number of ordered physical segments.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Returns persisted evidence for one ordered physical segment.
+    pub fn persisted_segment_receipt(
+        &self,
+        ordinal: usize,
+    ) -> Option<&SealedProviderCaptureSetReceipt> {
+        self.segments
+            .get(ordinal)
+            .map(ProviderWholeCaptureToken::persisted_receipt)
+    }
+}
+
+#[derive(Debug)]
+enum ProviderCaptureBindingAuthority {
+    Whole(ProviderWholeCaptureToken),
+    Component(ProviderCaptureComponentToken),
+    Ordered(ProviderOrderedCaptureSegments),
+}
+
+/// Non-reusable binding between one normalized extraction batch and its sealed raw evidence.
+///
+/// The binding deliberately has no clone or serialization surface. It is minted only after the
+/// exact batch object is rejoined to either the complete capture or one adapter-selected request
+/// graph component. Durable publication authority consumes this value; provider adapters cannot
+/// manufacture a second storage or manifest authority from it.
+#[derive(Debug)]
+pub struct SealedProviderCaptureBinding {
+    authority: ProviderCaptureBindingAuthority,
+    batch: ExtractionBatch,
+    native_lineage: ProviderNativeLineageBatch,
+    content_identity: ExtractionContentIdentity,
+    record_count: usize,
+    row_frames: Box<[ProviderCaptureRowFrame]>,
+}
+
+impl SealedProviderCaptureBinding {
+    /// Binds a batch whose source object consumes the complete sealed capture.
+    pub fn try_whole(
+        token: ProviderWholeCaptureToken,
+        batch: ExtractionBatch,
+        native_lineage: ProviderNativeLineageBatch,
+        row_capture_page_ordinals: Vec<u16>,
+    ) -> Result<Self, ProviderCaptureError> {
+        validate_whole_capture(&token, &batch)?;
+        let receipt = token.persisted_receipt();
+        let row_frames =
+            single_segment_row_frames(receipt, &batch, &row_capture_page_ordinals, None)?;
+        Self::finish(
+            ProviderCaptureBindingAuthority::Whole(token),
+            batch,
+            native_lineage,
+            row_frames,
+        )
+    }
+
+    /// Binds a batch to one exact adapter-selected complete request-graph component.
+    ///
+    /// The ordinal is authoritative input from the adapter-specific continuation. This method
+    /// never scans graph components by digest. It rebuilds the selected component's local page
+    /// chain, byte total, content identity, observation identity, and object capture identity.
+    pub fn try_component(
+        token: ProviderCaptureComponentToken,
+        batch: ExtractionBatch,
+        native_lineage: ProviderNativeLineageBatch,
+        row_capture_page_ordinals: Vec<u16>,
+    ) -> Result<Self, ProviderCaptureError> {
+        let (first_page, end_page) = validate_component_capture(&token, &batch)?;
+        let receipt = token.persisted_receipt();
+        let row_frames = single_segment_row_frames(
+            receipt,
+            &batch,
+            &row_capture_page_ordinals,
+            Some((first_page, end_page)),
+        )?;
+        Self::finish(
+            ProviderCaptureBindingAuthority::Component(token),
+            batch,
+            native_lineage,
+            row_frames,
+        )
+    }
+
+    /// Binds a batch to one source-neutral ordered multi-segment logical capture.
+    pub fn try_ordered_segments(
+        token: ProviderOrderedCaptureSegments,
+        batch: ExtractionBatch,
+        native_lineage: ProviderNativeLineageBatch,
+        row_capture_page_ordinals: Vec<u16>,
+    ) -> Result<Self, ProviderCaptureError> {
+        validate_ordered_capture(&token, &batch)?;
+        let row_frames = ordered_segment_row_frames(&token, &batch, &row_capture_page_ordinals)?;
+        Self::finish(
+            ProviderCaptureBindingAuthority::Ordered(token),
+            batch,
+            native_lineage,
+            row_frames,
+        )
+    }
+
+    fn finish(
+        authority: ProviderCaptureBindingAuthority,
+        batch: ExtractionBatch,
+        native_lineage: ProviderNativeLineageBatch,
+        row_frames: Box<[ProviderCaptureRowFrame]>,
+    ) -> Result<Self, ProviderCaptureError> {
+        native_lineage
+            .validate(&batch)
+            .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+        let content_identity = ExtractionContentIdentity::try_from_batch(&batch)
+            .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+        let record_count = batch.records().len();
+        if content_identity.record_count() != record_count || row_frames.len() != record_count {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        Ok(Self {
+            authority,
+            batch,
+            native_lineage,
+            content_identity,
+            record_count,
+            row_frames,
+        })
+    }
+
+    /// Revalidates canonical/native alignment, content identity, and exact page/frame mapping.
+    pub fn validate(&self) -> Result<(), ProviderCaptureError> {
+        if self.record_count != self.batch.records().len()
+            || self.content_identity
+                != ExtractionContentIdentity::try_from_batch(&self.batch)
+                    .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?
+            || self.native_lineage.validate(&self.batch).is_err()
+            || self.row_frames.len() != self.record_count
+            || self.row_frames.iter().enumerate().any(|(ordinal, frame)| {
+                frame.canonical_row_ordinal != u32::try_from(ordinal).unwrap_or(u32::MAX)
+            })
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let mut row_capture_page_ordinals = Vec::new();
+        row_capture_page_ordinals
+            .try_reserve_exact(self.row_frames.len())
+            .map_err(|_| ProviderCaptureError::AllocationFailed)?;
+        row_capture_page_ordinals.extend(
+            self.row_frames
+                .iter()
+                .map(|frame| frame.capture_page_ordinal),
+        );
+        let expected_row_frames = match &self.authority {
+            ProviderCaptureBindingAuthority::Whole(token) => {
+                validate_whole_capture(token, &self.batch)?;
+                single_segment_row_frames(
+                    token.persisted_receipt(),
+                    &self.batch,
+                    &row_capture_page_ordinals,
+                    None,
+                )?
+            }
+            ProviderCaptureBindingAuthority::Component(token) => {
+                let page_range = validate_component_capture(token, &self.batch)?;
+                single_segment_row_frames(
+                    token.persisted_receipt(),
+                    &self.batch,
+                    &row_capture_page_ordinals,
+                    Some(page_range),
+                )?
+            }
+            ProviderCaptureBindingAuthority::Ordered(token) => {
+                validate_ordered_capture(token, &self.batch)?;
+                ordered_segment_row_frames(token, &self.batch, &row_capture_page_ordinals)?
+            }
+        };
+        if expected_row_frames.as_ref() != self.row_frames.as_ref() {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        Ok(())
+    }
+
+    /// Returns the exact canonical batch retained inside this one-use authority.
+    pub const fn batch(&self) -> &ExtractionBatch {
+        &self.batch
+    }
+
+    /// Returns the exact aligned provider-native lineage retained inside this authority.
+    pub const fn native_lineage(&self) -> &ProviderNativeLineageBatch {
+        &self.native_lineage
+    }
+
+    /// Returns the recomputable semantic identity of the retained canonical batch.
+    pub const fn content_identity(&self) -> ExtractionContentIdentity {
+        self.content_identity
+    }
+
+    /// Returns the exact canonical record count bound at construction.
+    pub const fn record_count(&self) -> usize {
+        self.record_count
+    }
+
+    /// Returns the contiguous exact canonical-row to logical-page/physical-frame map.
+    pub const fn row_frames(&self) -> &[ProviderCaptureRowFrame] {
+        &self.row_frames
+    }
+
+    /// Returns persisted logical capture evidence; it cannot remint live authority.
+    pub fn capture_evidence(&self) -> &ProviderCaptureSetReceipt {
+        match &self.authority {
+            ProviderCaptureBindingAuthority::Whole(token) => token.receipt.capture(),
+            ProviderCaptureBindingAuthority::Component(token) => token.receipt.capture(),
+            ProviderCaptureBindingAuthority::Ordered(token) => token.root_capture(),
+        }
+    }
+
+    /// Returns the digest binding the logical observation to its exact physical seal(s).
+    pub fn sealed_capture_receipt_digest(&self) -> EvidenceDigest {
+        match &self.authority {
+            ProviderCaptureBindingAuthority::Whole(token) => token.receipt.receipt_digest(),
+            ProviderCaptureBindingAuthority::Component(token) => token.receipt.receipt_digest(),
+            ProviderCaptureBindingAuthority::Ordered(token) => token.receipt_digest(),
+        }
+    }
+
+    /// Returns exact persisted evidence for one ordered physical segment.
+    pub fn persisted_segment_receipt(
+        &self,
+        ordinal: usize,
+    ) -> Option<&SealedProviderCaptureSetReceipt> {
+        match &self.authority {
+            ProviderCaptureBindingAuthority::Whole(token) => {
+                (ordinal == 0).then_some(&token.receipt)
+            }
+            ProviderCaptureBindingAuthority::Component(token) => {
+                (ordinal == 0).then_some(token.persisted_receipt())
+            }
+            ProviderCaptureBindingAuthority::Ordered(token) => {
+                token.persisted_segment_receipt(ordinal)
+            }
+        }
+    }
+
+    /// Returns whether the bound batch consumes the whole capture or one exact component.
+    pub const fn scope(&self) -> ProviderCaptureScope {
+        match &self.authority {
+            ProviderCaptureBindingAuthority::Whole(_)
+            | ProviderCaptureBindingAuthority::Ordered(_) => ProviderCaptureScope::Whole,
+            ProviderCaptureBindingAuthority::Component(token) => {
+                ProviderCaptureScope::RequestGraphComponent {
+                    ordinal: token.ordinal,
+                }
+            }
+        }
+    }
+
+    /// Returns the exact physical layout retained by this binding.
+    pub const fn layout(&self) -> ProviderCaptureBindingLayout {
+        match self.authority {
+            ProviderCaptureBindingAuthority::Whole(_) => {
+                ProviderCaptureBindingLayout::WholeSingleSegment
+            }
+            ProviderCaptureBindingAuthority::Component(_) => {
+                ProviderCaptureBindingLayout::RequestGraphComponent
+            }
+            ProviderCaptureBindingAuthority::Ordered(_) => {
+                ProviderCaptureBindingLayout::OrderedSegments
+            }
+        }
+    }
+
+    /// Returns the exact request-graph component ordinal, when component-scoped.
+    pub const fn component_ordinal(&self) -> Option<u16> {
+        match self.scope() {
+            ProviderCaptureScope::Whole => None,
+            ProviderCaptureScope::RequestGraphComponent { ordinal } => Some(ordinal),
+        }
+    }
+}
+
+fn validate_whole_capture(
+    token: &ProviderWholeCaptureToken,
+    batch: &ExtractionBatch,
+) -> Result<(), ProviderCaptureError> {
+    let receipt = token.persisted_receipt();
+    let capture = receipt.capture();
+    let object = batch.request().object();
+    let expected_identity = SourceObjectCaptureIdentity::try_from_capture(capture)?;
+    if receipt.receipt_digest().bytes() == [0; 32]
+        || object.source_id() != capture.source_id()
+        || object.metadata_revision() != capture.metadata_revision()
+        || object.dataset() != capture.dataset()
+        || object.capture_identity() != expected_identity
+    {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    Ok(())
+}
+
+fn validate_component_capture(
+    token: &ProviderCaptureComponentToken,
+    batch: &ExtractionBatch,
+) -> Result<(usize, usize), ProviderCaptureError> {
+    let receipt = token.persisted_receipt();
+    let capture = receipt.capture();
+    if capture.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
+        || receipt.receipt_digest().bytes() == [0; 32]
+    {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    let component = capture
+        .request_graph_components()
+        .get(usize::from(token.ordinal))
+        .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+    if component.ordinal() != token.ordinal
+        || component.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph
+    {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    let first_page = usize::from(component.first_page_ordinal());
+    let page_count = usize::from(component.page_count().get());
+    let end_page = first_page
+        .checked_add(page_count)
+        .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+    let selected_pages = capture
+        .pages()
+        .get(first_page..end_page)
+        .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+    let mut local_pages = Vec::new();
+    local_pages
+        .try_reserve_exact(page_count)
+        .map_err(|_| ProviderCaptureError::AllocationFailed)?;
+    let mut total_body_bytes = 0_u64;
+    for (local_ordinal, page) in selected_pages.iter().enumerate() {
+        let local_ordinal = u16::try_from(local_ordinal)
+            .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+        total_body_bytes = total_body_bytes
+            .checked_add(page.body_bytes())
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        local_pages.push(page.with_ordinal(local_ordinal));
+    }
+    validate_page_chain(component.terminal(), &local_pages)?;
+    let content_digest = capture_content_digest(
+        capture.source_id(),
+        capture.metadata_revision(),
+        component.dataset(),
+        component.request_set_identity(),
+        component.terminal(),
+        total_body_bytes,
+        &local_pages,
+    );
+    let observation_digest = capture_observation_digest(content_digest, &local_pages);
+    let expected_identity = SourceObjectCaptureIdentity::Paged {
+        content_digest,
+        page_count: component.page_count(),
+        terminal: component.terminal(),
+    };
+    let object = batch.request().object();
+    if total_body_bytes != component.total_body_bytes()
+        || content_digest != component.content_digest()
+        || observation_digest != component.observation_digest()
+        || object.source_id() != capture.source_id()
+        || object.metadata_revision() != capture.metadata_revision()
+        || object.dataset() != component.dataset()
+        || object.capture_identity() != expected_identity
+    {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    Ok((first_page, end_page))
+}
+
+fn validate_ordered_capture(
+    token: &ProviderOrderedCaptureSegments,
+    batch: &ExtractionBatch,
+) -> Result<(), ProviderCaptureError> {
+    let capture = token.root_capture();
+    let object = batch.request().object();
+    let expected_identity = SourceObjectCaptureIdentity::try_from_capture(capture)?;
+    if token.receipt_digest().bytes() == [0; 32]
+        || object.source_id() != capture.source_id()
+        || object.metadata_revision() != capture.metadata_revision()
+        || object.dataset() != capture.dataset()
+        || object.capture_identity() != expected_identity
+    {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    // Rejoining already checked every standalone seal. Rechecking each frame here prevents a
+    // future representation change from weakening the retained ordered-segment invariant.
+    if token.segments.len() != capture.pages().len() {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    for (ordinal, (root_page, segment)) in capture.pages().iter().zip(&token.segments).enumerate() {
+        let ordinal =
+            u16::try_from(ordinal).map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+        let sealed = segment.persisted_receipt();
+        let [segment_page] = sealed.capture().pages() else {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        };
+        let [frame] = sealed.segment().frames() else {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        };
+        if root_page.ordinal() != ordinal
+            || sealed.capture().source_id() != capture.source_id()
+            || sealed.capture().metadata_revision() != capture.metadata_revision()
+            || sealed.capture().request_set_identity() != root_page.request_identity()
+            || sealed.capture().terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+            || segment_page.ordinal() != 0
+            || segment_page.request_identity() != root_page.request_identity()
+            || segment_page.http_status() != root_page.http_status()
+            || segment_page.body_bytes() != root_page.body_bytes()
+            || segment_page.body_digest() != root_page.body_digest()
+            || segment_page.received_at() != root_page.received_at()
+            || frame.ordinal() != 0
+            || frame.provider_payload_bytes() != root_page.body_bytes()
+            || frame.provider_payload_digest() != root_page.body_digest()
+            || frame.received_at() != root_page.received_at()
+            || frame.source_sequence() != Some(0)
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn single_segment_row_frames(
+    receipt: &SealedProviderCaptureSetReceipt,
+    batch: &ExtractionBatch,
+    row_capture_page_ordinals: &[u16],
+    allowed_page_range: Option<(usize, usize)>,
+) -> Result<Box<[ProviderCaptureRowFrame]>, ProviderCaptureError> {
+    if row_capture_page_ordinals.len() != batch.records().len() {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    let mut mappings = Vec::new();
+    mappings
+        .try_reserve_exact(row_capture_page_ordinals.len())
+        .map_err(|_| ProviderCaptureError::AllocationFailed)?;
+    for (row_ordinal, capture_page_ordinal) in row_capture_page_ordinals.iter().copied().enumerate()
+    {
+        let page_index = usize::from(capture_page_ordinal);
+        if allowed_page_range.is_some_and(|(start, end)| page_index < start || page_index >= end) {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let page = receipt
+            .capture()
+            .pages()
+            .get(page_index)
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        let frame = receipt
+            .segment()
+            .frames()
+            .get(page_index)
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        if page.ordinal() != capture_page_ordinal
+            || frame.ordinal() != u32::from(capture_page_ordinal)
+            || frame.provider_payload_bytes() != page.body_bytes()
+            || frame.provider_payload_digest() != page.body_digest()
+            || frame.received_at() != page.received_at()
+            || frame.source_sequence() != Some(u64::from(capture_page_ordinal))
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        mappings.push(ProviderCaptureRowFrame {
+            canonical_row_ordinal: u32::try_from(row_ordinal)
+                .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?,
+            capture_page_ordinal,
+            segment_ordinal: 0,
+            physical_frame_ordinal: frame.ordinal(),
+            page_body_digest: page.body_digest(),
+            received_at: page.received_at(),
+            source_sequence: frame.source_sequence(),
+        });
+    }
+    Ok(mappings.into_boxed_slice())
+}
+
+fn ordered_segment_row_frames(
+    token: &ProviderOrderedCaptureSegments,
+    batch: &ExtractionBatch,
+    row_capture_page_ordinals: &[u16],
+) -> Result<Box<[ProviderCaptureRowFrame]>, ProviderCaptureError> {
+    if row_capture_page_ordinals.len() != batch.records().len() {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    let mut mappings = Vec::new();
+    mappings
+        .try_reserve_exact(row_capture_page_ordinals.len())
+        .map_err(|_| ProviderCaptureError::AllocationFailed)?;
+    for (row_ordinal, capture_page_ordinal) in row_capture_page_ordinals.iter().copied().enumerate()
+    {
+        let segment_index = usize::from(capture_page_ordinal);
+        let page = token
+            .root_capture
+            .pages()
+            .get(segment_index)
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        let sealed = token
+            .persisted_segment_receipt(segment_index)
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        let [frame] = sealed.segment().frames() else {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        };
+        if page.ordinal() != capture_page_ordinal
+            || frame.ordinal() != 0
+            || frame.provider_payload_bytes() != page.body_bytes()
+            || frame.provider_payload_digest() != page.body_digest()
+            || frame.received_at() != page.received_at()
+            || frame.source_sequence() != Some(0)
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        mappings.push(ProviderCaptureRowFrame {
+            canonical_row_ordinal: u32::try_from(row_ordinal)
+                .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?,
+            capture_page_ordinal,
+            segment_ordinal: capture_page_ordinal,
+            physical_frame_ordinal: 0,
+            page_body_digest: page.body_digest(),
+            received_at: page.received_at(),
+            source_sequence: frame.source_sequence(),
+        });
+    }
+    Ok(mappings.into_boxed_slice())
 }
 
 /// Capture lineage attached to a discovered source object without embedding provider bytes.
@@ -1285,6 +2676,9 @@ pub enum ProviderCaptureError {
     /// Raw response records do not map one-to-one to the provider page receipt.
     #[error("provider capture material does not match its page receipt")]
     MaterialBindingMismatch,
+    /// A sealed whole-capture or request-component receipt does not match its normalized batch.
+    #[error("sealed provider capture does not match its extraction batch and scope")]
+    SealedBindingMismatch,
     /// A bounded allocation for capture framing could not be reserved.
     #[error("provider capture allocation failed")]
     AllocationFailed,
@@ -1506,6 +2900,63 @@ fn request_graph_identity_from_fields<'a>(
     EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
 }
 
+fn event_microbatch_content_digest(
+    source_id: &SourceId,
+    metadata_revision: &MetadataRevision,
+    dataset: &SourceIdentifier,
+    stream_identity: &SourceIdentifier,
+    total_payload_bytes: u64,
+    frames: &[ProviderEventMicrobatchFrameReceipt],
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/provider-event-microbatch-content/v1");
+    hash_field(&mut hash, source_id.as_str().as_bytes());
+    hash_field(
+        &mut hash,
+        metadata_revision.as_source_identifier().as_str().as_bytes(),
+    );
+    hash_field(&mut hash, dataset.as_str().as_bytes());
+    hash_field(&mut hash, stream_identity.as_str().as_bytes());
+    hash.update(total_payload_bytes.to_be_bytes());
+    hash.update((frames.len() as u64).to_be_bytes());
+    for frame in frames {
+        hash.update(frame.ordinal.to_be_bytes());
+        match frame.source_sequence {
+            Some(sequence) => {
+                hash.update([1]);
+                hash.update(sequence.to_be_bytes());
+            }
+            None => hash.update([0]),
+        }
+        match frame.exchange_at {
+            Some(exchange_at) => {
+                hash.update([1]);
+                hash.update(exchange_at.unix_nanos().to_be_bytes());
+            }
+            None => hash.update([0]),
+        }
+        hash.update(frame.payload_bytes.to_be_bytes());
+        hash_digest(&mut hash, frame.payload_digest);
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn event_microbatch_observation_digest(
+    content_digest: EvidenceDigest,
+    frames: &[ProviderEventMicrobatchFrameReceipt],
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/provider-event-microbatch-observation/v1");
+    hash_digest(&mut hash, content_digest);
+    for frame in frames {
+        hash.update(frame.ordinal.to_be_bytes());
+        hash.update(frame.event_id);
+        hash.update(frame.connection_id);
+        hash.update(frame.received_at.unix_nanos().to_be_bytes());
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "all stable capture coordinates are bound"
@@ -1697,23 +3148,55 @@ fn hash_field(hash: &mut Sha256, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use market_squawk_domain::{
         DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
         SourceId, SourceIdentifier, Timestamp,
     };
-    use market_squawk_platform::RawCaptureRecord;
+    use market_squawk_platform::{LocalPaths, RawCaptureRecord};
     use sha2::{Digest as _, Sha256};
+    use static_assertions::assert_not_impl_any;
 
     use super::{
         ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-        ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+        ProviderCaptureScope, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+        SealedProviderCaptureBinding,
     };
     use crate::{
         AvailabilityEvidence, DiscoveryRequest, ExtractionBatch, ExtractionError, ExtractionRecord,
-        ExtractionRequest, SourceObject,
+        ExtractionRequest, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES, ProviderEventMicrobatchMaterial,
+        ProviderEventMicrobatchToken, ProviderNativeLineageBatch,
+        ProviderNativeLineageBatchBuilder, ProviderNativeLineageError,
+        ProviderNativeLineageImplementation, SourceObject,
     };
     use bytes::Bytes;
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+
+    static TEMPORARY_DIRECTORY_ORDINAL: AtomicU64 = AtomicU64::new(0);
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn new() -> Self {
+            let ordinal = TEMPORARY_DIRECTORY_ORDINAL.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "market-squawk-provider-capture-binding-{}-{ordinal}",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn digest(byte: u8) -> EvidenceDigest {
         EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32])
@@ -1949,6 +3432,215 @@ mod tests {
             rebound.request().object().capture_identity(),
             crate::SourceObjectCaptureIdentity::try_from_capture(graph.receipt())?
         );
+
+        let component = &graph.receipt().request_graph_components()[0];
+        let component_identity = crate::SourceObjectCaptureIdentity::Paged {
+            content_digest: component.content_digest(),
+            page_count: component.page_count(),
+            terminal: component.terminal(),
+        };
+        let component_discovery = DiscoveryRequest::try_new(
+            graph.receipt().dataset().clone(),
+            None,
+            NonZeroU16::MIN,
+            Timestamp::from_unix_nanos(1_000),
+        )?;
+        let component_object = SourceObject::try_new_with_capture_identity(
+            graph.receipt().source_id().clone(),
+            graph.receipt().metadata_revision().clone(),
+            &component_discovery,
+            SourceIdentifier::try_from("fixture-component-object")?,
+            SourceIdentifier::try_from("application-json")?,
+            ExactPayloadEvidence::from_content_digest(component.content_digest()),
+            component_identity,
+            EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
+            None,
+            AvailabilityEvidence::LocalFirstObserved {
+                observed_at: Timestamp::from_unix_nanos(3),
+            },
+            Some(component.total_body_bytes()),
+        )?;
+        let component_request = ExtractionRequest::try_new(
+            component_object,
+            NonZeroU32::MIN,
+            NonZeroU64::new(100_000).ok_or("fixture byte bound")?,
+            Timestamp::from_unix_nanos(1_000),
+        )?;
+        let component_batch = ExtractionBatch::try_new(
+            &component_request,
+            vec![ExtractionRecord::try_new(
+                &component_request,
+                SourceIdentifier::try_from("schema-v1")?,
+                record_evidence,
+                Timestamp::from_unix_nanos(2),
+                None,
+                AvailabilityEvidence::LocalFirstObserved {
+                    observed_at: Timestamp::from_unix_nanos(3),
+                },
+                SourceIdentifier::try_from("record-r1")?,
+                None,
+                payload,
+            )?],
+        )?;
+        let temporary = TemporaryDirectory::new();
+        let paths = LocalPaths::prepare(temporary.path())?;
+        let store = paths.sealed_research_journal_store()?;
+        let (graph_expectation, graph_seal_request) = graph.into_component_seal_parts()?;
+        let sealed = graph_seal_request.seal(&store)?;
+        let mut component_tokens = graph_expectation
+            .try_rejoin(sealed)?
+            .try_into_components()?
+            .into_tokens()
+            .into_vec()
+            .into_iter();
+        let component_zero = component_tokens.next().ok_or("component zero")?;
+        let component_one = component_tokens.next().ok_or("component one")?;
+        assert!(component_tokens.next().is_none());
+        let build_native_lineage = |batch: &ExtractionBatch| {
+            let mut builder = ProviderNativeLineageBatchBuilder::try_new(
+                ProviderNativeLineageImplementation::BlsTimeseriesV1,
+                batch,
+            )?;
+            builder.try_push(&"provider-native-row")?;
+            builder.finish()
+        };
+        let wrong_native_lineage = build_native_lineage(&component_batch)?;
+        assert!(matches!(
+            SealedProviderCaptureBinding::try_component(
+                component_one,
+                component_batch.clone(),
+                wrong_native_lineage,
+                vec![0],
+            ),
+            Err(ProviderCaptureError::SealedBindingMismatch)
+        ));
+        let native_lineage = build_native_lineage(&component_batch)?;
+        let component_binding = SealedProviderCaptureBinding::try_component(
+            component_zero,
+            component_batch.clone(),
+            native_lineage,
+            vec![0],
+        )?;
+        assert_eq!(
+            component_binding.scope(),
+            ProviderCaptureScope::RequestGraphComponent { ordinal: 0 }
+        );
+        assert_eq!(component_binding.component_ordinal(), Some(0));
+        assert_eq!(component_binding.record_count(), 1);
+        assert_eq!(component_binding.row_frames()[0].capture_page_ordinal(), 0);
+        component_binding.validate()?;
+        assert_not_impl_any!(SealedProviderCaptureBinding: Clone, serde::Serialize);
+
+        let native_lineage = build_native_lineage(&component_batch)?;
+        let replay_native_digest = build_native_lineage(&component_batch)?.batch_digest();
+        assert_eq!(native_lineage.batch_digest(), replay_native_digest);
+        assert_eq!(native_lineage.schema().version(), 1);
+        assert_eq!(
+            native_lineage.schema().implementation(),
+            ProviderNativeLineageImplementation::BlsTimeseriesV1
+        );
+        assert_eq!(native_lineage.rows().len(), component_batch.records().len());
+        assert_eq!(native_lineage.rows()[0].ordinal(), 0);
+        assert_eq!(
+            native_lineage.rows()[0].canonical_record_digest(),
+            component_batch.records()[0].evidence().content_digest()
+        );
+        assert_eq!(
+            serde_json::from_slice::<String>(native_lineage.rows()[0].semantic_payload())?,
+            "provider-native-row"
+        );
+        native_lineage.validate(&component_batch)?;
+        let incomplete_native_lineage = ProviderNativeLineageBatchBuilder::try_new(
+            ProviderNativeLineageImplementation::BlsTimeseriesV1,
+            &component_batch,
+        )?;
+        assert_eq!(
+            incomplete_native_lineage.finish(),
+            Err(ProviderNativeLineageError::RowCountMismatch {
+                expected: 1,
+                observed: 0,
+            })
+        );
+        let mut oversized_native_lineage = ProviderNativeLineageBatchBuilder::try_new(
+            ProviderNativeLineageImplementation::BlsTimeseriesV1,
+            &component_batch,
+        )?;
+        let oversized_semantics = "x".repeat(MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES);
+        assert_eq!(
+            oversized_native_lineage.try_push(&oversized_semantics),
+            Err(ProviderNativeLineageError::RowByteLimitExceeded {
+                ordinal: 0,
+                max: MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
+            })
+        );
+        assert_not_impl_any!(ProviderNativeLineageBatchBuilder<'static>: Clone, serde::Serialize);
+        assert_not_impl_any!(ProviderNativeLineageBatch: Clone, serde::Serialize);
+
+        let event_records = vec![
+            record(
+                "fixture-live",
+                0,
+                Timestamp::from_unix_nanos(400),
+                vec![41, 42],
+            )?,
+            record(
+                "fixture-live",
+                1,
+                Timestamp::from_unix_nanos(500),
+                vec![51, 52, 53],
+            )?,
+        ];
+        let event_material = ProviderEventMicrobatchMaterial::try_new(
+            SourceId::try_from("fixture-live")?,
+            MetadataRevision::new(SourceIdentifier::try_from("fixture-live-r1")?),
+            SourceIdentifier::try_from("fixture-live-dataset")?,
+            SourceIdentifier::try_from("fixture-live-stream")?,
+            event_records,
+        )?;
+        let expected_event_receipt = event_material.receipt().clone();
+        let (event_expectation, event_seal_request) = event_material.into_sealing_parts();
+        let event_token = event_expectation.try_rejoin(event_seal_request.seal(&store)?)?;
+        assert_eq!(
+            event_token.persisted_receipt().capture(),
+            &expected_event_receipt
+        );
+        assert_eq!(event_token.persisted_receipt().segment().frames().len(), 2);
+        assert_ne!(
+            event_token.persisted_receipt().receipt_digest().bytes(),
+            [0; 32]
+        );
+        assert_not_impl_any!(ProviderEventMicrobatchToken: Clone, serde::Serialize);
+
+        let mismatch_material = ProviderEventMicrobatchMaterial::try_new(
+            SourceId::try_from("fixture-live")?,
+            MetadataRevision::new(SourceIdentifier::try_from("fixture-live-r1")?),
+            SourceIdentifier::try_from("fixture-live-dataset")?,
+            SourceIdentifier::try_from("fixture-live-stream")?,
+            vec![record(
+                "fixture-live",
+                2,
+                Timestamp::from_unix_nanos(600),
+                vec![61],
+            )?],
+        )?;
+        let (mismatch_expectation, _mismatch_request) = mismatch_material.into_sealing_parts();
+        let crosswire_material = ProviderEventMicrobatchMaterial::try_new(
+            SourceId::try_from("fixture-live")?,
+            MetadataRevision::new(SourceIdentifier::try_from("fixture-live-r1")?),
+            SourceIdentifier::try_from("fixture-live-dataset")?,
+            SourceIdentifier::try_from("fixture-live-stream")?,
+            vec![record(
+                "fixture-live",
+                3,
+                Timestamp::from_unix_nanos(700),
+                vec![71],
+            )?],
+        )?;
+        let (_crosswire_expectation, crosswire_request) = crosswire_material.into_sealing_parts();
+        assert!(matches!(
+            mismatch_expectation.try_rejoin(crosswire_request.seal(&store)?),
+            Err(ProviderCaptureError::SealedBindingMismatch)
+        ));
 
         let mut reversed = first.pages().to_vec();
         reversed.reverse();

@@ -5,6 +5,7 @@ use std::mem::size_of;
 
 use market_squawk_domain::{ResearchObservation, RevisionNumber, SourceId};
 
+use super::super::{ExtractionBatch, ProviderNativeLineageBatch, ProviderNativeLineageRow};
 use super::{
     CanonicalObservationFamily, CanonicalObservationPayload, MAX_OBSERVED_REVISION_BATCH_BYTES,
     MAX_OBSERVED_REVISION_BATCH_RECORDS, ObservedProviderOrder, ObservedRevisionError,
@@ -53,6 +54,30 @@ impl ExtractionRevisionEvidence {
         let family = CanonicalObservationFamily::try_from_observation(observation)?;
         let canonical_payload = CanonicalObservationPayload::try_from_observation(observation)?;
         let payload = ObservedSemanticPayload::try_from(&canonical_payload)?;
+        self.into_record_with_payload(family, payload)
+    }
+
+    fn into_record_with_native_lineage(
+        self,
+        observation: &ResearchObservation,
+        native_lineage: &ProviderNativeLineageBatch,
+        native_row: &ProviderNativeLineageRow,
+    ) -> Result<ObservedRevisionRecord, ObservedRevisionError> {
+        let family = CanonicalObservationFamily::try_from_observation(observation)?;
+        let canonical_payload = CanonicalObservationPayload::try_from_observation(observation)?;
+        let payload = ObservedSemanticPayload::try_from_canonical_and_native(
+            &canonical_payload,
+            native_lineage.schema(),
+            native_row,
+        )?;
+        self.into_record_with_payload(family, payload)
+    }
+
+    fn into_record_with_payload(
+        self,
+        family: CanonicalObservationFamily,
+        payload: ObservedSemanticPayload,
+    ) -> Result<ObservedRevisionRecord, ObservedRevisionError> {
         match self {
             Self::ProviderSupplied { version, order } => {
                 ObservedRevisionRecord::try_new(family, version, payload, Some(order))
@@ -80,6 +105,7 @@ impl ExtractionRevisionEvidence {
 pub struct ExtractionRevisionPlan {
     evidence: Box<[ExtractionRevisionEvidence]>,
     retained_bytes: usize,
+    native_lineage_required: bool,
 }
 
 impl ExtractionRevisionPlan {
@@ -125,20 +151,29 @@ impl ExtractionRevisionPlan {
         Ok(Self {
             evidence: evidence.into_boxed_slice(),
             retained_bytes,
+            native_lineage_required: false,
         })
+    }
+
+    /// Constructs an aligned plan whose decisive publication transition requires native lineage.
+    pub fn try_new_with_native_lineage(
+        evidence: Vec<ExtractionRevisionEvidence>,
+    ) -> Result<Self, ObservedRevisionError> {
+        let mut plan = Self::try_new(evidence)?;
+        plan.native_lineage_required = true;
+        Ok(plan)
     }
 
     /// Constructs local content authority for every record in a bounded nonempty batch.
     pub fn locally_observed(record_count: usize) -> Result<Self, ObservedRevisionError> {
-        if record_count == 0 || record_count > MAX_OBSERVED_REVISION_BATCH_RECORDS {
-            return Err(ObservedRevisionError::RecordLimitExceeded {
-                max: MAX_OBSERVED_REVISION_BATCH_RECORDS,
-            });
-        }
-        Self::try_new(vec![
-            ExtractionRevisionEvidence::LocallyObservedContent;
-            record_count
-        ])
+        Self::try_new(locally_observed_evidence(record_count)?)
+    }
+
+    /// Constructs local-content authority that cannot publish without aligned native lineage.
+    pub fn locally_observed_with_native_lineage(
+        record_count: usize,
+    ) -> Result<Self, ObservedRevisionError> {
+        Self::try_new_with_native_lineage(locally_observed_evidence(record_count)?)
     }
 
     /// Returns the exact input cardinality this plan must accompany.
@@ -154,6 +189,11 @@ impl ExtractionRevisionPlan {
     /// Returns checked deep bytes retained before canonical family/payload construction.
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    /// Returns whether this plan rejects the canonical-only publication transition.
+    pub const fn native_lineage_required(&self) -> bool {
+        self.native_lineage_required
     }
 
     /// Returns whether every aligned record uses exact local content as version authority.
@@ -174,6 +214,9 @@ impl ExtractionRevisionPlan {
         source_id: SourceId,
         observations: &[ResearchObservation],
     ) -> Result<ObservedRevisionBatch, ObservedRevisionError> {
+        if self.native_lineage_required {
+            return Err(ObservedRevisionError::Conflict);
+        }
         if observations.len() != self.evidence.len() {
             return Err(ObservedRevisionError::AssignmentCountMismatch {
                 expected: observations.len(),
@@ -189,6 +232,100 @@ impl ExtractionRevisionPlan {
             .collect::<Result<Vec<_>, _>>()?;
         ObservedRevisionBatch::try_new(source_id, records)
     }
+
+    /// Consumes aligned evidence while binding canonical and provider-native row identities.
+    ///
+    /// This is the source-owned handoff for a future durable consumer. The native batch is first
+    /// revalidated against the exact extraction batch, then its code-owned schema and row-local
+    /// native semantic digest enter the matching observed semantic payload. The native batch
+    /// digest, ordinal, and canonical record digest remain exact ingest/alignment identity without
+    /// coupling one row's local revision to unrelated batch membership or capture clocks. Local
+    /// revisions therefore change when either canonical or native row semantics change.
+    ///
+    /// # Errors
+    ///
+    /// Rejects source/cardinality transplants, invalid native alignment, or any canonical family,
+    /// payload, provider-order, or bounded batch invariant.
+    pub fn into_observed_batch_with_native_lineage(
+        self,
+        source_id: SourceId,
+        extraction_batch: &ExtractionBatch,
+        observations: &[ResearchObservation],
+        native_lineage: &ProviderNativeLineageBatch,
+    ) -> Result<ObservedRevisionBatch, ObservedRevisionError> {
+        if !self.native_lineage_required {
+            return Err(ObservedRevisionError::Conflict);
+        }
+        if extraction_batch.request().object().source_id() != &source_id {
+            return Err(ObservedRevisionError::SourceMismatch);
+        }
+        native_lineage
+            .validate(extraction_batch)
+            .map_err(|_| ObservedRevisionError::Conflict)?;
+        if observations.len() != self.evidence.len()
+            || observations.len() != native_lineage.rows().len()
+        {
+            return Err(ObservedRevisionError::AssignmentCountMismatch {
+                expected: observations.len(),
+                observed: self.evidence.len().min(native_lineage.rows().len()),
+            });
+        }
+        for (record, observation) in extraction_batch.records().iter().zip(observations) {
+            let decoded: ResearchObservation = serde_json::from_slice(record.payload())
+                .map_err(|_| ObservedRevisionError::Conflict)?;
+            if &decoded != observation {
+                return Err(ObservedRevisionError::Conflict);
+            }
+        }
+        let mut retained_bytes = checked_batch_fixed_bytes(
+            &source_id,
+            observations.len(),
+            MAX_OBSERVED_REVISION_BATCH_BYTES,
+        )?;
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(observations.len())
+            .map_err(|_| ObservedRevisionError::AllocationFailure)?;
+        for ((evidence, observation), native_row) in self
+            .evidence
+            .into_vec()
+            .into_iter()
+            .zip(observations)
+            .zip(native_lineage.rows())
+        {
+            let record = evidence.into_record_with_native_lineage(
+                observation,
+                native_lineage,
+                native_row,
+            )?;
+            retained_bytes = checked_batch_record_bytes(
+                retained_bytes,
+                &record,
+                MAX_OBSERVED_REVISION_BATCH_BYTES,
+            )?;
+            records.push(record);
+        }
+        ObservedRevisionBatch::try_new(source_id, records)
+    }
+}
+
+fn locally_observed_evidence(
+    record_count: usize,
+) -> Result<Vec<ExtractionRevisionEvidence>, ObservedRevisionError> {
+    if record_count == 0 || record_count > MAX_OBSERVED_REVISION_BATCH_RECORDS {
+        return Err(ObservedRevisionError::RecordLimitExceeded {
+            max: MAX_OBSERVED_REVISION_BATCH_RECORDS,
+        });
+    }
+    let mut evidence = Vec::new();
+    evidence
+        .try_reserve_exact(record_count)
+        .map_err(|_| ObservedRevisionError::AllocationFailure)?;
+    evidence.resize(
+        record_count,
+        ExtractionRevisionEvidence::LocallyObservedContent,
+    );
+    Ok(evidence)
 }
 
 /// One exact observed family/version/payload tuple awaiting durable revision assignment.
@@ -483,28 +620,48 @@ fn checked_batch_input_bytes(
     records: &[ObservedRevisionRecord],
     max_bytes: usize,
 ) -> Result<usize, ObservedRevisionError> {
+    let mut retained = checked_batch_fixed_bytes(source_id, records.len(), max_bytes)?;
+    for record in records {
+        retained = checked_batch_record_bytes(retained, record, max_bytes)?;
+    }
+    Ok(retained)
+}
+
+fn checked_batch_fixed_bytes(
+    source_id: &SourceId,
+    record_count: usize,
+    max_bytes: usize,
+) -> Result<usize, ObservedRevisionError> {
     let record_scratch = size_of::<ObservedRevisionRecord>()
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(size_of::<Vec<usize>>()))
         .and_then(|bytes| bytes.checked_add(size_of::<usize>() * 2))
         .ok_or(ObservedRevisionError::ByteCountOverflow)?;
-    let fixed_records = records
-        .len()
+    let fixed_records = record_count
         .checked_mul(record_scratch)
         .ok_or(ObservedRevisionError::ByteCountOverflow)?;
-    let mut retained = source_id
+    let retained = source_id
         .retained_bytes()
         .checked_add(fixed_records)
         .ok_or(ObservedRevisionError::ByteCountOverflow)?;
-    for record in records {
-        retained = retained
-            .checked_add(record.retained_bytes()?)
-            .ok_or(ObservedRevisionError::ByteCountOverflow)?;
-        if retained > max_bytes {
-            return Err(ObservedRevisionError::BatchByteLimitExceeded { max: max_bytes });
-        }
+    if retained > max_bytes {
+        return Err(ObservedRevisionError::BatchByteLimitExceeded { max: max_bytes });
     }
     Ok(retained)
+}
+
+fn checked_batch_record_bytes(
+    retained_bytes: usize,
+    record: &ObservedRevisionRecord,
+    max_bytes: usize,
+) -> Result<usize, ObservedRevisionError> {
+    let retained_bytes = retained_bytes
+        .checked_add(record.retained_bytes()?)
+        .ok_or(ObservedRevisionError::ByteCountOverflow)?;
+    if retained_bytes > max_bytes {
+        return Err(ObservedRevisionError::BatchByteLimitExceeded { max: max_bytes });
+    }
+    Ok(retained_bytes)
 }
 
 fn record_identity_cmp(left: &ObservedRevisionRecord, right: &ObservedRevisionRecord) -> Ordering {

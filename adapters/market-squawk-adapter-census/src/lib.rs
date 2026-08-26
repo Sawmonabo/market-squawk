@@ -24,6 +24,7 @@ pub use discovery::{
 pub use doctor::{
     CENSUS_DOCTOR_MAX_RESPONSE_BYTES, CENSUS_DOCTOR_TIMEOUT, CensusDoctorOutput,
     CensusDoctorRateHeaderEvidence, CensusDoctorReadiness, CensusDoctorReport, CensusDoctorScope,
+    CensusPendingDoctorSeal,
 };
 pub use policy::{CensusRateDeclarationError, census_provider_rate_declaration};
 pub use query::{
@@ -48,8 +49,9 @@ pub use runtime::{
 pub use source::{
     CensusAnnotatedMissingRule, CensusAnnotationMatch, CensusCapturedData, CensusCapturedDiscovery,
     CensusDatasetAcquisition, CensusDatasetContract, CensusDiscoveryOutput,
-    CensusEffectiveTimePolicy, CensusExtractionOutput, CensusMetadataBundle, CensusSource,
-    CensusSourceConfig, CensusSourceError, CensusSourceTelemetry, CensusVariableMapping,
+    CensusEffectiveTimePolicy, CensusMetadataBundle, CensusPendingDiscovery,
+    CensusSealedDiscoveryAdmission, CensusSealedExtractionOutput, CensusSource, CensusSourceConfig,
+    CensusSourceError, CensusSourceTelemetry, CensusVariableMapping,
     MAX_CENSUS_ANNOTATED_MISSING_RULES, MAX_CENSUS_ANNOTATION_RULE_BYTES,
     MAX_CENSUS_ANNOTATIONS_PER_RULE, MAX_CENSUS_CONFIGURED_DATASETS, census_api_endpoint_rules,
 };

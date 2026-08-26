@@ -7,6 +7,7 @@ use market_squawk_domain::{
 };
 use rust_decimal::Decimal;
 
+use super::super::{ProviderNativeLineageRow, ProviderNativeLineageSchema};
 use super::ObservedRevisionError;
 use super::evidence::ObservedSemanticPayload;
 
@@ -15,6 +16,7 @@ pub(super) mod serializer;
 use serializer::{PitV1CanonicalEncoder, PitV1EncodingControl, PitV1EncodingError};
 
 const PIT_PAYLOAD_DOMAIN: &str = "market-squawk/pit/payload";
+const PIT_PROVIDER_NATIVE_PAYLOAD_DOMAIN: &str = "market-squawk/pit/provider-native-payload";
 
 /// Exact PIT-v2 payload bytes excluding provenance, time, and assigned revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -412,6 +414,38 @@ impl TryFrom<&CanonicalObservationPayload> for ObservedSemanticPayload {
     fn try_from(value: &CanonicalObservationPayload) -> Result<Self, Self::Error> {
         Self::try_from_bytes(value.exact_bytes())
     }
+}
+
+impl ObservedSemanticPayload {
+    pub(super) fn try_from_canonical_and_native(
+        canonical: &CanonicalObservationPayload,
+        schema: ProviderNativeLineageSchema,
+        native_row: &ProviderNativeLineageRow,
+    ) -> Result<Self, ObservedRevisionError> {
+        let mut control = NoopEncodingControl;
+        let (exact_bytes, _) = encode_exact(
+            PIT_PROVIDER_NATIVE_PAYLOAD_DOMAIN,
+            "semantic_payload",
+            super::MAX_OBSERVED_SEMANTIC_PAYLOAD_BYTES,
+            &mut control,
+            &|encoder| {
+                encoder.bytes(canonical.exact_bytes())?;
+                encoder.u16(schema.version())?;
+                encoder.u8(schema.implementation().tag())?;
+                encode_digest(encoder, schema.fingerprint())?;
+                encode_digest(encoder, native_row.semantic_payload_digest())
+            },
+        )?;
+        Self::try_from_bytes(&exact_bytes)
+    }
+}
+
+fn encode_digest(
+    encoder: &mut PitV1CanonicalEncoder<'_>,
+    digest: EvidenceDigest,
+) -> Result<(), PitV1EncodingError> {
+    encoder.u8(digest_algorithm_tag(digest.algorithm()))?;
+    encoder.bytes(&digest.bytes())
 }
 
 pub(super) fn encode_exact<F>(

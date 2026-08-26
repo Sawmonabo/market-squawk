@@ -3,7 +3,10 @@
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
-use market_squawk_sources::ProviderCaptureMaterial;
+use market_squawk_sources::{
+    ProviderCaptureMaterial, ProviderCaptureSealExpectation, ProviderCaptureSealRequest,
+    ProviderWholeCaptureToken, RejoinedProviderCapture, SealedProviderCaptureMaterial,
+};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -259,10 +262,11 @@ impl BeaDoctorReceipt {
     ///
     /// The returned evidence is non-serializable in-process readiness. It cannot restore itself,
     /// mint an immutable dataset generation, or attest a point-in-time query.
-    pub fn bind_sealed(
+    fn bind_sealed(
         self,
         binding: &BeaSourceBinding,
         sealed: &BeaSealedAcquisitionReceipt,
+        capture_token: ProviderWholeCaptureToken,
     ) -> Result<BeaDoctorAdmissionEvidence, BeaDoctorError> {
         if self.source_binding_digest != binding.binding_digest()
             || self.quota_declaration_digest != binding.quota_declaration_digest()
@@ -353,6 +357,7 @@ impl BeaDoctorReceipt {
             missing_rows: self.missing_rows,
             completeness: self.data_completeness,
             admission_digest,
+            capture_token,
         })
     }
 
@@ -416,7 +421,7 @@ impl BeaDoctorReceipt {
 ///
 /// This type can gate provider work in the current process. It deliberately has no restore or
 /// publication constructor and contains no manifest or immutable-generation coordinate.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct BeaDoctorAdmissionEvidence {
     source_id: SourceId,
     metadata_revision: MetadataRevision,
@@ -433,6 +438,7 @@ pub struct BeaDoctorAdmissionEvidence {
     missing_rows: Option<u64>,
     completeness: BeaCompleteness,
     admission_digest: EvidenceDigest,
+    capture_token: ProviderWholeCaptureToken,
 }
 
 impl BeaDoctorAdmissionEvidence {
@@ -450,6 +456,19 @@ impl BeaDoctorAdmissionEvidence {
             || self.quota_declaration_digest != binding.quota_declaration_digest()
             || &self.dataset_id != dataset_id
             || &self.analytical_dataset_id != analytical_dataset_id
+            || self
+                .capture_token
+                .persisted_receipt()
+                .receipt_digest()
+                .bytes()
+                == [0; 32]
+            || self.capture_token.persisted_receipt().capture().source_id() != &self.source_id
+            || self
+                .capture_token
+                .persisted_receipt()
+                .capture()
+                .metadata_revision()
+                != &self.metadata_revision
         {
             return Err(BeaDoctorError::InvalidAuthority);
         }
@@ -542,6 +561,39 @@ pub struct BeaDoctorRun {
     acquisition: BeaDatasetAcquisition,
 }
 
+/// Exact doctor evidence and private witness awaiting the common physical seal result.
+#[derive(Debug)]
+pub struct BeaPendingDoctorSeal {
+    receipt: BeaDoctorReceipt,
+    evidence: crate::BeaDatasetEvidence,
+    expectation: ProviderCaptureSealExpectation,
+}
+
+impl BeaPendingDoctorSeal {
+    /// Rejoins only the opaque result produced from this doctor's exact seal request.
+    pub fn try_rejoin(
+        self,
+        binding: &BeaSourceBinding,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<BeaDoctorAdmissionEvidence, BeaDoctorError> {
+        let capture_token = match self
+            .expectation
+            .try_rejoin(sealed)
+            .map_err(|_| BeaDoctorError::InvalidAuthority)?
+        {
+            RejoinedProviderCapture::Whole(token) => token,
+            RejoinedProviderCapture::Components(_) => {
+                return Err(BeaDoctorError::InvalidAuthority);
+            }
+        };
+        let sealed_acquisition =
+            BeaSealedAcquisitionReceipt::try_from_token(self.evidence, &capture_token)
+                .map_err(|_| BeaDoctorError::InvalidEvidence)?;
+        self.receipt
+            .bind_sealed(binding, &sealed_acquisition, capture_token)
+    }
+}
+
 impl BeaDoctorRun {
     /// Binds a validated acquisition into one complete diagnostic doctor result.
     pub(crate) fn try_new(
@@ -576,19 +628,20 @@ impl BeaDoctorRun {
         &self.acquisition
     }
 
-    /// Consumes the run into evidence and one exact request graph for the shared `MSJ1` sealer.
+    /// Splits the run into a private witness expectation and the sole common seal request.
     pub fn into_sealing_parts(
         self,
-    ) -> Result<
-        (
-            BeaDoctorReceipt,
-            crate::BeaDatasetEvidence,
-            ProviderCaptureMaterial,
-        ),
-        BeaSourceError,
-    > {
+    ) -> Result<(BeaPendingDoctorSeal, ProviderCaptureSealRequest), BeaSourceError> {
         let (evidence, graph) = self.acquisition.into_sealing_parts()?;
-        Ok((self.receipt, evidence, graph))
+        let (expectation, request) = graph.into_whole_seal_parts();
+        Ok((
+            BeaPendingDoctorSeal {
+                receipt: self.receipt,
+                evidence,
+                expectation,
+            },
+            request,
+        ))
     }
 }
 

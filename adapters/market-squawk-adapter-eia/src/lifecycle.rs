@@ -4,8 +4,10 @@ use market_squawk_domain::{
     EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    ExtractionAuthority, ProviderCaptureMaterial, ProviderCaptureSetReceipt,
-    SealedProviderCaptureSetReceipt, SourceMetadata, SourceMetadataProvider,
+    ExtractionAuthority, ProviderCaptureMaterial, ProviderCaptureSealExpectation,
+    ProviderCaptureSealRequest, ProviderCaptureSetReceipt, ProviderWholeCaptureToken,
+    RejoinedProviderCapture, SealedProviderCaptureMaterial, SealedProviderCaptureSetReceipt,
+    SourceMetadata, SourceMetadataProvider,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -468,21 +470,50 @@ pub struct EiaDoctorOutput {
     captures: Box<[ProviderCaptureMaterial]>,
 }
 
+/// Exact doctor activation candidate and private witnesses awaiting common seal results.
+#[derive(Debug)]
+pub struct EiaPendingActivation {
+    candidate: EiaActivationCandidate,
+    expectations: Box<[ProviderCaptureSealExpectation]>,
+}
+
 impl EiaDoctorOutput {
     /// Returns redacted doctor evidence before consuming capture material.
     pub const fn report(&self) -> &EiaDoctorReport {
         &self.candidate.report
     }
 
-    /// Consumes the indivisible activation handoff.
-    pub fn into_parts(self) -> (EiaActivationCandidate, Box<[ProviderCaptureMaterial]>) {
-        (self.candidate, self.captures)
+    /// Splits every doctor material into an ordered private witness and common seal request.
+    pub fn into_sealing_parts(
+        self,
+    ) -> Result<(EiaPendingActivation, Box<[ProviderCaptureSealRequest]>), EiaLifecycleError> {
+        let capture_count = self.captures.len();
+        let mut expectations = Vec::new();
+        expectations
+            .try_reserve_exact(capture_count)
+            .map_err(|_| EiaLifecycleError::InvalidEvidence)?;
+        let mut requests = Vec::new();
+        requests
+            .try_reserve_exact(capture_count)
+            .map_err(|_| EiaLifecycleError::InvalidEvidence)?;
+        for capture in self.captures.into_vec() {
+            let (expectation, request) = capture.into_whole_seal_parts();
+            expectations.push(expectation);
+            requests.push(request);
+        }
+        Ok((
+            EiaPendingActivation {
+                candidate: self.candidate,
+                expectations: expectations.into_boxed_slice(),
+            },
+            requests.into_boxed_slice(),
+        ))
     }
 }
 
 /// Non-serializable candidate bound to freshly acquired metadata and a real data probe.
 #[derive(Debug)]
-pub struct EiaActivationCandidate {
+pub(crate) struct EiaActivationCandidate {
     transport: EiaSourceTransport,
     contract: EiaDatasetContract,
     report: EiaDoctorReport,
@@ -543,7 +574,7 @@ pub async fn run_eia_doctor(
     let publication = profile.publication_mode();
     let contract = profile.freeze(route_metadata, facet_catalogs)?;
     let probe = transport
-        .probe_data(authority, &contract, deadline, cancellation)
+        .probe_data(authority, &contract, deadline, cancellation.clone())
         .await?;
     let (_dataset, page, probe_raw, probe_capture) = probe.into_parts();
     response_bytes = response_bytes
@@ -598,11 +629,12 @@ pub async fn run_eia_doctor(
         return Err(EiaLifecycleError::InvalidEvidence);
     }
     let effective = authorization.effective_interval();
-    let doctor_capture_receipts = captures
-        .iter()
-        .map(|capture| capture.receipt().clone())
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
+    let mut doctor_capture_receipts = Vec::new();
+    doctor_capture_receipts
+        .try_reserve_exact(captures.len())
+        .map_err(|_| EiaLifecycleError::InvalidEvidence)?;
+    doctor_capture_receipts.extend(captures.iter().map(|capture| capture.receipt().clone()));
+    let doctor_capture_receipts = doctor_capture_receipts.into_boxed_slice();
     let mut report = EiaDoctorReport {
         source_id: source_metadata.source_id().clone(),
         metadata_revision: source_metadata.revision().clone(),
@@ -638,15 +670,44 @@ pub async fn run_eia_doctor(
         doctor_capture_receipts,
     };
     report.report_digest = report.compute_digest()?;
-    let candidate = EiaActivationCandidate {
-        transport,
-        contract,
-        report,
-    };
-    Ok(EiaDoctorOutput {
-        candidate,
+    let output = EiaDoctorOutput {
+        candidate: EiaActivationCandidate {
+            transport,
+            contract,
+            report,
+        },
         captures: captures.into_boxed_slice(),
-    })
+    };
+    if cancellation.is_cancelled() {
+        return Err(EiaLifecycleError::Cancelled);
+    }
+    let completed_at = crate::transport::system_timestamp()?;
+    if completed_at >= deadline {
+        return Err(EiaLifecycleError::InvalidEvidence);
+    }
+    output.candidate.transport.validate_authority(authority)?;
+    let current_metadata = output.candidate.transport.metadata();
+    let current_authorization = current_metadata.authorization();
+    if current_metadata.source_id() != output.candidate.report.source_id()
+        || current_metadata.revision() != output.candidate.report.metadata_revision()
+        || current_metadata
+            .revision_evidence()
+            .payload_evidence()
+            .content_digest()
+            != output.candidate.report.source_metadata_payload_digest()
+        || current_authorization.basis().as_source_identifier()
+            != output.candidate.report.authorization_subject()
+        || current_authorization.evidence().content_digest()
+            != output.candidate.report.authorization_evidence()
+        || current_authorization.effective_interval().starts_at()
+            != output.candidate.report.authorization_starts_at()
+        || current_authorization.effective_interval().ends_at()
+            != output.candidate.report.authorization_ends_at()
+        || !current_authorization.is_effective_at(completed_at)
+    {
+        return Err(EiaLifecycleError::InvalidEvidence);
+    }
+    Ok(output)
 }
 
 /// Activated, credential-bearing provider boundary. Secrets remain solely inside its transport.
@@ -654,7 +715,7 @@ pub struct EiaActivatedProvider {
     transport: EiaSourceTransport,
     contract: EiaDatasetContract,
     report: EiaDoctorReport,
-    sealed_doctor_captures: Box<[SealedProviderCaptureSetReceipt]>,
+    doctor_capture_tokens: Box<[ProviderWholeCaptureToken]>,
 }
 
 impl std::fmt::Debug for EiaActivatedProvider {
@@ -671,20 +732,17 @@ impl std::fmt::Debug for EiaActivatedProvider {
 impl EiaActivatedProvider {
     /// Activates only after every doctor response has an immutable physical receipt.
     pub fn try_activate(
-        candidate: EiaActivationCandidate,
-        sealed_doctor_captures: &[SealedProviderCaptureSetReceipt],
+        pending: EiaPendingActivation,
+        sealed_doctor_captures: Vec<SealedProviderCaptureMaterial>,
     ) -> Result<Self, EiaLifecycleError> {
         let activated_at = crate::transport::system_timestamp()?;
+        let EiaPendingActivation {
+            candidate,
+            expectations,
+        } = pending;
         candidate.report.validate()?;
-        if sealed_doctor_captures.len() != candidate.report.doctor_capture_receipts().len()
-            || sealed_doctor_captures
-                .iter()
-                .zip(candidate.report.doctor_capture_receipts())
-                .any(|(sealed, expected)| {
-                    sealed.capture() != expected
-                        || sealed.receipt_digest().bytes() == [0; 32]
-                        || sealed.segment().physical_receipt_digest().bytes() == [0; 32]
-                })
+        if sealed_doctor_captures.len() != expectations.len()
+            || sealed_doctor_captures.len() != candidate.report.doctor_capture_receipts().len()
             || candidate.transport.metadata().source_id() != candidate.report.source_id()
             || candidate.transport.metadata().revision() != candidate.report.metadata_revision()
             || candidate
@@ -736,16 +794,43 @@ impl EiaActivatedProvider {
         {
             return Err(EiaLifecycleError::InvalidEvidence);
         }
-        let mut retained_doctor_seals = Vec::new();
-        retained_doctor_seals
+        let mut doctor_capture_tokens = Vec::new();
+        doctor_capture_tokens
             .try_reserve_exact(sealed_doctor_captures.len())
             .map_err(|_| EiaLifecycleError::InvalidEvidence)?;
-        retained_doctor_seals.extend_from_slice(sealed_doctor_captures);
+        for (expectation, sealed) in expectations
+            .into_vec()
+            .into_iter()
+            .zip(sealed_doctor_captures)
+        {
+            let token = match expectation
+                .try_rejoin(sealed)
+                .map_err(|_| EiaLifecycleError::InvalidEvidence)?
+            {
+                RejoinedProviderCapture::Whole(token) => token,
+                RejoinedProviderCapture::Components(_) => {
+                    return Err(EiaLifecycleError::InvalidEvidence);
+                }
+            };
+            doctor_capture_tokens.push(token);
+        }
+        if doctor_capture_tokens
+            .iter()
+            .zip(candidate.report.doctor_capture_receipts())
+            .any(|(token, expected)| {
+                let sealed = token.persisted_receipt();
+                sealed.capture() != expected
+                    || sealed.receipt_digest().bytes() == [0; 32]
+                    || sealed.segment().physical_receipt_digest().bytes() == [0; 32]
+            })
+        {
+            return Err(EiaLifecycleError::InvalidEvidence);
+        }
         let activated = Self {
             transport: candidate.transport,
             contract: candidate.contract,
             report: candidate.report,
-            sealed_doctor_captures: retained_doctor_seals.into_boxed_slice(),
+            doctor_capture_tokens: doctor_capture_tokens.into_boxed_slice(),
         };
         activated.ensure_current_at(crate::transport::system_timestamp()?)?;
         Ok(activated)
@@ -766,9 +851,19 @@ impl EiaActivatedProvider {
         &self.report
     }
 
-    /// Returns the actual immutable doctor receipts retained by the active provider.
-    pub fn sealed_doctor_captures(&self) -> &[SealedProviderCaptureSetReceipt] {
-        &self.sealed_doctor_captures
+    /// Returns the number of exact doctor whole-capture tokens retained by activation.
+    pub fn doctor_capture_count(&self) -> usize {
+        self.doctor_capture_tokens.len()
+    }
+
+    /// Returns persisted evidence for one doctor token; it cannot remint live authority.
+    pub fn sealed_doctor_capture(
+        &self,
+        ordinal: usize,
+    ) -> Option<&SealedProviderCaptureSetReceipt> {
+        self.doctor_capture_tokens
+            .get(ordinal)
+            .map(ProviderWholeCaptureToken::persisted_receipt)
     }
 
     /// Returns whether the selected fields were admitted for canonical macro publication.
@@ -820,45 +915,62 @@ impl EiaActivatedProvider {
         &self,
         authority: &ExtractionAuthority,
         rejoin: EiaDataPageSealRejoin,
-        sealed_page: SealedProviderCaptureSetReceipt,
+        sealed_page: SealedProviderCaptureMaterial,
         deadline: Timestamp,
+        cancellation: &CancellationToken,
     ) -> Result<EiaDataPageTransition, EiaLifecycleError> {
         let observed_at = crate::transport::system_timestamp()?;
+        if cancellation.is_cancelled() {
+            return Err(EiaLifecycleError::Cancelled);
+        }
         self.ensure_transition_deadline(observed_at, deadline)?;
+        self.transport.validate_authority(authority)?;
         self.ensure_current_at(rejoin.root_journal_rejoin().capture_receipt().received_at())?;
         let transition =
             self.transport
                 .rejoin_data_page(authority, &self.contract, rejoin, sealed_page)?;
-        self.ensure_transition_deadline(crate::transport::system_timestamp()?, deadline)?;
+        if cancellation.is_cancelled() {
+            return Err(EiaLifecycleError::Cancelled);
+        }
+        let completed_at = crate::transport::system_timestamp()?;
+        self.ensure_transition_deadline(completed_at, deadline)?;
+        self.transport.validate_authority(authority)?;
         Ok(transition)
     }
 
-    /// Consumes the complete terminal retrieval and its actual combined shared-journal seal.
+    /// Consumes the complete terminal retrieval and its ordered standalone physical page seals.
     pub fn publication_candidate(
         &self,
+        authority: &ExtractionAuthority,
         retrieval: EiaDataRetrievalSealRejoin,
-        sealed_capture: SealedProviderCaptureSetReceipt,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
     ) -> Result<crate::EiaPublicationCandidate, EiaLifecycleError> {
-        let normalization_admitted_at = crate::transport::system_timestamp()?;
-        self.ensure_current_at(normalization_admitted_at)?;
-        let capture_pages = sealed_capture.capture().pages();
+        let operation_at = crate::transport::system_timestamp()?;
+        if cancellation.is_cancelled() {
+            return Err(EiaLifecycleError::Cancelled);
+        }
+        self.ensure_transition_deadline(operation_at, deadline)?;
+        self.transport.validate_authority(authority)?;
+        let capture_pages = retrieval.capture_receipt().pages();
         if capture_pages.is_empty()
             || capture_pages
                 .iter()
-                .any(|page| page.received_at() > normalization_admitted_at)
+                .any(|page| page.received_at() > operation_at)
         {
             return Err(EiaLifecycleError::InvalidEvidence);
         }
         for page in capture_pages {
             self.ensure_current_at(page.received_at())?;
         }
-        let candidate = crate::EiaPublicationCandidate::try_new(
-            self,
-            retrieval,
-            sealed_capture,
-            normalization_admitted_at,
-        )?;
-        self.ensure_current_at(crate::transport::system_timestamp()?)?;
+        let candidate = crate::EiaPublicationCandidate::try_new(self, retrieval, operation_at)?;
+        if cancellation.is_cancelled() {
+            return Err(EiaLifecycleError::Cancelled);
+        }
+        let completed_at = crate::transport::system_timestamp()?;
+        self.ensure_transition_deadline(completed_at, deadline)?;
+        self.transport.validate_authority(authority)?;
+        self.ensure_current_at(completed_at)?;
         Ok(candidate)
     }
 
@@ -928,12 +1040,13 @@ impl EiaActivatedProvider {
             || observed_at >= self.report.expires_at()
             || required_data_pages(self.report.provider_total(), self.contract.query().length())?
                 > u64::from(self.transport.max_pages())
-            || self.sealed_doctor_captures.len() != self.report.doctor_capture_receipts().len()
+            || self.doctor_capture_tokens.len() != self.report.doctor_capture_receipts().len()
             || self
-                .sealed_doctor_captures
+                .doctor_capture_tokens
                 .iter()
                 .zip(self.report.doctor_capture_receipts())
-                .any(|(sealed, expected)| {
+                .any(|(token, expected)| {
+                    let sealed = token.persisted_receipt();
                     sealed.capture() != expected
                         || sealed.receipt_digest().bytes() == [0; 32]
                         || sealed.segment().physical_receipt_digest().bytes() == [0; 32]
@@ -954,6 +1067,9 @@ impl SourceMetadataProvider for EiaActivatedProvider {
 /// Provider-local activation failure with no credential-bearing context.
 #[derive(Debug, Error)]
 pub enum EiaLifecycleError {
+    /// Caller cancellation won before the one-shot transition completed.
+    #[error("EIA lifecycle transition was cancelled")]
+    Cancelled,
     /// Doctor, capture, or activation evidence did not bind exactly.
     #[error("invalid EIA activation evidence")]
     InvalidEvidence,

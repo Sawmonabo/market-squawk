@@ -4,7 +4,9 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     CURRENT_RESEARCH_RECORD_SCHEMA, ExtractionBatch, ExtractionContentIdentity,
-    ExtractionRevisionPlan, ProviderCaptureMaterial, ProviderCaptureTerminalDisposition,
+    ExtractionRevisionPlan, ProviderCaptureScope, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
+    ProviderNativeLineageImplementation, ProviderWholeCaptureToken, SealedProviderCaptureBinding,
     SealedProviderCaptureSetReceipt, SourceMetadata, SourceObjectCaptureIdentity,
 };
 use serde::Serialize;
@@ -146,10 +148,11 @@ impl CensusActivationPlan {
 /// Provider readiness candidate bound to the exact doctor capture.
 ///
 /// This is activation evidence only. It grants no manifest, restart, or query authority.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct CensusActivationCandidate {
     plan: CensusActivationPlan,
+    doctor: CensusDoctorReport,
+    capture_token: ProviderWholeCaptureToken,
     doctor_report_digest: EvidenceDigest,
     doctor_capture_receipt_digest: EvidenceDigest,
     activated_at: Timestamp,
@@ -161,12 +164,13 @@ impl CensusActivationCandidate {
     /// Admits one current doctor report only after its exact raw response was sealed.
     pub(crate) fn try_new(
         plan: CensusActivationPlan,
-        doctor: &CensusDoctorReport,
-        sealed_capture: &SealedProviderCaptureSetReceipt,
+        doctor: CensusDoctorReport,
+        capture_token: ProviderWholeCaptureToken,
         activated_at: Timestamp,
     ) -> Result<Self, CensusSourceError> {
+        let sealed_capture = capture_token.persisted_receipt();
         plan.validate()?;
-        validate_doctor_capture(&plan, doctor, sealed_capture)?;
+        validate_doctor_capture(&plan, &doctor, sealed_capture)?;
         let expires_at = doctor
             .checked_at()
             .checked_add_nanos(CENSUS_DOCTOR_ACTIVATION_TTL_NANOS)
@@ -188,6 +192,8 @@ impl CensusActivationCandidate {
         )?;
         Ok(Self {
             plan,
+            doctor,
+            capture_token,
             doctor_report_digest,
             doctor_capture_receipt_digest,
             activated_at,
@@ -196,15 +202,11 @@ impl CensusActivationCandidate {
         })
     }
 
-    /// Reopens doctor and sealed-capture evidence at the exact operation time.
-    pub fn validate(
-        &self,
-        doctor: &CensusDoctorReport,
-        sealed_capture: &SealedProviderCaptureSetReceipt,
-        operation_at: Timestamp,
-    ) -> Result<(), CensusSourceError> {
+    /// Reopens the retained doctor and exact live capture token at trusted operation time.
+    pub fn validate(&self, operation_at: Timestamp) -> Result<(), CensusSourceError> {
+        let sealed_capture = self.capture_token.persisted_receipt();
         self.plan.validate()?;
-        validate_doctor_capture(&self.plan, doctor, sealed_capture)?;
+        validate_doctor_capture(&self.plan, &self.doctor, sealed_capture)?;
         let expected = digest_serialized(
             b"market-squawk/census-activation-candidate/v4",
             &(
@@ -215,7 +217,7 @@ impl CensusActivationCandidate {
                 self.expires_at,
             ),
         )?;
-        if doctor.report_digest() != self.doctor_report_digest
+        if self.doctor.report_digest() != self.doctor_report_digest
             || sealed_capture.receipt_digest() != self.doctor_capture_receipt_digest
             || operation_at < self.activated_at
             || operation_at >= self.expires_at
@@ -367,6 +369,9 @@ pub struct CensusCanonicalObservationBinding {
     canonical_ordinal: u64,
     dataset: CensusDataset,
     provider_variable: SourceIdentifier,
+    variable_label: String,
+    concept: Option<String>,
+    group: Option<SourceIdentifier>,
     geography: CensusGeographyValue,
     predicates: Box<[CensusPredicateValue]>,
     reported_time: Option<CensusReportedTime>,
@@ -402,6 +407,9 @@ impl CensusCanonicalObservationBinding {
             canonical_ordinal,
             dataset: observation.dataset().clone(),
             provider_variable: observation.variable().clone(),
+            variable_label: observation.label().to_owned(),
+            concept: observation.concept().map(str::to_owned),
+            group: observation.group().cloned(),
             geography: observation.geography().clone(),
             predicates: observation.predicates().to_vec().into_boxed_slice(),
             reported_time: observation.reported_time().cloned(),
@@ -434,6 +442,21 @@ impl CensusCanonicalObservationBinding {
     /// Returns the exact provider variable.
     pub const fn provider_variable(&self) -> &SourceIdentifier {
         &self.provider_variable
+    }
+
+    /// Returns the exact label of the selected provider variable.
+    pub fn variable_label(&self) -> &str {
+        &self.variable_label
+    }
+
+    /// Returns the exact provider concept attached to the selected variable, when present.
+    pub fn concept(&self) -> Option<&str> {
+        self.concept.as_deref()
+    }
+
+    /// Returns the exact provider group attached to the selected variable, when present.
+    pub const fn group(&self) -> Option<&SourceIdentifier> {
+        self.group.as_ref()
     }
 
     /// Returns the exact row geography.
@@ -654,35 +677,49 @@ impl CensusPublicationPlan {
 #[derive(Debug)]
 pub struct CensusPublicationCandidate {
     plan: CensusPublicationPlan,
+    activation: CensusActivationCandidate,
     activation_candidate_digest: EvidenceDigest,
     canonical_schema: SourceIdentifier,
     canonical_schema_version: SchemaVersion,
     canonical_schema_fingerprint: EvidenceDigest,
-    batch: ExtractionBatch,
-    sealed_capture: SealedProviderCaptureSetReceipt,
+    sealed_capture_binding: SealedProviderCaptureBinding,
     candidate_digest: EvidenceDigest,
 }
 
 impl CensusPublicationCandidate {
     /// Binds canonical evidence to the actual shared sealed-journal receipt.
-    pub fn try_new(
+    pub(crate) fn try_new(
         plan: CensusPublicationPlan,
-        batch: ExtractionBatch,
-        sealed_capture: SealedProviderCaptureSetReceipt,
-        activation: &CensusActivationCandidate,
+        sealed_capture_binding: SealedProviderCaptureBinding,
+        activation: CensusActivationCandidate,
     ) -> Result<Self, CensusSourceError> {
         plan.validate()?;
-        validate_publication_activation_binding(&plan, activation)?;
-        validate_sealed_capture(&plan, &sealed_capture, activation)?;
+        validate_publication_activation_binding(&plan, &activation)?;
+        let batch = sealed_capture_binding.batch();
+        let native_lineage = sealed_capture_binding.native_lineage();
+        if sealed_capture_binding.scope() != ProviderCaptureScope::Whole
+            || native_lineage.schema().implementation()
+                != ProviderNativeLineageImplementation::CensusTabularV1
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        let sealed_capture = sealed_capture_binding
+            .persisted_segment_receipt(0)
+            .ok_or(CensusSourceError::Protocol)?;
+        validate_sealed_capture(&plan, sealed_capture, &activation)?;
         let canonical_schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
             .map_err(|_| CensusSourceError::Protocol)?;
         let canonical_schema_version = SchemaVersion::CURRENT;
         let canonical_schema_fingerprint =
             canonical_schema_fingerprint(&canonical_schema, canonical_schema_version)?;
-        validate_bound_batch(&plan, &canonical_schema, &batch, &sealed_capture)?;
+        validate_bound_batch(&plan, &canonical_schema, &batch, sealed_capture)?;
+        native_lineage
+            .validate(&batch)
+            .map_err(|_| CensusSourceError::Protocol)?;
         let sealed_capture_receipt_digest = sealed_capture.receipt_digest();
+        let native_schema = native_lineage.schema();
         let candidate_digest = digest_serialized(
-            b"market-squawk/census-publication-candidate/v5",
+            b"market-squawk/census-publication-candidate/v6",
             &(
                 plan.publication_identity,
                 activation.candidate_digest,
@@ -691,44 +728,64 @@ impl CensusPublicationCandidate {
                 canonical_schema_fingerprint,
                 plan.extraction_content_digest,
                 sealed_capture_receipt_digest,
+                native_schema.version(),
+                native_schema.fingerprint(),
+                native_lineage.batch_digest(),
             ),
         )?;
+        let activation_candidate_digest = activation.candidate_digest;
         Ok(Self {
             plan,
-            activation_candidate_digest: activation.candidate_digest,
+            activation,
+            activation_candidate_digest,
             canonical_schema,
             canonical_schema_version,
             canonical_schema_fingerprint,
-            batch,
-            sealed_capture,
+            sealed_capture_binding,
             candidate_digest,
         })
     }
 
     /// Provides one consuming handoff from Census extraction into common ingest inputs.
     ///
-    /// Activation readiness is rechecked at `operation_at` before ownership leaves this adapter.
+    /// Activation readiness is rechecked from a trusted internal clock before ownership leaves.
     /// The returned revision plan contains evidence only; shared revision and publication
     /// authority remain the global components that deduplicate, assign revisions, or commit a
     /// generation.
     pub fn try_into_root_publication_parts(
         self,
-        activation: &CensusActivationCandidate,
-        operation_at: Timestamp,
     ) -> Result<
         (
-            ExtractionBatch,
-            SealedProviderCaptureSetReceipt,
+            SealedProviderCaptureBinding,
             ExtractionRevisionPlan,
+            CensusActivationCandidate,
         ),
         CensusSourceError,
     > {
-        if self.activation_candidate_digest != activation.candidate_digest {
+        let operation_at = crate::http::system_timestamp()?;
+        if self.activation_candidate_digest != self.activation.candidate_digest {
             return Err(CensusSourceError::InvalidConfiguration);
         }
-        validate_publication_readiness(&self.plan, activation, operation_at)?;
-        let revisions = ExtractionRevisionPlan::locally_observed(self.batch.records().len())?;
-        Ok((self.batch, self.sealed_capture, revisions))
+        self.activation.validate(operation_at)?;
+        validate_publication_readiness(&self.plan, &self.activation, operation_at)?;
+        self.sealed_capture_binding
+            .validate()
+            .map_err(|_| CensusSourceError::Protocol)?;
+        let revisions = ExtractionRevisionPlan::locally_observed_with_native_lineage(
+            self.sealed_capture_binding.record_count(),
+        )?;
+        Ok((self.sealed_capture_binding, revisions, self.activation))
+    }
+
+    pub(crate) fn validate_activation_at(
+        &self,
+        operation_at: Timestamp,
+    ) -> Result<(), CensusSourceError> {
+        if self.activation_candidate_digest != self.activation.candidate_digest {
+            return Err(CensusSourceError::InvalidConfiguration);
+        }
+        self.activation.validate(operation_at)?;
+        validate_publication_readiness(&self.plan, &self.activation, operation_at)
     }
 
     /// Returns the full canonical/native publication plan.
@@ -781,14 +838,19 @@ impl CensusPublicationCandidate {
         self.plan.provider_rate_declaration_digest
     }
 
-    /// Returns the actual sealed request graph root ingest must attach to publication.
-    pub const fn sealed_capture(&self) -> &SealedProviderCaptureSetReceipt {
-        &self.sealed_capture
+    /// Returns the exact whole-graph physical binding root ingest must attach to publication.
+    pub const fn sealed_capture_binding(&self) -> &SealedProviderCaptureBinding {
+        &self.sealed_capture_binding
     }
 
     /// Returns the actual sealed request-graph receipt identity.
-    pub const fn sealed_capture_receipt_digest(&self) -> EvidenceDigest {
-        self.sealed_capture.receipt_digest()
+    pub fn sealed_capture_receipt_digest(&self) -> EvidenceDigest {
+        self.sealed_capture_binding.sealed_capture_receipt_digest()
+    }
+
+    /// Returns exact provider-native semantics aligned to the canonical batch.
+    pub const fn native_lineage(&self) -> &ProviderNativeLineageBatch {
+        self.sealed_capture_binding.native_lineage()
     }
 
     /// Returns the non-authoritative candidate identity.
@@ -1079,13 +1141,12 @@ pub(crate) fn build_publication_plan(
     contract: &CensusDatasetContract,
     acquisition: &CensusDatasetAcquisition,
     batch: &ExtractionBatch,
-    capture_material: &ProviderCaptureMaterial,
+    receipt: &ProviderCaptureSetReceipt,
     observations: Box<[CensusCanonicalObservationBinding]>,
 ) -> Result<CensusPublicationPlan, CensusSourceError> {
     let activation = build_activation_plan(metadata, config)?;
     let extraction = ExtractionContentIdentity::try_from_batch(batch)
         .map_err(|_| CensusSourceError::Protocol)?;
-    let receipt = capture_material.receipt();
     if extraction.record_count() != observations.len()
         || receipt.source_id() != metadata.source_id()
         || receipt.metadata_revision() != metadata.revision()

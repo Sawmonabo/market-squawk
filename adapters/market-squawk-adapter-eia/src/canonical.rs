@@ -17,8 +17,11 @@ use market_squawk_sources::{
     CURRENT_RESEARCH_RECORD_SCHEMA, CanonicalObservationFamily, CanonicalObservationPayload,
     ExtractionBatch, ExtractionContentIdentity, ExtractionRecord, ExtractionRequest,
     ExtractionRevisionEvidence, ExtractionRevisionPlan, MAX_OBSERVED_REVISION_BATCH_BYTES,
-    ObservedRevisionRecord, ObservedSemanticPayload, ProviderCaptureTerminalDisposition,
-    SealedProviderCaptureSetReceipt, SourceMetadata, SourceObjectCaptureIdentity,
+    ObservedRevisionRecord, ObservedSemanticPayload, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
+    ProviderNativeLineageBatchBuilder, ProviderNativeLineageImplementation,
+    ProviderOrderedCaptureSegments, SealedProviderCaptureBinding, SealedProviderCaptureSetReceipt,
+    SourceMetadata, SourceObjectCaptureIdentity,
 };
 
 use crate::types::{digest_bytes, digest_parts};
@@ -33,7 +36,7 @@ use crate::{
 ///
 /// This is intentionally neither serializable nor a publication receipt. It contains the actual
 /// sealed capture receipt and no generation, manifest, checkpoint, PIT, or query authority.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct EiaPublicationRejoin {
     source_metadata: Arc<SourceMetadata>,
     doctor_report: EiaDoctorReport,
@@ -45,10 +48,9 @@ pub struct EiaPublicationRejoin {
     acquisition_receipt: EiaAcquisitionReceipt,
     acquisition_digest: EiaDigest,
     root_page_rejoins: Box<[EiaRootPageJournalRejoin]>,
-    sealed_page_captures: Box<[SealedProviderCaptureSetReceipt]>,
     capture_content_digest: EvidenceDigest,
     capture_observation_digest: EvidenceDigest,
-    sealed_capture: SealedProviderCaptureSetReceipt,
+    ordered_capture: ProviderOrderedCaptureSegments,
     canonical_schema: SourceIdentifier,
     canonical_schema_version: SchemaVersion,
     canonical_record_count: u32,
@@ -75,10 +77,11 @@ struct EiaPublicationRejoinDigestInput<'a> {
     acquisition_page_digests: &'a [EiaDigest],
     acquisition_digest: EiaDigest,
     root_page_rejoins: &'a [EiaRootPageRejoinDigestInput<'a>],
-    sealed_page_captures: &'a [SealedProviderCaptureSetReceipt],
+    sealed_page_captures: &'a [&'a SealedProviderCaptureSetReceipt],
     capture_content_digest: EvidenceDigest,
     capture_observation_digest: EvidenceDigest,
-    sealed_capture: &'a SealedProviderCaptureSetReceipt,
+    root_capture: &'a ProviderCaptureSetReceipt,
+    ordered_capture_receipt_digest: EvidenceDigest,
     canonical_schema: &'a SourceIdentifier,
     canonical_schema_version: SchemaVersion,
     canonical_record_count: u32,
@@ -182,9 +185,14 @@ impl EiaPublicationRejoin {
         &self.root_page_rejoins
     }
 
-    /// Returns every actual standalone page seal in exact acquisition order.
-    pub fn sealed_page_captures(&self) -> &[SealedProviderCaptureSetReceipt] {
-        &self.sealed_page_captures
+    /// Returns the exact number of standalone page seals in acquisition order.
+    pub fn sealed_page_capture_count(&self) -> usize {
+        self.ordered_capture.segment_count()
+    }
+
+    /// Returns persisted evidence for one exact standalone page seal.
+    pub fn sealed_page_capture(&self, ordinal: usize) -> Option<&SealedProviderCaptureSetReceipt> {
+        self.ordered_capture.persisted_segment_receipt(ordinal)
     }
 
     /// Returns the source-neutral provider-content identity.
@@ -197,9 +205,14 @@ impl EiaPublicationRejoin {
         self.capture_observation_digest
     }
 
-    /// Returns the actual shared immutable-journal receipt root publication must consume.
-    pub const fn sealed_capture(&self) -> &SealedProviderCaptureSetReceipt {
-        &self.sealed_capture
+    /// Returns the complete logical provider response capture.
+    pub const fn capture_receipt(&self) -> &ProviderCaptureSetReceipt {
+        self.ordered_capture.root_capture()
+    }
+
+    /// Returns the identity joining the logical capture to every ordered physical page seal.
+    pub const fn ordered_capture_receipt_digest(&self) -> EvidenceDigest {
+        self.ordered_capture.receipt_digest()
     }
 
     /// Returns the shared canonical research schema expected at root ingest.
@@ -239,6 +252,7 @@ impl EiaPublicationRejoin {
             .map_err(|_| EiaError::CaptureBinding)?;
         let page_count = usize::try_from(self.acquisition_receipt.page_count())
             .map_err(|_| EiaError::CaptureBinding)?;
+        let capture = self.ordered_capture.root_capture();
         if current_source != self.source_metadata.as_ref()
             || self.doctor_report.source_id() != self.source_metadata.source_id()
             || self.doctor_report.metadata_revision() != self.source_metadata.revision()
@@ -289,17 +303,11 @@ impl EiaPublicationRejoin {
             || self.acquisition_receipt.content_digest() != self.acquisition_digest
             || page_count == 0
             || self.root_page_rejoins.len() != page_count
-            || self.sealed_page_captures.len() != page_count
-            || self.sealed_capture.capture().pages().len() != page_count
-            || self.sealed_capture.capture().content_digest() != self.capture_content_digest
-            || self.sealed_capture.capture().observation_digest() != self.capture_observation_digest
-            || self.sealed_capture.receipt_digest().bytes() == [0; 32]
-            || self
-                .sealed_capture
-                .segment()
-                .physical_receipt_digest()
-                .bytes()
-                == [0; 32]
+            || self.ordered_capture.segment_count() != page_count
+            || capture.pages().len() != page_count
+            || capture.content_digest() != self.capture_content_digest
+            || capture.observation_digest() != self.capture_observation_digest
+            || self.ordered_capture.receipt_digest().bytes() == [0; 32]
             || u64::from(self.canonical_record_count)
                 != self.acquisition_receipt.observation_count()
             || self.publication_retained_bytes
@@ -315,24 +323,27 @@ impl EiaPublicationRejoin {
         {
             return Err(EiaError::CaptureBinding);
         }
-        validate_sealed_capture_receipt(
+        validate_capture_receipt(
             self.source_metadata.as_ref(),
             &self.provider_dataset,
             self.query_digest,
             self.contract_schema_digest,
             &self.api_version,
             &self.acquisition_receipt,
-            &self.sealed_capture,
+            capture,
         )?;
         let mut previous_received_at = None;
-        for (index, ((page_rejoin, sealed_page), full_page)) in self
+        for (index, (page_rejoin, full_page)) in self
             .root_page_rejoins
             .iter()
-            .zip(&self.sealed_page_captures)
-            .zip(self.sealed_capture.capture().pages())
+            .zip(capture.pages())
             .enumerate()
         {
             let ordinal = u16::try_from(index).map_err(|_| EiaError::CaptureBinding)?;
+            let sealed_page = self
+                .ordered_capture
+                .persisted_segment_receipt(index)
+                .ok_or(EiaError::CaptureBinding)?;
             let expected_next_offset = self
                 .root_page_rejoins
                 .get(index + 1)
@@ -395,6 +406,17 @@ impl EiaPublicationRejoin {
                 capture_receipt: rejoin.capture_receipt(),
             }
         }));
+        let mut sealed_page_captures = Vec::new();
+        sealed_page_captures
+            .try_reserve_exact(self.ordered_capture.segment_count())
+            .map_err(|_| EiaError::AllocationFailure)?;
+        for ordinal in 0..self.ordered_capture.segment_count() {
+            sealed_page_captures.push(
+                self.ordered_capture
+                    .persisted_segment_receipt(ordinal)
+                    .ok_or(EiaError::CaptureBinding)?,
+            );
+        }
         let semantic = serde_json::to_vec(&EiaPublicationRejoinDigestInput {
             source_metadata: self.source_metadata.as_ref(),
             doctor_report_digest: self.doctor_report.report_digest(),
@@ -414,10 +436,11 @@ impl EiaPublicationRejoin {
             acquisition_page_digests: self.acquisition_receipt.page_digests(),
             acquisition_digest: self.acquisition_digest,
             root_page_rejoins: &root_page_rejoins,
-            sealed_page_captures: &self.sealed_page_captures,
+            sealed_page_captures: &sealed_page_captures,
             capture_content_digest: self.capture_content_digest,
             capture_observation_digest: self.capture_observation_digest,
-            sealed_capture: &self.sealed_capture,
+            root_capture: self.ordered_capture.root_capture(),
+            ordered_capture_receipt_digest: self.ordered_capture.receipt_digest(),
             canonical_schema: &self.canonical_schema,
             canonical_schema_version: self.canonical_schema_version,
             canonical_record_count: self.canonical_record_count,
@@ -426,7 +449,7 @@ impl EiaPublicationRejoin {
         })
         .map_err(|_| EiaError::Canonicalization)?;
         Ok(digest_parts(
-            b"market-squawk/eia-publication-rejoin/v5",
+            b"market-squawk/eia-publication-rejoin/v6",
             [semantic.as_slice()],
         ))
     }
@@ -436,10 +459,12 @@ impl EiaPublicationRejoin {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EiaCanonicalObservation {
     observation: MacroObservation,
+    page_ordinal: u16,
     native_series: Arc<EiaSeriesIdentity>,
     native_period: EiaPeriod,
     native_value: EiaNativeValue,
     native_clocks: EiaObservationClocks,
+    native_semantic_digest: EiaDigest,
     native_row_digest: EiaDigest,
     native_schema_digest: EiaDigest,
     series_digest: EiaDigest,
@@ -449,9 +474,16 @@ pub struct EiaCanonicalObservation {
 impl EiaCanonicalObservation {
     fn try_from_native(
         native: EiaObservation,
+        observation_ordinal: usize,
         context: &EiaCanonicalContext<'_>,
     ) -> Result<Self, EiaError> {
-        let observation = canonical_macro(&native, context)?;
+        let page_ordinal = context
+            .observation_page_ordinals
+            .get(observation_ordinal)
+            .copied()
+            .ok_or(EiaError::CaptureBinding)?;
+        let observation = canonical_macro(&native, observation_ordinal, context)?;
+        let native_semantic_digest = native.semantic_digest();
         let native_row_digest = native.row_digest();
         let native_schema_digest = native.row_schema_digest();
         let series_digest = native.series().digest();
@@ -460,10 +492,12 @@ impl EiaCanonicalObservation {
         let (native_series, native_period, native_value) = native.into_canonical_lineage();
         Ok(Self {
             observation,
+            page_ordinal,
             native_series: Arc::new(native_series),
             native_period,
             native_value,
             native_clocks,
+            native_semantic_digest,
             native_row_digest,
             native_schema_digest,
             series_digest,
@@ -519,9 +553,19 @@ impl EiaCanonicalObservation {
 
 fn canonical_macro(
     native: &EiaObservation,
+    observation_ordinal: usize,
     context: &EiaCanonicalContext<'_>,
 ) -> Result<MacroObservation, EiaError> {
-    if !context.page_digests.contains(&native.page_payload_digest()) {
+    let page_ordinal = context
+        .observation_page_ordinals
+        .get(observation_ordinal)
+        .copied()
+        .ok_or(EiaError::CaptureBinding)?;
+    if context
+        .page_digests
+        .get(usize::from(page_ordinal))
+        .is_none_or(|digest| *digest != native.page_payload_digest())
+    {
         return Err(EiaError::CaptureBinding);
     }
     let clocks = native.clocks();
@@ -616,7 +660,7 @@ impl EiaPublishedSeries {
 /// The adapter deliberately stops here. Only root composition may assign durable revisions,
 /// ingest Arrow, commit immutable Parquet/manifests, advance restart state, or mint PIT/read
 /// authority.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct EiaPublicationCandidate {
     rejoin: EiaPublicationRejoin,
     observations: Box<[EiaCanonicalObservation]>,
@@ -624,41 +668,120 @@ pub struct EiaPublicationCandidate {
     revision_plan: ExtractionRevisionPlan,
 }
 
+/// Current provider-policy evidence retained separately from decoded analytical payloads.
+///
+/// This is neither raw-capture authority nor durable publication authority. Shared composition
+/// retains it to recheck that the exact source/authorization generation and bounded doctor window
+/// used by the adapter are still current when it consumes the capture-bound publication input.
+#[derive(Debug, Eq, PartialEq)]
+pub struct EiaPublicationPolicyEvidence {
+    source_metadata: Arc<SourceMetadata>,
+    doctor_report: EiaDoctorReport,
+    sealed_doctor_captures: Box<[SealedProviderCaptureSetReceipt]>,
+    normalization_admitted_at: Timestamp,
+}
+
+impl EiaPublicationPolicyEvidence {
+    /// Returns the exact source/authorization generation admitted by the adapter.
+    pub fn source_metadata(&self) -> &SourceMetadata {
+        self.source_metadata.as_ref()
+    }
+
+    /// Returns the exact activation/doctor report admitted by the adapter.
+    pub const fn doctor_report(&self) -> &EiaDoctorReport {
+        &self.doctor_report
+    }
+
+    /// Returns persisted doctor response evidence; it is not live capture authority.
+    pub fn sealed_doctor_captures(&self) -> &[SealedProviderCaptureSetReceipt] {
+        &self.sealed_doctor_captures
+    }
+
+    /// Returns the trusted normalization admission clock.
+    pub const fn normalization_admitted_at(&self) -> Timestamp {
+        self.normalization_admitted_at
+    }
+
+    /// Rechecks the exact source generation, authorization, doctor receipts, and bounded expiry.
+    pub fn validate(&self, current_source: &SourceMetadata) -> Result<(), EiaError> {
+        let operation_at =
+            crate::transport::system_timestamp().map_err(|_| EiaError::CaptureBinding)?;
+        self.doctor_report
+            .validate()
+            .map_err(|_| EiaError::CaptureBinding)?;
+        if current_source != self.source_metadata.as_ref()
+            || self.doctor_report.source_id() != current_source.source_id()
+            || self.doctor_report.metadata_revision() != current_source.revision()
+            || self.doctor_report.source_metadata_payload_digest()
+                != current_source
+                    .revision_evidence()
+                    .payload_evidence()
+                    .content_digest()
+            || self.doctor_report.authorization_subject()
+                != current_source
+                    .authorization()
+                    .basis()
+                    .as_source_identifier()
+            || self.doctor_report.authorization_evidence()
+                != current_source.authorization().evidence().content_digest()
+            || self.doctor_report.authorization_starts_at()
+                != current_source
+                    .authorization()
+                    .effective_interval()
+                    .starts_at()
+            || self.doctor_report.authorization_ends_at()
+                != current_source
+                    .authorization()
+                    .effective_interval()
+                    .ends_at()
+            || self.sealed_doctor_captures.len()
+                != self.doctor_report.doctor_capture_receipts().len()
+            || self
+                .sealed_doctor_captures
+                .iter()
+                .zip(self.doctor_report.doctor_capture_receipts())
+                .any(|(sealed, expected)| {
+                    sealed.capture() != expected
+                        || sealed.receipt_digest().bytes() == [0; 32]
+                        || sealed.segment().physical_receipt_digest().bytes() == [0; 32]
+                })
+            || self.normalization_admitted_at < self.doctor_report.observed_at()
+            || self.normalization_admitted_at >= self.doctor_report.expires_at()
+            || operation_at < self.normalization_admitted_at
+            || operation_at >= self.doctor_report.expires_at()
+            || !current_source
+                .authorization()
+                .is_effective_at(self.normalization_admitted_at)
+            || !current_source.authorization().is_effective_at(operation_at)
+        {
+            return Err(EiaError::CaptureBinding);
+        }
+        Ok(())
+    }
+}
+
 /// Owned, capture-bound inputs for the shared extraction and publication spine.
 #[derive(Debug)]
 pub struct EiaSharedPublicationParts {
-    batch: ExtractionBatch,
-    extraction_content_identity: ExtractionContentIdentity,
-    rejoin: EiaPublicationRejoin,
-    observations: Box<[EiaCanonicalObservation]>,
-    series: Box<[EiaPublishedSeries]>,
+    policy_evidence: EiaPublicationPolicyEvidence,
     revision_plan: ExtractionRevisionPlan,
+    sealed_capture_binding: SealedProviderCaptureBinding,
 }
 
 impl EiaSharedPublicationParts {
     /// Returns the standard source-neutral canonical extraction batch.
     pub const fn batch(&self) -> &ExtractionBatch {
-        &self.batch
+        self.sealed_capture_binding.batch()
     }
 
     /// Returns the standard semantic identity recomputed from the capture-bound batch.
     pub const fn extraction_content_identity(&self) -> ExtractionContentIdentity {
-        self.extraction_content_identity
+        self.sealed_capture_binding.content_identity()
     }
 
-    /// Returns the actual sealed-capture rejoin retained beside the batch.
-    pub const fn rejoin(&self) -> &EiaPublicationRejoin {
-        &self.rejoin
-    }
-
-    /// Returns provider-native row lineage aligned one-for-one with the canonical batch.
-    pub fn observations(&self) -> &[EiaCanonicalObservation] {
-        &self.observations
-    }
-
-    /// Returns the lossless provider route and dimension dictionary.
-    pub fn series(&self) -> &[EiaPublishedSeries] {
-        &self.series
+    /// Returns current provider-policy evidence kept separate from decoded event payloads.
+    pub const fn policy_evidence(&self) -> &EiaPublicationPolicyEvidence {
+        &self.policy_evidence
     }
 
     /// Returns the local-content revision evidence aligned with the canonical batch.
@@ -666,24 +789,28 @@ impl EiaSharedPublicationParts {
         &self.revision_plan
     }
 
+    /// Returns exact bounded EIA-native semantics aligned one-for-one with the canonical batch.
+    pub const fn native_lineage(&self) -> &ProviderNativeLineageBatch {
+        self.sealed_capture_binding.native_lineage()
+    }
+
+    /// Returns the validated whole-chain physical capture binding.
+    pub const fn sealed_capture_binding(&self) -> &SealedProviderCaptureBinding {
+        &self.sealed_capture_binding
+    }
+
     /// Consumes the handoff into the exact owned inputs required by root publication.
     pub fn into_parts(
         self,
     ) -> (
-        ExtractionBatch,
-        ExtractionContentIdentity,
-        EiaPublicationRejoin,
-        Box<[EiaCanonicalObservation]>,
-        Box<[EiaPublishedSeries]>,
+        EiaPublicationPolicyEvidence,
         ExtractionRevisionPlan,
+        SealedProviderCaptureBinding,
     ) {
         (
-            self.batch,
-            self.extraction_content_identity,
-            self.rejoin,
-            self.observations,
-            self.series,
+            self.policy_evidence,
             self.revision_plan,
+            self.sealed_capture_binding,
         )
     }
 }
@@ -693,7 +820,6 @@ impl EiaPublicationCandidate {
     pub(crate) fn try_new(
         provider: &EiaActivatedProvider,
         retrieval: EiaDataRetrievalSealRejoin,
-        sealed_capture: SealedProviderCaptureSetReceipt,
         normalization_admitted_at: Timestamp,
     ) -> Result<Self, EiaError> {
         if provider.publication_mode() != EiaPublicationMode::CanonicalMacro {
@@ -706,17 +832,10 @@ impl EiaPublicationCandidate {
             current_source,
             provider.contract(),
             &retrieval,
-            &sealed_capture,
         )
         .map_err(|_| EiaError::CaptureBinding)?;
-        let (
-            retrieval_dataset,
-            acquisition,
-            pages,
-            _transport_receipt,
-            sealed_page_captures,
-            _combined_capture_receipt,
-        ) = retrieval.into_parts();
+        let (retrieval_dataset, acquisition, pages, _transport_receipt, ordered_capture) =
+            retrieval.into_parts();
         if retrieval_dataset != provider_dataset || acquisition.observations().is_empty() {
             return Err(EiaError::Canonicalization);
         }
@@ -727,19 +846,22 @@ impl EiaPublicationCandidate {
         if source.as_ref() != current_source {
             return Err(EiaError::CaptureBinding);
         }
-        validate_sealed_capture(
+        validate_capture(
             source.as_ref(),
             &provider_dataset,
             provider.contract().query().identity(),
             provider.contract().schema_digest(),
             provider.contract().metadata().api_version(),
             &acquisition,
-            &sealed_capture,
+            ordered_capture.root_capture(),
         )?;
         let (native_observations, acquisition_receipt) = acquisition.into_parts();
+        let observation_page_ordinals =
+            observation_page_ordinals(&pages, native_observations.len())?;
         let context = EiaCanonicalContext {
             source: source.as_ref(),
             page_digests: acquisition_receipt.page_digests(),
+            observation_page_ordinals: &observation_page_ordinals,
             normalization_admitted_at,
         };
         let publication_retained_bytes = publication_working_set_bytes(
@@ -748,7 +870,7 @@ impl EiaPublicationCandidate {
             acquisition_receipt.publication_retained_bytes(),
             pages.len(),
             provider,
-            &sealed_capture,
+            &ordered_capture,
         )?;
         let mut root_page_rejoins = Vec::new();
         root_page_rejoins
@@ -764,8 +886,12 @@ impl EiaPublicationCandidate {
         observations
             .try_reserve_exact(native_observations.len())
             .map_err(|_| EiaError::AllocationFailure)?;
-        for native in native_observations {
-            observations.push(EiaCanonicalObservation::try_from_native(native, &context)?);
+        for (observation_ordinal, native) in native_observations.into_iter().enumerate() {
+            observations.push(EiaCanonicalObservation::try_from_native(
+                native,
+                observation_ordinal,
+                &context,
+            )?);
         }
         let mut series_by_digest: BTreeMap<EiaDigest, EiaPublishedSeries> = BTreeMap::new();
         for observation in &observations {
@@ -801,13 +927,20 @@ impl EiaPublicationCandidate {
             u32::try_from(observations.len()).map_err(|_| EiaError::InvalidLimit)?;
         let canonical_schema = SourceIdentifier::try_from("market-squawk-research-v3")
             .map_err(|_| EiaError::Canonicalization)?;
-        let capture_content_digest = sealed_capture.capture().content_digest();
-        let capture_observation_digest = sealed_capture.capture().observation_digest();
+        let capture_content_digest = ordered_capture.root_capture().content_digest();
+        let capture_observation_digest = ordered_capture.root_capture().observation_digest();
         let mut sealed_doctor_captures = Vec::new();
         sealed_doctor_captures
-            .try_reserve_exact(provider.sealed_doctor_captures().len())
+            .try_reserve_exact(provider.doctor_capture_count())
             .map_err(|_| EiaError::AllocationFailure)?;
-        sealed_doctor_captures.extend_from_slice(provider.sealed_doctor_captures());
+        for ordinal in 0..provider.doctor_capture_count() {
+            sealed_doctor_captures.push(
+                provider
+                    .sealed_doctor_capture(ordinal)
+                    .ok_or(EiaError::CaptureBinding)?
+                    .clone(),
+            );
+        }
         let mut rejoin = EiaPublicationRejoin {
             source_metadata: source,
             doctor_report: provider.doctor_report().clone(),
@@ -819,10 +952,9 @@ impl EiaPublicationCandidate {
             acquisition_digest: acquisition_receipt.content_digest(),
             acquisition_receipt,
             root_page_rejoins: root_page_rejoins.into_boxed_slice(),
-            sealed_page_captures,
             capture_content_digest,
             capture_observation_digest,
-            sealed_capture,
+            ordered_capture,
             canonical_schema,
             canonical_schema_version: SchemaVersion::CURRENT,
             canonical_record_count,
@@ -832,8 +964,9 @@ impl EiaPublicationCandidate {
         };
         rejoin.rejoin_digest = rejoin.compute_digest()?;
         rejoin.validate(provider.source_metadata())?;
-        let revision_plan = ExtractionRevisionPlan::locally_observed(observations.len())
-            .map_err(|_| EiaError::InvalidLimit)?;
+        let revision_plan =
+            ExtractionRevisionPlan::locally_observed_with_native_lineage(observations.len())
+                .map_err(|_| EiaError::InvalidLimit)?;
         Ok(Self {
             rejoin,
             observations: observations.into_boxed_slice(),
@@ -884,15 +1017,29 @@ impl EiaPublicationCandidate {
             .map_err(|_| EiaError::AllocationFailure)?;
         for observation in &self.observations {
             let context = observation.observation.context();
+            let page_ordinal = usize::from(observation.page_ordinal);
             let page = self
                 .rejoin
-                .sealed_capture
-                .capture()
+                .capture_receipt()
                 .pages()
-                .iter()
-                .find(|page| page.body_digest().bytes() == observation.raw_page_digest.bytes())
+                .get(page_ordinal)
                 .ok_or(EiaError::CaptureBinding)?;
-            if page.received_at() != observation.native_clocks.received_at()
+            let page_rejoin = self
+                .rejoin
+                .root_page_rejoins()
+                .get(page_ordinal)
+                .ok_or(EiaError::CaptureBinding)?;
+            let sealed_page = self
+                .rejoin
+                .sealed_page_capture(page_ordinal)
+                .ok_or(EiaError::CaptureBinding)?;
+            if page.ordinal() != observation.page_ordinal
+                || page.body_digest().bytes() != observation.raw_page_digest.bytes()
+                || page.received_at() != observation.native_clocks.received_at()
+                || page_rejoin.page_ordinal() != observation.page_ordinal
+                || page_rejoin.capture_receipt() != page
+                || crate::transport::validate_root_page_rejoin_seal(page_rejoin, sealed_page)
+                    .is_err()
                 || context.provenance().received_at() != observation.native_clocks.received_at()
                 || context.provenance().ingested_at() != self.rejoin.normalization_admitted_at
                 || context.time().published()
@@ -935,26 +1082,50 @@ impl EiaPublicationCandidate {
             );
         }
         let batch = ExtractionBatch::try_new(&request, records)
-            .and_then(|batch| batch.try_bind_provider_capture(self.rejoin.sealed_capture.capture()))
+            .and_then(|batch| batch.try_bind_provider_capture(self.rejoin.capture_receipt()))
             .map_err(|_| EiaError::CaptureBinding)?;
         if batch.records().len() != self.observations.len()
             || batch.request().object().capture_identity()
-                != SourceObjectCaptureIdentity::try_from_capture(
-                    self.rejoin.sealed_capture.capture(),
-                )
-                .map_err(|_| EiaError::CaptureBinding)?
+                != SourceObjectCaptureIdentity::try_from_capture(self.rejoin.capture_receipt())
+                    .map_err(|_| EiaError::CaptureBinding)?
         {
             return Err(EiaError::CaptureBinding);
         }
-        let extraction_content_identity = ExtractionContentIdentity::try_from_batch(&batch)
-            .map_err(|_| EiaError::CaptureBinding)?;
-        Ok(EiaSharedPublicationParts {
+        let native_lineage = eia_native_lineage(&self.observations, &batch)?;
+        let mut row_capture_page_ordinals = Vec::new();
+        row_capture_page_ordinals
+            .try_reserve_exact(self.observations.len())
+            .map_err(|_| EiaError::AllocationFailure)?;
+        row_capture_page_ordinals.extend(
+            self.observations
+                .iter()
+                .map(|observation| observation.page_ordinal),
+        );
+        let EiaPublicationRejoin {
+            source_metadata,
+            doctor_report,
+            sealed_doctor_captures,
+            ordered_capture,
+            normalization_admitted_at,
+            ..
+        } = self.rejoin;
+        let policy_evidence = EiaPublicationPolicyEvidence {
+            source_metadata,
+            doctor_report,
+            sealed_doctor_captures,
+            normalization_admitted_at,
+        };
+        let sealed_capture_binding = SealedProviderCaptureBinding::try_ordered_segments(
+            ordered_capture,
             batch,
-            extraction_content_identity,
-            rejoin: self.rejoin,
-            observations: self.observations,
-            series: self.series,
+            native_lineage,
+            row_capture_page_ordinals,
+        )
+        .map_err(|_| EiaError::CaptureBinding)?;
+        Ok(EiaSharedPublicationParts {
+            policy_evidence,
             revision_plan: self.revision_plan,
+            sealed_capture_binding,
         })
     }
 
@@ -962,7 +1133,7 @@ impl EiaPublicationCandidate {
         self.rejoin.validate(self.rejoin.source_metadata())?;
         let object = request.object();
         let receipt = self.rejoin.acquisition_receipt();
-        let capture = self.rejoin.sealed_capture.capture();
+        let capture = self.rejoin.capture_receipt();
         let effective =
             market_squawk_domain::EffectiveInterval::new(receipt.first_received_at(), None)
                 .map_err(|_| EiaError::CaptureBinding)?;
@@ -995,6 +1166,7 @@ impl EiaPublicationCandidate {
                     .map_err(|_| EiaError::CaptureBinding)?
             || self.revision_plan.len() != self.observations.len()
             || !self.revision_plan.is_locally_observed()
+            || !self.revision_plan.native_lineage_required()
             || self.series.is_empty()
             || self.series.len() > self.observations.len()
         {
@@ -1021,11 +1193,93 @@ impl EiaPublicationCandidate {
     }
 }
 
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct EiaNativeLineageRowV1<'a> {
+    native_series: &'a EiaSeriesIdentity,
+    native_period: &'a EiaPeriod,
+    native_value: &'a EiaNativeValue,
+    released_at: Option<Timestamp>,
+    updated_at: Option<Timestamp>,
+    available_at: Option<Timestamp>,
+    series_digest: EiaDigest,
+}
+
+fn eia_native_lineage(
+    observations: &[EiaCanonicalObservation],
+    batch: &ExtractionBatch,
+) -> Result<ProviderNativeLineageBatch, EiaError> {
+    if observations.is_empty() || observations.len() != batch.records().len() {
+        return Err(EiaError::Canonicalization);
+    }
+    let mut native_lineage = ProviderNativeLineageBatchBuilder::try_new(
+        ProviderNativeLineageImplementation::EiaSeriesV1,
+        batch,
+    )
+    .map_err(|_| EiaError::AllocationFailure)?;
+    for observation in observations {
+        native_lineage
+            .try_push(&EiaNativeLineageRowV1 {
+                native_series: observation.native_series.as_ref(),
+                native_period: &observation.native_period,
+                native_value: &observation.native_value,
+                released_at: observation.native_clocks.released_at(),
+                updated_at: observation.native_clocks.updated_at(),
+                available_at: observation.native_clocks.available_at(),
+                series_digest: observation.series_digest,
+            })
+            .map_err(|_| EiaError::Canonicalization)?;
+    }
+    native_lineage
+        .finish()
+        .map_err(|_| EiaError::Canonicalization)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EiaCanonicalContext<'a> {
     source: &'a SourceMetadata,
     page_digests: &'a [EiaDigest],
+    observation_page_ordinals: &'a [u16],
     normalization_admitted_at: Timestamp,
+}
+
+fn observation_page_ordinals(
+    pages: &[crate::EiaDataPageMaterial],
+    expected_observations: usize,
+) -> Result<Box<[u16]>, EiaError> {
+    let mut ordinals = Vec::new();
+    ordinals
+        .try_reserve_exact(expected_observations)
+        .map_err(|_| EiaError::AllocationFailure)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        let ordinal = u16::try_from(ordinal).map_err(|_| EiaError::InvalidLimit)?;
+        let data = page.data_receipt();
+        let raw = page.raw_page();
+        let capture = raw.capture_receipt();
+        if capture.ordinal() != ordinal
+            || page.root_journal_rejoin().page_ordinal() != ordinal
+            || page.root_journal_rejoin().capture_receipt() != capture
+            || data.retained_payload_digest().bytes() != capture.body_digest().bytes()
+            || data.retained_payload_digest() != digest_bytes(raw.payload())
+            || data.received_at() != capture.received_at()
+        {
+            return Err(EiaError::CaptureBinding);
+        }
+        let count =
+            usize::try_from(data.observation_count()).map_err(|_| EiaError::InvalidLimit)?;
+        if ordinals
+            .len()
+            .checked_add(count)
+            .is_none_or(|count| count > expected_observations)
+        {
+            return Err(EiaError::CaptureBinding);
+        }
+        ordinals.extend(std::iter::repeat_n(ordinal, count));
+    }
+    if ordinals.len() != expected_observations {
+        return Err(EiaError::CaptureBinding);
+    }
+    Ok(ordinals.into_boxed_slice())
 }
 
 fn publication_working_set_bytes(
@@ -1034,7 +1288,7 @@ fn publication_working_set_bytes(
     acquisition_retained_bytes: usize,
     page_count: usize,
     provider: &EiaActivatedProvider,
-    sealed_capture: &SealedProviderCaptureSetReceipt,
+    ordered_capture: &ProviderOrderedCaptureSegments,
 ) -> Result<usize, EiaError> {
     let record_scratch = size_of::<ObservedRevisionRecord>()
         .checked_mul(2)
@@ -1051,15 +1305,15 @@ fn publication_working_set_bytes(
         .and_then(|bytes| bytes.checked_add(record_scratch))
         .ok_or(EiaError::InvalidLimit)?;
     let lineage_retained_bytes =
-        publication_lineage_retained_bytes(page_count, provider, sealed_capture)?;
+        publication_lineage_retained_bytes(page_count, provider, ordered_capture)?;
     let mut retained = acquisition_retained_bytes
         .checked_add(lineage_retained_bytes)
         .and_then(|bytes| bytes.checked_add(native.len().checked_mul(fixed_per_record)?))
         .and_then(|bytes| bytes.checked_add(context.source.source_id().retained_bytes()))
         .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
         .ok_or(EiaError::InvalidLimit)?;
-    for observation in native {
-        let macro_observation = canonical_macro(observation, context)?;
+    for (observation_ordinal, observation) in native.iter().enumerate() {
+        let macro_observation = canonical_macro(observation, observation_ordinal, context)?;
         let serialized =
             serde_json::to_vec(&macro_observation).map_err(|_| EiaError::Canonicalization)?;
         let research = ResearchObservation::Macro(macro_observation);
@@ -1087,12 +1341,32 @@ fn publication_working_set_bytes(
 fn publication_lineage_retained_bytes(
     page_count: usize,
     provider: &EiaActivatedProvider,
-    sealed_capture: &SealedProviderCaptureSetReceipt,
+    ordered_capture: &ProviderOrderedCaptureSegments,
 ) -> Result<usize, EiaError> {
-    let combined_seal =
-        serde_json::to_vec(sealed_capture).map_err(|_| EiaError::Canonicalization)?;
+    if ordered_capture.segment_count() != page_count {
+        return Err(EiaError::CaptureBinding);
+    }
+    let root_capture = serde_json::to_vec(ordered_capture.root_capture())
+        .map_err(|_| EiaError::Canonicalization)?;
+    let mut page_seals = 0_usize;
+    for ordinal in 0..ordered_capture.segment_count() {
+        page_seals = page_seals
+            .checked_add(
+                serde_json::to_vec(
+                    ordered_capture
+                        .persisted_segment_receipt(ordinal)
+                        .ok_or(EiaError::CaptureBinding)?,
+                )
+                .map_err(|_| EiaError::Canonicalization)?
+                .len(),
+            )
+            .ok_or(EiaError::InvalidLimit)?;
+    }
     let mut doctor_seals = 0_usize;
-    for sealed in provider.sealed_doctor_captures() {
+    for ordinal in 0..provider.doctor_capture_count() {
+        let sealed = provider
+            .sealed_doctor_capture(ordinal)
+            .ok_or(EiaError::CaptureBinding)?;
         doctor_seals = doctor_seals
             .checked_add(
                 serde_json::to_vec(sealed)
@@ -1113,12 +1387,13 @@ fn publication_lineage_retained_bytes(
         .and_then(|bytes| {
             bytes.checked_add(
                 provider
-                    .sealed_doctor_captures()
-                    .len()
+                    .doctor_capture_count()
                     .checked_mul(size_of::<SealedProviderCaptureSetReceipt>())?,
             )
         })
-        .and_then(|bytes| bytes.checked_add(combined_seal.len()))
+        .and_then(|bytes| bytes.checked_add(root_capture.len()))
+        .and_then(|bytes| bytes.checked_add(page_seals))
+        .and_then(|bytes| bytes.checked_add(size_of::<ProviderOrderedCaptureSegments>()))
         .and_then(|bytes| bytes.checked_add(doctor_seals))
         .and_then(|bytes| bytes.checked_add(size_of::<EiaDoctorReport>()))
         .and_then(|bytes| bytes.checked_add(provider.doctor_report().route().as_str().len()))
@@ -1126,45 +1401,52 @@ fn publication_lineage_retained_bytes(
         .ok_or(EiaError::InvalidLimit)
 }
 
-fn validate_sealed_capture(
+fn validate_capture(
     source: &SourceMetadata,
     dataset: &SourceIdentifier,
     query_digest: EiaDigest,
     contract_schema_digest: EiaDigest,
     api_version: &crate::EiaApiVersion,
     acquisition: &EiaAcquisition,
-    sealed_capture: &SealedProviderCaptureSetReceipt,
+    capture: &ProviderCaptureSetReceipt,
 ) -> Result<(), EiaError> {
-    validate_sealed_capture_receipt(
+    validate_capture_receipt(
         source,
         dataset,
         query_digest,
         contract_schema_digest,
         api_version,
         acquisition.receipt(),
-        sealed_capture,
+        capture,
     )?;
-    if acquisition.observations().iter().any(|observation| {
-        !acquisition
-            .receipt()
-            .page_digests()
-            .contains(&observation.page_payload_digest())
-    }) {
+    let mut observation_ordinal = 0_usize;
+    for page in capture.pages() {
+        let page_digest = EiaDigest::new(page.body_digest().bytes());
+        let expected = acquisition
+            .observations()
+            .iter()
+            .skip(observation_ordinal)
+            .take_while(|observation| observation.page_payload_digest() == page_digest)
+            .count();
+        observation_ordinal = observation_ordinal
+            .checked_add(expected)
+            .ok_or(EiaError::CaptureBinding)?;
+    }
+    if observation_ordinal != acquisition.observations().len() {
         return Err(EiaError::CaptureBinding);
     }
     Ok(())
 }
 
-fn validate_sealed_capture_receipt(
+fn validate_capture_receipt(
     source: &SourceMetadata,
     dataset: &SourceIdentifier,
     query_digest: EiaDigest,
     contract_schema_digest: EiaDigest,
     api_version: &crate::EiaApiVersion,
     receipt: &EiaAcquisitionReceipt,
-    sealed_capture: &SealedProviderCaptureSetReceipt,
+    capture: &ProviderCaptureSetReceipt,
 ) -> Result<(), EiaError> {
-    let capture = sealed_capture.capture();
     if capture.source_id() != source.source_id()
         || capture.metadata_revision() != source.revision()
         || capture.dataset() != dataset
@@ -1180,8 +1462,6 @@ fn validate_sealed_capture_receipt(
             .iter()
             .zip(receipt.page_digests())
             .any(|(page, digest)| page.body_digest().bytes() != digest.bytes())
-        || sealed_capture.receipt_digest().bytes() == [0; 32]
-        || sealed_capture.segment().physical_receipt_digest().bytes() == [0; 32]
     {
         return Err(EiaError::CaptureBinding);
     }

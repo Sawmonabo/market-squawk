@@ -1,6 +1,7 @@
 //! Application-owned composition for research ingestion and immutable analytical generations.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalReadCapability, CatalogAuthority,
@@ -22,8 +23,8 @@ use market_squawk_platform::{
 };
 use market_squawk_sources::{
     ExtractionBatch, ExtractionRevisionPlan, ProviderCaptureMaterial,
-    ProviderCaptureMaterialSealError, ProviderRateAuthority, SourceClass, SourceMetadata,
-    SourceObjectCaptureIdentity,
+    ProviderCaptureMaterialSealError, ProviderCaptureSealRequest, ProviderRateAuthority,
+    SealedProviderCaptureMaterial, SourceClass, SourceMetadata, SourceObjectCaptureIdentity,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -465,9 +466,33 @@ impl ResearchService {
             .map_err(Into::into)
     }
 
-    /// Returns the single sealed raw-provider-evidence authority shared by ingestion runtimes.
-    pub(crate) fn provider_capture_store(&self) -> Arc<SealedResearchJournalStore> {
-        Arc::clone(&self.provider_captures)
+    /// Consumes and seals one already validated provider capture without exposing store authority.
+    ///
+    /// Cancellation and the monotonic deadline are checked on both sides of the synchronous seal.
+    /// If either wins after the store commit, the unreferenced segment remains recoverable by the
+    /// existing startup quarantine pass and no continuation receives its receipt.
+    pub(crate) fn seal_provider_capture(
+        &self,
+        request: ProviderCaptureSealRequest,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<SealedProviderCaptureMaterial, ResearchServiceError> {
+        if cancellation.is_cancelled() {
+            return Err(ResearchServiceError::Ingest(IngestError::Cancelled));
+        }
+        if Instant::now() >= deadline {
+            return Err(ResearchServiceError::Ingest(IngestError::DeadlineExceeded));
+        }
+        let sealed = request
+            .seal(self.provider_captures.as_ref())
+            .map_err(map_provider_capture_seal_error)?;
+        if cancellation.is_cancelled() {
+            return Err(ResearchServiceError::Ingest(IngestError::Cancelled));
+        }
+        if Instant::now() >= deadline {
+            return Err(ResearchServiceError::Ingest(IngestError::DeadlineExceeded));
+        }
+        Ok(sealed)
     }
 
     /// Executes one rights-reserved ingest through durable revision and publication authority.
@@ -744,6 +769,19 @@ impl ResearchService {
             .instrument_catalog()
             .synchronize(instruments, observed_at, limit)
             .map_err(Into::into)
+    }
+}
+
+fn map_provider_capture_seal_error(
+    error: ProviderCaptureMaterialSealError,
+) -> ResearchServiceError {
+    match error {
+        ProviderCaptureMaterialSealError::Store(error) => {
+            ResearchServiceError::ProviderCaptureStore(error)
+        }
+        ProviderCaptureMaterialSealError::Capture(error) => {
+            ResearchServiceError::Ingest(IngestError::ProviderCapture(error))
+        }
     }
 }
 

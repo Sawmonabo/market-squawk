@@ -9,8 +9,9 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryRequestId, ExtractionBatch, ExtractionContentIdentity,
-    ExtractionRevisionPlan, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
-    SourceMetadata, SourceObjectCaptureIdentity,
+    ExtractionRevisionPlan, ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
+    ProviderNativeLineageBatchBuilder, ProviderNativeLineageImplementation,
+    SealedProviderCaptureBinding, SourceMetadata, SourceObjectCaptureIdentity,
 };
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -383,6 +384,88 @@ impl BlsCanonicalProviderSemantics {
             &(&self.schema_requirement, &self.series, &self.observations),
         )
     }
+
+    fn try_native_lineage(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<ProviderNativeLineageBatch, BlsSourceError> {
+        self.validate(batch)?;
+        let mut native_lineage = ProviderNativeLineageBatchBuilder::try_new(
+            ProviderNativeLineageImplementation::BlsTimeseriesV1,
+            batch,
+        )
+        .map_err(|_| BlsSourceError::InvalidPublication)?;
+        for observation in &self.observations {
+            let mut matching_series = self
+                .series
+                .iter()
+                .filter(|series| series.series_id == observation.series_id);
+            let series = matching_series
+                .next()
+                .ok_or(BlsSourceError::InvalidPublication)?;
+            if matching_series.next().is_some() {
+                return Err(BlsSourceError::InvalidPublication);
+            }
+            native_lineage
+                .try_push(&BlsNativeLineageRowV1 {
+                    series: BlsNativeLineageSeriesV1 {
+                        series_id: &series.series_id,
+                        title: &series.title,
+                        unit: &series.unit,
+                        frequency: &series.frequency,
+                        seasonal_adjustment: &series.seasonal_adjustment,
+                        measure: &series.measure,
+                    },
+                    observation: BlsNativeLineageObservationV1 {
+                        series_id: &observation.series_id,
+                        year: observation.year,
+                        period: &observation.period,
+                        period_label: &observation.period_label,
+                        raw_value: &observation.raw_value,
+                        value: &observation.value,
+                        preliminary: observation.preliminary,
+                        footnotes: &observation.footnotes,
+                        missing_explanations: &observation.missing_explanations,
+                    },
+                })
+                .map_err(|_| BlsSourceError::InvalidPublication)?;
+        }
+        native_lineage
+            .finish()
+            .map_err(|_| BlsSourceError::InvalidPublication)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BlsNativeLineageRowV1<'a> {
+    series: BlsNativeLineageSeriesV1<'a>,
+    observation: BlsNativeLineageObservationV1<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BlsNativeLineageSeriesV1<'a> {
+    series_id: &'a SourceIdentifier,
+    title: &'a str,
+    unit: &'a SourceIdentifier,
+    frequency: &'a SourceIdentifier,
+    seasonal_adjustment: &'a SourceIdentifier,
+    measure: &'a SourceIdentifier,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BlsNativeLineageObservationV1<'a> {
+    series_id: &'a SourceIdentifier,
+    year: u16,
+    period: &'a SourceIdentifier,
+    period_label: &'a str,
+    raw_value: &'a str,
+    value: &'a Option<Decimal>,
+    preliminary: bool,
+    footnotes: &'a [BlsCanonicalFootnote],
+    missing_explanations: &'a [Box<str>],
 }
 
 /// Canonical BLS input whose exact provider response has already been physically sealed.
@@ -391,8 +474,7 @@ impl BlsCanonicalProviderSemantics {
 /// committed timestamp, checkpoint, restore admission, query pin, or point-in-time receipt. Only
 /// the shared application/data authority may assign locally observed revisions, commit an
 /// immutable dataset, advance a job checkpoint, and mint a typed point-in-time read.
-#[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct BlsPublicationCandidate {
     schema_version: u16,
     source_id: SourceId,
@@ -417,20 +499,19 @@ pub struct BlsPublicationCandidate {
     component_content_digest: EvidenceDigest,
     component_observation_digest: EvidenceDigest,
     source_generation_digest: EvidenceDigest,
-    sealed_discovery_capture: SealedProviderCaptureSetReceipt,
+    sealed_capture_binding: SealedProviderCaptureBinding,
     extraction_content_digest: EvidenceDigest,
     canonical_content_digest: EvidenceDigest,
     provider_semantics_digest: EvidenceDigest,
+    native_lineage_digest: EvidenceDigest,
     credential_rejoin: BlsCredentialRejoin,
     provider_rate_declaration_digest: EvidenceDigest,
     doctor_report_digest: EvidenceDigest,
     sealed_doctor_capture_receipt_digest: EvidenceDigest,
     activation_expires_at: Timestamp,
     activation_candidate_digest: EvidenceDigest,
-    batch: ExtractionBatch,
     provider_semantics: BlsCanonicalProviderSemantics,
     candidate_digest: EvidenceDigest,
-    #[serde(skip_serializing)]
     runtime_instance: Arc<BlsRuntimeInstanceCapability>,
 }
 
@@ -451,7 +532,7 @@ impl BlsPublicationCandidate {
         )?;
         let object = batch.request().object();
         let chunk_index = discovery_admission.chunk_index();
-        let sealed_discovery_capture = discovery_admission.sealed_discovery_capture().clone();
+        let sealed_discovery_capture = discovery_admission.sealed_discovery_capture();
         let capture = sealed_discovery_capture.capture();
         let page = capture
             .pages()
@@ -478,10 +559,17 @@ impl BlsPublicationCandidate {
             &canonical_schema,
         )?;
         provider_semantics.validate(&batch)?;
+        let native_lineage = provider_semantics.try_native_lineage(&batch)?;
         let schema_extension_requirement_digest =
             provider_semantics.schema_requirement().requirement_digest();
         let extraction_content = ExtractionContentIdentity::try_from_batch(&batch)
             .map_err(|_| BlsSourceError::InvalidPublication)?;
+        let discovery_request_id = object.discovery_request_id();
+        let object_id = object.object_id().clone();
+        let component_request_identity = discovery_admission.component_request_identity();
+        let component_content_digest = discovery_admission.component_content_digest();
+        let component_observation_digest = discovery_admission.component_observation_digest();
+        let source_generation_digest = discovery_admission.source_generation_digest();
 
         if object.source_id() != metadata.source_id()
             || object.metadata_revision() != metadata.revision()
@@ -493,9 +581,9 @@ impl BlsPublicationCandidate {
                 capture,
                 usize::from(chunk_index),
                 object.capture_identity(),
-                discovery_admission.component_request_identity(),
-                discovery_admission.component_content_digest(),
-                discovery_admission.component_observation_digest(),
+                component_request_identity,
+                component_content_digest,
+                component_observation_digest,
             )
             || object.evidence().content_digest() != page.body_digest()
             || object.expected_bytes() != Some(page.body_bytes())
@@ -515,15 +603,38 @@ impl BlsPublicationCandidate {
         {
             return Err(BlsSourceError::InvalidPublication);
         }
+        let discovery_request_set_identity = capture.request_set_identity();
+        let discovery_capture_content_digest = capture.content_digest();
+        let discovery_capture_observation_digest = capture.observation_digest();
+        if !matches!(
+            capture.terminal(),
+            ProviderCaptureTerminalDisposition::StandaloneResponse
+                | ProviderCaptureTerminalDisposition::CompleteRequestGraph
+        ) {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        let extraction_content_digest = extraction_content.digest();
+        let canonical_content_digest = canonical_content_digest(&batch)?;
+        let provider_semantics_digest = provider_semantics.semantics_digest();
+        let native_lineage_digest = native_lineage.batch_digest();
+        let mut row_capture_page_ordinals = Vec::new();
+        row_capture_page_ordinals
+            .try_reserve_exact(batch.records().len())
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
+        row_capture_page_ordinals
+            .extend(std::iter::repeat(chunk_index).take(batch.records().len()));
+        let capture_token = discovery_admission.into_capture_token();
+        let sealed_capture_binding =
+            capture_token.try_bind(batch, native_lineage, row_capture_page_ordinals)?;
 
         let mut candidate = Self {
             schema_version: PUBLICATION_CANDIDATE_SCHEMA_VERSION,
             source_id: metadata.source_id().clone(),
             metadata_revision: metadata.revision().clone(),
-            discovery_request_id: object.discovery_request_id(),
+            discovery_request_id,
             provider_dataset: config.dataset().clone(),
             analytical_dataset: BlsSource::analytical_dataset_identifier(config.dataset())?,
-            object_id: object.object_id().clone(),
+            object_id,
             canonical_schema,
             canonical_schema_version,
             schema_extension_requirement_digest,
@@ -533,17 +644,18 @@ impl BlsPublicationCandidate {
             first_observed_at,
             response_received_at,
             canonical_ingested_at,
-            discovery_request_set_identity: capture.request_set_identity(),
-            discovery_capture_content_digest: capture.content_digest(),
-            discovery_capture_observation_digest: capture.observation_digest(),
-            component_request_identity: discovery_admission.component_request_identity(),
-            component_content_digest: discovery_admission.component_content_digest(),
-            component_observation_digest: discovery_admission.component_observation_digest(),
-            source_generation_digest: discovery_admission.source_generation_digest(),
-            sealed_discovery_capture,
-            extraction_content_digest: extraction_content.digest(),
-            canonical_content_digest: canonical_content_digest(&batch)?,
-            provider_semantics_digest: provider_semantics.semantics_digest(),
+            discovery_request_set_identity,
+            discovery_capture_content_digest,
+            discovery_capture_observation_digest,
+            component_request_identity,
+            component_content_digest,
+            component_observation_digest,
+            source_generation_digest,
+            sealed_capture_binding,
+            extraction_content_digest,
+            canonical_content_digest,
+            provider_semantics_digest,
+            native_lineage_digest,
             credential_rejoin: config.credential_rejoin(),
             provider_rate_declaration_digest: rate.declaration_digest(),
             doctor_report_digest: activation.doctor_report().report_digest(),
@@ -552,7 +664,6 @@ impl BlsPublicationCandidate {
                 .receipt_digest(),
             activation_expires_at: activation.expires_at(),
             activation_candidate_digest: activation.candidate_digest(),
-            batch,
             provider_semantics,
             candidate_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
             runtime_instance: Arc::clone(expected_runtime_instance),
@@ -585,24 +696,32 @@ impl BlsPublicationCandidate {
             crate::client::system_timestamp()?,
             expected_runtime_instance,
         )?;
-        let object = self.batch.request().object();
-        let capture = self.sealed_discovery_capture.capture();
+        self.sealed_capture_binding
+            .validate()
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
+        let batch = self.sealed_capture_binding.batch();
+        let native_lineage = self.sealed_capture_binding.native_lineage();
+        let object = batch.request().object();
+        let capture = self.sealed_capture_binding.capture_evidence();
         let page = capture
             .pages()
             .get(usize::from(self.chunk_index))
             .ok_or(BlsSourceError::InvalidPublication)?;
-        let extraction = ExtractionContentIdentity::try_from_batch(&self.batch)
+        let extraction = ExtractionContentIdentity::try_from_batch(batch)
             .map_err(|_| BlsSourceError::InvalidPublication)?;
         let canonical_ingested_at = validate_canonical_batch(
             metadata,
             config,
-            &self.batch,
+            batch,
             page.body_digest(),
             self.first_observed_at,
             self.response_received_at,
             &self.canonical_schema,
         )?;
-        self.provider_semantics.validate(&self.batch)?;
+        self.provider_semantics.validate(batch)?;
+        native_lineage
+            .validate(batch)
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
         if self.schema_version != PUBLICATION_CANDIDATE_SCHEMA_VERSION
             || self.source_id != *metadata.source_id()
             || self.metadata_revision != *metadata.revision()
@@ -614,7 +733,7 @@ impl BlsPublicationCandidate {
             || self.first_observed_at != object.effective_interval().starts_at()
             || self.response_received_at != page.received_at()
             || self.response_received_at > self.canonical_ingested_at
-            || self.batch.request().deadline() >= activation.expires_at()
+            || batch.request().deadline() >= activation.expires_at()
             || self.canonical_schema.as_str() != CURRENT_RESEARCH_RECORD_SCHEMA
             || self.canonical_schema_version != SchemaVersion::CURRENT
             || self.schema_extension_requirement_digest
@@ -623,13 +742,19 @@ impl BlsPublicationCandidate {
                     .schema_requirement()
                     .requirement_digest()
             || usize::from(self.total_chunks) != config.chunk_count()
-            || usize::try_from(self.canonical_record_count).ok() != Some(self.batch.records().len())
+            || usize::try_from(self.canonical_record_count).ok() != Some(batch.records().len())
             || self.canonical_record_count == 0
             || self.canonical_ingested_at != canonical_ingested_at
             || self.discovery_request_set_identity != capture.request_set_identity()
             || self.discovery_capture_content_digest != capture.content_digest()
             || self.discovery_capture_observation_digest != capture.observation_digest()
-            || self.sealed_discovery_capture.receipt_digest().bytes() == [0; 32]
+            || self
+                .sealed_capture_binding
+                .sealed_capture_receipt_digest()
+                .bytes()
+                == [0; 32]
+            || self.sealed_capture_binding.component_ordinal()
+                != (self.total_chunks > 1).then_some(self.chunk_index)
             || self.source_generation_digest != activation.plan().plan_digest()
             || !validate_discovery_component(
                 capture,
@@ -640,8 +765,9 @@ impl BlsPublicationCandidate {
                 self.component_observation_digest,
             )
             || extraction.digest() != self.extraction_content_digest
-            || canonical_content_digest(&self.batch)? != self.canonical_content_digest
+            || canonical_content_digest(batch)? != self.canonical_content_digest
             || self.provider_semantics.semantics_digest() != self.provider_semantics_digest
+            || native_lineage.batch_digest() != self.native_lineage_digest
             || self.credential_rejoin != config.credential_rejoin()
             || self.provider_rate_declaration_digest != rate.declaration_digest()
             || self.doctor_report_digest != activation.doctor_report().report_digest()
@@ -747,14 +873,14 @@ impl BlsPublicationCandidate {
         self.source_generation_digest
     }
 
-    /// Returns the actual immutable raw-journal receipt root ingest must attach.
-    pub const fn sealed_discovery_capture(&self) -> &SealedProviderCaptureSetReceipt {
-        &self.sealed_discovery_capture
+    /// Returns the validated scope binding between this batch and its immutable raw evidence.
+    pub const fn sealed_capture_binding(&self) -> &SealedProviderCaptureBinding {
+        &self.sealed_capture_binding
     }
 
     /// Returns the physical receipt identity of the owned immutable raw-journal seal.
-    pub const fn sealed_discovery_capture_receipt_digest(&self) -> EvidenceDigest {
-        self.sealed_discovery_capture.receipt_digest()
+    pub fn sealed_discovery_capture_receipt_digest(&self) -> EvidenceDigest {
+        self.sealed_capture_binding.sealed_capture_receipt_digest()
     }
 
     /// Returns the capture-bound semantic extraction identity root must recompute.
@@ -804,7 +930,7 @@ impl BlsPublicationCandidate {
 
     /// Returns the exact canonical extraction batch root ingest must publish.
     pub const fn batch(&self) -> &ExtractionBatch {
-        &self.batch
+        self.sealed_capture_binding.batch()
     }
 
     /// Returns BLS-native semantics root must co-persist and join on typed reads.
@@ -812,27 +938,33 @@ impl BlsPublicationCandidate {
         &self.provider_semantics
     }
 
-    /// Consumes the candidate into the three root-owned publication inputs.
+    /// Returns bounded BLS-native semantics aligned exactly to canonical row ordinals.
+    pub const fn native_lineage(&self) -> &ProviderNativeLineageBatch {
+        self.sealed_capture_binding.native_lineage()
+    }
+
+    /// Consumes the candidate into provider provenance and the sole batch/native/physical authority.
+    ///
+    /// Response-wide metadata identity and BLS's clock-relative `latest` marker remain provenance;
+    /// neither is encoded into row-local native revision semantics.
     pub fn into_root_publication_parts(
         self,
-    ) -> (
-        ExtractionBatch,
-        BlsCanonicalProviderSemantics,
-        SealedProviderCaptureSetReceipt,
-    ) {
-        (
-            self.batch,
-            self.provider_semantics,
-            self.sealed_discovery_capture,
-        )
+    ) -> (BlsCanonicalProviderSemantics, SealedProviderCaptureBinding) {
+        (self.provider_semantics, self.sealed_capture_binding)
     }
 
     /// Returns the exact input-aligned local-content revision plan root must durably assign.
     ///
     /// This plan contains evidence only; it cannot allocate revision numbers or publish data.
     pub fn revision_plan(&self) -> Result<ExtractionRevisionPlan, BlsSourceError> {
-        self.provider_semantics.validate(&self.batch)?;
-        ExtractionRevisionPlan::locally_observed(self.batch.records().len()).map_err(Into::into)
+        let batch = self.sealed_capture_binding.batch();
+        self.provider_semantics.validate(batch)?;
+        self.sealed_capture_binding
+            .native_lineage()
+            .validate(batch)
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
+        ExtractionRevisionPlan::locally_observed_with_native_lineage(batch.records().len())
+            .map_err(Into::into)
     }
 }
 
@@ -1027,10 +1159,13 @@ fn candidate_digest(candidate: &BlsPublicationCandidate) -> Result<EvidenceDiges
         candidate.component_content_digest,
         candidate.component_observation_digest,
         candidate.source_generation_digest,
-        candidate.sealed_discovery_capture.receipt_digest(),
+        candidate
+            .sealed_capture_binding
+            .sealed_capture_receipt_digest(),
         candidate.extraction_content_digest,
         candidate.canonical_content_digest,
         candidate.provider_semantics_digest,
+        candidate.native_lineage_digest,
         candidate.provider_rate_declaration_digest,
         candidate.doctor_report_digest,
         candidate.sealed_doctor_capture_receipt_digest,

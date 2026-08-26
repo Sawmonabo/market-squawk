@@ -17,9 +17,10 @@ use market_squawk_sources::{
     DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRequest,
     ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HistoricalCapability,
     MAX_PROVIDER_CAPTURE_PAGES, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
-    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
-    SourceObjectCaptureIdentity, SourceProtocolProfile, payload_matches_exact_evidence,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderWholeCaptureToken,
+    SealedProviderCaptureMaterial, SourceClass, SourceError, SourceMetadata,
+    SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity, SourceProtocolProfile,
+    payload_matches_exact_evidence,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -53,15 +54,19 @@ pub struct BlsSourceConfig {
     dataset: SourceIdentifier,
 }
 
-/// Indivisible BLS extraction handoff containing canonical rows and their exact response bytes.
-///
-/// Application composition must seal [`Self::capture_material`] before publishing
-/// [`Self::batch`] as a durable canonical generation.
+/// Indivisible BLS extraction handoff containing canonical rows and their one-use sealed discovery
+/// admission. Shared publication must consume this value through [`BlsSource::publication_candidate`].
 #[derive(Debug)]
 pub struct BlsExtractionOutput {
     batch: ExtractionBatch,
     provider_semantics: BlsCanonicalProviderSemantics,
     discovery_admission: BlsDiscoveryObjectAdmission,
+}
+
+#[derive(Debug)]
+struct BlsDoctorCaptureAuthority {
+    activation_candidate_digest: EvidenceDigest,
+    capture_token: ProviderWholeCaptureToken,
 }
 
 impl BlsExtractionOutput {
@@ -97,7 +102,7 @@ pub struct BlsSource {
     rate_declaration: BlsProviderRateDeclaration,
     http: BlsHttpClient,
     runtime_instance: Arc<BlsRuntimeInstanceCapability>,
-    cache: Mutex<PageCache>,
+    doctor_capture_authority: Mutex<Option<BlsDoctorCaptureAuthority>>,
     health: Mutex<BlsSourceHealth>,
     #[cfg(test)]
     publication_actions: Mutex<VecDeque<Option<AuthoritativeSourceRegistry>>>,
@@ -173,7 +178,8 @@ impl BlsSource {
         {
             return Err(BlsSourceError::InvalidMetadata);
         }
-        ExtractionRevisionPlan::locally_observed(batch.records().len()).map_err(Into::into)
+        ExtractionRevisionPlan::locally_observed_with_native_lineage(batch.records().len())
+            .map_err(Into::into)
     }
 
     /// Binds a provider configuration to exact immutable metadata.
@@ -194,7 +200,7 @@ impl BlsSource {
             rate_declaration,
             http,
             runtime_instance: BlsRuntimeInstanceCapability::new(),
-            cache: Mutex::new(PageCache::new()),
+            doctor_capture_authority: Mutex::new(None),
             health: Mutex::new(BlsSourceHealth::new()),
             #[cfg(test)]
             publication_actions: Mutex::new(VecDeque::new()),
@@ -216,7 +222,7 @@ impl BlsSource {
             rate_declaration,
             http,
             runtime_instance: BlsRuntimeInstanceCapability::new(),
-            cache: Mutex::new(PageCache::new()),
+            doctor_capture_authority: Mutex::new(None),
             health: Mutex::new(BlsSourceHealth::new()),
             publication_actions: Mutex::new(VecDeque::new()),
         })
@@ -269,17 +275,26 @@ impl BlsSource {
     /// Admits one freshly sealed successful doctor for a bounded in-process production window.
     pub fn activation_candidate(
         &self,
-        doctor: BlsDoctorReport,
-        sealed_doctor_capture: SealedProviderCaptureSetReceipt,
+        pending: crate::doctor::BlsPendingDoctorSeal,
+        sealed_doctor_capture: SealedProviderCaptureMaterial,
     ) -> Result<BlsActivationCandidate, BlsSourceError> {
+        let (doctor, capture_token) = pending.try_rejoin(sealed_doctor_capture)?;
         let activated_at = system_timestamp()?;
-        BlsActivationCandidate::try_new(
+        let activation = BlsActivationCandidate::try_new(
             self.activation_plan()?,
             doctor,
-            sealed_doctor_capture,
+            capture_token.persisted_receipt().clone(),
             activated_at,
             Arc::clone(&self.runtime_instance),
-        )
+        )?;
+        *self
+            .doctor_capture_authority
+            .lock()
+            .map_err(|_| BlsSourceError::InvalidPublication)? = Some(BlsDoctorCaptureAuthority {
+            activation_candidate_digest: activation.candidate_digest(),
+            capture_token,
+        });
+        Ok(activation)
     }
 
     /// Reopens a doctor-backed in-process admission against this exact source configuration.
@@ -300,7 +315,20 @@ impl BlsSource {
             &self.activation_plan()?,
             operation_at,
             &self.runtime_instance,
-        )
+        )?;
+        let retained = self
+            .doctor_capture_authority
+            .lock()
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
+        let retained = retained
+            .as_ref()
+            .ok_or(BlsSourceError::InvalidPublication)?;
+        if retained.activation_candidate_digest != activation.candidate_digest()
+            || retained.capture_token.persisted_receipt() != activation.sealed_doctor_capture()
+        {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        Ok(())
     }
 
     fn validate_activation_operation_at(
@@ -500,8 +528,14 @@ impl BlsSource {
             Arc::clone(&self.runtime_instance),
         )
         .map_err(|_| SourceError::InvalidProtocolState)?;
-        BlsDoctorOutput::try_new(report, capture_material)
-            .map_err(|_| SourceError::InvalidProtocolState.into())
+        let output = BlsDoctorOutput::try_new(report, capture_material)
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        if cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
+        ensure_deadline_open(deadline)?;
+        self.validate_authority(&authority)?;
+        Ok(output)
     }
 
     /// Fetches and discovers exact response objects only through current doctor-backed admission.
@@ -641,6 +675,14 @@ impl BlsSource {
             source_generation_digest,
         );
         validate_discovery_output(&self.metadata, &self.config, &output)?;
+        if cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
+        ensure_deadline_open(request.deadline())?;
+        authority.validate_current()?;
+        let completed_at = system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
+        self.validate_activation_operation_at(activation, completed_at, request.deadline())
+            .map_err(|_| SourceError::InvalidProtocolState)?;
         Ok(output)
     }
 
@@ -648,44 +690,11 @@ impl BlsSource {
     pub fn admit_sealed_discovery(
         &self,
         pending: BlsPendingDiscovery,
-        sealed_capture: SealedProviderCaptureSetReceipt,
+        sealed_capture: SealedProviderCaptureMaterial,
         activation: &BlsActivationCandidate,
     ) -> Result<BlsDiscoveryAdmission, BlsSourceError> {
         self.validate_activation_candidate(activation)?;
-        let (admission, retained_pages) = BlsDiscoveryAdmission::try_new(
-            pending,
-            sealed_capture,
-            &self.runtime_instance,
-            activation,
-        )?;
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| BlsSourceError::InvalidPublication)?;
-        let mut staged = cache.clone();
-        for (object, page) in admission.objects().iter().zip(retained_pages.iter()) {
-            let cache_key = page_cache_key(
-                object.object().object_id(),
-                object.component_request_identity(),
-                object.component_observation_digest(),
-                object.source_generation_digest(),
-            )?;
-            let retained = staged
-                .insert(
-                    &cache_key,
-                    object.object().object_id(),
-                    object.component_request_identity(),
-                    object.component_observation_digest(),
-                    object.source_generation_digest(),
-                    page,
-                )
-                .map_err(|_| BlsSourceError::InvalidPublication)?;
-            if !retained {
-                return Err(BlsSourceError::InvalidPublication);
-            }
-        }
-        *cache = staged;
-        Ok(admission)
+        BlsDiscoveryAdmission::try_new(pending, sealed_capture, &self.runtime_instance, activation)
     }
 
     async fn normalized_admitted_page(
@@ -720,29 +729,8 @@ impl BlsSource {
         if chunk_index != discovery_admission.chunk_index() {
             return Err(SourceError::InvalidProtocolState.into());
         }
-        let cache_key = page_cache_key(
-            request.object().object_id(),
-            discovery_admission.component_request_identity(),
-            discovery_admission.component_observation_digest(),
-            discovery_admission.source_generation_digest(),
-        )
-        .map_err(|_| SourceError::InvalidProtocolState)?;
-        let cached = self
-            .cache
-            .lock()
-            .map_err(|_| SourceError::InvalidProtocolState)?
-            .pages
-            .get(&cache_key)
-            .cloned()
-            .ok_or(SourceError::GenerationResynchronizationRequired)?;
-        if cached.object_id != *request.object().object_id()
-            || cached.request_identity != discovery_admission.component_request_identity()
-            || cached.observation_digest != discovery_admission.component_observation_digest()
-            || cached.source_generation != discovery_admission.source_generation_digest()
-        {
-            return Err(SourceError::GenerationResynchronizationRequired.into());
-        }
-        let bytes = cached.bytes;
+        let retained_page = discovery_admission.retained_page();
+        let bytes = retained_page.bytes.clone();
         let requested = chunk
             .series()
             .iter()
@@ -759,8 +747,8 @@ impl BlsSource {
         let page = RetrievedBlsPage {
             bytes,
             response,
-            received_at: cached.received_at,
-            sha256_hex: cached.sha256_hex,
+            received_at: retained_page.received_at,
+            sha256_hex: retained_page.sha256_hex.clone(),
         };
         if page.response.is_partial()
             || page.sha256_hex != object_digest
@@ -827,9 +815,8 @@ impl BlsSource {
     /// Consumes one physically sealed discovery-object admission into canonical BLS records.
     ///
     /// Extraction performs no provider request and never substitutes a byte-identical refetch for
-    /// the earlier first-observed response. A freshly reconstructed source can repopulate its
-    /// bounded cache only from an exact pending response joined to its physical capture seal and
-    /// the same stable source generation.
+    /// the earlier first-observed response. The exact retained response moves through the sealed
+    /// admission; the source holds no provider-response cache or publication authority.
     pub async fn extract_sealed_discovery(
         &self,
         authority: ExtractionAuthority,
@@ -841,6 +828,7 @@ impl BlsSource {
         let started_at = system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
         self.validate_activation_operation_at(activation, started_at, request.deadline())
             .map_err(|_| SourceError::InvalidProtocolState)?;
+        let final_cancellation = cancellation.clone();
         let page = self
             .normalized_admitted_page(
                 &authority,
@@ -888,9 +876,13 @@ impl BlsSource {
         .map_err(|_| SourceError::InvalidProtocolState)?;
         #[cfg(test)]
         self.apply_test_publication_action()?;
+        if final_cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
+        ensure_deadline_open(request.deadline())?;
         authority.validate_current()?;
         let completed_at = system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
-        self.validate_activation_candidate_at(activation, completed_at)
+        self.validate_activation_operation_at(activation, completed_at, request.deadline())
             .map_err(|_| SourceError::InvalidProtocolState)?;
         Ok(BlsExtractionOutput {
             batch,

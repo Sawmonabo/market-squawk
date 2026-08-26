@@ -4,7 +4,11 @@ use bytes::Bytes;
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
 };
-use market_squawk_sources::{ProviderCaptureMaterial, ProviderCaptureSetReceipt, SourceMetadata};
+use market_squawk_sources::{
+    ProviderCaptureMaterial, ProviderCaptureSealExpectation, ProviderCaptureSealRequest,
+    ProviderCaptureSetReceipt, ProviderWholeCaptureToken, RejoinedProviderCapture,
+    SealedProviderCaptureMaterial, SourceMetadata,
+};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -209,6 +213,32 @@ pub struct CensusDoctorOutput {
     capture: ProviderCaptureMaterial,
 }
 
+/// Exact redacted doctor evidence and private witness awaiting the common seal result.
+#[derive(Debug)]
+pub struct CensusPendingDoctorSeal {
+    report: CensusDoctorReport,
+    expectation: ProviderCaptureSealExpectation,
+}
+
+impl CensusPendingDoctorSeal {
+    pub(crate) fn try_rejoin(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<(CensusDoctorReport, ProviderWholeCaptureToken), CensusSourceError> {
+        let token = match self
+            .expectation
+            .try_rejoin(sealed)
+            .map_err(|_| CensusSourceError::InvalidConfiguration)?
+        {
+            RejoinedProviderCapture::Whole(token) => token,
+            RejoinedProviderCapture::Components(_) => {
+                return Err(CensusSourceError::InvalidConfiguration);
+            }
+        };
+        Ok((self.report, token))
+    }
+}
+
 impl CensusDoctorOutput {
     pub(crate) const fn new(report: CensusDoctorReport, capture: ProviderCaptureMaterial) -> Self {
         Self { report, capture }
@@ -224,9 +254,16 @@ impl CensusDoctorOutput {
         &self.capture
     }
 
-    /// Consumes the indivisible doctor handoff.
-    pub fn into_parts(self) -> (CensusDoctorReport, ProviderCaptureMaterial) {
-        (self.report, self.capture)
+    /// Splits the doctor result into its private witness and sole common seal request.
+    pub fn into_sealing_parts(self) -> (CensusPendingDoctorSeal, ProviderCaptureSealRequest) {
+        let (expectation, request) = self.capture.into_whole_seal_parts();
+        (
+            CensusPendingDoctorSeal {
+                report: self.report,
+                expectation,
+            },
+            request,
+        )
     }
 }
 
