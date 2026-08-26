@@ -9,8 +9,8 @@ use market_squawk_domain::{
     BarTimeSemantics, BarTimestampBasis, CalendarDate, Currency, DigestAlgorithm, EvidenceDigest,
     ExactPayloadEvidence, FundNavCompleteness, FundNavDisposition, FundNavMissingState,
     FundNavValue, InstrumentId, MarketBarAdjustment, MarketBarSessionEvidence,
-    MarketBarSessionKind, MetadataRevision, ProviderInstrumentId, ResearchObservation,
-    RevisionBoundPayloadEvidence, RevisionNumber, SourceId, SourceIdentifier, Timestamp, VenueId,
+    MarketBarSessionKind, MetadataRevision, ProviderInstrumentId, RevisionBoundPayloadEvidence,
+    SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_platform::{LocalPaths, RawCaptureRecord, SealedResearchJournalStore};
 use market_squawk_sources::{
@@ -21,19 +21,21 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    TIINGO_APPLICATION_BYTES_PER_MONTH, TiingoAdapterError, TiingoCompletedFundNavHistoryCandidate,
-    TiingoCompletedHistoryCandidate, TiingoCompletedHistoryCapture, TiingoDecoder,
+    TIINGO_APPLICATION_BYTES_PER_MONTH, TiingoAdapterError, TiingoCompletedEodHistoryCandidate,
+    TiingoCompletedFundNavHistoryCandidate, TiingoCompletedHistoryCapture, TiingoDecoder,
     TiingoEodBarTimeAuthority, TiingoEodBarTimeRequest, TiingoEodContractEvidence,
     TiingoEodExpectedSessionAuthority, TiingoEodExpectedSessionEvidence,
     TiingoEodExpectedSessionRequest, TiingoEodExpectedSessionValidationReceipt,
     TiingoEodFinancialCoverageDisposition, TiingoEodInstrumentAuthority, TiingoEodInstrumentKind,
-    TiingoEodMapError, TiingoEodMappingInput, TiingoFundContext, TiingoFundNavContractEvidence,
+    TiingoEodMapError, TiingoEodMappingInput, TiingoEodPagePublicationRoute, TiingoFundContext,
+    TiingoFundNavContractEvidence,
     TiingoFundNavHistoryFinancialCoverage, TiingoFundNavMappingInput, TiingoFundSupport,
     TiingoHistoryCheckpointReceipt, TiingoHistoryPlan, TiingoHistoryTerminalDisposition,
     TiingoNavValueState, TiingoProviderAuthorityInstallation, TiingoProviderAuthorityRequirements,
-    TiingoQuotaAdmission, TiingoQuotaLedger, TiingoQuotaWindows, TiingoRequestSpec,
-    TiingoResponseEvidence, TiingoSealedHistoryPage, TiingoTicker, classify_fund_support,
-    map_eod_bars, map_fund_nav_candidate, missing_nav_candidate, normalize_mutual_fund_row,
+    TiingoProviderRevisionEvidence, TiingoQuotaAdmission, TiingoQuotaLedger, TiingoQuotaWindows,
+    TiingoRequestSpec, TiingoResponseEvidence, TiingoSealedHistoryPage,
+    TiingoSourcePublicationEvidence, TiingoTicker, classify_fund_support, map_eod_page_candidate,
+    map_fund_nav_candidate, missing_nav_candidate, normalize_mutual_fund_row,
     tiingo_provider_rate_declaration,
 };
 
@@ -697,10 +699,7 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
     ));
 
     let venue_id = VenueId::try_from("xnas")?;
-    let raw_feed = identifier("tiingo-starter-daily-eod-raw")?;
-    let adjusted_feed = identifier("tiingo-starter-daily-eod-adjusted-all-v1")?;
     let eod_contract = TiingoEodContractEvidence::try_new(
-        contract.source_id().clone(),
         contract.source_contract_revision().clone(),
         contract.source_contract_evidence().clone(),
         contract.native_schema_revision().clone(),
@@ -708,11 +707,10 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
         contract.entitlement_generation(),
         contract.entitlement_generation_identity().clone(),
         contract.entitlement_evidence(),
-        raw_feed.clone(),
-        adjusted_feed.clone(),
-        MarketBarAdjustment::All,
         ExactPayloadEvidence::from_content_digest(digest(b"tiingo-adjusted-eod-surface-v1")),
     )?;
+    let raw_feed = eod_contract.raw_feed().clone();
+    let adjusted_feed = eod_contract.adjusted_feed().clone();
     let eod_instrument = TiingoEodInstrumentAuthority::try_new(
         "06dd06da-ef2d-44dd-bf28-b006da06b24b".parse::<InstrumentId>()?,
         venue_id.clone(),
@@ -737,7 +735,7 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
         &contract,
         &store,
     )?;
-    let mapped_eod = map_eod_bars(TiingoEodMappingInput {
+    let eod_page = map_eod_page_candidate(TiingoEodMappingInput {
         response: &equity_response,
         metadata: &equity_metadata,
         sealed_capture: &equity_sealed,
@@ -745,34 +743,91 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
         instrument: &eod_instrument,
         contract: &eod_contract,
         bar_time_authority: &FixedEodTimeAuthority,
-        authority_seed_revision: RevisionNumber::new(1)?,
         ingested_at: Timestamp::from_unix_nanos(54),
     })?;
-    assert_eq!(mapped_eod.observations().len(), 2);
-    assert!(mapped_eod.gaps().is_empty());
-    assert_eq!(mapped_eod.provider_actions().len(), 1);
-    let [
-        ResearchObservation::MarketBar(raw),
-        ResearchObservation::MarketBar(adjusted),
-    ] = mapped_eod.observations()
-    else {
-        return Err("expected separate raw and adjusted Tiingo EOD bars".into());
+    let eod_page = match eod_page.into_publication_route() {
+        TiingoEodPagePublicationRoute::Latest(_) => {
+            return Err("historical Tiingo EOD entered the latest publication handoff".into());
+        }
+        TiingoEodPagePublicationRoute::Historical(page) => page,
     };
-    assert_eq!(raw.adjustment(), MarketBarAdjustment::Raw);
-    assert_eq!(adjusted.adjustment(), MarketBarAdjustment::All);
-    assert_eq!(raw.feed(), &raw_feed);
-    assert_eq!(adjusted.feed(), &adjusted_feed);
+    let [raw, adjusted] = eod_page.bars() else {
+        return Err("expected separate raw and adjusted Tiingo EOD candidates".into());
+    };
+    assert_eq!(
+        (
+            raw.adjustment(),
+            adjusted.adjustment(),
+            raw.feed(),
+            adjusted.feed(),
+            raw.provider_row_index(),
+            adjusted.provider_row_index(),
+            raw.provider_row_digest(),
+            adjusted.provider_row_digest(),
+        ),
+        (
+            MarketBarAdjustment::Raw,
+            MarketBarAdjustment::All,
+            &raw_feed,
+            &adjusted_feed,
+            0,
+            0,
+            equity_response.rows()[0].row_digest(),
+            equity_response.rows()[0].row_digest(),
+        )
+    );
+    assert_eq!(
+        (
+            raw.source_publication(),
+            raw.provider_revision(),
+            raw.received_at(),
+            raw.decoded_at(),
+            raw.ingested_at(),
+            eod_page.gaps().len(),
+            eod_page.provider_actions().len(),
+            eod_page.sealed_metadata_capture_receipt(),
+        ),
+        (
+            TiingoSourcePublicationEvidence::NotSupplied,
+            TiingoProviderRevisionEvidence::NotSupplied,
+            Timestamp::from_unix_nanos(52),
+            Timestamp::from_unix_nanos(53),
+            Timestamp::from_unix_nanos(54),
+            0,
+            1,
+            equity_metadata_sealed.receipt_digest(),
+        )
+    );
+    let eod_disposition = eod_page.eod_request_disposition();
+    let metadata_disposition = eod_page.metadata_request_disposition();
+    assert_eq!(
+        (
+            eod_disposition.requested_symbols(),
+            eod_disposition.returned_symbols(),
+            eod_disposition.missing_symbols(),
+            eod_disposition.returned_rows(),
+            eod_disposition.response_bytes(),
+            metadata_disposition.requested_symbols(),
+            metadata_disposition.returned_symbols(),
+            metadata_disposition.missing_symbols(),
+            metadata_disposition.returned_rows(),
+            metadata_disposition.response_bytes(),
+        ),
+        (
+            1,
+            1,
+            0,
+            1,
+            u64::try_from(equity_body.len())?,
+            1,
+            1,
+            0,
+            1,
+            u64::try_from(equity_metadata_body.len())?,
+        )
+    );
     assert_ne!(raw.feed(), adjusted.feed());
-    assert_eq!(
-        mapped_eod
-            .revision_plan()
-            .map(market_squawk_sources::ExtractionRevisionPlan::len),
-        Some(2)
-    );
-    assert_eq!(
-        mapped_eod.sealed_metadata_capture_receipt(),
-        equity_metadata_sealed.receipt_digest()
-    );
+    assert_ne!(raw.semantic_identity(), adjusted.semantic_identity());
 
     let completed_capture = completed_single_page_history(
         equity_history_plan,
@@ -780,32 +835,43 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
         &equity_sealed,
         &contract,
     )?;
-    let completed_history = TiingoCompletedHistoryCandidate::try_new(
+    let completed_history = TiingoCompletedEodHistoryCandidate::try_new(
         completed_capture,
-        vec![mapped_eod.clone()],
+        vec![eod_page],
         &eod_instrument,
         &FixedEodExpectedSessionAuthority,
     )?;
+    let expected_completion_identity = completed_history.completion_identity();
+    let pending_history = completed_history.into_pending_publication();
     assert_eq!(
-        completed_history.terminal(),
-        TiingoHistoryTerminalDisposition::ApplicationDateWindowsExhaustedWithoutProviderCursor
+        (
+            pending_history.capture().terminal(),
+            pending_history.pages().len(),
+            pending_history.total_bars(),
+            pending_history.total_gaps(),
+            pending_history.total_provider_actions(),
+            pending_history.financial_coverage(),
+            pending_history.returned_sessions(),
+            pending_history.missing_expected_sessions().is_empty(),
+            pending_history
+                .expected_session_validation()
+                .authority_generation()
+                .as_str(),
+            pending_history.completion_identity(),
+        ),
+        (
+            TiingoHistoryTerminalDisposition::ApplicationDateWindowsExhaustedWithoutProviderCursor,
+            1,
+            2,
+            0,
+            1,
+            TiingoEodFinancialCoverageDisposition::Complete,
+            [date(2026, 8, 10)?].as_slice(),
+            true,
+            "xnas-calendar-authority-generation-7",
+            expected_completion_identity,
+        )
     );
-    assert_eq!(completed_history.pages().len(), 1);
-    assert_eq!(completed_history.total_observations(), 2);
-    assert_eq!(
-        completed_history.financial_coverage(),
-        TiingoEodFinancialCoverageDisposition::Complete
-    );
-    assert_eq!(completed_history.returned_sessions(), [date(2026, 8, 10)?]);
-    assert!(completed_history.missing_expected_sessions().is_empty());
-    assert_eq!(
-        completed_history
-            .expected_session_validation()
-            .authority_generation()
-            .as_str(),
-        "xnas-calendar-authority-generation-7"
-    );
-    assert_ne!(completed_history.completion_identity().bytes(), [0; 32]);
 
     let windows = TiingoQuotaWindows::try_new(
         Timestamp::from_unix_nanos(100),

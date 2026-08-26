@@ -24,7 +24,7 @@ const TIINGO_SOURCE_ID: &str = "tiingo-starter";
 const TIINGO_HISTORY_DATASET: &str = "tiingo-daily-history-window";
 
 /// One exact decoded history response after its raw body is sealed by shared authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct TiingoSealedHistoryPage {
     source_id: SourceId,
     source_contract_revision: MetadataRevision,
@@ -180,7 +180,7 @@ pub enum TiingoHistoryTerminalDisposition {
 }
 
 /// Surface-neutral request-graph-complete raw/native handoff for later coverage reconciliation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct TiingoCompletedHistoryCapture {
     source_id: SourceId,
     source_contract_revision: MetadataRevision,

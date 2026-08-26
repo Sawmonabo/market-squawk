@@ -1,7 +1,7 @@
 //! Bounded Tiingo Starter adapter core for supported mutual-fund NAV and curated daily EOD data.
 //!
 //! The crate owns only provider-specific authentication, request planning, native decoding,
-//! NAV-versus-EOD semantics, exact pre-publication canonical mapping, and Tiingo-specific shared
+//! NAV-versus-EOD semantics, exact provider-native publication handoffs, and Tiingo-specific shared
 //! authority requirements. It does not allocate canonical revisions, mint dataset/PIT receipts,
 //! or claim that a provider EOD row is an intraday trade or bar. Its optional HTTP source emits
 //! one bounded raw/capture/native page at a time; shared durable authority must seal/checkpoint
@@ -36,14 +36,16 @@ pub use authority::{
 pub use credentials::{TiingoApiToken, TiingoRequestBuilder};
 pub use decoder::{TiingoDecoder, TiingoSchemaCircuitState};
 pub use eod::{
-    TiingoCompletedHistoryCandidate, TiingoEodBarTimeAuthority, TiingoEodBarTimeRequest,
-    TiingoEodContractEvidence, TiingoEodExpectedSessionAuthority,
+    TiingoCompletedEodHistoryCandidate, TiingoEodBarCandidate, TiingoEodBarTimeAuthority,
+    TiingoEodBarTimeRequest, TiingoEodContractEvidence, TiingoEodExpectedSessionAuthority,
     TiingoEodExpectedSessionEvidence, TiingoEodExpectedSessionRequest,
     TiingoEodExpectedSessionValidationReceipt,
     TiingoEodFinancialCoverageDisposition, TiingoEodInstrumentAuthority,
     TiingoEodInstrumentKind, TiingoEodMapError, TiingoEodMappingInput,
-    TiingoEodProviderActionEvidence, TiingoEodSurface, TiingoEodSurfaceGap,
-    TiingoEodSurfaceGapReason, TiingoMappedEodPage, map_eod_bars,
+    TiingoEodPageCandidate, TiingoEodPagePublicationRoute, TiingoEodProviderActionEvidence,
+    TiingoEodSurface, TiingoEodSurfaceGap, TiingoEodSurfaceGapReason,
+    TiingoPendingEodHistoryPublication, TiingoPendingLatestEodPublication,
+    map_eod_page_candidate,
 };
 pub use error::{
     TiingoAdapterError, TiingoProviderFailure, TiingoSchemaChange, TiingoSchemaChangeReason,

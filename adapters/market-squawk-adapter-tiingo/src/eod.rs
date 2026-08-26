@@ -1,22 +1,14 @@
-//! Strict Tiingo equity/ETF EOD mapping into separate raw and adjusted canonical bars.
+//! Strict Tiingo equity/ETF EOD mapping into separate raw and adjusted provider candidates.
 
-use std::{
-    io,
-    num::NonZeroU64,
-};
+use std::num::NonZeroU64;
 
 use market_squawk_domain::{
-    AvailabilityEvidence, BarTimeSemantics, CalendarDate, Currency, DataQuality, DigestAlgorithm,
-    EvidenceDigest, ExactPayloadEvidence, InstrumentId, MarketBarAdjustment,
-    MarketBarObservation, MetadataRevision, Money, PayloadHash, PayloadReference,
-    ProviderInstrumentId, ResearchContext, ResearchObservation, ResearchProvenance,
-    ResearchProvenanceInput, ResearchTime, RevisionBoundPayloadEvidence, RevisionNumber, SourceId,
-    SourceIdentifier, Timestamp, VenueId,
+    AvailabilityEvidence, BarTimeSemantics, BarTimestampBasis, CalendarDate, Currency,
+    DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, InstrumentId, MarketBarAdjustment,
+    MarketBarSessionKind, MetadataRevision, Money, ProviderInstrumentId,
+    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
-use market_squawk_sources::{
-    ExtractionRevisionPlan, ObservedRevisionError, ProviderCaptureTerminalDisposition,
-    SealedProviderCaptureSetReceipt,
-};
+use market_squawk_sources::{ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt};
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -24,7 +16,9 @@ use thiserror::Error;
 use crate::{
     TiingoCompletedHistoryCapture, TiingoCoverage, TiingoEndpointFamily, TiingoEodReceipt,
     TiingoEodRow, TiingoHistoryPlan, TiingoHistoryTerminalDisposition, TiingoMetadataReceipt,
-    TiingoPaginationEvidence, TiingoRequestScope, TiingoRequestSpec, TiingoTicker,
+    TiingoPaginationEvidence, TiingoProviderRevisionEvidence, TiingoRequestDisposition,
+    TiingoRequestScope, TiingoRequestSpec, TiingoResponseEvidence, TiingoSourcePublicationEvidence,
+    TiingoTicker,
 };
 
 const TIINGO_SOURCE_ID: &str = "tiingo-starter";
@@ -32,9 +26,10 @@ const TIINGO_MUTUAL_FUND_EXCHANGE_CODE: &str = "MF";
 const TIINGO_LATEST_DATASET: &str = "tiingo-daily-latest";
 const TIINGO_HISTORY_DATASET: &str = "tiingo-daily-history-window";
 const TIINGO_DAILY_INTERVAL: &str = "tiingo-calendar-day";
-const MAX_EOD_HANDOFF_CANONICAL_BYTES: u64 = 16 * 1024 * 1024;
+const TIINGO_RAW_EOD_FEED: &str = "tiingo-starter-daily-eod-raw";
+const TIINGO_ADJUSTED_EOD_FEED: &str = "tiingo-starter-daily-eod-adjusted-all-v1";
 
-/// Closed canonical asset classification admitted by the Tiingo EOD bar mapper.
+/// Closed externally resolved asset classification admitted by the Tiingo EOD mapper.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TiingoEodInstrumentKind {
     /// A resolved exchange-listed equity.
@@ -153,13 +148,10 @@ impl TiingoEodInstrumentAuthority {
 
     fn mapping_identity(&self) -> EvidenceDigest {
         let mut hasher = Sha256::new();
-        append_field(&mut hasher, b"market-squawk/tiingo/eod-instrument/v1");
+        append_field(&mut hasher, b"market-squawk/tiingo/eod-instrument/v2");
         append_field(&mut hasher, self.instrument_id.to_string().as_bytes());
         append_field(&mut hasher, self.venue_id.as_str().as_bytes());
-        append_field(
-            &mut hasher,
-            self.provider_instrument_id.as_str().as_bytes(),
-        );
+        append_field(&mut hasher, self.provider_instrument_id.as_str().as_bytes());
         append_field(&mut hasher, self.ticker.as_str().as_bytes());
         append_field(&mut hasher, self.provider_exchange_code.as_str().as_bytes());
         append_field(
@@ -177,18 +169,13 @@ impl TiingoEodInstrumentAuthority {
                 .as_str()
                 .as_bytes(),
         );
-        append_field(
+        append_evidence_digest(
             &mut hasher,
-            &self
-                .instrument_definition
+            self.instrument_definition
                 .payload_evidence()
-                .content_digest()
-                .bytes(),
+                .content_digest(),
         );
-        append_field(
-            &mut hasher,
-            &self.provider_mapping_evidence.content_digest().bytes(),
-        );
+        append_evidence_digest(&mut hasher, self.provider_mapping_evidence.content_digest());
         append_field(&mut hasher, &self.resolved_at.unix_nanos().to_be_bytes());
         append_field(&mut hasher, self.currency.as_str().as_bytes());
         EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
@@ -213,13 +200,12 @@ pub struct TiingoEodContractEvidence {
 }
 
 impl TiingoEodContractEvidence {
-    /// Binds one activated Tiingo contract and distinct canonical raw/adjusted feed identities.
+    /// Binds one activated Tiingo contract to code-owned raw and adjusted provider semantics.
     #[allow(
         clippy::too_many_arguments,
-        reason = "source, schema, entitlement, and two price-surface identities remain explicit"
+        reason = "source contract, schema, entitlement, and adjusted-surface evidence remain explicit"
     )]
     pub fn try_new(
-        source_id: SourceId,
         source_contract_revision: MetadataRevision,
         source_contract_evidence: ExactPayloadEvidence,
         native_schema_revision: SourceIdentifier,
@@ -227,15 +213,9 @@ impl TiingoEodContractEvidence {
         entitlement_generation: NonZeroU64,
         entitlement_generation_identity: SourceIdentifier,
         entitlement_evidence: EvidenceDigest,
-        raw_feed: SourceIdentifier,
-        adjusted_feed: SourceIdentifier,
-        adjusted_adjustment: MarketBarAdjustment,
         adjusted_surface_evidence: ExactPayloadEvidence,
     ) -> Result<Self, TiingoEodMapError> {
-        if source_id.as_str() != TIINGO_SOURCE_ID
-            || raw_feed == adjusted_feed
-            || adjusted_adjustment == MarketBarAdjustment::Raw
-            || [
+        if [
                 source_contract_evidence.content_digest(),
                 native_schema_evidence.content_digest(),
                 entitlement_evidence,
@@ -246,6 +226,12 @@ impl TiingoEodContractEvidence {
         {
             return Err(TiingoEodMapError::InvalidContractEvidence);
         }
+        let source_id = SourceId::try_from(TIINGO_SOURCE_ID)
+            .map_err(|_| TiingoEodMapError::InvalidContractEvidence)?;
+        let raw_feed = SourceIdentifier::try_from(TIINGO_RAW_EOD_FEED)
+            .map_err(|_| TiingoEodMapError::InvalidContractEvidence)?;
+        let adjusted_feed = SourceIdentifier::try_from(TIINGO_ADJUSTED_EOD_FEED)
+            .map_err(|_| TiingoEodMapError::InvalidContractEvidence)?;
         Ok(Self {
             source_id,
             source_contract_revision,
@@ -257,7 +243,7 @@ impl TiingoEodContractEvidence {
             entitlement_evidence,
             raw_feed,
             adjusted_feed,
-            adjusted_adjustment,
+            adjusted_adjustment: MarketBarAdjustment::All,
             adjusted_surface_evidence,
         })
     }
@@ -302,17 +288,17 @@ impl TiingoEodContractEvidence {
         self.entitlement_evidence
     }
 
-    /// Returns the canonical feed identity for unadjusted Tiingo values.
+    /// Returns the provider-feed identity selected for unadjusted Tiingo values.
     pub const fn raw_feed(&self) -> &SourceIdentifier {
         &self.raw_feed
     }
 
-    /// Returns the distinct canonical feed identity for Tiingo-adjusted values.
+    /// Returns the distinct provider-feed identity selected for Tiingo-adjusted values.
     pub const fn adjusted_feed(&self) -> &SourceIdentifier {
         &self.adjusted_feed
     }
 
-    /// Returns the exact reviewed canonical adjustment class for the adjusted surface.
+    /// Returns the exact reviewed adjustment class for the adjusted provider surface.
     pub const fn adjusted_adjustment(&self) -> MarketBarAdjustment {
         self.adjusted_adjustment
     }
@@ -324,7 +310,7 @@ impl TiingoEodContractEvidence {
 
     fn mapping_identity(&self) -> EvidenceDigest {
         let mut hasher = Sha256::new();
-        append_field(&mut hasher, b"market-squawk/tiingo/eod-contract/v1");
+        append_field(&mut hasher, b"market-squawk/tiingo/eod-contract/v2");
         append_field(&mut hasher, self.source_id.as_str().as_bytes());
         append_field(
             &mut hasher,
@@ -339,7 +325,7 @@ impl TiingoEodContractEvidence {
             self.entitlement_evidence,
             self.adjusted_surface_evidence.content_digest(),
         ] {
-            append_field(&mut hasher, &digest.bytes());
+            append_evidence_digest(&mut hasher, digest);
         }
         append_field(
             &mut hasher,
@@ -349,10 +335,7 @@ impl TiingoEodContractEvidence {
             &mut hasher,
             self.entitlement_generation_identity.as_str().as_bytes(),
         );
-        append_field(
-            &mut hasher,
-            self.native_schema_revision.as_str().as_bytes(),
-        );
+        append_field(&mut hasher, self.native_schema_revision.as_str().as_bytes());
         append_field(&mut hasher, self.raw_feed.as_str().as_bytes());
         append_field(&mut hasher, self.adjusted_feed.as_str().as_bytes());
         append_field(
@@ -537,6 +520,10 @@ pub struct TiingoEodExpectedSessionEvidence {
 
 impl TiingoEodExpectedSessionEvidence {
     /// Binds an exact reviewed calendar revision to every expected venue session in the request.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "calendar identity, revision, authority, clocks, receipt, and exact sessions remain explicit"
+    )]
     pub fn try_new(
         request: &TiingoEodExpectedSessionRequest,
         calendar_id: SourceIdentifier,
@@ -563,10 +550,12 @@ impl TiingoEodExpectedSessionEvidence {
             || resolved_at < calendar_available_at
             || resolution_receipt.bytes() == [0; 32]
             || expected_sessions.len() > inclusive_calendar_days
-            || expected_sessions.iter().any(|date| {
-                *date < request.start_date() || *date > request.end_date()
-            })
-            || expected_sessions.windows(2).any(|dates| dates[0] >= dates[1])
+            || expected_sessions
+                .iter()
+                .any(|date| *date < request.start_date() || *date > request.end_date())
+            || expected_sessions
+                .windows(2)
+                .any(|dates| dates[0] >= dates[1])
         {
             return Err(TiingoEodMapError::InvalidExpectedSessionEvidence);
         }
@@ -749,7 +738,157 @@ pub enum TiingoEodSurface {
     Adjusted,
 }
 
-/// Why one provider-native daily surface did not become a canonical market bar.
+/// One exact revision-free EOD surface awaiting common canonical publication authority.
+///
+/// This value retains provider-native economics, identity, clocks, and session evidence. It is not
+/// a canonical observation: it has no observed revision, publication clock, predecessor,
+/// successor, manifest, catalog, or PIT authority. Those facts belong to the common publication
+/// transaction after the shared seal/native-lineage spine consumes the exact raw capture.
+#[derive(Debug, Eq, PartialEq)]
+pub struct TiingoEodBarCandidate {
+    instrument_id: InstrumentId,
+    venue_id: VenueId,
+    provider_instrument_id: ProviderInstrumentId,
+    provider_date: CalendarDate,
+    provider_row_index: u32,
+    provider_row_digest: EvidenceDigest,
+    surface: TiingoEodSurface,
+    feed: SourceIdentifier,
+    interval: SourceIdentifier,
+    time_semantics: BarTimeSemantics,
+    adjustment: MarketBarAdjustment,
+    open: Money,
+    high: Money,
+    low: Money,
+    close: Money,
+    volume: Decimal,
+    source_publication: TiingoSourcePublicationEvidence,
+    provider_revision: TiingoProviderRevisionEvidence,
+    availability: AvailabilityEvidence,
+    received_at: Timestamp,
+    decoded_at: Timestamp,
+    ingested_at: Timestamp,
+    semantic_identity: EvidenceDigest,
+}
+
+impl TiingoEodBarCandidate {
+    /// Returns the stable canonical instrument selected by external reference authority.
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the exact canonical venue selected by external reference authority.
+    pub const fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+
+    /// Returns the exact Tiingo provider instrument.
+    pub const fn provider_instrument_id(&self) -> &ProviderInstrumentId {
+        &self.provider_instrument_id
+    }
+
+    /// Returns Tiingo's exact daily civil date without inventing midnight precision.
+    pub const fn provider_date(&self) -> CalendarDate {
+        self.provider_date
+    }
+
+    /// Returns the exact zero-based native row coordinate in the response.
+    pub const fn provider_row_index(&self) -> u32 {
+        self.provider_row_index
+    }
+
+    /// Returns the exact provider-native row identity.
+    pub const fn provider_row_digest(&self) -> EvidenceDigest {
+        self.provider_row_digest
+    }
+
+    /// Returns whether this is the unadjusted or separately adjusted provider surface.
+    pub const fn surface(&self) -> TiingoEodSurface {
+        self.surface
+    }
+
+    /// Returns the distinct feed identity selected for this provider surface.
+    pub const fn feed(&self) -> &SourceIdentifier {
+        &self.feed
+    }
+
+    /// Returns the exact provider daily interval identity.
+    pub const fn interval(&self) -> &SourceIdentifier {
+        &self.interval
+    }
+
+    /// Returns externally resolved completed-period and venue-session evidence.
+    pub const fn time_semantics(&self) -> &BarTimeSemantics {
+        &self.time_semantics
+    }
+
+    /// Returns the exact adjustment semantics for this surface.
+    pub const fn adjustment(&self) -> MarketBarAdjustment {
+        self.adjustment
+    }
+
+    /// Returns the exact opening price.
+    pub const fn open(&self) -> Money {
+        self.open
+    }
+
+    /// Returns the exact high price.
+    pub const fn high(&self) -> Money {
+        self.high
+    }
+
+    /// Returns the exact low price.
+    pub const fn low(&self) -> Money {
+        self.low
+    }
+
+    /// Returns the exact closing price.
+    pub const fn close(&self) -> Money {
+        self.close
+    }
+
+    /// Returns exact provider-reported surface volume.
+    pub const fn volume(&self) -> Decimal {
+        self.volume
+    }
+
+    /// Returns the explicit absence of a provider publication timestamp.
+    pub const fn source_publication(&self) -> TiingoSourcePublicationEvidence {
+        self.source_publication
+    }
+
+    /// Returns the explicit absence of a provider revision/finality coordinate.
+    pub const fn provider_revision(&self) -> TiingoProviderRevisionEvidence {
+        self.provider_revision
+    }
+
+    /// Returns conservative first-local-observation availability evidence.
+    pub const fn availability(&self) -> &AvailabilityEvidence {
+        &self.availability
+    }
+
+    /// Returns when the exact provider body completed local receipt.
+    pub const fn received_at(&self) -> Timestamp {
+        self.received_at
+    }
+
+    /// Returns when strict provider-native decoding completed.
+    pub const fn decoded_at(&self) -> Timestamp {
+        self.decoded_at
+    }
+
+    /// Returns when provider-local semantic mapping completed.
+    pub const fn ingested_at(&self) -> Timestamp {
+        self.ingested_at
+    }
+
+    /// Returns stable provider-native economic semantics excluding local clocks and raw placement.
+    pub const fn semantic_identity(&self) -> EvidenceDigest {
+        self.semantic_identity
+    }
+}
+
+/// Why one provider-native daily surface could not form an EOD bar candidate.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TiingoEodSurfaceGapReason {
     /// At least one OHLC component was null.
@@ -762,6 +901,7 @@ pub enum TiingoEodSurfaceGapReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TiingoEodSurfaceGap {
     provider_date: CalendarDate,
+    provider_row_index: u32,
     surface: TiingoEodSurface,
     reason: TiingoEodSurfaceGapReason,
     row_digest: EvidenceDigest,
@@ -771,6 +911,11 @@ impl TiingoEodSurfaceGap {
     /// Returns the exact provider daily date.
     pub const fn provider_date(&self) -> CalendarDate {
         self.provider_date
+    }
+
+    /// Returns the exact zero-based native row coordinate in the response.
+    pub const fn provider_row_index(&self) -> u32 {
+        self.provider_row_index
     }
 
     /// Returns the incomplete raw or adjusted surface.
@@ -793,6 +938,7 @@ impl TiingoEodSurfaceGap {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TiingoEodProviderActionEvidence {
     provider_date: CalendarDate,
+    provider_row_index: u32,
     cash_dividend: Option<Decimal>,
     split_factor: Option<Decimal>,
     row_digest: EvidenceDigest,
@@ -802,6 +948,11 @@ impl TiingoEodProviderActionEvidence {
     /// Returns the exact provider daily date.
     pub const fn provider_date(&self) -> CalendarDate {
         self.provider_date
+    }
+
+    /// Returns the exact zero-based native row coordinate in the response.
+    pub const fn provider_row_index(&self) -> u32 {
+        self.provider_row_index
     }
 
     /// Returns source-reported `divCash`; no corporate action semantics are inferred.
@@ -836,9 +987,7 @@ pub struct TiingoEodMappingInput<'a> {
     pub contract: &'a TiingoEodContractEvidence,
     /// Independent provider-calendar/session authority.
     pub bar_time_authority: &'a dyn TiingoEodBarTimeAuthority,
-    /// Nonzero placeholder replaced by shared observed-revision authority before publication.
-    pub authority_seed_revision: RevisionNumber,
-    /// Time canonical ingestion completed locally.
+    /// Time provider-local semantic mapping completed locally.
     pub ingested_at: Timestamp,
 }
 
@@ -850,22 +999,29 @@ impl std::fmt::Debug for TiingoEodMappingInput<'_> {
             .field("instrument", self.instrument)
             .field("contract", self.contract)
             .field("bar_time_authority", &"[REVOCABLE AUTHORITY]")
-            .field("authority_seed_revision", &self.authority_seed_revision)
             .field("ingested_at", &self.ingested_at)
             .finish()
     }
 }
 
-/// Provider-local canonical handoff for shared revision assignment and immutable publication.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TiingoMappedEodPage {
-    request: TiingoRequestSpec,
-    observations: Vec<ResearchObservation>,
-    revision_plan: Option<ExtractionRevisionPlan>,
-    gaps: Vec<TiingoEodSurfaceGap>,
-    provider_actions: Vec<TiingoEodProviderActionEvidence>,
-    request_identity: EvidenceDigest,
-    response_bytes: u64,
+/// One provider-local EOD page candidate without canonical publication authority.
+///
+/// The exact raw and metadata receipt digests are retained only as persisted evidence. The common
+/// seal/native-lineage spine must still consume the corresponding exclusive seal authority before
+/// this candidate can become a canonical generation. This type is deliberately non-cloneable and
+/// non-serializable and cannot mint revision, manifest, catalog, or PIT facts.
+#[derive(Debug, Eq, PartialEq)]
+pub struct TiingoEodPageCandidate {
+    bars: Box<[TiingoEodBarCandidate]>,
+    gaps: Box<[TiingoEodSurfaceGap]>,
+    provider_actions: Box<[TiingoEodProviderActionEvidence]>,
+    instrument: TiingoEodInstrumentAuthority,
+    contract: TiingoEodContractEvidence,
+    response_evidence: TiingoResponseEvidence,
+    metadata_evidence: TiingoResponseEvidence,
+    eod_request_disposition: TiingoRequestDisposition,
+    metadata_request_disposition: TiingoRequestDisposition,
+    ingested_at: Timestamp,
     sealed_capture_receipt: EvidenceDigest,
     sealed_metadata_capture_receipt: EvidenceDigest,
     contract_identity: EvidenceDigest,
@@ -873,20 +1029,15 @@ pub struct TiingoMappedEodPage {
     handoff_identity: EvidenceDigest,
 }
 
-impl TiingoMappedEodPage {
+impl TiingoEodPageCandidate {
     /// Returns the exact latest or one-window history request this page proves.
     pub const fn request(&self) -> &TiingoRequestSpec {
-        &self.request
+        self.response_evidence.request()
     }
 
-    /// Returns raw and adjusted canonical bars in row order, raw before adjusted for each date.
-    pub fn observations(&self) -> &[ResearchObservation] {
-        &self.observations
-    }
-
-    /// Returns aligned local-content evidence for shared durable revision assignment.
-    pub const fn revision_plan(&self) -> Option<&ExtractionRevisionPlan> {
-        self.revision_plan.as_ref()
+    /// Returns revision-free raw and adjusted candidates in row order, raw before adjusted.
+    pub fn bars(&self) -> &[TiingoEodBarCandidate] {
+        &self.bars
     }
 
     /// Returns every provider-native surface that was incomplete and therefore not fabricated.
@@ -899,14 +1050,73 @@ impl TiingoMappedEodPage {
         &self.provider_actions
     }
 
+    /// Returns the complete canonical/provider/reference evidence retained for later publication.
+    pub const fn instrument(&self) -> &TiingoEodInstrumentAuthority {
+        &self.instrument
+    }
+
+    /// Returns the complete source/schema/entitlement/surface contract evidence.
+    pub const fn contract(&self) -> &TiingoEodContractEvidence {
+        &self.contract
+    }
+
+    /// Returns the complete secret-free EOD response identity and clocks.
+    pub const fn response_evidence(&self) -> &TiingoResponseEvidence {
+        &self.response_evidence
+    }
+
+    /// Returns the complete secret-free metadata response identity and clocks.
+    pub const fn metadata_evidence(&self) -> &TiingoResponseEvidence {
+        &self.metadata_evidence
+    }
+
+    /// Returns exact EOD requested/returned/missing/row/byte accounting required by quota settlement.
+    ///
+    /// This accounting is not itself a durable quota-settlement receipt.
+    pub const fn eod_request_disposition(&self) -> TiingoRequestDisposition {
+        self.eod_request_disposition
+    }
+
+    /// Returns exact metadata request accounting required by quota settlement.
+    ///
+    /// This accounting is not itself a durable quota-settlement receipt.
+    pub const fn metadata_request_disposition(&self) -> TiingoRequestDisposition {
+        self.metadata_request_disposition
+    }
+
     /// Returns the credential-free exact request identity.
-    pub const fn request_identity(&self) -> EvidenceDigest {
-        self.request_identity
+    pub fn request_identity(&self) -> EvidenceDigest {
+        self.response_evidence.request().request_identity()
+    }
+
+    /// Returns the exact successful EOD response-body identity.
+    pub const fn response_body_digest(&self) -> EvidenceDigest {
+        self.response_evidence.body_digest()
+    }
+
+    /// Returns the exact successful metadata response-body identity.
+    pub const fn metadata_body_digest(&self) -> EvidenceDigest {
+        self.metadata_evidence.body_digest()
     }
 
     /// Returns exact retained response-body bytes for aggregate history admission.
     pub const fn response_bytes(&self) -> u64 {
-        self.response_bytes
+        self.eod_request_disposition.response_bytes()
+    }
+
+    /// Returns when the exact EOD body completed receipt locally.
+    pub const fn received_at(&self) -> Timestamp {
+        self.response_evidence.received_at()
+    }
+
+    /// Returns when strict provider-native EOD decoding completed.
+    pub const fn decoded_at(&self) -> Timestamp {
+        self.response_evidence.decoded_at()
+    }
+
+    /// Returns when provider-local semantic mapping completed.
+    pub const fn ingested_at(&self) -> Timestamp {
+        self.ingested_at
     }
 
     /// Returns evidence binding the raw response to immutable physical storage.
@@ -934,39 +1144,43 @@ impl TiingoMappedEodPage {
         self.handoff_identity
     }
 
-    /// Consumes the complete provider-local publication handoff without dropping gaps or native
-    /// action evidence.
-    #[allow(clippy::type_complexity)]
-    pub fn into_parts(
-        self,
-    ) -> (
-        TiingoRequestSpec,
-        Vec<ResearchObservation>,
-        Option<ExtractionRevisionPlan>,
-        Vec<TiingoEodSurfaceGap>,
-        Vec<TiingoEodProviderActionEvidence>,
-        EvidenceDigest,
-        EvidenceDigest,
-        EvidenceDigest,
-        EvidenceDigest,
-        EvidenceDigest,
-        EvidenceDigest,
-        u64,
-    ) {
-        (
-            self.request,
-            self.observations,
-            self.revision_plan,
-            self.gaps,
-            self.provider_actions,
-            self.request_identity,
-            self.sealed_capture_receipt,
-            self.sealed_metadata_capture_receipt,
-            self.contract_identity,
-            self.instrument_authority_identity,
-            self.handoff_identity,
-            self.response_bytes,
-        )
+    /// Consumes one page into a closed latest or history-window publication route.
+    ///
+    /// Only the latest route receives direct pending-publication capability. A historical page
+    /// remains owned by the route until complete request-graph reconciliation consumes it.
+    pub fn into_publication_route(self) -> TiingoEodPagePublicationRoute {
+        if matches!(self.request().scope(), TiingoRequestScope::Latest) {
+            TiingoEodPagePublicationRoute::Latest(TiingoPendingLatestEodPublication { page: self })
+        } else {
+            TiingoEodPagePublicationRoute::Historical(self)
+        }
+    }
+}
+
+/// Consuming route that keeps latest and history-window publication authority disjoint.
+#[derive(Debug)]
+pub enum TiingoEodPagePublicationRoute {
+    /// A latest response may proceed directly to the common publication transaction.
+    Latest(TiingoPendingLatestEodPublication),
+    /// A history-window response must first enter complete request-graph reconciliation.
+    Historical(TiingoEodPageCandidate),
+}
+
+/// One latest EOD page awaiting the common exclusive seal/native-lineage publication transaction.
+#[derive(Debug)]
+pub struct TiingoPendingLatestEodPublication {
+    page: TiingoEodPageCandidate,
+}
+
+impl TiingoPendingLatestEodPublication {
+    /// Returns the complete revision-free provider candidate while the handoff remains owned.
+    pub const fn page(&self) -> &TiingoEodPageCandidate {
+        &self.page
+    }
+
+    /// Consumes the closed latest handoff into its exact provider-local candidate.
+    pub fn into_page(self) -> TiingoEodPageCandidate {
+        self.page
     }
 }
 
@@ -976,26 +1190,26 @@ impl TiingoMappedEodPage {
 /// This remains a pre-publication candidate. The shared data plane must bind this exact completion
 /// identity and financial coverage disposition into the immutable generation manifest. HTTP
 /// request-graph completion does not by itself prove complete financial-date coverage.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TiingoCompletedHistoryCandidate {
+#[derive(Debug, Eq, PartialEq)]
+pub struct TiingoCompletedEodHistoryCandidate {
     capture: TiingoCompletedHistoryCapture,
-    pages: Box<[TiingoMappedEodPage]>,
+    pages: Box<[TiingoEodPageCandidate]>,
     expected_session_evidence: TiingoEodExpectedSessionEvidence,
     expected_session_validation: TiingoEodExpectedSessionValidationReceipt,
     returned_sessions: Box<[CalendarDate]>,
     missing_expected_sessions: Box<[CalendarDate]>,
     financial_coverage: TiingoEodFinancialCoverageDisposition,
-    total_observations: u64,
+    total_bars: u64,
     total_gaps: u64,
     total_provider_actions: u64,
     completion_identity: EvidenceDigest,
 }
 
-impl TiingoCompletedHistoryCandidate {
+impl TiingoCompletedEodHistoryCandidate {
     /// Closes one history handoff only when the HTTP graph and exact calendar reconciliation agree.
     pub fn try_new(
         capture: TiingoCompletedHistoryCapture,
-        pages: Vec<TiingoMappedEodPage>,
+        pages: Vec<TiingoEodPageCandidate>,
         instrument: &TiingoEodInstrumentAuthority,
         expected_session_authority: &dyn TiingoEodExpectedSessionAuthority,
     ) -> Result<Self, TiingoEodMapError> {
@@ -1006,8 +1220,7 @@ impl TiingoCompletedHistoryCandidate {
                 .any(|(page, sealed_page)| {
                     page.request() != sealed_page.request()
                         || page.request_identity() != sealed_page.request().request_identity()
-                        || page.sealed_capture_receipt()
-                            != sealed_page.sealed_capture_receipt()
+                        || page.sealed_capture_receipt() != sealed_page.sealed_capture_receipt()
                         || page.response_bytes() != sealed_page.response_bytes()
                 })
         {
@@ -1018,10 +1231,8 @@ impl TiingoCompletedHistoryCandidate {
         };
         if pages.iter().any(|page| {
             page.contract_identity() != first.contract_identity()
-                || page.instrument_authority_identity()
-                    != first.instrument_authority_identity()
-                || page.sealed_metadata_capture_receipt()
-                    != first.sealed_metadata_capture_receipt()
+                || page.instrument_authority_identity() != first.instrument_authority_identity()
+                || page.sealed_metadata_capture_receipt() != first.sealed_metadata_capture_receipt()
         }) {
             return Err(TiingoEodMapError::IncompleteHistory);
         }
@@ -1030,20 +1241,18 @@ impl TiingoCompletedHistoryCandidate {
         {
             return Err(TiingoEodMapError::AuthorityMismatch);
         }
-        let mut total_observations = 0_u64;
+        let mut total_bars = 0_u64;
         let mut total_gaps = 0_u64;
         let mut total_provider_actions = 0_u64;
         for page in &pages {
-            total_observations = total_observations
+            total_bars = total_bars
                 .checked_add(
-                    u64::try_from(page.observations().len())
-                        .map_err(|_| TiingoEodMapError::Allocation)?,
+                    u64::try_from(page.bars().len()).map_err(|_| TiingoEodMapError::Allocation)?,
                 )
                 .ok_or(TiingoEodMapError::Allocation)?;
             total_gaps = total_gaps
                 .checked_add(
-                    u64::try_from(page.gaps().len())
-                        .map_err(|_| TiingoEodMapError::Allocation)?,
+                    u64::try_from(page.gaps().len()).map_err(|_| TiingoEodMapError::Allocation)?,
                 )
                 .ok_or(TiingoEodMapError::Allocation)?;
             total_provider_actions = total_provider_actions
@@ -1053,24 +1262,26 @@ impl TiingoCompletedHistoryCandidate {
                 )
                 .ok_or(TiingoEodMapError::Allocation)?;
         }
-        if total_provider_actions != capture.total_rows() {
+        let expected_surfaces = capture
+            .total_rows()
+            .checked_mul(2)
+            .ok_or(TiingoEodMapError::Allocation)?;
+        if total_provider_actions != capture.total_rows()
+            || total_bars
+                .checked_add(total_gaps)
+                .is_none_or(|actual| actual != expected_surfaces)
+        {
             return Err(TiingoEodMapError::IncompleteHistory);
         }
         let returned_sessions = collect_returned_sessions(&capture, &pages)?;
         let expected_session_request =
             TiingoEodExpectedSessionRequest::new(capture.plan(), instrument);
-        let expected_session_evidence = expected_session_authority
-            .resolve_expected_sessions(&expected_session_request)?;
-        validate_expected_session_evidence(
-            &expected_session_request,
-            &expected_session_evidence,
-        )?;
+        let expected_session_evidence =
+            expected_session_authority.resolve_expected_sessions(&expected_session_request)?;
+        validate_expected_session_evidence(&expected_session_request, &expected_session_evidence)?;
         let initial_validation =
             expected_session_authority.validate_current(&expected_session_evidence)?;
-        validate_expected_session_validation(
-            &expected_session_evidence,
-            &initial_validation,
-        )?;
+        validate_expected_session_validation(&expected_session_evidence, &initial_validation)?;
         let missing_expected_sessions = reconcile_expected_sessions(
             expected_session_evidence.expected_sessions(),
             &returned_sessions,
@@ -1097,10 +1308,10 @@ impl TiingoCompletedHistoryCandidate {
             &returned_sessions,
             &missing_expected_sessions,
             financial_coverage,
-            total_observations,
+            total_bars,
             total_gaps,
             total_provider_actions,
-        );
+        )?;
         Ok(Self {
             capture,
             pages: pages.into_boxed_slice(),
@@ -1109,7 +1320,7 @@ impl TiingoCompletedHistoryCandidate {
             returned_sessions: returned_sessions.into_boxed_slice(),
             missing_expected_sessions: missing_expected_sessions.into_boxed_slice(),
             financial_coverage,
-            total_observations,
+            total_bars,
             total_gaps,
             total_provider_actions,
             completion_identity,
@@ -1127,7 +1338,7 @@ impl TiingoCompletedHistoryCandidate {
     }
 
     /// Returns every sealed/mapped page in exact plan order.
-    pub fn pages(&self) -> &[TiingoMappedEodPage] {
+    pub fn pages(&self) -> &[TiingoEodPageCandidate] {
         &self.pages
     }
 
@@ -1137,9 +1348,7 @@ impl TiingoCompletedHistoryCandidate {
     }
 
     /// Returns the durable currentness validation retained for shared publication authority.
-    pub const fn expected_session_validation(
-        &self,
-    ) -> &TiingoEodExpectedSessionValidationReceipt {
+    pub const fn expected_session_validation(&self) -> &TiingoEodExpectedSessionValidationReceipt {
         &self.expected_session_validation
     }
 
@@ -1171,9 +1380,9 @@ impl TiingoCompletedHistoryCandidate {
         self.capture.total_response_bytes()
     }
 
-    /// Returns canonical observation cardinality across every page.
-    pub const fn total_observations(&self) -> u64 {
-        self.total_observations
+    /// Returns revision-free EOD bar-candidate cardinality across every page.
+    pub const fn total_bars(&self) -> u64 {
+        self.total_bars
     }
 
     /// Returns explicit incomplete-surface cardinality across every page.
@@ -1191,43 +1400,145 @@ impl TiingoCompletedHistoryCandidate {
     pub const fn completion_identity(&self) -> EvidenceDigest {
         self.completion_identity
     }
+
+    /// Consumes the closed request graph into one pending common-publication capability.
+    pub fn into_pending_publication(self) -> TiingoPendingEodHistoryPublication {
+        let Self {
+            capture,
+            pages,
+            expected_session_evidence,
+            expected_session_validation,
+            returned_sessions,
+            missing_expected_sessions,
+            financial_coverage,
+            total_bars,
+            total_gaps,
+            total_provider_actions,
+            completion_identity,
+        } = self;
+        TiingoPendingEodHistoryPublication {
+            capture,
+            pages,
+            expected_session_evidence,
+            expected_session_validation,
+            returned_sessions,
+            missing_expected_sessions,
+            financial_coverage,
+            total_bars,
+            total_gaps,
+            total_provider_actions,
+            completion_identity,
+        }
+    }
+}
+
+/// Entire terminal Tiingo EOD history graph awaiting one common publication transaction.
+///
+/// The shared transaction must consume this graph together with exact exclusive raw-seal
+/// authority and the Tiingo native-lineage encoder. Until that dependency lands, this value cannot
+/// create canonical rows, revisions, immutable generations, manifests, or PIT selections.
+#[derive(Debug)]
+pub struct TiingoPendingEodHistoryPublication {
+    capture: TiingoCompletedHistoryCapture,
+    pages: Box<[TiingoEodPageCandidate]>,
+    expected_session_evidence: TiingoEodExpectedSessionEvidence,
+    expected_session_validation: TiingoEodExpectedSessionValidationReceipt,
+    returned_sessions: Box<[CalendarDate]>,
+    missing_expected_sessions: Box<[CalendarDate]>,
+    financial_coverage: TiingoEodFinancialCoverageDisposition,
+    total_bars: u64,
+    total_gaps: u64,
+    total_provider_actions: u64,
+    completion_identity: EvidenceDigest,
+}
+
+impl TiingoPendingEodHistoryPublication {
+    /// Returns the complete surface-neutral raw/native history evidence.
+    pub const fn capture(&self) -> &TiingoCompletedHistoryCapture {
+        &self.capture
+    }
+
+    /// Returns every revision-free page in exact request-plan order.
+    pub fn pages(&self) -> &[TiingoEodPageCandidate] {
+        &self.pages
+    }
+
+    /// Returns the exact retained calendar generation and expected-session set.
+    pub const fn expected_session_evidence(&self) -> &TiingoEodExpectedSessionEvidence {
+        &self.expected_session_evidence
+    }
+
+    /// Returns the terminal currentness receipt retained for common publication.
+    pub const fn expected_session_validation(
+        &self,
+    ) -> &TiingoEodExpectedSessionValidationReceipt {
+        &self.expected_session_validation
+    }
+
+    /// Returns every provider date actually returned in exact order.
+    pub fn returned_sessions(&self) -> &[CalendarDate] {
+        &self.returned_sessions
+    }
+
+    /// Returns every financially expected session with no provider row.
+    pub fn missing_expected_sessions(&self) -> &[CalendarDate] {
+        &self.missing_expected_sessions
+    }
+
+    /// Returns exact reconciled financial-date coverage.
+    pub const fn financial_coverage(&self) -> TiingoEodFinancialCoverageDisposition {
+        self.financial_coverage
+    }
+
+    /// Returns the exact revision-free bar-candidate count.
+    pub const fn total_bars(&self) -> u64 {
+        self.total_bars
+    }
+
+    /// Returns the exact incomplete-surface count.
+    pub const fn total_gaps(&self) -> u64 {
+        self.total_gaps
+    }
+
+    /// Returns the exact provider-native action-evidence count.
+    pub const fn total_provider_actions(&self) -> u64 {
+        self.total_provider_actions
+    }
+
+    /// Returns the complete provider/page/calendar/coverage handoff identity.
+    pub const fn completion_identity(&self) -> EvidenceDigest {
+        self.completion_identity
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn history_completion_identity(
     capture: &TiingoCompletedHistoryCapture,
-    pages: &[TiingoMappedEodPage],
+    pages: &[TiingoEodPageCandidate],
     expected_session_evidence: &TiingoEodExpectedSessionEvidence,
     expected_session_validation: &TiingoEodExpectedSessionValidationReceipt,
     returned_sessions: &[CalendarDate],
     missing_expected_sessions: &[CalendarDate],
     financial_coverage: TiingoEodFinancialCoverageDisposition,
-    total_observations: u64,
+    total_bars: u64,
     total_gaps: u64,
     total_provider_actions: u64,
-) -> EvidenceDigest {
+) -> Result<EvidenceDigest, TiingoEodMapError> {
     let mut hasher = Sha256::new();
     append_field(
         &mut hasher,
-        b"market-squawk/tiingo/eod-history-completion/v3",
+        b"market-squawk/tiingo/eod-history-completion/v4",
     );
-    append_field(&mut hasher, &capture.completion_identity().bytes());
-    append_field(
-        &mut hasher,
-        &u64::try_from(pages.len())
-            .unwrap_or(u64::MAX)
-            .to_be_bytes(),
-    );
+    append_evidence_digest(&mut hasher, capture.completion_identity());
+    let page_count = u64::try_from(pages.len()).map_err(|_| TiingoEodMapError::Allocation)?;
+    append_field(&mut hasher, &page_count.to_be_bytes());
     for page in pages {
-        append_field(&mut hasher, &page.request_identity().bytes());
-        append_field(&mut hasher, &page.handoff_identity().bytes());
-        append_field(&mut hasher, &page.sealed_capture_receipt().bytes());
+        append_evidence_digest(&mut hasher, page.request_identity());
+        append_evidence_digest(&mut hasher, page.handoff_identity());
+        append_evidence_digest(&mut hasher, page.sealed_capture_receipt());
         append_field(&mut hasher, &page.response_bytes().to_be_bytes());
     }
-    append_field(
-        &mut hasher,
-        &expected_session_evidence.evidence_identity().bytes(),
-    );
+    append_evidence_digest(&mut hasher, expected_session_evidence.evidence_identity());
     append_field(
         &mut hasher,
         expected_session_evidence.calendar_id().as_str().as_bytes(),
@@ -1269,14 +1580,8 @@ fn history_completion_identity(
             .unix_nanos()
             .to_be_bytes(),
     );
-    append_evidence_digest(
-        &mut hasher,
-        expected_session_evidence.resolution_receipt(),
-    );
-    append_evidence_digest(
-        &mut hasher,
-        expected_session_validation.receipt_identity(),
-    );
+    append_evidence_digest(&mut hasher, expected_session_evidence.resolution_receipt());
+    append_evidence_digest(&mut hasher, expected_session_validation.receipt_identity());
     append_field(
         &mut hasher,
         &expected_session_validation
@@ -1284,10 +1589,7 @@ fn history_completion_identity(
             .unix_nanos()
             .to_be_bytes(),
     );
-    append_dates(
-        &mut hasher,
-        expected_session_evidence.expected_sessions(),
-    );
+    append_dates(&mut hasher, expected_session_evidence.expected_sessions());
     append_dates(&mut hasher, returned_sessions);
     append_dates(&mut hasher, missing_expected_sessions);
     append_field(
@@ -1297,16 +1599,19 @@ fn history_completion_identity(
             TiingoEodFinancialCoverageDisposition::MissingExpectedSessions => 1,
         }],
     );
-    for total in [
-        total_observations,
-        total_gaps,
-        total_provider_actions,
-    ] {
+    for total in [total_bars, total_gaps, total_provider_actions] {
         append_field(&mut hasher, &total.to_be_bytes());
     }
-    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hasher.finalize().into(),
+    ))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the identity binds every explicit field accepted by expected-session evidence"
+)]
 fn expected_session_evidence_identity(
     request_identity: EvidenceDigest,
     calendar_id: &SourceIdentifier,
@@ -1334,9 +1639,7 @@ fn expected_session_evidence_identity(
     );
     append_evidence_digest(
         &mut hasher,
-        calendar_revision
-            .payload_evidence()
-            .content_digest(),
+        calendar_revision.payload_evidence().content_digest(),
     );
     append_field(&mut hasher, authority_generation.as_str().as_bytes());
     append_field(
@@ -1381,9 +1684,10 @@ fn validate_expected_session_evidence(
         || evidence.resolved_at() < evidence.calendar_available_at()
         || evidence.resolution_receipt().bytes() == [0; 32]
         || evidence.expected_sessions().len() > inclusive_calendar_days
-        || evidence.expected_sessions().iter().any(|date| {
-            *date < request.start_date() || *date > request.end_date()
-        })
+        || evidence
+            .expected_sessions()
+            .iter()
+            .any(|date| *date < request.start_date() || *date > request.end_date())
         || evidence
             .expected_sessions()
             .windows(2)
@@ -1413,10 +1717,10 @@ fn validate_expected_session_validation(
 
 fn collect_returned_sessions(
     capture: &TiingoCompletedHistoryCapture,
-    pages: &[TiingoMappedEodPage],
+    pages: &[TiingoEodPageCandidate],
 ) -> Result<Vec<CalendarDate>, TiingoEodMapError> {
-    let capacity = usize::try_from(capture.total_rows())
-        .map_err(|_| TiingoEodMapError::Allocation)?;
+    let capacity =
+        usize::try_from(capture.total_rows()).map_err(|_| TiingoEodMapError::Allocation)?;
     let mut returned_sessions = Vec::new();
     returned_sessions
         .try_reserve_exact(capacity)
@@ -1434,13 +1738,15 @@ fn collect_returned_sessions(
         if page.provider_actions().len() != sealed_page.row_digests().len() {
             return Err(TiingoEodMapError::IncompleteHistory);
         }
-        for (action, row_digest) in page
+        for (expected_row_index, (action, row_digest)) in page
             .provider_actions()
             .iter()
             .zip(sealed_page.row_digests())
+            .enumerate()
         {
             let provider_date = action.provider_date();
             if action.row_digest() != *row_digest
+                || usize::try_from(action.provider_row_index()).ok() != Some(expected_row_index)
                 || provider_date < start_date
                 || provider_date > end_date
                 || previous_date.is_some_and(|previous| previous >= provider_date)
@@ -1493,9 +1799,7 @@ fn reconcile_expected_sessions(
 fn append_dates(hasher: &mut Sha256, dates: &[CalendarDate]) {
     append_field(
         hasher,
-        &u64::try_from(dates.len())
-            .unwrap_or(u64::MAX)
-            .to_be_bytes(),
+        &u64::try_from(dates.len()).unwrap_or(u64::MAX).to_be_bytes(),
     );
     for date in dates {
         append_field(hasher, date.to_string().as_bytes());
@@ -1513,13 +1817,14 @@ fn append_evidence_digest(hasher: &mut Sha256, digest: EvidenceDigest) {
     append_field(hasher, &digest.bytes());
 }
 
-/// Maps strict Tiingo equity/ETF daily rows to distinct raw and adjusted canonical bars.
+/// Maps strict Tiingo equity/ETF rows to revision-free raw and adjusted EOD candidates.
 ///
 /// Missing OHLCV components remain explicit gaps. Source-reported dividend and split fields stay
-/// native evidence until a separate corporate-action contract proves their full semantics.
-pub fn map_eod_bars(
+/// native evidence until a separate corporate-action contract proves their full semantics. This
+/// function does not construct a canonical observation or accept any revision/PIT authority.
+pub fn map_eod_page_candidate(
     input: TiingoEodMappingInput<'_>,
-) -> Result<TiingoMappedEodPage, TiingoEodMapError> {
+) -> Result<TiingoEodPageCandidate, TiingoEodMapError> {
     validate_authority(&input)?;
     validate_capture(&input)?;
     validate_response(&input)?;
@@ -1530,13 +1835,11 @@ pub fn map_eod_bars(
         .len()
         .checked_mul(2)
         .ok_or(TiingoEodMapError::Allocation)?;
-    let mut observations = Vec::new();
-    observations
-        .try_reserve_exact(surface_capacity)
+    let mut bars = Vec::new();
+    bars.try_reserve_exact(surface_capacity)
         .map_err(|_| TiingoEodMapError::Allocation)?;
     let mut gaps = Vec::new();
-    gaps
-        .try_reserve_exact(surface_capacity)
+    gaps.try_reserve_exact(surface_capacity)
         .map_err(|_| TiingoEodMapError::Allocation)?;
     let mut provider_actions = Vec::new();
     provider_actions
@@ -1544,7 +1847,9 @@ pub fn map_eod_bars(
         .map_err(|_| TiingoEodMapError::Allocation)?;
 
     let coverage = input.metadata.metadata().coverage();
-    for row in input.response.rows() {
+    for (provider_row_index, row) in input.response.rows().iter().enumerate() {
+        let provider_row_index =
+            u32::try_from(provider_row_index).map_err(|_| TiingoEodMapError::Allocation)?;
         if !coverage.contains(row.date()) {
             return Err(TiingoEodMapError::OutsideMetadataCoverage);
         }
@@ -1552,134 +1857,136 @@ pub fn map_eod_bars(
         map_surface(
             &input,
             row,
+            provider_row_index,
             TiingoEodSurface::Raw,
             time_semantics.clone(),
-            &mut observations,
+            &mut bars,
             &mut gaps,
         )?;
         map_surface(
             &input,
             row,
+            provider_row_index,
             TiingoEodSurface::Adjusted,
             time_semantics,
-            &mut observations,
+            &mut bars,
             &mut gaps,
         )?;
         provider_actions.push(TiingoEodProviderActionEvidence {
             provider_date: row.date(),
+            provider_row_index,
             cash_dividend: row.cash_dividend(),
             split_factor: row.split_factor(),
             row_digest: row.row_digest(),
         });
     }
-    let revision_plan = (!observations.is_empty())
-        .then(|| ExtractionRevisionPlan::locally_observed(observations.len()))
-        .transpose()?;
-    let request_identity = input.response.evidence().request().request_identity();
-    let response_bytes = input.response.evidence().response_bytes();
+    let response_evidence = input.response.evidence();
+    let metadata_evidence = input.metadata.evidence();
+    let eod_request_disposition = input.response.disposition();
+    let metadata_request_disposition = input.metadata.disposition();
     let sealed_capture_receipt = input.sealed_capture.receipt_digest();
     let sealed_metadata_capture_receipt = input.sealed_metadata_capture.receipt_digest();
     let contract_identity = input.contract.mapping_identity();
     let instrument_authority_identity = input.instrument.mapping_identity();
     let handoff_identity = eod_handoff_identity(
-        request_identity,
-        response_bytes,
+        response_evidence,
+        metadata_evidence,
+        eod_request_disposition,
+        metadata_request_disposition,
+        input.ingested_at,
         sealed_capture_receipt,
         sealed_metadata_capture_receipt,
         contract_identity,
         instrument_authority_identity,
-        &observations,
-        revision_plan.as_ref(),
+        &bars,
         &gaps,
         &provider_actions,
     )?;
-    Ok(TiingoMappedEodPage {
-        request: input.response.evidence().request().clone(),
-        observations,
-        revision_plan,
-        gaps,
-        provider_actions,
-        request_identity,
+    Ok(TiingoEodPageCandidate {
+        bars: bars.into_boxed_slice(),
+        gaps: gaps.into_boxed_slice(),
+        provider_actions: provider_actions.into_boxed_slice(),
+        instrument: input.instrument.clone(),
+        contract: input.contract.clone(),
+        response_evidence: response_evidence.clone(),
+        metadata_evidence: metadata_evidence.clone(),
+        eod_request_disposition,
+        metadata_request_disposition,
         sealed_capture_receipt,
         sealed_metadata_capture_receipt,
         contract_identity,
         instrument_authority_identity,
         handoff_identity,
-        response_bytes,
+        ingested_at: input.ingested_at,
     })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn eod_handoff_identity(
-    request_identity: EvidenceDigest,
-    response_bytes: u64,
+    response: &TiingoResponseEvidence,
+    metadata: &TiingoResponseEvidence,
+    eod_disposition: TiingoRequestDisposition,
+    metadata_disposition: TiingoRequestDisposition,
+    ingested_at: Timestamp,
     sealed_capture_receipt: EvidenceDigest,
     sealed_metadata_capture_receipt: EvidenceDigest,
     contract_identity: EvidenceDigest,
     instrument_authority_identity: EvidenceDigest,
-    observations: &[ResearchObservation],
-    revision_plan: Option<&ExtractionRevisionPlan>,
+    bars: &[TiingoEodBarCandidate],
     gaps: &[TiingoEodSurfaceGap],
     provider_actions: &[TiingoEodProviderActionEvidence],
 ) -> Result<EvidenceDigest, TiingoEodMapError> {
-    if revision_plan.map(ExtractionRevisionPlan::len) != (!observations.is_empty()).then_some(observations.len())
-        || revision_plan.is_some_and(|plan| !plan.is_locally_observed())
-        || observations
-            .iter()
-            .any(|observation| !matches!(observation, ResearchObservation::MarketBar(_)))
+    if response.received_at() > response.decoded_at()
+        || response.decoded_at() > ingested_at
+        || metadata.received_at() > metadata.decoded_at()
+        || metadata.decoded_at() > response.received_at()
     {
-        return Err(TiingoEodMapError::InvalidCanonicalEvidence);
+        return Err(TiingoEodMapError::InvalidCandidateEvidence);
     }
-    let mut canonical_writer = BoundedCanonicalDigestWriter::new(
-        MAX_EOD_HANDOFF_CANONICAL_BYTES,
-    );
-    serde_json::to_writer(&mut canonical_writer, &observations)
-        .map_err(|_| TiingoEodMapError::InvalidCanonicalEvidence)?;
-    let (canonical_bytes, canonical_digest) = canonical_writer.finish();
     let mut hasher = Sha256::new();
-    append_field(&mut hasher, b"market-squawk/tiingo/eod-handoff/v3");
+    append_field(&mut hasher, b"market-squawk/tiingo/eod-page-candidate/v4");
     for digest in [
-        request_identity,
+        response.request().request_identity(),
+        response.body_digest(),
+        metadata.request().request_identity(),
+        metadata.body_digest(),
         sealed_capture_receipt,
         sealed_metadata_capture_receipt,
         contract_identity,
         instrument_authority_identity,
     ] {
-        append_field(&mut hasher, &digest.bytes());
+        append_evidence_digest(&mut hasher, digest);
     }
-    append_field(&mut hasher, &response_bytes.to_be_bytes());
-    append_field(
-        &mut hasher,
-        &u64::try_from(observations.len())
-            .unwrap_or(u64::MAX)
-            .to_be_bytes(),
-    );
-    append_field(&mut hasher, &canonical_bytes.to_be_bytes());
-    append_evidence_digest(&mut hasher, canonical_digest);
-    match revision_plan {
-        Some(revision_plan) => {
-            append_field(
-                &mut hasher,
-                &u64::try_from(revision_plan.len())
-                    .unwrap_or(u64::MAX)
-                    .to_be_bytes(),
-            );
-            append_field(
-                &mut hasher,
-                &u64::try_from(revision_plan.retained_bytes())
-                    .unwrap_or(u64::MAX)
-                    .to_be_bytes(),
-            );
-            append_field(&mut hasher, b"locally-observed-content");
+    for evidence in [response, metadata] {
+        append_field(
+            &mut hasher,
+            evidence.native_contract_revision().as_str().as_bytes(),
+        );
+        append_field(
+            &mut hasher,
+            evidence.entitlement_generation().as_str().as_bytes(),
+        );
+        append_field(&mut hasher, &evidence.status().to_be_bytes());
+        append_field(&mut hasher, &evidence.response_bytes().to_be_bytes());
+        for timestamp in [evidence.received_at(), evidence.decoded_at()] {
+            append_field(&mut hasher, &timestamp.unix_nanos().to_be_bytes());
         }
-        None => append_field(&mut hasher, b"no-canonical-observations"),
     }
-    append_field(
-        &mut hasher,
-        &u64::try_from(gaps.len()).unwrap_or(u64::MAX).to_be_bytes(),
-    );
+    append_request_disposition(&mut hasher, b"eod", eod_disposition);
+    append_request_disposition(&mut hasher, b"metadata", metadata_disposition);
+    append_field(&mut hasher, &ingested_at.unix_nanos().to_be_bytes());
+    let bar_count = u64::try_from(bars.len()).map_err(|_| TiingoEodMapError::Allocation)?;
+    append_field(&mut hasher, &bar_count.to_be_bytes());
+    for bar in bars {
+        append_evidence_digest(&mut hasher, bar.semantic_identity());
+        append_field(&mut hasher, &bar.provider_row_index().to_be_bytes());
+        append_evidence_digest(&mut hasher, bar.provider_row_digest());
+    }
+    let gap_count = u64::try_from(gaps.len()).map_err(|_| TiingoEodMapError::Allocation)?;
+    append_field(&mut hasher, &gap_count.to_be_bytes());
     for gap in gaps {
         append_field(&mut hasher, gap.provider_date.to_string().as_bytes());
+        append_field(&mut hasher, &gap.provider_row_index.to_be_bytes());
         append_field(
             &mut hasher,
             &[
@@ -1693,16 +2000,14 @@ fn eod_handoff_identity(
                 },
             ],
         );
-        append_field(&mut hasher, &gap.row_digest.bytes());
+        append_evidence_digest(&mut hasher, gap.row_digest);
     }
-    append_field(
-        &mut hasher,
-        &u64::try_from(provider_actions.len())
-            .unwrap_or(u64::MAX)
-            .to_be_bytes(),
-    );
+    let action_count =
+        u64::try_from(provider_actions.len()).map_err(|_| TiingoEodMapError::Allocation)?;
+    append_field(&mut hasher, &action_count.to_be_bytes());
     for action in provider_actions {
         append_field(&mut hasher, action.provider_date.to_string().as_bytes());
+        append_field(&mut hasher, &action.provider_row_index.to_be_bytes());
         for value in [action.cash_dividend, action.split_factor] {
             match value {
                 Some(value) => {
@@ -1712,7 +2017,7 @@ fn eod_handoff_identity(
                 None => append_field(&mut hasher, b"missing"),
             }
         }
-        append_field(&mut hasher, &action.row_digest.bytes());
+        append_evidence_digest(&mut hasher, action.row_digest);
     }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
@@ -1720,49 +2025,20 @@ fn eod_handoff_identity(
     ))
 }
 
-struct BoundedCanonicalDigestWriter {
-    hasher: Sha256,
-    written: u64,
-    maximum: u64,
-}
-
-impl BoundedCanonicalDigestWriter {
-    fn new(maximum: u64) -> Self {
-        Self {
-            hasher: Sha256::new(),
-            written: 0,
-            maximum,
-        }
-    }
-
-    fn finish(self) -> (u64, EvidenceDigest) {
-        (
-            self.written,
-            EvidenceDigest::new(DigestAlgorithm::Sha256, self.hasher.finalize().into()),
-        )
-    }
-}
-
-impl io::Write for BoundedCanonicalDigestWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let next = self
-            .written
-            .checked_add(u64::try_from(buffer.len()).map_err(|_| {
-                io::Error::other("canonical serialization byte count overflow")
-            })?)
-            .ok_or_else(|| io::Error::other("canonical serialization byte count overflow"))?;
-        if next > self.maximum {
-            return Err(io::Error::other(
-                "canonical serialization exceeded admitted byte ceiling",
-            ));
-        }
-        self.hasher.update(buffer);
-        self.written = next;
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+fn append_request_disposition(
+    hasher: &mut Sha256,
+    family: &[u8],
+    disposition: TiingoRequestDisposition,
+) {
+    append_field(hasher, family);
+    for value in [
+        u64::from(disposition.requested_symbols()),
+        u64::from(disposition.returned_symbols()),
+        u64::from(disposition.missing_symbols()),
+        u64::from(disposition.returned_rows()),
+        disposition.response_bytes(),
+    ] {
+        append_field(hasher, &value.to_be_bytes());
     }
 }
 
@@ -1830,10 +2106,8 @@ fn validate_capture(input: &TiingoEodMappingInput<'_>) -> Result<(), TiingoEodMa
         || metadata_capture.source_id() != input.contract.source_id()
         || metadata_capture.metadata_revision() != input.contract.source_contract_revision()
         || metadata_capture.dataset().as_str() != "tiingo-daily-metadata"
-        || metadata_capture.terminal()
-            != ProviderCaptureTerminalDisposition::StandaloneResponse
-        || metadata_capture.request_set_identity()
-            != metadata_response.request().request_identity()
+        || metadata_capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+        || metadata_capture.request_set_identity() != metadata_response.request().request_identity()
         || metadata_capture.total_body_bytes() != metadata_response.response_bytes()
         || metadata_page.request_identity() != metadata_response.request().request_identity()
         || metadata_page.http_status() != metadata_response.status()
@@ -1849,11 +2123,11 @@ fn validate_capture(input: &TiingoEodMappingInput<'_>) -> Result<(), TiingoEodMa
 fn validate_response(input: &TiingoEodMappingInput<'_>) -> Result<(), TiingoEodMapError> {
     let evidence = input.response.evidence();
     let disposition = input.response.disposition();
-    let row_count = u32::try_from(input.response.rows().len()).unwrap_or(u32::MAX);
-    let pagination_matches = match (
-        evidence.request().scope(),
-        input.response.pagination(),
-    ) {
+    let metadata_evidence = input.metadata.evidence();
+    let metadata_disposition = input.metadata.disposition();
+    let row_count = u32::try_from(input.response.rows().len())
+        .map_err(|_| TiingoEodMapError::Allocation)?;
+    let pagination_matches = match (evidence.request().scope(), input.response.pagination()) {
         (TiingoRequestScope::Latest, TiingoPaginationEvidence::NotApplicable) => true,
         (
             TiingoRequestScope::History { page: expected, .. },
@@ -1870,6 +2144,11 @@ fn validate_response(input: &TiingoEodMappingInput<'_>) -> Result<(), TiingoEodM
         || disposition.returned_symbols() != u16::from(row_count != 0)
         || disposition.missing_symbols() != u16::from(row_count == 0)
         || disposition.response_bytes() != evidence.response_bytes()
+        || metadata_disposition.requested_symbols() != 1
+        || metadata_disposition.returned_symbols() != 1
+        || metadata_disposition.missing_symbols() != 0
+        || metadata_disposition.returned_rows() != 1
+        || metadata_disposition.response_bytes() != metadata_evidence.response_bytes()
         || !pagination_matches
     {
         return Err(TiingoEodMapError::InvalidDisposition);
@@ -1900,9 +2179,10 @@ fn resolve_time(
 fn map_surface(
     input: &TiingoEodMappingInput<'_>,
     row: &TiingoEodRow,
+    provider_row_index: u32,
     surface: TiingoEodSurface,
     time_semantics: BarTimeSemantics,
-    observations: &mut Vec<ResearchObservation>,
+    bars: &mut Vec<TiingoEodBarCandidate>,
     gaps: &mut Vec<TiingoEodSurfaceGap>,
 ) -> Result<(), TiingoEodMapError> {
     let (ohlc, volume) = match surface {
@@ -1912,6 +2192,7 @@ fn map_surface(
     let (Some(open), Some(high), Some(low), Some(close)) = ohlc else {
         gaps.push(TiingoEodSurfaceGap {
             provider_date: row.date(),
+            provider_row_index,
             surface,
             reason: TiingoEodSurfaceGapReason::MissingOhlc,
             row_digest: row.row_digest(),
@@ -1921,50 +2202,13 @@ fn map_surface(
     let Some(volume) = volume else {
         gaps.push(TiingoEodSurfaceGap {
             provider_date: row.date(),
+            provider_row_index,
             surface,
             reason: TiingoEodSurfaceGapReason::MissingVolume,
             row_digest: row.row_digest(),
         });
         return Ok(());
     };
-    let provider_timestamp = time_semantics.provider_timestamp();
-    let source_identifier = SourceIdentifier::try_from(format!(
-        "tiingo-eod-{}-{}-{}",
-        input.instrument.ticker(),
-        row.date(),
-        match surface {
-            TiingoEodSurface::Raw => "raw",
-            TiingoEodSurface::Adjusted => "adjusted",
-        }
-    ))
-    .map_err(|_| TiingoEodMapError::InvalidCanonicalIdentity)?;
-    let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
-        source_id: input.contract.source_id().clone(),
-        instrument_id: Some(input.instrument.instrument_id()),
-        venue_id: Some(input.instrument.venue_id().clone()),
-        source_identifier,
-        source_timestamp: Some(provider_timestamp),
-        received_at: input.response.evidence().received_at(),
-        ingested_at: input.ingested_at,
-        quality: DataQuality::Aggregated,
-        payload_reference: PayloadReference::ContentHash(PayloadHash::new(
-            row.row_digest().algorithm(),
-            row.row_digest().bytes(),
-        )),
-        availability: AvailabilityEvidence::local_first_observed(
-            input.response.evidence().received_at(),
-        ),
-    })
-    .map_err(|_| TiingoEodMapError::InvalidCanonicalEvidence)?;
-    let time = ResearchTime::new(
-        provider_timestamp,
-        None,
-        input.authority_seed_revision,
-        None,
-    )
-    .map_err(|_| TiingoEodMapError::InvalidCanonicalEvidence)?;
-    let context = ResearchContext::new(provenance, time)
-        .map_err(|_| TiingoEodMapError::InvalidCanonicalEvidence)?;
     let (feed, adjustment) = match surface {
         TiingoEodSurface::Raw => (input.contract.raw_feed().clone(), MarketBarAdjustment::Raw),
         TiingoEodSurface::Adjusted => (
@@ -1973,25 +2217,143 @@ fn map_surface(
         ),
     };
     let interval = SourceIdentifier::try_from(TIINGO_DAILY_INTERVAL)
-        .map_err(|_| TiingoEodMapError::InvalidCanonicalIdentity)?;
-    let observation = MarketBarObservation::new(
-        context,
-        input.instrument.provider_instrument_id().clone(),
+        .map_err(|_| TiingoEodMapError::InvalidCandidateIdentity)?;
+    if [open, high, low, close]
+        .into_iter()
+        .any(|price| price <= Decimal::ZERO)
+        || low > high
+        || open < low
+        || open > high
+        || close < low
+        || close > high
+        || volume.is_sign_negative()
+    {
+        return Err(TiingoEodMapError::InvalidProviderBarEvidence);
+    }
+    let received_at = input.response.evidence().received_at();
+    let decoded_at = input.response.evidence().decoded_at();
+    let currency = input.instrument.currency();
+    let open = Money::new(open, currency);
+    let high = Money::new(high, currency);
+    let low = Money::new(low, currency);
+    let close = Money::new(close, currency);
+    let volume = volume.normalize();
+    let semantic_identity = eod_bar_semantic_identity(
+        input.instrument,
+        row.date(),
+        surface,
+        &feed,
+        &interval,
+        &time_semantics,
+        adjustment,
+        [open, high, low, close],
+        volume,
+    );
+    bars.push(TiingoEodBarCandidate {
+        instrument_id: input.instrument.instrument_id(),
+        venue_id: input.instrument.venue_id().clone(),
+        provider_instrument_id: input.instrument.provider_instrument_id().clone(),
+        provider_date: row.date(),
+        provider_row_index,
+        provider_row_digest: row.row_digest(),
+        surface,
         feed,
         interval,
         time_semantics,
         adjustment,
-        Money::new(open, input.instrument.currency()),
-        Money::new(high, input.instrument.currency()),
-        Money::new(low, input.instrument.currency()),
-        Money::new(close, input.instrument.currency()),
+        open,
+        high,
+        low,
+        close,
         volume,
-        None,
-        None,
-    )
-    .map_err(|_| TiingoEodMapError::InvalidCanonicalEvidence)?;
-    observations.push(ResearchObservation::MarketBar(observation));
+        source_publication: TiingoSourcePublicationEvidence::NotSupplied,
+        provider_revision: TiingoProviderRevisionEvidence::NotSupplied,
+        availability: AvailabilityEvidence::local_first_observed(received_at),
+        received_at,
+        decoded_at,
+        ingested_at: input.ingested_at,
+        semantic_identity,
+    });
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eod_bar_semantic_identity(
+    instrument: &TiingoEodInstrumentAuthority,
+    provider_date: CalendarDate,
+    surface: TiingoEodSurface,
+    feed: &SourceIdentifier,
+    interval: &SourceIdentifier,
+    time_semantics: &BarTimeSemantics,
+    adjustment: MarketBarAdjustment,
+    ohlc: [Money; 4],
+    volume: Decimal,
+) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    append_field(
+        &mut hasher,
+        b"market-squawk/tiingo/eod-provider-native-bar-semantics/v1",
+    );
+    append_field(
+        &mut hasher,
+        instrument.instrument_id().to_string().as_bytes(),
+    );
+    append_field(&mut hasher, instrument.venue_id().as_str().as_bytes());
+    append_field(
+        &mut hasher,
+        instrument.provider_instrument_id().as_str().as_bytes(),
+    );
+    append_field(&mut hasher, provider_date.to_string().as_bytes());
+    append_field(
+        &mut hasher,
+        &[match surface {
+            TiingoEodSurface::Raw => 0,
+            TiingoEodSurface::Adjusted => 1,
+        }],
+    );
+    append_field(&mut hasher, feed.as_str().as_bytes());
+    append_field(&mut hasher, interval.as_str().as_bytes());
+    append_field(
+        &mut hasher,
+        &time_semantics.period_start().unix_nanos().to_be_bytes(),
+    );
+    append_field(
+        &mut hasher,
+        &time_semantics
+            .period_end_exclusive()
+            .unix_nanos()
+            .to_be_bytes(),
+    );
+    append_field(
+        &mut hasher,
+        &[match time_semantics.timestamp_basis() {
+            BarTimestampBasis::PeriodStart => 0,
+            BarTimestampBasis::PeriodEnd => 1,
+        }],
+    );
+    append_field(
+        &mut hasher,
+        &[match time_semantics.session().kind() {
+            MarketBarSessionKind::Regular => 0,
+            MarketBarSessionKind::Extended => 1,
+            MarketBarSessionKind::Continuous => 2,
+            MarketBarSessionKind::ProviderDefined => 3,
+        }],
+    );
+    append_field(
+        &mut hasher,
+        time_semantics.session().ruleset().as_str().as_bytes(),
+    );
+    append_evidence_digest(&mut hasher, time_semantics.session().evidence());
+    append_field(&mut hasher, &[adjustment_discriminant(adjustment)]);
+    append_field(&mut hasher, ohlc[0].currency().as_str().as_bytes());
+    for value in ohlc {
+        append_field(&mut hasher, value.amount().to_string().as_bytes());
+    }
+    append_field(&mut hasher, volume.to_string().as_bytes());
+    append_field(&mut hasher, b"provider-publication-not-supplied");
+    append_field(&mut hasher, b"provider-revision-not-supplied");
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
 }
 
 fn append_field(hasher: &mut Sha256, value: &[u8]) {
@@ -2009,7 +2371,7 @@ const fn adjustment_discriminant(adjustment: MarketBarAdjustment) -> u8 {
     }
 }
 
-/// Closed failure to construct canonical Tiingo EOD evidence.
+/// Closed failure to construct exact revision-free Tiingo EOD handoff evidence.
 #[derive(Debug, Error)]
 pub enum TiingoEodMapError {
     /// Canonical/provider identity, ticker metadata, or equity/ETF classification disagreed.
@@ -2042,16 +2404,16 @@ pub enum TiingoEodMapError {
     /// One or more exact HTTP plan pages or mapped provider rows were absent or inconsistent.
     #[error("Tiingo EOD HTTP history request graph is incomplete")]
     IncompleteHistory,
-    /// A code-owned canonical identity crossed the domain grammar or byte limit.
-    #[error("Tiingo EOD canonical identity is invalid")]
-    InvalidCanonicalIdentity,
-    /// Canonical provenance, time, or OHLCV invariants rejected the supplied evidence.
-    #[error("Tiingo EOD canonical evidence is invalid")]
-    InvalidCanonicalEvidence,
+    /// A code-owned source/feed/interval identity crossed the domain grammar or byte limit.
+    #[error("Tiingo EOD candidate identity is invalid")]
+    InvalidCandidateIdentity,
+    /// Provider clocks or exact handoff evidence rejected the supplied values.
+    #[error("Tiingo EOD candidate evidence is invalid")]
+    InvalidCandidateEvidence,
+    /// A provider-native OHLCV surface violated exact positive-price/range/volume invariants.
+    #[error("Tiingo EOD provider bar evidence is invalid")]
+    InvalidProviderBarEvidence,
     /// Bounded output allocation failed.
-    #[error("Tiingo EOD canonical output allocation failed")]
+    #[error("Tiingo EOD candidate allocation failed")]
     Allocation,
-    /// Shared observed-revision plan construction failed.
-    #[error(transparent)]
-    Revision(#[from] ObservedRevisionError),
 }
