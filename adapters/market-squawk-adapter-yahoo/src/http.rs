@@ -14,7 +14,7 @@ use market_squawk_domain::{
 use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_sources::{
     ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
 };
 use reqwest::cookie::Jar;
 use reqwest::header::{
@@ -33,14 +33,18 @@ use zeroize::Zeroizing;
 use crate::durable::{
     MAX_YAHOO_DURABLE_CACHE_BODY_BYTES, YahooDurableCacheEntry, YahooDurableState,
 };
+use crate::native::{
+    YahooNativeEvidenceError, YahooNativePublicationEvidence, YahooPendingChartHistory,
+};
 use crate::{
     AdapterBounds, AdmissionDecision, AdmissionPolicy, AdmissionRejection, AttemptDisposition,
-    AttemptKind, AttemptOutcome, AttemptPermit, ParseContext, YAHOO_SOURCE_ID, YahooAdapterError,
-    YahooAdmission, YahooAssetClass, YahooChart, YahooDurableStateStore, YahooEnrichment,
-    YahooFundData, YahooHttpMethod, YahooHttpRequest, YahooLookupHint, YahooOptionChain,
-    YahooQuote, YahooReference, YahooRequestFamily, YahooRequestPlan, YahooReturnedDisposition,
-    parse_chart_response, parse_fund_response, parse_lookup_response, parse_option_response,
-    parse_quote_response, parse_reference_response,
+    AttemptKind, AttemptOutcome, AttemptPermit, ChartInterval, ChartWindow, ExplicitDemand,
+    LookupKind, ParseContext, YAHOO_SOURCE_ID, YahooAdapterError, YahooAdmission, YahooAssetClass,
+    YahooChart, YahooDurableStateStore, YahooEnrichment, YahooFundData, YahooHttpMethod,
+    YahooHttpRequest, YahooLocale, YahooLookupHint, YahooOptionChain, YahooQuote, YahooReference,
+    YahooRequestFamily, YahooRequestPlan, YahooRequestPlanner, YahooReturnedDisposition,
+    YahooSymbol, YahooTarget, parse_chart_response, parse_fund_response, parse_lookup_response,
+    parse_option_response, parse_quote_response, parse_reference_response,
 };
 
 const FALLBACK_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
@@ -205,13 +209,15 @@ impl YahooHttpResult {
         if self.disposition != YahooExecutionDisposition::Network {
             return Err(YahooPublicationBridgeError::NonPublicationResult);
         }
-        let material = self.raw.capture_material(binding)?;
-        let expected_capture = material.receipt().clone();
+        let native_evidence =
+            YahooNativePublicationEvidence::try_new(self.raw.as_ref(), self.parsed.as_ref())?;
+        let material = self.raw.capture_material(&binding)?;
         Ok(YahooPendingPublication {
             rejoin: YahooPublicationSealRejoin {
                 raw: self.raw,
                 parsed: self.parsed,
-                expected_capture,
+                binding,
+                native_evidence,
             },
             material,
         })
@@ -234,29 +240,43 @@ impl YahooPendingPublication {
 
 /// Opaque continuation held until the shared sealer returns a consuming material-bound seal.
 ///
-/// There is intentionally no public post-seal transition using
-/// [`SealedProviderCaptureSetReceipt`]. Logical capture equality cannot prove that a physical seal
-/// came from this continuation's exact raw envelope. Integration therefore waits for the common
-/// `SealedProviderCaptureMaterial` returned only by consuming `ProviderCaptureMaterial` in
-/// `ResearchService::seal_provider_capture`; that source-neutral value must remain noncloneable and
-/// nonserializable through the future consuming Yahoo rejoin. The serialized integration seam is:
+/// There is intentionally no public post-seal transition accepting a cloneable logical or physical
+/// receipt. Integration waits for the common nonforgeable material-to-physical-seal witness. Once
+/// that source-neutral API is available at this lane's base, the serialized integration seam is:
 ///
 /// ```text
+/// let (expectation, request) = material.into_whole_seal_parts();
+/// // The Yahoo pending continuation privately takes ownership of `expectation`.
 /// ResearchService::seal_provider_capture(
-///     material: ProviderCaptureMaterial,
+///     request: ProviderCaptureSealRequest,
 ///     cancellation: &CancellationToken,
 ///     deadline: Instant,
 /// ) -> Result<SealedProviderCaptureMaterial, ResearchServiceError>
 ///
-/// YahooPublicationSealRejoin::bind_sealed(
+/// YahooPublicationSealRejoin::try_rejoin(
 ///     self,
 ///     sealed: SealedProviderCaptureMaterial,
-/// ) -> Result<YahooSealedPublication, YahooPublicationBridgeError>
+/// ) -> Result<YahooPublicationCandidate, YahooPublicationBridgeError>
 /// ```
 pub struct YahooPublicationSealRejoin {
     raw: Arc<YahooRawReceipt>,
     parsed: Arc<YahooParsedResponse>,
-    expected_capture: ProviderCaptureSetReceipt,
+    binding: YahooPublicationBinding,
+    native_evidence: YahooNativePublicationEvidence,
+}
+
+impl YahooPublicationSealRejoin {
+    /// Returns the provider-native chart candidate without granting publication authority.
+    ///
+    /// The owning continuation remains noncloneable and must later be consumed by the common
+    /// material-bound seal rejoin before any canonical or durable composition.
+    pub fn pending_chart_history(&self) -> Option<YahooPendingChartHistory<'_>> {
+        self.native_evidence.pending_chart_history(
+            &self.binding,
+            self.raw.as_ref(),
+            self.parsed.as_ref(),
+        )
+    }
 }
 
 impl fmt::Debug for YahooPublicationSealRejoin {
@@ -277,41 +297,10 @@ impl fmt::Debug for YahooPublicationSealRejoin {
             )
             .field("request_family", &self.raw.request_family)
             .field("parsed_response_family", &parsed_response_family)
-            .field(
-                "expected_capture_observation_digest",
-                &self.expected_capture.observation_digest(),
-            )
+            .field("source_id", &self.binding.source_id())
+            .field("metadata_revision", &self.binding.metadata_revision())
             .field("sealed_transition", &"AWAITING_COMMON_MATERIAL_BINDING")
             .finish()
-    }
-}
-
-/// Typed Yahoo evidence bound to an exact shared immutable raw receipt.
-#[derive(Debug)]
-pub struct YahooSealedPublication {
-    raw: Arc<YahooRawReceipt>,
-    parsed: Arc<YahooParsedResponse>,
-    sealed_capture: SealedProviderCaptureSetReceipt,
-}
-
-impl YahooSealedPublication {
-    /// Returns the exact provider request/body/attempt receipt retained across cache reuse.
-    pub(crate) fn raw_receipt(&self) -> &YahooRawReceipt {
-        self.raw.as_ref()
-    }
-
-    /// Returns the closed typed response parsed from the exact raw body.
-    pub(crate) fn parsed_response(&self) -> &YahooParsedResponse {
-        self.parsed.as_ref()
-    }
-
-    /// Returns the shared physical receipt that binds the exact provider body.
-    pub(crate) const fn sealed_capture(&self) -> &SealedProviderCaptureSetReceipt {
-        &self.sealed_capture
-    }
-
-    pub(crate) fn into_sealed_capture(self) -> SealedProviderCaptureSetReceipt {
-        self.sealed_capture
     }
 }
 
@@ -363,7 +352,7 @@ impl YahooPublicationBinding {
 impl YahooRawReceipt {
     fn capture_material(
         &self,
-        binding: YahooPublicationBinding,
+        binding: &YahooPublicationBinding,
     ) -> Result<ProviderCaptureMaterial, YahooPublicationBridgeError> {
         if self.request.family != self.request_family
             || self.request.request_key != self.request_target_without_crumb
@@ -411,7 +400,7 @@ impl YahooRawReceipt {
             .map_err(|_| YahooPublicationBridgeError::InvalidDataset)?;
         let capture = ProviderCaptureSetReceipt::try_new(
             binding.source_id.clone(),
-            binding.metadata_revision,
+            binding.metadata_revision.clone(),
             dataset,
             request_identity,
             ProviderCaptureTerminalDisposition::StandaloneResponse,
@@ -450,6 +439,8 @@ pub enum YahooPublicationBridgeError {
     RawRecord(#[from] RawCaptureRecordError),
     #[error("Yahoo provider capture material is invalid")]
     ProviderCapture(#[from] ProviderCaptureError),
+    #[error("Yahoo provider-native pending evidence is inconsistent")]
+    NativeEvidence(#[from] YahooNativeEvidenceError),
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -642,7 +633,7 @@ impl YahooHttpSession {
             .transpose()
             .map_err(|_| YahooHttpFailureKind::StateUnavailable)?
             .flatten();
-        let (admission, shared) = restore_shared_state(&config, &endpoints, restored)?;
+        let (admission, shared) = restore_shared_state(&config, restored)?;
         let network = NetworkState::new(CookieStrategy::Basic, &config, &endpoints)?;
         Ok(Self {
             inner: Arc::new(SessionInner {
@@ -692,7 +683,7 @@ impl YahooHttpSession {
                 YahooHttpFailureKind::DeadlineExceeded,
             ));
         }
-        validate_selected_request(&request, &self.inner.endpoints)?;
+        validate_selected_request(&request, self.inner.config.adapter_bounds)?;
         let identity = request_identity(&request);
         match self.begin(&request, &identity, limits.maximum_cache_age)? {
             BeginExecution::Cached(payload) => Ok(result_from_payload(
@@ -772,7 +763,7 @@ impl YahooHttpSession {
         match self
             .inner
             .admission
-            .admit(request, AttemptKind::Primary, now)
+            .admit(request, identity, AttemptKind::Primary, now)
             .map_err(YahooHttpFailure::from_admission)?
         {
             AdmissionDecision::Execute(permit) => {
@@ -891,17 +882,19 @@ impl YahooHttpSession {
             }
         };
 
+        let mut strategy_fallback_available = true;
         if network.crumb.is_none()
             && let Err(first_error) = self
                 .establish_crumb(&mut network, permit, attempts, deadline, cancellation)
                 .await
         {
-            if matches!(first_error, YahooHttpFailureKind::CircuitOpen { .. }) {
+            if !allows_cookie_strategy_fallback(&first_error) {
                 return Err(first_error);
             }
             if self.circuit_is_open()? {
                 return Err(first_error);
             }
+            strategy_fallback_available = false;
             network.switch_strategy(&self.inner.config, &self.inner.endpoints)?;
             self.establish_crumb(&mut network, permit, attempts, deadline, cancellation)
                 .await?;
@@ -922,7 +915,7 @@ impl YahooHttpSession {
             Ok(wire) => self.finish_data_response(request, identity, wire, attempts, permit),
             Err(DataFailure::Terminal(kind)) => Err(kind),
             Err(DataFailure::StrategyFallback { status }) => {
-                if self.circuit_is_open()? {
+                if !strategy_fallback_available || self.circuit_is_open()? {
                     return Err(YahooHttpFailureKind::ProviderStatus { status });
                 }
                 network.switch_strategy(&self.inner.config, &self.inner.endpoints)?;
@@ -1394,6 +1387,7 @@ impl YahooHttpSession {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<WireResponse, YahooHttpFailureKind> {
+        self.ensure_attempt_slot(attempts)?;
         #[cfg(test)]
         if let WireClient::Scripted(state) = client {
             return self
@@ -1760,6 +1754,16 @@ impl YahooHttpSession {
         attempts.push(receipt);
         Ok(())
     }
+
+    fn ensure_attempt_slot(
+        &self,
+        attempts: &[YahooHttpAttemptReceipt],
+    ) -> Result<(), YahooHttpFailureKind> {
+        if attempts.len() >= self.inner.config.max_attempt_receipts {
+            return Err(YahooHttpFailureKind::AttemptReceiptLimit);
+        }
+        Ok(())
+    }
 }
 
 impl crate::CircuitSnapshot {
@@ -1784,9 +1788,16 @@ impl YahooParsedResponse {
             Self::Quote(value) => measured_disposition(value, requested_units),
             Self::Lookup(value) => measured_disposition(value, requested_units),
             Self::Chart(value) => {
-                let returned = usize::from(value.data.is_some());
+                let returned = usize::from(
+                    value
+                        .data
+                        .as_ref()
+                        .is_some_and(crate::YahooChart::has_usable_market_data),
+                );
                 let records = value.data.as_ref().map_or(0, |chart| {
-                    chart.valid_bar_count.saturating_add(chart.events.len())
+                    chart
+                        .valid_bar_count
+                        .saturating_add(chart.provider_action_count())
                 });
                 measured_single(requested_units, returned, records)
             }
@@ -1870,71 +1881,181 @@ fn parse_selected_response(
 
 fn validate_selected_request(
     request: &YahooHttpRequest,
-    endpoints: &EndpointSet,
+    bounds: AdapterBounds,
 ) -> Result<(), YahooHttpFailure> {
-    if request.method != YahooHttpMethod::Get
-        || request.request_key != request.target
-        || !request.requires_cookie_crumb_session
-        || request
-            .effective_arguments
-            .get("pinned_yfinance_version")
-            .map(String::as_str)
-            != Some(crate::PINNED_YFINANCE_VERSION)
-        || request
-            .effective_arguments
-            .get("pinned_yfinance_commit")
-            .map(String::as_str)
-            != Some(crate::PINNED_YFINANCE_COMMIT)
-    {
-        return Err(YahooHttpFailure::without_attempts(
-            YahooHttpFailureKind::InvalidRequest,
-        ));
-    }
-    if request
-        .requested_targets
-        .iter()
-        .any(|target| !admitted_asset(target.asset_class))
-    {
-        return Err(YahooHttpFailure::without_attempts(
-            YahooHttpFailureKind::InvalidRequest,
-        ));
-    }
-    let url = Url::parse(&request.target)
-        .map_err(|_| YahooHttpFailure::without_attempts(YahooHttpFailureKind::InvalidRequest))?;
-    if url.username() != ""
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || url.query_pairs().any(|(key, _)| key == "crumb")
-        || (!endpoints.allow_plain_http && url.scheme() != "https")
-    {
-        return Err(YahooHttpFailure::without_attempts(
-            YahooHttpFailureKind::InvalidRequest,
-        ));
-    }
-    let expected_host = match request.family {
-        YahooRequestFamily::Quote | YahooRequestFamily::Lookup => "query1.finance.yahoo.com",
-        YahooRequestFamily::ChartHistory
-        | YahooRequestFamily::ReferenceSummary
-        | YahooRequestFamily::FundSummary
-        | YahooRequestFamily::OptionChain
-        | YahooRequestFamily::Search => "query2.finance.yahoo.com",
-    };
-    let valid_path = match request.family {
-        YahooRequestFamily::Quote => url.path() == "/v7/finance/quote",
-        YahooRequestFamily::ChartHistory => url.path().starts_with("/v8/finance/chart/"),
-        YahooRequestFamily::ReferenceSummary | YahooRequestFamily::FundSummary => {
-            url.path().starts_with("/v10/finance/quoteSummary/")
-        }
-        YahooRequestFamily::OptionChain => url.path().starts_with("/v7/finance/options/"),
-        YahooRequestFamily::Search => url.path() == "/v1/finance/search",
-        YahooRequestFamily::Lookup => url.path() == "/v1/finance/lookup",
-    };
-    if url.host_str() != Some(expected_host) || !valid_path {
+    if rebuild_selected_request(request, bounds).as_ref() != Some(request) {
         return Err(YahooHttpFailure::without_attempts(
             YahooHttpFailureKind::InvalidRequest,
         ));
     }
     Ok(())
+}
+
+/// Rebuilds the selected endpoint through the sole code-owned planner.
+///
+/// `YahooHttpRequest` remains deserializable because the bounded durable cache persists it. A
+/// deserialized value is therefore untrusted until every parser-affecting input, URL component,
+/// query argument, schema pin, and target has reproduced the exact planner output.
+fn rebuild_selected_request(
+    request: &YahooHttpRequest,
+    bounds: AdapterBounds,
+) -> Option<YahooHttpRequest> {
+    let bounds = bounds.validate().ok()?;
+    let demand = ExplicitDemand::new(
+        request.demand.operation_id().to_owned(),
+        request.demand.requested_at_unix_ms(),
+        request.demand.purpose(),
+        bounds.max_string_bytes,
+    )
+    .ok()?;
+    if demand != request.demand {
+        return None;
+    }
+    for target in &request.requested_targets {
+        if !admitted_asset(target.asset_class)
+            || YahooSymbol::parse(target.symbol.as_str().to_owned(), bounds.max_string_bytes)
+                .ok()
+                .as_ref()
+                != Some(&target.symbol)
+        {
+            return None;
+        }
+    }
+
+    let url = Url::parse(&request.target).ok()?;
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let query = unique_query(&url)?;
+    if query.contains_key("crumb") {
+        return None;
+    }
+
+    let plan = match request.family {
+        YahooRequestFamily::Quote => planner_with_request_locale(bounds, &query)?
+            .quote(demand, request.requested_targets.clone())
+            .ok()?,
+        YahooRequestFamily::ChartHistory => {
+            let target = exactly_one_target(request)?;
+            let interval = ChartInterval::from_provider_value(query.get("interval")?)?;
+            let include_pre_post = match query.get("includePrePost")?.as_str() {
+                "false" => false,
+                "true" => true,
+                _ => return None,
+            };
+            neutral_locale_planner(bounds)?
+                .chart_history(
+                    demand,
+                    vec![target],
+                    selected_chart_window(&query)?,
+                    interval,
+                    include_pre_post,
+                )
+                .ok()?
+        }
+        YahooRequestFamily::ReferenceSummary => planner_with_request_locale(bounds, &query)?
+            .reference(demand, exactly_one_target(request)?)
+            .ok()?,
+        YahooRequestFamily::FundSummary => planner_with_request_locale(bounds, &query)?
+            .fund(demand, exactly_one_target(request)?)
+            .ok()?,
+        YahooRequestFamily::OptionChain => {
+            let expiration = match query.get("date") {
+                Some(value) => Some(value.parse().ok()?),
+                None => None,
+            };
+            neutral_locale_planner(bounds)?
+                .option_chain(demand, exactly_one_target(request)?, expiration)
+                .ok()?
+        }
+        YahooRequestFamily::Search => {
+            let text = query.get("q")?.clone();
+            let requested_results = query.get("quotesCount")?.parse().ok()?;
+            neutral_locale_planner(bounds)?
+                .search(demand, text, requested_results)
+                .ok()?
+        }
+        YahooRequestFamily::Lookup => {
+            let text = query.get("query")?.clone();
+            let requested_results = query.get("count")?.parse().ok()?;
+            let kind = match query.get("type")?.as_str() {
+                "equity" => LookupKind::Equity,
+                "mutualfund" => LookupKind::MutualFund,
+                "etf" => LookupKind::Etf,
+                "index" => LookupKind::Index,
+                _ => return None,
+            };
+            planner_with_request_locale(bounds, &query)?
+                .lookup(demand, text, kind, requested_results)
+                .ok()?
+        }
+    };
+    exactly_one_planned_request(plan)
+}
+
+fn unique_query(url: &Url) -> Option<BTreeMap<String, String>> {
+    let mut query = BTreeMap::new();
+    for (key, value) in url.query_pairs() {
+        if query.insert(key.into_owned(), value.into_owned()).is_some() {
+            return None;
+        }
+    }
+    Some(query)
+}
+
+fn planner_with_request_locale(
+    bounds: AdapterBounds,
+    query: &BTreeMap<String, String>,
+) -> Option<YahooRequestPlanner> {
+    let locale = YahooLocale::new(
+        query.get("lang")?.clone(),
+        query.get("region")?.clone(),
+        bounds.max_string_bytes,
+    )
+    .ok()?;
+    YahooRequestPlanner::new(bounds, locale).ok()
+}
+
+fn neutral_locale_planner(bounds: AdapterBounds) -> Option<YahooRequestPlanner> {
+    let locale = YahooLocale::new("a", "a", bounds.max_string_bytes).ok()?;
+    YahooRequestPlanner::new(bounds, locale).ok()
+}
+
+fn exactly_one_target(request: &YahooHttpRequest) -> Option<YahooTarget> {
+    let [target] = request.requested_targets.as_slice() else {
+        return None;
+    };
+    Some(target.clone())
+}
+
+fn exactly_one_planned_request(mut plan: YahooRequestPlan) -> Option<YahooHttpRequest> {
+    if plan.requests.len() != 1 {
+        return None;
+    }
+    plan.requests.pop()
+}
+
+fn selected_chart_window(query: &BTreeMap<String, String>) -> Option<ChartWindow> {
+    match (
+        query.get("range"),
+        query.get("period1"),
+        query.get("period2"),
+    ) {
+        (Some(range), None, None) => ChartWindow::from_provider_range(range),
+        (None, Some(start), Some(end)) => {
+            let start_unix_seconds = start.parse().ok()?;
+            let end_exclusive_unix_seconds = end.parse().ok()?;
+            (start_unix_seconds < end_exclusive_unix_seconds).then_some(ChartWindow::UnixRange {
+                start_unix_seconds,
+                end_exclusive_unix_seconds,
+            })
+        }
+        _ => None,
+    }
 }
 
 const fn admitted_asset(asset: YahooAssetClass) -> bool {
@@ -1963,14 +2084,76 @@ fn request_units(request: &YahooHttpRequest) -> usize {
 
 pub(crate) fn request_identity(request: &YahooHttpRequest) -> String {
     let mut digest = Sha256::new();
-    digest.update(format!("{:?}\n{}\n", request.family, request.target));
-    for (key, value) in &request.effective_arguments {
-        digest.update(key.as_bytes());
-        digest.update(b"=");
-        digest.update(value.as_bytes());
-        digest.update(b"\n");
+    digest_field(&mut digest, b"market-squawk.yahoo.request-identity.v2");
+    digest_field(
+        &mut digest,
+        match request.method {
+            YahooHttpMethod::Get => b"get",
+        },
+    );
+    digest_field(&mut digest, request_family_identity(request.family));
+    digest_field(&mut digest, request.target.as_bytes());
+    digest_field(&mut digest, request.request_key.as_bytes());
+    digest_field(
+        &mut digest,
+        if request.requires_cookie_crumb_session {
+            b"cookie-crumb-required"
+        } else {
+            b"cookie-crumb-not-required"
+        },
+    );
+    digest_field(
+        &mut digest,
+        &u64::try_from(request.requested_targets.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for target in &request.requested_targets {
+        digest_field(&mut digest, target.symbol.as_str().as_bytes());
+        digest_field(&mut digest, asset_class_identity(target.asset_class));
     }
+    digest_field(
+        &mut digest,
+        &u64::try_from(request.effective_arguments.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for (key, value) in &request.effective_arguments {
+        digest_field(&mut digest, key.as_bytes());
+        digest_field(&mut digest, value.as_bytes());
+    }
+    // Explicit-demand identity authorizes the caller but does not change the upstream request or
+    // parser inputs. Cache/coalesced callers retain the original receipt and are never presented as
+    // a new provider acquisition.
     sha256_finish(digest)
+}
+
+fn digest_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value);
+}
+
+const fn request_family_identity(family: YahooRequestFamily) -> &'static [u8] {
+    match family {
+        YahooRequestFamily::Quote => b"quote",
+        YahooRequestFamily::ChartHistory => b"chart-history",
+        YahooRequestFamily::ReferenceSummary => b"reference-summary",
+        YahooRequestFamily::FundSummary => b"fund-summary",
+        YahooRequestFamily::OptionChain => b"option-chain",
+        YahooRequestFamily::Search => b"search",
+        YahooRequestFamily::Lookup => b"lookup",
+    }
+}
+
+const fn asset_class_identity(asset_class: YahooAssetClass) -> &'static [u8] {
+    match asset_class {
+        YahooAssetClass::Equity => b"equity",
+        YahooAssetClass::Etf => b"etf",
+        YahooAssetClass::Index => b"index",
+        YahooAssetClass::MutualFund => b"mutual-fund",
+        YahooAssetClass::OptionUnderlying => b"option-underlying",
+        YahooAssetClass::ReferenceHint => b"reference-hint",
+    }
 }
 
 fn result_from_payload(
@@ -2031,7 +2214,6 @@ fn insert_cache(
 
 fn restore_shared_state(
     config: &YahooHttpSessionConfig,
-    endpoints: &EndpointSet,
     restored: Option<YahooDurableState>,
 ) -> Result<(YahooAdmission, SharedState), YahooHttpFailureKind> {
     let Some(restored) = restored else {
@@ -2056,7 +2238,7 @@ fn restore_shared_state(
     let mut cache_bytes = 0_usize;
     for persisted in restored.cache {
         let identity = persisted.request_identity_sha256_hex.clone();
-        let entry = restore_cache_entry(config, endpoints, persisted)?;
+        let entry = restore_cache_entry(config, persisted)?;
         cache_bytes = cache_bytes
             .checked_add(entry.bytes)
             .ok_or(YahooHttpFailureKind::StateUnavailable)?;
@@ -2087,10 +2269,9 @@ fn restore_shared_state(
 
 fn restore_cache_entry(
     config: &YahooHttpSessionConfig,
-    endpoints: &EndpointSet,
     persisted: YahooDurableCacheEntry,
 ) -> Result<CacheEntry, YahooHttpFailureKind> {
-    validate_selected_request(&persisted.request, endpoints)
+    validate_selected_request(&persisted.request, config.adapter_bounds)
         .map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
     let body_length = persisted.response_bytes.len();
     if body_length == 0
@@ -2505,6 +2686,18 @@ enum DataFailure {
     StrategyFallback { status: u16 },
 }
 
+const fn allows_cookie_strategy_fallback(failure: &YahooHttpFailureKind) -> bool {
+    matches!(
+        failure,
+        YahooHttpFailureKind::Network
+            | YahooHttpFailureKind::UnsupportedEncoding
+            | YahooHttpFailureKind::ProviderStatus { .. }
+            | YahooHttpFailureKind::CrumbUnavailable
+            | YahooHttpFailureKind::ConsentSchema
+            | YahooHttpFailureKind::Schema
+    )
+}
+
 impl EndpointSet {
     fn production() -> Result<Self, YahooHttpFailureKind> {
         let parse =
@@ -2572,6 +2765,12 @@ impl NetworkState {
             CookieStrategy::Basic => CookieStrategy::Csrf,
             CookieStrategy::Csrf => CookieStrategy::Basic,
         };
+        #[cfg(test)]
+        if matches!(self.client, WireClient::Scripted(_)) {
+            self.strategy = strategy;
+            self.crumb = None;
+            return Ok(());
+        }
         *self = Self::new(strategy, config, endpoints)?;
         Ok(())
     }
@@ -2636,7 +2835,7 @@ impl YahooHttpSession {
             .transpose()
             .map_err(|_| YahooHttpFailureKind::StateUnavailable)?
             .flatten();
-        let (admission, shared) = restore_shared_state(&config, &endpoints, restored)?;
+        let (admission, shared) = restore_shared_state(&config, restored)?;
         let cookie_jar = Arc::new(Jar::default());
         Ok(Self {
             inner: Arc::new(SessionInner {

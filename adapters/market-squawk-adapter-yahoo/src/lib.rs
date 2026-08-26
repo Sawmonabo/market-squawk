@@ -7,22 +7,17 @@
 //! coalescing, and circuit state across every clone in one process.
 
 mod admission;
-mod canonical;
 mod durable;
 mod error;
 mod http;
 mod model;
+mod native;
 mod parse;
 mod request;
 
 pub use admission::{
     AdmissionDecision, AdmissionPolicy, AdmissionRejection, AdmissionSnapshot, AttemptDisposition,
     AttemptKind, AttemptOutcome, AttemptPermit, CircuitSnapshot, YahooAdmission,
-};
-pub use canonical::{
-    YahooChartInstrumentAuthority, YahooChartMapError, YahooChartMappingInput,
-    YahooHistoricalBarTimeAuthority, YahooHistoricalBarTimeRequest, YahooMappedChartHistory,
-    map_chart_bars,
 };
 pub use durable::{
     MAX_YAHOO_DURABLE_CACHE_BODY_BYTES, YahooDurableStateError, YahooDurableStateStore,
@@ -33,14 +28,18 @@ pub use http::{
     YahooHttpFailure, YahooHttpFailureKind, YahooHttpResult, YahooHttpSession,
     YahooHttpSessionConfig, YahooParsedResponse, YahooPendingPublication, YahooPublicationBinding,
     YahooPublicationBridgeError, YahooPublicationSealRejoin, YahooRawReceipt,
-    YahooSealedPublication,
 };
 pub use model::{
     EvidenceAuthority, ExplicitDemand, ExplicitDemandPurpose, ParseContext, ProviderField,
-    QualityIssue, YahooAssetClass, YahooBar, YahooChart, YahooChartEvent, YahooChartEventKind,
-    YahooEnrichment, YahooEnrichmentState, YahooFundData, YahooFundHolding, YahooLookupHint,
-    YahooOptionChain, YahooOptionContract, YahooOptionSide, YahooProvenance, YahooQuote,
-    YahooReference, YahooReturnedDisposition, YahooSymbol, YahooTarget,
+    QualityIssue, YahooAssetClass, YahooBar, YahooChart, YahooChartActions, YahooChartEvent,
+    YahooChartEventKind, YahooChartIndicatorContainers, YahooEnrichment, YahooEnrichmentState,
+    YahooFundData, YahooFundHolding, YahooLookupHint, YahooOptionChain, YahooOptionContract,
+    YahooOptionSide, YahooProvenance, YahooQuote, YahooReference, YahooReturnedDisposition,
+    YahooSymbol, YahooTarget,
+};
+pub use native::{
+    YahooChartActionScope, YahooChartAdjustmentMode, YahooChartRequestEvidence,
+    YahooChartSessionScope, YahooNativeEvidenceError, YahooPendingChartHistory,
 };
 pub use parse::{
     parse_chart_response, parse_fund_response, parse_lookup_response, parse_option_response,

@@ -238,6 +238,7 @@ impl YahooAdmission {
     pub fn admit(
         &self,
         request: &YahooHttpRequest,
+        request_identity: &str,
         attempt_kind: AttemptKind,
         now_unix_ms: i64,
     ) -> Result<AdmissionDecision, AdmissionRejection> {
@@ -247,11 +248,11 @@ impl YahooAdmission {
             .map_err(|_| AdmissionRejection::StateUnavailable)?;
 
         if let Some(active) = state.active.as_ref() {
-            if active.request_key == request.request_key {
+            if active.request_key == request_identity {
                 state.snapshot.coalesced_callers_total =
                     checked_add(state.snapshot.coalesced_callers_total, 1)?;
                 return Ok(AdmissionDecision::JoinInFlight {
-                    request_key: request.request_key.clone(),
+                    request_key: request_identity.to_owned(),
                 });
             }
             return Ok(AdmissionDecision::Busy {
@@ -287,12 +288,12 @@ impl YahooAdmission {
         }
         state.active = Some(ActiveAttempt {
             id: attempt_id,
-            request_key: request.request_key.clone(),
+            request_key: request_identity.to_owned(),
             requested_units,
             started_at_unix_ms: now_unix_ms,
             half_open_probe,
         });
-        state.snapshot.active_request_key = Some(request.request_key.clone());
+        state.snapshot.active_request_key = Some(request_identity.to_owned());
         state.snapshot.circuit = state.circuit.snapshot();
         Ok(AdmissionDecision::Execute(AttemptPermit {
             inner: Arc::clone(&self.inner),
@@ -497,7 +498,12 @@ fn record_actual_attempt(
 
     let reopen = match outcome.disposition {
         AttemptDisposition::Success => {
-            state.snapshot.consecutive_failures = 0;
+            // Session bootstrap/crumb progress is not a successful market-data observation and
+            // cannot erase provider data failures. Only a successful observation-carrying attempt
+            // restores provider health.
+            if attempt_carries_observation_units(kind) {
+                state.snapshot.consecutive_failures = 0;
+            }
             false
         }
         AttemptDisposition::Partial => active.half_open_probe,

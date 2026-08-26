@@ -7,10 +7,11 @@ use serde_json::{Map, Value};
 use crate::{
     AdapterBounds, EvidenceAuthority, PINNED_YFINANCE_COMMIT, PINNED_YFINANCE_VERSION,
     ParseContext, ProviderField, QualityIssue, YAHOO_FINANCE_EXPERIMENTAL, YahooAdapterError,
-    YahooBar, YahooChart, YahooChartEvent, YahooChartEventKind, YahooEnrichment,
-    YahooEnrichmentState, YahooFundData, YahooFundHolding, YahooHttpRequest, YahooLookupHint,
-    YahooOptionChain, YahooOptionContract, YahooOptionSide, YahooProvenance, YahooQuote,
-    YahooReference, YahooRequestFamily, YahooReturnedDisposition, YahooSymbol,
+    YahooBar, YahooChart, YahooChartActions, YahooChartEvent, YahooChartEventKind,
+    YahooChartIndicatorContainers, YahooEnrichment, YahooEnrichmentState, YahooFundData,
+    YahooFundHolding, YahooHttpRequest, YahooLookupHint, YahooOptionChain, YahooOptionContract,
+    YahooOptionSide, YahooProvenance, YahooQuote, YahooReference, YahooRequestFamily,
+    YahooReturnedDisposition, YahooSymbol,
 };
 
 pub fn parse_quote_response(
@@ -180,28 +181,46 @@ pub fn parse_chart_response(
         ));
     }
 
-    let timestamps =
-        optional_array_member(result, "timestamp", "chart.result[0].timestamp")?.unwrap_or(&[]);
+    let (timestamp_container_entries, timestamps) =
+        optional_array_member_with_state(result, "timestamp", "chart.result[0].timestamp")?;
+    let timestamps = timestamps.unwrap_or(&[]);
     enforce_count(
         "chart.result[0].timestamp",
         timestamps.len(),
         bounds.max_records_per_response,
     )?;
-    let indicators = nested_object_path(result, &["indicators"])?;
-    let quote_arrays =
-        optional_array_member(indicators, "quote", "chart.result[0].indicators.quote")?
-            .unwrap_or(&[]);
-    let quote_object = quote_arrays
-        .first()
-        .map(|value| as_object(value, "chart.result[0].indicators.quote[0]"))
-        .transpose()?
-        .unwrap_or(&EMPTY_OBJECT);
-    let adjclose_object = optional_nested_first_object(
-        result,
-        &["indicators", "adjclose"],
-        "chart.result[0].indicators.adjclose[0]",
-    )?
-    .unwrap_or(&EMPTY_OBJECT);
+    let (indicator_containers, quote_object, adjclose_object) = match result.get("indicators") {
+        None => (ProviderField::Missing, &*EMPTY_OBJECT, &*EMPTY_OBJECT),
+        Some(Value::Null) => (ProviderField::Null, &*EMPTY_OBJECT, &*EMPTY_OBJECT),
+        Some(value) => {
+            let indicators = as_object(value, "chart.result[0].indicators")?;
+            let (quote_container_entries, quote_arrays) = optional_array_member_with_state(
+                indicators,
+                "quote",
+                "chart.result[0].indicators.quote",
+            )?;
+            let (adjusted_close_container_entries, adjusted_close_arrays) =
+                optional_array_member_with_state(
+                    indicators,
+                    "adjclose",
+                    "chart.result[0].indicators.adjclose",
+                )?;
+            let quote_object =
+                first_chart_indicator_object(quote_arrays, "chart.result[0].indicators.quote")?;
+            let adjclose_object = first_chart_indicator_object(
+                adjusted_close_arrays,
+                "chart.result[0].indicators.adjclose",
+            )?;
+            (
+                ProviderField::Value(YahooChartIndicatorContainers {
+                    quote_container_entries,
+                    adjusted_close_container_entries,
+                }),
+                quote_object,
+                adjclose_object,
+            )
+        }
+    };
     for field in ["open", "high", "low", "close", "volume"] {
         note_array_length(quote_object, field, timestamps.len(), &mut issues)?;
     }
@@ -232,7 +251,8 @@ pub fn parse_chart_response(
         });
     }
     let events = parse_chart_events(result, bounds, &mut issues)?;
-    if bars.is_empty() && events.is_empty() {
+    let has_events = matches!(&events, ProviderField::Value(actions) if actions.event_count() > 0);
+    if bars.is_empty() && !has_events {
         issues.push(QualityIssue::EmptyResult);
     }
     let valid_ranges = parse_string_array(
@@ -291,12 +311,28 @@ pub fn parse_chart_response(
             &mut issues,
         ),
         valid_ranges,
+        timestamp_container_entries,
+        indicators: indicator_containers,
         valid_bar_count,
         bars,
         events,
     };
-    let has_data = data.valid_bar_count > 0 || !data.events.is_empty();
-    Ok(enrichment(has_data.then_some(data), provenance, issues))
+    let state = if data.has_usable_market_data() {
+        if issues.is_empty() {
+            YahooEnrichmentState::Experimental
+        } else {
+            YahooEnrichmentState::Degraded
+        }
+    } else {
+        YahooEnrichmentState::Unavailable
+    };
+    Ok(YahooEnrichment {
+        state,
+        authority: EvidenceAuthority::ExperimentalSupplementOnly,
+        provenance,
+        issues,
+        data: Some(data),
+    })
 }
 
 // A shared immutable empty map avoids manufacturing temporary references while optional modules
@@ -1215,25 +1251,6 @@ fn object_path<'a>(
         })
 }
 
-fn nested_object_path<'a>(
-    root: &'a Map<String, Value>,
-    path: &[&str],
-) -> Result<&'a Map<String, Value>, YahooAdapterError> {
-    let mut cursor = root;
-    for (index, segment) in path.iter().enumerate() {
-        let value = cursor
-            .get(*segment)
-            .ok_or(YahooAdapterError::MissingEnvelope("nested path member"))?;
-        cursor = value
-            .as_object()
-            .ok_or_else(|| YahooAdapterError::InvalidSchema {
-                path: path[..=index].join("."),
-                reason: "expected object".to_owned(),
-            })?;
-    }
-    Ok(cursor)
-}
-
 fn as_object<'a>(
     value: &'a Value,
     path: &str,
@@ -1313,35 +1330,44 @@ fn optional_array_member<'a>(
     }
 }
 
-fn optional_nested_first_object<'a>(
-    root: &'a Map<String, Value>,
-    path: &[&str],
-    display_path: &str,
-) -> Result<Option<&'a Map<String, Value>>, YahooAdapterError> {
-    let Some((last, parents)) = path.split_last() else {
-        return Ok(None);
-    };
-    let parent = match nested_object_path(root, parents) {
-        Ok(parent) => parent,
-        Err(YahooAdapterError::MissingEnvelope(_)) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let Some(value) = parent.get(*last) else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(None);
+fn optional_array_member_with_state<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> Result<(ProviderField<usize>, Option<&'a [Value]>), YahooAdapterError> {
+    match object.get(key) {
+        None => Ok((ProviderField::Missing, None)),
+        Some(Value::Null) => Ok((ProviderField::Null, None)),
+        Some(value) => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| YahooAdapterError::InvalidSchema {
+                    path: path.to_owned(),
+                    reason: "expected array".to_owned(),
+                })?;
+            Ok((ProviderField::Value(values.len()), Some(values.as_slice())))
+        }
     }
-    let array = value
-        .as_array()
-        .ok_or_else(|| YahooAdapterError::InvalidSchema {
-            path: display_path.to_owned(),
-            reason: "expected array".to_owned(),
-        })?;
-    array
+}
+
+fn first_chart_indicator_object<'a>(
+    values: Option<&'a [Value]>,
+    path: &str,
+) -> Result<&'a Map<String, Value>, YahooAdapterError> {
+    let Some(values) = values else {
+        return Ok(&EMPTY_OBJECT);
+    };
+    if values.len() > 1 {
+        return Err(YahooAdapterError::InvalidSchema {
+            path: path.to_owned(),
+            reason: "expected at most one chart indicator object".to_owned(),
+        });
+    }
+    values
         .first()
-        .map(|value| as_object(value, display_path))
+        .map(|value| as_object(value, &format!("{path}[0]")))
         .transpose()
+        .map(|value| value.unwrap_or(&EMPTY_OBJECT))
 }
 
 fn first_summary_result(
@@ -1826,93 +1852,147 @@ fn parse_chart_events(
     result: &Map<String, Value>,
     bounds: AdapterBounds,
     issues: &mut Vec<QualityIssue>,
-) -> Result<Vec<YahooChartEvent>, YahooAdapterError> {
+) -> Result<ProviderField<YahooChartActions>, YahooAdapterError> {
     let Some(events) = result.get("events") else {
-        return Ok(Vec::new());
+        return Ok(ProviderField::Missing);
     };
     if events.is_null() {
-        return Ok(Vec::new());
+        return Ok(ProviderField::Null);
     }
     let events = as_object(events, "chart.result[0].events")?;
-    let mut parsed = Vec::new();
-    for (key, kind) in [
-        ("dividends", YahooChartEventKind::Dividend),
-        ("splits", YahooChartEventKind::Split),
-        ("capitalGains", YahooChartEventKind::CapitalGain),
-    ] {
-        let Some(values) = events.get(key) else {
-            continue;
-        };
-        if values.is_null() {
-            continue;
-        }
-        let values = as_object(values, &format!("chart.events.{key}"))?;
-        let next_count = parsed.len().checked_add(values.len()).ok_or(
-            YahooAdapterError::ApplicationBoundExceeded {
+    let mut total = 0;
+    let dividends = parse_chart_event_family(
+        events,
+        "dividends",
+        YahooChartEventKind::Dividend,
+        bounds,
+        issues,
+        &mut total,
+    )?;
+    let splits = parse_chart_event_family(
+        events,
+        "splits",
+        YahooChartEventKind::Split,
+        bounds,
+        issues,
+        &mut total,
+    )?;
+    let capital_gains = parse_chart_event_family(
+        events,
+        "capitalGains",
+        YahooChartEventKind::CapitalGain,
+        bounds,
+        issues,
+        &mut total,
+    )?;
+    Ok(ProviderField::Value(YahooChartActions {
+        dividends,
+        splits,
+        capital_gains,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_chart_event_family(
+    events: &Map<String, Value>,
+    key: &str,
+    kind: YahooChartEventKind,
+    bounds: AdapterBounds,
+    issues: &mut Vec<QualityIssue>,
+    total: &mut usize,
+) -> Result<ProviderField<Vec<YahooChartEvent>>, YahooAdapterError> {
+    let Some(values) = events.get(key) else {
+        return Ok(ProviderField::Missing);
+    };
+    if values.is_null() {
+        return Ok(ProviderField::Null);
+    }
+    let values = as_object(values, &format!("chart.events.{key}"))?;
+    *total =
+        total
+            .checked_add(values.len())
+            .ok_or(YahooAdapterError::ApplicationBoundExceeded {
                 name: "chart events",
                 actual: usize::MAX,
                 maximum: bounds.max_records_per_response,
-            },
-        )?;
-        enforce_count("chart events", next_count, bounds.max_records_per_response)?;
-        reserve(&mut parsed, values.len(), "chart events")?;
-        for (identity, value) in values {
-            let object = as_object(value, &format!("chart.events.{key}.{identity}"))?;
-            let timestamp = object
-                .get("date")
-                .and_then(parse_i64_value)
-                .or_else(|| identity.parse::<i64>().ok())
-                .ok_or_else(|| YahooAdapterError::InvalidNumber {
-                    path: format!("chart.events.{key}.{identity}.date"),
-                })?;
-            parsed.push(YahooChartEvent {
-                kind,
-                timestamp_unix_seconds: timestamp,
-                amount: decimal_field(
-                    object,
-                    "amount",
-                    &format!("chart.events.{key}.{identity}.amount"),
-                    issues,
-                ),
-                currency: string_field(
-                    object,
-                    "currency",
-                    &format!("chart.events.{key}.{identity}.currency"),
-                    bounds,
-                    issues,
-                )?,
-                numerator: decimal_field(
-                    object,
-                    "numerator",
-                    &format!("chart.events.{key}.{identity}.numerator"),
-                    issues,
-                ),
-                denominator: decimal_field(
-                    object,
-                    "denominator",
-                    &format!("chart.events.{key}.{identity}.denominator"),
-                    issues,
-                ),
-                split_ratio: string_field(
-                    object,
-                    "splitRatio",
-                    &format!("chart.events.{key}.{identity}.splitRatio"),
-                    bounds,
-                    issues,
-                )?,
+            })?;
+    enforce_count("chart events", *total, bounds.max_records_per_response)?;
+    let mut parsed = Vec::new();
+    reserve(&mut parsed, values.len(), "chart events")?;
+    for (identity, value) in values {
+        if identity.is_empty() || identity.chars().any(char::is_control) {
+            return Err(YahooAdapterError::InvalidSchema {
+                path: format!("chart.events.{key}"),
+                reason: "provider action identity is empty or unsafe".to_owned(),
             });
         }
+        if identity.len() > bounds.max_string_bytes {
+            return Err(YahooAdapterError::StringTooLong {
+                path: format!("chart.events.{key} identity"),
+            });
+        }
+        let object = as_object(value, &format!("chart.events.{key}.{identity}"))?;
+        let date_path = format!("chart.events.{key}.{identity}.date");
+        let date_unix_seconds = i64_field(object, "date", &date_path, issues);
+        let identity_timestamp = identity.parse::<i64>().ok();
+        let timestamp_unix_seconds = match (&date_unix_seconds, identity_timestamp) {
+            (ProviderField::Value(date), Some(identity_date)) if *date != identity_date => {
+                return Err(YahooAdapterError::InvalidSchema {
+                    path: date_path,
+                    reason: "provider action identity conflicts with its date".to_owned(),
+                });
+            }
+            (ProviderField::Value(date), _) => *date,
+            (_, Some(identity_date)) => identity_date,
+            _ => {
+                return Err(YahooAdapterError::InvalidNumber { path: date_path });
+            }
+        };
+        parsed.push(YahooChartEvent {
+            kind,
+            provider_identity: identity.clone(),
+            date_unix_seconds,
+            timestamp_unix_seconds,
+            amount: decimal_field(
+                object,
+                "amount",
+                &format!("chart.events.{key}.{identity}.amount"),
+                issues,
+            ),
+            currency: string_field(
+                object,
+                "currency",
+                &format!("chart.events.{key}.{identity}.currency"),
+                bounds,
+                issues,
+            )?,
+            numerator: decimal_field(
+                object,
+                "numerator",
+                &format!("chart.events.{key}.{identity}.numerator"),
+                issues,
+            ),
+            denominator: decimal_field(
+                object,
+                "denominator",
+                &format!("chart.events.{key}.{identity}.denominator"),
+                issues,
+            ),
+            split_ratio: string_field(
+                object,
+                "splitRatio",
+                &format!("chart.events.{key}.{identity}.splitRatio"),
+                bounds,
+                issues,
+            )?,
+        });
     }
-    parsed.sort_by_key(|event| (event.timestamp_unix_seconds, event_kind_order(event.kind)));
-    Ok(parsed)
-}
-
-const fn event_kind_order(kind: YahooChartEventKind) -> u8 {
-    match kind {
-        YahooChartEventKind::Dividend => 0,
-        YahooChartEventKind::Split => 1,
-        YahooChartEventKind::CapitalGain => 2,
-    }
+    parsed.sort_by(|left, right| {
+        left.timestamp_unix_seconds
+            .cmp(&right.timestamp_unix_seconds)
+            .then_with(|| left.provider_identity.cmp(&right.provider_identity))
+    });
+    Ok(ProviderField::Value(parsed))
 }
 
 fn named_decimal_fields(

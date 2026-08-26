@@ -248,6 +248,13 @@ pub struct YahooBar {
     pub volume: ProviderField<u64>,
 }
 
+/// Presence and cardinality of the provider's chart indicator containers.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct YahooChartIndicatorContainers {
+    pub quote_container_entries: ProviderField<usize>,
+    pub adjusted_close_container_entries: ProviderField<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum YahooChartEventKind {
@@ -259,12 +266,40 @@ pub enum YahooChartEventKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct YahooChartEvent {
     pub kind: YahooChartEventKind,
+    /// Exact object key from the provider's action-family map.
+    pub provider_identity: String,
+    /// Exact state of the provider's `date` field before identity fallback.
+    pub date_unix_seconds: ProviderField<i64>,
+    /// Validated event time: `date`, or the numeric provider identity when `date` is absent.
     pub timestamp_unix_seconds: i64,
     pub amount: ProviderField<Decimal>,
     pub currency: ProviderField<String>,
     pub numerator: ProviderField<Decimal>,
     pub denominator: ProviderField<Decimal>,
     pub split_ratio: ProviderField<String>,
+}
+
+/// Exact state of each provider action-family container.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct YahooChartActions {
+    pub dividends: ProviderField<Vec<YahooChartEvent>>,
+    pub splits: ProviderField<Vec<YahooChartEvent>>,
+    pub capital_gains: ProviderField<Vec<YahooChartEvent>>,
+}
+
+impl YahooChartActions {
+    pub fn event_count(&self) -> usize {
+        provider_vec_len(&self.dividends)
+            .saturating_add(provider_vec_len(&self.splits))
+            .saturating_add(provider_vec_len(&self.capital_gains))
+    }
+}
+
+fn provider_vec_len<T>(field: &ProviderField<Vec<T>>) -> usize {
+    match field {
+        ProviderField::Value(values) => values.len(),
+        ProviderField::Missing | ProviderField::Null | ProviderField::Invalid => 0,
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -279,9 +314,24 @@ pub struct YahooChart {
     pub previous_close: ProviderField<Decimal>,
     pub chart_previous_close: ProviderField<Decimal>,
     pub valid_ranges: Vec<String>,
+    pub timestamp_container_entries: ProviderField<usize>,
+    pub indicators: ProviderField<YahooChartIndicatorContainers>,
     pub valid_bar_count: usize,
     pub bars: Vec<YahooBar>,
-    pub events: Vec<YahooChartEvent>,
+    pub events: ProviderField<YahooChartActions>,
+}
+
+impl YahooChart {
+    pub fn provider_action_count(&self) -> usize {
+        match &self.events {
+            ProviderField::Value(actions) => actions.event_count(),
+            ProviderField::Missing | ProviderField::Null | ProviderField::Invalid => 0,
+        }
+    }
+
+    pub fn has_usable_market_data(&self) -> bool {
+        self.valid_bar_count > 0 || self.provider_action_count() > 0
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

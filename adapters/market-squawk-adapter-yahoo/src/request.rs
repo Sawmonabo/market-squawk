@@ -115,7 +115,7 @@ pub enum ChartInterval {
 }
 
 impl ChartInterval {
-    const fn provider_value(self) -> &'static str {
+    pub(crate) const fn provider_value(self) -> &'static str {
         match self {
             Self::OneMinute => "1m",
             Self::TwoMinutes => "2m",
@@ -130,6 +130,25 @@ impl ChartInterval {
             Self::OneWeek => "1wk",
             Self::OneMonth => "1mo",
             Self::ThreeMonths => "3mo",
+        }
+    }
+
+    pub(crate) fn from_provider_value(value: &str) -> Option<Self> {
+        match value {
+            "1m" => Some(Self::OneMinute),
+            "2m" => Some(Self::TwoMinutes),
+            "5m" => Some(Self::FiveMinutes),
+            "15m" => Some(Self::FifteenMinutes),
+            "30m" => Some(Self::ThirtyMinutes),
+            "60m" => Some(Self::SixtyMinutes),
+            "90m" => Some(Self::NinetyMinutes),
+            "1h" => Some(Self::OneHour),
+            "1d" => Some(Self::OneDay),
+            "5d" => Some(Self::FiveDays),
+            "1wk" => Some(Self::OneWeek),
+            "1mo" => Some(Self::OneMonth),
+            "3mo" => Some(Self::ThreeMonths),
+            _ => None,
         }
     }
 }
@@ -155,6 +174,40 @@ pub enum ChartWindow {
 }
 
 impl ChartWindow {
+    pub(crate) const fn provider_range_value(self) -> Option<&'static str> {
+        match self {
+            Self::OneDay => Some("1d"),
+            Self::FiveDays => Some("5d"),
+            Self::OneMonth => Some("1mo"),
+            Self::ThreeMonths => Some("3mo"),
+            Self::SixMonths => Some("6mo"),
+            Self::OneYear => Some("1y"),
+            Self::TwoYears => Some("2y"),
+            Self::FiveYears => Some("5y"),
+            Self::TenYears => Some("10y"),
+            Self::YearToDate => Some("ytd"),
+            Self::Maximum => Some("max"),
+            Self::UnixRange { .. } => None,
+        }
+    }
+
+    pub(crate) fn from_provider_range(value: &str) -> Option<Self> {
+        match value {
+            "1d" => Some(Self::OneDay),
+            "5d" => Some(Self::FiveDays),
+            "1mo" => Some(Self::OneMonth),
+            "3mo" => Some(Self::ThreeMonths),
+            "6mo" => Some(Self::SixMonths),
+            "1y" => Some(Self::OneYear),
+            "2y" => Some(Self::TwoYears),
+            "5y" => Some(Self::FiveYears),
+            "10y" => Some(Self::TenYears),
+            "ytd" => Some(Self::YearToDate),
+            "max" => Some(Self::Maximum),
+            _ => None,
+        }
+    }
+
     fn append(self, url: &mut Url) -> Result<(), YahooAdapterError> {
         let mut query = url.query_pairs_mut();
         match self {
@@ -169,20 +222,9 @@ impl ChartWindow {
                 query.append_pair("period2", &end_exclusive_unix_seconds.to_string());
             }
             window => {
-                let range = match window {
-                    Self::OneDay => "1d",
-                    Self::FiveDays => "5d",
-                    Self::OneMonth => "1mo",
-                    Self::ThreeMonths => "3mo",
-                    Self::SixMonths => "6mo",
-                    Self::OneYear => "1y",
-                    Self::TwoYears => "2y",
-                    Self::FiveYears => "5y",
-                    Self::TenYears => "10y",
-                    Self::YearToDate => "ytd",
-                    Self::Maximum => "max",
-                    Self::UnixRange { .. } => return Err(YahooAdapterError::InvalidHistoryWindow),
-                };
+                let range = window
+                    .provider_range_value()
+                    .ok_or(YahooAdapterError::InvalidHistoryWindow)?;
                 query.append_pair("range", range);
             }
         }
@@ -212,18 +254,43 @@ impl LookupKind {
 
 /// Exact effective provider request. Cookies, crumbs, fallback, and retries belong to transport.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct YahooHttpRequest {
-    pub method: YahooHttpMethod,
-    pub family: YahooRequestFamily,
-    pub target: String,
-    pub request_key: String,
-    pub demand: ExplicitDemand,
-    pub requested_targets: Vec<YahooTarget>,
-    pub effective_arguments: BTreeMap<String, String>,
-    pub requires_cookie_crumb_session: bool,
+    pub(crate) method: YahooHttpMethod,
+    pub(crate) family: YahooRequestFamily,
+    pub(crate) target: String,
+    pub(crate) request_key: String,
+    pub(crate) demand: ExplicitDemand,
+    pub(crate) requested_targets: Vec<YahooTarget>,
+    pub(crate) effective_arguments: BTreeMap<String, String>,
+    pub(crate) requires_cookie_crumb_session: bool,
 }
 
 impl YahooHttpRequest {
+    pub const fn method(&self) -> YahooHttpMethod {
+        self.method
+    }
+
+    pub const fn family(&self) -> YahooRequestFamily {
+        self.family
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn demand(&self) -> &ExplicitDemand {
+        &self.demand
+    }
+
+    pub fn requested_targets(&self) -> &[YahooTarget] {
+        &self.requested_targets
+    }
+
+    pub fn effective_arguments(&self) -> &BTreeMap<String, String> {
+        &self.effective_arguments
+    }
+
     pub fn requested_symbol_count(&self) -> usize {
         self.requested_targets.len()
     }
