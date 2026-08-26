@@ -1,11 +1,11 @@
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Exact SHA-256 content identity.
-#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Sha256Digest([u8; 32]);
 
@@ -51,7 +51,7 @@ impl fmt::Debug for Sha256Digest {
 }
 
 /// Gregorian trade date retained as the provider's `YYYYMMDD` coordinate.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct TradeDate {
     year: u16,
     month: u8,
@@ -196,13 +196,19 @@ pub enum DateError {
 }
 
 /// Selected IEX feed family supported by this decoder core.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum FeedKind {
     /// IEX top-of-book and last-sale feed.
     Tops,
     /// IEX displayed price-level depth feed.
     Deep,
+    /// Exact catalog `DPLS` family carrying IEX DEEP+ order-by-order messages.
+    #[serde(rename = "DPLS")]
+    DeepPlusDpls,
+    /// Exact catalog `DPLC` family carrying IEX DEEP+ order-by-order messages.
+    #[serde(rename = "DPLC")]
+    DeepPlusDplc,
 }
 
 impl FeedKind {
@@ -210,6 +216,8 @@ impl FeedKind {
         match self {
             Self::Tops => "TOPS",
             Self::Deep => "DEEP",
+            Self::DeepPlusDpls => "DPLS",
+            Self::DeepPlusDplc => "DPLC",
         }
     }
 
@@ -217,6 +225,7 @@ impl FeedKind {
         match self {
             Self::Tops => 0x8003,
             Self::Deep => 0x8004,
+            Self::DeepPlusDpls | Self::DeepPlusDplc => 0x8005,
         }
     }
 }
@@ -230,6 +239,12 @@ pub enum FeedVersion {
     /// Catalog `DEEP` version `1.0`, decoded from the stable prefix defined by DEEP 1.0x.
     #[serde(rename = "1.0")]
     Deep1_0,
+    /// Catalog `DPLS` version `1.0`, decoded against the selected DEEP+ 1.0x schema.
+    #[serde(rename = "1.0")]
+    DeepPlusDpls1_0,
+    /// Catalog `DPLC` version `1`, decoded against the selected DEEP+ 1.0x schema.
+    #[serde(rename = "1")]
+    DeepPlusDplc1,
 }
 
 impl FeedVersion {
@@ -237,6 +252,18 @@ impl FeedVersion {
         match self {
             Self::Tops1_6 => "1.6",
             Self::Deep1_0 => "1.0",
+            Self::DeepPlusDpls1_0 => "1.0",
+            Self::DeepPlusDplc1 => "1",
+        }
+    }
+
+    /// Returns the exact first-party native specification selected by this decoder schema.
+    #[must_use]
+    pub const fn specification_value(self) -> &'static str {
+        match self {
+            Self::Tops1_6 => "TOPS-1.66",
+            Self::Deep1_0 => "DEEP-1.08",
+            Self::DeepPlusDpls1_0 | Self::DeepPlusDplc1 => "DEEP+-1.04",
         }
     }
 
@@ -246,12 +273,14 @@ impl FeedVersion {
         match self {
             Self::Tops1_6 => FeedKind::Tops,
             Self::Deep1_0 => FeedKind::Deep,
+            Self::DeepPlusDpls1_0 => FeedKind::DeepPlusDpls,
+            Self::DeepPlusDplc1 => FeedKind::DeepPlusDplc,
         }
     }
 }
 
 /// Exact IEX transport family admitted by the current HIST catalog contract.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum TransportVersion {
     /// Catalog `IEXTP1`, whose outbound header version byte is `1`.
     #[serde(rename = "IEXTP1")]
@@ -262,10 +291,34 @@ impl TransportVersion {
     pub(crate) const fn catalog_value(self) -> &'static str {
         "IEXTP1"
     }
+
+    /// Returns the exact first-party transport specification selected by this decoder.
+    #[must_use]
+    pub const fn specification_value(self) -> &'static str {
+        "IEX-TP-1.26"
+    }
+}
+
+/// Exact provider object representation selected from the mutable HIST catalog.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum PcapObjectEncoding {
+    /// A gzip member whose validated output is one classic PCAP stream.
+    Gzip,
+    /// An identity-encoded classic PCAP object; no gzip framing or trailer exists.
+    Identity,
+}
+
+impl PcapObjectEncoding {
+    pub(crate) const fn identity_value(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip-pcap",
+            Self::Identity => "identity-pcap",
+        }
+    }
 }
 
 /// Exact non-negative nanoseconds since the Unix epoch.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct EpochNanos(i64);
 
@@ -319,7 +372,7 @@ impl IexVenueSemantics {
     pub const CONSOLIDATED: bool = false;
     /// TOPS is IEX top-of-book, never national best bid and offer.
     pub const NBBO: bool = false;
-    /// DEEP is displayed IEX depth, never complete market-wide depth.
+    /// DEEP and DEEP+ are displayed IEX depth, never complete market-wide depth.
     pub const MARKET_WIDE_DEPTH: bool = false;
     /// Hidden and reserve liquidity are not represented.
     pub const HIDDEN_LIQUIDITY: bool = false;
@@ -327,7 +380,7 @@ impl IexVenueSemantics {
     pub const LIVE: bool = false;
 }
 
-/// System-session event code from TOPS/DEEP.
+/// System-session event code from TOPS, DEEP, or DEEP+.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum SystemEventCode {
     /// Start of feed messages.
@@ -375,6 +428,98 @@ pub enum PriceType {
     Closing,
 }
 
+/// Limit-Up/Limit-Down tier published in a security-directory message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum LuldTier {
+    /// The LULD tier is not applicable.
+    NotApplicable,
+    /// Tier 1 NMS stock.
+    Tier1,
+    /// Tier 2 NMS stock.
+    Tier2,
+}
+
+/// IEX retail-liquidity interest for one security.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum RetailLiquidityIndicator {
+    /// Retail indicator is not applicable.
+    NotApplicable,
+    /// Buy interest for retail.
+    Buy,
+    /// Sell interest for retail.
+    Sell,
+    /// Buy and sell interest for retail.
+    BuyAndSell,
+}
+
+/// IEX-specific operational halt state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum OperationalHaltStatus {
+    /// Trading is operationally halted on IEX.
+    Halted,
+    /// Trading is not operationally halted on IEX.
+    NotHalted,
+}
+
+/// Provider detail accompanying a Regulation SHO price-test state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum ShortSalePriceTestDetail {
+    /// No price test is in place.
+    NoPriceTest,
+    /// The test was activated by an intraday price drop.
+    Activated,
+    /// The test continues from the prior day.
+    Continued,
+    /// The test was deactivated.
+    Deactivated,
+    /// Provider detail is unavailable for this security.
+    NotAvailable,
+}
+
+/// Security opening/closing process event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum SecurityEventCode {
+    /// Opening process completed.
+    OpeningProcessComplete,
+    /// Closing process completed.
+    ClosingProcessComplete,
+}
+
+/// IEX auction type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum AuctionType {
+    /// Opening auction.
+    Opening,
+    /// Closing auction.
+    Closing,
+    /// Initial-public-offering auction.
+    Ipo,
+    /// Halt auction.
+    Halt,
+    /// Volatility auction.
+    Volatility,
+}
+
+/// Side of the unpaired shares in an auction message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum AuctionImbalanceSide {
+    /// Buy-side imbalance.
+    Buy,
+    /// Sell-side imbalance.
+    Sell,
+    /// No imbalance.
+    None,
+}
+
+/// Displayed DEEP+ order side.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum OrderSide {
+    /// Displayed buy order.
+    Buy,
+    /// Displayed sell order.
+    Sell,
+}
+
 /// Selected typed event families plus digest-only evidence for intentionally unmapped messages.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -386,12 +531,27 @@ pub enum IexEvent {
         /// Exact source timestamp.
         source_time: EpochNanos,
     },
-    /// Security-specific opening/closing process event from DEEP.
+    /// Provider security-directory state.
+    SecurityDirectory {
+        /// Provider flags retained intact.
+        flags: u8,
+        /// Exact trimmed Nasdaq Integrated symbol.
+        symbol: String,
+        /// Shares representing a round lot.
+        round_lot_size: u32,
+        /// Corporate-action-adjusted previous official close.
+        adjusted_poc_price: PriceUnits1e4,
+        /// LULD tier.
+        luld_tier: LuldTier,
+        /// Exact source timestamp.
+        source_time: EpochNanos,
+    },
+    /// Security-specific opening/closing process event from DEEP or DEEP+.
     SecurityEvent {
         /// Exact trimmed Nasdaq Integrated symbol.
         symbol: String,
-        /// Exact provider code (`O` or `C`).
-        event: char,
+        /// Interpreted opening/closing event.
+        event: SecurityEventCode,
         /// Exact source timestamp.
         source_time: EpochNanos,
     },
@@ -403,6 +563,35 @@ pub enum IexEvent {
         status: TradingStatus,
         /// Trimmed exact reason code.
         reason: String,
+        /// Exact source timestamp.
+        source_time: EpochNanos,
+    },
+    /// IEX retail-liquidity interest state.
+    RetailLiquidity {
+        /// Exact trimmed Nasdaq Integrated symbol.
+        symbol: String,
+        /// Interpreted interest state.
+        indicator: RetailLiquidityIndicator,
+        /// Exact source timestamp.
+        source_time: EpochNanos,
+    },
+    /// IEX-specific operational halt state.
+    OperationalHalt {
+        /// Exact trimmed Nasdaq Integrated symbol.
+        symbol: String,
+        /// Interpreted halt state.
+        status: OperationalHaltStatus,
+        /// Exact source timestamp.
+        source_time: EpochNanos,
+    },
+    /// Regulation SHO short-sale price-test state.
+    ShortSalePriceTest {
+        /// Exact trimmed Nasdaq Integrated symbol.
+        symbol: String,
+        /// Whether the restriction is in effect.
+        in_effect: bool,
+        /// Provider detail.
+        detail: ShortSalePriceTestDetail,
         /// Exact source timestamp.
         source_time: EpochNanos,
     },
@@ -479,6 +668,100 @@ pub enum IexEvent {
         /// Exact source timestamp.
         source_time: EpochNanos,
     },
+    /// IEX auction information for one IEX-listed security.
+    Auction {
+        /// Auction type.
+        auction_type: AuctionType,
+        /// Exact trimmed Nasdaq Integrated symbol.
+        symbol: String,
+        /// Shares paired at the reference price.
+        paired_shares: u32,
+        /// Reference price.
+        reference_price: PriceUnits1e4,
+        /// Indicative clearing price.
+        indicative_clearing_price: PriceUnits1e4,
+        /// Unpaired shares at the reference price.
+        imbalance_shares: u32,
+        /// Side of the imbalance.
+        imbalance_side: AuctionImbalanceSide,
+        /// Number of automatic extensions.
+        extension_number: u8,
+        /// Projected auction match time in whole seconds since the Unix epoch.
+        scheduled_auction_time_unix_seconds: u32,
+        /// Clearing price using auction-book orders.
+        auction_book_clearing_price: PriceUnits1e4,
+        /// Auction-collar reference price, or zero when unused.
+        collar_reference_price: PriceUnits1e4,
+        /// Lower auction collar, or zero when unused.
+        lower_auction_collar: PriceUnits1e4,
+        /// Upper auction collar, or zero when unused.
+        upper_auction_collar: PriceUnits1e4,
+        /// Exact source timestamp.
+        source_time: EpochNanos,
+    },
+    /// Displayed order added to the IEX DEEP+ book.
+    AddOrder {
+        /// Exact trimmed Nasdaq Integrated symbol.
+        symbol: String,
+        /// Displayed side.
+        side: OrderSide,
+        /// IEX order identifier.
+        order_id: i64,
+        /// Quoted shares.
+        size: u32,
+        /// Booking price.
+        price: PriceUnits1e4,
+        /// Exact source timestamp.
+        source_time: EpochNanos,
+    },
+    /// Displayed IEX DEEP+ order modification.
+    ModifyOrder {
+        /// Exact trimmed Nasdaq Integrated symbol.
+        symbol: String,
+        /// Referenced IEX order identifier.
+        order_id: i64,
+        /// New total quoted shares.
+        size: u32,
+        /// New booking price.
+        price: PriceUnits1e4,
+        /// Whether the provider says priority is maintained.
+        maintains_priority: bool,
+        /// Exact source timestamp.
+        source_time: EpochNanos,
+    },
+    /// Displayed IEX DEEP+ order removal.
+    DeleteOrder {
+        /// Exact trimmed Nasdaq Integrated symbol.
+        symbol: String,
+        /// Referenced IEX order identifier.
+        order_id: i64,
+        /// Exact source timestamp.
+        source_time: EpochNanos,
+    },
+    /// Execution against a displayed IEX DEEP+ order.
+    ExecuteOrder {
+        /// Exact trimmed Nasdaq Integrated symbol.
+        symbol: String,
+        /// Provider sale-condition flags retained intact.
+        sale_condition_flags: u8,
+        /// Referenced IEX order identifier.
+        order_id: i64,
+        /// Shares executed.
+        size: u32,
+        /// Exact execution price.
+        price: PriceUnits1e4,
+        /// IEX trade identifier.
+        trade_id: i64,
+        /// Exact source timestamp.
+        source_time: EpochNanos,
+    },
+    /// All displayed orders for one symbol were cleared from the DEEP+ book.
+    ClearBook {
+        /// Exact trimmed Nasdaq Integrated symbol.
+        symbol: String,
+        /// Exact source timestamp.
+        source_time: EpochNanos,
+    },
     /// A valid length-framed message outside the selected typed families.
     Unmapped {
         /// Provider message-type byte.
@@ -505,7 +788,11 @@ pub struct DecodedIexEvent {
     pub transport_version: TransportVersion,
     /// Digest binding the catalog descriptor and raw capture receipt.
     pub source_file_identity: Sha256Digest,
-    /// IEX-TP channel; selected contracts currently require channel 1.
+    /// Exact immutable decoder contract selected by the cold plan.
+    pub decoder_contract_sha256: Sha256Digest,
+    /// Exact authority-owned attempt that performed this decode.
+    pub decode_attempt_evidence_sha256: Sha256Digest,
+    /// IEX-TP channel; TOPS, DEEP, and DPLS use 1 while DPLC admits 1 through 16.
     pub channel_id: u32,
     /// IEX-TP session identifier.
     pub session_id: u32,
