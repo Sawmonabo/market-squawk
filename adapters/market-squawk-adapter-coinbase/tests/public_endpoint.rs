@@ -5,11 +5,12 @@ use std::time::Duration;
 use common::{TestResult, config, identifier};
 use market_squawk_adapter_coinbase::{
     COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT, CoinbaseExchangeDecoder, CoinbaseExchangeSource,
+    CoinbaseMarketDecodeOutcome,
 };
 use market_squawk_domain::{ConnectionGeneration, LiveEventClass, Timestamp};
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, DecodeOutcome, LiveMarketSource, MarketDecoder, RawMarketFrame,
-    RawMarketSink, SessionId, SinkError, SourceError,
+    AuthoritativeSourceRegistry, LiveMarketSource, RawMarketFrame, RawMarketSink, SessionId,
+    SinkError, SourceError,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -100,13 +101,11 @@ async fn production_endpoint_smoke_is_opt_in_and_bounded() -> TestResult {
     let validated = session.validate_live_frame(&snapshot)?;
     let decoder_config = config()?;
     let mut decoder = CoinbaseExchangeDecoder::try_new(&decoder_config)?;
-    let decoded = decoder.decode(&validated)?;
-    let DecodeOutcome::Data(batch) = decoded else {
-        return Err(format!(
-            "Coinbase's live level2 frame did not decode as market data: {decoded:?}"
-        )
-        .into());
+    let decoded = decoder.decode_market_handoff(&validated)?;
+    let CoinbaseMarketDecodeOutcome::Market(handoff) = decoded else {
+        return Err("Coinbase's live level2 frame did not decode as a market handoff".into());
     };
+    let (_evidence, _raw_lineage, batch) = handoff.into_parts();
     assert!(
         batch
             .observations()

@@ -7,7 +7,9 @@ use market_squawk_adapter_alpaca::{
     AlpacaCredentials, AlpacaIexDecoder, AlpacaIexLiveConfig, AlpacaIexLiveSource,
     AlpacaOptionsDecoder, AlpacaOptionsLiveConfig, AlpacaOptionsLiveSource,
 };
-use market_squawk_adapter_coinbase::{CoinbaseExchangeDecoder, CoinbaseExchangeSource};
+use market_squawk_adapter_coinbase::{
+    CoinbaseExchangeDecoder, CoinbaseExchangeSource, CoinbaseMarketDecodeOutcome,
+};
 use market_squawk_adapter_kraken::{KrakenMarketDecoder, KrakenSource};
 use market_squawk_sources::{
     DecodeInternalError, DecodeOutcome, LiveMarketSource, LiveSourceGeneration, MarketDecoder,
@@ -427,16 +429,27 @@ impl SourceMetadataProvider for ProductionMarketDecoder {
     }
 }
 
-impl MarketDecoder for ProductionMarketDecoder {
-    fn decode(
+pub(super) enum ProductionDecodeOutcome {
+    Coinbase(CoinbaseMarketDecodeOutcome),
+    Standard(DecodeOutcome),
+}
+
+impl ProductionMarketDecoder {
+    pub(super) fn decode(
         &mut self,
         frame: &ValidatedRawMarketFrame<'_>,
-    ) -> Result<DecodeOutcome, DecodeInternalError> {
+    ) -> Result<ProductionDecodeOutcome, DecodeInternalError> {
         match self {
-            Self::Coinbase(decoder) => decoder.decode(frame),
-            Self::Kraken(decoder) => decoder.decode(frame),
-            Self::AlpacaIex(decoder) => decoder.decode(frame),
-            Self::AlpacaOptions(decoder) => decoder.decode(frame),
+            Self::Coinbase(decoder) => decoder
+                .decode_market_handoff(frame)
+                .map(ProductionDecodeOutcome::Coinbase),
+            Self::Kraken(decoder) => decoder.decode(frame).map(ProductionDecodeOutcome::Standard),
+            Self::AlpacaIex(decoder) => {
+                decoder.decode(frame).map(ProductionDecodeOutcome::Standard)
+            }
+            Self::AlpacaOptions(decoder) => {
+                decoder.decode(frame).map(ProductionDecodeOutcome::Standard)
+            }
         }
     }
 }

@@ -12,8 +12,8 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
-    DecodeOutcome, FreshnessPolicy, LiveSourceGeneration, MarketDecoder, ProviderBudgetPolicy,
-    RawMarketFrame, RawMarketSink, RegistryError, SessionId, SinkError, SourceError,
+    DecodeOutcome, FreshnessPolicy, LiveSourceGeneration, ProviderBudgetPolicy, RawMarketFrame,
+    RawMarketSink, RegistryError, SessionId, SinkError, SourceError,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::CoinbaseExchangeSource;
 use crate::{
-    CoinbaseChannel, CoinbaseExchangeConfig, CoinbaseExchangeDecoder, CoinbaseProductMapping,
-    CoinbaseTransportLimits,
+    CoinbaseChannel, CoinbaseExchangeConfig, CoinbaseExchangeDecoder, CoinbaseMarketDecodeOutcome,
+    CoinbaseProductMapping, CoinbaseTransportLimits,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -117,12 +117,12 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
     );
     let mut decoder = CoinbaseExchangeDecoder::try_new(&config)?;
     assert!(matches!(
-        decoder.decode(&session.validate_live_frame(&sink.frames[0])?)?,
-        DecodeOutcome::Control(_)
+        decoder.decode_market_handoff(&session.validate_live_frame(&sink.frames[0])?)?,
+        CoinbaseMarketDecodeOutcome::Other(DecodeOutcome::Control(_))
     ));
     assert!(matches!(
-        decoder.decode(&session.validate_live_frame(&sink.frames[1])?)?,
-        DecodeOutcome::Data(_)
+        decoder.decode_market_handoff(&session.validate_live_frame(&sink.frames[1])?)?,
+        CoinbaseMarketDecodeOutcome::Market(_)
     ));
 
     let refusal = WebSocketError::Http(Box::new(
@@ -143,8 +143,15 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
         .remaining_wait(deadline)
         .map_err(|reason| format!("Coinbase budget wait failed: {reason:?}"))?;
     tokio::time::sleep(remaining).await;
-    let market_squawk_sources::BudgetDecision::Ready(permit) = source.budget.try_acquire() else {
+    let market_squawk_sources::BudgetReservationDecision::Ready(reservation) =
+        source.budget.try_reserve_request()
+    else {
         return Err("Coinbase budget remained unavailable after its exact deadline".into());
+    };
+    let market_squawk_sources::BudgetDispatchDecision::Ready(permit) =
+        reservation.commit_dispatch()
+    else {
+        return Err("Coinbase budget dispatch remained unavailable after reservation".into());
     };
     permit.release();
     source

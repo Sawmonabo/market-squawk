@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::error::Error;
+use std::io::Read as _;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::str::FromStr as _;
 use std::sync::{Arc, Mutex};
@@ -15,11 +16,11 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
-    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
-    BudgetDecision, BudgetScope, BudgetUnavailableReason, DecodedControlFrame, DecoderEvidence,
-    DirectBookLimits, DirectSyncPhase, FreshnessPolicy, LiveSourceGeneration, ProviderBookSide,
-    ProviderBudgetPolicy, ProviderDecimalLexeme, ProviderObservationPayload, ProviderOrderEvent,
-    ProviderOrderEventKind, RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
+    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
+    BudgetUnavailableReason, DecodedControlFrame, DecoderEvidence, DirectBookLimits,
+    DirectSyncPhase, FreshnessPolicy, LiveSourceGeneration, ProviderBookSide, ProviderBudgetPolicy,
+    ProviderDecimalLexeme, ProviderObservationPayload, ProviderOrderEvent, ProviderOrderEventKind,
+    RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,30 +29,29 @@ use tokio_tungstenite::{accept_async, client_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    CoinbaseDirectBookUpdate, CoinbaseDirectHttpRequest, CoinbaseDirectHttpResponse,
-    CoinbaseDirectHttpTransport, CoinbaseDirectHttpTransportError, CoinbaseDirectOrderLevelPayload,
-    CoinbaseDirectOrderLevelUpdate, CoinbaseDirectOutput, CoinbaseDirectSession,
-    CoinbaseDirectSessionError,
+    CoinbaseDirectHttpRequest, CoinbaseDirectHttpResponse, CoinbaseDirectHttpTransport,
+    CoinbaseDirectHttpTransportError, CoinbaseDirectOrderLevelPayload,
+    CoinbaseDirectOrderLevelUpdate, CoinbaseDirectOutput, CoinbaseDirectOutputAdmission,
+    CoinbaseDirectSession, CoinbaseDirectSessionError,
 };
 use crate::{
     CoinbaseDirectAuthentication, CoinbaseDirectConfig, CoinbaseDirectLimits,
     CoinbaseDirectNonBookEvent, CoinbaseDirectProductEvidence, CoinbaseDirectSigningCapability,
-    CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseProductMapping,
-    CoinbaseTransportLimits,
+    CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseMarketChannel,
+    CoinbaseMarketContinuity, CoinbaseMarketFeed, CoinbaseProductMapping, CoinbaseTransportLimits,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const PRODUCT_BODY: &[u8] = br#"{"id":"BTC-USD","status":"online","base_increment":"0.00000001","quote_increment":"0.01","trading_disabled":false,"cancel_only":false,"post_only":false,"limit_only":false,"auction_mode":false}"#;
-const SNAPSHOT_BODY: &[u8] = br#"{"sequence":102,"time":"2026-07-24T21:34:10.602Z","bids":[["100.00","1.00000000","bid-1"]],"asks":[["101.00","2.00000000","ask-1"]]}"#;
+const SNAPSHOT_BODY: &[u8] = br#"{"sequence":104,"time":"2026-07-24T21:34:10.604Z","bids":[["100.00","1.00000000","bid-1"]],"asks":[["101.00","2.00000000","ask-1"]]}"#;
 const SEQUENCE_101: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.601Z","product_id":"BTC-USD","sequence":101,"order_id":"order-101","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_102: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.602Z","product_id":"BTC-USD","sequence":102,"order_id":"order-102","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_103: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.603Z","product_id":"BTC-USD","sequence":103,"order_id":"order-103","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_104: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.604Z","product_id":"BTC-USD","sequence":104,"order_id":"order-104","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
-const SEQUENCE_105: &str = r#"{"type":"open","time":"2026-07-24T21:34:10.605Z","product_id":"BTC-USD","sequence":105,"order_id":"order-105","price":"99.00","remaining_size":"0.50000000","side":"buy"}"#;
-const SEQUENCE_106: &str = r#"{"type":"done","time":"2026-07-24T21:34:10.606Z","product_id":"BTC-USD","sequence":106,"order_id":"order-105","reason":"canceled","price":"99.00","remaining_size":"0.50000000","side":"buy"}"#;
-const SEQUENCE_107: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.607Z","product_id":"BTC-USD","sequence":107,"order_id":"order-107","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
-const PRIVATE_RECEIVED: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.605Z","product_id":"BTC-USD","order_id":"private-order","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy","user_id":"fixture-user"}"#;
+const SEQUENCE_105: &str = r#"{"type":"match","time":"2026-07-24T21:34:10.605Z","product_id":"BTC-USD","sequence":105,"trade_id":7005,"maker_order_id":"bid-1","taker_order_id":"taker-105","size":"0.25000000","price":"100.00","side":"buy"}"#;
+const SEQUENCE_106: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.606Z","product_id":"BTC-USD","sequence":106,"order_id":"order-106","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
+const PRIVATE_RECEIVED: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.607Z","product_id":"BTC-USD","order_id":"private-order","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy","user_id":"fixture-user"}"#;
 const SUBSCRIPTION_ACK: &str =
     r#"{"type":"subscriptions","channels":[{"name":"full","product_ids":["BTC-USD"]}]}"#;
 
@@ -217,9 +217,38 @@ struct RecordedBook {
     snapshot_url: String,
     source_identifier: String,
     event_class: LiveEventClass,
+    input_depth: Option<MarketDepth>,
+    output_depth: Option<MarketDepth>,
     publication: RecordedPublication,
-    bids: Vec<(i64, i64)>,
-    asks: Vec<(i64, i64)>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RecordedNativeTrade {
+    trade_id: u64,
+    maker_order_id: String,
+    taker_order_id: String,
+    maker_side: ProviderBookSide,
+    price: i64,
+    quantity: i64,
+    sequence: u64,
+    provider_timestamp: i64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RecordedReplayFrame {
+    sequence: u64,
+    payload: Vec<u8>,
+    native_trade: Option<RecordedNativeTrade>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RecordedPendingHandoff {
+    snapshot_sequence: u64,
+    terminal_sequence: u64,
+    snapshot_body: Vec<u8>,
+    replay: Vec<RecordedReplayFrame>,
+    request_set_digest: [u8; 32],
+    subscription_digest: [u8; 32],
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -243,9 +272,14 @@ struct RecordingOutput {
     private_events: usize,
     books: Vec<RecordedBook>,
     order_level: Vec<RecordedOrderLevel>,
+    handoffs: Vec<RecordedPendingHandoff>,
+    pending_handoff: Option<crate::CoinbaseMarketHandoff>,
+    output_admission: Option<CoinbaseDirectOutputAdmission>,
+    discarded_sequences: Vec<u64>,
     reject_raw_at: Option<usize>,
     sequence_101_captured: Arc<Notify>,
     sequence_102_captured: Arc<Notify>,
+    sequence_106_captured: Arc<Notify>,
     first_book: Arc<Notify>,
 }
 
@@ -261,12 +295,25 @@ impl RawMarketSink for RecordingOutput {
         if frame.payload() == SEQUENCE_102.as_bytes() {
             self.sequence_102_captured.notify_one();
         }
+        if frame.payload() == SEQUENCE_106.as_bytes() {
+            self.sequence_106_captured.notify_one();
+        }
         self.frames.push(frame);
         Ok(())
     }
 }
 
 impl CoinbaseDirectOutput for RecordingOutput {
+    fn try_admit_replay(
+        &mut self,
+        admission: CoinbaseDirectOutputAdmission,
+    ) -> Result<(), SinkError> {
+        if self.output_admission.replace(admission).is_some() {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        Ok(())
+    }
+
     fn try_publish_subscription_acknowledgement(
         &mut self,
         acknowledgement: DecodedControlFrame,
@@ -306,6 +353,20 @@ impl CoinbaseDirectOutput for RecordingOutput {
         {
             return Err(SinkError::CaptureIncomplete);
         }
+        Ok(())
+    }
+
+    fn try_discard_sequenced_frame(&mut self, evidence: &DecoderEvidence) -> Result<(), SinkError> {
+        let frame = self
+            .frames
+            .iter()
+            .find(|frame| frame.frame_id() == evidence.frame_id())
+            .ok_or(SinkError::CaptureIncomplete)?;
+        let sequence = serde_json::from_slice::<serde_json::Value>(frame.payload())
+            .ok()
+            .and_then(|value| value.get("sequence").and_then(serde_json::Value::as_u64))
+            .ok_or(SinkError::CaptureIncomplete)?;
+        self.discarded_sequences.push(sequence);
         Ok(())
     }
 
@@ -350,14 +411,89 @@ impl CoinbaseDirectOutput for RecordingOutput {
         Ok(())
     }
 
-    fn try_publish_book(&mut self, update: CoinbaseDirectBookUpdate<'_>) -> Result<(), SinkError> {
-        let batch = update
-            .try_publication_batch()
+    fn try_publish_book(&mut self, handoff: crate::CoinbaseMarketHandoff) -> Result<(), SinkError> {
+        let evidence = handoff.evidence();
+        let (snapshot_sequence, terminal_sequence) = match evidence.continuity() {
+            CoinbaseMarketContinuity::SnapshotContiguous { snapshot, terminal } => {
+                (snapshot.get(), terminal.get())
+            }
+            CoinbaseMarketContinuity::ProviderCursorUnverified { .. } => {
+                return Err(SinkError::CaptureIncomplete);
+            }
+        };
+        if evidence.feed() != CoinbaseMarketFeed::ExchangeDirectFull
+            || evidence.channel() != CoinbaseMarketChannel::Full
+            || evidence.product().as_source_identifier().as_str() != "BTC-USD"
+            || evidence.venue().as_str() != "coinbase-exchange"
+            || evidence.event_class() != LiveEventClass::BookSnapshot
+            || evidence.native_input_depth() != Some(MarketDepth::OrderLevel)
+            || evidence.output_depth() != Some(MarketDepth::PriceLevel)
+            || evidence.subscription_acknowledgement().is_none()
+            || evidence.request_set_digest().bytes()
+                != [
+                    0xe1, 0x65, 0x33, 0x9d, 0x1c, 0xfb, 0x77, 0xb9, 0x21, 0xa2, 0x51, 0x30, 0xf3,
+                    0x6a, 0x0d, 0xc4, 0xfa, 0x68, 0x56, 0x2e, 0xc1, 0xcb, 0xc7, 0x2b, 0xfa, 0xd6,
+                    0xdb, 0x16, 0x4e, 0x15, 0x99, 0xb6,
+                ]
+            || evidence.subscription_digest().bytes()
+                != [
+                    0x1f, 0xc6, 0x84, 0x81, 0x41, 0x1f, 0xb9, 0x07, 0x5f, 0xa8, 0xe7, 0x84, 0x69,
+                    0x94, 0x68, 0x2e, 0x21, 0x32, 0x70, 0x6d, 0xf2, 0x94, 0x1b, 0x5f, 0xd2, 0xfb,
+                    0x06, 0xb6, 0xe6, 0x7a, 0xa9, 0x8f,
+                ]
+            || handoff.raw_payload_digest() != handoff.typed_batch().evidence().payload_digest()
+        {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        let crate::CoinbaseMarketRawLineage::DirectInitial(lineage) = handoff.raw_lineage() else {
+            return Err(SinkError::CaptureIncomplete);
+        };
+        let snapshot_receipt = lineage.snapshot().receipt();
+        let mut snapshot_body = Vec::new();
+        lineage
+            .snapshot()
+            .reader()
+            .read_to_end(&mut snapshot_body)
             .map_err(|_error| SinkError::CaptureIncomplete)?;
-        let observation = batch
+        let replay = lineage
+            .replay()
+            .iter()
+            .map(|frame| {
+                let native_trade = frame.native_trade().map(|trade| RecordedNativeTrade {
+                    trade_id: trade.trade_id(),
+                    maker_order_id: trade.maker_order_id().as_str().to_owned(),
+                    taker_order_id: trade.taker_order_id().as_str().to_owned(),
+                    maker_side: trade.maker_side(),
+                    price: trade.price().get(),
+                    quantity: trade.quantity().get(),
+                    sequence: trade.sequence().get(),
+                    provider_timestamp: trade.provider_timestamp().unix_nanos(),
+                });
+                RecordedReplayFrame {
+                    sequence: frame.sequence().get(),
+                    payload: frame.raw_payload().as_bytes().to_vec(),
+                    native_trade,
+                }
+            })
+            .collect::<Vec<_>>();
+        let observation = handoff
+            .typed_batch()
             .observations()
             .first()
             .ok_or(SinkError::CaptureIncomplete)?;
+        if observation.event_class() != evidence.event_class()
+            || observation.depth() != evidence.output_depth()
+            || snapshot_receipt.status() != 200
+            || snapshot_receipt.body_length() != SNAPSHOT_BODY.len() as u64
+            || snapshot_receipt.body_digest().bytes()
+                != <[u8; 32]>::from(Sha256::digest(SNAPSHOT_BODY))
+            || snapshot_body != SNAPSHOT_BODY
+            || replay.last().is_none_or(|frame| {
+                frame.sequence != terminal_sequence || frame.payload != SEQUENCE_106.as_bytes()
+            })
+        {
+            return Err(SinkError::CaptureIncomplete);
+        }
         let publication = match observation.payload() {
             ProviderObservationPayload::BookSnapshot(snapshot) => RecordedPublication::Snapshot {
                 bids: snapshot.bids().iter().map(record_level).collect::<Vec<_>>(),
@@ -379,23 +515,25 @@ impl CoinbaseDirectOutput for RecordingOutput {
             },
             _ => return Err(SinkError::CaptureIncomplete),
         };
-        let book = update.book();
+        self.handoffs.push(RecordedPendingHandoff {
+            snapshot_sequence,
+            terminal_sequence,
+            snapshot_body,
+            replay,
+            request_set_digest: evidence.request_set_digest().bytes(),
+            subscription_digest: evidence.subscription_digest().bytes(),
+        });
         self.books.push(RecordedBook {
-            sequence: update.sequence().get(),
-            snapshot_url: update.snapshot_receipt().final_url().to_owned(),
+            sequence: terminal_sequence,
+            snapshot_url: snapshot_receipt.final_url().to_owned(),
             source_identifier: observation.source_identifier().as_str().to_owned(),
             event_class: observation.event_class(),
+            input_depth: evidence.native_input_depth(),
+            output_depth: observation.depth(),
             publication,
-            bids: book
-                .bids()
-                .map(|level| (level.price().get(), level.quantity().get()))
-                .collect(),
-            asks: book
-                .asks()
-                .map(|level| (level.price().get(), level.quantity().get()))
-                .collect(),
         });
         self.first_book.notify_one();
+        self.pending_handoff = Some(handoff);
         Ok(())
     }
 }
@@ -432,15 +570,10 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         config.metadata().quality_ceiling(),
         DataQuality::DirectUnverified
     );
+    let complete_session_bytes = config.limits().checked_maximum_retained_bytes()?;
     assert_eq!(
         config.checked_maximum_retained_bytes()?,
-        config
-            .limits()
-            .checked_order_level_maximum_retained_bytes()?
-    );
-    assert!(
-        config.checked_maximum_retained_bytes()?
-            > config.limits().checked_maximum_retained_bytes()?
+        complete_session_bytes
     );
     let live_coverage = config
         .metadata()
@@ -468,10 +601,12 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
     let first_book = Arc::new(Notify::new());
     let sequence_101_captured = Arc::new(Notify::new());
     let sequence_102_captured = Arc::new(Notify::new());
+    let sequence_106_captured = Arc::new(Notify::new());
     let mut output = RecordingOutput {
         first_book: Arc::clone(&first_book),
         sequence_101_captured: Arc::clone(&sequence_101_captured),
         sequence_102_captured: Arc::clone(&sequence_102_captured),
+        sequence_106_captured: Arc::clone(&sequence_106_captured),
         ..RecordingOutput::default()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -492,15 +627,19 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         assert_eq!(subscription["passphrase"], "fixture-passphrase");
         assert_eq!(subscription["signature"], "fixture-signature");
         assert!(matches!(
-            budget.try_acquire(),
-            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+            budget.try_reserve_request(),
+            market_squawk_sources::BudgetReservationDecision::Unavailable(
+                BudgetUnavailableReason::ConcurrencyExhausted
+            )
         ));
         socket.send(Message::Text(SUBSCRIPTION_ACK.into())).await?;
 
         controls.product_started.await?;
         assert!(matches!(
-            budget.try_acquire(),
-            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+            budget.try_reserve_request(),
+            market_squawk_sources::BudgetReservationDecision::Unavailable(
+                BudgetUnavailableReason::ConcurrencyExhausted
+            )
         ));
         socket.send(Message::Text(SEQUENCE_101.into())).await?;
         sequence_101_captured.notified().await;
@@ -511,8 +650,10 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
 
         controls.snapshot_started.await?;
         assert!(matches!(
-            budget.try_acquire(),
-            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+            budget.try_reserve_request(),
+            market_squawk_sources::BudgetReservationDecision::Unavailable(
+                BudgetUnavailableReason::ConcurrencyExhausted
+            )
         ));
         socket.send(Message::Text(SEQUENCE_102.into())).await?;
         sequence_102_captured.notified().await;
@@ -521,9 +662,6 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             .send(())
             .map_err(|_| "snapshot request was dropped")?;
 
-        socket.send(Message::Text(PRIVATE_RECEIVED.into())).await?;
-        socket.send(Message::Text(SEQUENCE_103.into())).await?;
-        socket.send(Message::Text(SEQUENCE_104.into())).await?;
         let frontier = socket
             .next()
             .await
@@ -532,22 +670,27 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             return Err("snapshot handoff frontier was not a Ping".into());
         };
         assert_eq!(frontier.len(), 56);
+        assert_eq!(&frontier[..8], b"MSQCBF01");
         socket.send(Message::Pong(frontier)).await?;
 
-        first_book.notified().await;
+        socket.send(Message::Text(PRIVATE_RECEIVED.into())).await?;
+        socket.send(Message::Text(SEQUENCE_103.into())).await?;
+        socket.send(Message::Text(SEQUENCE_104.into())).await?;
         socket.send(Message::Text(SEQUENCE_105.into())).await?;
+        let publication_frontier = socket
+            .next()
+            .await
+            .ok_or("snapshot publication frontier Ping was not sent")??;
+        let Message::Ping(publication_frontier) = publication_frontier else {
+            return Err("snapshot publication frontier was not a Ping".into());
+        };
+        assert_eq!(publication_frontier.len(), 56);
+        assert_eq!(&publication_frontier[..8], b"MSQCBF02");
         socket.send(Message::Text(SEQUENCE_106.into())).await?;
-        socket.send(Message::Text(SEQUENCE_107.into())).await?;
-        socket
-            .send(Message::Ping(Bytes::from_static(b"direct-probe")))
-            .await?;
-        assert!(matches!(
-            socket.next().await,
-            Some(Ok(Message::Pong(payload)))
-                if payload == Bytes::from_static(b"direct-probe")
-        ));
-        socket.send(Message::Close(None)).await?;
-        assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
+        sequence_106_captured.notified().await;
+        socket.send(Message::Pong(publication_frontier)).await?;
+
+        first_book.notified().await;
         Ok::<(), Box<dyn Error + Send + Sync>>(())
     });
     let stream = TcpStream::connect(address).await?;
@@ -567,115 +710,81 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
     assert!(
         matches!(
             outcome,
-            Err(CoinbaseDirectSessionError::Source(
-                SourceError::ProviderUnavailable
-            ))
+            Err(CoinbaseDirectSessionError::SnapshotClaimRequired)
         ),
-        "unexpected terminal outcome: {outcome:?}"
+        "unexpected terminal outcome: {outcome:?}; output: {output:?}"
     );
     server
         .await?
         .map_err(|error| std::io::Error::other(error.to_string()))?;
 
-    assert_eq!(output.frames.len(), 9);
+    assert_eq!(output.frames.len(), 8);
     assert_eq!(output.frames[0].payload(), SUBSCRIPTION_ACK.as_bytes());
     assert_eq!(output.product_statuses, ["online"]);
     assert_eq!(output.private_events, 1);
+    let output_admission = CoinbaseDirectOutputAdmission::try_from_config(&config)?;
+    assert_eq!(output.output_admission, Some(output_admission));
     assert_eq!(
-        output.order_level,
-        [
-            RecordedOrderLevel::Snapshot {
-                generation: 1,
-                snapshot_sequence: 102,
-                orders: vec![
-                    (
-                        "bid-1".to_owned(),
-                        ProviderBookSide::Bid,
-                        10_000,
-                        100_000_000,
-                    ),
-                    (
-                        "ask-1".to_owned(),
-                        ProviderBookSide::Ask,
-                        10_100,
-                        200_000_000,
-                    ),
-                ],
-                replay_sequences: vec![103, 104],
-            },
-            RecordedOrderLevel::Event {
-                sequence: 105,
-                order_identity: Some("order-105".to_owned()),
-            },
-            RecordedOrderLevel::Event {
-                sequence: 106,
-                order_identity: Some("order-105".to_owned()),
-            },
-            RecordedOrderLevel::Event {
-                sequence: 107,
-                order_identity: None,
-            },
-        ]
+        output_admission.complete_retained_bytes(),
+        complete_session_bytes
+    );
+    assert_eq!(output.discarded_sequences, [101, 102, 103, 104]);
+    assert!(output.order_level.is_empty());
+    assert_eq!(
+        output.handoffs,
+        [RecordedPendingHandoff {
+            snapshot_sequence: 104,
+            terminal_sequence: 106,
+            snapshot_body: SNAPSHOT_BODY.to_vec(),
+            replay: vec![
+                RecordedReplayFrame {
+                    sequence: 105,
+                    payload: SEQUENCE_105.as_bytes().to_vec(),
+                    native_trade: Some(RecordedNativeTrade {
+                        trade_id: 7005,
+                        maker_order_id: "bid-1".to_owned(),
+                        taker_order_id: "taker-105".to_owned(),
+                        maker_side: ProviderBookSide::Bid,
+                        price: 10_000,
+                        quantity: 25_000_000,
+                        sequence: 105,
+                        provider_timestamp: 1_784_928_850_605_000_000,
+                    }),
+                },
+                RecordedReplayFrame {
+                    sequence: 106,
+                    payload: SEQUENCE_106.as_bytes().to_vec(),
+                    native_trade: None,
+                },
+            ],
+            request_set_digest: [
+                0xe1, 0x65, 0x33, 0x9d, 0x1c, 0xfb, 0x77, 0xb9, 0x21, 0xa2, 0x51, 0x30, 0xf3, 0x6a,
+                0x0d, 0xc4, 0xfa, 0x68, 0x56, 0x2e, 0xc1, 0xcb, 0xc7, 0x2b, 0xfa, 0xd6, 0xdb, 0x16,
+                0x4e, 0x15, 0x99, 0xb6,
+            ],
+            subscription_digest: [
+                0x1f, 0xc6, 0x84, 0x81, 0x41, 0x1f, 0xb9, 0x07, 0x5f, 0xa8, 0xe7, 0x84, 0x69, 0x94,
+                0x68, 0x2e, 0x21, 0x32, 0x70, 0x6d, 0xf2, 0x94, 0x1b, 0x5f, 0xd2, 0xfb, 0x06, 0xb6,
+                0xe6, 0x7a, 0xa9, 0x8f,
+            ],
+        }]
     );
     assert_eq!(
         output.books,
-        [
-            RecordedBook {
-                sequence: 104,
-                snapshot_url: config.snapshot_url().to_owned(),
-                source_identifier: snapshot_identity(104),
-                event_class: LiveEventClass::BookSnapshot,
-                publication: RecordedPublication::Snapshot {
-                    bids: vec![("100.00".to_owned(), "1.00000000".to_owned())],
-                    asks: vec![("101.00".to_owned(), "2.00000000".to_owned())],
-                },
-                bids: vec![(10_000, 100_000_000)],
-                asks: vec![(10_100, 200_000_000)],
+        [RecordedBook {
+            sequence: 106,
+            snapshot_url: config.snapshot_url().to_owned(),
+            source_identifier: snapshot_identity(106),
+            event_class: LiveEventClass::BookSnapshot,
+            input_depth: Some(MarketDepth::OrderLevel),
+            output_depth: Some(MarketDepth::PriceLevel),
+            publication: RecordedPublication::Snapshot {
+                bids: vec![("100.00".to_owned(), "0.75000000".to_owned())],
+                asks: vec![("101.00".to_owned(), "2.00000000".to_owned())],
             },
-            RecordedBook {
-                sequence: 105,
-                snapshot_url: config.snapshot_url().to_owned(),
-                source_identifier: snapshot_identity(105),
-                event_class: LiveEventClass::BookDelta,
-                publication: RecordedPublication::Delta {
-                    changes: vec![(
-                        ProviderBookSide::Bid,
-                        "99.00".to_owned(),
-                        "0.50000000".to_owned(),
-                    )],
-                },
-                bids: vec![(10_000, 100_000_000), (9_900, 50_000_000)],
-                asks: vec![(10_100, 200_000_000)],
-            },
-            RecordedBook {
-                sequence: 106,
-                snapshot_url: config.snapshot_url().to_owned(),
-                source_identifier: snapshot_identity(106),
-                event_class: LiveEventClass::BookDelta,
-                publication: RecordedPublication::Delta {
-                    changes: vec![(
-                        ProviderBookSide::Bid,
-                        "99.00".to_owned(),
-                        "0.00000000".to_owned(),
-                    )],
-                },
-                bids: vec![(10_000, 100_000_000)],
-                asks: vec![(10_100, 200_000_000)],
-            },
-            RecordedBook {
-                sequence: 107,
-                snapshot_url: config.snapshot_url().to_owned(),
-                source_identifier: snapshot_identity(107),
-                event_class: LiveEventClass::Quote,
-                publication: RecordedPublication::Quote {
-                    bid: Some(("100.00".to_owned(), "1.00000000".to_owned())),
-                    ask: Some(("101.00".to_owned(), "2.00000000".to_owned())),
-                },
-                bids: vec![(10_000, 100_000_000)],
-                asks: vec![(10_100, 200_000_000)],
-            },
-        ]
+        }]
     );
+    assert!(output.pending_handoff.is_some());
     assert_eq!(direct.book.phase(), DirectSyncPhase::Quarantined);
     registry.end_session(&session, Timestamp::from_unix_nanos(2))?;
     Ok(())

@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::DateTime;
 use market_squawk_domain::{
-    AggressorSide, InstrumentId, IntegrityRule, MarketDepth, SourceIdentifier, Timestamp, VenueId,
+    AggressorSide, EvidenceDigest, InstrumentId, IntegrityRule, MarketDepth, ProviderProduct,
+    RawCaptureFrameView as _, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
     ControlFrameKind, DecodeInternalError, DecodeOutcome, DecodedControlFrame, DecodedIgnoredFrame,
     DecodedProviderBatch, DecodedQuarantineAction, DecodedRecoveryAction, DecoderEvidence,
-    IgnoredFrameReason, MarketDecoder, ProviderAggressorEvidence, ProviderBookChange,
-    ProviderBookLevel, ProviderBookSide, ProviderChecksumEvidence, ProviderDecimalLexeme,
+    IgnoredFrameReason, ProviderAggressorEvidence, ProviderBookChange, ProviderBookLevel,
+    ProviderBookSide, ProviderChecksumEvidence, ProviderDecimalLexeme,
     ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
     ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence,
     QuarantineReason, ResynchronizationReason, SourceMetadata, SourceMetadataProvider,
@@ -17,7 +18,14 @@ use market_squawk_sources::{
 use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use crate::{CoinbaseChannel, CoinbaseConfigError, CoinbaseExchangeConfig};
+use crate::market_handoff::{
+    CoinbaseMarketHandoffInput, CoinbaseMarketRawLineage, public_request_digests,
+};
+use crate::{
+    CoinbaseChannel, CoinbaseConfigError, CoinbaseExchangeConfig, CoinbaseMarketChannel,
+    CoinbaseMarketContinuity, CoinbaseMarketDecodeOutcome, CoinbaseMarketFeed,
+    CoinbaseMarketHandoff,
+};
 
 const MAX_ENVELOPE_EVENTS: usize = market_squawk_sources::MAX_DECODED_EVENTS;
 const MAX_L2_UPDATES: usize = market_squawk_sources::MAX_DECODED_BOOK_ITEMS;
@@ -43,6 +51,19 @@ pub struct CoinbaseExchangeDecoder {
     observed_subscriptions: BTreeMap<String, BTreeSet<String>>,
     acknowledgement_complete: bool,
     max_frame_bytes: usize,
+    product: ProviderProduct,
+    configured_instrument: InstrumentId,
+    request_set_digest: EvidenceDigest,
+    subscription_digest: EvidenceDigest,
+    last_market_coordinates: Option<CoinbasePublicMarketCoordinates>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CoinbasePublicMarketCoordinates {
+    channel: CoinbaseMarketChannel,
+    depth: Option<MarketDepth>,
+    sequence: u64,
+    provider_published_at: Timestamp,
 }
 
 impl CoinbaseExchangeDecoder {
@@ -53,6 +74,13 @@ impl CoinbaseExchangeDecoder {
     /// Returns [`CoinbaseConfigError::InvalidProtocolProfile`] if the supplied metadata no longer
     /// exposes the live rules guaranteed by [`CoinbaseExchangeConfig`].
     pub fn try_new(config: &CoinbaseExchangeConfig) -> Result<Self, CoinbaseConfigError> {
+        let mapping = config
+            .mappings()
+            .first()
+            .ok_or(CoinbaseConfigError::InvalidMappingCount)?;
+        let product = mapping.product().clone();
+        let configured_instrument = mapping.instrument();
+        let (request_set_digest, subscription_digest) = public_request_digests(config);
         let live = match config.metadata().protocol_profile() {
             market_squawk_sources::SourceProtocolProfile::Live(profile) => profile,
             market_squawk_sources::SourceProtocolProfile::NotLive => {
@@ -121,6 +149,11 @@ impl CoinbaseExchangeDecoder {
             observed_subscriptions: BTreeMap::new(),
             acknowledgement_complete: false,
             max_frame_bytes: config.transport_limits().max_frame_bytes(),
+            product,
+            configured_instrument,
+            request_set_digest,
+            subscription_digest,
+            last_market_coordinates: None,
         })
     }
 
@@ -181,7 +214,7 @@ impl CoinbaseExchangeDecoder {
         Ok(outcome)
     }
 
-    fn decode_l2(&self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
+    fn decode_l2(&mut self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
         let wire = match serde_json::from_slice::<L2Envelope>(payload) {
             Ok(wire) => wire,
             Err(_) => return quarantine(evidence, QuarantineReason::SchemaViolation, None),
@@ -299,22 +332,32 @@ impl CoinbaseExchangeDecoder {
                 payload.1,
             ));
         }
-        self.data(evidence, observations)
+        let outcome = self.data(evidence, observations);
+        if matches!(outcome, DecodeOutcome::Data(_)) {
+            self.last_market_coordinates = Some(CoinbasePublicMarketCoordinates {
+                channel: CoinbaseMarketChannel::Level2,
+                depth: Some(MarketDepth::PriceLevel),
+                sequence: wire.sequence_num,
+                provider_published_at: envelope_at,
+            });
+        }
+        outcome
     }
 
-    fn decode_market_trades(&self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
+    fn decode_market_trades(&mut self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
         let wire = match serde_json::from_slice::<MarketTradesEnvelope>(payload) {
             Ok(wire) => wire,
             Err(_) => return quarantine(evidence, QuarantineReason::SchemaViolation, None),
         };
-        if let Err(reason) = validate_header(
+        let envelope_at = match validate_header(
             &wire.channel,
             "market_trades",
             &wire.client_id,
             &wire.timestamp,
         ) {
-            return quarantine(evidence, reason, None);
-        }
+            Ok(timestamp) => timestamp,
+            Err(reason) => return quarantine(evidence, reason, None),
+        };
         let mut observations = Vec::new();
         let mut trade_ids = BTreeSet::new();
         for event in wire.events.0 {
@@ -410,7 +453,16 @@ impl CoinbaseExchangeDecoder {
                 source_code(&wire.sequence_num.to_string()),
             ))
         } else {
-            self.data(evidence, observations)
+            let outcome = self.data(evidence, observations);
+            if matches!(outcome, DecodeOutcome::Data(_)) {
+                self.last_market_coordinates = Some(CoinbasePublicMarketCoordinates {
+                    channel: CoinbaseMarketChannel::MarketTrades,
+                    depth: None,
+                    sequence: wire.sequence_num,
+                    provider_published_at: envelope_at,
+                });
+            }
+            outcome
         }
     }
 
@@ -587,28 +639,67 @@ impl CoinbaseExchangeDecoder {
             Err(_) => quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None),
         }
     }
+
+    fn decode_with_market_coordinates(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+    ) -> Result<(DecodeOutcome, Option<CoinbasePublicMarketCoordinates>), DecodeInternalError> {
+        self.last_market_coordinates = None;
+        let evidence = DecoderEvidence::from_validated_frame(frame, self.decoder_rule.clone());
+        let outcome = if frame.frame().transport() == TransportFrameKind::Text {
+            self.decode_text(frame, evidence)?
+        } else {
+            quarantine(evidence, QuarantineReason::SchemaViolation, None)
+        };
+        Ok((outcome, self.last_market_coordinates.take()))
+    }
+
+    /// Decodes one public frame and, for book/trade data, consumes exact raw bytes and the typed
+    /// batch into the provider-owned market handoff. Controls and fail-closed outcomes retain the
+    /// ordinary decoder shape.
+    pub fn decode_market_handoff(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+    ) -> Result<CoinbaseMarketDecodeOutcome, DecodeInternalError> {
+        let (outcome, coordinates) = self.decode_with_market_coordinates(frame)?;
+        match (outcome, coordinates) {
+            (DecodeOutcome::Data(typed_batch), Some(coordinates)) => {
+                let handoff = CoinbaseMarketHandoff::try_new(
+                    CoinbaseMarketHandoffInput {
+                        feed: CoinbaseMarketFeed::AdvancedTradePublic,
+                        channel: coordinates.channel,
+                        native_input_depth: coordinates.depth,
+                        product: self.product.clone(),
+                        configured_instrument: self.configured_instrument,
+                        venue: self.venue.clone(),
+                        request_set_digest: self.request_set_digest,
+                        subscription_digest: self.subscription_digest,
+                        subscription_acknowledgement: None,
+                        continuity: CoinbaseMarketContinuity::ProviderCursorUnverified {
+                            terminal: coordinates.sequence,
+                        },
+                        provider_published_at: coordinates.provider_published_at,
+                        snapshot_provider_at: None,
+                    },
+                    CoinbaseMarketRawLineage::AdvancedTrade(
+                        frame.frame().capture_payload().clone(),
+                    ),
+                    typed_batch,
+                )
+                .map_err(|_error| DecodeInternalError::InvariantViolation)?;
+                Ok(CoinbaseMarketDecodeOutcome::Market(handoff))
+            }
+            (DecodeOutcome::Data(_), None) | (_, Some(_)) => {
+                Err(DecodeInternalError::InvariantViolation)
+            }
+            (outcome, None) => Ok(CoinbaseMarketDecodeOutcome::Other(outcome)),
+        }
+    }
 }
 
 impl SourceMetadataProvider for CoinbaseExchangeDecoder {
     fn metadata(&self) -> &SourceMetadata {
         &self.metadata
-    }
-}
-
-impl MarketDecoder for CoinbaseExchangeDecoder {
-    fn decode(
-        &mut self,
-        frame: &ValidatedRawMarketFrame<'_>,
-    ) -> Result<DecodeOutcome, DecodeInternalError> {
-        let evidence = DecoderEvidence::from_validated_frame(frame, self.decoder_rule.clone());
-        if frame.frame().transport() != TransportFrameKind::Text {
-            return Ok(quarantine(
-                evidence,
-                QuarantineReason::SchemaViolation,
-                None,
-            ));
-        }
-        self.decode_text(frame, evidence)
     }
 }
 

@@ -10,11 +10,14 @@ use super::{
     display_market::{
         DisplayMarketIngress, DisplayMarketRouteIdentity, DisplayMarketTerminalFailure,
     },
-    provider::{ProductionMarketDecoder, StartupReadinessPolicy},
+    provider::{ProductionDecodeOutcome, ProductionMarketDecoder, StartupReadinessPolicy},
     route_actor::{RouteActivationBinding, RouteActivationPublisher},
     subscription_state::{
         GenerationIdentity, SubscriptionFailure, SubscriptionPhase, SubscriptionStateMachine,
     },
+};
+use market_squawk_adapter_coinbase::{
+    CoinbaseMarketDecodeOutcome, CoinbaseMarketFeed, CoinbaseMarketRawLineage,
 };
 use market_squawk_domain::{ExactPayloadEvidence, StreamIntegrityState, Timestamp};
 use market_squawk_live::{LiveIngressBindError, LiveIngressError, LiveRuntimeIngress, ShardKey};
@@ -24,9 +27,9 @@ use market_squawk_sources::{
     CaptureGenerationCapabilities, ConnectionLiveness, ControlFrameKind,
     CurrentDecodedProviderBatch, CurrentDecodedProviderBatches, CurrentHealthRecording,
     CurrentHealthReporter, CurrentSourceSession, DecodeInternalError, DecodeOutcome,
-    FreshnessPolicy, MarketDecoder, ProviderTimestampEvidence, QuarantineReason, RawMarketFrame,
-    RawMarketSink, RegistryError, ResynchronizationReason, SinkError, SourceHealthError,
-    SourceHealthSnapshot, SourceMetadata, SourceMetadataProvider, ValidatedSessionDecodeOutcome,
+    FreshnessPolicy, ProviderTimestampEvidence, QuarantineReason, RawMarketFrame, RawMarketSink,
+    RegistryError, ResynchronizationReason, SinkError, SourceHealthError, SourceHealthSnapshot,
+    SourceMetadata, SourceMetadataProvider, ValidatedSessionDecodeOutcome,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -250,7 +253,39 @@ impl<'a> ProductionRawMarketSink<'a> {
             .ok_or(ProductionSinkFailure::MissingDecoder)?
             .decode(&validated_frame)
             .map_err(ProductionSinkFailure::Decode)?;
-        self.process_captured_outcome(outcome, receipt)
+        match outcome {
+            ProductionDecodeOutcome::Standard(outcome)
+            | ProductionDecodeOutcome::Coinbase(CoinbaseMarketDecodeOutcome::Other(outcome)) => {
+                self.process_captured_outcome(outcome, receipt)
+            }
+            ProductionDecodeOutcome::Coinbase(CoinbaseMarketDecodeOutcome::Market(handoff)) => {
+                self.process_coinbase_handoff(handoff, receipt)
+            }
+        }
+    }
+
+    fn process_coinbase_handoff(
+        &mut self,
+        handoff: market_squawk_adapter_coinbase::CoinbaseMarketHandoff,
+        receipt: market_squawk_sources::CaptureAdmissionReceipt,
+    ) -> Result<(), ProductionSinkFailure> {
+        if handoff.evidence().feed() != CoinbaseMarketFeed::AdvancedTradePublic {
+            return Err(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            ));
+        }
+        let (_evidence, raw_lineage, batch) = handoff.into_parts();
+        let CoinbaseMarketRawLineage::AdvancedTrade(payload) = raw_lineage else {
+            return Err(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            ));
+        };
+        if payload.as_bytes().len() != batch.evidence().frame_bytes() {
+            return Err(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            ));
+        }
+        self.process_captured_outcome(DecodeOutcome::Data(batch), receipt)
     }
 
     /// Captures and validates one adapter-predecoded frame without decoding it a second time.

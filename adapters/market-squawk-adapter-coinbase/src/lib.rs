@@ -10,6 +10,7 @@ mod config;
 mod decoder;
 mod direct;
 mod direct_transport;
+mod market_handoff;
 mod source;
 
 pub use config::{
@@ -23,14 +24,22 @@ pub use direct::{
     CoinbaseDirectDecodeError, CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder,
     CoinbaseDirectHmacSigner, CoinbaseDirectLimits, CoinbaseDirectNonBookEvent,
     CoinbaseDirectNonBookKind, CoinbaseDirectProductError, CoinbaseDirectProductEvidence,
-    CoinbaseDirectReceivedLifecycle, CoinbaseDirectSigningCapability, CoinbaseDirectSigningError,
-    CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError,
-    CoinbaseDirectStopType, CoinbaseDirectTpslTriggeredLifecycle, CoinbaseSignedSubscription,
+    CoinbaseDirectReceivedLifecycle, CoinbaseDirectSequencedEvent, CoinbaseDirectSigningCapability,
+    CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder,
+    CoinbaseDirectSnapshotError, CoinbaseDirectStopType, CoinbaseDirectTpslTriggeredLifecycle,
+    CoinbaseSignedSubscription,
 };
 pub use direct_transport::{
-    CoinbaseDirectBookUpdate, CoinbaseDirectOrderLevelPayload,
-    CoinbaseDirectOrderLevelPublicationError, CoinbaseDirectOrderLevelUpdate, CoinbaseDirectOutput,
+    CoinbaseDirectOrderLevelPayload, CoinbaseDirectOrderLevelPublicationError,
+    CoinbaseDirectOrderLevelUpdate, CoinbaseDirectOutput, CoinbaseDirectOutputAdmission,
     CoinbaseDirectPublicationError, CoinbaseDirectPublicationKind, CoinbaseDirectSession,
     CoinbaseDirectSessionError,
+};
+pub use market_handoff::{
+    CoinbaseDirectInitialMarketLineage, CoinbaseDirectReplayFrame,
+    CoinbaseDirectSnapshotSealExpectation, CoinbaseDirectTradeEvidence, CoinbaseMarketChannel,
+    CoinbaseMarketContinuity, CoinbaseMarketDecodeOutcome, CoinbaseMarketFeed,
+    CoinbaseMarketHandoff, CoinbaseMarketHandoffError, CoinbaseMarketHandoffEvidence,
+    CoinbaseMarketRawLineage,
 };
 pub use source::CoinbaseExchangeSource;
