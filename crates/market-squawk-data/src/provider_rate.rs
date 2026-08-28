@@ -1,6 +1,7 @@
 //! SQLite-backed aggregate provider request and connection admission.
 
 use std::fs::{self, File};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,10 +13,12 @@ use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
 use market_squawk_sources::{
     AuthorizationMode, BudgetUnavailableReason, BudgetWindowSemantics,
     PreparedProviderRateRegistrationBatch, ProviderBudgetPolicy, ProviderRateCollisionKind,
-    ProviderRateDeclaration, ProviderRateDispatchDecision, ProviderRateGroupId,
-    ProviderRatePermitId, ProviderRateRegistration, ProviderRateReservationDecision,
-    ProviderRateReservationId, ProviderRateRunId, ProviderRateStore, ProviderRateStoreError,
-    RetryAfter,
+    ProviderRateDeclaration, ProviderRateDispatchClaim, ProviderRateDispatchDecision,
+    ProviderRateGroupId, ProviderRatePermitId, ProviderRateRegistration,
+    ProviderRateReservationDecision, ProviderRateReservationId, ProviderRateResponseClass,
+    ProviderRateResponseSettlement, ProviderRateResponseSettlementReceipt,
+    ProviderRateRetryAfterDisposition, ProviderRateRunId, ProviderRateSettlementAvailability,
+    ProviderRateStore, ProviderRateStoreError, ProviderRateWeightedDimension, RetryAfter,
 };
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
@@ -25,18 +28,21 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 const PROVIDER_RATE_APPLICATION_ID: i64 = 0x4d53_5152;
-const PROVIDER_RATE_SCHEMA_VERSION: i64 = 1;
+const PROVIDER_RATE_SCHEMA_VERSION: i64 = 2;
+const PROVIDER_RATE_STATE_SEMANTICS_VERSION: u16 = 2;
 const MAXIMUM_RETAINED_RUNS: i64 = 1_024;
+const MAXIMUM_RETAINED_REQUESTS: i64 = 65_536;
 const MAXIMUM_AUTHORIZATION_SUBJECTS: i64 = 4_096;
 const MAXIMUM_GROUPS: i64 = 4_096;
 const MAXIMUM_DECLARATIONS: i64 = 4_096;
 const MAXIMUM_COLLISION_KEYS: usize = 64;
 const COLLISION_KEY_BYTES: usize = 33;
+const MAXIMUM_WEIGHTED_SLIDING_RELEASES: usize = 4_096;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(750);
 const OWNER_LOCK_FILE: &str = "provider-rate-authority.owner.lock";
 const PROVIDER_RATE_LOGICAL_CHECKPOINT_SCHEMA: &str =
     "market-squawk.provider-rate-logical-checkpoint";
-const PROVIDER_RATE_LOGICAL_CHECKPOINT_VERSION: u16 = 1;
+const PROVIDER_RATE_LOGICAL_CHECKPOINT_VERSION: u16 = 2;
 const MAXIMUM_LOGICAL_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 
 const SCHEMA: &str = r#"
@@ -75,7 +81,14 @@ CREATE TABLE provider_rate_requests (
     group_id BLOB NOT NULL REFERENCES provider_rate_groups(group_id) ON DELETE RESTRICT,
     reserved_at_ns INTEGER NOT NULL,
     dispatched_at_ns INTEGER,
-    CHECK(dispatched_at_ns IS NULL OR dispatched_at_ns >= reserved_at_ns)
+    maximum_response_bytes INTEGER CHECK(maximum_response_bytes > 0),
+    provider_error_units INTEGER NOT NULL CHECK(provider_error_units IN (0, 1)),
+    request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+    CHECK(dispatched_at_ns IS NULL OR dispatched_at_ns >= reserved_at_ns),
+    CHECK(
+        dispatched_at_ns IS NOT NULL
+        OR (maximum_response_bytes IS NULL AND provider_error_units = 0)
+    )
 ) STRICT;
 
 CREATE TABLE provider_authorization_subjects (
@@ -271,6 +284,7 @@ struct ProviderRateCheckpointCapacities {
     maximum_declarations: i64,
     maximum_authorization_subjects: i64,
     maximum_collision_keys: usize,
+    maximum_weighted_sliding_releases: usize,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -408,15 +422,7 @@ impl ProviderRateStore for SqliteProviderRateStore {
         let mut connection = self.connection()?;
         let transaction = immediate(&mut connection)?;
         validate_global_clock(&transaction, now)?;
-        transaction
-            .execute(
-                "DELETE FROM provider_rate_requests
-                 WHERE run_id IN (
-                    SELECT run_id FROM provider_rate_runs WHERE status = 'active'
-                 )",
-                [],
-            )
-            .map_err(map_sql)?;
+        reconcile_abandoned_requests(&transaction, now)?;
         transaction
             .execute(
                 "UPDATE provider_rate_runs
@@ -532,17 +538,36 @@ impl ProviderRateStore for SqliteProviderRateStore {
                 BudgetUnavailableReason::ConcurrencyExhausted,
             ));
         }
+        let retained_requests: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM provider_rate_requests", [], |row| {
+                row.get(0)
+            })
+            .map_err(map_sql)?;
+        if !(0..MAXIMUM_RETAINED_REQUESTS).contains(&retained_requests) {
+            return Err(ProviderRateStoreError::Capacity);
+        }
         let reservation_id = ProviderRateReservationId::from_bytes(*Uuid::new_v4().as_bytes());
+        let request_digest = request_row_digest(
+            reservation_id.bytes(),
+            run_id.bytes(),
+            registration.group_id().bytes(),
+            now.unix_nanos(),
+            None,
+            None,
+            0,
+        );
         transaction
             .execute(
                 "INSERT INTO provider_rate_requests(
-                    request_id, run_id, group_id, reserved_at_ns, dispatched_at_ns
-                 ) VALUES (?1, ?2, ?3, ?4, NULL)",
+                    request_id, run_id, group_id, reserved_at_ns, dispatched_at_ns,
+                    maximum_response_bytes, provider_error_units, request_digest
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, 0, ?5)",
                 params![
                     reservation_id.bytes(),
                     run_id.bytes(),
                     registration.group_id().bytes(),
-                    now.unix_nanos()
+                    now.unix_nanos(),
+                    request_digest,
                 ],
             )
             .map_err(map_sql)?;
@@ -558,25 +583,37 @@ impl ProviderRateStore for SqliteProviderRateStore {
         reservation_id: ProviderRateReservationId,
         now: Timestamp,
     ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
+        self.commit_dispatch_with_claim(
+            run_id,
+            registration,
+            reservation_id,
+            now,
+            ProviderRateDispatchClaim::request_only(),
+        )
+    }
+
+    fn commit_dispatch_with_claim(
+        &self,
+        run_id: ProviderRateRunId,
+        registration: ProviderRateRegistration,
+        reservation_id: ProviderRateReservationId,
+        now: Timestamp,
+        claim: ProviderRateDispatchClaim,
+    ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
         let mut connection = self.connection()?;
         let transaction = immediate(&mut connection)?;
         validate_run(&transaction, run_id, now)?;
-        let mut group = load_group(&transaction, registration)?;
-        let row: Option<Option<i64>> = transaction
-            .query_row(
-                "SELECT dispatched_at_ns FROM provider_rate_requests
-                 WHERE request_id = ?1 AND run_id = ?2 AND group_id = ?3",
-                params![
-                    reservation_id.bytes(),
-                    run_id.bytes(),
-                    registration.group_id().bytes(),
-                ],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(map_sql)?;
-        if row != Some(None) {
-            return Err(ProviderRateStoreError::Conflict);
+        let mut group = load_group_exact(&transaction, registration)?;
+        validate_claim_shape(group.policy.as_ref(), claim)?;
+        let request = load_request(&transaction, reservation_id.bytes())?
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        if request.run_id != run_id.bytes()
+            || request.group_id != registration.group_id().bytes()
+            || request.dispatched_at_ns.is_some()
+            || request.maximum_response_bytes.is_some()
+            || request.provider_error_units != 0
+        {
+            return Err(ProviderRateStoreError::Corrupt);
         }
         group.state.advance(group.policy.as_ref(), now)?;
         if group.state.disabled {
@@ -593,15 +630,53 @@ impl ProviderRateStore for SqliteProviderRateStore {
             transaction.commit().map_err(map_sql)?;
             return Ok(ProviderRateDispatchDecision::WaitUntil(deadline));
         }
+        let pending = pending_claims(&transaction, run_id, &group, Some(reservation_id.bytes()))?;
+        match group
+            .state
+            .weighted_blocker(group.policy.as_ref(), &pending, claim, now)?
+        {
+            WeightedDispatchBlocker::None => {}
+            WeightedDispatchBlocker::WaitUntil(deadline) => {
+                delete_reserved_request(&transaction, run_id, registration, reservation_id)?;
+                persist_group(&transaction, &mut group, now)?;
+                transaction.commit().map_err(map_sql)?;
+                return Ok(ProviderRateDispatchDecision::WaitUntil(deadline));
+            }
+            WeightedDispatchBlocker::PendingUnknown => {
+                delete_reserved_request(&transaction, run_id, registration, reservation_id)?;
+                persist_group(&transaction, &mut group, now)?;
+                transaction.commit().map_err(map_sql)?;
+                return Ok(ProviderRateDispatchDecision::Unavailable(
+                    BudgetUnavailableReason::ConcurrencyExhausted,
+                ));
+            }
+        }
         group.state.admit(group.policy.as_ref(), now)?;
+        let maximum_response_bytes = claim
+            .maximum_response_bytes()
+            .map(|value| i64::try_from(value).map_err(|_| ProviderRateStoreError::Capacity))
+            .transpose()?;
+        let request_digest = request_row_digest(
+            reservation_id.bytes(),
+            run_id.bytes(),
+            registration.group_id().bytes(),
+            request.reserved_at_ns,
+            Some(now.unix_nanos()),
+            claim.maximum_response_bytes(),
+            claim.provider_error_units(),
+        );
         let dispatched = transaction
             .execute(
                 "UPDATE provider_rate_requests
-                 SET dispatched_at_ns = ?1
-                 WHERE request_id = ?2 AND run_id = ?3 AND group_id = ?4
+                 SET dispatched_at_ns = ?1, maximum_response_bytes = ?2,
+                     provider_error_units = ?3, request_digest = ?4
+                 WHERE request_id = ?5 AND run_id = ?6 AND group_id = ?7
                    AND dispatched_at_ns IS NULL",
                 params![
                     now.unix_nanos(),
+                    maximum_response_bytes,
+                    i64::from(claim.provider_error_units()),
+                    request_digest,
                     reservation_id.bytes(),
                     run_id.bytes(),
                     registration.group_id().bytes(),
@@ -609,7 +684,7 @@ impl ProviderRateStore for SqliteProviderRateStore {
             )
             .map_err(map_sql)?;
         if dispatched != 1 {
-            return Err(ProviderRateStoreError::Conflict);
+            return Err(ProviderRateStoreError::Corrupt);
         }
         persist_group(&transaction, &mut group, now)?;
         transaction.commit().map_err(map_sql)?;
@@ -626,6 +701,19 @@ impl ProviderRateStore for SqliteProviderRateStore {
     ) -> Result<(), ProviderRateStoreError> {
         let mut connection = self.connection()?;
         let transaction = immediate(&mut connection)?;
+        let Some(request) = load_request(&transaction, reservation_id.bytes())? else {
+            transaction.commit().map_err(map_sql)?;
+            return Ok(());
+        };
+        if request.run_id != run_id.bytes()
+            || request.group_id != registration.group_id().bytes()
+            || request.dispatched_at_ns.is_some()
+            || request.maximum_response_bytes.is_some()
+            || request.provider_error_units != 0
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let _group = load_group_exact(&transaction, registration)?;
         let deleted = transaction
             .execute(
                 "DELETE FROM provider_rate_requests
@@ -638,11 +726,8 @@ impl ProviderRateStore for SqliteProviderRateStore {
                 ],
             )
             .map_err(map_sql)?;
-        if deleted > 1 {
+        if deleted != 1 {
             return Err(ProviderRateStoreError::Corrupt);
-        }
-        if deleted == 0 && request_row_exists(&transaction, reservation_id.bytes())? {
-            return Err(ProviderRateStoreError::Conflict);
         }
         transaction.commit().map_err(map_sql)
     }
@@ -655,6 +740,22 @@ impl ProviderRateStore for SqliteProviderRateStore {
     ) -> Result<(), ProviderRateStoreError> {
         let mut connection = self.connection()?;
         let transaction = immediate(&mut connection)?;
+        let Some(request) = load_request(&transaction, permit_id.bytes())? else {
+            transaction.commit().map_err(map_sql)?;
+            return Ok(());
+        };
+        if request.run_id != run_id.bytes()
+            || request.group_id != registration.group_id().bytes()
+            || request.dispatched_at_ns.is_none()
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let group = load_group_exact(&transaction, registration)?;
+        let claim = request.claim()?;
+        validate_claim_shape(group.policy.as_ref(), claim)?;
+        if !claim.is_request_only() {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
         let deleted = transaction
             .execute(
                 "DELETE FROM provider_rate_requests
@@ -667,13 +768,111 @@ impl ProviderRateStore for SqliteProviderRateStore {
                 ],
             )
             .map_err(map_sql)?;
-        if deleted > 1 {
+        if deleted != 1 {
             return Err(ProviderRateStoreError::Corrupt);
         }
-        if deleted == 0 && request_row_exists(&transaction, permit_id.bytes())? {
-            return Err(ProviderRateStoreError::Conflict);
-        }
         transaction.commit().map_err(map_sql)
+    }
+
+    fn settle_response(
+        &self,
+        run_id: ProviderRateRunId,
+        registration: ProviderRateRegistration,
+        permit_id: ProviderRatePermitId,
+        now: Timestamp,
+        settlement: ProviderRateResponseSettlement,
+    ) -> Result<ProviderRateResponseSettlementReceipt, ProviderRateStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        validate_run(&transaction, run_id, now)?;
+        let mut group = load_group_exact(&transaction, registration)?;
+        group.state.advance(group.policy.as_ref(), now)?;
+        let request = load_request(&transaction, permit_id.bytes())?
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        if request.run_id != run_id.bytes()
+            || request.group_id != registration.group_id().bytes()
+            || request.dispatched_at_ns.is_none()
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let claim = request.claim()?;
+        validate_claim_shape(group.policy.as_ref(), claim)?;
+        if claim.is_request_only() {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let (charged_response_bytes, provider_error_units) =
+            if settlement.response_class() == ProviderRateResponseClass::AbandonedUnknown {
+                (
+                    claim.maximum_response_bytes().unwrap_or(0),
+                    claim.provider_error_units(),
+                )
+            } else {
+                if claim
+                    .maximum_response_bytes()
+                    .is_some_and(|maximum| settlement.completed_response_bytes() > maximum)
+                {
+                    return Err(ProviderRateStoreError::Corrupt);
+                }
+                (
+                    settlement.completed_response_bytes(),
+                    settlement.provider_error_units(),
+                )
+            };
+        let pending = pending_claims(&transaction, run_id, &group, Some(permit_id.bytes()))?;
+        validate_weighted_replacement(
+            group.policy.as_ref(),
+            &group.state,
+            &pending,
+            charged_response_bytes,
+            provider_error_units,
+        )?;
+        group.state.charge_weighted(
+            group.policy.as_ref(),
+            charged_response_bytes,
+            provider_error_units,
+            now,
+        )?;
+        let control =
+            group
+                .state
+                .apply_settlement_control(group.policy.as_ref(), now, settlement)?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM provider_rate_requests
+                 WHERE request_id = ?1 AND run_id = ?2 AND group_id = ?3
+                   AND dispatched_at_ns IS NOT NULL",
+                params![
+                    permit_id.bytes(),
+                    run_id.bytes(),
+                    registration.group_id().bytes(),
+                ],
+            )
+            .map_err(map_sql)?;
+        if deleted != 1 {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let availability =
+            group
+                .state
+                .settlement_availability(group.policy.as_ref(), now, control)?;
+        let state_digest = persist_group(&transaction, &mut group, now)?;
+        let state_version = NonZeroU64::new(
+            u64::try_from(group.version).map_err(|_| ProviderRateStoreError::Corrupt)?,
+        )
+        .ok_or(ProviderRateStoreError::Corrupt)?;
+        let receipt = ProviderRateResponseSettlementReceipt::try_new(
+            registration.group_id(),
+            permit_id,
+            settlement,
+            charged_response_bytes,
+            availability,
+            group.state.consecutive_refusals,
+            state_version,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, state_digest),
+        )
+        .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(receipt)
     }
 
     fn apply_retry_after(
@@ -886,6 +1085,7 @@ fn register_in_open_transaction(
     declaration: &ProviderRateDeclaration,
     now: Timestamp,
 ) -> Result<ProviderRateRegistration, ProviderRateStoreError> {
+    validate_policy_store_bounds(declaration.policy())?;
     let policy_digest = sha256_bytes(declaration.policy_digest())?;
     let declaration_digest = sha256_bytes(declaration.declaration_digest())?;
     let collision_keys = encode_collision_keys(declaration)?;
@@ -968,24 +1168,389 @@ fn delete_reserved_request(
         )
         .map_err(map_sql)?;
     if deleted != 1 {
-        return Err(ProviderRateStoreError::Conflict);
+        return Err(ProviderRateStoreError::Corrupt);
     }
     Ok(())
 }
 
-fn request_row_exists(
-    transaction: &Transaction<'_>,
+fn load_request(
+    transaction: &Connection,
     request_id: [u8; 16],
-) -> Result<bool, ProviderRateStoreError> {
+) -> Result<Option<RequestRow>, ProviderRateStoreError> {
     transaction
         .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM provider_rate_requests WHERE request_id = ?1
-             )",
+            "SELECT request_id, run_id, group_id, reserved_at_ns, dispatched_at_ns,
+                    maximum_response_bytes, provider_error_units, request_digest
+             FROM provider_rate_requests WHERE request_id = ?1",
             [request_id],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                ))
+            },
         )
-        .map_err(map_sql)
+        .optional()
+        .map_err(map_sql)?
+        .map(parse_request_row)
+        .transpose()
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_request_row(
+    row: (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        Vec<u8>,
+    ),
+) -> Result<RequestRow, ProviderRateStoreError> {
+    let (
+        request_id,
+        run_id,
+        group_id,
+        reserved_at_ns,
+        dispatched_at_ns,
+        maximum_response_bytes,
+        provider_error_units,
+        digest,
+    ) = row;
+    let request_id = fixed_bytes(request_id)?;
+    let run_id = fixed_bytes(run_id)?;
+    let group_id = fixed_bytes(group_id)?;
+    let maximum_response_bytes = match maximum_response_bytes {
+        Some(value) => Some(
+            u64::try_from(value)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or(ProviderRateStoreError::Corrupt)?,
+        ),
+        None => None,
+    };
+    let provider_error_units = u8::try_from(provider_error_units)
+        .ok()
+        .filter(|value| *value <= 1)
+        .ok_or(ProviderRateStoreError::Corrupt)?;
+    if dispatched_at_ns.is_none() && (maximum_response_bytes.is_some() || provider_error_units != 0)
+    {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    let actual_digest: [u8; 32] = fixed_bytes(digest)?;
+    let expected_digest = request_row_digest(
+        request_id,
+        run_id,
+        group_id,
+        reserved_at_ns,
+        dispatched_at_ns,
+        maximum_response_bytes,
+        provider_error_units,
+    );
+    if actual_digest != expected_digest {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    Ok(RequestRow {
+        request_id,
+        run_id,
+        group_id,
+        reserved_at_ns,
+        dispatched_at_ns,
+        maximum_response_bytes,
+        provider_error_units,
+    })
+}
+
+fn pending_claims(
+    transaction: &Connection,
+    run_id: ProviderRateRunId,
+    group: &LoadedGroup,
+    excluded_request_id: Option<[u8; 16]>,
+) -> Result<PendingClaims, ProviderRateStoreError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT request_id, run_id, group_id, reserved_at_ns, dispatched_at_ns,
+                    maximum_response_bytes, provider_error_units, request_digest
+             FROM provider_rate_requests WHERE group_id = ?1 ORDER BY request_id",
+        )
+        .map_err(map_sql)?;
+    let mut rows = statement.query([group.group_id]).map_err(map_sql)?;
+    let mut pending = PendingClaims::default();
+    while let Some(row) = rows.next().map_err(map_sql)? {
+        let request = parse_request_row((
+            row.get(0).map_err(map_sql)?,
+            row.get(1).map_err(map_sql)?,
+            row.get(2).map_err(map_sql)?,
+            row.get(3).map_err(map_sql)?,
+            row.get(4).map_err(map_sql)?,
+            row.get(5).map_err(map_sql)?,
+            row.get(6).map_err(map_sql)?,
+            row.get(7).map_err(map_sql)?,
+        ))?;
+        if request.run_id != run_id.bytes() || request.group_id != group.group_id {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        if excluded_request_id == Some(request.request_id) || request.dispatched_at_ns.is_none() {
+            continue;
+        }
+        let claim = request.claim()?;
+        validate_claim_shape(group.policy.as_ref(), claim)?;
+        if let Some(bytes) = request.maximum_response_bytes {
+            pending.response_bytes = pending
+                .response_bytes
+                .checked_add(bytes)
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            pending.response_byte_claims = pending
+                .response_byte_claims
+                .checked_add(1)
+                .ok_or(ProviderRateStoreError::Capacity)?;
+        }
+        if request.provider_error_units != 0 {
+            pending.provider_errors = pending
+                .provider_errors
+                .checked_add(u64::from(request.provider_error_units))
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            pending.provider_error_claims = pending
+                .provider_error_claims
+                .checked_add(1)
+                .ok_or(ProviderRateStoreError::Capacity)?;
+        }
+    }
+    Ok(pending)
+}
+
+fn reconcile_abandoned_requests(
+    transaction: &Transaction<'_>,
+    now: Timestamp,
+) -> Result<(), ProviderRateStoreError> {
+    let request_count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM provider_rate_requests", [], |row| {
+            row.get(0)
+        })
+        .map_err(map_sql)?;
+    if !(0..=MAXIMUM_RETAINED_REQUESTS).contains(&request_count) {
+        return Err(ProviderRateStoreError::Capacity);
+    }
+    let mut statement = transaction
+        .prepare(
+            "SELECT request_id, requests.run_id, group_id, reserved_at_ns, dispatched_at_ns,
+                    maximum_response_bytes, provider_error_units, request_digest, runs.status
+             FROM provider_rate_requests AS requests
+             JOIN provider_rate_runs AS runs ON runs.run_id = requests.run_id
+             ORDER BY group_id, request_id",
+        )
+        .map_err(map_sql)?;
+    let mut rows = statement.query([]).map_err(map_sql)?;
+    let mut requests = Vec::new();
+    requests
+        .try_reserve_exact(
+            usize::try_from(request_count).map_err(|_| ProviderRateStoreError::Capacity)?,
+        )
+        .map_err(|_| ProviderRateStoreError::Capacity)?;
+    while let Some(row) = rows.next().map_err(map_sql)? {
+        let status: String = row.get(8).map_err(map_sql)?;
+        if status != "active" {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        requests.push(parse_request_row((
+            row.get(0).map_err(map_sql)?,
+            row.get(1).map_err(map_sql)?,
+            row.get(2).map_err(map_sql)?,
+            row.get(3).map_err(map_sql)?,
+            row.get(4).map_err(map_sql)?,
+            row.get(5).map_err(map_sql)?,
+            row.get(6).map_err(map_sql)?,
+            row.get(7).map_err(map_sql)?,
+        ))?);
+    }
+    if requests.len()
+        != usize::try_from(request_count).map_err(|_| ProviderRateStoreError::Capacity)?
+    {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    drop(rows);
+    drop(statement);
+
+    let mut groups = std::collections::BTreeMap::<[u8; 16], LoadedGroup>::new();
+    for request in requests {
+        if request.dispatched_at_ns.is_none() {
+            if !request.claim()?.is_request_only() {
+                return Err(ProviderRateStoreError::Corrupt);
+            }
+            continue;
+        }
+        if !groups.contains_key(&request.group_id) {
+            groups.insert(
+                request.group_id,
+                load_group_by_id(transaction, request.group_id)?,
+            );
+        }
+        let group = groups
+            .get_mut(&request.group_id)
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        group.state.advance(group.policy.as_ref(), now)?;
+        let claim = request.claim()?;
+        validate_claim_shape(group.policy.as_ref(), claim)?;
+        group.state.charge_weighted(
+            group.policy.as_ref(),
+            claim.maximum_response_bytes().unwrap_or(0),
+            claim.provider_error_units(),
+            now,
+        )?;
+        if !claim.is_request_only() {
+            group.state.apply_settlement_control(
+                group.policy.as_ref(),
+                now,
+                ProviderRateResponseSettlement::abandoned_unknown(),
+            )?;
+        }
+    }
+    for group in groups.values_mut() {
+        persist_group(transaction, group, now)?;
+    }
+    transaction
+        .execute("DELETE FROM provider_rate_requests", [])
+        .map_err(map_sql)?;
+    Ok(())
+}
+
+impl RequestRow {
+    fn claim(self) -> Result<ProviderRateDispatchClaim, ProviderRateStoreError> {
+        ProviderRateDispatchClaim::try_new(
+            self.maximum_response_bytes.and_then(NonZeroU64::new),
+            self.provider_error_units,
+        )
+        .map_err(|_| ProviderRateStoreError::Corrupt)
+    }
+}
+
+fn validate_claim_shape(
+    policy: &ProviderBudgetPolicy,
+    claim: ProviderRateDispatchClaim,
+) -> Result<(), ProviderRateStoreError> {
+    let mut response_bytes = false;
+    let mut provider_errors = false;
+    let mut minimum_response_byte_limit = None;
+    for index in 0..policy.weighted_window_count() {
+        let window = policy
+            .weighted_window(index)
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        match window.dimension() {
+            ProviderRateWeightedDimension::ResponseBytes => {
+                response_bytes = true;
+                minimum_response_byte_limit = Some(
+                    minimum_response_byte_limit.map_or(window.maximum_units(), |current: u64| {
+                        current.min(window.maximum_units())
+                    }),
+                );
+            }
+            ProviderRateWeightedDimension::ProviderErrors => provider_errors = true,
+        }
+    }
+    if response_bytes != claim.maximum_response_bytes().is_some()
+        || u8::from(provider_errors) != claim.provider_error_units()
+        || claim
+            .maximum_response_bytes()
+            .zip(minimum_response_byte_limit)
+            .is_some_and(|(claim, limit)| claim > limit)
+    {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    Ok(())
+}
+
+fn validate_weighted_replacement(
+    policy: &ProviderBudgetPolicy,
+    state: &RateState,
+    pending: &PendingClaims,
+    response_bytes: u64,
+    provider_errors: u8,
+) -> Result<(), ProviderRateStoreError> {
+    for index in 0..policy.weighted_window_count() {
+        let window = policy
+            .weighted_window(index)
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        let window_state = state
+            .weighted_windows
+            .get(index)
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        let (pending_units, exact_units, pending_events) = match window.dimension() {
+            ProviderRateWeightedDimension::ResponseBytes => (
+                pending.response_bytes,
+                response_bytes,
+                pending.response_byte_claims,
+            ),
+            ProviderRateWeightedDimension::ProviderErrors => (
+                pending.provider_errors,
+                u64::from(provider_errors),
+                pending.provider_error_claims,
+            ),
+        };
+        let total = window_state
+            .active_units(window.semantics())?
+            .checked_add(pending_units)
+            .and_then(|value| value.checked_add(exact_units))
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        if total > window.maximum_units() {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        if window.semantics() == BudgetWindowSemantics::Sliding && exact_units > 0 {
+            let retained = window_state
+                .sliding_releases
+                .len()
+                .checked_add(pending_events)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(ProviderRateStoreError::Capacity)?;
+            if retained > MAXIMUM_WEIGHTED_SLIDING_RELEASES {
+                return Err(ProviderRateStoreError::Capacity);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_store_bounds(
+    policy: &ProviderBudgetPolicy,
+) -> Result<(), ProviderRateStoreError> {
+    for index in 0..policy.weighted_window_count() {
+        let weighted = policy
+            .weighted_window(index)
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        if weighted.semantics() != BudgetWindowSemantics::Sliding {
+            continue;
+        }
+        let mut dispatch_bound = u64::MAX;
+        for request_index in 0..policy.window_count() {
+            let request = policy
+                .window(request_index)
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            let periods = weighted
+                .window_nanos()
+                .checked_add(request.window_nanos() - 1)
+                .and_then(|value| value.checked_div(request.window_nanos()))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(ProviderRateStoreError::Capacity)?;
+            let bound = periods
+                .checked_mul(u64::from(request.requests_per_window()))
+                .ok_or(ProviderRateStoreError::Capacity)?;
+            dispatch_bound = dispatch_bound.min(bound);
+        }
+        let event_bound = dispatch_bound
+            .checked_add(u64::from(policy.max_concurrent()))
+            .ok_or(ProviderRateStoreError::Capacity)?;
+        if event_bound > MAXIMUM_WEIGHTED_SLIDING_RELEASES as u64 {
+            return Err(ProviderRateStoreError::Capacity);
+        }
+    }
+    Ok(())
 }
 
 fn acquire_owner_lease(path: &Path) -> Result<ProviderRateOwnerLease, ProviderRateStoreError> {
@@ -1101,6 +1666,17 @@ struct ExistingDeclaration {
     collision_keys: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RequestRow {
+    request_id: [u8; 16],
+    run_id: [u8; 16],
+    group_id: [u8; 16],
+    reserved_at_ns: i64,
+    dispatched_at_ns: Option<i64>,
+    maximum_response_bytes: Option<u64>,
+    provider_error_units: u8,
+}
+
 #[derive(Debug)]
 struct LoadedGroup {
     group_id: [u8; 16],
@@ -1115,7 +1691,9 @@ type ProviderRateGroupRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64);
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RateState {
+    semantics_version: u16,
     windows: Vec<RateWindowState>,
+    weighted_windows: Vec<WeightedRateWindowState>,
     cooldown_until_ns: Option<i64>,
     consecutive_refusals: u32,
     disabled: bool,
@@ -1128,6 +1706,42 @@ struct RateWindowState {
     started_at_ns: i64,
     admitted: u32,
     sliding_release_ns: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WeightedRateWindowState {
+    started_at_ns: i64,
+    admitted_units: u64,
+    sliding_releases: Vec<WeightedReleaseState>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WeightedReleaseState {
+    release_at_ns: i64,
+    units: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PendingClaims {
+    response_bytes: u64,
+    provider_errors: u64,
+    response_byte_claims: usize,
+    provider_error_claims: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WeightedDispatchBlocker {
+    None,
+    WaitUntil(Timestamp),
+    PendingUnknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettlementControlOutcome {
+    Normal,
+    RetryAfterExceedsPolicy,
 }
 
 impl RateState {
@@ -1143,8 +1757,21 @@ impl RateState {
                 sliding_release_ns: Vec::new(),
             });
         }
+        let mut weighted_windows = Vec::new();
+        weighted_windows
+            .try_reserve_exact(policy.weighted_window_count())
+            .map_err(|_| ProviderRateStoreError::Capacity)?;
+        for _ in 0..policy.weighted_window_count() {
+            weighted_windows.push(WeightedRateWindowState {
+                started_at_ns: now.unix_nanos(),
+                admitted_units: 0,
+                sliding_releases: Vec::new(),
+            });
+        }
         Ok(Self {
+            semantics_version: PROVIDER_RATE_STATE_SEMANTICS_VERSION,
             windows,
+            weighted_windows,
             cooldown_until_ns: None,
             consecutive_refusals: 0,
             disabled: false,
@@ -1157,8 +1784,14 @@ impl RateState {
         policy: &ProviderBudgetPolicy,
         now: Timestamp,
     ) -> Result<(), ProviderRateStoreError> {
-        if now.unix_nanos() < self.last_observed_ns || self.windows.len() != policy.window_count() {
+        if now.unix_nanos() < self.last_observed_ns {
             return Err(ProviderRateStoreError::Clock);
+        }
+        if self.semantics_version != PROVIDER_RATE_STATE_SEMANTICS_VERSION
+            || self.windows.len() != policy.window_count()
+            || self.weighted_windows.len() != policy.weighted_window_count()
+        {
+            return Err(ProviderRateStoreError::Corrupt);
         }
         for (index, state) in self.windows.iter_mut().enumerate() {
             let window = policy
@@ -1167,6 +1800,7 @@ impl RateState {
             match window.semantics() {
                 BudgetWindowSemantics::Tumbling => {
                     if !state.sliding_release_ns.is_empty()
+                        || state.started_at_ns > self.last_observed_ns
                         || state.admitted > window.requests_per_window()
                     {
                         return Err(ProviderRateStoreError::Corrupt);
@@ -1185,6 +1819,7 @@ impl RateState {
                 }
                 BudgetWindowSemantics::Sliding => {
                     if state.admitted != 0
+                        || state.started_at_ns > self.last_observed_ns
                         || state
                             .sliding_release_ns
                             .windows(2)
@@ -1198,6 +1833,61 @@ impl RateState {
                     if state.sliding_release_ns.len()
                         > usize::try_from(window.requests_per_window())
                             .map_err(|_| ProviderRateStoreError::Corrupt)?
+                    {
+                        return Err(ProviderRateStoreError::Corrupt);
+                    }
+                    state.started_at_ns = now.unix_nanos();
+                }
+            }
+        }
+        for (index, state) in self.weighted_windows.iter_mut().enumerate() {
+            let window = policy
+                .weighted_window(index)
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            match window.semantics() {
+                BudgetWindowSemantics::Tumbling => {
+                    if !state.sliding_releases.is_empty()
+                        || state.started_at_ns > self.last_observed_ns
+                        || state.admitted_units > window.maximum_units()
+                    {
+                        return Err(ProviderRateStoreError::Corrupt);
+                    }
+                    let ends_at = state
+                        .started_at_ns
+                        .checked_add(
+                            i64::try_from(window.window_nanos())
+                                .map_err(|_| ProviderRateStoreError::Corrupt)?,
+                        )
+                        .ok_or(ProviderRateStoreError::Corrupt)?;
+                    if now.unix_nanos() >= ends_at {
+                        state.started_at_ns = now.unix_nanos();
+                        state.admitted_units = 0;
+                    }
+                }
+                BudgetWindowSemantics::Sliding => {
+                    if state.admitted_units != 0
+                        || state.started_at_ns > self.last_observed_ns
+                        || state.sliding_releases.len() > MAXIMUM_WEIGHTED_SLIDING_RELEASES
+                        || state
+                            .sliding_releases
+                            .iter()
+                            .any(|release| release.units == 0)
+                        || state
+                            .sliding_releases
+                            .windows(2)
+                            .any(|pair| pair[0].release_at_ns > pair[1].release_at_ns)
+                    {
+                        return Err(ProviderRateStoreError::Corrupt);
+                    }
+                    state
+                        .sliding_releases
+                        .retain(|release| release.release_at_ns > now.unix_nanos());
+                    if state
+                        .sliding_releases
+                        .iter()
+                        .try_fold(0_u64, |total, release| total.checked_add(release.units))
+                        .filter(|total| *total <= window.maximum_units())
+                        .is_none()
                     {
                         return Err(ProviderRateStoreError::Corrupt);
                     }
@@ -1284,6 +1974,306 @@ impl RateState {
         }
         Ok(())
     }
+
+    fn weighted_blocker(
+        &self,
+        policy: &ProviderBudgetPolicy,
+        pending: &PendingClaims,
+        claim: ProviderRateDispatchClaim,
+        now: Timestamp,
+    ) -> Result<WeightedDispatchBlocker, ProviderRateStoreError> {
+        let mut deadline = None;
+        for (index, state) in self.weighted_windows.iter().enumerate() {
+            let window = policy
+                .weighted_window(index)
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            let (pending_units, claim_units, pending_events) = match window.dimension() {
+                ProviderRateWeightedDimension::ResponseBytes => (
+                    pending.response_bytes,
+                    claim.maximum_response_bytes().unwrap_or(0),
+                    pending.response_byte_claims,
+                ),
+                ProviderRateWeightedDimension::ProviderErrors => (
+                    pending.provider_errors,
+                    u64::from(claim.provider_error_units()),
+                    pending.provider_error_claims,
+                ),
+            };
+            let settled = state.active_units(window.semantics())?;
+            let required = settled
+                .checked_add(pending_units)
+                .and_then(|value| value.checked_add(claim_units))
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            if window.semantics() == BudgetWindowSemantics::Sliding && claim_units > 0 {
+                let retained = state
+                    .sliding_releases
+                    .len()
+                    .checked_add(pending_events)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(ProviderRateStoreError::Capacity)?;
+                if retained > MAXIMUM_WEIGHTED_SLIDING_RELEASES {
+                    return Err(ProviderRateStoreError::Capacity);
+                }
+            }
+            if required <= window.maximum_units() {
+                continue;
+            }
+            if pending_units
+                .checked_add(claim_units)
+                .ok_or(ProviderRateStoreError::Corrupt)?
+                > window.maximum_units()
+            {
+                return Ok(WeightedDispatchBlocker::PendingUnknown);
+            }
+            let needed_release = required
+                .checked_sub(window.maximum_units())
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            let window_deadline = match window.semantics() {
+                BudgetWindowSemantics::Tumbling => state
+                    .started_at_ns
+                    .checked_add(
+                        i64::try_from(window.window_nanos())
+                            .map_err(|_| ProviderRateStoreError::Corrupt)?,
+                    )
+                    .ok_or(ProviderRateStoreError::Corrupt)?,
+                BudgetWindowSemantics::Sliding => {
+                    state.release_deadline_for_units(needed_release)?
+                }
+            };
+            if window_deadline <= now.unix_nanos() {
+                return Err(ProviderRateStoreError::Corrupt);
+            }
+            deadline =
+                Some(deadline.map_or(window_deadline, |current: i64| current.max(window_deadline)));
+        }
+        Ok(deadline.map_or(WeightedDispatchBlocker::None, |deadline| {
+            WeightedDispatchBlocker::WaitUntil(Timestamp::from_unix_nanos(deadline))
+        }))
+    }
+
+    fn charge_weighted(
+        &mut self,
+        policy: &ProviderBudgetPolicy,
+        response_bytes: u64,
+        provider_errors: u8,
+        now: Timestamp,
+    ) -> Result<(), ProviderRateStoreError> {
+        for (index, state) in self.weighted_windows.iter_mut().enumerate() {
+            let window = policy
+                .weighted_window(index)
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            let units = match window.dimension() {
+                ProviderRateWeightedDimension::ResponseBytes => response_bytes,
+                ProviderRateWeightedDimension::ProviderErrors => u64::from(provider_errors),
+            };
+            if units == 0 {
+                continue;
+            }
+            let active = state.active_units(window.semantics())?;
+            if active
+                .checked_add(units)
+                .filter(|total| *total <= window.maximum_units())
+                .is_none()
+            {
+                return Err(ProviderRateStoreError::Corrupt);
+            }
+            match window.semantics() {
+                BudgetWindowSemantics::Tumbling => {
+                    state.admitted_units = state
+                        .admitted_units
+                        .checked_add(units)
+                        .ok_or(ProviderRateStoreError::Corrupt)?;
+                }
+                BudgetWindowSemantics::Sliding => {
+                    if state.sliding_releases.len() == MAXIMUM_WEIGHTED_SLIDING_RELEASES {
+                        return Err(ProviderRateStoreError::Capacity);
+                    }
+                    state
+                        .sliding_releases
+                        .try_reserve(1)
+                        .map_err(|_| ProviderRateStoreError::Capacity)?;
+                    state.sliding_releases.push(WeightedReleaseState {
+                        release_at_ns: checked_timestamp_add(now, window.window_nanos())?
+                            .unix_nanos(),
+                        units,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_settlement_control(
+        &mut self,
+        policy: &ProviderBudgetPolicy,
+        now: Timestamp,
+        settlement: ProviderRateResponseSettlement,
+    ) -> Result<SettlementControlOutcome, ProviderRateStoreError> {
+        match settlement.response_class() {
+            ProviderRateResponseClass::ValidatedSuccess => {
+                self.consecutive_refusals = 0;
+            }
+            ProviderRateResponseClass::ProviderRefusal => {
+                if let Some(retry_after) = parsed_retry_after(settlement.retry_after()) {
+                    return self.apply_retry_after(policy, now, retry_after);
+                }
+                self.apply_fallback(
+                    policy,
+                    now,
+                    settlement.fallback_jitter_sample_basis_points(),
+                )?;
+            }
+            ProviderRateResponseClass::InvalidProviderResponse => {
+                if let Some(retry_after) = parsed_retry_after(settlement.retry_after()) {
+                    return self.apply_retry_after(policy, now, retry_after);
+                }
+            }
+            ProviderRateResponseClass::AbandonedUnknown => {
+                self.apply_fallback(policy, now, 0)?;
+            }
+            ProviderRateResponseClass::HttpProviderError
+            | ProviderRateResponseClass::ProviderBodyError => {}
+        }
+        Ok(SettlementControlOutcome::Normal)
+    }
+
+    fn apply_retry_after(
+        &mut self,
+        policy: &ProviderBudgetPolicy,
+        now: Timestamp,
+        retry_after: RetryAfter,
+    ) -> Result<SettlementControlOutcome, ProviderRateStoreError> {
+        let delay = match retry_after {
+            RetryAfter::Delay(delay) => delay.get(),
+            RetryAfter::AtWallClock(deadline) => deadline
+                .unix_nanos()
+                .checked_sub(now.unix_nanos())
+                .ok_or(ProviderRateStoreError::Clock)?
+                .max(0)
+                .unsigned_abs(),
+        };
+        if delay > policy.backoff().maximum_nanos() {
+            self.disabled = true;
+            return Ok(SettlementControlOutcome::RetryAfterExceedsPolicy);
+        }
+        let deadline = checked_timestamp_add(now, delay)?.unix_nanos();
+        if deadline > now.unix_nanos() {
+            self.cooldown_until_ns = Some(
+                self.cooldown_until_ns
+                    .map_or(deadline, |current| current.max(deadline)),
+            );
+        }
+        Ok(SettlementControlOutcome::Normal)
+    }
+
+    fn apply_fallback(
+        &mut self,
+        policy: &ProviderBudgetPolicy,
+        now: Timestamp,
+        jitter_sample_basis_points: u16,
+    ) -> Result<(), ProviderRateStoreError> {
+        let delay = policy
+            .backoff()
+            .delay_nanos(self.consecutive_refusals, jitter_sample_basis_points);
+        self.consecutive_refusals = self
+            .consecutive_refusals
+            .checked_add(1)
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        let deadline = checked_timestamp_add(now, delay)?.unix_nanos();
+        self.cooldown_until_ns = Some(
+            self.cooldown_until_ns
+                .map_or(deadline, |current| current.max(deadline)),
+        );
+        Ok(())
+    }
+
+    fn settlement_availability(
+        &self,
+        policy: &ProviderBudgetPolicy,
+        now: Timestamp,
+        control: SettlementControlOutcome,
+    ) -> Result<ProviderRateSettlementAvailability, ProviderRateStoreError> {
+        if control == SettlementControlOutcome::RetryAfterExceedsPolicy {
+            return Ok(ProviderRateSettlementAvailability::Unavailable(
+                BudgetUnavailableReason::RetryAfterExceedsPolicy,
+            ));
+        }
+        if self.disabled {
+            return Ok(ProviderRateSettlementAvailability::Unavailable(
+                BudgetUnavailableReason::Disabled,
+            ));
+        }
+        let mut blocker = self.blocked_until(policy, now)?.map(Timestamp::unix_nanos);
+        for (index, state) in self.weighted_windows.iter().enumerate() {
+            let window = policy
+                .weighted_window(index)
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            if state.active_units(window.semantics())? < window.maximum_units() {
+                continue;
+            }
+            let deadline = match window.semantics() {
+                BudgetWindowSemantics::Tumbling => state
+                    .started_at_ns
+                    .checked_add(
+                        i64::try_from(window.window_nanos())
+                            .map_err(|_| ProviderRateStoreError::Corrupt)?,
+                    )
+                    .ok_or(ProviderRateStoreError::Corrupt)?,
+                BudgetWindowSemantics::Sliding => state.release_deadline_for_units(1)?,
+            };
+            blocker = Some(blocker.map_or(deadline, |current| current.max(deadline)));
+        }
+        Ok(
+            blocker.map_or(ProviderRateSettlementAvailability::Available, |deadline| {
+                ProviderRateSettlementAvailability::WaitUntil(Timestamp::from_unix_nanos(deadline))
+            }),
+        )
+    }
+}
+
+impl WeightedRateWindowState {
+    fn active_units(
+        &self,
+        semantics: BudgetWindowSemantics,
+    ) -> Result<u64, ProviderRateStoreError> {
+        match semantics {
+            BudgetWindowSemantics::Tumbling => Ok(self.admitted_units),
+            BudgetWindowSemantics::Sliding => self
+                .sliding_releases
+                .iter()
+                .try_fold(0_u64, |total, release| total.checked_add(release.units))
+                .ok_or(ProviderRateStoreError::Corrupt),
+        }
+    }
+
+    fn release_deadline_for_units(&self, needed: u64) -> Result<i64, ProviderRateStoreError> {
+        if needed == 0 {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let mut released = 0_u64;
+        for release in &self.sliding_releases {
+            released = released
+                .checked_add(release.units)
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            if released >= needed {
+                return Ok(release.release_at_ns);
+            }
+        }
+        Err(ProviderRateStoreError::Corrupt)
+    }
+}
+
+const fn parsed_retry_after(disposition: ProviderRateRetryAfterDisposition) -> Option<RetryAfter> {
+    match disposition {
+        ProviderRateRetryAfterDisposition::ValidRelativeDelay(delay) => {
+            Some(RetryAfter::Delay(delay))
+        }
+        ProviderRateRetryAfterDisposition::ValidHttpDate(deadline) => {
+            Some(RetryAfter::AtWallClock(deadline))
+        }
+        ProviderRateRetryAfterDisposition::Absent
+        | ProviderRateRetryAfterDisposition::MalformedOrUnsupported => None,
+    }
 }
 
 fn prepare_path(path: PathBuf) -> Result<PathBuf, ProviderRateStoreError> {
@@ -1348,8 +2338,12 @@ fn checkpoint_from_connection(
             maximum_declarations: MAXIMUM_DECLARATIONS,
             maximum_authorization_subjects: MAXIMUM_AUTHORIZATION_SUBJECTS,
             maximum_collision_keys: MAXIMUM_COLLISION_KEYS,
+            maximum_weighted_sliding_releases: MAXIMUM_WEIGHTED_SLIDING_RELEASES,
         },
-        groups: checkpoint_groups(connection)?,
+        groups: {
+            validate_checkpoint_request_exclusion(connection)?;
+            checkpoint_groups(connection)?
+        },
         declarations: checkpoint_declarations(connection)?,
         authorization_subjects: checkpoint_authorization_subjects(connection)?,
     };
@@ -1366,7 +2360,7 @@ fn checkpoint_from_envelope(
     }
     let content_sha256 = Sha256::digest(&bytes).into();
     let mut authority = Sha256::new();
-    authority.update(b"market-squawk/provider-rate-logical-checkpoint-authority/v1\0");
+    authority.update(b"market-squawk/provider-rate-logical-checkpoint-authority/v2\0");
     authority.update(content_sha256);
     Ok(ProviderRateLogicalCheckpoint {
         bytes,
@@ -1421,6 +2415,65 @@ fn checkpoint_groups(
         return Err(ProviderRateStoreError::Corrupt);
     }
     Ok(groups)
+}
+
+fn validate_checkpoint_request_exclusion(
+    connection: &Connection,
+) -> Result<(), ProviderRateStoreError> {
+    let request_count = bounded_table_count(
+        connection,
+        "provider_rate_requests",
+        MAXIMUM_RETAINED_REQUESTS,
+    )?;
+    if request_count == 0 {
+        return Ok(());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT request_id, requests.run_id, group_id, reserved_at_ns, dispatched_at_ns,
+                    maximum_response_bytes, provider_error_units, request_digest, runs.status
+             FROM provider_rate_requests AS requests
+             JOIN provider_rate_runs AS runs ON runs.run_id = requests.run_id
+             ORDER BY group_id, request_id",
+        )
+        .map_err(map_sql)?;
+    let mut rows = statement.query([]).map_err(map_sql)?;
+    let mut observed_requests = 0_i64;
+    while let Some(row) = rows.next().map_err(map_sql)? {
+        observed_requests = observed_requests
+            .checked_add(1)
+            .ok_or(ProviderRateStoreError::Capacity)?;
+        let status: String = row.get(8).map_err(map_sql)?;
+        if status != "active" {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let request = parse_request_row((
+            row.get(0).map_err(map_sql)?,
+            row.get(1).map_err(map_sql)?,
+            row.get(2).map_err(map_sql)?,
+            row.get(3).map_err(map_sql)?,
+            row.get(4).map_err(map_sql)?,
+            row.get(5).map_err(map_sql)?,
+            row.get(6).map_err(map_sql)?,
+            row.get(7).map_err(map_sql)?,
+        ))?;
+        if request.dispatched_at_ns.is_none() {
+            if !request.claim()?.is_request_only() {
+                return Err(ProviderRateStoreError::Corrupt);
+            }
+            continue;
+        }
+        let group = load_group_by_id(connection, request.group_id)?;
+        let claim = request.claim()?;
+        validate_claim_shape(group.policy.as_ref(), claim)?;
+        if !claim.is_request_only() {
+            return Err(ProviderRateStoreError::Conflict);
+        }
+    }
+    if observed_requests != request_count {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    Ok(())
 }
 
 fn checkpoint_declarations(
@@ -1524,6 +2577,8 @@ fn validate_checkpoint_envelope(
         || checkpoint.capacities.maximum_declarations != MAXIMUM_DECLARATIONS
         || checkpoint.capacities.maximum_authorization_subjects != MAXIMUM_AUTHORIZATION_SUBJECTS
         || checkpoint.capacities.maximum_collision_keys != MAXIMUM_COLLISION_KEYS
+        || checkpoint.capacities.maximum_weighted_sliding_releases
+            != MAXIMUM_WEIGHTED_SLIDING_RELEASES
         || i64::try_from(checkpoint.groups.len()).map_or(true, |count| count > MAXIMUM_GROUPS)
         || i64::try_from(checkpoint.declarations.len())
             .map_or(true, |count| count > MAXIMUM_DECLARATIONS)
@@ -1765,7 +2820,7 @@ fn schema_sha256(connection: &Connection) -> Result<[u8; 32], ProviderRateStoreE
         .map_err(map_sql)?;
     let mut rows = statement.query([]).map_err(map_sql)?;
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/provider-rate-sqlite-schema/v1\0");
+    digest.update(b"market-squawk/provider-rate-sqlite-schema/v2\0");
     let mut count = 0_u64;
     while let Some(row) = rows.next().map_err(map_sql)? {
         for index in 0..4 {
@@ -2167,11 +3222,39 @@ fn load_group(
     transaction: &Transaction<'_>,
     registration: ProviderRateRegistration,
 ) -> Result<LoadedGroup, ProviderRateStoreError> {
+    let group = load_group_by_id(transaction, registration.group_id().bytes())?;
+    if group.policy_digest != sha256_bytes(registration.policy_digest())? {
+        return Err(ProviderRateStoreError::Conflict);
+    }
+    let declaration_digest = sha256_bytes(registration.declaration_digest())?;
+    let declaration = existing_declaration(transaction, declaration_digest)?
+        .ok_or(ProviderRateStoreError::Conflict)?;
+    if declaration.group_id != group.group_id || declaration.policy_digest != group.policy_digest {
+        return Err(ProviderRateStoreError::Conflict);
+    }
+    validate_policy_store_bounds(group.policy.as_ref())?;
+    Ok(group)
+}
+
+fn load_group_exact(
+    transaction: &Transaction<'_>,
+    registration: ProviderRateRegistration,
+) -> Result<LoadedGroup, ProviderRateStoreError> {
+    match load_group(transaction, registration) {
+        Err(ProviderRateStoreError::Conflict) => Err(ProviderRateStoreError::Corrupt),
+        result => result,
+    }
+}
+
+fn load_group_by_id(
+    transaction: &Connection,
+    group_id: [u8; 16],
+) -> Result<LoadedGroup, ProviderRateStoreError> {
     let row: Option<ProviderRateGroupRow> = transaction
         .query_row(
             "SELECT policy_digest, policy_json, state_json, state_digest, state_version
              FROM provider_rate_groups WHERE group_id = ?1",
-            [registration.group_id().bytes()],
+            [group_id],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -2187,19 +3270,12 @@ fn load_group(
     let (policy_digest, policy_json, state_json, state_digest_bytes, version) =
         row.ok_or(ProviderRateStoreError::Corrupt)?;
     let policy_digest: [u8; 32] = fixed_bytes(policy_digest)?;
-    if policy_digest != sha256_bytes(registration.policy_digest())? || version < 1 {
-        return Err(ProviderRateStoreError::Conflict);
+    if version < 1 {
+        return Err(ProviderRateStoreError::Corrupt);
     }
-    let group_id = registration.group_id().bytes();
     let expected_state_digest = state_digest(group_id, policy_digest, version, &state_json);
     if state_digest_bytes.as_slice() != expected_state_digest.as_slice() {
         return Err(ProviderRateStoreError::Corrupt);
-    }
-    let declaration_digest = sha256_bytes(registration.declaration_digest())?;
-    let declaration = existing_declaration(transaction, declaration_digest)?
-        .ok_or(ProviderRateStoreError::Conflict)?;
-    if declaration.group_id != group_id || declaration.policy_digest != policy_digest {
-        return Err(ProviderRateStoreError::Conflict);
     }
     let policy: ProviderBudgetPolicy =
         serde_json::from_slice(&policy_json).map_err(|_| ProviderRateStoreError::Corrupt)?;
@@ -2208,6 +3284,7 @@ fn load_group(
     if sha256_bytes(actual_policy_digest)? != policy_digest {
         return Err(ProviderRateStoreError::Corrupt);
     }
+    validate_policy_store_bounds(&policy)?;
     Ok(LoadedGroup {
         group_id,
         policy_digest,
@@ -2221,7 +3298,7 @@ fn persist_group(
     transaction: &Transaction<'_>,
     group: &mut LoadedGroup,
     now: Timestamp,
-) -> Result<(), ProviderRateStoreError> {
+) -> Result<[u8; 32], ProviderRateStoreError> {
     let next_version = group
         .version
         .checked_add(1)
@@ -2253,7 +3330,7 @@ fn persist_group(
         return Err(ProviderRateStoreError::Conflict);
     }
     group.version = next_version;
-    Ok(())
+    Ok(digest)
 }
 
 fn declaration_row_digest(
@@ -2263,7 +3340,7 @@ fn declaration_row_digest(
     collision_keys: &[u8],
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/provider-rate-declaration-row/v1\0");
+    digest.update(b"market-squawk/provider-rate-declaration-row/v2\0");
     digest.update(declaration_digest);
     digest.update(group_id);
     digest.update(policy_digest);
@@ -2312,11 +3389,45 @@ fn state_digest(
     state_json: &[u8],
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/provider-rate-state/v1\0");
+    digest.update(b"market-squawk/provider-rate-state/v2\0");
     digest.update(group_id);
     digest.update(policy_digest);
     digest.update(version.to_be_bytes());
     digest.update(state_json);
+    digest.finalize().into()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_row_digest(
+    request_id: [u8; 16],
+    run_id: [u8; 16],
+    group_id: [u8; 16],
+    reserved_at_ns: i64,
+    dispatched_at_ns: Option<i64>,
+    maximum_response_bytes: Option<u64>,
+    provider_error_units: u8,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/provider-rate-request/v2\0");
+    digest.update(request_id);
+    digest.update(run_id);
+    digest.update(group_id);
+    digest.update(reserved_at_ns.to_be_bytes());
+    match dispatched_at_ns {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    match maximum_response_bytes {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    digest.update([provider_error_units]);
     digest.finalize().into()
 }
 
