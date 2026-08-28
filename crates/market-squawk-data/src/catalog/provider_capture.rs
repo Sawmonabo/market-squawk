@@ -1615,6 +1615,8 @@ pub(super) const fn native_implementation_name(
         ProviderNativeLineageImplementation::SchwabStreamerMarketDataV1 => {
             "schwab_streamer_market_data_v1"
         }
+        ProviderNativeLineageImplementation::TiingoFundNavV1 => "tiingo_fund_nav_v1",
+        ProviderNativeLineageImplementation::TiingoEodMarketBarV1 => "tiingo_eod_market_bar_v1",
         ProviderNativeLineageImplementation::YahooEnrichmentV1 => "yahoo_enrichment_v1",
     }
 }
@@ -1643,6 +1645,8 @@ pub(super) fn parse_native_implementation(
         "schwab_streamer_market_data_v1" => {
             Ok(ProviderNativeLineageImplementation::SchwabStreamerMarketDataV1)
         }
+        "tiingo_fund_nav_v1" => Ok(ProviderNativeLineageImplementation::TiingoFundNavV1),
+        "tiingo_eod_market_bar_v1" => Ok(ProviderNativeLineageImplementation::TiingoEodMarketBarV1),
         "yahoo_enrichment_v1" => Ok(ProviderNativeLineageImplementation::YahooEnrichmentV1),
         _ => Err(CatalogError::CorruptCatalog),
     }

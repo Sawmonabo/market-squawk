@@ -15,13 +15,54 @@ use thiserror::Error;
 use crate::{
     TiingoCompletedHistoryCapture, TiingoEndpointFamily, TiingoNavObservationCandidate,
     TiingoNavValueState, TiingoPaginationEvidence, TiingoProviderRevisionEvidence,
-    TiingoRequestScope,
+    TiingoRequestScope, TiingoRequestSpec,
 };
 
 const TIINGO_PROVIDER_PRODUCT: &str = "starter";
 const TIINGO_PROVIDER_CHANNEL: &str = "daily-eod";
 const TIINGO_NAV_NATIVE_SCHEMA: &str = "tiingo.daily-prices.eod-row";
 const TIINGO_SOURCE_ID: &str = "tiingo-starter";
+pub(crate) const TIINGO_LATEST_PUBLICATION_DATASET: &str = "tiingo-latest-metadata-price-graph";
+pub(crate) const TIINGO_METADATA_DATASET: &str = "tiingo-daily-metadata";
+pub(crate) const TIINGO_LATEST_DATASET: &str = "tiingo-daily-latest";
+
+pub(crate) fn latest_publication_request_graph_identity(
+    metadata_request: &TiingoRequestSpec,
+    latest_request: &TiingoRequestSpec,
+) -> Result<EvidenceDigest, TiingoFundNavMapError> {
+    if metadata_request.ticker() != latest_request.ticker()
+        || metadata_request.endpoint() != TiingoEndpointFamily::Metadata
+        || metadata_request.scope() != &TiingoRequestScope::Metadata
+        || latest_request.endpoint() != TiingoEndpointFamily::LatestDailyPrices
+        || latest_request.scope() != &TiingoRequestScope::Latest
+    {
+        return Err(TiingoFundNavMapError::CaptureMismatch);
+    }
+    Ok(latest_publication_request_graph_identity_from_parts(
+        metadata_request.ticker(),
+        metadata_request.request_identity(),
+        latest_request.request_identity(),
+    ))
+}
+
+fn latest_publication_request_graph_identity_from_parts(
+    ticker: &crate::TiingoTicker,
+    metadata_request_identity: EvidenceDigest,
+    latest_request_identity: EvidenceDigest,
+) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    append_field(
+        &mut hasher,
+        b"market-squawk/tiingo/latest-metadata-price-request-graph/v1",
+    );
+    append_field(&mut hasher, ticker.as_str().as_bytes());
+    append_field(&mut hasher, &metadata_request_identity.bytes());
+    append_field(&mut hasher, &latest_request_identity.bytes());
+    EvidenceDigest::new(
+        market_squawk_domain::DigestAlgorithm::Sha256,
+        hasher.finalize().into(),
+    )
+}
 
 /// Exact policy/schema/entitlement evidence required by canonical Tiingo NAV mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -934,6 +975,9 @@ fn append_field(hasher: &mut Sha256, value: &[u8]) {
 
 fn validate_capture(input: &TiingoFundNavMappingInput<'_>) -> Result<(), TiingoFundNavMapError> {
     let capture = input.sealed_capture.capture();
+    if capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph {
+        return validate_latest_request_graph_capture(input);
+    }
     let Some(page) = capture.pages().first() else {
         return Err(TiingoFundNavMapError::CaptureMismatch);
     };
@@ -973,6 +1017,70 @@ fn validate_capture(input: &TiingoFundNavMappingInput<'_>) -> Result<(), TiingoF
         || metadata_page.body_bytes() != input.candidate.metadata_response_bytes()
         || metadata_page.body_digest() != input.candidate.metadata_raw_object_digest()
         || metadata_page.received_at() != input.candidate.metadata_received_at()
+    {
+        return Err(TiingoFundNavMapError::CaptureMismatch);
+    }
+    Ok(())
+}
+
+fn validate_latest_request_graph_capture(
+    input: &TiingoFundNavMappingInput<'_>,
+) -> Result<(), TiingoFundNavMapError> {
+    let graph = input.sealed_capture;
+    if graph != input.sealed_metadata_capture {
+        return Err(TiingoFundNavMapError::CaptureMismatch);
+    }
+    let capture = graph.capture();
+    let [metadata_component, latest_component] = capture.request_graph_components() else {
+        return Err(TiingoFundNavMapError::CaptureMismatch);
+    };
+    let [metadata_page, latest_page] = capture.pages() else {
+        return Err(TiingoFundNavMapError::CaptureMismatch);
+    };
+    let candidate = input.candidate;
+    let expected_request_graph = latest_publication_request_graph_identity_from_parts(
+        candidate.context().ticker(),
+        candidate.metadata_request_identity(),
+        candidate.request_identity(),
+    );
+    let expected_total_bytes = candidate
+        .metadata_response_bytes()
+        .checked_add(candidate.request_disposition().response_bytes())
+        .ok_or(TiingoFundNavMapError::CaptureMismatch)?;
+    if candidate.response_endpoint() != TiingoEndpointFamily::LatestDailyPrices
+        || candidate.pagination() != TiingoPaginationEvidence::NotApplicable
+        || candidate.provider_revision() != TiingoProviderRevisionEvidence::NotSupplied
+        || capture.source_id() != input.contract.source_id()
+        || capture.metadata_revision() != input.contract.source_contract_revision()
+        || capture.dataset().as_str() != TIINGO_LATEST_PUBLICATION_DATASET
+        || capture.request_set_identity() != expected_request_graph
+        || capture.total_body_bytes() != expected_total_bytes
+        || metadata_component.ordinal() != 0
+        || metadata_component.dataset().as_str() != TIINGO_METADATA_DATASET
+        || metadata_component.request_set_identity() != candidate.metadata_request_identity()
+        || metadata_component.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+        || metadata_component.first_page_ordinal() != 0
+        || metadata_component.page_count().get() != 1
+        || metadata_component.total_body_bytes() != candidate.metadata_response_bytes()
+        || latest_component.ordinal() != 1
+        || latest_component.dataset().as_str() != TIINGO_LATEST_DATASET
+        || latest_component.request_set_identity() != candidate.request_identity()
+        || latest_component.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+        || latest_component.first_page_ordinal() != 1
+        || latest_component.page_count().get() != 1
+        || latest_component.total_body_bytes() != candidate.request_disposition().response_bytes()
+        || metadata_page.ordinal() != 0
+        || metadata_page.request_identity() != candidate.metadata_request_identity()
+        || metadata_page.http_status() != candidate.metadata_response_status()
+        || metadata_page.body_bytes() != candidate.metadata_response_bytes()
+        || metadata_page.body_digest() != candidate.metadata_raw_object_digest()
+        || metadata_page.received_at() != candidate.metadata_received_at()
+        || latest_page.ordinal() != 1
+        || latest_page.request_identity() != candidate.request_identity()
+        || latest_page.http_status() != candidate.response_status()
+        || latest_page.body_bytes() != candidate.request_disposition().response_bytes()
+        || latest_page.body_digest() != candidate.raw_object_digest()
+        || latest_page.received_at() != candidate.clocks().received_at()
     {
         return Err(TiingoFundNavMapError::CaptureMismatch);
     }

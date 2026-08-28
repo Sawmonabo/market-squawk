@@ -17,6 +17,7 @@ mod history;
 mod http;
 mod model;
 mod nav;
+mod publication;
 mod quota;
 mod request;
 
@@ -69,6 +70,12 @@ pub use nav::{
     TiingoNavInvalidReason, TiingoNavObservationCandidate, TiingoNavValueState,
     TiingoProviderRevisionEvidence, TiingoSourcePublicationEvidence, classify_fund_support,
     missing_nav_candidate, normalize_mutual_fund_row,
+};
+pub use publication::{
+    TiingoLatestEodPublicationOutcome, TiingoLatestFundNavPublicationOutcome,
+    TiingoLatestPublicationError, TiingoLatestUnavailableReason, TiingoPendingLatestPublication,
+    TiingoSealedEodPublication, TiingoSealedFundNavPublication, TiingoSealedLatestPublication,
+    TiingoSealedLatestUnavailable, prepare_latest_publication,
 };
 pub use quota::{
     TIINGO_APPLICATION_BYTES_PER_MONTH, TIINGO_APPLICATION_REQUESTS_PER_DAY,

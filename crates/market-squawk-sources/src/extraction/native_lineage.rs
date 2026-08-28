@@ -47,6 +47,10 @@ pub enum ProviderNativeLineageImplementation {
     SchwabRestMarketDataV1,
     /// Schwab Streamer market-data frame semantics encoder v1.
     SchwabStreamerMarketDataV1,
+    /// Tiingo mutual-fund NAV response semantics encoder v1.
+    TiingoFundNavV1,
+    /// Tiingo end-of-day market-bar response semantics encoder v1.
+    TiingoEodMarketBarV1,
     /// Yahoo explicit-demand enrichment response semantics encoder v1.
     YahooEnrichmentV1,
 }
@@ -74,6 +78,10 @@ impl ProviderNativeLineageImplementation {
             Self::SchwabStreamerMarketDataV1 => {
                 b"market-squawk/schwab-streamer-market-data/provider-native-lineage/v1"
             }
+            Self::TiingoFundNavV1 => b"market-squawk/tiingo-fund-nav/provider-native-lineage/v1",
+            Self::TiingoEodMarketBarV1 => {
+                b"market-squawk/tiingo-eod-market-bar/provider-native-lineage/v1"
+            }
             Self::YahooEnrichmentV1 => b"market-squawk/yahoo-enrichment/provider-native-lineage/v1",
         }
     }
@@ -90,6 +98,8 @@ impl ProviderNativeLineageImplementation {
             Self::KrakenSpotV1 => 19,
             Self::SchwabRestMarketDataV1 => 14,
             Self::SchwabStreamerMarketDataV1 => 15,
+            Self::TiingoFundNavV1 => 6,
+            Self::TiingoEodMarketBarV1 => 7,
             Self::YahooEnrichmentV1 => 16,
         }
     }

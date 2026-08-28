@@ -13,6 +13,10 @@ use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::canonical::{
+    TIINGO_LATEST_DATASET, TIINGO_LATEST_PUBLICATION_DATASET, TIINGO_METADATA_DATASET,
+    latest_publication_request_graph_identity,
+};
 use crate::{
     TiingoCompletedHistoryCapture, TiingoCoverage, TiingoEndpointFamily, TiingoEodReceipt,
     TiingoEodRow, TiingoHistoryPlan, TiingoHistoryTerminalDisposition, TiingoMetadataReceipt,
@@ -23,7 +27,6 @@ use crate::{
 
 const TIINGO_SOURCE_ID: &str = "tiingo-starter";
 const TIINGO_MUTUAL_FUND_EXCHANGE_CODE: &str = "MF";
-const TIINGO_LATEST_DATASET: &str = "tiingo-daily-latest";
 const TIINGO_HISTORY_DATASET: &str = "tiingo-daily-history-window";
 const TIINGO_DAILY_INTERVAL: &str = "tiingo-calendar-day";
 const TIINGO_RAW_EOD_FEED: &str = "tiingo-starter-daily-eod-raw";
@@ -2075,6 +2078,9 @@ fn validate_capture(input: &TiingoEodMappingInput<'_>) -> Result<(), TiingoEodMa
     let response = input.response.evidence();
     let request = response.request();
     let capture = input.sealed_capture.capture();
+    if capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph {
+        return validate_latest_request_graph_capture(input);
+    }
     let Some(page) = capture.pages().first() else {
         return Err(TiingoEodMapError::CaptureMismatch);
     };
@@ -2112,6 +2118,67 @@ fn validate_capture(input: &TiingoEodMappingInput<'_>) -> Result<(), TiingoEodMa
         || metadata_page.body_bytes() != metadata_response.response_bytes()
         || metadata_page.body_digest() != metadata_response.body_digest()
         || metadata_page.received_at() != metadata_response.received_at()
+    {
+        return Err(TiingoEodMapError::CaptureMismatch);
+    }
+    Ok(())
+}
+
+fn validate_latest_request_graph_capture(
+    input: &TiingoEodMappingInput<'_>,
+) -> Result<(), TiingoEodMapError> {
+    if input.sealed_capture != input.sealed_metadata_capture {
+        return Err(TiingoEodMapError::CaptureMismatch);
+    }
+    let capture = input.sealed_capture.capture();
+    let [metadata_component, latest_component] = capture.request_graph_components() else {
+        return Err(TiingoEodMapError::CaptureMismatch);
+    };
+    let [metadata_page, latest_page] = capture.pages() else {
+        return Err(TiingoEodMapError::CaptureMismatch);
+    };
+    let metadata = input.metadata.evidence();
+    let latest = input.response.evidence();
+    let expected_request_graph =
+        latest_publication_request_graph_identity(metadata.request(), latest.request())
+            .map_err(|_| TiingoEodMapError::CaptureMismatch)?;
+    let expected_total_bytes = metadata
+        .response_bytes()
+        .checked_add(latest.response_bytes())
+        .ok_or(TiingoEodMapError::CaptureMismatch)?;
+    if latest.request().endpoint() != TiingoEndpointFamily::LatestDailyPrices
+        || input.response.pagination() != TiingoPaginationEvidence::NotApplicable
+        || capture.source_id() != input.contract.source_id()
+        || capture.metadata_revision() != input.contract.source_contract_revision()
+        || capture.dataset().as_str() != TIINGO_LATEST_PUBLICATION_DATASET
+        || capture.request_set_identity() != expected_request_graph
+        || capture.total_body_bytes() != expected_total_bytes
+        || metadata_component.ordinal() != 0
+        || metadata_component.dataset().as_str() != TIINGO_METADATA_DATASET
+        || metadata_component.request_set_identity() != metadata.request().request_identity()
+        || metadata_component.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+        || metadata_component.first_page_ordinal() != 0
+        || metadata_component.page_count().get() != 1
+        || metadata_component.total_body_bytes() != metadata.response_bytes()
+        || latest_component.ordinal() != 1
+        || latest_component.dataset().as_str() != TIINGO_LATEST_DATASET
+        || latest_component.request_set_identity() != latest.request().request_identity()
+        || latest_component.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+        || latest_component.first_page_ordinal() != 1
+        || latest_component.page_count().get() != 1
+        || latest_component.total_body_bytes() != latest.response_bytes()
+        || metadata_page.ordinal() != 0
+        || metadata_page.request_identity() != metadata.request().request_identity()
+        || metadata_page.http_status() != metadata.status()
+        || metadata_page.body_bytes() != metadata.response_bytes()
+        || metadata_page.body_digest() != metadata.body_digest()
+        || metadata_page.received_at() != metadata.received_at()
+        || latest_page.ordinal() != 1
+        || latest_page.request_identity() != latest.request().request_identity()
+        || latest_page.http_status() != latest.status()
+        || latest_page.body_bytes() != latest.response_bytes()
+        || latest_page.body_digest() != latest.body_digest()
+        || latest_page.received_at() != latest.received_at()
     {
         return Err(TiingoEodMapError::CaptureMismatch);
     }
