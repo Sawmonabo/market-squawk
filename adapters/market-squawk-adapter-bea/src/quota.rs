@@ -112,30 +112,30 @@ impl BeaProviderQuotaDeclaration {
         let minimum_request_interval_nanos =
             u64::try_from(BeaPacingPolicy::minimum_request_interval().as_nanos())
                 .map_err(|_| BeaSourceError::InvalidConfiguration)?;
+        let honors_retry_after = BeaPacingPolicy::honors_retry_after();
         let shared_policy = shared_request_declaration.policy();
         let has_pacing_window = (0..shared_policy.window_count()).any(|index| {
             shared_policy.window(index).is_some_and(|window| {
                 window.requests_per_window() == 1
                     && window.window_nanos() == minimum_request_interval_nanos
-                    && window.semantics()
-                        == market_squawk_sources::BudgetWindowSemantics::Sliding
+                    && window.semantics() == market_squawk_sources::BudgetWindowSemantics::Sliding
             })
         });
         let has_application_window = (0..shared_policy.window_count()).any(|index| {
             shared_policy.window(index).is_some_and(|window| {
                 window.requests_per_window() == application.requests
                     && window.window_nanos() == application.window_nanos
-                    && window.semantics()
-                        == market_squawk_sources::BudgetWindowSemantics::Sliding
+                    && window.semantics() == market_squawk_sources::BudgetWindowSemantics::Sliding
             })
         });
-        if application.requests > official.requests
-            || application.response_bytes > official.response_bytes
-            || application.errors > official.errors
+        if application.requests >= official.requests
+            || application.response_bytes >= official.response_bytes
+            || application.errors >= official.errors
             || application.window_nanos != official.window_nanos
             || maximum_in_flight == 0
             || maximum_in_flight > application.requests
             || minimum_request_interval_nanos == 0
+            || !honors_retry_after
             || shared_policy.window_count() != 2
             || !has_pacing_window
             || !has_application_window
@@ -143,7 +143,6 @@ impl BeaProviderQuotaDeclaration {
         {
             return Err(BeaSourceError::InvalidConfiguration);
         }
-        let honors_retry_after = BeaPacingPolicy::honors_retry_after();
         let mut hasher = Sha256::new();
         hasher.update(b"market-squawk/bea-provider-quota-declaration/v1");
         hasher.update(shared_request_declaration.declaration_digest().bytes());
@@ -177,9 +176,7 @@ impl BeaProviderQuotaDeclaration {
     }
 
     /// Returns the exact missing shared post-response settlement dimensions.
-    pub const fn required_shared_settlements(
-        &self,
-    ) -> &'static [BeaRequiredSharedSettlement; 2] {
+    pub const fn required_shared_settlements(&self) -> &'static [BeaRequiredSharedSettlement; 2] {
         &REQUIRED_SHARED_SETTLEMENTS
     }
     /// Returns provider-published ceilings.
