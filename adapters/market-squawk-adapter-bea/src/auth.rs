@@ -5,7 +5,6 @@ use std::mem;
 
 use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
-use subtle::ConstantTimeEq;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -27,16 +26,15 @@ impl BeaUserId {
     ///
     /// # Errors
     ///
-    /// Rejects a value that is not exactly 36 printable ASCII bytes or that could change URL query
-    /// structure.
+    /// Rejects a value that is not exactly 36 unreserved ASCII bytes. Keeping the admitted
+    /// credential alphabet URL- and JSON-literal-safe lets the response sanitizer replace the
+    /// one validated upstream echo before a general-purpose parser can allocate it.
     pub fn try_new(mut value: String) -> Result<Self, BeaError> {
         if value.len() != BEA_USER_ID_BYTES
             || !value.is_ascii()
             || value.as_bytes() == BEA_REDACTED_USER_ID
-            || value.bytes().any(|byte| {
-                byte.is_ascii_whitespace()
-                    || byte.is_ascii_control()
-                    || matches!(byte, b'&' | b'=' | b'?' | b'#')
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
             })
         {
             value.zeroize();
@@ -47,19 +45,6 @@ impl BeaUserId {
 
     pub(crate) fn expose_secret(&self) -> &str {
         self.0.as_str()
-    }
-
-    pub(crate) fn matches_echo(&self, candidate: &str) -> bool {
-        candidate.len() == self.0.len() && self.0.as_bytes().ct_eq(candidate.as_bytes()).into()
-    }
-
-    pub(crate) fn redact_from(&self, mut value: String) -> String {
-        if !value.contains(self.expose_secret()) {
-            return value;
-        }
-        let redacted = value.replace(self.expose_secret(), "[REDACTED]");
-        value.zeroize();
-        redacted
     }
 }
 

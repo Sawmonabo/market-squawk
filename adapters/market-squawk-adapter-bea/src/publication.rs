@@ -16,9 +16,9 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::canonical::{BeaCanonicalBatch, BeaCanonicalContext};
+use crate::sealed::BeaSealedExtractionOutput;
 use crate::{
-    BeaCanonicalObservation, BeaDatasetIdentity, BeaDoctorAdmissionEvidence,
-    BeaSealedExtractionOutput, BeaSourceBinding,
+    BeaCanonicalObservation, BeaDatasetIdentity, BeaDoctorAdmissionEvidence, BeaSourceBinding,
 };
 
 /// Provider-specific canonical-candidate or rejoin invariant failure.
@@ -174,7 +174,7 @@ pub struct BeaPublicationCandidate {
 
 impl BeaPublicationCandidate {
     /// Builds a shared-publication candidate from the source output and its acquisition seal.
-    pub fn try_new(
+    pub(crate) fn try_new(
         binding: &BeaSourceBinding,
         doctor: &BeaDoctorAdmissionEvidence,
         sealed_output: BeaSealedExtractionOutput,
@@ -284,10 +284,10 @@ impl BeaPublicationCandidate {
         row_capture_page_ordinals
             .try_reserve_exact(canonical_batch.records().len())
             .map_err(|_| BeaPublicationError::InvalidEvidence)?;
-        row_capture_page_ordinals.extend(
-            std::iter::repeat(data_component.first_page_ordinal())
-                .take(canonical_batch.records().len()),
-        );
+        row_capture_page_ordinals.extend(std::iter::repeat_n(
+            data_component.first_page_ordinal(),
+            canonical_batch.records().len(),
+        ));
         let sealed_capture_binding = SealedProviderCaptureBinding::try_whole(
             capture_token,
             canonical_batch,
@@ -457,6 +457,43 @@ struct BeaNativeLineageRowV1<'a> {
 
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
+struct BeaNativeLineageBatchV1<'a> {
+    version: u16,
+    family: &'static str,
+    provider_method: &'static str,
+    dataset: &'a str,
+    parameters: Vec<BeaNativeParameterV1<'a>>,
+    metadata_generation: [u8; 32],
+    dimensions: Vec<BeaNativeDimensionV1<'a>>,
+    result_attributes: &'a std::collections::BTreeMap<String, String>,
+    notes: Vec<BeaNativeNoteV1<'a>>,
+    result_note_references: &'a [String],
+    production_time_raw: Option<&'a str>,
+    production_time_unix_nanos: Option<i64>,
+    expected_rows: Option<u64>,
+    returned_rows: u64,
+    missing_rows: Option<u64>,
+    completeness: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BeaNativeParameterV1<'a> {
+    name: &'a str,
+    value: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BeaNativeDimensionV1<'a> {
+    name: &'a str,
+    ordinal: Option<u16>,
+    data_type: &'static str,
+    is_value: bool,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
 struct BeaNativeNoteV1<'a> {
     reference: &'a str,
     text: &'a str,
@@ -466,9 +503,14 @@ fn native_lineage(
     sealed_acquisition: &crate::BeaSealedAcquisitionReceipt,
     canonical_batch: &ExtractionBatch,
 ) -> Result<ProviderNativeLineageBatch, BeaPublicationError> {
-    let page = sealed_acquisition.evidence().data().page();
+    let data = sealed_acquisition.evidence().data();
+    let request = data.request();
+    let page = data.page();
     if page.observations().len() != canonical_batch.records().len()
         || page.observations().is_empty()
+        || request.query().method() != crate::BeaMethod::GetData
+        || request.query().dataset() != Some(page.dataset())
+        || request.query().metadata_generation() != Some(page.metadata_generation())
     {
         return Err(BeaPublicationError::InvalidEvidence);
     }
@@ -477,6 +519,82 @@ fn native_lineage(
         canonical_batch,
     )
     .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    let mut parameters = Vec::new();
+    parameters
+        .try_reserve_exact(request.query().supplied_parameters().len())
+        .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    parameters.extend(
+        request
+            .query()
+            .supplied_parameters()
+            .iter()
+            .map(|(name, value)| BeaNativeParameterV1 {
+                name: name.as_str(),
+                value,
+            }),
+    );
+    let mut dimensions = Vec::new();
+    dimensions
+        .try_reserve_exact(page.dimensions().len())
+        .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    dimensions.extend(
+        page.dimensions()
+            .iter()
+            .map(|dimension| BeaNativeDimensionV1 {
+                name: dimension.name(),
+                ordinal: dimension.ordinal(),
+                data_type: match dimension.data_type() {
+                    crate::BeaDataType::String => "string",
+                    crate::BeaDataType::Numeric => "numeric",
+                },
+                is_value: dimension.is_value(),
+            }),
+    );
+    let mut response_notes = Vec::new();
+    response_notes
+        .try_reserve_exact(page.notes().len())
+        .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    response_notes.extend(page.notes().iter().map(|note| BeaNativeNoteV1 {
+        reference: note.reference(),
+        text: note.text(),
+    }));
+    native_lineage
+        .try_set_batch_sidecar(&BeaNativeLineageBatchV1 {
+            version: 1,
+            family: "bea.dataset-observations",
+            provider_method: request.query().method().as_str(),
+            dataset: page.dataset().as_str(),
+            parameters,
+            metadata_generation: page.metadata_generation().digest(),
+            dimensions,
+            result_attributes: page.result_attributes(),
+            notes: response_notes,
+            result_note_references: page.result_note_references(),
+            production_time_raw: page.production_time().map(crate::BeaProductionTime::raw),
+            production_time_unix_nanos: page
+                .production_time()
+                .map(|production| production.timestamp().unix_nanos()),
+            expected_rows: page
+                .receipt()
+                .requested_rows()
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| BeaPublicationError::InvalidEvidence)?,
+            returned_rows: u64::try_from(page.receipt().returned_rows())
+                .map_err(|_| BeaPublicationError::InvalidEvidence)?,
+            missing_rows: page
+                .receipt()
+                .missing_rows()
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| BeaPublicationError::InvalidEvidence)?,
+            completeness: match page.receipt().completeness() {
+                crate::BeaCompleteness::Complete => "complete",
+                crate::BeaCompleteness::Partial => "partial",
+                crate::BeaCompleteness::ExpectedCountUnknown => "expected_count_unknown",
+            },
+        })
+        .map_err(|_| BeaPublicationError::InvalidEvidence)?;
     for observation in page.observations() {
         let (value, raw_value, missing, missing_marker) = match observation.value() {
             crate::BeaObservationValue::Observed { value, raw } => {

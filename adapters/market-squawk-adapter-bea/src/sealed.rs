@@ -4,7 +4,7 @@ use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
 };
 use market_squawk_sources::{
-    ExtractionBatch, ProviderCaptureSealExpectation, ProviderCaptureSetReceipt,
+    DiscoveryBatch, ExtractionBatch, ProviderCaptureSealExpectation, ProviderCaptureSetReceipt,
     ProviderCaptureTerminalDisposition, ProviderWholeCaptureToken, RejoinedProviderCapture,
     SealedProviderCaptureMaterial, SealedProviderCaptureSetReceipt,
 };
@@ -166,35 +166,45 @@ impl BeaSealedAcquisitionReceipt {
     }
 }
 
-/// Opaque source output waiting for the shared sealer's physical receipt.
-#[derive(Debug)]
-pub struct BeaPendingExtractionSeal {
-    source_batch: ExtractionBatch,
+/// Opaque captured discovery waiting for the shared sealer's physical receipt.
+pub struct BeaPendingDiscoverySeal {
+    discovery_batch: DiscoveryBatch,
     evidence: BeaDatasetEvidence,
-    source_batch_digest: EvidenceDigest,
+    doctor_admission_digest: EvidenceDigest,
+    doctor_sealed_graph_digest: EvidenceDigest,
     expectation: ProviderCaptureSealExpectation,
 }
 
-impl BeaPendingExtractionSeal {
+impl std::fmt::Debug for BeaPendingDiscoverySeal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BeaPendingDiscoverySeal")
+            .finish_non_exhaustive()
+    }
+}
+
+impl BeaPendingDiscoverySeal {
     pub(crate) fn from_source(
-        source_batch: ExtractionBatch,
+        discovery_batch: DiscoveryBatch,
         evidence: BeaDatasetEvidence,
-        source_batch_digest: EvidenceDigest,
+        doctor_admission_digest: EvidenceDigest,
+        doctor_sealed_graph_digest: EvidenceDigest,
         expectation: ProviderCaptureSealExpectation,
     ) -> Self {
         Self {
-            source_batch,
+            discovery_batch,
             evidence,
-            source_batch_digest,
+            doctor_admission_digest,
+            doctor_sealed_graph_digest,
             expectation,
         }
     }
 
-    /// Consumes only the opaque physical result split from this exact source output.
+    /// Consumes only the opaque physical result split from this exact discovery graph.
     pub fn try_rejoin(
         self,
         sealed: SealedProviderCaptureMaterial,
-    ) -> Result<BeaSealedExtractionOutput, BeaSealedAcquisitionError> {
+    ) -> Result<BeaSealedDiscoveryAdmission, BeaSealedAcquisitionError> {
         let capture_token = match self
             .expectation
             .try_rejoin(sealed)
@@ -207,21 +217,61 @@ impl BeaPendingExtractionSeal {
         };
         let sealed_acquisition =
             BeaSealedAcquisitionReceipt::try_from_token(self.evidence, &capture_token)?;
-        Ok(BeaSealedExtractionOutput {
-            source_batch: self.source_batch,
-            source_batch_digest: self.source_batch_digest,
+        Ok(BeaSealedDiscoveryAdmission {
+            discovery_batch: self.discovery_batch,
             sealed_acquisition,
             capture_token,
+            doctor_admission_digest: self.doctor_admission_digest,
+            doctor_sealed_graph_digest: self.doctor_sealed_graph_digest,
         })
     }
 }
 
-/// Original source extraction output joined to the physical acquisition sidecar.
+/// Discovery object and exact metadata/data graph admitted by one matching physical seal.
+///
+/// The source object cannot be observed before this value exists. The value is intentionally
+/// non-cloneable and non-serializable because it retains the one-use whole-capture token needed by
+/// the final provider publication binding.
+#[derive(Debug)]
+pub struct BeaSealedDiscoveryAdmission {
+    discovery_batch: DiscoveryBatch,
+    sealed_acquisition: BeaSealedAcquisitionReceipt,
+    capture_token: ProviderWholeCaptureToken,
+    doctor_admission_digest: EvidenceDigest,
+    doctor_sealed_graph_digest: EvidenceDigest,
+}
+
+impl BeaSealedDiscoveryAdmission {
+    /// Returns the exact discovery batch only after its influencing graph has been sealed.
+    pub const fn batch(&self) -> &DiscoveryBatch {
+        &self.discovery_batch
+    }
+
+    pub(crate) fn into_extraction_parts(
+        self,
+    ) -> (
+        DiscoveryBatch,
+        BeaSealedAcquisitionReceipt,
+        ProviderWholeCaptureToken,
+        EvidenceDigest,
+        EvidenceDigest,
+    ) {
+        (
+            self.discovery_batch,
+            self.sealed_acquisition,
+            self.capture_token,
+            self.doctor_admission_digest,
+            self.doctor_sealed_graph_digest,
+        )
+    }
+}
+
+/// Original sealed discovery transformed into its exact source extraction output.
 ///
 /// The source batch retains provider-content identity and its original request bounds. The sealed
 /// acquisition separately retains the complete native dictionaries and shared physical receipt.
 #[derive(Debug)]
-pub struct BeaSealedExtractionOutput {
+pub(crate) struct BeaSealedExtractionOutput {
     source_batch: ExtractionBatch,
     source_batch_digest: EvidenceDigest,
     sealed_acquisition: BeaSealedAcquisitionReceipt,
@@ -229,14 +279,18 @@ pub struct BeaSealedExtractionOutput {
 }
 
 impl BeaSealedExtractionOutput {
-    /// Returns the original source-produced extraction batch.
-    pub const fn source_batch(&self) -> &ExtractionBatch {
-        &self.source_batch
-    }
-
-    /// Returns native dictionaries and the physical acquisition sidecar.
-    pub const fn sealed_acquisition(&self) -> &BeaSealedAcquisitionReceipt {
-        &self.sealed_acquisition
+    pub(crate) fn from_sealed_discovery(
+        source_batch: ExtractionBatch,
+        source_batch_digest: EvidenceDigest,
+        sealed_acquisition: BeaSealedAcquisitionReceipt,
+        capture_token: ProviderWholeCaptureToken,
+    ) -> Self {
+        Self {
+            source_batch,
+            source_batch_digest,
+            sealed_acquisition,
+            capture_token,
+        }
     }
 
     pub(crate) fn into_publication_parts(

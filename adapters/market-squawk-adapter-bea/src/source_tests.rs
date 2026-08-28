@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
+use std::fmt::Write as _;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,8 +32,8 @@ use crate::source::bea_api_endpoint_rule;
 use crate::transport::{BeaHttpResponse, BeaSensitiveHeader, BeaTransport, system_timestamp};
 use crate::{
     BeaAuthorizedRequest, BeaDatasetContract, BeaDatasetIdentity, BeaObservationValue,
-    BeaParseLimits, BeaPublicationCandidate, BeaRequiredSharedSettlement, BeaSource,
-    BeaSourceConfig, BeaSourceError, BeaUserId,
+    BeaParseLimits, BeaRequiredSharedSettlement, BeaSource, BeaSourceConfig, BeaSourceError,
+    BeaUserId,
 };
 
 const USER_ID: &str = "11111111-2222-3333-4444-555555555555";
@@ -141,6 +142,26 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     let config = BeaSourceConfig::try_new(vec![contract], BeaParseLimits::production_defaults())?;
     let upstream_responses = responses()?;
     let user_id = BeaUserId::try_new(USER_ID.to_owned())?;
+    let mut escaped_user_id = String::new();
+    for byte in USER_ID.bytes() {
+        write!(&mut escaped_user_id, "\\u{byte:04x}")?;
+    }
+    let malformed = format!(
+        r#"{{"BEAAPI":{{"Request":{{"RequestParam":[{{"ParameterName":"USERID","ParameterValue":"{USER_ID}"}},{{"ParameterName":"METHOD","ParameterValue":"GETDATASETLIST"}},{{"ParameterName":"RESULTFORMAT","ParameterValue":"JSON"}}]}},"Results":{{"Dataset":[]}}}},"{escaped_user_id}":true}}"#
+    );
+    let malformed_request = crate::BeaQuery::dataset_list()?.single_page(None)?;
+    let malformed_error = match crate::parse_metadata_page(
+        malformed.as_bytes(),
+        &malformed_request,
+        &user_id,
+        BeaParseLimits::production_defaults(),
+    ) {
+        Ok(_) => return Err("credential-bearing malformed fields must fail closed".into()),
+        Err(error) => error,
+    };
+    assert!(matches!(malformed_error, crate::BeaError::InvalidJson));
+    assert!(!format!("{malformed_error}").contains(USER_ID));
+    assert!(!format!("{malformed_error:?}").contains(USER_ID));
     let malicious_header = format!("{}?UserID={USER_ID}", crate::BEA_API_ENDPOINT);
     let mut malicious_response = BeaHttpResponse {
         status: 200,
@@ -169,12 +190,6 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             .is_some_and(BeaSensitiveHeader::is_zeroized)
     );
     let mut scripted_responses = upstream_responses.clone();
-    scripted_responses.push(
-        upstream_responses
-            .last()
-            .ok_or("missing discovery data response")?
-            .clone(),
-    );
     scripted_responses.extend(upstream_responses.iter().cloned());
     let transport = Arc::new(ScriptedTransport {
         responses: Mutex::new(VecDeque::from(scripted_responses)),
@@ -305,7 +320,9 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             CancellationToken::new(),
         )
         .await?;
-    let discovered_object = discovery
+    let (pending_discovery, discovery_seal_request) = discovery.into_sealing_parts()?;
+    let sealed_discovery = pending_discovery.try_rejoin(discovery_seal_request.seal(&store)?)?;
+    let discovered_object = sealed_discovery
         .batch()
         .objects()
         .first()
@@ -317,30 +334,17 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
         NonZeroU64::new(2 * 1024 * 1024).ok_or("extraction byte bound")?,
         deadline,
     )?;
-    let expected_original_request = extraction_request.clone();
-    let extraction = source
-        .extract_captured(
-            authority.clone(),
-            extraction_request,
-            CancellationToken::new(),
-        )
-        .await?;
-    let (pending_seal, seal_request) = extraction.into_pending_seal()?;
-    let sealed_output = pending_seal.try_rejoin(seal_request.seal(&store)?)?;
-    let source_batch = sealed_output.source_batch();
-    assert_eq!(source_batch.request(), &expected_original_request);
-    let provider_content_evidence = source_batch.request().object().evidence().content_digest();
-    let native_record = source_batch
-        .records()
-        .first()
-        .ok_or("missing native source record")?;
-    let native_revision = native_record.revision().clone();
-    assert!(native_revision.as_str().starts_with("bea-version:"));
-    let native_payload: serde_json::Value = serde_json::from_slice(native_record.payload())?;
-    assert_eq!(native_payload["frequency"], "quarterly");
-    assert_eq!(native_payload["missing"], "suppressed_regional");
-    let candidate =
-        BeaPublicationCandidate::try_new(source.source_binding(), &admission, sealed_output)?;
+    let expected_object_id = extraction_request.object().object_id().clone();
+    let discovery_capture_identity = extraction_request.object().capture_identity();
+    let requests_before_extraction = source.telemetry().requests();
+    assert_eq!(requests_before_extraction, 8);
+    let candidate = source.extract_sealed_discovery(
+        authority.clone(),
+        extraction_request,
+        sealed_discovery,
+        CancellationToken::new(),
+    )?;
+    assert_eq!(source.telemetry().requests(), requests_before_extraction);
     assert!(
         candidate.observations()[0]
             .observation()
@@ -349,6 +353,35 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             .is_some_and(|missing| missing.marker().as_str() == "bea-regional-suppression-l")
     );
     let handoff = candidate.into_shared_publication_parts();
+    let source_batch = handoff.batch();
+    assert_eq!(
+        source_batch.request().object().object_id(),
+        &expected_object_id
+    );
+    assert_ne!(
+        source_batch.request().object().capture_identity(),
+        discovery_capture_identity
+    );
+    let provider_content_evidence = source_batch.request().object().evidence().content_digest();
+    let native_sidecar: serde_json::Value = serde_json::from_slice(
+        handoff
+            .native_lineage()
+            .batch_sidecar()
+            .ok_or("missing BEA native batch sidecar")?
+            .semantic_payload(),
+    )?;
+    assert_eq!(native_sidecar["family"], "bea.dataset-observations");
+    assert_eq!(native_sidecar["dataset"], "Regional");
+    assert_eq!(native_sidecar["provider_method"], "GetData");
+    assert_eq!(native_sidecar["parameters"][0]["name"], "TableName");
+    assert_eq!(native_sidecar["parameters"][0]["value"], "SAINC1");
+    assert_eq!(
+        native_sidecar["dimensions"].as_array().map(Vec::len),
+        Some(4)
+    );
+    assert_eq!(native_sidecar["completeness"], "complete");
+    assert_eq!(native_sidecar["returned_rows"], 1);
+    assert!(native_sidecar["production_time_unix_nanos"].is_i64());
     let native_semantics: serde_json::Value =
         serde_json::from_slice(handoff.native_lineage().rows()[0].semantic_payload())?;
     assert_eq!(native_semantics["dataset"], "Regional");
@@ -374,10 +407,18 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             .content_digest(),
         provider_content_evidence
     );
-    assert_eq!(handoff.batch().records()[0].revision(), &native_revision);
     let (coordinates, revision_plan, sealed_capture_binding) = handoff.into_parts();
     let batch = sealed_capture_binding.batch();
     let native_lineage = sealed_capture_binding.native_lineage();
+    assert_eq!(
+        sealed_capture_binding
+            .persisted_segment_receipt(0)
+            .ok_or("missing sealed BEA discovery graph")?
+            .capture()
+            .request_graph_components()
+            .len(),
+        4
+    );
     assert_eq!(
         coordinates.acquisition_capture_receipt_digest(),
         sealed_capture_binding.sealed_capture_receipt_digest()

@@ -50,8 +50,11 @@ pub enum BeaError {
     #[error("BEA response allocation could not be admitted")]
     Allocation,
     /// The response is not valid JSON.
-    #[error("invalid BEA JSON response: {0}")]
-    InvalidJson(#[from] serde_json::Error),
+    ///
+    /// Provider parser detail is deliberately not retained because a malformed field name or
+    /// value can contain the query credential echoed by the upstream response.
+    #[error("invalid BEA JSON response")]
+    InvalidJson,
     /// The response envelope, method result, or dataset-driven dimension contract is invalid.
     #[error("invalid BEA protocol field: {0}")]
     InvalidField(&'static str),

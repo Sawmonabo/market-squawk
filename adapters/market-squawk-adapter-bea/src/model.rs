@@ -117,17 +117,6 @@ impl BeaMetadataGeneration {
     pub const fn digest(self) -> [u8; 32] {
         self.0
     }
-
-    pub(crate) fn try_from_admitted_digest(
-        digest: market_squawk_domain::EvidenceDigest,
-    ) -> Result<Self, BeaError> {
-        if digest.algorithm() != market_squawk_domain::DigestAlgorithm::Sha256
-            || digest.bytes() == [0; 32]
-        {
-            return Err(BeaError::InvalidRequest);
-        }
-        Ok(Self(digest.bytes()))
-    }
 }
 
 /// One dataset advertised by BEA metadata discovery.
