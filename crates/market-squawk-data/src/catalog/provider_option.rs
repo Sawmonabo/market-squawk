@@ -1,7 +1,7 @@
 //! Durable value-only evidence for sealed provider option-market publications.
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, InstrumentId, Timestamp};
-use market_squawk_platform::SealedResearchJournalSegmentClaim;
+use market_squawk_platform::{SealedResearchJournalSegmentClaim, SealedResearchRawClaim};
 use market_squawk_sources::{
     MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
     MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES, MAX_PROVIDER_OPTION_MARKET_BATCH_ROWS,
@@ -220,9 +220,9 @@ impl PersistedProviderOptionMarketBindingEvidence {
         {
             return Err(CatalogError::ProviderEventMismatch);
         }
-        let claim_json = serde_json::to_vec(&self.physical_claim)?;
+        let claim_json = journal_claim_json(&self.physical_claim)?;
         if claim_json.len() > MAX_OPTION_CLAIM_JSON_BYTES
-            || raw_claim_digest(&claim_json) != self.raw_claim_digest
+            || raw_claim_digest(claim_json.as_bytes()) != self.raw_claim_digest
         {
             return Err(CatalogError::ProviderEventMismatch);
         }
@@ -328,7 +328,7 @@ impl PreparedProviderOptionMarketBinding {
             });
         }
         let claim = binding.persisted_receipt().segment().claim().clone();
-        let claim_json = serde_json::to_vec(&claim)?;
+        let claim_json = journal_claim_json(&claim)?;
         if claim_json.len() > MAX_OPTION_CLAIM_JSON_BYTES {
             return Err(CatalogError::ResultByteLimitExceeded);
         }
@@ -365,7 +365,7 @@ impl PreparedProviderOptionMarketBinding {
             },
             row_mapping_digest: option_row_mapping_digest(&rows)?,
             rows,
-            raw_claim_digest: raw_claim_digest(&claim_json),
+            raw_claim_digest: raw_claim_digest(claim_json.as_bytes()),
             physical_claim: claim,
         };
         evidence.verify_integrity()?;
@@ -604,6 +604,14 @@ fn load_provider_option_market_binding_evidence(
         Vec<u8>,
         Vec<u8>,
         Vec<u8>,
+        String,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        i64,
+        Option<i64>,
+        i64,
+        String,
     )> = connection
         .query_row(
             "SELECT binding.capture_observation_digest, binding.sealed_capture_receipt_digest,
@@ -616,7 +624,10 @@ fn load_provider_option_market_binding_evidence(
                     binding.row_mapping_digest, native.implementation, native.schema_version,
                     capture.capture_json, native.schema_fingerprint, native.row_count,
                     native.batch_digest, native.batch_sidecar_payload,
-                    native.batch_sidecar_digest, object.raw_claim_digest
+                    native.batch_sidecar_digest, object.raw_claim_digest,
+                    object.raw_claim_kind, object.physical_receipt_digest,
+                    object.relative_reference, object.content_digest, object.size_bytes,
+                    object.integrity_chunk_bytes, object.unit_count, object.raw_claim_json
              FROM provider_option_market_bindings AS binding
              JOIN provider_option_market_binding_native_lineage AS native
                USING (option_binding_digest)
@@ -659,6 +670,14 @@ fn load_provider_option_market_binding_evidence(
                     row.get(24)?,
                     row.get(25)?,
                     row.get(26)?,
+                    row.get(27)?,
+                    row.get(28)?,
+                    row.get(29)?,
+                    row.get(30)?,
+                    row.get(31)?,
+                    row.get(32)?,
+                    row.get(33)?,
+                    row.get(34)?,
                 ))
             },
         )
@@ -691,6 +710,14 @@ fn load_provider_option_market_binding_evidence(
         sidecar,
         sidecar_digest,
         raw_claim_digest_bytes,
+        raw_claim_kind,
+        physical_receipt_digest,
+        relative_reference,
+        raw_content_digest,
+        raw_size_bytes,
+        integrity_chunk_bytes,
+        unit_count,
+        claim_json,
     )) = header
     else {
         return Ok(None);
@@ -699,12 +726,25 @@ fn load_provider_option_market_binding_evidence(
     if parse_digest(1, &capture_digest)? != capture.observation_digest() {
         return Err(CatalogError::CorruptCatalog);
     }
-    let claim_json: String = connection.query_row(
-        "SELECT raw_claim_json FROM sealed_raw_objects WHERE raw_claim_digest=?1",
-        [raw_claim_digest_bytes.as_slice()],
-        |row| row.get(0),
-    )?;
-    let physical_claim: SealedResearchJournalSegmentClaim = serde_json::from_str(&claim_json)?;
+    if claim_json.len() > MAX_OPTION_CLAIM_JSON_BYTES
+        || raw_claim_digest(claim_json.as_bytes()) != parse_digest(1, &raw_claim_digest_bytes)?
+    {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let physical_claim = parse_journal_claim(&claim_json)?;
+    if raw_claim_kind != "journal_segment"
+        || journal_claim_json(&physical_claim)? != claim_json
+        || parse_digest(1, &physical_receipt_digest)? != physical_claim.physical_receipt_digest()
+        || relative_reference != physical_claim.relative_reference()
+        || parse_digest(1, &raw_content_digest)? != physical_claim.content_digest()
+        || u64::try_from(raw_size_bytes).map_err(|_| CatalogError::CorruptCatalog)?
+            != physical_claim.size_bytes()
+        || integrity_chunk_bytes.is_some()
+        || usize::try_from(unit_count).map_err(|_| CatalogError::CorruptCatalog)?
+            != physical_claim.frames().len()
+    {
+        return Err(CatalogError::CorruptCatalog);
+    }
     let mut statement = connection.prepare(
         "SELECT canonical_row_ordinal, canonical_row_digest, native_semantic_payload,
                 native_semantic_digest, capture_page_ordinal, physical_frame_ordinal,
@@ -917,6 +957,18 @@ fn parse_disposition(value: &str) -> Result<OptionMarketBatchDisposition, Catalo
 
 fn sha256_evidence(bytes: &[u8]) -> EvidenceDigest {
     EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into())
+}
+
+fn journal_claim_json(claim: &SealedResearchJournalSegmentClaim) -> Result<String, CatalogError> {
+    serde_json::to_string(&SealedResearchRawClaim::JournalSegment(claim.clone()))
+        .map_err(Into::into)
+}
+
+fn parse_journal_claim(json: &str) -> Result<SealedResearchJournalSegmentClaim, CatalogError> {
+    match serde_json::from_str(json)? {
+        SealedResearchRawClaim::JournalSegment(claim) => Ok(claim),
+        SealedResearchRawClaim::LogicalObject(_) => Err(CatalogError::CorruptCatalog),
+    }
 }
 
 fn finalize(digest: Sha256) -> EvidenceDigest {

@@ -186,7 +186,7 @@ impl PersistedProviderLogicalPublicationBinding {
                     role: object.role(),
                     ordinal: object.ordinal(),
                     semantic_identity: object.semantic_identity(),
-                    raw_claim_digest: raw_claim_digest(&claim_json),
+                    raw_claim_digest: raw_claim_digest(claim_json.as_bytes()),
                     claim,
                 })
             })
@@ -204,7 +204,7 @@ impl PersistedProviderLogicalPublicationBinding {
                     item_range: partition.item_range(),
                     schema_identity: partition.schema_identity(),
                     semantic_digest: partition.semantic_digest(),
-                    raw_claim_digest: raw_claim_digest(&claim_json),
+                    raw_claim_digest: raw_claim_digest(claim_json.as_bytes()),
                     claim,
                 })
             })
@@ -253,7 +253,7 @@ impl PersistedProviderLogicalPublicationBinding {
             }
             validate_sha256(object.semantic_identity)?;
             let claim_json = logical_claim_json(&object.claim)?;
-            if raw_claim_digest(&claim_json) != object.raw_claim_digest {
+            if raw_claim_digest(claim_json.as_bytes()) != object.raw_claim_digest {
                 return Err(CatalogError::ProviderLogicalMismatch);
             }
             metadata_bytes = charge_metadata(metadata_bytes, claim_catalog_bytes(&object.claim)?)?;
@@ -572,10 +572,10 @@ fn insert_logical_claim(
     claim: &ResearchObjectClaim,
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
-    let claim_json = serde_json::to_vec(claim)?;
+    let claim_json = logical_claim_json(claim)?;
     if claim_json.is_empty()
         || claim_json.len() > MAX_PROVIDER_LOGICAL_CATALOG_BYTES
-        || raw_claim_digest(&claim_json) != claim_digest
+        || raw_claim_digest(claim_json.as_bytes()) != claim_digest
     {
         return Err(CatalogError::ProviderLogicalMismatch);
     }
@@ -752,7 +752,7 @@ fn load_objects(
             row.get::<_, Vec<u8>>(2)?,
             row.get::<_, Vec<u8>>(3)?,
             row.get::<_, Vec<u8>>(4)?,
-            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, String>(5)?,
         ))
     })?;
     let mut values = Vec::new();
@@ -814,7 +814,7 @@ fn load_partitions(
             row.get::<_, Vec<u8>>(6)?,
             row.get::<_, Vec<u8>>(7)?,
             row.get::<_, Vec<u8>>(8)?,
-            row.get::<_, Vec<u8>>(9)?,
+            row.get::<_, String>(9)?,
         ))
     })?;
     let mut values = Vec::new();
@@ -937,7 +937,7 @@ fn validate_partition_order_and_claims(
         validate_sha256(partition.schema_identity)?;
         validate_sha256(partition.semantic_digest)?;
         let claim_json = logical_claim_json(&partition.claim)?;
-        if raw_claim_digest(&claim_json) != partition.raw_claim_digest
+        if raw_claim_digest(claim_json.as_bytes()) != partition.raw_claim_digest
             || partition.claim.size_bytes() == 0
             || partition_semantic_digest(partition) != partition.semantic_digest
         {
@@ -1134,20 +1134,23 @@ fn charge_metadata(total: usize, bytes: usize) -> Result<usize, CatalogError> {
         .ok_or(CatalogError::ProviderLogicalMismatch)
 }
 
-fn logical_claim_json(claim: &ResearchObjectClaim) -> Result<Vec<u8>, CatalogError> {
-    serde_json::to_vec(&SealedResearchRawClaim::LogicalObject(claim.clone())).map_err(Into::into)
+fn logical_claim_json(claim: &ResearchObjectClaim) -> Result<String, CatalogError> {
+    serde_json::to_string(&SealedResearchRawClaim::LogicalObject(claim.clone())).map_err(Into::into)
 }
 
 fn claim_catalog_bytes(claim: &ResearchObjectClaim) -> Result<usize, CatalogError> {
-    serde_json::to_vec(claim)
-        .map(|encoded| encoded.len())
-        .map_err(Into::into)
+    logical_claim_json(claim).map(|encoded| encoded.len())
 }
 
-fn parse_logical_claim(bytes: &[u8]) -> Result<ResearchObjectClaim, CatalogError> {
-    match serde_json::from_slice(bytes)? {
-        SealedResearchRawClaim::LogicalObject(claim) => Ok(claim),
-        SealedResearchRawClaim::JournalSegment(_) => Err(CatalogError::CorruptCatalog),
+fn parse_logical_claim(json: &str) -> Result<ResearchObjectClaim, CatalogError> {
+    let claim = match serde_json::from_str(json)? {
+        SealedResearchRawClaim::LogicalObject(claim) => claim,
+        SealedResearchRawClaim::JournalSegment(_) => return Err(CatalogError::CorruptCatalog),
+    };
+    if logical_claim_json(&claim)? == json {
+        Ok(claim)
+    } else {
+        Err(CatalogError::CorruptCatalog)
     }
 }
 

@@ -1,7 +1,7 @@
 //! Immutable provider raw observations and their canonical publication bindings.
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
-use market_squawk_platform::SealedResearchJournalSegmentClaim;
+use market_squawk_platform::{SealedResearchJournalSegmentClaim, SealedResearchRawClaim};
 use market_squawk_sources::{
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES,
     ProviderCaptureBindingDigest, ProviderCaptureBindingLayout, ProviderCapturePageReceipt,
@@ -353,13 +353,13 @@ impl PersistedProviderCaptureBindingEvidence {
             .map_err(|_| CatalogError::Allocation)?;
         let mut claim_bytes = 0usize;
         for claim in &self.physical_claims {
-            let claim_json = serde_json::to_vec(&claim.claim)?;
+            let claim_json = journal_claim_json(&claim.claim)?;
             claim_bytes = claim_bytes
                 .checked_add(claim_json.len())
                 .ok_or(CatalogError::CorruptCatalog)?;
             if claim_json.len() > MAX_PROVIDER_CLAIM_JSON_BYTES
                 || claim_bytes > MAX_PROVIDER_CLAIM_JSON_BYTES * MAX_PROVIDER_CAPTURE_SEGMENTS
-                || raw_claim_digest(&claim_json) != claim.raw_claim_digest
+                || raw_claim_digest(claim_json.as_bytes()) != claim.raw_claim_digest
             {
                 return Err(CatalogError::CorruptCatalog);
             }
@@ -433,7 +433,7 @@ impl PreparedProviderCaptureBinding {
             let receipt = binding
                 .persisted_segment_receipt(ordinal)
                 .ok_or(CatalogError::ProviderCaptureMismatch)?;
-            let claim_json = serde_json::to_vec(receipt.segment().claim())?;
+            let claim_json = journal_claim_json(receipt.segment().claim())?;
             claim_bytes = claim_bytes
                 .checked_add(claim_json.len())
                 .ok_or(CatalogError::ProviderCaptureMismatch)?;
@@ -442,7 +442,7 @@ impl PreparedProviderCaptureBinding {
             {
                 return Err(CatalogError::ResultByteLimitExceeded);
             }
-            raw_claim_digests.push(raw_claim_digest(&claim_json));
+            raw_claim_digests.push(raw_claim_digest(claim_json.as_bytes()));
         }
         if binding.persisted_segment_receipt(segment_count).is_some() {
             return Err(CatalogError::ProviderCaptureMismatch);
@@ -615,16 +615,48 @@ impl Catalog {
         claims
             .try_reserve_exact(PROVIDER_CAPTURE_CLAIM_PAGE_ROWS)
             .map_err(|_| CatalogError::Allocation)?;
+        let mut scan_after = after;
+        while claims.len() < PROVIDER_CAPTURE_CLAIM_PAGE_ROWS {
+            let page = self.authoritative_provider_raw_claim_page(scan_after)?;
+            if page.is_empty() {
+                break;
+            }
+            let page_was_full = page.len() == PROVIDER_CAPTURE_CLAIM_PAGE_ROWS;
+            for (digest, claim) in page {
+                scan_after = Some(digest);
+                if let SealedResearchRawClaim::JournalSegment(claim) = claim {
+                    claims.push((digest, claim));
+                    if claims.len() == PROVIDER_CAPTURE_CLAIM_PAGE_ROWS {
+                        break;
+                    }
+                }
+            }
+            if !page_was_full {
+                break;
+            }
+        }
+        Ok(claims)
+    }
+
+    /// Pages every authoritative sealed raw claim across journal and logical-object formats.
+    pub(crate) fn authoritative_provider_raw_claim_page(
+        &self,
+        after: Option<EvidenceDigest>,
+    ) -> Result<Vec<(EvidenceDigest, SealedResearchRawClaim)>, CatalogError> {
+        let mut claims = Vec::new();
+        claims
+            .try_reserve_exact(PROVIDER_CAPTURE_CLAIM_PAGE_ROWS)
+            .map_err(|_| CatalogError::Allocation)?;
         let limit = to_i64(PROVIDER_CAPTURE_CLAIM_PAGE_ROWS)?;
         if let Some(after) = after {
             let mut statement = self.connection.prepare(
-                "SELECT raw_claim_digest, raw_claim_json
+                "SELECT raw_claim_digest, raw_claim_kind, raw_claim_json
                  FROM sealed_raw_objects
-                 WHERE raw_claim_digest > ?1
-                   AND (EXISTS (
-                     SELECT 1 FROM provider_capture_binding_objects AS object
-                     WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
-                       AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                 WHERE raw_claim_digest > ?1 AND (
+                    EXISTS (
+                      SELECT 1 FROM provider_capture_binding_objects AS object
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                     OR EXISTS (
                       SELECT 1 FROM provider_event_microbatch_objects AS object
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
@@ -635,7 +667,7 @@ impl Catalog {
                       JOIN provider_response_market_event_bindings AS binding
                         ON binding.capture_observation_digest=object.capture_observation_digest
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
-                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest))
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                     OR EXISTS (
                       SELECT 1
                       FROM provider_raw_observation_objects AS object
@@ -643,19 +675,26 @@ impl Catalog {
                         ON binding.capture_observation_digest=object.capture_observation_digest
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
-                 ORDER BY raw_claim_digest
-                 LIMIT ?2",
+                    OR EXISTS (
+                      SELECT 1 FROM provider_logical_publication_objects AS object
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                    OR EXISTS (
+                      SELECT 1 FROM provider_logical_publication_partitions AS partition
+                      WHERE partition.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND partition.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                 ) ORDER BY raw_claim_digest LIMIT ?2",
             )?;
             let mut rows = statement.query(params![after.bytes().as_slice(), limit])?;
-            append_authoritative_claim_rows(&mut rows, &mut claims)?;
+            append_authoritative_raw_claim_rows(&mut rows, &mut claims)?;
         } else {
             let mut statement = self.connection.prepare(
-                "SELECT raw_claim_digest, raw_claim_json
+                "SELECT raw_claim_digest, raw_claim_kind, raw_claim_json
                  FROM sealed_raw_objects
                  WHERE EXISTS (
-                     SELECT 1 FROM provider_capture_binding_objects AS object
-                     WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
-                       AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                      SELECT 1 FROM provider_capture_binding_objects AS object
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                     OR EXISTS (
                       SELECT 1 FROM provider_event_microbatch_objects AS object
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
@@ -674,11 +713,18 @@ impl Catalog {
                         ON binding.capture_observation_digest=object.capture_observation_digest
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
-                 ORDER BY raw_claim_digest
-                 LIMIT ?1",
+                    OR EXISTS (
+                      SELECT 1 FROM provider_logical_publication_objects AS object
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                    OR EXISTS (
+                      SELECT 1 FROM provider_logical_publication_partitions AS partition
+                      WHERE partition.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND partition.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                 ORDER BY raw_claim_digest LIMIT ?1",
             )?;
             let mut rows = statement.query([limit])?;
-            append_authoritative_claim_rows(&mut rows, &mut claims)?;
+            append_authoritative_raw_claim_rows(&mut rows, &mut claims)?;
         }
         Ok(claims)
     }
@@ -951,20 +997,22 @@ fn require_physical_claim_capacity(
     Ok(())
 }
 
-fn append_authoritative_claim_rows(
+fn append_authoritative_raw_claim_rows(
     rows: &mut rusqlite::Rows<'_>,
-    claims: &mut Vec<(EvidenceDigest, SealedResearchJournalSegmentClaim)>,
+    claims: &mut Vec<(EvidenceDigest, SealedResearchRawClaim)>,
 ) -> Result<(), CatalogError> {
     while let Some(row) = rows.next()? {
         let digest = parse_digest(1, &row.get::<_, Vec<u8>>(0)?)?;
-        let json: String = row.get(1)?;
+        let kind: String = row.get(1)?;
+        let json: String = row.get(2)?;
         if json.len() > MAX_PROVIDER_CLAIM_JSON_BYTES {
             return Err(CatalogError::ResultByteLimitExceeded);
         }
         if raw_claim_digest(json.as_bytes()) != digest {
             return Err(CatalogError::CorruptCatalog);
         }
-        claims.push((digest, serde_json::from_str(&json)?));
+        let claim = parse_raw_claim(&kind, &json)?;
+        claims.push((digest, claim));
     }
     Ok(())
 }
@@ -1011,7 +1059,7 @@ fn insert_raw_observation(
     }
     for (segment_ordinal, physical) in evidence.physical_claims.iter().enumerate() {
         let claim = &physical.claim;
-        let claim_json = serde_json::to_string(claim)?;
+        let claim_json = journal_claim_json(claim)?;
         if claim_json.len() > MAX_PROVIDER_CLAIM_JSON_BYTES {
             return Err(CatalogError::ProviderCaptureMismatch);
         }
@@ -1021,9 +1069,10 @@ fn insert_raw_observation(
         }
         connection.execute(
             "INSERT OR IGNORE INTO sealed_raw_objects
-             (raw_claim_digest, physical_receipt_digest, relative_reference,
-              content_digest, size_bytes, frame_count, raw_claim_json, recorded_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (raw_claim_digest, raw_claim_kind, physical_receipt_digest, relative_reference,
+              content_digest, size_bytes, integrity_chunk_bytes, unit_count, raw_claim_json,
+              recorded_at_ns)
+             VALUES (?1, 'journal_segment', ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
             params![
                 digest_bytes(claim_digest),
                 digest_bytes(claim.physical_receipt_digest()),
@@ -1321,6 +1370,7 @@ fn load_provider_capture_binding_evidence(
          JOIN sealed_raw_objects AS object
            ON object.raw_claim_digest=edge.raw_claim_digest
           AND object.physical_receipt_digest=edge.physical_receipt_digest
+          AND object.raw_claim_kind='journal_segment'
          WHERE selected.binding_digest=?1 ORDER BY selected.input_ordinal",
     )?;
     let mut claim_rows = statement.query([digest_bytes(binding_digest)])?;
@@ -1345,7 +1395,7 @@ fn load_provider_capture_binding_evidence(
             capture_content_digest: parse_digest(1, &content)?,
             capture_observation_digest: parse_digest(1, &observation)?,
             sealed_capture_receipt_digest: parse_digest(1, &receipt)?,
-            claim: serde_json::from_str(&json)?,
+            claim: parse_journal_claim(&json)?,
         });
     }
     let evidence = PersistedProviderCaptureBindingEvidence {
@@ -1476,6 +1526,33 @@ pub(super) fn raw_claim_digest(json: &[u8]) -> EvidenceDigest {
     hash.update((json.len() as u64).to_be_bytes());
     hash.update(json);
     EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn journal_claim_json(claim: &SealedResearchJournalSegmentClaim) -> Result<String, CatalogError> {
+    serde_json::to_string(&SealedResearchRawClaim::JournalSegment(claim.clone()))
+        .map_err(Into::into)
+}
+
+fn parse_journal_claim(json: &str) -> Result<SealedResearchJournalSegmentClaim, CatalogError> {
+    match parse_raw_claim("journal_segment", json)? {
+        SealedResearchRawClaim::JournalSegment(claim) => Ok(claim),
+        SealedResearchRawClaim::LogicalObject(_) => Err(CatalogError::CorruptCatalog),
+    }
+}
+
+fn parse_raw_claim(kind: &str, json: &str) -> Result<SealedResearchRawClaim, CatalogError> {
+    let claim: SealedResearchRawClaim = serde_json::from_str(json)?;
+    if serde_json::to_string(&claim)? == json
+        && matches!(
+            (kind, &claim),
+            ("journal_segment", SealedResearchRawClaim::JournalSegment(_))
+                | ("logical_object", SealedResearchRawClaim::LogicalObject(_))
+        )
+    {
+        Ok(claim)
+    } else {
+        Err(CatalogError::CorruptCatalog)
+    }
 }
 
 fn hash_field(hash: &mut Sha256, value: &[u8]) -> Result<(), CatalogError> {

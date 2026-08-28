@@ -487,6 +487,9 @@ CREATE TABLE sealed_raw_objects (
     raw_claim_digest BLOB PRIMARY KEY CHECK (
         length(raw_claim_digest) = 32 AND raw_claim_digest <> zeroblob(32)
     ),
+    raw_claim_kind TEXT NOT NULL CHECK (
+        raw_claim_kind IN ('journal_segment', 'logical_object')
+    ),
     physical_receipt_digest BLOB NOT NULL CHECK (
         length(physical_receipt_digest) = 32
         AND physical_receipt_digest <> zeroblob(32)
@@ -497,14 +500,28 @@ CREATE TABLE sealed_raw_objects (
     content_digest BLOB NOT NULL CHECK (
         length(content_digest) = 32 AND content_digest <> zeroblob(32)
     ),
-    size_bytes INTEGER NOT NULL CHECK (size_bytes BETWEEN 1 AND 536870912),
-    frame_count INTEGER NOT NULL CHECK (frame_count BETWEEN 1 AND 64),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes BETWEEN 1 AND 68719476736),
+    integrity_chunk_bytes INTEGER CHECK (
+        integrity_chunk_bytes IS NULL
+        OR integrity_chunk_bytes BETWEEN 1 AND 16777216
+    ),
+    unit_count INTEGER NOT NULL CHECK (unit_count BETWEEN 1 AND 4096),
     raw_claim_json TEXT NOT NULL CHECK (
         length(CAST(raw_claim_json AS BLOB)) BETWEEN 2 AND 2097152
         AND json_valid(raw_claim_json)
     ),
     recorded_at_ns INTEGER NOT NULL,
-    UNIQUE (raw_claim_digest, physical_receipt_digest)
+    UNIQUE (raw_claim_digest, physical_receipt_digest),
+    CHECK (
+        (raw_claim_kind = 'journal_segment'
+            AND size_bytes <= 536870912
+            AND integrity_chunk_bytes IS NULL
+            AND unit_count <= 64)
+        OR (raw_claim_kind = 'logical_object'
+            AND integrity_chunk_bytes IS NOT NULL
+            AND size_bytes <= unit_count * integrity_chunk_bytes
+            AND size_bytes > (unit_count - 1) * integrity_chunk_bytes)
+    )
 ) STRICT, WITHOUT ROWID;
 
 CREATE TRIGGER sealed_raw_objects_recovery_capacity_insert
@@ -1273,6 +1290,189 @@ BEGIN
     SELECT RAISE(ABORT, 'composite response-event binding is invalid');
 END;
 
+-- Large provider surfaces retain one common logical-object graph. These tables bind the exact
+-- terminal receipt, ordered raw objects, evidence partitions, and canonical partition
+-- expectations without introducing a provider-specific or second physical raw-object store.
+CREATE TABLE provider_logical_publication_bindings (
+    binding_digest BLOB PRIMARY KEY CHECK (
+        length(binding_digest) = 32 AND binding_digest <> zeroblob(32)
+    ),
+    binding_format_version INTEGER NOT NULL CHECK (binding_format_version = 1),
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    terminal_receipt_digest BLOB NOT NULL UNIQUE CHECK (
+        length(terminal_receipt_digest) = 32
+        AND terminal_receipt_digest <> zeroblob(32)
+    ),
+    terminal_json BLOB NOT NULL CHECK (
+        length(terminal_json) BETWEEN 2 AND 2097152
+        AND json_valid(terminal_json)
+    ),
+    required_family_count INTEGER NOT NULL CHECK (
+        required_family_count BETWEEN 1 AND 6
+    ),
+    object_count INTEGER NOT NULL CHECK (object_count BETWEEN 1 AND 64),
+    partition_count INTEGER NOT NULL CHECK (partition_count BETWEEN 1 AND 4096),
+    canonical_partition_count INTEGER NOT NULL CHECK (
+        canonical_partition_count BETWEEN 0 AND 1024
+    ),
+    recorded_at_ns INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_logical_publication_required_families (
+    binding_digest BLOB NOT NULL
+        REFERENCES provider_logical_publication_bindings(binding_digest),
+    family_ordinal INTEGER NOT NULL CHECK (family_ordinal BETWEEN 0 AND 5),
+    family TEXT NOT NULL CHECK (
+        family IN (
+            'decoded_event', 'provider_native', 'canonical_row_map',
+            'resolver_assertion', 'resolver_outcome', 'resolver_conflict'
+        )
+    ),
+    PRIMARY KEY (binding_digest, family_ordinal),
+    UNIQUE (binding_digest, family),
+    UNIQUE (binding_digest, family_ordinal, family)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_logical_publication_objects (
+    binding_digest BLOB NOT NULL
+        REFERENCES provider_logical_publication_bindings(binding_digest),
+    object_ordinal INTEGER NOT NULL CHECK (object_ordinal BETWEEN 0 AND 63),
+    object_role TEXT NOT NULL CHECK (
+        object_role IN (
+            'catalog', 'provider_payload', 'expanded_payload', 'provider_component'
+        )
+    ),
+    semantic_identity BLOB NOT NULL CHECK (
+        length(semantic_identity) = 32 AND semantic_identity <> zeroblob(32)
+    ),
+    raw_claim_digest BLOB NOT NULL REFERENCES sealed_raw_objects(raw_claim_digest),
+    physical_receipt_digest BLOB NOT NULL CHECK (
+        length(physical_receipt_digest) = 32
+        AND physical_receipt_digest <> zeroblob(32)
+    ),
+    PRIMARY KEY (binding_digest, object_ordinal),
+    UNIQUE (binding_digest, raw_claim_digest, physical_receipt_digest),
+    FOREIGN KEY (raw_claim_digest, physical_receipt_digest)
+        REFERENCES sealed_raw_objects(raw_claim_digest, physical_receipt_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_logical_publication_partitions (
+    binding_digest BLOB NOT NULL
+        REFERENCES provider_logical_publication_bindings(binding_digest),
+    partition_family_ordinal INTEGER NOT NULL CHECK (
+        partition_family_ordinal BETWEEN 0 AND 5
+    ),
+    partition_family TEXT NOT NULL CHECK (
+        partition_family IN (
+            'decoded_event', 'provider_native', 'canonical_row_map',
+            'resolver_assertion', 'resolver_outcome', 'resolver_conflict'
+        )
+    ),
+    partition_ordinal INTEGER NOT NULL CHECK (
+        partition_ordinal BETWEEN 0 AND 4095
+    ),
+    first_item_ordinal INTEGER NOT NULL CHECK (first_item_ordinal >= 0),
+    item_count INTEGER NOT NULL CHECK (item_count BETWEEN 1 AND 4294967295),
+    schema_identity BLOB NOT NULL CHECK (
+        length(schema_identity) = 32 AND schema_identity <> zeroblob(32)
+    ),
+    semantic_digest BLOB NOT NULL CHECK (
+        length(semantic_digest) = 32 AND semantic_digest <> zeroblob(32)
+    ),
+    raw_claim_digest BLOB NOT NULL REFERENCES sealed_raw_objects(raw_claim_digest),
+    physical_receipt_digest BLOB NOT NULL CHECK (
+        length(physical_receipt_digest) = 32
+        AND physical_receipt_digest <> zeroblob(32)
+    ),
+    PRIMARY KEY (binding_digest, partition_family_ordinal, partition_ordinal),
+    UNIQUE (binding_digest, partition_family, partition_ordinal),
+    UNIQUE (binding_digest, semantic_digest),
+    FOREIGN KEY (binding_digest, partition_family_ordinal, partition_family)
+        REFERENCES provider_logical_publication_required_families(
+            binding_digest, family_ordinal, family
+        ),
+    FOREIGN KEY (raw_claim_digest, physical_receipt_digest)
+        REFERENCES sealed_raw_objects(raw_claim_digest, physical_receipt_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX provider_logical_publication_partitions_by_raw_object
+ON provider_logical_publication_partitions(raw_claim_digest, physical_receipt_digest);
+
+CREATE TABLE provider_logical_publication_canonical_expectations (
+    binding_digest BLOB NOT NULL
+        REFERENCES provider_logical_publication_bindings(binding_digest),
+    partition_ordinal INTEGER NOT NULL CHECK (
+        partition_ordinal BETWEEN 0 AND 1023
+    ),
+    first_row_ordinal INTEGER NOT NULL CHECK (first_row_ordinal >= 0),
+    row_count INTEGER NOT NULL CHECK (row_count BETWEEN 1 AND 4294967295),
+    schema_identity BLOB NOT NULL CHECK (
+        length(schema_identity) = 32 AND schema_identity <> zeroblob(32)
+    ),
+    semantic_digest BLOB NOT NULL CHECK (
+        length(semantic_digest) = 32 AND semantic_digest <> zeroblob(32)
+    ),
+    aligned_native_partition INTEGER NOT NULL CHECK (
+        aligned_native_partition BETWEEN 0 AND 4095
+    ),
+    aligned_row_map_partition INTEGER NOT NULL CHECK (
+        aligned_row_map_partition BETWEEN 0 AND 4095
+    ),
+    PRIMARY KEY (binding_digest, partition_ordinal),
+    UNIQUE (binding_digest, semantic_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER provider_logical_publication_objects_guarded_insert
+BEFORE INSERT ON provider_logical_publication_objects
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM sealed_raw_objects AS claim
+    WHERE claim.raw_claim_digest=NEW.raw_claim_digest
+      AND claim.physical_receipt_digest=NEW.physical_receipt_digest
+      AND claim.raw_claim_kind='logical_object'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider logical object lacks its sealed logical raw claim');
+END;
+
+CREATE TRIGGER provider_logical_publication_partitions_guarded_insert
+BEFORE INSERT ON provider_logical_publication_partitions
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM provider_logical_publication_required_families AS family
+    JOIN sealed_raw_objects AS claim
+      ON claim.raw_claim_digest=NEW.raw_claim_digest
+     AND claim.physical_receipt_digest=NEW.physical_receipt_digest
+    WHERE family.binding_digest=NEW.binding_digest
+      AND family.family_ordinal=NEW.partition_family_ordinal
+      AND family.family=NEW.partition_family
+      AND claim.raw_claim_kind='logical_object'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider logical partition evidence is invalid');
+END;
+
+CREATE TRIGGER provider_logical_publication_canonical_expectations_guarded_insert
+BEFORE INSERT ON provider_logical_publication_canonical_expectations
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM provider_logical_publication_partitions AS native
+    JOIN provider_logical_publication_partitions AS row_map
+      ON row_map.binding_digest=native.binding_digest
+    WHERE native.binding_digest=NEW.binding_digest
+      AND native.partition_family='provider_native'
+      AND native.partition_ordinal=NEW.aligned_native_partition
+      AND row_map.partition_family='canonical_row_map'
+      AND row_map.partition_ordinal=NEW.aligned_row_map_partition
+      AND native.first_item_ordinal=NEW.first_row_ordinal
+      AND native.item_count=NEW.row_count
+      AND row_map.first_item_ordinal=NEW.first_row_ordinal
+      AND row_map.item_count=NEW.row_count
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider logical canonical alignment is invalid');
+END;
+
 CREATE TABLE ingest_run_provider_capture_bindings (
     run_id TEXT NOT NULL REFERENCES ingest_runs(run_id),
     input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 4095),
@@ -1295,7 +1495,8 @@ CREATE TABLE ingest_run_provider_publication_bindings (
             'event_microbatch',
             'composite_response_event',
             'option_snapshots',
-            'option_expirations'
+            'option_expirations',
+            'provider_logical'
         )
     ),
     source_id TEXT NOT NULL REFERENCES sources(source_id),
@@ -1306,6 +1507,8 @@ CREATE TABLE ingest_run_provider_publication_bindings (
         REFERENCES provider_composite_response_event_bindings(composite_binding_digest),
     option_binding_digest BLOB
         REFERENCES provider_option_market_bindings(option_binding_digest),
+    logical_binding_digest BLOB
+        REFERENCES provider_logical_publication_bindings(binding_digest),
     PRIMARY KEY (run_id, input_ordinal),
     UNIQUE (run_id, publication_digest),
     CHECK (
@@ -1314,25 +1517,36 @@ CREATE TABLE ingest_run_provider_publication_bindings (
             AND event_binding_digest IS NULL
             AND composite_binding_digest IS NULL
             AND option_binding_digest IS NULL
+            AND logical_binding_digest IS NULL
             AND publication_digest=response_binding_digest)
         OR (publication_kind='event_microbatch'
             AND response_binding_digest IS NULL
             AND event_binding_digest IS NOT NULL
             AND composite_binding_digest IS NULL
             AND option_binding_digest IS NULL
+            AND logical_binding_digest IS NULL
             AND publication_digest=event_binding_digest)
         OR (publication_kind='composite_response_event'
             AND response_binding_digest IS NOT NULL
             AND event_binding_digest IS NOT NULL
             AND composite_binding_digest IS NOT NULL
             AND option_binding_digest IS NULL
+            AND logical_binding_digest IS NULL
             AND publication_digest=composite_binding_digest)
         OR (publication_kind IN ('option_snapshots', 'option_expirations')
             AND response_binding_digest IS NULL
             AND event_binding_digest IS NULL
             AND composite_binding_digest IS NULL
             AND option_binding_digest IS NOT NULL
+            AND logical_binding_digest IS NULL
             AND publication_digest=option_binding_digest)
+        OR (publication_kind='provider_logical'
+            AND response_binding_digest IS NULL
+            AND event_binding_digest IS NULL
+            AND composite_binding_digest IS NULL
+            AND option_binding_digest IS NULL
+            AND logical_binding_digest IS NOT NULL
+            AND publication_digest=logical_binding_digest)
     )
 ) STRICT, WITHOUT ROWID;
 
@@ -1556,10 +1770,63 @@ WHEN NOT EXISTS (
                      WHERE row.option_binding_digest=binding.option_binding_digest)
                     = binding.canonical_row_count
           ))
+          OR (NEW.publication_kind='provider_logical' AND EXISTS (
+              SELECT 1
+              FROM provider_logical_publication_bindings AS binding
+              WHERE binding.binding_digest=NEW.logical_binding_digest
+                AND NEW.publication_digest=binding.binding_digest
+                AND binding.source_id=NEW.source_id
+                AND binding.required_family_count=(
+                    SELECT COUNT(*)
+                    FROM provider_logical_publication_required_families AS family
+                    WHERE family.binding_digest=binding.binding_digest
+                )
+                AND binding.object_count=(
+                    SELECT COUNT(*)
+                    FROM provider_logical_publication_objects AS object
+                    WHERE object.binding_digest=binding.binding_digest
+                )
+                AND binding.partition_count=(
+                    SELECT COUNT(*)
+                    FROM provider_logical_publication_partitions AS partition
+                    WHERE partition.binding_digest=binding.binding_digest
+                )
+                AND binding.canonical_partition_count=(
+                    SELECT COUNT(*)
+                    FROM provider_logical_publication_canonical_expectations AS expected
+                    WHERE expected.binding_digest=binding.binding_digest
+                )
+                AND (SELECT MIN(family.family_ordinal)
+                     FROM provider_logical_publication_required_families AS family
+                     WHERE family.binding_digest=binding.binding_digest)=0
+                AND (SELECT MAX(family.family_ordinal)
+                     FROM provider_logical_publication_required_families AS family
+                     WHERE family.binding_digest=binding.binding_digest)
+                    = binding.required_family_count - 1
+                AND (SELECT MIN(object.object_ordinal)
+                     FROM provider_logical_publication_objects AS object
+                     WHERE object.binding_digest=binding.binding_digest)=0
+                AND (SELECT MAX(object.object_ordinal)
+                     FROM provider_logical_publication_objects AS object
+                     WHERE object.binding_digest=binding.binding_digest)
+                    = binding.object_count - 1
+                AND (
+                    binding.canonical_partition_count=0
+                    OR (
+                        (SELECT MIN(expected.partition_ordinal)
+                         FROM provider_logical_publication_canonical_expectations AS expected
+                         WHERE expected.binding_digest=binding.binding_digest)=0
+                        AND (SELECT MAX(expected.partition_ordinal)
+                             FROM provider_logical_publication_canonical_expectations AS expected
+                             WHERE expected.binding_digest=binding.binding_digest)
+                            = binding.canonical_partition_count - 1
+                    )
+                )
+          ))
       )
 )
 BEGIN
-    SELECT RAISE(ABORT, 'ingest-run provider event publication is invalid');
+    SELECT RAISE(ABORT, 'ingest-run provider publication is invalid');
 END;
 
 CREATE TRIGGER ingest_run_provider_capture_bindings_guarded_insert
@@ -1614,7 +1881,8 @@ CREATE TABLE analytical_generation_provider_publication_bindings (
             'event_microbatch',
             'composite_response_event',
             'option_snapshots',
-            'option_expirations'
+            'option_expirations',
+            'provider_logical'
         )
     ),
     run_id TEXT NOT NULL,
@@ -1913,6 +2181,56 @@ END;
 CREATE TRIGGER provider_option_market_binding_rows_immutable_delete
 BEFORE DELETE ON provider_option_market_binding_rows BEGIN
     SELECT RAISE(ABORT, 'provider option-market rows are immutable');
+END;
+
+CREATE TRIGGER provider_logical_publication_bindings_immutable_update
+BEFORE UPDATE ON provider_logical_publication_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider logical publication bindings are immutable');
+END;
+
+CREATE TRIGGER provider_logical_publication_bindings_immutable_delete
+BEFORE DELETE ON provider_logical_publication_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider logical publication bindings are immutable');
+END;
+
+CREATE TRIGGER provider_logical_publication_required_families_immutable_update
+BEFORE UPDATE ON provider_logical_publication_required_families BEGIN
+    SELECT RAISE(ABORT, 'provider logical required families are immutable');
+END;
+
+CREATE TRIGGER provider_logical_publication_required_families_immutable_delete
+BEFORE DELETE ON provider_logical_publication_required_families BEGIN
+    SELECT RAISE(ABORT, 'provider logical required families are immutable');
+END;
+
+CREATE TRIGGER provider_logical_publication_objects_immutable_update
+BEFORE UPDATE ON provider_logical_publication_objects BEGIN
+    SELECT RAISE(ABORT, 'provider logical publication objects are immutable');
+END;
+
+CREATE TRIGGER provider_logical_publication_objects_immutable_delete
+BEFORE DELETE ON provider_logical_publication_objects BEGIN
+    SELECT RAISE(ABORT, 'provider logical publication objects are immutable');
+END;
+
+CREATE TRIGGER provider_logical_publication_partitions_immutable_update
+BEFORE UPDATE ON provider_logical_publication_partitions BEGIN
+    SELECT RAISE(ABORT, 'provider logical publication partitions are immutable');
+END;
+
+CREATE TRIGGER provider_logical_publication_partitions_immutable_delete
+BEFORE DELETE ON provider_logical_publication_partitions BEGIN
+    SELECT RAISE(ABORT, 'provider logical publication partitions are immutable');
+END;
+
+CREATE TRIGGER provider_logical_publication_canonical_expectations_immutable_update
+BEFORE UPDATE ON provider_logical_publication_canonical_expectations BEGIN
+    SELECT RAISE(ABORT, 'provider logical canonical expectations are immutable');
+END;
+
+CREATE TRIGGER provider_logical_publication_canonical_expectations_immutable_delete
+BEFORE DELETE ON provider_logical_publication_canonical_expectations BEGIN
+    SELECT RAISE(ABORT, 'provider logical canonical expectations are immutable');
 END;
 
 CREATE TRIGGER ingest_run_provider_capture_bindings_immutable_update

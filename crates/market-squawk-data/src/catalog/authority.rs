@@ -175,8 +175,17 @@ impl Catalog {
                  + (SELECT COUNT(*) FROM provider_event_binding_native_lineage)
                  + (SELECT COUNT(*) FROM provider_event_binding_rows)
                  + (SELECT COUNT(*) FROM provider_composite_response_event_bindings)
+                 + (SELECT COUNT(*) FROM provider_option_market_bindings)
+                 + (SELECT COUNT(*) FROM provider_option_market_binding_native_lineage)
+                 + (SELECT COUNT(*) FROM provider_option_market_binding_rows)
+                 + (SELECT COUNT(*) FROM provider_logical_publication_bindings)
+                 + (SELECT COUNT(*) FROM provider_logical_publication_required_families)
+                 + (SELECT COUNT(*) FROM provider_logical_publication_objects)
+                 + (SELECT COUNT(*) FROM provider_logical_publication_partitions)
+                 + (SELECT COUNT(*) FROM provider_logical_publication_canonical_expectations)
                  + (SELECT COUNT(*) FROM ingest_run_provider_capture_bindings)
                  + (SELECT COUNT(*) FROM ingest_run_provider_publication_bindings)
+                 + (SELECT COUNT(*) FROM provider_market_event_selection_index)
                  + (SELECT COUNT(*) FROM analytical_generation_provider_capture_bindings)
                  + (SELECT COUNT(*) FROM analytical_generation_provider_publication_bindings)",
             [],
