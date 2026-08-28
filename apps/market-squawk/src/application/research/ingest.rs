@@ -700,25 +700,6 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_sec::SecEdgarSour
         })
     }
 
-    fn extract_managed(
-        &self,
-        authority: market_squawk_sources::ExtractionAuthority,
-        request: ExtractionRequest,
-        cancellation: CancellationToken,
-    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
-        let extracted = self.extract_with_company_identity(authority, request, cancellation);
-        Box::pin(async move {
-            extracted.await.map(|result| {
-                let (batch, company_identity) = result.into_parts();
-                ManagedExtraction {
-                    batch,
-                    company_identity,
-                    capture_material: None,
-                }
-            })
-        })
-    }
-
     fn revision_plan(
         &self,
         batch: &ExtractionBatch,
@@ -778,19 +759,6 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_fred::FredSource 
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_bls::BlsSource {
-    fn extract_managed(
-        &self,
-        authority: market_squawk_sources::ExtractionAuthority,
-        request: ExtractionRequest,
-        cancellation: CancellationToken,
-    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
-        let extracted = self.extract_with_capture(authority, request, cancellation);
-        Box::pin(async move {
-            let (batch, capture_material) = extracted.await?.into_parts();
-            bind_single_provider_capture(batch, capture_material)
-        })
-    }
-
     fn discovery_dataset_identifier(&self) -> Option<&SourceIdentifier> {
         Some(self.dataset())
     }

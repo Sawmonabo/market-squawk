@@ -11,6 +11,10 @@ use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     CompanyIdentityObservation, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
 };
+use market_squawk_platform::{
+    ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
+    SealedResearchRawClaim, SealedResearchRecoveryAdmission,
+};
 use market_squawk_sources::{
     ExtractionBatch, ExtractionContentIdentity, ExtractionError, ExtractionRevisionPlan,
     ObservedRevisionAuthority, ObservedRevisionError, ProviderCaptureError,
@@ -46,6 +50,24 @@ use crate::{
 
 const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 const REVISION_ASSIGNMENT_DEADLINE: Duration = Duration::from_secs(30);
+const PROVIDER_CAPTURE_RECOVERY_TOTAL_ENTRY_LIMIT: usize = 100_000;
+
+struct ProviderCaptureRecoveryControl<'a> {
+    cancellation: &'a CancellationToken,
+}
+
+impl ResearchObjectControl for ProviderCaptureRecoveryControl<'_> {
+    fn checkpoint(
+        &self,
+        _point: ResearchObjectControlPoint,
+    ) -> Result<(), ResearchObjectControlError> {
+        if self.cancellation.is_cancelled() {
+            Err(ResearchObjectControlError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// Exact immutable generation returned after successful reconciliation or commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1103,10 +1125,24 @@ impl AnalyticalDataService {
         }
         let authority = self.lock_authority()?;
         let claims = authority.authoritative_provider_capture_claims()?;
+        drop(authority);
         if cancellation.is_cancelled() {
             return Err(IngestError::Cancelled);
         }
-        Ok(store.recover_after_catalog_scan(&claims)?)
+        let maximum_claims = claims.len().max(1);
+        let maximum_entries = PROVIDER_CAPTURE_RECOVERY_TOTAL_ENTRY_LIMIT
+            .checked_sub(maximum_claims)
+            .filter(|maximum| *maximum > 0)
+            .ok_or(IngestError::ProviderCaptureRequired)?;
+        let control = ProviderCaptureRecoveryControl { cancellation };
+        let mut recovery = store.begin_recovery(
+            SealedResearchRecoveryAdmission::try_new(maximum_claims, maximum_entries)?,
+            &control,
+        )?;
+        for claim in claims {
+            recovery.observe_claim(&SealedResearchRawClaim::JournalSegment(claim))?;
+        }
+        Ok(recovery.finish()?)
     }
 
     /// Returns sealed backup authority for this exact active catalog and artifact root.

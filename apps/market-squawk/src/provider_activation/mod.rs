@@ -692,9 +692,10 @@ impl ProviderAdapterActivation {
                     .onboarding
                     .read_secret_for_activation_request(&lease, cancellation.clone())
                     .await?;
-                let authorization = BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
-                    secret.expose_secret().to_owned(),
-                )?);
+                let authorization = BlsAuthorization::registered_v2(
+                    BlsRegistrationKey::try_new(secret.expose_secret().to_owned())?,
+                    candidate.generation_digest()?,
+                )?;
                 let rights = provider_research_rights(&lease, metadata.source_id())?;
                 let config = BlsSourceConfig::try_new(authorization, series, start_year, end_year)?;
                 let source = BlsSource::try_new(metadata, config)?;
@@ -961,6 +962,7 @@ impl ProviderAdapterActivation {
             metadata,
             configuration,
         } = spec;
+        let rights = provider_research_rights(&lease, metadata.source_id())?;
         let config = match (lease.surface_id().as_str(), configuration) {
             (BLS_PUBLIC_SURFACE, BlsAdapterConfiguration::Public(config)) => config,
             (
@@ -971,14 +973,18 @@ impl ProviderAdapterActivation {
                     end_year,
                 },
             ) => {
+                let credential_generation_digest =
+                    runtime_generation(&lease, metadata.clone(), rights.clone())?
+                        .generation_digest()?;
                 let secret = self
                     .onboarding
                     .read_secret_for_activation_request(&lease, cancellation)
                     .await?;
                 BlsSourceConfig::try_new(
-                    BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
-                        secret.expose_secret().to_owned(),
-                    )?),
+                    BlsAuthorization::registered_v2(
+                        BlsRegistrationKey::try_new(secret.expose_secret().to_owned())?,
+                        credential_generation_digest,
+                    )?,
                     series,
                     start_year,
                     end_year,
@@ -986,7 +992,6 @@ impl ProviderAdapterActivation {
             }
             _ => return Err(ProviderAdapterActivationError::SurfaceMismatch),
         };
-        let rights = provider_research_rights(&lease, metadata.source_id())?;
         let source = BlsSource::try_new(metadata, config)?;
         self.register(lease, source, rights)
     }

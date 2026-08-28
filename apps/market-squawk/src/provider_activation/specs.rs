@@ -257,7 +257,7 @@ impl BlsAdapterActivation {
     ) -> Result<Self, market_squawk_adapter_bls::BlsSourceError> {
         let configuration = match tier {
             BlsAccessTier::PublicV1 => BlsAdapterConfiguration::Public(BlsSourceConfig::try_new(
-                BlsAuthorization::PublicV1,
+                BlsAuthorization::public_v1(),
                 series,
                 start_year,
                 end_year,
