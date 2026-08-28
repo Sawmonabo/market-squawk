@@ -54,11 +54,12 @@ use market_squawk_platform::{
 };
 use market_squawk_sources::{
     AlpacaPaperIexDoctorReceiptV1, AuthorityBindings, AuthorityVerification,
-    AuthorityVerificationInput, CapabilityRegistrationOutcome, CredentialGenerationState,
-    OnboardingEvent, OnboardingState, ProbeTransport, ProfileReleaseState,
-    ProviderOnboardingProfile, ProviderProfileError, ProviderProfileRegistry,
+    AuthorityVerificationInput, AuthorizationMode, CapabilityRegistrationOutcome,
+    CredentialGenerationState, OnboardingEvent, OnboardingState, ProbeTransport,
+    ProfileReleaseState, ProviderOnboardingProfile, ProviderProfileError, ProviderProfileRegistry,
     ProviderPublicConfiguration, ProviderRateAuthority, ProviderRateDeclaration,
-    RuntimeVerificationEvidence, SecretStoreClearOutcome, TREASURY_DAILY_RATES_PROBE_YEAR,
+    RuntimeVerificationEvidence, SCHWAB_MARKET_DATA_SURFACE_ID as SOURCES_SCHWAB_SURFACE_ID,
+    SchwabMarketDataDoctorObservation, SecretStoreClearOutcome, TREASURY_DAILY_RATES_PROBE_YEAR,
     built_in_provider_profiles, install_ring_tls_provider,
 };
 use sha2::{Digest as _, Sha256};
@@ -75,6 +76,9 @@ use super::contracts::{
     OnboardingSessionView, ProviderActivationLease, ProviderActivationLeaseInput,
     ProviderProfileRegistration, ProviderProfileView, SchwabOAuthBootstrapLease,
     SchwabOAuthBootstrapLeaseInput, session_view,
+};
+use super::schwab_market_doctor::{
+    SchwabMarketDoctorAuthorityBinding, SchwabMarketDoctorRateAuthority,
 };
 use crate::provider_activation::credentials::{
     AlpacaCredentialEnvelope, KrakenL3CredentialSigner, next_kraken_nonce,
@@ -571,6 +575,157 @@ impl ProviderOnboardingService {
             secrets: Arc::clone(&self.secrets),
             application_credential: lease.application_secret_reference().clone(),
         })
+    }
+
+    /// Derives the complete doctor authority binding from one exact current bootstrap lease.
+    ///
+    /// No caller supplies capability, configuration, rights, rate, generation, or renewal
+    /// predecessor coordinates. Those facts are recovered from the retained catalog lifecycle.
+    pub(crate) fn schwab_market_doctor_authority_binding(
+        &self,
+        lease: &SchwabOAuthBootstrapLease,
+    ) -> Result<SchwabMarketDoctorAuthorityBinding, ProviderOnboardingError> {
+        let (resumed, _profile) = self.current_schwab_oauth_bootstrap_session(lease)?;
+        let lifecycle = resumed.lifecycle();
+        let generation = lease.generation();
+        let predecessor_digest = if lifecycle.state() == OnboardingState::RenewalRequired
+            && lifecycle.active_generation() == Some(generation)
+            && lifecycle.candidate_generation().is_none()
+        {
+            Some(
+                lifecycle
+                    .generation_runtime_evidence(generation)
+                    .and_then(RuntimeVerificationEvidence::schwab_market_data_receipt)
+                    .map(|receipt| receipt.receipt_sha256())
+                    .ok_or(ProviderOnboardingError::InvalidSessionState)?,
+            )
+        } else if lifecycle.candidate_generation() == Some(generation)
+            && lifecycle.generation_runtime_evidence(generation).is_none()
+        {
+            None
+        } else {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        };
+        let verification = lifecycle
+            .generation_verification(generation)
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let rights_decision_digest = lifecycle
+            .generation_rights_digest(generation)
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let rate_policy_digest = lifecycle
+            .generation_rate_policy_digest(generation)
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        if verification.expires_at().is_some()
+            || verification.bindings().account_digest().is_some()
+            || verification.restrictions_digest() != rights_decision_digest
+        {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        SchwabMarketDoctorAuthorityBinding::try_new(
+            lifecycle.surface_id().clone(),
+            resumed.reservation().session_id(),
+            generation,
+            lifecycle.capability_revision(),
+            lifecycle.capability_digest(),
+            resumed.reservation().public_configuration_digest(),
+            rights_decision_digest,
+            rate_policy_digest,
+            predecessor_digest,
+        )
+        .map_err(|_| ProviderOnboardingError::InvalidSessionState)
+    }
+
+    /// Narrows the application-private probe-rate authority to one exact Schwab bootstrap lease.
+    pub(crate) fn schwab_market_doctor_rate_authority(
+        &self,
+        lease: &SchwabOAuthBootstrapLease,
+    ) -> Result<Arc<dyn SchwabMarketDoctorRateAuthority>, ProviderOnboardingError> {
+        let _binding = self.schwab_market_doctor_authority_binding(lease)?;
+        let (resumed, profile) = self.current_schwab_oauth_bootstrap_session(lease)?;
+        let verification = resumed
+            .lifecycle()
+            .generation_verification(lease.generation())
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let subject = digest_qualified_subject(
+            "schwab-market-data-application-",
+            verification.evidence_digest(),
+        )?;
+        let authority = self
+            .probe_rates
+            .schwab_market_doctor(profile, subject.clone())?;
+        self.provider_rate
+            .bind_authorization_subject(
+                AuthorizationMode::UserAuthorized,
+                verification.evidence_digest(),
+                &subject,
+            )
+            .map_err(|_| ProviderOnboardingError::ProbeRateLimited)?;
+        Ok(Arc::new(authority))
+    }
+
+    /// Records one provider-observed Schwab doctor result against the exact bootstrap generation.
+    ///
+    /// Cancellation is observed before the serialized catalog commit. Once the synchronous append
+    /// begins, its replay-safe durable outcome is returned instead of claiming cancellation after
+    /// an irreversible event may already have committed.
+    pub(crate) async fn record_schwab_market_data_doctor_observation(
+        &self,
+        lease: &SchwabOAuthBootstrapLease,
+        observation: SchwabMarketDataDoctorObservation,
+        cancellation: CancellationToken,
+    ) -> Result<(), ProviderOnboardingError> {
+        let _activation = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                return Err(ProviderOnboardingError::OperationCancelled);
+            }
+            activation = self.activation.lock() => activation,
+        };
+        if cancellation.is_cancelled() {
+            return Err(ProviderOnboardingError::OperationCancelled);
+        }
+        let (resumed, _profile) = self.current_schwab_oauth_bootstrap_session(lease)?;
+        if cancellation.is_cancelled() {
+            return Err(ProviderOnboardingError::OperationCancelled);
+        }
+        self.catalog
+            .append_schwab_market_data_doctor_observation(
+                resumed.reservation(),
+                resumed.next_sequence(),
+                lease.generation(),
+                observation,
+            )
+            .map_err(ProviderOnboardingError::Catalog)?;
+        Ok(())
+    }
+
+    fn current_schwab_oauth_bootstrap_session<'a>(
+        &'a self,
+        lease: &SchwabOAuthBootstrapLease,
+    ) -> Result<(ResumedProviderOnboarding, &'a ProviderOnboardingProfile), ProviderOnboardingError>
+    {
+        let now = system_timestamp()?;
+        if lease.surface_id().as_str() != SCHWAB_MARKET_DATA_SURFACE_ID
+            || lease.surface_id().as_str() != SOURCES_SCHWAB_SURFACE_ID
+            || lease.issued_at() > now
+            || now >= lease.exclusive_expires_at()
+        {
+            return Err(ProviderOnboardingError::ActivationExpired);
+        }
+        let resumed = self
+            .catalog
+            .resume_provider_onboarding(lease.session_id())?;
+        let profile = self.current_profile_for(&resumed)?;
+        let exact = self.schwab_oauth_bootstrap_lease_from_resumed(
+            &resumed,
+            profile,
+            lease.issued_at(),
+            lease.exclusive_expires_at(),
+        )?;
+        if !exact.same_authority_as(lease) {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        Ok((resumed, profile))
     }
 
     /// Constructs the production service with one product-wide durable provider-rate authority.

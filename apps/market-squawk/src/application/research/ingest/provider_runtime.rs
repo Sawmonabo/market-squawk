@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use futures_util::future::BoxFuture;
+use market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt;
 use market_squawk_data::{IngestError, IngestPrecommitAuthority, SourceOperation};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{SecretGeneration, SecretRef};
@@ -17,6 +19,7 @@ use super::{
     ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
     ResearchIngestCompositionError, ResearchRightsAuthority,
 };
+use crate::provider_onboarding::SchwabOAuthPublicationEpoch;
 
 /// Exact non-secret generation identity for one callable research-provider adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -498,6 +501,89 @@ impl ResearchProviderAdmission {
     }
 }
 
+/// One callable Schwab generation bound to both generic provider and exact OAuth currentness.
+struct SchwabCompositeMarketRuntimeAdmission {
+    generation_digest: EvidenceDigest,
+    admission: ResearchProviderAdmission,
+    oauth_epoch: SchwabOAuthPublicationEpoch,
+}
+
+impl SchwabCompositeMarketRuntimeAdmission {
+    fn ensure_exact_current(&self) -> Result<(), ResearchIngestCompositionError> {
+        self.admission.ensure_live()?;
+        if self.admission.generation_digest != Some(self.generation_digest) {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        self.oauth_epoch
+            .validate_current(self.oauth_epoch.receipt())
+            .map_err(|_error| ResearchIngestCompositionError::StaleRuntimeGeneration)?;
+        self.admission.ensure_live()
+    }
+}
+
+impl super::schwab_market::SchwabMarketRuntimeAdmission for SchwabCompositeMarketRuntimeAdmission {
+    fn generation_digest(&self) -> Option<EvidenceDigest> {
+        self.ensure_exact_current()
+            .ok()
+            .map(|()| self.generation_digest)
+    }
+
+    fn ensure_live(&self) -> Result<(), ResearchIngestCompositionError> {
+        self.ensure_exact_current()
+    }
+
+    fn validate_oauth_current(
+        &self,
+        receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        self.admission.ensure_live()?;
+        self.oauth_epoch
+            .validate_current(receipt)
+            .map_err(|_error| ResearchIngestCompositionError::StaleRuntimeGeneration)?;
+        self.ensure_exact_current()
+    }
+
+    fn cancellation(&self) -> &CancellationToken {
+        self.admission.cancellation()
+    }
+
+    fn acquire_publication_lease(
+        &self,
+    ) -> BoxFuture<'_, Result<ResearchProviderPublicationLease, ResearchIngestCompositionError>>
+    {
+        Box::pin(async move {
+            self.ensure_exact_current()?;
+            let lease = self.admission.acquire_publication_lease().await?;
+            self.ensure_exact_current()?;
+            Ok(lease)
+        })
+    }
+
+    fn revoke(&self) {
+        self.admission.revoke();
+    }
+
+    fn revoke_and_drain(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.admission.revoke_and_drain().await;
+        })
+    }
+
+    fn revocation_drained(&self) -> bool {
+        self.admission.revocation_drained()
+    }
+}
+
+impl std::fmt::Debug for SchwabCompositeMarketRuntimeAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SchwabCompositeMarketRuntimeAdmission")
+            .field("generation_digest", &self.generation_digest)
+            .field("oauth_epoch", &self.oauth_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Fully constructed replacement held outside the callable runtime until exact finalization.
 struct PreparedResearchProviderReplacement {
     coordinator: Arc<ProductionResearchIngestCoordinator>,
@@ -870,6 +956,65 @@ impl ResearchProviderRuntimeMutationAuthority {
         } else {
             Err(ResearchIngestCompositionError::StaleRuntimeGeneration)
         }
+    }
+
+    /// Binds one exact callable Schwab provider generation to a reconciled OAuth epoch.
+    pub(super) fn schwab_market_runtime_admission(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        oauth_epoch: SchwabOAuthPublicationEpoch,
+    ) -> Result<
+        Arc<dyn super::schwab_market::SchwabMarketRuntimeAdmission>,
+        ResearchIngestCompositionError,
+    > {
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || generation.profile().as_str() != market_squawk_sources::SCHWAB_MARKET_DATA_SURFACE_ID
+            || oauth_epoch.session_id() != generation.session_id()
+        {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        let generation_digest = generation.generation_digest()?;
+        oauth_epoch
+            .validate_current(oauth_epoch.receipt())
+            .map_err(|_error| ResearchIngestCompositionError::StaleRuntimeGeneration)?;
+        let admission = {
+            let authority = self
+                .coordinator
+                .authority
+                .lock()
+                .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+            if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+                || authority.registry.is_none()
+            {
+                return Err(ResearchIngestCompositionError::ShuttingDown);
+            }
+            let current = authority
+                .sources
+                .get(generation.profile())
+                .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+            if current.generation.as_ref() != Some(generation)
+                || current.source.metadata() != generation.metadata()
+                || current.metadata != *generation.metadata()
+                || current.rights != generation.rights
+                || current.registration.source_id() != generation.metadata().source_id()
+                || current.registration.revision() != generation.metadata().revision()
+                || current.admission.generation_digest != Some(generation_digest)
+            {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            current.admission.ensure_live()?;
+            oauth_epoch
+                .validate_current(oauth_epoch.receipt())
+                .map_err(|_error| ResearchIngestCompositionError::StaleRuntimeGeneration)?;
+            current.admission.clone()
+        };
+        let admission = Arc::new(SchwabCompositeMarketRuntimeAdmission {
+            generation_digest,
+            admission,
+            oauth_epoch,
+        });
+        admission.ensure_exact_current()?;
+        Ok(admission)
     }
 
     /// Registers one provider adapter bound to an exact onboarding/runtime generation.

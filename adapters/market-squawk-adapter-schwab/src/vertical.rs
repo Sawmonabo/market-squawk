@@ -5,16 +5,18 @@
 //! minimum parsed User Preference evidence needed to establish a price-history capability.
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
-use market_squawk_domain::Timestamp;
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ACCESS_TOKEN_MAX_LIFETIME_SECONDS, ExecutedRestResponse, MarketDataService, ReadOnlyRoute,
-    SchwabOAuthAuthorityReceipt, SchwabRestPayload, SchwabSealedStreamerCapture,
-    SchwabStreamerServiceResponseEvidence, SchwabUserPreferenceEvidence,
+    ACCESS_TOKEN_MAX_LIFETIME_SECONDS, AccessTokenGeneration, ConnectionGeneration,
+    ExecutedRestResponse, MarketDataService, ReadOnlyRoute, SchwabOAuthAuthorityReceipt,
+    SchwabRestPayload, SchwabSealedStreamerCapture, SchwabStreamerServiceResponseEvidence,
+    SchwabUserPreferenceEvidence,
 };
 
 /// One independently probed read-only Schwab market-data family.
@@ -70,71 +72,506 @@ impl<'a> SchwabRestFamilyDoctorInput<'a> {
     }
 }
 
-/// Typed Streamer doctor input bound to one selected service and one physically sealed capture.
-#[derive(Clone, Copy, Debug)]
-pub struct SchwabStreamerFamilyDoctorInput<'a> {
+/// Non-cloneable selected-service doctor accumulator beginning with one exact sealed ACK capture.
+pub struct SchwabStreamerFamilyDoctorAccumulator {
     service: MarketDataService,
-    capture: &'a SchwabSealedStreamerCapture,
-    service_response: &'a SchwabStreamerServiceResponseEvidence,
+    captures: Vec<SchwabSealedStreamerCapture>,
+    command: Box<str>,
+    request_id: Box<str>,
+    request_payload_sha256: EvidenceDigest,
+    acknowledgement: SchwabStreamerServiceResponseEvidence,
+    generation: ConnectionGeneration,
+    token_generation: AccessTokenGeneration,
+    last_frame_ordinal: NonZeroU64,
     provider_records: u64,
 }
 
-impl<'a> SchwabStreamerFamilyDoctorInput<'a> {
-    pub fn try_new(
+impl fmt::Debug for SchwabStreamerFamilyDoctorAccumulator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabStreamerFamilyDoctorAccumulator")
+            .field("service", &self.service)
+            .field("capture_count", &self.captures.len())
+            .field("command", &self.command)
+            .field("request_id", &self.request_id)
+            .field("request_payload_sha256", &self.request_payload_sha256)
+            .field("last_frame_ordinal", &self.last_frame_ordinal)
+            .field("provider_records", &self.provider_records)
+            .finish()
+    }
+}
+
+impl SchwabStreamerFamilyDoctorAccumulator {
+    /// Starts one cross-capture proof from an exact successful subscription acknowledgement.
+    pub fn try_from_ack_capture(
         service: MarketDataService,
-        capture: &'a SchwabSealedStreamerCapture,
-    ) -> Result<Self, SchwabVerticalError> {
-        let mut provider_records = 0_u64;
-        for frame in capture.parsed_frames() {
-            for batch in &frame.value().data {
-                if batch.service == service {
-                    provider_records = provider_records
-                        .checked_add(
-                            u64::try_from(batch.content.len())
-                                .map_err(|_| SchwabVerticalError::Overflow)?,
-                        )
-                        .ok_or(SchwabVerticalError::Overflow)?;
+        capture: SchwabSealedStreamerCapture,
+    ) -> Result<Self, SchwabStreamerDoctorCaptureRejection> {
+        match validate_ack_capture(service, &capture) {
+            Ok((acknowledgement, last_frame_ordinal)) => {
+                let command = acknowledgement.command().to_owned().into_boxed_str();
+                let request_id = acknowledgement.request_id().to_owned().into_boxed_str();
+                let Some(request_payload_sha256) = acknowledgement.request_payload_sha256() else {
+                    return Err(SchwabStreamerDoctorCaptureRejection::new(
+                        SchwabVerticalError::InvalidCapabilityEvidence,
+                        capture,
+                    ));
+                };
+                let mut captures = Vec::new();
+                if captures.try_reserve_exact(2).is_err() {
+                    return Err(SchwabStreamerDoctorCaptureRejection::new(
+                        SchwabVerticalError::ResourceLimit,
+                        capture,
+                    ));
                 }
+                let generation = capture.streamer_receipt().generation();
+                let token_generation = capture.streamer_receipt().token_generation();
+                captures.push(capture);
+                Ok(Self {
+                    service,
+                    captures,
+                    command,
+                    request_id,
+                    request_payload_sha256,
+                    acknowledgement,
+                    generation,
+                    token_generation,
+                    last_frame_ordinal,
+                    provider_records: 0,
+                })
             }
+            Err(error) => Err(SchwabStreamerDoctorCaptureRejection::new(error, capture)),
         }
-        let mut service_responses = capture
-            .service_responses()
-            .iter()
-            .filter(|response| response.service() == service);
-        let service_response = service_responses
-            .next()
-            .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?;
-        if provider_records == 0
-            || capture.frames().is_empty()
-            || service_response.status_code() != 0
-            || service_response.round_trip_latency_ms().is_none()
-            || service_responses.next().is_some()
-        {
+    }
+
+    /// Adds one exact physically sealed data capture from the acknowledged subscription.
+    pub fn try_push_data_capture(
+        &mut self,
+        capture: SchwabSealedStreamerCapture,
+    ) -> Result<(), SchwabStreamerDoctorCaptureRejection> {
+        let Some(anchor) = self.captures.first() else {
+            return Err(SchwabStreamerDoctorCaptureRejection::new(
+                SchwabVerticalError::InvalidCapabilityEvidence,
+                capture,
+            ));
+        };
+        let records = match validate_data_capture(
+            self.service,
+            &self.command,
+            self.last_frame_ordinal,
+            anchor,
+            &capture,
+        ) {
+            Ok(records) => records,
+            Err(error) => {
+                return Err(SchwabStreamerDoctorCaptureRejection::new(error, capture));
+            }
+        };
+        if self.captures.try_reserve(1).is_err() {
+            return Err(SchwabStreamerDoctorCaptureRejection::new(
+                SchwabVerticalError::ResourceLimit,
+                capture,
+            ));
+        }
+        let Some(last_frame_ordinal) = capture
+            .frames()
+            .last()
+            .map(|frame| frame.transport_ordinal())
+        else {
+            return Err(SchwabStreamerDoctorCaptureRejection::new(
+                SchwabVerticalError::InvalidCapabilityEvidence,
+                capture,
+            ));
+        };
+        let provider_records = match self.provider_records.checked_add(records) {
+            Some(value) => value,
+            None => {
+                return Err(SchwabStreamerDoctorCaptureRejection::new(
+                    SchwabVerticalError::Overflow,
+                    capture,
+                ));
+            }
+        };
+        self.captures.push(capture);
+        self.last_frame_ordinal = last_frame_ordinal;
+        self.provider_records = provider_records;
+        Ok(())
+    }
+
+    /// Completes only after at least one separate sealed data capture supplied nonzero records.
+    pub fn try_finish(self) -> Result<SchwabStreamerFamilyDoctorHandoff, SchwabVerticalError> {
+        if self.captures.len() < 2 || self.provider_records == 0 {
             return Err(SchwabVerticalError::InvalidCapabilityEvidence);
         }
-        Ok(Self {
-            service,
-            capture,
-            service_response,
-            provider_records,
+        let capture_set_sha256 = streamer_doctor_capture_set_sha256(
+            self.service,
+            self.generation,
+            self.token_generation,
+            &self.command,
+            &self.request_id,
+            self.request_payload_sha256,
+            &self.captures,
+        )?;
+        let total_payload_bytes = self.captures.iter().try_fold(0_u64, |total, capture| {
+            total
+                .checked_add(capture.streamer_receipt().payload_bytes())
+                .ok_or(SchwabVerticalError::Overflow)
+        })?;
+        Ok(SchwabStreamerFamilyDoctorHandoff {
+            service: self.service,
+            captures: self.captures.into_boxed_slice(),
+            command: self.command,
+            request_id: self.request_id,
+            request_payload_sha256: self.request_payload_sha256,
+            acknowledgement: self.acknowledgement,
+            generation: self.generation,
+            token_generation: self.token_generation,
+            capture_set_sha256,
+            total_payload_bytes,
+            provider_records: self.provider_records,
         })
     }
+}
 
-    pub const fn family(self) -> SchwabObservedCapabilityFamily {
-        SchwabObservedCapabilityFamily::Streamer(self.service)
+/// Rejection retaining ownership of the exact sealed capture that could not join the doctor proof.
+pub struct SchwabStreamerDoctorCaptureRejection {
+    error: SchwabVerticalError,
+    capture: SchwabSealedStreamerCapture,
+}
+
+impl SchwabStreamerDoctorCaptureRejection {
+    fn new(error: SchwabVerticalError, capture: SchwabSealedStreamerCapture) -> Self {
+        Self { error, capture }
     }
 
-    pub const fn capture(self) -> &'a SchwabSealedStreamerCapture {
+    pub const fn error(&self) -> SchwabVerticalError {
+        self.error
+    }
+
+    pub fn into_capture(self) -> SchwabSealedStreamerCapture {
         self.capture
     }
+}
 
-    pub const fn provider_records(self) -> u64 {
+impl fmt::Debug for SchwabStreamerDoctorCaptureRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabStreamerDoctorCaptureRejection")
+            .field("error", &self.error)
+            .field("capture", &self.capture)
+            .finish()
+    }
+}
+
+/// Non-cloneable complete cross-capture Streamer doctor proof.
+pub struct SchwabStreamerFamilyDoctorHandoff {
+    service: MarketDataService,
+    captures: Box<[SchwabSealedStreamerCapture]>,
+    command: Box<str>,
+    request_id: Box<str>,
+    request_payload_sha256: EvidenceDigest,
+    acknowledgement: SchwabStreamerServiceResponseEvidence,
+    generation: ConnectionGeneration,
+    token_generation: AccessTokenGeneration,
+    capture_set_sha256: EvidenceDigest,
+    total_payload_bytes: u64,
+    provider_records: u64,
+}
+
+impl fmt::Debug for SchwabStreamerFamilyDoctorHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabStreamerFamilyDoctorHandoff")
+            .field("service", &self.service)
+            .field("capture_count", &self.captures.len())
+            .field("command", &self.command)
+            .field("request_id", &self.request_id)
+            .field("request_payload_sha256", &self.request_payload_sha256)
+            .field("provider_records", &self.provider_records)
+            .finish()
+    }
+}
+
+impl SchwabStreamerFamilyDoctorHandoff {
+    pub const fn family_input(&self) -> SchwabStreamerFamilyDoctorInput<'_> {
+        SchwabStreamerFamilyDoctorInput { handoff: self }
+    }
+
+    pub const fn service(&self) -> MarketDataService {
+        self.service
+    }
+
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub const fn request_payload_sha256(&self) -> EvidenceDigest {
+        self.request_payload_sha256
+    }
+
+    pub const fn generation(&self) -> ConnectionGeneration {
+        self.generation
+    }
+
+    pub const fn token_generation(&self) -> AccessTokenGeneration {
+        self.token_generation
+    }
+
+    pub const fn provider_records(&self) -> u64 {
         self.provider_records
     }
 
-    pub const fn service_response(self) -> &'a SchwabStreamerServiceResponseEvidence {
-        self.service_response
+    /// Digest over every physical receipt, exact ordinal range, and cross-capture authority.
+    pub const fn capture_set_sha256(&self) -> EvidenceDigest {
+        self.capture_set_sha256
     }
+
+    pub const fn total_payload_bytes(&self) -> u64 {
+        self.total_payload_bytes
+    }
+
+    pub fn capture_count(&self) -> usize {
+        self.captures.len()
+    }
+
+    /// Returns one exact physical receipt; parsed provider frames remain private.
+    pub fn capture_receipt(
+        &self,
+        index: usize,
+    ) -> Option<&market_squawk_sources::SealedProviderEventMicrobatchReceipt> {
+        self.captures
+            .get(index)
+            .map(SchwabSealedStreamerCapture::persisted_receipt)
+    }
+
+    /// Returns the exact inclusive transport-ordinal range retained by one physical capture.
+    pub fn capture_frame_ordinals(&self, index: usize) -> Option<(NonZeroU64, NonZeroU64)> {
+        let capture = self.captures.get(index)?;
+        Some((
+            capture.frames().first()?.transport_ordinal(),
+            capture.frames().last()?.transport_ordinal(),
+        ))
+    }
+
+    pub fn acknowledgement(&self) -> &SchwabStreamerServiceResponseEvidence {
+        &self.acknowledgement
+    }
+}
+
+/// Borrowed provider-record evidence from one complete non-cloneable cross-capture handoff.
+#[derive(Clone, Copy, Debug)]
+pub struct SchwabStreamerFamilyDoctorInput<'a> {
+    handoff: &'a SchwabStreamerFamilyDoctorHandoff,
+}
+
+impl<'a> SchwabStreamerFamilyDoctorInput<'a> {
+    pub const fn family(self) -> SchwabObservedCapabilityFamily {
+        SchwabObservedCapabilityFamily::Streamer(self.handoff.service)
+    }
+
+    pub const fn handoff(self) -> &'a SchwabStreamerFamilyDoctorHandoff {
+        self.handoff
+    }
+
+    pub const fn provider_records(self) -> u64 {
+        self.handoff.provider_records
+    }
+
+    pub fn service_response(self) -> &'a SchwabStreamerServiceResponseEvidence {
+        self.handoff.acknowledgement()
+    }
+}
+
+fn validate_ack_capture(
+    service: MarketDataService,
+    capture: &SchwabSealedStreamerCapture,
+) -> Result<(SchwabStreamerServiceResponseEvidence, NonZeroU64), SchwabVerticalError> {
+    validate_sealed_capture_shape(capture)?;
+    let [response] = capture.service_responses() else {
+        return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+    };
+    let Some(request_payload_sha256) = response.request_payload_sha256() else {
+        return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+    };
+    if response.service() != service
+        || response.command() != "SUBS"
+        || response.request_id().is_empty()
+        || response.status_code() != 0
+        || response.round_trip_latency_ms().is_none()
+        || request_payload_sha256.algorithm() != DigestAlgorithm::Sha256
+        || request_payload_sha256.bytes() == [0; 32]
+        || response.sealed_capture_receipt_sha256() != capture.persisted_receipt().receipt_digest()
+        || capture.frames().iter().all(|frame| {
+            frame.transport_ordinal() != response.transport_ordinal()
+                || frame.event_id() != response.event_id()
+                || frame.payload_digest() != response.payload_digest()
+        })
+        || capture
+            .parsed_frames()
+            .iter()
+            .any(|frame| !frame.value().data.is_empty())
+    {
+        return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+    }
+    let last_frame_ordinal = capture
+        .frames()
+        .last()
+        .map(|frame| frame.transport_ordinal())
+        .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?;
+    Ok((response.clone(), last_frame_ordinal))
+}
+
+fn validate_data_capture(
+    service: MarketDataService,
+    command: &str,
+    prior_last_frame_ordinal: NonZeroU64,
+    anchor: &SchwabSealedStreamerCapture,
+    capture: &SchwabSealedStreamerCapture,
+) -> Result<u64, SchwabVerticalError> {
+    validate_sealed_capture_shape(capture)?;
+    if !capture.service_responses().is_empty()
+        || capture.streamer_receipt().generation() != anchor.streamer_receipt().generation()
+        || capture.streamer_receipt().token_generation()
+            != anchor.streamer_receipt().token_generation()
+        || capture.coordinates() != anchor.coordinates()
+        || capture.stream_identity() != anchor.stream_identity()
+        || capture
+            .frames()
+            .first()
+            .is_none_or(|frame| frame.transport_ordinal() <= prior_last_frame_ordinal)
+    {
+        return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+    }
+    let mut provider_records = 0_u64;
+    for frame in capture.parsed_frames() {
+        if !frame.value().responses.is_empty() {
+            return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+        }
+        for batch in &frame.value().data {
+            if batch.service != service
+                || batch.command.as_ref() != command
+                || batch.content.is_empty()
+            {
+                return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+            }
+            provider_records = provider_records
+                .checked_add(
+                    u64::try_from(batch.content.len())
+                        .map_err(|_| SchwabVerticalError::Overflow)?,
+                )
+                .ok_or(SchwabVerticalError::Overflow)?;
+        }
+    }
+    if provider_records == 0 {
+        return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+    }
+    Ok(provider_records)
+}
+
+fn validate_sealed_capture_shape(
+    capture: &SchwabSealedStreamerCapture,
+) -> Result<(), SchwabVerticalError> {
+    let frames = capture.frames();
+    let receipt = capture.streamer_receipt();
+    let persisted = capture.persisted_receipt();
+    if frames.is_empty()
+        || frames.len() != capture.parsed_frames().len()
+        || frames.len() != persisted.capture().frames().len()
+        || frames.len() != persisted.segment().frames().len()
+        || receipt.frame_count()
+            != u64::try_from(frames.len()).map_err(|_| SchwabVerticalError::Overflow)?
+        || receipt.first_ordinal()
+            != frames
+                .first()
+                .map(|frame| frame.transport_ordinal())
+                .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?
+        || receipt.last_ordinal()
+            != frames
+                .last()
+                .map(|frame| frame.transport_ordinal())
+                .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?
+    {
+        return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+    }
+    let mut prior = None;
+    for frame in frames {
+        if frame.generation() != receipt.generation()
+            || prior.is_some_and(|ordinal: u64| {
+                ordinal
+                    .checked_add(1)
+                    .is_none_or(|next| frame.transport_ordinal().get() != next)
+            })
+        {
+            return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+        }
+        prior = Some(frame.transport_ordinal().get());
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact cross-capture doctor authority remains explicit"
+)]
+fn streamer_doctor_capture_set_sha256(
+    service: MarketDataService,
+    generation: ConnectionGeneration,
+    token_generation: AccessTokenGeneration,
+    command: &str,
+    request_id: &str,
+    request_payload_sha256: EvidenceDigest,
+    captures: &[SchwabSealedStreamerCapture],
+) -> Result<EvidenceDigest, SchwabVerticalError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/schwab-streamer-doctor-capture-set/v1");
+    hash_vertical_text(&mut hasher, service.as_str())?;
+    hasher.update(generation.get().to_be_bytes());
+    hasher.update(token_generation.get().to_be_bytes());
+    hash_vertical_text(&mut hasher, command)?;
+    hash_vertical_text(&mut hasher, request_id)?;
+    hasher.update(request_payload_sha256.bytes());
+    hasher.update(
+        u64::try_from(captures.len())
+            .map_err(|_| SchwabVerticalError::Overflow)?
+            .to_be_bytes(),
+    );
+    for capture in captures {
+        let receipt = capture.streamer_receipt();
+        let physical = capture.persisted_receipt();
+        let first = capture
+            .frames()
+            .first()
+            .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?;
+        let last = capture
+            .frames()
+            .last()
+            .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?;
+        hasher.update(physical.receipt_digest().bytes());
+        hasher.update(receipt.content_sha256());
+        hasher.update(receipt.observation_sha256());
+        hasher.update(receipt.frame_count().to_be_bytes());
+        hasher.update(receipt.payload_bytes().to_be_bytes());
+        hasher.update(first.transport_ordinal().get().to_be_bytes());
+        hasher.update(last.transport_ordinal().get().to_be_bytes());
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hasher.finalize().into(),
+    ))
+}
+
+fn hash_vertical_text(hasher: &mut Sha256, value: &str) -> Result<(), SchwabVerticalError> {
+    hasher.update(
+        u64::try_from(value.len())
+            .map_err(|_| SchwabVerticalError::Overflow)?
+            .to_be_bytes(),
+    );
+    hasher.update(value.as_bytes());
+    Ok(())
 }
 
 /// Closed typed doctor input across every admitted read-only market-data family.
@@ -584,6 +1021,8 @@ const fn route_tag(route: ReadOnlyRoute) -> u8 {
 pub enum SchwabVerticalError {
     #[error("Schwab family capability evidence is incomplete or inconsistent")]
     InvalidCapabilityEvidence,
+    #[error("Schwab provider evidence exceeded its local resource bound")]
+    ResourceLimit,
     #[error("Schwab provider evidence arithmetic overflowed")]
     Overflow,
 }

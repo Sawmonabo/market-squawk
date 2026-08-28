@@ -12,7 +12,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::{Component, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -234,7 +234,7 @@ impl SchwabOAuthRuntime {
         let session = self
             .ensure_session(&mut sessions, session_id, cancellation)
             .await?;
-        let status = session.authority.status().await?;
+        let status = session.status().await?;
         lifecycle_view(session_id, SchwabOAuthLifecycleAction::Continue, status)
     }
 
@@ -271,14 +271,15 @@ impl SchwabOAuthRuntime {
             return Err(SchwabOAuthRuntimeError::AuthorizationExchangeInFlight);
         }
         let authority = &session.authority;
-        let SchwabOAuthAuthorityStatus::Active(receipt) = authority.status().await? else {
+        let status = session.status().await?;
+        let SchwabOAuthAuthorityStatus::Active(receipt) = status else {
             return Err(SchwabOAuthRuntimeError::ReauthorizationRequired);
         };
         Ok(SchwabOAuthMarketAuthority {
             session_id,
             issued_receipt: receipt,
             authority: Arc::clone(authority),
-            currentness: session.market_epoch.child_token(),
+            currentness: Arc::clone(&session.market_epoch),
         })
     }
 
@@ -429,7 +430,8 @@ impl SchwabOAuthRuntime {
                 SchwabOAuthLifecycleAction::Begin,
             ));
         }
-        if let SchwabOAuthAuthorityStatus::Active(receipt) = session.authority.status().await? {
+        let status = session.status().await?;
+        if let SchwabOAuthAuthorityStatus::Active(receipt) = status {
             return active_view(session_id, SchwabOAuthLifecycleAction::Begin, receipt);
         }
 
@@ -511,10 +513,13 @@ impl SchwabOAuthRuntime {
                 .task
                 .await
                 .map_err(|_join| SchwabOAuthRuntimeError::ExchangeTask)??;
+            session
+                .market_epoch
+                .observe_status(SchwabOAuthAuthorityStatus::Active(receipt))?;
             return active_view(session_id, SchwabOAuthLifecycleAction::Continue, receipt);
         }
         let Some(pending) = session.pending.as_ref() else {
-            let status = session.authority.status().await?;
+            let status = session.status().await?;
             return lifecycle_view(session_id, SchwabOAuthLifecycleAction::Continue, status);
         };
         if !pending.task.is_finished() {
@@ -540,6 +545,7 @@ impl SchwabOAuthRuntime {
                 if cancellation.is_cancelled() || self.shutdown.is_cancelled() {
                     return Err(SchwabOAuthRuntimeError::Cancelled);
                 }
+                session.market_epoch.invalidate();
                 // The provider exchange may legitimately outlive the portal's request timeout.
                 // Supervise it under the application runtime so dropping the HTTP request cannot
                 // discard the validated one-time callback or detach the protected transition.
@@ -602,7 +608,7 @@ impl SchwabOAuthRuntime {
                 None,
             ));
         }
-        let status = session.authority.status().await?;
+        let status = session.status().await?;
         if let SchwabOAuthAuthorityStatus::Active(receipt) = status {
             return active_view(session_id, SchwabOAuthLifecycleAction::Cancel, receipt);
         }
@@ -648,7 +654,7 @@ impl SchwabOAuthRuntime {
                 .await
                 .map_err(|_join| SchwabOAuthRuntimeError::CallbackTask)?;
         }
-        let status = session.authority.status().await?;
+        let status = session.status().await?;
         let receipt = match status {
             SchwabOAuthAuthorityStatus::Active(receipt) => Some(receipt),
             SchwabOAuthAuthorityStatus::AwaitingAuthorization
@@ -718,7 +724,10 @@ impl SchwabOAuthRuntime {
                 authority,
                 pending: None,
                 exchange: None,
-                market_epoch: CancellationToken::new(),
+                market_epoch: Arc::new(SchwabOAuthMarketEpochAuthority::new(
+                    session_id,
+                    self.shutdown.child_token(),
+                )),
             },
         );
         sessions
@@ -770,11 +779,11 @@ impl SchwabOAuthRuntime {
                 return Err(SchwabOAuthRuntimeError::CallbackTask);
             }
         }
-        let status = match current.authority.status().await {
+        let status = match current.status().await {
             Ok(status) => status,
             Err(error) => {
                 sessions.insert(session_id, current);
-                return Err(error.into());
+                return Err(error);
             }
         };
         let receipt = match status {
@@ -811,7 +820,10 @@ impl SchwabOAuthRuntime {
                         authority: Arc::new(authority),
                         pending: None,
                         exchange: None,
-                        market_epoch: CancellationToken::new(),
+                        market_epoch: Arc::new(SchwabOAuthMarketEpochAuthority::new(
+                            session_id,
+                            self.shutdown.child_token(),
+                        )),
                     },
                 );
                 Ok(())
@@ -819,7 +831,10 @@ impl SchwabOAuthRuntime {
             Err(failure) => {
                 let (authority, binding, error) = failure.into_parts();
                 current.authority = Arc::new(authority);
-                current.market_epoch = CancellationToken::new();
+                current.market_epoch = Arc::new(SchwabOAuthMarketEpochAuthority::new(
+                    session_id,
+                    self.shutdown.child_token(),
+                ));
                 match binding {
                     SchwabApplicationCredentialReplacementBinding::Replacement => {
                         current.bootstrap = replacement_lease;
@@ -945,12 +960,214 @@ impl Drop for SchwabOAuthRuntime {
     }
 }
 
+#[derive(Debug)]
+struct CurrentSchwabOAuthPublicationEpoch {
+    receipt: SchwabOAuthAuthorityReceipt,
+    currentness: CancellationToken,
+}
+
+/// Process-local, secret-free currentness authority for one OAuth market session.
+///
+/// The protected OAuth store is intentionally absent from this synchronous boundary. Async token
+/// acquisition and status reconciliation update this state before a publication capability can be
+/// minted; durable precommit performs only nonblocking in-memory checks.
+struct SchwabOAuthMarketEpochAuthority {
+    session_id: Uuid,
+    lifecycle: CancellationToken,
+    current: StdMutex<Option<CurrentSchwabOAuthPublicationEpoch>>,
+    token_acquisitions_in_flight: AtomicUsize,
+}
+
+impl SchwabOAuthMarketEpochAuthority {
+    fn new(session_id: Uuid, shutdown: CancellationToken) -> Self {
+        Self {
+            session_id,
+            lifecycle: shutdown.child_token(),
+            current: StdMutex::new(None),
+            token_acquisitions_in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.lifecycle.is_cancelled()
+    }
+
+    fn cancel(&self) {
+        self.lifecycle.cancel();
+        self.invalidate();
+    }
+
+    fn invalidate(&self) {
+        let mut current = match self.current.lock() {
+            Ok(current) => current,
+            Err(poisoned) => {
+                self.lifecycle.cancel();
+                poisoned.into_inner()
+            }
+        };
+        if let Some(current) = current.take() {
+            current.currentness.cancel();
+        }
+    }
+
+    /// Observes a lifecycle status without minting publication authority.
+    fn observe_status(
+        &self,
+        status: SchwabOAuthAuthorityStatus,
+    ) -> Result<(), SchwabOAuthRuntimeError> {
+        if self.is_cancelled() {
+            self.invalidate();
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        let mut current = self.current.lock().map_err(|_poisoned| {
+            self.lifecycle.cancel();
+            SchwabOAuthRuntimeError::MarketEpochUnavailable
+        })?;
+        match status {
+            SchwabOAuthAuthorityStatus::Active(receipt) => {
+                if current
+                    .as_ref()
+                    .is_some_and(|current| current.receipt != receipt)
+                    && let Some(stale) = current.take()
+                {
+                    stale.currentness.cancel();
+                }
+            }
+            SchwabOAuthAuthorityStatus::AwaitingAuthorization
+            | SchwabOAuthAuthorityStatus::ReauthorizationRequired => {
+                if let Some(stale) = current.take() {
+                    stale.currentness.cancel();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconciles an async protected-authority status into one exact local publication epoch.
+    fn reconcile_current(
+        &self,
+        receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<CancellationToken, SchwabOAuthRuntimeError> {
+        validate_receipt_time(receipt)?;
+        if self.is_cancelled() {
+            self.invalidate();
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        if self.token_acquisitions_in_flight.load(Ordering::Acquire) != 0 {
+            self.invalidate();
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        let mut current = self.current.lock().map_err(|_poisoned| {
+            self.lifecycle.cancel();
+            SchwabOAuthRuntimeError::MarketEpochUnavailable
+        })?;
+        if let Some(current) = current.as_ref()
+            && current.receipt == receipt
+        {
+            return Ok(current.currentness.clone());
+        }
+        if let Some(stale) = current.take() {
+            stale.currentness.cancel();
+        }
+        let currentness = self.lifecycle.child_token();
+        *current = Some(CurrentSchwabOAuthPublicationEpoch {
+            receipt,
+            currentness: currentness.clone(),
+        });
+        drop(current);
+        if self.is_cancelled() || self.token_acquisitions_in_flight.load(Ordering::Acquire) != 0 {
+            self.invalidate();
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        Ok(currentness)
+    }
+
+    fn begin_token_acquisition(
+        self: &Arc<Self>,
+    ) -> Result<SchwabOAuthTokenAcquisition, SchwabOAuthRuntimeError> {
+        if self.is_cancelled() {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        self.token_acquisitions_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_current| SchwabOAuthRuntimeError::MarketEpochUnavailable)?;
+        let transition = SchwabOAuthTokenAcquisition {
+            authority: Arc::clone(self),
+            finished: false,
+        };
+        self.invalidate();
+        if self.is_cancelled() {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        Ok(transition)
+    }
+
+    fn finish_token_acquisition(&self) -> Result<(), SchwabOAuthRuntimeError> {
+        self.token_acquisitions_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(1)
+            })
+            .map_err(|_current| SchwabOAuthRuntimeError::MarketEpochUnavailable)?;
+        if self.is_cancelled() {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for SchwabOAuthMarketEpochAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabOAuthMarketEpochAuthority")
+            .field("session_id", &self.session_id)
+            .field("revoked", &self.is_cancelled())
+            .finish_non_exhaustive()
+    }
+}
+
+struct SchwabOAuthTokenAcquisition {
+    authority: Arc<SchwabOAuthMarketEpochAuthority>,
+    finished: bool,
+}
+
+impl SchwabOAuthTokenAcquisition {
+    fn finish(mut self) -> Result<(), SchwabOAuthRuntimeError> {
+        let result = self.authority.finish_token_acquisition();
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for SchwabOAuthTokenAcquisition {
+    fn drop(&mut self) {
+        if !self.finished && self.authority.finish_token_acquisition().is_err() {
+            self.authority.cancel();
+        }
+    }
+}
+
 struct SchwabOAuthSession {
     bootstrap: SchwabOAuthBootstrapLease,
     authority: Arc<ProtectedSchwabOAuthAuthority>,
     pending: Option<PendingAuthorization>,
     exchange: Option<PendingTokenExchange>,
-    market_epoch: CancellationToken,
+    market_epoch: Arc<SchwabOAuthMarketEpochAuthority>,
+}
+
+impl SchwabOAuthSession {
+    async fn status(&self) -> Result<SchwabOAuthAuthorityStatus, SchwabOAuthRuntimeError> {
+        let status = match self.authority.status().await {
+            Ok(status) => status,
+            Err(error) => {
+                self.market_epoch.invalidate();
+                return Err(error.into());
+            }
+        };
+        self.market_epoch.observe_status(status)?;
+        Ok(status)
+    }
 }
 
 impl fmt::Debug for SchwabOAuthSession {
@@ -1004,7 +1221,7 @@ pub(crate) struct SchwabOAuthMarketAuthority {
     session_id: Uuid,
     issued_receipt: SchwabOAuthAuthorityReceipt,
     authority: Arc<ProtectedSchwabOAuthAuthority>,
-    currentness: CancellationToken,
+    currentness: Arc<SchwabOAuthMarketEpochAuthority>,
 }
 
 impl SchwabOAuthMarketAuthority {
@@ -1020,20 +1237,55 @@ impl SchwabOAuthMarketAuthority {
     pub(crate) async fn current_receipt(
         &self,
     ) -> Result<SchwabOAuthAuthorityReceipt, SchwabOAuthRuntimeError> {
+        self.reconciled_receipt()
+            .await
+            .map(|(receipt, _currentness)| receipt)
+    }
+
+    async fn reconciled_receipt(
+        &self,
+    ) -> Result<(SchwabOAuthAuthorityReceipt, CancellationToken), SchwabOAuthRuntimeError> {
         if self.currentness.is_cancelled() {
             return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
         }
-        let status = self.authority.status().await?;
+        let status = match self.authority.status().await {
+            Ok(status) => status,
+            Err(error) => {
+                self.currentness.invalidate();
+                return Err(error.into());
+            }
+        };
         if self.currentness.is_cancelled() {
             return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
         }
         match status {
-            SchwabOAuthAuthorityStatus::Active(receipt) => Ok(receipt),
+            SchwabOAuthAuthorityStatus::Active(receipt) => {
+                let currentness = self.currentness.reconcile_current(receipt)?;
+                if currentness.is_cancelled() || self.currentness.is_cancelled() {
+                    return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+                }
+                Ok((receipt, currentness))
+            }
             SchwabOAuthAuthorityStatus::AwaitingAuthorization
             | SchwabOAuthAuthorityStatus::ReauthorizationRequired => {
+                self.currentness.invalidate();
                 Err(SchwabOAuthRuntimeError::ReauthorizationRequired)
             }
         }
+    }
+
+    /// Mints a secret-free synchronous publication capability after exact async reconciliation.
+    pub(crate) async fn publication_epoch(
+        &self,
+    ) -> Result<SchwabOAuthPublicationEpoch, SchwabOAuthRuntimeError> {
+        let (receipt, currentness) = self.reconciled_receipt().await?;
+        let epoch = SchwabOAuthPublicationEpoch {
+            session_id: self.currentness.session_id,
+            receipt,
+            currentness,
+        };
+        epoch.validate_current(receipt)?;
+        Ok(epoch)
     }
 }
 
@@ -1042,16 +1294,24 @@ impl SchwabAccessTokenSource for SchwabOAuthMarketAuthority {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<TransientAccessToken, TokenAuthorityError>> + Send + '_>>
     {
-        let currentness = self.currentness.clone();
+        let currentness = Arc::clone(&self.currentness);
         let authority = Arc::clone(&self.authority);
         Box::pin(async move {
-            if currentness.is_cancelled() {
-                return Err(TokenAuthorityError::ReauthorizationRequired);
-            }
-            let token = authority.acquire().await?;
-            if currentness.is_cancelled() {
-                return Err(TokenAuthorityError::ReauthorizationRequired);
-            }
+            let transition = currentness
+                .begin_token_acquisition()
+                .map_err(map_market_epoch_token_error)?;
+            let token = match authority.acquire().await {
+                Ok(token) => token,
+                Err(error) => {
+                    drop(transition);
+                    currentness.invalidate();
+                    return Err(error);
+                }
+            };
+            transition.finish().map_err(|error| {
+                currentness.invalidate();
+                map_market_epoch_token_error(error)
+            })?;
             Ok(token)
         })
     }
@@ -1064,6 +1324,53 @@ impl fmt::Debug for SchwabOAuthMarketAuthority {
             .field("session_id", &self.session_id)
             .field("issued_generation", &self.issued_receipt.generation().get())
             .field("authority", &"[PROTECTED TOKEN AUTHORITY]")
+            .field("revoked", &self.currentness.is_cancelled())
+            .finish()
+    }
+}
+
+/// Secret-free synchronous currentness capability for one reconciled OAuth publication epoch.
+///
+/// This value owns no token or protected store handle. It can only compare the exact receipt and
+/// process-local market epoch minted by [`SchwabOAuthMarketAuthority::publication_epoch`].
+#[derive(Clone)]
+pub(crate) struct SchwabOAuthPublicationEpoch {
+    session_id: Uuid,
+    receipt: SchwabOAuthAuthorityReceipt,
+    currentness: CancellationToken,
+}
+
+impl SchwabOAuthPublicationEpoch {
+    pub(crate) const fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub(crate) const fn receipt(&self) -> SchwabOAuthAuthorityReceipt {
+        self.receipt
+    }
+
+    /// Revalidates the exact receipt without blocking or reopening protected OAuth state.
+    pub(crate) fn validate_current(
+        &self,
+        receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<(), SchwabOAuthRuntimeError> {
+        if receipt != self.receipt || self.currentness.is_cancelled() {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        validate_receipt_time(receipt)?;
+        if self.currentness.is_cancelled() {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for SchwabOAuthPublicationEpoch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabOAuthPublicationEpoch")
+            .field("session_id", &self.session_id)
+            .field("oauth_generation", &self.receipt.generation().get())
             .field("revoked", &self.currentness.is_cancelled())
             .finish()
     }
@@ -1170,6 +1477,27 @@ fn timestamp_from_unix_seconds(seconds: u64) -> Result<Timestamp, SchwabOAuthRun
     Ok(Timestamp::from_unix_nanos(nanos))
 }
 
+fn validate_receipt_time(
+    receipt: SchwabOAuthAuthorityReceipt,
+) -> Result<(), SchwabOAuthRuntimeError> {
+    let now = unix_seconds()?;
+    if now >= receipt.access_expires_at_unix_seconds()
+        || now >= receipt.refresh_expires_at_unix_seconds()
+    {
+        return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+    }
+    Ok(())
+}
+
+fn map_market_epoch_token_error(error: SchwabOAuthRuntimeError) -> TokenAuthorityError {
+    match error {
+        SchwabOAuthRuntimeError::MarketAuthorityRevoked
+        | SchwabOAuthRuntimeError::ReauthorizationRequired
+        | SchwabOAuthRuntimeError::ShuttingDown => TokenAuthorityError::ReauthorizationRequired,
+        _ => TokenAuthorityError::Unavailable,
+    }
+}
+
 /// Closed, secret-free application OAuth runtime failure.
 #[derive(Debug, Error)]
 pub(crate) enum SchwabOAuthRuntimeError {
@@ -1199,6 +1527,8 @@ pub(crate) enum SchwabOAuthRuntimeError {
     AuthorizationExchangeInFlight,
     #[error("the issued Schwab market authority was revoked")]
     MarketAuthorityRevoked,
+    #[error("the Schwab OAuth publication epoch authority is unavailable")]
+    MarketEpochUnavailable,
     #[error("a Schwab market authority remained retained after its required drain")]
     MarketAuthorityRetained,
     #[error("secure OAuth correlation state is unavailable")]

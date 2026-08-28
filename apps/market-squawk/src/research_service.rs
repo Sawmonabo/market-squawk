@@ -623,6 +623,14 @@ impl ResearchService {
         &self.analytical
     }
 
+    /// Shares the sole application-owned sealed store with typed restart-verification closures.
+    ///
+    /// This does not expose physical sealing to adapters; callers can only verify claims already
+    /// retained by an immutable provider generation.
+    pub(crate) fn provider_capture_store(&self) -> Arc<SealedResearchJournalStore> {
+        Arc::clone(&self.provider_captures)
+    }
+
     /// Returns immutable bounded analytical metadata and fixed-template observation reads.
     pub fn analytical_reader(&self) -> AnalyticalReadCapability {
         self.analytical.analytical_reader()
@@ -638,12 +646,12 @@ impl ResearchService {
         self.analytical.instrument_definitions()
     }
 
-    /// Returns bounded reads over FIGI-backed, explicitly non-executable market identities.
+    /// Returns bounded reads over repository-owned, explicitly non-executable market identities.
     pub fn market_data_instruments(&self) -> MarketDataInstrumentReadCapability {
         self.analytical.market_data_instruments()
     }
 
-    /// Returns the sole atomic publisher for FIGI-backed market-data identities.
+    /// Returns the sole atomic publisher for repository-owned market-data identities.
     pub fn market_data_instrument_synchronization(
         &self,
     ) -> MarketDataInstrumentSynchronizationCapability {

@@ -51,6 +51,7 @@ const MAXIMUM_PREPUBLISHED_RESEARCH_SOURCES: usize = 64;
 
 mod alpaca_historical;
 mod provider_runtime;
+mod schwab_market;
 mod selection;
 
 pub(crate) use alpaca_historical::{

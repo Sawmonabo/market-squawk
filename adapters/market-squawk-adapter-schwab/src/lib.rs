@@ -121,7 +121,8 @@ pub use transport::{
 pub use vertical::{
     SchwabCapabilityCurrentness, SchwabFamilyDoctorInput, SchwabObservedCapabilityFamily,
     SchwabPriceHistoryCapabilityObservation, SchwabRestFamilyDoctorInput,
-    SchwabStreamerFamilyDoctorInput, SchwabVerticalError,
+    SchwabStreamerDoctorCaptureRejection, SchwabStreamerFamilyDoctorAccumulator,
+    SchwabStreamerFamilyDoctorHandoff, SchwabStreamerFamilyDoctorInput, SchwabVerticalError,
 };
 
 /// Exact Schwab OAuth authorization endpoint.

@@ -4681,6 +4681,7 @@ fn map_schwab_oauth_error(error: SchwabOAuthRuntimeError) -> ProviderPortalActiv
         SchwabOAuthRuntimeError::InvalidState
         | SchwabOAuthRuntimeError::RuntimeRootUnavailable
         | SchwabOAuthRuntimeError::RuntimeRootAlreadyOwned
+        | SchwabOAuthRuntimeError::MarketEpochUnavailable
         | SchwabOAuthRuntimeError::MarketAuthorityRetained
         | SchwabOAuthRuntimeError::CallbackTask
         | SchwabOAuthRuntimeError::ExchangeTask

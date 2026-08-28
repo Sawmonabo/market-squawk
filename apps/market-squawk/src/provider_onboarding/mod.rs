@@ -4,6 +4,8 @@ mod contracts;
 pub(crate) mod credential_bundle;
 mod credential_bundle_delegation;
 mod portal;
+mod schwab_market_doctor;
+mod schwab_market_doctor_probe;
 mod schwab_oauth_installation;
 mod schwab_oauth_runtime;
 mod service;
@@ -45,9 +47,9 @@ pub use schwab_oauth_installation::{
     SchwabOAuthInstallationTrustState,
 };
 pub(crate) use schwab_oauth_runtime::{
-    SchwabOAuthBrowserError, SchwabOAuthMarketDrain, SchwabOAuthMarketDrainError,
-    SchwabOAuthMarketDrainFuture, SchwabOAuthRuntime, SchwabOAuthRuntimeConfiguration,
-    SchwabOAuthRuntimeError,
+    SchwabOAuthBrowserError, SchwabOAuthMarketAuthority, SchwabOAuthMarketDrain,
+    SchwabOAuthMarketDrainError, SchwabOAuthMarketDrainFuture, SchwabOAuthPublicationEpoch,
+    SchwabOAuthRuntime, SchwabOAuthRuntimeConfiguration, SchwabOAuthRuntimeError,
 };
 pub(crate) use service::{
     AcquiredFredTermsDocument, ProviderOnboardingMutationAuthority,

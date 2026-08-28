@@ -375,6 +375,7 @@ struct PendingStreamerServiceResponseEvidence {
     status_code: i64,
     provider_timestamp_millis: Option<u64>,
     round_trip_latency_ms: Option<u64>,
+    request_payload_sha256: Option<EvidenceDigest>,
     frame_ordinal: NonZeroU64,
 }
 
@@ -387,6 +388,7 @@ pub struct SchwabStreamerServiceResponseEvidence {
     status_code: i64,
     provider_timestamp_millis: Option<u64>,
     round_trip_latency_ms: Option<u64>,
+    request_payload_sha256: Option<EvidenceDigest>,
     generation: ConnectionGeneration,
     transport_ordinal: NonZeroU64,
     received_at_unix_millis: u64,
@@ -422,6 +424,11 @@ impl SchwabStreamerServiceResponseEvidence {
     /// Monotonic local request-to-response measurement when the response matched an owned request.
     pub const fn round_trip_latency_ms(&self) -> Option<u64> {
         self.round_trip_latency_ms
+    }
+
+    /// SHA-256 of the exact owned outbound subscription request when request matching succeeded.
+    pub const fn request_payload_sha256(&self) -> Option<EvidenceDigest> {
+        self.request_payload_sha256
     }
 
     pub const fn generation(&self) -> ConnectionGeneration {
@@ -645,6 +652,7 @@ fn bind_service_response_evidence(
             status_code: response.status_code,
             provider_timestamp_millis: response.provider_timestamp_millis,
             round_trip_latency_ms: response.round_trip_latency_ms,
+            request_payload_sha256: response.request_payload_sha256,
             generation: frame.generation,
             transport_ordinal: frame.transport_ordinal,
             received_at_unix_millis: frame.received_at_unix_millis,
@@ -671,6 +679,7 @@ fn service_response_observation_sha256(
     hasher.update(response.status_code.to_be_bytes());
     hash_optional_u64(&mut hasher, response.provider_timestamp_millis);
     hash_optional_u64(&mut hasher, response.round_trip_latency_ms);
+    hash_optional_digest(&mut hasher, response.request_payload_sha256);
     hasher.update(frame.generation.get().to_be_bytes());
     hasher.update(frame.transport_ordinal.get().to_be_bytes());
     hasher.update(frame.received_at_unix_millis.to_be_bytes());
@@ -699,6 +708,16 @@ fn hash_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
         Some(value) => {
             hasher.update([1]);
             hasher.update(value.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn hash_optional_digest(hasher: &mut Sha256, value: Option<EvidenceDigest>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.bytes());
         }
         None => hasher.update([0]),
     }
@@ -1469,10 +1488,13 @@ impl SchwabStreamerExecutor {
                                     .as_ref()
                                     .map(|sent| duration_millis(sent.dispatched_at.elapsed()))
                                     .transpose()?;
+                                let request_payload_sha256 =
+                                    sent.as_ref().map(|sent| sent.request_payload_sha256);
                                 batch.record_service_response(
                                     captured_ordinal,
                                     response,
                                     latency,
+                                    request_payload_sha256,
                                 )?;
                                 let Some(sent) = sent else {
                                     response_error.get_or_insert(SchwabTransportError::Protocol);
@@ -1590,6 +1612,12 @@ impl SchwabStreamerExecutor {
             .map_err(|_| SchwabTransportError::Overflow)?;
         self.telemetry
             .record_stream_semantics(events, responses, notifications)?;
+        if parsed.value().responses.is_empty()
+            && !parsed.value().data.is_empty()
+            && batch.has_service_responses()
+        {
+            flush_batch(batch, sink, &self.telemetry)?;
+        }
         let captured_ordinal = if parsed
             .value()
             .responses
@@ -1665,6 +1693,10 @@ impl MicrobatchBuilder {
             .unwrap_or(self.opened_at)
     }
 
+    fn has_service_responses(&self) -> bool {
+        !self.service_responses.is_empty()
+    }
+
     fn would_exceed(&self, additional: usize) -> Result<bool, SchwabTransportError> {
         let bytes = self
             .payload_bytes
@@ -1716,6 +1748,7 @@ impl MicrobatchBuilder {
         frame_ordinal: NonZeroU64,
         response: &crate::StreamerResponse,
         round_trip_latency_ms: Option<u64>,
+        request_payload_sha256: Option<EvidenceDigest>,
     ) -> Result<(), SchwabTransportError> {
         let Some(service) = selected_service(response.service.as_ref()) else {
             if response.service.as_ref() == "ADMIN" {
@@ -1741,6 +1774,7 @@ impl MicrobatchBuilder {
                 status_code: response_code_value(response.code),
                 provider_timestamp_millis: response.timestamp_millis,
                 round_trip_latency_ms,
+                request_payload_sha256,
                 frame_ordinal,
             });
         Ok(())
@@ -1835,6 +1869,7 @@ struct SentStreamerRequest {
     service: Option<crate::MarketDataService>,
     command: Box<str>,
     request_id: Box<str>,
+    request_payload_sha256: EvidenceDigest,
     dispatched_at: Instant,
 }
 
@@ -1845,10 +1880,15 @@ async fn send_request(
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<SentStreamerRequest, SchwabTransportError> {
+    let request_payload_sha256 = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256::digest(request.expose_body()).into(),
+    );
     let sent = SentStreamerRequest {
         service: request.service(),
         command: request.command().to_owned().into_boxed_str(),
         request_id: request.request_id().get().to_string().into_boxed_str(),
+        request_payload_sha256,
         dispatched_at: Instant::now(),
     };
     let bytes = Bytes::copy_from_slice(request.expose_body());
