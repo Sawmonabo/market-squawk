@@ -20,6 +20,7 @@ mod ingest;
 mod manifest;
 mod market_event;
 mod migrations;
+mod option_market;
 mod parquet_store;
 mod pit;
 mod provider_rate;
@@ -112,6 +113,10 @@ pub use catalog::{
     PersistedProviderResponseMarketEventBindingEvidence,
     PersistedProviderResponseMarketEventBindingRow,
 };
+pub use catalog::{
+    PersistedProviderOptionMarketBindingEvidence, PersistedProviderOptionMarketBindingRow,
+    PersistedProviderOptionMarketNativeLineage,
+};
 pub use catalog_capabilities::{
     CompanyIdentityReadCapability, FairValueCatalogCapability, InstrumentCatalogCapability,
     InstrumentDefinitionReadCapability, OnboardingCatalogCapability,
@@ -142,9 +147,9 @@ pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
     IngestPrecommitAuthority, ListingReferenceAdmissionCapability, PinnedArtifactQueryRequest,
     ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
-    ProviderPublicationInput, QueryArtifactPublication, ResearchIngestService,
-    extraction_batch_digest, extraction_provider_payload_digest,
-    provider_market_event_publication_digest,
+    ProviderOptionMarketPublicationSelector, ProviderPublicationInput, QueryArtifactPublication,
+    ResearchIngestService, extraction_batch_digest, extraction_provider_payload_digest,
+    provider_market_event_publication_digest, provider_option_market_publication_digest,
 };
 pub use manifest::{
     AnalyticalManifestCatalog, CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
@@ -160,6 +165,10 @@ pub use manifest::{
     ReleaseEvidenceStorageError, ReleaseEvidenceStorageResult, run_release_evidence_storage,
 };
 pub use market_event::ProviderMarketEventArrowBatch;
+pub use option_market::{
+    OptionMarketPointInTimeRequest, OptionMarketPointInTimeSelection,
+    ProviderOptionMarketArrowBatch,
+};
 pub use parquet_store::{
     ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PublishedObject,
 };

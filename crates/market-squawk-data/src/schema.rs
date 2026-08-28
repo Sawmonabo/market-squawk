@@ -26,10 +26,12 @@ pub(crate) const PROVIDER_PUBLICATION_KIND_KEY: &str = "market_squawk.provider_p
 pub(crate) const RESEARCH_SCHEMA_NAME: &str = "market_squawk.research_observations";
 pub(crate) const FEATURE_LABEL_SCHEMA_NAME: &str = "market_squawk.feature_label_components";
 pub(crate) const MARKET_EVENT_SCHEMA_NAME: &str = "market_squawk.market_events";
+pub(crate) const OPTION_MARKET_SCHEMA_NAME: &str = "market_squawk.option_market";
 pub(crate) const RESEARCH_RECORD_SCHEMA: &str = CURRENT_RESEARCH_RECORD_SCHEMA;
 pub(crate) const RESEARCH_SCHEMA_VERSION: u16 = 3;
 pub(crate) const FEATURE_LABEL_SCHEMA_VERSION: u16 = 3;
 pub(crate) const MARKET_EVENT_SCHEMA_VERSION: u16 = 1;
+pub(crate) const OPTION_MARKET_SCHEMA_VERSION: u16 = 1;
 pub(crate) const FEATURE_LABEL_EXAMPLE_ID_BYTES: i32 = 256;
 pub(crate) const FEATURE_LABEL_INSTRUMENT_ID_BYTES: i32 = 16;
 pub(crate) const FEATURE_LABEL_COMPONENT_NAME_BYTES: i32 = 256;
@@ -267,6 +269,11 @@ impl DatasetSchemaRegistry {
         identity_for_schema(MARKET_EVENT_SCHEMA_NAME, market_event_schema_definition())
     }
 
+    /// Returns the exact durable provider-neutral option-market identity.
+    pub fn canonical_option_market(self) -> Result<DatasetSchemaRef, DatasetSchemaError> {
+        identity_for_schema(OPTION_MARKET_SCHEMA_NAME, option_market_schema_definition())
+    }
+
     /// Resolves an exact known identity to its canonical Arrow schema.
     ///
     /// Unknown names or versions and known names with altered fingerprints fail closed.
@@ -278,6 +285,9 @@ impl DatasetSchemaRegistry {
             }
             (MARKET_EVENT_SCHEMA_NAME, MARKET_EVENT_SCHEMA_VERSION) => {
                 market_event_schema_definition()
+            }
+            (OPTION_MARKET_SCHEMA_NAME, OPTION_MARKET_SCHEMA_VERSION) => {
+                option_market_schema_definition()
             }
             _ => return Err(DatasetSchemaError::UnknownIdentity),
         };
@@ -362,6 +372,30 @@ pub(crate) fn market_event_schema(
 ) -> Result<SchemaRef, DatasetSchemaError> {
     let registry = DatasetSchemaRegistry::local();
     let schema_ref = registry.canonical_market_events()?;
+    let schema = registry.resolve(&schema_ref)?;
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(DATASET_KEY.to_owned(), dataset.as_str().to_owned());
+    metadata.insert(
+        PROVIDER_PUBLICATION_DIGEST_KEY.to_owned(),
+        encode_hex(publication_digest.bytes()),
+    );
+    metadata.insert(
+        PROVIDER_PUBLICATION_KIND_KEY.to_owned(),
+        publication_kind.to_owned(),
+    );
+    Ok(Arc::new(Schema::new_with_metadata(
+        schema.fields().clone(),
+        metadata,
+    )))
+}
+
+pub(crate) fn option_market_schema(
+    dataset: &SourceIdentifier,
+    publication_digest: EvidenceDigest,
+    publication_kind: &str,
+) -> Result<SchemaRef, DatasetSchemaError> {
+    let registry = DatasetSchemaRegistry::local();
+    let schema_ref = registry.canonical_option_market()?;
     let schema = registry.resolve(&schema_ref)?;
     let mut metadata = schema.metadata().clone();
     metadata.insert(DATASET_KEY.to_owned(), dataset.as_str().to_owned());
@@ -605,6 +639,60 @@ fn market_event_schema_definition() -> Schema {
             (
                 "market_squawk.market_event_encoding".to_owned(),
                 "typed-json-v1".to_owned(),
+            ),
+        ]),
+    )
+}
+
+fn option_market_schema_definition() -> Schema {
+    let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()));
+    Schema::new_with_metadata(
+        vec![
+            Field::new("schema_version", DataType::UInt16, false),
+            Field::new("row_kind", DataType::Utf8, false),
+            Field::new("canonical_row_ordinal", DataType::UInt32, true),
+            Field::new("source_id", DataType::Utf8, false),
+            Field::new("batch_kind", DataType::Utf8, false),
+            Field::new(
+                "underlying_instrument_id",
+                DataType::FixedSizeBinary(16),
+                false,
+            ),
+            Field::new("provider_instrument_id", DataType::Utf8, false),
+            Field::new("available_at", timestamp.clone(), false),
+            Field::new("received_at", timestamp.clone(), false),
+            Field::new("ingested_at", timestamp, false),
+            Field::new("disposition", DataType::Utf8, false),
+            Field::new("scope_sha256", DataType::FixedSizeBinary(32), false),
+            Field::new("completeness_sha256", DataType::FixedSizeBinary(32), false),
+            Field::new("canonical_row_sha256", DataType::FixedSizeBinary(32), true),
+            Field::new(
+                "native_semantic_sha256",
+                DataType::FixedSizeBinary(32),
+                true,
+            ),
+            Field::new("capture_page_ordinal", DataType::UInt16, true),
+            Field::new("physical_frame_ordinal", DataType::UInt32, true),
+            Field::new("raw_payload_sha256", DataType::FixedSizeBinary(32), true),
+            Field::new("source_sequence_be", DataType::Binary, true),
+            Field::new("payload_json", DataType::Binary, false),
+        ],
+        HashMap::from([
+            (
+                SCHEMA_NAME_KEY.to_owned(),
+                OPTION_MARKET_SCHEMA_NAME.to_owned(),
+            ),
+            (
+                SCHEMA_VERSION_KEY.to_owned(),
+                OPTION_MARKET_SCHEMA_VERSION.to_string(),
+            ),
+            (
+                "market_squawk.timestamp_timezone".to_owned(),
+                "UTC".to_owned(),
+            ),
+            (
+                "market_squawk.option_market_encoding".to_owned(),
+                "batch-header-plus-typed-json-rows-v1".to_owned(),
             ),
         ]),
     )

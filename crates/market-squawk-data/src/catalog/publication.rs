@@ -10,8 +10,9 @@ use super::storage::{
 };
 use super::types::*;
 use super::{
-    PreparedProviderCaptureBinding, PreparedProviderPublicationBinding,
-    retain_prepared_provider_capture_binding, retain_prepared_provider_publication_binding,
+    PreparedProviderCaptureBinding, PreparedProviderOptionMarketBinding,
+    PreparedProviderPublicationBinding, retain_prepared_provider_capture_binding,
+    retain_prepared_provider_option_market_binding, retain_prepared_provider_publication_binding,
 };
 
 /// Closed raw-input state admitted by the sole artifact/manifest transaction.
@@ -23,6 +24,8 @@ pub(crate) enum PublicationSourceEvidence<'a> {
     Provider(&'a PreparedProviderCaptureBinding),
     /// The provider publication consumes one exact typed event/composite binding.
     ProviderEvent(&'a PreparedProviderPublicationBinding),
+    /// The provider publication consumes one exact sealed option-market binding.
+    ProviderOptionMarket(&'a PreparedProviderOptionMarketBinding),
 }
 
 /// One atomically published artifact and its exact durable dataset manifest.
@@ -261,6 +264,14 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
         }
         PublicationSourceEvidence::ProviderEvent(binding) => {
             retain_prepared_provider_publication_binding(
+                transaction,
+                reservation.run_id,
+                binding,
+                catalog_now,
+            )?;
+        }
+        PublicationSourceEvidence::ProviderOptionMarket(binding) => {
+            retain_prepared_provider_option_market_binding(
                 transaction,
                 reservation.run_id,
                 binding,

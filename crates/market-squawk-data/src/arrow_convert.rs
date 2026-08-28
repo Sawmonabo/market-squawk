@@ -1249,6 +1249,9 @@ pub enum ArrowConversionError {
     /// A typed canonical market-event row violates its retained publication evidence.
     #[error("Arrow market-event row does not match its exact provider publication evidence")]
     InvalidMarketEventRow,
+    /// A typed canonical option row or batch header violates retained publication evidence.
+    #[error("Arrow option-market batch does not match its exact provider publication evidence")]
+    InvalidOptionMarketRow,
     /// Canonical payload and analytical projections disagree.
     #[error("Arrow analytical projection does not match its canonical payload")]
     ProjectionMismatch,

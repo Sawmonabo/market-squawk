@@ -1160,6 +1160,129 @@ CREATE TABLE provider_composite_response_event_bindings (
     recorded_at_ns INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
 
+-- One sealed option response is published as a coherent batch. The canonical count may be zero;
+-- its mandatory Parquet batch-header row keeps the empty or unavailable response immutable.
+CREATE TABLE provider_option_market_bindings (
+    option_binding_digest BLOB PRIMARY KEY CHECK (
+        length(option_binding_digest) = 32 AND option_binding_digest <> zeroblob(32)
+    ),
+    binding_format_version INTEGER NOT NULL CHECK (binding_format_version = 1),
+    capture_observation_digest BLOB NOT NULL
+        REFERENCES provider_raw_observations(capture_observation_digest),
+    sealed_capture_receipt_digest BLOB NOT NULL CHECK (
+        length(sealed_capture_receipt_digest) = 32
+        AND sealed_capture_receipt_digest <> zeroblob(32)
+    ),
+    publication_kind TEXT NOT NULL CHECK (
+        publication_kind IN ('option_snapshots', 'option_expirations')
+    ),
+    canonical_schema_fingerprint BLOB NOT NULL CHECK (
+        length(canonical_schema_fingerprint) = 32
+        AND canonical_schema_fingerprint <> zeroblob(32)
+    ),
+    canonical_content_digest BLOB NOT NULL CHECK (
+        length(canonical_content_digest) = 32
+        AND canonical_content_digest <> zeroblob(32)
+    ),
+    canonical_row_count INTEGER NOT NULL CHECK (
+        canonical_row_count BETWEEN 0 AND 100000
+    ),
+    scope_json BLOB NOT NULL CHECK (length(scope_json) BETWEEN 2 AND 67108864),
+    scope_digest BLOB NOT NULL CHECK (
+        length(scope_digest) = 32 AND scope_digest <> zeroblob(32)
+    ),
+    completeness_json BLOB NOT NULL CHECK (
+        length(completeness_json) BETWEEN 2 AND 1048576
+    ),
+    completeness_digest BLOB NOT NULL CHECK (
+        length(completeness_digest) = 32 AND completeness_digest <> zeroblob(32)
+    ),
+    filter_json BLOB NOT NULL CHECK (length(filter_json) BETWEEN 2 AND 4194304),
+    filter_digest BLOB NOT NULL CHECK (
+        length(filter_digest) = 32 AND filter_digest <> zeroblob(32)
+    ),
+    underlying_instrument_id BLOB NOT NULL CHECK (length(underlying_instrument_id) = 16),
+    available_at_ns INTEGER NOT NULL,
+    received_at_ns INTEGER NOT NULL,
+    ingested_at_ns INTEGER NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition IN ('complete', 'unavailable')),
+    row_mapping_digest BLOB NOT NULL CHECK (
+        length(row_mapping_digest) = 32 AND row_mapping_digest <> zeroblob(32)
+    ),
+    recorded_at_ns INTEGER NOT NULL,
+    UNIQUE (option_binding_digest, capture_observation_digest),
+    CHECK (available_at_ns <= ingested_at_ns AND received_at_ns <= ingested_at_ns)
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER provider_option_market_bindings_guarded_insert
+BEFORE INSERT ON provider_option_market_bindings
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM provider_raw_observation_objects AS object
+    WHERE object.capture_observation_digest=NEW.capture_observation_digest
+      AND object.capture_receipt_digest=NEW.sealed_capture_receipt_digest
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider option-market binding lacks its sealed response object');
+END;
+
+CREATE TABLE provider_option_market_binding_native_lineage (
+    option_binding_digest BLOB PRIMARY KEY
+        REFERENCES provider_option_market_bindings(option_binding_digest),
+    schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+    implementation TEXT NOT NULL CHECK (
+        length(CAST(implementation AS BLOB)) BETWEEN 1 AND 128
+    ),
+    schema_fingerprint BLOB NOT NULL CHECK (
+        length(schema_fingerprint) = 32 AND schema_fingerprint <> zeroblob(32)
+    ),
+    row_count INTEGER NOT NULL CHECK (row_count BETWEEN 0 AND 100000),
+    batch_digest BLOB NOT NULL CHECK (
+        length(batch_digest) = 32 AND batch_digest <> zeroblob(32)
+    ),
+    batch_sidecar_payload BLOB NOT NULL CHECK (
+        length(batch_sidecar_payload) BETWEEN 1 AND 4194304
+    ),
+    batch_sidecar_digest BLOB NOT NULL CHECK (
+        length(batch_sidecar_digest) = 32 AND batch_sidecar_digest <> zeroblob(32)
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_option_market_binding_rows (
+    option_binding_digest BLOB NOT NULL,
+    capture_observation_digest BLOB NOT NULL,
+    canonical_row_ordinal INTEGER NOT NULL CHECK (
+        canonical_row_ordinal BETWEEN 0 AND 99999
+    ),
+    canonical_row_digest BLOB NOT NULL CHECK (
+        length(canonical_row_digest) = 32 AND canonical_row_digest <> zeroblob(32)
+    ),
+    native_semantic_payload BLOB NOT NULL CHECK (
+        length(native_semantic_payload) BETWEEN 1 AND 65536
+    ),
+    native_semantic_digest BLOB NOT NULL CHECK (
+        length(native_semantic_digest) = 32 AND native_semantic_digest <> zeroblob(32)
+    ),
+    capture_page_ordinal INTEGER NOT NULL CHECK (capture_page_ordinal BETWEEN 0 AND 63),
+    physical_frame_ordinal INTEGER NOT NULL CHECK (physical_frame_ordinal BETWEEN 0 AND 63),
+    payload_digest BLOB NOT NULL CHECK (
+        length(payload_digest) = 32 AND payload_digest <> zeroblob(32)
+    ),
+    received_at_ns INTEGER NOT NULL,
+    source_sequence BLOB CHECK (source_sequence IS NULL OR length(source_sequence) = 8),
+    PRIMARY KEY (option_binding_digest, canonical_row_ordinal),
+    FOREIGN KEY (option_binding_digest, capture_observation_digest)
+        REFERENCES provider_option_market_bindings(
+            option_binding_digest,
+            capture_observation_digest
+        ),
+    FOREIGN KEY (capture_observation_digest, capture_page_ordinal)
+        REFERENCES provider_raw_observation_pages(
+            capture_observation_digest,
+            page_ordinal
+        )
+) STRICT, WITHOUT ROWID;
+
 CREATE TRIGGER provider_composite_response_event_bindings_guarded_insert
 BEFORE INSERT ON provider_composite_response_event_bindings
 WHEN NOT EXISTS (
@@ -1201,7 +1324,9 @@ CREATE TABLE ingest_run_provider_publication_bindings (
         publication_kind IN (
             'response_market_event',
             'event_microbatch',
-            'composite_response_event'
+            'composite_response_event',
+            'option_snapshots',
+            'option_expirations'
         )
     ),
     source_id TEXT NOT NULL REFERENCES sources(source_id),
@@ -1210,6 +1335,8 @@ CREATE TABLE ingest_run_provider_publication_bindings (
     event_binding_digest BLOB REFERENCES provider_event_bindings(event_binding_digest),
     composite_binding_digest BLOB
         REFERENCES provider_composite_response_event_bindings(composite_binding_digest),
+    option_binding_digest BLOB
+        REFERENCES provider_option_market_bindings(option_binding_digest),
     PRIMARY KEY (run_id, input_ordinal),
     UNIQUE (run_id, publication_digest),
     CHECK (
@@ -1217,17 +1344,26 @@ CREATE TABLE ingest_run_provider_publication_bindings (
             AND response_binding_digest IS NOT NULL
             AND event_binding_digest IS NULL
             AND composite_binding_digest IS NULL
+            AND option_binding_digest IS NULL
             AND publication_digest=response_binding_digest)
         OR (publication_kind='event_microbatch'
             AND response_binding_digest IS NULL
             AND event_binding_digest IS NOT NULL
             AND composite_binding_digest IS NULL
+            AND option_binding_digest IS NULL
             AND publication_digest=event_binding_digest)
         OR (publication_kind='composite_response_event'
             AND response_binding_digest IS NOT NULL
             AND event_binding_digest IS NOT NULL
             AND composite_binding_digest IS NOT NULL
+            AND option_binding_digest IS NULL
             AND publication_digest=composite_binding_digest)
+        OR (publication_kind IN ('option_snapshots', 'option_expirations')
+            AND response_binding_digest IS NULL
+            AND event_binding_digest IS NULL
+            AND composite_binding_digest IS NULL
+            AND option_binding_digest IS NOT NULL
+            AND publication_digest=option_binding_digest)
     )
 ) STRICT, WITHOUT ROWID;
 
@@ -1278,6 +1414,22 @@ WHEN NOT EXISTS (
                 AND composite.response_binding_digest=NEW.response_binding_digest
                 AND composite.event_binding_digest=NEW.event_binding_digest
                 AND NEW.publication_digest=composite.composite_binding_digest
+          ))
+          OR (NEW.publication_kind IN ('option_snapshots', 'option_expirations') AND EXISTS (
+              SELECT 1
+              FROM provider_option_market_bindings AS binding
+              JOIN provider_raw_observations AS capture
+                ON capture.capture_observation_digest=binding.capture_observation_digest
+              JOIN provider_option_market_binding_native_lineage AS native
+                ON native.option_binding_digest=binding.option_binding_digest
+              WHERE binding.option_binding_digest=NEW.option_binding_digest
+                AND binding.publication_kind=NEW.publication_kind
+                AND NEW.publication_digest=binding.option_binding_digest
+                AND capture.source_id=NEW.source_id
+                AND native.row_count=binding.canonical_row_count
+                AND (SELECT COUNT(*) FROM provider_option_market_binding_rows AS row
+                     WHERE row.option_binding_digest=binding.option_binding_digest)
+                    = binding.canonical_row_count
           ))
       )
 )
@@ -1335,7 +1487,9 @@ CREATE TABLE analytical_generation_provider_publication_bindings (
         publication_kind IN (
             'response_market_event',
             'event_microbatch',
-            'composite_response_event'
+            'composite_response_event',
+            'option_snapshots',
+            'option_expirations'
         )
     ),
     run_id TEXT NOT NULL,
@@ -1604,6 +1758,36 @@ END;
 CREATE TRIGGER provider_composite_response_event_bindings_immutable_delete
 BEFORE DELETE ON provider_composite_response_event_bindings BEGIN
     SELECT RAISE(ABORT, 'provider composite response-event bindings are immutable');
+END;
+
+CREATE TRIGGER provider_option_market_bindings_immutable_update
+BEFORE UPDATE ON provider_option_market_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider option-market bindings are immutable');
+END;
+
+CREATE TRIGGER provider_option_market_bindings_immutable_delete
+BEFORE DELETE ON provider_option_market_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider option-market bindings are immutable');
+END;
+
+CREATE TRIGGER provider_option_market_binding_native_lineage_immutable_update
+BEFORE UPDATE ON provider_option_market_binding_native_lineage BEGIN
+    SELECT RAISE(ABORT, 'provider option-market native lineage is immutable');
+END;
+
+CREATE TRIGGER provider_option_market_binding_native_lineage_immutable_delete
+BEFORE DELETE ON provider_option_market_binding_native_lineage BEGIN
+    SELECT RAISE(ABORT, 'provider option-market native lineage is immutable');
+END;
+
+CREATE TRIGGER provider_option_market_binding_rows_immutable_update
+BEFORE UPDATE ON provider_option_market_binding_rows BEGIN
+    SELECT RAISE(ABORT, 'provider option-market rows are immutable');
+END;
+
+CREATE TRIGGER provider_option_market_binding_rows_immutable_delete
+BEFORE DELETE ON provider_option_market_binding_rows BEGIN
+    SELECT RAISE(ABORT, 'provider option-market rows are immutable');
 END;
 
 CREATE TRIGGER ingest_run_provider_capture_bindings_immutable_update

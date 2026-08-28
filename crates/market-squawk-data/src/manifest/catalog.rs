@@ -35,6 +35,7 @@ use super::{
     MAX_DERIVED_GENERATION_PARENTS, ManifestObject, ManifestPlan, ManifestPlanError,
     MarketBarHistoryPublicationCandidate, Sha256Digest, compare_manifest_refs,
 };
+use crate::OptionMarketPointInTimeRequest;
 use crate::catalog::exact_catalog_file_binding;
 use crate::catalog::{
     PublicationSourceEvidence, complete_ingest_in_transaction,
@@ -222,6 +223,118 @@ impl fmt::Debug for AnalyticalManifestCatalog {
 }
 
 impl AnalyticalManifestCatalog {
+    pub(crate) fn select_provider_option_market_publication(
+        &self,
+        request: &OptionMarketPointInTimeRequest,
+    ) -> Result<Option<(DatasetManifestRef, EvidenceDigest, String)>, ManifestCatalogError> {
+        let connection = self.lock()?;
+        let exact_version = request
+            .exact_manifest()
+            .map(|manifest| to_i64(manifest.manifest_version()))
+            .transpose()?;
+        let publication_kind = match request.publication_kind() {
+            market_squawk_sources::OptionMarketBatchKind::Snapshots => "option_snapshots",
+            market_squawk_sources::OptionMarketBatchKind::Expirations => "option_expirations",
+        };
+        let mut statement = connection.prepare(
+            "WITH candidates AS (
+                 SELECT generation.dataset_id, generation.manifest_version,
+                        generation.schema_name, generation.schema_version,
+                        generation.schema_fingerprint, generation.content_hash,
+                        publication.publication_digest, publication.publication_kind,
+                        binding.available_at_ns, binding.received_at_ns, binding.ingested_at_ns,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY publication.publication_digest
+                            ORDER BY generation.manifest_version
+                        ) AS origin_rank
+                 FROM analytical_generation_provider_publication_bindings AS publication
+                 JOIN analytical_generations AS generation
+                   ON generation.generation_sequence=publication.generation_sequence
+                 JOIN provider_option_market_bindings AS binding
+                   ON binding.option_binding_digest=publication.publication_digest
+                 WHERE generation.dataset_id=?1
+                   AND generation.schema_name='market_squawk.option_market'
+                   AND publication.publication_kind=?2
+                   AND binding.underlying_instrument_id=?3
+                   AND binding.filter_digest=?4
+                   AND binding.available_at_ns<=?5
+                   AND binding.ingested_at_ns<=?5
+                   AND (?6 IS NULL OR generation.manifest_version=?6)
+             )
+             SELECT dataset_id, manifest_version, schema_name, schema_version,
+                    schema_fingerprint, content_hash, publication_digest, publication_kind,
+                    available_at_ns, received_at_ns, ingested_at_ns
+             FROM candidates WHERE origin_rank=1 OR ?6 IS NOT NULL
+             ORDER BY available_at_ns DESC, received_at_ns DESC, ingested_at_ns DESC,
+                      publication_digest
+             LIMIT 2",
+        )?;
+        let mut rows = statement.query(params![
+            request.dataset().as_str(),
+            publication_kind,
+            request
+                .underlying_instrument_id()
+                .as_uuid()
+                .as_bytes()
+                .as_slice(),
+            request.filter_digest().bytes().as_slice(),
+            request.knowledge_cutoff().unix_nanos(),
+            exact_version,
+        ])?;
+        type Candidate = (DatasetManifestRef, EvidenceDigest, String, (i64, i64, i64));
+        let mut candidates: Vec<Candidate> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let dataset_id = DatasetId::try_from(row.get::<_, String>(0)?.as_str())?;
+            let version = u64::try_from(row.get::<_, i64>(1)?)
+                .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+            let schema_name: String = row.get(2)?;
+            let schema_version = market_squawk_domain::SchemaVersion::new(
+                u16::try_from(row.get::<_, i64>(3)?)
+                    .map_err(|_| ManifestCatalogError::CorruptCatalog)?,
+            )
+            .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+            let schema_fingerprint: Vec<u8> = row.get(4)?;
+            let schema = DatasetSchemaRef::try_new(
+                schema_name,
+                schema_version,
+                parse_digest(&schema_fingerprint)?.bytes(),
+            )?;
+            DatasetSchemaRegistry::local().resolve(&schema)?;
+            let content_hash: Vec<u8> = row.get(5)?;
+            let manifest = DatasetManifestRef::try_new_with_schema(
+                dataset_id,
+                version,
+                schema,
+                parse_digest(&content_hash)?,
+            )?;
+            candidates.push((
+                manifest,
+                EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    parse_digest(&row.get::<_, Vec<u8>>(6)?)?.bytes(),
+                ),
+                row.get(7)?,
+                (row.get(8)?, row.get(9)?, row.get(10)?),
+            ));
+        }
+        let Some(first) = candidates.first() else {
+            return Ok(None);
+        };
+        if candidates
+            .get(1)
+            .is_some_and(|second| second.3 == first.3 && second.1 != first.1)
+        {
+            return Err(ManifestCatalogError::GenerationConflict);
+        }
+        if request
+            .exact_manifest()
+            .is_some_and(|exact| exact != &first.0)
+        {
+            return Err(ManifestCatalogError::GenerationConflict);
+        }
+        Ok(Some((first.0.clone(), first.1, first.2.clone())))
+    }
+
     pub(crate) fn provider_publication_bindings(
         &self,
         manifest: &DatasetManifestRef,

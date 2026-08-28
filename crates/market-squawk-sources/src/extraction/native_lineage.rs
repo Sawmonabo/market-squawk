@@ -41,6 +41,8 @@ pub enum ProviderNativeLineageImplementation {
     SchwabRestMarketDataV1,
     /// Schwab Streamer market-data frame semantics encoder v1.
     SchwabStreamerMarketDataV1,
+    /// Yahoo explicit-demand enrichment response semantics encoder v1.
+    YahooEnrichmentV1,
 }
 
 impl ProviderNativeLineageImplementation {
@@ -59,6 +61,7 @@ impl ProviderNativeLineageImplementation {
             Self::SchwabStreamerMarketDataV1 => {
                 b"market-squawk/schwab-streamer-market-data/provider-native-lineage/v1"
             }
+            Self::YahooEnrichmentV1 => b"market-squawk/yahoo-enrichment/provider-native-lineage/v1",
         }
     }
 
@@ -71,6 +74,7 @@ impl ProviderNativeLineageImplementation {
             Self::EiaSeriesV1 => 4,
             Self::SchwabRestMarketDataV1 => 14,
             Self::SchwabStreamerMarketDataV1 => 15,
+            Self::YahooEnrichmentV1 => 16,
         }
     }
 }

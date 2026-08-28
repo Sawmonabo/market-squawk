@@ -10,9 +10,10 @@ use uuid::Uuid;
 use super::ArrowConversionError;
 use crate::schema::{
     BUILD_DIGEST_KEY, DATASET_KEY, DatasetSchemaRef, DatasetSchemaRegistry,
-    FEATURE_LABEL_SCHEMA_NAME, MARKET_EVENT_SCHEMA_NAME, POLICY_DIGEST_KEY,
-    PROVIDER_PUBLICATION_DIGEST_KEY, PROVIDER_PUBLICATION_KIND_KEY, REQUEST_DIGEST_KEY,
-    RESEARCH_SCHEMA_NAME, UNIVERSE_DIGEST_KEY, decode_hex, schema_ref_from_metadata,
+    FEATURE_LABEL_SCHEMA_NAME, MARKET_EVENT_SCHEMA_NAME, OPTION_MARKET_SCHEMA_NAME,
+    POLICY_DIGEST_KEY, PROVIDER_PUBLICATION_DIGEST_KEY, PROVIDER_PUBLICATION_KIND_KEY,
+    REQUEST_DIGEST_KEY, RESEARCH_SCHEMA_NAME, UNIVERSE_DIGEST_KEY, decode_hex,
+    schema_ref_from_metadata,
 };
 
 /// A nonempty Arrow record batch validated against one exact registered dataset schema.
@@ -87,7 +88,7 @@ fn validate_batch_metadata(
             UNIVERSE_DIGEST_KEY,
             POLICY_DIGEST_KEY,
         ],
-        MARKET_EVENT_SCHEMA_NAME => &[
+        MARKET_EVENT_SCHEMA_NAME | OPTION_MARKET_SCHEMA_NAME => &[
             DATASET_KEY,
             PROVIDER_PUBLICATION_DIGEST_KEY,
             PROVIDER_PUBLICATION_KIND_KEY,
@@ -135,6 +136,13 @@ fn validate_batch_metadata(
                     "response_market_event" | "event_microbatch" | "composite_response_event"
                 )
             })
+    {
+        return Err(ArrowConversionError::InvalidSchemaMetadata);
+    }
+    if schema_ref.name() == OPTION_MARKET_SCHEMA_NAME
+        && !metadata
+            .get(PROVIDER_PUBLICATION_KIND_KEY)
+            .is_some_and(|kind| matches!(kind.as_str(), "option_snapshots" | "option_expirations"))
     {
         return Err(ArrowConversionError::InvalidSchemaMetadata);
     }

@@ -629,6 +629,13 @@ impl Catalog {
                         ON binding.capture_observation_digest=object.capture_observation_digest
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest))
+                    OR EXISTS (
+                      SELECT 1
+                      FROM provider_raw_observation_objects AS object
+                      JOIN provider_option_market_bindings AS binding
+                        ON binding.capture_observation_digest=object.capture_observation_digest
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                  ORDER BY raw_claim_digest
                  LIMIT ?2",
             )?;
@@ -650,6 +657,13 @@ impl Catalog {
                       SELECT 1
                       FROM provider_raw_observation_objects AS object
                       JOIN provider_response_market_event_bindings AS binding
+                        ON binding.capture_observation_digest=object.capture_observation_digest
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                    OR EXISTS (
+                      SELECT 1
+                      FROM provider_raw_observation_objects AS object
+                      JOIN provider_option_market_bindings AS binding
                         ON binding.capture_observation_digest=object.capture_observation_digest
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
@@ -1401,6 +1415,7 @@ pub(super) const fn native_implementation_name(
         ProviderNativeLineageImplementation::SchwabStreamerMarketDataV1 => {
             "schwab_streamer_market_data_v1"
         }
+        ProviderNativeLineageImplementation::YahooEnrichmentV1 => "yahoo_enrichment_v1",
     }
 }
 
@@ -1421,6 +1436,7 @@ pub(super) fn parse_native_implementation(
         "schwab_streamer_market_data_v1" => {
             Ok(ProviderNativeLineageImplementation::SchwabStreamerMarketDataV1)
         }
+        "yahoo_enrichment_v1" => Ok(ProviderNativeLineageImplementation::YahooEnrichmentV1),
         _ => Err(CatalogError::CorruptCatalog),
     }
 }

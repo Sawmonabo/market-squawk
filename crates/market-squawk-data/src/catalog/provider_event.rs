@@ -1071,13 +1071,20 @@ fn retain_response_event_binding_evidence(
 ) -> Result<(), CatalogError> {
     let evidence = &prepared.evidence;
     evidence.verify_integrity()?;
-    validate_response_event_source_revision(connection, run_id, &evidence.capture)?;
+    validate_response_capture_source_revision(connection, run_id, &evidence.capture)?;
     require_raw_claim_capacity(
         connection,
         evidence.raw_claim_digest,
         &evidence.physical_claim,
     )?;
-    insert_response_event_capture(connection, evidence, recorded_at)?;
+    insert_response_capture(
+        connection,
+        &evidence.capture,
+        evidence.sealed_capture_receipt_digest,
+        evidence.raw_claim_digest,
+        &evidence.physical_claim,
+        recorded_at,
+    )?;
     insert_response_event_binding(connection, evidence, recorded_at)?;
     let retained =
         load_provider_response_event_binding_evidence(connection, evidence.binding_digest)?
@@ -1121,7 +1128,7 @@ fn validate_event_source_revision(
     )
 }
 
-fn validate_response_event_source_revision(
+pub(super) fn validate_response_capture_source_revision(
     connection: &Connection,
     run_id: Uuid,
     capture: &ProviderCaptureSetReceipt,
@@ -1166,12 +1173,14 @@ fn validate_source_revision_identity(
     Ok(())
 }
 
-fn insert_response_event_capture(
+pub(super) fn insert_response_capture(
     connection: &Connection,
-    evidence: &PersistedProviderResponseMarketEventBindingEvidence,
+    capture: &ProviderCaptureSetReceipt,
+    sealed_capture_receipt_digest: EvidenceDigest,
+    retained_raw_claim_digest: EvidenceDigest,
+    claim: &SealedResearchJournalSegmentClaim,
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
-    let capture = &evidence.capture;
     let capture_json = serde_json::to_string(capture)?;
     if capture_json.len() > MAX_EVENT_CLAIM_JSON_BYTES {
         return Err(CatalogError::ResultByteLimitExceeded);
@@ -1223,10 +1232,9 @@ fn insert_response_event_capture(
             ],
         )?;
     }
-    let claim = &evidence.physical_claim;
     let claim_json = serde_json::to_string(claim)?;
     if claim_json.len() > MAX_EVENT_CLAIM_JSON_BYTES
-        || raw_claim_digest(claim_json.as_bytes()) != evidence.raw_claim_digest
+        || raw_claim_digest(claim_json.as_bytes()) != retained_raw_claim_digest
     {
         return Err(CatalogError::ProviderEventMismatch);
     }
@@ -1236,7 +1244,7 @@ fn insert_response_event_capture(
           content_digest, size_bytes, frame_count, raw_claim_json, recorded_at_ns)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
-            digest_bytes(evidence.raw_claim_digest),
+            digest_bytes(retained_raw_claim_digest),
             digest_bytes(claim.physical_receipt_digest()),
             claim.relative_reference(),
             digest_bytes(claim.content_digest()),
@@ -1254,11 +1262,11 @@ fn insert_response_event_capture(
          VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6)",
         params![
             digest_bytes(capture.observation_digest()),
-            digest_bytes(evidence.raw_claim_digest),
+            digest_bytes(retained_raw_claim_digest),
             digest_bytes(claim.physical_receipt_digest()),
             digest_bytes(capture.content_digest()),
             digest_bytes(capture.observation_digest()),
-            digest_bytes(evidence.sealed_capture_receipt_digest),
+            digest_bytes(sealed_capture_receipt_digest),
         ],
     )?;
     for frame in claim.frames() {
@@ -1272,7 +1280,7 @@ fn insert_response_event_capture(
             params![
                 digest_bytes(capture.observation_digest()),
                 i64::from(frame.ordinal()),
-                digest_bytes(evidence.raw_claim_digest),
+                digest_bytes(retained_raw_claim_digest),
                 digest_bytes(claim.physical_receipt_digest()),
                 i64::from(frame.ordinal()),
                 to_i64(frame.offset())?,
@@ -1364,7 +1372,7 @@ fn require_event_claim_capacity(
     )
 }
 
-fn require_raw_claim_capacity(
+pub(super) fn require_raw_claim_capacity(
     connection: &Connection,
     raw_claim_digest: EvidenceDigest,
     physical_claim: &SealedResearchJournalSegmentClaim,

@@ -14,6 +14,7 @@ mod observed_revisions;
 mod onboarding;
 mod provider_capture;
 mod provider_event;
+mod provider_option;
 mod publication;
 mod query_artifacts;
 mod records;
@@ -111,6 +112,13 @@ pub use provider_event::{
 };
 pub(crate) use provider_event::{
     PreparedProviderPublicationBinding, retain_prepared_provider_publication_binding,
+};
+pub use provider_option::{
+    PersistedProviderOptionMarketBindingEvidence, PersistedProviderOptionMarketBindingRow,
+    PersistedProviderOptionMarketNativeLineage,
+};
+pub(crate) use provider_option::{
+    PreparedProviderOptionMarketBinding, retain_prepared_provider_option_market_binding,
 };
 pub use publication::PublishedIngest;
 pub(crate) use publication::{PublicationSourceEvidence, publish_artifact_manifest_in_transaction};

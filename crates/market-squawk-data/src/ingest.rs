@@ -18,9 +18,9 @@ use market_squawk_platform::{
 };
 use market_squawk_sources::{
     ExtractionBatch, ExtractionContentIdentity, ExtractionError, ExtractionRevisionPlan,
-    ObservedRevisionAuthority, ObservedRevisionError, ProviderCaptureError,
-    SealedProviderCaptureBinding, SealedProviderPublicationBinding, SourceClass, SourceMetadata,
-    SourceObjectCaptureIdentity,
+    ObservedRevisionAuthority, ObservedRevisionError, OptionMarketBatchKind, ProviderCaptureError,
+    SealedProviderCaptureBinding, SealedProviderOptionMarketBinding,
+    SealedProviderPublicationBinding, SourceClass, SourceMetadata, SourceObjectCaptureIdentity,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -38,7 +38,8 @@ use crate::catalog::{
     PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET,
 };
 use crate::catalog::{
-    PreparedProviderCaptureBinding, PreparedProviderPublicationBinding, PublicationSourceEvidence,
+    PreparedProviderCaptureBinding, PreparedProviderOptionMarketBinding,
+    PreparedProviderPublicationBinding, PublicationSourceEvidence,
 };
 use crate::manifest::MarketBarHistoryPublicationCandidate;
 use crate::parquet_store::MAX_SCAN_OBJECTS;
@@ -52,14 +53,15 @@ use crate::{
     ListingReferenceReadCapability, ManifestCatalogError, ManifestObject, ManifestPlan,
     ManifestPlanError, ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore,
     ParquetStoreError, PinnedDataset, PinnedQueryOutput, ProviderMarketEventArrowBatch,
-    PublishedObject, QueryArtifactReservation, QueryArtifactReservationInput, QueryError,
-    QueryLimits, QueryRequest, ResearchArrowBatch, ResearchQueryEngine, RightsDecisionInput,
-    Sha256Digest, SourceOperation,
+    ProviderOptionMarketArrowBatch, PublishedObject, QueryArtifactReservation,
+    QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, ResearchArrowBatch,
+    ResearchQueryEngine, RightsDecisionInput, Sha256Digest, SourceOperation,
 };
 
 const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 const REVISION_ASSIGNMENT_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_EVENT_PUBLICATION_READ_BYTES: usize = 128 * 1024 * 1024;
+const MAX_OPTION_PUBLICATION_READ_BYTES: usize = 192 * 1024 * 1024;
 
 struct ProviderCaptureRecoveryControl<'a> {
     cancellation: &'a CancellationToken,
@@ -129,6 +131,23 @@ impl ProviderMarketEventPublicationSelector {
 
     /// Returns the closed durable publication kind.
     pub const fn publication_kind(self) -> ProviderMarketEventPublicationKind {
+        self.publication_kind
+    }
+}
+
+/// Exact generation-owned selector required to reopen one option-market publication.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProviderOptionMarketPublicationSelector {
+    publication_digest: EvidenceDigest,
+    publication_kind: OptionMarketBatchKind,
+}
+
+impl ProviderOptionMarketPublicationSelector {
+    pub const fn publication_digest(self) -> EvidenceDigest {
+        self.publication_digest
+    }
+
+    pub const fn publication_kind(self) -> OptionMarketBatchKind {
         self.publication_kind
     }
 }
@@ -254,6 +273,14 @@ pub fn provider_market_event_publication_digest(
     if matches!(binding, SealedProviderPublicationBinding::ResponseSet(_)) {
         return Err(IngestError::ProviderCaptureRequired);
     }
+    Ok(binding.evidence_digest().evidence())
+}
+
+/// Returns the exact digest a persist reservation must carry for a sealed option batch.
+pub fn provider_option_market_publication_digest(
+    binding: &SealedProviderOptionMarketBinding,
+) -> Result<EvidenceDigest, IngestError> {
+    binding.validate()?;
     Ok(binding.evidence_digest().evidence())
 }
 
@@ -1216,6 +1243,12 @@ impl AnalyticalDataService {
             .try_reserve_exact(retained.len())
             .map_err(|_| IngestError::ProviderCaptureRequired)?;
         for (publication_digest, publication_kind) in retained {
+            if matches!(
+                publication_kind.as_str(),
+                "option_snapshots" | "option_expirations"
+            ) {
+                continue;
+            }
             if selectors
                 .iter()
                 .any(|selector: &ProviderMarketEventPublicationSelector| {
@@ -1229,6 +1262,33 @@ impl AnalyticalDataService {
                 publication_kind: ProviderMarketEventPublicationKind::from_catalog(
                     &publication_kind,
                 )?,
+            });
+        }
+        Ok(selectors)
+    }
+
+    /// Lists every bounded option-market publication retained by one exact generation.
+    pub fn provider_option_market_publications(
+        &self,
+        manifest: &DatasetManifestRef,
+    ) -> Result<Vec<ProviderOptionMarketPublicationSelector>, IngestError> {
+        let retained = self.manifests.provider_publication_bindings(manifest)?;
+        let mut selectors = Vec::new();
+        selectors
+            .try_reserve_exact(retained.len())
+            .map_err(|_| IngestError::ProviderCaptureRequired)?;
+        for (publication_digest, publication_kind) in retained {
+            let publication_kind = match publication_kind.as_str() {
+                "option_snapshots" => OptionMarketBatchKind::Snapshots,
+                "option_expirations" => OptionMarketBatchKind::Expirations,
+                "response_market_event" | "event_microbatch" | "composite_response_event" => {
+                    continue;
+                }
+                _ => return Err(IngestError::ProviderCaptureRequired),
+            };
+            selectors.push(ProviderOptionMarketPublicationSelector {
+                publication_digest,
+                publication_kind,
             });
         }
         Ok(selectors)
@@ -1323,6 +1383,121 @@ impl AnalyticalDataService {
             Arc::clone(&self.authority),
             Arc::clone(&self.objects),
         )
+    }
+
+    /// Reopens and verifies one generation-bound option publication's raw evidence.
+    pub fn provider_option_market_publication_evidence(
+        &self,
+        manifest: &DatasetManifestRef,
+        selector: ProviderOptionMarketPublicationSelector,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+    ) -> Result<crate::PersistedProviderOptionMarketBindingEvidence, IngestError> {
+        if !self
+            .provider_option_market_publications(manifest)?
+            .contains(&selector)
+        {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
+        let evidence = self
+            .lock_authority()?
+            .provider_option_market_binding_evidence(selector.publication_digest)?
+            .ok_or(IngestError::ProviderCaptureRequired)?;
+        evidence.verify_integrity()?;
+        if evidence.binding_digest() != selector.publication_digest
+            || evidence.publication_kind() != selector.publication_kind
+        {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
+        let verified = store.open_verified_claim(evidence.physical_claim())?;
+        if verified.receipt().claim() != evidence.physical_claim() {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
+        drop(verified);
+        Ok(evidence)
+    }
+
+    /// Reopens one exact option publication and verifies its raw claim plus pinned Parquet.
+    pub async fn read_provider_option_market_publication(
+        &self,
+        manifest: &DatasetManifestRef,
+        selector: ProviderOptionMarketPublicationSelector,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderOptionMarketArrowBatch, IngestError> {
+        let evidence =
+            self.provider_option_market_publication_evidence(manifest, selector, store)?;
+        let pinned = self.manifests.pinned(manifest)?;
+        let batches = self
+            .objects
+            .read_pinned_async(&pinned, &cancellation)
+            .await?;
+        let expected_hex = crate::schema::encode_hex(selector.publication_digest.bytes());
+        let expected_kind = match selector.publication_kind {
+            OptionMarketBatchKind::Snapshots => "option_snapshots",
+            OptionMarketBatchKind::Expirations => "option_expirations",
+        };
+        let selected = batches
+            .into_iter()
+            .filter(|batch| {
+                let schema = batch.schema();
+                schema
+                    .metadata()
+                    .get(crate::schema::PROVIDER_PUBLICATION_DIGEST_KEY)
+                    == Some(&expected_hex)
+                    && schema
+                        .metadata()
+                        .get(crate::schema::PROVIDER_PUBLICATION_KIND_KEY)
+                        .is_some_and(|kind| kind == expected_kind)
+            })
+            .collect::<Vec<_>>();
+        let schema = selected
+            .first()
+            .map(RecordBatch::schema)
+            .ok_or(IngestError::ProviderCaptureRequired)?;
+        let batch = concat_batches(&schema, &selected).map_err(ArrowConversionError::Arrow)?;
+        ProviderOptionMarketArrowBatch::try_from_record_batch_with_publication_evidence(
+            batch,
+            &evidence,
+            MAX_OPTION_PUBLICATION_READ_BYTES,
+        )
+        .map_err(IngestError::Arrow)
+    }
+
+    /// Selects and reopens the uniquely latest coherent option batch at one knowledge cutoff.
+    pub async fn read_provider_option_market_point_in_time(
+        &self,
+        request: &crate::OptionMarketPointInTimeRequest,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        cancellation: CancellationToken,
+    ) -> Result<Option<crate::OptionMarketPointInTimeSelection>, IngestError> {
+        let Some((manifest, publication_digest, publication_kind)) = self
+            .manifests
+            .select_provider_option_market_publication(request)?
+        else {
+            return Ok(None);
+        };
+        let publication_kind = match publication_kind.as_str() {
+            "option_snapshots" => OptionMarketBatchKind::Snapshots,
+            "option_expirations" => OptionMarketBatchKind::Expirations,
+            _ => return Err(IngestError::ProviderCaptureRequired),
+        };
+        let selector = ProviderOptionMarketPublicationSelector {
+            publication_digest,
+            publication_kind,
+        };
+        let batch = self
+            .read_provider_option_market_publication(&manifest, selector, store, cancellation)
+            .await?;
+        let retained_filter = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(serde_json::to_vec(batch.scope().filter())?).into(),
+        );
+        if retained_filter != request.filter_digest() {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
+        crate::OptionMarketPointInTimeSelection::try_new(request, manifest, batch)
+            .map(Some)
+            .map_err(IngestError::Arrow)
     }
 
     /// Persists query-result ownership and expiry before artifact publication begins.
@@ -1843,6 +2018,90 @@ impl AnalyticalDataService {
         )
     }
 
+    /// Atomically publishes one coherent option batch, its sealed raw evidence, and generation.
+    pub async fn ingest_provider_option_market(
+        &self,
+        reservation: IngestReservation,
+        analytical_dataset: DatasetId,
+        binding: SealedProviderOptionMarketBinding,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Result<CommittedDataset, IngestError> {
+        precommit_authority.validate_precommit()?;
+        let payload_digest = provider_option_market_publication_digest(&binding)?;
+        let source_id = binding.batch().scope().source_id().clone();
+        let converted = ProviderOptionMarketArrowBatch::try_from_publication(&binding)?;
+        let prepared = PreparedProviderOptionMarketBinding::try_from_live(&binding)?;
+        if prepared.publication_digest() != payload_digest {
+            return Err(IngestError::ReservationPayloadMismatch);
+        }
+        let schema = converted.schema_ref().clone();
+        let lineage = converted.lineage_digest()?;
+        let converted = converted.dataset_batch();
+        self.manifests
+            .validate_append_schema(&analytical_dataset, &schema)?;
+        let _operation = self
+            .operation_gate
+            .acquire(&cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        {
+            let authority = self.lock_authority()?;
+            let run =
+                self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
+            if run.state() == IngestRunState::Failed {
+                return Err(IngestError::TerminalRun);
+            }
+            if run.state() == IngestRunState::Succeeded {
+                return self.reconcile_succeeded_provider_option_run(
+                    &authority,
+                    &reservation,
+                    &analytical_dataset,
+                    &prepared,
+                );
+            }
+            self.validate_provider_option_binding(&authority, &reservation, &prepared)?;
+        }
+        let publication = self.objects.begin_publication(&cancellation).await?;
+        let published = self
+            .objects
+            .publish_dataset_under_lease(converted, &cancellation, &publication)
+            .await?;
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        let object = ManifestObject::try_new(
+            published.content_hash(),
+            published.row_count(),
+            published.size_bytes(),
+            Sha256Digest::new(lineage.bytes()),
+        )?;
+        let authority = self.lock_authority()?;
+        let run = self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
+        self.validate_provider_option_binding(&authority, &reservation, &prepared)?;
+        if run.state() != IngestRunState::Reserved {
+            return Err(IngestError::TerminalRun);
+        }
+        let plan = self
+            .manifests
+            .preview_append(analytical_dataset.clone(), &schema, object)?;
+        self.commit_plan(
+            &authority,
+            &reservation,
+            &run,
+            SourceIdentifier::try_from(analytical_dataset.as_str())
+                .map_err(|_| IngestError::InvalidDataset)?,
+            schema,
+            plan,
+            published,
+            GenerationKind::Ingest,
+            Some(precommit_authority.as_ref()),
+            None,
+            None,
+            PublicationSourceEvidence::ProviderOptionMarket(&prepared),
+        )
+    }
+
     /// Ingests a locally observed batch while retaining exact caller authority through commit.
     pub async fn ingest_with_precommit_authority(
         &self,
@@ -2023,6 +2282,47 @@ impl AnalyticalDataService {
         Ok(CommittedDataset::new(existing))
     }
 
+    fn validate_provider_option_binding(
+        &self,
+        authority: &CatalogAuthority,
+        reservation: &IngestReservation,
+        input: &PreparedProviderOptionMarketBinding,
+    ) -> Result<(), IngestError> {
+        match authority.provider_option_market_for_run(reservation.run_id())? {
+            None => Ok(()),
+            Some(retained) if input.matches_persisted(&retained) => Ok(()),
+            Some(_) => Err(IngestError::ProviderCaptureRequired),
+        }
+    }
+
+    fn reconcile_succeeded_provider_option_run(
+        &self,
+        authority: &CatalogAuthority,
+        reservation: &IngestReservation,
+        dataset_id: &DatasetId,
+        input: &PreparedProviderOptionMarketBinding,
+    ) -> Result<CommittedDataset, IngestError> {
+        let existing = self
+            .manifests
+            .for_run(reservation.run_id())?
+            .ok_or(IngestError::IncompleteSuccessfulRun)?;
+        let retained = authority
+            .provider_option_market_for_run(reservation.run_id())?
+            .ok_or(IngestError::IncompleteSuccessfulRun)?;
+        let generation = self
+            .manifests
+            .provider_publication_bindings(existing.manifest())?;
+        if existing.manifest().dataset_id() != dataset_id
+            || !input.matches_persisted(&retained)
+            || !generation.iter().any(|(digest, kind)| {
+                *digest == retained.binding_digest() && kind == retained.publication_kind_name()
+            })
+        {
+            return Err(IngestError::ReplayConflict);
+        }
+        Ok(CommittedDataset::new(existing))
+    }
+
     fn reconcile_committed_run(
         &self,
         authority: &CatalogAuthority,
@@ -2181,7 +2481,9 @@ impl AnalyticalDataService {
         );
         if matches!(
             source_evidence,
-            PublicationSourceEvidence::Provider(_) | PublicationSourceEvidence::ProviderEvent(_)
+            PublicationSourceEvidence::Provider(_)
+                | PublicationSourceEvidence::ProviderEvent(_)
+                | PublicationSourceEvidence::ProviderOptionMarket(_)
         ) {
             if kind != GenerationKind::Ingest {
                 return Err(IngestError::ProviderCaptureRequired);
