@@ -18,9 +18,9 @@ mod publication;
 mod transport;
 
 pub use cboe::{
-    CBOE_ALL_SERIES_MAX_BYTES, CBOE_ALL_SERIES_MAX_RECORDS, CboeAllSeriesCsvSchema,
-    CboeAllSeriesParseReceipt, CboeAllSeriesParser, CboeListingEvidence, CboeParseError,
-    CboeSeriesReference, CboeSeriesStatus, CboeSymbolId, CboeVenue,
+    CboeAllSeriesCsvSchema, CboeAllSeriesParseReceipt, CboeAllSeriesParser, CboeListingEvidence,
+    CboeParseError, CboeSeriesReference, CboeSeriesStatus, CboeSymbolId, CboeVenue,
+    CBOE_ALL_SERIES_MAX_BYTES, CBOE_ALL_SERIES_MAX_RECORDS,
 };
 pub use export::{
     OptionsReferenceAliasDisposition, OptionsReferenceCurrentnessDisposition,
@@ -35,37 +35,39 @@ pub use identity::{
     OptionIdentityError, OptionStrike,
 };
 pub use occ::{
-    OCC_DLP_MAX_BYTES, OCC_DLP_MAX_RECORDS, OCC_MEMO_MAX_BYTES, OCC_MEMO_MAX_RECORDS,
     OccDlpParseReceipt, OccDlpParser, OccDlpPresence, OccDlpProductReference, OccDlpSchema,
     OccExchangeCode, OccExchangeListingEvidence, OccMemoCategory, OccMemoCsvSchema,
     OccMemoDiscovery, OccMemoInterpretation, OccMemoParseReceipt, OccMemoParser, OccParseError,
-    OccPositionLimit, OccProductType,
+    OccPositionLimit, OccProductType, OCC_DLP_MAX_BYTES, OCC_DLP_MAX_RECORDS, OCC_MEMO_MAX_BYTES,
+    OCC_MEMO_MAX_RECORDS,
 };
 pub use publication::{
-    HttpLastModifiedEvidence, ObjectClockEvidence, PageTerminalState, PublicationError,
-    PublicationLimits, PublicationRequest, ReferenceConditionalPriorEvidence,
-    ReferenceConditionalValidatorEvidence, ReferenceNativeSchemaIdentity, ReferenceObjectContext,
+    CompletedModifiedReferencePublicationCapture, HttpLastModifiedEvidence, ObjectClockEvidence,
+    PageTerminalState, PublicationError, PublicationLimits, PublicationRequest,
+    ReferenceConditionalPriorEvidence, ReferenceConditionalValidatorEvidence,
+    ReferenceModifiedObjectHandoff, ReferenceNativeSchemaIdentity, ReferenceObjectContext,
     ReferenceOfficialRequestEvidence, ReferencePageReceipt, ReferenceProvider,
     ReferenceRequestAccountingReceipt, ReferenceRequestBodyEvidence, ReferenceRequestBudget,
     ReferenceRequestMethod, ReferenceResponseDisposition, ReferenceSurface,
     ReferenceTransportEvidence,
 };
 pub use transport::{
-    CBOE_OPTIONS_REFERENCE_PROVIDER_ID, CBOE_OPTIONS_REFERENCE_SOURCE_ID, CboeSchemaFreeze,
-    ConditionalCacheRequest, HttpCacheEvidence, OCC_MEMO_DOCUMENT_MAX_BYTES,
+    options_reference_application_budget_policy, options_reference_endpoint_policy,
+    options_reference_provider_rate_declaration, CboeSchemaFreeze, ConditionalCacheRequest,
+    HttpCacheEvidence, OfficialPublicationPlan, OfficialPublicationPolicy,
+    OfficialReferenceRequest, OfficialReferenceStreamingClient, PendingReferenceTypedHandoff,
+    PendingUninterpretedMemoHandoff, ReferenceCancellation, ReferenceFetchControl,
+    ReferenceHeaderValue, ReferenceHttpReceipt, ReferenceNotModifiedReceipt,
+    ReferenceTransportError, ReferenceTypedHandoff, ReferenceUninterpretedMemoHandoff,
+    RetryAfterEvidence, SelectedReferenceDecoder, StreamedReferenceObject,
+    StreamingReferenceFetchOutcome, StrictReferenceParseReceipt,
+    StrictUninterpretedMemoDocumentReceipt, CBOE_OPTIONS_REFERENCE_PROVIDER_ID,
+    CBOE_OPTIONS_REFERENCE_SOURCE_ID, OCC_MEMO_DOCUMENT_MAX_BYTES,
     OCC_OPTIONS_REFERENCE_PROVIDER_ID, OCC_OPTIONS_REFERENCE_SOURCE_ID,
     OPTIONS_REFERENCE_APPLICATION_MAX_CONCURRENT,
     OPTIONS_REFERENCE_APPLICATION_REQUESTS_PER_MINUTE, OPTIONS_REFERENCE_APPLICATION_WINDOW_NANOS,
     OPTIONS_REFERENCE_MINIMUM_CONNECT_TIMEOUT_NANOS, OPTIONS_REFERENCE_MINIMUM_READ_TIMEOUT_NANOS,
-    OPTIONS_REFERENCE_MINIMUM_TOTAL_TIMEOUT_NANOS, OfficialPublicationPlan,
-    OfficialPublicationPolicy, OfficialReferenceRequest, OfficialReferenceStreamingClient,
-    PendingReferenceTypedHandoff, PendingUninterpretedMemoHandoff, ReferenceCancellation,
-    ReferenceFetchControl, ReferenceHeaderValue, ReferenceHttpReceipt, ReferenceNotModifiedReceipt,
-    ReferenceTransportError, ReferenceTypedHandoff, ReferenceUninterpretedMemoHandoff,
-    RetryAfterEvidence, SelectedReferenceDecoder, StreamedReferenceObject,
-    StreamingReferenceFetchOutcome, StrictReferenceParseReceipt,
-    StrictUninterpretedMemoDocumentReceipt, options_reference_application_budget_policy,
-    options_reference_endpoint_policy, options_reference_provider_rate_declaration,
+    OPTIONS_REFERENCE_MINIMUM_TOTAL_TIMEOUT_NANOS,
 };
 
 #[cfg(all(test, unix))]
@@ -154,8 +156,8 @@ mod tests {
     }
 
     #[test]
-    fn current_cboe_identity_keeps_underlying_and_matching_unit_provider_native()
-    -> Result<(), Box<dyn Error>> {
+    fn current_cboe_identity_keeps_underlying_and_matching_unit_provider_native(
+    ) -> Result<(), Box<dyn Error>> {
         let bytes = b"Cboe Symbol,OSI Symbol,Underlying,Matching Unit,Closing Only\n000u56,ZVZZT 990101C00005000,SPY,25,False\n";
         let context = object_context(
             ReferenceSurface::CboeAllSeries {
@@ -193,8 +195,8 @@ mod tests {
     }
 
     #[test]
-    fn occ_selected_daily_and_xml_are_distinct_wires_with_equal_semantics()
-    -> Result<(), Box<dyn Error>> {
+    fn occ_selected_daily_and_xml_are_distinct_wires_with_equal_semantics(
+    ) -> Result<(), Box<dyn Error>> {
         let name = "American Airlines Group Inc";
         let selected = format!(
             "{:<6}\t{:<6}\t{:<50}\tABCIPX\t25000000\tEF\t\r\n",
@@ -309,8 +311,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[cfg(unix)]
-    async fn official_source_mock_proves_raw_reopen_and_conflict_preserving_typed_handoff()
-    -> Result<(), Box<dyn Error>> {
+    async fn official_source_mock_proves_raw_reopen_and_conflict_preserving_typed_handoff(
+    ) -> Result<(), Box<dyn Error>> {
         let cboe_bytes = b"Cboe Symbol,OSI Symbol,Underlying,Matching Unit,Closing Only\n000u56,ZVZZT 990101C00005000,SPY,25,False\n000u57,ZVZZT 990101C00005000,SPY,25,False\n";
         let occ_bytes = format!(
             "{:<6}\t{:<6}\t{:<50}\tABCIPX\t25000000\tEF\t\r\n",
@@ -344,10 +346,9 @@ mod tests {
             Duration::from_secs(60),
             ReferenceCancellation::new(),
         )?;
-        let mut request_budget =
-            ReferenceRequestBudget::try_for_publication(plan.publication_request())?;
         let mut exports = Vec::new();
         let mut alias_assertions = Vec::new();
+        let mut handoffs = Vec::new();
         let mut cboe_claim = None;
         for official_request in plan.requests() {
             let (body, content_type, disposition) = match official_request.surface() {
@@ -423,12 +424,17 @@ mod tests {
                         OptionsReferenceCurrentnessDisposition::RequiresApplicationFreshnessClassification
                     );
                     assert_eq!(handoff.page_receipt().returned_records(), 2);
-                    request_budget.observe_typed_handoff(&handoff)?;
-                    let (raw, context, http, page) = handoff.into_parts();
-                    assert_eq!(raw.content_digest(), context.payload_digest());
-                    assert_eq!(http.payload_digest(), context.payload_digest());
-                    assert_eq!(page.context(), &context);
-                    cboe_claim = Some(raw.claim().clone());
+                    assert_eq!(
+                        handoff.raw_receipt().content_digest(),
+                        handoff.context().payload_digest()
+                    );
+                    assert_eq!(
+                        handoff.http_receipt().payload_digest(),
+                        handoff.context().payload_digest()
+                    );
+                    assert_eq!(handoff.page_receipt().context(), handoff.context());
+                    cboe_claim = Some(handoff.raw_receipt().claim().clone());
+                    handoffs.push(handoff.into());
                 }
                 ReferenceSurface::OccDlpSelectedText => {
                     let receipt = streamed.parse_occ_dlp(|record| {
@@ -447,11 +453,16 @@ mod tests {
                         .finish()
                         .await?;
                     assert_eq!(handoff.page_receipt().returned_records(), 1);
-                    request_budget.observe_typed_handoff(&handoff)?;
-                    let (raw, context, http, page) = handoff.into_parts();
-                    assert_eq!(raw.content_digest(), context.payload_digest());
-                    assert_eq!(http.payload_digest(), context.payload_digest());
-                    assert_eq!(page.context(), &context);
+                    assert_eq!(
+                        handoff.raw_receipt().content_digest(),
+                        handoff.context().payload_digest()
+                    );
+                    assert_eq!(
+                        handoff.http_receipt().payload_digest(),
+                        handoff.context().payload_digest()
+                    );
+                    assert_eq!(handoff.page_receipt().context(), handoff.context());
+                    handoffs.push(handoff.into());
                 }
                 _ => return Err(std::io::Error::other("unexpected core surface").into()),
             }
@@ -497,10 +508,36 @@ mod tests {
                         Ok(())
                     },
                 )?;
-        let accounting = request_budget.finish(&reconciliation)?;
+        let completed = CompletedModifiedReferencePublicationCapture::try_new(
+            plan.publication_request().clone(),
+            handoffs,
+            reconciliation,
+        )?;
+        let accounting = completed.accounting();
         assert_eq!(accounting.completed_pages(), 2);
         assert_eq!(accounting.returned_records(), 3);
         assert_eq!(accounting.conflicts(), 1);
+        assert_eq!(
+            accounting.strict_row_set_digest().algorithm(),
+            DigestAlgorithm::Sha256
+        );
+        assert_ne!(accounting.strict_row_set_digest().bytes(), [0; 32]);
+        assert_eq!(accounting.alias_assertions(), 7);
+        assert_eq!(completed.reconciliation().assertions(), 7);
+        assert_ne!(accounting.alias_assertion_closure_digest().bytes(), [0; 32]);
+        let empty_reconciliation = ReferenceConflictReconciler::try_for_publication(
+            completed.request(),
+        )?
+        .reconcile(|| Ok(None), |_| Ok(()), |_| Ok(()))?;
+        assert_eq!(empty_reconciliation.assertions(), 0);
+        assert!(matches!(
+            crate::publication::validate_completed_modified_reference_publication(
+                completed.request(),
+                completed.objects(),
+                &empty_reconciliation,
+            ),
+            Err(PublicationError::InvalidRequest)
+        ));
         assert!(resolutions.iter().any(|resolution| {
             resolution.state() == ReferenceAliasResolutionState::Ambiguous
                 && matches!(resolution.key(), ReferenceAliasKey::CboeOsi { .. })

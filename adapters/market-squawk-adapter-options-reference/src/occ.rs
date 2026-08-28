@@ -8,19 +8,21 @@ use csv::{ReaderBuilder, StringRecord};
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EvidenceDigest, ProviderInstrumentId, SourceIdentifier,
 };
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::Reader;
 use serde::{
-    Deserialize, Serialize,
     de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
+    Deserialize, Serialize,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
+    export::{visit_occ_alias_assertions, ReferenceAliasAssertionSetEvidence},
+    payload::{BoundedTokenReader, ExactPayloadReader},
+    publication::StrictReferenceRowSetDigestBuilder,
     PageTerminalState, ReferenceObjectContext, ReferencePageReceipt, ReferenceProvider,
     ReferenceSurface,
-    payload::{BoundedTokenReader, ExactPayloadReader},
 };
 
 /// Application maximum for one OCC DLP text object.
@@ -60,7 +62,6 @@ pub enum OccDlpSchema {
     /// Current dated `results/record` XML publication with the same six financial fields.
     DailyXmlV1,
 }
-
 impl OccDlpSchema {
     /// Returns the stable provider-native decoder identity.
     pub const fn native_schema(self) -> &'static str {
@@ -318,6 +319,19 @@ pub struct OccDlpProductReference {
     object_context: ReferenceObjectContext,
 }
 
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OccDlpNativeSemanticsV1<'a> {
+    options_symbol: &'a ProviderInstrumentId,
+    underlying_symbol: &'a ProviderInstrumentId,
+    symbol_name: &'a str,
+    trading_exchanges: &'a [OccExchangeCode],
+    exchange_listing_evidence: OccExchangeListingEvidence,
+    position_limit: OccPositionLimit,
+    product_type: OccProductType,
+    presence: OccDlpPresence,
+}
+
 impl OccDlpProductReference {
     /// Returns the stable provider row identity.
     pub const fn record_id(&self) -> &SourceIdentifier {
@@ -374,6 +388,19 @@ impl OccDlpProductReference {
     pub const fn object_context(&self) -> &ReferenceObjectContext {
         &self.object_context
     }
+
+    pub(crate) fn native_semantics(&self) -> OccDlpNativeSemanticsV1<'_> {
+        OccDlpNativeSemanticsV1 {
+            options_symbol: &self.options_symbol,
+            underlying_symbol: &self.underlying_symbol,
+            symbol_name: &self.symbol_name,
+            trading_exchanges: &self.trading_exchanges,
+            exchange_listing_evidence: self.exchange_listing_evidence,
+            position_limit: self.position_limit,
+            product_type: self.product_type,
+            presence: self.presence,
+        }
+    }
 }
 
 /// Successful strict decode evidence for one OCC DLP text object.
@@ -382,12 +409,19 @@ impl OccDlpProductReference {
 pub struct OccDlpParseReceipt {
     context: ReferenceObjectContext,
     returned_records: u32,
+    strict_row_set_digest: EvidenceDigest,
+    alias_assertion_set: ReferenceAliasAssertionSetEvidence,
 }
 
 impl OccDlpParseReceipt {
     /// Returns valid decoded record count.
     pub const fn returned_records(&self) -> u32 {
         self.returned_records
+    }
+
+    /// Returns the exact ordered identity of every accepted provider-native row.
+    pub const fn strict_row_set_digest(&self) -> EvidenceDigest {
+        self.strict_row_set_digest
     }
 
     /// Converts the strict complete text decode to terminal page evidence.
@@ -397,6 +431,8 @@ impl OccDlpParseReceipt {
             NonZeroU32::MIN,
             self.returned_records,
             0,
+            self.strict_row_set_digest,
+            self.alias_assertion_set,
             PageTerminalState::Terminal,
         )
     }
@@ -492,6 +528,8 @@ impl OccDlpParser {
             .trim(csv::Trim::None)
             .from_reader(&mut framed);
         let mut returned = 0_u32;
+        let mut strict_rows = StrictReferenceRowSetDigestBuilder::new();
+        let mut alias_assertion_set = ReferenceAliasAssertionSetEvidence::empty();
         for result in reader.records() {
             returned = returned
                 .checked_add(1)
@@ -500,12 +538,15 @@ impl OccDlpParser {
                 return Err(OccParseError::RecordLimitExceeded);
             }
             let row = result.map_err(|_| OccParseError::MalformedText)?;
-            sink(parse_dlp_text_row(
-                returned,
-                &row,
-                wire_schema,
-                self.context.clone(),
-            )?)?;
+            let record = parse_dlp_text_row(returned, &row, wire_schema, self.context.clone())?;
+            strict_rows
+                .try_observe(&record.native_semantics())
+                .map_err(|_| OccParseError::InvalidEvidence)?;
+            visit_occ_alias_assertions(&record, |assertion| {
+                alias_assertion_set.try_observe(&assertion)
+            })
+            .map_err(|_| OccParseError::InvalidEvidence)?;
+            sink(record)?;
         }
         drop(reader);
         let terminal = framed
@@ -521,6 +562,10 @@ impl OccDlpParser {
         Ok(OccDlpParseReceipt {
             context: self.context.clone(),
             returned_records: returned,
+            strict_row_set_digest: strict_rows
+                .finish(returned)
+                .map_err(|_| OccParseError::InvalidEvidence)?,
+            alias_assertion_set,
         })
     }
 
@@ -545,6 +590,8 @@ impl OccDlpParser {
         let mut in_record = false;
         let mut record = OccXmlRecord::default();
         let mut returned = 0_u32;
+        let mut strict_rows = StrictReferenceRowSetDigestBuilder::new();
+        let mut alias_assertion_set = ReferenceAliasAssertionSetEvidence::empty();
 
         loop {
             match reader.read_event_into(&mut event_buffer) {
@@ -610,7 +657,15 @@ impl OccDlpParser {
                             if returned > OCC_DLP_MAX_RECORDS {
                                 return Err(OccParseError::RecordLimitExceeded);
                             }
-                            sink(record.finish(returned, self.context.clone())?)?;
+                            let completed = record.finish(returned, self.context.clone())?;
+                            strict_rows
+                                .try_observe(&completed.native_semantics())
+                                .map_err(|_| OccParseError::InvalidEvidence)?;
+                            visit_occ_alias_assertions(&completed, |assertion| {
+                                alias_assertion_set.try_observe(&assertion)
+                            })
+                            .map_err(|_| OccParseError::InvalidEvidence)?;
+                            sink(completed)?;
                             in_record = false;
                             record = OccXmlRecord::default();
                         }
@@ -656,6 +711,10 @@ impl OccDlpParser {
         Ok(OccDlpParseReceipt {
             context: self.context.clone(),
             returned_records: returned,
+            strict_row_set_digest: strict_rows
+                .finish(returned)
+                .map_err(|_| OccParseError::InvalidEvidence)?,
+            alias_assertion_set,
         })
     }
 }
@@ -1044,6 +1103,18 @@ pub struct OccMemoDiscovery {
     object_context: ReferenceObjectContext,
 }
 
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OccMemoNativeSemanticsV1<'a> {
+    memo_number: u64,
+    posted_date: CalendarDate,
+    effective_date: Option<CalendarDate>,
+    title: &'a str,
+    categories: &'a [OccMemoCategory],
+    memo_locator: &'a SourceIdentifier,
+    interpretation: OccMemoInterpretation,
+}
+
 impl OccMemoDiscovery {
     #[allow(
         clippy::too_many_arguments,
@@ -1161,6 +1232,18 @@ impl OccMemoDiscovery {
     pub const fn object_context(&self) -> &ReferenceObjectContext {
         &self.object_context
     }
+
+    pub(crate) fn native_semantics(&self) -> OccMemoNativeSemanticsV1<'_> {
+        OccMemoNativeSemanticsV1 {
+            memo_number: self.memo_number,
+            posted_date: self.posted_date,
+            effective_date: self.effective_date,
+            title: &self.title,
+            categories: &self.categories,
+            memo_locator: &self.memo_locator,
+            interpretation: self.interpretation,
+        }
+    }
 }
 
 /// Exact admitted header label for the memo category column.
@@ -1225,6 +1308,8 @@ pub struct OccMemoParseReceipt {
     context: ReferenceObjectContext,
     page_ordinal: NonZeroU32,
     returned_records: u32,
+    strict_row_set_digest: EvidenceDigest,
+    alias_assertion_set: ReferenceAliasAssertionSetEvidence,
     terminal_state: PageTerminalState,
 }
 
@@ -1232,6 +1317,11 @@ impl OccMemoParseReceipt {
     /// Returns valid memo discovery count.
     pub const fn returned_records(&self) -> u32 {
         self.returned_records
+    }
+
+    /// Returns the exact ordered identity of every accepted provider-native discovery row.
+    pub const fn strict_row_set_digest(&self) -> EvidenceDigest {
+        self.strict_row_set_digest
     }
 
     /// Returns the one-based page coordinate.
@@ -1251,6 +1341,8 @@ impl OccMemoParseReceipt {
             self.page_ordinal,
             self.returned_records,
             0,
+            self.strict_row_set_digest,
+            self.alias_assertion_set,
             self.terminal_state.clone(),
         )
     }
@@ -1307,6 +1399,7 @@ impl OccMemoParser {
             return Err(OccParseError::UnknownHeader);
         }
         let mut returned = 0_u32;
+        let mut strict_rows = StrictReferenceRowSetDigestBuilder::new();
         for result in reader.records() {
             returned = returned
                 .checked_add(1)
@@ -1315,11 +1408,11 @@ impl OccMemoParser {
                 return Err(OccParseError::RecordLimitExceeded);
             }
             let row = result.map_err(|_| OccParseError::MalformedCsv)?;
-            sink(parse_memo_csv_row(
-                returned.saturating_add(1),
-                &row,
-                context.clone(),
-            )?)?;
+            let record = parse_memo_csv_row(returned.saturating_add(1), &row, context.clone())?;
+            strict_rows
+                .try_observe(&record.native_semantics())
+                .map_err(|_| OccParseError::InvalidEvidence)?;
+            sink(record)?;
         }
         drop(reader);
         framed
@@ -1330,6 +1423,10 @@ impl OccMemoParser {
             context,
             page_ordinal: NonZeroU32::MIN,
             returned_records: returned,
+            strict_row_set_digest: strict_rows
+                .finish(returned)
+                .map_err(|_| OccParseError::InvalidEvidence)?,
+            alias_assertion_set: ReferenceAliasAssertionSetEvidence::empty(),
             terminal_state: PageTerminalState::Terminal,
         })
     }
@@ -1363,11 +1460,18 @@ impl OccMemoParser {
             .map_err(|_| OccParseError::PayloadMismatch)?;
         let mut framed = BoundedTokenReader::json(payload, OCC_PARSER_MAX_TOKEN_BYTES)
             .map_err(|_| OccParseError::BodyTooLarge)?;
+        let mut strict_rows = StrictReferenceRowSetDigestBuilder::new();
+        let mut digesting_sink = |record: OccMemoDiscovery| {
+            strict_rows
+                .try_observe(&record.native_semantics())
+                .map_err(|_| OccParseError::InvalidEvidence)?;
+            sink(record)
+        };
         let sink_error = Cell::new(None);
         let mut deserializer = serde_json::Deserializer::from_reader(&mut framed);
         let summary = MemoPageSeed {
             context: &context,
-            sink: &mut sink,
+            sink: &mut digesting_sink,
             sink_error: &sink_error,
         }
         .deserialize(&mut deserializer)
@@ -1376,6 +1480,7 @@ impl OccMemoParser {
             .end()
             .map_err(|_| OccParseError::MalformedJson)?;
         drop(deserializer);
+        drop(digesting_sink);
         framed
             .into_inner()
             .finish()
@@ -1400,6 +1505,10 @@ impl OccMemoParser {
             context,
             page_ordinal: page,
             returned_records: summary.returned_records,
+            strict_row_set_digest: strict_rows
+                .finish(summary.returned_records)
+                .map_err(|_| OccParseError::InvalidEvidence)?,
+            alias_assertion_set: ReferenceAliasAssertionSetEvidence::empty(),
             terminal_state,
         })
     }

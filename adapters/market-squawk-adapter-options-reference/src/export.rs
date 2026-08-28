@@ -7,14 +7,24 @@
 
 use std::cmp::Ordering;
 
-use market_squawk_domain::{OccOptionIdentity, ProviderInstrumentId, SourceIdentifier};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, OccOptionIdentity, ProviderInstrumentId, SourceIdentifier,
+};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
     CboeSeriesReference, CboeSymbolId, CboeVenue, OccDlpProductReference, OccProductType,
     PublicationRequest, ReferenceObjectContext,
 };
+
+const MAX_REFERENCE_ALIAS_ASSERTION_BYTES: usize = 64 * 1024;
+const MAX_REFERENCE_ALIAS_ASSERTIONS_PER_RECORD: u64 = 3;
+const REFERENCE_ALIAS_ASSERTION_ELEMENT_DIGEST_DOMAIN: &[u8] =
+    b"market-squawk/options-reference-alias-assertion-element/v1";
+const REFERENCE_ALIAS_ASSERTION_CLOSURE_DIGEST_DOMAIN: &[u8] =
+    b"market-squawk/options-reference-alias-assertion-closure/v1";
 
 /// Why an exported row cannot itself establish a canonical security identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -123,54 +133,80 @@ impl ReferenceExportRecord {
     where
         F: FnMut(ReferenceAliasAssertion) -> Result<(), ReferenceExportError>,
     {
-        let context = self.object_context();
-        let request_id = context.transport_evidence().request().request_id().clone();
         match self {
-            Self::CboeSeries(record) => {
-                let symbol = record.cboe_symbol_id().clone();
-                let osi = record.contract().osi().clone();
-                let underlying = record.underlying().clone();
-                let evidence = record.record_id().clone();
-                sink(ReferenceAliasAssertion::new(
-                    request_id.clone(),
-                    ReferenceAliasKey::CboeSymbol {
-                        symbol: symbol.clone(),
-                    },
-                    ReferenceAliasTarget::CboeContract {
-                        osi: osi.clone(),
-                        underlying,
-                    },
-                    evidence.clone(),
-                ))?;
-                sink(ReferenceAliasAssertion::new(
-                    request_id.clone(),
-                    ReferenceAliasKey::CboeOsi { osi },
-                    ReferenceAliasTarget::CboeSymbol {
-                        symbol: symbol.clone(),
-                    },
-                    evidence.clone(),
-                ))?;
-                sink(ReferenceAliasAssertion::new(
-                    request_id,
-                    ReferenceAliasKey::CboeVenueSymbol {
-                        venue: record.venue(),
-                        symbol,
-                    },
-                    ReferenceAliasTarget::ProviderRecord,
-                    evidence,
-                ))
-            }
-            Self::OccProduct(record) => sink(ReferenceAliasAssertion::new(
-                request_id,
-                ReferenceAliasKey::OccProduct {
-                    options_symbol: record.options_symbol().clone(),
-                    product_type: record.product_type(),
-                },
-                ReferenceAliasTarget::ProviderRecord,
-                record.record_id().clone(),
-            )),
+            Self::CboeSeries(record) => visit_cboe_alias_assertions(record, &mut sink),
+            Self::OccProduct(record) => visit_occ_alias_assertions(record, &mut sink),
         }
     }
+}
+
+pub(crate) fn visit_cboe_alias_assertions<F>(
+    record: &CboeSeriesReference,
+    mut sink: F,
+) -> Result<(), ReferenceExportError>
+where
+    F: FnMut(ReferenceAliasAssertion) -> Result<(), ReferenceExportError>,
+{
+    let request_id = record
+        .object_context()
+        .transport_evidence()
+        .request()
+        .request_id()
+        .clone();
+    let symbol = record.cboe_symbol_id().clone();
+    let osi = record.contract().osi().clone();
+    let evidence = record.record_id().clone();
+    sink(ReferenceAliasAssertion::new(
+        request_id.clone(),
+        ReferenceAliasKey::CboeSymbol {
+            symbol: symbol.clone(),
+        },
+        ReferenceAliasTarget::CboeContract {
+            osi: osi.clone(),
+            underlying: record.underlying().clone(),
+        },
+        evidence.clone(),
+    ))?;
+    sink(ReferenceAliasAssertion::new(
+        request_id.clone(),
+        ReferenceAliasKey::CboeOsi { osi },
+        ReferenceAliasTarget::CboeSymbol {
+            symbol: symbol.clone(),
+        },
+        evidence.clone(),
+    ))?;
+    sink(ReferenceAliasAssertion::new(
+        request_id,
+        ReferenceAliasKey::CboeVenueSymbol {
+            venue: record.venue(),
+            symbol,
+        },
+        ReferenceAliasTarget::ProviderRecord,
+        evidence,
+    ))
+}
+
+pub(crate) fn visit_occ_alias_assertions<F>(
+    record: &OccDlpProductReference,
+    mut sink: F,
+) -> Result<(), ReferenceExportError>
+where
+    F: FnMut(ReferenceAliasAssertion) -> Result<(), ReferenceExportError>,
+{
+    sink(ReferenceAliasAssertion::new(
+        record
+            .object_context()
+            .transport_evidence()
+            .request()
+            .request_id()
+            .clone(),
+        ReferenceAliasKey::OccProduct {
+            options_symbol: record.options_symbol().clone(),
+            product_type: record.product_type(),
+        },
+        ReferenceAliasTarget::ProviderRecord,
+        record.record_id().clone(),
+    ))
 }
 
 /// Deterministic provider alias or natural key within one exact acquisition request.
@@ -417,6 +453,107 @@ impl ReferenceAliasAssertion {
     }
 }
 
+/// Bounded order-independent commitment to one exact multiset of alias assertions.
+///
+/// Strict parsers build this evidence directly from their typed rows. The reconciler builds the
+/// same evidence from the caller-owned externally sorted stream. Count and modular sum retain
+/// duplicate multiplicity; xor supplies an additional aggregate check while allowing
+/// production-sized streams to be sorted without changing the resulting commitment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReferenceAliasAssertionSetEvidence {
+    assertions: u64,
+    digest_sum: [u8; 32],
+    digest_xor: [u8; 32],
+}
+
+impl ReferenceAliasAssertionSetEvidence {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            assertions: 0,
+            digest_sum: [0; 32],
+            digest_xor: [0; 32],
+        }
+    }
+
+    pub(crate) const fn assertions(self) -> u64 {
+        self.assertions
+    }
+
+    pub(crate) fn try_observe(
+        &mut self,
+        assertion: &ReferenceAliasAssertion,
+    ) -> Result<(), ReferenceExportError> {
+        validate_assertion_shape(assertion.key(), assertion.target())?;
+        let encoded =
+            serde_json::to_vec(assertion).map_err(|_| ReferenceExportError::InvalidAssertion)?;
+        if encoded.is_empty() || encoded.len() > MAX_REFERENCE_ALIAS_ASSERTION_BYTES {
+            return Err(ReferenceExportError::InvalidAssertion);
+        }
+        let mut digest = Sha256::new();
+        digest.update(REFERENCE_ALIAS_ASSERTION_ELEMENT_DIGEST_DOMAIN);
+        digest.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| ReferenceExportError::CountOverflow)?
+                .to_be_bytes(),
+        );
+        digest.update(encoded);
+        let element: [u8; 32] = digest.finalize().into();
+        add_digest_modulo_256(&mut self.digest_sum, element);
+        for (aggregate, element) in self.digest_xor.iter_mut().zip(element) {
+            *aggregate ^= element;
+        }
+        self.assertions = self
+            .assertions
+            .checked_add(1)
+            .ok_or(ReferenceExportError::CountOverflow)?;
+        Ok(())
+    }
+
+    pub(crate) fn try_merge(&mut self, other: Self) -> Result<(), ReferenceExportError> {
+        self.assertions = self
+            .assertions
+            .checked_add(other.assertions)
+            .ok_or(ReferenceExportError::CountOverflow)?;
+        add_digest_modulo_256(&mut self.digest_sum, other.digest_sum);
+        for (aggregate, element) in self.digest_xor.iter_mut().zip(other.digest_xor) {
+            *aggregate ^= element;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn closure_digest(
+        self,
+        strict_row_set_digest: EvidenceDigest,
+    ) -> Result<EvidenceDigest, ReferenceExportError> {
+        if strict_row_set_digest.algorithm() != DigestAlgorithm::Sha256
+            || strict_row_set_digest.bytes() == [0; 32]
+        {
+            return Err(ReferenceExportError::InvalidAssertion);
+        }
+        let mut digest = Sha256::new();
+        digest.update(REFERENCE_ALIAS_ASSERTION_CLOSURE_DIGEST_DOMAIN);
+        digest.update(strict_row_set_digest.bytes());
+        digest.update(self.assertions.to_be_bytes());
+        digest.update(self.digest_sum);
+        digest.update(self.digest_xor);
+        Ok(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            digest.finalize().into(),
+        ))
+    }
+}
+
+fn add_digest_modulo_256(aggregate: &mut [u8; 32], element: [u8; 32]) {
+    let mut carry = false;
+    for index in (0..aggregate.len()).rev() {
+        let (sum, first_carry) = aggregate[index].overflowing_add(element[index]);
+        let (sum, second_carry) = sum.overflowing_add(u8::from(carry));
+        aggregate[index] = sum;
+        carry = first_carry || second_carry;
+    }
+}
+
 /// Provider-local ambiguity class; no candidate is selected as a winner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -522,6 +659,7 @@ impl ReferenceAliasResolution {
 pub struct ReferenceConflictReconciler {
     request_id: SourceIdentifier,
     max_conflicts: u32,
+    max_assertions: u64,
 }
 
 /// Terminal counts from one complete deterministic conflict-reconciliation stream.
@@ -532,6 +670,7 @@ pub struct ReferenceConflictReconciler {
 pub struct ReferenceConflictReconciliationReceipt {
     request_id: SourceIdentifier,
     conflicts: usize,
+    assertion_set: ReferenceAliasAssertionSetEvidence,
 }
 
 impl ReferenceConflictReconciliationReceipt {
@@ -544,6 +683,15 @@ impl ReferenceConflictReconciliationReceipt {
     pub const fn conflicts(&self) -> usize {
         self.conflicts
     }
+
+    /// Returns the exact number of alias assertions consumed through terminal EOF.
+    pub const fn assertions(&self) -> u64 {
+        self.assertion_set.assertions()
+    }
+
+    pub(crate) const fn assertion_set(&self) -> ReferenceAliasAssertionSetEvidence {
+        self.assertion_set
+    }
 }
 
 impl ReferenceConflictReconciler {
@@ -555,9 +703,15 @@ impl ReferenceConflictReconciler {
     pub fn try_for_publication(request: &PublicationRequest) -> Result<Self, ReferenceExportError> {
         let max_conflicts = u32::try_from(request.limits().max_conflicts())
             .map_err(|_| ReferenceExportError::InvalidLimit)?;
+        let max_assertions = request
+            .limits()
+            .max_total_records()
+            .checked_mul(MAX_REFERENCE_ALIAS_ASSERTIONS_PER_RECORD)
+            .ok_or(ReferenceExportError::InvalidLimit)?;
         Ok(Self {
             request_id: request.request_id().clone(),
             max_conflicts,
+            max_assertions,
         })
     }
 
@@ -587,9 +741,14 @@ impl ReferenceConflictReconciler {
         let mut previous_sort_key = None;
         let mut active = None;
         let mut total_conflicts = 0_u32;
+        let mut assertion_set = ReferenceAliasAssertionSetEvidence::empty();
         while let Some(assertion) = next_assertion()? {
             if assertion.request_id != self.request_id {
                 return Err(ReferenceExportError::RequestMismatch);
+            }
+            assertion_set.try_observe(&assertion)?;
+            if assertion_set.assertions() > self.max_assertions {
+                return Err(ReferenceExportError::AssertionLimitExceeded);
             }
             let sort_key = assertion.sort_key();
             if previous_sort_key
@@ -641,6 +800,7 @@ impl ReferenceConflictReconciler {
             request_id: self.request_id,
             conflicts: usize::try_from(total_conflicts)
                 .map_err(|_| ReferenceExportError::CountOverflow)?,
+            assertion_set,
         })
     }
 }
@@ -765,6 +925,9 @@ pub enum ReferenceExportError {
     /// Retained conflicts exceeded the explicit caller ceiling.
     #[error("option-reference conflict limit exceeded")]
     ConflictLimitExceeded,
+    /// Alias assertions exceeded the exact record-derived publication ceiling.
+    #[error("option-reference alias assertion limit exceeded")]
+    AssertionLimitExceeded,
     /// A bounded observation or conflict counter overflowed.
     #[error("option-reference export counter overflowed")]
     CountOverflow,

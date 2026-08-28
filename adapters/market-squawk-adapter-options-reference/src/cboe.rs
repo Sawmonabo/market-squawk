@@ -3,14 +3,16 @@ use std::io::Read;
 use std::num::{NonZeroU16, NonZeroU32};
 
 use csv::{ReaderBuilder, StringRecord};
-use market_squawk_domain::{ProviderInstrumentId, SourceIdentifier};
+use market_squawk_domain::{EvidenceDigest, ProviderInstrumentId, SourceIdentifier};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+    export::{visit_cboe_alias_assertions, ReferenceAliasAssertionSetEvidence},
+    payload::{BoundedTokenReader, ExactPayloadReader},
+    publication::StrictReferenceRowSetDigestBuilder,
     OptionContractIdentity, PageTerminalState, ReferenceObjectContext, ReferencePageReceipt,
     ReferenceProvider, ReferenceSurface,
-    payload::{BoundedTokenReader, ExactPayloadReader},
 };
 
 /// Application maximum for one Cboe `All Series` source object.
@@ -39,7 +41,6 @@ pub enum CboeVenue {
     /// Cboe EDGX Options.
     Edgx,
 }
-
 impl CboeVenue {
     /// Returns the exact selected `All Series` locator.
     pub const fn all_series_locator(self) -> &'static str {
@@ -197,6 +198,18 @@ pub struct CboeSeriesReference {
     object_context: ReferenceObjectContext,
 }
 
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CboeSeriesNativeSemanticsV1<'a> {
+    venue: CboeVenue,
+    cboe_symbol_id: &'a CboeSymbolId,
+    contract: &'a OptionContractIdentity,
+    underlying: &'a ProviderInstrumentId,
+    unit: u16,
+    status: CboeSeriesStatus,
+    listing_evidence: CboeListingEvidence,
+}
+
 impl CboeSeriesReference {
     #[allow(
         clippy::too_many_arguments,
@@ -293,6 +306,18 @@ impl CboeSeriesReference {
     pub const fn object_context(&self) -> &ReferenceObjectContext {
         &self.object_context
     }
+
+    pub(crate) const fn native_semantics(&self) -> CboeSeriesNativeSemanticsV1<'_> {
+        CboeSeriesNativeSemanticsV1 {
+            venue: self.venue,
+            cboe_symbol_id: &self.cboe_symbol_id,
+            contract: &self.contract,
+            underlying: &self.underlying,
+            unit: self.unit.get(),
+            status: self.status,
+            listing_evidence: self.listing_evidence,
+        }
+    }
 }
 
 /// Successful strict decode evidence for one complete Cboe file.
@@ -302,6 +327,8 @@ pub struct CboeAllSeriesParseReceipt {
     schema: CboeAllSeriesCsvSchema,
     context: ReferenceObjectContext,
     returned_records: u32,
+    strict_row_set_digest: EvidenceDigest,
+    alias_assertion_set: ReferenceAliasAssertionSetEvidence,
 }
 
 impl CboeAllSeriesParseReceipt {
@@ -315,6 +342,11 @@ impl CboeAllSeriesParseReceipt {
         self.returned_records
     }
 
+    /// Returns the exact ordered identity of every accepted provider-native row.
+    pub const fn strict_row_set_digest(&self) -> EvidenceDigest {
+        self.strict_row_set_digest
+    }
+
     /// Converts the strict single-file decode into terminal page-completeness evidence.
     pub fn page_receipt(&self) -> ReferencePageReceipt {
         ReferencePageReceipt::new(
@@ -322,6 +354,8 @@ impl CboeAllSeriesParseReceipt {
             NonZeroU32::MIN,
             self.returned_records,
             0,
+            self.strict_row_set_digest,
+            self.alias_assertion_set,
             PageTerminalState::Terminal,
         )
     }
@@ -395,6 +429,8 @@ impl CboeAllSeriesParser {
             _ => return Err(CboeParseError::InvalidContext),
         };
         let mut returned = 0_u32;
+        let mut strict_rows = StrictReferenceRowSetDigestBuilder::new();
+        let mut alias_assertion_set = ReferenceAliasAssertionSetEvidence::empty();
         for result in reader.records() {
             returned = returned
                 .checked_add(1)
@@ -406,12 +442,15 @@ impl CboeAllSeriesParser {
             let row_number = returned
                 .checked_add(1)
                 .ok_or(CboeParseError::RecordLimitExceeded)?;
-            sink(parse_record(
-                row_number,
-                venue,
-                &record,
-                self.context.clone(),
-            )?)?;
+            let record = parse_record(row_number, venue, &record, self.context.clone())?;
+            strict_rows
+                .try_observe(&record.native_semantics())
+                .map_err(|_| CboeParseError::InvalidEvidence)?;
+            visit_cboe_alias_assertions(&record, |assertion| {
+                alias_assertion_set.try_observe(&assertion)
+            })
+            .map_err(|_| CboeParseError::InvalidEvidence)?;
+            sink(record)?;
         }
         drop(reader);
         let terminal = framed
@@ -428,6 +467,10 @@ impl CboeAllSeriesParser {
             schema: self.schema,
             context: self.context.clone(),
             returned_records: returned,
+            strict_row_set_digest: strict_rows
+                .finish(returned)
+                .map_err(|_| CboeParseError::InvalidEvidence)?,
+            alias_assertion_set,
         })
     }
 }

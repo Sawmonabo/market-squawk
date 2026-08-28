@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::time::UNIX_EPOCH;
 
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::CboeVenue;
+use crate::{export::ReferenceAliasAssertionSetEvidence, CboeVenue};
 
 const MAX_PUBLICATION_SURFACES: usize = 64;
 const MAX_PUBLICATION_PAGES: u32 = 10_000;
@@ -22,6 +22,63 @@ const MAX_TRANSPORT_HEADER_EVIDENCE_BYTES: usize = 1_024;
 const MAX_TRANSPORT_REDIRECTS: usize = 4;
 const MAX_REFERENCE_TRANSPORT_ELAPSED_NANOS: u64 = 10 * 60 * 1_000_000_000;
 const REFERENCE_EVIDENCE_DIGEST_BYTES: usize = 32;
+const MAX_STRICT_REFERENCE_ROW_EVIDENCE_BYTES: usize = 64 * 1024;
+const STRICT_REFERENCE_ROW_SET_DIGEST_DOMAIN: &[u8] =
+    b"market-squawk/options-reference-strict-row-set/v1";
+const STRICT_REFERENCE_REQUEST_ROW_SET_DIGEST_DOMAIN: &[u8] =
+    b"market-squawk/options-reference-strict-request-row-set/v1";
+
+/// Incremental exact digest of the ordered typed rows accepted by one strict parser.
+///
+/// The caller-owned sink may stage rows outside adapter memory. This digest binds the exact
+/// provider-native serialized rows and their order without retaining the production-sized file.
+pub(crate) struct StrictReferenceRowSetDigestBuilder {
+    digest: Sha256,
+    rows: u32,
+}
+impl StrictReferenceRowSetDigestBuilder {
+    pub(crate) fn new() -> Self {
+        let mut digest = Sha256::new();
+        digest.update(STRICT_REFERENCE_ROW_SET_DIGEST_DOMAIN);
+        Self { digest, rows: 0 }
+    }
+
+    pub(crate) fn try_observe<T: Serialize>(&mut self, row: &T) -> Result<(), PublicationError> {
+        let encoded =
+            serde_json::to_vec(row).map_err(|_| PublicationError::InvalidObjectContext)?;
+        if encoded.is_empty() || encoded.len() > MAX_STRICT_REFERENCE_ROW_EVIDENCE_BYTES {
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        let ordinal = self
+            .rows
+            .checked_add(1)
+            .ok_or(PublicationError::LimitsExceeded)?;
+        self.digest.update(ordinal.to_be_bytes());
+        self.digest.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| PublicationError::LimitsExceeded)?
+                .to_be_bytes(),
+        );
+        self.digest.update(encoded);
+        self.rows = ordinal;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self, expected_rows: u32) -> Result<EvidenceDigest, PublicationError> {
+        if self.rows != expected_rows {
+            return Err(PublicationError::InvalidObjectContext);
+        }
+        self.digest.update(self.rows.to_be_bytes());
+        Ok(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            self.digest.finalize().into(),
+        ))
+    }
+}
+
+fn strict_empty_row_set_digest() -> Result<EvidenceDigest, PublicationError> {
+    StrictReferenceRowSetDigestBuilder::new().finish(0)
+}
 
 /// Exact bounded HTTP date field retained separately from provider-native and local clocks.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -276,8 +333,12 @@ impl PublicationRequest {
 /// retention, a publication catalog, an immutable generation, a PIT selector, or restart evidence.
 pub struct ReferenceRequestBudget {
     request_id: SourceIdentifier,
+    requested_at: Timestamp,
+    deadline: Timestamp,
     requested_surfaces: BTreeSet<ReferenceSurface>,
     observed_surfaces: BTreeSet<ReferenceSurface>,
+    strict_row_set_digests: BTreeMap<ReferenceSurface, EvidenceDigest>,
+    alias_assertion_sets: BTreeMap<ReferenceSurface, ReferenceAliasAssertionSetEvidence>,
     limits: PublicationLimits,
     completed_pages: u32,
     payload_bytes: u64,
@@ -314,8 +375,12 @@ impl ReferenceRequestBudget {
         }
         Ok(Self {
             request_id: request.request_id.clone(),
+            requested_at: request.requested_at,
+            deadline: request.deadline,
             requested_surfaces: request.surfaces.iter().cloned().collect(),
             observed_surfaces: BTreeSet::new(),
+            strict_row_set_digests: BTreeMap::new(),
+            alias_assertion_sets: BTreeMap::new(),
             limits: request.limits,
             completed_pages: 0,
             payload_bytes: 0,
@@ -345,6 +410,24 @@ impl ReferenceRequestBudget {
             return Err(PublicationError::InvalidObjectContext);
         }
         let result = self.observe_object(context, u64::from(page.returned_records()));
+        if result.is_ok()
+            && self
+                .strict_row_set_digests
+                .insert(context.surface().clone(), page.strict_row_set_digest())
+                .is_some()
+        {
+            self.failed = true;
+            return Err(PublicationError::InvalidRequest);
+        }
+        if result.is_ok()
+            && self
+                .alias_assertion_sets
+                .insert(context.surface().clone(), page.alias_assertion_set())
+                .is_some()
+        {
+            self.failed = true;
+            return Err(PublicationError::InvalidRequest);
+        }
         if result.is_err() {
             self.failed = true;
         }
@@ -370,6 +453,27 @@ impl ReferenceRequestBudget {
             return Err(PublicationError::InvalidObjectContext);
         }
         let result = self.observe_object(context, 0);
+        if result.is_ok()
+            && self
+                .strict_row_set_digests
+                .insert(context.surface().clone(), strict_empty_row_set_digest()?)
+                .is_some()
+        {
+            self.failed = true;
+            return Err(PublicationError::InvalidRequest);
+        }
+        if result.is_ok()
+            && self
+                .alias_assertion_sets
+                .insert(
+                    context.surface().clone(),
+                    ReferenceAliasAssertionSetEvidence::empty(),
+                )
+                .is_some()
+        {
+            self.failed = true;
+            return Err(PublicationError::InvalidRequest);
+        }
         if result.is_err() {
             self.failed = true;
         }
@@ -389,6 +493,8 @@ impl ReferenceRequestBudget {
         if self.failed
             || reconciliation.request_id() != &self.request_id
             || self.observed_surfaces != self.requested_surfaces
+            || self.strict_row_set_digests.len() != self.requested_surfaces.len()
+            || self.alias_assertion_sets.len() != self.requested_surfaces.len()
         {
             return Err(PublicationError::InvalidRequest);
         }
@@ -399,12 +505,32 @@ impl ReferenceRequestBudget {
         {
             return Err(PublicationError::LimitsExceeded);
         }
+        let strict_row_set_digest = strict_request_row_set_digest(
+            &self.request_id,
+            &self.strict_row_set_digests,
+            self.returned_records,
+        )?;
+        let mut expected_assertion_set = ReferenceAliasAssertionSetEvidence::empty();
+        for assertion_set in self.alias_assertion_sets.into_values() {
+            expected_assertion_set
+                .try_merge(assertion_set)
+                .map_err(|_| PublicationError::LimitsExceeded)?;
+        }
+        if expected_assertion_set != reconciliation.assertion_set() {
+            return Err(PublicationError::InvalidRequest);
+        }
+        let alias_assertion_closure_digest = expected_assertion_set
+            .closure_digest(strict_row_set_digest)
+            .map_err(|_| PublicationError::InvalidRequest)?;
         Ok(ReferenceRequestAccountingReceipt {
             request_id: self.request_id,
             completed_pages: self.completed_pages,
             payload_bytes: self.payload_bytes,
             returned_records: self.returned_records,
             conflicts: reconciliation.conflicts(),
+            strict_row_set_digest,
+            alias_assertions: expected_assertion_set.assertions(),
+            alias_assertion_closure_digest,
         })
     }
 
@@ -413,8 +539,11 @@ impl ReferenceRequestBudget {
         context: &ReferenceObjectContext,
         returned_records: u64,
     ) -> Result<(), PublicationError> {
+        let official_request = context.transport_evidence().request();
         if self.failed
-            || context.transport_evidence().request().request_id() != &self.request_id
+            || official_request.request_id() != &self.request_id
+            || official_request.wall_started_at() != self.requested_at
+            || official_request.wall_deadline() != self.deadline
             || !self.requested_surfaces.contains(context.surface())
             || !self.observed_surfaces.insert(context.surface().clone())
         {
@@ -450,6 +579,9 @@ pub struct ReferenceRequestAccountingReceipt {
     payload_bytes: u64,
     returned_records: u64,
     conflicts: usize,
+    strict_row_set_digest: EvidenceDigest,
+    alias_assertions: u64,
+    alias_assertion_closure_digest: EvidenceDigest,
 }
 
 impl ReferenceRequestAccountingReceipt {
@@ -477,6 +609,224 @@ impl ReferenceRequestAccountingReceipt {
     pub const fn conflicts(&self) -> usize {
         self.conflicts
     }
+
+    /// Returns the exact ordered-row identity across the complete requested surface closure.
+    pub const fn strict_row_set_digest(&self) -> EvidenceDigest {
+        self.strict_row_set_digest
+    }
+
+    /// Returns the exact number of provider alias assertions bound to the typed row closure.
+    pub const fn alias_assertions(&self) -> u64 {
+        self.alias_assertions
+    }
+
+    /// Returns the assertion multiset commitment bound to the complete strict row-set identity.
+    pub const fn alias_assertion_closure_digest(&self) -> EvidenceDigest {
+        self.alias_assertion_closure_digest
+    }
+}
+
+/// One non-cloneable modified OCC/Cboe object after its exact terminal parser contract.
+pub enum ReferenceModifiedObjectHandoff {
+    /// A strictly decoded Cboe, OCC DLP, or OCC memo-index object.
+    Typed(crate::ReferenceTypedHandoff),
+    /// A complete retained OCC memo whose economics remain explicitly uninterpreted.
+    UninterpretedMemo(crate::ReferenceUninterpretedMemoHandoff),
+}
+
+impl std::fmt::Debug for ReferenceModifiedObjectHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReferenceModifiedObjectHandoff")
+            .field("object_id", self.context().object_id())
+            .field("surface", self.context().surface())
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<crate::ReferenceTypedHandoff> for ReferenceModifiedObjectHandoff {
+    fn from(value: crate::ReferenceTypedHandoff) -> Self {
+        Self::Typed(value)
+    }
+}
+
+impl From<crate::ReferenceUninterpretedMemoHandoff> for ReferenceModifiedObjectHandoff {
+    fn from(value: crate::ReferenceUninterpretedMemoHandoff) -> Self {
+        Self::UninterpretedMemo(value)
+    }
+}
+
+impl ReferenceModifiedObjectHandoff {
+    /// Returns exact provider object, schema, checksum, and clock evidence.
+    pub const fn context(&self) -> &ReferenceObjectContext {
+        match self {
+            Self::Typed(value) => value.context(),
+            Self::UninterpretedMemo(value) => value.context(),
+        }
+    }
+
+    /// Returns the complete common raw-object receipt.
+    pub const fn raw_receipt(&self) -> &market_squawk_platform::ResearchObjectReceipt {
+        match self {
+            Self::Typed(value) => value.raw_receipt(),
+            Self::UninterpretedMemo(value) => value.raw_receipt(),
+        }
+    }
+
+    /// Returns exact modified-response evidence.
+    pub const fn http_receipt(&self) -> &crate::ReferenceHttpReceipt {
+        match self {
+            Self::Typed(value) => value.http_receipt(),
+            Self::UninterpretedMemo(value) => value.http_receipt(),
+        }
+    }
+}
+
+/// Complete non-cloneable modified OCC/Cboe request closure for root composition.
+///
+/// Every selected surface appears exactly once in request order, every object has a final strict
+/// parse receipt, and aggregate bytes, rows, aliases, and conflicts are closed. This value still
+/// does not grant generation publication: the application must atomically rejoin it with the
+/// caller-owned staged canonical partitions and the forthcoming large-logical-object seal token.
+pub struct CompletedModifiedReferencePublicationCapture {
+    request: PublicationRequest,
+    objects: Box<[ReferenceModifiedObjectHandoff]>,
+    reconciliation: crate::ReferenceConflictReconciliationReceipt,
+    accounting: ReferenceRequestAccountingReceipt,
+}
+
+impl std::fmt::Debug for CompletedModifiedReferencePublicationCapture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompletedModifiedReferencePublicationCapture")
+            .field("request_id", self.request.request_id())
+            .field("objects", &self.objects.len())
+            .field("records", &self.accounting.returned_records())
+            .field("conflicts", &self.accounting.conflicts())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CompletedModifiedReferencePublicationCapture {
+    /// Closes one exact selected-surface request around its final typed/raw handoffs.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incomplete, duplicate, reordered, cross-request, or internally inconsistent
+    /// objects and reconciliation evidence.
+    pub fn try_new(
+        request: PublicationRequest,
+        objects: Vec<ReferenceModifiedObjectHandoff>,
+        reconciliation: crate::ReferenceConflictReconciliationReceipt,
+    ) -> Result<Self, PublicationError> {
+        let accounting =
+            validate_completed_modified_reference_publication(&request, &objects, &reconciliation)?;
+        Ok(Self {
+            request,
+            objects: objects.into_boxed_slice(),
+            reconciliation,
+            accounting,
+        })
+    }
+
+    /// Returns the exact selected request closed by this capture.
+    pub const fn request(&self) -> &PublicationRequest {
+        &self.request
+    }
+
+    /// Returns each complete object in the request's sorted selected-surface order.
+    pub fn objects(&self) -> &[ReferenceModifiedObjectHandoff] {
+        &self.objects
+    }
+
+    /// Returns aggregate exact bytes, rows, conflicts, and strict row-set identity.
+    pub const fn accounting(&self) -> &ReferenceRequestAccountingReceipt {
+        &self.accounting
+    }
+
+    /// Returns terminal ambiguity/conflict reconciliation evidence for the same request.
+    pub const fn reconciliation(&self) -> &crate::ReferenceConflictReconciliationReceipt {
+        &self.reconciliation
+    }
+
+    /// Consumes the closure for application-owned staged-partition and seal rejoin.
+    pub fn into_parts(
+        self,
+    ) -> (
+        PublicationRequest,
+        Box<[ReferenceModifiedObjectHandoff]>,
+        crate::ReferenceConflictReconciliationReceipt,
+        ReferenceRequestAccountingReceipt,
+    ) {
+        (
+            self.request,
+            self.objects,
+            self.reconciliation,
+            self.accounting,
+        )
+    }
+}
+
+pub(crate) fn validate_completed_modified_reference_publication(
+    request: &PublicationRequest,
+    objects: &[ReferenceModifiedObjectHandoff],
+    reconciliation: &crate::ReferenceConflictReconciliationReceipt,
+) -> Result<ReferenceRequestAccountingReceipt, PublicationError> {
+    if objects.len() != request.surfaces().len()
+        || objects
+            .iter()
+            .zip(request.surfaces())
+            .any(|(object, surface)| object.context().surface() != surface)
+    {
+        return Err(PublicationError::InvalidRequest);
+    }
+    let mut budget = ReferenceRequestBudget::try_for_publication(request)?;
+    for object in objects {
+        match object {
+            ReferenceModifiedObjectHandoff::Typed(value) => {
+                budget.observe_typed_handoff(value)?;
+            }
+            ReferenceModifiedObjectHandoff::UninterpretedMemo(value) => {
+                budget.observe_uninterpreted_memo_handoff(value)?;
+            }
+        }
+    }
+    budget.finish(reconciliation)
+}
+
+fn strict_request_row_set_digest(
+    request_id: &SourceIdentifier,
+    surface_digests: &BTreeMap<ReferenceSurface, EvidenceDigest>,
+    returned_records: u64,
+) -> Result<EvidenceDigest, PublicationError> {
+    if surface_digests.is_empty() {
+        return Err(PublicationError::InvalidRequest);
+    }
+    let mut digest = Sha256::new();
+    digest.update(STRICT_REFERENCE_REQUEST_ROW_SET_DIGEST_DOMAIN);
+    digest.update(
+        u64::try_from(request_id.as_str().len())
+            .map_err(|_| PublicationError::LimitsExceeded)?
+            .to_be_bytes(),
+    );
+    digest.update(request_id.as_str().as_bytes());
+    for (surface, row_digest) in surface_digests {
+        ensure_sha256(*row_digest)?;
+        let encoded_surface =
+            serde_json::to_vec(surface).map_err(|_| PublicationError::InvalidObjectContext)?;
+        digest.update(
+            u64::try_from(encoded_surface.len())
+                .map_err(|_| PublicationError::LimitsExceeded)?
+                .to_be_bytes(),
+        );
+        digest.update(encoded_surface);
+        digest.update(row_digest.bytes());
+    }
+    digest.update(returned_records.to_be_bytes());
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
 }
 
 /// Provider clocks retained without converting date-only values to invented instants.
@@ -1792,6 +2142,8 @@ pub struct ReferencePageReceipt {
     page_ordinal: NonZeroU32,
     returned_records: u32,
     rejected_records: u32,
+    strict_row_set_digest: EvidenceDigest,
+    alias_assertion_set: ReferenceAliasAssertionSetEvidence,
     terminal_state: PageTerminalState,
 }
 
@@ -1806,6 +2158,8 @@ impl ReferencePageReceipt {
         page_ordinal: NonZeroU32,
         returned_records: u32,
         rejected_records: u32,
+        strict_row_set_digest: EvidenceDigest,
+        alias_assertion_set: ReferenceAliasAssertionSetEvidence,
         terminal_state: PageTerminalState,
     ) -> Self {
         Self {
@@ -1813,6 +2167,8 @@ impl ReferencePageReceipt {
             page_ordinal,
             returned_records,
             rejected_records,
+            strict_row_set_digest,
+            alias_assertion_set,
             terminal_state,
         }
     }
@@ -1836,6 +2192,15 @@ impl ReferencePageReceipt {
     /// partial page; strict decoders normally fail before producing a receipt.
     pub const fn rejected_records(&self) -> u32 {
         self.rejected_records
+    }
+
+    /// Returns the exact ordered identity of every typed row delivered by the strict parser.
+    pub const fn strict_row_set_digest(&self) -> EvidenceDigest {
+        self.strict_row_set_digest
+    }
+
+    pub(crate) const fn alias_assertion_set(&self) -> ReferenceAliasAssertionSetEvidence {
+        self.alias_assertion_set
     }
 
     /// Returns the observed terminal state.
