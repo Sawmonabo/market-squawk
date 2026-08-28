@@ -24,8 +24,11 @@ pub use observations::{
     BlsFootnote, BlsObservation, BlsParseError, BlsResponse, BlsSeries, BlsVintageCapability,
 };
 pub use publication::{
-    BlsCanonicalFootnote, BlsCanonicalObservationSemantics, BlsCanonicalProviderSemantics,
-    BlsCanonicalSeriesManifest, BlsPublicationCandidate, BlsRootSchemaExtensionRequirement,
+    BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION, BlsCanonicalFootnote,
+    BlsCanonicalObservationSemantics, BlsCanonicalProviderSemantics, BlsCanonicalSeriesManifest,
+    BlsCompletePublicationPlanHandoff, BlsPublicationCandidate, BlsRootSchemaExtensionRequirement,
+    BlsTimeseriesNativeLineageObservationV1, BlsTimeseriesNativeLineageRowV1,
+    BlsTimeseriesNativeLineageSeriesV1,
 };
 pub use series_metadata::{BlsSeriesMetadata, BlsSeriesMetadataInput};
 pub use source::{

@@ -9,12 +9,14 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryRequestId, ExtractionBatch, ExtractionContentIdentity,
-    ExtractionRevisionPlan, ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
-    ProviderNativeLineageBatchBuilder, ProviderNativeLineageImplementation,
-    SealedProviderCaptureBinding, SourceMetadata, SourceObjectCaptureIdentity,
+    ExtractionRevisionPlan, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
+    PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION, ProviderCaptureTerminalDisposition,
+    ProviderNativeLineageBatch, ProviderNativeLineageBatchBuilder,
+    ProviderNativeLineageImplementation, ProviderNativeLineageSchema, SealedProviderCaptureBinding,
+    SourceMetadata, SourceObjectCaptureIdentity,
 };
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::contract::BlsRuntimeInstanceCapability;
@@ -25,7 +27,10 @@ use crate::{
 };
 
 const PUBLICATION_CANDIDATE_SCHEMA_VERSION: u16 = 1;
+const COMPLETE_PUBLICATION_PLAN_HANDOFF_SCHEMA_VERSION: u16 = 1;
 const BLS_PROVIDER_SEMANTICS_SCHEMA: &str = "market-squawk-bls-provider-semantics-v1";
+/// Durable shared-catalog name of the exact BLS native-row implementation decoded here.
+pub const BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION: &str = "bls_timeseries_v1";
 
 /// Explicit root schema-extension rejoin required to preserve BLS-native semantics.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -96,7 +101,7 @@ impl BlsRootSchemaExtensionRequirement {
 }
 
 /// Exact BLS footnote semantics retained beside the shared canonical macro row.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlsCanonicalFootnote {
     code: Option<Box<str>>,
@@ -468,6 +473,426 @@ struct BlsNativeLineageObservationV1<'a> {
     missing_explanations: &'a [Box<str>],
 }
 
+/// Checked typed view of one persisted `BlsTimeseriesV1` provider-native row.
+///
+/// The shared store owns row identity and publication authority. This value only decodes the
+/// bounded adapter payload after the caller supplies the persisted native-lineage schema.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BlsTimeseriesNativeLineageRowV1 {
+    series: BlsTimeseriesNativeLineageSeriesV1,
+    observation: BlsTimeseriesNativeLineageObservationV1,
+}
+
+impl BlsTimeseriesNativeLineageRowV1 {
+    /// Decodes one exact persisted native row under the only supported BLS implementation/version.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an incompatible shared schema, an empty or oversized payload, malformed JSON,
+    /// unknown fields, or semantics that could not have been emitted by the BLS v1 encoder.
+    pub fn try_decode(
+        schema: ProviderNativeLineageSchema,
+        semantic_payload: &[u8],
+    ) -> Result<Self, BlsSourceError> {
+        if schema.version() != PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION
+            || schema.implementation() != ProviderNativeLineageImplementation::BlsTimeseriesV1
+        {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        Self::decode_payload(semantic_payload)
+    }
+
+    /// Decodes the value-only schema projection exposed by a durable shared-catalog read.
+    ///
+    /// The caller must first validate the complete persisted binding, including its schema
+    /// fingerprint, row digest, and raw-capture join. This adapter check then rejects any catalog
+    /// row that is not explicitly labeled as the current BLS timeseries implementation.
+    pub fn try_decode_persisted(
+        schema_version: u16,
+        implementation: &str,
+        semantic_payload: &[u8],
+    ) -> Result<Self, BlsSourceError> {
+        if schema_version != PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION
+            || implementation != BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION
+        {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        Self::decode_payload(semantic_payload)
+    }
+
+    fn decode_payload(semantic_payload: &[u8]) -> Result<Self, BlsSourceError> {
+        if semantic_payload.is_empty()
+            || semantic_payload.len() > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES
+        {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        let row: Self = serde_json::from_slice(semantic_payload)
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
+        row.validate()?;
+        Ok(row)
+    }
+
+    /// Returns the exact configured series semantics retained for this observation.
+    pub const fn series(&self) -> &BlsTimeseriesNativeLineageSeriesV1 {
+        &self.series
+    }
+
+    /// Returns the exact provider observation semantics retained beside the canonical row.
+    pub const fn observation(&self) -> &BlsTimeseriesNativeLineageObservationV1 {
+        &self.observation
+    }
+
+    fn validate(&self) -> Result<(), BlsSourceError> {
+        let expected_value = if self.observation.raw_value.as_ref() == "-" {
+            None
+        } else {
+            Some(
+                Decimal::from_str_exact(&self.observation.raw_value)
+                    .map_err(|_| BlsSourceError::InvalidPublication)?,
+            )
+        };
+        let expected_preliminary = self
+            .observation
+            .footnotes
+            .iter()
+            .any(|footnote| footnote.code() == Some("P"));
+        let expected_missing_explanations = if expected_value.is_none() {
+            self.observation
+                .footnotes
+                .iter()
+                .filter_map(BlsCanonicalFootnote::text)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if self.series.series_id != self.observation.series_id
+            || self.series.title.is_empty()
+            || self.series.title.len() > 512
+            || self.series.title.trim() != self.series.title.as_ref()
+            || self.series.title.chars().any(char::is_control)
+            || self.observation.year < 1900
+            || crate::observations::period_parts(self.observation.period.as_str()).is_none()
+            || self.observation.period_label.len() > 64
+            || self.observation.value != expected_value
+            || self.observation.preliminary != expected_preliminary
+            || self
+                .observation
+                .missing_explanations
+                .iter()
+                .map(AsRef::as_ref)
+                .ne(expected_missing_explanations)
+        {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        Ok(())
+    }
+}
+
+/// Typed configured-series projection decoded from one persisted BLS native row.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BlsTimeseriesNativeLineageSeriesV1 {
+    series_id: SourceIdentifier,
+    title: Box<str>,
+    unit: SourceIdentifier,
+    frequency: SourceIdentifier,
+    seasonal_adjustment: SourceIdentifier,
+    measure: SourceIdentifier,
+}
+
+impl BlsTimeseriesNativeLineageSeriesV1 {
+    /// Returns the exact BLS series identifier.
+    pub const fn series_id(&self) -> &SourceIdentifier {
+        &self.series_id
+    }
+
+    /// Returns the user-verified series title.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Returns the explicit unit retained from verified series metadata.
+    pub const fn unit(&self) -> &SourceIdentifier {
+        &self.unit
+    }
+
+    /// Returns the exact provider frequency semantic.
+    pub const fn frequency(&self) -> &SourceIdentifier {
+        &self.frequency
+    }
+
+    /// Returns the exact provider seasonal-adjustment semantic.
+    pub const fn seasonal_adjustment(&self) -> &SourceIdentifier {
+        &self.seasonal_adjustment
+    }
+
+    /// Returns the exact configured measure semantic.
+    pub const fn measure(&self) -> &SourceIdentifier {
+        &self.measure
+    }
+}
+
+/// Typed observation projection decoded from one persisted BLS native row.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BlsTimeseriesNativeLineageObservationV1 {
+    series_id: SourceIdentifier,
+    year: u16,
+    period: SourceIdentifier,
+    period_label: Box<str>,
+    raw_value: Box<str>,
+    value: Option<Decimal>,
+    preliminary: bool,
+    footnotes: Box<[BlsCanonicalFootnote]>,
+    missing_explanations: Box<[Box<str>]>,
+}
+
+impl BlsTimeseriesNativeLineageObservationV1 {
+    /// Returns the exact BLS series identifier.
+    pub const fn series_id(&self) -> &SourceIdentifier {
+        &self.series_id
+    }
+
+    /// Returns the observation year.
+    pub const fn year(&self) -> u16 {
+        self.year
+    }
+
+    /// Returns the exact BLS period code.
+    pub const fn period(&self) -> &SourceIdentifier {
+        &self.period
+    }
+
+    /// Returns the provider period label.
+    pub fn period_label(&self) -> &str {
+        &self.period_label
+    }
+
+    /// Returns the exact lexical provider value, including the missing `-` marker.
+    pub fn raw_value(&self) -> &str {
+        &self.raw_value
+    }
+
+    /// Returns the parsed exact decimal, or `None` for the provider missing marker.
+    pub const fn value(&self) -> Option<Decimal> {
+        self.value
+    }
+
+    /// Returns whether the provider marked this value preliminary.
+    pub const fn is_preliminary(&self) -> bool {
+        self.preliminary
+    }
+
+    /// Returns all exact provider footnotes.
+    pub fn footnotes(&self) -> &[BlsCanonicalFootnote] {
+        &self.footnotes
+    }
+
+    /// Returns explicit missing-value explanations derived from provider footnotes.
+    pub fn missing_explanations(&self) -> &[Box<str>] {
+        &self.missing_explanations
+    }
+}
+
+/// One-use, provider-local proof that every deterministic BLS request chunk is present.
+///
+/// This value does not publish data or mint a shared generation. It keeps all non-cloneable
+/// candidates together so the application can reserve and commit the request plan as one logical
+/// unit without losing the exact request-set, source-generation, or chunk-closure evidence.
+#[derive(Debug)]
+pub struct BlsCompletePublicationPlanHandoff {
+    schema_version: u16,
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    discovery_request_id: DiscoveryRequestId,
+    provider_dataset: SourceIdentifier,
+    analytical_dataset: SourceIdentifier,
+    request_set_identity: EvidenceDigest,
+    capture_content_digest: EvidenceDigest,
+    capture_observation_digest: EvidenceDigest,
+    source_generation_digest: EvidenceDigest,
+    sealed_capture_receipt_digest: EvidenceDigest,
+    total_chunks: u16,
+    canonical_record_count: u64,
+    candidates: Box<[BlsPublicationCandidate]>,
+    completion_digest: EvidenceDigest,
+}
+
+impl BlsCompletePublicationPlanHandoff {
+    /// Consumes an exact, ordered set of BLS candidates and proves complete plan closure.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, missing, duplicate, reordered, cross-request, cross-capture,
+    /// cross-generation, cross-activation, or otherwise internally inconsistent candidates.
+    pub fn try_new(candidates: Vec<BlsPublicationCandidate>) -> Result<Self, BlsSourceError> {
+        let first = candidates
+            .first()
+            .ok_or(BlsSourceError::InvalidPublication)?;
+        let total_chunks = first.total_chunks;
+        if total_chunks == 0 || candidates.len() != usize::from(total_chunks) {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        first.validate_complete_plan_projection()?;
+        let source_id = first.source_id.clone();
+        let metadata_revision = first.metadata_revision.clone();
+        let discovery_request_id = first.discovery_request_id;
+        let provider_dataset = first.provider_dataset.clone();
+        let analytical_dataset = first.analytical_dataset.clone();
+        let request_set_identity = first.discovery_request_set_identity;
+        let capture_content_digest = first.discovery_capture_content_digest;
+        let capture_observation_digest = first.discovery_capture_observation_digest;
+        let source_generation_digest = first.source_generation_digest;
+        let sealed_capture_receipt_digest =
+            first.sealed_capture_binding.sealed_capture_receipt_digest();
+        let credential_rejoin = first.credential_rejoin;
+        let provider_rate_declaration_digest = first.provider_rate_declaration_digest;
+        let doctor_report_digest = first.doctor_report_digest;
+        let sealed_doctor_capture_receipt_digest = first.sealed_doctor_capture_receipt_digest;
+        let activation_expires_at = first.activation_expires_at;
+        let activation_candidate_digest = first.activation_candidate_digest;
+        let runtime_instance = Arc::clone(&first.runtime_instance);
+
+        let mut canonical_record_count = 0_u64;
+        for (expected_index, candidate) in candidates.iter().enumerate() {
+            candidate.validate_complete_plan_projection()?;
+            let expected_index =
+                u16::try_from(expected_index).map_err(|_| BlsSourceError::InvalidPublication)?;
+            if candidate.chunk_index != expected_index
+                || candidate.total_chunks != total_chunks
+                || candidate.source_id != source_id
+                || candidate.metadata_revision != metadata_revision
+                || candidate.discovery_request_id != discovery_request_id
+                || candidate.provider_dataset != provider_dataset
+                || candidate.analytical_dataset != analytical_dataset
+                || candidate.discovery_request_set_identity != request_set_identity
+                || candidate.discovery_capture_content_digest != capture_content_digest
+                || candidate.discovery_capture_observation_digest != capture_observation_digest
+                || candidate.source_generation_digest != source_generation_digest
+                || candidate
+                    .sealed_capture_binding
+                    .sealed_capture_receipt_digest()
+                    != sealed_capture_receipt_digest
+                || candidate.credential_rejoin != credential_rejoin
+                || candidate.provider_rate_declaration_digest != provider_rate_declaration_digest
+                || candidate.doctor_report_digest != doctor_report_digest
+                || candidate.sealed_doctor_capture_receipt_digest
+                    != sealed_doctor_capture_receipt_digest
+                || candidate.activation_expires_at != activation_expires_at
+                || candidate.activation_candidate_digest != activation_candidate_digest
+                || !Arc::ptr_eq(&candidate.runtime_instance, &runtime_instance)
+            {
+                return Err(BlsSourceError::InvalidPublication);
+            }
+            canonical_record_count = canonical_record_count
+                .checked_add(u64::from(candidate.canonical_record_count))
+                .ok_or(BlsSourceError::InvalidPublication)?;
+        }
+        if canonical_record_count == 0 {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+
+        let mut handoff = Self {
+            schema_version: COMPLETE_PUBLICATION_PLAN_HANDOFF_SCHEMA_VERSION,
+            source_id,
+            metadata_revision,
+            discovery_request_id,
+            provider_dataset,
+            analytical_dataset,
+            request_set_identity,
+            capture_content_digest,
+            capture_observation_digest,
+            source_generation_digest,
+            sealed_capture_receipt_digest,
+            total_chunks,
+            canonical_record_count,
+            candidates: candidates.into_boxed_slice(),
+            completion_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
+        };
+        handoff.completion_digest = complete_publication_plan_digest(&handoff)?;
+        Ok(handoff)
+    }
+
+    /// Returns the exact provider source root shared publication must rejoin.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact provider metadata revision shared publication must rejoin.
+    pub const fn metadata_revision(&self) -> &MetadataRevision {
+        &self.metadata_revision
+    }
+
+    /// Returns the discovery operation shared by every completed chunk.
+    pub const fn discovery_request_id(&self) -> DiscoveryRequestId {
+        self.discovery_request_id
+    }
+
+    /// Returns the exact provider request-plan dataset.
+    pub const fn provider_dataset(&self) -> &SourceIdentifier {
+        &self.provider_dataset
+    }
+
+    /// Returns the shared analytical dataset root to reserve once for the complete plan.
+    pub const fn analytical_dataset(&self) -> &SourceIdentifier {
+        &self.analytical_dataset
+    }
+
+    /// Returns the deterministic identity of the complete provider request graph.
+    pub const fn request_set_identity(&self) -> EvidenceDigest {
+        self.request_set_identity
+    }
+
+    /// Returns the stable content identity of the complete provider request graph.
+    pub const fn capture_content_digest(&self) -> EvidenceDigest {
+        self.capture_content_digest
+    }
+
+    /// Returns the receipt-time-bound identity of the complete provider request graph.
+    pub const fn capture_observation_digest(&self) -> EvidenceDigest {
+        self.capture_observation_digest
+    }
+
+    /// Returns the stable source/configuration/rights/credential generation for every chunk.
+    pub const fn source_generation_digest(&self) -> EvidenceDigest {
+        self.source_generation_digest
+    }
+
+    /// Returns the one physical seal shared by every completed request-plan chunk.
+    pub const fn sealed_capture_receipt_digest(&self) -> EvidenceDigest {
+        self.sealed_capture_receipt_digest
+    }
+
+    /// Returns the exact number of contiguous deterministic chunks retained by this handoff.
+    pub const fn total_chunks(&self) -> u16 {
+        self.total_chunks
+    }
+
+    /// Returns the checked total canonical row count across all completed chunks.
+    pub const fn canonical_record_count(&self) -> u64 {
+        self.canonical_record_count
+    }
+
+    /// Returns candidates in exact deterministic chunk order without consuming authority.
+    pub fn candidates(&self) -> &[BlsPublicationCandidate] {
+        &self.candidates
+    }
+
+    /// Returns the non-authoritative identity of the complete provider-local plan handoff.
+    pub const fn completion_digest(&self) -> EvidenceDigest {
+        self.completion_digest
+    }
+
+    /// Consumes the closure proof into its ordered, still-one-use publication candidates.
+    ///
+    /// Callers must keep this returned slice as one logical publication group. Splitting it does
+    /// not create partial-plan publication authority.
+    pub fn into_candidates(self) -> Box<[BlsPublicationCandidate]> {
+        self.candidates
+    }
+}
+
 /// Canonical BLS input whose exact provider response has already been physically sealed.
 ///
 /// This value is deliberately only a root-ingest handoff. It carries no manifest, generation,
@@ -776,6 +1201,79 @@ impl BlsPublicationCandidate {
             || self.activation_expires_at != activation.expires_at()
             || self.activation_candidate_digest != activation.candidate_digest()
             || !Arc::ptr_eq(&self.runtime_instance, expected_runtime_instance)
+            || self.candidate_digest != candidate_digest(self)?
+        {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        Ok(())
+    }
+
+    fn validate_complete_plan_projection(&self) -> Result<(), BlsSourceError> {
+        self.sealed_capture_binding
+            .validate()
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
+        let batch = self.sealed_capture_binding.batch();
+        let native_lineage = self.sealed_capture_binding.native_lineage();
+        let object = batch.request().object();
+        let capture = self.sealed_capture_binding.capture_evidence();
+        let chunk_index = usize::from(self.chunk_index);
+        let total_chunks = usize::from(self.total_chunks);
+        let page = capture
+            .pages()
+            .get(chunk_index)
+            .ok_or(BlsSourceError::InvalidPublication)?;
+        self.provider_semantics.validate(batch)?;
+        native_lineage
+            .validate(batch)
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
+        for row in native_lineage.rows() {
+            BlsTimeseriesNativeLineageRowV1::try_decode(
+                native_lineage.schema(),
+                row.semantic_payload(),
+            )?;
+        }
+        let complete_capture = if total_chunks == 1 {
+            capture.terminal() == ProviderCaptureTerminalDisposition::StandaloneResponse
+                && capture.request_graph_components().is_empty()
+                && self.sealed_capture_binding.component_ordinal().is_none()
+        } else {
+            capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph
+                && capture.request_graph_components().len() == total_chunks
+                && self.sealed_capture_binding.component_ordinal() == Some(self.chunk_index)
+        };
+        if self.schema_version != PUBLICATION_CANDIDATE_SCHEMA_VERSION
+            || total_chunks == 0
+            || chunk_index >= total_chunks
+            || capture.pages().len() != total_chunks
+            || !complete_capture
+            || self.source_id != *object.source_id()
+            || self.metadata_revision != *object.metadata_revision()
+            || self.discovery_request_id != object.discovery_request_id()
+            || self.provider_dataset != *object.dataset()
+            || self.object_id != *object.object_id()
+            || self.first_observed_at != object.effective_interval().starts_at()
+            || self.response_received_at != page.received_at()
+            || self.response_received_at > self.canonical_ingested_at
+            || self.discovery_request_set_identity != capture.request_set_identity()
+            || self.discovery_capture_content_digest != capture.content_digest()
+            || self.discovery_capture_observation_digest != capture.observation_digest()
+            || self.canonical_record_count == 0
+            || usize::try_from(self.canonical_record_count).ok() != Some(batch.records().len())
+            || self.schema_extension_requirement_digest
+                != self
+                    .provider_semantics
+                    .schema_requirement()
+                    .requirement_digest()
+            || self.provider_semantics_digest != self.provider_semantics.semantics_digest()
+            || self.native_lineage_digest != native_lineage.batch_digest()
+            || !validate_discovery_component(
+                capture,
+                chunk_index,
+                object.capture_identity(),
+                self.component_request_identity,
+                self.component_content_digest,
+                self.component_observation_digest,
+            )
             || self.candidate_digest != candidate_digest(self)?
         {
             return Err(BlsSourceError::InvalidPublication);
@@ -1175,6 +1673,57 @@ fn candidate_digest(candidate: &BlsPublicationCandidate) -> Result<EvidenceDiges
     }
     hash_credential_rejoin(&mut digest, candidate.credential_rejoin);
     digest.update(candidate.activation_expires_at.unix_nanos().to_be_bytes());
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn complete_publication_plan_digest(
+    handoff: &BlsCompletePublicationPlanHandoff,
+) -> Result<EvidenceDigest, BlsSourceError> {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/bls-complete-publication-plan-handoff/v1\0");
+    digest.update(handoff.schema_version.to_be_bytes());
+    hash_field(&mut digest, handoff.source_id.as_str().as_bytes())?;
+    hash_field(
+        &mut digest,
+        handoff
+            .metadata_revision
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
+    hash_field(
+        &mut digest,
+        &serde_json::to_vec(&handoff.discovery_request_id)
+            .map_err(|_| BlsSourceError::InvalidPublication)?,
+    )?;
+    hash_field(&mut digest, handoff.provider_dataset.as_str().as_bytes())?;
+    hash_field(&mut digest, handoff.analytical_dataset.as_str().as_bytes())?;
+    for value in [
+        handoff.request_set_identity,
+        handoff.capture_content_digest,
+        handoff.capture_observation_digest,
+        handoff.source_generation_digest,
+        handoff.sealed_capture_receipt_digest,
+    ] {
+        hash_evidence_digest(&mut digest, value);
+    }
+    digest.update(handoff.total_chunks.to_be_bytes());
+    digest.update(handoff.canonical_record_count.to_be_bytes());
+    for candidate in &handoff.candidates {
+        digest.update(candidate.chunk_index.to_be_bytes());
+        hash_field(&mut digest, candidate.object_id.as_str().as_bytes())?;
+        for value in [
+            candidate.component_request_identity,
+            candidate.component_content_digest,
+            candidate.component_observation_digest,
+            candidate.candidate_digest,
+        ] {
+            hash_evidence_digest(&mut digest, value);
+        }
+    }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
         digest.finalize().into(),

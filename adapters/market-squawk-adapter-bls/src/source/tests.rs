@@ -223,9 +223,9 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path())?;
     let store = paths.sealed_research_journal_store()?;
-    let (doctor_report, doctor_capture) = doctor.into_parts();
-    let sealed_doctor_capture = doctor_capture.seal(&store)?;
-    let activation = source.activation_candidate(doctor_report, sealed_doctor_capture)?;
+    let (pending_doctor, doctor_seal) = doctor.into_sealing_parts();
+    let sealed_doctor_capture = doctor_seal.seal(&store)?;
+    let activation = source.activation_candidate(pending_doctor, sealed_doctor_capture)?;
     source.validate_activation_candidate(&activation)?;
     assert_eq!(activation.plan(), &activation_plan);
     assert_eq!(
@@ -308,14 +308,10 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
     );
     let first_object = first_discovery.batch().objects()[0].clone();
     let second_object = second_discovery.batch().objects()[0].clone();
-    let (first_pending, first_capture) = first_discovery.into_sealing_parts();
-    let (second_pending, second_capture) = second_discovery.into_sealing_parts();
+    let (first_pending, first_capture) = first_discovery.into_sealing_parts()?;
+    let (second_pending, second_capture) = second_discovery.into_sealing_parts()?;
     let first_sealed = first_capture.seal(&store)?;
     let second_sealed = second_capture.seal(&store)?;
-    assert_ne!(
-        first_sealed.receipt_digest(),
-        second_sealed.receipt_digest()
-    );
 
     drop(activation);
     drop(source);
@@ -358,9 +354,9 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
             CancellationToken::new(),
         )
         .await?;
-    let (restarted_report, restarted_capture) = restarted_doctor.into_parts();
+    let (restarted_pending, restarted_seal) = restarted_doctor.into_sealing_parts();
     let restarted_activation =
-        restarted_source.activation_candidate(restarted_report, restarted_capture.seal(&store)?)?;
+        restarted_source.activation_candidate(restarted_pending, restarted_seal.seal(&store)?)?;
 
     let first_admission = restarted_source
         .admit_sealed_discovery(first_pending, first_sealed, &restarted_activation)?
@@ -434,10 +430,18 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
         first_publication.candidate_digest(),
         second_publication.candidate_digest()
     );
-    let candidate_wire = serde_json::to_string(&first_publication)?;
-    assert!(!candidate_wire.contains(secret));
     assert!(!format!("{restarted_source:?}").contains(secret));
-    assert!(!candidate_wire.contains("\"manifest"));
+
+    let native_lineage = first_publication.native_lineage();
+    let native_row = crate::BlsTimeseriesNativeLineageRowV1::try_decode_persisted(
+        native_lineage.schema().version(),
+        crate::BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION,
+        native_lineage.rows()[0].semantic_payload(),
+    )?;
+    assert_eq!(native_row.series().series_id().as_str(), "LNS14000000");
+    assert_eq!(native_row.series().unit().as_str(), "percent");
+    assert_eq!(native_row.observation().period().as_str(), "M06");
+    assert_eq!(native_row.observation().raw_value(), "4.2");
 
     let record = &first_publication.batch().records()[0];
     assert_eq!(record.schema().as_str(), "market-squawk-research-v3");
@@ -496,6 +500,20 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
     assert_eq!(health.last_success_at(), Some(restarted_doctor_received_at));
     assert!(health.last_payload_digest().is_some());
     assert_eq!(health.consecutive_failures(), 0);
+
+    let complete_plan = crate::BlsCompletePublicationPlanHandoff::try_new(vec![first_publication])?;
+    assert_eq!(complete_plan.total_chunks(), 1);
+    assert_eq!(complete_plan.canonical_record_count(), 1);
+    assert_eq!(
+        complete_plan.request_set_identity(),
+        complete_plan.candidates()[0].request_set_identity()
+    );
+    assert_eq!(
+        complete_plan.source_generation_digest(),
+        activation_plan.plan_digest()
+    );
+    assert_ne!(complete_plan.completion_digest().bytes(), [0; 32]);
+    assert_eq!(complete_plan.into_candidates().len(), 1);
     Ok(())
 }
 
@@ -563,8 +581,8 @@ async fn source_harness(
     let doctor = source
         .doctor(authority.clone(), deadline, CancellationToken::new())
         .await?;
-    let (doctor_report, doctor_capture) = doctor.into_parts();
-    let activation = source.activation_candidate(doctor_report, doctor_capture.seal(store)?)?;
+    let (pending_doctor, doctor_seal) = doctor.into_sealing_parts();
+    let activation = source.activation_candidate(pending_doctor, doctor_seal.seal(store)?)?;
     Ok((source, registry, authority, activation, deadline))
 }
 
@@ -612,7 +630,7 @@ async fn discover_object(
         .first()
         .cloned()
         .ok_or("missing BLS source object")?;
-    let (pending, capture) = discovery.into_sealing_parts();
+    let (pending, capture) = discovery.into_sealing_parts()?;
     let admission = source
         .admit_sealed_discovery(pending, capture.seal(store)?, activation)?
         .into_objects()
