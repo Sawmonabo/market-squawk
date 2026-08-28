@@ -10,6 +10,8 @@ use std::{
 #[cfg(debug_assertions)]
 use market_squawk::verified_development_service_program;
 use market_squawk::{
+    SchwabOAuthInstallationCapabilityError, SchwabOAuthInstallationTrustAction,
+    SchwabOAuthInstallationTrustState,
     service::{
         BootstrapRequirement, InstalledServiceBootstrapState, InstalledServiceConnector,
         InstalledServiceError,
@@ -56,6 +58,25 @@ impl DesktopServiceBootstrap {
     }
 }
 
+impl DesktopServiceAuthority {
+    /// Runs the explicit foreground macOS trust transition outside the background service.
+    pub(crate) async fn schwab_oauth_installation_trust(
+        &self,
+        action: SchwabOAuthInstallationTrustAction,
+        cancellation: CancellationToken,
+    ) -> Result<SchwabOAuthInstallationTrustState, DesktopServiceError> {
+        self.connector
+            .schwab_oauth_installation_trust(action, cancellation)
+            .await
+            .map_err(|error| match error {
+                InstalledServiceError::SchwabOAuthTrust(error) => {
+                    DesktopServiceError::SchwabOAuthTrust(error)
+                }
+                _ => DesktopServiceError::Discovery,
+            })
+    }
+}
+
 /// Native-only authority for reconnecting to or restarting the exact installed service.
 ///
 /// The retained launch specification contains only already validated paths. It contains no
@@ -82,6 +103,8 @@ pub(crate) enum DesktopBootstrapAction {
 pub(crate) enum DesktopServiceError {
     #[error("installed service discovery is unavailable")]
     Discovery,
+    #[error("Schwab OAuth callback trust is unavailable")]
+    SchwabOAuthTrust(#[source] SchwabOAuthInstallationCapabilityError),
     #[error("the verified installed service could not start")]
     Launch(#[source] std::io::Error),
     #[error("the installed service did not become ready before the startup deadline")]

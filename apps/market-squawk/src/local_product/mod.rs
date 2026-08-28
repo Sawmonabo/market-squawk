@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use market_squawk_adapter_schwab::{OAuthLoopbackBounds, SchwabOAuthWireBounds};
 use market_squawk_adapter_treasury::TreasuryFiscalQuery;
 use market_squawk_analytics::{
     BatchFeatureCatalog, BatchFeatureCatalogConfig, BatchFeaturePolicies, FeatureMetadataError,
@@ -36,6 +37,7 @@ use market_squawk_platform::{
     InstalledServiceSelectedWorkspaceGuard, LocalAuthorityStateStore, LocalPaths,
     PreferredSecretStore,
 };
+use market_squawk_runtime::InstallationId;
 use market_squawk_services::{ArtifactAuthority, ArtifactError, ArtifactRepository};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationSubjectResolver, RESEARCH_SOURCE_AUTHORITY_DIRECTORY,
@@ -49,7 +51,8 @@ pub use self::cli_model::CliModelAdmissionError;
 pub use self::cli_portfolio::CliPortfolioImportError;
 pub use self::cli_provider::CliProviderActivationError;
 pub(crate) use self::cli_provider::{
-    ControlledLocalFileRequest, ProviderResearchActivationService,
+    ControlledLocalFileRequest, ProviderResearchActivationService, SchwabOAuthRuntimeFactory,
+    SchwabOAuthRuntimeInitializationError,
 };
 pub use self::cli_transport::{
     CliProductError, CliProductResult, execute_cli_command, execute_installed_cli_command,
@@ -115,6 +118,11 @@ use crate::backtest_strategy::{
 };
 use crate::local_product::operations::{SettingsLifecycleAuthority, WorkspaceRestorePolicy};
 use crate::provider_activation::nasdaq_reference::NasdaqReferenceUniverseService;
+use crate::provider_onboarding::{
+    InstallationSchwabOAuthBrowser, InstallationSchwabOAuthIdentity,
+    InstallationSchwabOAuthTlsAcceptor, SchwabOAuthMarketDrain, SchwabOAuthMarketDrainError,
+    SchwabOAuthMarketDrainFuture, SchwabOAuthRuntime, SchwabOAuthRuntimeConfiguration,
+};
 use crate::provider_rate::open_provider_rate_authority;
 use crate::{
     AppConfig, PortfolioApplicationLimits, PortfolioApplicationService,
@@ -141,6 +149,82 @@ const LOCAL_MAXIMUM_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const MAXIMUM_CONFIGURED_LIVE_INSTRUMENTS: usize = 101;
 const COINBASE_LIVE_AUTHORITY_KEY: &str = "coinbase-exchange-public";
 const KRAKEN_LIVE_AUTHORITY_KEY: &str = "kraken-public-book-v2";
+const SCHWAB_OAUTH_AUTHORITY_DIRECTORY: &str = "sources/schwab-oauth-v1";
+const SCHWAB_OAUTH_MAXIMUM_AUTHORIZATION_BYTES: usize = 16 * 1024;
+const SCHWAB_OAUTH_MAXIMUM_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
+const SCHWAB_OAUTH_MAXIMUM_CALLBACK_BYTES: usize = 32 * 1024;
+const SCHWAB_OAUTH_MAXIMUM_CALLBACK_HEADERS: usize = 64;
+const SCHWAB_OAUTH_MAXIMUM_CALLBACK_CONNECTIONS: usize = 16;
+
+#[derive(Debug)]
+struct NoActiveSchwabMarketDrain;
+
+impl SchwabOAuthMarketDrain for NoActiveSchwabMarketDrain {
+    fn drain(
+        &self,
+        _session_id: uuid::Uuid,
+        _current: Option<market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt>,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> SchwabOAuthMarketDrainFuture<'_> {
+        Box::pin(async { Ok::<(), SchwabOAuthMarketDrainError>(()) })
+    }
+}
+
+fn open_schwab_oauth_runtime(
+    workspace_paths: &LocalPaths,
+    onboarding: Arc<ProviderOnboardingService>,
+    identity: Arc<InstallationSchwabOAuthIdentity>,
+) -> Result<Arc<SchwabOAuthRuntime>, SchwabOAuthRuntimeInitializationError> {
+    let tls = InstallationSchwabOAuthTlsAcceptor::try_from_identity(identity.as_ref())
+        .map_err(|_error| SchwabOAuthRuntimeInitializationError::Installation)?;
+    let wire_bounds = SchwabOAuthWireBounds::try_new(
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+        Duration::from_secs(20),
+        NonZeroUsize::new(SCHWAB_OAUTH_MAXIMUM_TOKEN_RESPONSE_BYTES)
+            .ok_or(SchwabOAuthRuntimeInitializationError::Configuration)?,
+    )
+    .map_err(|_error| SchwabOAuthRuntimeInitializationError::Configuration)?;
+    let callback_bounds = OAuthLoopbackBounds::try_new(
+        Duration::from_secs(10 * 60),
+        Duration::from_secs(15),
+        Duration::from_secs(10),
+        NonZeroUsize::new(SCHWAB_OAUTH_MAXIMUM_CALLBACK_CONNECTIONS)
+            .ok_or(SchwabOAuthRuntimeInitializationError::Configuration)?,
+        NonZeroUsize::new(SCHWAB_OAUTH_MAXIMUM_CALLBACK_BYTES)
+            .ok_or(SchwabOAuthRuntimeInitializationError::Configuration)?,
+        NonZeroUsize::new(SCHWAB_OAUTH_MAXIMUM_CALLBACK_HEADERS)
+            .ok_or(SchwabOAuthRuntimeInitializationError::Configuration)?,
+    )
+    .map_err(|_error| SchwabOAuthRuntimeInitializationError::Configuration)?;
+    let configuration = SchwabOAuthRuntimeConfiguration::try_new(
+        workspace_paths
+            .control_root()
+            .map_err(|_error| SchwabOAuthRuntimeInitializationError::Runtime)?
+            .root()
+            .join(SCHWAB_OAUTH_AUTHORITY_DIRECTORY),
+        wire_bounds,
+        callback_bounds,
+        NonZeroUsize::new(SCHWAB_OAUTH_MAXIMUM_AUTHORIZATION_BYTES)
+            .ok_or(SchwabOAuthRuntimeInitializationError::Configuration)?,
+    )
+    .map_err(|_error| SchwabOAuthRuntimeInitializationError::Runtime)?;
+    SchwabOAuthRuntime::try_new(
+        onboarding,
+        configuration,
+        Arc::new(tls),
+        Arc::new(InstallationSchwabOAuthBrowser::new(identity)),
+        Arc::new(NoActiveSchwabMarketDrain),
+    )
+    .map(Arc::new)
+    .map_err(|_error| SchwabOAuthRuntimeInitializationError::Runtime)
+}
+
+#[derive(Clone)]
+struct SchwabOAuthInstallationContext {
+    paths: LocalPaths,
+    installation_id: InstallationId,
+}
 
 /// Returns the installed CLI path after stable-file and permission verification.
 ///
@@ -246,12 +330,18 @@ impl LocalProduct {
     pub(crate) fn try_new_at_selected_workspace(
         config: AppConfig,
         selected_workspace: &InstalledServiceSelectedWorkspaceGuard,
+        installation_paths: &LocalPaths,
+        installation_id: InstallationId,
     ) -> Result<Self, LocalProductError> {
         Self::try_new_with_paths_and_prepublished_research_sources(
             config,
             selected_workspace.workspace_paths().clone(),
             std::iter::empty::<PrepublishedResearchSourceRegistration>(),
             SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace),
+            Some(SchwabOAuthInstallationContext {
+                paths: installation_paths.clone(),
+                installation_id,
+            }),
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             None,
         )
@@ -261,6 +351,8 @@ impl LocalProduct {
     pub(crate) fn try_new_at_selected_workspace_with_board_fixture(
         config: AppConfig,
         selected_workspace: &InstalledServiceSelectedWorkspaceGuard,
+        installation_paths: &LocalPaths,
+        installation_id: InstallationId,
         board_fixture: BoardInstalledFixtureBundle,
     ) -> Result<Self, LocalProductError> {
         Self::try_new_with_paths_and_prepublished_research_sources(
@@ -268,6 +360,10 @@ impl LocalProduct {
             selected_workspace.workspace_paths().clone(),
             std::iter::empty::<PrepublishedResearchSourceRegistration>(),
             SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace),
+            Some(SchwabOAuthInstallationContext {
+                paths: installation_paths.clone(),
+                installation_id,
+            }),
             Some(board_fixture),
         )
     }
@@ -294,6 +390,7 @@ impl LocalProduct {
             paths,
             registrations,
             SourceAuthorityStartupPolicy::RejectUncleanPredecessor,
+            None,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             None,
         )
@@ -304,6 +401,7 @@ impl LocalProduct {
         paths: LocalPaths,
         registrations: I,
         source_authority_startup_policy: SourceAuthorityStartupPolicy<'_>,
+        schwab_oauth_installation: Option<SchwabOAuthInstallationContext>,
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))] board_fixture: Option<
             BoardInstalledFixtureBundle,
         >,
@@ -458,15 +556,6 @@ impl LocalProduct {
             &provider_activation,
             &provider_activation_state,
         );
-        let portal_activation = Arc::new(cli_provider::ProviderResearchActivationService::new(
-            paths.clone(),
-            Arc::clone(&onboarding),
-            Arc::clone(&provider_activation),
-            provider_activation_state.clone(),
-        ));
-        let provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority> =
-            portal_activation.clone();
-
         let decisions = Arc::new(DecisionApplication::open(
             paths.control_root()?.decision_database_location(),
             decision_repository_limits()?,
@@ -496,6 +585,34 @@ impl LocalProduct {
             prepared_market_configuration,
             Arc::clone(&live_fair_value),
         )?;
+        let schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory> = schwab_oauth_installation
+            .map(|installation| {
+                let workspace_paths = paths.clone();
+                let onboarding = Arc::clone(&onboarding);
+                Arc::new(move || {
+                    let control_root = installation
+                        .paths
+                        .control_root()
+                        .map_err(|_error| SchwabOAuthRuntimeInitializationError::Installation)?;
+                    let identity = Arc::new(
+                        InstallationSchwabOAuthIdentity::try_prepare(
+                            control_root,
+                            installation.installation_id,
+                        )
+                        .map_err(|_error| SchwabOAuthRuntimeInitializationError::Installation)?,
+                    );
+                    open_schwab_oauth_runtime(&workspace_paths, Arc::clone(&onboarding), identity)
+                }) as SchwabOAuthRuntimeFactory
+            });
+        let portal_activation = Arc::new(cli_provider::ProviderResearchActivationService::new(
+            paths.clone(),
+            Arc::clone(&onboarding),
+            Arc::clone(&provider_activation),
+            provider_activation_state.clone(),
+            schwab_oauth_factory,
+        ));
+        let provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority> =
+            portal_activation.clone();
         let reference_search: Arc<dyn MarketReferenceSearchAuthority> = nasdaq_reference;
         let paper = PaperApplicationServices::new(
             config.clone(),

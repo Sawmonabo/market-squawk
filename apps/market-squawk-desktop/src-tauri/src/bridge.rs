@@ -8,6 +8,10 @@ use std::{
 };
 
 use market_squawk::service::BootstrapRequirement;
+use market_squawk::{
+    SchwabOAuthInstallationCapabilityError, SchwabOAuthInstallationTrustAction,
+    SchwabOAuthInstallationTrustState,
+};
 use market_squawk_installer::{
     CommandError, InstallError, InstallStatus, RepairRequest, RollbackRequest, repair, rollback,
     status as installation_status, update_from_channel,
@@ -35,7 +39,7 @@ use crate::events::DesktopEventSubscriptions;
 use crate::mcp_clients::{DesktopMcpClientState, DesktopMcpRuntimeBinding};
 use crate::service::{
     self, DesktopBootstrapAction, DesktopServiceAuthority, DesktopServiceBootstrap,
-    DesktopServiceConnection, DesktopServiceStartup,
+    DesktopServiceConnection, DesktopServiceError, DesktopServiceStartup,
 };
 
 const MAXIMUM_APPLICATION_ARGUMENT_BYTES: usize = 256 * 1024;
@@ -48,6 +52,7 @@ const GOVERNANCE_AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAXIMUM_GOVERNANCE_AUTHORIZATIONS: usize = 256;
 const SOURCE_SETUP_OPERATION: &str = "Source.Setup";
 const SOURCE_STATUS_OPERATION: &str = "Source.GetStatus";
+const SCHWAB_PROVIDER_ID: &str = "schwab.trader-api-market-data";
 
 #[derive(Clone)]
 pub(crate) struct DesktopCompositionContext {
@@ -1650,6 +1655,44 @@ pub(crate) async fn open_protected_provider_setup(
             "The selected provider is not supported.",
         ));
     }
+    if provider_id == SCHWAB_PROVIDER_ID {
+        let authority = state.service_authority();
+        let status = authority
+            .schwab_oauth_installation_trust(
+                SchwabOAuthInstallationTrustAction::Status,
+                generation.cancellation(),
+            )
+            .await
+            .map_err(map_schwab_callback_trust_error)?;
+        let trust = match status {
+            SchwabOAuthInstallationTrustState::Trusted => status,
+            SchwabOAuthInstallationTrustState::SetupRequired => authority
+                .schwab_oauth_installation_trust(
+                    SchwabOAuthInstallationTrustAction::Enroll,
+                    generation.cancellation(),
+                )
+                .await
+                .map_err(map_schwab_callback_trust_error)?,
+            SchwabOAuthInstallationTrustState::RepairRequired => {
+                return Err(DesktopCommandError::new(
+                    "schwab_callback_repair_required",
+                    "Schwab's private local callback needs repair before setup can continue.",
+                ));
+            }
+            SchwabOAuthInstallationTrustState::Unsupported => {
+                return Err(DesktopCommandError::new(
+                    "schwab_callback_unsupported",
+                    "Secure Schwab browser setup is not available on this operating system yet.",
+                ));
+            }
+        };
+        if trust != SchwabOAuthInstallationTrustState::Trusted {
+            return Err(DesktopCommandError::new(
+                "schwab_callback_trust_required",
+                "Schwab setup needs approval for Market Squawk's private local callback.",
+            ));
+        }
+    }
     let mut arguments = Map::new();
     arguments.insert("provider".to_owned(), Value::String(provider_id));
     arguments.insert("confirm".to_owned(), Value::Bool(true));
@@ -1686,6 +1729,42 @@ pub(crate) async fn open_protected_provider_setup(
         )
     })?;
     state.admit_current(&generation)
+}
+
+fn map_schwab_callback_trust_error(error: DesktopServiceError) -> DesktopCommandError {
+    match error {
+        DesktopServiceError::SchwabOAuthTrust(
+            SchwabOAuthInstallationCapabilityError::TrustCancelled,
+        ) => DesktopCommandError::new(
+            "schwab_callback_cancelled",
+            "Schwab setup was cancelled before the private local callback was approved.",
+        ),
+        DesktopServiceError::SchwabOAuthTrust(
+            SchwabOAuthInstallationCapabilityError::TrustTimeout,
+        ) => DesktopCommandError::new(
+            "schwab_callback_timeout",
+            "Schwab setup approval timed out. Try again when you are ready.",
+        ),
+        DesktopServiceError::SchwabOAuthTrust(
+            SchwabOAuthInstallationCapabilityError::InvalidTlsIdentity,
+        ) => DesktopCommandError::new(
+            "schwab_callback_repair_required",
+            "Schwab's private local callback needs repair before setup can continue.",
+        ),
+        DesktopServiceError::SchwabOAuthTrust(
+            SchwabOAuthInstallationCapabilityError::UnsupportedPlatform,
+        ) => DesktopCommandError::new(
+            "schwab_callback_unsupported",
+            "Secure Schwab browser setup is not available on this operating system yet.",
+        ),
+        DesktopServiceError::SchwabOAuthTrust(
+            SchwabOAuthInstallationCapabilityError::TrustEnrollment,
+        ) => DesktopCommandError::new(
+            "schwab_callback_trust_required",
+            "Schwab setup needs approval for Market Squawk's private local callback.",
+        ),
+        _ => DesktopCommandError::internal(),
+    }
 }
 
 async fn provider_bootstrap(

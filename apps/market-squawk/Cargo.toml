@@ -121,6 +121,7 @@ market-squawk-sources = { workspace = true }
 market-squawk-valuation = { workspace = true }
 rust_decimal = { workspace = true }
 reqwest = { workspace = true }
+rcgen = { workspace = true }
 rpassword = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
@@ -131,6 +132,7 @@ sysinfo = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -139,6 +141,11 @@ uuid = { workspace = true }
 url = { workspace = true }
 webbrowser = { workspace = true }
 zeroize = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "=0.6.4", default-features = false }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSWorkspace"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSString", "NSURL"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }

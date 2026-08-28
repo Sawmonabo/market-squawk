@@ -101,6 +101,8 @@ pub use provider_onboarding::{
     ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalActivationAuthority,
     ProviderPortalActivationError, ProviderPortalActivationRequest, ProviderPortalActivationView,
     ProviderPortalConfig, ProviderPortalError, ProviderProfileRegistration,
-    ProviderProfileRegistrationOutcome, ProviderProfileView, StartOnboardingRequest,
+    ProviderProfileRegistrationOutcome, ProviderProfileView,
+    SchwabOAuthInstallationCapabilityError, SchwabOAuthInstallationTrustAction,
+    SchwabOAuthInstallationTrustState, StartOnboardingRequest,
 };
 pub use research_service::{ResearchIngestRequest, ResearchService, ResearchServiceError};

@@ -80,6 +80,30 @@ const PROVIDER_COPY = Object.freeze({
       submitLabel: 'Save replacement and reconnect'
     }
   },
+  'schwab.trader-api-market-data': {
+    mark: 'SCH',
+    name: 'Charles Schwab',
+    purpose:
+      'Optional read-only multi-asset quotes, price history, options, market hours, movers, and streaming market data from your authorized Schwab connection.',
+    examples: [
+      'Provider-qualified stock and ETF quotes',
+      'Price history and option chains',
+      'Read-only streaming market data'
+    ],
+    goals: [],
+    effort: 'About 3 minutes',
+    access: 'Schwab authorization',
+    account:
+      'A Schwab brokerage relationship and an already configured Trader API application are required. Market Squawk reads the application key and secret only from its protected local credential store. This browser page never asks for or displays either value.',
+    handoffUrl: 'https://developer.schwab.com/products/trader-api--individual',
+    setupSteps: [
+      'Market Squawk confirms that the Schwab application credential is already stored locally.',
+      'Choose Authorize with Schwab. The Market Squawk backend opens the official Schwab authorization page in your default browser.',
+      'Sign in to Schwab and approve the read-only market-data connection on that official page.',
+      'Return here and choose I finished in Schwab to complete the protected token exchange.',
+      'Market Squawk retains only the protected authorization and its secret-free status; it does not request account, position, order, or money-movement access.'
+    ]
+  },
   'kraken.spot-public-market-data': {
     mark: 'KR',
     name: 'Kraken',
@@ -356,7 +380,7 @@ const ERROR_COPY = Object.freeze({
     'This provider cannot be activated yet',
     'The required provider capability is not currently admitted. The setup remains visibly incomplete.'
   ],
-  adapter_state_unavailable: [
+  activation_state_unavailable: [
     'The local provider state could not be saved',
     'Nothing was silently activated. Check local storage and try again.'
   ],
@@ -384,6 +408,7 @@ const state = {
   notice: null,
   technical: null,
   pendingRequests: new Map(),
+  schwabOAuthViews: new Map(),
   advancedFilter: '',
   providerMode: 'guided',
   renewingProfile: null,
@@ -763,6 +788,8 @@ function renderProviderStep(profile) {
     body.append(renderRenewalAction(profile, session));
   } else if (isConnected(session)) {
     body.append(renderConnectedPanel(profile, session));
+  } else if (isSchwabProfile(profile)) {
+    body.append(renderSchwabProviderAction(profile, session));
   } else if (!releaseAllowsSetup(profile)) {
     body.append(renderUnavailablePanel(profile));
   } else {
@@ -854,6 +881,7 @@ function renderConnectedPanel(profile, session) {
   if (
     state.providerMode === 'advanced' &&
     session &&
+    !isSchwabProfile(profile) &&
     profile.credential_requirement === 'required_provider_controlled'
   ) {
     const renewal = renewalPresentation(profile);
@@ -935,6 +963,255 @@ function renderUnavailablePanel(profile) {
   return panel;
 }
 
+function renderSchwabProviderAction(profile, session) {
+  const root = element('section', 'secret-panel');
+  if (!session) {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab application setup is required',
+        'Market Squawk can begin Schwab authorization only after the installation has imported the application key and secret into its protected local credential store. This browser page never collects those credentials.'
+      )
+    );
+    return root;
+  }
+
+  if (session.next_action !== 'complete_oauth_authorization') {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab authorization is not available yet',
+        schwabOAuthUnavailableReason(session.next_action)
+      )
+    );
+    return root;
+  }
+
+  const view = schwabOAuthView(profile, session);
+  if (!view) {
+    root.append(
+      renderSetupSteps(profile),
+      element('h3', '', 'Authorize read-only Schwab market data'),
+      element(
+        'p',
+        'page-copy',
+        'Market Squawk will ask its backend to open the official Schwab authorization page. The authorization URL, callback, application credential, and protected tokens never pass through this browser page.'
+      ),
+      actionButton('Authorize with Schwab', 'button-primary', () =>
+        runSchwabOAuthAction(profile, session, 'begin')
+      )
+    );
+  } else if (view.state === 'awaiting_authorization') {
+    root.append(
+      schwabOAuthNotice(
+        'info',
+        'i',
+        'Waiting for Schwab authorization',
+        'The Market Squawk backend opened the official Schwab authorization page. Finish signing in and approving there, then return to this page.'
+      ),
+      schwabOAuthActions(
+        ['I finished in Schwab', 'button-primary', 'continue'],
+        ['Cancel this authorization', 'button-quiet', 'cancel'],
+        profile,
+        session
+      )
+    );
+  } else if (view.state === 'exchanging_authorization') {
+    root.append(
+      schwabOAuthNotice(
+        'info',
+        'i',
+        'Finishing Schwab authorization',
+        'Market Squawk is completing the protected token transition locally. No token is returned to this page.'
+      ),
+      schwabOAuthActions(
+        ['Check authorization completion', 'button-primary', 'continue'],
+        null,
+        profile,
+        session
+      )
+    );
+  } else if (view.state === 'active') {
+    root.append(
+      schwabOAuthNotice(
+        'success',
+        '✓',
+        'Schwab authorization is complete',
+        'The read-only Schwab market-data authorization is active and protected locally. This page received only its secret-free lifecycle status; it has no account, position, order, or money-movement authority.'
+      )
+    );
+  } else if (view.state === 'reauthorization_required') {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab authorization must be renewed',
+        'The protected Schwab authority can no longer issue a current market-data token. Complete Schwab authorization again before this source can be used.'
+      ),
+      schwabOAuthActions(
+        ['Authorize with Schwab again', 'button-primary', 'begin'],
+        null,
+        profile,
+        session
+      )
+    );
+  } else if (view.state === 'cancelled') {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab authorization was cancelled',
+        'No incomplete Schwab authorization was granted. You may start a new authorization when you are ready.'
+      ),
+      schwabOAuthActions(
+        ['Start Schwab authorization again', 'button-primary', 'begin'],
+        null,
+        profile,
+        session
+      )
+    );
+  } else if (view.state === 'unlinked') {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab authorization is unlinked',
+        'The prior protected Schwab token authority is no longer available to Market Squawk.'
+      ),
+      schwabOAuthActions(
+        ['Authorize Schwab again', 'button-primary', 'begin'],
+        null,
+        profile,
+        session
+      )
+    );
+  } else {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab authorization is unavailable',
+        'The local Schwab authorization runtime could not admit this operation. The saved onboarding session remains incomplete.'
+      ),
+      schwabOAuthActions(
+        ['Try Schwab authorization again', 'button-primary', 'begin'],
+        null,
+        profile,
+        session
+      )
+    );
+  }
+
+  if (state.busy) root.append(renderBusyLine('Updating protected Schwab authorization…'));
+  return root;
+}
+
+function schwabOAuthNotice(kind, mark, title, message) {
+  const notice = element('section', `notice notice-${kind}`);
+  notice.setAttribute('role', 'status');
+  const copy = element('div');
+  copy.append(element('h3', '', title), element('p', '', message));
+  notice.append(element('span', 'notice-mark', mark), copy);
+  return notice;
+}
+
+function schwabOAuthActions(primary, secondary, profile, session) {
+  const actions = element('div', 'button-row');
+  for (const specification of [primary, secondary]) {
+    if (!specification) continue;
+    const [label, className, action] = specification;
+    actions.append(
+      actionButton(label, className, () => runSchwabOAuthAction(profile, session, action))
+    );
+  }
+  return actions;
+}
+
+function schwabOAuthUnavailableReason(action) {
+  if (secretAction(action)) {
+    return 'The Schwab application credential has not completed protected local import. Import it through the installation-owned credential path; do not enter it in this browser.';
+  }
+  if (action === 'refresh_evidence' || action === 'resolve_rights') {
+    return 'The saved Schwab session still requires backend evidence or entitlement work before OAuth can continue. Nothing was silently activated.';
+  }
+  if (action === 'start_new_session' || action === 'none') {
+    return 'This saved Schwab session cannot continue. Preserve it for audit and begin a new installation-owned credential session.';
+  }
+  return 'The saved Schwab session does not currently admit OAuth authorization. Follow the next setup action reported by the backend.';
+}
+
+async function runSchwabOAuthAction(profile, session, action) {
+  await runAction(async () => {
+    try {
+      const view = await mutate(
+        `/api/v1/sessions/${session.session_id}/schwab-oauth-${action}`,
+        '{}',
+        'application/json'
+      );
+      const retained = retainSchwabOAuthView(session, action, view);
+      state.schwabOAuthViews.set(profile.id, retained);
+      state.technical = retained;
+      if (retained.state === 'active') {
+        state.notice = {
+          kind: 'success',
+          title: 'Schwab authorization completed',
+          message: 'The protected read-only market-data authorization is active locally.'
+        };
+      }
+    } catch (error) {
+      if (
+        error instanceof PortalError &&
+        (error.code === 'adapter_activation_unavailable' ||
+          error.code === 'activation_state_unavailable' ||
+          error.code === 'operation_unavailable')
+      ) {
+        state.schwabOAuthViews.set(profile.id, {
+          session_id: session.session_id,
+          action,
+          state: 'unavailable'
+        });
+      }
+      throw error;
+    }
+  });
+}
+
+function retainSchwabOAuthView(session, expectedAction, view) {
+  const actions = new Set(['begin', 'continue', 'cancel', 'unlink']);
+  const states = new Set([
+    'awaiting_authorization',
+    'exchanging_authorization',
+    'active',
+    'reauthorization_required',
+    'cancelled',
+    'unlinked'
+  ]);
+  if (
+    !view ||
+    view.session_id !== session.session_id ||
+    view.action !== expectedAction ||
+    !actions.has(view.action) ||
+    !states.has(view.state)
+  ) {
+    throw new PortalError('invalid_session_state', 409, view);
+  }
+  return {
+    session_id: view.session_id,
+    action: view.action,
+    state: view.state,
+    access_token_generation: view.access_token_generation ?? null,
+    access_expires_at: view.access_expires_at ?? null,
+    refresh_expires_at: view.refresh_expires_at ?? null
+  };
+}
+
+function schwabOAuthView(profile, session) {
+  const view = state.schwabOAuthViews.get(profile.id);
+  return view && session && view.session_id === session.session_id ? view : null;
+}
+
 function renderProviderAction(profile, session) {
   const root = element('section');
   if (session && secretAction(session.next_action)) {
@@ -953,14 +1230,7 @@ function renderProviderAction(profile, session) {
     return root;
   }
 
-  const steps = element('section');
-  steps.append(element('h3', '', 'What happens next'));
-  const list = element('ol', 'steps-list');
-  for (const step of setupSteps(profile)) {
-    list.append(element('li', '', step));
-  }
-  steps.append(list);
-  root.append(steps);
+  root.append(renderSetupSteps(profile));
 
   const configuration = buildConfiguration(profile, state.providerMode === 'advanced');
   if (!configuration) {
@@ -983,6 +1253,17 @@ function renderProviderAction(profile, session) {
   root.append(actions);
   if (state.busy) root.append(renderBusyLine('Checking the provider and saving local state…'));
   return root;
+}
+
+function renderSetupSteps(profile) {
+  const steps = element('section');
+  steps.append(element('h3', '', 'What happens next'));
+  const list = element('ol', 'steps-list');
+  for (const step of setupSteps(profile)) {
+    list.append(element('li', '', step));
+  }
+  steps.append(list);
+  return steps;
 }
 
 function renderSecretStep(profile, session, resumedConfiguration) {
@@ -1772,7 +2053,12 @@ async function continueSession(profile, session, adapterRequest, depth) {
     );
     return continueSession(profile, next, adapterRequest, depth + 1);
   }
-  if (secretAction(action) || action === 'refresh_evidence' || action === 'resolve_rights') {
+  if (
+    secretAction(action) ||
+    action === 'complete_oauth_authorization' ||
+    action === 'refresh_evidence' ||
+    action === 'resolve_rights'
+  ) {
     return;
   }
   if (action === 'start_new_session') {
@@ -2122,10 +2408,12 @@ function renderAdvancedCard(profile) {
     technicalDetails(profile, session)
   );
   if (session && isConnected(session) && profile.credential_requirement === 'required_provider_controlled') {
-    const renewal = renewalPresentation(profile);
-    detailsBody.append(
-      actionButton(renewal.manageLabel, '', () => prepareRenewal(profile))
-    );
+    if (!isSchwabProfile(profile)) {
+      const renewal = renewalPresentation(profile);
+      detailsBody.append(
+        actionButton(renewal.manageLabel, '', () => prepareRenewal(profile))
+      );
+    }
   }
   if (session) {
     detailsBody.append(
@@ -2206,6 +2494,22 @@ function badge(text, className) {
 function statusBadge(profile) {
   const session = state.sessions.get(profile.id);
   if (isConnected(session)) return badge('Connected', 'status-connected');
+  if (isSchwabProfile(profile)) {
+    const view = schwabOAuthView(profile, session);
+    if (view && view.state === 'active') return badge('Authorized', 'status-connected');
+    if (
+      view &&
+      (view.state === 'awaiting_authorization' || view.state === 'exchanging_authorization')
+    ) {
+      return badge('Authorization pending', 'status-attention');
+    }
+    if (view && view.state === 'reauthorization_required') {
+      return badge('Reauthorization needed', 'status-attention');
+    }
+    if (session && session.next_action === 'complete_oauth_authorization') {
+      return badge('Authorization needed', 'status-attention');
+    }
+  }
   if (profile.id === 'fred-alfred.api-v1-v2') {
     return badge('Written permission needed', 'status-attention');
   }
@@ -2328,6 +2632,10 @@ function isConnected(session) {
 
 function isLocalProfile(profile) {
   return Object.prototype.hasOwnProperty.call(LOCAL_GUIDANCE, profile.id);
+}
+
+function isSchwabProfile(profile) {
+  return profile.id === 'schwab.trader-api-market-data';
 }
 
 function releaseAllowsSetup(profile) {
@@ -2536,6 +2844,16 @@ function applyBootstrap(data) {
       session.surface_id,
       session
     ])
+  );
+  state.schwabOAuthViews = new Map(
+    [...state.schwabOAuthViews].filter(([profileId, view]) => {
+      const session = state.sessions.get(profileId);
+      return (
+        session &&
+        session.session_id === view.session_id &&
+        session.next_action === 'complete_oauth_authorization'
+      );
+    })
   );
   state.providerDatasets = new Map(
     (Array.isArray(data.provider_datasets) ? data.provider_datasets : [])

@@ -29,6 +29,7 @@ use market_squawk_adapter_fred::{
     FredTermsDocumentBytes, FredTermsDocumentRole, MAX_FRED_SERVICE_PERMISSION_BYTES,
     MAX_FRED_TERMS_DOCUMENT_BYTES, Sha256Digest, fred_series_endpoint_rule,
 };
+use market_squawk_adapter_schwab::OAuthLoopbackError;
 use market_squawk_adapter_sec::{
     RawEvidenceStore, SecParserLimits, SecRepresentationLimits, SecRepresentationRegistry,
 };
@@ -57,7 +58,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, OnceCell, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
@@ -72,6 +73,10 @@ use crate::provider_onboarding::{
     AcquiredFredTermsDocument, FredPortalEvidenceInput, FredPortalGrantInput,
     FredPortalServiceEvidenceInput, FredPortalServicePermissionChannelInput,
     FredPortalServicePermissionInput, FredPortalServiceReviewInput, SecCikInput,
+};
+use crate::provider_onboarding::{
+    SchwabOAuthBrowserError, SchwabOAuthLifecycleAction, SchwabOAuthLifecycleView,
+    SchwabOAuthRuntime, SchwabOAuthRuntimeError,
 };
 use crate::{
     BlsAdapterActivation, FredAdapterActivation, ProviderActivationLease,
@@ -149,6 +154,24 @@ pub(crate) struct ProviderResearchActivationService {
     activation: Arc<ProviderAdapterActivation>,
     state: DurableProviderActivationState,
     tasks: Arc<ProviderActivationTaskAuthority>,
+    schwab_oauth: Arc<OnceCell<Arc<SchwabOAuthRuntime>>>,
+    schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory>,
+}
+
+pub(crate) type SchwabOAuthRuntimeFactory = Arc<
+    dyn Fn() -> Result<Arc<SchwabOAuthRuntime>, SchwabOAuthRuntimeInitializationError>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SchwabOAuthRuntimeInitializationError {
+    #[error("the installation callback identity is unavailable")]
+    Installation,
+    #[error("the Schwab OAuth runtime configuration is unavailable")]
+    Configuration,
+    #[error("the Schwab OAuth runtime could not be constructed")]
+    Runtime,
 }
 
 impl ProviderResearchActivationService {
@@ -157,6 +180,7 @@ impl ProviderResearchActivationService {
         onboarding: Arc<ProviderOnboardingService>,
         activation: Arc<ProviderAdapterActivation>,
         state: DurableProviderActivationState,
+        schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory>,
     ) -> Self {
         Self {
             paths,
@@ -164,6 +188,8 @@ impl ProviderResearchActivationService {
             activation,
             state,
             tasks: Arc::new(ProviderActivationTaskAuthority::new()),
+            schwab_oauth: Arc::new(OnceCell::new()),
+            schwab_oauth_factory,
         }
     }
 
@@ -1393,18 +1419,50 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
             .map_err(map_portal_activation_error)
     }
 
+    async fn schwab_oauth(
+        &self,
+        session_id: Uuid,
+        action: SchwabOAuthLifecycleAction,
+        cancellation: CancellationToken,
+    ) -> Result<SchwabOAuthLifecycleView, ProviderPortalActivationError> {
+        let factory = self
+            .schwab_oauth_factory
+            .as_ref()
+            .ok_or(ProviderPortalActivationError::Unavailable)?;
+        let runtime = self
+            .schwab_oauth
+            .get_or_try_init(|| async { factory() })
+            .await
+            .map_err(|_error| ProviderPortalActivationError::Unavailable)?;
+        runtime
+            .apply(session_id, action, cancellation)
+            .await
+            .map_err(map_schwab_oauth_error)
+    }
+
     fn begin_shutdown(&self) {
         self.tasks.begin_shutdown();
+        if let Some(runtime) = self.schwab_oauth.get() {
+            runtime.begin_shutdown();
+        }
     }
 
     async fn finish_shutdown(
         &self,
         deadline: Instant,
     ) -> Result<(), ProviderPortalActivationError> {
-        self.tasks
-            .finish_shutdown(deadline)
-            .await
-            .map_err(map_portal_activation_error)
+        let tasks = self.tasks.finish_shutdown(deadline);
+        let oauth = async {
+            match self.schwab_oauth.get() {
+                Some(runtime) => runtime
+                    .finish_shutdown(deadline)
+                    .await
+                    .map_err(map_schwab_oauth_error),
+                None => Ok(()),
+            }
+        };
+        let (tasks, oauth) = tokio::join!(tasks, oauth);
+        tasks.map_err(map_portal_activation_error).and(oauth)
     }
 }
 
@@ -4608,6 +4666,43 @@ fn map_portal_activation_error(error: CliProviderActivationError) -> ProviderPor
     }
 }
 
+fn map_schwab_oauth_error(error: SchwabOAuthRuntimeError) -> ProviderPortalActivationError {
+    match error {
+        SchwabOAuthRuntimeError::InvalidSession
+        | SchwabOAuthRuntimeError::DifferentSessionOwned => {
+            ProviderPortalActivationError::InvalidRequest
+        }
+        SchwabOAuthRuntimeError::Cancelled
+        | SchwabOAuthRuntimeError::Browser(SchwabOAuthBrowserError::Cancelled)
+        | SchwabOAuthRuntimeError::Callback(OAuthLoopbackError::Cancelled)
+        | SchwabOAuthRuntimeError::Onboarding(ProviderOnboardingError::OperationCancelled) => {
+            ProviderPortalActivationError::Cancelled
+        }
+        SchwabOAuthRuntimeError::InvalidState
+        | SchwabOAuthRuntimeError::RuntimeRootUnavailable
+        | SchwabOAuthRuntimeError::RuntimeRootAlreadyOwned
+        | SchwabOAuthRuntimeError::MarketAuthorityRetained
+        | SchwabOAuthRuntimeError::CallbackTask
+        | SchwabOAuthRuntimeError::ExchangeTask
+        | SchwabOAuthRuntimeError::ShutdownDeadline
+        | SchwabOAuthRuntimeError::ShutdownStillDraining
+        | SchwabOAuthRuntimeError::Clock
+        | SchwabOAuthRuntimeError::Authority(_)
+        | SchwabOAuthRuntimeError::Onboarding(_) => ProviderPortalActivationError::StateUnavailable,
+        SchwabOAuthRuntimeError::InvalidConfiguration
+        | SchwabOAuthRuntimeError::ShuttingDown
+        | SchwabOAuthRuntimeError::OperationCapacity
+        | SchwabOAuthRuntimeError::CallbackAlreadyOwned
+        | SchwabOAuthRuntimeError::ReauthorizationRequired
+        | SchwabOAuthRuntimeError::AuthorizationExchangeInFlight
+        | SchwabOAuthRuntimeError::MarketAuthorityRevoked
+        | SchwabOAuthRuntimeError::RandomUnavailable
+        | SchwabOAuthRuntimeError::Browser(_)
+        | SchwabOAuthRuntimeError::MarketDrain(_)
+        | SchwabOAuthRuntimeError::Callback(_) => ProviderPortalActivationError::Unavailable,
+    }
+}
+
 /// Closed provider-activation failure without path, secret, or response-body disclosure.
 #[derive(Debug, Error)]
 pub enum CliProviderActivationError {
@@ -5078,6 +5173,7 @@ mod tests {
             recovered.provider_onboarding(),
             recovered.provider_activation(),
             recovered.provider_activation_state().clone(),
+            None,
         );
         let _cancelled = cancellation
             .cancel_from_portal(recovery_lease.session_id(), CancellationToken::new())
@@ -5249,6 +5345,7 @@ mod tests {
             product.provider_onboarding(),
             product.provider_activation(),
             product.provider_activation_state().clone(),
+            None,
         );
 
         activation
@@ -5328,6 +5425,7 @@ mod tests {
             product.provider_onboarding(),
             product.provider_activation(),
             product.provider_activation_state().clone(),
+            None,
         );
 
         let activated = activation
@@ -5405,6 +5503,7 @@ mod tests {
             recovered.provider_onboarding(),
             recovered.provider_activation(),
             recovered.provider_activation_state().clone(),
+            None,
         );
         assert_eq!(
             recovered_activation.provider_dataset_identifier(lease.surface_id())?,

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, LazyLock};
@@ -31,7 +32,11 @@ use market_squawk_adapter_fred::{
     FredParseLimits, FredSeriesMetadata, FredTermsDocumentRole, MAX_FRED_SERVICE_PERMISSION_BYTES,
     MAX_FRED_TERMS_DOCUMENT_BYTES,
 };
-use market_squawk_adapter_schwab::SchwabApplicationCredentialEnvelope;
+use market_squawk_adapter_schwab::{
+    AccessTokenAdmission, ParseBounds, SchwabApplicationCredentialEnvelope,
+    SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError, SchwabOAuthSecretPolicy,
+    SchwabOAuthWire,
+};
 use market_squawk_adapter_tiingo::TiingoApiToken;
 use market_squawk_adapter_treasury::{
     FiscalDataParseLimits, TreasuryDailyRateFamily, TreasuryDailyRatePage, TreasuryDailyRateQuery,
@@ -65,9 +70,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::SCHWAB_MARKET_DATA_SURFACE_ID;
 use super::contracts::{
     OnboardingSessionView, ProviderActivationLease, ProviderActivationLeaseInput,
-    ProviderProfileRegistration, ProviderProfileView, session_view,
+    ProviderProfileRegistration, ProviderProfileView, SchwabOAuthBootstrapLease,
+    SchwabOAuthBootstrapLeaseInput, session_view,
 };
 use crate::provider_activation::credentials::{
     AlpacaCredentialEnvelope, KrakenL3CredentialSigner, next_kraken_nonce,
@@ -90,6 +97,9 @@ const FRED_PERMISSION_MEDIA_TYPES: [&str; 5] = [
 ];
 const BLS_REGISTRATION_VALIDITY_NANOS: i64 = 365 * 86_400 * 1_000_000_000;
 const COINBASE_DIRECT_VERIFICATION_VALIDITY_NANOS: i64 = 15 * 60 * 1_000_000_000;
+const SCHWAB_OAUTH_BOOTSTRAP_LEASE_DURATION: Duration = Duration::from_secs(15 * 60);
+const SCHWAB_OAUTH_SECRET_OPERATION_DURATION: Duration = Duration::from_secs(30);
+const SCHWAB_OAUTH_REFRESH_EARLY_SECONDS: u64 = 5 * 60;
 const MARKET_DATA_VERIFICATION_VALIDITY_NANOS: i64 = 15 * 60 * 1_000_000_000;
 const ALPACA_DOCTOR_OPERATION_DURATION: Duration = Duration::from_secs(60);
 const ALPACA_DOCTOR_FRAME_BYTES: usize = 1024 * 1024;
@@ -127,6 +137,54 @@ pub struct StartOnboardingRequest {
     surface_id: String,
     organization: Option<String>,
     administrative_email: Option<String>,
+}
+
+/// Opaque least-authority factory for the sole protected Schwab OAuth authority.
+///
+/// The factory exposes neither the shared provider credential store nor the application secret
+/// reference. It can construct only the adapter's code-selected OAuth token authority contract.
+pub(crate) struct SchwabOAuthBootstrapAuthorityFactory {
+    secrets: Arc<dyn SecretStore>,
+    application_credential: market_squawk_platform::SecretRef,
+}
+
+impl SchwabOAuthBootstrapAuthorityFactory {
+    pub(crate) fn configuration(
+        &self,
+        wire: Arc<dyn SchwabOAuthWire>,
+    ) -> Result<SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError> {
+        let parse_bounds = ParseBounds::new(
+            NonZeroUsize::new(256 * 1024).ok_or(SchwabOAuthAuthorityError::InvalidConfiguration)?,
+            NonZeroUsize::new(64).ok_or(SchwabOAuthAuthorityError::InvalidConfiguration)?,
+            NonZeroUsize::new(8 * 1024).ok_or(SchwabOAuthAuthorityError::InvalidConfiguration)?,
+            NonZeroUsize::new(32).ok_or(SchwabOAuthAuthorityError::InvalidConfiguration)?,
+            64,
+            64 * 1024,
+        );
+        SchwabOAuthAuthorityConfiguration::try_new(
+            Arc::clone(&self.secrets),
+            wire,
+            self.application_credential.clone(),
+            SchwabOAuthSecretPolicy::try_new(SCHWAB_OAUTH_SECRET_OPERATION_DURATION, 0)?,
+            parse_bounds,
+            AccessTokenAdmission::new(
+                NonZeroUsize::new(16 * 1024)
+                    .ok_or(SchwabOAuthAuthorityError::InvalidConfiguration)?,
+                Duration::from_secs(60),
+            ),
+            SCHWAB_OAUTH_REFRESH_EARLY_SECONDS,
+        )
+    }
+}
+
+impl fmt::Debug for SchwabOAuthBootstrapAuthorityFactory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabOAuthBootstrapAuthorityFactory")
+            .field("secrets", &"[PROTECTED STORE]")
+            .field("application_credential", &"[OPAQUE REFERENCE]")
+            .finish()
+    }
 }
 
 impl StartOnboardingRequest {
@@ -361,6 +419,158 @@ impl ProviderOnboardingService {
     ) -> Result<(), ProviderOnboardingError> {
         self.try_acquire_runtime_mutation_authority()?
             .discard_prepared_activation_at_startup(prepared, evidence_digest)
+    }
+
+    /// Verifies the imported Schwab application credential locally and issues only OAuth
+    /// bootstrap authority. No provider market-data read or runtime activation is admitted here.
+    pub(crate) async fn prepare_schwab_oauth_bootstrap(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<SchwabOAuthBootstrapLease, ProviderOnboardingError> {
+        let _activation = self.activation.lock().await;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(ProviderOnboardingError::OperationCancelled);
+            }
+            let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+            let profile = self.current_profile_for(&resumed)?;
+            if profile.id() != SCHWAB_MARKET_DATA_SURFACE_ID
+                || profile.release_state() == ProfileReleaseState::RightsBlocked
+            {
+                return Err(ProviderOnboardingError::InvalidProfile);
+            }
+            let lifecycle = resumed.lifecycle();
+            let generation = lifecycle
+                .candidate_generation()
+                .or_else(|| lifecycle.active_generation())
+                .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+            match lifecycle.generation_state(generation) {
+                Some(CredentialGenerationState::StoredUnverified) => {
+                    if lifecycle.candidate_generation() != Some(generation) {
+                        return Err(ProviderOnboardingError::InvalidSessionState);
+                    }
+                    let reference = lifecycle
+                        .generation_reference(generation)
+                        .cloned()
+                        .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+                    let secrets = Arc::clone(&self.secrets);
+                    let secret = await_blocking_secret_operation(
+                        Arc::clone(&self.secret_operations),
+                        cancellation.clone(),
+                        move |operation| {
+                            read_secret_reference(
+                                secrets.as_ref(),
+                                session_id,
+                                &reference,
+                                operation,
+                                SecretInteractionPolicy::AllowPlatformPrompt,
+                            )
+                        },
+                    )
+                    .await?;
+                    validate_secret_shape(profile, &secret)?;
+                    let verified_at = system_timestamp()?;
+                    let requested = lifecycle.requested_authority().clone();
+                    let verification = AuthorityVerification::try_new(
+                        profile.capability(),
+                        AuthorityVerificationInput {
+                            requested: requested.clone(),
+                            observed: requested,
+                            restrictions_digest: profile.rights_decision_digest(),
+                            bindings: AuthorityBindings::new(None, None, None, None),
+                            verified_at,
+                            expires_at: None,
+                            verifier_revision: profile.capability().verifier_revision().clone(),
+                            assurance_limitation: credential_assurance(profile)?,
+                            evidence_digest: schwab_application_shape_evidence(
+                                session_id, generation, &secret,
+                            ),
+                        },
+                    )
+                    .map_err(|_| ProviderOnboardingError::InvalidSessionState)?;
+                    self.append(
+                        resumed.reservation(),
+                        resumed.next_sequence(),
+                        OnboardingEvent::AuthorityVerified {
+                            verification: Box::new(verification),
+                        },
+                    )?;
+                }
+                Some(CredentialGenerationState::VerifiedLeastPrivilege) => {
+                    if lifecycle.generation_rights_digest(generation).is_none() {
+                        self.append(
+                            resumed.reservation(),
+                            resumed.next_sequence(),
+                            OnboardingEvent::RightsAdmitted {
+                                generation: Some(generation),
+                                decision_digest: profile.rights_decision_digest(),
+                            },
+                        )?;
+                    } else if lifecycle
+                        .generation_rate_policy_digest(generation)
+                        .is_none()
+                    {
+                        self.append(
+                            resumed.reservation(),
+                            resumed.next_sequence(),
+                            OnboardingEvent::RatePolicyAdmitted {
+                                generation: Some(generation),
+                                policy_digest: profile.capability().rate_policy().evidence_digest(),
+                            },
+                        )?;
+                    } else {
+                        return self.mint_schwab_oauth_bootstrap_lease(&resumed, profile);
+                    }
+                }
+                Some(CredentialGenerationState::ActiveScoped)
+                    if lifecycle.active_generation() == Some(generation) =>
+                {
+                    return self.mint_schwab_oauth_bootstrap_lease(&resumed, profile);
+                }
+                Some(
+                    CredentialGenerationState::Reserved
+                    | CredentialGenerationState::StorePlanned
+                    | CredentialGenerationState::StoreReconciliationRequired
+                    | CredentialGenerationState::SupersededRetained
+                    | CredentialGenerationState::Retired
+                    | CredentialGenerationState::Tombstoned
+                    | CredentialGenerationState::AbandonedNoEffect
+                    | CredentialGenerationState::CleanupRequired
+                    | CredentialGenerationState::ActiveScoped,
+                )
+                | None => return Err(ProviderOnboardingError::ActivationUnavailable),
+            }
+        }
+    }
+
+    /// Revalidates one exact bootstrap lease and returns an opaque factory over the same protected
+    /// provider credential store used by onboarding.
+    pub(crate) fn schwab_oauth_authority_factory(
+        &self,
+        lease: &SchwabOAuthBootstrapLease,
+    ) -> Result<SchwabOAuthBootstrapAuthorityFactory, ProviderOnboardingError> {
+        let now = system_timestamp()?;
+        if lease.issued_at() > now || now >= lease.exclusive_expires_at() {
+            return Err(ProviderOnboardingError::ActivationExpired);
+        }
+        let resumed = self
+            .catalog
+            .resume_provider_onboarding(lease.session_id())?;
+        let profile = self.current_profile_for(&resumed)?;
+        let exact = self.schwab_oauth_bootstrap_lease_from_resumed(
+            &resumed,
+            profile,
+            lease.issued_at(),
+            lease.exclusive_expires_at(),
+        )?;
+        if !exact.same_authority_as(lease) {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        Ok(SchwabOAuthBootstrapAuthorityFactory {
+            secrets: Arc::clone(&self.secrets),
+            application_credential: lease.application_secret_reference().clone(),
+        })
     }
 
     /// Constructs the production service with one product-wide durable provider-rate authority.
@@ -2163,6 +2373,91 @@ impl ProviderOnboardingService {
         Ok((current.session_id(), reference))
     }
 
+    fn mint_schwab_oauth_bootstrap_lease(
+        &self,
+        resumed: &ResumedProviderOnboarding,
+        profile: &ProviderOnboardingProfile,
+    ) -> Result<SchwabOAuthBootstrapLease, ProviderOnboardingError> {
+        let issued_at = system_timestamp()?;
+        let exclusive_expires_at = issued_at
+            .unix_nanos()
+            .checked_add(
+                i64::try_from(SCHWAB_OAUTH_BOOTSTRAP_LEASE_DURATION.as_nanos())
+                    .map_err(|_| ProviderOnboardingError::Clock)?,
+            )
+            .map(Timestamp::from_unix_nanos)
+            .ok_or(ProviderOnboardingError::Clock)?;
+        self.schwab_oauth_bootstrap_lease_from_resumed(
+            resumed,
+            profile,
+            issued_at,
+            exclusive_expires_at,
+        )
+    }
+
+    fn schwab_oauth_bootstrap_lease_from_resumed(
+        &self,
+        resumed: &ResumedProviderOnboarding,
+        profile: &ProviderOnboardingProfile,
+        issued_at: Timestamp,
+        exclusive_expires_at: Timestamp,
+    ) -> Result<SchwabOAuthBootstrapLease, ProviderOnboardingError> {
+        let lifecycle = resumed.lifecycle();
+        if profile.id() != SCHWAB_MARKET_DATA_SURFACE_ID
+            || lifecycle.surface_id().as_str() != SCHWAB_MARKET_DATA_SURFACE_ID
+            || profile.release_state() == ProfileReleaseState::RightsBlocked
+            || exclusive_expires_at <= issued_at
+        {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        let generation = lifecycle
+            .candidate_generation()
+            .or_else(|| lifecycle.active_generation())
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        if !matches!(
+            lifecycle.generation_state(generation),
+            Some(
+                CredentialGenerationState::VerifiedLeastPrivilege
+                    | CredentialGenerationState::ActiveScoped
+            )
+        ) {
+            return Err(ProviderOnboardingError::ActivationUnavailable);
+        }
+        let application_secret_reference = lifecycle
+            .generation_reference(generation)
+            .cloned()
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let verification = lifecycle
+            .generation_verification(generation)
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let rights_decision_digest = profile.rights_decision_digest();
+        let rate_policy_digest = profile.capability().rate_policy().evidence_digest();
+        if verification.expires_at().is_some()
+            || verification.bindings().account_digest().is_some()
+            || verification.restrictions_digest() != rights_decision_digest
+            || lifecycle.generation_rights_digest(generation) != Some(rights_decision_digest)
+            || lifecycle.generation_rate_policy_digest(generation) != Some(rate_policy_digest)
+        {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        Ok(SchwabOAuthBootstrapLease::new(
+            SchwabOAuthBootstrapLeaseInput {
+                session_id: resumed.reservation().session_id(),
+                surface_id: lifecycle.surface_id().clone(),
+                capability_revision: lifecycle.capability_revision(),
+                capability_digest: lifecycle.capability_digest(),
+                public_configuration_digest: resumed.reservation().public_configuration_digest(),
+                rights_decision_digest,
+                rate_policy_digest,
+                generation,
+                application_secret_reference,
+                verification_evidence_digest: verification.evidence_digest(),
+                issued_at,
+                exclusive_expires_at,
+            },
+        ))
+    }
+
     fn prepared_lease_from_resumed(
         &self,
         resumed: &ResumedProviderOnboarding,
@@ -3143,6 +3438,19 @@ fn alpaca_credential_shape_evidence(
     })
 }
 
+fn schwab_application_shape_evidence(
+    session_id: Uuid,
+    generation: SecretGeneration,
+    secret: &SecretValue,
+) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/schwab-application-credential-shape/v1\0");
+    hasher.update(session_id.as_bytes());
+    hasher.update(generation.get().to_be_bytes());
+    hasher.update(secret.expose_secret().as_bytes());
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
+}
+
 fn coinbase_account_digest(body: &[u8]) -> Result<EvidenceDigest, ProviderOnboardingError> {
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
@@ -3276,6 +3584,10 @@ fn credential_assurance(
         .map_err(Into::into),
         "alpaca.basic-market-data" => SourceIdentifier::try_from(
             "alpaca-paper-market-data-credential-principal-shape-verified",
+        )
+        .map_err(Into::into),
+        SCHWAB_MARKET_DATA_SURFACE_ID => SourceIdentifier::try_from(
+            "schwab-application-credential-shape-verified-oauth-entitlement-pending",
         )
         .map_err(Into::into),
         "kraken.spot-authenticated-level3-market-data" => {

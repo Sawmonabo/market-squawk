@@ -25,7 +25,7 @@ const ALPACA_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 };
 const SCHWAB_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "schwab.trader-api-market-data",
-    capability_revision: 3,
+    capability_revision: 4,
     release_state: ProfileReleaseState::RefreshRequired,
 };
 const YAHOO_FINANCE_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
@@ -561,9 +561,14 @@ async fn delegate_credential(
         .submit_secret(started.session_id(), secret, cancellation)
         .await
         .map_err(|source| onboarding_error(provider, source))?;
+    let expected_next_action = if provider == ProviderCredentialBundleProvider::Schwab {
+        OnboardingNextAction::CompleteOAuthAuthorization
+    } else {
+        OnboardingNextAction::VerifyAndActivate
+    };
     if imported.surface_id() != profile.surface_id
         || !imported.credential_stored()
-        || imported.next_action() != OnboardingNextAction::VerifyAndActivate
+        || imported.next_action() != expected_next_action
     {
         return Err(ProviderCredentialBundleDelegationError::ServiceInvariant { provider });
     }

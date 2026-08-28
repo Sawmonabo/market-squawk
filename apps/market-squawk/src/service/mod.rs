@@ -82,7 +82,11 @@ use operations_bootstrap::{PreparedInstalledOperations, ReadyInstalledOperations
 
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use crate::BoardInstalledFixtureBundle;
-use crate::{AppConfig, LocalProduct, LocalProductError, jobs::InstalledJobAuthority};
+use crate::{
+    AppConfig, LocalProduct, LocalProductError, SchwabOAuthInstallationCapabilityError,
+    SchwabOAuthInstallationTrustAction, SchwabOAuthInstallationTrustState,
+    jobs::InstalledJobAuthority, provider_onboarding::apply_installation_trust_action,
+};
 
 use self::portfolio_import::InstalledPortfolioImportOperations;
 use self::provider_credential_import::InstalledProviderCredentialImport;
@@ -258,6 +262,24 @@ impl InstalledServiceConnector {
         &self,
     ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
         bootstrap::retry_after_foreground_keyring(&self.paths).await
+    }
+
+    /// Applies one explicit native Schwab callback-trust action to this installation.
+    pub async fn schwab_oauth_installation_trust(
+        &self,
+        action: SchwabOAuthInstallationTrustAction,
+        cancellation: CancellationToken,
+    ) -> Result<SchwabOAuthInstallationTrustState, InstalledServiceError> {
+        let installation_id = runtime::installation_id(&self.paths)?
+            .ok_or(InstalledServiceError::InvalidRuntimeState)?;
+        apply_installation_trust_action(
+            self.paths.control_root()?,
+            installation_id,
+            action,
+            cancellation,
+        )
+        .await
+        .map_err(InstalledServiceError::SchwabOAuthTrust)
     }
 
     /// Resolves one current Claude Code or Codex registration into a credential-owning MCP relay
@@ -561,17 +583,23 @@ impl InstalledService {
                 Some(fixture) => LocalProduct::try_new_at_selected_workspace_with_board_fixture(
                     config.clone(),
                     &selected_workspace_guard,
+                    &installation_paths,
+                    installation_id,
                     fixture,
                 )?,
                 None => LocalProduct::try_new_at_selected_workspace(
                     config.clone(),
                     &selected_workspace_guard,
+                    &installation_paths,
+                    installation_id,
                 )?,
             };
             #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
             let product = LocalProduct::try_new_at_selected_workspace(
                 config.clone(),
                 &selected_workspace_guard,
+                &installation_paths,
+                installation_id,
             )?;
             let provider_capture_recovery = CancellationToken::new();
             let research = product.research();
@@ -1541,6 +1569,9 @@ pub enum InstalledServiceError {
     /// The operating-system secret authority requires one foreground user interaction.
     #[error("installed-service secret storage requires foreground user interaction")]
     SecretInteractionRequired,
+    /// The exact installation-global Schwab callback identity or browser trust is unavailable.
+    #[error("Schwab OAuth callback trust is unavailable")]
+    SchwabOAuthTrust(#[source] SchwabOAuthInstallationCapabilityError),
     /// Durable governance registrations, audit, or authority state could not be composed.
     #[error("installed-service governance state is unavailable")]
     GovernanceState,
