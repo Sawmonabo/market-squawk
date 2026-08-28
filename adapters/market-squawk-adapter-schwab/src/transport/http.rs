@@ -14,7 +14,9 @@ use market_squawk_platform::RawCaptureRecord;
 use market_squawk_sources::{
     ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSealExpectation,
     ProviderCaptureSealRequest, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    ProviderWholeCaptureToken, SealedProviderCaptureMaterial, SealedProviderCaptureSetReceipt,
+    ProviderEventMicrobatchMaterial, ProviderEventMicrobatchSealExpectation,
+    ProviderEventMicrobatchToken, ProviderWholeCaptureToken, SealedProviderCaptureMaterial,
+    SealedProviderCaptureSetReceipt, SealedProviderEventMicrobatchReceipt,
 };
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
@@ -235,6 +237,7 @@ impl SchwabHttpWire for ReqwestSchwabHttpWire {
 #[derive(Eq, PartialEq)]
 pub struct CapturedRestResponse {
     receipt: RawRestResponseReceipt,
+    accounting: RestItemAccounting,
     body: Bytes,
 }
 
@@ -243,6 +246,7 @@ impl fmt::Debug for CapturedRestResponse {
         formatter
             .debug_struct("CapturedRestResponse")
             .field("receipt", &self.receipt)
+            .field("accounting", &self.accounting)
             .field("body", &"[EXACT RAW BODY REDACTED]")
             .finish()
     }
@@ -251,6 +255,39 @@ impl fmt::Debug for CapturedRestResponse {
 impl CapturedRestResponse {
     pub const fn receipt(&self) -> &RawRestResponseReceipt {
         &self.receipt
+    }
+
+    /// Same-unit request completion retained even when the body is rejected or cannot be parsed.
+    pub const fn accounting(&self) -> RestItemAccounting {
+        self.accounting
+    }
+
+    /// Consumes one rejected or invalid market-data body into the sole raw-sealing handoff.
+    ///
+    /// The typed adapter error or provider disposition remains owned by the caller. This handoff
+    /// proves only that the exact bounded response body, status, headers, latency, and same-unit
+    /// item accounting crossed the application-owned physical sealer.
+    pub fn into_pending_capture(
+        self,
+        coordinates: SchwabCaptureCoordinates,
+        event_id: Uuid,
+    ) -> Result<SchwabPendingRawRestCapture, SchwabTransportError> {
+        let Self {
+            receipt,
+            accounting,
+            body,
+        } = self;
+        let material = raw_rest_capture_material(&receipt, body, &coordinates, event_id)?;
+        let (seal_expectation, seal_request) = material.into_sealing_parts();
+        Ok(SchwabPendingRawRestCapture {
+            rejoin: SchwabRawRestCaptureSealRejoin {
+                coordinates,
+                receipt,
+                accounting,
+                seal_expectation,
+            },
+            seal_request,
+        })
     }
 }
 
@@ -348,7 +385,6 @@ impl RestItemAccounting {
 pub struct ExecutedRestResponse {
     capture: CapturedRestResponse,
     payload: SchwabRestPayload,
-    accounting: RestItemAccounting,
 }
 
 /// Bodyless accepted `userPreference` evidence retained only for Streamer bootstrap/currentness.
@@ -398,7 +434,7 @@ impl ExecutedRestResponse {
     }
 
     pub const fn accounting(&self) -> RestItemAccounting {
-        self.accounting
+        self.capture.accounting
     }
 
     /// Consumes one accepted market-data response into the sole raw-sealing handoff.
@@ -414,9 +450,13 @@ impl ExecutedRestResponse {
         event_id: Uuid,
     ) -> Result<SchwabPendingRestCapture, SchwabTransportError> {
         let Self {
-            capture: CapturedRestResponse { receipt, body },
+            capture:
+                CapturedRestResponse {
+                    receipt,
+                    accounting,
+                    body,
+                },
             payload,
-            accounting,
         } = self;
         if !payload_matches_capturable_route(receipt.route(), &payload) {
             return Err(SchwabTransportError::CaptureMaterial);
@@ -433,6 +473,118 @@ impl ExecutedRestResponse {
             },
             seal_request,
         })
+    }
+}
+
+/// One non-cloneable rejected/invalid REST response waiting for the shared raw sealer.
+pub struct SchwabPendingRawRestCapture {
+    rejoin: SchwabRawRestCaptureSealRejoin,
+    seal_request: ProviderCaptureSealRequest,
+}
+
+impl fmt::Debug for SchwabPendingRawRestCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabPendingRawRestCapture")
+            .field("rejoin", &self.rejoin)
+            .field("seal_request", &"EXACT RAW BODY PENDING PHYSICAL SEAL")
+            .finish()
+    }
+}
+
+impl SchwabPendingRawRestCapture {
+    /// Splits the evidence continuation from the sole consuming physical-seal request.
+    pub fn into_sealing_parts(
+        self,
+    ) -> (SchwabRawRestCaptureSealRejoin, ProviderCaptureSealRequest) {
+        (self.rejoin, self.seal_request)
+    }
+}
+
+/// Opaque rejected/invalid REST continuation awaiting its exact common seal witness.
+pub struct SchwabRawRestCaptureSealRejoin {
+    coordinates: SchwabCaptureCoordinates,
+    receipt: RawRestResponseReceipt,
+    accounting: RestItemAccounting,
+    seal_expectation: ProviderEventMicrobatchSealExpectation,
+}
+
+impl fmt::Debug for SchwabRawRestCaptureSealRejoin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabRawRestCaptureSealRejoin")
+            .field("coordinates", &self.coordinates)
+            .field("route", &self.receipt.route())
+            .field("token_generation", &self.receipt.token_generation())
+            .field("request_sha256", &self.receipt.request_sha256())
+            .field("status", &self.receipt.status())
+            .field("body_sha256", &self.receipt.body_sha256())
+            .field("accounting", &self.accounting)
+            .field("sealed_transition", &"AWAITING_COMMON_PHYSICAL_SEAL")
+            .finish()
+    }
+}
+
+impl SchwabRawRestCaptureSealRejoin {
+    /// Rejoins the exact application-owned seal without claiming typed provider validity.
+    pub fn try_rejoin(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<SchwabSealedRawRestCapture, SchwabTransportError> {
+        let token = rejoin_raw_rest_capture(
+            self.seal_expectation,
+            sealed,
+            &self.coordinates,
+            &self.receipt,
+        )?;
+        Ok(SchwabSealedRawRestCapture {
+            coordinates: self.coordinates,
+            receipt: self.receipt,
+            accounting: self.accounting,
+            token,
+        })
+    }
+}
+
+/// Physically sealed rejected/invalid REST response evidence.
+///
+/// This value cannot become a typed or canonical success response. It retains the exact response
+/// receipt and item counts so doctor and degradation paths can report evidence rather than infer
+/// an unavailable family from a transport error.
+pub struct SchwabSealedRawRestCapture {
+    coordinates: SchwabCaptureCoordinates,
+    receipt: RawRestResponseReceipt,
+    accounting: RestItemAccounting,
+    token: ProviderEventMicrobatchToken,
+}
+
+impl fmt::Debug for SchwabSealedRawRestCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabSealedRawRestCapture")
+            .field("coordinates", &self.coordinates)
+            .field("receipt", &self.receipt)
+            .field("accounting", &self.accounting)
+            .field("raw_body", &"PHYSICALLY SEALED")
+            .finish()
+    }
+}
+
+impl SchwabSealedRawRestCapture {
+    pub const fn coordinates(&self) -> &SchwabCaptureCoordinates {
+        &self.coordinates
+    }
+
+    pub const fn receipt(&self) -> &RawRestResponseReceipt {
+        &self.receipt
+    }
+
+    pub const fn accounting(&self) -> RestItemAccounting {
+        self.accounting
+    }
+
+    pub fn persisted_receipt(&self) -> &SealedProviderEventMicrobatchReceipt {
+        self.token.persisted_receipt()
     }
 }
 
@@ -519,35 +671,13 @@ impl SchwabRestCaptureSealRejoin {
         self,
         sealed: SealedProviderCaptureMaterial,
     ) -> Result<SchwabSealedRestResponseParts, SchwabTransportError> {
-        let token = self
-            .seal_expectation
-            .try_rejoin(sealed)
-            .and_then(|capture| capture.try_into_whole())
-            .map_err(|_| SchwabTransportError::CaptureMaterial)?;
-        if token.persisted_receipt().capture().source_id() != self.coordinates.source_id()
-            || token.persisted_receipt().capture().metadata_revision()
-                != self.coordinates.metadata_revision()
-            || token.persisted_receipt().capture().dataset() != self.coordinates.dataset()
-        {
-            return Err(SchwabTransportError::CaptureMaterial);
-        }
-        let capture = token.persisted_receipt().capture();
-        let [page] = capture.pages() else {
-            return Err(SchwabTransportError::CaptureMaterial);
-        };
-        let received_at = self
-            .receipt
-            .received_at_unix_millis()
-            .checked_mul(1_000_000)
-            .and_then(|value| i64::try_from(value).ok())
-            .map(Timestamp::from_unix_nanos)
-            .ok_or(SchwabTransportError::CaptureMaterial)?;
-        if capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
-            || page.body_digest()
-                != EvidenceDigest::new(DigestAlgorithm::Sha256, self.receipt.body_sha256())
-            || page.body_bytes() != self.receipt.body_bytes()
-            || page.received_at() != received_at
-            || self.payload.raw_sha256() != self.receipt.body_sha256()
+        let token = rejoin_rest_capture(
+            self.seal_expectation,
+            sealed,
+            &self.coordinates,
+            &self.receipt,
+        )?;
+        if self.payload.raw_sha256() != self.receipt.body_sha256()
             || u64::try_from(self.payload.record_count())
                 .map_err(|_| SchwabTransportError::Overflow)?
                 != self.accounting.provider_records
@@ -715,6 +845,121 @@ fn rest_capture_material(
     .map_err(|_| SchwabTransportError::CaptureMaterial)?;
     ProviderCaptureMaterial::try_new(capture, vec![record])
         .map_err(|_| SchwabTransportError::CaptureMaterial)
+}
+
+fn raw_rest_capture_material(
+    receipt: &RawRestResponseReceipt,
+    body: Bytes,
+    coordinates: &SchwabCaptureCoordinates,
+    event_id: Uuid,
+) -> Result<ProviderEventMicrobatchMaterial, SchwabTransportError> {
+    if event_id.is_nil() {
+        return Err(SchwabTransportError::CaptureMaterial);
+    }
+    let received_nanos = i64::try_from(receipt.received_at_unix_millis())
+        .ok()
+        .and_then(|value| value.checked_mul(1_000_000))
+        .ok_or(SchwabTransportError::CaptureMaterial)?;
+    let record = RawCaptureRecord::try_new_live(
+        event_id,
+        Arc::from(coordinates.source_id().as_str()),
+        coordinates.connection_id(),
+        Some(0),
+        None,
+        chrono::DateTime::from_timestamp_nanos(received_nanos),
+        body,
+    )
+    .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+    ProviderEventMicrobatchMaterial::try_new(
+        coordinates.source_id().clone(),
+        coordinates.metadata_revision().clone(),
+        coordinates.dataset().clone(),
+        coordinates.dataset().clone(),
+        vec![record],
+    )
+    .map_err(|_| SchwabTransportError::CaptureMaterial)
+}
+
+fn rejoin_raw_rest_capture(
+    expectation: ProviderEventMicrobatchSealExpectation,
+    sealed: SealedProviderCaptureMaterial,
+    coordinates: &SchwabCaptureCoordinates,
+    receipt: &RawRestResponseReceipt,
+) -> Result<ProviderEventMicrobatchToken, SchwabTransportError> {
+    let token = expectation
+        .try_rejoin(sealed)
+        .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+    let persisted = token.persisted_receipt();
+    let capture = persisted.capture();
+    let [frame] = capture.frames() else {
+        return Err(SchwabTransportError::CaptureMaterial);
+    };
+    let [physical] = persisted.segment().frames() else {
+        return Err(SchwabTransportError::CaptureMaterial);
+    };
+    let received_at = receipt
+        .received_at_unix_millis()
+        .checked_mul(1_000_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(SchwabTransportError::CaptureMaterial)?;
+    let payload_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, receipt.body_sha256());
+    if capture.source_id() != coordinates.source_id()
+        || capture.metadata_revision() != coordinates.metadata_revision()
+        || capture.dataset() != coordinates.dataset()
+        || capture.stream_identity() != coordinates.dataset()
+        || frame.event_id() == [0; 16]
+        || frame.connection_id() != *coordinates.connection_id().as_bytes()
+        || frame.source_sequence() != Some(0)
+        || frame.exchange_at().is_some()
+        || frame.received_at() != received_at
+        || frame.payload_bytes() != receipt.body_bytes()
+        || frame.payload_digest() != payload_digest
+        || physical.provider_payload_bytes() != receipt.body_bytes()
+        || physical.provider_payload_digest() != payload_digest
+    {
+        return Err(SchwabTransportError::CaptureMaterial);
+    }
+    Ok(token)
+}
+
+fn rejoin_rest_capture(
+    expectation: ProviderCaptureSealExpectation,
+    sealed: SealedProviderCaptureMaterial,
+    coordinates: &SchwabCaptureCoordinates,
+    receipt: &RawRestResponseReceipt,
+) -> Result<ProviderWholeCaptureToken, SchwabTransportError> {
+    let token = expectation
+        .try_rejoin(sealed)
+        .and_then(|capture| capture.try_into_whole())
+        .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+    let capture = token.persisted_receipt().capture();
+    if capture.source_id() != coordinates.source_id()
+        || capture.metadata_revision() != coordinates.metadata_revision()
+        || capture.dataset() != coordinates.dataset()
+    {
+        return Err(SchwabTransportError::CaptureMaterial);
+    }
+    let [page] = capture.pages() else {
+        return Err(SchwabTransportError::CaptureMaterial);
+    };
+    let received_at = receipt
+        .received_at_unix_millis()
+        .checked_mul(1_000_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(SchwabTransportError::CaptureMaterial)?;
+    if capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+        || page.request_identity()
+            != EvidenceDigest::new(DigestAlgorithm::Sha256, receipt.request_sha256())
+        || page.http_status() != receipt.status()
+        || page.body_digest() != EvidenceDigest::new(DigestAlgorithm::Sha256, receipt.body_sha256())
+        || page.body_bytes() != receipt.body_bytes()
+        || page.received_at() != received_at
+    {
+        return Err(SchwabTransportError::CaptureMaterial);
+    }
+    Ok(token)
 }
 
 /// Completed network outcome.
@@ -899,16 +1144,36 @@ impl SchwabRestExecutor {
         }
 
         if !(200..=299).contains(&status) {
-            self.telemetry.record_rest_accounting(0, requested, 0, 0)?;
+            let accounting = unavailable_accounting(requested)?;
+            self.telemetry.record_rest_accounting(
+                accounting.returned,
+                accounting.missing,
+                accounting.unexpected,
+                accounting.provider_records,
+            )?;
             return Ok(RestExecutionOutcome::ProviderRejected(
-                CapturedRestResponse { receipt, body },
+                CapturedRestResponse {
+                    receipt,
+                    accounting,
+                    body,
+                },
             ));
         }
         if !response_is_json(receipt.headers()) {
             self.telemetry.record_validation_failure()?;
-            self.telemetry.record_rest_accounting(0, requested, 0, 0)?;
+            let accounting = unavailable_accounting(requested)?;
+            self.telemetry.record_rest_accounting(
+                accounting.returned,
+                accounting.missing,
+                accounting.unexpected,
+                accounting.provider_records,
+            )?;
             return Ok(RestExecutionOutcome::InvalidPayload {
-                capture: CapturedRestResponse { receipt, body },
+                capture: CapturedRestResponse {
+                    receipt,
+                    accounting,
+                    body,
+                },
                 error: SchwabAdapterError::SchemaViolation,
             });
         }
@@ -916,9 +1181,19 @@ impl SchwabRestExecutor {
             Ok(payload) => payload,
             Err(error) => {
                 self.telemetry.record_validation_failure()?;
-                self.telemetry.record_rest_accounting(0, requested, 0, 0)?;
+                let accounting = unavailable_accounting(requested)?;
+                self.telemetry.record_rest_accounting(
+                    accounting.returned,
+                    accounting.missing,
+                    accounting.unexpected,
+                    accounting.provider_records,
+                )?;
                 return Ok(RestExecutionOutcome::InvalidPayload {
-                    capture: CapturedRestResponse { receipt, body },
+                    capture: CapturedRestResponse {
+                        receipt,
+                        accounting,
+                        body,
+                    },
                     error,
                 });
             }
@@ -935,11 +1210,25 @@ impl SchwabRestExecutor {
             accounting.provider_records,
         )?;
         Ok(RestExecutionOutcome::Accepted(ExecutedRestResponse {
-            capture: CapturedRestResponse { receipt, body },
+            capture: CapturedRestResponse {
+                receipt,
+                accounting,
+                body,
+            },
             payload,
-            accounting,
         }))
     }
+}
+
+fn unavailable_accounting(requested: u64) -> Result<RestItemAccounting, SchwabTransportError> {
+    RestItemAccounting {
+        requested,
+        returned: 0,
+        missing: requested,
+        unexpected: 0,
+        provider_records: 0,
+    }
+    .validate()
 }
 
 fn parse_payload(

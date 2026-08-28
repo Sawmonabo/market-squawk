@@ -26,8 +26,9 @@ pub(crate) use http::SchwabSealedRestResponseParts;
 pub use http::{
     CapturedRestResponse, ExecutedRestResponse, ReqwestSchwabHttpWire, RestExecutionOutcome,
     RestItemAccounting, SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse,
-    SchwabPendingRestCapture, SchwabRestCaptureSealRejoin, SchwabRestExecutor, SchwabRestFamily,
-    SchwabRestPayload, SchwabSealedRestResponse, SchwabUserPreferenceEvidence,
+    SchwabPendingRawRestCapture, SchwabPendingRestCapture, SchwabRawRestCaptureSealRejoin,
+    SchwabRestCaptureSealRejoin, SchwabRestExecutor, SchwabRestFamily, SchwabRestPayload,
+    SchwabSealedRawRestCapture, SchwabSealedRestResponse, SchwabUserPreferenceEvidence,
 };
 pub(crate) use streamer::SchwabSealedStreamerCaptureParts;
 pub use streamer::{
@@ -36,8 +37,8 @@ pub use streamer::{
     SchwabStreamerConnection, SchwabStreamerConnectionControl,
     SchwabStreamerConnectionControlSource, SchwabStreamerConnectionEvidence,
     SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence,
-    StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerMicrobatchReceipt,
-    StreamerRunExit,
+    SchwabStreamerServiceResponseEvidence, StreamerCaptureSink, StreamerCaptureSinkError,
+    StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit,
 };
 
 /// Source-neutral capture coordinates supplied by the registered provider/runtime owner.

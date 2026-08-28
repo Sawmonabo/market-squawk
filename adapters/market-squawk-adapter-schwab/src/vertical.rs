@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::{
     ACCESS_TOKEN_MAX_LIFETIME_SECONDS, ExecutedRestResponse, MarketDataService, ReadOnlyRoute,
     SchwabOAuthAuthorityReceipt, SchwabRestPayload, SchwabSealedStreamerCapture,
-    SchwabUserPreferenceEvidence,
+    SchwabStreamerServiceResponseEvidence, SchwabUserPreferenceEvidence,
 };
 
 /// One independently probed read-only Schwab market-data family.
@@ -75,6 +75,7 @@ impl<'a> SchwabRestFamilyDoctorInput<'a> {
 pub struct SchwabStreamerFamilyDoctorInput<'a> {
     service: MarketDataService,
     capture: &'a SchwabSealedStreamerCapture,
+    service_response: &'a SchwabStreamerServiceResponseEvidence,
     provider_records: u64,
 }
 
@@ -96,12 +97,25 @@ impl<'a> SchwabStreamerFamilyDoctorInput<'a> {
                 }
             }
         }
-        if provider_records == 0 || capture.frames().is_empty() {
+        let mut service_responses = capture
+            .service_responses()
+            .iter()
+            .filter(|response| response.service() == service);
+        let service_response = service_responses
+            .next()
+            .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?;
+        if provider_records == 0
+            || capture.frames().is_empty()
+            || service_response.status_code() != 0
+            || service_response.round_trip_latency_ms().is_none()
+            || service_responses.next().is_some()
+        {
             return Err(SchwabVerticalError::InvalidCapabilityEvidence);
         }
         Ok(Self {
             service,
             capture,
+            service_response,
             provider_records,
         })
     }
@@ -116,6 +130,10 @@ impl<'a> SchwabStreamerFamilyDoctorInput<'a> {
 
     pub const fn provider_records(self) -> u64 {
         self.provider_records
+    }
+
+    pub const fn service_response(self) -> &'a SchwabStreamerServiceResponseEvidence {
+        self.service_response
     }
 }
 

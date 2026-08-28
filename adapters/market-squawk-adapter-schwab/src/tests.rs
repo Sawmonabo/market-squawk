@@ -1342,7 +1342,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         connects: 0,
         inbound: Some(VecDeque::from([
             InboundStreamerFrame::Text(login),
-            InboundStreamerFrame::Text(subscribed),
+            InboundStreamerFrame::Text(subscribed.clone()),
             InboundStreamerFrame::Text(Bytes::from_static(market_data)),
         ])),
         sent: Vec::new(),
@@ -1419,7 +1419,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         stream_microbatch.receipt().token_generation(),
         AccessTokenGeneration::new(NonZeroU64::MIN)
     );
-    assert_eq!(stream_microbatch.receipt().frame_count(), 1);
+    assert_eq!(stream_microbatch.receipt().frame_count(), 2);
     assert_eq!(
         stream_microbatch.connection().generation(),
         application_generation
@@ -1431,18 +1431,22 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     );
     assert_ne!(stream_microbatch.receipt().content_sha256(), [0; 32]);
     assert_ne!(stream_microbatch.receipt().observation_sha256(), [0; 32]);
-    let [frame] = stream_microbatch.frames() else {
-        panic!("validated stream microbatch did not retain exactly one frame");
+    let [acknowledgement, frame] = stream_microbatch.frames() else {
+        panic!("validated stream microbatch did not retain acknowledgement and data frames");
     };
+    assert_eq!(acknowledgement.payload(), &subscribed);
     assert!(!format!("{frame:?}").contains("LEVELONE_EQUITIES"));
     assert_eq!(frame.kind(), RawStreamerFrameKind::Text);
     assert_eq!(frame.generation(), stream_microbatch.receipt().generation());
-    assert_eq!(frame.ordinal(), stream_microbatch.receipt().first_ordinal());
+    assert_eq!(
+        acknowledgement.ordinal(),
+        stream_microbatch.receipt().first_ordinal()
+    );
     assert_eq!(frame.ordinal(), stream_microbatch.receipt().last_ordinal());
     assert_eq!(frame.payload(), market_data);
     assert_ne!(frame.payload_sha256(), [0; 32]);
     assert_eq!(
-        frame.received_at_unix_millis(),
+        acknowledgement.received_at_unix_millis(),
         stream_microbatch.receipt().first_received_at_unix_millis()
     );
     assert_eq!(
@@ -1459,9 +1463,10 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     let frame_generation = frame.generation();
     let frame_digest = frame.payload_sha256();
     let frame_received_at_unix_millis = frame.received_at_unix_millis();
+    let acknowledgement_event_id = Uuid::new_v4();
     let event_id = Uuid::new_v4();
     let (pending, seal_request) = stream_microbatch
-        .into_pending_capture(vec![event_id], bounds())
+        .into_pending_capture(vec![acknowledgement_event_id, event_id], bounds())
         .unwrap_or_else(|error| panic!("pending Streamer capture: {error}"));
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path().join("stream-raw-publication"))
@@ -1477,25 +1482,37 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         .unwrap_or_else(|error| panic!("sealed Streamer capture: {error}"));
     assert_eq!(sealed.coordinates(), &coordinates);
     assert_eq!(sealed.stream_identity(), &stream_identity);
-    assert_eq!(sealed.frames().len(), 1);
-    assert_eq!(sealed.frames()[0].event_id(), event_id);
-    assert_eq!(sealed.frames()[0].transport_ordinal(), frame_ordinal);
-    assert_eq!(sealed.frames()[0].payload_digest().bytes(), frame_digest);
+    assert_eq!(sealed.frames().len(), 2);
+    assert_eq!(sealed.frames()[0].event_id(), acknowledgement_event_id);
+    assert_eq!(sealed.frames()[1].event_id(), event_id);
+    assert_eq!(sealed.frames()[1].transport_ordinal(), frame_ordinal);
+    assert_eq!(sealed.frames()[1].payload_digest().bytes(), frame_digest);
     assert_eq!(
-        sealed.frames()[0].received_at_unix_millis(),
+        sealed.frames()[1].received_at_unix_millis(),
         frame_received_at_unix_millis
     );
+    let [service_response] = sealed.service_responses() else {
+        panic!("sealed Streamer capture must retain one service acknowledgement");
+    };
+    assert_eq!(
+        service_response.service(),
+        MarketDataService::LevelOneEquities
+    );
+    assert_eq!(service_response.status_code(), 0);
+    assert!(service_response.round_trip_latency_ms().is_some());
+    assert_eq!(service_response.event_id(), acknowledgement_event_id);
+    assert_ne!(service_response.observation_sha256().bytes(), [0; 32]);
     let persisted = sealed.persisted_receipt();
     assert_eq!(persisted.capture().source_id(), coordinates.source_id());
     assert_eq!(persisted.capture().dataset(), coordinates.dataset());
     assert_eq!(persisted.capture().stream_identity(), &stream_identity);
     assert_ne!(persisted.receipt_digest().bytes(), [0; 32]);
-    assert_eq!(persisted.capture().frames().len(), 1);
+    assert_eq!(persisted.capture().frames().len(), 2);
     assert_eq!(
-        persisted.capture().frames()[0].event_id(),
+        persisted.capture().frames()[1].event_id(),
         *event_id.as_bytes()
     );
-    assert_eq!(persisted.capture().frames()[0].source_sequence(), None);
+    assert_eq!(persisted.capture().frames()[1].source_sequence(), None);
     let streamer_doctor =
         SchwabStreamerFamilyDoctorInput::try_new(MarketDataService::LevelOneEquities, &sealed)
             .unwrap_or_else(|error| panic!("typed Streamer doctor input: {error}"));
@@ -1503,9 +1520,11 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     let reopened = store
         .open_verified(persisted.segment())
         .unwrap_or_else(|error| panic!("reopen Streamer physical seal: {error}"));
-    let [record] = reopened.records() else {
-        panic!("sealed Streamer microbatch must contain one raw frame");
+    let [acknowledgement_record, record] = reopened.records() else {
+        panic!("sealed Streamer microbatch must contain acknowledgement and data frames");
     };
+    assert_eq!(acknowledgement_record.event_id(), acknowledgement_event_id);
+    assert_eq!(acknowledgement_record.payload(), &subscribed);
     assert_eq!(record.event_id(), event_id);
     assert_eq!(record.connection_id(), coordinates.connection_id());
     assert_eq!(record.payload(), market_data);

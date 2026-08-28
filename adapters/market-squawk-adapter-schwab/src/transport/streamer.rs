@@ -1,6 +1,6 @@
 //! One-owner Schwab Streamer execution with bounded reconnect and exact payload microbatches.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU64;
@@ -36,7 +36,7 @@ use crate::{
 use super::{
     AccessTokenAdmission, AccessTokenGeneration, SchwabAccessTokenSource, SchwabCaptureCoordinates,
     SchwabTransportError, SchwabTransportTelemetry, StreamerTransportBounds, TransientAccessToken,
-    hash_frame, hash_observation, unix_millis, unix_seconds,
+    duration_millis, hash_frame, hash_observation, unix_millis, unix_seconds,
 };
 
 /// Exact application payload kind delivered by the WebSocket implementation.
@@ -199,6 +199,7 @@ pub struct StreamerMicrobatch {
     receipt: StreamerMicrobatchReceipt,
     connection: SchwabStreamerConnectionEvidence,
     frames: Box<[RawStreamerFrame]>,
+    service_responses: Box<[PendingStreamerServiceResponseEvidence]>,
 }
 
 impl fmt::Debug for StreamerMicrobatch {
@@ -207,6 +208,7 @@ impl fmt::Debug for StreamerMicrobatch {
             .debug_struct("StreamerMicrobatch")
             .field("receipt", &self.receipt)
             .field("frame_count", &self.frames.len())
+            .field("service_response_count", &self.service_responses.len())
             .field("frames", &"[EXACT RAW FRAMES REDACTED]")
             .finish()
     }
@@ -244,6 +246,7 @@ impl StreamerMicrobatch {
             receipt,
             connection,
             frames,
+            service_responses,
         } = self;
         let SchwabStreamerConnectionEvidence {
             coordinates,
@@ -314,6 +317,7 @@ impl StreamerMicrobatch {
                 streamer_receipt: receipt,
                 frames: evidence.into_boxed_slice(),
                 parsed_frames: parsed_frames.into_boxed_slice(),
+                service_responses,
             },
             seal_request,
         ))
@@ -363,6 +367,96 @@ impl SchwabStreamerFrameSealEvidence {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct PendingStreamerServiceResponseEvidence {
+    service: crate::MarketDataService,
+    command: Box<str>,
+    request_id: Box<str>,
+    status_code: i64,
+    provider_timestamp_millis: Option<u64>,
+    round_trip_latency_ms: Option<u64>,
+    frame_ordinal: NonZeroU64,
+}
+
+/// One provider-owned Streamer service acknowledgement or error bound to its sealed raw frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchwabStreamerServiceResponseEvidence {
+    service: crate::MarketDataService,
+    command: Box<str>,
+    request_id: Box<str>,
+    status_code: i64,
+    provider_timestamp_millis: Option<u64>,
+    round_trip_latency_ms: Option<u64>,
+    generation: ConnectionGeneration,
+    transport_ordinal: NonZeroU64,
+    received_at_unix_millis: u64,
+    payload_bytes: u64,
+    payload_digest: EvidenceDigest,
+    event_id: Uuid,
+    sealed_capture_receipt_sha256: EvidenceDigest,
+    observation_sha256: EvidenceDigest,
+}
+
+impl SchwabStreamerServiceResponseEvidence {
+    pub const fn service(&self) -> crate::MarketDataService {
+        self.service
+    }
+
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Exact provider response code (`0` is success; other values are provider errors).
+    pub const fn status_code(&self) -> i64 {
+        self.status_code
+    }
+
+    pub const fn provider_timestamp_millis(&self) -> Option<u64> {
+        self.provider_timestamp_millis
+    }
+
+    /// Monotonic local request-to-response measurement when the response matched an owned request.
+    pub const fn round_trip_latency_ms(&self) -> Option<u64> {
+        self.round_trip_latency_ms
+    }
+
+    pub const fn generation(&self) -> ConnectionGeneration {
+        self.generation
+    }
+
+    pub const fn transport_ordinal(&self) -> NonZeroU64 {
+        self.transport_ordinal
+    }
+
+    pub const fn received_at_unix_millis(&self) -> u64 {
+        self.received_at_unix_millis
+    }
+
+    pub const fn payload_bytes(&self) -> u64 {
+        self.payload_bytes
+    }
+
+    pub const fn payload_digest(&self) -> EvidenceDigest {
+        self.payload_digest
+    }
+
+    pub const fn event_id(&self) -> Uuid {
+        self.event_id
+    }
+
+    pub const fn sealed_capture_receipt_sha256(&self) -> EvidenceDigest {
+        self.sealed_capture_receipt_sha256
+    }
+
+    pub const fn observation_sha256(&self) -> EvidenceDigest {
+        self.observation_sha256
+    }
+}
+
 /// Non-cloneable Schwab Streamer continuation awaiting its exact common physical seal.
 pub struct SchwabPendingStreamerCapture {
     expectation: ProviderEventMicrobatchSealExpectation,
@@ -371,6 +465,7 @@ pub struct SchwabPendingStreamerCapture {
     streamer_receipt: StreamerMicrobatchReceipt,
     frames: Box<[SchwabStreamerFrameSealEvidence]>,
     parsed_frames: Box<[ParsedNative<StreamerFrame>]>,
+    service_responses: Box<[PendingStreamerServiceResponseEvidence]>,
 }
 
 impl fmt::Debug for SchwabPendingStreamerCapture {
@@ -382,6 +477,7 @@ impl fmt::Debug for SchwabPendingStreamerCapture {
             .field("streamer_receipt", &self.streamer_receipt)
             .field("frame_count", &self.frames.len())
             .field("parsed_frame_count", &self.parsed_frames.len())
+            .field("service_response_count", &self.service_responses.len())
             .field("raw_frames", &"AWAITING COMMON PHYSICAL SEAL")
             .finish()
     }
@@ -434,6 +530,12 @@ impl SchwabPendingStreamerCapture {
                 return Err(SchwabTransportError::CaptureMaterial);
             }
         }
+        let sealed_capture_receipt_sha256 = token.persisted_receipt().receipt_digest();
+        let service_responses = bind_service_response_evidence(
+            &self.service_responses,
+            &self.frames,
+            sealed_capture_receipt_sha256,
+        )?;
         Ok(SchwabSealedStreamerCapture {
             token,
             coordinates: self.coordinates,
@@ -441,6 +543,7 @@ impl SchwabPendingStreamerCapture {
             streamer_receipt: self.streamer_receipt,
             frames: self.frames,
             parsed_frames: self.parsed_frames,
+            service_responses,
         })
     }
 }
@@ -453,6 +556,7 @@ pub struct SchwabSealedStreamerCapture {
     streamer_receipt: StreamerMicrobatchReceipt,
     frames: Box<[SchwabStreamerFrameSealEvidence]>,
     parsed_frames: Box<[ParsedNative<StreamerFrame>]>,
+    service_responses: Box<[SchwabStreamerServiceResponseEvidence]>,
 }
 
 pub(crate) struct SchwabSealedStreamerCaptureParts {
@@ -469,6 +573,7 @@ impl fmt::Debug for SchwabSealedStreamerCapture {
             .field("streamer_receipt", &self.streamer_receipt)
             .field("frame_count", &self.frames.len())
             .field("parsed_frame_count", &self.parsed_frames.len())
+            .field("service_response_count", &self.service_responses.len())
             .field("raw_frames", &"PHYSICALLY SEALED")
             .finish()
     }
@@ -497,6 +602,11 @@ impl SchwabSealedStreamerCapture {
         &self.frames
     }
 
+    /// Exact selected-service acknowledgements/errors carried by these sealed frames.
+    pub fn service_responses(&self) -> &[SchwabStreamerServiceResponseEvidence] {
+        &self.service_responses
+    }
+
     pub(crate) fn parsed_frames(&self) -> &[ParsedNative<StreamerFrame>] {
         &self.parsed_frames
     }
@@ -507,6 +617,117 @@ impl SchwabSealedStreamerCapture {
             coordinates: self.coordinates,
         }
     }
+}
+
+fn bind_service_response_evidence(
+    pending: &[PendingStreamerServiceResponseEvidence],
+    frames: &[SchwabStreamerFrameSealEvidence],
+    sealed_capture_receipt_sha256: EvidenceDigest,
+) -> Result<Box<[SchwabStreamerServiceResponseEvidence]>, SchwabTransportError> {
+    if sealed_capture_receipt_sha256.algorithm() != DigestAlgorithm::Sha256 {
+        return Err(SchwabTransportError::CaptureMaterial);
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(pending.len())
+        .map_err(|_| SchwabTransportError::PayloadTooLarge)?;
+    for response in pending {
+        let frame_index = frames
+            .binary_search_by_key(&response.frame_ordinal, |frame| frame.transport_ordinal)
+            .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+        let frame = &frames[frame_index];
+        let observation_sha256 =
+            service_response_observation_sha256(response, frame, sealed_capture_receipt_sha256)?;
+        output.push(SchwabStreamerServiceResponseEvidence {
+            service: response.service,
+            command: response.command.clone(),
+            request_id: response.request_id.clone(),
+            status_code: response.status_code,
+            provider_timestamp_millis: response.provider_timestamp_millis,
+            round_trip_latency_ms: response.round_trip_latency_ms,
+            generation: frame.generation,
+            transport_ordinal: frame.transport_ordinal,
+            received_at_unix_millis: frame.received_at_unix_millis,
+            payload_bytes: frame.payload_bytes,
+            payload_digest: frame.payload_digest,
+            event_id: frame.event_id,
+            sealed_capture_receipt_sha256,
+            observation_sha256,
+        });
+    }
+    Ok(output.into_boxed_slice())
+}
+
+fn service_response_observation_sha256(
+    response: &PendingStreamerServiceResponseEvidence,
+    frame: &SchwabStreamerFrameSealEvidence,
+    sealed_capture_receipt_sha256: EvidenceDigest,
+) -> Result<EvidenceDigest, SchwabTransportError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/schwab-streamer-service-response/v1");
+    hash_bounded_text(&mut hasher, response.service.as_str())?;
+    hash_bounded_text(&mut hasher, &response.command)?;
+    hash_bounded_text(&mut hasher, &response.request_id)?;
+    hasher.update(response.status_code.to_be_bytes());
+    hash_optional_u64(&mut hasher, response.provider_timestamp_millis);
+    hash_optional_u64(&mut hasher, response.round_trip_latency_ms);
+    hasher.update(frame.generation.get().to_be_bytes());
+    hasher.update(frame.transport_ordinal.get().to_be_bytes());
+    hasher.update(frame.received_at_unix_millis.to_be_bytes());
+    hasher.update(frame.payload_bytes.to_be_bytes());
+    hasher.update(frame.payload_digest.bytes());
+    hasher.update(frame.event_id.as_bytes());
+    hasher.update(sealed_capture_receipt_sha256.bytes());
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hasher.finalize().into(),
+    ))
+}
+
+fn hash_bounded_text(hasher: &mut Sha256, value: &str) -> Result<(), SchwabTransportError> {
+    hasher.update(
+        u64::try_from(value.len())
+            .map_err(|_| SchwabTransportError::Overflow)?
+            .to_be_bytes(),
+    );
+    hasher.update(value.as_bytes());
+    Ok(())
+}
+
+fn hash_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+const fn response_code_value(code: StreamerResponseCode) -> i64 {
+    match code {
+        StreamerResponseCode::Success => 0,
+        StreamerResponseCode::SymbolLimit => 19,
+        StreamerResponseCode::Other(value) => value,
+    }
+}
+
+fn selected_service(value: &str) -> Option<crate::MarketDataService> {
+    Some(match value {
+        "LEVELONE_EQUITIES" => crate::MarketDataService::LevelOneEquities,
+        "LEVELONE_OPTIONS" => crate::MarketDataService::LevelOneOptions,
+        "LEVELONE_FUTURES" => crate::MarketDataService::LevelOneFutures,
+        "LEVELONE_FUTURES_OPTIONS" => crate::MarketDataService::LevelOneFuturesOptions,
+        "LEVELONE_FOREX" => crate::MarketDataService::LevelOneForex,
+        "NYSE_BOOK" => crate::MarketDataService::NyseBook,
+        "NASDAQ_BOOK" => crate::MarketDataService::NasdaqBook,
+        "OPTIONS_BOOK" => crate::MarketDataService::OptionsBook,
+        "CHART_EQUITY" => crate::MarketDataService::ChartEquity,
+        "CHART_FUTURES" => crate::MarketDataService::ChartFutures,
+        "SCREENER_EQUITY" => crate::MarketDataService::ScreenerEquity,
+        "SCREENER_OPTION" => crate::MarketDataService::ScreenerOption,
+        _ => return None,
+    })
 }
 
 fn validate_streamer_microbatch(
@@ -1125,8 +1346,7 @@ impl SchwabStreamerExecutor {
         let login = self
             .controller
             .login_request(bootstrap, token.expose_bearer())?;
-        let login_id = login.request_id().get().to_string();
-        send_request(
+        let login_request = send_request(
             connection,
             login,
             &self.telemetry,
@@ -1173,11 +1393,14 @@ impl SchwabStreamerExecutor {
                 )
                 .await?
             {
-                ProcessedFrame::Parsed(frame) => {
+                ProcessedFrame::Parsed {
+                    frame,
+                    captured_ordinal: _,
+                } => {
                     if let Some(response) = frame.value().responses.iter().find(|response| {
                         response.service.as_ref() == "ADMIN"
                             && response.command.as_ref() == "LOGIN"
-                            && response.request_id.as_ref() == login_id
+                            && response.request_id.as_ref() == login_request.request_id.as_ref()
                     }) {
                         if response.code != StreamerResponseCode::Success {
                             flush_batch(&mut batch, sink, &self.telemetry)?;
@@ -1197,10 +1420,9 @@ impl SchwabStreamerExecutor {
         }
 
         let requests = self.controller.replay_desired()?;
-        let mut pending = BTreeSet::new();
+        let mut pending = BTreeMap::new();
         for request in requests {
-            pending.insert(request.request_id().get().to_string());
-            send_request(
+            let sent = send_request(
                 connection,
                 request,
                 &self.telemetry,
@@ -1208,6 +1430,9 @@ impl SchwabStreamerExecutor {
                 cancellation,
             )
             .await?;
+            if sent.service.is_none() || pending.insert(sent.request_id.clone(), sent).is_some() {
+                return Err(SchwabTransportError::Protocol);
+            }
         }
         let mut idle_deadline = Instant::now()
             .checked_add(self.transport_bounds.io_timeout())
@@ -1231,16 +1456,43 @@ impl SchwabStreamerExecutor {
                         )
                         .await?
                     {
-                        ProcessedFrame::Parsed(frame) => {
+                        ProcessedFrame::Parsed {
+                            frame,
+                            captured_ordinal,
+                        } => {
+                            let captured_ordinal =
+                                captured_ordinal.ok_or(SchwabTransportError::Protocol)?;
+                            let mut response_error = None;
                             for response in &frame.value().responses {
-                                if response.code != StreamerResponseCode::Success {
-                                    flush_batch(&mut batch, sink, &self.telemetry)?;
-                                    return Err(SchwabTransportError::Adapter);
+                                let sent = pending.remove(response.request_id.as_ref());
+                                let latency = sent
+                                    .as_ref()
+                                    .map(|sent| duration_millis(sent.dispatched_at.elapsed()))
+                                    .transpose()?;
+                                batch.record_service_response(
+                                    captured_ordinal,
+                                    response,
+                                    latency,
+                                )?;
+                                let Some(sent) = sent else {
+                                    response_error.get_or_insert(SchwabTransportError::Protocol);
+                                    continue;
+                                };
+                                let Some(service) = sent.service else {
+                                    response_error.get_or_insert(SchwabTransportError::Protocol);
+                                    continue;
+                                };
+                                if response.service.as_ref() != service.as_str()
+                                    || response.command.as_ref() != sent.command.as_ref()
+                                {
+                                    response_error.get_or_insert(SchwabTransportError::Protocol);
+                                } else if response.code != StreamerResponseCode::Success {
+                                    response_error.get_or_insert(SchwabTransportError::Adapter);
                                 }
-                                if !pending.remove(response.request_id.as_ref()) {
-                                    flush_batch(&mut batch, sink, &self.telemetry)?;
-                                    return Err(SchwabTransportError::Protocol);
-                                }
+                            }
+                            if let Some(error) = response_error {
+                                flush_batch(&mut batch, sink, &self.telemetry)?;
+                                return Err(error);
                             }
                         }
                         ProcessedFrame::Control => {}
@@ -1338,17 +1590,29 @@ impl SchwabStreamerExecutor {
             .map_err(|_| SchwabTransportError::Overflow)?;
         self.telemetry
             .record_stream_semantics(events, responses, notifications)?;
-        if !parsed.value().data.is_empty() || !parsed.value().notifications.is_empty() {
-            append_frame(
+        let captured_ordinal = if parsed
+            .value()
+            .responses
+            .iter()
+            .any(|response| response.service.as_ref() != "ADMIN")
+            || !parsed.value().data.is_empty()
+            || !parsed.value().notifications.is_empty()
+        {
+            Some(append_frame(
                 generation,
                 RawStreamerFrameKind::Text,
                 payload,
                 batch,
                 sink,
                 &self.telemetry,
-            )?;
-        }
-        Ok(ProcessedFrame::Parsed(parsed))
+            )?)
+        } else {
+            None
+        };
+        Ok(ProcessedFrame::Parsed {
+            frame: parsed,
+            captured_ordinal,
+        })
     }
 }
 
@@ -1358,7 +1622,10 @@ enum ConnectionExit {
 }
 
 enum ProcessedFrame {
-    Parsed(ParsedNative<StreamerFrame>),
+    Parsed {
+        frame: ParsedNative<StreamerFrame>,
+        captured_ordinal: Option<NonZeroU64>,
+    },
     Control,
     Closed,
 }
@@ -1368,6 +1635,7 @@ struct MicrobatchBuilder {
     token_generation: AccessTokenGeneration,
     bounds: StreamerTransportBounds,
     frames: Vec<RawStreamerFrame>,
+    service_responses: Vec<PendingStreamerServiceResponseEvidence>,
     payload_bytes: usize,
     next_ordinal: NonZeroU64,
     opened_at: Instant,
@@ -1384,6 +1652,7 @@ impl MicrobatchBuilder {
             token_generation,
             bounds,
             frames: Vec::new(),
+            service_responses: Vec::new(),
             payload_bytes: 0,
             next_ordinal: NonZeroU64::MIN,
             opened_at: Instant::now(),
@@ -1410,15 +1679,16 @@ impl MicrobatchBuilder {
         &mut self,
         kind: RawStreamerFrameKind,
         payload: Bytes,
-    ) -> Result<(), SchwabTransportError> {
+    ) -> Result<NonZeroU64, SchwabTransportError> {
         if payload.len() > self.bounds.max_frame_bytes()
             || payload.len() > self.bounds.max_microbatch_bytes()
         {
             return Err(SchwabTransportError::PayloadTooLarge);
         }
+        let ordinal = self.next_ordinal;
         let frame = RawStreamerFrame::try_new(
             self.connection.generation,
-            self.next_ordinal,
+            ordinal,
             kind,
             payload,
             self.bounds.max_frame_bytes(),
@@ -1438,17 +1708,61 @@ impl MicrobatchBuilder {
             .try_reserve(1)
             .map_err(|_| SchwabTransportError::PayloadTooLarge)?;
         self.frames.push(frame);
+        Ok(ordinal)
+    }
+
+    fn record_service_response(
+        &mut self,
+        frame_ordinal: NonZeroU64,
+        response: &crate::StreamerResponse,
+        round_trip_latency_ms: Option<u64>,
+    ) -> Result<(), SchwabTransportError> {
+        let Some(service) = selected_service(response.service.as_ref()) else {
+            if response.service.as_ref() == "ADMIN" {
+                return Ok(());
+            }
+            return Err(SchwabTransportError::Protocol);
+        };
+        if !self
+            .frames
+            .last()
+            .is_some_and(|frame| frame.ordinal == frame_ordinal)
+        {
+            return Err(SchwabTransportError::Protocol);
+        }
+        self.service_responses
+            .try_reserve(1)
+            .map_err(|_| SchwabTransportError::PayloadTooLarge)?;
+        self.service_responses
+            .push(PendingStreamerServiceResponseEvidence {
+                service,
+                command: response.command.clone(),
+                request_id: response.request_id.clone(),
+                status_code: response_code_value(response.code),
+                provider_timestamp_millis: response.timestamp_millis,
+                round_trip_latency_ms,
+                frame_ordinal,
+            });
         Ok(())
     }
 
     fn finish(&mut self) -> Result<Option<StreamerMicrobatch>, SchwabTransportError> {
         if self.frames.is_empty() {
+            if !self.service_responses.is_empty() {
+                return Err(SchwabTransportError::Protocol);
+            }
             self.opened_at = Instant::now();
             return Ok(None);
         }
         let frames = std::mem::take(&mut self.frames);
+        let service_responses = std::mem::take(&mut self.service_responses);
         let first = frames.first().ok_or(SchwabTransportError::Protocol)?;
         let last = frames.last().ok_or(SchwabTransportError::Protocol)?;
+        if service_responses.iter().any(|response| {
+            response.frame_ordinal < first.ordinal || response.frame_ordinal > last.ordinal
+        }) {
+            return Err(SchwabTransportError::Protocol);
+        }
         let mut content = Sha256::new();
         let mut observation = Sha256::new();
         for frame in &frames {
@@ -1483,6 +1797,7 @@ impl MicrobatchBuilder {
             receipt,
             connection: self.connection.clone(),
             frames: frames.into_boxed_slice(),
+            service_responses: service_responses.into_boxed_slice(),
         }))
     }
 }
@@ -1494,7 +1809,7 @@ fn append_frame(
     batch: &mut MicrobatchBuilder,
     sink: &mut dyn StreamerCaptureSink,
     telemetry: &SchwabTransportTelemetry,
-) -> Result<(), SchwabTransportError> {
+) -> Result<NonZeroU64, SchwabTransportError> {
     if batch.would_exceed(payload.len())? {
         flush_batch(batch, sink, telemetry)?;
     }
@@ -1516,17 +1831,31 @@ fn flush_batch(
     telemetry.record_stream_microbatch(frames, bytes)
 }
 
+struct SentStreamerRequest {
+    service: Option<crate::MarketDataService>,
+    command: Box<str>,
+    request_id: Box<str>,
+    dispatched_at: Instant,
+}
+
 async fn send_request(
     connection: &mut dyn SchwabStreamerConnection,
     request: TransientStreamerRequest,
     telemetry: &SchwabTransportTelemetry,
     timeout: Duration,
     cancellation: &CancellationToken,
-) -> Result<(), SchwabTransportError> {
+) -> Result<SentStreamerRequest, SchwabTransportError> {
+    let sent = SentStreamerRequest {
+        service: request.service(),
+        command: request.command().to_owned().into_boxed_str(),
+        request_id: request.request_id().get().to_string().into_boxed_str(),
+        dispatched_at: Instant::now(),
+    };
     let bytes = Bytes::copy_from_slice(request.expose_body());
     let length = u64::try_from(bytes.len()).map_err(|_| SchwabTransportError::Overflow)?;
     await_operation(connection.send_text(bytes), timeout, cancellation).await?;
-    telemetry.record_stream_request(length)
+    telemetry.record_stream_request(length)?;
+    Ok(sent)
 }
 
 async fn acquire_token(
