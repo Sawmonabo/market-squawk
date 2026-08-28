@@ -1,9 +1,22 @@
 use std::error::Error;
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use market_squawk_domain::{MetadataRevision, SourceId, SourceIdentifier};
+use market_squawk_domain::{
+    BarTimeSemantics, BarTimestampBasis, Currency, DigestAlgorithm, EffectiveInterval,
+    EvidenceDigest, ExactPayloadEvidence, InstrumentId, MarketBarSessionEvidence,
+    MarketBarSessionKind, MetadataRevision, ProviderInstrumentId, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
+};
+use market_squawk_platform::LocalPaths;
+use market_squawk_sources::{
+    AvailabilityEvidence, DiscoveryRequest, ExtractionRequest, ProviderNativeLineageImplementation,
+    SourceObject,
+};
 use rust_decimal::Decimal;
+use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
@@ -11,13 +24,33 @@ use uuid::Uuid;
 use crate::http::ScriptedHttpResponse;
 use crate::{
     AdapterBounds, AdmissionDecision, AdmissionPolicy, AttemptKind, ChartInterval, ChartWindow,
-    ExplicitDemand, ExplicitDemandPurpose, ProviderField, YahooAdmission, YahooAssetClass,
-    YahooAttemptTarget, YahooChartActionScope, YahooChartAdjustmentMode, YahooChartEventKind,
-    YahooChartSessionScope, YahooDurableStateStore, YahooExecutionDisposition,
-    YahooExecutionLimits, YahooHttpFailureKind, YahooHttpSession, YahooHttpSessionConfig,
-    YahooLocale, YahooParsedResponse, YahooPublicationBinding, YahooPublicationBridgeError,
-    YahooRequestPlanner, YahooSymbol, YahooTarget,
+    CircuitSnapshot, ExplicitDemand, ExplicitDemandPurpose, ProviderField,
+    YAHOO_MISSING_RETRY_AFTER_COOLDOWN_FLOOR_MS, YahooAdmission, YahooAssetClass,
+    YahooAttemptTarget, YahooCanonicalInstrumentAuthority, YahooCanonicalPublicationRequest,
+    YahooChartActionScope, YahooChartAdjustmentMode, YahooChartEventKind, YahooChartSessionScope,
+    YahooDurableStateStore, YahooExecutionDisposition, YahooExecutionLimits, YahooHttpFailureKind,
+    YahooHttpSession, YahooHttpSessionConfig, YahooLocale, YahooParsedResponse,
+    YahooPublicationBinding, YahooPublicationBridgeError, YahooRequestPlanner, YahooSymbol,
+    YahooTarget,
 };
+
+struct TemporaryDirectory(PathBuf);
+
+impl TemporaryDirectory {
+    fn new(name: &str) -> Self {
+        Self(std::env::temp_dir().join(format!("market-squawk-yahoo-{name}-{}", Uuid::new_v4())))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 fn bounds(maximum_symbols: usize) -> AdapterBounds {
     AdapterBounds {
@@ -54,6 +87,81 @@ fn target(symbol: String) -> Result<YahooTarget, Box<dyn Error>> {
     })
 }
 
+fn chart_publication_request(
+    raw: &crate::YahooRawReceipt,
+    binding: &YahooPublicationBinding,
+) -> Result<YahooCanonicalPublicationRequest, Box<dyn Error>> {
+    let received_at = Timestamp::from_unix_nanos(
+        raw.received_at_unix_ms
+            .checked_mul(1_000_000)
+            .ok_or("received timestamp")?,
+    );
+    let available_at = Timestamp::from_unix_nanos(
+        raw.available_at_unix_ms
+            .checked_mul(1_000_000)
+            .ok_or("available timestamp")?,
+    );
+    let ingested_at = available_at.checked_add_nanos(1)?;
+    let deadline = ingested_at.checked_add_nanos(60_000_000_000)?;
+    let dataset = SourceIdentifier::try_from("yahoo-finance.experimental.chart-history")?;
+    let discovery = DiscoveryRequest::try_new(dataset, None, NonZeroU16::MIN, deadline)?;
+    let object = SourceObject::try_new_with_availability(
+        binding.source_id().clone(),
+        binding.metadata_revision().clone(),
+        &discovery,
+        SourceIdentifier::try_from("yahoo-chart-aapl-response")?,
+        SourceIdentifier::try_from("application-json")?,
+        ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(&raw.response_bytes).into(),
+        )),
+        EffectiveInterval::new(received_at, None)?,
+        None,
+        AvailabilityEvidence::LocalFirstObserved {
+            observed_at: available_at,
+        },
+        Some(u64::try_from(raw.response_bytes.len())?),
+    )?;
+    let extraction = ExtractionRequest::try_new(
+        object,
+        NonZeroU32::new(32).ok_or("record bound")?,
+        NonZeroU64::new(4 * 1024 * 1024).ok_or("byte bound")?,
+        deadline,
+    )?;
+    let authority = YahooCanonicalInstrumentAuthority::try_new(
+        YahooSymbol::parse("AAPL", 512)?,
+        InstrumentId::try_from(Uuid::from_u128(10))?,
+        ProviderInstrumentId::try_from("AAPL")?,
+        Some(VenueId::try_from("yahoo-nasdaq-experimental")?),
+        Some(Currency::try_from("USD")?),
+        MetadataRevision::new(SourceIdentifier::try_from("instrument-map-v1")?),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [7; 32]),
+    )?;
+    let session = MarketBarSessionEvidence::try_new(
+        MarketBarSessionKind::ProviderDefined,
+        SourceIdentifier::try_from("yahoo-provider-daily-session")?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [8; 32]),
+    )?;
+    let semantics = [1_786_473_600_i64, 1_786_560_000_i64]
+        .into_iter()
+        .map(|seconds| {
+            let start = Timestamp::from_unix_nanos(seconds * 1_000_000_000);
+            Ok(BarTimeSemantics::try_new(
+                start,
+                start.checked_add_nanos(86_400_000_000_000)?,
+                BarTimestampBasis::PeriodStart,
+                session.clone(),
+            )?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok(YahooCanonicalPublicationRequest::try_new(
+        extraction,
+        vec![authority],
+        semantics,
+        ingested_at,
+    )?)
+}
+
 #[tokio::test]
 async fn explicit_demand_network_response_crosses_one_pending_publication_handoff()
 -> Result<(), Box<dyn Error>> {
@@ -71,7 +179,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         max_cache_bytes: 128 * 1_024,
         max_redirects: 3,
         max_attempt_receipts: 8,
-        admission_policy: AdmissionPolicy::new(1_000, 3)?,
+        admission_policy: AdmissionPolicy::new(YAHOO_MISSING_RETRY_AFTER_COOLDOWN_FLOOR_MS, 3)?,
     };
     let state_root = std::env::temp_dir().join(format!(
         "market-squawk-yahoo-durable-test-{}",
@@ -157,8 +265,12 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         Uuid::from_u128(1),
         Uuid::from_u128(2),
     )?;
-    let pending = first.into_pending_publication(publication_binding.clone())?;
-    let (rejoin, material) = pending.into_sealing_parts();
+    let canonical = chart_publication_request(first.raw_receipt(), &publication_binding)?;
+    let seal_root = TemporaryDirectory::new("seal");
+    let seal_paths = LocalPaths::prepare(seal_root.path())?;
+    let store = seal_paths.sealed_research_journal_store()?;
+    let pending = first.into_pending_publication(publication_binding.clone(), canonical)?;
+    let (rejoin, seal_request) = pending.into_sealing_parts();
     let native_history = rejoin
         .pending_chart_history()
         .ok_or("chart response must retain one native history candidate")?;
@@ -263,22 +375,51 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     );
     assert_eq!(splits[0].kind, YahooChartEventKind::Split);
     assert_eq!(capital_gains[0].kind, YahooChartEventKind::CapitalGain);
-    assert_eq!(material.records().len(), 1);
+    let sealed_publication = rejoin.try_rejoin(seal_request.seal(&store)?)?;
     assert_eq!(
-        material.records()[0].payload().len(),
-        usize::try_from(material.receipt().total_body_bytes())?
+        sealed_publication.authority(),
+        crate::EvidenceAuthority::ExperimentalSupplementOnly
     );
-    assert_eq!(material.records()[0].source_sequence(), Some(0));
+    assert!(!sealed_publication.governed_override_permitted());
+    assert!(sealed_publication.revision_plan().native_lineage_required());
     assert_eq!(
-        material.receipt().dataset().as_str(),
-        "yahoo-finance.experimental.chart-history"
+        sealed_publication.sealed_capture_binding().record_count(),
+        1
     );
     assert_eq!(
-        material.receipt().pages()[0].body_bytes(),
-        material.receipt().total_body_bytes()
+        sealed_publication
+            .sealed_capture_binding()
+            .native_lineage()
+            .schema()
+            .implementation(),
+        ProviderNativeLineageImplementation::YahooEnrichmentV1
     );
-    drop(rejoin);
-    drop(material);
+    assert!(
+        sealed_publication
+            .sealed_capture_binding()
+            .native_lineage()
+            .batch_sidecar()
+            .is_some()
+    );
+    let lineage = sealed_publication.sealed_capture_binding().native_lineage();
+    let sidecar: serde_json::Value = serde_json::from_slice(
+        lineage
+            .batch_sidecar()
+            .ok_or("native sidecar")?
+            .semantic_payload(),
+    )?;
+    let row: serde_json::Value = serde_json::from_slice(lineage.rows()[0].semantic_payload())?;
+    let pointer = row
+        .get("parsed_response_pointer")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("parsed-response pointer")?;
+    assert_eq!(
+        sidecar
+            .get("parsed_response")
+            .and_then(|parsed| parsed.pointer(pointer)),
+        row.get("native_value")
+    );
+    sealed_publication.sealed_capture_binding().validate()?;
 
     let second = session
         .execute(plan.requests[1].clone(), limits, &cancellation)
@@ -290,6 +431,14 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     ));
     assert_eq!(second.attempts.len(), 1);
     assert_eq!(second.attempts[0].status, Some(429));
+    assert_eq!(
+        session.admission().snapshot()?.circuit,
+        CircuitSnapshot::Open {
+            retry_at_unix_ms: second.attempts[0]
+                .completed_at_unix_ms
+                .saturating_add(2_000),
+        }
+    );
     let rejected = session
         .execute(plan.requests[0].clone(), limits, &cancellation)
         .await
@@ -311,8 +460,9 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         )
         .await?;
     assert_eq!(cached.disposition(), YahooExecutionDisposition::CacheHit);
+    let cached_canonical = chart_publication_request(cached.raw_receipt(), &publication_binding)?;
     assert!(matches!(
-        cached.into_pending_publication(publication_binding.clone()),
+        cached.into_pending_publication(publication_binding.clone(), cached_canonical),
         Err(YahooPublicationBridgeError::NonPublicationResult)
     ));
 
@@ -396,7 +546,10 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
 
     let fallback_session = YahooHttpSession::new_for_test_with_durable(
         YahooHttpSessionConfig {
-            admission_policy: AdmissionPolicy::new(1_000, 3)?,
+            admission_policy: AdmissionPolicy::new(
+                YAHOO_MISSING_RETRY_AFTER_COOLDOWN_FLOOR_MS,
+                3,
+            )?,
             ..config
         },
         Url::parse("http://yahoo-fallback.test/")?,
@@ -481,7 +634,10 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         same_url_different_semantics.requests[0].target()
     );
     assert_ne!(first_identity, second_identity);
-    let identity_admission = YahooAdmission::new(AdmissionPolicy::new(1_000, 3)?);
+    let identity_admission = YahooAdmission::new(AdmissionPolicy::new(
+        YAHOO_MISSING_RETRY_AFTER_COOLDOWN_FLOOR_MS,
+        3,
+    )?);
     let first_permit = match identity_admission.admit(
         &plan.requests[0],
         &first_identity,
@@ -534,8 +690,10 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         network_received_at
     );
     assert_eq!(restored_cache.raw_receipt().attempts, network_attempts);
+    let restored_canonical =
+        chart_publication_request(restored_cache.raw_receipt(), &publication_binding)?;
     assert!(matches!(
-        restored_cache.into_pending_publication(publication_binding),
+        restored_cache.into_pending_publication(publication_binding, restored_canonical),
         Err(YahooPublicationBridgeError::NonPublicationResult)
     ));
     let restored_circuit = restarted
@@ -548,6 +706,67 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     ));
     assert!(restarted.scripted_observed_targets().await.is_empty());
     drop(restarted);
+
+    let body_rate_session = YahooHttpSession::new_for_test_with_durable(
+        YahooHttpSessionConfig {
+            admission_policy: AdmissionPolicy::new(1, 3)?,
+            ..config
+        },
+        Url::parse("http://yahoo-body-rate-limit.test/")?,
+        vec![
+            ScriptedHttpResponse {
+                status: 200,
+                content_type: "text/plain",
+                retry_after_ms: None,
+                body: Bytes::new(),
+            },
+            ScriptedHttpResponse {
+                status: 200,
+                content_type: "text/plain",
+                retry_after_ms: None,
+                body: Bytes::from_static(b"too MANY requests\r\n"),
+            },
+        ],
+        None,
+    )?;
+    let body_rate_limits = YahooExecutionLimits {
+        deadline: Instant::now() + Duration::from_secs(5),
+        maximum_cache_age: Duration::ZERO,
+    };
+    let body_rate_failure = body_rate_session
+        .execute(plan.requests[0].clone(), body_rate_limits, &cancellation)
+        .await
+        .expect_err("a crumb body rate limit must stop before any data request");
+    assert!(matches!(
+        body_rate_failure.kind,
+        YahooHttpFailureKind::CircuitOpen { .. }
+    ));
+    assert_eq!(body_rate_failure.attempts.len(), 2);
+    assert_eq!(body_rate_failure.attempts[1].status, Some(200));
+    assert!(matches!(
+        body_rate_failure.attempts[1].disposition,
+        crate::AttemptDisposition::Http429 {
+            retry_after_ms: None
+        }
+    ));
+    assert_eq!(body_rate_session.scripted_observed_targets().await.len(), 2);
+    let body_rate_snapshot = body_rate_session.admission().snapshot()?;
+    assert_eq!(body_rate_snapshot.http_429_total, 1);
+    assert_eq!(
+        body_rate_snapshot.circuit,
+        CircuitSnapshot::Open {
+            retry_at_unix_ms: body_rate_failure.attempts[1]
+                .completed_at_unix_ms
+                .saturating_add(i64::try_from(YAHOO_MISSING_RETRY_AFTER_COOLDOWN_FLOOR_MS,)?),
+        }
+    );
+    let body_rate_rejected = body_rate_session
+        .execute(plan.requests[0].clone(), body_rate_limits, &cancellation)
+        .await
+        .expect_err("the body-form rate-limit circuit must reject without another request");
+    assert!(body_rate_rejected.attempts.is_empty());
+    assert_eq!(body_rate_session.scripted_observed_targets().await.len(), 2);
+
     std::fs::remove_dir_all(state_root)?;
     Ok(())
 }

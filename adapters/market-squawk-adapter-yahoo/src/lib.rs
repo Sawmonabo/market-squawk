@@ -13,11 +13,13 @@ mod http;
 mod model;
 mod native;
 mod parse;
+mod publication;
 mod request;
 
 pub use admission::{
     AdmissionDecision, AdmissionPolicy, AdmissionRejection, AdmissionSnapshot, AttemptDisposition,
-    AttemptKind, AttemptOutcome, AttemptPermit, CircuitSnapshot, YahooAdmission,
+    AttemptKind, AttemptOutcome, AttemptPermit, CircuitSnapshot,
+    YAHOO_MISSING_RETRY_AFTER_COOLDOWN_FLOOR_MS, YahooAdmission,
 };
 pub use durable::{
     MAX_YAHOO_DURABLE_CACHE_BODY_BYTES, YahooDurableStateError, YahooDurableStateStore,
@@ -44,6 +46,9 @@ pub use native::{
 pub use parse::{
     parse_chart_response, parse_fund_response, parse_lookup_response, parse_option_response,
     parse_quote_response, parse_reference_response,
+};
+pub use publication::{
+    YahooCanonicalInstrumentAuthority, YahooCanonicalPublicationRequest, YahooSealedPublication,
 };
 pub use request::{
     AdapterBounds, ChartInterval, ChartWindow, LookupKind, YahooHttpMethod, YahooHttpRequest,

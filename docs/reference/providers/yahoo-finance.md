@@ -4,10 +4,10 @@
 | --- | --- |
 | Document type | Selected-provider target and evidence contract |
 | Audience | Operators, financial-data engineers, quantitative researchers, application integrators, and reviewers |
-| Status | Experimental explicit-demand enrichment only; no adapter, scheduled ingestion, canonical publication, or frontend composition ships yet |
+| Status | Provider-local explicit-demand adapter, durable cache/circuit, raw handoff, and canonical publication candidate implemented; application and frontend composition remain open; scheduled ingestion is prohibited |
 | Evidence cutoff | 2026-08-11, America/New_York |
-| Audit basis | `3a2f24ddbe88a886d9ba6458dd141774e3716a9d` plus the preserved working-tree overlay |
-| Refresh gate | Pin and hash the exact yfinance release/commit, freeze effective requests and schemas, and pass a normal-session benchmark before any implementation or capacity claim |
+| Audit basis | `0a1cee1e6f7cce477ad37028cb6a05a109a4c2ad` plus the preserved working-tree overlay |
+| Refresh gate | Re-audit the pinned yfinance release/commit and frozen effective requests before upgrade; require dated measurements before any provider-capacity claim |
 
 Numeric and contractual statements use the evidence labels defined in the
 [provider index](README.md).
@@ -106,13 +106,19 @@ source to become the canonical tick record.
 - **APPLICATION POLICY:** Only a user-visible, explicit-demand operation can enqueue Yahoo work.
 - **APPLICATION POLICY:** Coalesce identical in-flight requests and prefer a fresh bounded cache
   before making a network attempt.
-- **APPLICATION POLICY:** Begin with one serialized provider lane and `zero automatic transient
-  retries`. A retry requires classified transient evidence and shared budget admission.
+- **APPLICATION POLICY:** Use one application-owned session and one serialized provider lane with
+  `zero automatic transient retries`. The pinned cookie-strategy fallback is bounded, separately
+  receipted, and stops immediately on a rate-limit signal.
 - **APPLICATION POLICY:** Track logical operations, actual HTTP attempts, requested/returned/missing
   symbols, response bytes, latency, cache outcome, fallback/repair attempts, `429`, `Retry-After`,
   parse failures, and circuit state.
-- **APPLICATION POLICY:** One `429` or repeated transport/schema failure opens the provider circuit.
-  Recovery uses a single bounded half-open probe; the scheduler never tries to catch up.
+- **APPLICATION POLICY:** One HTTP `429`, or a case-insensitive `Too Many Requests` response body,
+  opens the provider circuit immediately. A usable `Retry-After` value is authoritative and used
+  exactly, including when it is shorter than the local fallback. Only when Yahoo supplies no usable
+  recovery value does the configured delay apply, subject to a code-owned one-hour safety floor.
+  That missing-header fallback is a conservative application safeguard, not a Yahoo capacity or
+  reset-window claim. Recovery uses a single bounded half-open probe; the application never tries
+  to catch up.
 - **APPLICATION POLICY:** No recurring daily request target is admitted until a dated,
   normal-session benchmark establishes sustainable behavior.
 
@@ -164,16 +170,19 @@ workflow and never overwrite a governed observation silently.
 
 ## Repository integration seams and current status
 
-No Yahoo/yfinance adapter, profile, rate lane, raw publisher, canonical mapper, typed operation, or
-frontend composition currently exists.
+The provider-local Rust adapter now owns explicit-demand planning, bounded request execution,
+fresh-cache and in-flight reuse, a persistent circuit/telemetry snapshot, typed parsing, raw-sealer
+handoff, and provider-local canonical publication preparation. It deliberately has no scheduler.
+Application ownership of the single session, manifest/PIT composition, typed product operation,
+doctor surface, and frontend composition remain open.
 
 | Seam | Required integration |
 | --- | --- |
-| Profile/admission | Add one experimental, no-secret profile through the existing provider onboarding and activation framework |
-| Provider rate/circuit | Reuse the shared `ProviderRateAuthority` and persistent provider health; count actual attempts |
-| Bounded request worker | Add a pinned, cancellable adapter with cache/coalescing and strict output/deadline limits |
-| Raw and canonical data | Reuse content-addressed receipts, Arrow validation, schema registry, immutable Parquet manifests, and PIT selection |
-| Application composition | Add a bounded typed enrichment operation and explicit provenance/freshness UI; no raw provider object crosses the boundary |
+| Profile/admission | Provider-local admission exists; add one application-owned experimental session through onboarding and activation so independently constructed sessions cannot create parallel lanes |
+| Provider rate/circuit | Durable provider-local circuit and actual-attempt accounting exist; compose their health truth into shared application status |
+| Bounded request worker | Implemented for the admitted REST families with cache/coalescing, cancellation, fixed output/deadline limits, and no automatic transient retries |
+| Raw and canonical data | Provider-local sealed-capture rejoin and canonical preparation exist; shared immutable manifest and PIT publication remain an application-owned seam |
+| Application composition | Add a bounded typed enrichment operation and explicit provenance/freshness/circuit UI; no raw provider object crosses the boundary |
 
 ## Doctor and end-to-end acceptance gates
 
@@ -200,7 +209,8 @@ Availability requires:
 - Normal-session sustainable request and stream capacity is unmeasured.
 - Quote component consistency, venue/feed semantics, fund coverage, option-chain completeness, and
   action-history point-in-time behavior are not established.
-- The exact implementation mechanism is not selected, and no repository integration ships.
+- The provider-local implementation is not yet composed into application-owned manifest/PIT reads,
+  doctor, or Desktop workflows.
 - This source cannot close consolidated quote, authoritative option quote, survivorship-safe
   identity, or complete point-in-time corporate-action gaps.
 
@@ -209,6 +219,8 @@ Availability requires:
 - [Yahoo developer API catalog](https://developer.yahoo.com/api/)
 - [Yahoo Finance exchange and data delays](https://help.yahoo.com/kb/finance/article-exchanges-data-delays-sln2310.html)
 - [yfinance API reference](https://ranaroussi.github.io/yfinance/reference/index.html)
+- [yfinance configuration and retry defaults](https://ranaroussi.github.io/yfinance/advanced/config.html)
+- [Pinned yfinance request/session implementation](https://github.com/ranaroussi/yfinance/blob/beac22d981ab37362a70c9e4e49261ac622acbe4/yfinance/data.py)
 - [yfinance download reference](https://ranaroussi.github.io/yfinance/reference/api/yfinance.download.html)
 - [yfinance Ticker reference](https://ranaroussi.github.io/yfinance/reference/api/yfinance.Ticker.html)
 - [yfinance WebSocket reference](https://ranaroussi.github.io/yfinance/reference/api/yfinance.WebSocket.html)

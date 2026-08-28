@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use market_squawk_domain::{MetadataRevision, SourceId};
+use serde::Serialize;
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -20,20 +21,23 @@ use crate::{
 };
 
 /// Price fields requested and retained by the pinned chart request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum YahooChartAdjustmentMode {
     /// OHLCV remains provider-raw while adjusted close is retained as a separate provider field.
     RawOhlcvWithSeparateAdjustedClose,
 }
 
 /// Corporate-action families requested alongside the chart response.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum YahooChartActionScope {
     DividendsSplitsAndCapitalGains,
 }
 
 /// Provider request scope for extended-session rows.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum YahooChartSessionScope {
     RegularOnly,
     IncludePreAndPost,
@@ -43,7 +47,8 @@ pub enum YahooChartSessionScope {
 ///
 /// This value is provider evidence, not exchange-calendar authority. Yahoo does not classify each
 /// returned chart timestamp as pre-market, regular, or post-market in this response family.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct YahooChartRequestEvidence {
     interval: ChartInterval,
     window: ChartWindow,
@@ -188,6 +193,13 @@ impl YahooNativePublicationEvidence {
             enrichment,
             request_evidence,
         })
+    }
+
+    pub(crate) const fn chart_request_evidence(&self) -> Option<&YahooChartRequestEvidence> {
+        match self {
+            Self::Chart(evidence) => Some(evidence),
+            Self::Other => None,
+        }
     }
 }
 

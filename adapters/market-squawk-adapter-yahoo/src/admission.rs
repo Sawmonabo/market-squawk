@@ -5,9 +5,15 @@ use thiserror::Error;
 
 use crate::{YahooAdapterError, YahooHttpRequest};
 
+/// Code-owned fallback delay when Yahoo supplies no usable `Retry-After` value.
+///
+/// This is deliberately a conservative local safety floor, not a claim about provider capacity.
+/// Any usable provider-supplied recovery delay is authoritative instead.
+pub const YAHOO_MISSING_RETRY_AFTER_COOLDOWN_FLOOR_MS: u64 = 60 * 60 * 1_000;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AdmissionPolicy {
-    /// Application-owned recovery delay when the response supplies no usable Retry-After value.
+    /// Application-requested fallback when Yahoo supplies no usable `Retry-After` value.
     pub circuit_cooldown_ms: u64,
     /// Application-owned count of consecutive transport/schema failures that opens the circuit.
     pub repeated_failure_threshold: u32,
@@ -586,7 +592,12 @@ fn increment_failure(state: &mut AdmissionState) -> Result<bool, AdmissionReject
 }
 
 fn open_circuit(state: &mut AdmissionState, now_unix_ms: i64, retry_after_ms: Option<u64>) {
-    let delay = retry_after_ms.unwrap_or(state.policy.circuit_cooldown_ms);
+    let delay = retry_after_ms.unwrap_or_else(|| {
+        state
+            .policy
+            .circuit_cooldown_ms
+            .max(YAHOO_MISSING_RETRY_AFTER_COOLDOWN_FLOOR_MS)
+    });
     state.circuit = CircuitState::Open {
         retry_at_unix_ms: add_millis(now_unix_ms, delay),
     };
