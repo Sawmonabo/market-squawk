@@ -12,13 +12,15 @@ use thiserror::Error;
 use super::{ExtractionBatch, ExtractionContentIdentity, MAX_EXTRACTION_RECORDS};
 
 const SCHEMA_FINGERPRINT_DOMAIN: &[u8] =
-    b"market-squawk/provider-native-lineage/schema-fingerprint/v1";
-const BATCH_DIGEST_DOMAIN: &[u8] = b"market-squawk/provider-native-lineage/batch/v1";
+    b"market-squawk/provider-native-lineage/schema-fingerprint/v2";
+const BATCH_DIGEST_DOMAIN: &[u8] = b"market-squawk/provider-native-lineage/batch/v2";
 
 /// Current code-owned provider-native lineage schema version.
-pub const PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION: u16 = 1;
+pub const PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION: u16 = 2;
 /// Maximum exact provider-native semantic bytes retained beside one canonical record.
 pub const MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES: usize = 64 * 1024;
+/// Maximum exact provider-native batch-level semantic evidence.
+pub const MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum checked deep bytes retained by one provider-native lineage batch.
 pub const MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
@@ -125,6 +127,29 @@ pub struct ProviderNativeLineageRow {
     semantic_payload_digest: EvidenceDigest,
 }
 
+/// Optional exact provider-native semantics that apply to the complete response or bulk artifact.
+///
+/// This value is non-cloneable and carries no publication authority. It is intended for bounded
+/// evidence such as SEC filing nil/non-numeric dispositions or bulk manifest, coverage, topology,
+/// and physical-receipt semantics that cannot truthfully be repeated on every canonical row.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ProviderNativeLineageBatchSidecar {
+    semantic_payload: Bytes,
+    semantic_payload_digest: EvidenceDigest,
+}
+
+impl ProviderNativeLineageBatchSidecar {
+    /// Returns the exact adapter-encoded batch-level semantic payload.
+    pub fn semantic_payload(&self) -> &Bytes {
+        &self.semantic_payload
+    }
+
+    /// Returns SHA-256 of the exact batch-level semantic payload bytes.
+    pub const fn semantic_payload_digest(&self) -> EvidenceDigest {
+        self.semantic_payload_digest
+    }
+}
+
 impl ProviderNativeLineageRow {
     /// Returns the zero-based contiguous canonical record ordinal.
     pub const fn ordinal(&self) -> u32 {
@@ -208,12 +233,64 @@ impl<'a> ProviderNativeLineageRowEvidenceRef<'a> {
     }
 }
 
+/// Checked borrowed restart projection of optional batch-level native semantics.
+///
+/// This value is validation-only: it exposes no builder, sealing, or publication capability.
+#[derive(Debug)]
+pub struct ProviderNativeLineageBatchSidecarEvidenceRef<'a> {
+    semantic_payload: &'a [u8],
+    semantic_payload_digest: EvidenceDigest,
+}
+
+impl<'a> ProviderNativeLineageBatchSidecarEvidenceRef<'a> {
+    /// Validates bounded persisted sidecar bytes and their exact SHA-256 identity.
+    pub fn try_new(
+        semantic_payload: &'a [u8],
+        semantic_payload_digest: EvidenceDigest,
+    ) -> Result<Self, ProviderNativeLineageError> {
+        if semantic_payload.is_empty() {
+            return Err(ProviderNativeLineageError::EmptySidecarPayload);
+        }
+        if semantic_payload.len() > MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES {
+            return Err(ProviderNativeLineageError::SidecarByteLimitExceeded {
+                max: MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES,
+            });
+        }
+        require_sha256_nonzero(semantic_payload_digest)?;
+        if semantic_payload_digest != sha256(semantic_payload) {
+            return Err(ProviderNativeLineageError::AlignmentMismatch);
+        }
+        Ok(Self {
+            semantic_payload,
+            semantic_payload_digest,
+        })
+    }
+
+    /// Returns the exact borrowed sidecar bytes for sibling value-only verifiers.
+    pub const fn semantic_payload(&self) -> &'a [u8] {
+        self.semantic_payload
+    }
+
+    /// Returns SHA-256 of the exact borrowed sidecar bytes.
+    pub const fn semantic_payload_digest(&self) -> EvidenceDigest {
+        self.semantic_payload_digest
+    }
+
+    fn digest_evidence(&self) -> ProviderNativeLineageSidecarDigestEvidence {
+        ProviderNativeLineageSidecarDigestEvidence {
+            semantic_payload_bytes: self.semantic_payload.len(),
+            semantic_payload_digest: self.semantic_payload_digest,
+        }
+    }
+}
+
 /// Non-cloneable, bounded provider-native evidence aligned one-for-one to a canonical batch.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ProviderNativeLineageBatch {
     schema: ProviderNativeLineageSchema,
     content_identity: ExtractionContentIdentity,
     rows: Box<[ProviderNativeLineageRow]>,
+    batch_sidecar: Option<ProviderNativeLineageBatchSidecar>,
     batch_digest: EvidenceDigest,
 }
 
@@ -231,6 +308,11 @@ impl ProviderNativeLineageBatch {
     /// Returns exact contiguous rows in canonical input order.
     pub const fn rows(&self) -> &[ProviderNativeLineageRow] {
         &self.rows
+    }
+
+    /// Returns optional exact batch-level provider-native semantics.
+    pub const fn batch_sidecar(&self) -> Option<&ProviderNativeLineageBatchSidecar> {
+        self.batch_sidecar.as_ref()
     }
 
     /// Returns the deterministic digest of schema and every aligned row identity.
@@ -275,7 +357,27 @@ impl ProviderNativeLineageBatch {
                 return Err(ProviderNativeLineageError::AlignmentMismatch);
             }
         }
-        if self.batch_digest != batch_digest(self.schema, self.content_identity, &self.rows)? {
+        if let Some(sidecar) = self.batch_sidecar.as_ref() {
+            retained_bytes = retained_bytes
+                .checked_add(size_of::<ProviderNativeLineageBatchSidecar>())
+                .and_then(|bytes| bytes.checked_add(sidecar.semantic_payload.len()))
+                .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
+            if sidecar.semantic_payload.is_empty()
+                || sidecar.semantic_payload.len() > MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES
+                || sidecar.semantic_payload_digest != sha256(&sidecar.semantic_payload)
+                || retained_bytes > MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES
+            {
+                return Err(ProviderNativeLineageError::AlignmentMismatch);
+            }
+        }
+        if self.batch_digest
+            != batch_digest(
+                self.schema,
+                self.content_identity,
+                &self.rows,
+                self.batch_sidecar.as_ref(),
+            )?
+        {
             return Err(ProviderNativeLineageError::AlignmentMismatch);
         }
         Ok(())
@@ -300,6 +402,7 @@ pub fn verify_provider_native_lineage_batch_evidence(
     extraction_content_digest: EvidenceDigest,
     extraction_record_count: usize,
     rows: &[ProviderNativeLineageRowEvidenceRef<'_>],
+    batch_sidecar: Option<&ProviderNativeLineageBatchSidecarEvidenceRef<'_>>,
 ) -> Result<(), ProviderNativeLineageError> {
     require_sha256_nonzero(expected_batch_digest)?;
     require_sha256_nonzero(extraction_content_digest)?;
@@ -335,12 +438,26 @@ pub fn verify_provider_native_lineage_batch_evidence(
         require_sha256_nonzero(row.canonical_record_digest)?;
         require_sha256_nonzero(row.semantic_payload_digest)?;
     }
+    if let Some(sidecar) = batch_sidecar {
+        retained_bytes = retained_bytes
+            .checked_add(size_of::<ProviderNativeLineageBatchSidecar>())
+            .and_then(|bytes| bytes.checked_add(sidecar.semantic_payload.len()))
+            .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
+        if sidecar.semantic_payload.is_empty()
+            || sidecar.semantic_payload.len() > MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES
+            || sidecar.semantic_payload_digest != sha256(sidecar.semantic_payload)
+            || retained_bytes > MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES
+        {
+            return Err(ProviderNativeLineageError::AlignmentMismatch);
+        }
+    }
     let observed = batch_digest_from_rows(
         schema,
         extraction_content_digest,
         extraction_record_count,
         rows.iter()
             .map(ProviderNativeLineageRowEvidenceRef::digest_row),
+        batch_sidecar.map(ProviderNativeLineageBatchSidecarEvidenceRef::digest_evidence),
     )?;
     if observed != expected_batch_digest {
         return Err(ProviderNativeLineageError::AlignmentMismatch);
@@ -359,6 +476,7 @@ pub struct ProviderNativeLineageBatchBuilder<'batch> {
     batch: &'batch ExtractionBatch,
     content_identity: ExtractionContentIdentity,
     rows: Vec<ProviderNativeLineageRow>,
+    batch_sidecar: Option<ProviderNativeLineageBatchSidecar>,
     retained_bytes: usize,
 }
 
@@ -405,8 +523,41 @@ impl<'batch> ProviderNativeLineageBatchBuilder<'batch> {
             batch,
             content_identity,
             rows,
+            batch_sidecar: None,
             retained_bytes,
         })
+    }
+
+    /// Serializes and retains the sole optional batch-level provider-native semantic payload.
+    ///
+    /// The sidecar is implementation-specific evidence for facts that apply to the response or
+    /// bulk artifact as a whole. Calling this method more than once is rejected.
+    pub fn try_set_batch_sidecar<T>(&mut self, value: &T) -> Result<(), ProviderNativeLineageError>
+    where
+        T: Serialize + ?Sized,
+    {
+        if self.batch_sidecar.is_some() {
+            return Err(ProviderNativeLineageError::SidecarAlreadyPresent);
+        }
+        let payload = serialize_provider_native_lineage_sidecar(value)?;
+        let retained_bytes = self
+            .retained_bytes
+            .checked_add(size_of::<ProviderNativeLineageBatchSidecar>())
+            .and_then(|bytes| bytes.checked_add(payload.len()))
+            .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
+        if retained_bytes > MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES {
+            return Err(ProviderNativeLineageError::BatchByteLimitExceeded {
+                max: MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES,
+            });
+        }
+        let semantic_payload = Bytes::from(payload);
+        let semantic_payload_digest = sha256(&semantic_payload);
+        self.batch_sidecar = Some(ProviderNativeLineageBatchSidecar {
+            semantic_payload,
+            semantic_payload_digest,
+        });
+        self.retained_bytes = retained_bytes;
+        Ok(())
     }
 
     /// Serializes and retains the next provider-native semantic row under the common bounds.
@@ -438,7 +589,7 @@ impl<'batch> ProviderNativeLineageBatchBuilder<'batch> {
                 max: MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES,
             });
         }
-        let semantic_payload = Bytes::from(semantic_payload.into_boxed_slice().into_vec());
+        let semantic_payload = Bytes::from(semantic_payload);
         let semantic_payload_digest = sha256(&semantic_payload);
         self.rows.push(ProviderNativeLineageRow {
             ordinal: u32::try_from(ordinal)
@@ -459,11 +610,17 @@ impl<'batch> ProviderNativeLineageBatchBuilder<'batch> {
             return Err(ProviderNativeLineageError::RowCountMismatch { expected, observed });
         }
         let rows = self.rows.into_boxed_slice();
-        let batch_digest = batch_digest(self.schema, self.content_identity, &rows)?;
+        let batch_digest = batch_digest(
+            self.schema,
+            self.content_identity,
+            &rows,
+            self.batch_sidecar.as_ref(),
+        )?;
         Ok(ProviderNativeLineageBatch {
             schema: self.schema,
             content_identity: self.content_identity,
             rows,
+            batch_sidecar: self.batch_sidecar,
             batch_digest,
         })
     }
@@ -494,6 +651,18 @@ pub enum ProviderNativeLineageError {
         /// Inclusive byte ceiling.
         max: usize,
     },
+    /// The optional batch-level semantic payload was empty.
+    #[error("provider-native lineage batch sidecar semantic payload is empty")]
+    EmptySidecarPayload,
+    /// The optional batch-level semantic payload exceeded its byte ceiling.
+    #[error("provider-native lineage batch sidecar exceeds {max} bytes")]
+    SidecarByteLimitExceeded {
+        /// Inclusive byte ceiling.
+        max: usize,
+    },
+    /// One builder attempted to retain more than one batch-level sidecar.
+    #[error("provider-native lineage batch sidecar is already present")]
+    SidecarAlreadyPresent,
     /// The row count exceeded the extraction batch ceiling.
     #[error("provider-native lineage exceeds {max} rows")]
     RecordLimitExceeded {
@@ -527,7 +696,7 @@ fn serialize_provider_native_lineage_row<T>(
 where
     T: Serialize + ?Sized,
 {
-    let mut writer = BoundedNativeLineageWriter::default();
+    let mut writer = BoundedNativeLineageWriter::new(MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES);
     if serde_json::to_writer(&mut writer, value).is_err() {
         return Err(if writer.limit_exceeded {
             ProviderNativeLineageError::RowByteLimitExceeded {
@@ -546,11 +715,46 @@ where
     Ok(writer.bytes)
 }
 
-#[derive(Default)]
+fn serialize_provider_native_lineage_sidecar<T>(
+    value: &T,
+) -> Result<Vec<u8>, ProviderNativeLineageError>
+where
+    T: Serialize + ?Sized,
+{
+    let mut writer = BoundedNativeLineageWriter::new(MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES);
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return Err(if writer.limit_exceeded {
+            ProviderNativeLineageError::SidecarByteLimitExceeded {
+                max: MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES,
+            }
+        } else if writer.allocation_failed {
+            ProviderNativeLineageError::AllocationFailure
+        } else {
+            ProviderNativeLineageError::SerializationFailure
+        });
+    }
+    if writer.bytes.is_empty() {
+        return Err(ProviderNativeLineageError::EmptySidecarPayload);
+    }
+    Ok(writer.bytes)
+}
+
 struct BoundedNativeLineageWriter {
     bytes: Vec<u8>,
+    maximum: usize,
     limit_exceeded: bool,
     allocation_failed: bool,
+}
+
+impl BoundedNativeLineageWriter {
+    fn new(maximum: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum,
+            limit_exceeded: false,
+            allocation_failed: false,
+        }
+    }
 }
 
 impl Write for BoundedNativeLineageWriter {
@@ -562,7 +766,7 @@ impl Write for BoundedNativeLineageWriter {
                 "provider-native lineage row length overflow",
             ));
         };
-        if next_len > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES {
+        if next_len > self.maximum {
             self.limit_exceeded = true;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -592,10 +796,17 @@ struct ProviderNativeLineageDigestRow {
     semantic_payload_digest: EvidenceDigest,
 }
 
+#[derive(Clone, Copy)]
+struct ProviderNativeLineageSidecarDigestEvidence {
+    semantic_payload_bytes: usize,
+    semantic_payload_digest: EvidenceDigest,
+}
+
 fn batch_digest(
     schema: ProviderNativeLineageSchema,
     content_identity: ExtractionContentIdentity,
     rows: &[ProviderNativeLineageRow],
+    batch_sidecar: Option<&ProviderNativeLineageBatchSidecar>,
 ) -> Result<EvidenceDigest, ProviderNativeLineageError> {
     batch_digest_from_rows(
         schema,
@@ -607,6 +818,10 @@ fn batch_digest(
             semantic_payload_bytes: row.semantic_payload.len(),
             semantic_payload_digest: row.semantic_payload_digest,
         }),
+        batch_sidecar.map(|sidecar| ProviderNativeLineageSidecarDigestEvidence {
+            semantic_payload_bytes: sidecar.semantic_payload.len(),
+            semantic_payload_digest: sidecar.semantic_payload_digest,
+        }),
     )
 }
 
@@ -615,6 +830,7 @@ fn batch_digest_from_rows(
     extraction_content_digest: EvidenceDigest,
     extraction_record_count: usize,
     rows: impl ExactSizeIterator<Item = ProviderNativeLineageDigestRow>,
+    batch_sidecar: Option<ProviderNativeLineageSidecarDigestEvidence>,
 ) -> Result<EvidenceDigest, ProviderNativeLineageError> {
     let mut digest = Sha256::new();
     hash_checked_field(&mut digest, BATCH_DIGEST_DOMAIN)?;
@@ -641,6 +857,15 @@ fn batch_digest_from_rows(
                 .to_be_bytes(),
         );
         hash_evidence(&mut digest, row.semantic_payload_digest);
+    }
+    digest.update([u8::from(batch_sidecar.is_some())]);
+    if let Some(sidecar) = batch_sidecar {
+        digest.update(
+            u64::try_from(sidecar.semantic_payload_bytes)
+                .map_err(|_| ProviderNativeLineageError::ByteCountOverflow)?
+                .to_be_bytes(),
+        );
+        hash_evidence(&mut digest, sidecar.semantic_payload_digest);
     }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,

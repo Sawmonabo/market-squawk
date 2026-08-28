@@ -47,7 +47,7 @@ use crate::{
     SchwabHttpWireResponse, SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError,
     SchwabOAuthAuthorityStatus, SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire,
     SchwabOAuthWireError, SchwabOAuthWireRequest, SchwabOAuthWireResponse,
-    SchwabObservedCapabilityFamily, SchwabOptionCandidateAbstention, SchwabOptionCandidateOutcome,
+    SchwabObservedCapabilityFamily, SchwabOptionCandidateOutcome,
     SchwabPriceHistoryCapabilityObservation, SchwabPriceHistoryMarketDataEvidence,
     SchwabResolvedProviderIdentity, SchwabRestDelayEvidence, SchwabRestExecutor, SchwabRestFamily,
     SchwabRestFamilyDoctorInput, SchwabRestOptionContractRequest,
@@ -105,34 +105,6 @@ impl SchwabOAuthWire for ShortLivedOAuthWire {
                 br#"{"access_token":"short-access","refresh_token":"short-refresh","token_type":"Bearer","expires_in":30,"scope":"market-data"}"#.to_vec(),
                 nonzero(4 * 1024),
             )
-        })
-    }
-}
-
-#[derive(Debug, Default)]
-struct RetryableRefreshOAuthWire {
-    calls: Mutex<u64>,
-}
-
-impl SchwabOAuthWire for RetryableRefreshOAuthWire {
-    fn exchange(
-        &self,
-        _request: SchwabOAuthWireRequest,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<SchwabOAuthWireResponse, SchwabOAuthWireError>> + Send + '_>,
-    > {
-        Box::pin(async move {
-            let mut calls = self
-                .calls
-                .lock()
-                .map_err(|_| SchwabOAuthWireError::Network)?;
-            *calls = calls.checked_add(1).ok_or(SchwabOAuthWireError::Network)?;
-            let body = match *calls {
-                1 => br#"{"access_token":"initial-access","refresh_token":"initial-refresh","token_type":"Bearer","expires_in":30,"scope":"market-data"}"#.as_slice(),
-                2 => br#"{"malformed":"retryable-parse-failure"}"#.as_slice(),
-                _ => br#"{"access_token":"refreshed-access","refresh_token":"refreshed-refresh","token_type":"Bearer","expires_in":30,"scope":"market-data"}"#.as_slice(),
-            };
-            SchwabOAuthWireResponse::try_new(200, body.to_vec(), nonzero(4 * 1024))
         })
     }
 }

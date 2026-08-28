@@ -12,6 +12,7 @@ mod identifiers;
 mod identity;
 mod instrument;
 mod market;
+mod option_market;
 mod order;
 mod provenance;
 mod research;
@@ -95,6 +96,13 @@ pub use market::{
     BookSnapshotEvent, CorporateActionEvent, CorporateActionKind, HaltTransition,
     InstrumentStatusEvent, MarketEvent, MarketEventError, MarketSide, MergerConsideration,
     QuoteEvent, TradeEvent, TradeTakerOrderType, TradingHaltEvent,
+};
+pub use option_market::{
+    MAX_OPTION_TRADE_CONDITIONS, OptionComponent, OptionComponentState, OptionContractTerms,
+    OptionContractTermsInput, OptionExerciseStyle, OptionExpirationClass,
+    OptionExpirationObservation, OptionExpirationObservationInput, OptionMarketError,
+    OptionSettlementKind, OptionSnapshotObservation, OptionSnapshotObservationInput,
+    OptionUnderlyingObservation,
 };
 pub use order::{
     InstrumentDefinitionRevision, InstrumentExecutionTerms, OrderContractError, OrderReasonCode,

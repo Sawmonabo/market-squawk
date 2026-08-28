@@ -1,5 +1,18 @@
 //! Bounded, source-neutral provider response capture receipts.
 
+mod market_event;
+
+pub use market_event::{
+    MAX_PROVIDER_MARKET_EVENT_BATCH_BYTES, MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS,
+    PROVIDER_MARKET_EVENT_SCHEMA_VERSION, ProviderEventMicrobatchBindingDigest,
+    ProviderEventMicrobatchRowFrame, ProviderEventMicrobatchRowFrameEvidence,
+    ProviderMarketEventBatch, ProviderMarketEventContentIdentity,
+    ProviderMarketEventNativeLineageBatch, ProviderMarketEventNativeLineageRowEvidenceRef,
+    ProviderResponseMarketEventBindingDigest, ProviderResponseMarketEventRowFrameEvidence,
+    SealedProviderEventMicrobatchBinding, SealedProviderResponseMarketEventBinding,
+    verify_provider_market_event_native_lineage_batch_evidence,
+};
+
 use std::mem::size_of;
 use std::num::NonZeroU16;
 use std::sync::Arc;
@@ -4364,6 +4377,7 @@ mod tests {
             persisted_content.digest(),
             persisted_content.record_count(),
             &persisted_native_rows,
+            None,
         )?;
         assert_eq!(
             verify_provider_native_lineage_batch_evidence(
@@ -4374,6 +4388,7 @@ mod tests {
                 persisted_content.digest(),
                 persisted_content.record_count(),
                 &persisted_native_rows,
+                None,
             ),
             Err(ProviderNativeLineageError::AlignmentMismatch)
         );

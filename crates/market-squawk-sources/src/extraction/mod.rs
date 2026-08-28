@@ -4,6 +4,7 @@ mod batch;
 mod capture;
 mod contracts;
 mod native_lineage;
+mod option_market;
 mod revisions;
 
 use futures_util::future::BoxFuture;
@@ -23,19 +24,26 @@ pub use capture::{
     MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS, MAX_PROVIDER_CAPTURE_BYTES,
     MAX_PROVIDER_CAPTURE_PAGE_BYTES, MAX_PROVIDER_CAPTURE_PAGES,
     MAX_PROVIDER_EVENT_MICROBATCH_BYTES, MAX_PROVIDER_EVENT_MICROBATCH_FRAMES,
-    ProviderCaptureBindingDigest, ProviderCaptureBindingLayout, ProviderCaptureComponentToken,
-    ProviderCaptureComponentTokenSet, ProviderCaptureError, ProviderCaptureMaterial,
-    ProviderCaptureMaterialSealError, ProviderCapturePageReceipt,
-    ProviderCapturePhysicalClaimEvidenceRef, ProviderCaptureRequestGraphComponent,
-    ProviderCaptureRowFrame, ProviderCaptureRowFrameEvidence, ProviderCaptureScope,
-    ProviderCaptureSealExpectation, ProviderCaptureSealRequest, ProviderCaptureSemanticBinding,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    ProviderEventMicrobatchFrameReceipt, ProviderEventMicrobatchMaterial,
-    ProviderEventMicrobatchReceipt, ProviderEventMicrobatchSealExpectation,
-    ProviderEventMicrobatchToken, ProviderOrderedCaptureSegments, ProviderWholeCaptureToken,
-    RejoinedProviderCapture, SealedProviderCaptureBinding, SealedProviderCaptureMaterial,
-    SealedProviderCaptureSetReceipt, SealedProviderEventMicrobatchReceipt,
-    SourceObjectCaptureIdentity,
+    MAX_PROVIDER_MARKET_EVENT_BATCH_BYTES, MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS,
+    PROVIDER_MARKET_EVENT_SCHEMA_VERSION, ProviderCaptureBindingDigest,
+    ProviderCaptureBindingLayout, ProviderCaptureComponentToken, ProviderCaptureComponentTokenSet,
+    ProviderCaptureError, ProviderCaptureMaterial, ProviderCaptureMaterialSealError,
+    ProviderCapturePageReceipt, ProviderCapturePhysicalClaimEvidenceRef,
+    ProviderCaptureRequestGraphComponent, ProviderCaptureRowFrame, ProviderCaptureRowFrameEvidence,
+    ProviderCaptureScope, ProviderCaptureSealExpectation, ProviderCaptureSealRequest,
+    ProviderCaptureSemanticBinding, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    ProviderEventMicrobatchBindingDigest, ProviderEventMicrobatchFrameReceipt,
+    ProviderEventMicrobatchMaterial, ProviderEventMicrobatchReceipt,
+    ProviderEventMicrobatchRowFrame, ProviderEventMicrobatchRowFrameEvidence,
+    ProviderEventMicrobatchSealExpectation, ProviderEventMicrobatchToken, ProviderMarketEventBatch,
+    ProviderMarketEventContentIdentity, ProviderMarketEventNativeLineageBatch,
+    ProviderMarketEventNativeLineageRowEvidenceRef, ProviderOrderedCaptureSegments,
+    ProviderResponseMarketEventBindingDigest, ProviderResponseMarketEventRowFrameEvidence,
+    ProviderWholeCaptureToken, RejoinedProviderCapture, SealedProviderCaptureBinding,
+    SealedProviderCaptureMaterial, SealedProviderCaptureSetReceipt,
+    SealedProviderEventMicrobatchBinding, SealedProviderEventMicrobatchReceipt,
+    SealedProviderResponseMarketEventBinding, SourceObjectCaptureIdentity,
+    verify_provider_market_event_native_lineage_batch_evidence,
 };
 pub use contracts::{
     AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryBatch, DiscoveryRequest,
@@ -46,11 +54,23 @@ pub use contracts::{
 };
 pub use native_lineage::{
     MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
-    PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION, ProviderNativeLineageBatch,
-    ProviderNativeLineageBatchBuilder, ProviderNativeLineageError,
-    ProviderNativeLineageImplementation, ProviderNativeLineageRow,
+    MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES, PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION,
+    ProviderNativeLineageBatch, ProviderNativeLineageBatchBuilder,
+    ProviderNativeLineageBatchSidecar, ProviderNativeLineageBatchSidecarEvidenceRef,
+    ProviderNativeLineageError, ProviderNativeLineageImplementation, ProviderNativeLineageRow,
     ProviderNativeLineageRowEvidenceRef, ProviderNativeLineageSchema,
     verify_provider_native_lineage_batch_evidence,
+};
+pub use option_market::{
+    MAX_OPTION_REQUEST_CONTRACTS, MAX_PROVIDER_OPTION_MARKET_BATCH_BYTES,
+    MAX_PROVIDER_OPTION_MARKET_BATCH_ROWS, MAX_PROVIDER_OPTION_MARKET_ROW_BYTES,
+    OptionExpirationRange, OptionMarketBatchDisposition, OptionMarketBatchKind,
+    OptionMarketCompleteness, OptionMarketCompletenessInput, OptionMarketCursorState,
+    OptionMarketRequestFilter, OptionMarketRequestScope, OptionMarketRequestScopeInput,
+    OptionStrikeRange, PROVIDER_OPTION_MARKET_SCHEMA_VERSION, ProviderOptionMarketBatch,
+    ProviderOptionMarketBindingDigest, ProviderOptionMarketContentIdentity,
+    ProviderOptionMarketNativeLineageBatch, ProviderOptionMarketRowFrame,
+    SealedProviderOptionMarketBinding,
 };
 pub use revisions::{
     CanonicalObservationFamily, CanonicalObservationPayload, ExtractionRevisionEvidence,
