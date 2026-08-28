@@ -11,8 +11,8 @@ use market_squawk_data::{
     FeatureLabelDataset, IngestError, IngestIdentity, IngestPrecommitAuthority,
     InstrumentDefinitionReadCapability, ManifestCatalogError, MarketDataInstrumentReadCapability,
     MarketDataInstrumentSynchronizationCapability, ObjectStoreConfig, OnboardingCatalogCapability,
-    ResearchIngestService, RightsDecisionInput, RightsError, SourceOperation,
-    extraction_provider_payload_digest,
+    ProviderPublicationInput, ResearchIngestService, RightsDecisionInput, RightsError,
+    SourceOperation, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     CompanyIdentityObservation, DigestAlgorithm, ExactPayloadEvidence, InstrumentDefinition,
@@ -22,12 +22,13 @@ use market_squawk_platform::{
     LocalPaths, PathError, SealedResearchJournalStore, SealedResearchJournalStoreError, SecretStore,
 };
 use market_squawk_sources::{
-    ExtractionBatch, ExtractionRevisionPlan, ProviderCaptureMaterial,
-    ProviderCaptureMaterialSealError, ProviderCaptureSealRequest, ProviderRateAuthority,
+    ExtractionBatch, ExtractionRevisionPlan, ProviderCaptureMaterialSealError,
+    ProviderCaptureSealRequest, ProviderRateAuthority, SealedProviderCaptureBinding,
     SealedProviderCaptureMaterial, SourceClass, SourceMetadata, SourceObjectCaptureIdentity,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::{ProviderOnboardingError, ProviderOnboardingService};
@@ -40,11 +41,18 @@ pub struct ResearchIngestRequest {
     rights: RightsDecisionInput,
     identity: IngestIdentity,
     analytical_dataset: DatasetId,
-    batch: ExtractionBatch,
-    revisions: Option<ExtractionRevisionPlan>,
+    payload: ResearchIngestPayload,
     company_identity: Option<CompanyIdentityObservation>,
-    capture_material: Option<ProviderCaptureMaterial>,
     precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
+}
+
+#[derive(Debug)]
+enum ResearchIngestPayload {
+    Local(ExtractionBatch),
+    Provider {
+        sealed_capture: SealedProviderCaptureBinding,
+        revisions: ExtractionRevisionPlan,
+    },
 }
 
 impl ResearchIngestRequest {
@@ -55,105 +63,71 @@ impl ResearchIngestRequest {
         analytical_dataset: DatasetId,
         batch: ExtractionBatch,
     ) -> Result<Self, ResearchServiceError> {
-        Self::try_new(source, rights, analytical_dataset, batch, None, None)
+        Self::try_new_local(source, rights, analytical_dataset, batch)
     }
 
-    /// Constructs an ingest with one explicit provider revision decision per normalized record.
-    pub fn with_provider_revisions(
+    /// Constructs a provider ingest from one adapter-produced canonical/native/physical binding.
+    pub fn with_provider_publication(
         source: SourceMetadata,
         rights: RightsDecisionInput,
         analytical_dataset: DatasetId,
-        batch: ExtractionBatch,
+        sealed_capture: SealedProviderCaptureBinding,
         revisions: ExtractionRevisionPlan,
     ) -> Result<Self, ResearchServiceError> {
-        Self::try_new(
-            source,
-            rights,
-            analytical_dataset,
-            batch,
-            Some(revisions),
-            None,
-        )
-    }
-
-    /// Constructs a remote-provider ingest whose complete exact request graph must be sealed.
-    pub fn with_provider_revisions_and_capture(
-        source: SourceMetadata,
-        rights: RightsDecisionInput,
-        analytical_dataset: DatasetId,
-        batch: ExtractionBatch,
-        revisions: ExtractionRevisionPlan,
-        capture_material: ProviderCaptureMaterial,
-    ) -> Result<Self, ResearchServiceError> {
-        Self::try_new(
-            source,
-            rights,
-            analytical_dataset,
-            batch,
-            Some(revisions),
-            Some(capture_material),
-        )
-    }
-
-    fn try_new(
-        source: SourceMetadata,
-        rights: RightsDecisionInput,
-        analytical_dataset: DatasetId,
-        batch: ExtractionBatch,
-        revisions: Option<ExtractionRevisionPlan>,
-        capture_material: Option<ProviderCaptureMaterial>,
-    ) -> Result<Self, ResearchServiceError> {
-        let object = batch.request().object();
-        let payload_digest = extraction_provider_payload_digest(&batch);
-        let source_id = object.source_id();
-        if source.source_id() != source_id
-            || source.revision() != object.metadata_revision()
-            || &rights.source_id != source_id
-            || rights.payload_digest != payload_digest
+        sealed_capture.validate().map_err(IngestError::from)?;
+        let batch = sealed_capture.batch();
+        if matches!(
+            source.source_class(),
+            SourceClass::LocalFile | SourceClass::PortfolioExport
+        ) || revisions.len() != batch.records().len()
         {
             return Err(ResearchServiceError::IngestAuthorityMismatch);
         }
-        let local_source = matches!(
-            source.source_class(),
-            SourceClass::LocalFile | SourceClass::PortfolioExport
-        );
-        match (local_source, revisions.as_ref(), capture_material.as_ref()) {
-            (true, _, None)
-                if matches!(
-                    object.capture_identity(),
-                    SourceObjectCaptureIdentity::Standalone
-                ) => {}
-            (false, Some(_), Some(capture_material)) => {
-                let receipt = capture_material.receipt();
-                if receipt.source_id() != object.source_id()
-                    || receipt.metadata_revision() != object.metadata_revision()
-                    || receipt.dataset() != object.dataset()
-                    || !SourceObjectCaptureIdentity::try_from_capture(receipt)
-                        .is_ok_and(|identity| identity == object.capture_identity())
-                {
-                    return Err(ResearchServiceError::IngestAuthorityMismatch);
-                }
-            }
-            _ => return Err(ResearchServiceError::IngestAuthorityMismatch),
-        }
-        let registered_at = rights.retrieved_at;
-        let idempotency_key = provider_object_ingest_key(&source, &analytical_dataset, &batch)?;
-        let identity = IngestIdentity::try_new(
-            source_id.clone(),
-            payload_digest,
-            SourceOperation::Persist,
-            idempotency_key,
-        )?;
+        let (registered_at, identity) =
+            validate_ingest_authority(&source, &rights, &analytical_dataset, batch, true)?;
         Ok(Self {
             source,
             registered_at,
             rights,
             identity,
             analytical_dataset,
-            batch,
-            revisions,
+            payload: ResearchIngestPayload::Provider {
+                sealed_capture,
+                revisions,
+            },
             company_identity: None,
-            capture_material,
+            precommit_authority: None,
+        })
+    }
+
+    fn try_new_local(
+        source: SourceMetadata,
+        rights: RightsDecisionInput,
+        analytical_dataset: DatasetId,
+        batch: ExtractionBatch,
+    ) -> Result<Self, ResearchServiceError> {
+        if !matches!(
+            source.source_class(),
+            SourceClass::LocalFile | SourceClass::PortfolioExport
+        ) {
+            return Err(ResearchServiceError::IngestAuthorityMismatch);
+        }
+        let (registered_at, identity) =
+            validate_ingest_authority(&source, &rights, &analytical_dataset, &batch, false)?;
+        if !matches!(
+            batch.request().object().capture_identity(),
+            SourceObjectCaptureIdentity::Standalone
+        ) {
+            return Err(ResearchServiceError::IngestAuthorityMismatch);
+        }
+        Ok(Self {
+            source,
+            registered_at,
+            rights,
+            identity,
+            analytical_dataset,
+            payload: ResearchIngestPayload::Local(batch),
+            company_identity: None,
             precommit_authority: None,
         })
     }
@@ -170,7 +144,7 @@ impl ResearchIngestRequest {
         mut self,
         company_identity: CompanyIdentityObservation,
     ) -> Result<Self, ResearchServiceError> {
-        if self.revisions.is_none()
+        if !matches!(&self.payload, ResearchIngestPayload::Provider { .. })
             || company_identity.source_id() != self.source.source_id()
             || company_identity
                 .parent_ingest_payload_evidence()
@@ -182,6 +156,38 @@ impl ResearchIngestRequest {
         self.company_identity = Some(company_identity);
         Ok(self)
     }
+}
+
+fn validate_ingest_authority(
+    source: &SourceMetadata,
+    rights: &RightsDecisionInput,
+    analytical_dataset: &DatasetId,
+    batch: &ExtractionBatch,
+    provider_publication: bool,
+) -> Result<(Timestamp, IngestIdentity), ResearchServiceError> {
+    let object = batch.request().object();
+    let payload_digest = extraction_provider_payload_digest(batch);
+    let source_id = object.source_id();
+    if source.source_id() != source_id
+        || source.revision() != object.metadata_revision()
+        || &rights.source_id != source_id
+        || rights.payload_digest != payload_digest
+        || provider_publication
+            == matches!(
+                object.capture_identity(),
+                SourceObjectCaptureIdentity::Standalone
+            )
+    {
+        return Err(ResearchServiceError::IngestAuthorityMismatch);
+    }
+    let idempotency_key = provider_object_ingest_key(source, analytical_dataset, batch)?;
+    let identity = IngestIdentity::try_new(
+        source_id.clone(),
+        payload_digest,
+        SourceOperation::Persist,
+        idempotency_key,
+    )?;
+    Ok((rights.retrieved_at, identity))
 }
 
 fn provider_object_ingest_key(
@@ -286,6 +292,7 @@ fn encode_lower_hex(bytes: [u8; 32]) -> String {
 pub struct ResearchService {
     analytical: AnalyticalDataService,
     provider_captures: Arc<SealedResearchJournalStore>,
+    provider_capture_seal_gate: Arc<Semaphore>,
 }
 
 impl ResearchService {
@@ -447,6 +454,7 @@ impl ResearchService {
         Ok(Self {
             analytical,
             provider_captures: Arc::new(paths.sealed_research_journal_store()?),
+            provider_capture_seal_gate: Arc::new(Semaphore::new(1)),
         })
     }
 
@@ -461,38 +469,56 @@ impl ResearchService {
     ) -> Result<market_squawk_platform::SealedResearchJournalRecoveryReport, ResearchServiceError>
     {
         self.analytical
-            .recover_provider_capture_store(self.provider_captures.as_ref(), cancellation)
+            .recover_provider_capture_store(Arc::clone(&self.provider_captures), cancellation)
             .await
             .map_err(Into::into)
     }
 
     /// Consumes and seals one already validated provider capture without exposing store authority.
     ///
-    /// Cancellation and the monotonic deadline are checked on both sides of the synchronous seal.
-    /// If either wins after the store commit, the unreferenced segment remains recoverable by the
-    /// existing startup quarantine pass and no continuation receives its receipt.
-    pub(crate) fn seal_provider_capture(
+    /// The synchronous filesystem work runs on one application-owned blocking lane. Cancellation
+    /// and the monotonic deadline race both lane admission and completion; a late unreferenced
+    /// segment remains recoverable by the startup quarantine pass.
+    pub(crate) async fn seal_provider_capture(
         &self,
         request: ProviderCaptureSealRequest,
         cancellation: &CancellationToken,
         deadline: Instant,
     ) -> Result<SealedProviderCaptureMaterial, ResearchServiceError> {
-        if cancellation.is_cancelled() {
-            return Err(ResearchServiceError::Ingest(IngestError::Cancelled));
+        let deadline = tokio::time::Instant::from_std(deadline);
+        let permit = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                return Err(ResearchServiceError::Ingest(IngestError::Cancelled));
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(ResearchServiceError::Ingest(IngestError::DeadlineExceeded));
+            }
+            permit = Arc::clone(&self.provider_capture_seal_gate).acquire_owned() => {
+                permit.map_err(|_error| ResearchServiceError::ProviderCaptureSealWorkerUnavailable)?
+            }
+        };
+        let store = Arc::clone(&self.provider_captures);
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            request.seal(store.as_ref())
+        });
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                reap_provider_capture_seal(worker);
+                Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                reap_provider_capture_seal(worker);
+                Err(ResearchServiceError::Ingest(IngestError::DeadlineExceeded))
+            }
+            result = &mut worker => {
+                result
+                    .map_err(|_error| ResearchServiceError::ProviderCaptureSealWorkerUnavailable)?
+                    .map_err(map_provider_capture_seal_error)
+            }
         }
-        if Instant::now() >= deadline {
-            return Err(ResearchServiceError::Ingest(IngestError::DeadlineExceeded));
-        }
-        let sealed = request
-            .seal(self.provider_captures.as_ref())
-            .map_err(map_provider_capture_seal_error)?;
-        if cancellation.is_cancelled() {
-            return Err(ResearchServiceError::Ingest(IngestError::Cancelled));
-        }
-        if Instant::now() >= deadline {
-            return Err(ResearchServiceError::Ingest(IngestError::DeadlineExceeded));
-        }
-        Ok(sealed)
     }
 
     /// Executes one rights-reserved ingest through durable revision and publication authority.
@@ -507,92 +533,43 @@ impl ResearchService {
             rights,
             identity,
             analytical_dataset,
-            batch,
-            revisions,
+            payload,
             company_identity,
-            capture_material,
             precommit_authority,
         } = request;
         let reservation = self
             .analytical
             .reserve_source_ingest(&source, registered_at, rights, &identity, &cancellation)
             .await?;
-        let provider_capture = match capture_material {
-            Some(capture_material) => {
-                match self.analytical.recover_provider_capture_input_if_present(
-                    &reservation,
-                    &batch,
-                    self.provider_captures.as_ref(),
-                )? {
-                    Some(recovered)
-                        if recovered.receipt().capture() == capture_material.receipt() =>
-                    {
-                        Some(recovered)
-                    }
-                    Some(_mismatched) => {
-                        return Err(ResearchServiceError::IngestAuthorityMismatch);
-                    }
-                    None => {
-                        let sealed = capture_material
-                            .seal(self.provider_captures.as_ref())
-                            .map_err(|error| match error {
-                                ProviderCaptureMaterialSealError::Store(error) => {
-                                    ResearchServiceError::ProviderCaptureStore(error)
-                                }
-                                ProviderCaptureMaterialSealError::Capture(error) => {
-                                    ResearchServiceError::Ingest(IngestError::ProviderCapture(
-                                        error,
-                                    ))
-                                }
-                            })?;
-                        Some(self.analytical.retain_provider_capture_input(
-                            &reservation,
-                            &batch,
-                            sealed,
-                        )?)
-                    }
+        match payload {
+            ResearchIngestPayload::Provider {
+                sealed_capture,
+                revisions,
+            } => {
+                let mut publication = ProviderPublicationInput::try_new(sealed_capture, revisions)?;
+                if let Some(company_identity) = company_identity {
+                    publication = publication.with_company_identity(company_identity);
                 }
+                if let Some(precommit_authority) = precommit_authority {
+                    publication = publication.with_precommit_authority(precommit_authority);
+                }
+                self.analytical
+                    .ingest_provider_publication(
+                        reservation,
+                        analytical_dataset,
+                        publication,
+                        cancellation,
+                    )
+                    .await
+                    .map_err(Into::into)
             }
-            None => None,
-        };
-        if let Some(provider_capture) = provider_capture {
-            let revisions = revisions.ok_or(ResearchServiceError::IngestAuthorityMismatch)?;
-            return match (company_identity, precommit_authority) {
-                (Some(company_identity), Some(precommit_authority)) => self
-                    .analytical
-                    .ingest_with_revision_plan_provider_capture_company_identity_and_precommit_authority(
-                        reservation,
-                        analytical_dataset,
-                        batch,
-                        revisions,
-                        provider_capture,
-                        company_identity,
-                        cancellation,
-                        precommit_authority,
-                    )
-                    .await
-                    .map_err(Into::into),
-                (Some(company_identity), None) => self
-                    .analytical
-                    .ingest_with_revision_plan_provider_capture_and_company_identity(
-                        reservation,
-                        analytical_dataset,
-                        batch,
-                        revisions,
-                        provider_capture,
-                        company_identity,
-                        cancellation,
-                    )
-                    .await
-                    .map_err(Into::into),
+            ResearchIngestPayload::Local(batch) => match (company_identity, precommit_authority) {
                 (None, Some(precommit_authority)) => self
                     .analytical
-                    .ingest_with_revision_plan_provider_capture_and_precommit_authority(
+                    .ingest_with_precommit_authority(
                         reservation,
                         analytical_dataset,
                         batch,
-                        revisions,
-                        provider_capture,
                         cancellation,
                         precommit_authority,
                     )
@@ -600,84 +577,11 @@ impl ResearchService {
                     .map_err(Into::into),
                 (None, None) => self
                     .analytical
-                    .ingest_with_revision_plan_and_provider_capture(
-                        reservation,
-                        analytical_dataset,
-                        batch,
-                        revisions,
-                        provider_capture,
-                        cancellation,
-                    )
+                    .ingest(reservation, analytical_dataset, batch, cancellation)
                     .await
                     .map_err(Into::into),
-            };
-        }
-        match (revisions, company_identity, precommit_authority) {
-            (Some(revisions), Some(company_identity), Some(precommit_authority)) => self
-                .analytical
-                .ingest_with_revision_plan_company_identity_and_precommit_authority(
-                    reservation,
-                    analytical_dataset,
-                    batch,
-                    revisions,
-                    company_identity,
-                    cancellation,
-                    precommit_authority,
-                )
-                .await
-                .map_err(Into::into),
-            (Some(revisions), Some(company_identity), None) => self
-                .analytical
-                .ingest_with_revision_plan_and_company_identity(
-                    reservation,
-                    analytical_dataset,
-                    batch,
-                    revisions,
-                    company_identity,
-                    cancellation,
-                )
-                .await
-                .map_err(Into::into),
-            (Some(revisions), None, Some(precommit_authority)) => self
-                .analytical
-                .ingest_with_revision_plan_and_precommit_authority(
-                    reservation,
-                    analytical_dataset,
-                    batch,
-                    revisions,
-                    cancellation,
-                    precommit_authority,
-                )
-                .await
-                .map_err(Into::into),
-            (Some(revisions), None, None) => self
-                .analytical
-                .ingest_with_revision_plan(
-                    reservation,
-                    analytical_dataset,
-                    batch,
-                    revisions,
-                    cancellation,
-                )
-                .await
-                .map_err(Into::into),
-            (None, None, Some(precommit_authority)) => self
-                .analytical
-                .ingest_with_precommit_authority(
-                    reservation,
-                    analytical_dataset,
-                    batch,
-                    cancellation,
-                    precommit_authority,
-                )
-                .await
-                .map_err(Into::into),
-            (None, None, None) => self
-                .analytical
-                .ingest(reservation, analytical_dataset, batch, cancellation)
-                .await
-                .map_err(Into::into),
-            (None, Some(_), _) => Err(ResearchServiceError::IngestAuthorityMismatch),
+                (Some(_), _) => Err(ResearchServiceError::IngestAuthorityMismatch),
+            },
         }
     }
 
@@ -785,6 +689,16 @@ fn map_provider_capture_seal_error(
     }
 }
 
+fn reap_provider_capture_seal(
+    worker: tokio::task::JoinHandle<
+        Result<SealedProviderCaptureMaterial, ProviderCaptureMaterialSealError>,
+    >,
+) {
+    tokio::spawn(async move {
+        let _late_result = worker.await;
+    });
+}
+
 /// Research composition, storage, ingestion, or analytical-generation failure.
 #[derive(Debug, Error)]
 pub enum ResearchServiceError {
@@ -800,6 +714,9 @@ pub enum ResearchServiceError {
     /// The sealed exact-provider-response authority could not be opened or verified.
     #[error("research service provider-capture store failed: {0}")]
     ProviderCaptureStore(#[from] SealedResearchJournalStoreError),
+    /// The bounded provider-capture sealing worker could not be admitted or joined.
+    #[error("research service provider-capture sealing worker is unavailable")]
+    ProviderCaptureSealWorkerUnavailable,
     /// Analytical authority composition or ingestion failed.
     #[error("research service ingestion failed: {0}")]
     Ingest(#[from] IngestError),

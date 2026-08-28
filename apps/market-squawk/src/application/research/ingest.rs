@@ -1765,16 +1765,7 @@ impl ProductionResearchIngestCoordinator {
             None => provider,
         };
         let ingest = match (revisions, capture_material) {
-            (Some(revisions), Some(capture_material)) => {
-                ResearchIngestRequest::with_provider_revisions_and_capture(
-                    source_metadata.clone(),
-                    rights,
-                    analytical_dataset,
-                    batch,
-                    revisions,
-                    capture_material,
-                )
-            }
+            (Some(_revisions), Some(_capture_material)) => return Err(ServiceError::Unavailable),
             (None, None) => ResearchIngestRequest::locally_observed(
                 source_metadata.clone(),
                 rights,
@@ -2058,6 +2049,7 @@ fn map_ingest_error(error: IngestError) -> ServiceError {
         | IngestError::ProviderCaptureRequired
         | IngestError::ProviderCapture(_)
         | IngestError::SealedProviderCapture(_)
+        | IngestError::ProviderCaptureRecoveryWorkerUnavailable
         | IngestError::AuthorityLockPoisoned => ServiceError::Unavailable,
     }
 }
@@ -2073,6 +2065,7 @@ fn map_research_error(error: ResearchServiceError) -> ServiceError {
         | ResearchServiceError::Catalog(_)
         | ResearchServiceError::Manifest(_)
         | ResearchServiceError::ProviderCaptureStore(_)
+        | ResearchServiceError::ProviderCaptureSealWorkerUnavailable
         | ResearchServiceError::ProviderOnboarding(_)
         | ResearchServiceError::Dataset(_) => ServiceError::Unavailable,
     }

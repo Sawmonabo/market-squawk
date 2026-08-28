@@ -936,6 +936,7 @@ fn map_phase_one_derived_generation_error(error: ResearchServiceError) -> JobRun
         | ResearchServiceError::Catalog(_)
         | ResearchServiceError::Manifest(_)
         | ResearchServiceError::ProviderCaptureStore(_)
+        | ResearchServiceError::ProviderCaptureSealWorkerUnavailable
         | ResearchServiceError::ProviderOnboarding(_)
         | ResearchServiceError::Ingest(_)
         | ResearchServiceError::IngestAuthorityMismatch
