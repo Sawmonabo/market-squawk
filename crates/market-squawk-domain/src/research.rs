@@ -10,6 +10,8 @@ use crate::{
     SourceIdentifier,
 };
 
+#[path = "research/fund_holdings.rs"]
+mod fund_holdings;
 #[path = "research/fund_nav.rs"]
 mod fund_nav;
 #[path = "research/fundamental_context.rs"]
@@ -21,6 +23,20 @@ mod portfolio_transactions;
 #[path = "research/xbrl.rs"]
 mod xbrl;
 
+pub use fund_holdings::{
+    FUND_HOLDING_SUPPLEMENT_TABLE_COUNT, FUND_HOLDINGS_SCHEMA_NAME, FUND_HOLDINGS_SCHEMA_VERSION,
+    FundAmendmentState, FundConflictState, FundCurrencyAmount, FundEtfMechanics,
+    FundEvidenceRecord, FundExchangeAssociation, FundFilingChronology, FundFilingIdentity,
+    FundHoldingAssociations, FundHoldingQuantity, FundHoldingSecurityIdentity,
+    FundHoldingSupplementEvidence, FundHoldingUnit, FundHoldingsError, FundLineageRowRange,
+    FundMissingState, FundPortfolioHoldingAttributes, FundPortfolioHoldingEvidence,
+    FundReleaseCoverage, FundReportAttributes, FundReportEvidence, FundReportedDecimal,
+    FundReportedValue, FundRevisionEvidence, FundRevisionLink, FundRevisionStatus,
+    FundSecurityIdentifier, FundShareClassAttributes, FundShareClassEvidence,
+    FundShareClassIdentity, FundSourceFamily, FundSourceLineage, FundSourceRowEvidence,
+    FundSourceTable, FundSourceText, FundSupplementDisposition, MAX_FUND_COMPETING_ACCESSIONS,
+    MAX_FUND_EXCHANGE_ASSOCIATIONS, MAX_FUND_SOURCE_ROWS,
+};
 pub use fund_nav::{
     FundNavCompleteness, FundNavCorrectionState, FundNavDisposition, FundNavEntitlementEvidence,
     FundNavFinality, FundNavLineage, FundNavMissingState, FundNavNativeSchema, FundNavObservation,

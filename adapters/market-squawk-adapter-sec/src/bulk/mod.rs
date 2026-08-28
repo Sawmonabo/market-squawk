@@ -1,13 +1,23 @@
 //! Streamed SEC quarterly archive capture, inspection, recovery, and typed row projection.
 
 mod archive;
+mod fund_publication;
 mod model;
 mod native_query;
 mod query;
 
 pub use archive::{
-    SecBulkParseLimits, SecBulkRowSink, SecBulkScanReport, SecBulkTypedArchiveScan,
-    inspect_bulk_archive, recover_bulk_archive, scan_bulk_archive, scan_bulk_archive_typed,
+    SecBulkLogicalPublicationHandoff, SecBulkLogicalRow, SecBulkLogicalRowLineage,
+    SecBulkParseLimits, SecBulkPendingLogicalRowSink, SecBulkRowSink, SecBulkScanReport,
+    SecBulkStagedLogicalPublication, SecBulkTypedArchiveScan,
+    SecNportHoldingSupplementCompleteness, SecNportHoldingSupplementEvidence,
+    SecNportHoldingSupplementState, SecNportHoldingSupplementTable,
+    SecNportHoldingSupplementTopology, SecPendingBulkLogicalPublication, inspect_bulk_archive,
+    recover_bulk_archive, scan_bulk_archive, scan_bulk_archive_typed,
+};
+pub use fund_publication::{
+    SecFundIdentityAuthority, SecFundPartitionAdmissions, SecFundPendingLogicalRows,
+    SecFundPublicationScope, SecPreparedFundCanonicalPartition, SecPreparedFundLogicalPublication,
 };
 pub use model::{
     SEC_BULK_CATALOG_SNAPSHOT_DATE, SEC_NCEN_SCHEMA_EFFECTIVE_DATE, SEC_NCEN_SCHEMA_VERSION,
@@ -143,6 +153,12 @@ pub enum SecBulkError {
     /// Exact raw evidence persistence/reopen failed.
     #[error(transparent)]
     RawEvidence(#[from] crate::RawEvidenceError),
+    /// Shared logical-object or partition publication rejected the handoff.
+    #[error(transparent)]
+    LogicalPublication(#[from] market_squawk_sources::ProviderLogicalPublicationError),
+    /// Caller-owned common logical-object staging or sealing failed.
+    #[error(transparent)]
+    LogicalObject(#[from] market_squawk_platform::SealedResearchJournalStoreError),
     /// A provider locator or source identifier was invalid.
     #[error(transparent)]
     Client(#[from] crate::SecClientError),

@@ -10,6 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::NaiveDate;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_platform::{
+    PendingResearchObject, ResearchObjectAdmission, ResearchObjectControl, VerifiedResearchObject,
+};
+use market_squawk_sources::{LogicalObjectRole, SealedLogicalObjectInput};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -55,6 +59,7 @@ const KEY_MERGE_FAN_IN: usize = 16;
 const MAX_VALIDATION_SCRATCH_BYTES: u64 = 96 * 1024 * 1024 * 1024;
 const MAX_VALIDATION_SCRATCH_FILES: usize = 4_096;
 const MAX_SCAN_ROWS: u64 = MAX_ROWS_PER_TABLE * MAX_ARCHIVE_ENTRIES as u64;
+const MAX_LOGICAL_OBJECT_CHUNKS: usize = 4_095;
 
 /// Hard ceilings for streamed SEC quarterly archive admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,6 +201,702 @@ impl SecBulkTypedArchiveScan {
     }
 }
 
+/// Exact inspected archive/readme graph awaiting caller-owned common-store descriptors.
+///
+/// The value is intentionally neither cloneable nor serializable. It carries no generation,
+/// revision, point-in-time, or publication authority.
+#[derive(Debug)]
+pub struct SecPendingBulkLogicalPublication {
+    manifest: SecBulkLayoutManifest,
+}
+
+/// Exact provider-native row coordinate bound to one terminal SEC archive/readme scan.
+///
+/// Object ordinals are stable references into the final common logical-object binding. Physical
+/// receipts remain owned by that binding and are not copied into every row frame.
+#[derive(Debug, Eq, PartialEq)]
+pub struct SecBulkLogicalRowLineage {
+    terminal_evidence: EvidenceDigest,
+    manifest_evidence: EvidenceDigest,
+    archive_object_ordinal: u32,
+    official_readme_object_ordinal: u32,
+    source_ordinal: u64,
+    table: SecBulkTableKind,
+    row_number: u64,
+    row_evidence: EvidenceDigest,
+}
+
+/// One lossless SEC row that cannot be detached from its exact terminal source coordinates.
+#[derive(Debug)]
+pub struct SecBulkLogicalRow {
+    row: SecBulkNativeRow,
+    lineage: SecBulkLogicalRowLineage,
+}
+
+/// Caller-owned non-visible staging used while the adapter re-verifies the complete graph.
+///
+/// There is deliberately no commit method. Only the shared logical-publication authority can
+/// make staged native/canonical evidence durable after consuming the terminal handoff.
+pub trait SecBulkPendingLogicalRowSink {
+    /// Stages one exact row in provider order.
+    fn stage(&mut self, row: SecBulkLogicalRow) -> Result<(), SecBulkError>;
+
+    /// Idempotently discards all caller-owned pending effects.
+    fn abort(&mut self);
+}
+
+/// Exact completeness state for one holding in one official N-PORT supplement table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecNportHoldingSupplementState {
+    /// One or more exact rows join to this holding.
+    ReportedRows,
+    /// The table contains rows but none join to this exact holding.
+    NoDerivedRowForHolding,
+    /// The table member exists with a header and zero data rows.
+    TablePresentEmpty,
+    /// Metadata declares the table but SEC omitted the unpopulated member.
+    TableDeclaredAbsent,
+}
+
+/// One member of the closed N-PORT C.9-C.12 supplement topology.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecNportHoldingSupplementTable {
+    table: SecBulkTableKind,
+    presence: super::model::SecBulkTablePresence,
+}
+
+/// Generation-free supplement topology bound to the exact terminal scan.
+#[derive(Debug)]
+pub struct SecNportHoldingSupplementTopology {
+    manifest_evidence: EvidenceDigest,
+    terminal_evidence: EvidenceDigest,
+    tables: Box<[SecNportHoldingSupplementTable]>,
+    evidence: EvidenceDigest,
+}
+
+/// Exact per-table completeness for one N-PORT holding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecNportHoldingSupplementEvidence {
+    table: SecBulkTableKind,
+    presence: super::model::SecBulkTablePresence,
+    state: SecNportHoldingSupplementState,
+    joined_rows: u64,
+    joined_rows_evidence: EvidenceDigest,
+}
+
+/// Complete generation-free C.9-C.12 evidence for one exact N-PORT holding.
+#[derive(Debug)]
+pub struct SecNportHoldingSupplementCompleteness {
+    terminal_evidence: EvidenceDigest,
+    topology_evidence: EvidenceDigest,
+    accession: SourceIdentifier,
+    holding_id: SourceIdentifier,
+    holding_row_evidence: EvidenceDigest,
+    tables: Box<[SecNportHoldingSupplementEvidence]>,
+    evidence: EvidenceDigest,
+}
+
+/// Terminal adapter evidence over common-sealed archive/readme objects and one complete scan.
+///
+/// This is not a durable generation. Root publication must consume it together with its pending
+/// native, row-map, and typed canonical partitions.
+#[derive(Debug)]
+pub struct SecBulkLogicalPublicationHandoff {
+    manifest: SecBulkLayoutManifest,
+    report: SecBulkScanReport,
+    objects: Box<[SealedLogicalObjectInput]>,
+    nport_holding_supplements: Option<SecNportHoldingSupplementTopology>,
+    terminal_evidence: EvidenceDigest,
+}
+
+/// Caller-owned staging paired with the only terminal adapter handoff accepted for publication.
+#[derive(Debug)]
+pub struct SecBulkStagedLogicalPublication<S> {
+    sink: S,
+    handoff: SecBulkLogicalPublicationHandoff,
+}
+
+impl SecPendingBulkLogicalPublication {
+    /// Returns exact caller-owned logical-object admissions for the ZIP and official PDF.
+    pub fn logical_object_admissions(
+        manifest: &SecBulkLayoutManifest,
+    ) -> Result<(ResearchObjectAdmission, ResearchObjectAdmission), SecBulkError> {
+        validate_bulk_manifest_for_logical_publication(manifest)?;
+        Ok((
+            ResearchObjectAdmission::try_new(
+                manifest.capture().size_bytes(),
+                MAX_LOGICAL_OBJECT_CHUNKS,
+            )?,
+            ResearchObjectAdmission::try_new(
+                manifest.official_readme_capture().size_bytes(),
+                MAX_LOGICAL_OBJECT_CHUNKS,
+            )?,
+        ))
+    }
+
+    /// Streams the already inspected exact captures into caller-created common-store stages.
+    ///
+    /// The adapter never finishes or publishes those stages. The caller owns the common store,
+    /// finishes both objects, and presents the resulting verified descriptors to
+    /// [`Self::verify_and_stage`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the two exact pending objects, controls, and parse bounds stay explicit"
+    )]
+    pub(crate) fn stage_from_raw_store(
+        raw_store: &RawEvidenceStore,
+        manifest: SecBulkLayoutManifest,
+        limits: SecBulkParseLimits,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+        archive_stage: &mut PendingResearchObject,
+        official_readme_stage: &mut PendingResearchObject,
+    ) -> Result<Self, SecBulkError> {
+        validate_bulk_manifest_for_logical_publication(&manifest)?;
+        copy_capture_to_logical_stage(
+            raw_store,
+            manifest.capture(),
+            limits.max_archive_bytes,
+            deadline,
+            cancellation,
+            archive_stage,
+        )?;
+        copy_capture_to_logical_stage(
+            raw_store,
+            manifest.official_readme_capture(),
+            limits.max_readme_bytes,
+            deadline,
+            cancellation,
+            official_readme_stage,
+        )?;
+        Ok(Self { manifest })
+    }
+
+    /// Admits one exact inspected quarterly archive/readme graph for common-store verification.
+    pub fn try_new(manifest: SecBulkLayoutManifest) -> Result<Self, SecBulkError> {
+        validate_bulk_manifest_for_logical_publication(&manifest)?;
+        Ok(Self { manifest })
+    }
+
+    /// Returns the exact layout whose two provider objects must be physically sealed.
+    pub const fn manifest(&self) -> &SecBulkLayoutManifest {
+        &self.manifest
+    }
+
+    /// Re-verifies the exact common-sealed archive/readme descriptors and stages every typed row.
+    ///
+    /// The scan is two-pass: all provider contracts are validated before the first caller-owned
+    /// row is staged. Both descriptors are re-read through EOF after staging and then consumed by
+    /// the common logical-object boundary. Every failure invokes `abort` on the pending sink.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "sealed descriptors, controls, parse bounds, and pending staging stay explicit"
+    )]
+    pub fn verify_and_stage<S>(
+        self,
+        archive: VerifiedResearchObject,
+        official_readme: VerifiedResearchObject,
+        limits: SecBulkParseLimits,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+        control: &dyn ResearchObjectControl,
+        mut sink: S,
+    ) -> Result<SecBulkStagedLogicalPublication<S>, SecBulkError>
+    where
+        S: SecBulkPendingLogicalRowSink,
+    {
+        let result = self.verify_and_stage_into(
+            archive,
+            official_readme,
+            limits,
+            deadline,
+            cancellation,
+            control,
+            &mut sink,
+        );
+        match result {
+            Ok(handoff) => Ok(SecBulkStagedLogicalPublication { sink, handoff }),
+            Err(error) => {
+                sink.abort();
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "sealed descriptors, controls, parse bounds, and pending staging stay explicit"
+    )]
+    fn verify_and_stage_into<S>(
+        self,
+        archive: VerifiedResearchObject,
+        official_readme: VerifiedResearchObject,
+        limits: SecBulkParseLimits,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+        control: &dyn ResearchObjectControl,
+        sink: &mut S,
+    ) -> Result<SecBulkLogicalPublicationHandoff, SecBulkError>
+    where
+        S: SecBulkPendingLogicalRowSink,
+    {
+        validate_bulk_manifest_for_logical_publication(&self.manifest)?;
+        validate_verified_object_binding(self.manifest.capture(), &archive)?;
+        validate_verified_object_binding(
+            self.manifest.official_readme_capture(),
+            &official_readme,
+        )?;
+        let pair = common_verified_pair(
+            archive,
+            official_readme,
+            self.manifest.capture(),
+            self.manifest.official_readme_capture(),
+            limits,
+        )?;
+        let (report, pair) =
+            validate_typed_bulk_pair(pair, &self.manifest, limits, deadline, cancellation)?;
+        let archive_semantic_identity = bulk_logical_object_semantic_identity(
+            &self.manifest,
+            self.manifest.capture(),
+            LogicalObjectRole::ProviderPayload,
+            0,
+        );
+        let readme_semantic_identity = bulk_logical_object_semantic_identity(
+            &self.manifest,
+            self.manifest.official_readme_capture(),
+            LogicalObjectRole::ProviderComponent,
+            1,
+        );
+        let terminal_evidence = bulk_terminal_evidence(
+            &self.manifest,
+            report,
+            archive_semantic_identity,
+            readme_semantic_identity,
+        );
+        let mut emitted = 0_u64;
+        let mut order = OrderedTypedRows::new();
+        let manifest_evidence = self.manifest.evidence();
+        let pair = observe_prevalidated_bulk_pair(
+            pair,
+            &self.manifest,
+            limits,
+            deadline,
+            cancellation,
+            &mut |row| {
+                order.observe(&row)?;
+                let source_ordinal = emitted;
+                emitted = emitted
+                    .checked_add(1)
+                    .ok_or(SecBulkError::TsvLimitExceeded)?;
+                let lineage = SecBulkLogicalRowLineage {
+                    terminal_evidence,
+                    manifest_evidence,
+                    archive_object_ordinal: 0,
+                    official_readme_object_ordinal: 1,
+                    source_ordinal,
+                    table: row.table(),
+                    row_number: row.row_number(),
+                    row_evidence: row.row_evidence(),
+                };
+                sink.stage(SecBulkLogicalRow { row, lineage })
+            },
+        )?;
+        if emitted != report.emitted_typed_rows()
+            || order.finish(emitted)? != report.ordered_typed_rows_evidence()
+        {
+            return Err(SecBulkError::RecoveryMismatch);
+        }
+        let ImmutableBulkPair {
+            archive,
+            official_readme,
+        } = pair;
+        let archive_object = SealedLogicalObjectInput::try_from_verified(
+            LogicalObjectRole::ProviderPayload,
+            0,
+            archive_semantic_identity,
+            archive.into_inner(),
+            control,
+        )?;
+        let official_readme_object = SealedLogicalObjectInput::try_from_verified(
+            LogicalObjectRole::ProviderComponent,
+            1,
+            readme_semantic_identity,
+            official_readme.into_inner(),
+            control,
+        )?;
+        let nport_holding_supplements =
+            nport_holding_supplement_topology(&self.manifest, terminal_evidence)?;
+        Ok(SecBulkLogicalPublicationHandoff {
+            manifest: self.manifest,
+            report,
+            objects: vec![archive_object, official_readme_object].into_boxed_slice(),
+            nport_holding_supplements,
+            terminal_evidence,
+        })
+    }
+}
+
+impl SecBulkLogicalRowLineage {
+    /// Returns the terminal parse/completeness identity shared by the complete row stream.
+    pub const fn terminal_evidence(&self) -> EvidenceDigest {
+        self.terminal_evidence
+    }
+
+    /// Returns the exact inspected layout identity.
+    pub const fn manifest_evidence(&self) -> EvidenceDigest {
+        self.manifest_evidence
+    }
+
+    /// Returns the archive object coordinate in the ordered common raw graph.
+    pub const fn archive_object_ordinal(&self) -> u32 {
+        self.archive_object_ordinal
+    }
+
+    /// Returns the independent official-readme object coordinate.
+    pub const fn official_readme_object_ordinal(&self) -> u32 {
+        self.official_readme_object_ordinal
+    }
+
+    /// Returns the zero-based position in the complete emitted provider-row stream.
+    pub const fn source_ordinal(&self) -> u64 {
+        self.source_ordinal
+    }
+
+    /// Returns the closed SEC table family containing this row.
+    pub const fn table(&self) -> SecBulkTableKind {
+        self.table
+    }
+
+    /// Returns the one-based provider TSV data-row coordinate.
+    pub const fn row_number(&self) -> u64 {
+        self.row_number
+    }
+
+    /// Returns deterministic decoded-row evidence.
+    pub const fn row_evidence(&self) -> EvidenceDigest {
+        self.row_evidence
+    }
+}
+
+impl SecBulkLogicalRow {
+    /// Returns the complete lossless provider-native row.
+    pub const fn provider_row(&self) -> &SecBulkNativeRow {
+        &self.row
+    }
+
+    /// Returns exact seal/manifest/source-order coordinates.
+    pub const fn lineage(&self) -> &SecBulkLogicalRowLineage {
+        &self.lineage
+    }
+
+    /// Returns the closed official table identity.
+    pub const fn table(&self) -> SecBulkTableKind {
+        self.row.table()
+    }
+
+    /// Returns exact metadata-declared primary-key fields in declared order.
+    pub fn primary_key(&self) -> &[SecBulkKeyField] {
+        self.row.primary_key()
+    }
+
+    /// Returns exact recognized cross-table coordinates.
+    pub fn joins(&self) -> &[SecBulkJoinCoordinate] {
+        self.row.joins()
+    }
+
+    /// Returns every exact field in metadata/header order.
+    pub fn fields(&self) -> &[SecBulkTypedField] {
+        self.row.fields()
+    }
+
+    /// Returns the provider-native projection outcome without discarding source evidence.
+    pub const fn projection_disposition(&self) -> &SecBulkProjectionDisposition {
+        self.row.projection_disposition()
+    }
+
+    /// Returns the one-based provider TSV data-row coordinate.
+    pub const fn row_number(&self) -> u64 {
+        self.row.row_number()
+    }
+
+    /// Returns deterministic decoded-row evidence.
+    pub const fn row_evidence(&self) -> EvidenceDigest {
+        self.row.row_evidence()
+    }
+
+    /// Consumes the row without permitting construction of substitute lineage.
+    pub fn into_parts(self) -> (SecBulkNativeRow, SecBulkLogicalRowLineage) {
+        (self.row, self.lineage)
+    }
+}
+
+impl<S> SecBulkStagedLogicalPublication<S> {
+    /// Returns terminal handoff evidence without separating it from caller staging.
+    pub const fn handoff(&self) -> &SecBulkLogicalPublicationHandoff {
+        &self.handoff
+    }
+
+    /// Consumes successful staging and terminal evidence together.
+    pub fn into_parts(self) -> (S, SecBulkLogicalPublicationHandoff) {
+        (self.sink, self.handoff)
+    }
+}
+
+impl SecBulkLogicalPublicationHandoff {
+    /// Returns the exact inspected layout, coverage, clocks, and table closure.
+    pub const fn manifest(&self) -> &SecBulkLayoutManifest {
+        &self.manifest
+    }
+
+    /// Returns exact source/emitted counts and ordered native-row evidence.
+    pub const fn report(&self) -> &SecBulkScanReport {
+        &self.report
+    }
+
+    /// Returns ordered common-sealed ZIP/PDF inputs.
+    pub const fn objects(&self) -> &[SealedLogicalObjectInput] {
+        &self.objects
+    }
+
+    /// Returns terminal-bound N-PORT supplement topology when applicable.
+    pub const fn nport_holding_supplements(&self) -> Option<&SecNportHoldingSupplementTopology> {
+        self.nport_holding_supplements.as_ref()
+    }
+
+    /// Returns exact adapter terminal evidence for common publication.
+    pub const fn terminal_evidence(&self) -> EvidenceDigest {
+        self.terminal_evidence
+    }
+
+    /// Consumes the handoff into shared logical-publication inputs.
+    pub fn into_shared_parts(
+        self,
+    ) -> (
+        SecBulkLayoutManifest,
+        SecBulkScanReport,
+        Box<[SealedLogicalObjectInput]>,
+        Option<SecNportHoldingSupplementTopology>,
+        EvidenceDigest,
+    ) {
+        (
+            self.manifest,
+            self.report,
+            self.objects,
+            self.nport_holding_supplements,
+            self.terminal_evidence,
+        )
+    }
+}
+
+impl SecNportHoldingSupplementTable {
+    /// Returns the exact member of the closed holding-supplement family.
+    pub const fn table(self) -> SecBulkTableKind {
+        self.table
+    }
+
+    /// Returns archive-level presence without collapsing omission into an empty table.
+    pub const fn presence(self) -> super::model::SecBulkTablePresence {
+        self.presence
+    }
+}
+
+impl SecNportHoldingSupplementTopology {
+    /// Returns exact layout lineage.
+    pub const fn manifest_evidence(&self) -> EvidenceDigest {
+        self.manifest_evidence
+    }
+
+    /// Returns the complete terminal scan identity.
+    pub const fn terminal_evidence(&self) -> EvidenceDigest {
+        self.terminal_evidence
+    }
+
+    /// Returns all 19 holding-linked official table families in closed order.
+    pub fn tables(&self) -> &[SecNportHoldingSupplementTable] {
+        &self.tables
+    }
+
+    /// Returns deterministic topology evidence.
+    pub const fn evidence(&self) -> EvidenceDigest {
+        self.evidence
+    }
+
+    /// Validates one exact holding plus its complete staged supplement subset.
+    ///
+    /// Rows must retain provider order and carry the same terminal identity. Empty joins are
+    /// classified from exact table presence, never guessed from a query result.
+    pub fn complete_holding(
+        &self,
+        accession: SourceIdentifier,
+        holding_id: SourceIdentifier,
+        rows: &[&SecBulkLogicalRow],
+    ) -> Result<SecNportHoldingSupplementCompleteness, SecBulkError> {
+        let mut previous_ordinal = None;
+        let mut holding_row_evidence = None;
+        let mut seen_coordinates = BTreeSet::new();
+        for row in rows {
+            let lineage = row.lineage();
+            let is_holding_core = row.table() == SecBulkTableKind::NportFundReportedHolding;
+            if lineage.terminal_evidence() != self.terminal_evidence
+                || lineage.manifest_evidence() != self.manifest_evidence
+                || previous_ordinal.is_some_and(|ordinal| ordinal >= lineage.source_ordinal())
+                || (is_holding_core
+                    && !row.joins().iter().any(|join| {
+                        join.domain() == SecBulkJoinDomain::Accession
+                            && join.value() == accession.as_str()
+                    }))
+                || !row.joins().iter().any(|join| {
+                    join.domain() == SecBulkJoinDomain::Holding
+                        && join.value() == holding_id.as_str()
+                })
+                || !seen_coordinates.insert((row.table(), row.row_number()))
+            {
+                return Err(SecBulkError::InvalidCanonicalMapping);
+            }
+            previous_ordinal = Some(lineage.source_ordinal());
+            if is_holding_core {
+                if holding_row_evidence.replace(row.row_evidence()).is_some() {
+                    return Err(SecBulkError::InvalidCanonicalMapping);
+                }
+            } else if !self.tables.iter().any(|table| table.table == row.table()) {
+                return Err(SecBulkError::InvalidCanonicalMapping);
+            }
+        }
+        let holding_row_evidence =
+            holding_row_evidence.ok_or(SecBulkError::InvalidCanonicalMapping)?;
+        let mut table_evidence = Vec::new();
+        table_evidence
+            .try_reserve_exact(self.tables.len())
+            .map_err(|_| SecBulkError::AllocationFailed)?;
+        for table in &self.tables {
+            let mut joined_rows = 0_u64;
+            let mut digest = Sha256::new();
+            digest.update(b"market-squawk/sec-nport-holding-supplement-rows/v1");
+            digest.update(self.terminal_evidence.bytes());
+            digest.update(table.table.ordinal().to_be_bytes());
+            for row in rows
+                .iter()
+                .copied()
+                .filter(|row| row.table() == table.table)
+            {
+                joined_rows = joined_rows
+                    .checked_add(1)
+                    .ok_or(SecBulkError::TsvLimitExceeded)?;
+                digest.update(row.lineage().source_ordinal().to_be_bytes());
+                digest.update(row.row_number().to_be_bytes());
+                digest.update(row.row_evidence().bytes());
+            }
+            let state = match (table.presence, joined_rows) {
+                (super::model::SecBulkTablePresence::PresentRows { row_count, .. }, count)
+                    if count > 0 && count <= row_count =>
+                {
+                    SecNportHoldingSupplementState::ReportedRows
+                }
+                (super::model::SecBulkTablePresence::PresentRows { .. }, 0) => {
+                    SecNportHoldingSupplementState::NoDerivedRowForHolding
+                }
+                (super::model::SecBulkTablePresence::PresentEmpty { .. }, 0) => {
+                    SecNportHoldingSupplementState::TablePresentEmpty
+                }
+                (super::model::SecBulkTablePresence::DeclaredAbsent, 0) => {
+                    SecNportHoldingSupplementState::TableDeclaredAbsent
+                }
+                _ => return Err(SecBulkError::InvalidCanonicalMapping),
+            };
+            table_evidence.push(SecNportHoldingSupplementEvidence {
+                table: table.table,
+                presence: table.presence,
+                state,
+                joined_rows,
+                joined_rows_evidence: EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    digest.finalize().into(),
+                ),
+            });
+        }
+        let evidence = nport_holding_completeness_evidence(
+            self,
+            &accession,
+            &holding_id,
+            holding_row_evidence,
+            &table_evidence,
+        );
+        Ok(SecNportHoldingSupplementCompleteness {
+            terminal_evidence: self.terminal_evidence,
+            topology_evidence: self.evidence,
+            accession,
+            holding_id,
+            holding_row_evidence,
+            tables: table_evidence.into_boxed_slice(),
+            evidence,
+        })
+    }
+}
+
+impl SecNportHoldingSupplementEvidence {
+    /// Returns the exact official supplement table.
+    pub const fn table(self) -> SecBulkTableKind {
+        self.table
+    }
+
+    /// Returns exact archive-level presence.
+    pub const fn presence(self) -> super::model::SecBulkTablePresence {
+        self.presence
+    }
+
+    /// Returns explicit reported/no-row/empty/absent state.
+    pub const fn state(self) -> SecNportHoldingSupplementState {
+        self.state
+    }
+
+    /// Returns the exact number of joined provider rows.
+    pub const fn joined_rows(self) -> u64 {
+        self.joined_rows
+    }
+
+    /// Returns source-order evidence for all joined rows in this table.
+    pub const fn joined_rows_evidence(self) -> EvidenceDigest {
+        self.joined_rows_evidence
+    }
+}
+
+impl SecNportHoldingSupplementCompleteness {
+    /// Returns the exact terminal identity shared by every admitted row.
+    pub const fn terminal_evidence(&self) -> EvidenceDigest {
+        self.terminal_evidence
+    }
+
+    /// Returns terminal-bound closed-topology evidence.
+    pub const fn topology_evidence(&self) -> EvidenceDigest {
+        self.topology_evidence
+    }
+
+    /// Returns the exact filing accession scoping the holding ID.
+    pub const fn accession(&self) -> &SourceIdentifier {
+        &self.accession
+    }
+
+    /// Returns the exact provider-native holding ID.
+    pub const fn holding_id(&self) -> &SourceIdentifier {
+        &self.holding_id
+    }
+
+    /// Returns decoded evidence for the one required holding core row.
+    pub const fn holding_row_evidence(&self) -> EvidenceDigest {
+        self.holding_row_evidence
+    }
+
+    /// Returns all 19 completeness results in code-owned order.
+    pub fn tables(&self) -> &[SecNportHoldingSupplementEvidence] {
+        &self.tables
+    }
+
+    /// Returns deterministic evidence for the holding, core row, and every table state.
+    pub const fn evidence(&self) -> EvidenceDigest {
+        self.evidence
+    }
+}
+
 /// Crate-private stand-in for the future common immutable large-object view.
 ///
 /// Construction remains inside this module and only follows complete verification by the
@@ -221,6 +922,10 @@ impl<R> ImmutableObjectView<R> {
             expected_bytes,
             maximum_bytes,
         }
+    }
+
+    fn into_inner(self) -> R {
+        self.reader
     }
 }
 
@@ -334,6 +1039,305 @@ fn open_store_verified_pair(
     })
 }
 
+fn copy_capture_to_logical_stage(
+    raw_store: &RawEvidenceStore,
+    capture: &SecBulkCapture,
+    maximum_bytes: u64,
+    deadline: Timestamp,
+    cancellation: &CancellationToken,
+    stage: &mut PendingResearchObject,
+) -> Result<(), SecBulkError> {
+    check_cancelled(cancellation, deadline)?;
+    if capture.size_bytes() > maximum_bytes {
+        return Err(SecBulkError::InvalidCapture);
+    }
+    let mut source = raw_store.open_verified_before(
+        &capture.evidence(),
+        capture.size_bytes(),
+        maximum_bytes,
+        deadline,
+        cancellation,
+    )?;
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; READ_BUFFER_BYTES];
+    loop {
+        check_cancelled(cancellation, deadline)?;
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        stage.write_all(&buffer[..read])?;
+        copied = copied
+            .checked_add(u64::try_from(read).map_err(|_| SecBulkError::InvalidCapture)?)
+            .ok_or(SecBulkError::InvalidCapture)?;
+        if copied > capture.size_bytes() {
+            return Err(SecBulkError::InvalidCapture);
+        }
+    }
+    if copied != capture.size_bytes() {
+        return Err(SecBulkError::InvalidCapture);
+    }
+    Ok(())
+}
+
+fn common_verified_pair(
+    archive: VerifiedResearchObject,
+    official_readme: VerifiedResearchObject,
+    archive_capture: &SecBulkCapture,
+    official_readme_capture: &SecBulkCapture,
+    limits: SecBulkParseLimits,
+) -> Result<ImmutableBulkPair<VerifiedResearchObject, VerifiedResearchObject>, SecBulkError> {
+    validate_verified_object_binding(archive_capture, &archive)?;
+    validate_verified_object_binding(official_readme_capture, &official_readme)?;
+    Ok(ImmutableBulkPair {
+        archive: ImmutableObjectView::from_store_verified(
+            archive,
+            archive_capture.evidence(),
+            archive_capture.size_bytes(),
+            limits.max_archive_bytes,
+        ),
+        official_readme: ImmutableObjectView::from_store_verified(
+            official_readme,
+            official_readme_capture.evidence(),
+            official_readme_capture.size_bytes(),
+            limits.max_readme_bytes,
+        ),
+    })
+}
+
+fn validate_bulk_manifest_for_logical_publication(
+    manifest: &SecBulkLayoutManifest,
+) -> Result<(), SecBulkError> {
+    let archive = manifest.capture();
+    let readme = manifest.official_readme_capture();
+    if archive.selection() != readme.selection()
+        || archive.locator() != archive.selection().archive_locator()
+        || readme.locator() != archive.selection().readme_locator()
+        || archive.transport().media_kind() != super::SecBulkMediaKind::Zip
+        || readme.transport().media_kind() != super::SecBulkMediaKind::Pdf
+        || archive.evidence().algorithm() != DigestAlgorithm::Sha256
+        || readme.evidence().algorithm() != DigestAlgorithm::Sha256
+        || manifest.evidence().algorithm() != DigestAlgorithm::Sha256
+        || archive.evidence().bytes().iter().all(|byte| *byte == 0)
+        || readme.evidence().bytes().iter().all(|byte| *byte == 0)
+        || manifest.evidence().bytes().iter().all(|byte| *byte == 0)
+        || archive.size_bytes() == 0
+        || readme.size_bytes() == 0
+    {
+        return Err(SecBulkError::InvalidCapture);
+    }
+    Ok(())
+}
+
+fn validate_verified_object_binding(
+    capture: &SecBulkCapture,
+    object: &VerifiedResearchObject,
+) -> Result<(), SecBulkError> {
+    if object.content_digest() != capture.evidence() || object.size_bytes() != capture.size_bytes()
+    {
+        return Err(SecBulkError::InvalidCapture);
+    }
+    Ok(())
+}
+
+fn bulk_logical_object_semantic_identity(
+    manifest: &SecBulkLayoutManifest,
+    capture: &SecBulkCapture,
+    role: LogicalObjectRole,
+    ordinal: u32,
+) -> EvidenceDigest {
+    let selection = capture.selection();
+    let transport = capture.transport();
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/sec-bulk-logical-object/v1");
+    digest.update([match role {
+        LogicalObjectRole::Catalog => 1,
+        LogicalObjectRole::ProviderPayload => 2,
+        LogicalObjectRole::ExpandedPayload => 3,
+        LogicalObjectRole::ProviderComponent => 4,
+    }]);
+    digest.update(ordinal.to_be_bytes());
+    digest.update([match selection.family() {
+        SecBulkFamily::Nport => 1,
+        SecBulkFamily::Ncen => 2,
+    }]);
+    digest.update(selection.quarter().year().to_be_bytes());
+    digest.update([selection.quarter().quarter()]);
+    hash_field(&mut digest, capture.locator().as_str().as_bytes());
+    digest.update(capture.evidence().bytes());
+    digest.update(capture.size_bytes().to_be_bytes());
+    digest.update(capture.retrieval_revision().to_be_bytes());
+    digest.update(capture.first_observed_at().unix_nanos().to_be_bytes());
+    digest.update(transport.http_status().to_be_bytes());
+    digest.update([match transport.media_kind() {
+        super::SecBulkMediaKind::Zip => 1,
+        super::SecBulkMediaKind::Pdf => 2,
+    }]);
+    hash_optional_bytes(&mut digest, transport.media_type().map(str::as_bytes));
+    hash_optional_bytes(
+        &mut digest,
+        transport.validators().etag().map(str::as_bytes),
+    );
+    hash_optional_bytes(
+        &mut digest,
+        transport.validators().last_modified().map(str::as_bytes),
+    );
+    match transport.last_modified_at() {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.unix_nanos().to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    digest.update(transport.body_received_at().unix_nanos().to_be_bytes());
+    digest.update(manifest.evidence().bytes());
+    EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
+}
+
+fn bulk_terminal_evidence(
+    manifest: &SecBulkLayoutManifest,
+    report: SecBulkScanReport,
+    archive_semantic_identity: EvidenceDigest,
+    readme_semantic_identity: EvidenceDigest,
+) -> EvidenceDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/sec-bulk-provider-terminal/v1");
+    digest.update(manifest.evidence().bytes());
+    digest.update(archive_semantic_identity.bytes());
+    digest.update(readme_semantic_identity.bytes());
+    digest.update(report.manifest_evidence().bytes());
+    digest.update(report.source_rows().to_be_bytes());
+    digest.update(report.emitted_typed_rows().to_be_bytes());
+    digest.update(report.ordered_typed_rows_evidence().bytes());
+    EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
+}
+
+fn nport_holding_supplement_topology(
+    manifest: &SecBulkLayoutManifest,
+    terminal_evidence: EvidenceDigest,
+) -> Result<Option<SecNportHoldingSupplementTopology>, SecBulkError> {
+    if manifest.capture().selection().family() != SecBulkFamily::Nport {
+        return Ok(None);
+    }
+    let expected = nport_canonical_holding_supplement_tables();
+    let mut tables = Vec::new();
+    tables
+        .try_reserve_exact(expected.len())
+        .map_err(|_| SecBulkError::AllocationFailed)?;
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/sec-nport-holding-supplement-topology/v1");
+    digest.update(terminal_evidence.bytes());
+    digest.update(manifest.evidence().bytes());
+    digest.update(
+        u64::try_from(expected.len())
+            .map_err(|_| SecBulkError::AllocationFailed)?
+            .to_be_bytes(),
+    );
+    for table in expected {
+        let presence = manifest.table_presence(*table)?;
+        digest.update(table.ordinal().to_be_bytes());
+        hash_bulk_table_presence(&mut digest, presence);
+        tables.push(SecNportHoldingSupplementTable {
+            table: *table,
+            presence,
+        });
+    }
+    Ok(Some(SecNportHoldingSupplementTopology {
+        manifest_evidence: manifest.evidence(),
+        terminal_evidence,
+        tables: tables.into_boxed_slice(),
+        evidence: EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into()),
+    }))
+}
+
+/// The provider-neutral holding contract treats `IDENTIFIERS.tsv` as security-identity evidence,
+/// not a holding supplement. All 19 actual C.9-C.12 supplement states include explanatory notes.
+const fn nport_canonical_holding_supplement_tables() -> &'static [SecBulkTableKind] {
+    &[
+        SecBulkTableKind::NportDebtSecurity,
+        SecBulkTableKind::NportDebtSecurityReferenceInstrument,
+        SecBulkTableKind::NportConvertibleSecurityCurrency,
+        SecBulkTableKind::NportRepurchaseAgreement,
+        SecBulkTableKind::NportRepurchaseCounterparty,
+        SecBulkTableKind::NportRepurchaseCollateral,
+        SecBulkTableKind::NportDerivativeCounterparty,
+        SecBulkTableKind::NportSwaptionOptionWarrantDerivative,
+        SecBulkTableKind::NportDescriptionReferenceIndexBasket,
+        SecBulkTableKind::NportDescriptionReferenceIndexComponent,
+        SecBulkTableKind::NportDescriptionReferenceOther,
+        SecBulkTableKind::NportFutureForwardNonforeignCurrencyContract,
+        SecBulkTableKind::NportForwardForeignCurrencyContractSwap,
+        SecBulkTableKind::NportNonforeignExchangeSwap,
+        SecBulkTableKind::NportFloatingRateResetTenor,
+        SecBulkTableKind::NportOtherDerivative,
+        SecBulkTableKind::NportOtherDerivativeNotionalAmount,
+        SecBulkTableKind::NportSecuritiesLending,
+        SecBulkTableKind::NportExplanatoryNote,
+    ]
+}
+
+fn nport_holding_completeness_evidence(
+    topology: &SecNportHoldingSupplementTopology,
+    accession: &SourceIdentifier,
+    holding_id: &SourceIdentifier,
+    holding_row_evidence: EvidenceDigest,
+    tables: &[SecNportHoldingSupplementEvidence],
+) -> EvidenceDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/sec-nport-holding-supplement-completeness/v1");
+    digest.update(topology.terminal_evidence.bytes());
+    digest.update(topology.evidence.bytes());
+    hash_field(&mut digest, accession.as_str().as_bytes());
+    hash_field(&mut digest, holding_id.as_str().as_bytes());
+    digest.update(holding_row_evidence.bytes());
+    digest.update(
+        u64::try_from(tables.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for table in tables {
+        digest.update(table.table.ordinal().to_be_bytes());
+        hash_bulk_table_presence(&mut digest, table.presence);
+        digest.update([match table.state {
+            SecNportHoldingSupplementState::ReportedRows => 1,
+            SecNportHoldingSupplementState::NoDerivedRowForHolding => 2,
+            SecNportHoldingSupplementState::TablePresentEmpty => 3,
+            SecNportHoldingSupplementState::TableDeclaredAbsent => 4,
+        }]);
+        digest.update(table.joined_rows.to_be_bytes());
+        digest.update(table.joined_rows_evidence.bytes());
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
+}
+
+fn hash_bulk_table_presence(digest: &mut Sha256, presence: super::model::SecBulkTablePresence) {
+    match presence {
+        super::model::SecBulkTablePresence::PresentRows {
+            evidence,
+            row_count,
+        } => {
+            digest.update([1]);
+            digest.update(evidence.bytes());
+            digest.update(row_count.to_be_bytes());
+        }
+        super::model::SecBulkTablePresence::PresentEmpty { evidence } => {
+            digest.update([2]);
+            digest.update(evidence.bytes());
+        }
+        super::model::SecBulkTablePresence::DeclaredAbsent => digest.update([3]),
+    }
+}
+
+fn hash_optional_bytes(digest: &mut Sha256, value: Option<&[u8]>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            hash_field(digest, value);
+        }
+        None => digest.update([0]),
+    }
+}
+
 /// Inspects every member from a disk-backed sealed archive and builds an exact layout manifest.
 pub fn inspect_bulk_archive(
     store: &RawEvidenceStore,
@@ -432,7 +1436,7 @@ where
         deadline,
         cancellation,
     )?;
-    let report =
+    let (report, _validation_pair) =
         validate_typed_bulk_pair(validation_pair, &manifest, limits, deadline, cancellation)?;
     let scan = SecBulkTypedArchiveScan::try_new(manifest, report)?;
     let observer_pair = open_store_verified_pair(
@@ -443,7 +1447,7 @@ where
         deadline,
         cancellation,
     )?;
-    observe_prevalidated_bulk_pair(
+    let _observer_pair = observe_prevalidated_bulk_pair(
         observer_pair,
         scan.manifest(),
         limits,
@@ -493,7 +1497,7 @@ fn validate_typed_bulk_pair<A, R>(
     limits: SecBulkParseLimits,
     deadline: Timestamp,
     cancellation: &CancellationToken,
-) -> Result<SecBulkScanReport, SecBulkError>
+) -> Result<(SecBulkScanReport, ImmutableBulkPair<A, R>), SecBulkError>
 where
     A: Read + Seek,
     R: Read + Seek,
@@ -521,7 +1525,13 @@ where
     let mut archive_view = archive.into_inner();
     archive_view.verify_terminal(deadline, cancellation)?;
     official_readme.verify_terminal(deadline, cancellation)?;
-    Ok(report)
+    Ok((
+        report,
+        ImmutableBulkPair {
+            archive: archive_view,
+            official_readme,
+        },
+    ))
 }
 
 fn observe_prevalidated_bulk_pair<A, R, F>(
@@ -531,7 +1541,7 @@ fn observe_prevalidated_bulk_pair<A, R, F>(
     deadline: Timestamp,
     cancellation: &CancellationToken,
     observer: &mut F,
-) -> Result<(), SecBulkError>
+) -> Result<ImmutableBulkPair<A, R>, SecBulkError>
 where
     A: Read + Seek,
     R: Read + Seek,
@@ -539,7 +1549,7 @@ where
 {
     let ImmutableBulkPair {
         archive: mut archive_view,
-        official_readme: _verified_readme,
+        mut official_readme,
     } = pair;
     preflight_zip_archive(
         &mut archive_view,
@@ -556,7 +1566,14 @@ where
         deadline,
         cancellation,
         observer,
-    )
+    )?;
+    let mut archive_view = archive.into_inner();
+    archive_view.verify_terminal(deadline, cancellation)?;
+    official_readme.verify_terminal(deadline, cancellation)?;
+    Ok(ImmutableBulkPair {
+        archive: archive_view,
+        official_readme,
+    })
 }
 
 fn scan_typed_rows<R, F>(

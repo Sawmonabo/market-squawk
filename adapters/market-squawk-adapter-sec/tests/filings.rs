@@ -5,17 +5,75 @@ mod bulk {
     use cap_std::{ambient_authority, fs::Dir};
     use market_squawk_adapter_sec::{
         RawEvidenceStore, SecBulkCapture, SecBulkCoverage, SecBulkError, SecBulkFamily,
-        SecBulkKeyField, SecBulkMediaKind, SecBulkNativePublicationSession, SecBulkParseLimits,
-        SecBulkProjectionDisposition, SecBulkProviderProjection, SecBulkQueryLimits,
-        SecBulkSelection, SecBulkTableKind, SecBulkTransportEvidence, SecBulkTypedValue,
-        SecHttpValidators, SecQuarter, SecRepresentationLimits, SecRepresentationRegistry,
-        inspect_bulk_archive, query_native_rows, recover_bulk_archive,
-        recover_native_generation_from_receipt, scan_bulk_archive, scan_bulk_archive_typed,
+        SecBulkMediaKind, SecBulkParseLimits, SecBulkProjectionDisposition,
+        SecBulkProviderProjection, SecBulkSelection, SecBulkTableKind, SecBulkTransportEvidence,
+        SecBulkTypedValue, SecFundIdentityAuthority, SecFundPartitionAdmissions,
+        SecFundPendingLogicalRows, SecFundPublicationScope, SecHttpValidators,
+        SecPendingBulkLogicalPublication, SecQuarter, SecRepresentationLimits,
+        SecRepresentationRegistry, inspect_bulk_archive, recover_bulk_archive,
+        scan_bulk_archive_typed,
     };
-    use market_squawk_domain::Timestamp;
+    use market_squawk_domain::{
+        EvidenceDigest, ExactPayloadEvidence, FundEvidenceRecord, FundHoldingSecurityIdentity,
+        FundMissingState, FundShareClassIdentity, InstrumentId, MetadataRevision, SourceId,
+        SourceIdentifier, Timestamp,
+    };
+    use market_squawk_platform::{
+        LocalPaths, ResearchObjectAdmission, ResearchObjectControl, ResearchObjectControlError,
+        ResearchObjectControlPoint,
+    };
+    use market_squawk_sources::{LogicalPartitionFamily, LogicalPartitionSetAdmission};
     use tokio_util::sync::CancellationToken;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
+
+    struct AllowResearchObjects;
+
+    impl ResearchObjectControl for AllowResearchObjects {
+        fn checkpoint(
+            &self,
+            _point: ResearchObjectControlPoint,
+        ) -> Result<(), ResearchObjectControlError> {
+            Ok(())
+        }
+    }
+
+    struct FixtureIdentityAuthority {
+        observed_at: Timestamp,
+        evidence: EvidenceDigest,
+    }
+
+    impl SecFundIdentityAuthority for FixtureIdentityAuthority {
+        fn resolve_share_class(
+            &mut self,
+            series_id: &SourceIdentifier,
+            _cutoff: Timestamp,
+        ) -> Result<FundShareClassIdentity, SecBulkError> {
+            FundShareClassIdentity::try_new(
+                "4c7f46e9-58f0-49de-90ef-beb9d49a2884"
+                    .parse::<InstrumentId>()
+                    .map_err(|_| SecBulkError::UnresolvedIdentity)?,
+                series_id.clone(),
+                SourceId::try_from("fixture-reference")
+                    .map_err(|_| SecBulkError::UnresolvedIdentity)?,
+                MetadataRevision::new(SourceIdentifier::try_from("fixture-reference-v1")?),
+                ExactPayloadEvidence::from_content_digest(self.evidence),
+                self.observed_at,
+                self.observed_at,
+            )
+            .map_err(|_| SecBulkError::UnresolvedIdentity)
+        }
+
+        fn resolve_holding_security(
+            &mut self,
+            _holding: &market_squawk_adapter_sec::SecNportHoldingRow,
+            _identifiers: &[market_squawk_adapter_sec::SecNportIdentifierRow],
+            _cutoff: Timestamp,
+        ) -> Result<FundHoldingSecurityIdentity, SecBulkError> {
+            FundHoldingSecurityIdentity::unresolved(FundMissingState::UnresolvedIdentity)
+                .map_err(|_| SecBulkError::UnresolvedIdentity)
+        }
+    }
 
     #[test]
     fn quarterly_bulk_is_exact_restart_safe_and_keeps_ncen_schema_gap_typed()
@@ -158,59 +216,70 @@ mod bulk {
 
         let publication_manifest =
             recover_bulk_archive(&store, &manifest, limits, deadline, &cancellation)?;
-        let published_at = archive_received_at.max(readme_received_at);
-        let mut publication = SecBulkNativePublicationSession::new(
-            &store,
-            publication_manifest,
-            published_at,
-            deadline,
-            cancellation.clone(),
-        )?;
-        scan_bulk_archive(
-            &store,
-            &manifest,
+        let (archive_admission, readme_admission) =
+            SecPendingBulkLogicalPublication::logical_object_admissions(&publication_manifest)?;
+        let sealed = LocalPaths::prepare(temporary.path().join("sealed-journal"))?
+            .sealed_research_journal_store()?;
+        let control = AllowResearchObjects;
+        let mut archive_stage = sealed.begin_logical_object(archive_admission)?;
+        archive_stage.write_all(&archive_bytes)?;
+        let archive_verified = sealed.finish_logical_object(archive_stage, &control)?;
+        let mut readme_stage = sealed.begin_logical_object(readme_admission)?;
+        readme_stage.write_all(readme_bytes)?;
+        let readme_verified = sealed.finish_logical_object(readme_stage, &control)?;
+        let pending = SecPendingBulkLogicalPublication::try_new(publication_manifest)?;
+        let staged = pending.verify_and_stage(
+            archive_verified,
+            readme_verified,
             limits,
             deadline,
             &cancellation,
-            &mut publication,
-        )
-        .map_err(|error| std::io::Error::other(format!("publish native bulk: {error:?}")))?;
-        let generation_receipt = publication
-            .published_generation()
-            .ok_or_else(|| std::io::Error::other("native generation was not published"))?
-            .receipt();
-        drop(publication);
-        let generation = recover_native_generation_from_receipt(
-            &store,
-            generation_receipt,
-            deadline,
-            &cancellation,
-        )
-        .map_err(|error| std::io::Error::other(format!("recover native receipt: {error:?}")))?;
-        assert_eq!(generation.receipt(), generation_receipt);
-        let primary_key = [SecBulkKeyField::try_new(
-            "ACCESSION_NUMBER",
-            "0001099263-26-004477",
-        )?];
-        let page = query_native_rows(
-            &store,
-            &generation,
-            SecBulkTableKind::NcenSubmission,
-            Some(&primary_key),
-            SecBulkQueryLimits::production_defaults(),
-            None,
-            deadline,
-            &cancellation,
-        )
-        .map_err(|error| std::io::Error::other(format!("query native row: {error:?}")))?;
-        assert_eq!(page.rows().len(), 1);
-        assert!(page.next_cursor().is_none());
+            &control,
+            SecFundPendingLogicalRows::new(SecFundPublicationScope::try_ncen(
+                SourceIdentifier::try_from("0001099263-26-004477")?,
+                SourceIdentifier::try_from("0001099263-26-004477_0001795351_S000095886")?,
+            )?),
+        )?;
+        let object_admission = ResearchObjectAdmission::try_new(8 * 1024 * 1024, 64)?;
+        let partition_admission =
+            LogicalPartitionSetAdmission::try_new(object_admission, 4, 100, 4 * 1024 * 1024)?;
+        let observed_at = archive_received_at.max(readme_received_at);
+        let mut identity = FixtureIdentityAuthority {
+            observed_at,
+            evidence: archive_evidence,
+        };
+        let prepared = staged.prepare_fund_logical_publication(
+            &mut identity,
+            observed_at,
+            SecFundPartitionAdmissions::new(partition_admission, partition_admission),
+            &sealed,
+            &control,
+        )?;
+        assert_eq!(prepared.canonical_partitions().len(), 1);
+        assert_eq!(prepared.canonical_partitions()[0].records().len(), 2);
         assert!(matches!(
-            page.rows()[0].projection_disposition(),
-            SecBulkProjectionDisposition::Projected(
-                SecBulkProviderProjection::NcenSubmission(candidate)
-            ) if candidate.accession.as_str() == "0001099263-26-004477"
+            prepared.canonical_partitions()[0].records(),
+            [
+                FundEvidenceRecord::Report(_),
+                FundEvidenceRecord::ShareClass(_)
+            ]
         ));
+        assert_eq!(prepared.terminal().total_canonical_rows, 2);
+        assert_eq!(
+            prepared
+                .partitions()
+                .iter()
+                .map(|partition| partition.family())
+                .collect::<Vec<_>>(),
+            [
+                LogicalPartitionFamily::ProviderNative,
+                LogicalPartitionFamily::CanonicalRowMap
+            ]
+        );
+        assert_ne!(
+            prepared.preparation_digest(),
+            prepared.canonical_partitions()[0].typed_input_digest()
+        );
 
         let typed_manifest =
             recover_bulk_archive(&store, &manifest, limits, deadline, &cancellation)?;

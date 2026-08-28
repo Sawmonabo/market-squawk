@@ -997,6 +997,47 @@ impl SealedResearchJournalStore {
         }
     }
 
+    /// Consumes and removes one unpublished logical-object stage after exact owner validation.
+    ///
+    /// A linked or identity-changed stage is rejected. Published immutable objects are never
+    /// removed by this cancellation path.
+    pub fn abort_logical_object(
+        &self,
+        pending: PendingResearchObject,
+    ) -> Result<(), SealedResearchJournalStoreError> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
+        self.validate_owner()?;
+        self.validate_pending_owner(&pending)?;
+        pending.validate_identity()?;
+        let stage_name = pending.stage_name.clone();
+        let identity = pending.identity;
+        let size_bytes = pending.size_bytes;
+        drop(pending);
+        let named = self
+            .staging
+            .symlink_metadata(&*stage_name)
+            .map_err(|source| {
+                SealedResearchJournalStoreError::io(
+                    "failed to inspect aborted logical research-object stage",
+                    source,
+                )
+            })?;
+        validate_private_regular_file_with_links(&named, Some(size_bytes), Some(1))?;
+        if FileIdentity::from_metadata(&named) != identity {
+            return Err(SealedResearchJournalStoreError::StateConflict);
+        }
+        self.staging.remove_file(&*stage_name).map_err(|source| {
+            SealedResearchJournalStoreError::io(
+                "failed to remove aborted logical research-object stage",
+                source,
+            )
+        })?;
+        sync_directory(&self.staging)
+    }
+
     /// Finishes, fully re-verifies, and publishes a content-addressed `.mro` without replacement.
     ///
     /// Control is checked throughout verification and immediately before the final-link attempt.

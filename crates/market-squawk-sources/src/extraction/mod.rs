@@ -3,6 +3,7 @@
 mod batch;
 mod capture;
 mod contracts;
+mod logical_publication;
 mod native_lineage;
 mod option_market;
 mod revisions;
@@ -54,6 +55,16 @@ pub use contracts::{
     MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORD_BYTES,
     MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceObject,
     payload_matches_exact_evidence,
+};
+pub use logical_publication::{
+    CanonicalPartitionExpectation, LOGICAL_PARTITION_FRAME_HEADER_BYTES, LogicalItemRange,
+    LogicalObjectRole, LogicalPartitionFamily, LogicalPartitionSetAdmission,
+    LogicalPartitionSetCheckpoint, MAX_PROVIDER_CANONICAL_PARTITIONS,
+    MAX_PROVIDER_LOGICAL_CATALOG_BYTES, MAX_PROVIDER_LOGICAL_OBJECTS,
+    MAX_PROVIDER_LOGICAL_PARTITIONS, PendingLogicalPartitionSet, ProviderLogicalPublicationError,
+    ProviderLogicalTerminalInput, ProviderLogicalTerminalReceipt, SealedLogicalObjectInput,
+    SealedLogicalPartitionClaim, SealedLogicalPartitionInput, SealedLogicalPartitionSet,
+    SealedProviderLogicalPublicationBinding, StagedLogicalItemCoordinate,
 };
 pub use native_lineage::{
     MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
