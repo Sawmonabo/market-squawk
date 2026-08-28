@@ -804,9 +804,10 @@ impl GenerationRecord {
 
     fn fully_admitted(&self, capability: &ProviderCapability, observed_at: Timestamp) -> bool {
         let authority_is_current = match self.runtime_evidence.as_ref() {
-            Some(RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(_)) => {
-                self.verification.is_some()
-            }
+            Some(
+                RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(_)
+                | RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(_),
+            ) => self.verification.is_some(),
             _ => self
                 .verification
                 .as_ref()
@@ -1807,6 +1808,15 @@ impl OnboardingLifecycle {
             .and_then(RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
     }
 
+    /// Returns the typed Schwab market-data doctor receipt for one exact generation.
+    pub fn generation_schwab_market_data_doctor_receipt(
+        &self,
+        generation: SecretGeneration,
+    ) -> Option<&super::SchwabMarketDataDoctorReceiptV1> {
+        self.generation_runtime_evidence(generation)
+            .and_then(RuntimeVerificationEvidence::schwab_market_data_receipt)
+    }
+
     /// Revalidates the exact active generation's complete admission at a trusted read time.
     pub fn active_generation_is_fully_admitted(
         &self,
@@ -2004,7 +2014,11 @@ impl OnboardingLifecycle {
         }
         match evidence {
             RuntimeVerificationEvidence::DigestV1(_) => {
-                if self.surface_id.as_str() == super::ALPACA_BASIC_MARKET_DATA_SURFACE_ID {
+                if matches!(
+                    self.surface_id.as_str(),
+                    super::ALPACA_BASIC_MARKET_DATA_SURFACE_ID
+                        | super::SCHWAB_MARKET_DATA_SURFACE_ID
+                ) {
                     Err(OnboardingStateError::EvidenceMismatch)
                 } else {
                     Ok(())
@@ -2016,6 +2030,13 @@ impl OnboardingLifecycle {
                     return Err(OnboardingStateError::InvalidEvidence);
                 }
                 self.validate_alpaca_receipt_binding(capability, generation, receipt)
+            }
+            RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(receipt) => {
+                let generation = generation.ok_or(OnboardingStateError::GenerationMismatch)?;
+                if receipt.predecessor_digest().is_some() {
+                    return Err(OnboardingStateError::InvalidEvidence);
+                }
+                self.validate_schwab_receipt_binding(capability, generation, receipt)
             }
         }
     }
@@ -2030,9 +2051,6 @@ impl OnboardingLifecycle {
         evidence
             .revalidate()
             .map_err(|_| OnboardingStateError::InvalidEvidence)?;
-        let next = evidence
-            .alpaca_paper_iex_receipt()
-            .ok_or(OnboardingStateError::EvidenceMismatch)?;
         let record = self.generation(generation)?;
         if self.state != OnboardingState::RenewalRequired
             || self.active_generation != Some(generation)
@@ -2042,17 +2060,38 @@ impl OnboardingLifecycle {
         {
             return Err(OnboardingStateError::InvalidTransition);
         }
-        self.validate_alpaca_receipt_binding(capability, generation, next)?;
-        let prior = record
-            .runtime_evidence
-            .as_ref()
-            .and_then(RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
-            .ok_or(OnboardingStateError::EvidenceMismatch)?;
-        if next.predecessor_digest() != Some(prior.receipt_sha256())
-            || next.verified_at() <= prior.verified_at()
-            || !next.same_authority_as(prior)
-        {
-            return Err(OnboardingStateError::EvidenceMismatch);
+        match evidence {
+            RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(next) => {
+                self.validate_alpaca_receipt_binding(capability, generation, next)?;
+                let prior = record
+                    .runtime_evidence
+                    .as_ref()
+                    .and_then(RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
+                    .ok_or(OnboardingStateError::EvidenceMismatch)?;
+                if next.predecessor_digest() != Some(prior.receipt_sha256())
+                    || next.verified_at() <= prior.verified_at()
+                    || !next.same_authority_as(prior)
+                {
+                    return Err(OnboardingStateError::EvidenceMismatch);
+                }
+            }
+            RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(next) => {
+                self.validate_schwab_receipt_binding(capability, generation, next)?;
+                let prior = record
+                    .runtime_evidence
+                    .as_ref()
+                    .and_then(RuntimeVerificationEvidence::schwab_market_data_receipt)
+                    .ok_or(OnboardingStateError::EvidenceMismatch)?;
+                if next.predecessor_digest() != Some(prior.receipt_sha256())
+                    || next.verified_at() <= prior.verified_at()
+                    || !next.same_authority_as(prior)
+                {
+                    return Err(OnboardingStateError::EvidenceMismatch);
+                }
+            }
+            RuntimeVerificationEvidence::DigestV1(_) => {
+                return Err(OnboardingStateError::EvidenceMismatch);
+            }
         }
         Ok(())
     }
@@ -2091,6 +2130,41 @@ impl OnboardingLifecycle {
             || receipt.rate_policy_digest() != capability.rate_policy().evidence_digest()
             || !principal_matches
             || !authority_is_nonexpiring
+        {
+            return Err(OnboardingStateError::EvidenceMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_schwab_receipt_binding(
+        &self,
+        capability: &ProviderCapability,
+        generation: SecretGeneration,
+        receipt: &super::SchwabMarketDataDoctorReceiptV1,
+    ) -> Result<(), OnboardingStateError> {
+        let record = self.generation(generation)?;
+        let context = self
+            .runtime_verification_context
+            .as_ref()
+            .ok_or(OnboardingStateError::EvidenceMismatch)?;
+        let application_credential_is_verified =
+            record.verification.as_ref().is_some_and(|verification| {
+                verification.expires_at().is_none()
+                    && verification.bindings().account_digest().is_none()
+            });
+        if receipt.surface_id() != &self.surface_id
+            || receipt.surface_id() != capability.surface_id()
+            || receipt.application_credential_generation() != generation
+            || receipt.capability_revision() != self.capability_revision
+            || receipt.capability_revision() != capability.revision()
+            || receipt.capability_digest() != self.capability_digest
+            || receipt.capability_digest() != capability.content_digest()
+            || receipt.session_identifier() != context.session_identifier()
+            || receipt.public_configuration_digest() != context.public_configuration_digest()
+            || record.rights_digest != Some(receipt.rights_decision_digest())
+            || record.rate_policy_digest != Some(receipt.rate_policy_digest())
+            || receipt.rate_policy_digest() != capability.rate_policy().evidence_digest()
+            || !application_credential_is_verified
         {
             return Err(OnboardingStateError::EvidenceMismatch);
         }

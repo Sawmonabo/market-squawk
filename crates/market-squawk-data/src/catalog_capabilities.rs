@@ -29,6 +29,8 @@ use market_squawk_sources::{
     AlpacaPaperIexDoctorReceiptInput, AlpacaPaperIexDoctorReceiptV1, AlpacaRateLimitField,
     AlpacaRetryAfterEvidence, CapabilityRegistrationOutcome, OnboardingEvent, OnboardingState,
     ProviderCapability, RuntimeCapabilityDisposition, RuntimeVerificationEvidence,
+    SCHWAB_MARKET_DATA_SURFACE_ID, SchwabMarketDataDoctorObservation,
+    SchwabMarketDataDoctorReceiptInput, SchwabMarketDataDoctorReceiptV1,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -540,6 +542,106 @@ impl OnboardingCatalogCapability {
             OnboardingEvent::RuntimeVerified {
                 generation: Some(generation),
                 evidence: RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(Box::new(
+                    receipt,
+                )),
+            },
+        )
+    }
+
+    /// Consumes one provider-observed Schwab market-data doctor result into a durable receipt.
+    ///
+    /// The caller selects the intended application-credential generation but supplies no receipt
+    /// authority. While holding the catalog writer mutex, this method recovers the canonical
+    /// session, configuration, capability, credential verification, rights, rate policy, quality,
+    /// and renewal predecessor. OAuth token deadlines shorten the source-owned doctor-validity
+    /// window, and the lifecycle rejects a receipt that is not current at the catalog commit time.
+    pub fn append_schwab_market_data_doctor_observation(
+        &self,
+        reservation: &OnboardingReservation,
+        sequence: u64,
+        generation: SecretGeneration,
+        observation: SchwabMarketDataDoctorObservation,
+    ) -> Result<OnboardingAppendOutcome, CatalogError> {
+        let authority = self.lock()?;
+        let resumed = authority.resume_provider_onboarding(reservation.session_id())?;
+        if resumed.reservation() != reservation
+            || resumed.lifecycle().surface_id().as_str() != SCHWAB_MARKET_DATA_SURFACE_ID
+            || observation.provider_observation_origin
+                != SchwabMarketDataDoctorObservation::provider_observed_origin()
+                    .map_err(|_| CatalogError::InvalidRecord)?
+        {
+            return Err(CatalogError::InvalidOnboardingReservationCapability);
+        }
+        let lifecycle = resumed.lifecycle();
+        let verification = lifecycle
+            .generation_verification(generation)
+            .ok_or(CatalogError::InvalidRecord)?;
+        let rights_decision_digest = lifecycle
+            .generation_rights_digest(generation)
+            .ok_or(CatalogError::InvalidRecord)?;
+        let rate_policy_digest = lifecycle
+            .generation_rate_policy_digest(generation)
+            .ok_or(CatalogError::InvalidRecord)?;
+        if verification.expires_at().is_some()
+            || verification.bindings().account_digest().is_some()
+            || rights_decision_digest != verification.restrictions_digest()
+        {
+            return Err(CatalogError::InvalidRecord);
+        }
+        let predecessor_digest = if lifecycle.state() == OnboardingState::RenewalRequired
+            && lifecycle.active_generation() == Some(generation)
+            && lifecycle.candidate_generation().is_none()
+        {
+            Some(
+                lifecycle
+                    .generation_runtime_evidence(generation)
+                    .and_then(RuntimeVerificationEvidence::schwab_market_data_receipt)
+                    .map(SchwabMarketDataDoctorReceiptV1::receipt_sha256)
+                    .ok_or(CatalogError::InvalidRecord)?,
+            )
+        } else if lifecycle.candidate_generation() == Some(generation)
+            && lifecycle.generation_runtime_evidence(generation).is_none()
+        {
+            None
+        } else {
+            return Err(CatalogError::InvalidRecord);
+        };
+        let context = lifecycle
+            .runtime_verification_context()
+            .ok_or(CatalogError::InvalidRecord)?;
+        let exclusive_expires_at = observation
+            .completed_at()
+            .unix_nanos()
+            .checked_add(SchwabMarketDataDoctorReceiptV1::VALIDITY_NANOS)
+            .map(|expires_at| {
+                expires_at
+                    .min(observation.access_expires_at.unix_nanos())
+                    .min(observation.refresh_expires_at.unix_nanos())
+            })
+            .map(Timestamp::from_unix_nanos)
+            .ok_or(CatalogError::InvalidRecord)?;
+        let receipt =
+            SchwabMarketDataDoctorReceiptV1::try_new(SchwabMarketDataDoctorReceiptInput {
+                surface_id: lifecycle.surface_id().clone(),
+                session_identifier: context.session_identifier().clone(),
+                application_credential_generation: generation,
+                capability_revision: lifecycle.capability_revision(),
+                capability_digest: lifecycle.capability_digest(),
+                public_configuration_digest: context.public_configuration_digest(),
+                rights_decision_digest,
+                rate_policy_digest,
+                data_quality: DataQuality::DirectUnverified,
+                observation,
+                exclusive_expires_at,
+                predecessor_digest,
+            })
+            .map_err(|_| CatalogError::InvalidRecord)?;
+        authority.append_provider_onboarding_event(
+            reservation,
+            sequence,
+            OnboardingEvent::RuntimeVerified {
+                generation: Some(generation),
+                evidence: RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(Box::new(
                     receipt,
                 )),
             },
