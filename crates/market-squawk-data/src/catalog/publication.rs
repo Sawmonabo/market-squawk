@@ -4,6 +4,7 @@ use market_squawk_domain::{SchemaVersion, SourceIdentifier, Timestamp};
 use rusqlite::{OptionalExtension as _, Transaction, params};
 use uuid::Uuid;
 
+use super::provider_capture::retain_ordered_prepared_provider_capture_bindings;
 use super::storage::{
     ResultBudget, append_audit, digest_columns, parse_digest, require_reserved_run,
     trusted_catalog_now,
@@ -22,6 +23,8 @@ pub(crate) enum PublicationSourceEvidence<'a> {
     NoNewRawInput,
     /// The provider publication consumes one exact prepared live binding.
     Provider(&'a PreparedProviderCaptureBinding),
+    /// One complete macro plan consumes every prepared capture in exact chunk order.
+    ProviderMacroPlan(&'a [PreparedProviderCaptureBinding]),
     /// The provider publication consumes one exact typed event/composite binding.
     ProviderEvent(&'a PreparedProviderPublicationBinding),
     /// The provider publication consumes one exact sealed option-market binding.
@@ -259,6 +262,14 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
                 transaction,
                 reservation.run_id,
                 binding,
+                catalog_now,
+            )?;
+        }
+        PublicationSourceEvidence::ProviderMacroPlan(bindings) => {
+            retain_ordered_prepared_provider_capture_bindings(
+                transaction,
+                reservation.run_id,
+                bindings,
                 catalog_now,
             )?;
         }

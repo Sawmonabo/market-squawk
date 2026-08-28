@@ -145,10 +145,14 @@ pub use dataset_builder::{
 };
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
-    IngestPrecommitAuthority, ListingReferenceAdmissionCapability, PinnedArtifactQueryRequest,
-    ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
-    ProviderOptionMarketPublicationSelector, ProviderPublicationInput, QueryArtifactPublication,
-    ResearchIngestService, extraction_batch_digest, extraction_provider_payload_digest,
+    IngestPrecommitAuthority, ListingReferenceAdmissionCapability,
+    PendingProviderMacroPlanPublication, PinnedArtifactQueryRequest, ProviderMacroPlanChunkInput,
+    ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
+    ProviderMacroPlanRestartSelector,
+    ProviderMacroPlanSemantics, ProviderMarketEventPublicationKind,
+    ProviderMarketEventPublicationSelector, ProviderOptionMarketPublicationSelector,
+    ProviderPublicationInput, QueryArtifactPublication, ResearchIngestService,
+    extraction_batch_digest, extraction_provider_payload_digest,
     provider_market_event_publication_digest, provider_option_market_publication_digest,
 };
 pub use manifest::{

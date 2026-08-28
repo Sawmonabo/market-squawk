@@ -10,7 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
-    CompanyIdentityObservation, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
+    CompanyIdentityObservation, DigestAlgorithm, EvidenceDigest, MetadataRevision,
+    ResearchObservation, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{
     ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
@@ -18,7 +19,9 @@ use market_squawk_platform::{
 };
 use market_squawk_sources::{
     ExtractionBatch, ExtractionContentIdentity, ExtractionError, ExtractionRevisionPlan,
-    ObservedRevisionAuthority, ObservedRevisionError, OptionMarketBatchKind, ProviderCaptureError,
+    MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, MAX_PROVIDER_CAPTURE_PAGES, ObservedRevisionAuthority,
+    ObservedRevisionError, OptionMarketBatchKind, ProviderCaptureError,
+    ProviderCaptureTerminalDisposition, ProviderNativeLineageImplementation,
     SealedProviderCaptureBinding, SealedProviderOptionMarketBinding,
     SealedProviderPublicationBinding, SourceClass, SourceMetadata, SourceObjectCaptureIdentity,
 };
@@ -62,6 +65,8 @@ const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 const REVISION_ASSIGNMENT_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_EVENT_PUBLICATION_READ_BYTES: usize = 128 * 1024 * 1024;
 const MAX_OPTION_PUBLICATION_READ_BYTES: usize = 192 * 1024 * 1024;
+const PROVIDER_MACRO_PLAN_PUBLICATION_DOMAIN: &[u8] =
+    b"market-squawk/provider-macro-plan-publication/v1";
 
 struct ProviderCaptureRecoveryControl<'a> {
     cancellation: &'a CancellationToken,
@@ -195,6 +200,446 @@ impl ProviderPublicationInput {
     }
 }
 
+/// Opaque provider semantics retained beside one canonical macro chunk.
+///
+/// The common data layer binds the adapter-authored semantic identity and exact bounded payload
+/// without interpreting provider-specific fields. Provider-native row semantics remain in the
+/// sealed capture binding; this companion retains response-wide semantics that cannot be reduced
+/// to one canonical row.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ProviderMacroPlanSemantics {
+    schema: SourceIdentifier,
+    schema_requirement_digest: EvidenceDigest,
+    semantic_digest: EvidenceDigest,
+    payload: Box<[u8]>,
+    payload_content_digest: EvidenceDigest,
+}
+
+impl ProviderMacroPlanSemantics {
+    /// Binds an exact bounded provider semantic document to its adapter-authored identities.
+    pub fn try_new(
+        schema: SourceIdentifier,
+        schema_requirement_digest: EvidenceDigest,
+        semantic_digest: EvidenceDigest,
+        payload: Box<[u8]>,
+    ) -> Result<Self, IngestError> {
+        require_provider_macro_digest(schema_requirement_digest)?;
+        require_provider_macro_digest(semantic_digest)?;
+        let payload_bytes =
+            u64::try_from(payload.len()).map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        if payload.is_empty() || payload_bytes > MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES {
+            return Err(IngestError::InvalidProviderMacroPlan);
+        }
+        let payload_content_digest = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(payload.as_ref()).into(),
+        );
+        Ok(Self {
+            schema,
+            schema_requirement_digest,
+            semantic_digest,
+            payload,
+            payload_content_digest,
+        })
+    }
+
+    /// Returns the exact provider semantics schema.
+    pub const fn schema(&self) -> &SourceIdentifier {
+        &self.schema
+    }
+
+    /// Returns the adapter-authored provider semantics identity.
+    pub const fn semantic_digest(&self) -> EvidenceDigest {
+        self.semantic_digest
+    }
+
+    /// Returns the SHA-256 identity of the exact serialized companion payload.
+    pub const fn payload_content_digest(&self) -> EvidenceDigest {
+        self.payload_content_digest
+    }
+}
+
+/// One non-cloneable, ordered macro-plan chunk awaiting an all-or-nothing shared commit.
+#[derive(Debug)]
+pub struct ProviderMacroPlanChunkInput {
+    chunk_index: u16,
+    total_chunks: u16,
+    candidate_digest: EvidenceDigest,
+    source_generation_digest: EvidenceDigest,
+    semantics: ProviderMacroPlanSemantics,
+    sealed_capture: SealedProviderCaptureBinding,
+    revisions: ExtractionRevisionPlan,
+}
+
+impl ProviderMacroPlanChunkInput {
+    /// Consumes one sealed canonical/native/raw chunk and its exact revision authority.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the ordered provider chunk keeps every independently verified identity explicit"
+    )]
+    pub fn try_new(
+        chunk_index: u16,
+        total_chunks: u16,
+        candidate_digest: EvidenceDigest,
+        source_generation_digest: EvidenceDigest,
+        semantics: ProviderMacroPlanSemantics,
+        sealed_capture: SealedProviderCaptureBinding,
+        revisions: ExtractionRevisionPlan,
+    ) -> Result<Self, IngestError> {
+        require_provider_macro_digest(candidate_digest)?;
+        require_provider_macro_digest(source_generation_digest)?;
+        sealed_capture.validate()?;
+        if total_chunks == 0
+            || chunk_index >= total_chunks
+            || sealed_capture.record_count() == 0
+            || revisions.len() != sealed_capture.record_count()
+            || !revisions.native_lineage_required()
+            || !revisions.is_locally_observed()
+            || sealed_capture.native_lineage().schema().implementation()
+                != ProviderNativeLineageImplementation::BlsTimeseriesV1
+        {
+            return Err(IngestError::InvalidProviderMacroPlan);
+        }
+        validate_provider_macro_chunk_rows(&sealed_capture, &revisions)?;
+        Ok(Self {
+            chunk_index,
+            total_chunks,
+            candidate_digest,
+            source_generation_digest,
+            semantics,
+            sealed_capture,
+            revisions,
+        })
+    }
+
+    /// Returns this chunk's contiguous position in the provider plan.
+    pub const fn chunk_index(&self) -> u16 {
+        self.chunk_index
+    }
+
+    /// Returns the exact canonical row count in this chunk.
+    pub fn row_count(&self) -> usize {
+        self.sealed_capture.record_count()
+    }
+
+    /// Returns the exact sealed canonical/native/raw binding.
+    pub const fn sealed_capture(&self) -> &SealedProviderCaptureBinding {
+        &self.sealed_capture
+    }
+}
+
+/// Complete ordered provider macro plan admitted for one atomic publication transaction.
+#[derive(Debug)]
+pub struct ProviderMacroPlanPublicationInput {
+    analytical_dataset: DatasetId,
+    completion_digest: EvidenceDigest,
+    publication_digest: EvidenceDigest,
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    provider_dataset: SourceIdentifier,
+    request_set_identity: EvidenceDigest,
+    source_generation_digest: EvidenceDigest,
+    sealed_capture_receipt_digest: EvidenceDigest,
+    total_rows: u64,
+    chunks: Box<[ProviderMacroPlanChunkInput]>,
+}
+
+impl ProviderMacroPlanPublicationInput {
+    /// Consumes every exact chunk only after proving complete contiguous request-graph closure.
+    pub fn try_new(
+        analytical_dataset: DatasetId,
+        completion_digest: EvidenceDigest,
+        expected_total_rows: u64,
+        chunks: Vec<ProviderMacroPlanChunkInput>,
+    ) -> Result<Self, IngestError> {
+        require_provider_macro_digest(completion_digest)?;
+        if chunks.is_empty() || chunks.len() > MAX_PROVIDER_CAPTURE_PAGES {
+            return Err(IngestError::InvalidProviderMacroPlan);
+        }
+        let total_chunks =
+            u16::try_from(chunks.len()).map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        let first = chunks
+            .first()
+            .ok_or(IngestError::InvalidProviderMacroPlan)?;
+        let root_capture = first.sealed_capture.capture_evidence();
+        let source_id = root_capture.source_id().clone();
+        let metadata_revision = root_capture.metadata_revision().clone();
+        let provider_dataset = root_capture.dataset().clone();
+        let request_set_identity = root_capture.request_set_identity();
+        let source_generation_digest = first.source_generation_digest;
+        let sealed_capture_receipt_digest = first.sealed_capture.sealed_capture_receipt_digest();
+        let semantics_schema = first.semantics.schema.clone();
+        let schema_requirement_digest = first.semantics.schema_requirement_digest;
+
+        validate_provider_macro_capture_shape(root_capture, total_chunks)?;
+        let mut total_rows = 0_u64;
+        let mut total_semantics_bytes = 0_u64;
+        for (expected_index, chunk) in chunks.iter().enumerate() {
+            let expected_index =
+                u16::try_from(expected_index).map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+            chunk.sealed_capture.validate()?;
+            let capture = chunk.sealed_capture.capture_evidence();
+            validate_provider_macro_capture_shape(capture, total_chunks)?;
+            if chunk.chunk_index != expected_index
+                || chunk.total_chunks != total_chunks
+                || capture != root_capture
+                || chunk.source_generation_digest != source_generation_digest
+                || chunk.sealed_capture.sealed_capture_receipt_digest()
+                    != sealed_capture_receipt_digest
+                || chunk.semantics.schema != semantics_schema
+                || chunk.semantics.schema_requirement_digest != schema_requirement_digest
+                || chunks[..expected_index as usize]
+                    .iter()
+                    .any(|prior| prior.candidate_digest == chunk.candidate_digest)
+            {
+                return Err(IngestError::InvalidProviderMacroPlan);
+            }
+            validate_provider_macro_component(chunk, total_chunks)?;
+            total_rows = total_rows
+                .checked_add(
+                    u64::try_from(chunk.sealed_capture.record_count())
+                        .map_err(|_| IngestError::InvalidProviderMacroPlan)?,
+                )
+                .ok_or(IngestError::InvalidProviderMacroPlan)?;
+            total_semantics_bytes = total_semantics_bytes
+                .checked_add(
+                    u64::try_from(chunk.semantics.payload.len())
+                        .map_err(|_| IngestError::InvalidProviderMacroPlan)?,
+                )
+                .ok_or(IngestError::InvalidProviderMacroPlan)?;
+        }
+        if total_rows == 0
+            || total_rows != expected_total_rows
+            || total_semantics_bytes > MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES
+        {
+            return Err(IngestError::InvalidProviderMacroPlan);
+        }
+        let publication_digest = provider_macro_plan_publication_digest(
+            &analytical_dataset,
+            completion_digest,
+            total_rows,
+            &chunks,
+        )?;
+        Ok(Self {
+            analytical_dataset,
+            completion_digest,
+            publication_digest,
+            source_id,
+            metadata_revision,
+            provider_dataset,
+            request_set_identity,
+            source_generation_digest,
+            sealed_capture_receipt_digest,
+            total_rows,
+            chunks: chunks.into_boxed_slice(),
+        })
+    }
+
+    /// Returns the Task 3 persist-reservation payload for this exact complete plan.
+    pub const fn publication_digest(&self) -> EvidenceDigest {
+        self.publication_digest
+    }
+
+    /// Returns the adapter-authored complete-plan identity bound into the publication digest.
+    pub const fn completion_digest(&self) -> EvidenceDigest {
+        self.completion_digest
+    }
+
+    /// Returns the exact number of deterministic chunks that must commit together.
+    pub fn total_chunks(&self) -> u16 {
+        u16::try_from(self.chunks.len()).unwrap_or(u16::MAX)
+    }
+
+    /// Returns the checked total canonical row count.
+    pub const fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    /// Returns the sole source-rights namespace shared by every chunk.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact source metadata revision shared by the complete capture graph.
+    pub const fn metadata_revision(&self) -> &MetadataRevision {
+        &self.metadata_revision
+    }
+
+    /// Returns the exact provider dataset addressed by the request graph.
+    pub const fn provider_dataset(&self) -> &SourceIdentifier {
+        &self.provider_dataset
+    }
+
+    /// Returns the complete provider request-set identity.
+    pub const fn request_set_identity(&self) -> EvidenceDigest {
+        self.request_set_identity
+    }
+
+    /// Returns the source/configuration/credential generation shared by every chunk.
+    pub const fn source_generation_digest(&self) -> EvidenceDigest {
+        self.source_generation_digest
+    }
+
+    /// Returns the physical receipt identity shared by every component binding.
+    pub const fn sealed_capture_receipt_digest(&self) -> EvidenceDigest {
+        self.sealed_capture_receipt_digest
+    }
+}
+
+/// Validated non-cloneable publication state ready for one multi-input catalog transaction.
+#[derive(Debug)]
+pub struct PendingProviderMacroPlanPublication {
+    reservation: IngestReservation,
+    input: ProviderMacroPlanPublicationInput,
+    prepared_captures: Box<[PreparedProviderCaptureBinding]>,
+}
+
+impl PendingProviderMacroPlanPublication {
+    /// Returns the exact persist reservation retained for the atomic transaction.
+    pub const fn reservation(&self) -> &IngestReservation {
+        &self.reservation
+    }
+
+    /// Returns how many existing prepared capture projections await ordered retention.
+    pub fn prepared_capture_count(&self) -> usize {
+        self.prepared_captures.len()
+    }
+
+    /// Consumes the complete validated plan into one immutable generation or commits nothing.
+    pub async fn commit(
+        self,
+        service: &AnalyticalDataService,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Result<ProviderMacroPlanPublicationReceipt, IngestError> {
+        service
+            .commit_prepared_provider_macro_plan(self, cancellation, precommit_authority)
+            .await
+    }
+}
+
+/// Durable result shape the catalog transaction must mint after all-or-nothing publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderMacroPlanPublicationReceipt {
+    manifest: DatasetManifestRef,
+    completion_digest: EvidenceDigest,
+    publication_digest: EvidenceDigest,
+    catalog_receipt_digest: EvidenceDigest,
+    source_id: SourceId,
+    request_set_identity: EvidenceDigest,
+    source_generation_digest: EvidenceDigest,
+    total_chunks: u16,
+    total_rows: u64,
+}
+
+impl ProviderMacroPlanPublicationReceipt {
+    /// Returns the exact immutable generation created by the atomic transaction.
+    pub const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    /// Returns the adapter-authored complete-plan identity bound to the manifest.
+    pub const fn completion_digest(&self) -> EvidenceDigest {
+        self.completion_digest
+    }
+
+    /// Returns the code-owned identity of every validated publication input.
+    pub const fn publication_digest(&self) -> EvidenceDigest {
+        self.publication_digest
+    }
+
+    /// Returns the durable catalog receipt binding the whole plan to this generation.
+    pub const fn catalog_receipt_digest(&self) -> EvidenceDigest {
+        self.catalog_receipt_digest
+    }
+
+    /// Returns the exact committed chunk count.
+    pub const fn total_chunks(&self) -> u16 {
+        self.total_chunks
+    }
+
+    /// Returns the exact committed canonical row count.
+    pub const fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    /// Returns an exact-manifest restart selector retaining plan closure and cardinality.
+    pub fn restart_selector(&self) -> ProviderMacroPlanRestartSelector {
+        ProviderMacroPlanRestartSelector {
+            manifest: self.manifest.clone(),
+            completion_digest: self.completion_digest,
+            publication_digest: self.publication_digest,
+            catalog_receipt_digest: self.catalog_receipt_digest,
+            source_id: self.source_id.clone(),
+            request_set_identity: self.request_set_identity,
+            source_generation_digest: self.source_generation_digest,
+            total_chunks: self.total_chunks,
+            total_rows: self.total_rows,
+        }
+    }
+}
+
+/// Exact immutable selector required to verify a complete macro plan after restart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderMacroPlanRestartSelector {
+    manifest: DatasetManifestRef,
+    completion_digest: EvidenceDigest,
+    publication_digest: EvidenceDigest,
+    catalog_receipt_digest: EvidenceDigest,
+    source_id: SourceId,
+    request_set_identity: EvidenceDigest,
+    source_generation_digest: EvidenceDigest,
+    total_chunks: u16,
+    total_rows: u64,
+}
+
+impl ProviderMacroPlanRestartSelector {
+    /// Returns the exact immutable manifest; no latest-generation substitution is permitted.
+    pub const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    /// Returns the complete-plan identity that durable catalog evidence must reproduce.
+    pub const fn completion_digest(&self) -> EvidenceDigest {
+        self.completion_digest
+    }
+
+    /// Returns the complete input identity that durable catalog evidence must reproduce.
+    pub const fn publication_digest(&self) -> EvidenceDigest {
+        self.publication_digest
+    }
+
+    /// Returns the exact immutable catalog receipt that must revalidate after restart.
+    pub const fn catalog_receipt_digest(&self) -> EvidenceDigest {
+        self.catalog_receipt_digest
+    }
+
+    /// Returns the exact source-rights owner.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the complete provider request-set identity bound into the publication digest.
+    pub const fn request_set_identity(&self) -> EvidenceDigest {
+        self.request_set_identity
+    }
+
+    /// Returns the exact provider activation/source generation bound into the publication digest.
+    pub const fn source_generation_digest(&self) -> EvidenceDigest {
+        self.source_generation_digest
+    }
+
+    /// Returns the exact expected chunk count.
+    pub const fn total_chunks(&self) -> u16 {
+        self.total_chunks
+    }
+
+    /// Returns the exact expected canonical row count.
+    pub const fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+}
+
 impl CommittedDataset {
     /// Returns the exact immutable generation pin.
     pub const fn manifest(&self) -> &DatasetManifestRef {
@@ -282,6 +727,191 @@ pub fn provider_option_market_publication_digest(
 ) -> Result<EvidenceDigest, IngestError> {
     binding.validate()?;
     Ok(binding.evidence_digest().evidence())
+}
+
+fn validate_provider_macro_chunk_rows(
+    sealed_capture: &SealedProviderCaptureBinding,
+    revisions: &ExtractionRevisionPlan,
+) -> Result<(), IngestError> {
+    let observations =
+        ResearchArrowBatch::validated_extraction_observations(sealed_capture.batch())?;
+    if observations
+        .iter()
+        .any(|observation| !matches!(observation, ResearchObservation::Macro(_)))
+    {
+        return Err(IngestError::InvalidProviderMacroPlan);
+    }
+    revisions
+        .clone()
+        .into_observed_batch_with_native_lineage(
+            sealed_capture
+                .batch()
+                .request()
+                .object()
+                .source_id()
+                .clone(),
+            sealed_capture.batch(),
+            &observations,
+            sealed_capture.native_lineage(),
+        )
+        .map_err(map_revision_error)?;
+    Ok(())
+}
+
+fn validate_provider_macro_capture_shape(
+    capture: &market_squawk_sources::ProviderCaptureSetReceipt,
+    total_chunks: u16,
+) -> Result<(), IngestError> {
+    let expected = usize::from(total_chunks);
+    let valid =
+        if total_chunks == 1 {
+            capture.terminal() == ProviderCaptureTerminalDisposition::StandaloneResponse
+                && capture.pages().len() == 1
+                && capture.request_graph_components().is_empty()
+                && capture.semantic_binding().is_none()
+        } else {
+            capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph
+                && capture.pages().len() == expected
+                && capture.request_graph_components().len() == expected
+                && capture.semantic_binding().is_none()
+                && capture.request_graph_components().iter().enumerate().all(
+                    |(index, component)| {
+                        usize::from(component.ordinal()) == index
+                            && usize::from(component.first_page_ordinal()) == index
+                            && component.page_count().get() == 1
+                            && component.terminal()
+                                == ProviderCaptureTerminalDisposition::StandaloneResponse
+                    },
+                )
+        };
+    if valid {
+        Ok(())
+    } else {
+        Err(IngestError::InvalidProviderMacroPlan)
+    }
+}
+
+fn validate_provider_macro_component(
+    chunk: &ProviderMacroPlanChunkInput,
+    total_chunks: u16,
+) -> Result<(), IngestError> {
+    let expected_page = chunk.chunk_index;
+    let capture = chunk.sealed_capture.capture_evidence();
+    let exact_scope = if total_chunks == 1 {
+        chunk.sealed_capture.component_ordinal().is_none()
+    } else {
+        let component = capture
+            .request_graph_components()
+            .get(usize::from(chunk.chunk_index))
+            .ok_or(IngestError::InvalidProviderMacroPlan)?;
+        chunk.sealed_capture.component_ordinal() == Some(chunk.chunk_index)
+            && component.dataset() == capture.dataset()
+            && component.ordinal() == chunk.chunk_index
+    };
+    if !exact_scope
+        || chunk.sealed_capture.persisted_segment_receipt(0).is_none()
+        || chunk.sealed_capture.persisted_segment_receipt(1).is_some()
+        || chunk.sealed_capture.row_frames().iter().any(|frame| {
+            frame.capture_page_ordinal() != expected_page
+                || frame.segment_ordinal() != 0
+                || frame.physical_frame_ordinal() != u32::from(expected_page)
+        })
+    {
+        return Err(IngestError::InvalidProviderMacroPlan);
+    }
+    Ok(())
+}
+
+fn provider_macro_plan_publication_digest(
+    analytical_dataset: &DatasetId,
+    completion_digest: EvidenceDigest,
+    total_rows: u64,
+    chunks: &[ProviderMacroPlanChunkInput],
+) -> Result<EvidenceDigest, IngestError> {
+    let first = chunks
+        .first()
+        .ok_or(IngestError::InvalidProviderMacroPlan)?;
+    let capture = first.sealed_capture.capture_evidence();
+    let mut digest = Sha256::new();
+    digest.update(PROVIDER_MACRO_PLAN_PUBLICATION_DOMAIN);
+    provider_macro_hash_text(&mut digest, analytical_dataset.as_str())?;
+    provider_macro_hash_evidence(&mut digest, completion_digest);
+    provider_macro_hash_text(&mut digest, capture.source_id().as_str())?;
+    provider_macro_hash_text(
+        &mut digest,
+        capture.metadata_revision().as_source_identifier().as_str(),
+    )?;
+    provider_macro_hash_text(&mut digest, capture.dataset().as_str())?;
+    provider_macro_hash_evidence(&mut digest, capture.request_set_identity());
+    provider_macro_hash_evidence(&mut digest, capture.content_digest());
+    provider_macro_hash_evidence(&mut digest, capture.observation_digest());
+    provider_macro_hash_evidence(
+        &mut digest,
+        first.sealed_capture.sealed_capture_receipt_digest(),
+    );
+    digest.update(
+        u16::try_from(chunks.len())
+            .map_err(|_| IngestError::InvalidProviderMacroPlan)?
+            .to_be_bytes(),
+    );
+    digest.update(total_rows.to_be_bytes());
+    for chunk in chunks {
+        digest.update(chunk.chunk_index.to_be_bytes());
+        digest.update(chunk.total_chunks.to_be_bytes());
+        digest.update(
+            u64::try_from(chunk.sealed_capture.record_count())
+                .map_err(|_| IngestError::InvalidProviderMacroPlan)?
+                .to_be_bytes(),
+        );
+        provider_macro_hash_evidence(&mut digest, chunk.candidate_digest);
+        provider_macro_hash_evidence(&mut digest, chunk.source_generation_digest);
+        provider_macro_hash_evidence(
+            &mut digest,
+            chunk.sealed_capture.evidence_digest().evidence(),
+        );
+        provider_macro_hash_evidence(
+            &mut digest,
+            chunk.sealed_capture.content_identity().digest(),
+        );
+        provider_macro_hash_evidence(
+            &mut digest,
+            chunk.sealed_capture.native_lineage().batch_digest(),
+        );
+        provider_macro_hash_text(&mut digest, chunk.semantics.schema.as_str())?;
+        provider_macro_hash_evidence(&mut digest, chunk.semantics.schema_requirement_digest);
+        provider_macro_hash_evidence(&mut digest, chunk.semantics.semantic_digest);
+        provider_macro_hash_evidence(&mut digest, chunk.semantics.payload_content_digest);
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn require_provider_macro_digest(digest: EvidenceDigest) -> Result<(), IngestError> {
+    if digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32] {
+        Err(IngestError::InvalidProviderMacroPlan)
+    } else {
+        Ok(())
+    }
+}
+
+fn provider_macro_hash_text(digest: &mut Sha256, value: &str) -> Result<(), IngestError> {
+    digest.update(
+        u64::try_from(value.len())
+            .map_err(|_| IngestError::InvalidProviderMacroPlan)?
+            .to_be_bytes(),
+    );
+    digest.update(value.as_bytes());
+    Ok(())
+}
+
+fn provider_macro_hash_evidence(digest: &mut Sha256, value: EvidenceDigest) {
+    digest.update(match value.algorithm() {
+        DigestAlgorithm::Sha256 => [1],
+        DigestAlgorithm::Blake3 => [2],
+    });
+    digest.update(value.bytes());
 }
 
 fn provider_market_event_source_id(
@@ -1934,6 +2564,250 @@ impl AnalyticalDataService {
         .await
     }
 
+    /// Consumes and validates every input needed by one atomic provider macro-plan publication.
+    pub fn prepare_provider_macro_plan_publication(
+        &self,
+        reservation: IngestReservation,
+        input: ProviderMacroPlanPublicationInput,
+    ) -> Result<PendingProviderMacroPlanPublication, IngestError> {
+        let schema = crate::DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(ArrowConversionError::from)?;
+        self.manifests
+            .validate_append_schema(&input.analytical_dataset, &schema)?;
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(input.chunks.len())
+            .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        for chunk in &input.chunks {
+            prepared.push(PreparedProviderCaptureBinding::try_from_live(
+                &chunk.sealed_capture,
+            )?);
+        }
+        {
+            let authority = self.lock_authority()?;
+            let run = self.validate_run(
+                &authority,
+                &reservation,
+                input.publication_digest,
+                Some(&input.source_id),
+            )?;
+            if run.state() != IngestRunState::Reserved {
+                return Err(IngestError::TerminalRun);
+            }
+        }
+        Ok(PendingProviderMacroPlanPublication {
+            reservation,
+            input,
+            prepared_captures: prepared.into_boxed_slice(),
+        })
+    }
+
+    async fn commit_prepared_provider_macro_plan(
+        &self,
+        pending: PendingProviderMacroPlanPublication,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Result<ProviderMacroPlanPublicationReceipt, IngestError> {
+        precommit_authority.validate_precommit()?;
+        let PendingProviderMacroPlanPublication {
+            reservation,
+            input,
+            prepared_captures,
+        } = pending;
+        let ProviderMacroPlanPublicationInput {
+            analytical_dataset,
+            completion_digest,
+            publication_digest,
+            source_id,
+            metadata_revision: _,
+            provider_dataset,
+            request_set_identity,
+            source_generation_digest,
+            sealed_capture_receipt_digest: _,
+            total_rows,
+            chunks,
+        } = input;
+        if chunks.len() != prepared_captures.len() {
+            return Err(IngestError::InvalidProviderMacroPlan);
+        }
+        let total_chunks =
+            u16::try_from(chunks.len()).map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        let revision_deadline = Instant::now()
+            .checked_add(REVISION_ASSIGNMENT_DEADLINE)
+            .ok_or(IngestError::DeadlineExceeded)?;
+        let revision_authority = self.observed_revision_authority();
+        let mut canonical_batches = Vec::new();
+        canonical_batches
+            .try_reserve_exact(chunks.len())
+            .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        for (chunk, prepared) in chunks.into_vec().into_iter().zip(prepared_captures.iter()) {
+            if cancellation.is_cancelled() {
+                return Err(IngestError::Cancelled);
+            }
+            let ProviderMacroPlanChunkInput {
+                chunk_index: _,
+                total_chunks: _,
+                candidate_digest: _,
+                source_generation_digest: _,
+                semantics: _,
+                sealed_capture,
+                revisions,
+            } = chunk;
+            let observations =
+                ResearchArrowBatch::validated_extraction_observations(sealed_capture.batch())?;
+            let observed = revisions
+                .into_observed_batch_with_native_lineage(
+                    source_id.clone(),
+                    sealed_capture.batch(),
+                    &observations,
+                    sealed_capture.native_lineage(),
+                )
+                .map_err(map_revision_error)?;
+            let assignments = revision_authority
+                .assign(observed, revision_deadline, cancellation.clone())
+                .await
+                .map_err(map_revision_error)?;
+            let converted = ResearchArrowBatch::try_from_extraction_batch_with_assigned_revisions_and_provider_binding(
+                sealed_capture.batch(),
+                assignments.as_slice(),
+                prepared,
+            )?;
+            canonical_batches.push(converted.record_batch().clone());
+        }
+        let converted = ResearchArrowBatch::try_from_compaction_batches(
+            provider_dataset,
+            publication_digest,
+            canonical_batches,
+        )?;
+        if u64::try_from(converted.record_batch().num_rows()) != Ok(total_rows) {
+            return Err(IngestError::InvalidProviderMacroPlan);
+        }
+        let schema = converted.schema_ref().clone();
+        let lineage = converted.lineage_digest()?;
+        let converted = DatasetArrowBatch::from(converted);
+        self.manifests
+            .validate_append_schema(&analytical_dataset, &schema)?;
+        let dataset_name = SourceIdentifier::try_from(analytical_dataset.as_str())
+            .map_err(|_| IngestError::InvalidDataset)?;
+        let _operation = self
+            .operation_gate
+            .acquire(&cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        {
+            let authority = self.lock_authority()?;
+            let run = self.validate_run(
+                &authority,
+                &reservation,
+                publication_digest,
+                Some(&source_id),
+            )?;
+            if run.state() != IngestRunState::Reserved {
+                return Err(IngestError::TerminalRun);
+            }
+        }
+        let publication = self.objects.begin_publication(&cancellation).await?;
+        let published = self
+            .objects
+            .publish_dataset_under_lease(&converted, &cancellation, &publication)
+            .await?;
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        let object = ManifestObject::try_new(
+            published.content_hash(),
+            published.row_count(),
+            published.size_bytes(),
+            Sha256Digest::new(lineage.bytes()),
+        )?;
+        if object.row_count() != total_rows {
+            return Err(IngestError::InvalidProviderMacroPlan);
+        }
+        let plan = self
+            .manifests
+            .preview_append(analytical_dataset, &schema, object)?;
+        let authority = self.lock_authority()?;
+        let run = self.validate_run(
+            &authority,
+            &reservation,
+            publication_digest,
+            Some(&source_id),
+        )?;
+        if run.state() != IngestRunState::Reserved {
+            return Err(IngestError::TerminalRun);
+        }
+        precommit_authority.validate_precommit()?;
+        let created_at = published.created_at().max(reservation.requested_at());
+        let artifact = ArtifactRecord::try_new(
+            published.relative_reference(),
+            published.content_hash().evidence(),
+            published.size_bytes(),
+            created_at,
+        )?;
+        let anchor = DatasetManifestRecord::try_new(
+            dataset_name,
+            schema.version(),
+            artifact.artifact_id(),
+            plan.content_hash().evidence(),
+            created_at,
+        );
+        let (manifest, catalog_receipt_digest) = self
+            .manifests
+            .commit_provider_macro_plan_publication(
+                self.catalog_id,
+                authority.result_limits(),
+                &reservation,
+                &plan,
+                &artifact,
+                &anchor,
+                &schema,
+                &run,
+                &prepared_captures,
+                completion_digest,
+                publication_digest,
+                total_rows,
+            )
+            .map_err(|error| match error {
+                ManifestCatalogError::CatalogAuthority(error) => IngestError::Catalog(error),
+                error => IngestError::Manifest(error),
+            })?;
+        drop(authority);
+        let receipt = ProviderMacroPlanPublicationReceipt {
+            manifest,
+            completion_digest,
+            publication_digest,
+            catalog_receipt_digest,
+            source_id,
+            request_set_identity,
+            source_generation_digest,
+            total_chunks,
+            total_rows,
+        };
+        self.verify_provider_macro_plan_restart(&receipt.restart_selector())?;
+        Ok(receipt)
+    }
+
+    /// Reopens only the exact generation and whole-plan receipt supplied by the selector.
+    pub fn verify_provider_macro_plan_restart(
+        &self,
+        selector: &ProviderMacroPlanRestartSelector,
+    ) -> Result<PinnedDataset, IngestError> {
+        if self.manifests.source_id(selector.manifest())? != *selector.source_id() {
+            return Err(IngestError::ReplayConflict);
+        }
+        self.manifests
+            .verify_provider_macro_plan_publication(
+                selector.manifest(),
+                selector.completion_digest(),
+                selector.publication_digest(),
+                selector.total_chunks(),
+                selector.total_rows(),
+                selector.catalog_receipt_digest(),
+            )
+            .map_err(Into::into)
+    }
+
     /// Atomically publishes typed canonical events, their sealed raw evidence, and one generation.
     pub async fn ingest_provider_market_events(
         &self,
@@ -2661,6 +3535,9 @@ pub enum IngestError {
     /// A paged provider extraction omitted or mismatched its exact retained capture authority.
     #[error("paged provider extraction requires its exact verified retained capture")]
     ProviderCaptureRequired,
+    /// A complete ordered macro plan failed canonical/native/raw closure validation.
+    #[error("provider macro publication plan is invalid")]
+    InvalidProviderMacroPlan,
     /// Provider page/frame and sealed-segment receipts could not be bound exactly.
     #[error("provider capture receipt is invalid")]
     ProviderCapture(#[from] ProviderCaptureError),

@@ -2029,6 +2029,7 @@ fn map_ingest_error(error: IngestError) -> ServiceError {
         IngestError::RevisionEvidenceMismatch
         | IngestError::RevisionEvidenceRequired
         | IngestError::InvalidDataset
+        | IngestError::InvalidProviderMacroPlan
         | IngestError::ContentIdentity(_) => ServiceError::InvalidResult,
         IngestError::PublicationAuthorityRevoked
         | IngestError::Plan(_)

@@ -31,6 +31,7 @@ pub(crate) const PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET: usize = 75_000;
 const PROVIDER_CAPTURE_CLAIM_PAGE_ROWS: usize = 128;
 const MAX_PROVIDER_CAPTURE_ROWS: usize = 100_000;
 const MAX_PROVIDER_CAPTURE_SEGMENTS: usize = 64;
+pub(crate) const MAX_PROVIDER_CAPTURE_INPUTS: usize = 4_096;
 const MAX_PROVIDER_NATIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROVIDER_CLAIM_JSON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROVIDER_PUBLICATION_PEAK_BYTES: usize = 768 * 1024 * 1024;
@@ -576,6 +577,12 @@ impl PreparedProviderCaptureBinding {
     pub(crate) const fn binding_digest(&self) -> EvidenceDigest {
         self.evidence.binding_digest
     }
+    pub(crate) const fn source_id(&self) -> &market_squawk_domain::SourceId {
+        self.evidence.capture.source_id()
+    }
+    pub(crate) const fn record_count(&self) -> usize {
+        self.evidence.record_count
+    }
     pub(crate) const fn capture_observation_digest(&self) -> EvidenceDigest {
         self.evidence.capture.observation_digest()
     }
@@ -681,19 +688,72 @@ pub(crate) fn load_provider_capture_for_run(
     connection: &Connection,
     run_id: Uuid,
 ) -> Result<Option<PersistedProviderCaptureBindingEvidence>, CatalogError> {
-    let digest = connection
-        .query_row(
-            "SELECT binding_digest FROM ingest_run_provider_capture_bindings WHERE run_id=?1",
-            [run_id.to_string()],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()?
-        .map(|bytes| parse_digest(1, &bytes))
-        .transpose()?;
-    digest
-        .map(|digest| load_provider_capture_binding_evidence(connection, digest))
-        .transpose()
-        .map(Option::flatten)
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM ingest_run_provider_capture_bindings WHERE run_id=?1",
+        [run_id.to_string()],
+        |row| row.get(0),
+    )?;
+    match count {
+        0 => Ok(None),
+        1 => load_ordered_provider_captures_for_run(connection, run_id)
+            .map(|mut values| values.pop()),
+        _ => Err(CatalogError::ProviderCaptureConflict),
+    }
+}
+
+/// Loads every direct provider capture for one run in its exact retained input order.
+pub(crate) fn load_ordered_provider_captures_for_run(
+    connection: &Connection,
+    run_id: Uuid,
+) -> Result<Vec<PersistedProviderCaptureBindingEvidence>, CatalogError> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM ingest_run_provider_capture_bindings WHERE run_id=?1",
+        [run_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let count = usize::try_from(count)
+        .ok()
+        .filter(|count| *count <= MAX_PROVIDER_CAPTURE_INPUTS)
+        .ok_or(CatalogError::ProviderCaptureConflict)?;
+    let limit = i64::try_from(MAX_PROVIDER_CAPTURE_INPUTS + 1)
+        .map_err(|_| CatalogError::ProviderCaptureConflict)?;
+    let mut statement = connection.prepare(
+        "SELECT input_ordinal, binding_digest, source_id
+         FROM ingest_run_provider_capture_bindings
+         WHERE run_id=?1 ORDER BY input_ordinal LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![run_id.to_string(), limit], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut retained = Vec::new();
+    retained
+        .try_reserve_exact(count)
+        .map_err(|_| CatalogError::Allocation)?;
+    for row in rows {
+        if retained.len() == MAX_PROVIDER_CAPTURE_INPUTS {
+            return Err(CatalogError::ProviderCaptureConflict);
+        }
+        let (ordinal, digest, source_id) = row?;
+        if ordinal != i64::try_from(retained.len()).map_err(|_| CatalogError::CorruptCatalog)? {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let digest = parse_digest(1, &digest)?;
+        let evidence = load_provider_capture_binding_evidence(connection, digest)?
+            .ok_or(CatalogError::CorruptCatalog)?;
+        if evidence.binding_digest != digest || evidence.capture.source_id().as_str() != source_id {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        retained.push(evidence);
+    }
+    if retained.len() != count {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    retained.shrink_to_fit();
+    Ok(retained)
 }
 
 pub(crate) fn retain_prepared_provider_capture_binding(
@@ -702,52 +762,108 @@ pub(crate) fn retain_prepared_provider_capture_binding(
     prepared: &PreparedProviderCaptureBinding,
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
-    retain_prepared_provider_capture_binding_evidence(connection, run_id, prepared, recorded_at)?;
-    let evidence = &prepared.evidence;
-    let associated: bool = connection.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM ingest_run_provider_capture_bindings WHERE binding_digest=?1
-         )",
-        [digest_bytes(evidence.binding_digest)],
-        |row| row.get(0),
-    )?;
-    if associated {
-        return Err(CatalogError::ProviderCaptureConflict);
-    }
-    let inserted = connection.execute(
-        "INSERT INTO ingest_run_provider_capture_bindings
-         (run_id, input_ordinal, binding_digest, source_id) VALUES (?1, 0, ?2, ?3)",
-        params![
-            run_id.to_string(),
-            digest_bytes(evidence.binding_digest),
-            evidence.capture.source_id().as_str()
-        ],
-    )?;
-    if inserted != 1 {
-        return Err(CatalogError::ProviderCaptureConflict);
-    }
-    let exact_association: bool = connection.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM ingest_run_provider_capture_bindings
-            WHERE run_id=?1 AND input_ordinal=0 AND binding_digest=?2 AND source_id=?3
-         )",
-        params![
-            run_id.to_string(),
-            digest_bytes(evidence.binding_digest),
-            evidence.capture.source_id().as_str()
-        ],
-        |row| row.get(0),
-    )?;
-    if !exact_association {
-        return Err(CatalogError::ProviderCaptureConflict);
-    }
-    append_audit(
+    retain_ordered_prepared_provider_capture_bindings(
         connection,
-        "provider-capture-binding.retained",
-        &run_id.to_string(),
-        evidence.binding_digest.bytes(),
+        run_id,
+        std::slice::from_ref(prepared),
         recorded_at,
+    )
+}
+
+/// Retains one complete ordered provider plan under contiguous input ordinals in the caller's
+/// transaction. Any failed binding rolls the whole plan back with the surrounding publication.
+pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
+    connection: &rusqlite::Transaction<'_>,
+    run_id: Uuid,
+    prepared: &[PreparedProviderCaptureBinding],
+    recorded_at: Timestamp,
+) -> Result<(), CatalogError> {
+    if prepared.is_empty() || prepared.len() > MAX_PROVIDER_CAPTURE_INPUTS {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
+    let source_id = prepared[0].source_id();
+    if prepared.iter().enumerate().any(|(ordinal, binding)| {
+        binding.source_id() != source_id
+            || prepared[..ordinal]
+                .iter()
+                .any(|prior| prior.binding_digest() == binding.binding_digest())
+    }) {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
+    let existing = connection.query_row(
+        "SELECT COUNT(*) FROM ingest_run_provider_capture_bindings WHERE run_id=?1",
+        [run_id.to_string()],
+        |row| row.get::<_, i64>(0),
     )?;
+    if existing != 0 {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
+    for (input_ordinal, binding) in prepared.iter().enumerate() {
+        retain_prepared_provider_capture_binding_evidence(
+            connection,
+            run_id,
+            binding,
+            recorded_at,
+        )?;
+        let evidence = &binding.evidence;
+        let associated: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ingest_run_provider_capture_bindings WHERE binding_digest=?1
+             )",
+            [digest_bytes(evidence.binding_digest)],
+            |row| row.get(0),
+        )?;
+        if associated {
+            return Err(CatalogError::ProviderCaptureConflict);
+        }
+        let input_ordinal =
+            i64::try_from(input_ordinal).map_err(|_| CatalogError::ProviderCaptureConflict)?;
+        let inserted = connection.execute(
+            "INSERT INTO ingest_run_provider_capture_bindings
+             (run_id, input_ordinal, binding_digest, source_id) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                run_id.to_string(),
+                input_ordinal,
+                digest_bytes(evidence.binding_digest),
+                evidence.capture.source_id().as_str()
+            ],
+        )?;
+        if inserted != 1 {
+            return Err(CatalogError::ProviderCaptureConflict);
+        }
+        let exact_association: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ingest_run_provider_capture_bindings
+                WHERE run_id=?1 AND input_ordinal=?2 AND binding_digest=?3 AND source_id=?4
+             )",
+            params![
+                run_id.to_string(),
+                input_ordinal,
+                digest_bytes(evidence.binding_digest),
+                evidence.capture.source_id().as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        if !exact_association {
+            return Err(CatalogError::ProviderCaptureConflict);
+        }
+        append_audit(
+            connection,
+            "provider-capture-binding.retained",
+            &run_id.to_string(),
+            evidence.binding_digest.bytes(),
+            recorded_at,
+        )?;
+    }
+    let retained = load_ordered_provider_captures_for_run(connection, run_id)?;
+    if retained.len() != prepared.len()
+        || retained
+            .iter()
+            .zip(prepared)
+            .any(|(persisted, expected)| persisted != &expected.evidence)
+    {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
     Ok(())
 }
 
