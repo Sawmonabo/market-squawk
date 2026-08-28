@@ -17,6 +17,10 @@ use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, ProviderIdentityRegistry, ProviderInstrumentId, SourceId,
     SourceIdentifier, Timestamp,
 };
+use market_squawk_platform::{
+    ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
+    SealedResearchJournalStore,
+};
 use market_squawk_sources::{
     AuthorizationMode, ExtractionAuthority, ExtractionAuthorityError, ExtractionRedirectPermit,
     HttpRequestBounds, MAX_PROVIDER_CAPTURE_PAGE_BYTES, NetworkAccessPolicy,
@@ -38,7 +42,9 @@ use crate::{
     SEC_PROVIDER_RATE_SCOPE, SecAuthoritativeIdentifierNamespace, SecBulkCapture, SecBulkCoverage,
     SecBulkDoctorReport, SecBulkDoctorState, SecBulkFamily, SecBulkLayoutManifest,
     SecBulkMediaKind, SecBulkParseLimits, SecBulkSelection, SecBulkTransportEvidence,
-    SecGovernedIdentityReceipt, SecHttpValidators, SecParserLimits, SecRepresentation,
+    SecFundIdentityAuthority, SecFundPartitionAdmissions, SecFundPendingLogicalRows,
+    SecFundPublicationScope, SecGovernedIdentityReceipt, SecHttpValidators, SecParserLimits,
+    SecPendingBulkLogicalPublication, SecPreparedFundLogicalPublication, SecRepresentation,
     SecRepresentationRegistry, SubmissionsArchive, SubmissionsDocument, XbrlDocumentContext,
     XbrlDocumentParser, inspect_bulk_archive, recover_bulk_archive,
 };
@@ -403,6 +409,80 @@ impl SecEdgarSource {
             () = cancellation.cancelled() => {
                 operation_cancellation.cancel();
                 Err(SecClientError::Cancelled)
+            }
+        }
+    }
+
+    /// Reopens one captured quarterly graph and prepares one bounded fund publication.
+    ///
+    /// Heavy raw copying, complete archive verification, identity mapping, and native/row-map
+    /// sealing run under this source's existing blocking-work admission. The source's private raw
+    /// store is never exposed: the exact archive and official readme are copied into the caller's
+    /// application-owned journal, re-read through EOF, and consumed by the existing code-owned
+    /// canonical preparation path.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "captured layout, fund scope, physical bounds, clocks, identity, and application storage are independent authorities"
+    )]
+    pub async fn prepare_fund_logical_publication<A>(
+        &self,
+        manifest: SecBulkLayoutManifest,
+        scope: SecFundPublicationScope,
+        limits: SecBulkParseLimits,
+        admissions: SecFundPartitionAdmissions,
+        ingested_at: Timestamp,
+        deadline: Timestamp,
+        identity_authority: A,
+        journal: Arc<SealedResearchJournalStore>,
+        cancellation: CancellationToken,
+    ) -> Result<SecPreparedFundLogicalPublication, crate::SecBulkError>
+    where
+        A: SecFundIdentityAuthority + Send + 'static,
+    {
+        ensure_before_deadline(deadline)?;
+        validate_fund_preparation_request(&manifest, &scope, ingested_at, deadline)?;
+        let admission_remaining = remaining_until(deadline)?;
+        let admission = Arc::clone(&self.blocking_admission);
+        let permit = tokio::select! {
+            permit = admission.acquire_owned() => {
+                permit.map_err(|_| SecClientError::BlockingAdmissionClosed)?
+            }
+            () = cancellation.cancelled() => return Err(crate::SecBulkError::Cancelled),
+            () = tokio::time::sleep(admission_remaining) => {
+                return Err(crate::SecBulkError::DeadlineExceeded);
+            }
+        };
+        let remaining = remaining_until(deadline)?;
+        let worker_cancellation = cancellation.child_token();
+        let worker_token = worker_cancellation.clone();
+        let raw_store = Arc::clone(&self.raw_store);
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            prepare_fund_from_captured_graph(
+                &raw_store,
+                manifest,
+                scope,
+                limits,
+                admissions,
+                ingested_at,
+                deadline,
+                identity_authority,
+                &journal,
+                &worker_token,
+            )
+        });
+        tokio::select! {
+            result = &mut worker => {
+                result
+                    .map_err(|_| crate::SecBulkError::Client(SecClientError::BlockingWorkerFailed))?
+            }
+            () = cancellation.cancelled() => {
+                worker_cancellation.cancel();
+                Err(crate::SecBulkError::Cancelled)
+            }
+            () = tokio::time::sleep(remaining) => {
+                worker_cancellation.cancel();
+                Err(crate::SecBulkError::DeadlineExceeded)
             }
         }
     }
@@ -1175,6 +1255,122 @@ impl SecEdgarSource {
 impl SourceMetadataProvider for SecEdgarSource {
     fn metadata(&self) -> &SourceMetadata {
         &self.metadata
+    }
+}
+
+fn validate_fund_preparation_request(
+    manifest: &SecBulkLayoutManifest,
+    scope: &SecFundPublicationScope,
+    ingested_at: Timestamp,
+    deadline: Timestamp,
+) -> Result<(), crate::SecBulkError> {
+    let archive = manifest.capture();
+    let readme = manifest.official_readme_capture();
+    if archive.selection().family() != scope.family()
+        || readme.selection() != archive.selection()
+        || archive.transport().body_received_at() > ingested_at
+        || readme.transport().body_received_at() > ingested_at
+        || archive.first_observed_at() > ingested_at
+        || readme.first_observed_at() > ingested_at
+        || ingested_at >= deadline
+    {
+        return Err(crate::SecBulkError::InvalidChronology);
+    }
+    SecPendingBulkLogicalPublication::logical_object_admissions(manifest)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "captured graph, mapping authority, bounded storage, and clocks must remain explicit"
+)]
+fn prepare_fund_from_captured_graph<A>(
+    raw_store: &RawEvidenceStore,
+    manifest: SecBulkLayoutManifest,
+    scope: SecFundPublicationScope,
+    limits: SecBulkParseLimits,
+    admissions: SecFundPartitionAdmissions,
+    ingested_at: Timestamp,
+    deadline: Timestamp,
+    mut identity_authority: A,
+    journal: &SealedResearchJournalStore,
+    cancellation: &CancellationToken,
+) -> Result<SecPreparedFundLogicalPublication, crate::SecBulkError>
+where
+    A: SecFundIdentityAuthority,
+{
+    validate_fund_preparation_request(&manifest, &scope, ingested_at, deadline)?;
+    let (archive_admission, readme_admission) =
+        SecPendingBulkLogicalPublication::logical_object_admissions(&manifest)?;
+    let mut archive_stage = journal.begin_logical_object(archive_admission)?;
+    let mut readme_stage = match journal.begin_logical_object(readme_admission) {
+        Ok(stage) => stage,
+        Err(error) => {
+            journal.abort_logical_object(archive_stage)?;
+            return Err(error.into());
+        }
+    };
+    let pending = match SecPendingBulkLogicalPublication::stage_from_raw_store(
+        raw_store,
+        manifest,
+        limits,
+        deadline,
+        cancellation,
+        &mut archive_stage,
+        &mut readme_stage,
+    ) {
+        Ok(pending) => pending,
+        Err(error) => {
+            let archive_abort = journal.abort_logical_object(archive_stage);
+            let readme_abort = journal.abort_logical_object(readme_stage);
+            archive_abort?;
+            readme_abort?;
+            return Err(error);
+        }
+    };
+    let control = SecFundPreparationControl {
+        cancellation,
+        deadline,
+    };
+    let archive = journal.finish_logical_object(archive_stage, &control)?;
+    let readme = journal.finish_logical_object(readme_stage, &control)?;
+    pending
+        .verify_and_stage(
+            archive,
+            readme,
+            limits,
+            deadline,
+            cancellation,
+            &control,
+            SecFundPendingLogicalRows::new(scope),
+        )?
+        .prepare_fund_logical_publication(
+            &mut identity_authority,
+            ingested_at,
+            admissions,
+            journal,
+            &control,
+        )
+}
+
+struct SecFundPreparationControl<'a> {
+    cancellation: &'a CancellationToken,
+    deadline: Timestamp,
+}
+
+impl ResearchObjectControl for SecFundPreparationControl<'_> {
+    fn checkpoint(
+        &self,
+        _point: ResearchObjectControlPoint,
+    ) -> Result<(), ResearchObjectControlError> {
+        if self.cancellation.is_cancelled() {
+            return Err(ResearchObjectControlError::Cancelled);
+        }
+        match system_timestamp() {
+            Ok(observed_at) if observed_at < self.deadline => Ok(()),
+            Ok(_) => Err(ResearchObjectControlError::DeadlineExceeded),
+            Err(_) => Err(ResearchObjectControlError::Unavailable),
+        }
     }
 }
 
