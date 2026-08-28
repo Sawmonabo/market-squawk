@@ -1,5 +1,6 @@
 //! Least-authority immutable analytical catalog and fixed-template observation reads.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU32;
@@ -7,13 +8,15 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array as _, BinaryArray, Date32Array, Int64Array, StringArray, UInt32Array};
+use arrow::array::{
+    Array as _, BinaryArray, Date32Array, Int64Array, StringArray, UInt16Array, UInt32Array,
+};
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     BarTimestampBasis, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
     FundNavObservation, InstrumentId, MacroObservation, MarketBarAdjustment, MarketBarObservation,
     MarketBarSessionEvidence, MarketBarSessionKind, ProviderInstrumentId, ResearchObservation,
-    ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp, VenueId,
+    ResearchPeriod, ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{CanonicalObservationFamily, CanonicalObservationPayload};
 use sha2::{Digest as _, Sha256};
@@ -478,6 +481,225 @@ impl AnalyticalMacroSeriesAllowlist {
 
     fn contains(&self, series: &SourceIdentifier) -> bool {
         self.series.binary_search(series).is_ok()
+    }
+}
+
+/// One source-rights namespace and its bounded code-owned Macro series set.
+///
+/// Provider-period series are never selected without their source namespace. A manifest has one
+/// retained source owner, and the read capability independently verifies it before querying.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyticalMacroSourceQualifiedSeries {
+    source_id: SourceId,
+    series_allowlist: AnalyticalMacroSeriesAllowlist,
+}
+
+impl AnalyticalMacroSourceQualifiedSeries {
+    /// Binds a validated code-owned series set to its sole source-rights namespace.
+    pub const fn new(
+        source_id: SourceId,
+        series_allowlist: AnalyticalMacroSeriesAllowlist,
+    ) -> Self {
+        Self {
+            source_id,
+            series_allowlist,
+        }
+    }
+
+    /// Returns the sole source owner admitted by the selection.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the canonical nonempty code-owned series set.
+    pub const fn series_allowlist(&self) -> &AnalyticalMacroSeriesAllowlist {
+        &self.series_allowlist
+    }
+}
+
+/// Exact immutable request for a bounded latest-known provider-period Macro snapshot.
+///
+/// The cutoff retains the provider/frequency scheme, source-authored year, sortable ordinal, and
+/// exact provider code. Cross-scheme periods are incomparable and never enter the query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyticalMacroProviderPeriodLatestKnownRequest {
+    manifest: DatasetManifestRef,
+    source_series: AnalyticalMacroSourceQualifiedSeries,
+    knowledge_cutoff: Timestamp,
+    effective_period_cutoff: ResearchPeriod,
+}
+
+impl AnalyticalMacroProviderPeriodLatestKnownRequest {
+    /// Validates the canonical schema and retains exact source, knowledge, period, and series pins.
+    pub fn try_new(
+        manifest: DatasetManifestRef,
+        source_series: AnalyticalMacroSourceQualifiedSeries,
+        knowledge_cutoff: Timestamp,
+        effective_period_cutoff: ResearchPeriod,
+    ) -> Result<Self, AnalyticalReadError> {
+        let canonical = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(|_| AnalyticalReadError::InvalidObservationSchema)?;
+        if manifest.schema() != &canonical {
+            return Err(AnalyticalReadError::InvalidObservationSchema);
+        }
+        Ok(Self {
+            manifest,
+            source_series,
+            knowledge_cutoff,
+            effective_period_cutoff,
+        })
+    }
+
+    /// Returns the exact immutable input generation.
+    pub const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    /// Returns the source-qualified code-owned series selection.
+    pub const fn source_series(&self) -> &AnalyticalMacroSourceQualifiedSeries {
+        &self.source_series
+    }
+
+    /// Returns the inclusive conservative local-knowledge cutoff.
+    pub const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    /// Returns the inclusive provider-period cutoff without calendar-date coercion.
+    pub const fn effective_period_cutoff(&self) -> &ResearchPeriod {
+        &self.effective_period_cutoff
+    }
+
+    /// Returns the minimum query row envelope needed to retain ties plus a saturation sentinel.
+    pub fn required_query_rows(&self) -> u64 {
+        u64::try_from(self.candidate_limit_with_sentinel()).unwrap_or(u64::MAX)
+    }
+
+    fn sql(&self) -> String {
+        let source_id = sql_string_literal(self.source_series.source_id.as_str());
+        let cutoff = self.knowledge_cutoff.unix_nanos();
+        let period = &self.effective_period_cutoff;
+        let scheme = sql_string_literal(period.scheme().as_str());
+        let period_code = sql_string_literal(period.code().as_str());
+        let year = period.year();
+        let ordinal = period.ordinal().get();
+        let series = self
+            .source_series
+            .series_allowlist
+            .series()
+            .iter()
+            .map(|series| sql_string_literal(series.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "WITH eligible AS ( \
+                 SELECT macro_series, effective_period_scheme, effective_period_year, \
+                        effective_period_ordinal, effective_period_code, revision, \
+                        payload_sha256, payload_json, source_identifier \
+                 FROM {OBSERVATION_TABLE} \
+                 WHERE observation_kind = 'macro' \
+                   AND source_id = {source_id} \
+                   AND macro_series IN ({series}) \
+                   AND available_at IS NOT NULL \
+                   AND CAST(available_at AS BIGINT) <= {cutoff} \
+                   AND CAST(received_at AS BIGINT) <= {cutoff} \
+                   AND CAST(ingested_at AS BIGINT) <= {cutoff} \
+                   AND (published_precision IS NULL \
+                        OR published_precision <> 'exact_timestamp' \
+                        OR (published_at IS NOT NULL \
+                            AND CAST(published_at AS BIGINT) <= {cutoff})) \
+                   AND effective_precision = 'source_period' \
+                   AND effective_period_scheme = {scheme} \
+                   AND effective_period_year IS NOT NULL \
+                   AND effective_period_ordinal IS NOT NULL \
+                   AND effective_period_code IS NOT NULL \
+                   AND (effective_period_year < {year} \
+                        OR (effective_period_year = {year} \
+                            AND effective_period_ordinal < {ordinal}) \
+                        OR (effective_period_year = {year} \
+                            AND effective_period_ordinal = {ordinal} \
+                            AND effective_period_code = {period_code})) \
+             ), latest_year AS ( \
+                 SELECT macro_series, MAX(effective_period_year) AS effective_period_year \
+                 FROM eligible GROUP BY macro_series \
+             ), latest_period AS ( \
+                 SELECT eligible.macro_series, eligible.effective_period_year, \
+                        MAX(eligible.effective_period_ordinal) AS effective_period_ordinal \
+                 FROM eligible \
+                 JOIN latest_year \
+                   ON eligible.macro_series = latest_year.macro_series \
+                  AND eligible.effective_period_year = latest_year.effective_period_year \
+                 GROUP BY eligible.macro_series, eligible.effective_period_year \
+             ), latest_revision AS ( \
+                 SELECT eligible.macro_series, eligible.effective_period_scheme, \
+                        eligible.effective_period_year, eligible.effective_period_ordinal, \
+                        eligible.effective_period_code, MAX(eligible.revision) AS revision \
+                 FROM eligible \
+                 JOIN latest_period \
+                   ON eligible.macro_series = latest_period.macro_series \
+                  AND eligible.effective_period_year = latest_period.effective_period_year \
+                  AND eligible.effective_period_ordinal = \
+                      latest_period.effective_period_ordinal \
+                 GROUP BY eligible.macro_series, eligible.effective_period_scheme, \
+                          eligible.effective_period_year, eligible.effective_period_ordinal, \
+                          eligible.effective_period_code \
+             ), selected AS ( \
+                 SELECT eligible.macro_series, eligible.effective_period_scheme, \
+                        eligible.effective_period_year, eligible.effective_period_ordinal, \
+                        eligible.effective_period_code, eligible.revision, \
+                        eligible.payload_sha256, eligible.payload_json, \
+                        eligible.source_identifier \
+                 FROM eligible \
+                 JOIN latest_revision \
+                   ON eligible.macro_series = latest_revision.macro_series \
+                  AND eligible.effective_period_scheme = \
+                      latest_revision.effective_period_scheme \
+                  AND eligible.effective_period_year = \
+                      latest_revision.effective_period_year \
+                  AND eligible.effective_period_ordinal = \
+                      latest_revision.effective_period_ordinal \
+                  AND eligible.effective_period_code = \
+                      latest_revision.effective_period_code \
+                  AND eligible.revision = latest_revision.revision \
+             ), tie_counts AS ( \
+                 SELECT macro_series, effective_period_scheme, effective_period_year, \
+                        effective_period_ordinal, effective_period_code, revision, \
+                        COUNT(*) AS tie_count \
+                 FROM selected \
+                 GROUP BY macro_series, effective_period_scheme, effective_period_year, \
+                          effective_period_ordinal, effective_period_code, revision \
+             ) \
+             SELECT selected.macro_series, selected.effective_period_scheme, \
+                    selected.effective_period_year, selected.effective_period_ordinal, \
+                    selected.effective_period_code, selected.revision, \
+                    selected.payload_sha256, selected.payload_json, tie_counts.tie_count \
+             FROM selected \
+             JOIN tie_counts \
+               ON selected.macro_series = tie_counts.macro_series \
+              AND selected.effective_period_scheme = tie_counts.effective_period_scheme \
+              AND selected.effective_period_year = tie_counts.effective_period_year \
+              AND selected.effective_period_ordinal = tie_counts.effective_period_ordinal \
+              AND selected.effective_period_code = tie_counts.effective_period_code \
+              AND selected.revision = tie_counts.revision \
+             ORDER BY selected.macro_series, selected.effective_period_year, \
+                      selected.effective_period_ordinal, selected.effective_period_code, \
+                      selected.payload_sha256, selected.source_identifier \
+             LIMIT {}",
+            self.candidate_limit_with_sentinel()
+        )
+    }
+
+    fn candidate_limit(&self) -> usize {
+        self.source_series
+            .series_allowlist
+            .series()
+            .len()
+            .saturating_mul(MAX_MACRO_SNAPSHOT_TIED_CANDIDATES_PER_SERIES)
+    }
+
+    fn candidate_limit_with_sentinel(&self) -> usize {
+        self.candidate_limit().saturating_add(1)
     }
 }
 
@@ -1357,6 +1579,43 @@ impl AnalyticalMacroLatestKnownOutput {
     }
 }
 
+/// Typed latest-known provider-period Macro observations plus exact query/selection evidence.
+#[derive(Debug)]
+pub struct AnalyticalMacroProviderPeriodLatestKnownOutput {
+    source_id: SourceId,
+    period_scheme: SourceIdentifier,
+    output: PinnedQueryOutput,
+    observations: Box<[MacroObservation]>,
+    selection_digest: EvidenceDigest,
+}
+
+impl AnalyticalMacroProviderPeriodLatestKnownOutput {
+    /// Returns the exact source-rights namespace requested and verified for the generation.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the sole provider/frequency period ordering namespace admitted by the request.
+    pub const fn period_scheme(&self) -> &SourceIdentifier {
+        &self.period_scheme
+    }
+
+    /// Returns exact manifest, object graph, candidate query, and candidate result evidence.
+    pub const fn output(&self) -> &PinnedQueryOutput {
+        &self.output
+    }
+
+    /// Returns latest-known observations in exact source-qualified canonical series order.
+    pub fn observations(&self) -> &[MacroObservation] {
+        &self.observations
+    }
+
+    /// Returns the code-owned SHA-256 identity of the final typed provider-period selection.
+    pub const fn selection_digest(&self) -> EvidenceDigest {
+        self.selection_digest
+    }
+}
+
 /// Typed bars plus the non-forgeable evidence for their exact manifest-pinned query.
 #[derive(Debug)]
 pub struct AnalyticalMarketBarOutput {
@@ -1788,6 +2047,76 @@ impl AnalyticalReadCapability {
             .into_boxed_slice();
         Ok(AnalyticalMacroLatestKnownOutput {
             source_id,
+            output,
+            observations,
+            selection_digest,
+        })
+    }
+
+    /// Reads a bounded latest-known PIT snapshot for one source-qualified provider-period set.
+    ///
+    /// The fixed query accepts only the exact requested provider/frequency scheme and preserves
+    /// source year, ordinal, and code. Availability, receipt, ingestion, and exact-timestamp
+    /// publication clocks remain bounded by the independent knowledge cutoff. No date is derived.
+    pub async fn read_macro_provider_period_latest_known_snapshot(
+        &self,
+        request: AnalyticalMacroProviderPeriodLatestKnownRequest,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<AnalyticalMacroProviderPeriodLatestKnownOutput, AnalyticalReadError> {
+        let (pinned, source_id, _) =
+            self.manifests
+                .read_exact(request.manifest(), deadline, &cancellation)?;
+        if &source_id != request.source_series.source_id() {
+            return Err(AnalyticalReadError::MacroSnapshotSourceOwnerMismatch);
+        }
+        let query = QueryRequest::try_new(pinned.manifest().clone(), request.sql())?;
+        let engine = ResearchQueryEngine::from_pinned_dataset(
+            pinned,
+            OBSERVATION_TABLE,
+            Arc::clone(&self.objects),
+            cancellation.clone(),
+        )
+        .await?;
+        let operation_cancellation = cancellation.child_token();
+        let execution_cancellation = operation_cancellation.clone();
+        let execution = engine.query_pinned(query, limits, execution_cancellation);
+        tokio::pin!(execution);
+        let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(deadline_wait);
+        let output = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                return Err(AnalyticalReadError::Query(QueryError::Cancelled));
+            }
+            _ = deadline_wait.as_mut() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                return Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded));
+            }
+            result = execution.as_mut() => result?,
+        };
+        let selected = decode_macro_provider_period_latest_known_snapshot(
+            &output,
+            &request,
+            deadline,
+            &cancellation,
+        )
+        .await?;
+        let selection_digest =
+            macro_provider_period_latest_known_selection_digest(&request, &output, &selected);
+        let period_scheme = request.effective_period_cutoff.scheme().clone();
+        let observations = selected
+            .into_iter()
+            .map(|selected| selected.observation)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(AnalyticalMacroProviderPeriodLatestKnownOutput {
+            source_id,
+            period_scheme,
             output,
             observations,
             selection_digest,
@@ -2582,6 +2911,330 @@ fn macro_latest_known_selection_digest(
         hash_evidence(&mut hash, selected.evidence_identity);
     }
     EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+struct SelectedMacroProviderPeriodObservation {
+    observation: MacroObservation,
+    effective_period: ResearchPeriod,
+    revision: u32,
+    stored_payload_sha256: EvidenceDigest,
+    payload_identity: EvidenceDigest,
+    provenance_identity: EvidenceDigest,
+    evidence_identity: EvidenceDigest,
+}
+
+async fn decode_macro_provider_period_latest_known_snapshot(
+    output: &PinnedQueryOutput,
+    request: &AnalyticalMacroProviderPeriodLatestKnownRequest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Vec<SelectedMacroProviderPeriodObservation>, AnalyticalReadError> {
+    if output.manifest() != request.manifest() {
+        return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+    }
+    let crate::QueryResult::Inline { batches, .. } = output.result() else {
+        return Err(AnalyticalReadError::MacroSnapshotResultRequiresInline);
+    };
+    let row_count = batches.iter().try_fold(0_usize, |count, batch| {
+        count
+            .checked_add(batch.num_rows())
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)
+    })?;
+    if row_count > request.candidate_limit() {
+        return Err(AnalyticalReadError::MacroSnapshotCandidateSetSaturated);
+    }
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(row_count)
+        .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let mut stored_payload_sha256 = Vec::new();
+    stored_payload_sha256
+        .try_reserve_exact(row_count)
+        .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let mut observed_ties =
+        BTreeMap::<(String, String, u16, u16, String, u32), (usize, usize)>::new();
+    let mut selected_periods = BTreeMap::<SourceIdentifier, ResearchPeriod>::new();
+    for batch in batches {
+        let series = required_macro_column::<StringArray>(batch, "macro_series")?;
+        let schemes = required_macro_column::<StringArray>(batch, "effective_period_scheme")?;
+        let years = required_macro_column::<UInt16Array>(batch, "effective_period_year")?;
+        let ordinals = required_macro_column::<UInt16Array>(batch, "effective_period_ordinal")?;
+        let codes = required_macro_column::<StringArray>(batch, "effective_period_code")?;
+        let revisions = required_macro_column::<UInt32Array>(batch, "revision")?;
+        let payload_digests = required_macro_column::<BinaryArray>(batch, "payload_sha256")?;
+        let payloads = required_macro_column::<BinaryArray>(batch, "payload_json")?;
+        let tie_counts = required_macro_column::<Int64Array>(batch, "tie_count")?;
+        if [
+            series.len(),
+            schemes.len(),
+            years.len(),
+            ordinals.len(),
+            codes.len(),
+            revisions.len(),
+            payload_digests.len(),
+            payloads.len(),
+            tie_counts.len(),
+        ]
+        .into_iter()
+        .any(|len| len != batch.num_rows())
+        {
+            return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+        }
+        for row in 0..batch.num_rows() {
+            if series.is_null(row)
+                || schemes.is_null(row)
+                || years.is_null(row)
+                || ordinals.is_null(row)
+                || codes.is_null(row)
+                || revisions.is_null(row)
+                || payload_digests.is_null(row)
+                || payloads.is_null(row)
+                || tie_counts.is_null(row)
+                || revisions.value(row) == 0
+            {
+                return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+            }
+            let tie_count = usize::try_from(tie_counts.value(row))
+                .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            if tie_count == 0 || tie_count > MAX_MACRO_SNAPSHOT_TIED_CANDIDATES_PER_SERIES {
+                return Err(AnalyticalReadError::MacroSnapshotCandidateSetSaturated);
+            }
+            let payload = payloads.value(row);
+            let payload_digest: [u8; 32] = payload_digests
+                .value(row)
+                .try_into()
+                .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            if payload_digest != <[u8; 32]>::from(Sha256::digest(payload)) {
+                return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+            }
+            let observation = serde_json::from_slice::<ResearchObservation>(payload)
+                .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            let ResearchObservation::Macro(macro_observation) = &observation else {
+                return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+            };
+            let context = macro_observation.context();
+            let provenance = context.provenance();
+            let effective_period = context
+                .time()
+                .effective()
+                .source_period_value()
+                .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            let available_at = provenance
+                .availability()
+                .conservative_available_at()
+                .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            if provenance.source_id() != request.source_series.source_id()
+                || series.value(row) != macro_observation.series().as_str()
+                || !request
+                    .source_series
+                    .series_allowlist
+                    .contains(macro_observation.series())
+                || schemes.value(row) != effective_period.scheme().as_str()
+                || years.value(row) != effective_period.year()
+                || ordinals.value(row) != effective_period.ordinal().get()
+                || codes.value(row) != effective_period.code().as_str()
+                || effective_period.scheme() != request.effective_period_cutoff.scheme()
+                || !matches!(
+                    effective_period.partial_cmp(&request.effective_period_cutoff),
+                    Some(Ordering::Less | Ordering::Equal)
+                )
+                || revisions.value(row) != context.time().revision().get()
+                || available_at > request.knowledge_cutoff
+                || provenance.received_at() > request.knowledge_cutoff
+                || provenance.ingested_at() > request.knowledge_cutoff
+                || context.time().published().is_some_and(|published| {
+                    published
+                        .exact_timestamp()
+                        .is_some_and(|published| published > request.knowledge_cutoff)
+                })
+            {
+                return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+            }
+            if selected_periods
+                .get(macro_observation.series())
+                .is_some_and(|selected| selected != effective_period)
+            {
+                return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+            }
+            selected_periods
+                .entry(macro_observation.series().clone())
+                .or_insert_with(|| effective_period.clone());
+            let tie_key = (
+                series.value(row).to_owned(),
+                schemes.value(row).to_owned(),
+                years.value(row),
+                ordinals.value(row),
+                codes.value(row).to_owned(),
+                revisions.value(row),
+            );
+            let entry = observed_ties.entry(tie_key).or_insert((tie_count, 0));
+            if entry.0 != tie_count {
+                return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+            }
+            entry.1 = entry
+                .1
+                .checked_add(1)
+                .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            candidates.push(PointInTimeCandidate::new(
+                observation,
+                request.manifest.clone(),
+            ));
+            stored_payload_sha256
+                .push(EvidenceDigest::new(DigestAlgorithm::Sha256, payload_digest));
+        }
+    }
+    if observed_ties
+        .iter()
+        .any(|(_, (declared, observed))| declared != observed)
+    {
+        return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+    }
+
+    let policy = PointInTimePolicy::try_new(NonZeroU32::MIN, PointInTimeRevisionMode::LatestKnown)
+        .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let series_count = request.source_series.series_allowlist.series().len();
+    let pit_limits = PointInTimeLimits::try_new(
+        request.candidate_limit(),
+        series_count,
+        request.candidate_limit(),
+        series_count,
+        32 * 1024 * 1024,
+    )
+    .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let pit_request = PointInTimeRequest::try_new(
+        policy,
+        request.knowledge_cutoff,
+        None,
+        ResearchTemporalCoordinate::source_period(request.effective_period_cutoff.clone()),
+        None,
+        pit_limits,
+    )
+    .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let selection = match PointInTimeService::new()
+        .select(&pit_request, &candidates, cancellation, deadline)
+        .await
+    {
+        Ok(selection) => selection,
+        Err(crate::PointInTimeError::RevisionConflicts { .. }) => {
+            return Err(AnalyticalReadError::MacroSnapshotRevisionConflict);
+        }
+        Err(crate::PointInTimeError::Cancelled) => {
+            return Err(AnalyticalReadError::Query(QueryError::Cancelled));
+        }
+        Err(crate::PointInTimeError::DeadlineExceeded) => {
+            return Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded));
+        }
+        Err(_) => return Err(AnalyticalReadError::InvalidMacroSnapshotResult),
+    };
+    if selection.records().len() != series_count {
+        return Err(AnalyticalReadError::MacroSnapshotIncomplete);
+    }
+    let mut selected = Vec::new();
+    selected
+        .try_reserve_exact(selection.records().len())
+        .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    for record in selection.records() {
+        let candidate_index = candidates
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, record.candidate()))
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        let ResearchObservation::Macro(observation) = record.candidate().observation() else {
+            return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
+        };
+        let effective_period = observation
+            .context()
+            .time()
+            .effective()
+            .source_period_value()
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        selected.push(SelectedMacroProviderPeriodObservation {
+            observation: observation.clone(),
+            effective_period: effective_period.clone(),
+            revision: observation.context().time().revision().get(),
+            stored_payload_sha256: *stored_payload_sha256
+                .get(candidate_index)
+                .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?,
+            payload_identity: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                record.payload_identity().bytes(),
+            ),
+            provenance_identity: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                record.provenance_identity().bytes(),
+            ),
+            evidence_identity: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                record.evidence_identity().bytes(),
+            ),
+        });
+    }
+    selected
+        .sort_unstable_by(|left, right| left.observation.series().cmp(right.observation.series()));
+    if !selected
+        .iter()
+        .map(|selected| selected.observation.series())
+        .eq(request.source_series.series_allowlist.series().iter())
+    {
+        return Err(AnalyticalReadError::MacroSnapshotIncomplete);
+    }
+    Ok(selected)
+}
+
+fn required_macro_column<'a, T: arrow::array::Array + 'static>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a T, AnalyticalReadError> {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<T>())
+        .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)
+}
+
+fn macro_provider_period_latest_known_selection_digest(
+    request: &AnalyticalMacroProviderPeriodLatestKnownRequest,
+    output: &PinnedQueryOutput,
+    selected: &[SelectedMacroProviderPeriodObservation],
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/analytical-macro-provider-period-latest-known-selection/v1");
+    hash_manifest(&mut hash, request.manifest());
+    hash_evidence(&mut hash, output.object_graph_digest());
+    hash_evidence(&mut hash, output.query_identity());
+    hash_evidence(&mut hash, output.result_digest());
+    hash_str(&mut hash, request.source_series.source_id.as_str());
+    hash_timestamp(&mut hash, request.knowledge_cutoff);
+    hash_research_period(&mut hash, &request.effective_period_cutoff);
+    hash.update(b"point-in-time-policy/v1:latest-known;provider-period-latest-effective/v1");
+    hash.update(
+        u64::try_from(request.source_series.series_allowlist.series().len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for series in request.source_series.series_allowlist.series() {
+        hash_str(&mut hash, series.as_str());
+    }
+    hash.update(
+        u64::try_from(selected.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for selected in selected {
+        hash_str(&mut hash, selected.observation.series().as_str());
+        hash_research_period(&mut hash, &selected.effective_period);
+        hash.update(selected.revision.to_be_bytes());
+        hash_evidence(&mut hash, selected.stored_payload_sha256);
+        hash_evidence(&mut hash, selected.payload_identity);
+        hash_evidence(&mut hash, selected.provenance_identity);
+        hash_evidence(&mut hash, selected.evidence_identity);
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn hash_research_period(hash: &mut Sha256, period: &ResearchPeriod) {
+    hash_str(hash, period.scheme().as_str());
+    hash.update(period.year().to_be_bytes());
+    hash.update(period.ordinal().get().to_be_bytes());
+    hash_str(hash, period.code().as_str());
 }
 
 async fn decode_fund_nav_history(
