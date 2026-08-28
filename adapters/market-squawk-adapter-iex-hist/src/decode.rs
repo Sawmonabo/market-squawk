@@ -449,9 +449,11 @@ impl DecodeActuals {
 }
 
 /// Structured failure retaining exact capacity actuals for typed settlement.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("IEX HIST decode failed after partial transactional staging: {error}")]
 pub struct DecodeFailure {
     /// Exhaustive underlying decode classification.
+    #[source]
     pub error: DecodeError,
     /// Exact bytes/events admitted before the failure and transactional abort.
     pub actuals: DecodeActuals,
@@ -1374,6 +1376,7 @@ pub struct IexHistVenueTradeBar {
     last_source_time: EpochNanos,
     first_event_ordinal: u64,
     last_event_ordinal: u64,
+    contributing_event_ordinals: Box<[u64]>,
     source_provider_content_sha256: Sha256Digest,
     bar_sha256: Sha256Digest,
 }
@@ -1442,6 +1445,12 @@ impl IexHistVenueTradeBar {
     #[must_use]
     pub const fn last_event_ordinal(&self) -> u64 {
         self.last_event_ordinal
+    }
+
+    /// Returns every exact decoded trade-event ordinal contributing to this bar in provider order.
+    #[must_use]
+    pub fn contributing_event_ordinals(&self) -> &[u64] {
+        &self.contributing_event_ordinals
     }
 
     #[must_use]
@@ -1554,6 +1563,7 @@ struct DerivedBarAccumulator {
     last_source_time: EpochNanos,
     first_event_ordinal: u64,
     last_event_ordinal: u64,
+    contributing_event_ordinals: Vec<u64>,
 }
 
 impl DerivedBarAccumulator {
@@ -1563,6 +1573,11 @@ impl DerivedBarAccumulator {
             .try_reserve_exact(trade.symbol.len())
             .map_err(|_| IexHistDerivedBarError::Capacity)?;
         symbol.push_str(trade.symbol);
+        let mut contributing_event_ordinals = Vec::new();
+        contributing_event_ordinals
+            .try_reserve_exact(1)
+            .map_err(|_| IexHistDerivedBarError::Capacity)?;
+        contributing_event_ordinals.push(trade.ordinal);
         Ok(Self {
             symbol,
             bucket_start,
@@ -1576,6 +1591,7 @@ impl DerivedBarAccumulator {
             last_source_time: trade.source_time,
             first_event_ordinal: trade.ordinal,
             last_event_ordinal: trade.ordinal,
+            contributing_event_ordinals,
         })
     }
 
@@ -1593,6 +1609,10 @@ impl DerivedBarAccumulator {
             .ok_or(IexHistDerivedBarError::Arithmetic)?;
         self.last_source_time = trade.source_time;
         self.last_event_ordinal = trade.ordinal;
+        self.contributing_event_ordinals
+            .try_reserve(1)
+            .map_err(|_| IexHistDerivedBarError::Capacity)?;
+        self.contributing_event_ordinals.push(trade.ordinal);
         Ok(())
     }
 
@@ -1606,6 +1626,17 @@ impl DerivedBarAccumulator {
             .bucket_start
             .checked_add(interval.nanos())
             .ok_or(IexHistDerivedBarError::Arithmetic)?;
+        if self.contributing_event_ordinals.len()
+            != usize::try_from(self.trade_count).map_err(|_| IexHistDerivedBarError::Arithmetic)?
+            || self.contributing_event_ordinals.first().copied() != Some(self.first_event_ordinal)
+            || self.contributing_event_ordinals.last().copied() != Some(self.last_event_ordinal)
+            || self
+                .contributing_event_ordinals
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(IexHistDerivedBarError::Arithmetic);
+        }
         let bar_sha256 = derived_bar_identity(
             &self.symbol,
             self.bucket_start,
@@ -1620,9 +1651,10 @@ impl DerivedBarAccumulator {
             self.last_source_time,
             self.first_event_ordinal,
             self.last_event_ordinal,
+            &self.contributing_event_ordinals,
             source_provider_content_sha256,
             calculation_sha256,
-        );
+        )?;
         Ok(IexHistVenueTradeBar {
             symbol: self.symbol,
             bucket_start_unix_nanos: self.bucket_start,
@@ -1637,6 +1669,7 @@ impl DerivedBarAccumulator {
             last_source_time: self.last_source_time,
             first_event_ordinal: self.first_event_ordinal,
             last_event_ordinal: self.last_event_ordinal,
+            contributing_event_ordinals: self.contributing_event_ordinals.into_boxed_slice(),
             source_provider_content_sha256,
             bar_sha256,
         })
@@ -1645,7 +1678,7 @@ impl DerivedBarAccumulator {
 
 fn derived_bar_calculation_identity(interval: IexHistBarInterval) -> Sha256Digest {
     crate::catalog::digest_fields(&[
-        b"market-squawk/iex-hist-derived-trade-bars/v1",
+        b"market-squawk/iex-hist-derived-trade-bars/v2",
         interval.identity_value(),
         b"iex-trade-only",
         b"exact-trade-break-netting",
@@ -1673,11 +1706,19 @@ fn derived_bar_identity(
     last_source_time: EpochNanos,
     first_event_ordinal: u64,
     last_event_ordinal: u64,
+    contributing_event_ordinals: &[u64],
     source_provider_content_sha256: Sha256Digest,
     calculation_sha256: Sha256Digest,
-) -> Sha256Digest {
-    crate::catalog::digest_fields(&[
-        b"market-squawk/iex-hist-derived-trade-bar/v1",
+) -> Result<Sha256Digest, IexHistDerivedBarError> {
+    let mut contributors = Sha256::new();
+    for ordinal in contributing_event_ordinals {
+        contributors.update(ordinal.to_le_bytes());
+    }
+    let contributors_sha256 = Sha256Digest::from_bytes(contributors.finalize().into());
+    let contributor_count = u64::try_from(contributing_event_ordinals.len())
+        .map_err(|_| IexHistDerivedBarError::Arithmetic)?;
+    Ok(crate::catalog::digest_fields(&[
+        b"market-squawk/iex-hist-derived-trade-bar/v2",
         symbol.as_bytes(),
         &bucket_start_unix_nanos.to_le_bytes(),
         &bucket_end_unix_nanos.to_le_bytes(),
@@ -1691,9 +1732,11 @@ fn derived_bar_identity(
         &last_source_time.value().to_le_bytes(),
         &first_event_ordinal.to_le_bytes(),
         &last_event_ordinal.to_le_bytes(),
+        &contributor_count.to_le_bytes(),
+        contributors_sha256.as_bytes(),
         source_provider_content_sha256.as_bytes(),
         calculation_sha256.as_bytes(),
-    ])
+    ]))
 }
 
 fn derived_bars_content_identity(
@@ -1714,7 +1757,7 @@ fn derived_bars_content_identity(
     let count = u64::try_from(bars.len()).map_err(|_| IexHistDerivedBarError::Arithmetic)?;
     let ordered_sha256 = Sha256Digest::from_bytes(ordered.finalize().into());
     Ok(crate::catalog::digest_fields(&[
-        b"market-squawk/iex-hist-derived-trade-bars-content/v1",
+        b"market-squawk/iex-hist-derived-trade-bars-content/v2",
         interval.identity_value(),
         calculation_sha256.as_bytes(),
         source_provider_content_sha256.as_bytes(),
