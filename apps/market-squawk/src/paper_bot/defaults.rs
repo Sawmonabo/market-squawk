@@ -59,7 +59,7 @@ use crate::{
     CoinbaseDirectProductActivation, ProductionLiveSourceComposition,
     ProductionLiveSourceCompositionError, ProductionLiveSourceRuntime,
     ProductionLiveSourceRuntimeError, ProductionSourceProvider, ProviderActivationOutcome,
-    ProviderAdapterActivation, ProviderAdapterActivationRequest,
+    ProviderAdapterActivation, ProviderAdapterActivationRequest, ResearchService,
 };
 
 const LOCAL_PAPER_ACCOUNT_ID: &str = "c8cadf63-d1ce-4c37-837c-8f9f71f9525e";
@@ -225,6 +225,7 @@ pub(crate) struct ProductionLiveMarketComposition {
 pub(crate) struct CoinbaseDirectLiveMarketComposition {
     activation: CoinbaseDirectAccountActivation,
     runtime_config: LiveRuntimeConfig,
+    research: Arc<ResearchService>,
 }
 
 impl CoinbaseDirectLiveMarketComposition {
@@ -235,7 +236,12 @@ impl CoinbaseDirectLiveMarketComposition {
         cancellation: CancellationToken,
     ) -> Result<crate::CoinbaseDirectLiveRuntime, crate::CoinbaseDirectSupervisorError> {
         self.activation
-            .start_live_with_order_level(self.runtime_config, order_level, cancellation)
+            .start_live_with_order_level(
+                self.runtime_config,
+                self.research,
+                order_level,
+                cancellation,
+            )
             .await
     }
 }
@@ -306,6 +312,7 @@ pub(crate) async fn local_coinbase_direct_live_market_with_activation(
     config: AppConfig,
     provider_session_id: Uuid,
     provider_activation: &ProviderAdapterActivation,
+    research: Arc<ResearchService>,
     cancellation: CancellationToken,
 ) -> Result<CoinbaseDirectLiveMarketComposition> {
     let source = configured_source(&config, ProductionSourceProvider::Coinbase)?;
@@ -326,6 +333,7 @@ pub(crate) async fn local_coinbase_direct_live_market_with_activation(
     Ok(CoinbaseDirectLiveMarketComposition {
         activation: *activation,
         runtime_config,
+        research,
     })
 }
 

@@ -3,10 +3,18 @@
 use std::{
     collections::{HashMap, VecDeque},
     mem::size_of,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use super::{
+    composition::system_timestamp,
+    direct::{
+        canonical::CoinbaseDirectCanonicalState,
+        publication_actor::{
+            CoinbaseDirectCapturedFrame, CoinbaseDirectPreparedCurrentPublication,
+        },
+    },
     display_market::{
         DisplayMarketIngress, DisplayMarketRouteIdentity, DisplayMarketTerminalFailure,
     },
@@ -16,23 +24,30 @@ use super::{
         GenerationIdentity, SubscriptionFailure, SubscriptionPhase, SubscriptionStateMachine,
     },
 };
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use market_squawk_adapter_coinbase::{
-    CoinbaseMarketDecodeOutcome, CoinbaseMarketFeed, CoinbaseMarketRawLineage,
+    COINBASE_EXCHANGE_DIRECT_FULL_REPLAY_EVENT_DATASET, CoinbaseDirectConfig,
+    CoinbaseMarketDecodeOutcome, CoinbaseMarketFeed, CoinbaseMarketHandoff,
+    CoinbaseMarketRawLineage,
 };
+use market_squawk_data::{IngestError, IngestPrecommitAuthority};
 use market_squawk_domain::{ExactPayloadEvidence, StreamIntegrityState, Timestamp};
 use market_squawk_live::{LiveIngressBindError, LiveIngressError, LiveRuntimeIngress, ShardKey};
-use market_squawk_platform::{CapturePublishError, RawCapturePublisher};
+use market_squawk_platform::{CapturePublishError, RawCapturePublisher, RawCaptureRecord};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationHealth, BudgetHealth, BudgetPermitLease,
     CaptureGenerationCapabilities, ConnectionLiveness, ControlFrameKind,
     CurrentDecodedProviderBatch, CurrentDecodedProviderBatches, CurrentHealthRecording,
-    CurrentHealthReporter, CurrentSourceSession, DecodeInternalError, DecodeOutcome,
-    FreshnessPolicy, ProviderTimestampEvidence, QuarantineReason, RawMarketFrame, RawMarketSink,
-    RegistryError, ResynchronizationReason, SinkError, SourceHealthError, SourceHealthSnapshot,
-    SourceMetadata, SourceMetadataProvider, ValidatedSessionDecodeOutcome,
+    CurrentHealthReporter, CurrentSourceAuthorityLease, CurrentSourceSession, DecodeInternalError,
+    DecodeOutcome, FreshnessPolicy, ProviderEventMicrobatchMaterial, ProviderTimestampEvidence,
+    QuarantineReason, RawMarketFrame, RawMarketSink, RegistryError, ResynchronizationReason,
+    SinkError, SourceHealthError, SourceHealthSnapshot, SourceMetadata, SourceMetadataProvider,
+    ValidatedSessionDecodeOutcome,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 /// Input capabilities consumed by one exact-generation production sink.
 #[derive(Debug)]
@@ -72,6 +87,21 @@ pub(super) struct ProductionDisplayMarketSinkInput<'a> {
     pub(super) display_ingresses: Vec<DisplayMarketIngress>,
     pub(super) ingress_timeout: Duration,
     pub(super) startup_readiness_policy: StartupReadinessPolicy,
+}
+
+#[derive(Debug)]
+struct CoinbaseDirectCurrentPrecommitAuthority {
+    lease: CurrentSourceAuthorityLease,
+}
+
+impl IngestPrecommitAuthority for CoinbaseDirectCurrentPrecommitAuthority {
+    fn validate_precommit(&self) -> Result<(), IngestError> {
+        let observed_at =
+            system_timestamp().map_err(|_error| IngestError::PublicationAuthorityRevoked)?;
+        self.lease
+            .validate_at(observed_at)
+            .map_err(|_error| IngestError::PublicationAuthorityRevoked)
+    }
 }
 
 /// Exact capture/session/health/live-route bridge used directly by the Coinbase reader.
@@ -307,6 +337,247 @@ impl<'a> ProductionRawMarketSink<'a> {
             .map_err(ProductionSinkFailure::Registry)
             .map_err(|failure| self.fail(failure))?;
         Ok(receipt)
+    }
+
+    /// Consumes the exact Direct replay captures into registry-current authority and seal-ready
+    /// event material without routing a second copy through the ordinary live actor.
+    ///
+    /// The terminal capture receipt is consumed by the authoritative registry. Earlier replay
+    /// frames are revalidated against the same current session and remain bound into the ordered
+    /// physical microbatch. The returned lineage is therefore the registry-minted value from the
+    /// exact terminal observation, never a caller reconstruction.
+    pub(super) fn try_prepare_coinbase_direct_current(
+        &mut self,
+        config: &CoinbaseDirectConfig,
+        handoff: &CoinbaseMarketHandoff,
+        captures: Box<[CoinbaseDirectCapturedFrame]>,
+        canonical: &mut CoinbaseDirectCanonicalState,
+    ) -> Result<CoinbaseDirectPreparedCurrentPublication, SinkError> {
+        if let Some(failure) = self.terminal {
+            return Err(failure.as_sink_error());
+        }
+        let replay = match handoff.raw_lineage() {
+            CoinbaseMarketRawLineage::DirectInitial(lineage) => lineage.replay(),
+            CoinbaseMarketRawLineage::DirectSuccessor(lineage) => lineage.frames(),
+            CoinbaseMarketRawLineage::AdvancedTrade(_) => {
+                return Err(self.fail(ProductionSinkFailure::Decode(
+                    DecodeInternalError::InvariantViolation,
+                )));
+            }
+        };
+        if captures.len() != replay.len() || captures.is_empty() {
+            return Err(self.fail(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            )));
+        }
+
+        let connection_id = Uuid::new_v4();
+        let source: Arc<str> = Arc::from(config.metadata().source_id().as_str());
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(captures.len())
+            .map_err(|_error| {
+                self.fail(ProductionSinkFailure::Decode(
+                    DecodeInternalError::InvariantViolation,
+                ))
+            })?;
+        let mut terminal_receipt = None;
+        for (ordinal, (captured, replay_frame)) in
+            captures.into_vec().into_iter().zip(replay).enumerate()
+        {
+            let (frame, receipt) = captured.into_parts();
+            self.session
+                .validate_live_frame(&frame)
+                .map_err(ProductionSinkFailure::Registry)
+                .map_err(|failure| self.fail(failure))?;
+            if frame.frame_id() != replay_frame.decoder_evidence().frame_id()
+                || frame.received_at() != replay_frame.decoder_evidence().received_at()
+                || frame.payload() != replay_frame.raw_payload().as_bytes()
+            {
+                return Err(self.fail(ProductionSinkFailure::Decode(
+                    DecodeInternalError::InvariantViolation,
+                )));
+            }
+            let record = RawCaptureRecord::try_new_live(
+                Uuid::new_v4(),
+                Arc::clone(&source),
+                connection_id,
+                Some(replay_frame.sequence().get()),
+                Some(DateTime::<Utc>::from_timestamp_nanos(
+                    replay_frame.event().timestamp().unix_nanos(),
+                )),
+                DateTime::<Utc>::from_timestamp_nanos(frame.received_at().unix_nanos()),
+                Bytes::copy_from_slice(frame.payload()),
+            )
+            .map_err(|_error| {
+                self.fail(ProductionSinkFailure::Decode(
+                    DecodeInternalError::InvariantViolation,
+                ))
+            })?;
+            records.push(record);
+            if ordinal + 1 == replay.len() {
+                terminal_receipt = Some(receipt);
+            }
+        }
+        let terminal_receipt = terminal_receipt.ok_or_else(|| {
+            self.fail(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            ))
+        })?;
+        let event_material = ProviderEventMicrobatchMaterial::try_new(
+            config.metadata().source_id().clone(),
+            config.metadata().revision().clone(),
+            market_squawk_domain::SourceIdentifier::try_from(
+                COINBASE_EXCHANGE_DIRECT_FULL_REPLAY_EVENT_DATASET,
+            )
+            .map_err(|_error| {
+                self.fail(ProductionSinkFailure::Decode(
+                    DecodeInternalError::InvariantViolation,
+                ))
+            })?,
+            handoff
+                .typed_batch()
+                .evidence()
+                .binding()
+                .session_id()
+                .as_source_identifier()
+                .clone(),
+            records,
+        )
+        .map_err(|_error| {
+            self.fail(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            ))
+        })?;
+
+        let received_at = handoff.typed_batch().evidence().received_at();
+        let validated_session = match self.registry.validate_session(self.session, received_at) {
+            Ok(validated) => validated,
+            Err(error) => {
+                return Err(self.fail(ProductionSinkFailure::Registry(error)));
+            }
+        };
+        let disposition = match validated_session.validate_decode_outcome_owned(
+            DecodeOutcome::Data(handoff.typed_batch().clone()),
+            terminal_receipt,
+        ) {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                return Err(self.fail(ProductionSinkFailure::Registry(error)));
+            }
+        };
+        let ValidatedSessionDecodeOutcome::Data(data) = disposition else {
+            return Err(self.fail(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            )));
+        };
+        self.subscription
+            .observe_data(&self.generation, Instant::now())
+            .map_err(ProductionSinkFailure::Subscription)
+            .map_err(|failure| self.fail(failure))?;
+        self.last_transport_at = Some(received_at);
+        self.last_market_at = Some(received_at);
+        let source_at = handoff.evidence().provider_published_at();
+        self.last_source_at = Some(
+            self.last_source_at
+                .map_or(source_at, |previous| previous.max(source_at)),
+        );
+        let requires_rebind = self
+            .health_rebind_at
+            .is_none_or(|deadline| received_at >= deadline);
+        if requires_rebind {
+            match self
+                .record_health(received_at)
+                .map_err(|failure| self.fail(failure))?
+            {
+                CurrentHealthRecording::Qualified => {}
+                CurrentHealthRecording::Unqualified(_cause) => {
+                    return Err(self.fail(ProductionSinkFailure::Registry(
+                        RegistryError::HealthNotQualified,
+                    )));
+                }
+            }
+        }
+        let current = match self.registry.validate_current_authority(self.session) {
+            Ok(current) => current,
+            Err(error) => {
+                return Err(self.fail(ProductionSinkFailure::Registry(error)));
+            }
+        };
+        let batches = match current.validate_data_outcome_owned(data) {
+            Ok(batches) => batches,
+            Err(error) => {
+                return Err(self.fail(ProductionSinkFailure::Registry(error)));
+            }
+        };
+        let mut batches = batches.into_iter();
+        let batch = batches.next().ok_or_else(|| {
+            self.fail(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            ))
+        })?;
+        if batches.next().is_some()
+            || batch.key().venue() != config.venue()
+            || batch.key().instrument() != config.instrument()
+        {
+            return Err(self.fail(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            )));
+        }
+        let mut observations = batch.into_observations();
+        let observation = observations.next().ok_or_else(|| {
+            self.fail(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            ))
+        })?;
+        if observations.next().is_some() {
+            return Err(self.fail(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            )));
+        }
+        let precommit_authority: Arc<dyn IngestPrecommitAuthority> =
+            Arc::new(CoinbaseDirectCurrentPrecommitAuthority {
+                lease: observation.current_lease().clone(),
+            });
+        let current_lineage = observation
+            .into_lineage_handoff()
+            .map_err(ProductionSinkFailure::Registry)
+            .map_err(|failure| self.fail(failure))?;
+        let [terminal_observation] = handoff.typed_batch().observations() else {
+            return Err(self.fail(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            )));
+        };
+        let canonical_events = canonical
+            .try_project_replay(
+                config,
+                replay,
+                terminal_observation,
+                event_material.receipt().frames(),
+            )
+            .map_err(|_error| {
+                self.fail(ProductionSinkFailure::Decode(
+                    DecodeInternalError::InvariantViolation,
+                ))
+            })?;
+        if requires_rebind {
+            self.health_rebind_at = Some(
+                rebind_at(received_at, self.metadata.freshness_policy())
+                    .map_err(|failure| self.fail(failure))?,
+            );
+            self.health_valid_until = Some(current_lineage.policy().valid_until());
+        }
+        CoinbaseDirectPreparedCurrentPublication::try_new(
+            event_material,
+            canonical_events,
+            current_lineage,
+            precommit_authority,
+        )
+        .map_err(|_error| {
+            self.fail(ProductionSinkFailure::Decode(
+                DecodeInternalError::InvariantViolation,
+            ))
+        })
     }
 
     pub(super) fn try_process_captured_outcome(

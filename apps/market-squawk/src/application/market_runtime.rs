@@ -60,6 +60,7 @@ use super::{
 };
 use crate::{
     AppConfig, CoinbaseDirectLiveRuntime, ProductionLiveSourceRuntime, ProductionSourceProvider,
+    ResearchService,
     live_source::display_market::{
         DisplayMarketDirectory, DisplayMarketDirectoryError, DisplayMarketReadError,
         MAX_DISPLAY_MARKET_ROUTES,
@@ -217,6 +218,7 @@ pub(crate) struct MarketRuntimeRegistry {
     config: AppConfig,
     provider_rate: ProviderRateAuthority,
     provider_activation: Arc<ProviderAdapterActivation>,
+    research: Arc<ResearchService>,
     alpaca_historical_source: AlpacaHistoricalSourceMutationAuthority,
     prepared_configuration: Arc<dyn PreparedMarketProviderConfigurationResolver>,
     live_fair_value: Arc<LiveFairValueObservationBuffer>,
@@ -261,6 +263,7 @@ impl MarketRuntimeRegistry {
         config: AppConfig,
         provider_rate: ProviderRateAuthority,
         provider_activation: Arc<ProviderAdapterActivation>,
+        research: Arc<ResearchService>,
         alpaca_historical_source: AlpacaHistoricalSourceMutationAuthority,
         prepared_configuration: Arc<dyn PreparedMarketProviderConfigurationResolver>,
         live_fair_value: Arc<LiveFairValueObservationBuffer>,
@@ -301,6 +304,7 @@ impl MarketRuntimeRegistry {
             config,
             provider_rate,
             provider_activation,
+            research,
             alpaca_historical_source,
             prepared_configuration,
             live_fair_value,
@@ -727,6 +731,7 @@ impl MarketRuntimeRegistry {
                         self.config.clone(),
                         session_id,
                         self.provider_activation.as_ref(),
+                        Arc::clone(&self.research),
                         runtime_cancellation.clone(),
                     ),
                 )

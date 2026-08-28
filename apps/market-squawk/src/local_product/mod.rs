@@ -492,6 +492,7 @@ impl LocalProduct {
             config.clone(),
             provider_rate.clone(),
             Arc::clone(&provider_activation),
+            Arc::clone(&research),
             alpaca_historical_source,
             prepared_market_configuration,
             Arc::clone(&live_fair_value),

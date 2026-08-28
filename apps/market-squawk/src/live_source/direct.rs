@@ -5,9 +5,11 @@
 //! mutable owner of its registry and book generation; the account owner retains cross-process
 //! exclusion, onboarding currentness, cancellation, and coordinated cleanup.
 
+pub(super) mod canonical;
 mod evidence;
 mod output;
 mod product;
+pub(super) mod publication_actor;
 
 use std::mem::size_of;
 use std::sync::{
@@ -17,19 +19,21 @@ use std::sync::{
 use std::time::Duration;
 
 use market_squawk_adapter_coinbase::{CoinbaseDirectHmacSigner, CoinbaseDirectSigningError};
+use market_squawk_data::RightsBasis;
 use market_squawk_live::{LiveRuntimeConfig, LiveSnapshotReader, RouteActionHook, ShardKey};
 use market_squawk_platform::{
     CaptureProcessInfrastructureLimits, DestinationFenceRegistryInitializationError,
     initialize_capture_process_infrastructure,
 };
-use market_squawk_sources::SourceMetadata;
+use market_squawk_sources::{DataUseOperation, SourceMetadata};
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ProviderOnboardingError,
+    ProviderActivationLease, ProviderOnboardingError, ResearchService,
+    application::ResearchRightsAuthority,
     live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError},
     live_source::order_level::OrderLevelDirectory,
     provider_activation::CoinbaseDirectAccountActivation,
@@ -39,6 +43,10 @@ use evidence::try_build_product_spec;
 pub use output::CoinbaseDirectOutputFailure;
 pub use product::CoinbaseDirectProductRuntimeError;
 use product::{ProductReady, ProductRuntimeSpec, run_product};
+use publication_actor::{
+    CoinbaseDirectPublicationActorRunError, ProductionCoinbaseDirectPublicationHandler,
+    coinbase_direct_publication_actor_channel,
+};
 
 use super::{composition::SupervisorDropCancellation, route_actor::RouteBufferLimits};
 
@@ -145,19 +153,29 @@ impl CoinbaseDirectAccountActivation {
     pub async fn start_live(
         self,
         runtime_config: LiveRuntimeConfig,
+        research: Arc<ResearchService>,
         cancellation: CancellationToken,
     ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
-        start_account(self, runtime_config, None, None, cancellation).await
+        start_account(self, runtime_config, research, None, None, cancellation).await
     }
 
     /// Starts Direct products with one shared generation-owned order-level read directory.
     pub(crate) async fn start_live_with_order_level(
         self,
         runtime_config: LiveRuntimeConfig,
+        research: Arc<ResearchService>,
         order_level: OrderLevelDirectory,
         cancellation: CancellationToken,
     ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
-        start_account(self, runtime_config, None, Some(order_level), cancellation).await
+        start_account(
+            self,
+            runtime_config,
+            research,
+            None,
+            Some(order_level),
+            cancellation,
+        )
+        .await
     }
 
     /// Starts Direct products only after exact execution action hooks are installed per route.
@@ -172,16 +190,26 @@ impl CoinbaseDirectAccountActivation {
     pub async fn start_live_with_action_hooks(
         self,
         runtime_config: LiveRuntimeConfig,
+        research: Arc<ResearchService>,
         action_hooks: Vec<RouteActionHook>,
         cancellation: CancellationToken,
     ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
-        start_account(self, runtime_config, Some(action_hooks), None, cancellation).await
+        start_account(
+            self,
+            runtime_config,
+            research,
+            Some(action_hooks),
+            None,
+            cancellation,
+        )
+        .await
     }
 }
 
 async fn start_account(
     mut activation: CoinbaseDirectAccountActivation,
     runtime_config: LiveRuntimeConfig,
+    research: Arc<ResearchService>,
     action_hooks: Option<Vec<RouteActionHook>>,
     order_level: Option<OrderLevelDirectory>,
     cancellation: CancellationToken,
@@ -260,6 +288,7 @@ async fn start_account(
         capture_process,
         route_buffer_limits,
         live,
+        research,
         order_level,
         cancellation,
     )
@@ -281,6 +310,7 @@ async fn start_on_live_runtime(
     capture_process: market_squawk_platform::CaptureProcessInfrastructure,
     route_buffer_limits: RouteBufferLimits,
     live: LiveRuntimeComposition,
+    research: Arc<ResearchService>,
     order_level: Option<OrderLevelDirectory>,
     cancellation: CancellationToken,
 ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
@@ -302,6 +332,7 @@ async fn start_on_live_runtime(
             capture_process,
             route_buffer_limits,
             live_ingress,
+            research,
             order_level,
             supervisor_cancellation,
             startup_sender,
@@ -362,6 +393,7 @@ async fn run_account(
     capture_process: market_squawk_platform::CaptureProcessInfrastructure,
     route_buffer_limits: RouteBufferLimits,
     live_ingress: market_squawk_live::LiveRuntimeIngress,
+    research: Arc<ResearchService>,
     order_level: Option<OrderLevelDirectory>,
     cancellation: CancellationToken,
     startup: oneshot::Sender<()>,
@@ -384,6 +416,17 @@ async fn run_account(
     let mut products = JoinSet::new();
     for spec in specs {
         let slot = spec.slot();
+        let publication_limits = spec.publication_actor_limits()?;
+        let publication_key = spec.publication_key();
+        let publication_rights =
+            direct_research_rights(activation.lease(), spec.metadata().source_id())?;
+        let publication_handler = ProductionCoinbaseDirectPublicationHandler::try_new(
+            Arc::clone(&research),
+            spec.config().clone(),
+            activation.lease().authority_effective_at(),
+            publication_rights,
+        )
+        .map_err(|_error| CoinbaseDirectSupervisorError::PublicationConstruction)?;
         let task_config = app_config.clone();
         let provider_rate = activation.provider_rate().clone();
         let account_subject = activation.account_subject().clone();
@@ -394,10 +437,16 @@ async fn run_account(
         let task_ingress = live_ingress.clone();
         let task_order_level = order_level.clone();
         let task_bootstrap_slots = Arc::clone(&bootstrap_slots);
+        let (publication_ingress, publication_actor) = coinbase_direct_publication_actor_channel(
+            publication_key,
+            publication_limits,
+            task_cancellation.clone(),
+        );
         products.spawn(async move {
-            (
-                slot,
-                run_product(
+            let runtime = tokio::runtime::Handle::current();
+            let product_cancellation = task_cancellation.clone();
+            let mut product = tokio::task::spawn_blocking(move || {
+                runtime.block_on(run_product(
                     spec,
                     task_config,
                     provider_rate,
@@ -405,16 +454,36 @@ async fn run_account(
                     admission,
                     capture_process,
                     task_ingress,
+                    publication_ingress,
                     task_order_level,
                     route_buffer_limits,
                     task_signer,
                     task_ready,
                     task_start,
                     task_bootstrap_slots,
-                    task_cancellation,
-                )
-                .await,
-            )
+                    product_cancellation,
+                ))
+            });
+            let mut publisher = tokio::spawn(publication_actor.run(publication_handler));
+            let result = tokio::select! {
+                biased;
+                product = &mut product => {
+                    let product = product
+                        .unwrap_or_else(|error| Err(CoinbaseDirectProductRuntimeError::ProductWorkerTask(error)));
+                    task_cancellation.cancel();
+                    let publication = map_publication_actor_outcome(publisher.await);
+                    merge_product_publication_outcomes(product, publication)
+                }
+                publication = &mut publisher => {
+                    let publication = map_publication_actor_outcome(publication);
+                    task_cancellation.cancel();
+                    let product = product
+                        .await
+                        .unwrap_or_else(|error| Err(CoinbaseDirectProductRuntimeError::ProductWorkerTask(error)));
+                    merge_publication_product_outcomes(publication, product)
+                }
+            };
+            (slot, result)
         });
     }
     drop(ready_sender);
@@ -508,6 +577,78 @@ async fn run_account(
             }
         }
     }
+}
+
+fn map_publication_actor_outcome(
+    outcome: Result<Result<(), CoinbaseDirectPublicationActorRunError>, JoinError>,
+) -> Result<(), CoinbaseDirectProductRuntimeError> {
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_error)) => Err(CoinbaseDirectProductRuntimeError::PublicationActor),
+        Err(error) => Err(CoinbaseDirectProductRuntimeError::PublicationActorTask(
+            error,
+        )),
+    }
+}
+
+fn merge_product_publication_outcomes(
+    product: Result<(), CoinbaseDirectProductRuntimeError>,
+    publication: Result<(), CoinbaseDirectProductRuntimeError>,
+) -> Result<(), CoinbaseDirectProductRuntimeError> {
+    match (product, publication) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(source), Ok(())) => Err(source),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(source), Err(cleanup)) => Err(
+            CoinbaseDirectProductRuntimeError::ProductPublicationCleanup {
+                source: Box::new(source),
+                cleanup: Box::new(cleanup),
+            },
+        ),
+    }
+}
+
+fn merge_publication_product_outcomes(
+    publication: Result<(), CoinbaseDirectProductRuntimeError>,
+    product: Result<(), CoinbaseDirectProductRuntimeError>,
+) -> Result<(), CoinbaseDirectProductRuntimeError> {
+    match publication {
+        Err(source) => match product {
+            Ok(()) => Err(source),
+            Err(cleanup) => Err(
+                CoinbaseDirectProductRuntimeError::ProductPublicationCleanup {
+                    source: Box::new(source),
+                    cleanup: Box::new(cleanup),
+                },
+            ),
+        },
+        Ok(()) => product,
+    }
+}
+
+fn direct_research_rights(
+    lease: &ProviderActivationLease,
+    source_id: &market_squawk_domain::SourceId,
+) -> Result<ResearchRightsAuthority, CoinbaseDirectSupervisorError> {
+    if !lease.admits(DataUseOperation::Persist) {
+        return Err(CoinbaseDirectSupervisorError::PublicationConstruction);
+    }
+    let evidence = lease
+        .persistence_evidence()
+        .filter(|evidence| !evidence.refresh_required())
+        .ok_or(CoinbaseDirectSupervisorError::PublicationConstruction)?;
+    let terms_digest = evidence
+        .content_digest()
+        .ok_or(CoinbaseDirectSupervisorError::PublicationConstruction)?;
+    let basis = RightsBasis::reviewed_terms(evidence.official_url(), terms_digest)
+        .map_err(|_error| CoinbaseDirectSupervisorError::PublicationConstruction)?;
+    ResearchRightsAuthority::try_new(
+        source_id.clone(),
+        basis,
+        lease.rights_decision_digest(),
+        lease.verification_expires_at(),
+    )
+    .map_err(|_error| CoinbaseDirectSupervisorError::PublicationConstruction)
 }
 
 fn product_outcome(outcome: ProductJoinOutcome) -> CoinbaseDirectSupervisorError {
@@ -680,4 +821,7 @@ pub enum CoinbaseDirectSupervisorError {
     /// One product runtime failed during construction.
     #[error(transparent)]
     ProductConstruction(#[from] CoinbaseDirectProductRuntimeError),
+    /// Durable Direct publication authority could not be constructed before network release.
+    #[error("Coinbase Direct publication authority construction failed")]
+    PublicationConstruction,
 }

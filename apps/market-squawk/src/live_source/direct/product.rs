@@ -48,6 +48,10 @@ use super::super::subscription_state::{
     GenerationIdentity, SubscriptionConstructionError, SubscriptionLimits, SubscriptionStateMachine,
 };
 use super::output::{CoinbaseDirectOutputFailure, CoinbaseDirectProductOutput};
+use super::publication_actor::{
+    CoinbaseDirectPublicationActorIngress, CoinbaseDirectPublicationActorLimits,
+    CoinbaseDirectPublicationKey,
+};
 
 const CAPTURE_FLUSH_RECORDS: usize = 256;
 const CONTROL_AUDIT_RECORDS: usize = 64;
@@ -96,6 +100,29 @@ impl ProductRuntimeSpec {
     pub(super) const fn metadata(&self) -> &SourceMetadata {
         self.config.metadata()
     }
+
+    pub(super) const fn config(&self) -> &CoinbaseDirectConfig {
+        &self.config
+    }
+
+    pub(super) fn publication_key(&self) -> CoinbaseDirectPublicationKey {
+        CoinbaseDirectPublicationKey::new(
+            self.config.metadata().source_id().clone(),
+            self.config.product().clone(),
+            self.config.instrument(),
+            self.config.venue().clone(),
+        )
+    }
+
+    pub(super) fn publication_actor_limits(
+        &self,
+    ) -> Result<CoinbaseDirectPublicationActorLimits, CoinbaseDirectProductRuntimeError> {
+        let retained_bytes = u32::try_from(self.config.checked_maximum_retained_bytes()?)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or(CoinbaseDirectProductRuntimeError::PublicationAccounting)?;
+        Ok(CoinbaseDirectPublicationActorLimits::new(retained_bytes))
+    }
 }
 
 /// Runs one product until account cancellation or a terminal product defect.
@@ -111,6 +138,7 @@ pub(super) async fn run_product(
     admission: CoinbaseDirectRuntimeAdmission,
     capture_process: CaptureProcessInfrastructure,
     live_ingress: LiveRuntimeIngress,
+    publication: CoinbaseDirectPublicationActorIngress,
     order_level: Option<OrderLevelDirectory>,
     route_buffer_limits: RouteBufferLimits,
     signer: Arc<CoinbaseDirectHmacSigner>,
@@ -119,6 +147,9 @@ pub(super) async fn run_product(
     bootstrap_slots: Arc<Semaphore>,
     cancellation: CancellationToken,
 ) -> Result<(), CoinbaseDirectProductRuntimeError> {
+    if publication.key() != &spec.publication_key() {
+        return Err(CoinbaseDirectProductRuntimeError::PublicationBinding);
+    }
     let paths = LocalPaths::prepare(app_config.data_dir())?;
     let authority_store = LocalAuthorityStateStore::try_open(
         paths
@@ -145,6 +176,7 @@ pub(super) async fn run_product(
         admission,
         capture_process,
         live_ingress,
+        &publication,
         order_level.as_ref(),
         route_buffer_limits,
         signer.as_ref(),
@@ -181,6 +213,7 @@ async fn run_product_loop(
     admission: CoinbaseDirectRuntimeAdmission,
     capture_process: CaptureProcessInfrastructure,
     live_ingress: LiveRuntimeIngress,
+    publication: &CoinbaseDirectPublicationActorIngress,
     order_level: Option<&OrderLevelDirectory>,
     route_buffer_limits: RouteBufferLimits,
     signer: &CoinbaseDirectHmacSigner,
@@ -204,6 +237,7 @@ async fn run_product_loop(
             admission,
             capture_process,
             live_ingress.clone(),
+            publication.clone(),
             order_level,
             route_buffer_limits,
             signer,
@@ -338,6 +372,7 @@ async fn run_generation(
     admission: CoinbaseDirectRuntimeAdmission,
     capture_process: CaptureProcessInfrastructure,
     live_ingress: LiveRuntimeIngress,
+    publication: CoinbaseDirectPublicationActorIngress,
     order_level: Option<&OrderLevelDirectory>,
     route_buffer_limits: RouteBufferLimits,
     signer: &CoinbaseDirectHmacSigner,
@@ -484,11 +519,13 @@ async fn run_generation(
             .map(|_| spec.config.limits().websocket().io_timeout());
         let mut output = CoinbaseDirectProductOutput::new(
             &mut sink,
-            spec.config.product().clone(),
+            spec.config.clone(),
             bootstrap_permit,
+            publication,
+            spec.config.limits().websocket().io_timeout(),
             order_level_ingress,
             order_level_publish_timeout,
-        );
+        )?;
         let session_result = match order_level_monitor.as_mut() {
             Some(monitor) => tokio::select! {
                 biased;
@@ -687,6 +724,12 @@ pub enum CoinbaseDirectProductRuntimeError {
     /// Checked order-level resource accounting could not be represented.
     #[error("Coinbase Direct order-level accounting is invalid")]
     OrderLevelAccounting,
+    /// Complete current-to-durable actor accounting could not be represented.
+    #[error("Coinbase Direct publication actor accounting is invalid")]
+    PublicationAccounting,
+    /// The injected publication actor belongs to another configured product.
+    #[error("Coinbase Direct publication actor identity does not match the product")]
+    PublicationBinding,
     /// The exact generation-owned order-level actor did not shut down cleanly.
     #[error("Coinbase Direct order-level actor shutdown was incomplete")]
     OrderLevelShutdownIncomplete,
@@ -793,6 +836,23 @@ pub enum CoinbaseDirectProductRuntimeError {
     /// Route actor task failed.
     #[error("Coinbase Direct route actor task failed")]
     RouteTask(tokio::task::JoinError),
+    /// The application publication actor exited outside coordinated cancellation.
+    #[error("Coinbase Direct publication actor failed")]
+    PublicationActor,
+    /// The application publication actor task panicked or was aborted.
+    #[error("Coinbase Direct publication actor task failed")]
+    PublicationActorTask(tokio::task::JoinError),
+    /// The isolated synchronous Direct product worker panicked or was aborted.
+    #[error("Coinbase Direct isolated product worker failed")]
+    ProductWorkerTask(tokio::task::JoinError),
+    /// Product execution failed and publication-actor cleanup also failed.
+    #[error("Coinbase Direct product and publication cleanup both failed")]
+    ProductPublicationCleanup {
+        /// Primary product or actor failure.
+        source: Box<Self>,
+        /// Cleanup failure observed while reaping the paired owner.
+        cleanup: Box<Self>,
+    },
     /// Subscription state construction failed.
     #[error(transparent)]
     Subscription(#[from] SubscriptionConstructionError),
@@ -821,7 +881,11 @@ impl CoinbaseDirectProductRuntimeError {
         match self {
             Self::Sink(failure) => failure.requires_generation_resynchronization(),
             Self::Output(CoinbaseDirectOutputFailure::ProductUnavailable) => true,
-            Self::Output(CoinbaseDirectOutputFailure::OrderLevelPublication)
+            Self::Output(
+                CoinbaseDirectOutputFailure::OrderLevelPublication
+                | CoinbaseDirectOutputFailure::CurrentPublicationSaturated
+                | CoinbaseDirectOutputFailure::CurrentPublicationDeadline,
+            )
             | Self::OrderLevelTerminal
             | Self::OrderLevelMonitor => true,
             Self::Session(CoinbaseDirectSessionError::Source(source)) => matches!(
