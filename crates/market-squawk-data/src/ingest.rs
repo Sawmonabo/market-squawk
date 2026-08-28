@@ -289,14 +289,18 @@ impl ProviderMacroPlanChunkInput {
         require_provider_macro_digest(candidate_digest)?;
         require_provider_macro_digest(source_generation_digest)?;
         sealed_capture.validate()?;
+        let native_implementation = sealed_capture.native_lineage().schema().implementation();
         if total_chunks == 0
             || chunk_index >= total_chunks
             || sealed_capture.record_count() == 0
             || revisions.len() != sealed_capture.record_count()
             || !revisions.native_lineage_required()
             || !revisions.is_locally_observed()
-            || sealed_capture.native_lineage().schema().implementation()
-                != ProviderNativeLineageImplementation::BlsTimeseriesV1
+            || !matches!(
+                native_implementation,
+                ProviderNativeLineageImplementation::BlsTimeseriesV1
+                    | ProviderNativeLineageImplementation::BeaRegionalV1
+            )
         {
             return Err(IngestError::InvalidProviderMacroPlan);
         }
@@ -370,8 +374,13 @@ impl ProviderMacroPlanPublicationInput {
         let sealed_capture_receipt_digest = first.sealed_capture.sealed_capture_receipt_digest();
         let semantics_schema = first.semantics.schema.clone();
         let schema_requirement_digest = first.semantics.schema_requirement_digest;
+        let native_implementation = first
+            .sealed_capture
+            .native_lineage()
+            .schema()
+            .implementation();
 
-        validate_provider_macro_capture_shape(root_capture, total_chunks)?;
+        validate_provider_macro_capture_shape(root_capture, total_chunks, native_implementation)?;
         let mut total_rows = 0_u64;
         let mut total_semantics_bytes = 0_u64;
         for (expected_index, chunk) in chunks.iter().enumerate() {
@@ -379,7 +388,7 @@ impl ProviderMacroPlanPublicationInput {
                 u16::try_from(expected_index).map_err(|_| IngestError::InvalidProviderMacroPlan)?;
             chunk.sealed_capture.validate()?;
             let capture = chunk.sealed_capture.capture_evidence();
-            validate_provider_macro_capture_shape(capture, total_chunks)?;
+            validate_provider_macro_capture_shape(capture, total_chunks, native_implementation)?;
             if chunk.chunk_index != expected_index
                 || chunk.total_chunks != total_chunks
                 || capture != root_capture
@@ -388,13 +397,19 @@ impl ProviderMacroPlanPublicationInput {
                     != sealed_capture_receipt_digest
                 || chunk.semantics.schema != semantics_schema
                 || chunk.semantics.schema_requirement_digest != schema_requirement_digest
+                || chunk
+                    .sealed_capture
+                    .native_lineage()
+                    .schema()
+                    .implementation()
+                    != native_implementation
                 || chunks[..expected_index as usize]
                     .iter()
                     .any(|prior| prior.candidate_digest == chunk.candidate_digest)
             {
                 return Err(IngestError::InvalidProviderMacroPlan);
             }
-            validate_provider_macro_component(chunk, total_chunks)?;
+            validate_provider_macro_component(chunk, total_chunks, native_implementation)?;
             total_rows = total_rows
                 .checked_add(
                     u64::try_from(chunk.sealed_capture.record_count())
@@ -761,6 +776,22 @@ fn validate_provider_macro_chunk_rows(
 fn validate_provider_macro_capture_shape(
     capture: &market_squawk_sources::ProviderCaptureSetReceipt,
     total_chunks: u16,
+    native_implementation: ProviderNativeLineageImplementation,
+) -> Result<(), IngestError> {
+    match native_implementation {
+        ProviderNativeLineageImplementation::BlsTimeseriesV1 => {
+            validate_bls_provider_macro_capture_shape(capture, total_chunks)
+        }
+        ProviderNativeLineageImplementation::BeaRegionalV1 => {
+            validate_bea_provider_macro_capture_shape(capture, total_chunks)
+        }
+        _ => Err(IngestError::InvalidProviderMacroPlan),
+    }
+}
+
+fn validate_bls_provider_macro_capture_shape(
+    capture: &market_squawk_sources::ProviderCaptureSetReceipt,
+    total_chunks: u16,
 ) -> Result<(), IngestError> {
     let expected = usize::from(total_chunks);
     let valid =
@@ -791,7 +822,46 @@ fn validate_provider_macro_capture_shape(
     }
 }
 
+fn validate_bea_provider_macro_capture_shape(
+    capture: &market_squawk_sources::ProviderCaptureSetReceipt,
+    total_chunks: u16,
+) -> Result<(), IngestError> {
+    let components = capture.request_graph_components();
+    let valid = total_chunks == 1
+        && capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph
+        && capture.semantic_binding().is_none()
+        && components.len() >= 2
+        && capture.pages().len() == components.len()
+        && components.iter().enumerate().all(|(index, component)| {
+            usize::from(component.ordinal()) == index
+                && usize::from(component.first_page_ordinal()) == index
+                && component.page_count().get() == 1
+                && component.terminal() == ProviderCaptureTerminalDisposition::StandaloneResponse
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(IngestError::InvalidProviderMacroPlan)
+    }
+}
+
 fn validate_provider_macro_component(
+    chunk: &ProviderMacroPlanChunkInput,
+    total_chunks: u16,
+    native_implementation: ProviderNativeLineageImplementation,
+) -> Result<(), IngestError> {
+    match native_implementation {
+        ProviderNativeLineageImplementation::BlsTimeseriesV1 => {
+            validate_bls_provider_macro_component(chunk, total_chunks)
+        }
+        ProviderNativeLineageImplementation::BeaRegionalV1 => {
+            validate_bea_provider_macro_component(chunk, total_chunks)
+        }
+        _ => Err(IngestError::InvalidProviderMacroPlan),
+    }
+}
+
+fn validate_bls_provider_macro_component(
     chunk: &ProviderMacroPlanChunkInput,
     total_chunks: u16,
 ) -> Result<(), IngestError> {
@@ -815,6 +885,50 @@ fn validate_provider_macro_component(
             frame.capture_page_ordinal() != expected_page
                 || frame.segment_ordinal() != 0
                 || frame.physical_frame_ordinal() != u32::from(expected_page)
+        })
+    {
+        return Err(IngestError::InvalidProviderMacroPlan);
+    }
+    Ok(())
+}
+
+fn validate_bea_provider_macro_component(
+    chunk: &ProviderMacroPlanChunkInput,
+    total_chunks: u16,
+) -> Result<(), IngestError> {
+    let capture = chunk.sealed_capture.capture_evidence();
+    let components = capture.request_graph_components();
+    let data_component = components
+        .last()
+        .ok_or(IngestError::InvalidProviderMacroPlan)?;
+    let data_page_ordinal = data_component.first_page_ordinal();
+    let data_page = capture
+        .pages()
+        .get(usize::from(data_page_ordinal))
+        .ok_or(IngestError::InvalidProviderMacroPlan)?;
+    let expected_data_component_ordinal = u16::try_from(components.len().saturating_sub(1))
+        .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+    if total_chunks != 1
+        || chunk.chunk_index != 0
+        || chunk.total_chunks != 1
+        || chunk.sealed_capture.component_ordinal().is_some()
+        || data_component.ordinal() != expected_data_component_ordinal
+        || data_component.page_count().get() != 1
+        || data_component.content_digest()
+            != chunk
+                .sealed_capture
+                .batch()
+                .request()
+                .object()
+                .evidence()
+                .content_digest()
+        || chunk.sealed_capture.persisted_segment_receipt(0).is_none()
+        || chunk.sealed_capture.persisted_segment_receipt(1).is_some()
+        || chunk.sealed_capture.row_frames().iter().any(|frame| {
+            frame.capture_page_ordinal() != data_page_ordinal
+                || frame.segment_ordinal() != 0
+                || frame.physical_frame_ordinal() != u32::from(data_page_ordinal)
+                || frame.page_body_digest() != data_page.body_digest()
         })
     {
         return Err(IngestError::InvalidProviderMacroPlan);
