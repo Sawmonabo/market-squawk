@@ -23,11 +23,14 @@ use market_squawk_adapter_kraken::{
 use market_squawk_data::{
     CommittedDataset, DatasetId, DatasetManifestRef, IngestError, IngestIdentity,
     IngestPrecommitAuthority, PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
-    ProviderMarketEventPublicationKind, RightsError, SourceOperation,
+    ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventPointInTimeRequest,
+    ProviderMarketEventPointInTimeSelection, ProviderMarketEventPublicationKind,
+    ProviderMarketEventSelectionError, RightsError, SourceOperation,
     provider_market_event_publication_digest,
 };
 use market_squawk_domain::{
-    AssetClass, DataQuality, DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
+    AssetClass, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, LiveEventClass,
+    SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_services::ServiceError;
@@ -90,20 +93,6 @@ impl CryptoMarketSurface {
             Self::KrakenSpot => None,
         }
     }
-}
-
-/// Exact missing shared-data capability for provider-neutral current/PIT crypto selection.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum CryptoMarketSelectorDependency {
-    /// The data layer can reopen an exact manifest/digest, but cannot yet choose a qualified
-    /// venue publication by instrument and point-in-time cutoff across immutable generations.
-    ProviderEventInstrumentVenuePointInTimeSelection,
-}
-
-/// Truthful availability of the provider-neutral current/PIT application operation.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum CryptoMarketSelectorAvailability {
-    Unavailable(CryptoMarketSelectorDependency),
 }
 
 /// One source-bound application capability for physical sealing and durable crypto publication.
@@ -305,14 +294,17 @@ impl CryptoMarketPublicationClosure {
         }
     }
 
-    /// Returns the exact shared-data dependency that prevents a provider-neutral current/PIT read.
-    /// Exact manifest/digest restart reads remain available through publication receipts.
-    pub(crate) const fn current_point_in_time_selector_availability(
+    /// Binds provider-event point-in-time reads to this exact registered crypto source and one
+    /// canonical analytical dataset. Source ranking remains outside this publication closure.
+    pub(crate) fn point_in_time_selector(
         &self,
-    ) -> CryptoMarketSelectorAvailability {
-        CryptoMarketSelectorAvailability::Unavailable(
-            CryptoMarketSelectorDependency::ProviderEventInstrumentVenuePointInTimeSelection,
-        )
+        analytical_dataset: DatasetId,
+    ) -> CryptoMarketPointInTimeSelector {
+        CryptoMarketPointInTimeSelector {
+            research: Arc::clone(&self.research),
+            analytical_dataset,
+            source_surface: self.source.source_id().clone(),
+        }
     }
 
     async fn seal_coinbase_material(
@@ -626,6 +618,152 @@ impl CryptoMarketPublicationClosure {
     }
 }
 
+/// Source-bound current/PIT capability over immutable Coinbase or Kraken market publications.
+///
+/// The selector deliberately fixes one source surface. A later unified resolver may compare the
+/// independently returned source receipts, but this layer never ranks or blends venues.
+#[derive(Clone)]
+pub(crate) struct CryptoMarketPointInTimeSelector {
+    research: Arc<ResearchService>,
+    analytical_dataset: DatasetId,
+    source_surface: SourceId,
+}
+
+impl fmt::Debug for CryptoMarketPointInTimeSelector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CryptoMarketPointInTimeSelector")
+            .field("analytical_dataset", &self.analytical_dataset)
+            .field("source_surface", &self.source_surface)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CryptoMarketPointInTimeSelector {
+    pub(crate) const fn analytical_dataset(&self) -> &DatasetId {
+        &self.analytical_dataset
+    }
+
+    pub(crate) const fn source_surface(&self) -> &SourceId {
+        &self.source_surface
+    }
+
+    /// Selects bounded newest ties for one exact canonical instrument, venue, event kind, clock,
+    /// and source surface. An empty result remains distinct from an empty, complete generation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "canonical identity, venue, event family, both PIT clocks, basis, and bound stay explicit"
+    )]
+    pub(crate) async fn select_latest(
+        &self,
+        instrument_id: InstrumentId,
+        venue_id: VenueId,
+        event_kind: LiveEventClass,
+        as_of_cutoff: Timestamp,
+        knowledge_cutoff: Timestamp,
+        effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
+        maximum_candidates: usize,
+        cancellation: CancellationToken,
+    ) -> Result<Option<CryptoMarketPointInTimeReceipt>, CryptoMarketPublicationError> {
+        let request = ProviderMarketEventPointInTimeRequest::try_latest(
+            self.analytical_dataset.clone(),
+            instrument_id,
+            venue_id,
+            event_kind,
+            as_of_cutoff,
+            knowledge_cutoff,
+            effective_time_basis,
+            maximum_candidates,
+            Some(self.source_surface.clone()),
+        )?;
+        let store = self.research.provider_capture_store();
+        let selection = self
+            .research
+            .analytical()
+            .read_provider_market_event_point_in_time(&request, store.as_ref(), cancellation)
+            .await?;
+        selection
+            .map(|selection| CryptoMarketPointInTimeReceipt::try_new(self, selection))
+            .transpose()
+    }
+
+    /// Reopens the original selection's exact manifest and rejects any request, source, row,
+    /// exclusion, tie, evidence, or selection-digest drift after process restart.
+    pub(crate) async fn verify_restart(
+        &self,
+        original: &CryptoMarketPointInTimeReceipt,
+        cancellation: CancellationToken,
+    ) -> Result<CryptoMarketPointInTimeReceipt, CryptoMarketPublicationError> {
+        original.validate_selector(self)?;
+        let store = self.research.provider_capture_store();
+        let replay = self
+            .research
+            .analytical()
+            .verify_provider_market_event_point_in_time_restart(
+                &original.selection,
+                store.as_ref(),
+                cancellation,
+            )
+            .await?;
+        CryptoMarketPointInTimeReceipt::try_new(self, replay)
+    }
+}
+
+/// Exact source-separated PIT selection with enough semantic state for verified restart replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CryptoMarketPointInTimeReceipt {
+    analytical_dataset: DatasetId,
+    source_surface: SourceId,
+    selection: ProviderMarketEventPointInTimeSelection,
+}
+
+impl CryptoMarketPointInTimeReceipt {
+    fn try_new(
+        selector: &CryptoMarketPointInTimeSelector,
+        selection: ProviderMarketEventPointInTimeSelection,
+    ) -> Result<Self, CryptoMarketPublicationError> {
+        if selection.request().dataset() != &selector.analytical_dataset
+            || selection.manifest().dataset_id() != &selector.analytical_dataset
+            || selection.request().exact_source_surface() != Some(&selector.source_surface)
+            || selection
+                .sources()
+                .iter()
+                .any(|source| source.source_surface() != &selector.source_surface)
+        {
+            return Err(CryptoMarketPublicationError::PointInTimeInvalid);
+        }
+        Ok(Self {
+            analytical_dataset: selector.analytical_dataset.clone(),
+            source_surface: selector.source_surface.clone(),
+            selection,
+        })
+    }
+
+    pub(crate) const fn analytical_dataset(&self) -> &DatasetId {
+        &self.analytical_dataset
+    }
+
+    pub(crate) const fn source_surface(&self) -> &SourceId {
+        &self.source_surface
+    }
+
+    pub(crate) const fn selection(&self) -> &ProviderMarketEventPointInTimeSelection {
+        &self.selection
+    }
+
+    fn validate_selector(
+        &self,
+        selector: &CryptoMarketPointInTimeSelector,
+    ) -> Result<(), CryptoMarketPublicationError> {
+        if self.analytical_dataset != selector.analytical_dataset
+            || self.source_surface != selector.source_surface
+        {
+            return Err(CryptoMarketPublicationError::PointInTimeInvalid);
+        }
+        Ok(())
+    }
+}
+
 /// Coinbase application result after exact physical sealing.
 #[derive(Debug)]
 pub(crate) enum CoinbaseMarketApplicationOutcome {
@@ -874,6 +1012,8 @@ pub(crate) enum CryptoMarketPublicationError {
     FamilyMismatch,
     #[error("the exact crypto immutable generation failed restart verification")]
     RestartInvalid,
+    #[error("the crypto point-in-time selection escaped its exact dataset or source surface")]
+    PointInTimeInvalid,
     #[error(transparent)]
     Coinbase(#[from] CoinbaseMarketPublicationError),
     #[error(transparent)]
@@ -882,6 +1022,8 @@ pub(crate) enum CryptoMarketPublicationError {
     Research(#[from] ResearchServiceError),
     #[error(transparent)]
     Ingest(#[from] IngestError),
+    #[error(transparent)]
+    PointInTime(#[from] ProviderMarketEventSelectionError),
     #[error(transparent)]
     Capture(#[from] ProviderCaptureError),
     #[error(transparent)]

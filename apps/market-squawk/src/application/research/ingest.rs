@@ -82,9 +82,9 @@ pub(crate) use bls::{
 pub(crate) use crypto_market::{
     CoinbaseMarketApplicationOutcome, CryptoMarketEventPublicationReceipt,
     CryptoMarketEventRestartReceipt, CryptoMarketEventRestartSelector,
+    CryptoMarketPointInTimeReceipt, CryptoMarketPointInTimeSelector,
     CryptoMarketPublicationClosure, CryptoMarketPublicationError,
-    CryptoMarketSealedReceiptEvidence, CryptoMarketSelectorAvailability,
-    CryptoMarketSelectorDependency, CryptoMarketSurface, KrakenMarketApplicationOutcome,
+    CryptoMarketSealedReceiptEvidence, CryptoMarketSurface, KrakenMarketApplicationOutcome,
     KrakenSealedRawCanonicalUnavailable,
 };
 pub(crate) use iex_hist::{
