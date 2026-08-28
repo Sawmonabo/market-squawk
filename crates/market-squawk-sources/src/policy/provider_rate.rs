@@ -10,6 +10,10 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{AuthorizationMode, AuthorizationSubjectResolutionError, AuthorizationSubjectResolver};
+use crate::{
+    ProviderRateDispatchClaim, ProviderRateResponseSettlement,
+    ProviderRateResponseSettlementReceipt,
+};
 
 use super::{
     BudgetClock, BudgetCollisionKey, BudgetPoolError, BudgetUnavailableReason, ClockObservation,
@@ -189,7 +193,7 @@ impl ProviderRateDeclaration {
         }
         let policy_digest = Self::policy_digest_for(&policy)?;
         let declaration_digest = digest_serialized(
-            b"market-squawk/provider-rate-declaration/v1\0",
+            b"market-squawk/provider-rate-declaration/v2\0",
             &ProviderRateDeclarationWire {
                 policy_digest,
                 collision_identities: &collision_identities,
@@ -225,8 +229,9 @@ impl ProviderRateDeclaration {
 
     /// Computes the canonical aggregate-limit digest for one validated provider policy.
     ///
-    /// Diagnostic provider/account labels are intentionally excluded; request windows,
-    /// concurrency, and refusal backoff are the complete enforcement identity.
+    /// Diagnostic provider/account labels are intentionally excluded. Request windows, weighted
+    /// response windows, concurrency, refusal backoff, and the dispatch/terminalization semantic
+    /// versions form the complete enforcement identity.
     ///
     /// # Errors
     ///
@@ -236,7 +241,7 @@ impl ProviderRateDeclaration {
         policy: &ProviderBudgetPolicy,
     ) -> Result<EvidenceDigest, BudgetPoolError> {
         digest_serialized(
-            b"market-squawk/provider-rate-limits/v1\0",
+            b"market-squawk/provider-rate-limits/v2\0",
             &ProviderRateLimitsWire::from_policy(policy),
         )
     }
@@ -264,16 +269,22 @@ impl ProviderRateDeclaration {
 #[serde(deny_unknown_fields)]
 struct ProviderRateLimitsWire {
     windows: Vec<super::ProviderBudgetWindow>,
+    weighted_windows: Vec<crate::ProviderRateWeightedWindow>,
     max_concurrent: u16,
     backoff: super::BackoffPolicy,
+    dispatch_claim_semantics_version: u16,
+    response_terminalization_semantics_version: u16,
 }
 
 impl ProviderRateLimitsWire {
     fn from_policy(policy: &ProviderBudgetPolicy) -> Self {
         Self {
             windows: policy.windows().collect(),
+            weighted_windows: policy.weighted_windows().collect(),
             max_concurrent: policy.max_concurrent(),
             backoff: policy.backoff(),
+            dispatch_claim_semantics_version: 1,
+            response_terminalization_semantics_version: 1,
         }
     }
 }
@@ -466,6 +477,26 @@ pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
         now: Timestamp,
     ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError>;
 
+    /// Atomically charges request windows and reserves the exact worst-case weighted response
+    /// claim for one reserved request at dispatch.
+    ///
+    /// The default preserves request-only stores without claiming weighted support. A nonempty
+    /// claim fails closed until the durable store implements weighted dispatch.
+    fn commit_dispatch_with_claim(
+        &self,
+        run_id: ProviderRateRunId,
+        registration: ProviderRateRegistration,
+        reservation_id: ProviderRateReservationId,
+        now: Timestamp,
+        claim: ProviderRateDispatchClaim,
+    ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
+        if claim.is_request_only() {
+            self.commit_dispatch(run_id, registration, reservation_id, now)
+        } else {
+            Err(ProviderRateStoreError::Conflict)
+        }
+    }
+
     /// Cancels only an undispatched concurrency reservation without charging a request window.
     fn cancel_reservation(
         &self,
@@ -474,13 +505,34 @@ pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
         reservation_id: ProviderRateReservationId,
     ) -> Result<(), ProviderRateStoreError>;
 
-    /// Releases only the concurrency slot; request-window consumption remains durable.
+    /// Releases an in-flight permit whose response was not explicitly terminalized.
+    ///
+    /// Request-window consumption remains durable. A weighted implementation must conservatively
+    /// replace every pending response claim with its maximum byte/error charge before releasing
+    /// concurrency; a request-only implementation releases only concurrency.
     fn release(
         &self,
         run_id: ProviderRateRunId,
         registration: ProviderRateRegistration,
         permit_id: ProviderRatePermitId,
     ) -> Result<(), ProviderRateStoreError>;
+
+    /// Atomically terminalizes one exact dispatched response, replaces its pending maximum claim
+    /// with the derived exact or conservative units, applies refusal state, removes permit
+    /// ownership, and releases concurrency.
+    ///
+    /// Request-only stores fail closed by default and therefore cannot return a false weighted
+    /// settlement receipt.
+    fn settle_response(
+        &self,
+        _run_id: ProviderRateRunId,
+        _registration: ProviderRateRegistration,
+        _permit_id: ProviderRatePermitId,
+        _now: Timestamp,
+        _settlement: ProviderRateResponseSettlement,
+    ) -> Result<ProviderRateResponseSettlementReceipt, ProviderRateStoreError> {
+        Err(ProviderRateStoreError::Conflict)
+    }
 
     /// Applies one standards-parsed provider retry instruction.
     fn apply_retry_after(
@@ -912,10 +964,17 @@ impl ProviderRateBinding {
     pub(in crate::policy) fn commit_dispatch(
         &self,
         reservation_id: ProviderRateReservationId,
+        claim: ProviderRateDispatchClaim,
     ) -> Result<(ClockObservation, ProviderRateDispatchDecision), BudgetUnavailableReason> {
         self.authority
             .serialized_timed_store_operation(|store, run_id, now| {
-                store.commit_dispatch(run_id, self.registration, reservation_id, now)
+                store.commit_dispatch_with_claim(
+                    run_id,
+                    self.registration,
+                    reservation_id,
+                    now,
+                    claim,
+                )
             })
             .map_err(map_store_runtime_error)
     }
@@ -982,8 +1041,9 @@ impl ProviderRateReservation {
 
     pub(in crate::policy) fn commit_dispatch(
         mut self,
+        claim: ProviderRateDispatchClaim,
     ) -> Result<ProviderRateReservationDispatch, BudgetUnavailableReason> {
-        let (observation, decision) = self.binding.commit_dispatch(self.reservation_id)?;
+        let (observation, decision) = self.binding.commit_dispatch(self.reservation_id, claim)?;
         self.released = true;
         match decision {
             ProviderRateDispatchDecision::Ready(permit_id) => {
@@ -992,6 +1052,7 @@ impl ProviderRateReservation {
                     permit: ProviderRatePermit {
                         binding: self.binding.clone(),
                         permit_id,
+                        claim,
                         released: false,
                     },
                 })
@@ -1046,6 +1107,7 @@ impl Drop for ProviderRateReservation {
 pub(in crate::policy) struct ProviderRatePermit {
     binding: ProviderRateBinding,
     permit_id: ProviderRatePermitId,
+    claim: ProviderRateDispatchClaim,
     released: bool,
 }
 
@@ -1054,22 +1116,90 @@ impl std::fmt::Debug for ProviderRatePermit {
         formatter
             .debug_struct("ProviderRatePermit")
             .field("permit_id", &self.permit_id)
+            .field("claim", &self.claim)
             .field("released", &self.released)
             .finish_non_exhaustive()
     }
 }
 
 impl ProviderRatePermit {
+    pub(in crate::policy) fn settle_response(
+        &mut self,
+        settlement: ProviderRateResponseSettlement,
+    ) -> Result<ProviderRateResponseSettlementReceipt, BudgetUnavailableReason> {
+        if self.released {
+            return Err(BudgetUnavailableReason::StateCorrupt);
+        }
+        let receipt = self
+            .binding
+            .authority
+            .serialized_timed_store_operation(|store, run_id, now| {
+                store.settle_response(
+                    run_id,
+                    self.binding.registration,
+                    self.permit_id,
+                    now,
+                    settlement,
+                )
+            })
+            .map(|(_observation, receipt)| receipt)
+            .map_err(map_store_runtime_error)?;
+        // The store has consumed the exact permit even if its returned receipt is malformed.
+        self.released = true;
+        if receipt.group_id() != self.binding.registration.group_id()
+            || receipt.permit_id() != self.permit_id
+            || receipt.settlement() != settlement
+            || self
+                .claim
+                .maximum_response_bytes()
+                .is_some_and(|maximum| receipt.charged_response_bytes() > maximum)
+            || (settlement.response_class() == crate::ProviderRateResponseClass::AbandonedUnknown
+                && receipt.charged_response_bytes()
+                    != self.claim.maximum_response_bytes().unwrap_or(0))
+        {
+            return Err(BudgetUnavailableReason::StateCorrupt);
+        }
+        Ok(receipt)
+    }
+
     pub(in crate::policy) fn release(&mut self) -> Result<(), BudgetUnavailableReason> {
         if self.released {
             return Ok(());
         }
-        self.binding
-            .authority
-            .serialized_store_operation(|store, run_id| {
-                store.release(run_id, self.binding.registration, self.permit_id)
-            })
-            .map_err(map_store_runtime_error)?;
+        if self.claim.is_request_only() {
+            self.binding
+                .authority
+                .serialized_store_operation(|store, run_id| {
+                    store.release(run_id, self.binding.registration, self.permit_id)
+                })
+                .map_err(map_store_runtime_error)?;
+        } else {
+            let settlement = ProviderRateResponseSettlement::abandoned_unknown();
+            let receipt = self
+                .binding
+                .authority
+                .serialized_timed_store_operation(|store, run_id, now| {
+                    store.settle_response(
+                        run_id,
+                        self.binding.registration,
+                        self.permit_id,
+                        now,
+                        settlement,
+                    )
+                })
+                .map(|(_observation, receipt)| receipt)
+                .map_err(map_store_runtime_error)?;
+            // The store has consumed the exact permit even if its returned receipt is malformed.
+            self.released = true;
+            if receipt.group_id() != self.binding.registration.group_id()
+                || receipt.permit_id() != self.permit_id
+                || receipt.settlement() != settlement
+                || receipt.charged_response_bytes()
+                    != self.claim.maximum_response_bytes().unwrap_or(0)
+            {
+                return Err(BudgetUnavailableReason::StateCorrupt);
+            }
+        }
         self.released = true;
         Ok(())
     }

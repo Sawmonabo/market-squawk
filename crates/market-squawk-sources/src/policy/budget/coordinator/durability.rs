@@ -1320,7 +1320,121 @@ impl BudgetPermit {
         }
     }
 
-    /// Explicitly releases the concurrency slot; request-window consumption remains recorded.
+    /// Atomically terminalizes this exact dispatched provider response and releases concurrency.
+    ///
+    /// The durable aggregate store consumes the exact permit first. The local allocation then
+    /// mirrors the returned refusal/cooldown state and persists its released in-flight slot. A
+    /// weighted permit cannot be terminalized through the legacy success/refusal controls.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when this permit is not bound to the product-wide provider-rate authority,
+    /// the exact response settlement is rejected, or local state cannot mirror the durable
+    /// receipt.
+    pub fn settle_response(
+        mut self,
+        settlement: crate::ProviderRateResponseSettlement,
+    ) -> Result<crate::ProviderRateResponseSettlementReceipt, BudgetUnavailableReason> {
+        if self.released
+            || !self.active.load(Ordering::Acquire)
+            || self.allocation.terminal.load(Ordering::Acquire)
+        {
+            return Err(BudgetUnavailableReason::AvailabilityGenerationExhausted);
+        }
+        let budget = SharedProviderBudget {
+            allocation: Arc::clone(&self.allocation),
+        };
+        if !budget.policy().has_weighted_windows() {
+            return Err(BudgetUnavailableReason::PersistenceUnavailable);
+        }
+        let provider_rate = self
+            .provider_rate
+            .as_mut()
+            .ok_or(BudgetUnavailableReason::PersistenceUnavailable)?;
+        let receipt = provider_rate
+            .settle_response(settlement)
+            .map_err(|reason| budget.terminal_fault(reason, &self.runtime_admission))?;
+
+        // The aggregate permit has now been consumed. Prevent every later error path and Drop
+        // from attempting a second release against the exact durable permit.
+        self.active.store(false, Ordering::Release);
+        self.released = true;
+
+        let mut state = self.allocation.state.lock().map_err(|_| {
+            budget.terminal_fault(
+                BudgetUnavailableReason::StatePoisoned,
+                &self.runtime_admission,
+            )
+        })?;
+        let observation = self.allocation.clock.observation().map_err(|_| {
+            budget.terminal_fault(
+                BudgetUnavailableReason::ClockUnavailable,
+                &self.runtime_admission,
+            )
+        })?;
+        let in_flight = state.in_flight.checked_sub(1).ok_or_else(|| {
+            budget.terminal_fault(
+                BudgetUnavailableReason::StateCorrupt,
+                &self.runtime_admission,
+            )
+        })?;
+        state.in_flight = in_flight;
+        let mirrored_version = self
+            .allocation
+            .provider_rate_state_version
+            .load(Ordering::Acquire);
+        if receipt.state_version() > mirrored_version {
+            state.consecutive_refusals = receipt.consecutive_refusals();
+            match receipt.availability() {
+                crate::ProviderRateSettlementAvailability::Available => {
+                    if state.disabled {
+                        drop(state);
+                        return Err(budget.terminal_fault(
+                            BudgetUnavailableReason::StateCorrupt,
+                            &self.runtime_admission,
+                        ));
+                    }
+                    state.unavailable_until = None;
+                }
+                crate::ProviderRateSettlementAvailability::WaitUntil(deadline) => {
+                    let deadline = wall_deadline_to_monotonic(
+                        observation.wall_clock,
+                        observation.monotonic,
+                        deadline,
+                    )
+                    .map_err(|reason| budget.terminal_fault(reason, &self.runtime_admission))?;
+                    state.unavailable_until = Some(deadline);
+                }
+                crate::ProviderRateSettlementAvailability::Unavailable(reason)
+                    if matches!(
+                        reason,
+                        BudgetUnavailableReason::Disabled
+                            | BudgetUnavailableReason::RetryAfterExceedsPolicy
+                    ) =>
+                {
+                    state.disabled = true;
+                    state.unavailable_until = None;
+                }
+                crate::ProviderRateSettlementAvailability::Unavailable(_) => {
+                    drop(state);
+                    return Err(budget.terminal_fault(
+                        BudgetUnavailableReason::StateCorrupt,
+                        &self.runtime_admission,
+                    ));
+                }
+            }
+            self.allocation
+                .provider_rate_state_version
+                .store(receipt.state_version(), Ordering::Release);
+        }
+        budget.persist_locked(&state, observation, &self.runtime_admission)?;
+        Ok(receipt)
+    }
+
+    /// Explicitly releases the in-flight slot; request-window consumption remains recorded.
+    ///
+    /// For a weighted provider-rate permit, the durable store conservatively terminalizes its
+    /// pending maximum response claim as unknown completion before releasing concurrency.
     pub fn release(mut self) {
         self.release_inner();
     }

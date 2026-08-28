@@ -377,6 +377,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(1),
+                provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: None,
                 provider_rate: None,
@@ -409,6 +410,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(1),
+                provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: None,
                 provider_rate: Some(binding),
@@ -429,6 +431,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(1),
+                provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: Some(binding),
                 provider_rate: None,
@@ -450,6 +453,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(1),
+                provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: Some(durability),
                 provider_rate: Some(provider_rate),
@@ -473,6 +477,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(checkpoint.availability_generation),
+                provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(checkpoint.terminal || checkpoint.poisoned),
                 durability: Some(binding),
                 provider_rate: None,
@@ -497,6 +502,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(checkpoint.availability_generation),
+                provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(checkpoint.terminal || checkpoint.poisoned),
                 durability: Some(durability),
                 provider_rate: Some(provider_rate),
@@ -902,6 +908,9 @@ impl SharedProviderBudget {
                 BudgetUnavailableReason::AvailabilityGenerationExhausted,
             );
         }
+        if self.policy().has_weighted_windows() {
+            return BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable);
+        }
         let provider_rate_deadline = match &self.allocation.provider_rate {
             Some(binding) => match binding.apply_retry_after(retry_after) {
                 Ok((observation, ProviderRateReservationDecision::WaitUntil(deadline))) => {
@@ -1018,6 +1027,9 @@ impl SharedProviderBudget {
                 BudgetUnavailableReason::AvailabilityGenerationExhausted,
             );
         }
+        if self.policy().has_weighted_windows() {
+            return BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable);
+        }
         let provider_rate_deadline = match &self.allocation.provider_rate {
             Some(binding) => match binding.apply_refusal(jitter_sample_basis_points) {
                 Ok((observation, ProviderRateReservationDecision::WaitUntil(deadline))) => {
@@ -1084,6 +1096,9 @@ impl SharedProviderBudget {
         if self.allocation.terminal.load(Ordering::Acquire) {
             return Err(BudgetUnavailableReason::AvailabilityGenerationExhausted);
         }
+        if self.policy().has_weighted_windows() {
+            return Err(BudgetUnavailableReason::PersistenceUnavailable);
+        }
         if let Some(binding) = &self.allocation.provider_rate {
             binding
                 .record_success()
@@ -1134,7 +1149,31 @@ impl BudgetReservation {
     ///
     /// This consumes the reservation. Only a successful result can mint an active request permit;
     /// wait and unavailable outcomes release concurrency without consuming a local request window.
-    pub fn commit_dispatch(mut self) -> BudgetDispatchDecision {
+    pub fn commit_dispatch(self) -> BudgetDispatchDecision {
+        self.commit_dispatch_with_claim(crate::ProviderRateDispatchClaim::request_only())
+    }
+
+    pub(crate) fn commit_dispatch_with_response_bound(
+        self,
+        maximum_response_bytes: NonZeroU64,
+    ) -> BudgetDispatchDecision {
+        let claim = match self
+            .allocation
+            .policy
+            .dispatch_claim(maximum_response_bytes)
+        {
+            Ok(claim) => claim,
+            Err(_) => {
+                return BudgetDispatchDecision::Unavailable(BudgetUnavailableReason::StateCorrupt);
+            }
+        };
+        self.commit_dispatch_with_claim(claim)
+    }
+
+    fn commit_dispatch_with_claim(
+        mut self,
+        claim: crate::ProviderRateDispatchClaim,
+    ) -> BudgetDispatchDecision {
         let budget = SharedProviderBudget {
             allocation: Arc::clone(&self.allocation),
         };
@@ -1150,6 +1189,14 @@ impl BudgetReservation {
             return BudgetDispatchDecision::Unavailable(
                 budget.terminal_fault(BudgetUnavailableReason::PersistenceUnavailable, operation),
             );
+        }
+        if budget.policy().has_weighted_windows() && self.provider_rate.is_none() {
+            return BudgetDispatchDecision::Unavailable(
+                BudgetUnavailableReason::PersistenceUnavailable,
+            );
+        }
+        if budget.policy().has_weighted_windows() == claim.is_request_only() {
+            return BudgetDispatchDecision::Unavailable(BudgetUnavailableReason::StateCorrupt);
         }
         let Ok(mut state) = self.allocation.state.lock() else {
             return BudgetDispatchDecision::Unavailable(
@@ -1200,7 +1247,7 @@ impl BudgetReservation {
         }
 
         let (dispatch_observation, provider_rate_permit) = match self.provider_rate.take() {
-            Some(reservation) => match reservation.commit_dispatch() {
+            Some(reservation) => match reservation.commit_dispatch(claim) {
                 Ok(ProviderRateReservationDispatch::Ready {
                     observation,
                     permit,
