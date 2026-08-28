@@ -1,5 +1,7 @@
 //! Product composition for the single durable provider-rate authority.
 
+mod tiingo;
+
 use std::path::Path;
 use std::sync::Arc;
 
