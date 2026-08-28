@@ -45,12 +45,13 @@ const COINBASE_PUBLIC_LIVE_SURFACE: &str = "coinbase.public-market-data";
 const COINBASE_DIRECT_LIVE_SURFACE: &str = "coinbase.exchange-direct-market-data";
 const KRAKEN_PUBLIC_LIVE_SURFACE: &str = "kraken.spot-public-market-data";
 
-const LIVE_SURFACES: [&str; 5] = [
+const LIVE_SURFACES: [&str; 6] = [
     COINBASE_PUBLIC_LIVE_SURFACE,
     COINBASE_DIRECT_LIVE_SURFACE,
     KRAKEN_PUBLIC_LIVE_SURFACE,
     ProviderMarketAccount::AlpacaBasic.surface_id(),
     ProviderMarketAccount::KrakenLevel3.surface_id(),
+    ProviderMarketAccount::SchwabMarketData.surface_id(),
 ];
 const PUBLIC_LIVE_SURFACES: [&str; 2] = [COINBASE_PUBLIC_LIVE_SURFACE, KRAKEN_PUBLIC_LIVE_SURFACE];
 

@@ -53,14 +53,14 @@ use market_squawk_platform::{
     SecretStore, SecretValue,
 };
 use market_squawk_sources::{
-    AlpacaPaperIexDoctorReceiptV1, AuthorityBindings, AuthorityVerification,
-    AuthorityVerificationInput, AuthorizationMode, CapabilityRegistrationOutcome,
-    CredentialGenerationState, OnboardingEvent, OnboardingState, ProbeTransport,
-    ProfileReleaseState, ProviderOnboardingProfile, ProviderProfileError, ProviderProfileRegistry,
-    ProviderPublicConfiguration, ProviderRateAuthority, ProviderRateDeclaration,
-    RuntimeVerificationEvidence, SCHWAB_MARKET_DATA_SURFACE_ID as SOURCES_SCHWAB_SURFACE_ID,
-    SchwabMarketDataDoctorObservation, SecretStoreClearOutcome, TREASURY_DAILY_RATES_PROBE_YEAR,
-    built_in_provider_profiles, install_ring_tls_provider,
+    AuthorityBindings, AuthorityVerification, AuthorityVerificationInput, AuthorizationMode,
+    CapabilityRegistrationOutcome, CredentialGenerationState, OnboardingEvent, OnboardingState,
+    ProbeTransport, ProfileReleaseState, ProviderOnboardingProfile, ProviderProfileError,
+    ProviderProfileRegistry, ProviderPublicConfiguration, ProviderRateAuthority,
+    ProviderRateDeclaration, RuntimeVerificationEvidence,
+    SCHWAB_MARKET_DATA_SURFACE_ID as SOURCES_SCHWAB_SURFACE_ID, SchwabMarketDataDoctorObservation,
+    SecretStoreClearOutcome, TREASURY_DAILY_RATES_PROBE_YEAR, built_in_provider_profiles,
+    install_ring_tls_provider,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -2682,18 +2682,16 @@ impl ProviderOnboardingService {
         if !runtime_verification_evidence.admits_activation_at(issued_at) {
             return Err(ProviderOnboardingError::ActivationExpired);
         }
-        let doctor_receipt = runtime_verification_evidence.alpaca_paper_iex_receipt();
-        let verification_expires_at = doctor_receipt
-            .map(AlpacaPaperIexDoctorReceiptV1::exclusive_expires_at)
-            .or(credential_expires_at);
-        let authority_effective_at = doctor_receipt
-            .map(AlpacaPaperIexDoctorReceiptV1::verified_at)
-            .map_or(credential_effective_at, |verified_at| {
-                verified_at.max(credential_effective_at)
-            });
-        if authority_effective_at > issued_at {
-            return Err(ProviderOnboardingError::InvalidSessionState);
-        }
+        let credential_account_digest = generation
+            .and_then(|generation| lifecycle.generation_verification(generation))
+            .and_then(|verification| verification.bindings().account_digest());
+        let runtime_projection = activation_lease_runtime_projection(
+            &runtime_verification_evidence,
+            credential_expires_at,
+            credential_effective_at,
+            credential_account_digest,
+            issued_at,
+        )?;
         Ok(ProviderActivationLease::new(ProviderActivationLeaseInput {
             session_id: resumed.reservation().session_id(),
             surface_id: lifecycle.surface_id().clone(),
@@ -2704,9 +2702,7 @@ impl ProviderOnboardingService {
             persistence_evidence: profile.persistence_evidence(),
             public_configuration_digest: resumed.reservation().public_configuration_digest(),
             public_configuration: resumed.public_configuration().clone(),
-            account_digest: generation
-                .and_then(|generation| lifecycle.generation_verification(generation))
-                .and_then(|verification| verification.bindings().account_digest()),
+            account_digest: runtime_projection.account_digest,
             verification_evidence_digest: generation
                 .and_then(|generation| lifecycle.generation_verification(generation))
                 .map(AuthorityVerification::evidence_digest),
@@ -2718,8 +2714,8 @@ impl ProviderOnboardingService {
                 .cloned(),
             generation,
             secret_reference,
-            verification_expires_at,
-            authority_effective_at,
+            verification_expires_at: runtime_projection.verification_expires_at,
+            authority_effective_at: runtime_projection.authority_effective_at,
             issued_at,
         }))
     }
@@ -2794,18 +2790,16 @@ impl ProviderOnboardingService {
         {
             return Err(ProviderOnboardingError::ActivationExpired);
         }
-        let doctor_receipt = runtime_verification_evidence.alpaca_paper_iex_receipt();
-        let verification_expires_at = doctor_receipt
-            .map(AlpacaPaperIexDoctorReceiptV1::exclusive_expires_at)
-            .or(credential_expires_at);
-        let authority_effective_at = doctor_receipt
-            .map(AlpacaPaperIexDoctorReceiptV1::verified_at)
-            .map_or(credential_effective_at, |verified_at| {
-                verified_at.max(credential_effective_at)
-            });
-        if authority_effective_at > issued_at {
-            return Err(ProviderOnboardingError::InvalidSessionState);
-        }
+        let credential_account_digest = generation
+            .and_then(|generation| lifecycle.generation_verification(generation))
+            .and_then(|verification| verification.bindings().account_digest());
+        let runtime_projection = activation_lease_runtime_projection(
+            &runtime_verification_evidence,
+            credential_expires_at,
+            credential_effective_at,
+            credential_account_digest,
+            issued_at,
+        )?;
         Ok(ProviderActivationLease::new(ProviderActivationLeaseInput {
             session_id: resumed.reservation().session_id(),
             surface_id: lifecycle.surface_id().clone(),
@@ -2816,9 +2810,7 @@ impl ProviderOnboardingService {
             persistence_evidence: profile.persistence_evidence(),
             public_configuration_digest: resumed.reservation().public_configuration_digest(),
             public_configuration: resumed.public_configuration().clone(),
-            account_digest: generation
-                .and_then(|generation| lifecycle.generation_verification(generation))
-                .and_then(|verification| verification.bindings().account_digest()),
+            account_digest: runtime_projection.account_digest,
             verification_evidence_digest: generation
                 .and_then(|generation| lifecycle.generation_verification(generation))
                 .map(AuthorityVerification::evidence_digest),
@@ -2830,8 +2822,8 @@ impl ProviderOnboardingService {
                 .cloned(),
             generation,
             secret_reference,
-            verification_expires_at,
-            authority_effective_at,
+            verification_expires_at: runtime_projection.verification_expires_at,
+            authority_effective_at: runtime_projection.authority_effective_at,
             issued_at,
         }))
     }
@@ -3247,6 +3239,55 @@ impl SecretOperationReaper {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActivationLeaseRuntimeProjection {
+    verification_expires_at: Option<Timestamp>,
+    authority_effective_at: Timestamp,
+    account_digest: Option<EvidenceDigest>,
+}
+
+fn activation_lease_runtime_projection(
+    evidence: &RuntimeVerificationEvidence,
+    credential_expires_at: Option<Timestamp>,
+    credential_effective_at: Timestamp,
+    credential_account_digest: Option<EvidenceDigest>,
+    issued_at: Timestamp,
+) -> Result<ActivationLeaseRuntimeProjection, ProviderOnboardingError> {
+    let projection = if let Some(receipt) = evidence.alpaca_paper_iex_receipt() {
+        if credential_account_digest != Some(receipt.market_data_principal_sha256()) {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        ActivationLeaseRuntimeProjection {
+            verification_expires_at: Some(receipt.exclusive_expires_at()),
+            authority_effective_at: receipt.verified_at().max(credential_effective_at),
+            account_digest: credential_account_digest,
+        }
+    } else if let Some(receipt) = evidence.schwab_market_data_receipt() {
+        if credential_account_digest.is_some() {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        ActivationLeaseRuntimeProjection {
+            verification_expires_at: Some(receipt.exclusive_expires_at()),
+            authority_effective_at: receipt.verified_at().max(credential_effective_at),
+            account_digest: Some(receipt.market_data_principal_sha256()),
+        }
+    } else {
+        ActivationLeaseRuntimeProjection {
+            verification_expires_at: credential_expires_at,
+            authority_effective_at: credential_effective_at,
+            account_digest: credential_account_digest,
+        }
+    };
+    if projection.authority_effective_at > issued_at
+        || projection
+            .verification_expires_at
+            .is_some_and(|expires_at| expires_at <= issued_at)
+    {
+        return Err(ProviderOnboardingError::InvalidSessionState);
+    }
+    Ok(projection)
 }
 
 fn read_secret_reference(

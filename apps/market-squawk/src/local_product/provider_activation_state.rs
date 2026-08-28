@@ -68,14 +68,15 @@ pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 9] = [
 
 const COINBASE_DIRECT_LIVE_SURFACE: &str = "coinbase.exchange-direct-market-data";
 
-const SESSION_BACKED_LIVE_SURFACES: [&str; 3] = [
+const SESSION_BACKED_LIVE_SURFACES: [&str; 4] = [
     COINBASE_DIRECT_LIVE_SURFACE,
     ProviderMarketAccount::AlpacaBasic.surface_id(),
     ProviderMarketAccount::KrakenLevel3.surface_id(),
+    ProviderMarketAccount::SchwabMarketData.surface_id(),
 ];
 
 // New lifecycle surfaces are appended so schema-v1 backups remain an exact prefix.
-const SERIALIZED_LIFECYCLE_SURFACES: [&str; 14] = [
+const SERIALIZED_LIFECYCLE_SURFACES: [&str; 15] = [
     "coinbase.public-market-data",
     COINBASE_DIRECT_LIVE_SURFACE,
     "kraken.spot-public-market-data",
@@ -90,6 +91,7 @@ const SERIALIZED_LIFECYCLE_SURFACES: [&str; 14] = [
     ProviderMarketAccount::AlpacaBasic.surface_id(),
     ProviderMarketAccount::KrakenLevel3.surface_id(),
     "federal-reserve-board.data-download-program",
+    ProviderMarketAccount::SchwabMarketData.surface_id(),
 ];
 
 /// Least-authority owner seam for the protected provider-metadata component.
@@ -1835,6 +1837,7 @@ fn lifecycle_surface_key(
         return Ok(match account {
             ProviderMarketAccount::AlpacaBasic => "alpaca-basic-market-data",
             ProviderMarketAccount::KrakenLevel3 => "kraken-authenticated-level3-market-data",
+            ProviderMarketAccount::SchwabMarketData => "schwab-trader-api-market-data",
         });
     }
     match surface_id {

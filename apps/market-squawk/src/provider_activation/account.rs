@@ -17,17 +17,24 @@ pub enum ProviderMarketAccount {
     AlpacaBasic,
     /// Kraken Spot API key admitted only for authenticated level-3 market data.
     KrakenLevel3,
+    /// Charles Schwab Trader API read-only market-data OAuth account.
+    SchwabMarketData,
 }
 
 impl ProviderMarketAccount {
     /// Every closed account-market group admitted by the installed product.
-    pub(crate) const ALL: [Self; 2] = [Self::AlpacaBasic, Self::KrakenLevel3];
+    pub(crate) const ALL: [Self; 3] = [
+        Self::AlpacaBasic,
+        Self::KrakenLevel3,
+        Self::SchwabMarketData,
+    ];
 
     /// Returns the canonical lifecycle surface owned by this account group.
     pub(crate) const fn surface_id(self) -> &'static str {
         match self {
             Self::AlpacaBasic => "alpaca.basic-market-data",
             Self::KrakenLevel3 => "kraken.spot-authenticated-level3-market-data",
+            Self::SchwabMarketData => crate::provider_onboarding::SCHWAB_MARKET_DATA_SURFACE_ID,
         }
     }
 
@@ -42,6 +49,7 @@ impl ProviderMarketAccount {
         match self {
             Self::AlpacaBasic => "alpaca-market-data",
             Self::KrakenLevel3 => "kraken",
+            Self::SchwabMarketData => "schwab-trader-api",
         }
     }
 
@@ -49,6 +57,7 @@ impl ProviderMarketAccount {
         match self {
             Self::AlpacaBasic => "alpaca-market-data-principal-",
             Self::KrakenLevel3 => "kraken-l3-account-",
+            Self::SchwabMarketData => "schwab-market-data-principal-",
         }
     }
 
@@ -56,6 +65,7 @@ impl ProviderMarketAccount {
         match self {
             Self::AlpacaBasic => "alpaca-market-data-account-authority",
             Self::KrakenLevel3 => "kraken-level3-account-authority",
+            Self::SchwabMarketData => "schwab-market-data-account-authority",
         }
     }
 }
@@ -85,9 +95,13 @@ impl ProviderAccountBinding {
         let digest = lease
             .account_digest()
             .ok_or(ProviderAccountActivationError::SourceBinding)?;
-        let verification_evidence = lease
-            .verification_evidence_digest()
-            .ok_or(ProviderAccountActivationError::SourceBinding)?;
+        let verification_evidence = if account == ProviderMarketAccount::SchwabMarketData {
+            lease.runtime_evidence_digest()
+        } else {
+            lease
+                .verification_evidence_digest()
+                .ok_or(ProviderAccountActivationError::SourceBinding)?
+        };
         if lease.surface_id().as_str() != account.surface_id() {
             return Err(ProviderAccountActivationError::SurfaceMismatch);
         }
@@ -107,6 +121,25 @@ impl ProviderAccountBinding {
                 .alpaca_paper_iex_receipt()
                 .ok_or(ProviderAccountActivationError::SourceBinding)?;
             if receipt.market_data_principal_sha256() != digest
+                || !receipt.admits_source_start()
+                || lease.verification_expires_at() != Some(receipt.exclusive_expires_at())
+            {
+                return Err(ProviderAccountActivationError::SourceBinding);
+            }
+        } else if account == ProviderMarketAccount::SchwabMarketData {
+            let receipt = lease
+                .runtime_verification_evidence()
+                .schwab_market_data_receipt()
+                .ok_or(ProviderAccountActivationError::SourceBinding)?;
+            if receipt.surface_id().as_str() != account.surface_id()
+                || uuid::Uuid::parse_str(receipt.session_identifier().as_str())
+                    != Ok(lease.session_id())
+                || receipt.market_data_principal_sha256() != digest
+                || receipt.application_credential_generation()
+                    != lease
+                        .generation()
+                        .ok_or(ProviderAccountActivationError::SourceBinding)?
+                || receipt.receipt_sha256() != verification_evidence
                 || !receipt.admits_source_start()
                 || lease.verification_expires_at() != Some(receipt.exclusive_expires_at())
             {

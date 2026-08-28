@@ -2064,6 +2064,7 @@ fn map_ingest_error(error: IngestError) -> ServiceError {
         | IngestError::RevisionEvidenceRequired
         | IngestError::InvalidDataset
         | IngestError::InvalidProviderMacroPlan
+        | IngestError::ProviderLogicalFundRequired
         | IngestError::ContentIdentity(_) => ServiceError::InvalidResult,
         IngestError::PublicationAuthorityRevoked
         | IngestError::Plan(_)
@@ -2086,6 +2087,7 @@ fn map_ingest_error(error: IngestError) -> ServiceError {
         | IngestError::ProviderCaptureRequired
         | IngestError::ProviderCapture(_)
         | IngestError::SealedProviderCapture(_)
+        | IngestError::ProviderMarketEventSelection(_)
         | IngestError::ProviderCaptureRecoveryWorkerUnavailable
         | IngestError::AuthorityLockPoisoned => ServiceError::Unavailable,
     }

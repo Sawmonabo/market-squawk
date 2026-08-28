@@ -18,7 +18,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 #[cfg(debug_assertions)]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_adapter_schwab::{OAuthLoopbackBounds, SchwabOAuthWireBounds};
@@ -158,17 +158,39 @@ const SCHWAB_OAUTH_MAXIMUM_CALLBACK_HEADERS: usize = 64;
 const SCHWAB_OAUTH_MAXIMUM_CALLBACK_CONNECTIONS: usize = 16;
 const FRED_ANALYTICAL_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug)]
-struct NoActiveSchwabMarketDrain;
+#[derive(Debug, Default)]
+struct RegistryBackedSchwabMarketDrain {
+    registry: OnceLock<Weak<MarketRuntimeRegistry>>,
+}
 
-impl SchwabOAuthMarketDrain for NoActiveSchwabMarketDrain {
+impl RegistryBackedSchwabMarketDrain {
+    fn bind(&self, registry: &Arc<MarketRuntimeRegistry>) -> Result<(), LocalProductError> {
+        self.registry
+            .set(Arc::downgrade(registry))
+            .map_err(|_prior| {
+                LocalProductError::MarketRuntime(market_squawk_services::ServiceError::Unavailable)
+            })
+    }
+}
+
+impl SchwabOAuthMarketDrain for RegistryBackedSchwabMarketDrain {
     fn drain(
         &self,
-        _session_id: uuid::Uuid,
-        _current: Option<market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt>,
-        _cancellation: tokio_util::sync::CancellationToken,
+        session_id: uuid::Uuid,
+        current: Option<market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> SchwabOAuthMarketDrainFuture<'_> {
-        Box::pin(async { Ok::<(), SchwabOAuthMarketDrainError>(()) })
+        Box::pin(async move {
+            let registry = self.registry.get().ok_or(SchwabOAuthMarketDrainError)?;
+            let Some(registry) = registry.upgrade() else {
+                // The registry cannot have a callable generation after its sole owner is gone.
+                return Ok(());
+            };
+            registry
+                .drain_schwab_oauth_runtime(session_id, current, &cancellation)
+                .await
+                .map_err(|_error| SchwabOAuthMarketDrainError)
+        })
     }
 }
 
@@ -176,6 +198,7 @@ fn open_schwab_oauth_runtime(
     workspace_paths: &LocalPaths,
     onboarding: Arc<ProviderOnboardingService>,
     identity: Arc<InstallationSchwabOAuthIdentity>,
+    market_drain: Arc<dyn SchwabOAuthMarketDrain>,
 ) -> Result<Arc<SchwabOAuthRuntime>, SchwabOAuthRuntimeInitializationError> {
     let tls = InstallationSchwabOAuthTlsAcceptor::try_from_identity(identity.as_ref())
         .map_err(|_error| SchwabOAuthRuntimeInitializationError::Installation)?;
@@ -216,7 +239,7 @@ fn open_schwab_oauth_runtime(
         configuration,
         Arc::new(tls),
         Arc::new(InstallationSchwabOAuthBrowser::new(identity)),
-        Arc::new(NoActiveSchwabMarketDrain),
+        market_drain,
     )
     .map(Arc::new)
     .map_err(|_error| SchwabOAuthRuntimeInitializationError::Runtime)
@@ -566,7 +589,12 @@ impl LocalProduct {
             maximum_live_route_count(&config)?,
         )?);
         let nasdaq_reference = Arc::new(
-            NasdaqReferenceUniverseService::try_new(provider_rate.clone()).map_err(|error| {
+            NasdaqReferenceUniverseService::try_new_durable(
+                provider_rate.clone(),
+                research.analytical(),
+                research.provider_capture_store(),
+            )
+            .map_err(|error| {
                 tracing::error!(%error, "Nasdaq reference-universe startup failed");
                 LocalProductError::NasdaqReference
             })?,
@@ -586,10 +614,13 @@ impl LocalProduct {
             prepared_market_configuration,
             Arc::clone(&live_fair_value),
         )?;
+        let schwab_market_drain = Arc::new(RegistryBackedSchwabMarketDrain::default());
+        schwab_market_drain.bind(&market_runtime)?;
         let schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory> = schwab_oauth_installation
             .map(|installation| {
                 let workspace_paths = paths.clone();
                 let onboarding = Arc::clone(&onboarding);
+                let market_drain = Arc::clone(&schwab_market_drain);
                 Arc::new(move || {
                     let control_root = installation
                         .paths
@@ -602,7 +633,12 @@ impl LocalProduct {
                         )
                         .map_err(|_error| SchwabOAuthRuntimeInitializationError::Installation)?,
                     );
-                    open_schwab_oauth_runtime(&workspace_paths, Arc::clone(&onboarding), identity)
+                    open_schwab_oauth_runtime(
+                        &workspace_paths,
+                        Arc::clone(&onboarding),
+                        identity,
+                        market_drain.clone(),
+                    )
                 }) as SchwabOAuthRuntimeFactory
             });
         let portal_activation = Arc::new(cli_provider::ProviderResearchActivationService::new(

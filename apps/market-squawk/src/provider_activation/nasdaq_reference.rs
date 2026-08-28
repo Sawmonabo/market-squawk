@@ -1,9 +1,9 @@
-//! Session-only official U.S. listing-reference discovery for unified Markets.
+//! Durable official U.S. listing-reference discovery for unified Markets.
 //!
 //! Nasdaq Trader's current directory is useful symbology, not a quote, book, trading-status, or
-//! execution source. The current terms evidence does not admit silent durable incorporation, so
-//! this service deliberately uses the production bounded-extraction registry and keeps normalized
-//! rows only in process memory. A restart reacquires the two official files.
+//! execution source. The service seals the complete two-file request graph before publishing one
+//! immutable listing-reference generation. Restart reads reopen that generation without network
+//! reacquisition; canonical `InstrumentId` approval remains a separate authority.
 
 use std::cmp::Ordering;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
@@ -12,10 +12,23 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use market_squawk_adapter_nasdaq_symbols::{
-    MAX_DIRECTORY_RECORDS, NASDAQ_LISTED_URL, NASDAQ_SYMBOL_DIRECTORY_PROVIDER,
-    NASDAQ_SYMBOL_DIRECTORY_VENUES, NasdaqListingRecord, NasdaqModelError,
-    NasdaqSymbolDirectoryConfig, NasdaqSymbolDirectorySource, NasdaqSymbolDirectorySourceError,
-    OTHER_LISTED_URL,
+    MAX_DIRECTORY_RECORDS, MAX_OPTIONS_SOURCE_BYTES, NASDAQ_APPLICATION_BUDGET_WINDOW_NANOS,
+    NASDAQ_APPLICATION_MAX_CONCURRENT_REQUESTS, NASDAQ_APPLICATION_MIN_BACKOFF_MAXIMUM_NANOS,
+    NASDAQ_APPLICATION_REQUESTS_PER_MINUTE, NASDAQ_REFERENCE_MIN_TOTAL_TIMEOUT_NANOS,
+    NASDAQ_SYMBOL_DIRECTORY_PROVIDER, NASDAQ_SYMBOL_DIRECTORY_VENUES, NasdaqDirectoryKind,
+    NasdaqDirectoryPublicationError, NasdaqFinancialStatus, NasdaqListingRecord,
+    NasdaqMarketCategory, NasdaqModelError, NasdaqOtherExchange, NasdaqPendingDirectoryPublication,
+    NasdaqSealedDirectoryPublication, NasdaqSymbolDirectoryConfig, NasdaqSymbolDirectorySource,
+    NasdaqSymbolDirectorySourceError, nasdaq_reference_endpoint_policy,
+};
+use market_squawk_data::{
+    AnalyticalDataService, IngestError, ListingReferenceAdmissionCapability, ListingReferenceError,
+    ListingReferenceExchangeCode, ListingReferenceFileKind, ListingReferenceFinancialStatus,
+    ListingReferenceGenerationInput, ListingReferenceGenerationSelection,
+    ListingReferenceMarketCategory, ListingReferenceMembershipPageState,
+    ListingReferenceReadCapability, ListingReferenceRecord, ListingReferenceRecordInput,
+    ListingReferenceSourceFileInput, MAX_LISTING_REFERENCE_MEMBERSHIP_PAGE_ROWS, RightsBasis,
+    RightsDecisionInput, RightsError, SourceOperation,
 };
 use market_squawk_domain::{
     AssetClass, AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality,
@@ -23,12 +36,13 @@ use market_squawk_domain::{
     MetadataRevision, ProviderInstrumentId, RevisionBoundPayloadEvidence, SchemaVersion,
     SequenceCapability, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
+use market_squawk_platform::SealedResearchJournalStore;
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
-    CURRENT_RESEARCH_RECORD_SCHEMA, CoverageTopology, DiscoveryRequest, EndpointPolicy,
-    ExtractionAuthority, ExtractionError, ExtractionRequest, ExtractionSource,
-    ExtractionSourceError, FreshnessPolicy, HistoricalCapability, InstrumentCoverage,
+    CURRENT_RESEARCH_RECORD_SCHEMA, CoverageTopology, DiscoveryRequest, ExtractionAuthority,
+    ExtractionError, ExtractionRequest, ExtractionSource, ExtractionSourceError, FreshnessPolicy,
+    HistoricalCapability, HttpRequestBounds, InstrumentCoverage,
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, NetworkAccessPolicy, ProviderBudgetPolicy,
     ProviderRateAuthority, RegistryError, SourceCapabilities, SourceClass, SourceCoverage,
     SourceMetadata, SourceMetadataInput, SourceMetadataProvider, SourceProtocolProfile,
@@ -49,6 +63,9 @@ pub(crate) const MAXIMUM_SELECTED_LISTING_IDENTITIES: usize = 250;
 const DIRECTORY_DELAY_NANOS: u64 = 60 * 1_000_000_000;
 const DAY_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * 1_000_000_000;
+const NASDAQ_CONNECT_TIMEOUT_NANOS: u64 = 30 * 1_000_000_000;
+const NASDAQ_READ_TIMEOUT_NANOS: u64 = MINUTE_NANOS;
+const NASDAQ_TERMS_URL: &str = "https://www.nasdaqtrader.com/Trader.aspx?id=CopyDisclaimMain";
 const DEFAULT_OVERVIEW_SYMBOLS: [&str; 8] =
     ["SPY", "QQQ", "DIA", "IWM", "VTI", "AAPL", "MSFT", "NVDA"];
 
@@ -73,7 +90,7 @@ impl NasdaqListingKey {
     }
 }
 
-/// Session-only current listing identity with the exact directory evidence that established it.
+/// Current listing identity with the exact durable directory evidence that established it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NasdaqCurrentListing {
     key: NasdaqListingKey,
@@ -115,11 +132,19 @@ impl NasdaqCurrentListing {
     }
 }
 
-/// One process-local source registry and normalized official-directory snapshot.
+#[derive(Debug)]
+struct DurableListingReference {
+    admission: ListingReferenceAdmissionCapability,
+    reader: ListingReferenceReadCapability,
+    captures: Arc<SealedResearchJournalStore>,
+}
+
+/// One source registry plus a catalog-backed normalized official-directory snapshot.
 pub(crate) struct NasdaqReferenceUniverseService {
     source: NasdaqSymbolDirectorySource,
     extraction: ExtractionAuthority,
     registry: StdMutex<Option<AuthoritativeSourceRegistry>>,
+    durable: Option<DurableListingReference>,
     snapshot: RwLock<Option<Arc<ReferenceUniverseSnapshot>>>,
     refresh: Mutex<()>,
     lifecycle: CancellationToken,
@@ -136,9 +161,30 @@ impl std::fmt::Debug for NasdaqReferenceUniverseService {
 }
 
 impl NasdaqReferenceUniverseService {
-    /// Creates one bounded non-durable extraction authority on the product-wide provider budget.
-    pub(crate) fn try_new(
+    /// Creates a seal-first reference source bound to the sole analytical catalog and raw store.
+    pub(crate) fn try_new_durable(
         provider_rate: ProviderRateAuthority,
+        analytical: &AnalyticalDataService,
+        captures: Arc<SealedResearchJournalStore>,
+    ) -> Result<Self, NasdaqReferenceUniverseError> {
+        let metadata = source_metadata()?;
+        let dataset = NasdaqSymbolDirectoryConfig::try_new()?.dataset().clone();
+        let registered_at = system_timestamp()?;
+        let admission = analytical.listing_reference_admission(metadata, registered_at, dataset);
+        let reader = admission.reader();
+        Self::try_new_inner(
+            provider_rate,
+            Some(DurableListingReference {
+                admission,
+                reader,
+                captures,
+            }),
+        )
+    }
+
+    fn try_new_inner(
+        provider_rate: ProviderRateAuthority,
+        durable: Option<DurableListingReference>,
     ) -> Result<Self, NasdaqReferenceUniverseError> {
         let metadata = source_metadata()?;
         let source = NasdaqSymbolDirectorySource::try_new(
@@ -156,6 +202,7 @@ impl NasdaqReferenceUniverseService {
             source,
             extraction,
             registry: StdMutex::new(Some(registry)),
+            durable,
             snapshot: RwLock::new(None),
             refresh: Mutex::new(()),
             lifecycle: CancellationToken::new(),
@@ -286,6 +333,24 @@ impl NasdaqReferenceUniverseService {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<ReferenceUniverseSnapshot, NasdaqReferenceUniverseError> {
+        if let Some(durable) = &self.durable {
+            if let Some(snapshot) = self.load_catalog_snapshot(durable, deadline, &cancellation)? {
+                return Ok(snapshot);
+            }
+            self.publish_current_directory(durable, deadline, cancellation.clone())
+                .await?;
+            return self
+                .load_catalog_snapshot(durable, deadline, &cancellation)?
+                .ok_or(NasdaqReferenceUniverseError::IncompleteDirectory);
+        }
+        self.load_session_snapshot(deadline, cancellation).await
+    }
+
+    async fn load_session_snapshot(
+        &self,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<ReferenceUniverseSnapshot, NasdaqReferenceUniverseError> {
         let provider_deadline = wall_deadline(deadline)?;
         let maximum_objects = NonZeroU16::new(DIRECTORY_OBJECT_COUNT)
             .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?;
@@ -382,6 +447,178 @@ impl NasdaqReferenceUniverseService {
         Ok(ReferenceUniverseSnapshot {
             records: records.into_boxed_slice(),
         })
+    }
+
+    fn load_catalog_snapshot(
+        &self,
+        durable: &DurableListingReference,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ReferenceUniverseSnapshot>, NasdaqReferenceUniverseError> {
+        let mut cursor = None;
+        let mut selected_generation = None;
+        let maximum_total = MAX_DIRECTORY_RECORDS
+            .checked_mul(usize::from(DIRECTORY_OBJECT_COUNT))
+            .ok_or(NasdaqReferenceUniverseError::Capacity)?;
+        let mut records = Vec::new();
+        records
+            .try_reserve(maximum_total)
+            .map_err(|_| NasdaqReferenceUniverseError::Capacity)?;
+        loop {
+            ensure_operation(deadline, cancellation)?;
+            let page = durable.reader.memberships(
+                ListingReferenceGenerationSelection::Current,
+                cursor.as_ref(),
+                MAX_LISTING_REFERENCE_MEMBERSHIP_PAGE_ROWS,
+                deadline,
+                cancellation,
+            )?;
+            let Some(generation) = page.generation() else {
+                if cursor.is_some()
+                    || !page.records().is_empty()
+                    || page.state() != ListingReferenceMembershipPageState::Complete
+                {
+                    return Err(NasdaqReferenceUniverseError::SourceBinding);
+                }
+                return Ok(None);
+            };
+            let digest = generation.generation_digest();
+            if selected_generation.is_some_and(|expected| expected != digest) {
+                return Err(NasdaqReferenceUniverseError::SourceBinding);
+            }
+            selected_generation = Some(digest);
+            for record in page.records() {
+                ensure_operation(deadline, cancellation)?;
+                if record.is_test_issue() {
+                    continue;
+                }
+                if records.len() == maximum_total {
+                    return Err(NasdaqReferenceUniverseError::Capacity);
+                }
+                records.push(ReferenceUniverseRecord::try_from_catalog(
+                    self.source.metadata(),
+                    record,
+                )?);
+            }
+            match page.state() {
+                ListingReferenceMembershipPageState::Complete => break,
+                ListingReferenceMembershipPageState::Truncated => {
+                    cursor = Some(
+                        page.next_cursor()
+                            .ok_or(NasdaqReferenceUniverseError::SourceBinding)?
+                            .clone(),
+                    );
+                }
+            }
+        }
+        if records.is_empty() {
+            return Err(NasdaqReferenceUniverseError::IncompleteDirectory);
+        }
+        records.sort_unstable_by(compare_reference_records);
+        if records
+            .windows(2)
+            .any(|pair| pair[0].symbol == pair[1].symbol && pair[0].venue_id == pair[1].venue_id)
+        {
+            return Err(NasdaqReferenceUniverseError::DuplicateIdentity);
+        }
+        Ok(Some(ReferenceUniverseSnapshot {
+            records: records.into_boxed_slice(),
+        }))
+    }
+
+    async fn publish_current_directory(
+        &self,
+        durable: &DurableListingReference,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<(), NasdaqReferenceUniverseError> {
+        ensure_operation(deadline, &cancellation)?;
+        let expected_previous_generation = durable
+            .reader
+            .current(deadline, &cancellation)?
+            .map(|generation| generation.generation_digest());
+        let provider_deadline = wall_deadline(deadline)?;
+        let maximum_objects = NonZeroU16::new(DIRECTORY_OBJECT_COUNT)
+            .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?;
+        let discovery = self
+            .source
+            .discover_with_capture(
+                self.extraction.clone(),
+                DiscoveryRequest::try_new(
+                    self.source.dataset().clone(),
+                    None,
+                    maximum_objects,
+                    provider_deadline,
+                )?,
+                cancellation.clone(),
+            )
+            .await?;
+        if discovery.batch().objects().len() != usize::from(DIRECTORY_OBJECT_COUNT) {
+            return Err(NasdaqReferenceUniverseError::IncompleteDirectory);
+        }
+        let objects = discovery.batch().objects().to_vec();
+        let maximum_records = u32::try_from(MAX_DIRECTORY_RECORDS)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?;
+        let maximum_bytes = NonZeroU64::new(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
+            .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?;
+        let mut batches = Vec::new();
+        batches
+            .try_reserve_exact(objects.len())
+            .map_err(|_| NasdaqReferenceUniverseError::Capacity)?;
+        for object in objects {
+            ensure_operation(deadline, &cancellation)?;
+            batches.push(
+                self.source
+                    .extract(
+                        self.extraction.clone(),
+                        ExtractionRequest::try_new(
+                            object,
+                            maximum_records,
+                            maximum_bytes,
+                            provider_deadline,
+                        )?,
+                        cancellation.clone(),
+                    )
+                    .await?,
+            );
+        }
+        let (pending, seal_request) =
+            NasdaqPendingDirectoryPublication::try_prepare(discovery, batches)?;
+        ensure_operation(deadline, &cancellation)?;
+        let captures = Arc::clone(&durable.captures);
+        let sealed = tokio::task::spawn_blocking(move || {
+            let sealed = seal_request.seal(&captures)?;
+            pending.try_rejoin(sealed)
+        })
+        .await
+        .map_err(|_| NasdaqReferenceUniverseError::SealTask)??;
+        ensure_operation(deadline, &cancellation)?;
+        let input = listing_reference_generation_input(
+            self.source.metadata().clone(),
+            expected_previous_generation,
+            &sealed,
+        )?;
+        let payload_digest = input.source_payload_set_digest();
+        let retrieved_at = sealed
+            .components()
+            .iter()
+            .map(|component| component.received_at())
+            .max()
+            .ok_or(NasdaqReferenceUniverseError::IncompleteDirectory)?;
+        let evidence = contract_evidence().content_digest();
+        let publication = durable.admission.admit(RightsDecisionInput {
+            source_id: self.source.metadata().source_id().clone(),
+            payload_digest,
+            retrieved_at,
+            basis: RightsBasis::reviewed_terms(NASDAQ_TERMS_URL, evidence)?,
+            authorization_evidence: evidence,
+            authorization_expires_at: None,
+            permitted_operations: vec![SourceOperation::Display, SourceOperation::Persist],
+        })?;
+        publication.publish(input, deadline, &cancellation)?;
+        Ok(())
     }
 
     fn search_snapshot(
@@ -561,6 +798,229 @@ impl ReferenceUniverseRecord {
             nasdaq_symbol: fields.nasdaq_symbol().map(str::to_owned),
         })
     }
+
+    fn try_from_catalog(
+        metadata: &SourceMetadata,
+        record: &ListingReferenceRecord,
+    ) -> Result<Self, NasdaqReferenceUniverseError> {
+        if record.generation().source_id() != metadata.source_id()
+            || record.generation().source_revision() != metadata.revision().as_source_identifier()
+            || record.quality() != DataQuality::OfficialDelayed
+            || record.directory_presence()
+                != market_squawk_data::ListingReferenceDirectoryPresence::CurrentDirectory
+        {
+            return Err(NasdaqReferenceUniverseError::SourceBinding);
+        }
+        let symbol = record.provider_symbol().to_owned();
+        let venue_id = record.listing_venue().clone();
+        let reference_id = SourceIdentifier::try_from(format!(
+            "nasdaq-reference:{}:{symbol}",
+            venue_id.as_str().to_ascii_lowercase(),
+        ))
+        .map_err(|_| NasdaqReferenceUniverseError::SourceBinding)?;
+        let security_name = record.display_name().to_owned();
+        let asset_class = if record.is_etf() {
+            AssetClass::Fund
+        } else {
+            AssetClass::Equity
+        };
+        let presentation = MarketReferenceRecord::try_new(
+            reference_id,
+            symbol.clone(),
+            security_name.clone(),
+            venue_id.clone(),
+            asset_class,
+            record.is_etf(),
+            record.round_lot_size(),
+            record.quality(),
+            record.effective_at(),
+            record.source_file().available_at(),
+            record.generation().source_id().clone(),
+            metadata.provider().clone(),
+            record.source_file().payload_evidence().content_digest(),
+            MarketReferenceMatchKind::DefaultOverview,
+        )
+        .map_err(|_| NasdaqReferenceUniverseError::SourceBinding)?;
+        let listing = NasdaqCurrentListing {
+            key: NasdaqListingKey::new(
+                ProviderInstrumentId::try_from(symbol.as_str())
+                    .map_err(|_| NasdaqReferenceUniverseError::SourceBinding)?,
+                venue_id.clone(),
+            ),
+            asset_class,
+            source_id: record.generation().source_id().clone(),
+            metadata_revision: MetadataRevision::new(record.generation().source_revision().clone()),
+            source_payload_evidence: record.source_file().payload_evidence().clone(),
+            source_timestamp: record.effective_at(),
+            observed_at: record.source_file().received_at(),
+        };
+        Ok(Self {
+            listing,
+            presentation,
+            symbol,
+            security_name,
+            venue_id,
+            cqs_symbol: record.cqs_symbol().map(str::to_owned),
+            nasdaq_symbol: record.nasdaq_symbol().map(str::to_owned),
+        })
+    }
+}
+
+fn listing_reference_generation_input(
+    source: SourceMetadata,
+    expected_previous_generation: Option<EvidenceDigest>,
+    publication: &NasdaqSealedDirectoryPublication,
+) -> Result<ListingReferenceGenerationInput, NasdaqReferenceUniverseError> {
+    if publication.components().len() != usize::from(DIRECTORY_OBJECT_COUNT)
+        || publication.sealed_capture().segment().frames().len()
+            != usize::from(DIRECTORY_OBJECT_COUNT)
+    {
+        return Err(NasdaqReferenceUniverseError::SourceBinding);
+    }
+    let mut files = Vec::new();
+    let mut records = Vec::new();
+    files
+        .try_reserve_exact(usize::from(DIRECTORY_OBJECT_COUNT))
+        .map_err(|_| NasdaqReferenceUniverseError::Capacity)?;
+    let maximum_records = MAX_DIRECTORY_RECORDS
+        .checked_mul(usize::from(DIRECTORY_OBJECT_COUNT))
+        .ok_or(NasdaqReferenceUniverseError::Capacity)?;
+    records
+        .try_reserve(maximum_records)
+        .map_err(|_| NasdaqReferenceUniverseError::Capacity)?;
+    for component in publication.components() {
+        let kind = listing_file_kind(component.family())?;
+        files.push(ListingReferenceSourceFileInput::try_new(
+            kind,
+            component.source_object_id().clone(),
+            component.source_reference().clone(),
+            component.file_creation_time(),
+            component.payload_evidence().clone(),
+            component.source_last_modified_at(),
+            component.received_at(),
+            component.received_at(),
+        )?);
+        for row in component.rows() {
+            let record = row.record();
+            let fields = record.provider_fields();
+            let input = match component.family() {
+                NasdaqDirectoryKind::NasdaqListed => {
+                    ListingReferenceRecordInput::try_nasdaq_listed(
+                        record.provider_row_number(),
+                        fields.primary_symbol(),
+                        fields.security_name(),
+                        record.listing_venue().clone(),
+                        listing_market_category(
+                            fields
+                                .market_category()
+                                .ok_or(NasdaqReferenceUniverseError::SourceBinding)?,
+                        ),
+                        listing_financial_status(
+                            fields
+                                .financial_status()
+                                .ok_or(NasdaqReferenceUniverseError::SourceBinding)?,
+                        ),
+                        fields.is_etf(),
+                        fields.is_test_issue(),
+                        fields.round_lot_size(),
+                        fields
+                            .is_next_shares()
+                            .ok_or(NasdaqReferenceUniverseError::SourceBinding)?,
+                        row.record_revision().clone(),
+                        row.record_payload_evidence().clone(),
+                        component.file_creation_time(),
+                        component.source_last_modified_at(),
+                        component.received_at(),
+                        component.payload_evidence().clone(),
+                    )?
+                }
+                NasdaqDirectoryKind::OtherListed => ListingReferenceRecordInput::try_other_listed(
+                    record.provider_row_number(),
+                    fields.primary_symbol(),
+                    fields.security_name(),
+                    record.listing_venue().clone(),
+                    listing_exchange_code(
+                        fields
+                            .other_exchange()
+                            .ok_or(NasdaqReferenceUniverseError::SourceBinding)?,
+                    ),
+                    fields
+                        .cqs_symbol()
+                        .ok_or(NasdaqReferenceUniverseError::SourceBinding)?,
+                    fields
+                        .nasdaq_symbol()
+                        .ok_or(NasdaqReferenceUniverseError::SourceBinding)?,
+                    fields.is_etf(),
+                    fields.is_test_issue(),
+                    fields.round_lot_size(),
+                    row.record_revision().clone(),
+                    row.record_payload_evidence().clone(),
+                    component.file_creation_time(),
+                    component.source_last_modified_at(),
+                    component.received_at(),
+                    component.payload_evidence().clone(),
+                )?,
+                NasdaqDirectoryKind::Bonds | NasdaqDirectoryKind::Options => {
+                    return Err(NasdaqReferenceUniverseError::SourceBinding);
+                }
+            };
+            records.push((kind, input));
+        }
+    }
+    ListingReferenceGenerationInput::try_new(source, expected_previous_generation, files, records)
+        .map_err(Into::into)
+}
+
+fn listing_file_kind(
+    family: NasdaqDirectoryKind,
+) -> Result<ListingReferenceFileKind, NasdaqReferenceUniverseError> {
+    match family {
+        NasdaqDirectoryKind::NasdaqListed => Ok(ListingReferenceFileKind::NasdaqListed),
+        NasdaqDirectoryKind::OtherListed => Ok(ListingReferenceFileKind::OtherListed),
+        NasdaqDirectoryKind::Bonds | NasdaqDirectoryKind::Options => {
+            Err(NasdaqReferenceUniverseError::SourceBinding)
+        }
+    }
+}
+
+const fn listing_market_category(value: NasdaqMarketCategory) -> ListingReferenceMarketCategory {
+    match value {
+        NasdaqMarketCategory::GlobalSelect => ListingReferenceMarketCategory::GlobalSelect,
+        NasdaqMarketCategory::GlobalMarket => ListingReferenceMarketCategory::GlobalMarket,
+        NasdaqMarketCategory::CapitalMarket => ListingReferenceMarketCategory::CapitalMarket,
+    }
+}
+
+const fn listing_financial_status(value: NasdaqFinancialStatus) -> ListingReferenceFinancialStatus {
+    match value {
+        NasdaqFinancialStatus::Normal => ListingReferenceFinancialStatus::Normal,
+        NasdaqFinancialStatus::Deficient => ListingReferenceFinancialStatus::Deficient,
+        NasdaqFinancialStatus::Delinquent => ListingReferenceFinancialStatus::Delinquent,
+        NasdaqFinancialStatus::Bankrupt => ListingReferenceFinancialStatus::Bankrupt,
+        NasdaqFinancialStatus::DeficientAndBankrupt => {
+            ListingReferenceFinancialStatus::DeficientAndBankrupt
+        }
+        NasdaqFinancialStatus::DeficientAndDelinquent => {
+            ListingReferenceFinancialStatus::DeficientAndDelinquent
+        }
+        NasdaqFinancialStatus::DelinquentAndBankrupt => {
+            ListingReferenceFinancialStatus::DelinquentAndBankrupt
+        }
+        NasdaqFinancialStatus::DeficientDelinquentAndBankrupt => {
+            ListingReferenceFinancialStatus::DeficientDelinquentAndBankrupt
+        }
+    }
+}
+
+const fn listing_exchange_code(value: NasdaqOtherExchange) -> ListingReferenceExchangeCode {
+    match value {
+        NasdaqOtherExchange::NyseAmerican => ListingReferenceExchangeCode::NyseAmerican,
+        NasdaqOtherExchange::Nyse => ListingReferenceExchangeCode::Nyse,
+        NasdaqOtherExchange::NyseArca => ListingReferenceExchangeCode::NyseArca,
+        NasdaqOtherExchange::NyseTexas => ListingReferenceExchangeCode::NyseTexas,
+        NasdaqOtherExchange::CboeBzx => ListingReferenceExchangeCode::CboeBzx,
+        NasdaqOtherExchange::Iex => ListingReferenceExchangeCode::Iex,
+    }
 }
 
 fn default_overview(
@@ -687,17 +1147,33 @@ fn source_metadata() -> Result<SourceMetadata, NasdaqReferenceUniverseError> {
                 .map_err(|_| NasdaqReferenceUniverseError::InvalidConfiguration)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let endpoint = EndpointPolicy::try_new([NASDAQ_LISTED_URL, OTHER_LISTED_URL])
+    let maximum_response_bytes = u64::try_from(MAX_OPTIONS_SOURCE_BYTES)
         .map_err(|_| NasdaqReferenceUniverseError::InvalidConfiguration)?;
+    let request_bounds = HttpRequestBounds::try_new(
+        NonZeroU64::new(NASDAQ_CONNECT_TIMEOUT_NANOS)
+            .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
+        NonZeroU64::new(NASDAQ_READ_TIMEOUT_NANOS)
+            .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
+        NonZeroU64::new(NASDAQ_REFERENCE_MIN_TOTAL_TIMEOUT_NANOS)
+            .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
+        0,
+        NonZeroU64::new(maximum_response_bytes)
+            .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
+    )
+    .map_err(|_| NasdaqReferenceUniverseError::InvalidConfiguration)?;
+    let endpoint = nasdaq_reference_endpoint_policy(request_bounds)?;
     let budget = ProviderBudgetPolicy::try_new(
         BudgetScope::new(provider.clone()),
-        NonZeroU32::new(8).ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
-        NonZeroU64::new(MINUTE_NANOS).ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
-        NonZeroU16::new(1).ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
+        NonZeroU32::new(NASDAQ_APPLICATION_REQUESTS_PER_MINUTE)
+            .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
+        NonZeroU64::new(NASDAQ_APPLICATION_BUDGET_WINDOW_NANOS)
+            .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
+        NonZeroU16::new(NASDAQ_APPLICATION_MAX_CONCURRENT_REQUESTS)
+            .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
         BackoffPolicy::try_new(
             NonZeroU64::new(1_000_000_000)
                 .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
-            NonZeroU64::new(MINUTE_NANOS)
+            NonZeroU64::new(NASDAQ_APPLICATION_MIN_BACKOFF_MAXIMUM_NANOS)
                 .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?,
             2_000,
         )
@@ -710,7 +1186,7 @@ fn source_metadata() -> Result<SourceMetadata, NasdaqReferenceUniverseError> {
             .map_err(|_| NasdaqReferenceUniverseError::InvalidConfiguration)?,
         RevisionBoundPayloadEvidence::new(
             MetadataRevision::new(
-                SourceIdentifier::try_from("nasdaq-symbol-directory-session-v1")
+                SourceIdentifier::try_from("nasdaq-symbol-directory-durable-v2")
                     .map_err(|_| NasdaqReferenceUniverseError::InvalidConfiguration)?,
             ),
             evidence.clone(),
@@ -721,7 +1197,7 @@ fn source_metadata() -> Result<SourceMetadata, NasdaqReferenceUniverseError> {
         SourceCoverage::try_instrument(
             evidence,
             effective,
-            vec![AssetClass::Equity, AssetClass::Fund],
+            vec![AssetClass::Equity, AssetClass::Fund, AssetClass::Option],
             CoverageTopology::consolidated(venues)
                 .map_err(|_| NasdaqReferenceUniverseError::InvalidConfiguration)?,
             InstrumentCoverage::partial(),
@@ -740,7 +1216,7 @@ fn source_metadata() -> Result<SourceMetadata, NasdaqReferenceUniverseError> {
             true,
             SequenceCapability::Unsupported,
             ChecksumCapability::Unsupported,
-            HistoricalCapability::Historical,
+            HistoricalCapability::None,
             false,
         ),
         SourceProtocolProfile::NotLive,
@@ -750,7 +1226,7 @@ fn source_metadata() -> Result<SourceMetadata, NasdaqReferenceUniverseError> {
 
 fn contract_evidence() -> ExactPayloadEvidence {
     let digest: [u8; 32] = Sha256::digest(
-        b"market-squawk/nasdaq-symbol-directory/session-reference/v1\0nasdaqlisted.txt\0otherlisted.txt\0reference-only\0non-persistent",
+        b"market-squawk/nasdaq-symbol-directory/durable-reference/v2\0nasdaqlisted.txt\0otherlisted.txt\0complete-request-graph\0sealed-raw\0reference-only\0display-and-persist\0no-redistribution",
     )
     .into();
     ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(DigestAlgorithm::Sha256, digest))
@@ -851,6 +1327,8 @@ pub(crate) enum NasdaqReferenceUniverseError {
     DeadlineExceeded,
     #[error("Nasdaq reference service is shutting down")]
     ShuttingDown,
+    #[error("Nasdaq raw-seal worker failed")]
+    SealTask,
     #[error(transparent)]
     Registry(#[from] RegistryError),
     #[error(transparent)]
@@ -861,4 +1339,12 @@ pub(crate) enum NasdaqReferenceUniverseError {
     Source(#[from] ExtractionSourceError),
     #[error(transparent)]
     Record(#[from] NasdaqModelError),
+    #[error(transparent)]
+    Publication(#[from] NasdaqDirectoryPublicationError),
+    #[error(transparent)]
+    Catalog(#[from] ListingReferenceError),
+    #[error(transparent)]
+    Ingest(#[from] IngestError),
+    #[error(transparent)]
+    Rights(#[from] RightsError),
 }

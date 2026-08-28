@@ -9,6 +9,7 @@ mod kraken_l3;
 mod market_config;
 pub(crate) mod nasdaq_reference;
 mod reference_identity;
+mod schwab;
 mod specs;
 
 use std::{
@@ -77,6 +78,7 @@ pub(crate) use reference_identity::{
     MarketReferenceIdentityError, MarketReferenceIdentityRequest,
     MarketReferenceIdentityResolution, MarketReferenceIdentityUnavailable,
 };
+pub use schwab::{SchwabMarketDataAccountActivation, SchwabMarketDataActivationError};
 pub use specs::{
     BlsAdapterActivation, BoardAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS,
     CoinbaseDirectActivationSpecError, CoinbaseDirectAdapterActivation,

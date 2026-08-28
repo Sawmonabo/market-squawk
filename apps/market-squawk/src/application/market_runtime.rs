@@ -30,6 +30,7 @@ use std::{
 };
 
 use market_squawk_adapter_alpaca::AlpacaHistoricalEquityPreflightPlan;
+use market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt;
 use market_squawk_domain::{
     ConnectionGeneration, CoverageStatus, DataQuality, EvidenceDigest, InstrumentId,
     MarketDataInstrumentDefinition, SourceId, SourceIdentifier, StreamIntegrityState, Timestamp,
@@ -1226,6 +1227,61 @@ impl MarketRuntimeRegistry {
         Ok(Some(generation))
     }
 
+    /// Drains the exact Schwab account runtime before OAuth revocation or credential replacement.
+    ///
+    /// This path deliberately tolerates an absent runtime: OAuth can be linked before a market
+    /// group is started, and shutdown can race a group that has already been removed. A runtime
+    /// owned by another onboarding session is never removed.
+    pub(crate) async fn drain_schwab_oauth_runtime(
+        &self,
+        session_id: uuid::Uuid,
+        current: Option<SchwabOAuthAuthorityReceipt>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        if session_id.is_nil() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let deadline = Instant::now()
+            .checked_add(self.config.source_shutdown())
+            .ok_or(ServiceError::Unavailable)?;
+        let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
+        let entry = {
+            let mut entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+            let Some(index) = entries.iter().position(|entry| {
+                entry.surface_id.as_str()
+                    == crate::provider_onboarding::SCHWAB_MARKET_DATA_SURFACE_ID
+            }) else {
+                return Ok(());
+            };
+            if entries[index].onboarding_session_id != Some(session_id) {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let group = entries[index]
+                .runtime
+                .account_evidence()
+                .ok_or(ServiceError::InvalidRequest)?;
+            let receipt = entries[index]
+                .runtime
+                .account_activation_lease()
+                .and_then(|lease| {
+                    lease
+                        .runtime_verification_evidence()
+                        .schwab_market_data_receipt()
+                })
+                .ok_or(ServiceError::InvalidRequest)?;
+            if group.onboarding_session_id() != session_id
+                || uuid::Uuid::parse_str(receipt.session_identifier().as_str()) != Ok(session_id)
+                || current.is_some_and(|current| {
+                    current.generation().get() < receipt.access_token_generation()
+                })
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            entries.swap_remove(index)
+        };
+        entry.shutdown(self.config.source_shutdown()).await
+    }
+
     pub(crate) async fn stop(
         &self,
         provider: &SourceIdentifier,
@@ -2259,6 +2315,13 @@ impl MarketRuntime {
     fn account_evidence(&self) -> Option<&MarketProviderGroupLifecycleEvidence> {
         match self {
             Self::Account(runtime) => Some(runtime.evidence()),
+            Self::Public(_) | Self::CoinbaseDirect(_) => None,
+        }
+    }
+
+    fn account_activation_lease(&self) -> Option<&crate::ProviderActivationLease> {
+        match self {
+            Self::Account(runtime) => Some(runtime.activation_lease()),
             Self::Public(_) | Self::CoinbaseDirect(_) => None,
         }
     }
