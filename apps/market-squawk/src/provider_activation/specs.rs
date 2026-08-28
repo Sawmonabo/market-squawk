@@ -12,7 +12,9 @@ use market_squawk_adapter_coinbase::{
 };
 use market_squawk_adapter_federal_reserve::BoardDatasetProfile;
 use market_squawk_adapter_files::ExtractionLimits;
-use market_squawk_adapter_fred::FredRightsPolicy;
+use market_squawk_adapter_fred::{
+    FredOperation, FredRightsDisposition, FredRightsPolicy, FredSource,
+};
 use market_squawk_adapter_portfolio::PortfolioImportLimits;
 use market_squawk_adapter_sec::{RawEvidenceStore, SecParserLimits, SecRepresentationRegistry};
 use market_squawk_adapter_treasury::TreasurySourceConfig;
@@ -303,13 +305,70 @@ impl TreasuryAdapterActivation {
 pub struct FredAdapterActivation {
     pub(super) metadata: SourceMetadata,
     pub(super) policy: FredRightsPolicy,
+    pub(super) provider_dataset: SourceIdentifier,
 }
 
 impl FredAdapterActivation {
-    /// Retains the exact per-series policy, metadata, and independent persistence evidence.
-    #[must_use]
-    pub fn new(metadata: SourceMetadata, policy: FredRightsPolicy) -> Self {
-        Self { metadata, policy }
+    /// Binds one exact provider dataset to its effective durable persistence policy.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid provider dataset or a series without effective persistence authority.
+    pub fn try_new(
+        metadata: SourceMetadata,
+        policy: FredRightsPolicy,
+        provider_dataset: SourceIdentifier,
+        effective_at: market_squawk_domain::Timestamp,
+    ) -> Result<Self, ProviderAdapterActivationError> {
+        Self::try_new_for_operation(
+            metadata,
+            policy,
+            provider_dataset,
+            effective_at,
+            FredOperation::Persist,
+        )
+    }
+
+    /// Binds one exact provider dataset to its non-persistent inspection policy.
+    pub(crate) fn try_new_for_ephemeral_inspection(
+        metadata: SourceMetadata,
+        policy: FredRightsPolicy,
+        provider_dataset: SourceIdentifier,
+        effective_at: market_squawk_domain::Timestamp,
+    ) -> Result<Self, ProviderAdapterActivationError> {
+        Self::try_new_for_operation(
+            metadata,
+            policy,
+            provider_dataset,
+            effective_at,
+            FredOperation::RetrieveEphemeral,
+        )
+    }
+
+    fn try_new_for_operation(
+        metadata: SourceMetadata,
+        policy: FredRightsPolicy,
+        provider_dataset: SourceIdentifier,
+        effective_at: market_squawk_domain::Timestamp,
+        operation: FredOperation,
+    ) -> Result<Self, ProviderAdapterActivationError> {
+        let series = FredSource::rights_subject_identifier(&provider_dataset)?;
+        let decision = policy
+            .assess(&series, &[operation], effective_at)
+            .map_err(|_| ProviderAdapterActivationError::InvalidRights)?;
+        if decision.disposition() != FredRightsDisposition::Permitted {
+            return Err(ProviderAdapterActivationError::InvalidRights);
+        }
+        Ok(Self {
+            metadata,
+            policy,
+            provider_dataset,
+        })
+    }
+
+    /// Returns the sole exact provider dataset bound to this activation.
+    pub(crate) const fn provider_dataset_identifier(&self) -> &SourceIdentifier {
+        &self.provider_dataset
     }
 }
 
@@ -515,11 +574,11 @@ impl ProviderAdapterActivationRequest {
         match self {
             Self::Bls(specification) => specification.provider_dataset_identifier(),
             Self::Board(specification) => Some(specification.provider_dataset_identifier()),
+            Self::Fred(specification) => Some(specification.provider_dataset_identifier()),
             Self::Live(_)
             | Self::CoinbaseDirect(_)
             | Self::Sec(_)
             | Self::Treasury(_)
-            | Self::Fred(_)
             | Self::LocalFiles(_)
             | Self::ControlledLocalFiles(_)
             | Self::Portfolio(_) => None,

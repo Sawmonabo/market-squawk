@@ -4,7 +4,6 @@ mod account;
 mod alpaca;
 pub(crate) mod credentials;
 mod direct;
-mod fred;
 mod fred_read;
 mod kraken_l3;
 mod market_config;
@@ -57,7 +56,6 @@ pub(crate) use account::ProviderAccountRuntimeCurrentness;
 pub use account::{ProviderAccountActivationError, ProviderAccountBinding, ProviderMarketAccount};
 pub use alpaca::{AlpacaBasicAccountActivation, AlpacaBasicActivationError};
 pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
-pub(crate) use fred::FredRestartActivation;
 pub(crate) use fred_read::{
     FRED_ALFRED_READ_OPERATION, FredDesktopPointInTimeReadDto, FredPointInTimeReadCapability,
     FredPointInTimeReadError,
@@ -231,7 +229,6 @@ impl ProviderAdapterActivation {
         &self,
         lease: ProviderActivationLease,
         spec: FredAdapterActivation,
-        dataset: SourceIdentifier,
         page_index: u16,
         page_records: NonZeroU16,
         max_bytes: NonZeroU64,
@@ -246,6 +243,7 @@ impl ProviderAdapterActivation {
             return Err(ProviderAdapterActivationError::Cancelled);
         }
         self.bind_authorization_subject(&spec.metadata)?;
+        let provider_dataset = spec.provider_dataset.clone();
         let secret = self
             .onboarding
             .read_secret_for_activation_request(&lease, cancellation.clone())
@@ -266,7 +264,8 @@ impl ProviderAdapterActivation {
             let authority = registry.extraction_authority(&registered, &source)?;
             let max_pages = NonZeroU16::new(MAXIMUM_EPHEMERAL_DISCOVERY_PAGES)
                 .ok_or(ProviderAdapterActivationError::SourceBinding)?;
-            let discovery_request = DiscoveryRequest::try_new(dataset, None, max_pages, deadline)?;
+            let discovery_request =
+                DiscoveryRequest::try_new(provider_dataset, None, max_pages, deadline)?;
             let discovered = source
                 .discover(authority.clone(), discovery_request, cancellation.clone())
                 .await?;

@@ -26,7 +26,7 @@ use market_squawk_adapter_fred::{
     CURRENT_FRED_RIGHTS_ARTIFACT_SHA256, CURRENT_UNRATE_RIGHTS_ARTIFACT_SHA256, FredOperation,
     FredRightsArtifact, FredRightsPolicy, FredSeriesRightsEvidence, FredSeriesRightsGrant,
     FredServicePermissionChannel, FredServicePermissionEvidence, FredServicePermissionReview,
-    FredTermsDocumentBytes, FredTermsDocumentRole, MAX_FRED_SERVICE_PERMISSION_BYTES,
+    FredSource, FredTermsDocumentBytes, FredTermsDocumentRole, MAX_FRED_SERVICE_PERMISSION_BYTES,
     MAX_FRED_TERMS_DOCUMENT_BYTES, Sha256Digest, fred_series_endpoint_rule,
 };
 use market_squawk_adapter_schwab::OAuthLoopbackError;
@@ -95,8 +95,8 @@ use super::provider_activation_state::{
 
 const LEGACY_REQUEST_SCHEMA_VERSION: u16 = 2;
 const EMBEDDED_PREDECESSOR_REQUEST_SCHEMA_VERSION: u16 = 3;
-const PREVIOUS_REQUEST_SCHEMA_VERSION: u16 = 4;
-const REQUEST_SCHEMA_VERSION: u16 = 5;
+const PREVIOUS_REQUEST_SCHEMA_VERSION: u16 = 5;
+const REQUEST_SCHEMA_VERSION: u16 = 6;
 const REQUEST_MAXIMUM_BYTES: u64 = 1024 * 1024;
 const BLS_SERIES_METADATA_MAXIMUM_BYTES: u64 = 4 * 1024;
 const FRED_RIGHTS_ARTIFACT_MAXIMUM_BYTES: u64 = 256 * 1024;
@@ -140,6 +140,9 @@ const FRED_SERVICE_OPERATIONS: [FredOperation; 4] = [
 const FRED_SERVICE_PERMISSION_ISSUER: &str = "federal-reserve-bank-of-st-louis";
 const FRED_SERVICE_PERMISSION_APPLICATION: &str = "market-squawk";
 const FRED_SERVICE_PERMISSION_SERVICE: &str = "fred-api";
+const FRED_UNRATE_DASHBOARD_DATASET_POLICY: &str = "market-squawk.fred-unrate-dashboard-dataset.v1";
+const FRED_UNRATE_DASHBOARD_PROVIDER_DATASET: &str =
+    "fred:series-observations:UNRATE:1776-07-04:9999-12-31";
 const PORTAL_SOURCE_SURFACES: [&str; 3] = [
     COINBASE_PUBLIC_SURFACE,
     COINBASE_DIRECT_SURFACE,
@@ -2332,14 +2335,17 @@ fn build_research_activation(
                 return Err(CliProviderActivationError::InvalidRights);
             }
             let FredProviderRequest {
+                dashboard_dataset,
                 rights_artifact,
                 terms,
                 service_permission,
                 grants,
             } = *configuration;
+            let provider_dataset = dashboard_dataset.provider_dataset.clone();
             let policy = fred_policy(
                 evidence,
                 &rights_artifact,
+                &dashboard_dataset,
                 terms,
                 service_permission,
                 grants,
@@ -2357,7 +2363,15 @@ fn build_research_activation(
                 fred_network_policy()?,
                 fred_budget(lease)?,
             )?;
-            ProviderAdapterActivationRequest::Fred(FredAdapterActivation::new(metadata, policy))
+            ProviderAdapterActivationRequest::Fred(
+                FredAdapterActivation::try_new(
+                    metadata,
+                    policy,
+                    provider_dataset,
+                    lease.issued_at(),
+                )
+                .map_err(CliProviderActivationError::Activation)?,
+            )
         }
         ProviderRequest::FederalReserveBoardH15 => {
             let profile = BoardDatasetProfile::h15_treasury_constant_maturities_rolling_dashboard()
@@ -2560,9 +2574,6 @@ enum LegacyProviderRequest {
         #[serde(default)]
         end_year: Option<u16>,
     },
-    FredAlfred {
-        configuration: Box<LegacyFredProviderRequest>,
-    },
 }
 
 impl From<LegacyProviderRequest> for ProviderRequest {
@@ -2597,9 +2608,6 @@ impl From<LegacyProviderRequest> for ProviderRequest {
                 year,
                 start_year,
                 end_year,
-            },
-            LegacyProviderRequest::FredAlfred { configuration } => Self::FredAlfred {
-                configuration: Box::new((*configuration).into()),
             },
         }
     }
@@ -2946,7 +2954,6 @@ fn fred_portal_request(
             series,
             owner,
             evidence,
-            operations: FredGrantOperations::Fixed,
             effective_at_unix_nanos: parse_decimal_timestamp(&effective_at_unix_nanos)?,
             expires_at_unix_nanos: parse_decimal_timestamp(&expires_at_unix_nanos)?,
         });
@@ -2955,6 +2962,7 @@ fn fred_portal_request(
     Ok((
         ProviderRequest::FredAlfred {
             configuration: Box::new(FredProviderRequest {
+                dashboard_dataset: reviewed_unrate_dashboard_dataset()?,
                 rights_artifact,
                 terms,
                 service_permission,
@@ -2963,6 +2971,19 @@ fn fred_portal_request(
         },
         LoadedActivationEvidence { objects },
     ))
+}
+
+fn reviewed_unrate_dashboard_dataset()
+-> Result<FredDashboardDatasetRequest, CliProviderActivationError> {
+    let provider_dataset = SourceIdentifier::try_from(FRED_UNRATE_DASHBOARD_PROVIDER_DATASET)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    FredSource::rights_subject_identifier(&provider_dataset)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    Ok(FredDashboardDatasetRequest {
+        policy: SourceIdentifier::try_from(FRED_UNRATE_DASHBOARD_DATASET_POLICY)
+            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?,
+        provider_dataset,
+    })
 }
 
 async fn validate_file_fred_authority(
@@ -2980,10 +3001,7 @@ async fn validate_file_fred_authority(
 
     let FredServicePermissionRequest::ExactWrittenPermission {
         channel, document, ..
-    } = &configuration.service_permission
-    else {
-        return Err(CliProviderActivationError::InvalidRights);
-    };
+    } = &configuration.service_permission;
     let permission = evidence.read(
         document,
         u64::try_from(MAX_FRED_SERVICE_PERMISSION_BYTES)
@@ -3012,35 +3030,37 @@ fn validate_file_fred_request_scope(
     {
         return Err(CliProviderActivationError::InvalidRights);
     }
-    validate_reviewed_fred_scope(&configuration.service_permission, &configuration.grants)
+    validate_reviewed_fred_scope(
+        &configuration.dashboard_dataset,
+        &configuration.service_permission,
+        &configuration.grants,
+    )
 }
 
 fn validate_reviewed_fred_scope(
+    dashboard_dataset: &FredDashboardDatasetRequest,
     service_permission: &FredServicePermissionRequest,
     grants: &[FredGrantRequest],
 ) -> Result<(), CliProviderActivationError> {
     let [grant] = grants else {
         return Err(CliProviderActivationError::InvalidRights);
     };
-    if grant.series.as_str() != "UNRATE"
+    let series = FredSource::rights_subject_identifier(&dashboard_dataset.provider_dataset)
+        .map_err(|_| CliProviderActivationError::InvalidRights)?;
+    if dashboard_dataset.policy.as_str() != FRED_UNRATE_DASHBOARD_DATASET_POLICY
+        || dashboard_dataset.provider_dataset.as_str() != FRED_UNRATE_DASHBOARD_PROVIDER_DATASET
+        || series != grant.series
+        || grant.series.as_str() != "UNRATE"
         || grant.owner.as_str() != "us-bureau-of-labor-statistics"
-        || !matches!(
-            &grant.evidence,
-            FredGrantEvidenceRequest::ReviewedPublicDomain { .. }
-        )
-        || !matches!(&grant.operations, FredGrantOperations::Fixed)
     {
         return Err(CliProviderActivationError::InvalidRights);
     }
-    let FredServicePermissionRequest::ExactWrittenPermission { review, .. } = service_permission
-    else {
-        return Err(CliProviderActivationError::InvalidRights);
-    };
+    let FredServicePermissionRequest::ExactWrittenPermission { review, .. } = service_permission;
     if review.issuer.as_str() != FRED_SERVICE_PERMISSION_ISSUER
         || review.application.as_str() != FRED_SERVICE_PERMISSION_APPLICATION
         || review.service.as_str() != FRED_SERVICE_PERMISSION_SERVICE
         || review.series.len() != 1
-        || review.series[0].as_str() != "UNRATE"
+        || review.series[0] != series
         || review.operations.len() != FRED_SERVICE_OPERATIONS.len()
         || review.operations.iter().copied().collect::<BTreeSet<_>>()
             != FRED_SERVICE_OPERATIONS.into_iter().collect()
@@ -3058,10 +3078,7 @@ fn validate_imported_fred_terms(
         api_terms,
         services_legal_terms,
         privacy_policy,
-    } = &configuration.terms
-    else {
-        return Err(CliProviderActivationError::InvalidRights);
-    };
+    } = &configuration.terms;
     let maximum = u64::try_from(MAX_FRED_TERMS_DOCUMENT_BYTES)
         .map_err(|_| CliProviderActivationError::InvalidRights)?;
     let api_terms = evidence.read(api_terms, maximum)?;
@@ -3307,9 +3324,51 @@ pub(super) fn treasury_fiscal_release_query(
     Ok((query, recipe.runtime_generation_digest))
 }
 
+/// Returns the exact application-owned FRED dashboard dataset from callable durable state.
+///
+/// The durable-state owner verifies the recipe envelope before this boundary. Only a current
+/// `Desired` recipe with the exact reviewed UNRATE dataset policy is projected; recipe JSON and
+/// rights evidence remain private to provider activation.
+pub(super) fn fred_dashboard_provider_dataset(
+    state: &DurableProviderActivationState,
+) -> Result<SourceIdentifier, CliProviderActivationError> {
+    let recipe = state
+        .load_recipe(FRED_SURFACE)
+        .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+    let DurableActivationRecipeState::Desired(recipe) = recipe else {
+        return Err(CliProviderActivationError::StateUnavailable);
+    };
+    let request = decode_request(&recipe.request_bytes)?;
+    if request.schema_version != REQUEST_SCHEMA_VERSION || request.session_id != recipe.session_id {
+        return Err(CliProviderActivationError::StateUnavailable);
+    }
+    let evidence = LoadedActivationEvidence::from_durable(state, &request)?;
+    let ProviderRequest::FredAlfred { configuration } = request.provider else {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    };
+    let FredProviderRequest {
+        dashboard_dataset,
+        rights_artifact,
+        terms,
+        service_permission,
+        grants,
+    } = *configuration;
+    let provider_dataset = dashboard_dataset.provider_dataset.clone();
+    fred_policy(
+        &evidence,
+        &rights_artifact,
+        &dashboard_dataset,
+        terms,
+        service_permission,
+        grants,
+    )?;
+    Ok(provider_dataset)
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FredProviderRequest {
+    dashboard_dataset: FredDashboardDatasetRequest,
     rights_artifact: ExactInputReference,
     terms: FredTermsRequest,
     service_permission: FredServicePermissionRequest,
@@ -3318,12 +3377,17 @@ struct FredProviderRequest {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct FredDashboardDatasetRequest {
+    policy: SourceIdentifier,
+    provider_dataset: SourceIdentifier,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct FredGrantRequest {
     series: SourceIdentifier,
     owner: SourceIdentifier,
     evidence: FredGrantEvidenceRequest,
-    #[serde(skip)]
-    operations: FredGrantOperations,
     effective_at_unix_nanos: i64,
     expires_at_unix_nanos: i64,
 }
@@ -3331,7 +3395,6 @@ struct FredGrantRequest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 enum FredTermsRequest {
-    ReviewedCurrent,
     ExactDocuments {
         api_terms: ExactInputReference,
         services_legal_terms: ExactInputReference,
@@ -3342,19 +3405,7 @@ enum FredTermsRequest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 enum FredGrantEvidenceRequest {
-    ReviewedPublicDomain {
-        decision: ExactInputReference,
-    },
-    PublicDomain {
-        evidence_reference_url: String,
-        authority_url: String,
-        document: ExactInputReference,
-    },
-    OwnerPermission {
-        evidence_reference_url: String,
-        authority_url: String,
-        document: ExactInputReference,
-    },
+    ReviewedPublicDomain { decision: ExactInputReference },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3365,8 +3416,6 @@ enum FredServicePermissionRequest {
         document: ExactInputReference,
         review: Box<FredServicePermissionReviewRequest>,
     },
-    #[serde(skip)]
-    LegacyUnavailable,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3392,65 +3441,6 @@ struct FredServicePermissionReviewRequest {
     effective_at_unix_nanos: i64,
     expires_at_unix_nanos: Option<i64>,
     revalidate_by_unix_nanos: i64,
-}
-
-#[derive(Debug, Default)]
-enum FredGrantOperations {
-    #[default]
-    Fixed,
-    Legacy(Vec<FredOperation>),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyFredProviderRequest {
-    rights_artifact: ExactInputReference,
-    api_terms: ExactInputReference,
-    services_legal_terms: ExactInputReference,
-    privacy_policy: ExactInputReference,
-    grants: Vec<LegacyFredGrantRequest>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyFredGrantRequest {
-    series: SourceIdentifier,
-    owner: SourceIdentifier,
-    authorization_url: String,
-    authorization_document: ExactInputReference,
-    operations: Vec<FredOperation>,
-    effective_at_unix_nanos: i64,
-    expires_at_unix_nanos: i64,
-}
-
-impl From<LegacyFredProviderRequest> for FredProviderRequest {
-    fn from(request: LegacyFredProviderRequest) -> Self {
-        Self {
-            rights_artifact: request.rights_artifact,
-            terms: FredTermsRequest::ExactDocuments {
-                api_terms: request.api_terms,
-                services_legal_terms: request.services_legal_terms,
-                privacy_policy: request.privacy_policy,
-            },
-            service_permission: FredServicePermissionRequest::LegacyUnavailable,
-            grants: request
-                .grants
-                .into_iter()
-                .map(|grant| FredGrantRequest {
-                    series: grant.series,
-                    owner: grant.owner,
-                    evidence: FredGrantEvidenceRequest::OwnerPermission {
-                        authority_url: grant.authorization_url.clone(),
-                        evidence_reference_url: grant.authorization_url,
-                        document: grant.authorization_document,
-                    },
-                    operations: FredGrantOperations::Legacy(grant.operations),
-                    effective_at_unix_nanos: grant.effective_at_unix_nanos,
-                    expires_at_unix_nanos: grant.expires_at_unix_nanos,
-                })
-                .collect(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3599,7 +3589,11 @@ fn evidence_references(
             );
         }
         ProviderRequest::FredAlfred { configuration } => {
-            validate_reviewed_fred_scope(&configuration.service_permission, &configuration.grants)?;
+            validate_reviewed_fred_scope(
+                &configuration.dashboard_dataset,
+                &configuration.service_permission,
+                &configuration.grants,
+            )?;
             let terms_maximum = u64::try_from(MAX_FRED_TERMS_DOCUMENT_BYTES)
                 .map_err(|_| CliProviderActivationError::InvalidRights)?;
             references.push(BoundedExactReference {
@@ -3610,10 +3604,7 @@ fn evidence_references(
                 api_terms,
                 services_legal_terms,
                 privacy_policy,
-            } = &configuration.terms
-            else {
-                return Err(CliProviderActivationError::InvalidRights);
-            };
+            } = &configuration.terms;
             references.extend([
                 BoundedExactReference {
                     reference: api_terms,
@@ -3628,15 +3619,13 @@ fn evidence_references(
                     maximum_bytes: terms_maximum,
                 },
             ]);
-            if let FredServicePermissionRequest::ExactWrittenPermission { document, .. } =
-                &configuration.service_permission
-            {
-                references.push(BoundedExactReference {
-                    reference: document,
-                    maximum_bytes: u64::try_from(MAX_FRED_SERVICE_PERMISSION_BYTES)
-                        .map_err(|_| CliProviderActivationError::InvalidRights)?,
-                });
-            }
+            let FredServicePermissionRequest::ExactWrittenPermission { document, .. } =
+                &configuration.service_permission;
+            references.push(BoundedExactReference {
+                reference: document,
+                maximum_bytes: u64::try_from(MAX_FRED_SERVICE_PERMISSION_BYTES)
+                    .map_err(|_| CliProviderActivationError::InvalidRights)?,
+            });
             references.extend(
                 configuration
                     .grants
@@ -3644,10 +3633,6 @@ fn evidence_references(
                     .map(|grant| BoundedExactReference {
                         reference: match &grant.evidence {
                             FredGrantEvidenceRequest::ReviewedPublicDomain { decision } => decision,
-                            FredGrantEvidenceRequest::PublicDomain { document, .. }
-                            | FredGrantEvidenceRequest::OwnerPermission { document, .. } => {
-                                document
-                            }
                         },
                         maximum_bytes: FRED_AUTHORIZATION_MAXIMUM_BYTES,
                     }),
@@ -3731,11 +3716,7 @@ fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivati
             let mut request: ActivationRequest = serde_json::from_slice(bytes)
                 .map_err(|_| CliProviderActivationError::InvalidRequest)?;
             if request.schema_version != PREVIOUS_REQUEST_SCHEMA_VERSION
-                || matches!(
-                    &request.provider,
-                    ProviderRequest::FederalReserveBoardH15
-                        | ProviderRequest::ControlledLocalFiles { .. }
-                )
+                || matches!(&request.provider, ProviderRequest::FredAlfred { .. })
             {
                 return Err(CliProviderActivationError::InvalidRequest);
             }
@@ -4483,56 +4464,42 @@ fn fred_network_policy() -> Result<EndpointPolicy, CliProviderActivationError> {
 fn fred_policy(
     inputs: &LoadedActivationEvidence,
     artifact_reference: &ExactInputReference,
+    dashboard_dataset: &FredDashboardDatasetRequest,
     terms: FredTermsRequest,
     service_permission: FredServicePermissionRequest,
     grants: Vec<FredGrantRequest>,
 ) -> Result<FredRightsPolicy, CliProviderActivationError> {
-    validate_reviewed_fred_scope(&service_permission, &grants)?;
+    validate_reviewed_fred_scope(dashboard_dataset, &service_permission, &grants)?;
     let artifact = inputs.read(artifact_reference, FRED_RIGHTS_ARTIFACT_MAXIMUM_BYTES)?;
-    let artifact = match terms {
-        FredTermsRequest::ReviewedCurrent => {
-            return Err(CliProviderActivationError::InvalidRights);
-        }
-        FredTermsRequest::ExactDocuments {
-            api_terms,
-            services_legal_terms,
-            privacy_policy,
-        } => {
-            let maximum = u64::try_from(MAX_FRED_TERMS_DOCUMENT_BYTES)
-                .map_err(|_| CliProviderActivationError::InvalidRights)?;
-            let api_terms = inputs.read(&api_terms, maximum)?;
-            let services = inputs.read(&services_legal_terms, maximum)?;
-            let privacy = inputs.read(&privacy_policy, maximum)?;
-            let documents = [
-                FredTermsDocumentBytes::try_new(
-                    FredTermsDocumentRole::ApiTerms,
-                    api_terms.as_bytes(),
-                ),
-                FredTermsDocumentBytes::try_new(
-                    FredTermsDocumentRole::FredServicesLegalTerms,
-                    services.as_bytes(),
-                ),
-                FredTermsDocumentBytes::try_new(
-                    FredTermsDocumentRole::PrivacyPolicy,
-                    privacy.as_bytes(),
-                ),
-            ]
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| CliProviderActivationError::InvalidRights)?;
-            FredRightsArtifact::parse_current_reviewed(artifact.as_bytes(), &documents)
-        }
-    }
+    let FredTermsRequest::ExactDocuments {
+        api_terms,
+        services_legal_terms,
+        privacy_policy,
+    } = terms;
+    let maximum = u64::try_from(MAX_FRED_TERMS_DOCUMENT_BYTES)
+        .map_err(|_| CliProviderActivationError::InvalidRights)?;
+    let api_terms = inputs.read(&api_terms, maximum)?;
+    let services = inputs.read(&services_legal_terms, maximum)?;
+    let privacy = inputs.read(&privacy_policy, maximum)?;
+    let documents = [
+        FredTermsDocumentBytes::try_new(FredTermsDocumentRole::ApiTerms, api_terms.as_bytes()),
+        FredTermsDocumentBytes::try_new(
+            FredTermsDocumentRole::FredServicesLegalTerms,
+            services.as_bytes(),
+        ),
+        FredTermsDocumentBytes::try_new(FredTermsDocumentRole::PrivacyPolicy, privacy.as_bytes()),
+    ]
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
     .map_err(|_| CliProviderActivationError::InvalidRights)?;
+    let artifact = FredRightsArtifact::parse_current_reviewed(artifact.as_bytes(), &documents)
+        .map_err(|_| CliProviderActivationError::InvalidRights)?;
     let terms_digest = artifact.terms_evidence().bundle_digest();
     let FredServicePermissionRequest::ExactWrittenPermission {
         channel,
         document,
         review,
-    } = service_permission
-    else {
-        return Err(CliProviderActivationError::InvalidRights);
-    };
+    } = service_permission;
     let FredServicePermissionReviewRequest {
         reviewer,
         reviewed_at_unix_nanos,
@@ -4599,26 +4566,12 @@ fn fred_policy(
             if effective_at.max(service_permission.effective_at()) >= expires_at.min(service_end) {
                 return Err(CliProviderActivationError::InvalidRights);
             }
-            let operations = match grant.operations {
-                FredGrantOperations::Fixed => FRED_SERIES_OPERATIONS.to_vec(),
-                FredGrantOperations::Legacy(legacy_operations) => {
-                    drop(legacy_operations);
-                    return Err(CliProviderActivationError::InvalidRights);
-                }
-            };
-            let evidence = match grant.evidence {
-                FredGrantEvidenceRequest::ReviewedPublicDomain { decision } => {
-                    let decision = inputs.read(&decision, FRED_AUTHORIZATION_MAXIMUM_BYTES)?;
-                    FredSeriesRightsEvidence::parse_reviewed_unrate_public_domain(
-                        decision.as_bytes(),
-                    )
-                }
-                FredGrantEvidenceRequest::PublicDomain { .. }
-                | FredGrantEvidenceRequest::OwnerPermission { .. } => {
-                    return Err(CliProviderActivationError::InvalidRights);
-                }
-            }
-            .map_err(|_| CliProviderActivationError::InvalidRights)?;
+            let operations = FRED_SERIES_OPERATIONS.to_vec();
+            let FredGrantEvidenceRequest::ReviewedPublicDomain { decision } = grant.evidence;
+            let decision = inputs.read(&decision, FRED_AUTHORIZATION_MAXIMUM_BYTES)?;
+            let evidence =
+                FredSeriesRightsEvidence::parse_reviewed_unrate_public_domain(decision.as_bytes())
+                    .map_err(|_| CliProviderActivationError::InvalidRights)?;
             FredSeriesRightsGrant::try_new_with_evidence(
                 grant.series,
                 grant.owner,
@@ -4745,7 +4698,7 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn fred_request_v3_is_rejected_and_v2_retains_legacy_unavailable_authority() -> TestResult {
+    fn fred_legacy_request_versions_are_rejected() -> TestResult {
         let session_id = Uuid::new_v4();
         let digest = "11".repeat(32);
         let v3 = json!({
@@ -4825,26 +4778,9 @@ mod tests {
                 }
             }
         });
-        let legacy = decode_request(&serde_json::to_vec(&v2)?)?;
-        let ProviderRequest::FredAlfred { configuration } = legacy.provider else {
-            return Err("v2 FRED request decoded to the wrong provider".into());
-        };
         assert!(matches!(
-            configuration.terms,
-            FredTermsRequest::ExactDocuments { .. }
-        ));
-        assert!(matches!(
-            configuration.service_permission,
-            FredServicePermissionRequest::LegacyUnavailable
-        ));
-        assert!(matches!(
-            configuration.grants[0].evidence,
-            FredGrantEvidenceRequest::OwnerPermission { .. }
-        ));
-        assert!(matches!(
-            &configuration.grants[0].operations,
-            FredGrantOperations::Legacy(operations)
-                if operations == &[FredOperation::Persist]
+            decode_request(&serde_json::to_vec(&v2)?),
+            Err(CliProviderActivationError::InvalidRequest)
         ));
         Ok(())
     }

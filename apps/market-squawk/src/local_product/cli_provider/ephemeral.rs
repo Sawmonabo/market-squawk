@@ -27,7 +27,7 @@ use crate::{FredAdapterActivation, ProviderAdapterActivationError, ProviderOnboa
 use super::{
     CliProviderActivationError, FRED_RIGHTS_MANIFEST_BYTES, FRED_SURFACE,
     ProviderResearchActivationService, ProviderSurface, fred_budget, fred_network_policy, metadata,
-    require_surface, update_digest,
+    require_surface, reviewed_unrate_dashboard_dataset, update_digest,
 };
 
 const INSPECTION_EVIDENCE_DOMAIN: &[u8] = b"market-squawk:fred-ephemeral-inspection-authority:v1\0";
@@ -71,6 +71,10 @@ impl EphemeralSourceInspectionAuthority for ProviderResearchActivationService {
         let policy = FredRightsPolicy::try_new(artifact, None, Vec::new())
             .map_err(|_error| ServiceError::Unauthorized)?;
         let dataset = request.dataset_identifier().clone();
+        let dashboard_dataset = reviewed_unrate_dashboard_dataset().map_err(map_cli_error)?;
+        if dataset != dashboard_dataset.provider_dataset {
+            return Err(ServiceError::InvalidRequest);
+        }
         let series = FredSource::rights_subject_identifier(&dataset)
             .map_err(|_error| ServiceError::InvalidRequest)?;
         let decision = policy
@@ -111,12 +115,18 @@ impl EphemeralSourceInspectionAuthority for ProviderResearchActivationService {
             fred_budget(&lease).map_err(map_cli_error)?,
         )
         .map_err(map_cli_error)?;
+        let policy_effective_at = lease.issued_at();
         let page = self
             .activation
             .inspect_fred_ephemeral(
                 lease,
-                FredAdapterActivation::new(source_metadata, policy),
-                dataset.clone(),
+                FredAdapterActivation::try_new_for_ephemeral_inspection(
+                    source_metadata,
+                    policy,
+                    dataset.clone(),
+                    policy_effective_at,
+                )
+                .map_err(map_activation_error)?,
                 request.page_index(),
                 request.max_records(),
                 request.max_bytes(),
