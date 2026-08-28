@@ -742,17 +742,6 @@ fn map_nport<A: SecFundIdentityAuthority>(
     candidates
         .try_reserve(2)
         .map_err(|_| SecBulkError::AllocationFailed)?;
-    candidates.push(CanonicalCandidate {
-        record: FundEvidenceRecord::Report(Box::new(report)),
-        row_indices: common_indices.clone(),
-        kind: CanonicalRecordKind::Report,
-    });
-    candidates.push(CanonicalCandidate {
-        record: FundEvidenceRecord::ShareClass(Box::new(share)),
-        row_indices: common_indices.clone(),
-        kind: CanonicalRecordKind::ShareClass,
-    });
-
     let mut holding_indices = BTreeMap::<SourceIdentifier, usize>::new();
     let mut identifiers = BTreeMap::<SourceIdentifier, Vec<usize>>::new();
     let mut supplements = BTreeMap::<SourceIdentifier, Vec<usize>>::new();
@@ -844,6 +833,19 @@ fn map_nport<A: SecFundIdentityAuthority>(
     if !identifiers.is_empty() || !supplements.is_empty() {
         return Err(SecBulkError::InvalidCanonicalMapping);
     }
+    candidates
+        .try_reserve(2)
+        .map_err(|_| SecBulkError::AllocationFailed)?;
+    candidates.push(CanonicalCandidate {
+        record: FundEvidenceRecord::Report(Box::new(report)),
+        row_indices: common_indices.clone(),
+        kind: CanonicalRecordKind::Report,
+    });
+    candidates.push(CanonicalCandidate {
+        record: FundEvidenceRecord::ShareClass(Box::new(share)),
+        row_indices: common_indices,
+        kind: CanonicalRecordKind::ShareClass,
+    });
     Ok(candidates)
 }
 
