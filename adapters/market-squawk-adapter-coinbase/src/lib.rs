@@ -11,6 +11,7 @@ mod decoder;
 mod direct;
 mod direct_transport;
 mod market_handoff;
+mod publication;
 mod source;
 
 pub use config::{
@@ -36,10 +37,19 @@ pub use direct_transport::{
     CoinbaseDirectSessionError,
 };
 pub use market_handoff::{
-    CoinbaseDirectInitialMarketLineage, CoinbaseDirectReplayFrame,
-    CoinbaseDirectSnapshotSealExpectation, CoinbaseDirectTradeEvidence, CoinbaseMarketChannel,
-    CoinbaseMarketContinuity, CoinbaseMarketDecodeOutcome, CoinbaseMarketFeed,
-    CoinbaseMarketHandoff, CoinbaseMarketHandoffError, CoinbaseMarketHandoffEvidence,
-    CoinbaseMarketRawLineage,
+    CoinbaseDirectInitialMarketLineage, CoinbaseDirectReplayFrame, CoinbaseDirectTradeEvidence,
+    CoinbaseMarketChannel, CoinbaseMarketContinuity, CoinbaseMarketDecodeOutcome,
+    CoinbaseMarketFeed, CoinbaseMarketHandoff, CoinbaseMarketHandoffError,
+    CoinbaseMarketHandoffEvidence, CoinbaseMarketRawLineage,
+};
+pub use publication::{
+    CoinbaseDirectSnapshotSealMaterial, CoinbaseDirectSnapshotSegmentEvidence,
+    CoinbaseEventMicrobatchSealMaterial, CoinbaseMarketNonPublicationReason,
+    CoinbaseMarketOmission, CoinbaseMarketOmissionReason, CoinbaseMarketPhysicalCaptureIdentity,
+    CoinbaseMarketPublicationContext, CoinbaseMarketPublicationError,
+    CoinbaseMarketQualificationOutcome, CoinbaseMarketRawSealFrame, CoinbaseMarketSealMaterial,
+    CoinbaseMarketSealRejoin, CoinbaseMarketSealedTokens, CoinbaseQualifiedDirectReplayRow,
+    CoinbaseQualifiedMarketPublication, CoinbaseQualifiedPublicRow,
+    CoinbaseSealedMarketPublication, CoinbaseSealedRawMarketPublication,
 };
 pub use source::CoinbaseExchangeSource;

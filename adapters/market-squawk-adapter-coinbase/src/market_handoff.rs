@@ -191,49 +191,23 @@ impl CoinbaseDirectReplayFrame {
     pub const fn native_trade(&self) -> Option<&CoinbaseDirectTradeEvidence> {
         self.native_trade.as_ref()
     }
-}
 
-/// Opaque, one-shot expectation for the missing common snapshot logical-object publisher.
-///
-/// This is not a sealed-capture claim. It only binds the exact snapshot material and ordered
-/// replay digests that a future common publisher must accept atomically. It is deliberately
-/// non-cloneable and has no provider-local completion constructor.
-#[derive(Debug)]
-pub struct CoinbaseDirectSnapshotSealExpectation {
-    snapshot_body_digest: EvidenceDigest,
-    snapshot_body_length: u64,
-    snapshot_received_at: Timestamp,
-    replay_payload_digests: Vec<EvidenceDigest>,
-}
-
-impl CoinbaseDirectSnapshotSealExpectation {
-    /// Returns the exact logical-object body digest that must be sealed.
-    pub const fn snapshot_body_digest(&self) -> EvidenceDigest {
-        self.snapshot_body_digest
-    }
-
-    /// Returns the exact logical-object body length that must be sealed.
-    pub const fn snapshot_body_length(&self) -> u64 {
-        self.snapshot_body_length
-    }
-
-    /// Returns the registry-trusted completion clock of the exact response body.
-    pub const fn snapshot_received_at(&self) -> Timestamp {
-        self.snapshot_received_at
-    }
-
-    /// Returns every admitted post-snapshot WebSocket payload digest in sequence order.
-    pub fn replay_payload_digests(&self) -> &[EvidenceDigest] {
-        &self.replay_payload_digests
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ProviderOrderEvent,
+        CapturePayload,
+        Option<CoinbaseDirectTradeEvidence>,
+    ) {
+        (self.event, self.raw_payload, self.native_trade)
     }
 }
 
-/// Exact Direct initial-state material pending one common immutable logical-object claim.
+/// Exact Direct initial-state material pending application-owned physical sealing.
 #[derive(Debug)]
 pub struct CoinbaseDirectInitialMarketLineage {
     snapshot: SegmentedHttpResponseCapture,
     replay: Vec<CoinbaseDirectReplayFrame>,
-    sealing_expectation: CoinbaseDirectSnapshotSealExpectation,
 }
 
 impl CoinbaseDirectInitialMarketLineage {
@@ -249,34 +223,7 @@ impl CoinbaseDirectInitialMarketLineage {
         if replay.is_empty() {
             return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
         }
-        let maximum_digest_slots = replay
-            .len()
-            .checked_next_power_of_two()
-            .ok_or(CoinbaseMarketHandoffError::Allocation)?;
-        let mut replay_payload_digests = Vec::new();
-        replay_payload_digests
-            .try_reserve_exact(replay.len())
-            .map_err(|_error| CoinbaseMarketHandoffError::Allocation)?;
-        if replay_payload_digests.capacity() > maximum_digest_slots {
-            return Err(CoinbaseMarketHandoffError::Allocation);
-        }
-        replay_payload_digests.extend(
-            replay
-                .iter()
-                .map(|frame| frame.decoder_evidence().payload_digest()),
-        );
-        let receipt = snapshot.receipt();
-        let sealing_expectation = CoinbaseDirectSnapshotSealExpectation {
-            snapshot_body_digest: receipt.body_digest(),
-            snapshot_body_length: receipt.body_length(),
-            snapshot_received_at: receipt.received_at(),
-            replay_payload_digests,
-        };
-        Ok(Self {
-            snapshot,
-            replay,
-            sealing_expectation,
-        })
+        Ok(Self { snapshot, replay })
     }
 
     /// Returns the exact segmented response capture; no receipt-only surrogate is exposed.
@@ -289,21 +236,15 @@ impl CoinbaseDirectInitialMarketLineage {
         &self.replay
     }
 
-    /// Returns the non-cloneable acceptance expectation for common product orchestration.
-    pub const fn sealing_expectation(&self) -> &CoinbaseDirectSnapshotSealExpectation {
-        &self.sealing_expectation
-    }
-
-    /// Consumes the pending lineage into the exact response, ordered replay, and opaque
-    /// completion expectation required by the future common publisher.
+    /// Consumes the pending lineage into exact snapshot-response and ordered replay material.
+    ///
+    /// No value returned by this split claims that bytes have been physically sealed. The
+    /// publication handoff converts both parts into application-consumable raw material and later
+    /// accepts only the exact one-use common seal tokens returned by that application boundary.
     pub fn into_sealing_split(
         self,
-    ) -> (
-        SegmentedHttpResponseCapture,
-        Vec<CoinbaseDirectReplayFrame>,
-        CoinbaseDirectSnapshotSealExpectation,
-    ) {
-        (self.snapshot, self.replay, self.sealing_expectation)
+    ) -> (SegmentedHttpResponseCapture, Vec<CoinbaseDirectReplayFrame>) {
+        (self.snapshot, self.replay)
     }
 }
 
@@ -642,10 +583,6 @@ fn validate_direct_initial(
             .currentness_lease()
             .shares_authority_with(receipt.currentness_lease())
         || input.snapshot_provider_at.is_none()
-        || lineage.sealing_expectation.snapshot_body_digest != receipt.body_digest()
-        || lineage.sealing_expectation.snapshot_body_length != receipt.body_length()
-        || lineage.sealing_expectation.snapshot_received_at != receipt.received_at()
-        || lineage.replay.len() != lineage.sealing_expectation.replay_payload_digests.len()
     {
         return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
     }
@@ -653,7 +590,7 @@ fn validate_direct_initial(
         .checked_next()
         .map_err(|_error| CoinbaseMarketHandoffError::EvidenceMismatch)?;
     let mut previous = None;
-    for (index, frame) in lineage.replay.iter().enumerate() {
+    for frame in &lineage.replay {
         frame
             .decoder_evidence()
             .currentness_lease()
@@ -662,10 +599,7 @@ fn validate_direct_initial(
         let expected = previous
             .map_or(Ok(expected_first), SequenceNumber::checked_next)
             .map_err(|_error| CoinbaseMarketHandoffError::EvidenceMismatch)?;
-        if frame.sequence() != expected
-            || frame.decoder_evidence().payload_digest()
-                != lineage.sealing_expectation.replay_payload_digests[index]
-        {
+        if frame.sequence() != expected {
             return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
         }
         previous = Some(frame.sequence());

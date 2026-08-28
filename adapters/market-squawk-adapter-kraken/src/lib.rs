@@ -4,6 +4,7 @@ mod config;
 mod decoder;
 mod level3;
 mod messages;
+mod publication;
 mod qualification;
 mod session;
 
@@ -21,6 +22,12 @@ pub use level3::{
     KrakenL3Depth, KrakenL3MetadataError, KrakenL3MetadataInput, KrakenL3Order, KrakenL3OrderEvent,
     KrakenL3OrderEventKind, KrakenL3ProductMapping, KrakenL3ScaleError, KrakenL3ScaledOrder,
     KrakenL3ScaledOrderEvent, KrakenL3SecretPayload, KrakenL3WebSocketToken,
+};
+pub use publication::{
+    KrakenNonMarketReason, KrakenPendingPublication, KrakenPublicationAbstention,
+    KrakenPublicationError, KrakenPublicationEvidence, KrakenPublicationSealRejoin,
+    KrakenPublicationUnavailable, KrakenSealedMarketPublicationMaterial,
+    KrakenSealedNonMarketPublication, KrakenSealedPublication,
 };
 pub use qualification::{
     KRAKEN_BOOK_SEQUENCE_RULE, KRAKEN_QUALIFICATION_POLICY_DIGEST,
