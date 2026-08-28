@@ -1409,7 +1409,14 @@ pub(super) const fn native_implementation_name(
         ProviderNativeLineageImplementation::BeaRegionalV1 => "bea_regional_v1",
         ProviderNativeLineageImplementation::BlsTimeseriesV1 => "bls_timeseries_v1",
         ProviderNativeLineageImplementation::CensusTabularV1 => "census_tabular_v1",
+        ProviderNativeLineageImplementation::CoinbaseAdvancedTradeV1 => {
+            "coinbase_advanced_trade_v1"
+        }
+        ProviderNativeLineageImplementation::CoinbaseExchangeDirectV1 => {
+            "coinbase_exchange_direct_v1"
+        }
         ProviderNativeLineageImplementation::EiaSeriesV1 => "eia_series_v1",
+        ProviderNativeLineageImplementation::KrakenSpotV1 => "kraken_spot_v1",
         ProviderNativeLineageImplementation::AlpacaHistoricalBarV1 => "alpaca_historical_bar_v1",
         ProviderNativeLineageImplementation::SchwabRestMarketDataV1 => "schwab_rest_market_data_v1",
         ProviderNativeLineageImplementation::SchwabStreamerMarketDataV1 => {
@@ -1426,7 +1433,14 @@ pub(super) fn parse_native_implementation(
         "bea_regional_v1" => Ok(ProviderNativeLineageImplementation::BeaRegionalV1),
         "bls_timeseries_v1" => Ok(ProviderNativeLineageImplementation::BlsTimeseriesV1),
         "census_tabular_v1" => Ok(ProviderNativeLineageImplementation::CensusTabularV1),
+        "coinbase_advanced_trade_v1" => {
+            Ok(ProviderNativeLineageImplementation::CoinbaseAdvancedTradeV1)
+        }
+        "coinbase_exchange_direct_v1" => {
+            Ok(ProviderNativeLineageImplementation::CoinbaseExchangeDirectV1)
+        }
         "eia_series_v1" => Ok(ProviderNativeLineageImplementation::EiaSeriesV1),
+        "kraken_spot_v1" => Ok(ProviderNativeLineageImplementation::KrakenSpotV1),
         "alpaca_historical_bar_v1" => {
             Ok(ProviderNativeLineageImplementation::AlpacaHistoricalBarV1)
         }

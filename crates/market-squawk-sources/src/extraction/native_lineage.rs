@@ -35,8 +35,14 @@ pub enum ProviderNativeLineageImplementation {
     BlsTimeseriesV1,
     /// Census tabular observation semantics encoder v1.
     CensusTabularV1,
+    /// Coinbase Advanced Trade public market-data semantics encoder v1.
+    CoinbaseAdvancedTradeV1,
+    /// Coinbase Exchange Direct authenticated market-data semantics encoder v1.
+    CoinbaseExchangeDirectV1,
     /// EIA series observation semantics encoder v1.
     EiaSeriesV1,
+    /// Kraken Spot public market-data semantics encoder v1.
+    KrakenSpotV1,
     /// Schwab REST market-data response semantics encoder v1.
     SchwabRestMarketDataV1,
     /// Schwab Streamer market-data frame semantics encoder v1.
@@ -54,7 +60,14 @@ impl ProviderNativeLineageImplementation {
             Self::BeaRegionalV1 => b"market-squawk/bea/provider-native-lineage/v1",
             Self::BlsTimeseriesV1 => b"market-squawk/bls/provider-native-lineage/v1",
             Self::CensusTabularV1 => b"market-squawk/census/provider-native-lineage/v1",
+            Self::CoinbaseAdvancedTradeV1 => {
+                b"market-squawk/coinbase-advanced-trade/provider-native-lineage/v1"
+            }
+            Self::CoinbaseExchangeDirectV1 => {
+                b"market-squawk/coinbase-exchange-direct/provider-native-lineage/v1"
+            }
             Self::EiaSeriesV1 => b"market-squawk/eia/provider-native-lineage/v1",
+            Self::KrakenSpotV1 => b"market-squawk/kraken-spot/provider-native-lineage/v1",
             Self::SchwabRestMarketDataV1 => {
                 b"market-squawk/schwab-rest-market-data/provider-native-lineage/v1"
             }
@@ -71,7 +84,10 @@ impl ProviderNativeLineageImplementation {
             Self::BeaRegionalV1 => 1,
             Self::BlsTimeseriesV1 => 2,
             Self::CensusTabularV1 => 3,
+            Self::CoinbaseAdvancedTradeV1 => 17,
+            Self::CoinbaseExchangeDirectV1 => 18,
             Self::EiaSeriesV1 => 4,
+            Self::KrakenSpotV1 => 19,
             Self::SchwabRestMarketDataV1 => 14,
             Self::SchwabStreamerMarketDataV1 => 15,
             Self::YahooEnrichmentV1 => 16,
