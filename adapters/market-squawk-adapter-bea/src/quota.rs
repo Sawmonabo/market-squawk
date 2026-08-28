@@ -16,16 +16,12 @@ pub enum BeaQuotaDeclarationError {
     InvalidDeclaration,
 }
 
-/// Post-response dimensions the shared durable provider-rate authority must settle.
-///
-/// The current shared request permit owns request-window and concurrency admission. It does not
-/// yet expose durable response-byte or provider/body-error settlement, so root composition must
-/// implement both dimensions before claiming the full BEA 60 MB/10-error application policy.
+/// Weighted dimensions that every dispatched BEA response must settle through shared authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BeaRequiredSharedSettlement {
-    /// Settle exact received provider body bytes into the shared sliding window.
+    /// Exact complete bytes, or the reserved maximum when completion is unknowable.
     ResponseBytes,
-    /// Settle HTTP and BEA body-level provider errors into the shared sliding window.
+    /// Zero for validated success and one for every closed failure class.
     ProviderErrors,
 }
 
@@ -81,16 +77,15 @@ impl BeaQuotaWindowDeclaration {
     }
 }
 
-/// Provider-local target declaration joined to the shared request authority.
+/// Provider-local evidence joined to the complete shared weighted authority.
 ///
 /// This is evidence and configuration, not an adapter-local counter. The embedded
-/// [`ProviderRateDeclaration`] covers request windows and concurrency. Exact response bytes,
-/// provider/body errors, cooldown, and crash recovery must be settled by shared root authority;
-/// `required_shared_settlements` makes the two currently missing dimensions explicit.
+/// [`ProviderRateDeclaration`] covers request starts, request volume, response bytes, provider
+/// errors, concurrency, cooldown, and durable recovery as one shared policy.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BeaProviderQuotaDeclaration {
-    shared_request_declaration: ProviderRateDeclaration,
+    shared_declaration: ProviderRateDeclaration,
     official: BeaQuotaWindowDeclaration,
     application: BeaQuotaWindowDeclaration,
     maximum_in_flight: u32,
@@ -102,7 +97,7 @@ pub struct BeaProviderQuotaDeclaration {
 impl BeaProviderQuotaDeclaration {
     /// Builds and validates the complete BEA request/byte/error declaration.
     pub fn try_new() -> Result<Self, BeaSourceError> {
-        let shared_request_declaration = bea_provider_rate_declaration()?;
+        let shared_declaration = bea_provider_rate_declaration()?;
         let official = BeaQuotaWindowDeclaration::try_from_budget(BeaPacingPolicy::official())
             .map_err(|_| BeaSourceError::InvalidConfiguration)?;
         let application =
@@ -113,7 +108,7 @@ impl BeaProviderQuotaDeclaration {
             u64::try_from(BeaPacingPolicy::minimum_request_interval().as_nanos())
                 .map_err(|_| BeaSourceError::InvalidConfiguration)?;
         let honors_retry_after = BeaPacingPolicy::honors_retry_after();
-        let shared_policy = shared_request_declaration.policy();
+        let shared_policy = shared_declaration.policy();
         let has_pacing_window = (0..shared_policy.window_count()).any(|index| {
             shared_policy.window(index).is_some_and(|window| {
                 window.requests_per_window() == 1
@@ -124,6 +119,24 @@ impl BeaProviderQuotaDeclaration {
         let has_application_window = (0..shared_policy.window_count()).any(|index| {
             shared_policy.window(index).is_some_and(|window| {
                 window.requests_per_window() == application.requests
+                    && window.window_nanos() == application.window_nanos
+                    && window.semantics() == market_squawk_sources::BudgetWindowSemantics::Sliding
+            })
+        });
+        let has_response_byte_window = (0..shared_policy.weighted_window_count()).any(|index| {
+            shared_policy.weighted_window(index).is_some_and(|window| {
+                window.dimension()
+                    == market_squawk_sources::ProviderRateWeightedDimension::ResponseBytes
+                    && window.maximum_units() == application.response_bytes
+                    && window.window_nanos() == application.window_nanos
+                    && window.semantics() == market_squawk_sources::BudgetWindowSemantics::Sliding
+            })
+        });
+        let has_provider_error_window = (0..shared_policy.weighted_window_count()).any(|index| {
+            shared_policy.weighted_window(index).is_some_and(|window| {
+                window.dimension()
+                    == market_squawk_sources::ProviderRateWeightedDimension::ProviderErrors
+                    && window.maximum_units() == u64::from(application.errors)
                     && window.window_nanos() == application.window_nanos
                     && window.semantics() == market_squawk_sources::BudgetWindowSemantics::Sliding
             })
@@ -139,13 +152,16 @@ impl BeaProviderQuotaDeclaration {
             || shared_policy.window_count() != 2
             || !has_pacing_window
             || !has_application_window
+            || shared_policy.weighted_window_count() != 2
+            || !has_response_byte_window
+            || !has_provider_error_window
             || u32::from(shared_policy.max_concurrent()) != maximum_in_flight
         {
             return Err(BeaSourceError::InvalidConfiguration);
         }
         let mut hasher = Sha256::new();
-        hasher.update(b"market-squawk/bea-provider-quota-declaration/v1");
-        hasher.update(shared_request_declaration.declaration_digest().bytes());
+        hasher.update(b"market-squawk/bea-provider-quota-declaration/v2");
+        hasher.update(shared_declaration.declaration_digest().bytes());
         for value in [official, application] {
             hasher.update(value.requests.to_be_bytes());
             hasher.update(value.response_bytes.to_be_bytes());
@@ -158,7 +174,7 @@ impl BeaProviderQuotaDeclaration {
         let declaration_digest =
             EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
         Ok(Self {
-            shared_request_declaration,
+            shared_declaration,
             official,
             application,
             maximum_in_flight,
@@ -168,14 +184,11 @@ impl BeaProviderQuotaDeclaration {
         })
     }
 
-    /// Returns request-window/concurrency admission for the sole durable provider-rate authority.
-    ///
-    /// This declaration does not claim response-byte or provider-error settlement.
-    pub const fn shared_request_declaration(&self) -> &ProviderRateDeclaration {
-        &self.shared_request_declaration
+    /// Returns the complete request/byte/error policy for the sole durable provider-rate authority.
+    pub const fn shared_declaration(&self) -> &ProviderRateDeclaration {
+        &self.shared_declaration
     }
-
-    /// Returns the exact missing shared post-response settlement dimensions.
+    /// Returns the exact dimensions terminalized by each shared in-flight permit.
     pub const fn required_shared_settlements(&self) -> &'static [BeaRequiredSharedSettlement; 2] {
         &REQUIRED_SHARED_SETTLEMENTS
     }
@@ -183,7 +196,7 @@ impl BeaProviderQuotaDeclaration {
     pub const fn official(&self) -> BeaQuotaWindowDeclaration {
         self.official
     }
-    /// Returns lower application target ceilings; see `required_shared_settlements`.
+    /// Returns lower application target ceilings enforced by the shared weighted policy.
     pub const fn application(&self) -> BeaQuotaWindowDeclaration {
         self.application
     }

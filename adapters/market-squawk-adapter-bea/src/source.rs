@@ -23,9 +23,10 @@ use market_squawk_sources::{
     NetworkPolicyError, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
     ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
     ProviderCaptureSealRequest, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    ProviderRateDeclaration, QueryParameterRule, QuerySensitivity, SourceClass, SourceError,
-    SourceMetadata, SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
-    SourceProtocolProfile,
+    ProviderRateDeclaration, ProviderRateResponseClass, ProviderRateResponseSettlement,
+    ProviderRateRetryAfterDisposition, ProviderRateWeightedDimension, ProviderRateWeightedWindow,
+    QueryParameterRule, QuerySensitivity, SourceClass, SourceError, SourceMetadata,
+    SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity, SourceProtocolProfile,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -39,9 +40,10 @@ use crate::transport::{
     system_timestamp,
 };
 use crate::{
-    BEA_API_ENDPOINT, BEA_APPLICATION_REQUESTS_PER_MINUTE, BEA_MINIMUM_REQUEST_INTERVAL,
-    BeaCompleteness, BeaDataPage, BeaDatasetIdentity, BeaDoctorAdmissionEvidence, BeaDoctorRun,
-    BeaError, BeaFrequency, BeaMetadataGeneration, BeaMetadataPage, BeaMetadataRecords, BeaMethod,
+    BEA_API_ENDPOINT, BEA_APPLICATION_ERRORS_PER_MINUTE, BEA_APPLICATION_REQUESTS_PER_MINUTE,
+    BEA_APPLICATION_RESPONSE_BYTES_PER_MINUTE, BEA_MINIMUM_REQUEST_INTERVAL, BeaCompleteness,
+    BeaDataPage, BeaDatasetIdentity, BeaDoctorAdmissionEvidence, BeaDoctorRun, BeaError,
+    BeaFrequency, BeaMetadataGeneration, BeaMetadataPage, BeaMetadataRecords, BeaMethod,
     BeaMissingValue, BeaObservation, BeaObservationValue, BeaParameterDefinition,
     BeaParameterIdentity, BeaParseLimits, BeaProviderQuotaDeclaration, BeaQuery, BeaRequest,
     BeaSourceBinding, BeaUserId, bea_provider_quota_declaration,
@@ -378,7 +380,7 @@ pub fn bea_api_endpoint_rule(
     ApiEndpointRule::try_new(BEA_API_ENDPOINT, PathScope::Exact, rules, 38, 16_384)
 }
 
-/// Builds the conservative product-wide provider-rate declaration for one BEA credential realm.
+/// Builds the exact product-wide weighted provider-rate declaration for one BEA credential realm.
 ///
 /// The collision subject is code-owned and stable; the `UserID` is never hashed into rate-policy
 /// state. App composition registers this declaration with `ProviderRateAuthority` and binds every
@@ -405,9 +407,26 @@ pub fn bea_provider_rate_declaration() -> Result<ProviderRateDeclaration, BeaSou
         BudgetWindowSemantics::Sliding,
     )
     .map_err(|_| BeaSourceError::InvalidConfiguration)?;
-    let policy = ProviderBudgetPolicy::try_new_conjunctive(
+    let response_bytes_window = ProviderRateWeightedWindow::try_new(
+        ProviderRateWeightedDimension::ResponseBytes,
+        NonZeroU64::new(BEA_APPLICATION_RESPONSE_BYTES_PER_MINUTE)
+            .ok_or(BeaSourceError::InvalidConfiguration)?,
+        NonZeroU64::new(60_000_000_000).ok_or(BeaSourceError::InvalidConfiguration)?,
+        BudgetWindowSemantics::Sliding,
+    )
+    .map_err(|_| BeaSourceError::InvalidConfiguration)?;
+    let provider_errors_window = ProviderRateWeightedWindow::try_new(
+        ProviderRateWeightedDimension::ProviderErrors,
+        NonZeroU64::new(u64::from(BEA_APPLICATION_ERRORS_PER_MINUTE))
+            .ok_or(BeaSourceError::InvalidConfiguration)?,
+        NonZeroU64::new(60_000_000_000).ok_or(BeaSourceError::InvalidConfiguration)?,
+        BudgetWindowSemantics::Sliding,
+    )
+    .map_err(|_| BeaSourceError::InvalidConfiguration)?;
+    let policy = ProviderBudgetPolicy::try_new_weighted_conjunctive(
         BudgetScope::with_authorization_account(provider, subject.clone()),
         &[pacing_window, minute_window],
+        &[response_bytes_window, provider_errors_window],
         NonZeroU16::new(1).ok_or(BeaSourceError::InvalidConfiguration)?,
         BackoffPolicy::try_new(
             NonZeroU64::new(1_000_000_000).ok_or(BeaSourceError::InvalidConfiguration)?,
@@ -1083,17 +1102,36 @@ impl BeaSource {
         });
         let has_application_window = (0..budget.window_count()).any(|index| {
             budget.window(index).is_some_and(|window| {
-                window.requests_per_window() <= BEA_APPLICATION_REQUESTS_PER_MINUTE
+                window.requests_per_window() == BEA_APPLICATION_REQUESTS_PER_MINUTE
                     && window.window_nanos() == 60_000_000_000
                     && window.semantics() == BudgetWindowSemantics::Sliding
             })
         });
-        if budget != expected_quota.shared_request_declaration().policy()
+        let has_response_byte_window = (0..budget.weighted_window_count()).any(|index| {
+            budget.weighted_window(index).is_some_and(|window| {
+                window.dimension() == ProviderRateWeightedDimension::ResponseBytes
+                    && window.maximum_units() == BEA_APPLICATION_RESPONSE_BYTES_PER_MINUTE
+                    && window.window_nanos() == 60_000_000_000
+                    && window.semantics() == BudgetWindowSemantics::Sliding
+            })
+        });
+        let has_provider_error_window = (0..budget.weighted_window_count()).any(|index| {
+            budget.weighted_window(index).is_some_and(|window| {
+                window.dimension() == ProviderRateWeightedDimension::ProviderErrors
+                    && window.maximum_units() == u64::from(BEA_APPLICATION_ERRORS_PER_MINUTE)
+                    && window.window_nanos() == 60_000_000_000
+                    && window.semantics() == BudgetWindowSemantics::Sliding
+            })
+        });
+        if budget != expected_quota.shared_declaration().policy()
             || budget.scope().as_source_identifier() != metadata.provider()
             || budget.scope().authorization_account().is_none()
             || budget.max_concurrent() != 1
             || !has_pacing_window
             || !has_application_window
+            || budget.weighted_window_count() != 2
+            || !has_response_byte_window
+            || !has_provider_error_window
         {
             return Err(BeaSourceError::InvalidMetadata);
         }
@@ -1281,21 +1319,47 @@ impl BeaSource {
             self.effective_parse_limits(),
             capture_dataset,
         )?;
-        let page = crate::parser::parse_metadata_page_sanitized(
-            fetched.retained_body()?,
+        let retained_body = match fetched.retained_body() {
+            Ok(body) => body,
+            Err(error) => {
+                fetched.settle_invalid_response()?;
+                return Err(error);
+            }
+        };
+        let page = match crate::parser::parse_metadata_page_sanitized(
+            retained_body,
             &request,
             self.effective_parse_limits(),
-        )
-        .map_err(|error| {
-            self.record_parse_failure(&error);
-            map_source_error(BeaSourceError::Adapter(error))
-        })?;
-        let page = page
-            .bind_sanitized_capture(fetched.upstream_digest, fetched.retained_digest)
-            .map_err(|error| map_source_error(BeaSourceError::Adapter(error)))?;
-        let telemetry = response_telemetry(&request, page.receipt(), &fetched)?;
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                self.record_parse_failure(&error);
+                fetched.settle_parse_error(&error)?;
+                return Err(map_source_error(BeaSourceError::Adapter(error)));
+            }
+        };
+        let page =
+            match page.bind_sanitized_capture(fetched.upstream_digest, fetched.retained_digest) {
+                Ok(page) => page,
+                Err(error) => {
+                    self.record_parse_failure(&error);
+                    fetched.settle_parse_error(&error)?;
+                    return Err(map_source_error(BeaSourceError::Adapter(error)));
+                }
+            };
+        let telemetry = match response_telemetry(&request, page.receipt(), &fetched) {
+            Ok(telemetry) => telemetry,
+            Err(error) => {
+                fetched.settle_invalid_response()?;
+                return Err(error);
+            }
+        };
+        if page.receipt().completeness() == BeaCompleteness::Partial {
+            fetched.settle_invalid_response()?;
+            return Err(invalid_protocol());
+        }
         self.validate_operation_current(authority, deadline, &cancellation)?;
-        fetched.record_success()?;
+        fetched.settle_success()?;
         self.record_page(&telemetry, page.records().len(), false);
         Ok(BeaCapturedMetadataPage {
             request,
@@ -1333,24 +1397,51 @@ impl BeaSource {
             self.effective_parse_limits(),
             contract.dataset_id().clone(),
         )?;
-        let page = crate::parser::parse_data_page_sanitized(
-            fetched.retained_body()?,
+        let retained_body = match fetched.retained_body() {
+            Ok(body) => body,
+            Err(error) => {
+                fetched.settle_invalid_response()?;
+                return Err(error);
+            }
+        };
+        let page = match crate::parser::parse_data_page_sanitized(
+            retained_body,
             &request,
             self.effective_parse_limits(),
-        )
-        .map_err(|error| {
-            self.record_parse_failure(&error);
-            map_source_error(BeaSourceError::Adapter(error))
-        })?;
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                self.record_parse_failure(&error);
+                fetched.settle_parse_error(&error)?;
+                return Err(map_source_error(BeaSourceError::Adapter(error)));
+            }
+        };
         if page.metadata_generation() != metadata_generation {
+            fetched.settle_invalid_response()?;
             return Err(invalid_protocol());
         }
-        let page = page
-            .bind_sanitized_capture(fetched.upstream_digest, fetched.retained_digest)
-            .map_err(|error| map_source_error(BeaSourceError::Adapter(error)))?;
-        let telemetry = response_telemetry(&request, page.receipt(), &fetched)?;
+        let page =
+            match page.bind_sanitized_capture(fetched.upstream_digest, fetched.retained_digest) {
+                Ok(page) => page,
+                Err(error) => {
+                    self.record_parse_failure(&error);
+                    fetched.settle_parse_error(&error)?;
+                    return Err(map_source_error(BeaSourceError::Adapter(error)));
+                }
+            };
+        let telemetry = match response_telemetry(&request, page.receipt(), &fetched) {
+            Ok(telemetry) => telemetry,
+            Err(error) => {
+                fetched.settle_invalid_response()?;
+                return Err(error);
+            }
+        };
+        if page.receipt().completeness() == BeaCompleteness::Partial {
+            fetched.settle_invalid_response()?;
+            return Err(invalid_protocol());
+        }
         self.validate_operation_current(authority, deadline, &cancellation)?;
-        fetched.record_success()?;
+        fetched.settle_success()?;
         self.record_page(&telemetry, 0, true);
         Ok(BeaCapturedDataPage {
             request,
@@ -1563,12 +1654,6 @@ impl BeaSource {
                 return Err(map_source_error(error));
             }
         };
-        let headers = response
-            .retain_secret_free_headers(&self.user_id)
-            .map_err(|error| {
-                self.telemetry.add(&self.telemetry.failures, 1);
-                map_source_error(error)
-            })?;
         let response_bytes = u64::try_from(response.body.len()).map_err(|_| invalid_protocol())?;
         in_flight.validate_response_size(response_bytes)?;
         self.telemetry
@@ -1577,6 +1662,20 @@ impl BeaSource {
             &self.telemetry.latency_nanos,
             duration_nanos(response.latency),
         );
+        let headers = match response.retain_secret_free_headers(&self.user_id) {
+            Ok(headers) => headers,
+            Err(error) => {
+                self.telemetry.add(&self.telemetry.failures, 1);
+                settle_complete_response(
+                    in_flight,
+                    response_bytes,
+                    ProviderRateResponseClass::InvalidProviderResponse,
+                    ProviderRateRetryAfterDisposition::Absent,
+                    0,
+                )?;
+                return Err(map_source_error(error));
+            }
+        };
         if headers.retry_after.is_some() {
             self.telemetry.add(&self.telemetry.retry_after_responses, 1);
         }
@@ -1586,22 +1685,49 @@ impl BeaSource {
                 || value.iter().any(u8::is_ascii_control)
         }) {
             self.telemetry.add(&self.telemetry.failures, 1);
+            settle_complete_response(
+                in_flight,
+                response_bytes,
+                ProviderRateResponseClass::InvalidProviderResponse,
+                ProviderRateRetryAfterDisposition::parse_http(headers.retry_after.as_deref()),
+                0,
+            )?;
             return Err(invalid_protocol());
         }
         match response.status {
             200 => {}
             401 | 403 => {
                 self.telemetry.add(&self.telemetry.failures, 1);
+                settle_complete_response(
+                    in_flight,
+                    response_bytes,
+                    ProviderRateResponseClass::HttpProviderError,
+                    ProviderRateRetryAfterDisposition::Absent,
+                    0,
+                )?;
                 return Err(SourceError::Unauthorized.into());
             }
             429 | 503 => {
                 self.telemetry
                     .add(&self.telemetry.rate_limited_responses, 1);
-                let wait = in_flight.apply_retry_after_header(headers.retry_after.as_deref(), 0)?;
-                return Err(SourceError::BudgetWaitUntil { deadline: wait }.into());
+                settle_complete_response(
+                    in_flight,
+                    response_bytes,
+                    ProviderRateResponseClass::ProviderRefusal,
+                    ProviderRateRetryAfterDisposition::parse_http(headers.retry_after.as_deref()),
+                    0,
+                )?;
+                return Err(SourceError::ProviderUnavailable.into());
             }
             _ => {
                 self.telemetry.add(&self.telemetry.failures, 1);
+                settle_complete_response(
+                    in_flight,
+                    response_bytes,
+                    ProviderRateResponseClass::HttpProviderError,
+                    ProviderRateRetryAfterDisposition::Absent,
+                    0,
+                )?;
                 return Err(SourceError::ProviderUnavailable.into());
             }
         }
@@ -1612,11 +1738,19 @@ impl BeaSource {
             || !content_type_is_json(headers.content_type.as_deref())
         {
             self.telemetry.add(&self.telemetry.failures, 1);
+            settle_complete_response(
+                in_flight,
+                response_bytes,
+                ProviderRateResponseClass::InvalidProviderResponse,
+                ProviderRateRetryAfterDisposition::parse_http(headers.retry_after.as_deref()),
+                0,
+            )?;
             return Err(invalid_protocol());
         }
         Ok(FetchedResponse {
             response,
             headers,
+            response_bytes,
             in_flight: Some(in_flight),
         })
     }
@@ -1741,6 +1875,7 @@ impl ExtractionSource for BeaSource {
 struct FetchedResponse {
     response: BeaHttpResponse,
     headers: BeaRetainedResponseHeaders,
+    response_bytes: u64,
     in_flight: Option<InFlightExtractionRequest>,
 }
 
@@ -1756,7 +1891,8 @@ impl FetchedResponse {
         let Self {
             response,
             headers,
-            in_flight,
+            response_bytes,
+            mut in_flight,
         } = self;
         let BeaRetainedResponseHeaders {
             retry_after,
@@ -1772,56 +1908,74 @@ impl FetchedResponse {
             received_at,
             latency,
         } = response;
-        let body = body
-            .sanitize_validated_echo(request, user_id, limits)
-            .map_err(|error| map_source_error(BeaSourceError::Adapter(error)))?;
-        let response_bytes = u64::try_from(body.bytes().len()).map_err(|_| invalid_protocol())?;
-        let request_identity = evidence_digest(request.request_digest());
-        let body_digest = evidence_digest(body.retained_digest());
-        let capture = ProviderCaptureSetReceipt::try_new(
-            metadata.source_id().clone(),
-            metadata.revision().clone(),
-            capture_dataset,
-            request_identity,
-            ProviderCaptureTerminalDisposition::StandaloneResponse,
-            vec![
-                ProviderCapturePageReceipt::try_new(
-                    0,
-                    request_identity,
-                    None,
-                    None,
-                    status,
+        let sanitized = (|| {
+            let body = body
+                .sanitize_validated_echo(request, user_id, limits)
+                .map_err(|error| map_source_error(BeaSourceError::Adapter(error)))?;
+            if u64::try_from(body.bytes().len()).map_err(|_| invalid_protocol())? != response_bytes
+            {
+                return Err(invalid_protocol());
+            }
+            let request_identity = evidence_digest(request.request_digest());
+            let body_digest = evidence_digest(body.retained_digest());
+            let capture = ProviderCaptureSetReceipt::try_new(
+                metadata.source_id().clone(),
+                metadata.revision().clone(),
+                capture_dataset,
+                request_identity,
+                ProviderCaptureTerminalDisposition::StandaloneResponse,
+                vec![
+                    ProviderCapturePageReceipt::try_new(
+                        0,
+                        request_identity,
+                        None,
+                        None,
+                        status,
+                        response_bytes,
+                        body_digest,
+                        received_at,
+                    )
+                    .map_err(map_capture_error)?,
+                ],
+            )
+            .map_err(map_capture_error)?;
+            let received = DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos());
+            let record = RawCaptureRecord::try_new_live(
+                capture_uuid(b"event", &capture),
+                Arc::from(metadata.source_id().as_str()),
+                capture_uuid(b"connection", &capture),
+                Some(0),
+                None,
+                received,
+                body.bytes().clone(),
+            )
+            .map_err(|error| map_source_error(BeaSourceError::RawCapture(error)))?;
+            let material = ProviderCaptureMaterial::try_new(capture, vec![record])
+                .map_err(map_capture_error)?;
+            Ok((body.upstream_digest(), body.retained_digest(), material))
+        })();
+        match sanitized {
+            Ok((upstream_digest, retained_digest, material)) => Ok(SanitizedFetchedResponse {
+                status,
+                retry_after,
+                response_bytes,
+                latency,
+                upstream_digest,
+                retained_digest,
+                material,
+                in_flight,
+            }),
+            Err(error) => {
+                settle_complete_response(
+                    in_flight.take().ok_or_else(invalid_protocol)?,
                     response_bytes,
-                    body_digest,
-                    received_at,
-                )
-                .map_err(map_capture_error)?,
-            ],
-        )
-        .map_err(map_capture_error)?;
-        let received = DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos());
-        let record = RawCaptureRecord::try_new_live(
-            capture_uuid(b"event", &capture),
-            Arc::from(metadata.source_id().as_str()),
-            capture_uuid(b"connection", &capture),
-            Some(0),
-            None,
-            received,
-            body.bytes().clone(),
-        )
-        .map_err(|error| map_source_error(BeaSourceError::RawCapture(error)))?;
-        let material =
-            ProviderCaptureMaterial::try_new(capture, vec![record]).map_err(map_capture_error)?;
-        Ok(SanitizedFetchedResponse {
-            status,
-            retry_after,
-            response_bytes,
-            latency,
-            upstream_digest: body.upstream_digest(),
-            retained_digest: body.retained_digest(),
-            material,
-            in_flight,
-        })
+                    ProviderRateResponseClass::InvalidProviderResponse,
+                    ProviderRateRetryAfterDisposition::parse_http(retry_after.as_deref()),
+                    0,
+                )?;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -1846,13 +2000,70 @@ impl SanitizedFetchedResponse {
             .ok_or_else(invalid_protocol)
     }
 
-    fn record_success(&mut self) -> Result<(), ExtractionSourceError> {
-        self.in_flight
-            .take()
-            .ok_or_else(invalid_protocol)?
-            .record_success()
-            .map_err(Into::into)
+    fn settle_success(&mut self) -> Result<(), ExtractionSourceError> {
+        self.settle(ProviderRateResponseClass::ValidatedSuccess)
     }
+
+    fn settle_parse_error(&mut self, error: &BeaError) -> Result<(), ExtractionSourceError> {
+        self.settle(match error {
+            BeaError::Provider(_) | BeaError::FilteredParameterValuesUnsupported => {
+                ProviderRateResponseClass::ProviderBodyError
+            }
+            BeaError::InvalidCredential
+            | BeaError::InvalidRequest
+            | BeaError::InvalidLimit
+            | BeaError::BodyTooLarge
+            | BeaError::RowLimitExceeded
+            | BeaError::StringLimitExceeded
+            | BeaError::Allocation
+            | BeaError::InvalidJson
+            | BeaError::InvalidField(_)
+            | BeaError::RequestEchoMismatch
+            | BeaError::InvalidDecimal
+            | BeaError::InvalidTimePeriod
+            | BeaError::InvalidRevision => ProviderRateResponseClass::InvalidProviderResponse,
+        })
+    }
+
+    fn settle_invalid_response(&mut self) -> Result<(), ExtractionSourceError> {
+        self.settle(ProviderRateResponseClass::InvalidProviderResponse)
+    }
+
+    fn settle(
+        &mut self,
+        response_class: ProviderRateResponseClass,
+    ) -> Result<(), ExtractionSourceError> {
+        let retry_after = if response_class == ProviderRateResponseClass::InvalidProviderResponse {
+            ProviderRateRetryAfterDisposition::parse_http(self.retry_after.as_deref())
+        } else {
+            ProviderRateRetryAfterDisposition::Absent
+        };
+        settle_complete_response(
+            self.in_flight.take().ok_or_else(invalid_protocol)?,
+            self.response_bytes,
+            response_class,
+            retry_after,
+            0,
+        )
+    }
+}
+
+fn settle_complete_response(
+    in_flight: InFlightExtractionRequest,
+    response_bytes: u64,
+    response_class: ProviderRateResponseClass,
+    retry_after: ProviderRateRetryAfterDisposition,
+    fallback_jitter_sample_basis_points: u16,
+) -> Result<(), ExtractionSourceError> {
+    let settlement = ProviderRateResponseSettlement::try_new(
+        response_bytes,
+        response_class,
+        retry_after,
+        fallback_jitter_sample_basis_points,
+    )
+    .map_err(|_| invalid_protocol())?;
+    let _receipt = in_flight.settle_response(settlement)?;
+    Ok(())
 }
 
 fn validate_metadata_bundle(
