@@ -19,7 +19,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_adapter_schwab::{OAuthLoopbackBounds, SchwabOAuthWireBounds};
 use market_squawk_adapter_treasury::TreasuryFiscalQuery;
@@ -117,6 +117,7 @@ use crate::backtest_strategy::{
     BacktestStrategyCompositionError, production_backtest_strategy_registry,
 };
 use crate::local_product::operations::{SettingsLifecycleAuthority, WorkspaceRestorePolicy};
+use crate::provider_activation::FredPointInTimeReadCapability;
 use crate::provider_activation::nasdaq_reference::NasdaqReferenceUniverseService;
 use crate::provider_onboarding::{
     InstallationSchwabOAuthBrowser, InstallationSchwabOAuthIdentity,
@@ -155,6 +156,7 @@ const SCHWAB_OAUTH_MAXIMUM_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 const SCHWAB_OAUTH_MAXIMUM_CALLBACK_BYTES: usize = 32 * 1024;
 const SCHWAB_OAUTH_MAXIMUM_CALLBACK_HEADERS: usize = 64;
 const SCHWAB_OAUTH_MAXIMUM_CALLBACK_CONNECTIONS: usize = 16;
+const FRED_ANALYTICAL_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct NoActiveSchwabMarketDrain;
@@ -647,7 +649,27 @@ impl LocalProduct {
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?
         {
             DurableActivationRecipeState::Desired(_) => {
-                FredLatestKnownOperation::desired_dataset_unbound()
+                let provider_dataset =
+                    cli_provider::fred_dashboard_provider_dataset(&provider_activation_state)?;
+                let analytical_reader = research.analytical_reader();
+                let capability = FredPointInTimeReadCapability::try_new(
+                    analytical_reader.clone(),
+                    provider_dataset,
+                )
+                .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+                let startup_deadline = Instant::now()
+                    .checked_add(FRED_ANALYTICAL_STARTUP_TIMEOUT)
+                    .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
+                let startup_cancellation = tokio_util::sync::CancellationToken::new();
+                let generation = analytical_reader
+                    .latest(
+                        capability.analytical_dataset(),
+                        startup_deadline,
+                        &startup_cancellation,
+                    )
+                    .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+                FredLatestKnownOperation::try_from_desired_activation(capability, generation)
+                    .map_err(|_error| CliProviderActivationError::StateUnavailable)?
             }
             DurableActivationRecipeState::Missing
             | DurableActivationRecipeState::Staged(_)
