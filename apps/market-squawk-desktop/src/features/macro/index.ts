@@ -17,3 +17,26 @@ export {
   type MacroDashboardObservation,
   type MacroDashboardSourceReadiness,
 } from "./contracts"
+export {
+  FredAlfredLatestKnown,
+  type FredAlfredLatestKnownProps,
+} from "./fred-alfred-latest-known"
+export {
+  FRED_ALFRED_OPERATION,
+  FRED_ALFRED_OPERATION_SCHEMA,
+  FRED_ALFRED_READ_SCHEMA,
+  FRED_ALFRED_SOURCE_ID,
+  FRED_ALFRED_SURFACE_ID,
+  fredAlfredCutoffsSchema,
+  fredAlfredGenerationKey,
+  fredAlfredGenerationSchema,
+  isFredAlfredReadyAvailability,
+  parseFredAlfredAvailability,
+  parseFredAlfredLatestKnownRead,
+  sameFredAlfredGeneration,
+  sameFredAlfredReadyAvailability,
+  type FredAlfredAvailability,
+  type FredAlfredCutoffs,
+  type FredAlfredLatestKnownRead,
+  type FredAlfredReadyAvailability,
+} from "./fred-alfred-latest-known-contracts"

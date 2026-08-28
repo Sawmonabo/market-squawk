@@ -51,12 +51,29 @@ export type SetupPlanSelection = {
   starterPlan: SetupStarterPlan
 }
 
+export type FredAlfredImmutableGeneration = {
+  manifestVersion: string
+  schema: {
+    name: string
+    version: number
+    fingerprint: string
+  }
+  contentHash: string
+}
+
 export type DashboardQuery =
   | { query: "overview" }
   | {
       query: "macroDashboard"
       provider: "federal-reserve-board.data-download-program"
       release: "h15"
+    }
+  | { query: "fredAlfredLatestKnownStatus" }
+  | {
+      query: "fredAlfredLatestKnownRead"
+      generation: FredAlfredImmutableGeneration
+      knowledgeCutoff: string
+      effectiveDateCutoff: string
     }
   | { query: "lookup"; text: string; categories?: string[] }
   | { query: "marketSnapshot" | "marketQuality" | "marketUnifiedFeed" }
