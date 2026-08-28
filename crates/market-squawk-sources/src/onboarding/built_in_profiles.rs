@@ -25,6 +25,8 @@ const SECOND_NANOS: u64 = 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
 const HOUR_NANOS: u64 = 60 * MINUTE_NANOS;
 const DAY_NANOS: u64 = 86_400 * SECOND_NANOS;
+const SCHWAB_MARKET_DATA_DOCTOR_ATTEMPTS: u32 = 20;
+const SCHWAB_MARKET_DATA_DOCTOR_WINDOW_NANOS: u64 = 15 * MINUTE_NANOS;
 const LEGACY_REPORT_DIGEST: EvidenceDigest = EvidenceDigest::new(
     DigestAlgorithm::Sha256,
     [
@@ -112,6 +114,7 @@ const FRED_PROFILE: &str = FRED_ALFRED_API_SURFACE_ID;
 const ALPACA_BASIC_PROFILE: &str = "alpaca.basic-market-data";
 const NASDAQ_REFERENCE_PROFILE: &str = "nasdaq-trader-symbol-directory-reference";
 const SCHWAB_MARKET_DATA_PROFILE: &str = "schwab.trader-api-market-data";
+const SCHWAB_USER_PREFERENCE_PROBE_URL: &str = "https://api.schwabapi.com/trader/v1/userPreference";
 const YAHOO_ENRICHMENT_PROFILE: &str = "yahoo-finance.experimental-enrichment";
 const IEX_HIST_PROFILE: &str = "iex.hist-feed-files";
 const OCC_REFERENCE_PROFILE: &str = "occ.options-reference";
@@ -997,7 +1000,8 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             LEGACY_REPORT_DIGEST,
             built_in_budget(&spec, false)?,
             spec.probe.transport() != ProbeTransport::Local
-                && spec.id != FEDERAL_RESERVE_BOARD_PROFILE,
+                && spec.id != FEDERAL_RESERVE_BOARD_PROFILE
+                && spec.id != SCHWAB_MARKET_DATA_PROFILE,
         )?,
         historical_rights_state,
     )?;
@@ -1178,6 +1182,44 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             vec![legacy_capability, revision_two, revision_three],
             current,
         )
+    } else if spec.id == SCHWAB_MARKET_DATA_PROFILE {
+        // Preserve revision three's local-placeholder policy exactly. Revision four binds the
+        // network User Preference bootstrap and the complete twenty-attempt entitlement doctor to
+        // one conservative application/account budget without presenting it as a Schwab limit.
+        let revision_three = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(3)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(spec.rate_policy)?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(2)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, false)?,
+                false,
+            )?,
+        )?;
+        let current = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(4)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(3)?,
+                SourceIdentifier::try_from("schwab.trader-api-market-data.entitlement-doctor.v1")?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, true)?,
+                true,
+            )?,
+        )?;
+        (
+            vec![legacy_capability, revision_two, revision_three],
+            current,
+        )
     } else if spec.id == ALPACA_BASIC_PROFILE {
         // Preserve the exact revision-three provider-fact budget. Revision four separates that
         // 200/min historical fact from Market Squawk's 150/min application ceiling and requires
@@ -1318,6 +1360,7 @@ fn build_capability_with_rights_state(
                 || (spec.id == TREASURY_FISCAL_PROFILE && revision.get() >= 4)
                 || (spec.id == FEDERAL_RESERVE_BOARD_PROFILE && revision.get() >= 4)
                 || (spec.id == ALPACA_BASIC_PROFILE && revision.get() >= 4)
+                || (spec.id == SCHWAB_MARKET_DATA_PROFILE && revision.get() >= 4)
             {
                 2
             } else {
@@ -1469,6 +1512,8 @@ fn current_rate_policy(spec: &BuiltInSpec) -> &'static str {
         "fred-alfred.api-v1-v2.rate-policy.v2"
     } else if spec.id == ALPACA_BASIC_PROFILE {
         "alpaca.basic-market-data.account-rate-policy.v2"
+    } else if spec.id == SCHWAB_MARKET_DATA_PROFILE {
+        "schwab.trader-api-market-data.application-account-rate-policy.v1"
     } else if spec.id == FEDERAL_RESERVE_BOARD_PROFILE {
         "federal-reserve-board.data-download-program.rate-policy.v1"
     } else {
@@ -1534,16 +1579,31 @@ fn built_in_budget(
             1,
             backoff,
         ),
-        // These refresh-required profiles use local non-network probes. Their one-per-minute
-        // placeholder budgets are not recurring provider capacity and confer no network authority.
-        SCHWAB_MARKET_DATA_PROFILE => simple_budget(
-            "schwab-trader-api",
-            Some("schwab.trader-api.account-template"),
-            1,
-            MINUTE_NANOS,
-            1,
-            backoff,
-        ),
+        SCHWAB_MARKET_DATA_PROFILE => {
+            // Revision three retains its one-per-minute local-placeholder budget. The current
+            // twenty-per-fifteen-minute ceiling is Market Squawk application policy, not a
+            // provider-published Schwab limit. Single flight plus 429/Retry-After feedback keeps
+            // the complete bounded doctor inside one shared account scope.
+            simple_budget(
+                "schwab-trader-api",
+                Some("schwab.trader-api.account-template"),
+                if current_revision {
+                    SCHWAB_MARKET_DATA_DOCTOR_ATTEMPTS
+                } else {
+                    1
+                },
+                if current_revision {
+                    SCHWAB_MARKET_DATA_DOCTOR_WINDOW_NANOS
+                } else {
+                    MINUTE_NANOS
+                },
+                1,
+                backoff,
+            )
+        }
+        // These remaining refresh-required profiles use local non-network probes. Their
+        // one-per-minute placeholder budgets are not recurring provider capacity and confer no
+        // network authority.
         YAHOO_ENRICHMENT_PROFILE => simple_budget(
             "yahoo-finance-experimental",
             None,
@@ -1902,27 +1962,31 @@ fn schwab_market_data() -> Result<BuiltInSpec, ProviderProfileError> {
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("schwab.market-data.read"),
         permissions: &["market-data.read", "streamer-bootstrap.read"],
-        coverage: "Optional owner-enabled target for Schwab Trader API market-data REST quotes, price history, option and expiration chains, movers, market hours, instruments/reference data, and one Streamer connection carrying selected level-one, named-book, chart, and screener services; source semantics remain provider/service-specific and never imply SIP, NBBO, OPRA, consolidated depth, account access, or execution; the provider-native read-only REST, Streamer, OAuth-contract, and bounded HTTP/WebSocket transport core is present, while application-owned OAuth callback/token persistence, entitlement doctor, activation binding, raw/canonical publication, PIT typed reads, product composition, and restart/release proof remain absent",
+        coverage: "Optional owner-enabled target for Schwab Trader API market-data REST quotes, price history, option and expiration chains, movers, market hours, instruments/reference data, and one Streamer connection carrying selected level-one, named-book, chart, and screener services; source semantics remain provider/service-specific and never imply SIP, NBBO, OPRA, consolidated depth, account access, or execution; the provider-native read-only REST/Streamer core, protected OAuth lifecycle, exact User Preference bootstrap, and bounded twenty-attempt entitlement doctor authority are present, while complete activation-to-publication binding, PIT typed reads, product composition, and restart/release proof remain incomplete",
         quality: DataQuality::DirectUnverified,
-        probe: VerificationProbe::local(
-            "Schwab's provider-native REST, Streamer, OAuth-contract, and bounded transport core is installed, but application-owned OAuth/token authority, bounded entitlement doctor, activation, publication, PIT read, and product proof are not; activation remains refresh_required",
-        ),
+        probe: VerificationProbe::network(
+            ProbeTransport::HttpGet,
+            SCHWAB_USER_PREFERENCE_PROBE_URL,
+            None,
+        )?,
         rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
         duties: &[
-            "import only the application key and secret pair; authorization codes, access tokens, and refresh tokens may enter only the application-owned protected OAuth/token authority that still requires composition",
+            "import only the application key and secret pair; authorization codes, access tokens, and refresh tokens may enter only the application-owned protected OAuth/token authority",
             "use the exact code-owned https://127.0.0.1:8182 callback and never accept an operator-supplied provider endpoint",
             "allowlist only market-data routes plus trader/v1/userPreference fields required for Streamer bootstrap; never admit account, position, order, or trading authority",
             "retain Schwab endpoint or Streamer service, provider symbol, named venue/book, account realm, event and receive clocks, sequence, reconnect, and delay or indicative fields",
-            "admit at most one Streamer connection; no recurring REST budget or numeric symbol ceiling exists until measured runtime evidence is frozen",
+            "admit at most one Streamer connection and one provider attempt in flight across the application/account scope",
+            "enforce the Market Squawk ceiling of twenty provider attempts per fifteen minutes for the exact User Preference plus seven REST plus twelve Streamer doctor probes; this is not a provider-published Schwab limit",
+            "refresh shared capacity on HTTP 429, honor valid server Retry-After feedback, and lower admission from refusals, partial returns, latency, bytes, acknowledgements, and queue pressure",
         ],
         persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
-        rotation: "after application-owned token authority is composed, rotate the provider application secret or seven-day refresh-token generation atomically in protected provider state",
+        rotation: "rotate the provider application secret or seven-day refresh-token generation atomically in application-owned protected provider state",
         revocation: "revoke the Schwab application or token remotely, then delete the exact local secret and token generations",
         recovery: REFRESH_RECOVERY,
         evidence: SCHWAB_MARKET_DATA_EVIDENCE,
         rate_policy: "schwab.trader-api-market-data.pending-rate-policy.v1",
         refresh_trigger: "SCHWAB-TRADER-API-MARKET-DATA",
-        handoff_instruction: "Import the configured Schwab application key and secret pair only. The provider-native read-only core and transports are present; the profile remains unavailable until application-owned OAuth/token lifecycle, bounded entitlement doctor, activation binding, canonical publication, PIT reads, product composition, and restart/release proof are implemented.",
+        handoff_instruction: "Import the configured Schwab application key and secret pair, complete provider-controlled OAuth authorization, then run the code-owned User Preference bootstrap and bounded entitlement doctor. The profile remains unavailable until complete activation-to-publication binding, PIT reads, product composition, and restart/release proof are delivered.",
     })
 }
 
