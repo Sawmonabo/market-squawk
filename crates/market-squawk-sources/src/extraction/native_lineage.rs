@@ -43,6 +43,8 @@ pub enum ProviderNativeLineageImplementation {
     EiaSeriesV1,
     /// Kraken Spot public market-data semantics encoder v1.
     KrakenSpotV1,
+    /// SEC EDGAR submissions, Company Facts, and filing-XBRL semantics encoder v1.
+    SecEdgarV1,
     /// Schwab REST market-data response semantics encoder v1.
     SchwabRestMarketDataV1,
     /// Schwab Streamer market-data frame semantics encoder v1.
@@ -72,6 +74,7 @@ impl ProviderNativeLineageImplementation {
             }
             Self::EiaSeriesV1 => b"market-squawk/eia/provider-native-lineage/v1",
             Self::KrakenSpotV1 => b"market-squawk/kraken-spot/provider-native-lineage/v1",
+            Self::SecEdgarV1 => b"market-squawk/sec-edgar/provider-native-lineage/v1",
             Self::SchwabRestMarketDataV1 => {
                 b"market-squawk/schwab-rest-market-data/provider-native-lineage/v1"
             }
@@ -96,6 +99,7 @@ impl ProviderNativeLineageImplementation {
             Self::CoinbaseExchangeDirectV1 => 18,
             Self::EiaSeriesV1 => 4,
             Self::KrakenSpotV1 => 19,
+            Self::SecEdgarV1 => 8,
             Self::SchwabRestMarketDataV1 => 14,
             Self::SchwabStreamerMarketDataV1 => 15,
             Self::TiingoFundNavV1 => 6,

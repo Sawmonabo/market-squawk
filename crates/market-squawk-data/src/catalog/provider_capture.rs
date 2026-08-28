@@ -1610,6 +1610,7 @@ pub(super) const fn native_implementation_name(
         }
         ProviderNativeLineageImplementation::EiaSeriesV1 => "eia_series_v1",
         ProviderNativeLineageImplementation::KrakenSpotV1 => "kraken_spot_v1",
+        ProviderNativeLineageImplementation::SecEdgarV1 => "sec_edgar_v1",
         ProviderNativeLineageImplementation::AlpacaHistoricalBarV1 => "alpaca_historical_bar_v1",
         ProviderNativeLineageImplementation::SchwabRestMarketDataV1 => "schwab_rest_market_data_v1",
         ProviderNativeLineageImplementation::SchwabStreamerMarketDataV1 => {
@@ -1636,6 +1637,7 @@ pub(super) fn parse_native_implementation(
         }
         "eia_series_v1" => Ok(ProviderNativeLineageImplementation::EiaSeriesV1),
         "kraken_spot_v1" => Ok(ProviderNativeLineageImplementation::KrakenSpotV1),
+        "sec_edgar_v1" => Ok(ProviderNativeLineageImplementation::SecEdgarV1),
         "alpaca_historical_bar_v1" => {
             Ok(ProviderNativeLineageImplementation::AlpacaHistoricalBarV1)
         }

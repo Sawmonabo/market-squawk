@@ -14,6 +14,12 @@ use market_squawk_domain::{
     ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
     RevisionNumber, SchemaVersion, SourceId, SourceIdentifier, Timestamp, XbrlPeriod,
 };
+use market_squawk_sources::{
+    ExtractionBatch, ProviderNativeLineageBatch, ProviderNativeLineageBatchBuilder,
+    ProviderNativeLineageError, ProviderNativeLineageImplementation,
+};
+use serde::ser::SerializeSeq as _;
+use serde::{Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +43,8 @@ pub struct SecXbrlNativeLineage {
     availability: AvailabilityEvidence,
     received_at: Timestamp,
     ingested_at: Timestamp,
+    numeric_fact_count: usize,
+    numeric_occurrence_ids: Vec<SourceIdentifier>,
     nonnumeric_occurrences: Vec<XbrlNonnumericOccurrence>,
     total_retained_bytes: u64,
 }
@@ -77,10 +85,152 @@ impl SecXbrlNativeLineage {
         &self.nonnumeric_occurrences
     }
 
+    /// Converts this complete filing handoff into the shared bounded native-lineage contract.
+    ///
+    /// Each numeric row carries the exact canonical XBRL observation JSON because that canonical
+    /// value already contains the complete provider occurrence evidence. The sidecar separately
+    /// retains the filing, availability, taxonomy, nil, and nonnumeric occurrence semantics that
+    /// cannot be represented as numeric facts.
+    pub(crate) fn try_into_provider_native_lineage(
+        self,
+        batch: &ExtractionBatch,
+    ) -> Result<ProviderNativeLineageBatch, ProviderNativeLineageError> {
+        if batch.records().len() != self.numeric_fact_count
+            || self.numeric_occurrence_ids.len() != self.numeric_fact_count
+        {
+            return Err(ProviderNativeLineageError::AlignmentMismatch);
+        }
+        let mut native_lineage = ProviderNativeLineageBatchBuilder::try_new(
+            ProviderNativeLineageImplementation::SecEdgarV1,
+            batch,
+        )?;
+        native_lineage.try_set_batch_sidecar(&SecFilingXbrlNativeBatchV1 {
+            version: 1,
+            family: "filing_xbrl",
+            dataset: &self.dataset,
+            filing: SecFilingXbrlCoordinatesV1::from_filing(&self.filing),
+            taxonomy: SecXbrlTaxonomyV1 {
+                version: self.taxonomy.version(),
+                artifact_set: self.taxonomy.artifact_set(),
+                fingerprint: self.taxonomy.fingerprint(),
+            },
+            nonnumeric_occurrences: SecXbrlNonnumericOccurrencesV1(&self.nonnumeric_occurrences),
+        })?;
+        for (occurrence_id, record) in self.numeric_occurrence_ids.iter().zip(batch.records()) {
+            if filing_fact_source_identifier(&self.dataset, occurrence_id)
+                .ok()
+                .as_ref()
+                != Some(record.revision())
+            {
+                return Err(ProviderNativeLineageError::AlignmentMismatch);
+            }
+            native_lineage.try_push(&SecFilingXbrlNativeRowV1 {
+                family: "numeric_fact",
+                occurrence_id,
+            })?;
+        }
+        native_lineage.finish()
+    }
+
     /// Returns the checked conservative deep-retained size of this complete native handoff.
     pub const fn total_retained_bytes(&self) -> u64 {
         self.total_retained_bytes
     }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecFilingXbrlNativeBatchV1<'a> {
+    version: u16,
+    family: &'static str,
+    dataset: &'a SourceIdentifier,
+    filing: SecFilingXbrlCoordinatesV1<'a>,
+    taxonomy: SecXbrlTaxonomyV1<'a>,
+    nonnumeric_occurrences: SecXbrlNonnumericOccurrencesV1<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecFilingXbrlCoordinatesV1<'a> {
+    cik: &'a str,
+    accession: &'a SourceIdentifier,
+    document: &'a SourceIdentifier,
+    filing_form: &'a SourceIdentifier,
+    filed_on: CalendarDate,
+    report_date: Option<CalendarDate>,
+    filing_size_bytes: Option<u64>,
+    is_inline_xbrl: bool,
+    accepted_at: Option<Timestamp>,
+    acceptance_evidence: Option<&'a SourceIdentifier>,
+}
+
+impl<'a> SecFilingXbrlCoordinatesV1<'a> {
+    fn from_filing(filing: &'a SecFilingXbrlCoordinates) -> Self {
+        Self {
+            cik: filing.cik(),
+            accession: filing.accession(),
+            document: filing.document(),
+            filing_form: filing.filing_form(),
+            filed_on: filing.filed_on(),
+            report_date: filing.report_date(),
+            filing_size_bytes: filing.filing_size_bytes(),
+            is_inline_xbrl: filing.is_inline_xbrl(),
+            accepted_at: filing.acceptance().map(|value| value.accepted_at()),
+            acceptance_evidence: filing.acceptance().map(|value| value.evidence()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecXbrlTaxonomyV1<'a> {
+    version: &'a SourceIdentifier,
+    artifact_set: EvidenceDigest,
+    fingerprint: EvidenceDigest,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecFilingXbrlNativeRowV1<'a> {
+    family: &'static str,
+    occurrence_id: &'a SourceIdentifier,
+}
+
+struct SecXbrlNonnumericOccurrencesV1<'a>(&'a [XbrlNonnumericOccurrence]);
+
+impl Serialize for SecXbrlNonnumericOccurrencesV1<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for occurrence in self.0 {
+            sequence.serialize_element(&SecXbrlNonnumericOccurrenceV1 {
+                occurrence_id: occurrence.occurrence_id(),
+                accession: occurrence.accession(),
+                concept: occurrence.concept(),
+                context_id: occurrence.context_id(),
+                lexical_value: occurrence.lexical_value(),
+                nil: occurrence.is_nil(),
+                source_payload: occurrence.source_payload(),
+                occurrence_relationships: occurrence.occurrence_relationships(),
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecXbrlNonnumericOccurrenceV1<'a> {
+    occurrence_id: &'a SourceIdentifier,
+    accession: &'a SourceIdentifier,
+    concept: &'a market_squawk_domain::XbrlQualifiedName,
+    context_id: &'a SourceIdentifier,
+    lexical_value: &'a market_squawk_domain::XbrlText,
+    nil: bool,
+    source_payload: &'a market_squawk_domain::ExactPayloadEvidence,
+    occurrence_relationships: &'a market_squawk_domain::XbrlOccurrenceRelationships,
 }
 
 /// Numeric canonical observations paired indivisibly with native nonnumeric lineage.
@@ -99,6 +249,8 @@ pub(crate) struct SecFilingXbrlNormalization {
     occurrence_ruleset: SourceIdentifier,
     numeric_facts: std::vec::IntoIter<crate::XbrlNumericFact>,
     ordinals: std::vec::IntoIter<FamilyOrdinal>,
+    numeric_fact_count: usize,
+    numeric_occurrence_ids: Vec<SourceIdentifier>,
     nonnumeric_occurrences: Vec<XbrlNonnumericOccurrence>,
     native_lineage_retained_bytes: u64,
 }
@@ -121,6 +273,14 @@ impl SecFilingXbrlNormalization {
             .ordinals
             .next()
             .ok_or(SecNormalizationError::XbrlDocumentBindingMismatch)?;
+        let numeric_index = self
+            .numeric_fact_count
+            .checked_sub(self.numeric_facts.len())
+            .and_then(|processed| processed.checked_sub(1))
+            .ok_or(SecNormalizationError::XbrlDocumentBindingMismatch)?;
+        if self.numeric_occurrence_ids.get(numeric_index) != Some(fact.evidence().occurrence_id()) {
+            return Err(SecNormalizationError::XbrlDocumentBindingMismatch);
+        }
         let (concept, unit, value, evidence) = fact.into_parts();
         let period = fundamental_period(evidence.period())?;
         let source_identifier =
@@ -198,6 +358,8 @@ impl SecFilingXbrlNormalization {
             availability: self.availability,
             received_at: self.received_at,
             ingested_at: self.ingested_at,
+            numeric_fact_count: self.numeric_fact_count,
+            numeric_occurrence_ids: self.numeric_occurrence_ids,
             nonnumeric_occurrences: self.nonnumeric_occurrences,
             total_retained_bytes: self.native_lineage_retained_bytes,
         })
@@ -318,8 +480,27 @@ pub(crate) fn normalize_filing_xbrl_with_cancellation(
     check_cancelled(cancellation)?;
     ordinals.sort_unstable_by_key(|assignment| assignment.original_index);
     check_cancelled(cancellation)?;
+    let mut numeric_occurrence_ids = Vec::new();
+    numeric_occurrence_ids
+        .try_reserve_exact(document.numeric_facts().len())
+        .map_err(|_| SecNormalizationError::AllocationFailed)?;
+    for fact in document.numeric_facts() {
+        check_cancelled(cancellation)?;
+        numeric_occurrence_ids.push(fact.evidence().occurrence_id().clone());
+    }
+    let numeric_occurrence_id_bytes = numeric_occurrence_ids
+        .capacity()
+        .checked_mul(size_of::<SourceIdentifier>())
+        .and_then(|bytes| {
+            numeric_occurrence_ids
+                .iter()
+                .try_fold(bytes, |total, id| total.checked_add(id.retained_bytes()))
+        })
+        .ok_or(SecNormalizationError::AllocationFailed)?;
+    check_cancelled(cancellation)?;
     let (numeric_facts, nonnumeric_occurrences, retained_output_upper_bound) =
         document.into_families();
+    let numeric_fact_count = numeric_facts.len();
     let nonnumeric_slot_bytes = nonnumeric_occurrences
         .capacity()
         .checked_mul(size_of::<XbrlNonnumericOccurrence>())
@@ -333,6 +514,7 @@ pub(crate) fn normalize_filing_xbrl_with_cancellation(
         &taxonomy,
         &availability,
         retained_output_upper_bound,
+        numeric_occurrence_id_bytes,
         nonnumeric_slot_bytes,
     )?;
     Ok(SecFilingXbrlNormalization {
@@ -349,6 +531,8 @@ pub(crate) fn normalize_filing_xbrl_with_cancellation(
         occurrence_ruleset: SourceIdentifier::try_from(SEC_XBRL_OCCURRENCE_ORDER_RULESET)?,
         numeric_facts: numeric_facts.into_iter(),
         ordinals: ordinals.into_iter(),
+        numeric_fact_count,
+        numeric_occurrence_ids,
         nonnumeric_occurrences,
         native_lineage_retained_bytes,
     })
@@ -360,6 +544,7 @@ fn checked_native_lineage_retained_bytes(
     taxonomy: &SecValidatedXbrlTaxonomySet,
     availability: &AvailabilityEvidence,
     parser_retained_output_upper_bound: usize,
+    numeric_occurrence_id_bytes: usize,
     nonnumeric_slot_bytes: usize,
 ) -> Result<u64, SecNormalizationError> {
     let availability_dynamic = match availability {
@@ -369,6 +554,7 @@ fn checked_native_lineage_retained_bytes(
     };
     let retained = size_of::<SecXbrlNativeLineage>()
         .checked_add(parser_retained_output_upper_bound)
+        .and_then(|bytes| bytes.checked_add(numeric_occurrence_id_bytes))
         .and_then(|bytes| bytes.checked_add(nonnumeric_slot_bytes))
         .and_then(|bytes| bytes.checked_add(dataset.retained_bytes()))
         .and_then(|bytes| bytes.checked_add(filing.checked_dynamic_retained_bytes()?))
@@ -475,13 +661,7 @@ pub fn normalize_filings_with_cancellation(
         .try_reserve(retrieved.document().filings().len())
         .map_err(|_| SecNormalizationError::AllocationFailed)?;
     ordered.extend(retrieved.document().filings().iter());
-    ordered.sort_by_key(|filing| {
-        (
-            filing.report_date().unwrap_or(filing.filed_on()),
-            filing.filed_on(),
-            filing.accession().as_str().to_owned(),
-        )
-    });
+    ordered.sort_by(|left, right| compare_filings(left, right));
     let mut family_revisions = BTreeMap::<(String, String), u32>::new();
     let mut observations = Vec::new();
     observations
@@ -681,7 +861,18 @@ pub fn normalize_company_facts_with_cancellation(
     Ok(observations)
 }
 
-fn compare_company_facts(left: &CompanyFactOccurrence, right: &CompanyFactOccurrence) -> Ordering {
+pub(crate) fn compare_filings(left: &SecFiling, right: &SecFiling) -> Ordering {
+    left.report_date()
+        .unwrap_or(left.filed_on())
+        .cmp(&right.report_date().unwrap_or(right.filed_on()))
+        .then_with(|| left.filed_on().cmp(&right.filed_on()))
+        .then_with(|| left.accession().cmp(right.accession()))
+}
+
+pub(crate) fn compare_company_facts(
+    left: &CompanyFactOccurrence,
+    right: &CompanyFactOccurrence,
+) -> Ordering {
     left.concept()
         .cmp(right.concept())
         .then_with(|| left.unit().cmp(right.unit()))

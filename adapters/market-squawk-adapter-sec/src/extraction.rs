@@ -19,19 +19,23 @@ use market_squawk_sources::{
     ExtractionRecord, ExtractionRequest, ExtractionRevisionEvidence, ExtractionRevisionPlan,
     ExtractionSource, ExtractionSourceError, MAX_EXTRACTION_RECORD_BYTES,
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, ObservedProviderOrder, ProviderCaptureMaterial,
-    SourceError, SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
+    ProviderNativeLineageBatch, ProviderNativeLineageBatchBuilder,
+    ProviderNativeLineageImplementation, SourceError, SourceMetadataProvider, SourceObject,
+    SourceObjectCaptureIdentity,
 };
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::normalize::SecXbrlNativeLineage;
+use crate::normalize::{compare_company_facts, compare_filings};
 use crate::product::{SEC_FILING_XBRL_DATASET_PREFIX, SecFilingXbrlCoordinates};
 use crate::xbrl::{SecPendingValidatedXbrlTaxonomySet, SecXbrlTaxonomyRegistry};
 use crate::{
-    RawEvidenceStore, RetrievedCompanyFacts, RetrievedSecBytes, RetrievedSubmissions,
-    SecClientError, SecCompositeBounds, SecEdgarSource, SecNormalizationError, SecObjectLocator,
-    SecParserError, SecParserLimits, SecRepresentation, SecResearchDataset, SecResearchDatasetKind,
-    normalize_company_facts_with_cancellation, normalize_filings_with_cancellation,
+    CompanyFactOccurrence, RawEvidenceStore, RetrievedCompanyFacts, RetrievedSecBytes,
+    RetrievedSubmissions, SecClientError, SecCompositeBounds, SecEdgarSource, SecFiling,
+    SecNormalizationError, SecObjectLocator, SecParserError, SecParserLimits, SecRepresentation,
+    SecResearchDataset, SecResearchDatasetKind, normalize_company_facts_with_cancellation,
+    normalize_filings_with_cancellation,
 };
 
 const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v3";
@@ -44,26 +48,7 @@ const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v3";
 pub struct SecExtractionResult {
     batch: ExtractionBatch,
     company_identity: Option<CompanyIdentityObservation>,
-    native_lineage: SecNativeLineageBatch,
-}
-
-/// Provider-native evidence that has no lossless canonical research-observation representation.
-#[derive(Debug, Eq, PartialEq)]
-pub enum SecNativeLineageBatch {
-    /// The selected SEC family produced no separate provider-native lineage.
-    None,
-    /// Mandatory nil and nonnumeric occurrence lineage from one filing XBRL document.
-    FilingXbrl(SecXbrlNativeLineage),
-}
-
-impl SecNativeLineageBatch {
-    /// Returns the checked conservative deep-retained size of the provider-native sidecar.
-    pub const fn total_retained_bytes(&self) -> u64 {
-        match self {
-            Self::None => 0,
-            Self::FilingXbrl(lineage) => lineage.total_retained_bytes(),
-        }
-    }
+    native_lineage: ProviderNativeLineageBatch,
 }
 
 /// Indivisible SEC discovery handoff containing one source object and its exact HTTP body set.
@@ -216,7 +201,7 @@ impl SecExtractionResult {
     }
 
     /// Returns mandatory provider-native lineage beside the canonical batch.
-    pub const fn native_lineage(&self) -> &SecNativeLineageBatch {
+    pub const fn native_lineage(&self) -> &ProviderNativeLineageBatch {
         &self.native_lineage
     }
 
@@ -226,7 +211,7 @@ impl SecExtractionResult {
     ) -> (
         ExtractionBatch,
         Option<CompanyIdentityObservation>,
-        SecNativeLineageBatch,
+        ProviderNativeLineageBatch,
     ) {
         (self.batch, self.company_identity, self.native_lineage)
     }
@@ -550,7 +535,7 @@ fn extract_blocking(
     let ingested_at = crate::client::system_timestamp()?;
     let dataset = SecResearchDataset::try_from_identifier(request.object().dataset())
         .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
-    let (observations, company_identity, native_lineage) = match dataset.kind() {
+    let (batch, company_identity, native_lineage) = match dataset.kind() {
         SecResearchDatasetKind::Submissions => {
             let retrieved = crate::composite::restore_online_submissions(
                 &raw_store,
@@ -574,11 +559,9 @@ fn extract_blocking(
                 ingested_at,
                 cancellation,
             )?;
-            (
-                observations,
-                Some(company_identity),
-                SecNativeLineageBatch::None,
-            )
+            let batch = canonical_batch(&request, observations, &authority, cancellation)?;
+            let native_lineage = submissions_native_lineage(&request, &retrieved, &batch)?;
+            (batch, Some(company_identity), native_lineage)
         }
         SecResearchDatasetKind::CompanyFacts => {
             let retrieved = RetrievedCompanyFacts::restored(
@@ -603,19 +586,31 @@ fn extract_blocking(
                 ingested_at,
                 cancellation,
             )?;
-            (
-                observations,
-                Some(company_identity),
-                SecNativeLineageBatch::None,
-            )
+            let batch = canonical_batch(&request, observations, &authority, cancellation)?;
+            let native_lineage = company_facts_native_lineage(&request, &retrieved, &batch)?;
+            (batch, Some(company_identity), native_lineage)
         }
         SecResearchDatasetKind::FilingXbrl => {
             return Err(SecClientError::InvalidCompositeRepresentation);
         }
     };
     authority.validate_current()?;
+    Ok(SecExtractionResult {
+        batch,
+        company_identity,
+        native_lineage,
+    })
+}
+
+fn canonical_batch(
+    request: &ExtractionRequest,
+    observations: Vec<ResearchObservation>,
+    authority: &ExtractionAuthority,
+    cancellation: &CancellationToken,
+) -> Result<ExtractionBatch, SecClientError> {
+    authority.validate_current()?;
     let mut records =
-        ExtractionBatchAccumulator::try_new(&request).map_err(map_extraction_contract_error)?;
+        ExtractionBatchAccumulator::try_new(request).map_err(map_extraction_contract_error)?;
     for observation in observations {
         authority.validate_current()?;
         if cancellation.is_cancelled() {
@@ -623,9 +618,9 @@ fn extract_blocking(
         }
         records
             .push(canonical_record(
-                &request,
+                request,
                 observation,
-                &authority,
+                authority,
                 cancellation,
             )?)
             .map_err(map_extraction_contract_error)?;
@@ -633,11 +628,134 @@ fn extract_blocking(
     authority.validate_current()?;
     let batch = records.finish().map_err(map_extraction_contract_error)?;
     authority.validate_current()?;
-    Ok(SecExtractionResult {
+    Ok(batch)
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecSubmissionsNativeBatchV1<'a> {
+    version: u16,
+    family: &'static str,
+    dataset: &'a SourceIdentifier,
+    cik: &'a SourceIdentifier,
+    company_metadata: &'a crate::SecSubmissionCompanyMetadata,
+    companion_files: &'a [SourceIdentifier],
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecSubmissionsNativeRowV1<'a> {
+    family: &'static str,
+    filing: &'a SecFiling,
+}
+
+fn submissions_native_lineage(
+    request: &ExtractionRequest,
+    retrieved: &RetrievedSubmissions,
+    batch: &ExtractionBatch,
+) -> Result<ProviderNativeLineageBatch, SecClientError> {
+    let document = retrieved.document();
+    if document.filings().len() != batch.records().len() {
+        return Err(SecClientError::InvalidCompositeRepresentation);
+    }
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(document.filings().len())
+        .map_err(|_| SecClientError::AllocationFailed)?;
+    ordered.extend(document.filings());
+    ordered.sort_by(|left, right| compare_filings(left, right));
+    if ordered
+        .iter()
+        .zip(batch.records())
+        .any(|(filing, record)| record.revision() != filing.accession())
+    {
+        return Err(SecClientError::InvalidCompositeRepresentation);
+    }
+    let mut native_lineage = ProviderNativeLineageBatchBuilder::try_new(
+        ProviderNativeLineageImplementation::SecEdgarV1,
         batch,
-        company_identity,
-        native_lineage,
-    })
+    )
+    .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    native_lineage
+        .try_set_batch_sidecar(&SecSubmissionsNativeBatchV1 {
+            version: 1,
+            family: "submissions",
+            dataset: request.object().dataset(),
+            cik: document.cik(),
+            company_metadata: document.company_metadata(),
+            companion_files: document.companion_files(),
+        })
+        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    for filing in ordered {
+        native_lineage
+            .try_push(&SecSubmissionsNativeRowV1 {
+                family: "filing",
+                filing,
+            })
+            .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    }
+    native_lineage
+        .finish()
+        .map_err(|_| SecClientError::InvalidCompositeRepresentation)
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecCompanyFactsNativeBatchV1<'a> {
+    version: u16,
+    family: &'static str,
+    dataset: &'a SourceIdentifier,
+    cik: &'a SourceIdentifier,
+    entity_name: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecCompanyFactsNativeRowV1<'a> {
+    family: &'static str,
+    occurrence: &'a CompanyFactOccurrence,
+}
+
+fn company_facts_native_lineage(
+    request: &ExtractionRequest,
+    retrieved: &RetrievedCompanyFacts,
+    batch: &ExtractionBatch,
+) -> Result<ProviderNativeLineageBatch, SecClientError> {
+    let document = retrieved.document();
+    if document.occurrences().len() != batch.records().len() {
+        return Err(SecClientError::InvalidCompositeRepresentation);
+    }
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(document.occurrences().len())
+        .map_err(|_| SecClientError::AllocationFailed)?;
+    ordered.extend(document.occurrences());
+    ordered.sort_unstable_by(|left, right| compare_company_facts(left, right));
+    let mut native_lineage = ProviderNativeLineageBatchBuilder::try_new(
+        ProviderNativeLineageImplementation::SecEdgarV1,
+        batch,
+    )
+    .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    native_lineage
+        .try_set_batch_sidecar(&SecCompanyFactsNativeBatchV1 {
+            version: 1,
+            family: "company_facts",
+            dataset: request.object().dataset(),
+            cik: document.cik(),
+            entity_name: document.entity_name(),
+        })
+        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    for occurrence in ordered {
+        native_lineage
+            .try_push(&SecCompanyFactsNativeRowV1 {
+                family: "company_fact",
+                occurrence,
+            })
+            .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    }
+    native_lineage
+        .finish()
+        .map_err(|_| SecClientError::InvalidCompositeRepresentation)
 }
 
 fn company_identity_from_submissions(
