@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
 use market_squawk_adapter_fred::FredSource;
 use market_squawk_data::{
-    AnalyticalMacroLatestKnownRequest, AnalyticalMacroSeriesAllowlist, AnalyticalReadCapability,
-    AnalyticalReadError, DatasetId, DatasetManifestRef, QueryError, QueryLimits,
+    AnalyticalGeneration, AnalyticalMacroLatestKnownRequest, AnalyticalMacroSeriesAllowlist,
+    AnalyticalReadCapability, AnalyticalReadError, DatasetId, DatasetManifestRef, QueryError,
+    QueryLimits,
 };
 use market_squawk_domain::{
     CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest, MacroObservation, PayloadReference,
@@ -98,6 +99,24 @@ impl FredPointInTimeReadCapability {
     /// Returns the exact immutable analytical dataset expected by this application read.
     pub const fn analytical_dataset(&self) -> &DatasetId {
         &self.analytical_dataset
+    }
+
+    /// Validates and freezes one complete immutable generation for this exact activation dataset.
+    ///
+    /// Application startup must resolve the generation through [`AnalyticalReadCapability`] and
+    /// pass it here before exposing a ready operation. A manifest alone cannot establish its
+    /// retained source owner, so both the generation's source and dataset are checked before the
+    /// complete manifest identity is cloned into the request-time capability.
+    pub fn try_pin_generation(
+        &self,
+        generation: &AnalyticalGeneration,
+    ) -> Result<DatasetManifestRef, FredPointInTimeReadError> {
+        if generation.source_id() != &self.source_id
+            || generation.manifest().dataset_id() != &self.analytical_dataset
+        {
+            return Err(FredPointInTimeReadError::InvalidBinding);
+        }
+        Ok(generation.manifest().clone())
     }
 
     /// Reads one latest-known exact-series observation from one immutable manifest.

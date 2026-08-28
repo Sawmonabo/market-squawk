@@ -3,7 +3,7 @@
 use std::{fmt, time::Instant};
 
 use chrono::{DateTime, Datelike, Utc};
-use market_squawk_data::DatasetManifestRef;
+use market_squawk_data::{AnalyticalGeneration, DatasetManifestRef};
 use market_squawk_domain::{CalendarDate, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
@@ -79,29 +79,34 @@ impl FredLatestKnownOperation {
 
     /// Binds a desired activation to its exact immutable analytical generation, when present.
     ///
-    /// `manifest` must come from application composition or restart restoration. It is never
-    /// reconstructed from request arguments. `None` preserves an explicit unavailable state
-    /// instead of silently selecting a later generation.
+    /// `generation` must come from application composition or restart restoration. Its complete
+    /// retained source and dataset identity are validated before this operation freezes its exact
+    /// manifest. It is never reconstructed from request arguments. `None` preserves an explicit
+    /// unavailable state instead of silently selecting a later generation.
     ///
     /// # Errors
     ///
-    /// Rejects a manifest from another analytical dataset or a reserved digest identity.
+    /// Rejects a generation owned by another source or analytical dataset, or a reserved digest
+    /// identity.
     pub(crate) fn try_from_desired_activation(
         capability: FredPointInTimeReadCapability,
-        manifest: Option<DatasetManifestRef>,
+        generation: Option<AnalyticalGeneration>,
     ) -> Result<Self, FredLatestKnownCompositionError> {
-        let state = match manifest {
-            Some(manifest)
-                if manifest.dataset_id() == capability.analytical_dataset()
-                    && manifest.content_hash().bytes() != [0; 32]
-                    && manifest.schema().fingerprint() != [0; 32] =>
-            {
+        let state = match generation {
+            Some(generation) => {
+                let manifest = capability
+                    .try_pin_generation(&generation)
+                    .map_err(|_| FredLatestKnownCompositionError::InvalidManifestBinding)?;
+                if manifest.content_hash().bytes() == [0; 32]
+                    || manifest.schema().fingerprint() == [0; 32]
+                {
+                    return Err(FredLatestKnownCompositionError::InvalidManifestBinding);
+                }
                 FredLatestKnownState::Ready {
                     capability,
                     manifest,
                 }
             }
-            Some(_) => return Err(FredLatestKnownCompositionError::InvalidManifestBinding),
             None => FredLatestKnownState::Unavailable { capability },
         };
         Ok(Self { state })
