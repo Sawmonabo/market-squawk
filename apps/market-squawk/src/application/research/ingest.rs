@@ -53,6 +53,7 @@ mod alpaca_historical;
 mod provider_runtime;
 mod schwab_market;
 mod selection;
+mod yahoo_enrichment;
 
 pub(crate) use alpaca_historical::{
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
