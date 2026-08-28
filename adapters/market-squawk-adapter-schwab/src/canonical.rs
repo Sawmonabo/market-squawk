@@ -204,11 +204,11 @@ fn named_number<K: Eq>(
     }
 }
 
-/// Adapter-private semantic inputs for one price-history response awaiting a common capture seal.
+/// Adapter-private semantic inputs for one price-history response before its common capture seal.
 ///
 /// This request deliberately has no source coordinates, sealed receipt, publication revision, or
-/// published clock. Those authority-bearing facts can only arrive through the future consuming
-/// `SealedProviderCaptureMaterial` rejoin.
+/// published clock. Those authority-bearing facts arrive only through the consuming
+/// `SealedProviderCaptureMaterial` rejoin in the REST publication boundary.
 #[derive(Debug)]
 pub(crate) struct SchwabDailyPriceHistoryCandidateRequest<'a> {
     pub(crate) capability: SchwabPriceHistoryCapabilityObservation,
@@ -230,56 +230,49 @@ pub(crate) struct SchwabDailyPriceHistoryCandidateRequest<'a> {
     pub(crate) ingested_at: Timestamp,
 }
 
-/// A validated semantic projection that cannot grant publication authority.
+/// A validated semantic projection that cannot grant publication authority by itself.
 ///
 /// It is intentionally crate-private, non-cloneable, and non-serializable. It preserves the pure
 /// identity/calendar/OHLCV work while the final point-in-time record remains unavailable until the
 /// shared consuming capture witness exists.
-#[allow(
-    dead_code,
-    reason = "retained semantic candidate awaits the common sealed-material rejoin"
-)]
 pub(crate) struct SchwabPendingPriceHistoryCandidate {
-    capability: SchwabPriceHistoryCapabilityObservation,
-    oauth_authority: SchwabOAuthAuthorityReceipt,
-    user_preference_observation_sha256: [u8; 32],
-    response_observation_sha256: [u8; 32],
-    requested_start: Timestamp,
-    requested_end: Timestamp,
-    response_received_at: Timestamp,
-    instrument_id: InstrumentId,
-    instrument_revision_digest: EvidenceDigest,
-    admitted_plan_digest: EvidenceDigest,
-    identity: SchwabResolvedProviderIdentity,
-    venue_id: VenueId,
-    feed: SourceIdentifier,
-    interval: SourceIdentifier,
-    adjustment: MarketBarAdjustment,
-    currency: Currency,
-    completeness_evidence: EvidenceDigest,
-    ingested_at: Timestamp,
-    bars: Box<[SchwabPendingPriceHistoryBar]>,
-    mapping_digest: EvidenceDigest,
+    pub(crate) capability: SchwabPriceHistoryCapabilityObservation,
+    pub(crate) oauth_authority: SchwabOAuthAuthorityReceipt,
+    pub(crate) user_preference_observation_sha256: [u8; 32],
+    pub(crate) market_data_permission: Option<Box<str>>,
+    pub(crate) response_observation_sha256: [u8; 32],
+    pub(crate) requested_start: Timestamp,
+    pub(crate) requested_end: Timestamp,
+    pub(crate) response_received_at: Timestamp,
+    pub(crate) instrument_id: InstrumentId,
+    pub(crate) instrument_revision_digest: EvidenceDigest,
+    pub(crate) admitted_plan_digest: EvidenceDigest,
+    pub(crate) identity: SchwabResolvedProviderIdentity,
+    pub(crate) venue_id: VenueId,
+    pub(crate) feed: SourceIdentifier,
+    pub(crate) interval: SourceIdentifier,
+    pub(crate) adjustment: MarketBarAdjustment,
+    pub(crate) currency: Currency,
+    pub(crate) completeness_evidence: EvidenceDigest,
+    pub(crate) ingested_at: Timestamp,
+    pub(crate) bars: Box<[SchwabPendingPriceHistoryBar]>,
+    pub(crate) mapping_digest: EvidenceDigest,
 }
 
 /// One exact provider bar after pure semantic/calendar validation but before PIT publication.
 #[derive(Serialize)]
 pub(crate) struct SchwabPendingPriceHistoryBar {
-    source_identifier: SourceIdentifier,
-    provider_timestamp: Timestamp,
-    time_semantics: BarTimeSemantics,
-    open: Decimal,
-    high: Decimal,
-    low: Decimal,
-    close: Decimal,
-    volume: Decimal,
+    pub(crate) source_identifier: SourceIdentifier,
+    pub(crate) provider_timestamp: Timestamp,
+    pub(crate) time_semantics: BarTimeSemantics,
+    pub(crate) open: Decimal,
+    pub(crate) high: Decimal,
+    pub(crate) low: Decimal,
+    pub(crate) close: Decimal,
+    pub(crate) volume: Decimal,
 }
 
 /// Retains reusable pure history mapping while withholding final revision/PIT authority.
-#[allow(
-    dead_code,
-    reason = "retained semantic candidate awaits the common sealed-material rejoin"
-)]
 pub(crate) fn prepare_price_history_candidate(
     request: SchwabDailyPriceHistoryCandidateRequest<'_>,
 ) -> Result<SchwabPendingPriceHistoryCandidate, SchwabCanonicalError> {
@@ -375,6 +368,12 @@ pub(crate) fn prepare_price_history_candidate(
 
     let user_preference_observation_sha256 =
         crate::vertical::user_preference_receipt_digest(request.user_preference);
+    let market_data_permission = request
+        .user_preference
+        .bootstrap()
+        .value()
+        .market_data_permission()
+        .map(Into::into);
     let response_observation_sha256 = crate::vertical::rest_receipt_digest(request.response);
     let accounting = request.response.accounting();
     let wire = PendingHistoryDigestWire {
@@ -435,6 +434,7 @@ pub(crate) fn prepare_price_history_candidate(
         capability: request.capability,
         oauth_authority: request.oauth_authority,
         user_preference_observation_sha256,
+        market_data_permission,
         response_observation_sha256,
         requested_start,
         requested_end,
@@ -589,8 +589,6 @@ pub enum SchwabOptionCandidateOutcome {
 pub enum SchwabOptionCandidateAbstention {
     MissingContractSymbol,
     CrossedQuote,
-    MissingRequiredGreek(OptionContractField),
-    InvalidRequiredGreek(OptionContractField),
 }
 
 /// Produces provider-qualified option candidates while retaining explicit per-contract abstention.
@@ -623,35 +621,12 @@ fn option_candidate(
     };
     let contract_symbol = ProviderIdentifier::try_new(contract_symbol)
         .map_err(|_| SchwabCanonicalError::InvalidIdentity)?;
-    let implied_volatility = required_greek(contract, OptionContractField::Volatility);
-    let delta = required_greek(contract, OptionContractField::Delta);
-    let gamma = required_greek(contract, OptionContractField::Gamma);
-    let theta = required_greek(contract, OptionContractField::Theta);
-    let vega = required_greek(contract, OptionContractField::Vega);
-    let rho = required_greek(contract, OptionContractField::Rho);
-    let [implied_volatility, delta, gamma, theta, vega, rho] =
-        [implied_volatility, delta, gamma, theta, vega, rho].map(|value| match value {
-            Ok(value) => Ok(SchwabCanonicalField::Value(value)),
-            Err(reason) => Err(reason),
-        });
-    let (implied_volatility, delta, gamma, theta, vega, rho) =
-        match (implied_volatility, delta, gamma, theta, vega, rho) {
-            (Ok(volatility), Ok(delta), Ok(gamma), Ok(theta), Ok(vega), Ok(rho)) => {
-                (volatility, delta, gamma, theta, vega, rho)
-            }
-            values => {
-                let reason = [values.0, values.1, values.2, values.3, values.4, values.5]
-                    .into_iter()
-                    .find_map(Result::err)
-                    .ok_or(SchwabCanonicalError::DomainInvariant)?;
-                return Ok(SchwabOptionCandidateOutcome::Abstained {
-                    expiration_group: contract.expiration_group().into(),
-                    strike_group: contract.strike_group().into(),
-                    side: contract.side(),
-                    reason,
-                });
-            }
-        };
+    let implied_volatility = option_number(contract, OptionContractField::Volatility)?;
+    let delta = option_number(contract, OptionContractField::Delta)?;
+    let gamma = option_number(contract, OptionContractField::Gamma)?;
+    let theta = option_number(contract, OptionContractField::Theta)?;
+    let vega = option_number(contract, OptionContractField::Vega)?;
+    let rho = option_number(contract, OptionContractField::Rho)?;
     let bid = option_number(contract, OptionContractField::Bid)?;
     let ask = option_number(contract, OptionContractField::Ask)?;
     if matches!((&bid, &ask), (SchwabCanonicalField::Value(bid), SchwabCanonicalField::Value(ask)) if bid > ask)
@@ -687,23 +662,6 @@ fn option_candidate(
             open_interest: option_number(contract, OptionContractField::OpenInterest)?,
         },
     )))
-}
-
-fn required_greek(
-    contract: &OptionContract,
-    name: OptionContractField,
-) -> Result<Decimal, SchwabOptionCandidateAbstention> {
-    match contract.fields().iter().find(|field| field.name() == &name) {
-        None => Err(SchwabOptionCandidateAbstention::MissingRequiredGreek(name)),
-        Some(field) => match field.value() {
-            NativeScalar::Null => Err(SchwabOptionCandidateAbstention::MissingRequiredGreek(name)),
-            NativeScalar::Number(value) => Decimal::from_str_exact(value.as_str())
-                .map_err(|_| SchwabOptionCandidateAbstention::InvalidRequiredGreek(name)),
-            NativeScalar::Bool(_) | NativeScalar::Text(_) => {
-                Err(SchwabOptionCandidateAbstention::InvalidRequiredGreek(name))
-            }
-        },
-    }
 }
 
 fn option_number(
@@ -754,6 +712,7 @@ pub struct SchwabInstrumentCandidate {
     pub description: SchwabCanonicalField<Box<str>>,
     pub exchange: SchwabCanonicalField<Box<str>>,
     pub asset_type: SchwabCanonicalField<Box<str>>,
+    pub fields: Box<[NativeFieldEntry<Box<str>>]>,
     pub fundamentals: Box<[NativeFieldEntry<FundamentalField>]>,
     pub response_sha256: [u8; 32],
 }
@@ -779,6 +738,7 @@ fn instrument_candidate(
         description: native_text_field(&instrument.description),
         exchange: native_text_field(&instrument.exchange),
         asset_type: native_text_field(&instrument.asset_type),
+        fields: instrument.fields.clone(),
         fundamentals: instrument.fundamental.clone(),
         response_sha256,
     };

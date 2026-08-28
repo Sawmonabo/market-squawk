@@ -22,17 +22,22 @@ use zeroize::Zeroizing;
 
 use crate::{ConnectionGeneration, ReadOnlyRoute, SchwabAdapterError};
 
+pub(crate) use http::SchwabSealedRestResponseParts;
 pub use http::{
     CapturedRestResponse, ExecutedRestResponse, ReqwestSchwabHttpWire, RestExecutionOutcome,
     RestItemAccounting, SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse,
-    SchwabPendingRestCapture, SchwabRestCaptureSealRejoin, SchwabRestExecutor, SchwabRestPayload,
-    SchwabUserPreferenceEvidence,
+    SchwabPendingRestCapture, SchwabRestCaptureSealRejoin, SchwabRestExecutor, SchwabRestFamily,
+    SchwabRestPayload, SchwabSealedRestResponse, SchwabUserPreferenceEvidence,
 };
+pub(crate) use streamer::SchwabSealedStreamerCaptureParts;
 pub use streamer::{
     InboundStreamerFrame, ProductionSchwabStreamerConnector, RawStreamerFrame,
-    RawStreamerFrameKind, SchwabStreamerConnection, SchwabStreamerConnector,
-    SchwabStreamerExecutor, StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch,
-    StreamerMicrobatchReceipt, StreamerRunExit,
+    RawStreamerFrameKind, SchwabPendingStreamerCapture, SchwabSealedStreamerCapture,
+    SchwabStreamerConnection, SchwabStreamerConnectionControl,
+    SchwabStreamerConnectionControlSource, SchwabStreamerConnectionEvidence,
+    SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence,
+    StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerMicrobatchReceipt,
+    StreamerRunExit,
 };
 
 /// Source-neutral capture coordinates supplied by the registered provider/runtime owner.

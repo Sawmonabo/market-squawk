@@ -10,6 +10,13 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
+use market_squawk_platform::RawCaptureRecord;
+use market_squawk_sources::{
+    ProviderCaptureSealRequest, ProviderEventMicrobatchMaterial,
+    ProviderEventMicrobatchSealExpectation, ProviderEventMicrobatchToken,
+    SealedProviderCaptureMaterial,
+};
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{
@@ -18,6 +25,7 @@ use tokio_tungstenite::tungstenite::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use uuid::Uuid;
 
 use crate::{
     ConnectionGeneration, ConnectionState, DesiredStateController, ParseBounds, ParsedNative,
@@ -26,9 +34,9 @@ use crate::{
 };
 
 use super::{
-    AccessTokenAdmission, AccessTokenGeneration, SchwabAccessTokenSource, SchwabTransportError,
-    SchwabTransportTelemetry, StreamerTransportBounds, TransientAccessToken, hash_frame,
-    hash_observation, unix_millis, unix_seconds,
+    AccessTokenAdmission, AccessTokenGeneration, SchwabAccessTokenSource, SchwabCaptureCoordinates,
+    SchwabTransportError, SchwabTransportTelemetry, StreamerTransportBounds, TransientAccessToken,
+    hash_frame, hash_observation, unix_millis, unix_seconds,
 };
 
 /// Exact application payload kind delivered by the WebSocket implementation.
@@ -189,6 +197,7 @@ impl StreamerMicrobatchReceipt {
 #[derive(Eq, PartialEq)]
 pub struct StreamerMicrobatch {
     receipt: StreamerMicrobatchReceipt,
+    connection: SchwabStreamerConnectionEvidence,
     frames: Box<[RawStreamerFrame]>,
 }
 
@@ -211,6 +220,348 @@ impl StreamerMicrobatch {
     pub fn frames(&self) -> &[RawStreamerFrame] {
         &self.frames
     }
+
+    /// Returns the exact application-minted connection evidence carried by every frame.
+    pub const fn connection(&self) -> &SchwabStreamerConnectionEvidence {
+        &self.connection
+    }
+
+    /// Consumes exact validated frames into the common event-microbatch physical seal boundary.
+    pub fn into_pending_capture(
+        self,
+        event_ids: Vec<Uuid>,
+        parse_bounds: ParseBounds,
+    ) -> Result<(SchwabPendingStreamerCapture, ProviderCaptureSealRequest), SchwabTransportError>
+    {
+        validate_streamer_microbatch(&self)?;
+        if event_ids.len() != self.frames.len()
+            || event_ids.iter().any(Uuid::is_nil)
+            || event_ids.iter().collect::<BTreeSet<_>>().len() != event_ids.len()
+        {
+            return Err(SchwabTransportError::CaptureMaterial);
+        }
+        let StreamerMicrobatch {
+            receipt,
+            connection,
+            frames,
+        } = self;
+        let SchwabStreamerConnectionEvidence {
+            coordinates,
+            stream_identity,
+            ..
+        } = connection;
+        let mut evidence = Vec::new();
+        let mut records = Vec::new();
+        let mut parsed_frames = Vec::new();
+        evidence
+            .try_reserve_exact(frames.len())
+            .map_err(|_| SchwabTransportError::PayloadTooLarge)?;
+        records
+            .try_reserve_exact(frames.len())
+            .map_err(|_| SchwabTransportError::PayloadTooLarge)?;
+        parsed_frames
+            .try_reserve_exact(frames.len())
+            .map_err(|_| SchwabTransportError::PayloadTooLarge)?;
+        for (event_id, frame) in event_ids.into_iter().zip(frames.into_vec()) {
+            if frame.kind != RawStreamerFrameKind::Text {
+                return Err(SchwabTransportError::CaptureMaterial);
+            }
+            parsed_frames.push(
+                parse_streamer_frame(&frame.payload, parse_bounds)
+                    .map_err(|_| SchwabTransportError::Adapter)?,
+            );
+            let received_nanos = i64::try_from(frame.received_at_unix_millis)
+                .ok()
+                .and_then(|value| value.checked_mul(1_000_000))
+                .ok_or(SchwabTransportError::CaptureMaterial)?;
+            evidence.push(SchwabStreamerFrameSealEvidence {
+                generation: frame.generation,
+                transport_ordinal: frame.ordinal,
+                kind: frame.kind,
+                received_at_unix_millis: frame.received_at_unix_millis,
+                payload_bytes: u64::try_from(frame.payload.len())
+                    .map_err(|_| SchwabTransportError::Overflow)?,
+                payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, frame.payload_sha256),
+                event_id,
+            });
+            records.push(
+                RawCaptureRecord::try_new_live(
+                    event_id,
+                    Arc::from(coordinates.source_id().as_str()),
+                    coordinates.connection_id(),
+                    None,
+                    None,
+                    chrono::DateTime::from_timestamp_nanos(received_nanos),
+                    frame.payload,
+                )
+                .map_err(|_| SchwabTransportError::CaptureMaterial)?,
+            );
+        }
+        let material = ProviderEventMicrobatchMaterial::try_new(
+            coordinates.source_id().clone(),
+            coordinates.metadata_revision().clone(),
+            coordinates.dataset().clone(),
+            stream_identity.clone(),
+            records,
+        )
+        .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+        let (expectation, seal_request) = material.into_sealing_parts();
+        Ok((
+            SchwabPendingStreamerCapture {
+                expectation,
+                coordinates,
+                stream_identity,
+                streamer_receipt: receipt,
+                frames: evidence.into_boxed_slice(),
+                parsed_frames: parsed_frames.into_boxed_slice(),
+            },
+            seal_request,
+        ))
+    }
+}
+
+/// Exact adapter transport-frame evidence aligned to one sealed common event frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchwabStreamerFrameSealEvidence {
+    generation: ConnectionGeneration,
+    transport_ordinal: NonZeroU64,
+    kind: RawStreamerFrameKind,
+    received_at_unix_millis: u64,
+    payload_bytes: u64,
+    payload_digest: EvidenceDigest,
+    event_id: Uuid,
+}
+
+impl SchwabStreamerFrameSealEvidence {
+    pub const fn generation(&self) -> ConnectionGeneration {
+        self.generation
+    }
+
+    /// Returns the local connection-generation transport ordinal, not a provider sequence.
+    pub const fn transport_ordinal(&self) -> NonZeroU64 {
+        self.transport_ordinal
+    }
+
+    pub const fn kind(&self) -> RawStreamerFrameKind {
+        self.kind
+    }
+
+    pub const fn received_at_unix_millis(&self) -> u64 {
+        self.received_at_unix_millis
+    }
+
+    pub const fn payload_bytes(&self) -> u64 {
+        self.payload_bytes
+    }
+
+    pub const fn payload_digest(&self) -> EvidenceDigest {
+        self.payload_digest
+    }
+
+    pub const fn event_id(&self) -> Uuid {
+        self.event_id
+    }
+}
+
+/// Non-cloneable Schwab Streamer continuation awaiting its exact common physical seal.
+pub struct SchwabPendingStreamerCapture {
+    expectation: ProviderEventMicrobatchSealExpectation,
+    coordinates: SchwabCaptureCoordinates,
+    stream_identity: SourceIdentifier,
+    streamer_receipt: StreamerMicrobatchReceipt,
+    frames: Box<[SchwabStreamerFrameSealEvidence]>,
+    parsed_frames: Box<[ParsedNative<StreamerFrame>]>,
+}
+
+impl fmt::Debug for SchwabPendingStreamerCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabPendingStreamerCapture")
+            .field("coordinates", &self.coordinates)
+            .field("stream_identity", &self.stream_identity)
+            .field("streamer_receipt", &self.streamer_receipt)
+            .field("frame_count", &self.frames.len())
+            .field("parsed_frame_count", &self.parsed_frames.len())
+            .field("raw_frames", &"AWAITING COMMON PHYSICAL SEAL")
+            .finish()
+    }
+}
+
+impl SchwabPendingStreamerCapture {
+    /// Rejoins only the exact witness-matched physical result and validates every frame mapping.
+    pub fn try_rejoin(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<SchwabSealedStreamerCapture, SchwabTransportError> {
+        let token = self
+            .expectation
+            .try_rejoin(sealed)
+            .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+        let persisted = token.persisted_receipt();
+        let capture = persisted.capture();
+        if capture.source_id() != self.coordinates.source_id()
+            || capture.metadata_revision() != self.coordinates.metadata_revision()
+            || capture.dataset() != self.coordinates.dataset()
+            || capture.stream_identity() != &self.stream_identity
+            || capture.frames().len() != self.frames.len()
+            || persisted.segment().frames().len() != self.frames.len()
+            || self.parsed_frames.len() != self.frames.len()
+        {
+            return Err(SchwabTransportError::CaptureMaterial);
+        }
+        for ((common, physical), expected) in capture
+            .frames()
+            .iter()
+            .zip(persisted.segment().frames())
+            .zip(&self.frames)
+        {
+            let received_at = expected
+                .received_at_unix_millis
+                .checked_mul(1_000_000)
+                .and_then(|value| i64::try_from(value).ok())
+                .map(market_squawk_domain::Timestamp::from_unix_nanos)
+                .ok_or(SchwabTransportError::CaptureMaterial)?;
+            if common.event_id() != *expected.event_id.as_bytes()
+                || common.connection_id() != *self.coordinates.connection_id().as_bytes()
+                || common.source_sequence().is_some()
+                || common.exchange_at().is_some()
+                || common.received_at() != received_at
+                || common.payload_bytes() != expected.payload_bytes
+                || common.payload_digest() != expected.payload_digest
+                || physical.provider_payload_bytes() != expected.payload_bytes
+                || physical.provider_payload_digest() != expected.payload_digest
+            {
+                return Err(SchwabTransportError::CaptureMaterial);
+            }
+        }
+        Ok(SchwabSealedStreamerCapture {
+            token,
+            coordinates: self.coordinates,
+            stream_identity: self.stream_identity,
+            streamer_receipt: self.streamer_receipt,
+            frames: self.frames,
+            parsed_frames: self.parsed_frames,
+        })
+    }
+}
+
+/// Opaque sealed Streamer frames awaiting typed event mapping and native-lineage publication.
+pub struct SchwabSealedStreamerCapture {
+    token: ProviderEventMicrobatchToken,
+    coordinates: SchwabCaptureCoordinates,
+    stream_identity: SourceIdentifier,
+    streamer_receipt: StreamerMicrobatchReceipt,
+    frames: Box<[SchwabStreamerFrameSealEvidence]>,
+    parsed_frames: Box<[ParsedNative<StreamerFrame>]>,
+}
+
+pub(crate) struct SchwabSealedStreamerCaptureParts {
+    pub(crate) token: ProviderEventMicrobatchToken,
+    pub(crate) coordinates: SchwabCaptureCoordinates,
+}
+
+impl fmt::Debug for SchwabSealedStreamerCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabSealedStreamerCapture")
+            .field("coordinates", &self.coordinates)
+            .field("stream_identity", &self.stream_identity)
+            .field("streamer_receipt", &self.streamer_receipt)
+            .field("frame_count", &self.frames.len())
+            .field("parsed_frame_count", &self.parsed_frames.len())
+            .field("raw_frames", &"PHYSICALLY SEALED")
+            .finish()
+    }
+}
+
+impl SchwabSealedStreamerCapture {
+    pub const fn coordinates(&self) -> &SchwabCaptureCoordinates {
+        &self.coordinates
+    }
+
+    pub const fn stream_identity(&self) -> &SourceIdentifier {
+        &self.stream_identity
+    }
+
+    pub const fn streamer_receipt(&self) -> &StreamerMicrobatchReceipt {
+        &self.streamer_receipt
+    }
+
+    pub fn persisted_receipt(
+        &self,
+    ) -> &market_squawk_sources::SealedProviderEventMicrobatchReceipt {
+        self.token.persisted_receipt()
+    }
+
+    pub fn frames(&self) -> &[SchwabStreamerFrameSealEvidence] {
+        &self.frames
+    }
+
+    pub(crate) fn parsed_frames(&self) -> &[ParsedNative<StreamerFrame>] {
+        &self.parsed_frames
+    }
+
+    pub(crate) fn into_parts(self) -> SchwabSealedStreamerCaptureParts {
+        SchwabSealedStreamerCaptureParts {
+            token: self.token,
+            coordinates: self.coordinates,
+        }
+    }
+}
+
+fn validate_streamer_microbatch(
+    microbatch: &StreamerMicrobatch,
+) -> Result<(), SchwabTransportError> {
+    let receipt = microbatch.receipt();
+    let connection = microbatch.connection();
+    let frames = microbatch.frames();
+    let first = frames
+        .first()
+        .ok_or(SchwabTransportError::CaptureMaterial)?;
+    let last = frames.last().ok_or(SchwabTransportError::CaptureMaterial)?;
+    let mut content = Sha256::new();
+    let mut observation = Sha256::new();
+    let mut payload_bytes = 0_u64;
+    let mut prior_ordinal = None;
+    if receipt.generation != connection.generation {
+        return Err(SchwabTransportError::CaptureMaterial);
+    }
+    for frame in frames {
+        let observed_payload_sha256: [u8; 32] = Sha256::digest(&frame.payload).into();
+        if frame.generation != receipt.generation
+            || frame.payload_sha256 != observed_payload_sha256
+            || prior_ordinal.is_some_and(|prior: u64| frame.ordinal.get() != prior + 1)
+        {
+            return Err(SchwabTransportError::CaptureMaterial);
+        }
+        payload_bytes = payload_bytes
+            .checked_add(
+                u64::try_from(frame.payload.len()).map_err(|_| SchwabTransportError::Overflow)?,
+            )
+            .ok_or(SchwabTransportError::Overflow)?;
+        hash_frame(&mut content, frame.kind.digest_tag(), &frame.payload)?;
+        hash_observation(
+            &mut observation,
+            frame.generation,
+            frame.ordinal,
+            frame.received_at_unix_millis,
+            frame.payload_sha256,
+        );
+        prior_ordinal = Some(frame.ordinal.get());
+    }
+    if receipt.first_ordinal != first.ordinal
+        || receipt.last_ordinal != last.ordinal
+        || receipt.frame_count
+            != u64::try_from(frames.len()).map_err(|_| SchwabTransportError::Overflow)?
+        || receipt.payload_bytes != payload_bytes
+        || receipt.first_received_at_unix_millis != first.received_at_unix_millis
+        || receipt.last_received_at_unix_millis != last.received_at_unix_millis
+        || receipt.content_sha256 != <[u8; 32]>::from(content.finalize())
+        || receipt.observation_sha256 != <[u8; 32]>::from(observation.finalize())
+    {
+        return Err(SchwabTransportError::CaptureMaterial);
+    }
+    Ok(())
 }
 
 /// Fail-closed nonblocking sink failure.
@@ -409,16 +760,110 @@ pub enum StreamerRunExit {
     Cancelled,
 }
 
+/// One-use application-issued authority for exactly one Streamer connection generation.
+///
+/// The application owns durable monotonic generation allocation and the connection UUID. The
+/// adapter consumes this control before connecting and carries only repeatable evidence into raw
+/// microbatches. The control implements neither `Clone` nor serialization.
+pub struct SchwabStreamerConnectionControl {
+    generation: ConnectionGeneration,
+    coordinates: SchwabCaptureCoordinates,
+    stream_identity: SourceIdentifier,
+}
+
+impl SchwabStreamerConnectionControl {
+    /// Binds one durable application generation to its exact raw-capture coordinates.
+    pub fn new(
+        generation: ConnectionGeneration,
+        coordinates: SchwabCaptureCoordinates,
+        stream_identity: SourceIdentifier,
+    ) -> Self {
+        Self {
+            generation,
+            coordinates,
+            stream_identity,
+        }
+    }
+
+    pub const fn generation(&self) -> ConnectionGeneration {
+        self.generation
+    }
+
+    pub const fn coordinates(&self) -> &SchwabCaptureCoordinates {
+        &self.coordinates
+    }
+
+    pub const fn stream_identity(&self) -> &SourceIdentifier {
+        &self.stream_identity
+    }
+
+    fn into_evidence(self) -> SchwabStreamerConnectionEvidence {
+        SchwabStreamerConnectionEvidence {
+            generation: self.generation,
+            coordinates: self.coordinates,
+            stream_identity: self.stream_identity,
+        }
+    }
+}
+
+impl fmt::Debug for SchwabStreamerConnectionControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabStreamerConnectionControl")
+            .field("generation", &self.generation)
+            .field("coordinates", &self.coordinates)
+            .field("stream_identity", &self.stream_identity)
+            .finish()
+    }
+}
+
+/// Repeatable secret-free evidence derived from one consumed connection control.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchwabStreamerConnectionEvidence {
+    generation: ConnectionGeneration,
+    coordinates: SchwabCaptureCoordinates,
+    stream_identity: SourceIdentifier,
+}
+
+impl SchwabStreamerConnectionEvidence {
+    pub const fn generation(&self) -> ConnectionGeneration {
+        self.generation
+    }
+
+    pub const fn coordinates(&self) -> &SchwabCaptureCoordinates {
+        &self.coordinates
+    }
+
+    pub const fn stream_identity(&self) -> &SourceIdentifier {
+        &self.stream_identity
+    }
+}
+
+/// Application-owned durable allocator for Streamer connection controls.
+pub trait SchwabStreamerConnectionControlSource: fmt::Debug + Send + Sync {
+    /// Mints the next restart-safe connection generation and exact capture coordinates.
+    fn mint(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<SchwabStreamerConnectionControl, SchwabTransportError>>
+                + Send
+                + '_,
+        >,
+    >;
+}
+
 /// Sole Streamer connection owner around the frozen desired-state controller.
 pub struct SchwabStreamerExecutor {
     connector: Arc<dyn SchwabStreamerConnector>,
     token_source: Arc<dyn SchwabAccessTokenSource>,
+    control_source: Arc<dyn SchwabStreamerConnectionControlSource>,
     controller: DesiredStateController,
     transport_bounds: StreamerTransportBounds,
     parse_bounds: ParseBounds,
     token_admission: AccessTokenAdmission,
     telemetry: SchwabTransportTelemetry,
-    next_generation: NonZeroU64,
+    last_generation: Option<ConnectionGeneration>,
 }
 
 impl fmt::Debug for SchwabStreamerExecutor {
@@ -427,12 +872,13 @@ impl fmt::Debug for SchwabStreamerExecutor {
             .debug_struct("SchwabStreamerExecutor")
             .field("connector", &self.connector)
             .field("token_source", &"[PROTECTED AUTHORITY]")
+            .field("control_source", &"[APPLICATION CONTROL AUTHORITY]")
             .field("controller", &self.controller)
             .field("transport_bounds", &self.transport_bounds)
             .field("parse_bounds", &self.parse_bounds)
             .field("token_admission", &self.token_admission)
             .field("telemetry", &self.telemetry)
-            .field("next_generation", &self.next_generation)
+            .field("last_generation", &self.last_generation)
             .finish()
     }
 }
@@ -441,6 +887,7 @@ impl SchwabStreamerExecutor {
     /// Builds the production WSS executor.
     pub fn try_production(
         token_source: Arc<dyn SchwabAccessTokenSource>,
+        control_source: Arc<dyn SchwabStreamerConnectionControlSource>,
         admission: StreamerAdmission,
         transport_bounds: StreamerTransportBounds,
         parse_bounds: ParseBounds,
@@ -450,6 +897,7 @@ impl SchwabStreamerExecutor {
         Self::try_new(
             Arc::new(ProductionSchwabStreamerConnector),
             token_source,
+            control_source,
             admission,
             transport_bounds,
             parse_bounds,
@@ -466,6 +914,7 @@ impl SchwabStreamerExecutor {
     pub fn try_new(
         connector: Arc<dyn SchwabStreamerConnector>,
         token_source: Arc<dyn SchwabAccessTokenSource>,
+        control_source: Arc<dyn SchwabStreamerConnectionControlSource>,
         admission: StreamerAdmission,
         transport_bounds: StreamerTransportBounds,
         parse_bounds: ParseBounds,
@@ -478,12 +927,13 @@ impl SchwabStreamerExecutor {
         Ok(Self {
             connector,
             token_source,
+            control_source,
             controller: DesiredStateController::new(admission),
             transport_bounds,
             parse_bounds,
             token_admission,
             telemetry,
-            next_generation: NonZeroU64::MIN,
+            last_generation: None,
         })
     }
 
@@ -550,7 +1000,17 @@ impl SchwabStreamerExecutor {
             }
             let reconnect = attempt > 0;
             self.telemetry.record_stream_connect_attempt(reconnect)?;
-            let generation = self.take_generation()?;
+            let control = await_operation(
+                self.control_source.mint(),
+                self.transport_bounds.connect_timeout(),
+                &cancellation,
+            )
+            .await?;
+            let generation = control.generation();
+            if self.last_generation.is_some_and(|last| generation <= last) {
+                return Err(SchwabTransportError::Protocol);
+            }
+            self.last_generation = Some(generation);
             let token = match acquire_token(
                 &*self.token_source,
                 self.token_admission,
@@ -602,7 +1062,7 @@ impl SchwabStreamerExecutor {
             let refresh_deadline = token_refresh_deadline(&token, self.token_admission)?;
             let outcome = self
                 .run_connection(
-                    generation,
+                    control,
                     token_generation,
                     refresh_deadline,
                     token,
@@ -651,7 +1111,7 @@ impl SchwabStreamerExecutor {
     )]
     async fn run_connection(
         &mut self,
-        generation: ConnectionGeneration,
+        control: SchwabStreamerConnectionControl,
         token_generation: AccessTokenGeneration,
         refresh_deadline: Instant,
         token: TransientAccessToken,
@@ -660,7 +1120,8 @@ impl SchwabStreamerExecutor {
         sink: &mut dyn StreamerCaptureSink,
         cancellation: &CancellationToken,
     ) -> Result<ConnectionExit, SchwabTransportError> {
-        let mut batch = MicrobatchBuilder::new(generation, token_generation, self.transport_bounds);
+        let generation = control.generation();
+        let mut batch = MicrobatchBuilder::new(control, token_generation, self.transport_bounds);
         let login = self
             .controller
             .login_request(bootstrap, token.expose_bearer())?;
@@ -889,18 +1350,6 @@ impl SchwabStreamerExecutor {
         }
         Ok(ProcessedFrame::Parsed(parsed))
     }
-
-    fn take_generation(&mut self) -> Result<ConnectionGeneration, SchwabTransportError> {
-        let current = self.next_generation;
-        self.next_generation = NonZeroU64::new(
-            current
-                .get()
-                .checked_add(1)
-                .ok_or(SchwabTransportError::Overflow)?,
-        )
-        .ok_or(SchwabTransportError::Overflow)?;
-        Ok(ConnectionGeneration::new(current))
-    }
 }
 
 enum ConnectionExit {
@@ -915,7 +1364,7 @@ enum ProcessedFrame {
 }
 
 struct MicrobatchBuilder {
-    generation: ConnectionGeneration,
+    connection: SchwabStreamerConnectionEvidence,
     token_generation: AccessTokenGeneration,
     bounds: StreamerTransportBounds,
     frames: Vec<RawStreamerFrame>,
@@ -926,12 +1375,12 @@ struct MicrobatchBuilder {
 
 impl MicrobatchBuilder {
     fn new(
-        generation: ConnectionGeneration,
+        control: SchwabStreamerConnectionControl,
         token_generation: AccessTokenGeneration,
         bounds: StreamerTransportBounds,
     ) -> Self {
         Self {
-            generation,
+            connection: control.into_evidence(),
             token_generation,
             bounds,
             frames: Vec::new(),
@@ -968,7 +1417,7 @@ impl MicrobatchBuilder {
             return Err(SchwabTransportError::PayloadTooLarge);
         }
         let frame = RawStreamerFrame::try_new(
-            self.generation,
+            self.connection.generation,
             self.next_ordinal,
             kind,
             payload,
@@ -1017,7 +1466,7 @@ impl MicrobatchBuilder {
         let payload_bytes =
             u64::try_from(self.payload_bytes).map_err(|_| SchwabTransportError::Overflow)?;
         let receipt = StreamerMicrobatchReceipt {
-            generation: self.generation,
+            generation: self.connection.generation,
             token_generation: self.token_generation,
             first_ordinal: first.ordinal,
             last_ordinal: last.ordinal,
@@ -1032,6 +1481,7 @@ impl MicrobatchBuilder {
         self.opened_at = Instant::now();
         Ok(Some(StreamerMicrobatch {
             receipt,
+            connection: self.connection.clone(),
             frames: frames.into_boxed_slice(),
         }))
     }
