@@ -7,7 +7,6 @@ mod direct;
 mod kraken_l3;
 mod market_config;
 pub(crate) mod nasdaq_reference;
-pub(crate) mod openfigi_identity;
 mod reference_identity;
 mod specs;
 

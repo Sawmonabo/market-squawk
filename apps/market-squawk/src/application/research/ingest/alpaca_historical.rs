@@ -1320,7 +1320,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
         ))
     }
 
-    /// Admits or idempotently resolves one exact FIGI-backed click plan.
+    /// Admits or idempotently resolves one exact repository-owned instrument click plan.
     async fn admit_plan(
         &self,
         preflight_plan: AlpacaHistoricalEquityPreflightPlan,
@@ -1805,7 +1805,7 @@ pub(crate) enum AlpacaHistoricalPlanAdmissionError {
     PreflightUnavailable,
     #[error("the Alpaca historical plan is invalid")]
     InvalidPlan,
-    #[error("the canonical FIGI/provider identity does not authorize this plan")]
+    #[error("the canonical instrument/provider identity does not authorize this plan")]
     InvalidInstrumentAuthority,
     #[error("the fixed plan directory allocation is unavailable")]
     CapacityUnavailable,
@@ -2056,12 +2056,9 @@ mod tests {
         CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig, RightsBasis,
     };
     use market_squawk_domain::{
-        AssetClass, AssignmentVerification, AuthorizationBasis, Currency, DataQuality,
-        EffectiveInterval, ExactPayloadEvidence, ExternalIdentifier, ExternalIdentifierRecord,
-        ExternalIdentifierRecordInput, Figi, IdentifierEntitlement,
-        IdentifierRightsPolicyReference, InstrumentId, MarketDataInstrumentDefinitionInput,
-        MetadataRevision, RevisionBoundPayloadEvidence, SourceId, Timestamp, VenueId, VenueMapping,
-        VenueSymbol,
+        AssetClass, AuthorizationBasis, Currency, DataQuality, EffectiveInterval,
+        ExactPayloadEvidence, InstrumentId, MarketDataInstrumentDefinitionInput, MetadataRevision,
+        RevisionBoundPayloadEvidence, SourceId, Timestamp, VenueId, VenueMapping, VenueSymbol,
     };
     use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths};
     use market_squawk_sources::{
@@ -2726,11 +2723,6 @@ mod tests {
             AlpacaHistoricalLookback::try_from_days(30)?,
             AlpacaAdjustment::All,
         )?;
-        let rights_policy = IdentifierRightsPolicyReference::new(
-            SourceIdentifier::try_from("figi-public-domain-v1")?,
-            IdentifierEntitlement::PublicDomain,
-            SourceIdentifier::try_from("https://www.openfigi.com/about/figi")?,
-        );
         let definition =
             MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
                 instrument_id,
@@ -2750,18 +2742,7 @@ mod tests {
                     VenueSymbol::try_from("AAPL")?,
                 )],
                 provider_identities: Vec::new(),
-                identifiers: vec![ExternalIdentifierRecord::new(
-                    ExternalIdentifierRecordInput {
-                        identifier: ExternalIdentifier::Figi(Figi::try_from("BBG000B9XRY4")?),
-                        assignment_verification: AssignmentVerification::VerifiedAssigned,
-                        source_id: SourceId::try_from("openfigi-v3")?,
-                        source_evidence: exact_evidence(53),
-                        source_timestamp: Some(Timestamp::from_unix_nanos(1)),
-                        observed_at: Timestamp::from_unix_nanos(2),
-                        validity: effective,
-                        rights_policy,
-                    },
-                )],
+                identifiers: Vec::new(),
             })?;
         Ok((plan, definition))
     }

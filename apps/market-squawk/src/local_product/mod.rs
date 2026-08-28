@@ -569,14 +569,13 @@ impl LocalProduct {
                 LocalProductError::NasdaqReference
             })?,
         );
-        let prepared_market_configuration = ProductionMarketProviderConfigurationResolver::try_new(
+        let prepared_market_configuration = ProductionMarketProviderConfigurationResolver::new(
             config.clone(),
             Arc::clone(&onboarding),
             Arc::clone(&provider_activation),
             Arc::clone(&nasdaq_reference),
             research.as_ref(),
-            provider_rate.clone(),
-        )?;
+        );
         let market_runtime = MarketRuntimeRegistry::try_new(
             config.clone(),
             provider_rate.clone(),

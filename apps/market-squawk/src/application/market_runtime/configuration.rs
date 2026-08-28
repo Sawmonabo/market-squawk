@@ -101,7 +101,8 @@ impl PreparedMarketProviderConfigurationRequest {
 ///
 /// The implementation must recover an already admitted onboarding lease and canonical instrument
 /// bindings. It may perform bounded public reference/identity resolution through its owned
-/// Nasdaq/OpenFIGI authorities. It must not read credentials, activate a provider market-data
+/// official Nasdaq reference and repository-owned catalog authorities. It must not read credentials,
+/// activate a provider market-data
 /// account, contact a credentialed market-data endpoint, or weaken the request's exact
 /// surface/session/configuration binding.
 #[async_trait]

@@ -1,7 +1,7 @@
 //! Evidence-bound construction of authenticated market-provider configurations.
 //!
 //! This boundary deliberately does not discover instruments, read the network, or mint stable
-//! instrument identities. Display-only Alpaca routes consume stable FIGI-backed
+//! instrument identities. Display-only Alpaca routes consume repository-owned
 //! market-data definitions plus source-qualified symbol evidence; they neither require nor retain
 //! execution terms or accepted execution-provider identities. Authenticated Kraken level 3 keeps
 //! the stricter execution-capable definition contract because decimal book updates require exact
@@ -26,10 +26,10 @@ use market_squawk_data::{
 use market_squawk_domain::{
     AssetClass, AssignmentVerification, AuthorizationBasis, CryptoProductType, DigestAlgorithm,
     EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, ExternalIdentifier,
-    ExternalIdentifierRecord, Figi, IdentifierEntitlement, InstrumentDefinition,
-    InstrumentExecutionTerms, InstrumentId, MarketDataInstrumentDefinition, MetadataRevision,
-    ProviderIdentityRecord, ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceId,
-    SourceIdentifier, Timestamp, TradingStatus, VenueId,
+    ExternalIdentifierRecord, IdentifierEntitlement, InstrumentDefinition,
+    InstrumentExecutionTerms, InstrumentId, MetadataRevision, ProviderIdentityRecord,
+    ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
+    TradingStatus, VenueId,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, BudgetPoolError, DataUseOperation, FreshnessPolicy,
@@ -47,9 +47,7 @@ use super::account::{
     ProviderAccountActivationError, ProviderAccountBinding, ProviderMarketAccount,
 };
 use super::nasdaq_reference::NasdaqCurrentListing;
-use super::openfigi_identity::{
-    OpenFigiIdentityPublicationResult, OpenFigiIdentityPublicationStatus,
-};
+use super::reference_identity::MarketReferenceIdentityApprovalV1;
 
 const MAX_PRIORITY_BINDINGS: usize = 256;
 const KRAKEN_L3_PRODUCT_LIMIT: usize = 200;
@@ -59,7 +57,7 @@ const KRAKEN_VENUE: &str = "kraken";
 const METADATA_EVIDENCE_DOMAIN: &[u8] =
     b"market-squawk/authenticated-market-provider-metadata/v2\0";
 const DISPLAY_METADATA_EVIDENCE_DOMAIN: &[u8] =
-    b"market-squawk/authenticated-display-market-provider-metadata/v2\0";
+    b"market-squawk/authenticated-display-market-provider-metadata/v3\0";
 const HISTORICAL_METADATA_EVIDENCE_DOMAIN: &[u8] =
     b"market-squawk/authenticated-historical-market-provider-metadata/v1\0";
 const KRAKEN_CONFIGURED_SYMBOL_EVIDENCE_REVISION: &str =
@@ -67,14 +65,14 @@ const KRAKEN_CONFIGURED_SYMBOL_EVIDENCE_REVISION: &str =
 
 /// Exact producer required when one market-provider configuration authority is unavailable.
 ///
-/// Display routes require stable FIGI identity plus source-qualified symbol evidence. Kraken L3
+/// Display routes require repository-owned identity plus source-qualified symbol evidence. Kraken L3
 /// requires a canonical venue mapping and exact execution terms; accepted provider identity and
 /// assigned-pair evidence remain mandatory for the strict binding, while the closed provisional
 /// binding defers provider acceptance to runtime qualification. A reference row never mints the
 /// stable instrument ID in either contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarketConfigAuthorityRequirement {
-    /// A stable FIGI-backed definition with no execution authority or terms.
+    /// A repository-owned definition with no execution authority or terms.
     MarketDataInstrumentDefinitionReadCapability,
     /// Source-qualified listing or assigned-identifier evidence for a provisional symbol.
     SourceQualifiedSubscriptionSymbolEvidenceProducer,
@@ -98,7 +96,7 @@ impl std::fmt::Display for MarketConfigAuthorityRequirement {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::MarketDataInstrumentDefinitionReadCapability => {
-                "MarketDataInstrumentDefinitionReadCapability backed by the stable FIGI reference master"
+                "MarketDataInstrumentDefinitionReadCapability backed by the repository-owned reference master"
             }
             Self::SourceQualifiedSubscriptionSymbolEvidenceProducer => {
                 "a source-qualified listing or assigned-identifier producer for the bounded subscription symbol"
@@ -276,14 +274,13 @@ enum MarketDataSubscriptionSymbolEvidenceKind {
 /// Display-only binding between stable reference identity and one bounded subscription symbol.
 ///
 /// Construction consumes a catalog-verified [`MarketDataInstrumentRecord`] and retains its exact
-/// whole-definition digest in addition to the stable ID, FIGI, asset class, effective interval,
+/// whole-definition digest in addition to the stable ID, asset class, effective interval,
 /// and revision-bound reference evidence. Tick size, lot size, multiplier, trading eligibility,
 /// and accepted execution-provider identity are absent from this type by construction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketDataInstrumentBinding {
     priority: MarketSubscriptionPriority,
     instrument_id: InstrumentId,
-    permanent_figi: Figi,
     asset_class: AssetClass,
     definition_reference_evidence: RevisionBoundPayloadEvidence,
     definition_effective: EffectiveInterval,
@@ -293,30 +290,28 @@ pub struct MarketDataInstrumentBinding {
 }
 
 impl MarketDataInstrumentBinding {
-    /// Binds one session-only Nasdaq symbol to stable FIGI-backed reference identity.
+    /// Binds one session-only Nasdaq symbol to a repository-owned reference identity.
     ///
-    /// The definition and exact OpenFIGI publication result must describe the same current
-    /// session listing. The constructor never requires a durable Nasdaq catalog row or venue
-    /// mapping, never reads an accepted provider identity, and never derives the stable ID from
-    /// `subscription_symbol`.
+    /// The immutable definition, exact official listing, and canonical identity approval must
+    /// describe the same current venue-symbol mapping. The constructor never derives the stable
+    /// ID from `subscription_symbol` or an external identifier.
     ///
     /// # Errors
     ///
-    /// Rejects a cross-bound listing/FIGI result, an incompatible equity/fund classification,
+    /// Rejects a cross-bound identity approval, an incompatible equity/fund classification,
     /// invalid source timing, or any symbol other than the exact current-directory symbol.
     pub(crate) fn try_from_nasdaq_session_listing(
         priority: MarketSubscriptionPriority,
         definition_record: MarketDataInstrumentRecord,
         subscription_symbol: ProviderInstrumentId,
         listing: NasdaqCurrentListing,
-        identity_result: &OpenFigiIdentityPublicationResult,
+        identity_approval: &MarketReferenceIdentityApprovalV1,
     ) -> Result<Self, MarketProviderConfigurationError> {
-        let definition = definition_record.definition();
         validate_market_data_session_listing_binding(
-            definition,
+            &definition_record,
             subscription_symbol.as_str(),
             &listing,
-            identity_result,
+            identity_approval,
         )?;
         let symbol_evidence = MarketDataSubscriptionSymbolEvidence {
             kind: MarketDataSubscriptionSymbolEvidenceKind::NasdaqSessionListing {
@@ -328,7 +323,10 @@ impl MarketDataInstrumentBinding {
                 symbol: listing.key().symbol().clone(),
                 mic: listing.key().mic().clone(),
                 asset_class: listing.asset_class(),
-                effective: EffectiveInterval::new(listing.observed_at(), None)?,
+                effective: EffectiveInterval::new(
+                    listing.observed_at(),
+                    Some(identity_approval.expires_at()),
+                )?,
             },
         };
         Ok(Self::from_validated_parts(
@@ -339,7 +337,7 @@ impl MarketDataInstrumentBinding {
         ))
     }
 
-    /// Binds one assigned OCC/index symbol to stable FIGI-backed reference identity.
+    /// Binds one assigned OCC/index symbol to a repository-owned reference identity.
     ///
     /// # Errors
     ///
@@ -400,7 +398,6 @@ impl MarketDataInstrumentBinding {
         Self {
             priority,
             instrument_id: definition.instrument_id(),
-            permanent_figi: definition.permanent_figi().clone(),
             asset_class: definition.asset_class(),
             definition_reference_evidence: definition.reference_evidence().clone(),
             definition_effective: definition.effective_interval(),
@@ -415,14 +412,9 @@ impl MarketDataInstrumentBinding {
         self.priority
     }
 
-    /// Returns the stable internal ID supplied by the FIGI-backed definition authority.
+    /// Returns the stable internal ID supplied by the repository-owned definition authority.
     pub const fn instrument_id(&self) -> InstrumentId {
         self.instrument_id
-    }
-
-    /// Returns the permanent FIGI that anchors stable reference identity.
-    pub const fn permanent_figi(&self) -> &Figi {
-        &self.permanent_figi
     }
 
     /// Returns the non-execution asset family supplied by the stable definition.
@@ -1184,26 +1176,30 @@ fn prepare_kraken_l3(
 }
 
 fn validate_market_data_session_listing_binding(
-    definition: &MarketDataInstrumentDefinition,
+    definition_record: &MarketDataInstrumentRecord,
     subscription_symbol: &str,
     listing: &NasdaqCurrentListing,
-    identity_result: &OpenFigiIdentityPublicationResult,
+    identity_approval: &MarketReferenceIdentityApprovalV1,
 ) -> Result<(), MarketProviderConfigurationError> {
-    let OpenFigiIdentityPublicationStatus::Exact {
-        candidate,
-        instrument_id,
-        catalog_disposition: _,
-    } = identity_result.status()
-    else {
-        return Err(MarketProviderConfigurationError::InvalidListingBinding {
-            instrument: definition.instrument_id(),
-        });
-    };
+    let definition = definition_record.definition();
     if !matches!(listing.asset_class(), AssetClass::Equity | AssetClass::Fund)
         || listing.asset_class() != definition.asset_class()
-        || identity_result.listing() != listing.key()
-        || *instrument_id != definition.instrument_id()
-        || candidate.exchange_figi() != definition.permanent_figi()
+        || identity_approval.request().provider_instrument_id() != listing.key().symbol()
+        || identity_approval.request().venue_id() != listing.key().mic()
+        || identity_approval.instrument_id() != definition.instrument_id()
+        || identity_approval.asset_class() != definition.asset_class()
+        || identity_approval.quote_currency() != definition.quote_currency()
+        || identity_approval.definition_revision_digest() != definition_record.revision_digest()
+        || identity_approval.definition_reference_evidence() != definition.reference_evidence()
+        || identity_approval.quote_currency_evidence() != definition.quote_currency_evidence()
+        || identity_approval.listing_payload_evidence() != listing.source_payload_evidence()
+        || identity_approval.listing_source_timestamp() != listing.source_timestamp()
+        || identity_approval.listing_observed_at() != listing.observed_at()
+        || identity_approval.evaluated_at() >= identity_approval.expires_at()
+        || !definition.venue_mappings().iter().any(|mapping| {
+            mapping.venue_id() == listing.key().mic()
+                && mapping.venue_symbol().as_str() == listing.key().symbol().as_str()
+        })
         || listing.key().symbol().as_str() != subscription_symbol
         || listing.source_timestamp() > listing.observed_at()
     {
@@ -1779,7 +1775,6 @@ enum KrakenRuntimeSymbolQualificationWire {
 struct MarketDataBindingEvidenceWire<'a> {
     priority: MarketSubscriptionPriority,
     instrument_id: InstrumentId,
-    permanent_figi: &'a Figi,
     asset_class: AssetClass,
     definition_reference_evidence: &'a RevisionBoundPayloadEvidence,
     definition_effective: EffectiveInterval,
@@ -1856,7 +1851,6 @@ impl<'a> From<&'a MarketDataInstrumentBinding> for MarketDataBindingEvidenceWire
         Self {
             priority: binding.priority(),
             instrument_id: binding.instrument_id(),
-            permanent_figi: binding.permanent_figi(),
             asset_class: binding.asset_class(),
             definition_reference_evidence: binding.definition_reference_evidence(),
             definition_effective: binding.definition_effective(),

@@ -4418,7 +4418,6 @@ dependencies = [
  "market-squawk-adapter-iex-hist",
  "market-squawk-adapter-kraken",
  "market-squawk-adapter-nasdaq-symbols",
- "market-squawk-adapter-openfigi",
  "market-squawk-adapter-options-reference",
  "market-squawk-adapter-paper",
  "market-squawk-adapter-portfolio",

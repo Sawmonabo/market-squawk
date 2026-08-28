@@ -20,23 +20,22 @@ use market_squawk_data::{
     MarketDataInstrumentReadCapability, MarketDataInstrumentSynchronization,
     MarketDataInstrumentSynchronizationCapability, ObjectStoreConfig, OnboardingAppendOutcome,
     OnboardingReservationRequest, RightsBasis, RightsDecisionInput, RightsError, SourceCursor,
-    SourceOperation, market_data_instrument_id,
+    SourceOperation,
 };
 use market_squawk_domain::{
-    AssetClass, AssignmentVerification, AuthorizationBasis, AvailabilityEvidence,
-    ChecksumCapability, CommonEquitySuitability, CompanyIdentityObservation,
-    CompanyIdentityObservationInput, CompanyIdentitySurface, CompanySecurityIdentityLink,
-    CompanySecurityIdentityLinkInput, CompanySecurityKind, CompanySecurityLinkTransition,
-    CompanySecurityRelationshipKind, CompanySecurityResolutionBasis, ContractRollMapping,
-    CoverageDelay, Currency, DataQuality, DeliveryEvidence, DigestAlgorithm, EffectiveInterval,
-    EvidenceDigest, ExactPayloadEvidence, ExternalIdentifier, ExternalIdentifierRecord,
-    ExternalIdentifierRecordInput, Figi, IdentifierEntitlement, IdentifierRightsPolicyReference,
-    InstrumentDefinition, InstrumentId, LifecycleTransition, LifecycleTransitionKind,
-    MarketDataDisplayName, MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput,
-    MetadataRevision, ProviderIdentityEvidence, ProviderIdentityRecord,
-    ProviderIdentityRecordInput, ProviderInstrumentId, ProviderReportedSecurityAssociation,
-    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
-    SymbolIdentityRecord, Timestamp, VenueId, VenueMapping, VenueSymbol,
+    AssetClass, AuthorizationBasis, AvailabilityEvidence, ChecksumCapability,
+    CommonEquitySuitability, CompanyIdentityObservation, CompanyIdentityObservationInput,
+    CompanyIdentitySurface, CompanySecurityIdentityLink, CompanySecurityIdentityLinkInput,
+    CompanySecurityKind, CompanySecurityLinkTransition, CompanySecurityRelationshipKind,
+    CompanySecurityResolutionBasis, ContractRollMapping, CoverageDelay, Currency, DataQuality,
+    DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
+    IdentifierEntitlement, IdentifierRightsPolicyReference, InstrumentDefinition, InstrumentId,
+    LifecycleTransition, LifecycleTransitionKind, MarketDataDisplayName,
+    MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput, MetadataRevision,
+    ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    ProviderInstrumentId, ProviderReportedSecurityAssociation, RevisionBoundPayloadEvidence,
+    SchemaVersion, SequenceCapability, SourceId, SourceIdentifier, SymbolIdentityRecord, Timestamp,
+    VenueId, VenueMapping, VenueSymbol,
 };
 use market_squawk_platform::LocalPaths;
 use market_squawk_platform::{SecretGeneration, SecretRef};
@@ -1087,7 +1086,8 @@ fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> Te
 }
 
 #[test]
-fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -> TestResult {
+fn repository_instrument_company_security_identity_is_point_in_time_and_parent_bound() -> TestResult
+{
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("market-data-instruments"))?;
     let database = paths.catalog()?.path().to_path_buf();
@@ -1097,29 +1097,11 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
         CatalogLimit::new(32)?,
         CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
     )?;
-    let figi = Figi::try_from("BBG000B9XVV8")?;
-    let derived_id = market_data_instrument_id(&figi)?;
-    assert_eq!(derived_id, market_data_instrument_id(&figi)?);
+    let instrument_id: InstrumentId = "00000000-0000-0000-0000-000000000101".parse()?;
+    let other_id: InstrumentId = "00000000-0000-0000-0000-000000000102".parse()?;
 
-    let initial = market_data_definition(
-        figi.clone(),
-        derived_id,
-        10,
-        None,
-        "Apple Incorporated",
-        "AAPL.US",
-        31,
-    )?;
-    let wrong_id = market_data_instrument_id(&Figi::try_from("BBG000BLNNH6")?)?;
-    let mismatched = market_data_definition(
-        figi.clone(),
-        wrong_id,
-        11,
-        None,
-        "Wrong Identity",
-        "WRONG.US",
-        32,
-    )?;
+    let initial =
+        market_data_definition(instrument_id, 10, None, "Apple Incorporated", "AAPL.US", 31)?;
     assert!(matches!(
         MarketDataInstrumentSynchronization::try_new(vec![initial.clone()], 2),
         Err(MarketDataInstrumentCatalogError::PartialBatch {
@@ -1193,15 +1175,9 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
     let relationship_reader = CompanySecurityIdentityReadCapability::new(Arc::clone(&authority));
     let cancellation = CancellationToken::new();
     let deadline = || Instant::now() + Duration::from_secs(2);
-    let invalid_batch =
-        MarketDataInstrumentSynchronization::try_new(vec![initial.clone(), mismatched], 2)?;
-    assert!(matches!(
-        publisher.synchronize(invalid_batch, deadline(), &cancellation),
-        Err(MarketDataInstrumentCatalogError::MismatchedInstrumentId)
-    ));
     assert!(
         reader
-            .latest(derived_id, deadline(), &cancellation)?
+            .latest(instrument_id, deadline(), &cancellation)?
             .is_none()
     );
 
@@ -1212,25 +1188,25 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
     )?;
     assert_eq!((inserted.inserted(), inserted.replayed()), (1, 0));
     let retained = reader
-        .latest_by_figi(&figi, deadline(), &cancellation)?
+        .latest(instrument_id, deadline(), &cancellation)?
         .ok_or(CatalogError::InvalidRecord)?;
     assert_eq!(retained.revision_sequence(), 1);
     let canonical_population = MarketDataInstrumentPopulationQuery::try_new(
-        vec![wrong_id, derived_id],
+        vec![other_id, instrument_id],
         retained.published_at(),
         Timestamp::from_unix_nanos(10),
     )?;
     assert_eq!(
         canonical_population,
         MarketDataInstrumentPopulationQuery::try_new(
-            vec![derived_id, wrong_id],
+            vec![instrument_id, other_id],
             retained.published_at(),
             Timestamp::from_unix_nanos(10),
         )?
     );
     assert!(matches!(
         MarketDataInstrumentPopulationQuery::try_new(
-            vec![derived_id, derived_id],
+            vec![instrument_id, instrument_id],
             retained.published_at(),
             Timestamp::from_unix_nanos(10),
         ),
@@ -1242,21 +1218,20 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
         provider_company_id: company.provider_company_id().clone(),
         company_surface: company.surface(),
         company_observation_digest: company_digest,
-        instrument_id: derived_id,
-        permanent_figi: figi.clone(),
+        instrument_id,
         market_instrument_revision_digest: retained.revision_digest(),
         security_kind: CompanySecurityKind::CommonEquity,
         relationship_kind: CompanySecurityRelationshipKind::Issuer,
         common_equity_suitability: CommonEquitySuitability::SuitableIssuerCommonEquity,
         resolution_basis: CompanySecurityResolutionBasis::DirectAuthoritativeCrosswalk {
-            authority_source_id: SourceId::try_from("openfigi-company-crosswalk")?,
-            authority_revision: SourceIdentifier::try_from("crosswalk-2026-08-10")?,
+            authority_source_id: SourceId::try_from("sec-company-ticker-exchange-reference")?,
+            authority_revision: SourceIdentifier::try_from("sec-company-tickers-2026-08-10")?,
             evidence: ExactPayloadEvidence::from_content_digest(digest(44)),
         },
         relationship_evidence_rights: IdentifierRightsPolicyReference::new(
-            SourceIdentifier::try_from("crosswalk-public-domain-v1")?,
-            IdentifierEntitlement::PublicDomain,
-            SourceIdentifier::try_from("https://www.openfigi.com/about/figi")?,
+            SourceIdentifier::try_from("sec-reference-personal-use-v1")?,
+            IdentifierEntitlement::LicensedInternalUse,
+            SourceIdentifier::try_from("https://www.sec.gov/files/company_tickers_exchange.json")?,
         ),
         effective_interval: EffectiveInterval::new(Timestamp::from_unix_nanos(100), None)?,
         available_at: Timestamp::from_unix_nanos(100),
@@ -1268,7 +1243,7 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
         company.source_id().clone(),
         company.provider_company_id().clone(),
         company.surface(),
-        Some(derived_id),
+        Some(instrument_id),
         true,
     );
     let before = relationship_reader.as_of(
@@ -1308,7 +1283,7 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
     assert_eq!((replay.inserted(), replay.replayed()), (0, 1));
     assert_eq!(
         reader
-            .latest(derived_id, deadline(), &cancellation)?
+            .latest(instrument_id, deadline(), &cancellation)?
             .ok_or(CatalogError::InvalidRecord)?,
         retained
     );
@@ -1318,8 +1293,7 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
     let successor_effective_end = shift_timestamp(successor_effective_start, 86_400_000_000_000)?;
     std::thread::sleep(Duration::from_millis(1));
     let successor = market_data_definition(
-        figi.clone(),
-        derived_id,
+        instrument_id,
         successor_effective_start.unix_nanos(),
         Some(successor_effective_end.unix_nanos()),
         "Apple Inc.",
@@ -1333,12 +1307,12 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
     )?;
     assert_eq!((advanced.inserted(), advanced.replayed()), (1, 0));
     let future_parent = reader
-        .latest(derived_id, deadline(), &cancellation)?
+        .latest(instrument_id, deadline(), &cancellation)?
         .ok_or(CatalogError::InvalidRecord)?;
     assert!(future_parent.published_at() > retained.published_at());
     assert!(future_parent.published_at() < successor_effective_start);
     let before_successor_query = MarketDataInstrumentPopulationQuery::try_new(
-        vec![derived_id],
+        vec![instrument_id],
         retained.published_at(),
         successor_effective_start,
     )?;
@@ -1350,7 +1324,7 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
     );
     assert_eq!(before_successor.records(), std::slice::from_ref(&retained));
     let after_successor_query = MarketDataInstrumentPopulationQuery::try_new(
-        vec![derived_id],
+        vec![instrument_id],
         future_parent.published_at(),
         successor_effective_start,
     )?;
@@ -1365,7 +1339,7 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
         std::slice::from_ref(&future_parent)
     );
     let ended_query = MarketDataInstrumentPopulationQuery::try_new(
-        vec![derived_id],
+        vec![instrument_id],
         future_parent.published_at(),
         successor_effective_end,
     )?;
@@ -1445,7 +1419,7 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
     let authority = Arc::new(Mutex::new(CatalogAuthority::open(config)?));
     let reader = MarketDataInstrumentReadCapability::new(authority);
     let reopened = reader
-        .latest_by_figi(&figi, deadline(), &cancellation)?
+        .latest(instrument_id, deadline(), &cancellation)?
         .ok_or(CatalogError::InvalidRecord)?;
     assert_eq!(reopened.revision_sequence(), 2);
     assert_eq!(
@@ -1472,7 +1446,6 @@ fn figi_company_security_identity_is_explicit_point_in_time_and_parent_bound() -
 }
 
 fn market_data_definition(
-    figi: Figi,
     instrument_id: InstrumentId,
     effective_start: i64,
     effective_end: Option<i64>,
@@ -1487,9 +1460,11 @@ fn market_data_definition(
     let exact = |byte| ExactPayloadEvidence::from_content_digest(digest(byte));
     let rights = || -> TestResult<IdentifierRightsPolicyReference> {
         Ok(IdentifierRightsPolicyReference::new(
-            SourceIdentifier::try_from("figi-public-domain-v1")?,
-            IdentifierEntitlement::PublicDomain,
-            SourceIdentifier::try_from("https://www.openfigi.com/about/figi")?,
+            SourceIdentifier::try_from("nasdaq-reference-personal-use-v1")?,
+            IdentifierEntitlement::LicensedInternalUse,
+            SourceIdentifier::try_from(
+                "https://www.nasdaqtrader.com/trader.aspx?id=symboldirdefs",
+            )?,
         ))
     };
     Ok(MarketDataInstrumentDefinition::try_new(
@@ -1530,18 +1505,7 @@ fn market_data_definition(
                 validity: effective,
                 supersedes: None,
             })],
-            identifiers: vec![ExternalIdentifierRecord::new(
-                ExternalIdentifierRecordInput {
-                    identifier: ExternalIdentifier::Figi(figi),
-                    assignment_verification: AssignmentVerification::VerifiedAssigned,
-                    source_id: SourceId::try_from("openfigi-v3")?,
-                    source_evidence: exact(evidence_byte.saturating_add(4)),
-                    source_timestamp: Some(Timestamp::from_unix_nanos(effective_start)),
-                    observed_at: Timestamp::from_unix_nanos(effective_start + 1),
-                    validity: effective,
-                    rights_policy: rights()?,
-                },
-            )],
+            identifiers: Vec::new(),
         },
     )?)
 }

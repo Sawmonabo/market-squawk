@@ -94,7 +94,6 @@ market-squawk-adapter-fred = { workspace = true }
 market-squawk-adapter-iex-hist = { workspace = true }
 market-squawk-adapter-kraken = { workspace = true }
 market-squawk-adapter-nasdaq-symbols = { workspace = true }
-market-squawk-adapter-openfigi = { workspace = true }
 market-squawk-adapter-options-reference = { workspace = true }
 market-squawk-adapter-paper = { workspace = true }
 market-squawk-adapter-portfolio = { workspace = true }

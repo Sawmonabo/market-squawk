@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use market_squawk_data::MarketDataInstrumentRecord;
 use market_squawk_domain::{
-    AssetClass, EffectiveInterval, EvidenceDigest, Figi, InstrumentId,
-    MarketDataInstrumentDefinition, RevisionBoundPayloadEvidence, SourceIdentifier,
+    AssetClass, EffectiveInterval, EvidenceDigest, InstrumentId, MarketDataInstrumentDefinition,
+    RevisionBoundPayloadEvidence, SourceIdentifier,
 };
 use market_squawk_services::ServiceError;
 use market_squawk_sources::SourceMetadata;
@@ -104,7 +104,6 @@ struct DisplayInstrumentSymbol {
 #[derive(Debug, Eq, PartialEq)]
 struct DisplayMarketDataDefinitionIdentity {
     instrument_id: InstrumentId,
-    permanent_figi: Figi,
     asset_class: AssetClass,
     reference_evidence: RevisionBoundPayloadEvidence,
     effective_interval: EffectiveInterval,
@@ -115,7 +114,6 @@ impl DisplayMarketDataDefinitionIdentity {
     fn from_binding(binding: &MarketDataInstrumentBinding) -> Self {
         Self {
             instrument_id: binding.instrument_id(),
-            permanent_figi: binding.permanent_figi().clone(),
             asset_class: binding.asset_class(),
             reference_evidence: binding.definition_reference_evidence().clone(),
             effective_interval: binding.definition_effective(),
@@ -134,7 +132,6 @@ impl DisplayMarketDataDefinitionIdentity {
 
     fn matches_definition(&self, definition: &MarketDataInstrumentDefinition) -> bool {
         self.instrument_id == definition.instrument_id()
-            && &self.permanent_figi == definition.permanent_figi()
             && self.asset_class == definition.asset_class()
             && &self.reference_evidence == definition.reference_evidence()
             && self.effective_interval == definition.effective_interval()

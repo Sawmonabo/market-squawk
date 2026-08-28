@@ -2,7 +2,8 @@
 
 use market_squawk_domain::{
     CommonEquitySuitability, CompanySecurityKind, CompanySecurityRelationshipKind, DigestAlgorithm,
-    EvidenceDigest, IdentifierEntitlement, Timestamp,
+    EvidenceDigest, ExactPayloadEvidence, IdentifierEntitlement, RevisionBoundPayloadEvidence,
+    Timestamp,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -14,7 +15,7 @@ use super::model::{
 };
 
 const PREVIEW_DIGEST_DOMAIN: &[u8] =
-    b"market-squawk/application/company-security-resolution-preview/v1\0";
+    b"market-squawk/application/company-security-resolution-preview/v2\0";
 
 pub(super) fn preview_digest(
     preview: &CompanySecurityResolutionPreview,
@@ -43,9 +44,9 @@ pub(super) fn preview_digest(
     hash_count(&mut digest, preview.candidates().len())?;
     for candidate in preview.candidates() {
         digest.update(candidate.ordinal().to_be_bytes());
-        hash_text(&mut digest, candidate.permanent_figi().as_str())?;
         digest.update(candidate.instrument_id().as_uuid().as_bytes());
         hash_evidence_digest(&mut digest, candidate.market_revision_digest());
+        hash_revision_bound_evidence(&mut digest, candidate.market_reference_evidence())?;
         digest.update(candidate.market_revision_sequence().to_be_bytes());
         hash_timestamp(&mut digest, candidate.market_published_at());
         hash_timestamp(
@@ -68,15 +69,7 @@ pub(super) fn preview_digest(
     digest.update([suitability_tag(preview.common_equity_suitability())]);
 
     let reviewed = preview.reviewed_evidence();
-    hash_evidence_digest(&mut digest, reviewed.evidence().content_digest());
-    match reviewed.evidence().version_pinned_locator() {
-        Some(locator) => {
-            digest.update([1]);
-            hash_text(&mut digest, locator.reference().as_str())?;
-            hash_text(&mut digest, locator.version().as_str())?;
-        }
-        None => digest.update([0]),
-    }
+    hash_exact_payload_evidence(&mut digest, reviewed.evidence())?;
     hash_timestamp(&mut digest, reviewed.evidence_available_at());
     hash_timestamp(&mut digest, reviewed.reviewed_at());
     hash_text(&mut digest, reviewed.rights().policy_id().as_str())?;
@@ -118,6 +111,35 @@ pub(super) fn preview_digest(
         DigestAlgorithm::Sha256,
         digest.finalize().into(),
     ))
+}
+
+fn hash_revision_bound_evidence(
+    digest: &mut Sha256,
+    evidence: &RevisionBoundPayloadEvidence,
+) -> Result<(), CompanySecurityResolutionError> {
+    hash_text(
+        digest,
+        evidence.metadata_revision().as_source_identifier().as_str(),
+    )?;
+    hash_exact_payload_evidence(digest, evidence.payload_evidence())
+}
+
+fn hash_exact_payload_evidence(
+    digest: &mut Sha256,
+    evidence: &ExactPayloadEvidence,
+) -> Result<(), CompanySecurityResolutionError> {
+    hash_evidence_digest(digest, evidence.content_digest());
+    match evidence.version_pinned_locator() {
+        Some(locator) => {
+            digest.update([1]);
+            hash_text(digest, locator.reference().as_str())?;
+            hash_text(digest, locator.version().as_str())
+        }
+        None => {
+            digest.update([0]);
+            Ok(())
+        }
+    }
 }
 
 fn hash_evidence_digest(digest: &mut Sha256, evidence: EvidenceDigest) {

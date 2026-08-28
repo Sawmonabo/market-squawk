@@ -1,4 +1,4 @@
-//! Immutable FIGI-backed definitions for non-execution market-data discovery.
+//! Immutable repository-owned definitions for non-execution market-data discovery.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -7,24 +7,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, ExternalIdentifier, ExternalIdentifierRecord, Figi,
-    IdentifierEntitlement, InstrumentId, MarketDataInstrumentDefinition, Timestamp,
+    DigestAlgorithm, EvidenceDigest, InstrumentId, MarketDataInstrumentDefinition, Timestamp,
 };
 use rusqlite::{OptionalExtension as _, Row, Transaction, params};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use super::CatalogAuthority;
 use super::storage::{ResultBudget, append_audit, sha256, trusted_catalog_now};
-
-/// Stable UUID-v5 namespace used only for assigned permanent-FIGI identities.
-///
-/// The namespace value is part of the durable schema contract. It must never be changed or reused
-/// for ticker-, venue-, provider-, or directory-derived identities.
-pub const MARKET_DATA_INSTRUMENT_ID_NAMESPACE: Uuid =
-    Uuid::from_u128(0x4f773442_e5ea_4e60_9c4f_d0e5da98a2f6);
 
 /// Maximum definitions accepted in one atomic synchronization.
 pub const MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS: usize = 65_536;
@@ -39,22 +30,6 @@ const POPULATION_QUERY_DOMAIN: &[u8] =
     b"market-squawk/market-data-instrument-population-query/v1\0";
 const POPULATION_RECEIPT_DOMAIN: &[u8] =
     b"market-squawk/market-data-instrument-population-receipt/v1\0";
-
-/// Derives the sole canonical internal identity for an assigned permanent FIGI.
-///
-/// # Errors
-///
-/// Returns [`MarketDataInstrumentCatalogError::IdentityDerivation`] if the UUID contract could not
-/// produce a valid non-nil [`InstrumentId`].
-pub fn market_data_instrument_id(
-    permanent_figi: &Figi,
-) -> Result<InstrumentId, MarketDataInstrumentCatalogError> {
-    InstrumentId::try_from(Uuid::new_v5(
-        &MARKET_DATA_INSTRUMENT_ID_NAMESPACE,
-        permanent_figi.as_str().as_bytes(),
-    ))
-    .map_err(|_| MarketDataInstrumentCatalogError::IdentityDerivation)
-}
 
 /// Complete caller-declared synchronization batch.
 ///
@@ -148,7 +123,7 @@ impl MarketDataInstrumentRecord {
         self.revision_digest
     }
 
-    /// Returns the monotonic revision position for this permanent FIGI.
+    /// Returns the monotonic revision position for this repository-owned instrument identity.
     pub const fn revision_sequence(&self) -> u32 {
         self.revision_sequence
     }
@@ -295,8 +270,8 @@ impl MarketDataInstrumentPopulationSelection {
 /// Current reference field responsible for a search match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarketDataInstrumentMatchKind {
-    /// Permanent assigned FIGI.
-    PermanentFigi,
+    /// Evidence-bearing external identifier such as a FIGI, ISIN, CUSIP, or ticker.
+    ExternalIdentifier,
     /// Rights-admitted display name.
     DisplayName,
     /// Current venue symbol.
@@ -423,20 +398,6 @@ impl MarketDataInstrumentReadCapability {
             .latest_market_data_instrument(instrument_id, deadline, cancellation)
     }
 
-    /// Returns the current definition for one assigned permanent FIGI.
-    pub fn latest_by_figi(
-        &self,
-        permanent_figi: &Figi,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<MarketDataInstrumentRecord>, MarketDataInstrumentCatalogError> {
-        check_operation(deadline, cancellation)?;
-        self.authority
-            .try_lock()
-            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
-            .latest_market_data_instrument_by_figi(permanent_figi, deadline, cancellation)
-    }
-
     /// Atomically pins one exact, bounded stable-identity set at independent knowledge/effective
     /// coordinates.
     ///
@@ -457,7 +418,8 @@ impl MarketDataInstrumentReadCapability {
             .pin_market_data_instrument_population(query, deadline, cancellation)
     }
 
-    /// Searches FIGI, admitted display name, venue symbol, and accepted provider symbol.
+    /// Searches external identifiers, admitted display names, venue symbols, and accepted provider
+    /// symbols.
     pub fn search(
         &self,
         query: &str,
@@ -498,21 +460,9 @@ pub enum MarketDataInstrumentCatalogError {
     /// Synchronization exceeded its hard row bound.
     #[error("market-data instrument batch exceeds maximum {max}")]
     BatchLimitExceeded { max: usize },
-    /// UUID-v5 identity derivation failed.
-    #[error("permanent FIGI could not derive a valid market-data instrument identity")]
-    IdentityDerivation,
-    /// Caller supplied an identity not derived from the permanent FIGI.
-    #[error("market-data instrument identity does not match its permanent FIGI")]
-    MismatchedInstrumentId,
     /// A submitted batch repeated one internal identity.
     #[error("market-data instrument batch contains a duplicate instrument identity")]
     DuplicateInstrumentId,
-    /// A submitted batch repeated one permanent FIGI.
-    #[error("market-data instrument batch contains a duplicate permanent FIGI")]
-    DuplicatePermanentFigi,
-    /// Existing FIGI-to-UUID identity disagreed with the immutable derivation contract.
-    #[error("market-data FIGI-to-instrument identity conflicts with durable catalog state")]
-    IdentityConflict,
     /// A changed definition predates the current effective revision.
     #[error("market-data instrument definition revision is stale")]
     StaleRevision,
@@ -578,20 +528,12 @@ enum PublicationPlan {
 struct StoredDefinitionRow {
     digest: Vec<u8>,
     instrument_id: String,
-    permanent_figi: String,
     revision_sequence: i64,
     effective_start_ns: i64,
     effective_end_ns: Option<i64>,
     reference_revision: String,
     reference_algorithm: i64,
     reference_payload_digest: Vec<u8>,
-    figi_source_id: String,
-    figi_source_algorithm: i64,
-    figi_source_payload_digest: Vec<u8>,
-    figi_source_timestamp_ns: Option<i64>,
-    figi_observed_at_ns: i64,
-    figi_rights_policy_id: String,
-    figi_terms_reference: String,
     definition_json: String,
     published_at_ns: i64,
 }
@@ -659,7 +601,7 @@ impl CatalogAuthority {
             append_audit(
                 &transaction,
                 "market-data-instrument.synchronized",
-                "figi-backed-market-data-definitions",
+                "repository-owned-market-data-definitions",
                 batch_digest,
                 published_at,
             )
@@ -685,20 +627,6 @@ impl CatalogAuthority {
         self.read_latest(
             "current_.instrument_id=?1",
             instrument_id.to_string(),
-            deadline,
-            cancellation,
-        )
-    }
-
-    fn latest_market_data_instrument_by_figi(
-        &self,
-        permanent_figi: &Figi,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<MarketDataInstrumentRecord>, MarketDataInstrumentCatalogError> {
-        self.read_latest(
-            "current_.permanent_figi=?1",
-            permanent_figi.as_str().to_owned(),
             deadline,
             cancellation,
         )
@@ -820,8 +748,8 @@ impl CatalogAuthority {
             let rows = statement.query_map(params![normalize(query), retrieval_limit], |row| {
                 Ok((
                     decode_stored_row(row)?,
-                    row.get::<_, String>(18)?,
-                    row.get::<_, String>(19)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             })?;
             let mut budget = ResultBudget::new(self.catalog().result_bytes);
@@ -918,21 +846,13 @@ fn prepare_definitions(
     definitions: Box<[MarketDataInstrumentDefinition]>,
 ) -> Result<Vec<PreparedDefinition>, MarketDataInstrumentCatalogError> {
     let mut instrument_ids = BTreeSet::new();
-    let mut figis = BTreeSet::new();
     let mut prepared = Vec::new();
     prepared
         .try_reserve_exact(definitions.len())
         .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
     for definition in Vec::from(definitions) {
-        let expected = market_data_instrument_id(definition.permanent_figi())?;
-        if expected != definition.instrument_id() {
-            return Err(MarketDataInstrumentCatalogError::MismatchedInstrumentId);
-        }
         if !instrument_ids.insert(definition.instrument_id()) {
             return Err(MarketDataInstrumentCatalogError::DuplicateInstrumentId);
-        }
-        if !figis.insert(definition.permanent_figi().clone()) {
-            return Err(MarketDataInstrumentCatalogError::DuplicatePermanentFigi);
         }
         let json = serde_json::to_string(&definition)?;
         let digest = sha256(json.as_bytes());
@@ -952,29 +872,11 @@ fn plan_publication(
     incoming: &PreparedDefinition,
 ) -> Result<PublicationPlan, MarketDataInstrumentCatalogError> {
     let instrument_id = incoming.definition.instrument_id().to_string();
-    let figi = incoming.definition.permanent_figi().as_str();
-    let figi_for_id: Option<String> = transaction
-        .query_row(
-            "SELECT permanent_figi FROM market_data_instrument_identities WHERE instrument_id=?1",
-            [&instrument_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let id_for_figi: Option<String> = transaction
-        .query_row(
-            "SELECT instrument_id FROM market_data_instrument_identities WHERE permanent_figi=?1",
-            [figi],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if figi_for_id.as_deref().is_some_and(|stored| stored != figi)
-        || id_for_figi
-            .as_deref()
-            .is_some_and(|stored| stored != instrument_id)
-        || figi_for_id.is_some() != id_for_figi.is_some()
-    {
-        return Err(MarketDataInstrumentCatalogError::IdentityConflict);
-    }
+    let identity_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM market_data_instrument_identities WHERE instrument_id=?1)",
+        [&instrument_id],
+        |row| row.get(0),
+    )?;
 
     let current: Option<([u8; 32], u32, i64)> = transaction
         .query_row(
@@ -1007,7 +909,7 @@ fn plan_publication(
         .starts_at()
         .unix_nanos();
     match current {
-        None if figi_for_id.is_some() => Err(MarketDataInstrumentCatalogError::CorruptCatalog),
+        None if identity_exists => Err(MarketDataInstrumentCatalogError::CorruptCatalog),
         None => Ok(PublicationPlan::Insert {
             sequence: 1,
             previous: None,
@@ -1062,31 +964,23 @@ fn insert_definition(
 ) -> Result<(), MarketDataInstrumentCatalogError> {
     let definition = &prepared.definition;
     let instrument_id = definition.instrument_id().to_string();
-    let figi = definition.permanent_figi().as_str();
     if identity_is_new {
         transaction.execute(
             "INSERT INTO market_data_instrument_identities
-             (instrument_id, permanent_figi, created_at_ns) VALUES (?1, ?2, ?3)",
-            params![instrument_id, figi, published_at.unix_nanos()],
+             (instrument_id, created_at_ns) VALUES (?1, ?2)",
+            params![instrument_id, published_at.unix_nanos()],
         )?;
     }
-    let figi_record = permanent_figi_record(definition)?;
     let reference = definition.reference_payload_evidence().content_digest();
-    let figi_evidence = figi_record.source_evidence().content_digest();
     transaction.execute(
         "INSERT INTO market_data_instrument_revisions
-         (revision_digest, instrument_id, permanent_figi, revision_sequence,
+         (revision_digest, instrument_id, revision_sequence,
           previous_revision_digest, effective_start_ns, effective_end_ns, reference_revision,
-          reference_algorithm, reference_payload_digest, figi_source_id, figi_source_algorithm,
-          figi_source_payload_digest, figi_source_timestamp_ns, figi_observed_at_ns,
-          figi_rights_policy_id, figi_entitlement, figi_terms_reference, definition_json,
-          published_at_ns)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 ?15, ?16, 'public_domain', ?17, ?18, ?19)",
+          reference_algorithm, reference_payload_digest, definition_json, published_at_ns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             prepared.digest,
             instrument_id,
-            figi,
             i64::from(sequence),
             previous,
             definition.effective_interval().starts_at().unix_nanos(),
@@ -1100,13 +994,6 @@ fn insert_definition(
                 .as_str(),
             algorithm_code(reference.algorithm()),
             reference.bytes(),
-            figi_record.source_id().as_str(),
-            algorithm_code(figi_evidence.algorithm()),
-            figi_evidence.bytes(),
-            figi_record.source_timestamp().map(Timestamp::unix_nanos),
-            figi_record.observed_at().unix_nanos(),
-            figi_record.rights_policy().policy_id().as_str(),
-            figi_record.rights_policy().terms_reference().as_str(),
             prepared.json,
             published_at.unix_nanos(),
         ],
@@ -1129,25 +1016,19 @@ fn insert_definition(
     if identity_is_new {
         transaction.execute(
             "INSERT INTO market_data_instrument_current
-             (instrument_id, permanent_figi, revision_digest, advanced_at_ns)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                instrument_id,
-                figi,
-                prepared.digest,
-                published_at.unix_nanos()
-            ],
+             (instrument_id, revision_digest, advanced_at_ns)
+             VALUES (?1, ?2, ?3)",
+            params![instrument_id, prepared.digest, published_at.unix_nanos()],
         )?;
     } else {
         let changed = transaction.execute(
             "UPDATE market_data_instrument_current
              SET revision_digest=?1, advanced_at_ns=?2
-             WHERE instrument_id=?3 AND permanent_figi=?4 AND revision_digest=?5",
+             WHERE instrument_id=?3 AND revision_digest=?4",
             params![
                 prepared.digest,
                 published_at.unix_nanos(),
                 instrument_id,
-                figi,
                 previous,
             ],
         )?;
@@ -1162,7 +1043,13 @@ fn search_terms(
     definition: &MarketDataInstrumentDefinition,
 ) -> Result<Vec<SearchTerm>, MarketDataInstrumentCatalogError> {
     let mut terms = Vec::new();
-    push_term(&mut terms, "figi", definition.permanent_figi().as_str())?;
+    for identifier in definition.identifiers() {
+        push_term(
+            &mut terms,
+            "external_identifier",
+            &identifier.identifier().to_string(),
+        )?;
+    }
     if let Some(name) = definition.display_name() {
         push_term(&mut terms, "display_name", name.as_str())?;
     }
@@ -1223,24 +1110,6 @@ fn push_term(
     Ok(())
 }
 
-fn permanent_figi_record(
-    definition: &MarketDataInstrumentDefinition,
-) -> Result<&ExternalIdentifierRecord, MarketDataInstrumentCatalogError> {
-    definition
-        .identifiers()
-        .iter()
-        .find(|record| {
-            matches!(
-                record.identifier(),
-                ExternalIdentifier::Figi(figi) if figi == definition.permanent_figi()
-            )
-        })
-        .filter(|record| {
-            record.rights_policy().entitlement() == IdentifierEntitlement::PublicDomain
-        })
-        .ok_or(MarketDataInstrumentCatalogError::CorruptCatalog)
-}
-
 fn load_record_by_digest(
     transaction: &Transaction<'_>,
     digest: [u8; 32],
@@ -1262,22 +1131,14 @@ fn decode_stored_row(row: &Row<'_>) -> rusqlite::Result<StoredDefinitionRow> {
     Ok(StoredDefinitionRow {
         digest: row.get(0)?,
         instrument_id: row.get(1)?,
-        permanent_figi: row.get(2)?,
-        revision_sequence: row.get(3)?,
-        effective_start_ns: row.get(4)?,
-        effective_end_ns: row.get(5)?,
-        reference_revision: row.get(6)?,
-        reference_algorithm: row.get(7)?,
-        reference_payload_digest: row.get(8)?,
-        figi_source_id: row.get(9)?,
-        figi_source_algorithm: row.get(10)?,
-        figi_source_payload_digest: row.get(11)?,
-        figi_source_timestamp_ns: row.get(12)?,
-        figi_observed_at_ns: row.get(13)?,
-        figi_rights_policy_id: row.get(14)?,
-        figi_terms_reference: row.get(15)?,
-        definition_json: row.get(16)?,
-        published_at_ns: row.get(17)?,
+        revision_sequence: row.get(2)?,
+        effective_start_ns: row.get(3)?,
+        effective_end_ns: row.get(4)?,
+        reference_revision: row.get(5)?,
+        reference_algorithm: row.get(6)?,
+        reference_payload_digest: row.get(7)?,
+        definition_json: row.get(8)?,
+        published_at_ns: row.get(9)?,
     })
 }
 
@@ -1298,8 +1159,6 @@ fn rebuild_record(
         .map_err(|_| MarketDataInstrumentCatalogError::CorruptCatalog)?
         != row.definition_json
         || definition.instrument_id().to_string() != row.instrument_id
-        || definition.permanent_figi().as_str() != row.permanent_figi
-        || market_data_instrument_id(definition.permanent_figi())? != definition.instrument_id()
         || definition.effective_interval().starts_at().unix_nanos() != row.effective_start_ns
         || definition
             .effective_interval()
@@ -1316,20 +1175,6 @@ fn rebuild_record(
             row.reference_algorithm,
             &row.reference_payload_digest,
         )
-    {
-        return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
-    }
-    let figi_record = permanent_figi_record(&definition)?;
-    if figi_record.source_id().as_str() != row.figi_source_id
-        || !digest_matches(
-            figi_record.source_evidence().content_digest(),
-            row.figi_source_algorithm,
-            &row.figi_source_payload_digest,
-        )
-        || figi_record.source_timestamp().map(Timestamp::unix_nanos) != row.figi_source_timestamp_ns
-        || figi_record.observed_at().unix_nanos() != row.figi_observed_at_ns
-        || figi_record.rights_policy().policy_id().as_str() != row.figi_rights_policy_id
-        || figi_record.rights_policy().terms_reference().as_str() != row.figi_terms_reference
     {
         return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
     }
@@ -1354,13 +1199,8 @@ fn charge_row(
             size_of::<MarketDataInstrumentRecord>(),
             row.digest.len(),
             row.instrument_id.len(),
-            row.permanent_figi.len(),
             row.reference_revision.len(),
             row.reference_payload_digest.len(),
-            row.figi_source_id.len(),
-            row.figi_source_payload_digest.len(),
-            row.figi_rights_policy_id.len(),
-            row.figi_terms_reference.len(),
             row.definition_json.len(),
         ])
         .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)
@@ -1379,7 +1219,7 @@ const fn algorithm_code(algorithm: DigestAlgorithm) -> i64 {
 
 fn batch_digest(prepared: &[PreparedDefinition]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk/figi-market-data-definition-batch/v1");
+    hasher.update(b"market-squawk/market-data-definition-batch/v2");
     hasher.update((prepared.len() as u64).to_be_bytes());
     for definition in prepared {
         hasher.update(definition.digest);
@@ -1464,7 +1304,7 @@ fn parse_match_kind(
     value: &str,
 ) -> Result<MarketDataInstrumentMatchKind, MarketDataInstrumentCatalogError> {
     match value {
-        "figi" => Ok(MarketDataInstrumentMatchKind::PermanentFigi),
+        "external_identifier" => Ok(MarketDataInstrumentMatchKind::ExternalIdentifier),
         "display_name" => Ok(MarketDataInstrumentMatchKind::DisplayName),
         "venue_symbol" => Ok(MarketDataInstrumentMatchKind::VenueSymbol),
         "provider_symbol" => Ok(MarketDataInstrumentMatchKind::ProviderSymbol),
@@ -1520,13 +1360,9 @@ fn classify_operation<T>(
 }
 
 const STORED_COLUMNS: &str = "revisions.revision_digest, revisions.instrument_id,
-    revisions.permanent_figi, revisions.revision_sequence, revisions.effective_start_ns,
-    revisions.effective_end_ns, revisions.reference_revision, revisions.reference_algorithm,
-    revisions.reference_payload_digest, revisions.figi_source_id,
-    revisions.figi_source_algorithm, revisions.figi_source_payload_digest,
-    revisions.figi_source_timestamp_ns, revisions.figi_observed_at_ns,
-    revisions.figi_rights_policy_id, revisions.figi_terms_reference,
-    revisions.definition_json, revisions.published_at_ns";
+    revisions.revision_sequence, revisions.effective_start_ns, revisions.effective_end_ns,
+    revisions.reference_revision, revisions.reference_algorithm,
+    revisions.reference_payload_digest, revisions.definition_json, revisions.published_at_ns";
 
 const POPULATION_AS_OF_SQL: &str = "
 WITH selected_start AS (
@@ -1536,14 +1372,10 @@ WITH selected_start AS (
       AND candidate.published_at_ns<=?2
       AND candidate.effective_start_ns<=?3
 )
-SELECT revisions.revision_digest, revisions.instrument_id, revisions.permanent_figi,
-       revisions.revision_sequence, revisions.effective_start_ns,
+SELECT revisions.revision_digest, revisions.instrument_id, revisions.revision_sequence,
+       revisions.effective_start_ns,
        revisions.effective_end_ns, revisions.reference_revision,
-       revisions.reference_algorithm, revisions.reference_payload_digest,
-       revisions.figi_source_id, revisions.figi_source_algorithm,
-       revisions.figi_source_payload_digest, revisions.figi_source_timestamp_ns,
-       revisions.figi_observed_at_ns, revisions.figi_rights_policy_id,
-       revisions.figi_terms_reference, revisions.definition_json,
+       revisions.reference_algorithm, revisions.reference_payload_digest, revisions.definition_json,
        revisions.published_at_ns
 FROM market_data_instrument_revisions AS revisions
 JOIN selected_start
@@ -1562,24 +1394,20 @@ SELECT EXISTS(
 
 const SEARCH_SQL: &str = "
 WITH matches AS (
-    SELECT revisions.revision_digest, revisions.instrument_id, revisions.permanent_figi,
-           revisions.revision_sequence, revisions.effective_start_ns,
+    SELECT revisions.revision_digest, revisions.instrument_id, revisions.revision_sequence,
+           revisions.effective_start_ns,
            revisions.effective_end_ns, revisions.reference_revision,
-           revisions.reference_algorithm, revisions.reference_payload_digest,
-           revisions.figi_source_id, revisions.figi_source_algorithm,
-           revisions.figi_source_payload_digest, revisions.figi_source_timestamp_ns,
-           revisions.figi_observed_at_ns, revisions.figi_rights_policy_id,
-           revisions.figi_terms_reference, revisions.definition_json,
+           revisions.reference_algorithm, revisions.reference_payload_digest, revisions.definition_json,
            revisions.published_at_ns, terms.term_kind, terms.display_term,
            CASE
              WHEN terms.normalized_term=?1 THEN
-               CASE terms.term_kind WHEN 'figi' THEN 0 WHEN 'venue_symbol' THEN 1
+               CASE terms.term_kind WHEN 'external_identifier' THEN 0 WHEN 'venue_symbol' THEN 1
                     WHEN 'provider_symbol' THEN 2 ELSE 3 END
              WHEN instr(terms.normalized_term, ?1)=1 THEN
-               10 + CASE terms.term_kind WHEN 'figi' THEN 0 WHEN 'venue_symbol' THEN 1
+               10 + CASE terms.term_kind WHEN 'external_identifier' THEN 0 WHEN 'venue_symbol' THEN 1
                     WHEN 'provider_symbol' THEN 2 ELSE 3 END
              ELSE
-               20 + CASE terms.term_kind WHEN 'figi' THEN 0 WHEN 'venue_symbol' THEN 1
+               20 + CASE terms.term_kind WHEN 'external_identifier' THEN 0 WHEN 'venue_symbol' THEN 1
                     WHEN 'provider_symbol' THEN 2 ELSE 3 END
            END AS match_rank
     FROM market_data_instrument_current AS current_
@@ -1596,13 +1424,11 @@ WITH matches AS (
            ) AS match_position
     FROM matches
 )
-SELECT revision_digest, instrument_id, permanent_figi, revision_sequence,
+SELECT revision_digest, instrument_id, revision_sequence,
        effective_start_ns, effective_end_ns, reference_revision, reference_algorithm,
-       reference_payload_digest, figi_source_id, figi_source_algorithm,
-       figi_source_payload_digest, figi_source_timestamp_ns, figi_observed_at_ns,
-       figi_rights_policy_id, figi_terms_reference, definition_json, published_at_ns,
+       reference_payload_digest, definition_json, published_at_ns,
        term_kind, display_term
 FROM ranked
 WHERE match_position=1
-ORDER BY match_rank, permanent_figi, instrument_id
+ORDER BY match_rank, instrument_id
 LIMIT ?2";

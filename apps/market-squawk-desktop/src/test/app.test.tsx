@@ -1751,7 +1751,6 @@ const unifiedKrakenMarket: ApplicationResult = {
       definitionKind: "execution",
       definitionRevision: "3",
       referenceRevision: null,
-      permanentFigi: null,
       displayName: "Bitcoin",
       tickSize: "0.1",
       lotSize: "0.00000001",

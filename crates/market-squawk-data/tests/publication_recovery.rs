@@ -39,29 +39,28 @@ use market_squawk_data::{
     ResearchQueryEngine, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseRequest,
     ResearchUseSet, RightsBasis, RightsDecisionInput, Sha256Digest, SourceOperation, UniverseId,
     UniverseLimits, UniverseMembership, extraction_provider_payload_digest,
-    market_data_instrument_id, provider_market_event_publication_digest,
+    provider_market_event_publication_digest,
 };
 use market_squawk_domain::{
-    AggressorSide, AssetClass, AssignmentVerification, AuthorizationBasis,
+    AggressorSide, AssetClass, AuthorizationBasis,
     AvailabilityEvidence as DomainAvailabilityEvidence, BarTimeSemantics, BarTimestampBasis,
     CanonicalStateDigest, CanonicalizationRule, ChecksumCapability, CompanyIdentityObservation,
     CompanyIdentityObservationInput, CompanyIdentitySurface, ConnectionGeneration, CoverageDelay,
     CoverageStatus, Currency, DataQuality, DecodedLiveProvenanceInput, DeliveryEvidence,
-    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, ExternalIdentifier,
-    ExternalIdentifierRecord, ExternalIdentifierRecordInput, Figi, FundNavCompleteness,
+    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, FundNavCompleteness,
     FundNavCorrectionState, FundNavDisposition, FundNavEntitlementEvidence, FundNavFinality,
     FundNavLineage, FundNavNativeSchema, FundNavObservation, FundNavObservationInput,
-    FundNavRevisionEvidence, FundNavValuationBasis, FundNavValue, IdentifierEntitlement,
-    IdentifierRightsPolicyReference, InstrumentId, LiveEventClass, LiveEvidenceBinding,
-    LiveProvenance, MacroObservation, MarketBarAdjustment, MarketBarObservation,
-    MarketBarSessionEvidence, MarketBarSessionKind, MarketDataInstrumentDefinition,
-    MarketDataInstrumentDefinitionInput, MarketEvent, MetadataRevision, Money, PayloadReference,
-    PriceTicks, ProviderChannel, ProviderIdentityEvidence, ProviderIdentityRecord,
-    ProviderIdentityRecordInput, ProviderInstrumentId, ProviderProduct, QuantityLots,
-    ResearchContext, ResearchObservation, ResearchProvenance, ResearchProvenanceInput,
-    ResearchTemporalCoordinate, ResearchTime, RevisionBoundPayloadEvidence, RevisionNumber,
-    RuleVersion, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier, Timestamp,
-    TradeEvent, UniverseMembershipObservation, VenueId, VenueMapping, VenueSymbol,
+    FundNavRevisionEvidence, FundNavValuationBasis, FundNavValue, InstrumentId, LiveEventClass,
+    LiveEvidenceBinding, LiveProvenance, MacroObservation, MarketBarAdjustment,
+    MarketBarObservation, MarketBarSessionEvidence, MarketBarSessionKind,
+    MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput, MarketEvent,
+    MetadataRevision, Money, PayloadReference, PriceTicks, ProviderChannel,
+    ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    ProviderInstrumentId, ProviderProduct, QuantityLots, ResearchContext, ResearchObservation,
+    ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
+    RevisionBoundPayloadEvidence, RevisionNumber, RuleVersion, SchemaVersion, SequenceCapability,
+    SourceId, SourceIdentifier, Timestamp, TradeEvent, UniverseMembershipObservation, VenueId,
+    VenueMapping, VenueSymbol,
 };
 use market_squawk_platform::{LocalPaths, RawCaptureRecord, SealedResearchJournalStore};
 use market_squawk_sources::{
@@ -2076,9 +2075,8 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     let paths = LocalPaths::prepare(directory.path().join("complete-alpaca-history"))?;
     let location = paths.catalog()?.clone();
     let catalog_config = test_catalog_config(location.clone())?;
-    let figi = Figi::try_from("BBG000B9XVV8")?;
-    let instrument_id = market_data_instrument_id(&figi)?;
-    let definition = complete_history_market_data_definition(figi, instrument_id)?;
+    let instrument_id = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
+    let definition = complete_history_market_data_definition(instrument_id)?;
     let definition_json = serde_json::to_string(&definition)?;
     let definition_digest = EvidenceDigest::new(
         DigestAlgorithm::Sha256,
@@ -3511,7 +3509,6 @@ fn complete_history_market_bar_observation(
 }
 
 fn complete_history_market_data_definition(
-    figi: Figi,
     instrument_id: InstrumentId,
 ) -> Result<MarketDataInstrumentDefinition, Box<dyn Error>> {
     let effective = EffectiveInterval::new(
@@ -3523,13 +3520,6 @@ fn complete_history_market_data_definition(
         None,
     )?;
     let exact = |byte| ExactPayloadEvidence::from_content_digest(digest(byte));
-    let rights = || -> Result<IdentifierRightsPolicyReference, Box<dyn Error>> {
-        Ok(IdentifierRightsPolicyReference::new(
-            SourceIdentifier::try_from("figi-public-domain-v1")?,
-            IdentifierEntitlement::PublicDomain,
-            SourceIdentifier::try_from("https://www.openfigi.com/about/figi")?,
-        ))
-    };
     Ok(MarketDataInstrumentDefinition::try_new(
         MarketDataInstrumentDefinitionInput {
             instrument_id,
@@ -3565,24 +3555,7 @@ fn complete_history_market_data_definition(
                 validity: effective,
                 supersedes: None,
             })],
-            identifiers: vec![ExternalIdentifierRecord::new(
-                ExternalIdentifierRecordInput {
-                    identifier: ExternalIdentifier::Figi(figi),
-                    assignment_verification: AssignmentVerification::VerifiedAssigned,
-                    source_id: SourceId::try_from("openfigi-v3")?,
-                    source_evidence: exact(130),
-                    source_timestamp: Some(Timestamp::from_unix_nanos(
-                        COMPLETE_HISTORY_FIRST_BAR_NS,
-                    )),
-                    observed_at: Timestamp::from_unix_nanos(
-                        COMPLETE_HISTORY_FIRST_BAR_NS
-                            .checked_add(1)
-                            .ok_or("complete-history FIGI observation overflow")?,
-                    ),
-                    validity: effective,
-                    rights_policy: rights()?,
-                },
-            )],
+            identifiers: Vec::new(),
         },
     )?)
 }

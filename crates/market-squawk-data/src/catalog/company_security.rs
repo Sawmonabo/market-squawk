@@ -10,8 +10,8 @@ use market_squawk_domain::{
     CommonEquitySuitability, CompanyIdentityObservation, CompanyIdentitySurface,
     CompanySecurityIdentityLink, CompanySecurityKind, CompanySecurityLinkTransition,
     CompanySecurityRelationshipKind, CompanySecurityResolutionBasis, DigestAlgorithm,
-    EvidenceDigest, Figi, IdentifierEntitlement, InstrumentId, MarketDataInstrumentDefinition,
-    SourceId, SourceIdentifier, Timestamp,
+    EvidenceDigest, IdentifierEntitlement, InstrumentId, MarketDataInstrumentDefinition, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use rusqlite::{Connection, OptionalExtension as _, Row, Transaction, params};
 use sha2::{Digest as _, Sha256};
@@ -19,7 +19,6 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use super::CatalogAuthority;
-use super::market_data_instruments::market_data_instrument_id;
 use super::storage::{ResultBudget, append_audit, trusted_catalog_now};
 
 /// Maximum current relationship keys evaluated by one selection.
@@ -182,7 +181,6 @@ pub struct CompanySecuritySelectionReceiptEntry {
     current_company_completed_at: Option<Timestamp>,
     linked_market_revision_digest: EvidenceDigest,
     instrument_id: InstrumentId,
-    permanent_figi: Figi,
     security_kind: CompanySecurityKind,
     relationship_kind: CompanySecurityRelationshipKind,
     common_equity_suitability: CommonEquitySuitability,
@@ -254,10 +252,6 @@ impl CompanySecuritySelectionReceiptEntry {
     /// Returns the exact stable instrument identity considered by the selection.
     pub const fn instrument_id(&self) -> InstrumentId {
         self.instrument_id
-    }
-    /// Returns the permanent FIGI bound to the exact market parent.
-    pub const fn permanent_figi(&self) -> &Figi {
-        &self.permanent_figi
     }
     /// Returns the evidenced security form.
     pub const fn security_kind(&self) -> CompanySecurityKind {
@@ -976,7 +970,6 @@ struct StoredLinkRow {
     company_surface: String,
     company_observation_digest: Vec<u8>,
     instrument_id: String,
-    permanent_figi: String,
     market_revision_digest: Vec<u8>,
     event_sequence: i64,
     security_kind: String,
@@ -1106,12 +1099,6 @@ impl CatalogAuthority {
         cancellation: &CancellationToken,
     ) -> Result<CompanySecurityLinkPublicationReceipt, CompanySecurityIdentityCatalogError> {
         check_operation(deadline, cancellation)?;
-        if market_data_instrument_id(link.permanent_figi())
-            .map_err(|_| CompanySecurityIdentityCatalogError::InvalidInput)?
-            != link.instrument_id()
-        {
-            return Err(CompanySecurityIdentityCatalogError::InvalidInput);
-        }
         let json = serde_json::to_string(&link)?;
         if json.len() > self.catalog().result_bytes.max_record_bytes() {
             return Err(CompanySecurityIdentityCatalogError::ResultLimitExceeded);
@@ -1148,7 +1135,6 @@ impl CatalogAuthority {
                 &transaction,
                 link.market_instrument_revision_digest(),
                 link.instrument_id(),
-                link.permanent_figi(),
             )?
             .ok_or(CompanySecurityIdentityCatalogError::ParentUnavailable)?;
             if company_parent.available_at.is_none()
@@ -1442,15 +1428,15 @@ fn insert_link(
     transaction.execute(
         "INSERT INTO company_security_link_events
          (link_digest, company_source_id, provider_company_id, company_surface,
-          company_observation_digest, instrument_id, permanent_figi, market_revision_digest,
-          event_sequence, security_kind, relationship_kind, common_equity_suitability, event_kind,
+          company_observation_digest, instrument_id, market_revision_digest, event_sequence,
+          security_kind, relationship_kind, common_equity_suitability, event_kind,
           previous_link_digest, effective_start_ns, effective_end_ns, resolution_kind,
           resolution_evidence_algorithm, resolution_evidence_digest,
           relationship_rights_policy_id, relationship_rights_entitlement,
           relationship_rights_terms_reference, available_at_ns, ingested_at_ns, link_json,
           published_at_ns)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         params![
             digest,
             link.company_source_id().as_str(),
@@ -1458,7 +1444,6 @@ fn insert_link(
             link.company_surface().database_name(),
             link.company_observation_digest().bytes(),
             link.instrument_id().to_string(),
-            link.permanent_figi().as_str(),
             link.market_instrument_revision_digest().bytes(),
             i64::from(event_sequence),
             security_kind_name(link.security_kind()),
@@ -1892,7 +1877,6 @@ fn select_instrument_company_links(
             connection,
             record.link().market_instrument_revision_digest(),
             record.link().instrument_id(),
-            record.link().permanent_figi(),
         )?
         .ok_or(CompanySecurityIdentityCatalogError::CorruptCatalog)?;
         let (current_company, company_parent_ambiguous) = match current_company_parent(
@@ -2090,7 +2074,6 @@ fn select_links(
             connection,
             record.link().market_instrument_revision_digest(),
             record.link().instrument_id(),
-            record.link().permanent_figi(),
         )?
         .ok_or(CompanySecurityIdentityCatalogError::CorruptCatalog)?;
         let current_market =
@@ -2308,7 +2291,6 @@ fn receipt_entry(
         current_company_completed_at: current_company.map(|value| value.completed_at),
         linked_market_revision_digest: link.market_instrument_revision_digest(),
         instrument_id: link.instrument_id(),
-        permanent_figi: link.permanent_figi().clone(),
         security_kind: link.security_kind(),
         relationship_kind: link.relationship_kind(),
         common_equity_suitability: link.common_equity_suitability(),
@@ -2683,7 +2665,6 @@ fn exact_market_parent(
     connection: &Connection,
     digest: EvidenceDigest,
     instrument_id: InstrumentId,
-    figi: &Figi,
 ) -> Result<Option<MarketParent>, CompanySecurityIdentityCatalogError> {
     if digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32] {
         return Err(CompanySecurityIdentityCatalogError::InvalidInput);
@@ -2691,10 +2672,10 @@ fn exact_market_parent(
     connection
         .query_row(
             "SELECT revision_digest, published_at_ns, effective_start_ns, effective_end_ns,
-                    definition_json, instrument_id, permanent_figi
+                    definition_json, instrument_id
              FROM market_data_instrument_revisions
-             WHERE revision_digest=?1 AND instrument_id=?2 AND permanent_figi=?3",
-            params![digest.bytes(), instrument_id.to_string(), figi.as_str()],
+             WHERE revision_digest=?1 AND instrument_id=?2",
+            params![digest.bytes(), instrument_id.to_string()],
             decode_market_parent,
         )
         .optional()
@@ -2709,7 +2690,7 @@ fn current_market_parent(
     connection
         .query_row(
             "SELECT revision_digest, published_at_ns, effective_start_ns, effective_end_ns,
-                    definition_json, instrument_id, permanent_figi
+                    definition_json, instrument_id
              FROM market_data_instrument_revisions
              WHERE instrument_id=?1 AND published_at_ns<=?2
                AND effective_start_ns<=?2
@@ -2738,14 +2719,9 @@ fn decode_market_parent(row: &Row<'_>) -> rusqlite::Result<MarketParent> {
         .get::<_, Option<i64>>(3)?
         .map(Timestamp::from_unix_nanos);
     let instrument_id: String = row.get(5)?;
-    let permanent_figi: String = row.get(6)?;
     if sha256(json.as_bytes()) != bytes
         || serde_json::to_string(&definition).map_err(|_| rusqlite::Error::InvalidQuery)? != json
         || definition.instrument_id().to_string() != instrument_id
-        || definition.permanent_figi().as_str() != permanent_figi
-        || market_data_instrument_id(definition.permanent_figi())
-            .map_err(|_| rusqlite::Error::InvalidQuery)?
-            != definition.instrument_id()
         || definition.effective_interval().starts_at() != effective_start
         || definition.effective_interval().ends_at() != effective_end
     {
@@ -2807,26 +2783,25 @@ fn decode_stored_link(row: &Row<'_>) -> rusqlite::Result<StoredLinkRow> {
         company_surface: row.get(3)?,
         company_observation_digest: row.get(4)?,
         instrument_id: row.get(5)?,
-        permanent_figi: row.get(6)?,
-        market_revision_digest: row.get(7)?,
-        event_sequence: row.get(8)?,
-        security_kind: row.get(9)?,
-        relationship_kind: row.get(10)?,
-        suitability: row.get(11)?,
-        event_kind: row.get(12)?,
-        previous_digest: row.get(13)?,
-        effective_start: row.get(14)?,
-        effective_end: row.get(15)?,
-        resolution_kind: row.get(16)?,
-        resolution_algorithm: row.get(17)?,
-        resolution_digest: row.get(18)?,
-        rights_policy_id: row.get(19)?,
-        rights_entitlement: row.get(20)?,
-        rights_terms_reference: row.get(21)?,
-        available_at: row.get(22)?,
-        ingested_at: row.get(23)?,
-        json: row.get(24)?,
-        published_at: row.get(25)?,
+        market_revision_digest: row.get(6)?,
+        event_sequence: row.get(7)?,
+        security_kind: row.get(8)?,
+        relationship_kind: row.get(9)?,
+        suitability: row.get(10)?,
+        event_kind: row.get(11)?,
+        previous_digest: row.get(12)?,
+        effective_start: row.get(13)?,
+        effective_end: row.get(14)?,
+        resolution_kind: row.get(15)?,
+        resolution_algorithm: row.get(16)?,
+        resolution_digest: row.get(17)?,
+        rights_policy_id: row.get(18)?,
+        rights_entitlement: row.get(19)?,
+        rights_terms_reference: row.get(20)?,
+        available_at: row.get(21)?,
+        ingested_at: row.get(22)?,
+        json: row.get(23)?,
+        published_at: row.get(24)?,
     })
 }
 
@@ -2847,7 +2822,6 @@ fn rebuild_link(
         || link.company_surface().database_name() != row.company_surface
         || link.company_observation_digest().bytes().as_slice() != row.company_observation_digest
         || link.instrument_id().to_string() != row.instrument_id
-        || link.permanent_figi().as_str() != row.permanent_figi
         || link.market_instrument_revision_digest().bytes().as_slice() != row.market_revision_digest
         || security_kind_name(link.security_kind()) != row.security_kind
         || relationship_kind_name(link.relationship_kind()) != row.relationship_kind
@@ -2892,9 +2866,6 @@ fn rebuild_link(
             != row.rights_terms_reference
         || link.available_at().unix_nanos() != row.available_at
         || link.ingested_at().unix_nanos() != row.ingested_at
-        || market_data_instrument_id(link.permanent_figi())
-            .map_err(|_| CompanySecurityIdentityCatalogError::CorruptCatalog)?
-            != link.instrument_id()
     {
         return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
     }
@@ -2923,7 +2894,6 @@ fn charge_stored_link(
             row.company_surface.len(),
             row.company_observation_digest.len(),
             row.instrument_id.len(),
-            row.permanent_figi.len(),
             row.market_revision_digest.len(),
             row.security_kind.len(),
             row.relationship_kind.len(),
@@ -3203,7 +3173,6 @@ fn hash_receipt_entry(hasher: &mut Sha256, entry: &CompanySecuritySelectionRecei
     hash_optional_timestamp(hasher, entry.current_company_completed_at);
     hash_digest(hasher, entry.linked_market_revision_digest);
     hasher.update(entry.instrument_id.as_uuid().as_bytes());
-    hash_text(hasher, entry.permanent_figi.as_str());
     hasher.update([security_kind_tag(entry.security_kind)]);
     hasher.update([relationship_kind_tag(entry.relationship_kind)]);
     hasher.update([suitability_tag(entry.common_equity_suitability)]);
@@ -3513,8 +3482,8 @@ ORDER BY terms.record_digest
 LIMIT ?5";
 
 const STORED_COLUMNS: &str = "link_digest, company_source_id, provider_company_id,
-    company_surface, company_observation_digest, instrument_id, permanent_figi,
-    market_revision_digest, event_sequence, security_kind, relationship_kind, common_equity_suitability,
+    company_surface, company_observation_digest, instrument_id, market_revision_digest,
+    event_sequence, security_kind, relationship_kind, common_equity_suitability,
     event_kind, previous_link_digest, effective_start_ns, effective_end_ns, resolution_kind,
     resolution_evidence_algorithm, resolution_evidence_digest, relationship_rights_policy_id,
     relationship_rights_entitlement, relationship_rights_terms_reference, available_at_ns,
@@ -3523,7 +3492,7 @@ const STORED_COLUMNS: &str = "link_digest, company_source_id, provider_company_i
 const INSTRUMENT_LINK_HISTORY_SQL: &str = "
 SELECT events.link_digest, events.company_source_id, events.provider_company_id,
        events.company_surface, events.company_observation_digest, events.instrument_id,
-       events.permanent_figi, events.market_revision_digest, events.event_sequence,
+       events.market_revision_digest, events.event_sequence,
        events.security_kind, events.relationship_kind, events.common_equity_suitability,
        events.event_kind, events.previous_link_digest, events.effective_start_ns,
        events.effective_end_ns, events.resolution_kind, events.resolution_evidence_algorithm,
@@ -3539,7 +3508,7 @@ LIMIT ?3";
 const CURRENT_LINK_BY_KEY_SQL: &str = "
 SELECT events.link_digest, events.company_source_id, events.provider_company_id,
        events.company_surface, events.company_observation_digest, events.instrument_id,
-       events.permanent_figi, events.market_revision_digest, events.event_sequence,
+       events.market_revision_digest, events.event_sequence,
        events.security_kind, events.relationship_kind, events.common_equity_suitability,
        events.event_kind, events.previous_link_digest, events.effective_start_ns,
        events.effective_end_ns, events.resolution_kind, events.resolution_evidence_algorithm,
@@ -3554,7 +3523,7 @@ WHERE current_.company_source_id=?1 AND current_.provider_company_id=?2
 const CURRENT_LINKS_SQL: &str = "
 SELECT events.link_digest, events.company_source_id, events.provider_company_id,
        events.company_surface, events.company_observation_digest, events.instrument_id,
-       events.permanent_figi, events.market_revision_digest, events.event_sequence, events.security_kind,
+       events.market_revision_digest, events.event_sequence, events.security_kind,
        events.relationship_kind, events.common_equity_suitability, events.event_kind,
        events.previous_link_digest, events.effective_start_ns, events.effective_end_ns,
        events.resolution_kind, events.resolution_evidence_algorithm,
@@ -3583,7 +3552,7 @@ WITH ranked AS (
     AND events.published_at_ns<=?5
 )
 SELECT link_digest, company_source_id, provider_company_id, company_surface,
-       company_observation_digest, instrument_id, permanent_figi, market_revision_digest,
+       company_observation_digest, instrument_id, market_revision_digest,
        event_sequence, security_kind, relationship_kind, common_equity_suitability, event_kind,
        previous_link_digest, effective_start_ns, effective_end_ns, resolution_kind,
        resolution_evidence_algorithm, resolution_evidence_digest,

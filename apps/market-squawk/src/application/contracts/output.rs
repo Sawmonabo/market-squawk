@@ -3025,7 +3025,7 @@ fn unified_market_rows() -> Value {
                 enumeration(&[
                     "venue_symbol",
                     "provider_subscription_symbol",
-                    "permanent_figi",
+                    "instrument_id",
                 ]),
             ),
             ("symbolVenueId", nullable(bounded_text(64))),
@@ -3037,7 +3037,6 @@ fn unified_market_rows() -> Value {
             ),
             ("definitionRevision", nullable(positive_integer_text())),
             ("referenceRevision", nullable(bounded_text(512))),
-            ("permanentFigi", nullable(exact_length_text(12))),
             ("displayName", nullable(bounded_text(512))),
             ("tickSize", nullable(canonical_decimal_text())),
             ("lotSize", nullable(canonical_decimal_text())),
@@ -3095,7 +3094,6 @@ fn unified_market_rows() -> Value {
             "definitionKind",
             "definitionRevision",
             "referenceRevision",
-            "permanentFigi",
             "displayName",
             "tickSize",
             "lotSize",
@@ -3132,7 +3130,6 @@ fn market_reference_evidence() -> Value {
             ),
             ("effectiveFrom", canonical_market_timestamp()),
             ("effectiveUntil", nullable(canonical_market_timestamp())),
-            ("permanentFigi", exact_length_text(12)),
         ],
         &[
             "referenceRevision",
@@ -3142,7 +3139,6 @@ fn market_reference_evidence() -> Value {
             "quoteCurrencyPayloadLocator",
             "effectiveFrom",
             "effectiveUntil",
-            "permanentFigi",
         ],
     )
 }

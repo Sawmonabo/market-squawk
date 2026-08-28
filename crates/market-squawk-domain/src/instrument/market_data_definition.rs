@@ -7,13 +7,12 @@ use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
-    AssetClass, AssignmentVerification, EffectiveInterval, ExternalIdentifier,
-    ExternalIdentifierRecord, IdentifierEntitlement, IdentifierRightsPolicyReference,
-    InstrumentError, ProviderIdentityKey, ProviderIdentityRecord, ProviderIdentityRegistry,
-    VenueMapping,
+    AssetClass, EffectiveInterval, ExternalIdentifier, ExternalIdentifierRecord,
+    IdentifierEntitlement, IdentifierRightsPolicyReference, InstrumentError, ProviderIdentityKey,
+    ProviderIdentityRecord, ProviderIdentityRegistry, VenueMapping,
 };
 use crate::{
-    Currency, ExactPayloadEvidence, Figi, InstrumentId, MetadataRevision, ProviderInstrumentId,
+    Currency, ExactPayloadEvidence, InstrumentId, MetadataRevision, ProviderInstrumentId,
     RevisionBoundPayloadEvidence, SourceId, Timestamp, VenueId,
 };
 
@@ -28,9 +27,8 @@ pub const MAX_MARKET_DATA_EXTERNAL_IDENTIFIERS: usize = 64;
 
 /// Optional, bounded display text with its own source, exact payload, and rights evidence.
 ///
-/// This is deliberately independent of the permanent FIGI anchor. A source name whose reuse
-/// rights have not been admitted must remain session-only and cannot construct or deserialize this
-/// type.
+/// A source name whose reuse rights have not been admitted must remain session-only and cannot
+/// construct or deserialize this type.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarketDataDisplayName {
@@ -123,14 +121,13 @@ impl<'de> Deserialize<'de> for MarketDataDisplayName {
 
 /// Stable reference identity for market-data display, with no execution authority or terms.
 ///
-/// The caller supplies the stable [`InstrumentId`]; this type never derives it from a ticker,
-/// venue symbol, provider symbol, or directory row. Exactly one assigned, public-domain FIGI must
-/// cover the complete definition interval. Tick size, lot size, multiplier, trading status,
-/// execution eligibility, and execution-term construction are intentionally absent.
+/// The caller supplies the repository-owned stable [`InstrumentId`]; this type never derives it
+/// from a ticker, FIGI, venue symbol, provider symbol, or directory row. Tick size, lot size,
+/// multiplier, trading status, execution eligibility, and execution-term construction are
+/// intentionally absent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketDataInstrumentDefinition {
     instrument_id: InstrumentId,
-    permanent_figi: Figi,
     reference_evidence: RevisionBoundPayloadEvidence,
     effective_interval: EffectiveInterval,
     asset_class: AssetClass,
@@ -145,7 +142,7 @@ pub struct MarketDataInstrumentDefinition {
 /// Complete input for constructing a checked [`MarketDataInstrumentDefinition`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketDataInstrumentDefinitionInput {
-    /// Stable internal identity minted by the canonical FIGI-backed producer, not by this type.
+    /// Stable internal identity explicitly minted by the repository-owned identity authority.
     pub instrument_id: InstrumentId,
     /// Reference-source revision atomically bound to the exact payload that established it.
     pub reference_evidence: RevisionBoundPayloadEvidence,
@@ -163,7 +160,7 @@ pub struct MarketDataInstrumentDefinitionInput {
     pub venue_mappings: Vec<VenueMapping>,
     /// Bounded source-qualified provider identity assertions.
     pub provider_identities: Vec<ProviderIdentityRecord>,
-    /// Bounded evidence-bearing external identifiers, including exactly one permanent FIGI.
+    /// Bounded evidence-bearing optional external identifiers.
     pub identifiers: Vec<ExternalIdentifierRecord>,
 }
 
@@ -177,8 +174,8 @@ impl MarketDataInstrumentDefinition {
     /// # Errors
     ///
     /// Returns [`MarketDataInstrumentDefinitionError`] for any bound, evidence, identity,
-    /// uniqueness, FIGI-assignment, entitlement, or effective-time failure. Provider revision-
-    /// graph failures retain their typed [`InstrumentError`] source.
+    /// uniqueness, entitlement, or effective-time failure. Provider revision-graph failures retain
+    /// their typed [`InstrumentError`] source.
     pub fn try_new(
         input: MarketDataInstrumentDefinitionInput,
     ) -> Result<Self, MarketDataInstrumentDefinitionError> {
@@ -294,32 +291,8 @@ impl MarketDataInstrumentDefinition {
                 return Err(MarketDataInstrumentDefinitionError::DuplicateExternalIdentifier);
             }
         }
-        let mut figi_records = identifiers
-            .iter()
-            .filter(|record| matches!(record.identifier(), ExternalIdentifier::Figi(_)));
-        let figi_record = figi_records
-            .next()
-            .ok_or(MarketDataInstrumentDefinitionError::MissingPermanentFigi)?;
-        if figi_records.next().is_some() {
-            return Err(MarketDataInstrumentDefinitionError::MultiplePermanentFigis);
-        }
-        if figi_record.assignment_verification() != AssignmentVerification::VerifiedAssigned {
-            return Err(MarketDataInstrumentDefinitionError::PermanentFigiNotVerifiedAssigned);
-        }
-        if figi_record.rights_policy().entitlement() != IdentifierEntitlement::PublicDomain {
-            return Err(MarketDataInstrumentDefinitionError::PermanentFigiNotPublicDomain);
-        }
-        if !interval_covers(figi_record.validity(), effective_interval) {
-            return Err(MarketDataInstrumentDefinitionError::PermanentFigiNotEffective);
-        }
-        let permanent_figi = match figi_record.identifier() {
-            ExternalIdentifier::Figi(figi) => figi.clone(),
-            _ => return Err(MarketDataInstrumentDefinitionError::MissingPermanentFigi),
-        };
-
         Ok(Self {
             instrument_id,
-            permanent_figi,
             reference_evidence,
             effective_interval,
             asset_class,
@@ -332,7 +305,7 @@ impl MarketDataInstrumentDefinition {
         })
     }
 
-    /// Returns the stable internal identity supplied by the canonical producer.
+    /// Returns the stable internal identity supplied by the repository-owned identity authority.
     pub const fn instrument_id(&self) -> InstrumentId {
         self.instrument_id
     }
@@ -401,11 +374,6 @@ impl MarketDataInstrumentDefinition {
     /// Returns evidence-bearing external identifiers.
     pub fn identifiers(&self) -> &[ExternalIdentifierRecord] {
         &self.identifiers
-    }
-
-    /// Returns the sole assigned public-domain FIGI anchor.
-    pub const fn permanent_figi(&self) -> &Figi {
-        &self.permanent_figi
     }
 }
 
@@ -540,16 +508,6 @@ pub enum MarketDataInstrumentDefinitionError {
     DuplicateExternalIdentifier,
     /// An external identifier carried an all-zero evidence digest.
     EmptyExternalIdentifierEvidence,
-    /// No permanent FIGI anchor was supplied.
-    MissingPermanentFigi,
-    /// More than one FIGI record was supplied.
-    MultiplePermanentFigis,
-    /// The sole FIGI was not verified assigned by its responsible source.
-    PermanentFigiNotVerifiedAssigned,
-    /// The sole FIGI did not carry an explicit public-domain rights decision.
-    PermanentFigiNotPublicDomain,
-    /// The FIGI assignment did not cover the complete definition interval.
-    PermanentFigiNotEffective,
 }
 
 impl fmt::Display for MarketDataInstrumentDefinitionError {
@@ -614,21 +572,6 @@ impl fmt::Display for MarketDataInstrumentDefinitionError {
             }
             Self::EmptyExternalIdentifierEvidence => formatter.write_str(
                 "market-data external identifier requires nonzero exact payload evidence",
-            ),
-            Self::MissingPermanentFigi => {
-                formatter.write_str("market-data definition requires one permanent FIGI")
-            }
-            Self::MultiplePermanentFigis => {
-                formatter.write_str("market-data definition permits exactly one permanent FIGI")
-            }
-            Self::PermanentFigiNotVerifiedAssigned => formatter.write_str(
-                "market-data definition FIGI must be verified assigned by its responsible source",
-            ),
-            Self::PermanentFigiNotPublicDomain => formatter.write_str(
-                "market-data definition FIGI must carry an explicit public-domain rights decision",
-            ),
-            Self::PermanentFigiNotEffective => formatter.write_str(
-                "market-data definition FIGI must cover the complete definition interval",
             ),
         }
     }
@@ -698,15 +641,6 @@ where
 
 fn evidence_is_empty(evidence: &ExactPayloadEvidence) -> bool {
     evidence.content_digest().bytes() == [0; 32]
-}
-
-fn interval_covers(outer: EffectiveInterval, inner: EffectiveInterval) -> bool {
-    outer.starts_at() <= inner.starts_at()
-        && match (outer.ends_at(), inner.ends_at()) {
-            (None, _) => true,
-            (Some(_), None) => false,
-            (Some(outer_end), Some(inner_end)) => outer_end >= inner_end,
-        }
 }
 
 const fn external_identifier_kind_rank(identifier: &ExternalIdentifier) -> u8 {

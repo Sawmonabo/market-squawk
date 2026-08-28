@@ -333,7 +333,6 @@ impl CompanySecurityResolutionAuthority {
             company_surface: preview.company_parent().company_surface(),
             company_observation_digest: preview.company_parent().company_observation_digest(),
             instrument_id: selected.instrument_id(),
-            permanent_figi: selected.permanent_figi().clone(),
             market_instrument_revision_digest: selected.market_revision_digest(),
             security_kind: preview.security_kind(),
             relationship_kind: preview.relationship_kind(),
@@ -383,10 +382,10 @@ impl CompanySecurityResolutionAuthority {
             check_operation(deadline, cancellation)?;
             let record = self
                 .market_instruments
-                .latest_by_figi(candidate.permanent_figi(), deadline, cancellation)
+                .latest(candidate.instrument_id(), deadline, cancellation)
                 .map_err(map_market_catalog_error)?
                 .ok_or(CompanySecurityResolutionError::ParentUnavailable)?;
-            validate_market_record(candidate.permanent_figi(), &record)?;
+            validate_market_record(candidate.instrument_id(), &record)?;
             if !instrument_ids.insert(record.definition().instrument_id()) {
                 return Err(CompanySecurityResolutionError::AmbiguousCandidates);
             }
@@ -399,9 +398,9 @@ impl CompanySecurityResolutionAuthority {
             }
             snapshots.push(CompanySecurityCandidateSnapshot::new(
                 ordinal,
-                record.definition().permanent_figi().clone(),
                 record.definition().instrument_id(),
                 record.revision_digest(),
+                record.definition().reference_evidence().clone(),
                 record.revision_sequence(),
                 record.published_at(),
                 record.definition().effective_interval(),
@@ -494,12 +493,12 @@ impl CompanySecurityResolutionAuthority {
             check_operation(deadline, cancellation)?;
             let record = self
                 .market_instruments
-                .latest_by_figi(expected.permanent_figi(), deadline, cancellation)
+                .latest(expected.instrument_id(), deadline, cancellation)
                 .map_err(map_market_catalog_error)?
                 .ok_or(CompanySecurityResolutionError::ParentDrift)?;
             if record.definition().instrument_id() != expected.instrument_id()
-                || record.definition().permanent_figi() != expected.permanent_figi()
                 || record.revision_digest() != expected.market_revision_digest()
+                || record.definition().reference_evidence() != expected.market_reference_evidence()
                 || record.revision_sequence() != expected.market_revision_sequence()
                 || record.published_at() != expected.market_published_at()
                 || record.definition().effective_interval() != expected.market_effective_interval()
@@ -550,7 +549,6 @@ fn ensure_action_is_admissible(
                 return Err(CompanySecurityResolutionError::RelationshipAlreadyRevoked);
             }
             if current.link().instrument_id() != selected.instrument_id()
-                || current.link().permanent_figi() != selected.permanent_figi()
                 || current.link().security_kind() != security_kind
                 || current.link().relationship_kind() != relationship_kind
                 || current.link().common_equity_suitability() != suitability
@@ -588,12 +586,22 @@ fn transition_for_preview(
 }
 
 fn validate_market_record(
-    requested_figi: &market_squawk_domain::Figi,
+    requested_instrument: InstrumentId,
     record: &MarketDataInstrumentRecord,
 ) -> Result<(), CompanySecurityResolutionError> {
-    if record.definition().permanent_figi() != requested_figi
+    let reference_digest = record
+        .definition()
+        .reference_payload_evidence()
+        .content_digest();
+    let quote_currency_digest = record
+        .definition()
+        .quote_currency_evidence()
+        .content_digest();
+    if record.definition().instrument_id() != requested_instrument
         || record.revision_digest().algorithm() != DigestAlgorithm::Sha256
         || record.revision_digest().bytes() == [0; 32]
+        || reference_digest.bytes() == [0; 32]
+        || quote_currency_digest.bytes() == [0; 32]
         || record.revision_sequence() == 0
     {
         return Err(CompanySecurityResolutionError::CorruptParent);

@@ -6,8 +6,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     CompanyIdentitySurface, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, Figi, IdentifierEntitlement, IdentifierRightsPolicyReference,
-    InstrumentId, SchemaVersion, SchemaVersionError, SourceId, SourceIdentifier, Timestamp,
+    ExactPayloadEvidence, IdentifierEntitlement, IdentifierRightsPolicyReference, InstrumentId,
+    SchemaVersion, SchemaVersionError, SourceId, SourceIdentifier, Timestamp,
 };
 
 /// The security form attached to a company identity.
@@ -148,10 +148,8 @@ pub struct CompanySecurityIdentityLinkInput {
     pub company_surface: CompanyIdentitySurface,
     /// SHA-256 digest of the exact canonical company observation revision.
     pub company_observation_digest: EvidenceDigest,
-    /// Stable FIGI-derived internal instrument identity.
+    /// Stable repository-owned internal instrument identity.
     pub instrument_id: InstrumentId,
-    /// Permanent assigned FIGI bound to the market-definition revision.
-    pub permanent_figi: Figi,
     /// SHA-256 digest of the exact market-instrument definition revision.
     pub market_instrument_revision_digest: EvidenceDigest,
     /// Security form.
@@ -188,7 +186,6 @@ pub struct CompanySecurityIdentityLink {
     company_surface: CompanyIdentitySurface,
     company_observation_digest: EvidenceDigest,
     instrument_id: InstrumentId,
-    permanent_figi: Figi,
     market_instrument_revision_digest: EvidenceDigest,
     security_kind: CompanySecurityKind,
     relationship_kind: CompanySecurityRelationshipKind,
@@ -256,7 +253,6 @@ impl CompanySecurityIdentityLink {
             company_surface: input.company_surface,
             company_observation_digest: input.company_observation_digest,
             instrument_id: input.instrument_id,
-            permanent_figi: input.permanent_figi,
             market_instrument_revision_digest: input.market_instrument_revision_digest,
             security_kind: input.security_kind,
             relationship_kind: input.relationship_kind,
@@ -290,13 +286,9 @@ impl CompanySecurityIdentityLink {
     pub const fn company_observation_digest(&self) -> EvidenceDigest {
         self.company_observation_digest
     }
-    /// Returns the stable FIGI-derived instrument identity.
+    /// Returns the stable repository-owned instrument identity.
     pub const fn instrument_id(&self) -> InstrumentId {
         self.instrument_id
-    }
-    /// Returns the permanent FIGI.
-    pub const fn permanent_figi(&self) -> &Figi {
-        &self.permanent_figi
     }
     /// Returns the exact market-definition revision digest.
     pub const fn market_instrument_revision_digest(&self) -> EvidenceDigest {

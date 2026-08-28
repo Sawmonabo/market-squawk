@@ -1391,7 +1391,6 @@ fn instrument_row(
         "definitionKind": definition_kind(definition),
         "definitionRevision": definition.executable.map(|value| value.definition_revision().get().to_string()),
         "referenceRevision": definition.market_data.map(|value| value.reference_revision().as_source_identifier().as_str()),
-        "permanentFigi": definition.market_data.map(|value| value.permanent_figi().as_str()),
         "displayName": definition.market_data.and_then(MarketDataInstrumentDefinition::display_name).map(|value| value.as_str()),
         "tickSize": definition.executable.map(|value| value.tick_size().as_decimal().normalize().to_string()),
         "lotSize": definition.executable.map(|value| value.lot_size().as_decimal().normalize().to_string()),
@@ -1533,9 +1532,9 @@ fn unified_symbol(
         });
     }
     Ok(UnifiedSymbol {
-        value: market_data.permanent_figi().as_str().to_owned(),
+        value: market_data.instrument_id().to_string(),
         venue_id: None,
-        kind: "permanent_figi",
+        kind: "instrument_id",
     })
 }
 
@@ -1565,8 +1564,7 @@ fn market_data_definition_evidence(definition: Option<&MarketDataInstrumentDefin
             "referencePayloadLocator": payload_locator(definition.reference_payload_evidence()),
             "quoteCurrencyPayloadLocator": payload_locator(definition.quote_currency_evidence()),
             "effectiveFrom": timestamp_value(definition.effective_interval().starts_at()),
-            "effectiveUntil": definition.effective_interval().ends_at().map(timestamp_value),
-            "permanentFigi": definition.permanent_figi().as_str()
+            "effectiveUntil": definition.effective_interval().ends_at().map(timestamp_value)
         })
     })
 }

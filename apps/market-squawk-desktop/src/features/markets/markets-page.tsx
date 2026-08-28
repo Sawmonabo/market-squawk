@@ -123,8 +123,8 @@ function ReadyMarketsPage({
     ? rows.filter((row) =>
         [
           row.symbol,
+          row.instrumentId,
           row.displayName,
-          row.permanentFigi,
           row.assetClass,
           row.quoteCurrency,
           row.selectedSource?.providerId,

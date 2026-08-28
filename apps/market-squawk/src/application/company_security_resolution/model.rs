@@ -3,16 +3,16 @@
 use market_squawk_domain::{
     CommonEquitySuitability, CompanyIdentitySurface, CompanySecurityKind,
     CompanySecurityRelationshipKind, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, Figi, IdentifierEntitlement, IdentifierRightsPolicyReference,
-    InstrumentId, SourceId, SourceIdentifier, Timestamp,
+    ExactPayloadEvidence, IdentifierEntitlement, IdentifierRightsPolicyReference, InstrumentId,
+    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
 };
 use serde::Serialize;
 use uuid::Uuid;
 
 use super::CompanySecurityResolutionError;
 
-/// Current application grammar. V1 has no compatibility or legacy decoding branch.
-pub const COMPANY_SECURITY_RESOLUTION_FORMAT_VERSION: u16 = 1;
+/// Current application grammar. There is no compatibility or legacy decoding branch.
+pub const COMPANY_SECURITY_RESOLUTION_FORMAT_VERSION: u16 = 2;
 /// Maximum exact security candidates retained by one operator preview.
 pub const MAXIMUM_REVIEWED_SECURITY_CANDIDATES: usize = 32;
 /// Maximum encoded immutable preview retained in process memory.
@@ -43,7 +43,7 @@ impl CompanySecurityResolutionPreviewId {
     }
 }
 
-/// Operator decision for one exact FIGI candidate.
+/// Operator decision for one exact repository-owned instrument candidate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "disposition", rename_all = "snake_case")]
 pub enum ReviewedSecurityCandidateDisposition {
@@ -70,29 +70,29 @@ impl ReviewedSecurityCandidateDisposition {
     }
 }
 
-/// One exact FIGI considered by the operator.
+/// One exact repository-owned instrument considered by the operator.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewedSecurityCandidate {
-    permanent_figi: Figi,
+    instrument_id: InstrumentId,
     disposition: ReviewedSecurityCandidateDisposition,
 }
 
 impl ReviewedSecurityCandidate {
-    /// Constructs one exact candidate; ticker, name, and exchange cannot identify it.
+    /// Constructs one exact candidate; external identifiers and symbols cannot identify it.
     pub const fn new(
-        permanent_figi: Figi,
+        instrument_id: InstrumentId,
         disposition: ReviewedSecurityCandidateDisposition,
     ) -> Self {
         Self {
-            permanent_figi,
+            instrument_id,
             disposition,
         }
     }
 
-    /// Returns the permanent FIGI used for the exact catalog read.
-    pub const fn permanent_figi(&self) -> &Figi {
-        &self.permanent_figi
+    /// Returns the stable internal identity used for the exact catalog read.
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
     }
 
     /// Returns the explicit selected or excluded decision.
@@ -257,7 +257,7 @@ pub struct CompanySecurityResolutionPreviewRequest {
 }
 
 impl CompanySecurityResolutionPreviewRequest {
-    /// Constructs one resolution request with exactly one selected FIGI candidate.
+    /// Constructs one resolution request with exactly one selected instrument candidate.
     #[allow(
         clippy::too_many_arguments,
         reason = "the authority request binds independent facts"
@@ -290,7 +290,7 @@ impl CompanySecurityResolutionPreviewRequest {
             if reviewed_candidates
                 .iter()
                 .skip(index + 1)
-                .any(|other| other.permanent_figi() == candidate.permanent_figi())
+                .any(|other| other.instrument_id() == candidate.instrument_id())
             {
                 return Err(CompanySecurityResolutionError::AmbiguousCandidates);
             }
@@ -448,9 +448,9 @@ impl CompanyIdentityParentSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct CompanySecurityCandidateSnapshot {
     ordinal: u16,
-    permanent_figi: Figi,
     instrument_id: InstrumentId,
     market_revision_digest: EvidenceDigest,
+    market_reference_evidence: RevisionBoundPayloadEvidence,
     market_revision_sequence: u32,
     market_published_at: Timestamp,
     market_effective_interval: EffectiveInterval,
@@ -464,9 +464,9 @@ impl CompanySecurityCandidateSnapshot {
     )]
     pub(super) const fn new(
         ordinal: u16,
-        permanent_figi: Figi,
         instrument_id: InstrumentId,
         market_revision_digest: EvidenceDigest,
+        market_reference_evidence: RevisionBoundPayloadEvidence,
         market_revision_sequence: u32,
         market_published_at: Timestamp,
         market_effective_interval: EffectiveInterval,
@@ -474,9 +474,9 @@ impl CompanySecurityCandidateSnapshot {
     ) -> Self {
         Self {
             ordinal,
-            permanent_figi,
             instrument_id,
             market_revision_digest,
+            market_reference_evidence,
             market_revision_sequence,
             market_published_at,
             market_effective_interval,
@@ -487,14 +487,14 @@ impl CompanySecurityCandidateSnapshot {
     pub const fn ordinal(&self) -> u16 {
         self.ordinal
     }
-    pub const fn permanent_figi(&self) -> &Figi {
-        &self.permanent_figi
-    }
     pub const fn instrument_id(&self) -> InstrumentId {
         self.instrument_id
     }
     pub const fn market_revision_digest(&self) -> EvidenceDigest {
         self.market_revision_digest
+    }
+    pub const fn market_reference_evidence(&self) -> &RevisionBoundPayloadEvidence {
+        &self.market_reference_evidence
     }
     pub const fn market_revision_sequence(&self) -> u32 {
         self.market_revision_sequence

@@ -1100,11 +1100,16 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
                 rows.len()
             )
         })?;
-    assert!(matches!(
-        row["symbolKind"].as_str(),
-        Some("provider_subscription_symbol" | "venue_symbol")
-    ));
-    required_nonempty_string(&row["symbolVenueId"], "Alpaca overview symbol venue")?;
+    match row["symbolKind"].as_str() {
+        Some("provider_subscription_symbol" | "venue_symbol") => {
+            required_nonempty_string(&row["symbolVenueId"], "Alpaca overview symbol venue")?;
+        }
+        Some("instrument_id") => {
+            assert_eq!(row["symbol"], row["instrumentId"]);
+            assert!(row["symbolVenueId"].is_null());
+        }
+        _ => anyhow::bail!("Alpaca overview used an unsupported display-symbol identity"),
+    }
     assert_eq!(row["assetClass"], "fund");
     assert_eq!(row["quoteCurrency"], "USD");
     assert_eq!(row["definitionKind"], "market_data");
@@ -1112,7 +1117,6 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
     assert_eq!(row["executionEligible"], false);
     assert_eq!(row["analyticalReadiness"], "runtime_display_only");
     assert!(row["orderBook"].is_null());
-    required_nonempty_string(&row["permanentFigi"], "Alpaca overview permanent FIGI")?;
     let definition_revision_digest = &row["definitionRevisionDigest"];
     assert_eq!(definition_revision_digest["algorithm"], "sha256");
     required_sha256(
@@ -1133,7 +1137,6 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
         "definitionKind": row["definitionKind"],
         "definitionRevisionDigest": definition_revision_digest,
         "referenceRevision": row["referenceRevision"],
-        "permanentFigi": row["permanentFigi"],
         "executionEligible": row["executionEligible"],
         "analyticalReadiness": row["analyticalReadiness"],
     });

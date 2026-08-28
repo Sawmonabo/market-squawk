@@ -114,7 +114,6 @@ const referenceEvidenceSchema = z
     quoteCurrencyPayloadLocator: payloadLocatorSchema.nullable(),
     effectiveFrom: timestampSchema,
     effectiveUntil: timestampSchema.nullable(),
-    permanentFigi: z.string().length(12),
   })
   .strict()
   .superRefine((evidence, context) => {
@@ -993,7 +992,7 @@ export const unifiedMarketRowSchema = z
     symbolKind: z.enum([
       "venue_symbol",
       "provider_subscription_symbol",
-      "permanent_figi",
+      "instrument_id",
     ]),
     symbolVenueId: venueIdSchema.nullable(),
     assetClass: assetClassSchema,
@@ -1005,7 +1004,6 @@ export const unifiedMarketRowSchema = z
     ]),
     definitionRevision: positiveIntegerTextSchema.nullable(),
     referenceRevision: nonemptyTextSchema.nullable(),
-    permanentFigi: z.string().length(12).nullable(),
     displayName: nonemptyTextSchema.nullable(),
     tickSize: canonicalDecimalSchema.nullable(),
     lotSize: canonicalDecimalSchema.nullable(),
@@ -1287,7 +1285,6 @@ function crossBindDefinition(
   }
   if (
     (row.referenceRevision !== null) !== hasReference ||
-    (row.permanentFigi !== null) !== hasReference ||
     (row.referenceEvidence !== null) !== hasReference
   ) {
     context.addIssue({ code: "custom", message: "market-data definition binding mismatch" })
@@ -1307,8 +1304,7 @@ function crossBindDefinition(
   }
   if (
     row.referenceEvidence &&
-    (row.referenceEvidence.referenceRevision !== row.referenceRevision ||
-      row.referenceEvidence.permanentFigi !== row.permanentFigi)
+    row.referenceEvidence.referenceRevision !== row.referenceRevision
   ) {
     context.addIssue({ code: "custom", message: "reference evidence identity mismatch" })
   }
@@ -1323,10 +1319,10 @@ function crossBindDefinition(
       message: "market-data definition is not effective at selection time",
     })
   }
-  if (row.symbolKind === "permanent_figi" && row.symbol !== row.permanentFigi) {
-    context.addIssue({ code: "custom", message: "permanent FIGI symbol mismatch" })
+  if (row.symbolKind === "instrument_id" && row.symbol !== row.instrumentId) {
+    context.addIssue({ code: "custom", message: "instrument ID symbol mismatch" })
   }
-  if ((row.symbolKind === "permanent_figi") !== (row.symbolVenueId === null)) {
+  if ((row.symbolKind === "instrument_id") !== (row.symbolVenueId === null)) {
     context.addIssue({ code: "custom", message: "market symbol venue mismatch" })
   }
 }
