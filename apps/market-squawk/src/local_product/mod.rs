@@ -72,7 +72,7 @@ use self::fair_value_producer::ProductionFairValueProducerSelectionAuthority;
 use self::governance::{DecisionGovernanceAdapter, ProductionFairValueGovernanceActionFactory};
 use self::market_provider_configuration::ProductionMarketProviderConfigurationResolver;
 use self::provider_activation_state::{
-    DurableProviderActivationState, ProviderMetadataBackupAuthority,
+    DurableActivationRecipeState, DurableProviderActivationState, ProviderMetadataBackupAuthority,
 };
 use self::source_lifecycle::ProductionSourceLifecycleAuthority;
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -103,7 +103,7 @@ use crate::application::settings::SettingsSeed;
 use crate::application::{
     Application, ApplicationCompositionError, ApplicationDomainService, FairValueDomainService,
     FairValueInputAuthorityError, FairValueInputAuthorityLimits,
-    FairValueProducerSelectionAuthority, LiveFairValueObservationBuffer,
+    FairValueProducerSelectionAuthority, FredLatestKnownOperation, LiveFairValueObservationBuffer,
     LiveFairValueObservationBufferError, MarketReferenceSearchAuthority, MarketRuntimeRegistry,
     PaperApplicationServices, PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
     PrepublishedResearchSourceRegistration, ProductionFairValueInputAuthority,
@@ -642,10 +642,25 @@ impl LocalProduct {
             portal_activation.clone(),
             source_lifecycle_service,
         )?);
-        let research_domains = ResearchApplicationServices::new_with_artifacts(
+        let fred_latest_known = match provider_activation_state
+            .load_recipe(market_squawk_sources::FRED_ALFRED_API_SURFACE_ID)
+            .map_err(|_error| CliProviderActivationError::StateUnavailable)?
+        {
+            DurableActivationRecipeState::Desired(_) => {
+                FredLatestKnownOperation::desired_dataset_unbound()
+            }
+            DurableActivationRecipeState::Missing
+            | DurableActivationRecipeState::Staged(_)
+            | DurableActivationRecipeState::Cutover(_)
+            | DurableActivationRecipeState::Quarantined(_) => {
+                FredLatestKnownOperation::setup_required()
+            }
+        };
+        let research_domains = ResearchApplicationServices::new_with_artifacts_and_fred(
             Arc::clone(&research),
             Arc::clone(&research_ingest) as Arc<_>,
             Arc::clone(&artifact_repository),
+            fred_latest_known,
         );
 
         let portfolio = Arc::new(PortfolioApplicationService::try_new(

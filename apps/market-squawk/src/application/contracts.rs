@@ -16,6 +16,7 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use self::output::output_data_schema;
+use crate::provider_activation::FRED_ALFRED_READ_OPERATION;
 
 /// Exact contract version shared by CLI and MCP for the first local release.
 pub const APPLICATION_CONTRACT_VERSION: &str = "1";
@@ -112,6 +113,11 @@ const MACRO_DASHBOARD_ARGUMENTS: &[ArgumentSpec] = &[
         ArgumentKind::Enumeration(&["federal-reserve-board.data-download-program"]),
     ),
     ArgumentSpec::required("release", ArgumentKind::Enumeration(&["h15"])),
+];
+const FRED_ALFRED_LATEST_KNOWN_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("generation", ArgumentKind::FredGeneration),
+    ArgumentSpec::optional("knowledgeCutoff", ArgumentKind::FredTimestamp),
+    ArgumentSpec::optional("effectiveDateCutoff", ArgumentKind::CalendarDate),
 ];
 const PROVIDER_CREDENTIAL_BUNDLE_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("inputTicketId", ArgumentKind::Uuid)];
@@ -1099,6 +1105,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         idempotent: true,
         open_world: false,
     },
+    read(
+        FRED_ALFRED_READ_OPERATION,
+        "Return FRED/ALFRED availability or one exact manifest-pinned latest-known observation.",
+        ServiceDomain::Macro,
+        LOCAL_SCOPE,
+        FRED_ALFRED_LATEST_KNOWN_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
     read_observations(
         "Macro.ListSeries",
         "List bounded macroeconomic series represented by a dataset.",
@@ -2409,6 +2423,9 @@ enum ArgumentKind {
     Object,
     Array,
     Timestamp,
+    CalendarDate,
+    FredTimestamp,
+    FredGeneration,
     FairValueMeasurement,
     ForecastRequest,
     PortfolioImportInterpretations,
@@ -2442,6 +2459,23 @@ fn schema_for(spec: OperationSpec) -> Value {
     schema.insert("properties".to_owned(), Value::Object(properties));
     if !required.is_empty() {
         schema.insert("required".to_owned(), Value::Array(required));
+    }
+    if spec.name == FRED_ALFRED_READ_OPERATION {
+        schema.insert(
+            "oneOf".to_owned(),
+            json!([
+                {
+                    "not": {
+                        "anyOf": [
+                            {"required": ["generation"]},
+                            {"required": ["knowledgeCutoff"]},
+                            {"required": ["effectiveDateCutoff"]},
+                        ]
+                    }
+                },
+                {"required": ["generation", "knowledgeCutoff", "effectiveDateCutoff"]},
+            ]),
+        );
     }
     schema.insert("additionalProperties".to_owned(), Value::Bool(false));
     Value::Object(schema)
@@ -2576,6 +2610,14 @@ fn argument_schema(kind: ArgumentKind) -> Value {
         ArgumentKind::Object => json!({"type": "object", "minProperties": 1}),
         ArgumentKind::Array => json!({"type": "array", "minItems": 1}),
         ArgumentKind::Timestamp => json!({"type": "string", "format": "date-time"}),
+        ArgumentKind::CalendarDate => calendar_date_argument_schema(),
+        ArgumentKind::FredTimestamp => json!({
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1,
+            "maxLength": 64,
+        }),
+        ArgumentKind::FredGeneration => fred_generation_argument_schema(),
         ArgumentKind::FairValueMeasurement => fair_value_measurement_schema(),
         ArgumentKind::ForecastRequest => forecast_request_schema(),
         ArgumentKind::PortfolioImportInterpretations => portfolio_import_interpretations_schema(),
@@ -2601,6 +2643,9 @@ fn admit(spec: OperationSpec, arguments: &Map<String, Value>) -> Result<(), Tool
     allowed
         .try_reserve(5_usize.saturating_add(spec.arguments.len()))
         .map_err(|_| ToolInputError::Invalid)?;
+    if spec.name == FRED_ALFRED_READ_OPERATION {
+        admit_fred_latest_known_argument_group(arguments)?;
+    }
     admit_scope(arguments, spec.scope, &mut allowed)?;
     for argument in spec.arguments {
         allowed.insert(argument.name);
@@ -2830,6 +2875,9 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
         ArgumentKind::Timestamp => admit_timestamp(value),
+        ArgumentKind::CalendarDate => admit_calendar_date(value),
+        ArgumentKind::FredTimestamp => admit_fred_timestamp(value),
+        ArgumentKind::FredGeneration => admit_fred_generation(value),
         ArgumentKind::FairValueMeasurement => admit_fair_value_measurement(value),
         ArgumentKind::ForecastRequest => admit_forecast_request(value),
         ArgumentKind::PortfolioImportInterpretations => {
@@ -2856,6 +2904,152 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
     }
+}
+
+fn fred_generation_argument_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "manifestVersion": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 20,
+                "pattern": "^[1-9][0-9]{0,19}$",
+            },
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                    },
+                    "version": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": u16::MAX,
+                    },
+                    "fingerprint": nonzero_sha256_argument_schema(),
+                },
+                "required": ["name", "version", "fingerprint"],
+                "additionalProperties": false,
+            },
+            "contentHash": nonzero_sha256_argument_schema(),
+        },
+        "required": ["manifestVersion", "schema", "contentHash"],
+        "additionalProperties": false,
+    })
+}
+
+fn nonzero_sha256_argument_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 64,
+        "maxLength": 64,
+        "pattern": "^[0-9a-f]{64}$",
+        "not": {
+            "const": "0000000000000000000000000000000000000000000000000000000000000000",
+        },
+    })
+}
+
+fn calendar_date_argument_schema() -> Value {
+    json!({
+        "type": "string",
+        "format": "date",
+        "minLength": 10,
+        "maxLength": 10,
+        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+    })
+}
+
+fn admit_fred_latest_known_argument_group(
+    arguments: &Map<String, Value>,
+) -> Result<(), ToolInputError> {
+    let supplied = ["generation", "knowledgeCutoff", "effectiveDateCutoff"]
+        .into_iter()
+        .filter(|name| arguments.contains_key(*name))
+        .count();
+    if supplied == 0 || supplied == 3 {
+        Ok(())
+    } else {
+        Err(ToolInputError::Invalid)
+    }
+}
+
+fn admit_fred_generation(value: &Value) -> Result<(), ToolInputError> {
+    let generation = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if generation.len() != 3
+        || generation
+            .keys()
+            .any(|key| !matches!(key.as_str(), "manifestVersion" | "schema" | "contentHash"))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    admit_argument(
+        generation
+            .get("manifestVersion")
+            .ok_or(ToolInputError::Invalid)?,
+        ArgumentKind::PositiveUnsignedText,
+    )?;
+    admit_nonzero_sha256(
+        generation
+            .get("contentHash")
+            .ok_or(ToolInputError::Invalid)?,
+    )?;
+
+    let schema = generation
+        .get("schema")
+        .and_then(Value::as_object)
+        .ok_or(ToolInputError::Invalid)?;
+    if schema.len() != 3
+        || schema
+            .keys()
+            .any(|key| !matches!(key.as_str(), "name" | "version" | "fingerprint"))
+        || schema
+            .get("name")
+            .and_then(Value::as_str)
+            .is_none_or(|name| name.is_empty() || name.len() > 256)
+        || schema
+            .get("version")
+            .and_then(Value::as_u64)
+            .is_none_or(|version| version == 0 || version > u64::from(u16::MAX))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    admit_nonzero_sha256(schema.get("fingerprint").ok_or(ToolInputError::Invalid)?)
+}
+
+fn admit_nonzero_sha256(value: &Value) -> Result<(), ToolInputError> {
+    let value = value.as_str().ok_or(ToolInputError::Invalid)?;
+    if value == "0000000000000000000000000000000000000000000000000000000000000000"
+        || value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    Ok(())
+}
+
+fn admit_calendar_date(value: &Value) -> Result<(), ToolInputError> {
+    value
+        .as_str()
+        .filter(|value| value.len() == 10)
+        .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+        .map(|_| ())
+        .ok_or(ToolInputError::Invalid)
+}
+
+fn admit_fred_timestamp(value: &Value) -> Result<(), ToolInputError> {
+    value
+        .as_str()
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .filter(|value| value.timestamp_nanos_opt().is_some())
+        .map(|_| ())
+        .ok_or(ToolInputError::Invalid)
 }
 
 fn recommendation_allocation_profile_schema() -> Value {

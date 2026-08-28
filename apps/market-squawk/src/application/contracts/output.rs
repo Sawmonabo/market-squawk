@@ -10,6 +10,8 @@ use market_squawk_decisions::{
 };
 use market_squawk_sources::FRED_ALFRED_API_SURFACE_ID;
 
+use crate::provider_activation::FRED_ALFRED_READ_OPERATION;
+
 pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
     let schema = match operation {
         "Source.ImportCredentialBundle" => closed(
@@ -182,6 +184,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         | "Fundamental.GetStatements"
         | "Fundamental.GetRatios" => observation_result(),
         "Macro.GetDashboard" => macro_dashboard(),
+        FRED_ALFRED_READ_OPERATION => fred_alfred_latest_known(),
         "Macro.ListSeries"
         | "Macro.GetObservations"
         | "Macro.GetVintages"
@@ -4654,6 +4657,268 @@ fn macro_dashboard() -> Value {
             "observations",
         ],
     )
+}
+
+fn fred_alfred_latest_known() -> Value {
+    let envelope = |variant_fields: Vec<(&str, Value)>, required: &[&str]| {
+        let mut fields = vec![
+            (
+                "schemaIdentity",
+                constant("market-squawk-fred-alfred-operation/v1"),
+            ),
+            ("operation", constant(FRED_ALFRED_READ_OPERATION)),
+        ];
+        fields.extend(variant_fields);
+        closed(fields, required)
+    };
+    one_of(vec![
+        envelope(
+            vec![
+                ("state", constant("setup_required")),
+                ("reason", constant("desired_activation_absent")),
+            ],
+            &["schemaIdentity", "operation", "state", "reason"],
+        ),
+        envelope(
+            vec![
+                ("state", constant("unavailable")),
+                ("reason", constant("exact_provider_dataset_absent")),
+            ],
+            &["schemaIdentity", "operation", "state", "reason"],
+        ),
+        envelope(
+            vec![
+                ("state", constant("unavailable")),
+                ("reason", constant("exact_manifest_absent")),
+                ("binding", fred_alfred_provider_binding()),
+            ],
+            &["schemaIdentity", "operation", "state", "reason", "binding"],
+        ),
+        envelope(
+            vec![
+                ("state", constant("ready")),
+                ("binding", fred_alfred_provider_binding()),
+                ("generation", fred_alfred_generation()),
+            ],
+            &[
+                "schemaIdentity",
+                "operation",
+                "state",
+                "binding",
+                "generation",
+            ],
+        ),
+        envelope(
+            vec![
+                ("state", constant("ready")),
+                ("generation", fred_alfred_generation()),
+                ("result", fred_alfred_point_in_time_read()),
+            ],
+            &[
+                "schemaIdentity",
+                "operation",
+                "state",
+                "generation",
+                "result",
+            ],
+        ),
+    ])
+}
+
+fn fred_alfred_provider_binding() -> Value {
+    closed(
+        vec![
+            ("surfaceId", constant(FRED_ALFRED_API_SURFACE_ID)),
+            ("providerDatasetId", bounded_text(512)),
+            ("analyticalDatasetId", analytical_dataset_identifier()),
+        ],
+        &["surfaceId", "providerDatasetId", "analyticalDatasetId"],
+    )
+}
+
+fn fred_alfred_generation() -> Value {
+    closed(
+        vec![
+            ("manifestVersion", positive_integer_text()),
+            ("schema", fred_alfred_schema_identity()),
+            ("contentHash", nonzero_lowercase_sha256()),
+        ],
+        &["manifestVersion", "schema", "contentHash"],
+    )
+}
+
+fn fred_alfred_schema_identity() -> Value {
+    closed(
+        vec![
+            ("name", bounded_text(256)),
+            ("version", bounded_unsigned_range(1, u64::from(u16::MAX))),
+            ("fingerprint", nonzero_lowercase_sha256()),
+        ],
+        &["name", "version", "fingerprint"],
+    )
+}
+
+fn fred_alfred_point_in_time_read() -> Value {
+    closed(
+        vec![
+            (
+                "schemaIdentity",
+                constant("market-squawk-fred-alfred-point-in-time/v1"),
+            ),
+            ("binding", fred_alfred_read_binding()),
+            ("selection", fred_alfred_read_selection()),
+            ("observation", fred_alfred_read_observation()),
+        ],
+        &["schemaIdentity", "binding", "selection", "observation"],
+    )
+}
+
+fn fred_alfred_read_binding() -> Value {
+    closed(
+        vec![
+            ("provider", fred_alfred_read_provider()),
+            ("manifest", fred_alfred_read_manifest()),
+            ("objectGraphDigest", nonzero_lowercase_sha256()),
+            ("queryIdentity", nonzero_lowercase_sha256()),
+            ("resultDigest", nonzero_lowercase_sha256()),
+        ],
+        &[
+            "provider",
+            "manifest",
+            "objectGraphDigest",
+            "queryIdentity",
+            "resultDigest",
+        ],
+    )
+}
+
+fn fred_alfred_read_provider() -> Value {
+    closed(
+        vec![
+            ("surfaceId", constant(FRED_ALFRED_API_SURFACE_ID)),
+            ("sourceId", constant("fred-fred-alfred.api-v1-v2")),
+            ("providerDatasetId", bounded_text(512)),
+            ("analyticalDatasetId", analytical_dataset_identifier()),
+            ("seriesId", bounded_text(512)),
+        ],
+        &[
+            "surfaceId",
+            "sourceId",
+            "providerDatasetId",
+            "analyticalDatasetId",
+            "seriesId",
+        ],
+    )
+}
+
+fn fred_alfred_read_manifest() -> Value {
+    closed(
+        vec![
+            ("datasetId", analytical_dataset_identifier()),
+            ("manifestVersion", positive_integer_text()),
+            ("schema", fred_alfred_schema_identity()),
+            ("contentHash", nonzero_lowercase_sha256()),
+        ],
+        &["datasetId", "manifestVersion", "schema", "contentHash"],
+    )
+}
+
+fn fred_alfred_read_selection() -> Value {
+    closed(
+        vec![
+            ("policy", constant("latest_known_by_series_as_of_cutoff_v1")),
+            ("knowledgeCutoff", canonical_market_timestamp()),
+            ("effectiveDateCutoff", exact_calendar_date()),
+            ("evaluatedAt", canonical_market_timestamp()),
+            ("selectionDigest", nonzero_lowercase_sha256()),
+            ("complete", constant_bool(true)),
+        ],
+        &[
+            "policy",
+            "knowledgeCutoff",
+            "effectiveDateCutoff",
+            "evaluatedAt",
+            "selectionDigest",
+            "complete",
+        ],
+    )
+}
+
+fn fred_alfred_read_observation() -> Value {
+    closed(
+        vec![
+            ("seriesId", bounded_text(512)),
+            ("unitId", bounded_text(512)),
+            ("effectiveDate", exact_calendar_date()),
+            ("publishedVintage", exact_calendar_date()),
+            ("supersededAfter", nullable(exact_calendar_date())),
+            ("availableAt", canonical_market_timestamp()),
+            ("receivedAt", canonical_market_timestamp()),
+            ("ingestedAt", canonical_market_timestamp()),
+            ("revision", bounded_unsigned_range(1, u64::from(u32::MAX))),
+            ("value", fred_alfred_read_value()),
+            ("sourceIdentifier", bounded_text(512)),
+            ("rawPageDigest", nonzero_lowercase_sha256()),
+            ("quality", constant("official_delayed")),
+        ],
+        &[
+            "seriesId",
+            "unitId",
+            "effectiveDate",
+            "publishedVintage",
+            "supersededAfter",
+            "availableAt",
+            "receivedAt",
+            "ingestedAt",
+            "revision",
+            "value",
+            "sourceIdentifier",
+            "rawPageDigest",
+            "quality",
+        ],
+    )
+}
+
+fn fred_alfred_read_value() -> Value {
+    one_of(vec![
+        closed(
+            vec![
+                ("state", constant("observed")),
+                ("decimal", canonical_decimal_text()),
+            ],
+            &["state", "decimal"],
+        ),
+        closed(
+            vec![
+                ("state", constant("missing")),
+                ("marker", bounded_text(512)),
+                ("reason", nullable(bounded_text(512))),
+            ],
+            &["state", "marker", "reason"],
+        ),
+    ])
+}
+
+fn exact_calendar_date() -> Value {
+    json!({
+        "type": "string",
+        "format": "date",
+        "minLength": 10,
+        "maxLength": 10,
+        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+    })
+}
+
+fn nonzero_lowercase_sha256() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 64,
+        "maxLength": 64,
+        "pattern": "^[0-9a-f]{64}$",
+        "not": {
+            "const": "0000000000000000000000000000000000000000000000000000000000000000",
+        },
+    })
 }
 
 fn macro_dashboard_binding() -> Value {

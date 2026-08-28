@@ -43,6 +43,7 @@ use crate::ResearchService;
 
 mod dataset_preparation;
 mod forecast_evidence;
+mod fred;
 mod ingest;
 
 pub(crate) use dataset_preparation::{
@@ -51,18 +52,31 @@ pub(crate) use dataset_preparation::{
     DatasetPreparationSelection,
 };
 pub(crate) use forecast_evidence::AnalyticalForecastEvidenceReader;
+pub(crate) use fred::{
+    FredLatestKnownAvailability, FredLatestKnownCompositionError, FredLatestKnownOperation,
+};
 pub(crate) use ingest::{
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
-    BLS_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BlsMacroApplicationClosure,
-    BlsMacroApplicationError, BlsMacroCapabilityState, BlsMacroPlanPublication,
-    BlsMacroUnavailableReason, BlsPreparedMacroPlan, BlsProviderPeriodLatestKnownDto,
-    BlsProviderPeriodLatestKnownRequest, BlsSealFirstExtractionLimits,
-    BlsWholePlanApplicationHandoff, CoinbaseMarketApplicationOutcome,
+    BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BLS_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION,
+    BeaCandidatePublicationState, BeaDoctorActivationState, BeaMacroApplicationClosure,
+    BeaMacroApplicationError, BeaMacroCapabilityState, BeaMacroPlanPublication,
+    BeaProviderPeriodLatestKnownDto, BeaProviderPeriodLatestKnownRequest, BeaSetupRequiredDto,
+    BeaSetupRequiredKind, BeaSharedQuotaSettlementAuthority, BeaSharedQuotaSettlementFailure,
+    BeaUnavailableDto, BeaUnavailableReason, BlsMacroApplicationClosure, BlsMacroApplicationError,
+    BlsMacroCapabilityState, BlsMacroPlanPublication, BlsMacroUnavailableReason,
+    BlsPreparedMacroPlan, BlsProviderPeriodLatestKnownDto, BlsProviderPeriodLatestKnownRequest,
+    BlsSealFirstExtractionLimits, BlsWholePlanApplicationHandoff, CoinbaseMarketApplicationOutcome,
     CryptoMarketEventPublicationReceipt, CryptoMarketEventRestartReceipt,
     CryptoMarketEventRestartSelector, CryptoMarketPublicationClosure, CryptoMarketPublicationError,
     CryptoMarketSealedReceiptEvidence, CryptoMarketSelectorAvailability,
-    CryptoMarketSelectorDependency, CryptoMarketSurface, KrakenMarketApplicationOutcome,
+    CryptoMarketSelectorDependency, CryptoMarketSurface, IexHistApplicationError,
+    IexHistApplicationLane, IexHistCaptureSealHandoff, IexHistCaptureSealRequirements,
+    IexHistCatalogSealHandoff, IexHistClockStatus, IexHistExactJobPreview,
+    IexHistExplicitJobRequest, IexHistInstrumentIdentityBlocker, IexHistInstrumentIdentityStatus,
+    IexHistJobAuthority, IexHistJobStatus, IexHistPhysicalArtifact, IexHistPhysicalSealRequirement,
+    IexHistPublicationAvailability, IexHistPublicationBlocker, IexHistPublicationBlockers,
+    IexHistResearchJobLeaf, IexHistSelectionStatus, KrakenMarketApplicationOutcome,
     KrakenSealedRawCanonicalUnavailable, ResearchProviderRuntimeMutationAuthority,
     ResearchProviderRuntimeReplacement,
 };
@@ -202,7 +216,12 @@ impl ResearchApplicationServices {
     /// Binds one application-owned analytical service and one concrete extraction coordinator.
     #[must_use]
     pub fn new(service: Arc<ResearchService>, ingest: Arc<dyn ResearchIngestCoordinator>) -> Self {
-        Self::compose(service, ingest, None)
+        Self::compose(
+            service,
+            ingest,
+            None,
+            FredLatestKnownOperation::setup_required(),
+        )
     }
 
     /// Binds the public application path to the shared controlled opaque-artifact repository.
@@ -212,13 +231,29 @@ impl ResearchApplicationServices {
         ingest: Arc<dyn ResearchIngestCoordinator>,
         artifacts: Arc<dyn ArtifactRepository>,
     ) -> Self {
-        Self::compose(service, ingest, Some(artifacts))
+        Self::compose(
+            service,
+            ingest,
+            Some(artifacts),
+            FredLatestKnownOperation::setup_required(),
+        )
+    }
+
+    /// Binds the public application path to artifacts and an exact startup-composed FRED read.
+    pub(crate) fn new_with_artifacts_and_fred(
+        service: Arc<ResearchService>,
+        ingest: Arc<dyn ResearchIngestCoordinator>,
+        artifacts: Arc<dyn ArtifactRepository>,
+        fred_latest_known: FredLatestKnownOperation,
+    ) -> Self {
+        Self::compose(service, ingest, Some(artifacts), fred_latest_known)
     }
 
     fn compose(
         service: Arc<ResearchService>,
         ingest: Arc<dyn ResearchIngestCoordinator>,
         artifacts: Option<Arc<dyn ArtifactRepository>>,
+        fred_latest_known: FredLatestKnownOperation,
     ) -> Self {
         let reader = service.analytical_reader();
         Self {
@@ -227,6 +262,7 @@ impl ResearchApplicationServices {
                 reader,
                 ingest,
                 artifacts,
+                fred_latest_known,
                 lifecycle: DomainLifecycle::new(),
             }),
         }
@@ -414,6 +450,13 @@ impl ApplicationDomainService for MacroDomainService {
     ) -> Result<TypedToolResult, ServiceError> {
         let _call = DomainLifecycle::enter(&self.controller.lifecycle, &context)?;
         match request.name() {
+            crate::provider_activation::FRED_ALFRED_READ_OPERATION => {
+                let limits = effective_service_limits(&request, &context)?;
+                self.controller
+                    .fred_latest_known
+                    .call(&request, &context, limits)
+                    .await
+            }
             MACRO_GET_DASHBOARD => {
                 let limits = effective_service_limits(&request, &context)?;
                 self.controller
@@ -452,6 +495,7 @@ struct ResearchController {
     reader: AnalyticalReadCapability,
     ingest: Arc<dyn ResearchIngestCoordinator>,
     artifacts: Option<Arc<dyn ArtifactRepository>>,
+    fred_latest_known: FredLatestKnownOperation,
     lifecycle: Arc<DomainLifecycle>,
 }
 
@@ -685,6 +729,7 @@ impl fmt::Debug for ResearchController {
                 "artifacts",
                 &self.artifacts.as_ref().map(|_| "[OPAQUE REPOSITORY]"),
             )
+            .field("fred_latest_known", &self.fred_latest_known)
             .field("lifecycle", &self.lifecycle)
             .finish()
     }

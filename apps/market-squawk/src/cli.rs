@@ -443,6 +443,32 @@ pub enum QueryCommand {
         #[arg(long, default_value_t = 1_000)]
         maximum_rows: usize,
     },
+    /// Report whether the exact desired FRED/ALFRED generation is ready for local reads.
+    FredAlfredStatus,
+    /// Read one latest-known FRED/ALFRED observation from an exact immutable generation.
+    FredAlfredLatestKnown {
+        /// Exact immutable manifest version returned by `fred-alfred-status`.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        manifest_version: u64,
+        /// Exact immutable schema name returned by `fred-alfred-status`.
+        #[arg(long)]
+        schema_name: String,
+        /// Exact immutable schema version returned by `fred-alfred-status`.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        schema_version: u16,
+        /// Exact lowercase schema SHA-256 returned by `fred-alfred-status`.
+        #[arg(long)]
+        schema_fingerprint: String,
+        /// Exact lowercase manifest-content SHA-256 returned by `fred-alfred-status`.
+        #[arg(long)]
+        content_hash: String,
+        /// RFC 3339 knowledge cutoff for the point-in-time read.
+        #[arg(long)]
+        knowledge_cutoff: String,
+        /// Effective-date cutoff in YYYY-MM-DD form.
+        #[arg(long)]
+        effective_date_cutoff: String,
+    },
 }
 
 /// Feature-registry operation.

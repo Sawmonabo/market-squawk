@@ -69,7 +69,7 @@ pub(crate) use research::{
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
     AnalyticalForecastEvidenceReader, DatasetPreparationAuthority, DatasetPreparationError,
     DatasetPreparationOptions, DatasetPreparationPreview, DatasetPreparationPreviewRequest,
-    DatasetPreparationReceipt, DatasetPreparationSelection,
+    DatasetPreparationReceipt, DatasetPreparationSelection, FredLatestKnownOperation,
     ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
 };
 pub use research::{

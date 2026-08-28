@@ -33,6 +33,7 @@ use crate::cli::{
     SourceCommand, UpdateChannelArgument, UpdateOperationsCommand, WorkspaceOperationsCommand,
     WorkspaceSwitchCommand,
 };
+use crate::provider_activation::FRED_ALFRED_READ_OPERATION;
 
 mod files;
 mod query;
@@ -554,6 +555,47 @@ async fn query(
                 &mut arguments,
                 Some(maximum_rows),
                 "dataset observations read",
+            )
+            .await
+        }
+        QueryCommand::FredAlfredStatus => {
+            invoke(
+                authority,
+                FRED_ALFRED_READ_OPERATION,
+                &mut Map::new(),
+                Some(1),
+                "FRED/ALFRED point-in-time availability read",
+            )
+            .await
+        }
+        QueryCommand::FredAlfredLatestKnown {
+            manifest_version,
+            schema_name,
+            schema_version,
+            schema_fingerprint,
+            content_hash,
+            knowledge_cutoff,
+            effective_date_cutoff,
+        } => {
+            let mut arguments = json_object(json!({
+                "generation": {
+                    "manifestVersion": manifest_version.to_string(),
+                    "schema": {
+                        "name": schema_name,
+                        "version": schema_version,
+                        "fingerprint": lowercase_sha256(&schema_fingerprint)?,
+                    },
+                    "contentHash": lowercase_sha256(&content_hash)?,
+                },
+                "knowledgeCutoff": knowledge_cutoff,
+                "effectiveDateCutoff": effective_date_cutoff,
+            }))?;
+            invoke(
+                authority,
+                FRED_ALFRED_READ_OPERATION,
+                &mut arguments,
+                Some(1),
+                "FRED/ALFRED latest-known point-in-time observation read",
             )
             .await
         }
