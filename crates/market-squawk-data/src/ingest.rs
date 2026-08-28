@@ -1909,11 +1909,12 @@ impl AnalyticalDataService {
             .map_err(Into::into)
     }
 
-    /// Reconciles the sealed-response store against the complete immutable catalog receipt set.
+    /// Reconciles the sealed raw-object store against the complete immutable catalog receipt set.
     ///
     /// This is the startup boundary for quarantining incomplete stages and unreferenced final
-    /// objects. Every catalog claim is decoded and cross-checked against its run/page/frame rows,
-    /// then the sealed store verifies every retained object before moving anything.
+    /// objects. Every catalog claim is decoded and cross-checked against its publication and
+    /// physical-unit rows, then the sealed store verifies every retained object before moving
+    /// anything.
     pub async fn recover_provider_capture_store(
         &self,
         store: Arc<market_squawk_platform::SealedResearchJournalStore>,
@@ -2091,10 +2092,18 @@ impl AnalyticalDataService {
             .objects
             .read_pinned_async(&pinned, &cancellation)
             .await?;
+        Self::provider_market_event_batch_from_pinned(&batches, selector, &evidence)
+    }
+
+    fn provider_market_event_batch_from_pinned(
+        batches: &[RecordBatch],
+        selector: ProviderMarketEventPublicationSelector,
+        evidence: &crate::PersistedProviderPublicationEvidence,
+    ) -> Result<ProviderMarketEventArrowBatch, IngestError> {
         let expected_hex = crate::schema::encode_hex(selector.publication_digest.bytes());
         let expected_kind = selector.publication_kind.as_str();
         let selected = batches
-            .into_iter()
+            .iter()
             .filter(|batch| {
                 let schema = batch.schema();
                 schema
@@ -2106,6 +2115,7 @@ impl AnalyticalDataService {
                         .get(crate::schema::PROVIDER_PUBLICATION_KIND_KEY)
                         .is_some_and(|kind| kind == expected_kind)
             })
+            .cloned()
             .collect::<Vec<_>>();
         let schema = selected
             .first()
@@ -2118,6 +2128,123 @@ impl AnalyticalDataService {
             MAX_EVENT_PUBLICATION_READ_BYTES,
         )
         .map_err(IngestError::Arrow)
+    }
+
+    /// Selects and reopens every newest coherent market-event tie at exact PIT cutoffs.
+    ///
+    /// The data layer retains source surfaces separately; provider ranking remains an application
+    /// concern. Each selected publication is reopened once from the exact resolved manifest, then
+    /// its catalog coordinate, canonical Parquet row, and persisted raw evidence are reconciled.
+    pub async fn read_provider_market_event_point_in_time(
+        &self,
+        request: &crate::ProviderMarketEventPointInTimeRequest,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        cancellation: CancellationToken,
+    ) -> Result<Option<crate::ProviderMarketEventPointInTimeSelection>, IngestError> {
+        let Some(plan) = self
+            .manifests
+            .select_provider_market_event_candidates(request)?
+        else {
+            return Ok(None);
+        };
+        if plan.candidates.is_empty() {
+            return crate::ProviderMarketEventPointInTimeSelection::try_from_reconstructed(
+                request.clone(),
+                plan,
+                Vec::new(),
+            )
+            .map(Some)
+            .map_err(Into::into);
+        }
+        let pinned = self.manifests.pinned(&plan.manifest)?;
+        let batches = self
+            .objects
+            .read_pinned_async(&pinned, &cancellation)
+            .await?;
+
+        let mut reopened: Vec<(
+            ProviderMarketEventPublicationSelector,
+            Arc<crate::PersistedProviderPublicationEvidence>,
+            ProviderMarketEventArrowBatch,
+        )> = Vec::new();
+        reopened
+            .try_reserve_exact(plan.candidates.len())
+            .map_err(|_| crate::ProviderMarketEventSelectionError::Allocation)?;
+        for planned in &plan.candidates {
+            if cancellation.is_cancelled() {
+                return Err(IngestError::Cancelled);
+            }
+            let selector = ProviderMarketEventPublicationSelector {
+                publication_digest: planned.publication.digest(),
+                publication_kind: planned.publication.kind(),
+            };
+            if reopened
+                .iter()
+                .any(|(retained, _, _)| *retained == selector)
+            {
+                continue;
+            }
+            let evidence = Arc::new(self.provider_market_event_publication_evidence(
+                &plan.manifest,
+                selector,
+                store,
+            )?);
+            let batch =
+                Self::provider_market_event_batch_from_pinned(&batches, selector, &evidence)?;
+            reopened.push((selector, evidence, batch));
+        }
+
+        let mut reconstructed = Vec::new();
+        reconstructed
+            .try_reserve_exact(plan.candidates.len())
+            .map_err(|_| crate::ProviderMarketEventSelectionError::Allocation)?;
+        let authority = self.lock_authority()?;
+        for planned in &plan.candidates {
+            if cancellation.is_cancelled() {
+                return Err(IngestError::Cancelled);
+            }
+            let selector = ProviderMarketEventPublicationSelector {
+                publication_digest: planned.publication.digest(),
+                publication_kind: planned.publication.kind(),
+            };
+            let (_, evidence, batch) = reopened
+                .iter()
+                .find(|(retained, _, _)| *retained == selector)
+                .ok_or(crate::ProviderMarketEventSelectionError::EvidenceMismatch)?;
+            reconstructed.push(
+                crate::ProviderMarketEventSelectedCandidate::try_from_reopened_publication(
+                    request,
+                    planned,
+                    authority.catalog(),
+                    batch,
+                    Arc::clone(evidence),
+                )?,
+            );
+        }
+        drop(authority);
+        crate::ProviderMarketEventPointInTimeSelection::try_from_reconstructed(
+            request.clone(),
+            plan,
+            reconstructed,
+        )
+        .map(Some)
+        .map_err(Into::into)
+    }
+
+    /// Replays one prior selection against its exact manifest and verifies the full receipt.
+    pub async fn verify_provider_market_event_point_in_time_restart(
+        &self,
+        original: &crate::ProviderMarketEventPointInTimeSelection,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        cancellation: CancellationToken,
+    ) -> Result<crate::ProviderMarketEventPointInTimeSelection, IngestError> {
+        let request = original.exact_restart_request()?;
+        let replay = self
+            .read_provider_market_event_point_in_time(&request, store, cancellation)
+            .await?
+            .ok_or(crate::ProviderMarketEventSelectionError::RestartMismatch)?;
+        original.verify_restart_replay(&replay)?;
+        Ok(replay)
     }
 
     /// Returns sealed backup authority for this exact active catalog and artifact root.
@@ -3655,9 +3782,12 @@ pub enum IngestError {
     /// Provider page/frame and sealed-segment receipts could not be bound exactly.
     #[error("provider capture receipt is invalid")]
     ProviderCapture(#[from] ProviderCaptureError),
-    /// The sealed provider response object could not be reopened and verified.
-    #[error("sealed provider capture could not be verified")]
+    /// A sealed provider raw object could not be reopened and verified.
+    #[error("sealed provider raw object could not be verified")]
     SealedProviderCapture(#[from] market_squawk_platform::SealedResearchJournalStoreError),
+    /// Provider market-event point-in-time selection or restart verification failed.
+    #[error("provider market-event point-in-time selection failed")]
+    ProviderMarketEventSelection(#[from] crate::ProviderMarketEventSelectionError),
     /// Source-specific revision evidence or durable assignment failed.
     #[error("observed revision assignment failed")]
     RevisionAuthority(#[source] ObservedRevisionError),
@@ -3733,11 +3863,16 @@ fn recover_provider_capture_store_blocking(
                     error,
                 ))
             })?;
-        let page = authority.authoritative_provider_capture_claim_page(after)?;
+        let page = authority.authoritative_provider_raw_claim_page(after)?;
         if page.is_empty() {
             break;
         }
         for (digest, claim) in page {
+            if digest.algorithm() != DigestAlgorithm::Sha256
+                || after.is_some_and(|prior| digest.bytes() <= prior.bytes())
+            {
+                return Err(IngestError::Catalog(CatalogError::CorruptCatalog));
+            }
             observed = observed
                 .checked_add(1)
                 .ok_or(IngestError::ProviderCaptureRequired)?;
@@ -3745,13 +3880,16 @@ fn recover_provider_capture_store_blocking(
                 return Err(IngestError::ProviderCaptureRequired);
             }
             observed_bytes = observed_bytes
-                .checked_add(claim.size_bytes())
+                .checked_add(match &claim {
+                    SealedResearchRawClaim::JournalSegment(claim) => claim.size_bytes(),
+                    SealedResearchRawClaim::LogicalObject(claim) => claim.size_bytes(),
+                })
                 .ok_or(IngestError::ProviderCaptureRequired)?;
             if observed_bytes > MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES {
                 return Err(IngestError::Catalog(CatalogError::CorruptCatalog));
             }
             recovery
-                .observe_claim(&SealedResearchRawClaim::JournalSegment(claim))
+                .observe_claim(&claim)
                 .map_err(map_provider_recovery_store_error)?;
             after = Some(digest);
         }
