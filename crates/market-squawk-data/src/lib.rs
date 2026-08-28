@@ -18,6 +18,7 @@ mod corporate_actions;
 mod dataset_builder;
 mod ingest;
 mod manifest;
+mod market_event;
 mod migrations;
 mod parquet_store;
 mod pit;
@@ -101,6 +102,16 @@ pub use catalog::{
     ReferenceBundle, ResumedIngest, ResumedProviderOnboarding, SourceCursor,
     StoredObservedRevision, market_data_instrument_id,
 };
+pub use catalog::{
+    PersistedProviderCaptureBindingEvidence, PersistedProviderCaptureBindingRow,
+    PersistedProviderCapturePhysicalClaim, PersistedProviderNativeLineageSchema,
+};
+pub use catalog::{
+    PersistedProviderEventBindingEvidence, PersistedProviderEventBindingRow,
+    PersistedProviderEventNativeLineage, PersistedProviderPublicationEvidence,
+    PersistedProviderResponseMarketEventBindingEvidence,
+    PersistedProviderResponseMarketEventBindingRow,
+};
 pub use catalog_capabilities::{
     CompanyIdentityReadCapability, FairValueCatalogCapability, InstrumentCatalogCapability,
     InstrumentDefinitionReadCapability, OnboardingCatalogCapability,
@@ -130,8 +141,10 @@ pub use dataset_builder::{
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
     IngestPrecommitAuthority, ListingReferenceAdmissionCapability, PinnedArtifactQueryRequest,
-    ProviderCaptureInput, QueryArtifactPublication, ResearchIngestService, extraction_batch_digest,
-    extraction_provider_payload_digest,
+    ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
+    ProviderPublicationInput, QueryArtifactPublication, ResearchIngestService,
+    extraction_batch_digest, extraction_provider_payload_digest,
+    provider_market_event_publication_digest,
 };
 pub use manifest::{
     AnalyticalManifestCatalog, CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
@@ -146,6 +159,7 @@ pub use manifest::{
 pub use manifest::{
     ReleaseEvidenceStorageError, ReleaseEvidenceStorageResult, run_release_evidence_storage,
 };
+pub use market_event::ProviderMarketEventArrowBatch;
 pub use parquet_store::{
     ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PublishedObject,
 };

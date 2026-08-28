@@ -11,7 +11,7 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     AvailabilityEvidence as ExtractionAvailabilityEvidence, CanonicalObservationPayload,
     ExtractionBatch, MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS, ProviderCaptureSemanticBinding,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
 };
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use super::catalog::load_pinned;
 use super::{
     DatasetId, DatasetManifestRef, ManifestCatalogError, ManifestPlan, PinnedDataset, Sha256Digest,
 };
-use crate::catalog::load_provider_capture_for_run;
+use crate::catalog::{PreparedProviderCaptureBinding, load_provider_capture_for_run};
 use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 use crate::{ArtifactRecord, DatasetManifestRecord, IngestRunRecord};
 
@@ -79,6 +79,7 @@ impl MarketHistorySelectionPolicy {
 /// Precommit proof reconstructed from normalized rows and a hash-bound provider request graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MarketBarHistoryPublicationCandidate {
+    binding_digest: Sha256Digest,
     source_id: SourceId,
     capture_receipt_digest: Sha256Digest,
     capture_content_digest: Sha256Digest,
@@ -122,12 +123,12 @@ impl MarketBarHistoryPublicationCandidate {
     pub(crate) fn try_from_batch(
         batch: &ExtractionBatch,
         observations: &[ResearchObservation],
-        sealed: Option<&SealedProviderCaptureSetReceipt>,
+        prepared: Option<&PreparedProviderCaptureBinding>,
     ) -> Result<Option<Self>, ManifestCatalogError> {
-        let Some(sealed) = sealed else {
+        let Some(prepared) = prepared else {
             return Ok(None);
         };
-        let capture = sealed.capture();
+        let capture = prepared.evidence.capture();
         let binding = match capture.semantic_binding() {
             Some(ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding)) => binding,
             None if capture.terminal()
@@ -320,8 +321,11 @@ impl MarketBarHistoryPublicationCandidate {
             expected_timestamp_set_digest(binding.expected_provider_timestamps())?;
         let bar_set_digest = nonzero_sha256(bar_set.finalize().into())?;
         Ok(Some(Self {
+            binding_digest: sha256_evidence(prepared.binding_digest())?,
             source_id: capture.source_id().clone(),
-            capture_receipt_digest: sha256_evidence(sealed.receipt_digest())?,
+            capture_receipt_digest: sha256_evidence(
+                prepared.evidence.sealed_capture_receipt_digest(),
+            )?,
             capture_content_digest: sha256_evidence(capture.content_digest())?,
             capture_observation_digest: sha256_evidence(capture.observation_digest())?,
             provider_dataset: capture.dataset().clone(),
@@ -698,6 +702,7 @@ pub struct MarketBarHistoryPublicationReceipt {
     origin_artifact_id: Uuid,
     origin_object_ordinal: u16,
     source_id: SourceId,
+    binding_digest: Sha256Digest,
     capture_receipt_digest: Sha256Digest,
     capture_content_digest: Sha256Digest,
     capture_observation_digest: Sha256Digest,
@@ -1095,6 +1100,7 @@ struct MarketBarHistoryReceiptWire {
     origin_artifact_id: Uuid,
     origin_object_ordinal: u16,
     source_id: SourceId,
+    binding_digest: [u8; 32],
     capture_receipt_digest: [u8; 32],
     capture_content_digest: [u8; 32],
     capture_observation_digest: [u8; 32],
@@ -1540,16 +1546,18 @@ fn insert_market_bar_history_publication(
         .ok_or(ManifestCatalogError::CorruptCatalog)?;
     let capture_recorded_at_ns: i64 = transaction
         .query_row(
-            "SELECT recorded_at_ns
-             FROM provider_capture_sets
-             WHERE capture_receipt_digest=?1
-               AND capture_content_digest=?2
-               AND capture_observation_digest=?3
-               AND source_id=?4
-               AND provider_dataset=?5
-               AND terminal_disposition='complete_request_graph'",
+            "SELECT capture.recorded_at_ns
+             FROM provider_capture_bindings AS binding
+             JOIN provider_raw_observations AS capture
+               ON capture.capture_observation_digest=binding.capture_observation_digest
+             WHERE binding.binding_digest=?1
+               AND capture.capture_content_digest=?2
+               AND capture.capture_observation_digest=?3
+               AND capture.source_id=?4
+               AND capture.provider_dataset=?5
+               AND capture.terminal_disposition='complete_request_graph'",
             params![
-                candidate.capture_receipt_digest.bytes(),
+                candidate.binding_digest.bytes(),
                 candidate.capture_content_digest.bytes(),
                 candidate.capture_observation_digest.bytes(),
                 candidate.source_id.as_str(),
@@ -1577,6 +1585,7 @@ fn insert_market_bar_history_publication(
         origin_artifact_id: artifact.artifact_id(),
         origin_object_ordinal,
         source_id: candidate.source_id.clone(),
+        binding_digest: candidate.binding_digest.bytes(),
         capture_receipt_digest: candidate.capture_receipt_digest.bytes(),
         capture_content_digest: candidate.capture_content_digest.bytes(),
         capture_observation_digest: candidate.capture_observation_digest.bytes(),
@@ -1632,7 +1641,7 @@ fn insert_market_bar_history_publication(
         "INSERT INTO market_bar_history_publications
          (publication_receipt_digest, receipt_version, origin_generation_sequence,
           origin_run_id, origin_anchor_manifest_id, origin_artifact_id, origin_object_ordinal,
-          source_id, capture_receipt_digest, capture_content_digest,
+          source_id, binding_digest, capture_receipt_digest, capture_content_digest,
           capture_observation_digest, capture_recorded_at_ns, provider_dataset, instrument_id,
           instrument_revision_digest, admitted_plan_digest, provider_instrument_id, venue_id,
           feed, bar_interval, adjustment, timestamp_basis, session_kind, session_ruleset,
@@ -1650,7 +1659,7 @@ fn insert_market_bar_history_publication(
           ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
           ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
           ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43,
-          ?44, ?45, 'current_research_only', 1, 0, 0, 0, ?46, ?47, ?48)",
+          ?44, ?45, ?46, 'current_research_only', 1, 0, 0, 0, ?47, ?48, ?49)",
         params![
             publication_receipt_digest.bytes(),
             generation_sequence,
@@ -1659,6 +1668,7 @@ fn insert_market_bar_history_publication(
             artifact.artifact_id().to_string(),
             i64::from(origin_object_ordinal),
             candidate.source_id.as_str(),
+            candidate.binding_digest.bytes(),
             candidate.capture_receipt_digest.bytes(),
             candidate.capture_content_digest.bytes(),
             candidate.capture_observation_digest.bytes(),
@@ -2043,11 +2053,13 @@ fn resolve_canonical_market_bar_history_series(
            USING (publication_receipt_digest)
          JOIN ingest_runs AS origin_run
            ON origin_run.run_id=publication.origin_run_id
-         JOIN provider_capture_sets AS capture
-           ON capture.capture_receipt_digest=publication.capture_receipt_digest
-         JOIN analytical_generation_capture_inputs AS selected_capture
+         JOIN provider_capture_bindings AS binding
+           ON binding.binding_digest=publication.binding_digest
+         JOIN provider_raw_observations AS capture
+           ON capture.capture_observation_digest=binding.capture_observation_digest
+         JOIN analytical_generation_provider_capture_bindings AS selected_capture
            ON selected_capture.generation_sequence=selected_generation.generation_sequence
-          AND selected_capture.capture_receipt_digest=publication.capture_receipt_digest
+          AND selected_capture.binding_digest=publication.binding_digest
          WHERE publication.instrument_id=?1
            AND publication.requested_start_ns=?13
            AND publication.requested_end_ns=?14
@@ -2289,11 +2301,13 @@ fn ensure_unambiguous_history_series(
                USING (publication_receipt_digest)
              JOIN ingest_runs AS origin_run
                ON origin_run.run_id=publication.origin_run_id
-             JOIN provider_capture_sets AS capture
-               ON capture.capture_receipt_digest=publication.capture_receipt_digest
-             JOIN analytical_generation_capture_inputs AS selected_capture
+             JOIN provider_capture_bindings AS binding
+               ON binding.binding_digest=publication.binding_digest
+             JOIN provider_raw_observations AS capture
+               ON capture.capture_observation_digest=binding.capture_observation_digest
+             JOIN analytical_generation_provider_capture_bindings AS selected_capture
                ON selected_capture.generation_sequence=selected_generation.generation_sequence
-              AND selected_capture.capture_receipt_digest=publication.capture_receipt_digest
+              AND selected_capture.binding_digest=publication.binding_digest
              WHERE publication.instrument_id=?1
                AND publication.requested_start_ns=?13
                AND publication.requested_end_ns=?14
@@ -2410,11 +2424,13 @@ pub(super) fn select_complete_market_bar_history(
                    USING (publication_receipt_digest)
                  JOIN ingest_runs AS origin_run
                    ON origin_run.run_id=publication.origin_run_id
-                 JOIN provider_capture_sets AS capture
-                   ON capture.capture_receipt_digest=publication.capture_receipt_digest
-                 JOIN analytical_generation_capture_inputs AS selected_capture
+                 JOIN provider_capture_bindings AS binding
+                   ON binding.binding_digest=publication.binding_digest
+                 JOIN provider_raw_observations AS capture
+                   ON capture.capture_observation_digest=binding.capture_observation_digest
+                 JOIN analytical_generation_provider_capture_bindings AS selected_capture
                    ON selected_capture.generation_sequence=selected_generation.generation_sequence
-                  AND selected_capture.capture_receipt_digest=publication.capture_receipt_digest
+                  AND selected_capture.binding_digest=publication.binding_digest
                  WHERE selected_generation.dataset_id=?1
                    AND selected_generation.manifest_version=?2
                    AND selected_generation.schema_name=?3
@@ -2514,11 +2530,13 @@ pub(super) fn select_complete_market_bar_history(
                    USING (publication_receipt_digest)
                  JOIN ingest_runs AS origin_run
                    ON origin_run.run_id=publication.origin_run_id
-                 JOIN provider_capture_sets AS capture
-                   ON capture.capture_receipt_digest=publication.capture_receipt_digest
-                 JOIN analytical_generation_capture_inputs AS selected_capture
+                 JOIN provider_capture_bindings AS binding
+                   ON binding.binding_digest=publication.binding_digest
+                 JOIN provider_raw_observations AS capture
+                   ON capture.capture_observation_digest=binding.capture_observation_digest
+                 JOIN analytical_generation_provider_capture_bindings AS selected_capture
                    ON selected_capture.generation_sequence=selected_generation.generation_sequence
-                  AND selected_capture.capture_receipt_digest=publication.capture_receipt_digest
+                  AND selected_capture.binding_digest=publication.binding_digest
                  WHERE publication.instrument_id=?1
                    AND selected_generation.schema_name=?3
                    AND selected_generation.schema_version=?4
@@ -2683,13 +2701,15 @@ fn load_market_bar_history_receipt(
               AND object.ordinal=publication.origin_object_ordinal
               AND object.artifact_id=artifact.artifact_id
               AND object.row_count=publication.returned_bar_count
-             JOIN analytical_generation_capture_inputs AS capture_input
+             JOIN analytical_generation_provider_capture_bindings AS capture_input
                ON capture_input.generation_sequence=origin_generation.generation_sequence
-              AND capture_input.capture_receipt_digest=publication.capture_receipt_digest
+              AND capture_input.binding_digest=publication.binding_digest
               AND capture_input.run_id=origin_run.run_id
               AND capture_input.source_id=publication.source_id
-             JOIN provider_capture_sets AS capture
-               ON capture.capture_receipt_digest=publication.capture_receipt_digest
+             JOIN provider_capture_bindings AS binding
+               ON binding.binding_digest=publication.binding_digest
+             JOIN provider_raw_observations AS capture
+               ON capture.capture_observation_digest=binding.capture_observation_digest
               AND capture.capture_content_digest=publication.capture_content_digest
               AND capture.capture_observation_digest=publication.capture_observation_digest
               AND capture.recorded_at_ns=publication.capture_recorded_at_ns
@@ -2732,7 +2752,10 @@ fn load_market_bar_history_receipt(
     }
     let persisted_capture = load_provider_capture_for_run(connection, wire.origin_run_id)?
         .ok_or(ManifestCatalogError::CorruptCatalog)?;
-    if sha256_evidence(persisted_capture.receipt_digest())?.bytes() != wire.capture_receipt_digest {
+    if sha256_evidence(persisted_capture.sealed_capture_receipt_digest())?.bytes()
+        != wire.capture_receipt_digest
+        || sha256_evidence(persisted_capture.binding_digest())?.bytes() != wire.binding_digest
+    {
         return Err(ManifestCatalogError::CorruptCatalog);
     }
     let expected_provider_timestamps =
@@ -2817,6 +2840,7 @@ fn publication_wire_matches_row(
                AND publication.retrospective_training_eligible=?56
                AND publication.admission_reason=?57
                AND publication.receipt_json=?58
+               AND publication.binding_digest=?60
          )",
         params![
             publication_digest.bytes(),
@@ -2879,6 +2903,7 @@ fn publication_wire_matches_row(
             wire.admission_reason,
             receipt_json,
             asset_class_name(wire.asset_class),
+            wire.binding_digest,
         ],
         |row| row.get(0),
     )?;
@@ -3036,6 +3061,7 @@ fn receipt_from_wire(
         origin_artifact_id: wire.origin_artifact_id,
         origin_object_ordinal: wire.origin_object_ordinal,
         source_id: wire.source_id,
+        binding_digest: nonzero_sha256(wire.binding_digest)?,
         capture_receipt_digest: nonzero_sha256(wire.capture_receipt_digest)?,
         capture_content_digest: nonzero_sha256(wire.capture_content_digest)?,
         capture_observation_digest: nonzero_sha256(wire.capture_observation_digest)?,

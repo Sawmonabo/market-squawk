@@ -1768,3 +1768,282 @@ fn sealed_provider_event_microbatch_receipt_digest(
     hash_digest(&mut hash, physical_receipt_digest);
     EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
 }
+
+/// Closed durable publication kind; response captures never masquerade as live-event batches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderPublicationBindingKind {
+    /// Completed response set or request graph with HTTP/page semantics.
+    ResponseSet,
+    /// Typed canonical market events derived from a sealed HTTP response set.
+    ResponseMarketEvent,
+    /// Application-bounded ordered WebSocket/source-event frames with no HTTP completeness claim.
+    EventMicrobatch,
+    /// One sealed REST response snapshot followed by ordered live-event frames.
+    CompositeResponseEvent,
+}
+
+/// One exact canonical row coordinate in a snapshot-plus-event publication.
+#[derive(Clone, Copy, Debug)]
+pub enum ProviderCompositeResponseEventRowCoordinate<'a> {
+    /// Canonical snapshot row mapped to an exact response component/page and physical frame.
+    ResponseSnapshot(&'a ProviderCaptureRowFrame),
+    /// Canonical live row mapped to an exact event frame and physical frame.
+    EventMicrobatch(&'a ProviderEventMicrobatchRowFrame),
+}
+
+/// Copyable evidence joining one exact response binding to one exact event binding.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProviderCompositeResponseEventBindingDigest(EvidenceDigest);
+
+impl ProviderCompositeResponseEventBindingDigest {
+    /// Returns the durable algorithm-qualified evidence digest.
+    pub const fn evidence(self) -> EvidenceDigest {
+        self.0
+    }
+
+    /// Verifies the kind-preserving composition digest from independently verified sub-bindings.
+    pub fn verify_evidence(
+        expected: EvidenceDigest,
+        response: EvidenceDigest,
+        event: EvidenceDigest,
+        response_row_count: usize,
+        event_row_count: usize,
+    ) -> Result<(), ProviderCaptureError> {
+        require_sha256_identity(expected)?;
+        if composite_response_event_binding_digest(
+            response,
+            event,
+            response_row_count,
+            event_row_count,
+        )?
+        .evidence()
+            != expected
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Non-cloneable authority joining a sealed response snapshot to sealed ordered live events.
+#[derive(Debug)]
+pub struct SealedProviderCompositeResponseEventBinding {
+    response: SealedProviderResponseMarketEventBinding,
+    event: SealedProviderEventMicrobatchBinding,
+    evidence_digest: ProviderCompositeResponseEventBindingDigest,
+}
+
+impl SealedProviderCompositeResponseEventBinding {
+    /// Joins independently sealed and canonical-bound response and event authorities.
+    pub fn try_new(
+        response: SealedProviderResponseMarketEventBinding,
+        event: SealedProviderEventMicrobatchBinding,
+    ) -> Result<Self, ProviderCaptureError> {
+        response.validate()?;
+        event.validate()?;
+        if response.capture_evidence().source_id() != event.capture_evidence().source_id()
+            || response.capture_evidence().metadata_revision()
+                != event.capture_evidence().metadata_revision()
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let evidence_digest = composite_response_event_binding_digest(
+            response.evidence_digest().evidence(),
+            event.evidence_digest().evidence(),
+            response.record_count(),
+            event.record_count(),
+        )?;
+        Ok(Self {
+            response,
+            event,
+            evidence_digest,
+        })
+    }
+
+    /// Returns the complete response-set snapshot authority.
+    pub const fn response(&self) -> &SealedProviderResponseMarketEventBinding {
+        &self.response
+    }
+
+    /// Returns the complete ordered event-microbatch authority.
+    pub const fn event(&self) -> &SealedProviderEventMicrobatchBinding {
+        &self.event
+    }
+
+    /// Returns the kind-preserving digest joining both independently complete authorities.
+    pub const fn evidence_digest(&self) -> ProviderCompositeResponseEventBindingDigest {
+        self.evidence_digest
+    }
+
+    /// Iterates exact component/page coordinates first, then exact event-frame coordinates.
+    pub fn row_coordinates(
+        &self,
+    ) -> impl Iterator<Item = ProviderCompositeResponseEventRowCoordinate<'_>> {
+        self.response
+            .row_frames()
+            .iter()
+            .map(ProviderCompositeResponseEventRowCoordinate::ResponseSnapshot)
+            .chain(
+                self.event
+                    .row_frames()
+                    .iter()
+                    .map(ProviderCompositeResponseEventRowCoordinate::EventMicrobatch),
+            )
+    }
+}
+
+fn composite_response_event_binding_digest(
+    response: EvidenceDigest,
+    event: EvidenceDigest,
+    response_row_count: usize,
+    event_row_count: usize,
+) -> Result<ProviderCompositeResponseEventBindingDigest, ProviderCaptureError> {
+    let mut digest = Sha256::new();
+    hash_binding_field(
+        &mut digest,
+        b"market-squawk/sealed-provider-composite-response-event-binding/v1",
+    )?;
+    require_sha256_identity(response)?;
+    require_sha256_identity(event)?;
+    hash_digest(&mut digest, response);
+    hash_binding_length(&mut digest, response_row_count)?;
+    hash_digest(&mut digest, event);
+    hash_binding_length(&mut digest, event_row_count)?;
+    Ok(ProviderCompositeResponseEventBindingDigest(
+        EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into()),
+    ))
+}
+
+/// Closed evidence identity for either admitted provider publication authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ProviderPublicationBindingDigest {
+    /// Evidence minted from completed response-set authority.
+    ResponseSet(ProviderCaptureBindingDigest),
+    /// Evidence minted from typed canonical events derived from a sealed HTTP response.
+    ResponseMarketEvent(ProviderResponseMarketEventBindingDigest),
+    /// Evidence minted from sealed event-microbatch authority.
+    EventMicrobatch(ProviderEventMicrobatchBindingDigest),
+    /// Evidence joining one exact response snapshot and one exact event microbatch.
+    CompositeResponseEvent(ProviderCompositeResponseEventBindingDigest),
+}
+
+impl ProviderPublicationBindingDigest {
+    /// Returns the durable algorithm-qualified evidence digest.
+    pub const fn evidence(self) -> EvidenceDigest {
+        match self {
+            Self::ResponseSet(digest) => digest.evidence(),
+            Self::ResponseMarketEvent(digest) => digest.evidence(),
+            Self::EventMicrobatch(digest) => digest.evidence(),
+            Self::CompositeResponseEvent(digest) => digest.evidence(),
+        }
+    }
+}
+
+/// Closed non-cloneable provider publication authority consumed by durable storage.
+#[derive(Debug)]
+pub enum SealedProviderPublicationBinding {
+    /// Completed response-set authority preserving existing capture constructors and evidence.
+    ResponseSet(SealedProviderCaptureBinding),
+    /// Typed HTTP-response market-event authority.
+    ResponseMarketEvent(SealedProviderResponseMarketEventBinding),
+    /// Sealed event-microbatch authority with exact stream-frame coordinates.
+    EventMicrobatch(SealedProviderEventMicrobatchBinding),
+    /// Coinbase Direct-style snapshot plus subsequent ordered event frames.
+    CompositeResponseEvent(SealedProviderCompositeResponseEventBinding),
+}
+
+impl SealedProviderPublicationBinding {
+    /// Returns the closed kind without exposing or converting the underlying authority.
+    pub const fn kind(&self) -> ProviderPublicationBindingKind {
+        match self {
+            Self::ResponseSet(_) => ProviderPublicationBindingKind::ResponseSet,
+            Self::ResponseMarketEvent(_) => ProviderPublicationBindingKind::ResponseMarketEvent,
+            Self::EventMicrobatch(_) => ProviderPublicationBindingKind::EventMicrobatch,
+            Self::CompositeResponseEvent(_) => {
+                ProviderPublicationBindingKind::CompositeResponseEvent
+            }
+        }
+    }
+
+    /// Returns response-set authority only when this is a pure response publication.
+    pub const fn response_set(&self) -> Option<&SealedProviderCaptureBinding> {
+        match self {
+            Self::ResponseSet(binding) => Some(binding),
+            Self::ResponseMarketEvent(_)
+            | Self::EventMicrobatch(_)
+            | Self::CompositeResponseEvent(_) => None,
+        }
+    }
+
+    /// Returns typed HTTP-response market-event authority only for that exact publication kind.
+    pub const fn response_market_event(&self) -> Option<&SealedProviderResponseMarketEventBinding> {
+        match self {
+            Self::ResponseMarketEvent(binding) => Some(binding),
+            Self::ResponseSet(_) | Self::EventMicrobatch(_) | Self::CompositeResponseEvent(_) => {
+                None
+            }
+        }
+    }
+
+    /// Returns event authority only when this is a pure event publication.
+    pub const fn event_microbatch(&self) -> Option<&SealedProviderEventMicrobatchBinding> {
+        match self {
+            Self::EventMicrobatch(binding) => Some(binding),
+            Self::ResponseSet(_)
+            | Self::ResponseMarketEvent(_)
+            | Self::CompositeResponseEvent(_) => None,
+        }
+    }
+
+    /// Returns composite authority only for a response-snapshot plus event publication.
+    pub const fn composite_response_event(
+        &self,
+    ) -> Option<&SealedProviderCompositeResponseEventBinding> {
+        match self {
+            Self::CompositeResponseEvent(binding) => Some(binding),
+            Self::ResponseSet(_) | Self::ResponseMarketEvent(_) | Self::EventMicrobatch(_) => None,
+        }
+    }
+
+    /// Returns the kind-qualified binding digest so downstream code must preserve the distinction.
+    pub const fn evidence_digest(&self) -> ProviderPublicationBindingDigest {
+        match self {
+            Self::ResponseSet(binding) => {
+                ProviderPublicationBindingDigest::ResponseSet(binding.evidence_digest())
+            }
+            Self::ResponseMarketEvent(binding) => {
+                ProviderPublicationBindingDigest::ResponseMarketEvent(binding.evidence_digest())
+            }
+            Self::EventMicrobatch(binding) => {
+                ProviderPublicationBindingDigest::EventMicrobatch(binding.evidence_digest())
+            }
+            Self::CompositeResponseEvent(binding) => {
+                ProviderPublicationBindingDigest::CompositeResponseEvent(binding.evidence_digest())
+            }
+        }
+    }
+}
+
+impl From<SealedProviderCaptureBinding> for SealedProviderPublicationBinding {
+    fn from(binding: SealedProviderCaptureBinding) -> Self {
+        Self::ResponseSet(binding)
+    }
+}
+
+impl From<SealedProviderEventMicrobatchBinding> for SealedProviderPublicationBinding {
+    fn from(binding: SealedProviderEventMicrobatchBinding) -> Self {
+        Self::EventMicrobatch(binding)
+    }
+}
+
+impl From<SealedProviderResponseMarketEventBinding> for SealedProviderPublicationBinding {
+    fn from(binding: SealedProviderResponseMarketEventBinding) -> Self {
+        Self::ResponseMarketEvent(binding)
+    }
+}
+
+impl From<SealedProviderCompositeResponseEventBinding> for SealedProviderPublicationBinding {
+    fn from(binding: SealedProviderCompositeResponseEventBinding) -> Self {
+        Self::CompositeResponseEvent(binding)
+    }
+}

@@ -18,8 +18,8 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AvailabilityEvidence as SourceAvailabilityEvidence, CanonicalObservationPayload,
-    DiscoveryRequestId, ExtractionBatch, ExtractionRequestId, ProviderCaptureTerminalDisposition,
-    SealedProviderCaptureSetReceipt, SourceObjectCaptureIdentity, payload_matches_exact_evidence,
+    DiscoveryRequestId, ExtractionBatch, ExtractionRequestId, SourceObjectCaptureIdentity,
+    payload_matches_exact_evidence,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ use serde_json::Error as JsonError;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::catalog::PreparedProviderCaptureBinding;
 use crate::schema::{
     DATASET_KEY, REQUEST_DIGEST_KEY, RESEARCH_RECORD_SCHEMA, RESEARCH_SCHEMA_NAME,
     RESEARCH_SCHEMA_VERSION, SCHEMA_VERSION_KEY, decode_hex, research_payload_contract_for,
@@ -100,17 +101,14 @@ struct RevisionAssignmentLineage {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct ProviderCaptureRowLineage {
-    receipt_digest: EvidenceDigest,
-    capture_content_digest: EvidenceDigest,
+    binding_digest: EvidenceDigest,
     capture_observation_digest: EvidenceDigest,
-    request_set_identity: EvidenceDigest,
-    terminal: ProviderCaptureTerminalDisposition,
-    page_count: u16,
-    total_body_bytes: u64,
-    sealed_relative_reference: Box<str>,
-    sealed_content_digest: EvidenceDigest,
-    sealed_size_bytes: u64,
-    sealed_physical_receipt_digest: EvidenceDigest,
+    canonical_row_ordinal: u32,
+    native_semantic_digest: EvidenceDigest,
+    capture_page_ordinal: u16,
+    segment_ordinal: u16,
+    physical_frame_ordinal: u32,
+    page_body_digest: EvidenceDigest,
 }
 
 #[derive(Deserialize)]
@@ -183,30 +181,27 @@ impl ResearchArrowBatch {
         Self::try_from_extraction_batch_with_revisions(extraction, Some(revisions), None)
     }
 
-    pub(crate) fn try_from_extraction_batch_with_assigned_revisions_and_provider_capture(
+    pub(crate) fn try_from_extraction_batch_with_assigned_revisions_and_provider_binding(
         extraction: &ExtractionBatch,
         revisions: &[RevisionNumber],
-        capture: &SealedProviderCaptureSetReceipt,
+        binding: &PreparedProviderCaptureBinding,
     ) -> Result<Self, ArrowConversionError> {
-        Self::try_from_extraction_batch_with_revisions(extraction, Some(revisions), Some(capture))
+        Self::try_from_extraction_batch_with_revisions(extraction, Some(revisions), Some(binding))
     }
 
     fn try_from_extraction_batch_with_revisions(
         extraction: &ExtractionBatch,
         revisions: Option<&[RevisionNumber]>,
-        capture: Option<&SealedProviderCaptureSetReceipt>,
+        binding: Option<&PreparedProviderCaptureBinding>,
     ) -> Result<Self, ArrowConversionError> {
         let original_observations = Self::validated_extraction_observations(extraction)?;
         if revisions.is_some_and(|values| values.len() != original_observations.len()) {
             return Err(ArrowConversionError::RevisionAssignmentMismatch);
         }
-        let capture_lineage = capture
-            .map(|capture| provider_capture_lineage(extraction, capture))
-            .transpose()?;
         if matches!(
             extraction.request().object().capture_identity(),
             SourceObjectCaptureIdentity::Paged { .. }
-        ) != capture_lineage.is_some()
+        ) != binding.is_some()
         {
             return Err(ArrowConversionError::ProviderCaptureRequired);
         }
@@ -242,7 +237,7 @@ impl ResearchArrowBatch {
                 None => original,
             };
             lineages.push(RowLineage::Extraction(Box::new(ExtractionRowLineage {
-                schema_version: if capture_lineage.is_some() {
+                schema_version: if binding.is_some() {
                     CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION
                 } else if assignment.is_some() {
                     EXTRACTION_LINEAGE_SCHEMA_VERSION
@@ -265,7 +260,9 @@ impl ResearchArrowBatch {
                 revision: record.revision().clone(),
                 superseded_time: record.superseded_time().cloned(),
                 revision_assignment: assignment,
-                provider_capture: capture_lineage.clone(),
+                provider_capture: binding
+                    .map(|binding| provider_capture_lineage(binding, index))
+                    .transpose()?,
             })));
             observations.push(observation);
         }
@@ -959,52 +956,35 @@ impl From<ResearchArrowBatch> for DatasetArrowBatch {
 }
 
 fn provider_capture_lineage(
-    extraction: &ExtractionBatch,
-    sealed: &SealedProviderCaptureSetReceipt,
+    binding: &PreparedProviderCaptureBinding,
+    index: usize,
 ) -> Result<ProviderCaptureRowLineage, ArrowConversionError> {
-    let capture = sealed.capture();
-    let segment = sealed.segment();
-    let object = extraction.request().object();
-    let page_count = u16::try_from(capture.pages().len())
-        .map_err(|_| ArrowConversionError::ExtractionBindingMismatch)?;
-    let expected_capture = SourceObjectCaptureIdentity::try_from_capture(capture)
-        .map_err(|_| ArrowConversionError::ExtractionBindingMismatch)?;
-    if page_count == 0
-        || capture.source_id() != object.source_id()
-        || capture.metadata_revision() != object.metadata_revision()
-        || capture.dataset() != object.dataset()
-        || object.capture_identity() != expected_capture
-        || segment.frames().len() != capture.pages().len()
-    {
-        return Err(ArrowConversionError::ExtractionBindingMismatch);
-    }
+    let row = binding
+        .rows()
+        .get(index)
+        .ok_or(ArrowConversionError::ExtractionBindingMismatch)?;
     Ok(ProviderCaptureRowLineage {
-        receipt_digest: sealed.receipt_digest(),
-        capture_content_digest: capture.content_digest(),
-        capture_observation_digest: capture.observation_digest(),
-        request_set_identity: capture.request_set_identity(),
-        terminal: capture.terminal(),
-        page_count,
-        total_body_bytes: capture.total_body_bytes(),
-        sealed_relative_reference: segment.relative_reference().into(),
-        sealed_content_digest: segment.content_digest(),
-        sealed_size_bytes: segment.size_bytes(),
-        sealed_physical_receipt_digest: segment.physical_receipt_digest(),
+        binding_digest: binding.binding_digest(),
+        capture_observation_digest: binding.capture_observation_digest(),
+        canonical_row_ordinal: row.canonical_row_ordinal(),
+        native_semantic_digest: row.native_semantic_digest(),
+        capture_page_ordinal: row.capture_page_ordinal(),
+        segment_ordinal: row.segment_ordinal(),
+        physical_frame_ordinal: row.physical_frame_ordinal(),
+        page_body_digest: row.page_body_digest(),
     })
 }
 
 fn valid_provider_capture_lineage(lineage: &ProviderCaptureRowLineage) -> bool {
-    lineage.page_count != 0
-        && lineage.total_body_bytes != 0
-        && !lineage.sealed_relative_reference.is_empty()
-        && lineage.sealed_size_bytes != 0
+    lineage.canonical_row_ordinal < 100_000
+        && lineage.capture_page_ordinal < 64
+        && lineage.segment_ordinal < 64
+        && lineage.physical_frame_ordinal < 64
         && [
-            lineage.receipt_digest,
-            lineage.capture_content_digest,
+            lineage.binding_digest,
             lineage.capture_observation_digest,
-            lineage.request_set_identity,
-            lineage.sealed_content_digest,
-            lineage.sealed_physical_receipt_digest,
+            lineage.native_semantic_digest,
+            lineage.page_body_digest,
         ]
         .into_iter()
         .all(|digest| digest.algorithm() == DigestAlgorithm::Sha256 && digest.bytes() != [0; 32])
@@ -1266,6 +1246,9 @@ pub enum ArrowConversionError {
     /// A typed feature/label component violates its closed row-level contract.
     #[error("Arrow feature/label component row is invalid")]
     InvalidFeatureLabelRow,
+    /// A typed canonical market-event row violates its retained publication evidence.
+    #[error("Arrow market-event row does not match its exact provider publication evidence")]
+    InvalidMarketEventRow,
     /// Canonical payload and analytical projections disagree.
     #[error("Arrow analytical projection does not match its canonical payload")]
     ProjectionMismatch,

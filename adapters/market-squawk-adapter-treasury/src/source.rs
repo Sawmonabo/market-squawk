@@ -462,7 +462,12 @@ impl TreasuryDoctorRun {
             TreasuryDoctorSealError::Contract(crate::TreasuryVerticalError::AccountingOverflow)
         })?;
         for capture in self.captures.into_vec() {
-            sealed.push(capture.seal(store)?);
+            let (expectation, seal_request) = capture.into_whole_seal_parts();
+            let capture_token = expectation
+                .try_rejoin(seal_request.seal(store)?)
+                .and_then(market_squawk_sources::RejoinedProviderCapture::try_into_whole)
+                .map_err(|_| crate::TreasuryVerticalError::DoctorRejected)?;
+            sealed.push(capture_token.persisted_receipt().clone());
         }
         crate::TreasurySealedDoctorReceipt::try_new(
             self.source_id,

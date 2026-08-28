@@ -4,12 +4,15 @@ mod market_event;
 
 pub use market_event::{
     MAX_PROVIDER_MARKET_EVENT_BATCH_BYTES, MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS,
-    PROVIDER_MARKET_EVENT_SCHEMA_VERSION, ProviderEventMicrobatchBindingDigest,
+    PROVIDER_MARKET_EVENT_SCHEMA_VERSION, ProviderCompositeResponseEventBindingDigest,
+    ProviderCompositeResponseEventRowCoordinate, ProviderEventMicrobatchBindingDigest,
     ProviderEventMicrobatchRowFrame, ProviderEventMicrobatchRowFrameEvidence,
     ProviderMarketEventBatch, ProviderMarketEventContentIdentity,
     ProviderMarketEventNativeLineageBatch, ProviderMarketEventNativeLineageRowEvidenceRef,
+    ProviderPublicationBindingDigest, ProviderPublicationBindingKind,
     ProviderResponseMarketEventBindingDigest, ProviderResponseMarketEventRowFrameEvidence,
-    SealedProviderEventMicrobatchBinding, SealedProviderResponseMarketEventBinding,
+    SealedProviderCompositeResponseEventBinding, SealedProviderEventMicrobatchBinding,
+    SealedProviderPublicationBinding, SealedProviderResponseMarketEventBinding,
     verify_provider_market_event_native_lineage_batch_evidence,
 };
 
@@ -1748,8 +1751,11 @@ pub struct SealedProviderCaptureSetReceipt {
 }
 
 impl SealedProviderCaptureSetReceipt {
-    /// Binds one completed capture to the exact sealed frame mapping.
-    fn try_bind(
+    /// Rebinds persisted capture evidence to a freshly verified immutable frame receipt.
+    ///
+    /// This returns cloneable restart evidence only; it does not recreate any one-use live
+    /// publication authority.
+    pub fn try_bind(
         capture: ProviderCaptureSetReceipt,
         segment: SealedResearchJournalSegmentReceipt,
     ) -> Result<Self, ProviderCaptureError> {

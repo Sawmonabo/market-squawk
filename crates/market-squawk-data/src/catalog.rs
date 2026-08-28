@@ -13,6 +13,7 @@ mod migration_preflight;
 mod observed_revisions;
 mod onboarding;
 mod provider_capture;
+mod provider_event;
 mod publication;
 mod query_artifacts;
 mod records;
@@ -80,6 +81,7 @@ pub use self::onboarding::{
     OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,
     ResumedProviderOnboarding,
 };
+pub(crate) use self::storage::trusted_catalog_now;
 use self::storage::{
     apply_migrations, initialize_catalog_identity, pragma_bool, prepare_local_path,
 };
@@ -92,8 +94,26 @@ pub use self::types::{
 };
 pub(crate) use observed_revisions::CatalogObservedRevisionAuthority;
 pub use observed_revisions::StoredObservedRevision;
-pub(crate) use provider_capture::{load_provider_capture_for_run, provider_capture_matches_batch};
+pub(crate) use provider_capture::{
+    MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES, MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
+    PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET, PreparedProviderCaptureBinding,
+    load_provider_capture_for_run, retain_prepared_provider_capture_binding,
+};
+pub use provider_capture::{
+    PersistedProviderCaptureBindingEvidence, PersistedProviderCaptureBindingRow,
+    PersistedProviderCapturePhysicalClaim, PersistedProviderNativeLineageSchema,
+};
+pub use provider_event::{
+    PersistedProviderEventBindingEvidence, PersistedProviderEventBindingRow,
+    PersistedProviderEventNativeLineage, PersistedProviderPublicationEvidence,
+    PersistedProviderResponseMarketEventBindingEvidence,
+    PersistedProviderResponseMarketEventBindingRow,
+};
+pub(crate) use provider_event::{
+    PreparedProviderPublicationBinding, retain_prepared_provider_publication_binding,
+};
 pub use publication::PublishedIngest;
+pub(crate) use publication::{PublicationSourceEvidence, publish_artifact_manifest_in_transaction};
 #[cfg(test)]
 pub(crate) use query_artifacts::QueryArtifactBindCheckpoint;
 pub(crate) use query_artifacts::QueryArtifactPublisher;
@@ -101,6 +121,7 @@ pub use query_artifacts::{
     QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult,
 };
 pub(crate) use restore_logical::RestoreCatalogBaseline;
+pub(crate) use runs::complete_ingest_in_transaction;
 pub use runs::{CatalogAuthority, ResumedIngest};
 pub use search::{InstrumentSearchMatch, InstrumentSearchPage};
 

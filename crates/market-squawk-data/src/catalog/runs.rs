@@ -9,7 +9,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::RestoreCatalogBaseline;
-use super::company_identity::persist_company_identity;
+use super::company_identity::{
+    persist_company_identity, validate_provider_company_identity_replay,
+};
 use super::publication::{PublishedIngest, publication_for_run};
 use super::storage::{
     AppendOutcome, ResultBudget, append_audit, digest_columns, existing_reservation, parse_digest,
@@ -365,50 +367,11 @@ impl Catalog {
         }
         let transaction = self.connection.unchecked_transaction()?;
         let completed_at = trusted_catalog_now(&transaction)?;
-        let operation: Option<String> = transaction
-            .query_row(
-                "SELECT operation FROM ingest_runs WHERE run_id=?1 AND state='reserved'",
-                [reservation.run_id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let operation = operation.ok_or(CatalogError::RunStateConflict)?;
-        if completion == ContractCompletion::Succeeded
-            && matches!(operation.as_str(), "persist" | "cache")
-        {
-            let has_manifest: bool = transaction.query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM artifacts
-                     JOIN dataset_manifests USING (artifact_id)
-                     WHERE artifacts.run_id=?1
-                 )",
-                [reservation.run_id.to_string()],
-                |row| row.get(0),
-            )?;
-            if !has_manifest {
-                return Err(CatalogError::RunStateConflict);
-            }
-        }
-        if let Some(company_identity) = company_identity {
-            persist_company_identity(&transaction, reservation, company_identity, completed_at)?;
-        }
-        let changed = transaction.execute(
-            "UPDATE ingest_runs SET state=?1, completed_at_ns=?2
-             WHERE run_id=?3 AND state='reserved'",
-            params![
-                completion.database_name(),
-                completed_at.unix_nanos(),
-                reservation.run_id.to_string()
-            ],
-        )?;
-        if changed != 1 {
-            return Err(CatalogError::RunStateConflict);
-        }
-        append_audit(
+        complete_ingest_in_transaction(
             &transaction,
-            "ingest.completed",
-            &reservation.run_id.to_string(),
-            sha256(completion.database_name().as_bytes()),
+            reservation,
+            completion,
+            company_identity,
             completed_at,
         )?;
         transaction.commit()?;
@@ -426,6 +389,20 @@ impl Catalog {
         let transaction = self.connection.unchecked_transaction()?;
         let reconciled_at = trusted_catalog_now(&transaction)?;
         persist_company_identity(&transaction, reservation, company_identity, reconciled_at)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_provider_company_identity_replay(
+        &self,
+        reservation: &IngestReservation,
+        company_identity: Option<&CompanyIdentityObservation>,
+    ) -> Result<(), CatalogError> {
+        if reservation.catalog_id != self.catalog_id {
+            return Err(CatalogError::InvalidReservationCapability);
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        validate_provider_company_identity_replay(&transaction, reservation, company_identity)?;
         transaction.commit()?;
         Ok(())
     }
@@ -586,6 +563,65 @@ impl Catalog {
         }
         Ok(runs)
     }
+}
+
+pub(crate) fn complete_ingest_in_transaction(
+    transaction: &Transaction<'_>,
+    reservation: &IngestReservation,
+    completion: ContractCompletion,
+    company_identity: Option<&CompanyIdentityObservation>,
+    completed_at: Timestamp,
+) -> Result<(), CatalogError> {
+    if company_identity.is_some() && completion != ContractCompletion::Succeeded {
+        return Err(CatalogError::RunStateConflict);
+    }
+    let operation: Option<String> = transaction
+        .query_row(
+            "SELECT operation FROM ingest_runs WHERE run_id=?1 AND state='reserved'",
+            [reservation.run_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let operation = operation.ok_or(CatalogError::RunStateConflict)?;
+    if completion == ContractCompletion::Succeeded
+        && matches!(operation.as_str(), "persist" | "cache")
+    {
+        let has_manifest: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM artifacts
+                 JOIN dataset_manifests USING (artifact_id)
+                 WHERE artifacts.run_id=?1
+             )",
+            [reservation.run_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !has_manifest {
+            return Err(CatalogError::RunStateConflict);
+        }
+    }
+    if let Some(company_identity) = company_identity {
+        persist_company_identity(transaction, reservation, company_identity, completed_at)?;
+    }
+    let changed = transaction.execute(
+        "UPDATE ingest_runs SET state=?1, completed_at_ns=?2
+         WHERE run_id=?3 AND state='reserved'",
+        params![
+            completion.database_name(),
+            completed_at.unix_nanos(),
+            reservation.run_id.to_string()
+        ],
+    )?;
+    if changed != 1 {
+        return Err(CatalogError::RunStateConflict);
+    }
+    append_audit(
+        transaction,
+        "ingest.completed",
+        &reservation.run_id.to_string(),
+        sha256(completion.database_name().as_bytes()),
+        completed_at,
+    )?;
+    Ok(())
 }
 
 fn persist_imported_user_input_rights(

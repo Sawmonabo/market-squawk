@@ -1,3 +1,30 @@
+-- Greenfield-register the durable typed market-event row schema beside the existing
+-- analytical schemas. Publication remains closed to exact code-owned fingerprints.
+DROP TRIGGER analytical_generations_registered_schema_insert;
+
+CREATE TRIGGER analytical_generations_registered_schema_insert
+BEFORE INSERT ON analytical_generations
+WHEN NOT (
+    (
+        NEW.schema_name = 'market_squawk.research_observations'
+        AND NEW.schema_version = 3
+        AND NEW.schema_fingerprint =
+            X'adbb26ab67e0389eb0a4422f1eb29b54be518fbb01a6b0624da41cb862e61c0a'
+    ) OR (
+        NEW.schema_name = 'market_squawk.feature_label_components'
+        AND NEW.schema_version = 3
+        AND NEW.schema_fingerprint =
+            X'ca7f3447c5c353181b3776f2980a55dcbc54ae69a75b9231d5925912444322a4'
+    ) OR (
+        NEW.schema_name = 'market_squawk.market_events'
+        AND NEW.schema_version = 1
+        AND NEW.schema_fingerprint =
+            X'e20fc1a2797ff2d8564c4be99c4ffbc162aad82b02e5f714c6384db815fe0912'
+    )
+) BEGIN
+    SELECT RAISE(ABORT, 'analytical generation schema identity is not registered');
+END;
+
 CREATE TABLE market_data_instrument_identities (
     instrument_id TEXT PRIMARY KEY CHECK (
         length(CAST(instrument_id AS BLOB)) = 36
@@ -399,18 +426,14 @@ BEFORE DELETE ON company_security_link_current BEGIN
     SELECT RAISE(ABORT, 'company/security current-link pointers cannot be deleted');
 END;
 
-CREATE TABLE provider_capture_sets (
-    capture_receipt_digest BLOB PRIMARY KEY CHECK (
-        length(capture_receipt_digest) = 32
-        AND capture_receipt_digest <> zeroblob(32)
+CREATE TABLE provider_raw_observations (
+    capture_observation_digest BLOB PRIMARY KEY CHECK (
+        length(capture_observation_digest) = 32
+        AND capture_observation_digest <> zeroblob(32)
     ),
     capture_content_digest BLOB NOT NULL CHECK (
         length(capture_content_digest) = 32
         AND capture_content_digest <> zeroblob(32)
-    ),
-    capture_observation_digest BLOB NOT NULL CHECK (
-        length(capture_observation_digest) = 32
-        AND capture_observation_digest <> zeroblob(32)
     ),
     source_id TEXT NOT NULL,
     source_revision_digest BLOB NOT NULL CHECK (
@@ -442,33 +465,14 @@ CREATE TABLE provider_capture_sets (
         length(CAST(capture_json AS BLOB)) BETWEEN 2 AND 2097152
         AND json_valid(capture_json)
     ),
-    sealed_relative_reference TEXT NOT NULL UNIQUE CHECK (
-        length(CAST(sealed_relative_reference AS BLOB)) BETWEEN 1 AND 1024
-    ),
-    sealed_content_digest BLOB NOT NULL UNIQUE CHECK (
-        length(sealed_content_digest) = 32
-        AND sealed_content_digest <> zeroblob(32)
-    ),
-    sealed_size_bytes INTEGER NOT NULL CHECK (
-        sealed_size_bytes BETWEEN 1 AND 536870912
-    ),
-    sealed_physical_receipt_digest BLOB NOT NULL UNIQUE CHECK (
-        length(sealed_physical_receipt_digest) = 32
-        AND sealed_physical_receipt_digest <> zeroblob(32)
-    ),
-    segment_claim_json TEXT NOT NULL CHECK (
-        length(CAST(segment_claim_json AS BLOB)) BETWEEN 2 AND 2097152
-        AND json_valid(segment_claim_json)
-    ),
     recorded_at_ns INTEGER NOT NULL,
     FOREIGN KEY (source_id, source_revision_digest)
-        REFERENCES source_revisions(source_id, revision_digest),
-    UNIQUE (capture_observation_digest, sealed_physical_receipt_digest)
+        REFERENCES source_revisions(source_id, revision_digest)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE provider_capture_pages (
-    capture_receipt_digest BLOB NOT NULL
-        REFERENCES provider_capture_sets(capture_receipt_digest),
+CREATE TABLE provider_raw_observation_pages (
+    capture_observation_digest BLOB NOT NULL
+        REFERENCES provider_raw_observations(capture_observation_digest),
     page_ordinal INTEGER NOT NULL CHECK (page_ordinal BETWEEN 0 AND 63),
     request_identity BLOB NOT NULL CHECK (
         length(request_identity) = 32 AND request_identity <> zeroblob(32)
@@ -493,12 +497,128 @@ CREATE TABLE provider_capture_pages (
         length(body_digest) = 32 AND body_digest <> zeroblob(32)
     ),
     received_at_ns INTEGER NOT NULL,
-    PRIMARY KEY (capture_receipt_digest, page_ordinal)
+    PRIMARY KEY (capture_observation_digest, page_ordinal)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE provider_capture_frames (
-    capture_receipt_digest BLOB NOT NULL,
-    frame_ordinal INTEGER NOT NULL CHECK (frame_ordinal BETWEEN 0 AND 63),
+CREATE TABLE provider_capture_recovery_capacity (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    physical_claims INTEGER NOT NULL CHECK (
+        physical_claims BETWEEN 0 AND 25000
+    ),
+    physical_bytes INTEGER NOT NULL CHECK (
+        physical_bytes BETWEEN 0 AND 549755813888
+    )
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO provider_capture_recovery_capacity
+    (singleton, physical_claims, physical_bytes)
+VALUES (1, 0, 0);
+
+CREATE TABLE sealed_raw_objects (
+    raw_claim_digest BLOB PRIMARY KEY CHECK (
+        length(raw_claim_digest) = 32 AND raw_claim_digest <> zeroblob(32)
+    ),
+    physical_receipt_digest BLOB NOT NULL CHECK (
+        length(physical_receipt_digest) = 32
+        AND physical_receipt_digest <> zeroblob(32)
+    ),
+    relative_reference TEXT NOT NULL CHECK (
+        length(CAST(relative_reference AS BLOB)) BETWEEN 1 AND 1024
+    ),
+    content_digest BLOB NOT NULL CHECK (
+        length(content_digest) = 32 AND content_digest <> zeroblob(32)
+    ),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes BETWEEN 1 AND 536870912),
+    frame_count INTEGER NOT NULL CHECK (frame_count BETWEEN 1 AND 64),
+    raw_claim_json TEXT NOT NULL CHECK (
+        length(CAST(raw_claim_json AS BLOB)) BETWEEN 2 AND 2097152
+        AND json_valid(raw_claim_json)
+    ),
+    recorded_at_ns INTEGER NOT NULL,
+    UNIQUE (raw_claim_digest, physical_receipt_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER sealed_raw_objects_recovery_capacity_insert
+BEFORE INSERT ON sealed_raw_objects
+WHEN NOT EXISTS (
+    SELECT 1 FROM sealed_raw_objects WHERE raw_claim_digest = NEW.raw_claim_digest
+) AND EXISTS (
+    SELECT 1
+    FROM provider_capture_recovery_capacity
+    WHERE singleton = 1
+      AND (
+          physical_claims >= 25000
+          OR physical_bytes > 549755813888 - NEW.size_bytes
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sealed provider raw-object recovery capacity exceeded');
+END;
+
+CREATE TRIGGER sealed_raw_objects_recovery_capacity_account
+AFTER INSERT ON sealed_raw_objects
+BEGIN
+    UPDATE provider_capture_recovery_capacity
+    SET physical_claims = physical_claims + 1,
+        physical_bytes = physical_bytes + NEW.size_bytes
+    WHERE singleton = 1;
+END;
+
+CREATE TABLE provider_raw_observation_objects (
+    capture_observation_digest BLOB NOT NULL
+        REFERENCES provider_raw_observations(capture_observation_digest),
+    input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 63),
+    raw_claim_digest BLOB NOT NULL REFERENCES sealed_raw_objects(raw_claim_digest),
+    physical_receipt_digest BLOB NOT NULL CHECK (
+        length(physical_receipt_digest) = 32
+        AND physical_receipt_digest <> zeroblob(32)
+    ),
+    object_capture_content_digest BLOB NOT NULL CHECK (
+        length(object_capture_content_digest) = 32
+        AND object_capture_content_digest <> zeroblob(32)
+    ),
+    object_capture_observation_digest BLOB NOT NULL CHECK (
+        length(object_capture_observation_digest) = 32
+        AND object_capture_observation_digest <> zeroblob(32)
+    ),
+    capture_receipt_digest BLOB NOT NULL CHECK (
+        length(capture_receipt_digest) = 32
+        AND capture_receipt_digest <> zeroblob(32)
+    ),
+    PRIMARY KEY (
+        capture_observation_digest,
+        input_ordinal,
+        raw_claim_digest,
+        physical_receipt_digest
+    ),
+    UNIQUE (
+        capture_observation_digest,
+        raw_claim_digest,
+        physical_receipt_digest
+    ),
+    UNIQUE (
+        capture_receipt_digest,
+        capture_observation_digest,
+        physical_receipt_digest
+    ),
+    FOREIGN KEY (raw_claim_digest, physical_receipt_digest)
+        REFERENCES sealed_raw_objects(raw_claim_digest, physical_receipt_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_raw_observation_frames (
+    capture_observation_digest BLOB NOT NULL,
+    observation_unit_ordinal INTEGER NOT NULL CHECK (
+        observation_unit_ordinal BETWEEN 0 AND 63
+    ),
+    raw_object_input_ordinal INTEGER NOT NULL CHECK (
+        raw_object_input_ordinal BETWEEN 0 AND 63
+    ),
+    raw_claim_digest BLOB NOT NULL,
+    physical_receipt_digest BLOB NOT NULL CHECK (
+        length(physical_receipt_digest) = 32
+        AND physical_receipt_digest <> zeroblob(32)
+    ),
+    raw_unit_ordinal INTEGER NOT NULL CHECK (raw_unit_ordinal BETWEEN 0 AND 63),
     frame_offset INTEGER NOT NULL CHECK (frame_offset >= 4),
     framed_bytes INTEGER NOT NULL CHECK (framed_bytes > 8),
     provider_payload_bytes INTEGER NOT NULL CHECK (
@@ -509,18 +629,53 @@ CREATE TABLE provider_capture_frames (
         AND provider_payload_digest <> zeroblob(32)
     ),
     received_at_ns INTEGER NOT NULL,
-    source_sequence INTEGER CHECK (source_sequence IS NULL OR source_sequence >= 0),
-    PRIMARY KEY (capture_receipt_digest, frame_ordinal),
-    FOREIGN KEY (capture_receipt_digest, frame_ordinal)
-        REFERENCES provider_capture_pages(capture_receipt_digest, page_ordinal)
+    source_sequence BLOB CHECK (
+        source_sequence IS NULL OR length(source_sequence) = 8
+    ),
+    PRIMARY KEY (
+        capture_observation_digest,
+        raw_claim_digest,
+        physical_receipt_digest,
+        raw_unit_ordinal
+    ),
+    UNIQUE (
+        capture_observation_digest,
+        raw_claim_digest,
+        physical_receipt_digest,
+        observation_unit_ordinal
+    ),
+    UNIQUE (
+        capture_observation_digest,
+        raw_object_input_ordinal,
+        raw_claim_digest,
+        physical_receipt_digest,
+        raw_unit_ordinal
+    ),
+    FOREIGN KEY (capture_observation_digest, observation_unit_ordinal)
+        REFERENCES provider_raw_observation_pages(
+            capture_observation_digest,
+            page_ordinal
+        ),
+    FOREIGN KEY (
+        capture_observation_digest,
+        raw_object_input_ordinal,
+        raw_claim_digest,
+        physical_receipt_digest
+    )
+        REFERENCES provider_raw_observation_objects(
+            capture_observation_digest,
+            input_ordinal,
+            raw_claim_digest,
+            physical_receipt_digest
+        )
 ) STRICT, WITHOUT ROWID;
 
-CREATE TRIGGER provider_capture_pages_set_match_insert
-BEFORE INSERT ON provider_capture_pages
+CREATE TRIGGER provider_raw_observation_pages_set_match_insert
+BEFORE INSERT ON provider_raw_observation_pages
 WHEN NOT EXISTS (
     SELECT 1
-    FROM provider_capture_sets AS capture
-    WHERE capture.capture_receipt_digest = NEW.capture_receipt_digest
+    FROM provider_raw_observations AS capture
+    WHERE capture.capture_observation_digest = NEW.capture_observation_digest
       AND NEW.page_ordinal < capture.page_count
       AND NEW.received_at_ns <= capture.recorded_at_ns
 )
@@ -528,13 +683,13 @@ BEGIN
     SELECT RAISE(ABORT, 'provider capture page does not match its set receipt');
 END;
 
-CREATE TRIGGER provider_capture_frames_page_match_insert
-BEFORE INSERT ON provider_capture_frames
+CREATE TRIGGER provider_raw_observation_frames_page_match_insert
+BEFORE INSERT ON provider_raw_observation_frames
 WHEN NOT EXISTS (
     SELECT 1
-    FROM provider_capture_pages AS page
-    WHERE page.capture_receipt_digest = NEW.capture_receipt_digest
-      AND page.page_ordinal = NEW.frame_ordinal
+    FROM provider_raw_observation_pages AS page
+    WHERE page.capture_observation_digest = NEW.capture_observation_digest
+      AND page.page_ordinal = NEW.observation_unit_ordinal
       AND page.body_bytes = NEW.provider_payload_bytes
       AND page.body_digest = NEW.provider_payload_digest
       AND page.received_at_ns = NEW.received_at_ns
@@ -543,59 +698,702 @@ BEGIN
     SELECT RAISE(ABORT, 'provider capture frame does not match its page receipt');
 END;
 
-CREATE TABLE ingest_run_capture_inputs (
-    run_id TEXT NOT NULL REFERENCES ingest_runs(run_id),
-    input_ordinal INTEGER NOT NULL CHECK (input_ordinal = 0),
-    capture_receipt_digest BLOB NOT NULL UNIQUE
-        REFERENCES provider_capture_sets(capture_receipt_digest),
-    source_id TEXT NOT NULL REFERENCES sources(source_id),
-    PRIMARY KEY (run_id, input_ordinal),
-    UNIQUE (run_id, capture_receipt_digest)
+CREATE TABLE provider_capture_bindings (
+    binding_digest BLOB PRIMARY KEY CHECK (
+        length(binding_digest) = 32 AND binding_digest <> zeroblob(32)
+    ),
+    binding_format_version INTEGER NOT NULL CHECK (binding_format_version = 1),
+    capture_observation_digest BLOB NOT NULL
+        REFERENCES provider_raw_observations(capture_observation_digest),
+    sealed_capture_receipt_digest BLOB NOT NULL CHECK (
+        length(sealed_capture_receipt_digest) = 32
+        AND sealed_capture_receipt_digest <> zeroblob(32)
+    ),
+    capture_scope TEXT NOT NULL CHECK (capture_scope IN ('whole', 'component')),
+    binding_layout TEXT NOT NULL CHECK (
+        binding_layout IN (
+            'whole_single_segment',
+            'request_graph_component',
+            'ordered_segments'
+        )
+    ),
+    request_graph_component_ordinal INTEGER CHECK (
+        request_graph_component_ordinal IS NULL
+        OR request_graph_component_ordinal BETWEEN 0 AND 63
+    ),
+    extraction_content_digest BLOB NOT NULL CHECK (
+        length(extraction_content_digest) = 32
+        AND extraction_content_digest <> zeroblob(32)
+    ),
+    canonical_record_count INTEGER NOT NULL CHECK (
+        canonical_record_count BETWEEN 1 AND 100000
+    ),
+    row_mapping_digest BLOB NOT NULL CHECK (
+        length(row_mapping_digest) = 32 AND row_mapping_digest <> zeroblob(32)
+    ),
+    recorded_at_ns INTEGER NOT NULL,
+    UNIQUE (binding_digest, capture_observation_digest),
+    CHECK (
+        (capture_scope = 'component'
+            AND binding_layout = 'request_graph_component'
+            AND request_graph_component_ordinal IS NOT NULL)
+        OR (capture_scope = 'whole'
+            AND binding_layout IN ('whole_single_segment', 'ordered_segments')
+            AND request_graph_component_ordinal IS NULL)
+    )
 ) STRICT, WITHOUT ROWID;
 
-CREATE TRIGGER ingest_run_capture_inputs_guarded_insert
-BEFORE INSERT ON ingest_run_capture_inputs
+CREATE TABLE provider_capture_binding_native_lineage (
+    binding_digest BLOB PRIMARY KEY
+        REFERENCES provider_capture_bindings(binding_digest),
+    schema_version INTEGER NOT NULL CHECK (schema_version BETWEEN 1 AND 65535),
+    implementation TEXT NOT NULL CHECK (
+        length(CAST(implementation AS BLOB)) BETWEEN 1 AND 128
+    ),
+    schema_fingerprint BLOB NOT NULL CHECK (
+        length(schema_fingerprint) = 32 AND schema_fingerprint <> zeroblob(32)
+    ),
+    row_count INTEGER NOT NULL CHECK (row_count BETWEEN 1 AND 100000),
+    batch_digest BLOB NOT NULL CHECK (
+        length(batch_digest) = 32 AND batch_digest <> zeroblob(32)
+    ),
+    batch_sidecar_payload BLOB CHECK (
+        batch_sidecar_payload IS NULL
+        OR length(batch_sidecar_payload) BETWEEN 1 AND 4194304
+    ),
+    batch_sidecar_digest BLOB CHECK (
+        batch_sidecar_digest IS NULL
+        OR (
+            length(batch_sidecar_digest) = 32
+            AND batch_sidecar_digest <> zeroblob(32)
+        )
+    ),
+    CHECK (
+        (batch_sidecar_payload IS NULL AND batch_sidecar_digest IS NULL)
+        OR (batch_sidecar_payload IS NOT NULL AND batch_sidecar_digest IS NOT NULL)
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_capture_binding_objects (
+    binding_digest BLOB NOT NULL,
+    input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 63),
+    capture_observation_digest BLOB NOT NULL,
+    raw_claim_digest BLOB NOT NULL,
+    physical_receipt_digest BLOB NOT NULL CHECK (
+        length(physical_receipt_digest) = 32
+        AND physical_receipt_digest <> zeroblob(32)
+    ),
+    PRIMARY KEY (binding_digest, input_ordinal),
+    UNIQUE (
+        binding_digest,
+        input_ordinal,
+        raw_claim_digest,
+        physical_receipt_digest
+    ),
+    FOREIGN KEY (binding_digest, capture_observation_digest)
+        REFERENCES provider_capture_bindings(binding_digest, capture_observation_digest),
+    FOREIGN KEY (
+        capture_observation_digest,
+        input_ordinal,
+        raw_claim_digest,
+        physical_receipt_digest
+    ) REFERENCES provider_raw_observation_objects(
+        capture_observation_digest,
+        input_ordinal,
+        raw_claim_digest,
+        physical_receipt_digest
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX provider_capture_binding_objects_by_raw_object
+ON provider_capture_binding_objects(raw_claim_digest, physical_receipt_digest);
+
+CREATE TABLE provider_capture_binding_rows (
+    binding_digest BLOB NOT NULL,
+    capture_observation_digest BLOB NOT NULL,
+    canonical_row_ordinal INTEGER NOT NULL CHECK (
+        canonical_row_ordinal BETWEEN 0 AND 99999
+    ),
+    canonical_record_digest BLOB NOT NULL CHECK (
+        length(canonical_record_digest) = 32
+        AND canonical_record_digest <> zeroblob(32)
+    ),
+    native_semantic_payload BLOB NOT NULL CHECK (
+        length(native_semantic_payload) BETWEEN 1 AND 65536
+    ),
+    native_semantic_digest BLOB NOT NULL CHECK (
+        length(native_semantic_digest) = 32
+        AND native_semantic_digest <> zeroblob(32)
+    ),
+    capture_page_ordinal INTEGER NOT NULL CHECK (capture_page_ordinal BETWEEN 0 AND 63),
+    segment_ordinal INTEGER NOT NULL CHECK (segment_ordinal BETWEEN 0 AND 63),
+    raw_claim_digest BLOB NOT NULL,
+    physical_receipt_digest BLOB NOT NULL CHECK (
+        length(physical_receipt_digest) = 32
+        AND physical_receipt_digest <> zeroblob(32)
+    ),
+    physical_frame_ordinal INTEGER NOT NULL CHECK (
+        physical_frame_ordinal BETWEEN 0 AND 63
+    ),
+    page_body_digest BLOB NOT NULL CHECK (
+        length(page_body_digest) = 32 AND page_body_digest <> zeroblob(32)
+    ),
+    received_at_ns INTEGER NOT NULL,
+    source_sequence BLOB CHECK (
+        source_sequence IS NULL OR length(source_sequence) = 8
+    ),
+    PRIMARY KEY (binding_digest, canonical_row_ordinal),
+    FOREIGN KEY (binding_digest, capture_observation_digest)
+        REFERENCES provider_capture_bindings(binding_digest, capture_observation_digest),
+    FOREIGN KEY (
+        binding_digest,
+        segment_ordinal,
+        raw_claim_digest,
+        physical_receipt_digest
+    ) REFERENCES provider_capture_binding_objects(
+        binding_digest,
+        input_ordinal,
+        raw_claim_digest,
+        physical_receipt_digest
+    ),
+    FOREIGN KEY (capture_observation_digest, capture_page_ordinal)
+        REFERENCES provider_raw_observation_pages(
+            capture_observation_digest,
+            page_ordinal
+        ),
+    FOREIGN KEY (
+        capture_observation_digest,
+        raw_claim_digest,
+        physical_receipt_digest,
+        physical_frame_ordinal
+    ) REFERENCES provider_raw_observation_frames(
+        capture_observation_digest,
+        raw_claim_digest,
+        physical_receipt_digest,
+        raw_unit_ordinal
+    )
+) STRICT, WITHOUT ROWID;
+
+-- Typed current-market events decoded from HTTP retain HTTP response semantics, while their
+-- canonical rows remain distinct from research observations/provider_capture_binding_rows.
+CREATE TABLE provider_response_market_event_bindings (
+    response_event_binding_digest BLOB PRIMARY KEY CHECK (
+        length(response_event_binding_digest) = 32
+        AND response_event_binding_digest <> zeroblob(32)
+    ),
+    binding_format_version INTEGER NOT NULL CHECK (binding_format_version = 1),
+    capture_observation_digest BLOB NOT NULL
+        REFERENCES provider_raw_observations(capture_observation_digest),
+    sealed_capture_receipt_digest BLOB NOT NULL CHECK (
+        length(sealed_capture_receipt_digest) = 32
+        AND sealed_capture_receipt_digest <> zeroblob(32)
+    ),
+    canonical_schema_fingerprint BLOB NOT NULL CHECK (
+        length(canonical_schema_fingerprint) = 32
+        AND canonical_schema_fingerprint <> zeroblob(32)
+    ),
+    canonical_content_digest BLOB NOT NULL CHECK (
+        length(canonical_content_digest) = 32
+        AND canonical_content_digest <> zeroblob(32)
+    ),
+    canonical_event_count INTEGER NOT NULL CHECK (canonical_event_count BETWEEN 1 AND 64),
+    row_mapping_digest BLOB NOT NULL CHECK (
+        length(row_mapping_digest) = 32 AND row_mapping_digest <> zeroblob(32)
+    ),
+    recorded_at_ns INTEGER NOT NULL,
+    UNIQUE (response_event_binding_digest, capture_observation_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_response_market_event_binding_native_lineage (
+    response_event_binding_digest BLOB PRIMARY KEY
+        REFERENCES provider_response_market_event_bindings(response_event_binding_digest),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    implementation TEXT NOT NULL CHECK (
+        length(CAST(implementation AS BLOB)) BETWEEN 1 AND 128
+    ),
+    row_count INTEGER NOT NULL CHECK (row_count BETWEEN 1 AND 64),
+    batch_digest BLOB NOT NULL CHECK (
+        length(batch_digest) = 32 AND batch_digest <> zeroblob(32)
+    ),
+    batch_sidecar_payload BLOB CHECK (
+        batch_sidecar_payload IS NULL
+        OR length(batch_sidecar_payload) BETWEEN 1 AND 4194304
+    ),
+    batch_sidecar_digest BLOB CHECK (
+        batch_sidecar_digest IS NULL
+        OR (
+            length(batch_sidecar_digest) = 32
+            AND batch_sidecar_digest <> zeroblob(32)
+        )
+    ),
+    CHECK (
+        (batch_sidecar_payload IS NULL AND batch_sidecar_digest IS NULL)
+        OR (batch_sidecar_payload IS NOT NULL AND batch_sidecar_digest IS NOT NULL)
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_response_market_event_binding_rows (
+    response_event_binding_digest BLOB NOT NULL,
+    capture_observation_digest BLOB NOT NULL,
+    canonical_row_ordinal INTEGER NOT NULL CHECK (canonical_row_ordinal BETWEEN 0 AND 63),
+    canonical_event_digest BLOB NOT NULL CHECK (
+        length(canonical_event_digest) = 32
+        AND canonical_event_digest <> zeroblob(32)
+    ),
+    native_semantic_payload BLOB NOT NULL CHECK (
+        length(native_semantic_payload) BETWEEN 1 AND 65536
+    ),
+    native_semantic_digest BLOB NOT NULL CHECK (
+        length(native_semantic_digest) = 32
+        AND native_semantic_digest <> zeroblob(32)
+    ),
+    capture_page_ordinal INTEGER NOT NULL CHECK (capture_page_ordinal BETWEEN 0 AND 63),
+    physical_frame_ordinal INTEGER NOT NULL CHECK (
+        physical_frame_ordinal BETWEEN 0 AND 63
+    ),
+    payload_digest BLOB NOT NULL CHECK (
+        length(payload_digest) = 32 AND payload_digest <> zeroblob(32)
+    ),
+    received_at_ns INTEGER NOT NULL,
+    source_sequence BLOB CHECK (
+        source_sequence IS NULL OR length(source_sequence) = 8
+    ),
+    PRIMARY KEY (response_event_binding_digest, canonical_row_ordinal),
+    FOREIGN KEY (response_event_binding_digest, capture_observation_digest)
+        REFERENCES provider_response_market_event_bindings(
+            response_event_binding_digest,
+            capture_observation_digest
+        ),
+    FOREIGN KEY (capture_observation_digest, capture_page_ordinal)
+        REFERENCES provider_raw_observation_pages(
+            capture_observation_digest,
+            page_ordinal
+        )
+) STRICT, WITHOUT ROWID;
+
+-- Live event microbatches retain their stream semantics independently from HTTP response pages.
+-- The immutable journal object is shared physical storage only; no event is represented as a
+-- provider_raw_observation_page.
+CREATE TABLE provider_event_microbatches (
+    event_observation_digest BLOB PRIMARY KEY CHECK (
+        length(event_observation_digest) = 32
+        AND event_observation_digest <> zeroblob(32)
+    ),
+    event_content_digest BLOB NOT NULL CHECK (
+        length(event_content_digest) = 32
+        AND event_content_digest <> zeroblob(32)
+    ),
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    source_revision_digest BLOB NOT NULL CHECK (
+        length(source_revision_digest) = 32
+        AND source_revision_digest <> zeroblob(32)
+    ),
+    dataset TEXT NOT NULL CHECK (length(CAST(dataset AS BLOB)) BETWEEN 1 AND 256),
+    stream_identity TEXT NOT NULL CHECK (
+        length(CAST(stream_identity AS BLOB)) BETWEEN 1 AND 256
+    ),
+    frame_count INTEGER NOT NULL CHECK (frame_count BETWEEN 1 AND 64),
+    total_payload_bytes INTEGER NOT NULL CHECK (
+        total_payload_bytes BETWEEN 1 AND 67108864
+    ),
+    capture_json TEXT NOT NULL CHECK (
+        length(CAST(capture_json AS BLOB)) BETWEEN 2 AND 2097152
+        AND json_valid(capture_json)
+    ),
+    recorded_at_ns INTEGER NOT NULL,
+    UNIQUE (event_observation_digest, source_id),
+    FOREIGN KEY (source_id, source_revision_digest)
+        REFERENCES source_revisions(source_id, revision_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_event_microbatch_frames (
+    event_observation_digest BLOB NOT NULL
+        REFERENCES provider_event_microbatches(event_observation_digest),
+    event_frame_ordinal INTEGER NOT NULL CHECK (event_frame_ordinal BETWEEN 0 AND 63),
+    event_id BLOB NOT NULL CHECK (length(event_id) = 16 AND event_id <> zeroblob(16)),
+    connection_id BLOB NOT NULL CHECK (
+        length(connection_id) = 16 AND connection_id <> zeroblob(16)
+    ),
+    source_sequence BLOB CHECK (
+        source_sequence IS NULL OR length(source_sequence) = 8
+    ),
+    exchange_at_ns INTEGER,
+    received_at_ns INTEGER NOT NULL,
+    payload_bytes INTEGER NOT NULL CHECK (payload_bytes BETWEEN 1 AND 16777216),
+    payload_digest BLOB NOT NULL CHECK (
+        length(payload_digest) = 32 AND payload_digest <> zeroblob(32)
+    ),
+    PRIMARY KEY (event_observation_digest, event_frame_ordinal),
+    UNIQUE (event_observation_digest, event_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_event_microbatch_objects (
+    event_observation_digest BLOB PRIMARY KEY
+        REFERENCES provider_event_microbatches(event_observation_digest),
+    raw_claim_digest BLOB NOT NULL REFERENCES sealed_raw_objects(raw_claim_digest),
+    physical_receipt_digest BLOB NOT NULL CHECK (
+        length(physical_receipt_digest) = 32
+        AND physical_receipt_digest <> zeroblob(32)
+    ),
+    sealed_event_receipt_digest BLOB NOT NULL UNIQUE CHECK (
+        length(sealed_event_receipt_digest) = 32
+        AND sealed_event_receipt_digest <> zeroblob(32)
+    ),
+    UNIQUE (event_observation_digest, sealed_event_receipt_digest),
+    UNIQUE (event_observation_digest, raw_claim_digest, physical_receipt_digest),
+    FOREIGN KEY (raw_claim_digest, physical_receipt_digest)
+        REFERENCES sealed_raw_objects(raw_claim_digest, physical_receipt_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_event_bindings (
+    event_binding_digest BLOB PRIMARY KEY CHECK (
+        length(event_binding_digest) = 32 AND event_binding_digest <> zeroblob(32)
+    ),
+    binding_format_version INTEGER NOT NULL CHECK (binding_format_version = 1),
+    event_observation_digest BLOB NOT NULL
+        REFERENCES provider_event_microbatches(event_observation_digest),
+    sealed_event_receipt_digest BLOB NOT NULL CHECK (
+        length(sealed_event_receipt_digest) = 32
+        AND sealed_event_receipt_digest <> zeroblob(32)
+    ),
+    canonical_schema_fingerprint BLOB NOT NULL CHECK (
+        length(canonical_schema_fingerprint) = 32
+        AND canonical_schema_fingerprint <> zeroblob(32)
+    ),
+    canonical_content_digest BLOB NOT NULL CHECK (
+        length(canonical_content_digest) = 32
+        AND canonical_content_digest <> zeroblob(32)
+    ),
+    canonical_event_count INTEGER NOT NULL CHECK (canonical_event_count BETWEEN 1 AND 64),
+    row_mapping_digest BLOB NOT NULL CHECK (
+        length(row_mapping_digest) = 32 AND row_mapping_digest <> zeroblob(32)
+    ),
+    recorded_at_ns INTEGER NOT NULL,
+    UNIQUE (event_binding_digest, event_observation_digest),
+    FOREIGN KEY (event_observation_digest, sealed_event_receipt_digest)
+        REFERENCES provider_event_microbatch_objects(
+            event_observation_digest,
+            sealed_event_receipt_digest
+        )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_event_binding_native_lineage (
+    event_binding_digest BLOB PRIMARY KEY
+        REFERENCES provider_event_bindings(event_binding_digest),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    implementation TEXT NOT NULL CHECK (
+        length(CAST(implementation AS BLOB)) BETWEEN 1 AND 128
+    ),
+    row_count INTEGER NOT NULL CHECK (row_count BETWEEN 1 AND 64),
+    batch_digest BLOB NOT NULL CHECK (
+        length(batch_digest) = 32 AND batch_digest <> zeroblob(32)
+    ),
+    batch_sidecar_payload BLOB CHECK (
+        batch_sidecar_payload IS NULL
+        OR length(batch_sidecar_payload) BETWEEN 1 AND 4194304
+    ),
+    batch_sidecar_digest BLOB CHECK (
+        batch_sidecar_digest IS NULL
+        OR (
+            length(batch_sidecar_digest) = 32
+            AND batch_sidecar_digest <> zeroblob(32)
+        )
+    ),
+    CHECK (
+        (batch_sidecar_payload IS NULL AND batch_sidecar_digest IS NULL)
+        OR (batch_sidecar_payload IS NOT NULL AND batch_sidecar_digest IS NOT NULL)
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_event_binding_rows (
+    event_binding_digest BLOB NOT NULL,
+    event_observation_digest BLOB NOT NULL,
+    canonical_row_ordinal INTEGER NOT NULL CHECK (canonical_row_ordinal BETWEEN 0 AND 63),
+    canonical_event_digest BLOB NOT NULL CHECK (
+        length(canonical_event_digest) = 32
+        AND canonical_event_digest <> zeroblob(32)
+    ),
+    native_semantic_payload BLOB NOT NULL CHECK (
+        length(native_semantic_payload) BETWEEN 1 AND 65536
+    ),
+    native_semantic_digest BLOB NOT NULL CHECK (
+        length(native_semantic_digest) = 32
+        AND native_semantic_digest <> zeroblob(32)
+    ),
+    event_frame_ordinal INTEGER NOT NULL CHECK (event_frame_ordinal BETWEEN 0 AND 63),
+    physical_frame_ordinal INTEGER NOT NULL CHECK (
+        physical_frame_ordinal BETWEEN 0 AND 63
+    ),
+    event_id BLOB NOT NULL CHECK (length(event_id) = 16 AND event_id <> zeroblob(16)),
+    connection_id BLOB NOT NULL CHECK (
+        length(connection_id) = 16 AND connection_id <> zeroblob(16)
+    ),
+    payload_digest BLOB NOT NULL CHECK (
+        length(payload_digest) = 32 AND payload_digest <> zeroblob(32)
+    ),
+    exchange_at_ns INTEGER,
+    received_at_ns INTEGER NOT NULL,
+    source_sequence BLOB CHECK (
+        source_sequence IS NULL OR length(source_sequence) = 8
+    ),
+    PRIMARY KEY (event_binding_digest, canonical_row_ordinal),
+    FOREIGN KEY (event_binding_digest, event_observation_digest)
+        REFERENCES provider_event_bindings(event_binding_digest, event_observation_digest),
+    FOREIGN KEY (event_observation_digest, event_frame_ordinal)
+        REFERENCES provider_event_microbatch_frames(
+            event_observation_digest,
+            event_frame_ordinal
+        )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_composite_response_event_bindings (
+    composite_binding_digest BLOB PRIMARY KEY CHECK (
+        length(composite_binding_digest) = 32
+        AND composite_binding_digest <> zeroblob(32)
+    ),
+    response_binding_digest BLOB NOT NULL UNIQUE
+        REFERENCES provider_response_market_event_bindings(response_event_binding_digest),
+    event_binding_digest BLOB NOT NULL UNIQUE
+        REFERENCES provider_event_bindings(event_binding_digest),
+    response_row_count INTEGER NOT NULL CHECK (response_row_count BETWEEN 1 AND 64),
+    event_row_count INTEGER NOT NULL CHECK (event_row_count BETWEEN 1 AND 64),
+    recorded_at_ns INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER provider_composite_response_event_bindings_guarded_insert
+BEFORE INSERT ON provider_composite_response_event_bindings
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM provider_response_market_event_bindings AS response
+    JOIN provider_raw_observations AS response_capture
+      ON response_capture.capture_observation_digest=response.capture_observation_digest
+    JOIN provider_event_bindings AS event
+      ON event.event_binding_digest=NEW.event_binding_digest
+    JOIN provider_event_microbatches AS event_capture
+      ON event_capture.event_observation_digest=event.event_observation_digest
+    WHERE response.response_event_binding_digest=NEW.response_binding_digest
+      AND response.canonical_event_count=NEW.response_row_count
+      AND event.canonical_event_count=NEW.event_row_count
+      AND response_capture.source_id=event_capture.source_id
+      AND response_capture.source_revision_digest=event_capture.source_revision_digest
+)
+BEGIN
+    SELECT RAISE(ABORT, 'composite response-event binding is invalid');
+END;
+
+CREATE TABLE ingest_run_provider_capture_bindings (
+    run_id TEXT NOT NULL REFERENCES ingest_runs(run_id),
+    input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 4095),
+    binding_digest BLOB NOT NULL UNIQUE
+        REFERENCES provider_capture_bindings(binding_digest),
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    PRIMARY KEY (run_id, input_ordinal),
+    UNIQUE (run_id, binding_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE ingest_run_provider_publication_bindings (
+    run_id TEXT NOT NULL REFERENCES ingest_runs(run_id),
+    input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 4095),
+    publication_digest BLOB NOT NULL UNIQUE CHECK (
+        length(publication_digest) = 32 AND publication_digest <> zeroblob(32)
+    ),
+    publication_kind TEXT NOT NULL CHECK (
+        publication_kind IN (
+            'response_market_event',
+            'event_microbatch',
+            'composite_response_event'
+        )
+    ),
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    response_binding_digest BLOB
+        REFERENCES provider_response_market_event_bindings(response_event_binding_digest),
+    event_binding_digest BLOB REFERENCES provider_event_bindings(event_binding_digest),
+    composite_binding_digest BLOB
+        REFERENCES provider_composite_response_event_bindings(composite_binding_digest),
+    PRIMARY KEY (run_id, input_ordinal),
+    UNIQUE (run_id, publication_digest),
+    CHECK (
+        (publication_kind='response_market_event'
+            AND response_binding_digest IS NOT NULL
+            AND event_binding_digest IS NULL
+            AND composite_binding_digest IS NULL
+            AND publication_digest=response_binding_digest)
+        OR (publication_kind='event_microbatch'
+            AND response_binding_digest IS NULL
+            AND event_binding_digest IS NOT NULL
+            AND composite_binding_digest IS NULL
+            AND publication_digest=event_binding_digest)
+        OR (publication_kind='composite_response_event'
+            AND response_binding_digest IS NOT NULL
+            AND event_binding_digest IS NOT NULL
+            AND composite_binding_digest IS NOT NULL
+            AND publication_digest=composite_binding_digest)
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER ingest_run_provider_publication_bindings_guarded_insert
+BEFORE INSERT ON ingest_run_provider_publication_bindings
 WHEN NOT EXISTS (
     SELECT 1
     FROM ingest_runs AS run
-    JOIN provider_capture_sets AS capture
-      ON capture.capture_receipt_digest = NEW.capture_receipt_digest
+    WHERE run.run_id=NEW.run_id
+      AND run.state='reserved'
+      AND run.operation='persist'
+      AND run.source_id=NEW.source_id
+      AND (
+          (NEW.publication_kind='response_market_event' AND EXISTS (
+              SELECT 1
+              FROM provider_response_market_event_bindings AS response
+              JOIN provider_raw_observations AS capture
+                ON capture.capture_observation_digest=response.capture_observation_digest
+              JOIN provider_response_market_event_binding_native_lineage AS native
+                ON native.response_event_binding_digest=response.response_event_binding_digest
+              WHERE response.response_event_binding_digest=NEW.response_binding_digest
+                AND NEW.publication_digest=response.response_event_binding_digest
+                AND capture.source_id=NEW.source_id
+                AND native.row_count=response.canonical_event_count
+                AND (SELECT COUNT(*)
+                     FROM provider_response_market_event_binding_rows AS row
+                     WHERE row.response_event_binding_digest=response.response_event_binding_digest)
+                    = response.canonical_event_count
+          ))
+          OR (NEW.publication_kind='event_microbatch' AND EXISTS (
+              SELECT 1
+              FROM provider_event_bindings AS event
+              JOIN provider_event_microbatches AS capture
+                ON capture.event_observation_digest=event.event_observation_digest
+              JOIN provider_event_binding_native_lineage AS native
+                ON native.event_binding_digest=event.event_binding_digest
+              WHERE event.event_binding_digest=NEW.event_binding_digest
+                AND NEW.publication_digest=event.event_binding_digest
+                AND capture.source_id=NEW.source_id
+                AND native.row_count=event.canonical_event_count
+                AND (SELECT COUNT(*) FROM provider_event_binding_rows AS row
+                     WHERE row.event_binding_digest=event.event_binding_digest)
+                    = event.canonical_event_count
+          ))
+          OR (NEW.publication_kind='composite_response_event' AND EXISTS (
+              SELECT 1 FROM provider_composite_response_event_bindings AS composite
+              WHERE composite.composite_binding_digest=NEW.composite_binding_digest
+                AND composite.response_binding_digest=NEW.response_binding_digest
+                AND composite.event_binding_digest=NEW.event_binding_digest
+                AND NEW.publication_digest=composite.composite_binding_digest
+          ))
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ingest-run provider event publication is invalid');
+END;
+
+CREATE TRIGGER ingest_run_provider_capture_bindings_guarded_insert
+BEFORE INSERT ON ingest_run_provider_capture_bindings
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM ingest_runs AS run
+    JOIN provider_capture_bindings AS binding
+      ON binding.binding_digest = NEW.binding_digest
+    JOIN provider_raw_observations AS capture
+      ON capture.capture_observation_digest = binding.capture_observation_digest
+    JOIN provider_capture_binding_native_lineage AS native
+      ON native.binding_digest = binding.binding_digest
     WHERE run.run_id = NEW.run_id
       AND run.state = 'reserved'
       AND run.operation = 'persist'
       AND run.source_id = NEW.source_id
       AND capture.source_id = NEW.source_id
+      AND native.row_count = binding.canonical_record_count
+      AND (SELECT COUNT(*) FROM provider_capture_binding_rows AS row
+           WHERE row.binding_digest = binding.binding_digest)
+          = binding.canonical_record_count
 )
 BEGIN
-    SELECT RAISE(ABORT, 'ingest-run provider capture input is invalid');
+    SELECT RAISE(ABORT, 'ingest-run provider capture binding is invalid');
 END;
 
-CREATE TABLE analytical_generation_capture_inputs (
+CREATE TABLE analytical_generation_provider_capture_bindings (
     generation_sequence INTEGER NOT NULL
         REFERENCES analytical_generations(generation_sequence),
     input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 4095),
-    capture_receipt_digest BLOB NOT NULL
-        REFERENCES provider_capture_sets(capture_receipt_digest),
+    binding_digest BLOB NOT NULL
+        REFERENCES provider_capture_bindings(binding_digest),
     run_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     PRIMARY KEY (generation_sequence, input_ordinal),
-    UNIQUE (generation_sequence, capture_receipt_digest),
-    FOREIGN KEY (run_id, capture_receipt_digest)
-        REFERENCES ingest_run_capture_inputs(run_id, capture_receipt_digest)
+    UNIQUE (generation_sequence, binding_digest),
+    FOREIGN KEY (run_id, binding_digest)
+        REFERENCES ingest_run_provider_capture_bindings(run_id, binding_digest)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TRIGGER analytical_generation_capture_inputs_guarded_insert
-BEFORE INSERT ON analytical_generation_capture_inputs
+CREATE TABLE analytical_generation_provider_publication_bindings (
+    generation_sequence INTEGER NOT NULL
+        REFERENCES analytical_generations(generation_sequence),
+    input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 4095),
+    publication_digest BLOB NOT NULL CHECK (
+        length(publication_digest) = 32 AND publication_digest <> zeroblob(32)
+    ),
+    publication_kind TEXT NOT NULL CHECK (
+        publication_kind IN (
+            'response_market_event',
+            'event_microbatch',
+            'composite_response_event'
+        )
+    ),
+    run_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    PRIMARY KEY (generation_sequence, input_ordinal),
+    UNIQUE (generation_sequence, publication_digest),
+    FOREIGN KEY (run_id, publication_digest)
+        REFERENCES ingest_run_provider_publication_bindings(run_id, publication_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER analytical_generation_provider_publication_bindings_guarded_insert
+BEFORE INSERT ON analytical_generation_provider_publication_bindings
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM analytical_generations AS generation
+    JOIN analytical_generation_source_inputs AS source_input
+      ON source_input.generation_sequence=generation.generation_sequence
+    JOIN ingest_run_provider_publication_bindings AS publication
+      ON publication.run_id=source_input.run_id
+    WHERE generation.generation_sequence=NEW.generation_sequence
+      AND generation.generation_kind='ingest'
+      AND publication.publication_digest=NEW.publication_digest
+      AND publication.publication_kind=NEW.publication_kind
+      AND publication.run_id=NEW.run_id
+      AND publication.source_id=NEW.source_id
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM analytical_generations AS child
+    JOIN analytical_generation_parents AS edge
+      ON edge.child_dataset_id=child.dataset_id
+     AND edge.child_manifest_version=child.manifest_version
+    JOIN analytical_generations AS parent
+      ON parent.generation_sequence=edge.parent_generation_sequence
+    JOIN analytical_generation_provider_publication_bindings AS parent_input
+      ON parent_input.generation_sequence=parent.generation_sequence
+    WHERE child.generation_sequence=NEW.generation_sequence
+      AND parent_input.publication_digest=NEW.publication_digest
+      AND parent_input.publication_kind=NEW.publication_kind
+      AND parent_input.run_id=NEW.run_id
+      AND parent_input.source_id=NEW.source_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'analytical generation provider event publication is invalid');
+END;
+
+CREATE TRIGGER analytical_generation_provider_capture_bindings_guarded_insert
+BEFORE INSERT ON analytical_generation_provider_capture_bindings
 WHEN NOT EXISTS (
     SELECT 1
     FROM analytical_generations AS generation
     JOIN analytical_generation_source_inputs AS source_input
       ON source_input.generation_sequence = generation.generation_sequence
-    JOIN ingest_run_capture_inputs AS capture_input
+    JOIN ingest_run_provider_capture_bindings AS capture_input
       ON capture_input.run_id = source_input.run_id
     WHERE generation.generation_sequence = NEW.generation_sequence
       AND generation.generation_kind = 'ingest'
-      AND capture_input.capture_receipt_digest = NEW.capture_receipt_digest
+      AND capture_input.binding_digest = NEW.binding_digest
       AND capture_input.run_id = NEW.run_id
       AND capture_input.source_id = NEW.source_id
 )
@@ -607,65 +1405,245 @@ AND NOT EXISTS (
      AND edge.child_manifest_version = child.manifest_version
     JOIN analytical_generations AS parent
       ON parent.generation_sequence = edge.parent_generation_sequence
-    JOIN analytical_generation_capture_inputs AS parent_input
+    JOIN analytical_generation_provider_capture_bindings AS parent_input
       ON parent_input.generation_sequence = parent.generation_sequence
     WHERE child.generation_sequence = NEW.generation_sequence
-      AND parent_input.capture_receipt_digest = NEW.capture_receipt_digest
+      AND parent_input.binding_digest = NEW.binding_digest
       AND parent_input.run_id = NEW.run_id
       AND parent_input.source_id = NEW.source_id
 )
 BEGIN
-    SELECT RAISE(ABORT, 'analytical generation provider capture input is invalid');
+    SELECT RAISE(ABORT, 'analytical generation provider capture binding is invalid');
 END;
 
-CREATE TRIGGER provider_capture_sets_immutable_update
-BEFORE UPDATE ON provider_capture_sets BEGIN
-    SELECT RAISE(ABORT, 'provider capture sets are immutable');
+CREATE TRIGGER provider_raw_observations_immutable_update
+BEFORE UPDATE ON provider_raw_observations BEGIN
+    SELECT RAISE(ABORT, 'provider raw observations are immutable');
 END;
 
-CREATE TRIGGER provider_capture_sets_immutable_delete
-BEFORE DELETE ON provider_capture_sets BEGIN
-    SELECT RAISE(ABORT, 'provider capture sets are immutable');
+CREATE TRIGGER provider_raw_observations_immutable_delete
+BEFORE DELETE ON provider_raw_observations BEGIN
+    SELECT RAISE(ABORT, 'provider raw observations are immutable');
 END;
 
-CREATE TRIGGER provider_capture_pages_immutable_update
-BEFORE UPDATE ON provider_capture_pages BEGIN
-    SELECT RAISE(ABORT, 'provider capture pages are immutable');
+CREATE TRIGGER provider_raw_observation_pages_immutable_update
+BEFORE UPDATE ON provider_raw_observation_pages BEGIN
+    SELECT RAISE(ABORT, 'provider raw-observation pages are immutable');
 END;
 
-CREATE TRIGGER provider_capture_pages_immutable_delete
-BEFORE DELETE ON provider_capture_pages BEGIN
-    SELECT RAISE(ABORT, 'provider capture pages are immutable');
+CREATE TRIGGER provider_raw_observation_pages_immutable_delete
+BEFORE DELETE ON provider_raw_observation_pages BEGIN
+    SELECT RAISE(ABORT, 'provider raw-observation pages are immutable');
 END;
 
-CREATE TRIGGER provider_capture_frames_immutable_update
-BEFORE UPDATE ON provider_capture_frames BEGIN
-    SELECT RAISE(ABORT, 'provider capture frames are immutable');
+CREATE TRIGGER provider_raw_observation_frames_immutable_update
+BEFORE UPDATE ON provider_raw_observation_frames BEGIN
+    SELECT RAISE(ABORT, 'provider raw-observation frames are immutable');
 END;
 
-CREATE TRIGGER provider_capture_frames_immutable_delete
-BEFORE DELETE ON provider_capture_frames BEGIN
-    SELECT RAISE(ABORT, 'provider capture frames are immutable');
+CREATE TRIGGER provider_raw_observation_frames_immutable_delete
+BEFORE DELETE ON provider_raw_observation_frames BEGIN
+    SELECT RAISE(ABORT, 'provider raw-observation frames are immutable');
 END;
 
-CREATE TRIGGER ingest_run_capture_inputs_immutable_update
-BEFORE UPDATE ON ingest_run_capture_inputs BEGIN
-    SELECT RAISE(ABORT, 'ingest-run provider capture inputs are immutable');
+CREATE TRIGGER sealed_raw_objects_immutable_update
+BEFORE UPDATE ON sealed_raw_objects BEGIN
+    SELECT RAISE(ABORT, 'sealed raw objects are immutable');
 END;
 
-CREATE TRIGGER ingest_run_capture_inputs_immutable_delete
-BEFORE DELETE ON ingest_run_capture_inputs BEGIN
-    SELECT RAISE(ABORT, 'ingest-run provider capture inputs are immutable');
+CREATE TRIGGER sealed_raw_objects_immutable_delete
+BEFORE DELETE ON sealed_raw_objects BEGIN
+    SELECT RAISE(ABORT, 'sealed raw objects are immutable');
 END;
 
-CREATE TRIGGER analytical_generation_capture_inputs_immutable_update
-BEFORE UPDATE ON analytical_generation_capture_inputs BEGIN
-    SELECT RAISE(ABORT, 'analytical generation provider capture inputs are immutable');
+CREATE TRIGGER provider_raw_observation_objects_immutable_update
+BEFORE UPDATE ON provider_raw_observation_objects BEGIN
+    SELECT RAISE(ABORT, 'provider raw-observation objects are immutable');
 END;
 
-CREATE TRIGGER analytical_generation_capture_inputs_immutable_delete
-BEFORE DELETE ON analytical_generation_capture_inputs BEGIN
-    SELECT RAISE(ABORT, 'analytical generation provider capture inputs are immutable');
+CREATE TRIGGER provider_raw_observation_objects_immutable_delete
+BEFORE DELETE ON provider_raw_observation_objects BEGIN
+    SELECT RAISE(ABORT, 'provider raw-observation objects are immutable');
+END;
+
+CREATE TRIGGER provider_capture_bindings_immutable_update
+BEFORE UPDATE ON provider_capture_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider capture bindings are immutable');
+END;
+
+CREATE TRIGGER provider_capture_bindings_immutable_delete
+BEFORE DELETE ON provider_capture_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider capture bindings are immutable');
+END;
+
+CREATE TRIGGER provider_capture_binding_native_lineage_immutable_update
+BEFORE UPDATE ON provider_capture_binding_native_lineage BEGIN
+    SELECT RAISE(ABORT, 'provider capture native lineage is immutable');
+END;
+
+CREATE TRIGGER provider_capture_binding_native_lineage_immutable_delete
+BEFORE DELETE ON provider_capture_binding_native_lineage BEGIN
+    SELECT RAISE(ABORT, 'provider capture native lineage is immutable');
+END;
+
+CREATE TRIGGER provider_capture_binding_objects_immutable_update
+BEFORE UPDATE ON provider_capture_binding_objects BEGIN
+    SELECT RAISE(ABORT, 'provider capture binding objects are immutable');
+END;
+
+CREATE TRIGGER provider_capture_binding_objects_immutable_delete
+BEFORE DELETE ON provider_capture_binding_objects BEGIN
+    SELECT RAISE(ABORT, 'provider capture binding objects are immutable');
+END;
+
+CREATE TRIGGER provider_capture_binding_rows_immutable_update
+BEFORE UPDATE ON provider_capture_binding_rows BEGIN
+    SELECT RAISE(ABORT, 'provider capture binding rows are immutable');
+END;
+
+CREATE TRIGGER provider_capture_binding_rows_immutable_delete
+BEFORE DELETE ON provider_capture_binding_rows BEGIN
+    SELECT RAISE(ABORT, 'provider capture binding rows are immutable');
+END;
+
+CREATE TRIGGER provider_event_microbatches_immutable_update
+BEFORE UPDATE ON provider_event_microbatches BEGIN
+    SELECT RAISE(ABORT, 'provider event microbatches are immutable');
+END;
+
+CREATE TRIGGER provider_response_market_event_bindings_immutable_update
+BEFORE UPDATE ON provider_response_market_event_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider response-market-event bindings are immutable');
+END;
+
+CREATE TRIGGER provider_response_market_event_bindings_immutable_delete
+BEFORE DELETE ON provider_response_market_event_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider response-market-event bindings are immutable');
+END;
+
+CREATE TRIGGER provider_response_market_event_binding_native_lineage_immutable_update
+BEFORE UPDATE ON provider_response_market_event_binding_native_lineage BEGIN
+    SELECT RAISE(ABORT, 'provider response-market-event native lineage is immutable');
+END;
+
+CREATE TRIGGER provider_response_market_event_binding_native_lineage_immutable_delete
+BEFORE DELETE ON provider_response_market_event_binding_native_lineage BEGIN
+    SELECT RAISE(ABORT, 'provider response-market-event native lineage is immutable');
+END;
+
+CREATE TRIGGER provider_response_market_event_binding_rows_immutable_update
+BEFORE UPDATE ON provider_response_market_event_binding_rows BEGIN
+    SELECT RAISE(ABORT, 'provider response-market-event rows are immutable');
+END;
+
+CREATE TRIGGER provider_response_market_event_binding_rows_immutable_delete
+BEFORE DELETE ON provider_response_market_event_binding_rows BEGIN
+    SELECT RAISE(ABORT, 'provider response-market-event rows are immutable');
+END;
+
+CREATE TRIGGER provider_event_microbatches_immutable_delete
+BEFORE DELETE ON provider_event_microbatches BEGIN
+    SELECT RAISE(ABORT, 'provider event microbatches are immutable');
+END;
+
+CREATE TRIGGER provider_event_microbatch_frames_immutable_update
+BEFORE UPDATE ON provider_event_microbatch_frames BEGIN
+    SELECT RAISE(ABORT, 'provider event microbatch frames are immutable');
+END;
+
+CREATE TRIGGER provider_event_microbatch_frames_immutable_delete
+BEFORE DELETE ON provider_event_microbatch_frames BEGIN
+    SELECT RAISE(ABORT, 'provider event microbatch frames are immutable');
+END;
+
+CREATE TRIGGER provider_event_microbatch_objects_immutable_update
+BEFORE UPDATE ON provider_event_microbatch_objects BEGIN
+    SELECT RAISE(ABORT, 'provider event microbatch objects are immutable');
+END;
+
+CREATE TRIGGER provider_event_microbatch_objects_immutable_delete
+BEFORE DELETE ON provider_event_microbatch_objects BEGIN
+    SELECT RAISE(ABORT, 'provider event microbatch objects are immutable');
+END;
+
+CREATE TRIGGER provider_event_bindings_immutable_update
+BEFORE UPDATE ON provider_event_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider event bindings are immutable');
+END;
+
+CREATE TRIGGER provider_event_bindings_immutable_delete
+BEFORE DELETE ON provider_event_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider event bindings are immutable');
+END;
+
+CREATE TRIGGER provider_event_binding_native_lineage_immutable_update
+BEFORE UPDATE ON provider_event_binding_native_lineage BEGIN
+    SELECT RAISE(ABORT, 'provider event native lineage is immutable');
+END;
+
+CREATE TRIGGER provider_event_binding_native_lineage_immutable_delete
+BEFORE DELETE ON provider_event_binding_native_lineage BEGIN
+    SELECT RAISE(ABORT, 'provider event native lineage is immutable');
+END;
+
+CREATE TRIGGER provider_event_binding_rows_immutable_update
+BEFORE UPDATE ON provider_event_binding_rows BEGIN
+    SELECT RAISE(ABORT, 'provider event binding rows are immutable');
+END;
+
+CREATE TRIGGER provider_event_binding_rows_immutable_delete
+BEFORE DELETE ON provider_event_binding_rows BEGIN
+    SELECT RAISE(ABORT, 'provider event binding rows are immutable');
+END;
+
+CREATE TRIGGER provider_composite_response_event_bindings_immutable_update
+BEFORE UPDATE ON provider_composite_response_event_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider composite response-event bindings are immutable');
+END;
+
+CREATE TRIGGER provider_composite_response_event_bindings_immutable_delete
+BEFORE DELETE ON provider_composite_response_event_bindings BEGIN
+    SELECT RAISE(ABORT, 'provider composite response-event bindings are immutable');
+END;
+
+CREATE TRIGGER ingest_run_provider_capture_bindings_immutable_update
+BEFORE UPDATE ON ingest_run_provider_capture_bindings BEGIN
+    SELECT RAISE(ABORT, 'ingest-run provider capture bindings are immutable');
+END;
+
+CREATE TRIGGER ingest_run_provider_capture_bindings_immutable_delete
+BEFORE DELETE ON ingest_run_provider_capture_bindings BEGIN
+    SELECT RAISE(ABORT, 'ingest-run provider capture bindings are immutable');
+END;
+
+CREATE TRIGGER ingest_run_provider_publication_bindings_immutable_update
+BEFORE UPDATE ON ingest_run_provider_publication_bindings BEGIN
+    SELECT RAISE(ABORT, 'ingest-run provider event publications are immutable');
+END;
+
+CREATE TRIGGER ingest_run_provider_publication_bindings_immutable_delete
+BEFORE DELETE ON ingest_run_provider_publication_bindings BEGIN
+    SELECT RAISE(ABORT, 'ingest-run provider event publications are immutable');
+END;
+
+CREATE TRIGGER analytical_generation_provider_capture_bindings_immutable_update
+BEFORE UPDATE ON analytical_generation_provider_capture_bindings BEGIN
+    SELECT RAISE(ABORT, 'analytical generation provider capture bindings are immutable');
+END;
+
+CREATE TRIGGER analytical_generation_provider_capture_bindings_immutable_delete
+BEFORE DELETE ON analytical_generation_provider_capture_bindings BEGIN
+    SELECT RAISE(ABORT, 'analytical generation provider capture bindings are immutable');
+END;
+
+CREATE TRIGGER analytical_generation_provider_publication_bindings_immutable_update
+BEFORE UPDATE ON analytical_generation_provider_publication_bindings BEGIN
+    SELECT RAISE(ABORT, 'analytical generation provider event publications are immutable');
+END;
+
+CREATE TRIGGER analytical_generation_provider_publication_bindings_immutable_delete
+BEFORE DELETE ON analytical_generation_provider_publication_bindings BEGIN
+    SELECT RAISE(ABORT, 'analytical generation provider event publications are immutable');
 END;
 
 CREATE TABLE market_bar_history_publications (
@@ -684,8 +1662,12 @@ CREATE TABLE market_bar_history_publications (
         origin_object_ordinal BETWEEN 0 AND 1023
     ),
     source_id TEXT NOT NULL REFERENCES sources(source_id),
-    capture_receipt_digest BLOB NOT NULL UNIQUE
-        REFERENCES provider_capture_sets(capture_receipt_digest),
+    binding_digest BLOB NOT NULL UNIQUE
+        REFERENCES provider_capture_bindings(binding_digest),
+    capture_receipt_digest BLOB NOT NULL UNIQUE CHECK (
+        length(capture_receipt_digest) = 32
+        AND capture_receipt_digest <> zeroblob(32)
+    ),
     capture_content_digest BLOB NOT NULL CHECK (
         length(capture_content_digest) = 32
         AND capture_content_digest <> zeroblob(32)
@@ -808,10 +1790,10 @@ CREATE TABLE market_bar_history_publications (
         length(CAST(receipt_json AS BLOB)) BETWEEN 2 AND 4194304
         AND json_valid(receipt_json)
     ),
-    UNIQUE (origin_generation_sequence, capture_receipt_digest),
-    FOREIGN KEY (origin_generation_sequence, capture_receipt_digest)
-        REFERENCES analytical_generation_capture_inputs(
-            generation_sequence, capture_receipt_digest
+    UNIQUE (origin_generation_sequence, binding_digest),
+    FOREIGN KEY (origin_generation_sequence, binding_digest)
+        REFERENCES analytical_generation_provider_capture_bindings(
+            generation_sequence, binding_digest
         )
 ) STRICT, WITHOUT ROWID;
 
@@ -854,11 +1836,13 @@ WHEN NOT EXISTS (
       ON object.dataset_id = generation.dataset_id
      AND object.manifest_version = generation.manifest_version
      AND object.ordinal = NEW.origin_object_ordinal
-    JOIN analytical_generation_capture_inputs AS capture_input
+    JOIN analytical_generation_provider_capture_bindings AS capture_input
       ON capture_input.generation_sequence = generation.generation_sequence
      AND capture_input.run_id = run.run_id
-    JOIN provider_capture_sets AS capture
-      ON capture.capture_receipt_digest = capture_input.capture_receipt_digest
+    JOIN provider_capture_bindings AS binding
+      ON binding.binding_digest = capture_input.binding_digest
+    JOIN provider_raw_observations AS capture
+      ON capture.capture_observation_digest = binding.capture_observation_digest
     JOIN market_data_instrument_revisions AS instrument_revision
       ON instrument_revision.revision_digest = NEW.instrument_revision_digest
      AND instrument_revision.instrument_id = NEW.instrument_id
@@ -872,7 +1856,7 @@ WHEN NOT EXISTS (
       AND artifact.artifact_id = NEW.origin_artifact_id
       AND object.artifact_id = NEW.origin_artifact_id
       AND object.row_count = NEW.returned_bar_count
-      AND capture_input.capture_receipt_digest = NEW.capture_receipt_digest
+      AND capture_input.binding_digest = NEW.binding_digest
       AND capture_input.source_id = NEW.source_id
       AND capture.source_id = NEW.source_id
       AND capture.provider_dataset = NEW.provider_dataset
@@ -898,9 +1882,9 @@ BEFORE INSERT ON analytical_generation_market_bar_history_inputs
 WHEN NOT EXISTS (
     SELECT 1
     FROM market_bar_history_publications AS publication
-    JOIN analytical_generation_capture_inputs AS capture_input
+    JOIN analytical_generation_provider_capture_bindings AS capture_input
       ON capture_input.generation_sequence = NEW.generation_sequence
-     AND capture_input.capture_receipt_digest = publication.capture_receipt_digest
+     AND capture_input.binding_digest = publication.binding_digest
     WHERE publication.publication_receipt_digest = NEW.publication_receipt_digest
       AND publication.origin_generation_sequence = NEW.generation_sequence
 )
@@ -914,9 +1898,9 @@ AND NOT EXISTS (
       ON parent_input.generation_sequence = edge.parent_generation_sequence
     JOIN market_bar_history_publications AS publication
       ON publication.publication_receipt_digest = parent_input.publication_receipt_digest
-    JOIN analytical_generation_capture_inputs AS capture_input
+    JOIN analytical_generation_provider_capture_bindings AS capture_input
       ON capture_input.generation_sequence = NEW.generation_sequence
-     AND capture_input.capture_receipt_digest = publication.capture_receipt_digest
+     AND capture_input.binding_digest = publication.binding_digest
     WHERE child.generation_sequence = NEW.generation_sequence
       AND child.generation_kind IN ('ingest', 'compaction')
       AND parent_input.publication_receipt_digest = NEW.publication_receipt_digest

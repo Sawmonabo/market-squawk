@@ -719,7 +719,7 @@ pub(super) fn now_timestamp() -> Result<Timestamp, CatalogError> {
 }
 
 /// Advances the durable authority clock only after ruling out local wall-clock rollback.
-pub(super) fn trusted_catalog_now(
+pub(crate) fn trusted_catalog_now(
     transaction: &Transaction<'_>,
 ) -> Result<Timestamp, CatalogError> {
     let wall_now = now_timestamp()?;

@@ -427,6 +427,37 @@ pub(super) fn persist_company_identity(
     Ok(())
 }
 
+pub(super) fn validate_provider_company_identity_replay(
+    transaction: &Transaction<'_>,
+    reservation: &IngestReservation,
+    observation: Option<&CompanyIdentityObservation>,
+) -> Result<(), CatalogError> {
+    let existing: Option<(String, Vec<u8>)> = transaction
+        .query_row(
+            "SELECT record_json, record_digest FROM company_identity_observations
+             WHERE run_id=?1",
+            [reservation.run_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match (existing, observation) {
+        (None, None) => Ok(()),
+        (Some((json, digest)), Some(observation)) => {
+            let retained: CompanyIdentityObservation =
+                serde_json::from_str(&json).map_err(|_| CatalogError::CorruptCatalog)?;
+            if digest.as_slice() != sha256(json.as_bytes()) {
+                return Err(CatalogError::CorruptCatalog);
+            }
+            if retained == *observation {
+                Ok(())
+            } else {
+                Err(CatalogError::EvidenceConflict)
+            }
+        }
+        (None, Some(_)) | (Some(_), None) => Err(CatalogError::EvidenceConflict),
+    }
+}
+
 struct CompanySearchTerm {
     kind: CompanyIdentityMatchKind,
     display: String,

@@ -4,21 +4,23 @@ use std::fmt;
 use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     CompanyIdentityObservation, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{
     ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
-    SealedResearchRawClaim, SealedResearchRecoveryAdmission,
+    SealedResearchJournalStoreError, SealedResearchRawClaim, SealedResearchRecoveryAdmission,
 };
 use market_squawk_sources::{
     ExtractionBatch, ExtractionContentIdentity, ExtractionError, ExtractionRevisionPlan,
     ObservedRevisionAuthority, ObservedRevisionError, ProviderCaptureError,
-    SealedProviderCaptureSetReceipt, SourceClass, SourceMetadata, SourceObjectCaptureIdentity,
+    SealedProviderCaptureBinding, SealedProviderPublicationBinding, SourceClass, SourceMetadata,
+    SourceObjectCaptureIdentity,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -26,12 +28,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::analytical_backup::AnalyticalOperationGate;
 use crate::authority_transition::{AuthorityTransitionError, AuthorityTransitionService};
-use crate::blocking_supervisor::BlockingIoSupervisor;
+use crate::blocking_supervisor::{BlockingIoAdmissionError, BlockingIoSupervisor};
 use crate::catalog::CatalogObservedRevisionAuthority;
 #[cfg(test)]
 use crate::catalog::QueryArtifactBindCheckpoint;
 use crate::catalog::QueryArtifactPublisher;
-use crate::catalog::provider_capture_matches_batch;
+use crate::catalog::{
+    MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES, MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
+    PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET,
+};
+use crate::catalog::{
+    PreparedProviderCaptureBinding, PreparedProviderPublicationBinding, PublicationSourceEvidence,
+};
 use crate::manifest::MarketBarHistoryPublicationCandidate;
 use crate::parquet_store::MAX_SCAN_OBJECTS;
 use crate::parquet_store::{ArtifactRootIdentity, QueryArtifactWriterAdmission};
@@ -43,14 +51,15 @@ use crate::{
     IngestRunState, ListingReferenceError, ListingReferencePublicationCapability,
     ListingReferenceReadCapability, ManifestCatalogError, ManifestObject, ManifestPlan,
     ManifestPlanError, ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore,
-    ParquetStoreError, PinnedDataset, PinnedQueryOutput, PublishedObject, QueryArtifactReservation,
-    QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, ResearchArrowBatch,
-    ResearchQueryEngine, RightsDecisionInput, Sha256Digest, SourceOperation,
+    ParquetStoreError, PinnedDataset, PinnedQueryOutput, ProviderMarketEventArrowBatch,
+    PublishedObject, QueryArtifactReservation, QueryArtifactReservationInput, QueryError,
+    QueryLimits, QueryRequest, ResearchArrowBatch, ResearchQueryEngine, RightsDecisionInput,
+    Sha256Digest, SourceOperation,
 };
 
 const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 const REVISION_ASSIGNMENT_DEADLINE: Duration = Duration::from_secs(30);
-const PROVIDER_CAPTURE_RECOVERY_TOTAL_ENTRY_LIMIT: usize = 100_000;
+const MAX_EVENT_PUBLICATION_READ_BYTES: usize = 128 * 1024 * 1024;
 
 struct ProviderCaptureRecoveryControl<'a> {
     cancellation: &'a CancellationToken,
@@ -62,10 +71,9 @@ impl ResearchObjectControl for ProviderCaptureRecoveryControl<'_> {
         _point: ResearchObjectControlPoint,
     ) -> Result<(), ResearchObjectControlError> {
         if self.cancellation.is_cancelled() {
-            Err(ResearchObjectControlError::Cancelled)
-        } else {
-            Ok(())
+            return Err(ResearchObjectControlError::Cancelled);
         }
+        Ok(())
     }
 }
 
@@ -75,22 +83,96 @@ pub struct CommittedDataset {
     pinned: PinnedDataset,
 }
 
-/// Non-forgeable, secret-free binding of one verified sealed provider capture to one ingest run.
-#[derive(Clone, Debug)]
-pub struct ProviderCaptureInput {
-    run_id: uuid::Uuid,
-    receipt: SealedProviderCaptureSetReceipt,
+/// Closed durable kind of one generation-bound provider market-event publication.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ProviderMarketEventPublicationKind {
+    /// Canonical market events decoded from one sealed response capture.
+    ResponseMarketEvent,
+    /// Canonical market events decoded from one sealed live-event microbatch.
+    EventMicrobatch,
+    /// One sealed response snapshot followed by one sealed live-event microbatch.
+    CompositeResponseEvent,
 }
 
-impl ProviderCaptureInput {
-    /// Returns the exact ingest run that owns this provider capture.
-    pub const fn run_id(&self) -> uuid::Uuid {
-        self.run_id
+impl ProviderMarketEventPublicationKind {
+    /// Returns the exact durable catalog and Arrow-metadata tag.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResponseMarketEvent => "response_market_event",
+            Self::EventMicrobatch => "event_microbatch",
+            Self::CompositeResponseEvent => "composite_response_event",
+        }
     }
 
-    /// Returns the complete verified provider and sealed-segment receipt.
-    pub const fn receipt(&self) -> &SealedProviderCaptureSetReceipt {
-        &self.receipt
+    fn from_catalog(value: &str) -> Result<Self, IngestError> {
+        match value {
+            "response_market_event" => Ok(Self::ResponseMarketEvent),
+            "event_microbatch" => Ok(Self::EventMicrobatch),
+            "composite_response_event" => Ok(Self::CompositeResponseEvent),
+            _ => Err(IngestError::ProviderCaptureRequired),
+        }
+    }
+}
+
+/// Exact generation-owned selector required to reopen one provider market-event publication.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProviderMarketEventPublicationSelector {
+    publication_digest: EvidenceDigest,
+    publication_kind: ProviderMarketEventPublicationKind,
+}
+
+impl ProviderMarketEventPublicationSelector {
+    /// Returns the exact kind-qualified publication digest.
+    pub const fn publication_digest(self) -> EvidenceDigest {
+        self.publication_digest
+    }
+
+    /// Returns the closed durable publication kind.
+    pub const fn publication_kind(self) -> ProviderMarketEventPublicationKind {
+        self.publication_kind
+    }
+}
+
+/// Exclusive provider publication request consumed by one atomic ingest transition.
+#[derive(Debug)]
+pub struct ProviderPublicationInput {
+    sealed_capture: SealedProviderCaptureBinding,
+    revisions: ExtractionRevisionPlan,
+    company_identity: Option<CompanyIdentityObservation>,
+    precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
+}
+
+impl ProviderPublicationInput {
+    /// Binds an exact revision plan to the sole non-cloneable sealed publication authority.
+    pub fn try_new(
+        sealed_capture: SealedProviderCaptureBinding,
+        revisions: ExtractionRevisionPlan,
+    ) -> Result<Self, IngestError> {
+        sealed_capture.validate()?;
+        if revisions.len() != sealed_capture.record_count() {
+            return Err(IngestError::RevisionEvidenceMismatch);
+        }
+        Ok(Self {
+            sealed_capture,
+            revisions,
+            company_identity: None,
+            precommit_authority: None,
+        })
+    }
+
+    /// Attaches source-authored company identity to the same provider publication transition.
+    pub fn with_company_identity(mut self, identity: CompanyIdentityObservation) -> Self {
+        self.company_identity = Some(identity);
+        self
+    }
+
+    /// Retains process-local caller authority through the final controlled commit.
+    pub fn with_precommit_authority(
+        mut self,
+        authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Self {
+        self.precommit_authority = Some(authority);
+        self
     }
 }
 
@@ -165,6 +247,35 @@ pub fn extraction_provider_payload_digest(batch: &ExtractionBatch) -> EvidenceDi
     batch.request().object().evidence().content_digest()
 }
 
+/// Returns the exact digest a persist reservation must carry for a typed event publication.
+pub fn provider_market_event_publication_digest(
+    binding: &SealedProviderPublicationBinding,
+) -> Result<EvidenceDigest, IngestError> {
+    if matches!(binding, SealedProviderPublicationBinding::ResponseSet(_)) {
+        return Err(IngestError::ProviderCaptureRequired);
+    }
+    Ok(binding.evidence_digest().evidence())
+}
+
+fn provider_market_event_source_id(
+    binding: &SealedProviderPublicationBinding,
+) -> Result<&market_squawk_domain::SourceId, IngestError> {
+    match binding {
+        SealedProviderPublicationBinding::ResponseSet(_) => {
+            Err(IngestError::ProviderCaptureRequired)
+        }
+        SealedProviderPublicationBinding::ResponseMarketEvent(response) => {
+            Ok(response.capture_evidence().source_id())
+        }
+        SealedProviderPublicationBinding::EventMicrobatch(event) => {
+            Ok(event.capture_evidence().source_id())
+        }
+        SealedProviderPublicationBinding::CompositeResponseEvent(composite) => {
+            Ok(composite.response().capture_evidence().source_id())
+        }
+    }
+}
+
 /// Process-local authority that must remain live through the durable ingest commit boundary.
 pub trait IngestPrecommitAuthority: fmt::Debug + Send + Sync {
     /// Revalidates the exact caller authority immediately before catalog and manifest commit.
@@ -186,7 +297,9 @@ pub trait ResearchIngestService {
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError>;
 
-    /// Assigns durable revisions from explicit source-specific evidence before publication.
+    /// Assigns durable revisions for a local/imported batch before publication.
+    ///
+    /// Provider captures must use [`AnalyticalDataService::ingest_provider_publication`].
     async fn ingest_with_revision_plan(
         &self,
         reservation: IngestReservation,
@@ -926,12 +1039,12 @@ impl AnalyticalDataService {
         crate::InstrumentDefinitionReadCapability::new(Arc::clone(&self.authority))
     }
 
-    /// Returns bounded current reads over FIGI-backed, non-execution market-data definitions.
+    /// Returns bounded current reads over repository-owned, non-execution market-data definitions.
     pub fn market_data_instruments(&self) -> crate::MarketDataInstrumentReadCapability {
         crate::MarketDataInstrumentReadCapability::new(Arc::clone(&self.authority))
     }
 
-    /// Returns the sole atomic publication authority for FIGI-backed market-data definitions.
+    /// Returns the sole atomic publication authority for receipt-bound market-data definitions.
     pub fn market_data_instrument_synchronization(
         &self,
     ) -> crate::MarketDataInstrumentSynchronizationCapability {
@@ -1025,86 +1138,6 @@ impl AnalyticalDataService {
             .map_err(Into::into)
     }
 
-    /// Durably binds one already sealed provider capture to its exact reserved ingest run.
-    ///
-    /// The raw provider bytes remain solely in the sealed `MSJ1` store. The catalog retains only
-    /// bounded immutable receipts, the non-authoritative reopen claim, and normalized page/frame
-    /// facts. A repeated exact admission is idempotent; another run or source is rejected.
-    pub fn retain_provider_capture_input(
-        &self,
-        reservation: &IngestReservation,
-        batch: &ExtractionBatch,
-        receipt: SealedProviderCaptureSetReceipt,
-    ) -> Result<ProviderCaptureInput, IngestError> {
-        if !matches!(
-            batch.request().object().capture_identity(),
-            SourceObjectCaptureIdentity::Paged { .. }
-        ) || !provider_capture_matches_batch(&receipt, batch)
-        {
-            return Err(IngestError::ProviderCaptureRequired);
-        }
-        let payload_digest = extraction_provider_payload_digest(batch);
-        let source_id = batch.request().object().source_id();
-        let authority = self.lock_authority()?;
-        self.validate_run(&authority, reservation, payload_digest, Some(source_id))?;
-        authority.retain_provider_capture(reservation, batch, &receipt)?;
-        Ok(ProviderCaptureInput {
-            run_id: reservation.run_id(),
-            receipt,
-        })
-    }
-
-    /// Reacquires provider-capture authority after restart by fully verifying the stored claim.
-    ///
-    /// A persisted claim is never upgraded on catalog evidence alone. The sealed store reopens,
-    /// hashes, and validates the exact `MSJ1` object before the provider receipt is rebound.
-    pub fn recover_provider_capture_input(
-        &self,
-        reservation: &IngestReservation,
-        batch: &ExtractionBatch,
-        store: &market_squawk_platform::SealedResearchJournalStore,
-    ) -> Result<ProviderCaptureInput, IngestError> {
-        self.recover_provider_capture_input_if_present(reservation, batch, store)?
-            .ok_or(IngestError::ProviderCaptureRequired)
-    }
-
-    /// Reacquires a retained provider capture when this exact run already owns one.
-    ///
-    /// `Ok(None)` means the validated reserved run has no retained capture yet. Corrupt,
-    /// mismatched, or unverifiable retained state remains an error, so callers may safely seal
-    /// and retain fresh material only for the genuinely absent case.
-    pub fn recover_provider_capture_input_if_present(
-        &self,
-        reservation: &IngestReservation,
-        batch: &ExtractionBatch,
-        store: &market_squawk_platform::SealedResearchJournalStore,
-    ) -> Result<Option<ProviderCaptureInput>, IngestError> {
-        let payload_digest = extraction_provider_payload_digest(batch);
-        let source_id = batch.request().object().source_id();
-        let persisted = {
-            let authority = self.lock_authority()?;
-            self.validate_run(&authority, reservation, payload_digest, Some(source_id))?;
-            authority.provider_capture_for_run(reservation.run_id())?
-        };
-        let Some(persisted) = persisted else {
-            return Ok(None);
-        };
-        let verified = store.open_verified_claim(persisted.claim())?;
-        let receipt = SealedProviderCaptureSetReceipt::try_bind(
-            persisted.capture().clone(),
-            verified.receipt().clone(),
-        )?;
-        if receipt.receipt_digest() != persisted.receipt_digest()
-            || !provider_capture_matches_batch(&receipt, batch)
-        {
-            return Err(IngestError::ProviderCaptureRequired);
-        }
-        Ok(Some(ProviderCaptureInput {
-            run_id: reservation.run_id(),
-            receipt,
-        }))
-    }
-
     /// Reconciles the sealed-response store against the complete immutable catalog receipt set.
     ///
     /// This is the startup boundary for quarantining incomplete stages and unreferenced final
@@ -1112,7 +1145,7 @@ impl AnalyticalDataService {
     /// then the sealed store verifies every retained object before moving anything.
     pub async fn recover_provider_capture_store(
         &self,
-        store: &market_squawk_platform::SealedResearchJournalStore,
+        store: Arc<market_squawk_platform::SealedResearchJournalStore>,
         cancellation: &CancellationToken,
     ) -> Result<market_squawk_platform::SealedResearchJournalRecoveryReport, IngestError> {
         let _operation = self
@@ -1123,26 +1156,164 @@ impl AnalyticalDataService {
         if cancellation.is_cancelled() {
             return Err(IngestError::Cancelled);
         }
-        let authority = self.lock_authority()?;
-        let claims = authority.authoritative_provider_capture_claims()?;
-        drop(authority);
-        if cancellation.is_cancelled() {
-            return Err(IngestError::Cancelled);
+        let supervisor = BlockingIoSupervisor::new(cancellation.clone());
+        let authority = Arc::clone(&self.authority);
+        let worker_cancellation = cancellation.clone();
+        let worker = supervisor
+            .spawn_blocking(move || {
+                recover_provider_capture_store_blocking(authority, store, &worker_cancellation)
+            })
+            .map_err(map_provider_recovery_admission_error)?;
+        worker
+            .await
+            .map_err(|_| IngestError::ProviderCaptureRecoveryWorkerUnavailable)?
+    }
+
+    /// Lists every bounded provider-binding digest retained by one exact generation.
+    pub fn provider_capture_binding_digests(
+        &self,
+        manifest: &DatasetManifestRef,
+    ) -> Result<Vec<EvidenceDigest>, IngestError> {
+        self.manifests
+            .provider_capture_binding_digests(manifest)
+            .map_err(IngestError::Manifest)
+    }
+
+    /// Reopens and verifies one explicitly selected historical provider binding.
+    pub fn provider_capture_binding_evidence(
+        &self,
+        manifest: &DatasetManifestRef,
+        binding_digest: EvidenceDigest,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+    ) -> Result<crate::PersistedProviderCaptureBindingEvidence, IngestError> {
+        let binding_digests = self.manifests.provider_capture_binding_digests(manifest)?;
+        if !binding_digests.contains(&binding_digest) {
+            return Err(IngestError::ProviderCaptureRequired);
         }
-        let maximum_claims = claims.len().max(1);
-        let maximum_entries = PROVIDER_CAPTURE_RECOVERY_TOTAL_ENTRY_LIMIT
-            .checked_sub(maximum_claims)
-            .filter(|maximum| *maximum > 0)
+        let evidence = self
+            .lock_authority()?
+            .provider_capture_binding_evidence(binding_digest)?
             .ok_or(IngestError::ProviderCaptureRequired)?;
-        let control = ProviderCaptureRecoveryControl { cancellation };
-        let mut recovery = store.begin_recovery(
-            SealedResearchRecoveryAdmission::try_new(maximum_claims, maximum_entries)?,
-            &control,
-        )?;
-        for claim in claims {
-            recovery.observe_claim(&SealedResearchRawClaim::JournalSegment(claim))?;
+        evidence.verify_integrity()?;
+        for physical in evidence.physical_claims() {
+            let verified = store.open_verified_claim(physical.claim())?;
+            if verified.receipt().claim() != physical.claim() {
+                return Err(IngestError::ProviderCaptureRequired);
+            }
+            drop(verified);
         }
-        Ok(recovery.finish()?)
+        Ok(evidence)
+    }
+
+    /// Lists every bounded, kind-qualified market-event publication retained by one generation.
+    pub fn provider_market_event_publications(
+        &self,
+        manifest: &DatasetManifestRef,
+    ) -> Result<Vec<ProviderMarketEventPublicationSelector>, IngestError> {
+        let retained = self.manifests.provider_publication_bindings(manifest)?;
+        let mut selectors = Vec::new();
+        selectors
+            .try_reserve_exact(retained.len())
+            .map_err(|_| IngestError::ProviderCaptureRequired)?;
+        for (publication_digest, publication_kind) in retained {
+            if selectors
+                .iter()
+                .any(|selector: &ProviderMarketEventPublicationSelector| {
+                    selector.publication_digest == publication_digest
+                })
+            {
+                return Err(IngestError::ProviderCaptureRequired);
+            }
+            selectors.push(ProviderMarketEventPublicationSelector {
+                publication_digest,
+                publication_kind: ProviderMarketEventPublicationKind::from_catalog(
+                    &publication_kind,
+                )?,
+            });
+        }
+        Ok(selectors)
+    }
+
+    /// Reopens and verifies one generation-bound typed event publication's raw evidence.
+    pub fn provider_market_event_publication_evidence(
+        &self,
+        manifest: &DatasetManifestRef,
+        selector: ProviderMarketEventPublicationSelector,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+    ) -> Result<crate::PersistedProviderPublicationEvidence, IngestError> {
+        if !self
+            .provider_market_event_publications(manifest)?
+            .contains(&selector)
+        {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
+        let evidence = self
+            .lock_authority()?
+            .provider_publication_evidence(selector.publication_digest)?
+            .ok_or(IngestError::ProviderCaptureRequired)?;
+        evidence.verify_integrity()?;
+        if evidence.publication_digest() != selector.publication_digest
+            || evidence.publication_kind() != selector.publication_kind.as_str()
+        {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
+        if let Some(response) = evidence.response() {
+            let verified = store.open_verified_claim(response.physical_claim())?;
+            if verified.receipt().claim() != response.physical_claim() {
+                return Err(IngestError::ProviderCaptureRequired);
+            }
+        }
+        if let Some(event) = evidence.event() {
+            let verified = store.open_verified_claim(event.physical_claim())?;
+            if verified.receipt().claim() != event.physical_claim() {
+                return Err(IngestError::ProviderCaptureRequired);
+            }
+        }
+        Ok(evidence)
+    }
+
+    /// Reopens one generation-bound typed event publication and verifies raw claim plus Parquet.
+    pub async fn read_provider_market_event_publication(
+        &self,
+        manifest: &DatasetManifestRef,
+        selector: ProviderMarketEventPublicationSelector,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderMarketEventArrowBatch, IngestError> {
+        let evidence =
+            self.provider_market_event_publication_evidence(manifest, selector, store)?;
+        let pinned = self.manifests.pinned(manifest)?;
+        let batches = self
+            .objects
+            .read_pinned_async(&pinned, &cancellation)
+            .await?;
+        let expected_hex = crate::schema::encode_hex(selector.publication_digest.bytes());
+        let expected_kind = selector.publication_kind.as_str();
+        let selected = batches
+            .into_iter()
+            .filter(|batch| {
+                let schema = batch.schema();
+                schema
+                    .metadata()
+                    .get(crate::schema::PROVIDER_PUBLICATION_DIGEST_KEY)
+                    == Some(&expected_hex)
+                    && schema
+                        .metadata()
+                        .get(crate::schema::PROVIDER_PUBLICATION_KIND_KEY)
+                        .is_some_and(|kind| kind == expected_kind)
+            })
+            .collect::<Vec<_>>();
+        let schema = selected
+            .first()
+            .map(RecordBatch::schema)
+            .ok_or(IngestError::ProviderCaptureRequired)?;
+        let batch = concat_batches(&schema, &selected).map_err(ArrowConversionError::Arrow)?;
+        ProviderMarketEventArrowBatch::try_from_record_batch_with_publication_evidence(
+            batch,
+            &evidence,
+            MAX_EVENT_PUBLICATION_READ_BYTES,
+        )
+        .map_err(IngestError::Arrow)
     }
 
     /// Returns sealed backup authority for this exact active catalog and artifact root.
@@ -1302,6 +1473,7 @@ impl AnalyticalDataService {
             None,
             None,
             None,
+            PublicationSourceEvidence::NoNewRawInput,
         )
     }
 
@@ -1364,25 +1536,21 @@ impl AnalyticalDataService {
         &self,
         reservation: IngestReservation,
         analytical_dataset: DatasetId,
-        batch: ExtractionBatch,
+        batch: &ExtractionBatch,
         revision_plan: Option<ExtractionRevisionPlan>,
-        provider_capture: Option<ProviderCaptureInput>,
+        provider_binding: Option<&PreparedProviderCaptureBinding>,
+        provider_native_lineage: Option<&market_squawk_sources::ProviderNativeLineageBatch>,
         company_identity: Option<CompanyIdentityObservation>,
         cancellation: CancellationToken,
         precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
     ) -> Result<CommittedDataset, IngestError> {
-        let payload_digest = extraction_provider_payload_digest(&batch);
+        let payload_digest = extraction_provider_payload_digest(batch);
         let source_id = batch.request().object().source_id().clone();
         let paged_capture = matches!(
             batch.request().object().capture_identity(),
             SourceObjectCaptureIdentity::Paged { .. }
         );
-        if paged_capture != provider_capture.is_some()
-            || provider_capture.as_ref().is_some_and(|input| {
-                input.run_id != reservation.run_id()
-                    || !provider_capture_matches_batch(&input.receipt, &batch)
-            })
-        {
+        if paged_capture != provider_binding.is_some() {
             return Err(IngestError::ProviderCaptureRequired);
         }
         if company_identity.as_ref().is_some_and(|identity| {
@@ -1393,23 +1561,38 @@ impl AnalyticalDataService {
         }
         let dataset_name = SourceIdentifier::try_from(analytical_dataset.as_str())
             .map_err(|_| IngestError::InvalidDataset)?;
-        let observations = ResearchArrowBatch::validated_extraction_observations(&batch)?;
+        let observations = ResearchArrowBatch::validated_extraction_observations(batch)?;
         let market_bar_history = MarketBarHistoryPublicationCandidate::try_from_batch(
-            &batch,
+            batch,
             &observations,
-            provider_capture.as_ref().map(ProviderCaptureInput::receipt),
+            provider_binding,
         )?;
         {
             let authority = self.lock_authority()?;
             let run =
                 self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
-            self.validate_provider_capture_input(
-                &authority,
-                &reservation,
-                provider_capture.as_ref(),
-            )?;
             if run.state() == IngestRunState::Failed {
                 return Err(IngestError::TerminalRun);
+            }
+            if provider_binding.is_some() && run.state() == IngestRunState::Succeeded {
+                return self.reconcile_succeeded_provider_run(
+                    &authority,
+                    &reservation,
+                    &analytical_dataset,
+                    company_identity.as_ref(),
+                );
+            }
+            self.validate_provider_binding(&authority, &reservation, provider_binding)?;
+            if provider_binding.is_none() {
+                let source = authority
+                    .source(&source_id)?
+                    .ok_or(IngestError::UnknownSource)?;
+                if !matches!(
+                    source.source_class(),
+                    SourceClass::LocalFile | SourceClass::PortfolioExport
+                ) {
+                    return Err(IngestError::ProviderCaptureRequired);
+                }
             }
             if let Some(committed) = self.reconcile_committed_run(
                 &authority,
@@ -1442,9 +1625,20 @@ impl AnalyticalDataService {
         if revision_plan.len() != observations.len() {
             return Err(IngestError::RevisionEvidenceMismatch);
         }
-        let observed_batch = revision_plan
-            .into_observed_batch(source_id.clone(), &observations)
-            .map_err(map_revision_error)?;
+        let observed_batch = match (provider_binding, provider_native_lineage) {
+            (Some(_), Some(native_lineage)) => revision_plan
+                .into_observed_batch_with_native_lineage(
+                    source_id.clone(),
+                    batch,
+                    &observations,
+                    native_lineage,
+                )
+                .map_err(map_revision_error)?,
+            (None, None) => revision_plan
+                .into_observed_batch(source_id.clone(), &observations)
+                .map_err(map_revision_error)?,
+            _ => return Err(IngestError::ProviderCaptureRequired),
+        };
         let deadline = Instant::now()
             .checked_add(REVISION_ASSIGNMENT_DEADLINE)
             .ok_or(IngestError::DeadlineExceeded)?;
@@ -1453,14 +1647,14 @@ impl AnalyticalDataService {
             .assign(observed_batch, deadline, cancellation.clone())
             .await
             .map_err(map_revision_error)?;
-        let converted = match provider_capture.as_ref() {
-            Some(capture) => ResearchArrowBatch::try_from_extraction_batch_with_assigned_revisions_and_provider_capture(
-                &batch,
+        let converted = match provider_binding {
+            Some(binding) => ResearchArrowBatch::try_from_extraction_batch_with_assigned_revisions_and_provider_binding(
+                batch,
                 assignments.as_slice(),
-                &capture.receipt,
+                binding,
             )?,
             None => ResearchArrowBatch::try_from_extraction_batch_with_assigned_revisions(
-                &batch,
+                batch,
                 assignments.as_slice(),
             )?,
         };
@@ -1478,11 +1672,7 @@ impl AnalyticalDataService {
             let authority = self.lock_authority()?;
             let run =
                 self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
-            self.validate_provider_capture_input(
-                &authority,
-                &reservation,
-                provider_capture.as_ref(),
-            )?;
+            self.validate_provider_binding(&authority, &reservation, provider_binding)?;
             if run.state() == IngestRunState::Failed {
                 return Err(IngestError::TerminalRun);
             }
@@ -1504,7 +1694,7 @@ impl AnalyticalDataService {
 
         let authority = self.lock_authority()?;
         let run = self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
-        self.validate_provider_capture_input(&authority, &reservation, provider_capture.as_ref())?;
+        self.validate_provider_binding(&authority, &reservation, provider_binding)?;
         if let Some(committed) = self.reconcile_existing(
             &authority,
             &reservation,
@@ -1532,6 +1722,124 @@ impl AnalyticalDataService {
             precommit_authority.as_deref(),
             company_identity.as_ref(),
             market_bar_history.as_ref(),
+            match provider_binding {
+                Some(binding) => PublicationSourceEvidence::Provider(binding),
+                None => PublicationSourceEvidence::NoNewRawInput,
+            },
+        )
+    }
+
+    /// Consumes one exclusive provider binding through canonical publication and catalog commit.
+    pub async fn ingest_provider_publication(
+        &self,
+        reservation: IngestReservation,
+        analytical_dataset: DatasetId,
+        input: ProviderPublicationInput,
+        cancellation: CancellationToken,
+    ) -> Result<CommittedDataset, IngestError> {
+        let ProviderPublicationInput {
+            sealed_capture,
+            revisions,
+            company_identity,
+            precommit_authority,
+        } = input;
+        sealed_capture.validate()?;
+        let prepared = PreparedProviderCaptureBinding::try_from_live(&sealed_capture)?;
+        self.ingest_batch(
+            reservation,
+            analytical_dataset,
+            sealed_capture.batch(),
+            Some(revisions),
+            Some(&prepared),
+            Some(sealed_capture.native_lineage()),
+            company_identity,
+            cancellation,
+            precommit_authority,
+        )
+        .await
+    }
+
+    /// Atomically publishes typed canonical events, their sealed raw evidence, and one generation.
+    pub async fn ingest_provider_market_events(
+        &self,
+        reservation: IngestReservation,
+        analytical_dataset: DatasetId,
+        binding: SealedProviderPublicationBinding,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Result<CommittedDataset, IngestError> {
+        precommit_authority.validate_precommit()?;
+        let payload_digest = provider_market_event_publication_digest(&binding)?;
+        let source_id = provider_market_event_source_id(&binding)?.clone();
+        let converted = ProviderMarketEventArrowBatch::try_from_publication(&binding)?;
+        let prepared = PreparedProviderPublicationBinding::try_from_live(&binding)?;
+        if prepared.publication_digest() != payload_digest {
+            return Err(IngestError::ReservationPayloadMismatch);
+        }
+        let schema = converted.schema_ref().clone();
+        let lineage = converted.lineage_digest()?;
+        let converted = converted.dataset_batch();
+        self.manifests
+            .validate_append_schema(&analytical_dataset, &schema)?;
+        let _operation = self
+            .operation_gate
+            .acquire(&cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        {
+            let authority = self.lock_authority()?;
+            let run =
+                self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
+            if run.state() == IngestRunState::Failed {
+                return Err(IngestError::TerminalRun);
+            }
+            if run.state() == IngestRunState::Succeeded {
+                return self.reconcile_succeeded_provider_event_run(
+                    &authority,
+                    &reservation,
+                    &analytical_dataset,
+                    &prepared,
+                );
+            }
+            self.validate_provider_event_binding(&authority, &reservation, &prepared)?;
+        }
+        let publication = self.objects.begin_publication(&cancellation).await?;
+        let published = self
+            .objects
+            .publish_dataset_under_lease(converted, &cancellation, &publication)
+            .await?;
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        let object = ManifestObject::try_new(
+            published.content_hash(),
+            published.row_count(),
+            published.size_bytes(),
+            Sha256Digest::new(lineage.bytes()),
+        )?;
+        let authority = self.lock_authority()?;
+        let run = self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
+        self.validate_provider_event_binding(&authority, &reservation, &prepared)?;
+        if run.state() != IngestRunState::Reserved {
+            return Err(IngestError::TerminalRun);
+        }
+        let plan = self
+            .manifests
+            .preview_append(analytical_dataset.clone(), &schema, object)?;
+        self.commit_plan(
+            &authority,
+            &reservation,
+            &run,
+            SourceIdentifier::try_from(analytical_dataset.as_str())
+                .map_err(|_| IngestError::InvalidDataset)?,
+            schema,
+            plan,
+            published,
+            GenerationKind::Ingest,
+            Some(precommit_authority.as_ref()),
+            None,
+            None,
+            PublicationSourceEvidence::ProviderEvent(&prepared),
         )
     }
 
@@ -1547,7 +1855,8 @@ impl AnalyticalDataService {
         self.ingest_batch(
             reservation,
             analytical_dataset,
-            batch,
+            &batch,
+            None,
             None,
             None,
             None,
@@ -1557,7 +1866,9 @@ impl AnalyticalDataService {
         .await
     }
 
-    /// Ingests provider revisions while retaining exact caller authority through commit.
+    /// Ingests explicit local/imported revisions while retaining caller authority through commit.
+    ///
+    /// Provider captures must use [`Self::ingest_provider_publication`].
     pub async fn ingest_with_revision_plan_and_precommit_authority(
         &self,
         reservation: IngestReservation,
@@ -1570,60 +1881,10 @@ impl AnalyticalDataService {
         self.ingest_batch(
             reservation,
             analytical_dataset,
-            batch,
+            &batch,
             Some(revisions),
             None,
             None,
-            cancellation,
-            Some(precommit_authority),
-        )
-        .await
-    }
-
-    /// Ingests provider revisions whose exact response pages were durably retained and verified.
-    pub async fn ingest_with_revision_plan_and_provider_capture(
-        &self,
-        reservation: IngestReservation,
-        analytical_dataset: DatasetId,
-        batch: ExtractionBatch,
-        revisions: ExtractionRevisionPlan,
-        provider_capture: ProviderCaptureInput,
-        cancellation: CancellationToken,
-    ) -> Result<CommittedDataset, IngestError> {
-        self.ingest_batch(
-            reservation,
-            analytical_dataset,
-            batch,
-            Some(revisions),
-            Some(provider_capture),
-            None,
-            cancellation,
-            None,
-        )
-        .await
-    }
-
-    /// Retains provider response lineage and caller authority through the same final commit.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "provider revisions, capture, cancellation, and publication authority stay explicit"
-    )]
-    pub async fn ingest_with_revision_plan_provider_capture_and_precommit_authority(
-        &self,
-        reservation: IngestReservation,
-        analytical_dataset: DatasetId,
-        batch: ExtractionBatch,
-        revisions: ExtractionRevisionPlan,
-        provider_capture: ProviderCaptureInput,
-        cancellation: CancellationToken,
-        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
-    ) -> Result<CommittedDataset, IngestError> {
-        self.ingest_batch(
-            reservation,
-            analytical_dataset,
-            batch,
-            Some(revisions),
-            Some(provider_capture),
             None,
             cancellation,
             Some(precommit_authority),
@@ -1644,37 +1905,10 @@ impl AnalyticalDataService {
         self.ingest_batch(
             reservation,
             analytical_dataset,
-            batch,
+            &batch,
             Some(revisions),
             None,
-            Some(company_identity),
-            cancellation,
             None,
-        )
-        .await
-    }
-
-    /// Ingests provider revisions and company identity from one durably verified response set.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "provider revision, capture, identity, and cancellation remain explicit"
-    )]
-    pub async fn ingest_with_revision_plan_provider_capture_and_company_identity(
-        &self,
-        reservation: IngestReservation,
-        analytical_dataset: DatasetId,
-        batch: ExtractionBatch,
-        revisions: ExtractionRevisionPlan,
-        provider_capture: ProviderCaptureInput,
-        company_identity: CompanyIdentityObservation,
-        cancellation: CancellationToken,
-    ) -> Result<CommittedDataset, IngestError> {
-        self.ingest_batch(
-            reservation,
-            analytical_dataset,
-            batch,
-            Some(revisions),
-            Some(provider_capture),
             Some(company_identity),
             cancellation,
             None,
@@ -1700,38 +1934,10 @@ impl AnalyticalDataService {
         self.ingest_batch(
             reservation,
             analytical_dataset,
-            batch,
+            &batch,
             Some(revisions),
             None,
-            Some(company_identity),
-            cancellation,
-            Some(precommit_authority),
-        )
-        .await
-    }
-
-    /// Retains provider response lineage, company identity, and caller authority through commit.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "provider revision, capture, identity, cancellation, and publication authority stay explicit"
-    )]
-    pub async fn ingest_with_revision_plan_provider_capture_company_identity_and_precommit_authority(
-        &self,
-        reservation: IngestReservation,
-        analytical_dataset: DatasetId,
-        batch: ExtractionBatch,
-        revisions: ExtractionRevisionPlan,
-        provider_capture: ProviderCaptureInput,
-        company_identity: CompanyIdentityObservation,
-        cancellation: CancellationToken,
-        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
-    ) -> Result<CommittedDataset, IngestError> {
-        self.ingest_batch(
-            reservation,
-            analytical_dataset,
-            batch,
-            Some(revisions),
-            Some(provider_capture),
+            None,
             Some(company_identity),
             cancellation,
             Some(precommit_authority),
@@ -1761,27 +1967,60 @@ impl AnalyticalDataService {
         Ok(run)
     }
 
-    fn validate_provider_capture_input(
+    fn validate_provider_binding(
         &self,
         authority: &CatalogAuthority,
         reservation: &IngestReservation,
-        input: Option<&ProviderCaptureInput>,
+        input: Option<&PreparedProviderCaptureBinding>,
     ) -> Result<(), IngestError> {
         let retained = authority.provider_capture_for_run(reservation.run_id())?;
         match (input, retained) {
             (None, None) => Ok(()),
-            (Some(input), Some(retained))
-                if input.run_id == reservation.run_id()
-                    && input.receipt.receipt_digest() == retained.receipt_digest()
-                    && input.receipt.capture() == retained.capture()
-                    && input.receipt.segment().claim() == retained.claim() =>
-            {
-                Ok(())
-            }
-            (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => {
-                Err(IngestError::ProviderCaptureRequired)
-            }
+            (Some(_), None) => Ok(()),
+            (Some(input), Some(retained)) if input.evidence == retained => Ok(()),
+            (None, Some(_)) | (Some(_), Some(_)) => Err(IngestError::ProviderCaptureRequired),
         }
+    }
+
+    fn validate_provider_event_binding(
+        &self,
+        authority: &CatalogAuthority,
+        reservation: &IngestReservation,
+        input: &PreparedProviderPublicationBinding,
+    ) -> Result<(), IngestError> {
+        match authority.provider_publication_for_run(reservation.run_id())? {
+            None => Ok(()),
+            Some(retained) if input.matches_persisted(&retained) => Ok(()),
+            Some(_) => Err(IngestError::ProviderCaptureRequired),
+        }
+    }
+
+    fn reconcile_succeeded_provider_event_run(
+        &self,
+        authority: &CatalogAuthority,
+        reservation: &IngestReservation,
+        dataset_id: &DatasetId,
+        input: &PreparedProviderPublicationBinding,
+    ) -> Result<CommittedDataset, IngestError> {
+        let existing = self
+            .manifests
+            .for_run(reservation.run_id())?
+            .ok_or(IngestError::IncompleteSuccessfulRun)?;
+        let retained = authority
+            .provider_publication_for_run(reservation.run_id())?
+            .ok_or(IngestError::IncompleteSuccessfulRun)?;
+        let generation = self
+            .manifests
+            .provider_publication_bindings(existing.manifest())?;
+        if existing.manifest().dataset_id() != dataset_id
+            || !input.matches_persisted(&retained)
+            || !generation.iter().any(|(digest, kind)| {
+                *digest == retained.publication_digest() && kind == retained.publication_kind()
+            })
+        {
+            return Err(IngestError::ReplayConflict);
+        }
+        Ok(CommittedDataset::new(existing))
     }
 
     fn reconcile_committed_run(
@@ -1823,6 +2062,33 @@ impl AnalyticalDataService {
             IngestRunState::Failed => return Err(IngestError::TerminalRun),
         }
         Ok(Some(CommittedDataset::new(existing)))
+    }
+
+    fn reconcile_succeeded_provider_run(
+        &self,
+        authority: &CatalogAuthority,
+        reservation: &IngestReservation,
+        dataset_id: &DatasetId,
+        company_identity: Option<&CompanyIdentityObservation>,
+    ) -> Result<CommittedDataset, IngestError> {
+        let existing = self
+            .manifests
+            .for_run(reservation.run_id())?
+            .ok_or(IngestError::IncompleteSuccessfulRun)?;
+        if existing.manifest().dataset_id() != dataset_id {
+            return Err(IngestError::ReplayConflict);
+        }
+        let retained = authority
+            .provider_capture_for_run(reservation.run_id())?
+            .ok_or(IngestError::IncompleteSuccessfulRun)?;
+        let generation_bindings = self
+            .manifests
+            .provider_capture_binding_digests(existing.manifest())?;
+        if !generation_bindings.contains(&retained.binding_digest()) {
+            return Err(IngestError::ReplayConflict);
+        }
+        authority.validate_provider_company_identity_replay(reservation, company_identity)?;
+        Ok(CommittedDataset::new(existing))
     }
 
     #[allow(
@@ -1891,6 +2157,7 @@ impl AnalyticalDataService {
         precommit_authority: Option<&dyn IngestPrecommitAuthority>,
         company_identity: Option<&CompanyIdentityObservation>,
         market_bar_history: Option<&MarketBarHistoryPublicationCandidate>,
+        source_evidence: PublicationSourceEvidence<'_>,
     ) -> Result<CommittedDataset, IngestError> {
         if run.state() != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
@@ -1912,7 +2179,40 @@ impl AnalyticalDataService {
             plan.content_hash().evidence(),
             created_at,
         );
-        let publication = authority.publish_artifact_manifest(reservation, &artifact, &anchor)?;
+        if matches!(
+            source_evidence,
+            PublicationSourceEvidence::Provider(_) | PublicationSourceEvidence::ProviderEvent(_)
+        ) {
+            if kind != GenerationKind::Ingest {
+                return Err(IngestError::ProviderCaptureRequired);
+            }
+            let manifest = self
+                .manifests
+                .commit_provider_ingest_publication(
+                    self.catalog_id,
+                    authority.result_limits(),
+                    reservation,
+                    &plan,
+                    &artifact,
+                    &anchor,
+                    &schema,
+                    run,
+                    source_evidence,
+                    company_identity,
+                    market_bar_history,
+                )
+                .map_err(|error| match error {
+                    ManifestCatalogError::CatalogAuthority(error) => IngestError::Catalog(error),
+                    error => IngestError::Manifest(error),
+                })?;
+            return Ok(CommittedDataset::new(self.manifests.pinned(&manifest)?));
+        }
+        let publication = authority.publish_artifact_manifest_with_source_evidence(
+            reservation,
+            &artifact,
+            &anchor,
+            source_evidence,
+        )?;
         let manifest = self.manifests.commit_generation(
             &plan,
             publication.artifact(),
@@ -1986,7 +2286,8 @@ impl ResearchIngestService for AnalyticalDataService {
         self.ingest_batch(
             reservation,
             analytical_dataset,
-            batch,
+            &batch,
+            None,
             None,
             None,
             None,
@@ -2007,8 +2308,9 @@ impl ResearchIngestService for AnalyticalDataService {
         self.ingest_batch(
             reservation,
             analytical_dataset,
-            batch,
+            &batch,
             Some(revisions),
+            None,
             None,
             None,
             cancellation,
@@ -2105,6 +2407,107 @@ pub enum IngestError {
     /// The process-owned Task 3 authority lock was poisoned.
     #[error("analytical catalog authority is unavailable")]
     AuthorityLockPoisoned,
+    /// The bounded blocking worker required for provider recovery was unavailable.
+    #[error("provider-capture recovery worker is unavailable")]
+    ProviderCaptureRecoveryWorkerUnavailable,
+}
+
+fn recover_provider_capture_store_blocking(
+    authority: Arc<Mutex<CatalogAuthority>>,
+    store: Arc<market_squawk_platform::SealedResearchJournalStore>,
+    cancellation: &CancellationToken,
+) -> Result<market_squawk_platform::SealedResearchJournalRecoveryReport, IngestError> {
+    let control = ProviderCaptureRecoveryControl { cancellation };
+    let admission = SealedResearchRecoveryAdmission::try_new(
+        MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
+        PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET,
+    )
+    .map_err(map_provider_recovery_store_error)?;
+    let mut recovery = store
+        .begin_recovery(admission, &control)
+        .map_err(map_provider_recovery_store_error)?;
+    let authority = lock_provider_recovery_authority(&authority, &control)?;
+    let mut after = None;
+    let mut observed = 0usize;
+    let mut observed_bytes = 0u64;
+    loop {
+        control
+            .checkpoint(ResearchObjectControlPoint::BeforeRecoveryClaim {
+                observed_claims: observed,
+            })
+            .map_err(|error| {
+                map_provider_recovery_store_error(SealedResearchJournalStoreError::ObjectControl(
+                    error,
+                ))
+            })?;
+        let page = authority.authoritative_provider_capture_claim_page(after)?;
+        if page.is_empty() {
+            break;
+        }
+        for (digest, claim) in page {
+            observed = observed
+                .checked_add(1)
+                .ok_or(IngestError::ProviderCaptureRequired)?;
+            if observed > MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS {
+                return Err(IngestError::ProviderCaptureRequired);
+            }
+            observed_bytes = observed_bytes
+                .checked_add(claim.size_bytes())
+                .ok_or(IngestError::ProviderCaptureRequired)?;
+            if observed_bytes > MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES {
+                return Err(IngestError::Catalog(CatalogError::CorruptCatalog));
+            }
+            recovery
+                .observe_claim(&SealedResearchRawClaim::JournalSegment(claim))
+                .map_err(map_provider_recovery_store_error)?;
+            after = Some(digest);
+        }
+    }
+    drop(authority);
+    recovery.finish().map_err(map_provider_recovery_store_error)
+}
+
+fn lock_provider_recovery_authority<'a>(
+    authority: &'a Mutex<CatalogAuthority>,
+    control: &ProviderCaptureRecoveryControl<'_>,
+) -> Result<MutexGuard<'a, CatalogAuthority>, IngestError> {
+    let mut blocked_attempts = 0usize;
+    loop {
+        if control.cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        match authority.try_lock() {
+            Ok(authority) => return Ok(authority),
+            Err(TryLockError::Poisoned(_)) => return Err(IngestError::AuthorityLockPoisoned),
+            Err(TryLockError::WouldBlock) => {
+                blocked_attempts = blocked_attempts
+                    .checked_add(1)
+                    .ok_or(IngestError::ProviderCaptureRecoveryWorkerUnavailable)?;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn map_provider_recovery_admission_error(error: BlockingIoAdmissionError) -> IngestError {
+    match error {
+        BlockingIoAdmissionError::Cancelled => IngestError::Cancelled,
+        BlockingIoAdmissionError::Saturated | BlockingIoAdmissionError::ReaperUnavailable => {
+            IngestError::ProviderCaptureRecoveryWorkerUnavailable
+        }
+    }
+}
+
+fn map_provider_recovery_store_error(error: SealedResearchJournalStoreError) -> IngestError {
+    match error {
+        SealedResearchJournalStoreError::ObjectControl(ResearchObjectControlError::Cancelled) => {
+            IngestError::Cancelled
+        }
+        SealedResearchJournalStoreError::ObjectControl(
+            ResearchObjectControlError::DeadlineExceeded,
+        ) => IngestError::DeadlineExceeded,
+        error => IngestError::SealedProviderCapture(error),
+    }
 }
 
 #[cfg(test)]

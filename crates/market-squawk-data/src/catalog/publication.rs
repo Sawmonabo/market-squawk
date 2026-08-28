@@ -1,7 +1,7 @@
 //! Controlled artifact, manifest, and immutable audit metadata.
 
 use market_squawk_domain::{SchemaVersion, SourceIdentifier, Timestamp};
-use rusqlite::{OptionalExtension as _, params};
+use rusqlite::{OptionalExtension as _, Transaction, params};
 use uuid::Uuid;
 
 use super::storage::{
@@ -9,6 +9,21 @@ use super::storage::{
     trusted_catalog_now,
 };
 use super::types::*;
+use super::{
+    PreparedProviderCaptureBinding, PreparedProviderPublicationBinding,
+    retain_prepared_provider_capture_binding, retain_prepared_provider_publication_binding,
+};
+
+/// Closed raw-input state admitted by the sole artifact/manifest transaction.
+#[derive(Clone, Copy)]
+pub(crate) enum PublicationSourceEvidence<'a> {
+    /// The local or derived publication introduces no provider raw input.
+    NoNewRawInput,
+    /// The provider publication consumes one exact prepared live binding.
+    Provider(&'a PreparedProviderCaptureBinding),
+    /// The provider publication consumes one exact typed event/composite binding.
+    ProviderEvent(&'a PreparedProviderPublicationBinding),
+}
 
 /// One atomically published artifact and its exact durable dataset manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +69,21 @@ impl Catalog {
         artifact: &ArtifactRecord,
         manifest: &DatasetManifestRecord,
     ) -> Result<PublishedIngest, CatalogError> {
+        self.publish_artifact_manifest_with_source_evidence(
+            reservation,
+            artifact,
+            manifest,
+            PublicationSourceEvidence::NoNewRawInput,
+        )
+    }
+
+    pub(crate) fn publish_artifact_manifest_with_source_evidence(
+        &self,
+        reservation: &IngestReservation,
+        artifact: &ArtifactRecord,
+        manifest: &DatasetManifestRecord,
+        source_evidence: PublicationSourceEvidence<'_>,
+    ) -> Result<PublishedIngest, CatalogError> {
         if reservation.catalog_id != self.catalog_id {
             return Err(CatalogError::InvalidReservationCapability);
         }
@@ -67,136 +97,21 @@ impl Catalog {
         }
         let transaction = self.connection.unchecked_transaction()?;
         let catalog_now = trusted_catalog_now(&transaction)?;
-        require_reserved_run(&transaction, reservation.run_id)?;
-        let mut budget = ResultBudget::new(self.result_bytes);
-        if let Some(existing) = publication_for_run(&transaction, reservation.run_id, &mut budget)?
-        {
-            return if existing.semantically_matches(artifact, manifest) {
-                Ok(existing)
-            } else {
-                Err(CatalogError::EvidenceConflict)
-            };
-        }
-        let (artifact_algorithm, artifact_digest) = digest_columns(artifact.content_digest);
-        let artifact_size =
-            i64::try_from(artifact.size_bytes).map_err(|_| CatalogError::InvalidRecord)?;
-        let existing_artifact: Option<(String, String, i64, Vec<u8>, i64, i64)> = transaction
-            .query_row(
-                "SELECT run_id, relative_reference, content_algorithm, content_digest,
-                        size_bytes, created_at_ns
-                 FROM artifacts WHERE artifact_id=?1",
-                [artifact.artifact_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let (manifest_algorithm, manifest_digest) = digest_columns(manifest.content_digest);
-        let existing_manifest: Option<(String, i64, String, i64, Vec<u8>, i64)> = transaction
-            .query_row(
-                "SELECT dataset_name, schema_version, artifact_id, content_algorithm,
-                        content_digest, created_at_ns
-                 FROM dataset_manifests WHERE manifest_id=?1",
-                [manifest.manifest_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        if let (Some(artifact_row), Some(manifest_row)) = (&existing_artifact, &existing_manifest) {
-            let exact_artifact = artifact_row.0 == reservation.run_id.to_string()
-                && artifact_row.1 == artifact.relative_reference
-                && artifact_row.2 == artifact_algorithm
-                && artifact_row.3.as_slice() == artifact_digest
-                && artifact_row.4 == artifact_size
-                && artifact_row.5 == artifact.created_at.unix_nanos();
-            let exact_manifest = manifest_row.0 == manifest.dataset_name.as_str()
-                && manifest_row.1 == i64::from(manifest.schema_version.get())
-                && manifest_row.2 == manifest.artifact_id.to_string()
-                && manifest_row.3 == manifest_algorithm
-                && manifest_row.4.as_slice() == manifest_digest
-                && manifest_row.5 == manifest.created_at.unix_nanos();
-            return if exact_artifact && exact_manifest {
-                Ok(PublishedIngest::new(artifact.clone(), manifest.clone()))
-            } else {
-                Err(CatalogError::EvidenceConflict)
-            };
-        }
-        if existing_artifact.is_some()
-            || existing_manifest.is_some()
-            || transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM artifacts WHERE relative_reference=?1)",
-                [&artifact.relative_reference],
-                |row| row.get::<_, bool>(0),
-            )?
-            || transaction.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM dataset_manifests
-                    WHERE dataset_name=?1 AND content_algorithm=?2 AND content_digest=?3
-                 )",
-                params![
-                    manifest.dataset_name.as_str(),
-                    manifest_algorithm,
-                    manifest_digest
-                ],
-                |row| row.get::<_, bool>(0),
-            )?
-        {
-            return Err(CatalogError::EvidenceConflict);
-        }
-        transaction.execute(
-            "INSERT INTO artifacts
-             (artifact_id, run_id, relative_reference, content_algorithm, content_digest,
-              size_bytes, created_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                artifact.artifact_id.to_string(),
-                reservation.run_id.to_string(),
-                artifact.relative_reference,
-                artifact_algorithm,
-                artifact_digest,
-                artifact_size,
-                artifact.created_at.unix_nanos()
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO dataset_manifests
-             (manifest_id, dataset_name, schema_version, artifact_id, content_algorithm,
-              content_digest, created_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                manifest.manifest_id.to_string(),
-                manifest.dataset_name.as_str(),
-                i64::from(manifest.schema_version.get()),
-                manifest.artifact_id.to_string(),
-                manifest_algorithm,
-                manifest_digest,
-                manifest.created_at.unix_nanos()
-            ],
-        )?;
-        append_audit(
+        let publication = publish_artifact_manifest_in_transaction(
             &transaction,
-            "dataset.manifest-published",
-            &manifest.manifest_id.to_string(),
-            manifest_digest,
+            self.result_bytes,
+            reservation,
+            artifact,
+            manifest,
+            source_evidence,
             catalog_now,
         )?;
         transaction.commit()?;
-        Ok(PublishedIngest::new(artifact.clone(), manifest.clone()))
+        Ok(publication)
+    }
+
+    pub(crate) const fn result_limits(&self) -> CatalogResultLimits {
+        self.result_bytes
     }
 
     /// Loads immutable manifest metadata by opaque identity.
@@ -310,6 +225,176 @@ impl Catalog {
         }
         Ok(events)
     }
+}
+
+pub(crate) fn publish_artifact_manifest_in_transaction(
+    transaction: &Transaction<'_>,
+    result_limits: CatalogResultLimits,
+    reservation: &IngestReservation,
+    artifact: &ArtifactRecord,
+    manifest: &DatasetManifestRecord,
+    source_evidence: PublicationSourceEvidence<'_>,
+    catalog_now: Timestamp,
+) -> Result<PublishedIngest, CatalogError> {
+    require_reserved_run(transaction, reservation.run_id)?;
+    match source_evidence {
+        PublicationSourceEvidence::NoNewRawInput => {
+            if transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ingest_run_provider_capture_bindings WHERE run_id=?1
+                    UNION ALL
+                    SELECT 1 FROM ingest_run_provider_publication_bindings WHERE run_id=?1
+                 )",
+                [reservation.run_id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )? {
+                return Err(CatalogError::ProviderCaptureConflict);
+            }
+        }
+        PublicationSourceEvidence::Provider(binding) => {
+            retain_prepared_provider_capture_binding(
+                transaction,
+                reservation.run_id,
+                binding,
+                catalog_now,
+            )?;
+        }
+        PublicationSourceEvidence::ProviderEvent(binding) => {
+            retain_prepared_provider_publication_binding(
+                transaction,
+                reservation.run_id,
+                binding,
+                catalog_now,
+            )?;
+        }
+    }
+    let mut budget = ResultBudget::new(result_limits);
+    if let Some(existing) = publication_for_run(transaction, reservation.run_id, &mut budget)? {
+        return if existing.semantically_matches(artifact, manifest) {
+            Ok(existing)
+        } else {
+            Err(CatalogError::EvidenceConflict)
+        };
+    }
+    let (artifact_algorithm, artifact_digest) = digest_columns(artifact.content_digest);
+    let artifact_size =
+        i64::try_from(artifact.size_bytes).map_err(|_| CatalogError::InvalidRecord)?;
+    let existing_artifact: Option<(String, String, i64, Vec<u8>, i64, i64)> = transaction
+        .query_row(
+            "SELECT run_id, relative_reference, content_algorithm, content_digest,
+                    size_bytes, created_at_ns
+             FROM artifacts WHERE artifact_id=?1",
+            [artifact.artifact_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (manifest_algorithm, manifest_digest) = digest_columns(manifest.content_digest);
+    let existing_manifest: Option<(String, i64, String, i64, Vec<u8>, i64)> = transaction
+        .query_row(
+            "SELECT dataset_name, schema_version, artifact_id, content_algorithm,
+                    content_digest, created_at_ns
+             FROM dataset_manifests WHERE manifest_id=?1",
+            [manifest.manifest_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let (Some(artifact_row), Some(manifest_row)) = (&existing_artifact, &existing_manifest) {
+        let exact_artifact = artifact_row.0 == reservation.run_id.to_string()
+            && artifact_row.1 == artifact.relative_reference
+            && artifact_row.2 == artifact_algorithm
+            && artifact_row.3.as_slice() == artifact_digest
+            && artifact_row.4 == artifact_size
+            && artifact_row.5 == artifact.created_at.unix_nanos();
+        let exact_manifest = manifest_row.0 == manifest.dataset_name.as_str()
+            && manifest_row.1 == i64::from(manifest.schema_version.get())
+            && manifest_row.2 == manifest.artifact_id.to_string()
+            && manifest_row.3 == manifest_algorithm
+            && manifest_row.4.as_slice() == manifest_digest
+            && manifest_row.5 == manifest.created_at.unix_nanos();
+        return if exact_artifact && exact_manifest {
+            Ok(PublishedIngest::new(artifact.clone(), manifest.clone()))
+        } else {
+            Err(CatalogError::EvidenceConflict)
+        };
+    }
+    if existing_artifact.is_some()
+        || existing_manifest.is_some()
+        || transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifacts WHERE relative_reference=?1)",
+            [&artifact.relative_reference],
+            |row| row.get::<_, bool>(0),
+        )?
+        || transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM dataset_manifests
+                WHERE dataset_name=?1 AND content_algorithm=?2 AND content_digest=?3
+             )",
+            params![
+                manifest.dataset_name.as_str(),
+                manifest_algorithm,
+                manifest_digest
+            ],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        return Err(CatalogError::EvidenceConflict);
+    }
+    transaction.execute(
+        "INSERT INTO artifacts
+         (artifact_id, run_id, relative_reference, content_algorithm, content_digest,
+          size_bytes, created_at_ns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            artifact.artifact_id.to_string(),
+            reservation.run_id.to_string(),
+            artifact.relative_reference,
+            artifact_algorithm,
+            artifact_digest,
+            artifact_size,
+            artifact.created_at.unix_nanos()
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO dataset_manifests
+         (manifest_id, dataset_name, schema_version, artifact_id, content_algorithm,
+          content_digest, created_at_ns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            manifest.manifest_id.to_string(),
+            manifest.dataset_name.as_str(),
+            i64::from(manifest.schema_version.get()),
+            manifest.artifact_id.to_string(),
+            manifest_algorithm,
+            manifest_digest,
+            manifest.created_at.unix_nanos()
+        ],
+    )?;
+    append_audit(
+        transaction,
+        "dataset.manifest-published",
+        &manifest.manifest_id.to_string(),
+        manifest_digest,
+        catalog_now,
+    )?;
+    Ok(PublishedIngest::new(artifact.clone(), manifest.clone()))
 }
 
 pub(super) fn publication_for_run(
