@@ -8,8 +8,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::model::{
-    DateError, FeedKind, FeedVersion, PcapObjectEncoding, Sha256Digest, TradeDate,
-    TransportVersion,
+    DateError, FeedKind, FeedVersion, PcapObjectEncoding, Sha256Digest, TradeDate, TransportVersion,
 };
 use crate::planning::IexHistCatalogObservationReceipt;
 
@@ -499,8 +498,9 @@ fn object_encoding(
 ) -> Result<PcapObjectEncoding, CatalogError> {
     match (feed, version, protocol) {
         ("DPLC", "1", "IEXTP1") => Ok(PcapObjectEncoding::Identity),
-        ("TOPS", "1.5" | "1.6", "IEXTP1")
-        | ("DEEP" | "DPLS", "1.0", "IEXTP1") => Ok(PcapObjectEncoding::Gzip),
+        ("TOPS", "1.5" | "1.6", "IEXTP1") | ("DEEP" | "DPLS", "1.0", "IEXTP1") => {
+            Ok(PcapObjectEncoding::Gzip)
+        }
         _ => Err(CatalogError::CatalogSchemaDrift),
     }
 }

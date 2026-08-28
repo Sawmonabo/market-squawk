@@ -14,9 +14,7 @@ use crate::model::{PcapObjectEncoding, Sha256Digest};
 use crate::planning::{
     ColdJobPlan, IexHistExecutionAttempt, IexHistPlanner, IexHistTrustedClockReading, PlanError,
 };
-use crate::receipt::{
-    CaptureChronologyDisposition, CaptureError, PcapMaterializationReceipt,
-};
+use crate::receipt::{CaptureChronologyDisposition, CaptureError, PcapMaterializationReceipt};
 
 // This provider envelope v3 embeds and revalidates the immutable cold-plan envelope v2 and its
 // decoder-contract-bound `market-squawk/iex-hist-cold-plan/v4` identity. Greenfield state rejects
@@ -155,8 +153,7 @@ impl IexHistTerminalCoordinate {
         sequence: Option<i64>,
         stream_offset: Option<i64>,
     ) -> Result<Self, IexHistCheckpointError> {
-        if sequence.is_some_and(|value| value <= 0)
-            || stream_offset.is_some_and(|value| value < 0)
+        if sequence.is_some_and(|value| value <= 0) || stream_offset.is_some_and(|value| value < 0)
         {
             return Err(IexHistCheckpointError::InvalidTerminalEvidence);
         }
@@ -169,13 +166,19 @@ impl IexHistTerminalCoordinate {
 
     /// Returns the zero-based PCAP packet ordinal, when known.
     #[must_use]
-    pub const fn packet_ordinal(self) -> Option<u64> { self.packet_ordinal }
+    pub const fn packet_ordinal(self) -> Option<u64> {
+        self.packet_ordinal
+    }
     /// Returns the exact IEX-TP sequence coordinate, when known.
     #[must_use]
-    pub const fn sequence(self) -> Option<i64> { self.sequence }
+    pub const fn sequence(self) -> Option<i64> {
+        self.sequence
+    }
     /// Returns the exact IEX-TP stream offset, when known.
     #[must_use]
-    pub const fn stream_offset(self) -> Option<i64> { self.stream_offset }
+    pub const fn stream_offset(self) -> Option<i64> {
+        self.stream_offset
+    }
 }
 
 /// Typed durable terminal evidence for one exact immutable plan state.
@@ -197,22 +200,34 @@ pub struct IexHistTerminalEvidence {
 impl IexHistTerminalEvidence {
     /// Returns the closed terminal classification.
     #[must_use]
-    pub const fn disposition(&self) -> IexHistTerminalDisposition { self.disposition }
+    pub const fn disposition(&self) -> IexHistTerminalDisposition {
+        self.disposition
+    }
     /// Returns the phase that failed.
     #[must_use]
-    pub const fn failed_phase(&self) -> IexHistTerminalPhase { self.failed_phase }
+    pub const fn failed_phase(&self) -> IexHistTerminalPhase {
+        self.failed_phase
+    }
     /// Returns the stable error classification.
     #[must_use]
-    pub const fn error(&self) -> IexHistTerminalError { self.error }
+    pub const fn error(&self) -> IexHistTerminalError {
+        self.error
+    }
     /// Returns optional packet/sequence/offset evidence.
     #[must_use]
-    pub const fn coordinate(&self) -> IexHistTerminalCoordinate { self.coordinate }
+    pub const fn coordinate(&self) -> IexHistTerminalCoordinate {
+        self.coordinate
+    }
     /// Returns the exact producing attempt when one was known.
     #[must_use]
-    pub const fn attempt_sha256(&self) -> Option<Sha256Digest> { self.attempt_sha256 }
+    pub const fn attempt_sha256(&self) -> Option<Sha256Digest> {
+        self.attempt_sha256
+    }
     /// Returns the trusted wall-clock instant at which the terminal condition was observed.
     #[must_use]
-    pub const fn observed_at_unix_nanos(&self) -> i64 { self.observed_clock.unix_nanos }
+    pub const fn observed_at_unix_nanos(&self) -> i64 {
+        self.observed_clock.unix_nanos
+    }
     /// Returns the trusted UTC offset retained with the terminal observation.
     #[must_use]
     pub const fn observed_utc_offset_seconds(&self) -> i32 {
@@ -220,16 +235,24 @@ impl IexHistTerminalEvidence {
     }
     /// Returns the exact trusted local calendar date retained with the terminal observation.
     #[must_use]
-    pub fn observed_date(&self) -> &str { &self.observed_clock.observed_date }
+    pub fn observed_date(&self) -> &str {
+        &self.observed_clock.observed_date
+    }
     /// Returns the retry policy recorded at the terminal CAS boundary.
     #[must_use]
-    pub const fn retry(&self) -> IexHistRetryDisposition { self.retry }
+    pub const fn retry(&self) -> IexHistRetryDisposition {
+        self.retry
+    }
     /// Returns the authority required to supersede this terminal state.
     #[must_use]
-    pub const fn reactivation(&self) -> IexHistReactivationRequirement { self.reactivation }
+    pub const fn reactivation(&self) -> IexHistReactivationRequirement {
+        self.reactivation
+    }
     /// Returns the complete terminal evidence identity.
     #[must_use]
-    pub const fn evidence_sha256(&self) -> Sha256Digest { self.evidence_sha256 }
+    pub const fn evidence_sha256(&self) -> Sha256Digest {
+        self.evidence_sha256
+    }
     /// Returns the exact predecessor evidence identity bound into this terminal result.
     #[must_use]
     pub const fn prior_evidence_sha256(&self) -> Sha256Digest {
@@ -326,11 +349,15 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
 
     /// Returns the independently restored immutable plan.
     #[must_use]
-    pub const fn plan(&self) -> &ColdJobPlan { &self.plan }
+    pub const fn plan(&self) -> &ColdJobPlan {
+        &self.plan
+    }
 
     /// Returns the monotonically increasing durable state version.
     #[must_use]
-    pub const fn state_version(&self) -> u64 { self.envelope.state_version }
+    pub const fn state_version(&self) -> u64 {
+        self.envelope.state_version
+    }
 
     /// Returns the latest provider-local evidence phase.
     #[must_use]
@@ -371,7 +398,8 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
             DurablePhase::DecodeEvidence { decode, .. } => Some(decode.as_ref()),
             DurablePhase::Terminal { prior, .. } => match prior.as_ref() {
                 DurableNonTerminalPhase::DecodeEvidence { decode, .. } => Some(decode.as_ref()),
-                DurableNonTerminalPhase::Planned | DurableNonTerminalPhase::CaptureEvidence { .. } => None,
+                DurableNonTerminalPhase::Planned
+                | DurableNonTerminalPhase::CaptureEvidence { .. } => None,
             },
             DurablePhase::Planned | DurablePhase::CaptureEvidence { .. } => None,
         }
@@ -416,8 +444,12 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
             DurablePhase::Planned => self.commit_phase(DurablePhase::CaptureEvidence {
                 capture: Box::new(capture),
             }),
-            DurablePhase::CaptureEvidence { capture: current } if current.as_ref() == &capture => Ok(()),
-            DurablePhase::DecodeEvidence { capture: current, .. } if current.as_ref() == &capture => Ok(()),
+            DurablePhase::CaptureEvidence { capture: current } if current.as_ref() == &capture => {
+                Ok(())
+            }
+            DurablePhase::DecodeEvidence {
+                capture: current, ..
+            } if current.as_ref() == &capture => Ok(()),
             DurablePhase::Terminal { .. }
             | DurablePhase::CaptureEvidence { .. }
             | DurablePhase::DecodeEvidence { .. } => Err(IexHistCheckpointError::InvalidTransition),
@@ -444,8 +476,10 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
                     decode: Box::new(decode),
                 })
             }
-            DurablePhase::DecodeEvidence { capture: current, decode: existing }
-                if current.as_ref() == capture && existing.as_ref() == &decode => Ok(()),
+            DurablePhase::DecodeEvidence {
+                capture: current,
+                decode: existing,
+            } if current.as_ref() == capture && existing.as_ref() == &decode => Ok(()),
             DurablePhase::Planned
             | DurablePhase::CaptureEvidence { .. }
             | DurablePhase::DecodeEvidence { .. }
@@ -454,7 +488,10 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
     }
 
     /// Atomically closes the current provider-local job with exact typed recovery evidence.
-    #[allow(clippy::too_many_arguments, reason = "terminal recovery retains complete typed evidence")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "terminal recovery retains complete typed evidence"
+    )]
     pub fn record_terminal(
         &mut self,
         plan: &ColdJobPlan,
@@ -499,20 +536,27 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
             DurablePhase::CaptureEvidence { capture } => DurableNonTerminalPhase::CaptureEvidence {
                 capture: capture.clone(),
             },
-            DurablePhase::DecodeEvidence { capture, decode } => DurableNonTerminalPhase::DecodeEvidence {
-                capture: capture.clone(),
-                decode: decode.clone(),
-            },
+            DurablePhase::DecodeEvidence { capture, decode } => {
+                DurableNonTerminalPhase::DecodeEvidence {
+                    capture: capture.clone(),
+                    decode: decode.clone(),
+                }
+            }
             DurablePhase::Terminal { .. } => return Err(IexHistCheckpointError::InvalidTransition),
         };
-        let prior = replacement_capture.map_or(prior, |capture| {
-            DurableNonTerminalPhase::CaptureEvidence { capture: Box::new(capture) }
-        });
+        let prior =
+            replacement_capture.map_or(prior, |capture| DurableNonTerminalPhase::CaptureEvidence {
+                capture: Box::new(capture),
+            });
         let prior_evidence_sha256 = nonterminal_identity(&prior);
         let observed_clock = DurableClockEvidence::from_trusted(observed_clock);
         let reactivation = match disposition {
-            IexHistTerminalDisposition::Quarantined => IexHistReactivationRequirement::RootAuthorityReview,
-            IexHistTerminalDisposition::Unavailable => IexHistReactivationRequirement::NewAuthorityAttempt,
+            IexHistTerminalDisposition::Quarantined => {
+                IexHistReactivationRequirement::RootAuthorityReview
+            }
+            IexHistTerminalDisposition::Unavailable => {
+                IexHistReactivationRequirement::NewAuthorityAttempt
+            }
         };
         let evidence_sha256 = terminal_identity(
             disposition,
@@ -553,7 +597,10 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
     }
 
     fn commit_phase(&mut self, phase: DurablePhase) -> Result<(), IexHistCheckpointError> {
-        let state_version = self.envelope.state_version.checked_add(1)
+        let state_version = self
+            .envelope
+            .state_version
+            .checked_add(1)
             .ok_or(IexHistCheckpointError::StateVersionExhausted)?;
         let mut next = DurableEnvelope {
             schema_version: DURABLE_SCHEMA_VERSION,
@@ -567,7 +614,8 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
         next.envelope_sha256 = envelope_identity(&next)?;
         next.validate(&self.plan)?;
         let payload = encode_envelope(&next)?;
-        self.store.compare_and_swap(Some(self.payload_sha256), &payload)?;
+        self.store
+            .compare_and_swap(Some(self.payload_sha256), &payload)?;
         self.payload_sha256 = Sha256Digest::of(&payload);
         self.envelope = next;
         Ok(())
@@ -605,7 +653,9 @@ impl DurableEnvelope {
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "phase")]
 enum DurablePhase {
     Planned,
-    CaptureEvidence { capture: Box<PcapMaterializationReceipt> },
+    CaptureEvidence {
+        capture: Box<PcapMaterializationReceipt>,
+    },
     DecodeEvidence {
         capture: Box<PcapMaterializationReceipt>,
         decode: Box<DecodeSummary>,
@@ -620,7 +670,9 @@ enum DurablePhase {
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "phase")]
 enum DurableNonTerminalPhase {
     Planned,
-    CaptureEvidence { capture: Box<PcapMaterializationReceipt> },
+    CaptureEvidence {
+        capture: Box<PcapMaterializationReceipt>,
+    },
     DecodeEvidence {
         capture: Box<PcapMaterializationReceipt>,
         decode: Box<DecodeSummary>,
@@ -748,9 +800,8 @@ fn validate_nonterminal(
 
 fn phase_capture(phase: &DurablePhase) -> Option<&PcapMaterializationReceipt> {
     match phase {
-        DurablePhase::CaptureEvidence { capture } | DurablePhase::DecodeEvidence { capture, .. } => {
-            Some(capture.as_ref())
-        }
+        DurablePhase::CaptureEvidence { capture }
+        | DurablePhase::DecodeEvidence { capture, .. } => Some(capture.as_ref()),
         DurablePhase::Terminal { prior, .. } => match prior.as_ref() {
             DurableNonTerminalPhase::CaptureEvidence { capture }
             | DurableNonTerminalPhase::DecodeEvidence { capture, .. } => Some(capture.as_ref()),
@@ -783,23 +834,24 @@ fn nonterminal_attempt_sha256(phase: &DurableNonTerminalPhase) -> Option<Sha256D
 
 fn nonterminal_identity(phase: &DurableNonTerminalPhase) -> Sha256Digest {
     match phase {
-        DurableNonTerminalPhase::Planned => crate::catalog::digest_fields(&[
-            b"market-squawk/iex-hist-durable-prior/v2",
-            b"planned",
-        ]),
+        DurableNonTerminalPhase::Planned => {
+            crate::catalog::digest_fields(&[b"market-squawk/iex-hist-durable-prior/v2", b"planned"])
+        }
         DurableNonTerminalPhase::CaptureEvidence { capture } => crate::catalog::digest_fields(&[
             b"market-squawk/iex-hist-durable-prior/v2",
             b"capture_evidence",
             capture.receipt_sha256().as_bytes(),
         ]),
-        DurableNonTerminalPhase::DecodeEvidence { capture, decode } => crate::catalog::digest_fields(&[
-            b"market-squawk/iex-hist-durable-prior/v2",
-            b"decode_evidence",
-            capture.receipt_sha256().as_bytes(),
-            decode.decoder_contract_sha256.as_bytes(),
-            decode.decode_attempt_evidence_sha256.as_bytes(),
-            decode.summary_sha256().as_bytes(),
-        ]),
+        DurableNonTerminalPhase::DecodeEvidence { capture, decode } => {
+            crate::catalog::digest_fields(&[
+                b"market-squawk/iex-hist-durable-prior/v2",
+                b"decode_evidence",
+                capture.receipt_sha256().as_bytes(),
+                decode.decoder_contract_sha256.as_bytes(),
+                decode.decode_attempt_evidence_sha256.as_bytes(),
+                decode.summary_sha256().as_bytes(),
+            ])
+        }
     }
 }
 
@@ -824,9 +876,9 @@ fn terminal_identity(
     let attempt = attempt_sha256.unwrap_or_else(|| Sha256Digest::of(b"no-attempt"));
     let (retry_tag, retry_at) = match retry {
         IexHistRetryDisposition::Never => (0_u8, i64::MIN),
-        IexHistRetryDisposition::ReacquireAndRestartWholeFile { not_before_unix_nanos } => {
-            (1, not_before_unix_nanos)
-        }
+        IexHistRetryDisposition::ReacquireAndRestartWholeFile {
+            not_before_unix_nanos,
+        } => (1, not_before_unix_nanos),
     };
     crate::catalog::digest_fields(&[
         b"market-squawk/iex-hist-terminal-evidence/v2",

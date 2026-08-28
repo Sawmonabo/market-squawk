@@ -29,11 +29,11 @@ pub use decode::{
     IexHistVenueTradeBar, PcapStreamDecoder,
 };
 pub use durable::{
-    IexHistCheckpointError, IexHistCheckpointStore, IexHistCheckpointStoreError,
-    IexHistDurableJob, IexHistJobPhase, IexHistReactivationRequirement, IexHistRecoveryAction,
-    IexHistResumeClaim, IexHistResumeClaimError, IexHistRetryDisposition,
-    IexHistTerminalCoordinate, IexHistTerminalDisposition, IexHistTerminalError,
-    IexHistTerminalEvidence, IexHistTerminalPhase,
+    IexHistCheckpointError, IexHistCheckpointStore, IexHistCheckpointStoreError, IexHistDurableJob,
+    IexHistJobPhase, IexHistReactivationRequirement, IexHistRecoveryAction, IexHistResumeClaim,
+    IexHistResumeClaimError, IexHistRetryDisposition, IexHistTerminalCoordinate,
+    IexHistTerminalDisposition, IexHistTerminalError, IexHistTerminalEvidence,
+    IexHistTerminalPhase,
 };
 pub use model::{
     AuctionImbalanceSide, AuctionType, DecodedIexEvent, EpochNanos, FeedKind, FeedVersion,

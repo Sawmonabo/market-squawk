@@ -145,20 +145,20 @@ impl IexHistCapacityFootprint {
             IexHistCapacityCategory::DecodedEventBatch => self.decoded_event_batch,
             IexHistCapacityCategory::CanonicalArrow => self.canonical_arrow,
             IexHistCapacityCategory::ImmutableParquet => self.immutable_parquet,
-            IexHistCapacityCategory::ManifestAndAtomicOverhead => {
-                self.manifest_and_atomic_overhead
-            }
+            IexHistCapacityCategory::ManifestAndAtomicOverhead => self.manifest_and_atomic_overhead,
             IexHistCapacityCategory::SafetyFreeReserve => self.safety_free_reserve,
         }
     }
 
     /// Returns the complete network-plus-disk reservation, including temporary/durable overlap.
     pub fn total_reserved_bytes(self) -> Result<u64, PlanError> {
-        CAPACITY_CATEGORIES.into_iter().try_fold(0_u64, |total, category| {
-            total
-                .checked_add(self.bytes(category))
-                .ok_or(PlanError::CapacityArithmetic)
-        })
+        CAPACITY_CATEGORIES
+            .into_iter()
+            .try_fold(0_u64, |total, category| {
+                total
+                    .checked_add(self.bytes(category))
+                    .ok_or(PlanError::CapacityArithmetic)
+            })
     }
 
     /// Returns all durable-volume categories, including temp/durable overlap and free reserve.
@@ -263,29 +263,53 @@ pub struct ColdJobPlan {
 
 impl ColdJobPlan {
     #[must_use]
-    pub const fn plan_sha256(&self) -> Sha256Digest { self.plan_sha256 }
+    pub const fn plan_sha256(&self) -> Sha256Digest {
+        self.plan_sha256
+    }
     #[must_use]
-    pub const fn selected_file(&self) -> &SelectedFileReceipt { &self.selected_file }
+    pub const fn selected_file(&self) -> &SelectedFileReceipt {
+        &self.selected_file
+    }
     #[must_use]
-    pub const fn trigger(&self) -> ColdJobTrigger { self.trigger }
+    pub const fn trigger(&self) -> ColdJobTrigger {
+        self.trigger
+    }
     #[must_use]
-    pub const fn lane(&self) -> ScheduleLane { self.lane }
+    pub const fn lane(&self) -> ScheduleLane {
+        self.lane
+    }
     #[must_use]
-    pub const fn automatic_archive_catch_up(&self) -> bool { self.automatic_archive_catch_up }
+    pub const fn automatic_archive_catch_up(&self) -> bool {
+        self.automatic_archive_catch_up
+    }
     #[must_use]
-    pub const fn max_parallel_transfers(&self) -> u8 { self.max_parallel_transfers }
+    pub const fn max_parallel_transfers(&self) -> u8 {
+        self.max_parallel_transfers
+    }
     #[must_use]
-    pub const fn resume_policy(&self) -> ResumePolicy { self.resume_policy }
+    pub const fn resume_policy(&self) -> ResumePolicy {
+        self.resume_policy
+    }
     #[must_use]
-    pub const fn earliest_available_on(&self) -> TradeDate { self.earliest_available_on }
+    pub const fn earliest_available_on(&self) -> TradeDate {
+        self.earliest_available_on
+    }
     #[must_use]
-    pub const fn rolling_window_start(&self) -> TradeDate { self.rolling_window_start }
+    pub const fn rolling_window_start(&self) -> TradeDate {
+        self.rolling_window_start
+    }
     #[must_use]
-    pub const fn capacity_footprint(&self) -> IexHistCapacityFootprint { self.capacity_footprint }
+    pub const fn capacity_footprint(&self) -> IexHistCapacityFootprint {
+        self.capacity_footprint
+    }
     #[must_use]
-    pub const fn object_encoding(&self) -> PcapObjectEncoding { self.object_encoding }
+    pub const fn object_encoding(&self) -> PcapObjectEncoding {
+        self.object_encoding
+    }
     #[must_use]
-    pub const fn decode_contract(&self) -> DecodeContract { self.decode_contract }
+    pub const fn decode_contract(&self) -> DecodeContract {
+        self.decode_contract
+    }
     /// Returns the complete reserved footprint, including overlap and protected free space.
     pub fn required_disk_bytes(&self) -> Result<u64, PlanError> {
         self.capacity_footprint.required_disk_bytes()
@@ -306,8 +330,16 @@ impl ColdJobPlan {
             trade_date: self.selected_file.trade_date.compact(),
             feed: self.selected_file.feed.catalog_name().to_owned(),
             feed_version: self.selected_file.feed_version.catalog_value().to_owned(),
-            transport_version: self.selected_file.transport_version.catalog_value().to_owned(),
-            object_encoding: self.selected_file.object_encoding.identity_value().to_owned(),
+            transport_version: self
+                .selected_file
+                .transport_version
+                .catalog_value()
+                .to_owned(),
+            object_encoding: self
+                .selected_file
+                .object_encoding
+                .identity_value()
+                .to_owned(),
             file_name: self.selected_file.file_name.clone(),
             download_url: self.selected_file.download_url.clone(),
             advertised_compressed_bytes: self.selected_file.advertised_compressed_bytes,
@@ -395,10 +427,10 @@ impl DurableCatalogObservationEnvelope {
     }
 
     fn into_receipt(self) -> Result<IexHistCatalogObservationReceipt, PlanError> {
-        let admitted_date = TradeDate::parse(&self.admitted_observed_date)
-            .map_err(PlanError::Date)?;
-        let retrieved_date = TradeDate::parse(&self.retrieved_observed_date)
-            .map_err(PlanError::Date)?;
+        let admitted_date =
+            TradeDate::parse(&self.admitted_observed_date).map_err(PlanError::Date)?;
+        let retrieved_date =
+            TradeDate::parse(&self.retrieved_observed_date).map_err(PlanError::Date)?;
         let admitted_clock = IexHistTrustedClockReading::try_new(
             self.admitted_at_unix_nanos,
             self.admitted_utc_offset_seconds,
@@ -522,11 +554,7 @@ impl IexHistPlanner {
         decode_limits: DecodeLimits,
         dplc_authority: Option<&dyn IexHistDplcDistributionAuthority>,
     ) -> Result<ColdJobPlan, PlanError> {
-        let decode_contract = Self::decode_contract(
-            &selected_file,
-            decode_limits,
-            dplc_authority,
-        )?;
+        let decode_contract = Self::decode_contract(&selected_file, decode_limits, dplc_authority)?;
         Self::plan_with_contract(selected_file, trigger, limits, decode_contract)
     }
 
@@ -559,7 +587,10 @@ impl IexHistPlanner {
         {
             return Err(PlanError::InvalidDecoderContract);
         }
-        let earliest_available_on = selected_file.trade_date.next_day().map_err(PlanError::Date)?;
+        let earliest_available_on = selected_file
+            .trade_date
+            .next_day()
+            .map_err(PlanError::Date)?;
         if selected_file.catalog_observed_on() < earliest_available_on {
             return Err(PlanError::NotTPlusOne);
         }
@@ -824,7 +855,12 @@ impl IexHistCapacityRequest {
         footprint: IexHistCapacityFootprint,
         deadline_unix_nanos: i64,
     ) -> Result<Self, IexHistCapacityError> {
-        Self::new(IexHistCapacityOperation::CatalogDiscovery, None, footprint, deadline_unix_nanos)
+        Self::new(
+            IexHistCapacityOperation::CatalogDiscovery,
+            None,
+            footprint,
+            deadline_unix_nanos,
+        )
     }
 
     pub(crate) fn selected_file(
@@ -857,7 +893,10 @@ impl IexHistCapacityRequest {
             return Err(IexHistCapacityError::InvalidRequest);
         }
         let plan_present = [u8::from(plan_sha256.is_some())];
-        let plan_bytes = plan_sha256.unwrap_or_else(|| Sha256Digest::of(b"")).as_bytes().to_owned();
+        let plan_bytes = plan_sha256
+            .unwrap_or_else(|| Sha256Digest::of(b""))
+            .as_bytes()
+            .to_owned();
         let request_sha256 = crate::catalog::digest_fields(&[
             b"market-squawk/iex-hist-capacity-request/v1",
             IEX_HIST_PROVIDER_LANE.as_bytes(),
@@ -870,19 +909,35 @@ impl IexHistCapacityRequest {
             footprint.identity().as_bytes(),
             &deadline_unix_nanos.to_le_bytes(),
         ]);
-        Ok(Self { operation, plan_sha256, footprint, deadline_unix_nanos, request_sha256 })
+        Ok(Self {
+            operation,
+            plan_sha256,
+            footprint,
+            deadline_unix_nanos,
+            request_sha256,
+        })
     }
 
     #[must_use]
-    pub const fn operation(&self) -> IexHistCapacityOperation { self.operation }
+    pub const fn operation(&self) -> IexHistCapacityOperation {
+        self.operation
+    }
     #[must_use]
-    pub const fn plan_sha256(&self) -> Option<Sha256Digest> { self.plan_sha256 }
+    pub const fn plan_sha256(&self) -> Option<Sha256Digest> {
+        self.plan_sha256
+    }
     #[must_use]
-    pub const fn footprint(&self) -> IexHistCapacityFootprint { self.footprint }
+    pub const fn footprint(&self) -> IexHistCapacityFootprint {
+        self.footprint
+    }
     #[must_use]
-    pub const fn deadline_unix_nanos(&self) -> i64 { self.deadline_unix_nanos }
+    pub const fn deadline_unix_nanos(&self) -> i64 {
+        self.deadline_unix_nanos
+    }
     #[must_use]
-    pub const fn request_sha256(&self) -> Sha256Digest { self.request_sha256 }
+    pub const fn request_sha256(&self) -> Sha256Digest {
+        self.request_sha256
+    }
 }
 
 /// Raw wall-clock/calendar sample returned only through the application authority seam.
@@ -920,8 +975,12 @@ impl IexHistTrustedClockReading {
         let offset_nanos = i64::from(utc_offset_seconds)
             .checked_mul(1_000_000_000)
             .ok_or(IexHistCapacityError::Clock)?;
-        let local_nanos = unix_nanos.checked_add(offset_nanos).ok_or(IexHistCapacityError::Clock)?;
-        let start = observed_date.start_epoch_nanos().map_err(|_| IexHistCapacityError::Clock)?;
+        let local_nanos = unix_nanos
+            .checked_add(offset_nanos)
+            .ok_or(IexHistCapacityError::Clock)?;
+        let start = observed_date
+            .start_epoch_nanos()
+            .map_err(|_| IexHistCapacityError::Clock)?;
         let end = observed_date
             .next_day()
             .and_then(TradeDate::start_epoch_nanos)
@@ -929,15 +988,25 @@ impl IexHistTrustedClockReading {
         if local_nanos < start || local_nanos >= end {
             return Err(IexHistCapacityError::Clock);
         }
-        Ok(Self { unix_nanos, utc_offset_seconds, observed_date })
+        Ok(Self {
+            unix_nanos,
+            utc_offset_seconds,
+            observed_date,
+        })
     }
 
     #[must_use]
-    pub const fn unix_nanos(self) -> i64 { self.unix_nanos }
+    pub const fn unix_nanos(self) -> i64 {
+        self.unix_nanos
+    }
     #[must_use]
-    pub const fn utc_offset_seconds(self) -> i32 { self.utc_offset_seconds }
+    pub const fn utc_offset_seconds(self) -> i32 {
+        self.utc_offset_seconds
+    }
     #[must_use]
-    pub const fn observed_date(self) -> TradeDate { self.observed_date }
+    pub const fn observed_date(self) -> TradeDate {
+        self.observed_date
+    }
 
     pub(crate) fn validate(self) -> Result<(), IexHistCapacityError> {
         Self::try_new(self.unix_nanos, self.utc_offset_seconds, self.observed_date).map(|_| ())
@@ -972,15 +1041,25 @@ pub struct IexHistCatalogObservationReceipt {
 
 impl IexHistCatalogObservationReceipt {
     #[must_use]
-    pub const fn body_sha256(&self) -> Sha256Digest { self.body_sha256 }
+    pub const fn body_sha256(&self) -> Sha256Digest {
+        self.body_sha256
+    }
     #[must_use]
-    pub const fn body_bytes(&self) -> u64 { self.body_bytes }
+    pub const fn body_bytes(&self) -> u64 {
+        self.body_bytes
+    }
     #[must_use]
-    pub const fn attempt(&self) -> IexHistExecutionAttempt { self.attempt }
+    pub const fn attempt(&self) -> IexHistExecutionAttempt {
+        self.attempt
+    }
     #[must_use]
-    pub const fn retrieved_clock(&self) -> IexHistTrustedClockReading { self.retrieved_clock }
+    pub const fn retrieved_clock(&self) -> IexHistTrustedClockReading {
+        self.retrieved_clock
+    }
     #[must_use]
-    pub const fn receipt_sha256(&self) -> Sha256Digest { self.receipt_sha256 }
+    pub const fn receipt_sha256(&self) -> Sha256Digest {
+        self.receipt_sha256
+    }
 
     pub(crate) fn validate(&self) -> Result<(), IexHistCapacityError> {
         self.retrieved_clock.validate()?;
@@ -1100,15 +1179,25 @@ pub struct IexHistCapacitySettlement {
 
 impl IexHistCapacitySettlement {
     #[must_use]
-    pub const fn request_sha256(&self) -> Sha256Digest { self.request_sha256 }
+    pub const fn request_sha256(&self) -> Sha256Digest {
+        self.request_sha256
+    }
     #[must_use]
-    pub const fn reservation_sha256(&self) -> Sha256Digest { self.reservation_sha256 }
+    pub const fn reservation_sha256(&self) -> Sha256Digest {
+        self.reservation_sha256
+    }
     #[must_use]
-    pub const fn attempt_sha256(&self) -> Sha256Digest { self.attempt_sha256 }
+    pub const fn attempt_sha256(&self) -> Sha256Digest {
+        self.attempt_sha256
+    }
     #[must_use]
-    pub const fn disposition(&self) -> IexHistCapacityDisposition { self.disposition }
+    pub const fn disposition(&self) -> IexHistCapacityDisposition {
+        self.disposition
+    }
     #[must_use]
-    pub const fn usage(&self) -> IexHistCapacityUsage { self.usage }
+    pub const fn usage(&self) -> IexHistCapacityUsage {
+        self.usage
+    }
 }
 
 /// Application-owned durable provider/network/disk authority.
@@ -1165,19 +1254,33 @@ pub struct IexHistExecutionAttempt {
 
 impl IexHistExecutionAttempt {
     #[must_use]
-    pub const fn request_sha256(self) -> Sha256Digest { self.request_sha256 }
+    pub const fn request_sha256(self) -> Sha256Digest {
+        self.request_sha256
+    }
     #[must_use]
-    pub const fn reservation_sha256(self) -> Sha256Digest { self.reservation_sha256 }
+    pub const fn reservation_sha256(self) -> Sha256Digest {
+        self.reservation_sha256
+    }
     #[must_use]
-    pub const fn authority_generation(self) -> u64 { self.authority_generation }
+    pub const fn authority_generation(self) -> u64 {
+        self.authority_generation
+    }
     #[must_use]
-    pub const fn storage_root_sha256(self) -> Sha256Digest { self.storage_root_sha256 }
+    pub const fn storage_root_sha256(self) -> Sha256Digest {
+        self.storage_root_sha256
+    }
     #[must_use]
-    pub const fn attempt_sha256(self) -> Sha256Digest { self.attempt_sha256 }
+    pub const fn attempt_sha256(self) -> Sha256Digest {
+        self.attempt_sha256
+    }
     #[must_use]
-    pub const fn admitted_clock(self) -> IexHistTrustedClockReading { self.admitted_clock }
+    pub const fn admitted_clock(self) -> IexHistTrustedClockReading {
+        self.admitted_clock
+    }
     #[must_use]
-    pub const fn deadline_unix_nanos(self) -> i64 { self.deadline_unix_nanos }
+    pub const fn deadline_unix_nanos(self) -> i64 {
+        self.deadline_unix_nanos
+    }
 
     pub(crate) fn validate(self) -> Result<(), IexHistCapacityError> {
         self.admitted_clock.validate()?;
@@ -1213,27 +1316,45 @@ pub struct IexHistDecodeAttemptEvidence {
 
 impl IexHistDecodeAttemptEvidence {
     #[must_use]
-    pub const fn plan_sha256(self) -> Sha256Digest { self.plan_sha256 }
+    pub const fn plan_sha256(self) -> Sha256Digest {
+        self.plan_sha256
+    }
     #[must_use]
-    pub const fn decode_contract_sha256(self) -> Sha256Digest { self.decode_contract_sha256 }
+    pub const fn decode_contract_sha256(self) -> Sha256Digest {
+        self.decode_contract_sha256
+    }
     #[must_use]
-    pub const fn request_sha256(self) -> Sha256Digest { self.attempt.request_sha256 }
+    pub const fn request_sha256(self) -> Sha256Digest {
+        self.attempt.request_sha256
+    }
     #[must_use]
-    pub const fn reservation_sha256(self) -> Sha256Digest { self.attempt.reservation_sha256 }
+    pub const fn reservation_sha256(self) -> Sha256Digest {
+        self.attempt.reservation_sha256
+    }
     #[must_use]
-    pub const fn authority_generation(self) -> u64 { self.attempt.authority_generation }
+    pub const fn authority_generation(self) -> u64 {
+        self.attempt.authority_generation
+    }
     #[must_use]
-    pub const fn storage_root_sha256(self) -> Sha256Digest { self.attempt.storage_root_sha256 }
+    pub const fn storage_root_sha256(self) -> Sha256Digest {
+        self.attempt.storage_root_sha256
+    }
     #[must_use]
     pub const fn admitted_clock(self) -> IexHistTrustedClockReading {
         self.attempt.admitted_clock
     }
     #[must_use]
-    pub const fn deadline_unix_nanos(self) -> i64 { self.attempt.deadline_unix_nanos }
+    pub const fn deadline_unix_nanos(self) -> i64 {
+        self.attempt.deadline_unix_nanos
+    }
     #[must_use]
-    pub const fn attempt_sha256(self) -> Sha256Digest { self.attempt.attempt_sha256 }
+    pub const fn attempt_sha256(self) -> Sha256Digest {
+        self.attempt.attempt_sha256
+    }
     #[must_use]
-    pub const fn evidence_sha256(self) -> Sha256Digest { self.evidence_sha256 }
+    pub const fn evidence_sha256(self) -> Sha256Digest {
+        self.evidence_sha256
+    }
 
     /// Revalidates every authority and immutable-plan coordinate before terminal evidence use.
     pub fn validate_against(self, plan: &ColdJobPlan) -> Result<(), IexHistCapacityError> {
@@ -1339,7 +1460,9 @@ impl IexHistExecutionPermit {
                 .unix_nanos()
                 .checked_sub(plan.selected_file.catalog_retrieved_at_unix_nanos())
                 .ok_or(IexHistCapacityError::Clock)?;
-            if age < 0 || u64::try_from(age).map_or(true, |value| value > plan.max_catalog_age_nanos) {
+            if age < 0
+                || u64::try_from(age).map_or(true, |value| value > plan.max_catalog_age_nanos)
+            {
                 return Err(IexHistCapacityError::CatalogStale);
             }
         }
@@ -1371,7 +1494,9 @@ impl IexHistExecutionPermit {
     }
 
     #[must_use]
-    pub const fn attempt(&self) -> IexHistExecutionAttempt { self.attempt }
+    pub const fn attempt(&self) -> IexHistExecutionAttempt {
+        self.attempt
+    }
 
     /// Mints decode evidence only from the active selected-file lease for this exact plan.
     pub(crate) fn decode_attempt_evidence(
@@ -1431,12 +1556,8 @@ impl IexHistExecutionPermit {
         }
         let retrieved_clock = self.trusted_clock()?;
         let body_sha256 = Sha256Digest::of(body);
-        let receipt_sha256 = catalog_observation_identity(
-            body_sha256,
-            body_bytes,
-            self.attempt,
-            retrieved_clock,
-        );
+        let receipt_sha256 =
+            catalog_observation_identity(body_sha256, body_bytes, self.attempt, retrieved_clock);
         let receipt = IexHistCatalogObservationReceipt {
             body_sha256,
             body_bytes,
@@ -1458,7 +1579,10 @@ impl IexHistExecutionPermit {
     }
 
     /// Atomically settles actual category bytes and releases provider/network ownership.
-    pub fn settle(mut self, disposition: IexHistCapacityDisposition) -> Result<(), IexHistCapacityError> {
+    pub fn settle(
+        mut self,
+        disposition: IexHistCapacityDisposition,
+    ) -> Result<(), IexHistCapacityError> {
         self.validate_settlement(disposition)?;
         self.settle_inner(disposition)
     }
@@ -1506,8 +1630,14 @@ impl IexHistExecutionPermit {
         Ok(())
     }
 
-    fn settle_inner(&mut self, disposition: IexHistCapacityDisposition) -> Result<(), IexHistCapacityError> {
-        let lease = self.lease.take().ok_or(IexHistCapacityError::AlreadySettled)?;
+    fn settle_inner(
+        &mut self,
+        disposition: IexHistCapacityDisposition,
+    ) -> Result<(), IexHistCapacityError> {
+        let lease = self
+            .lease
+            .take()
+            .ok_or(IexHistCapacityError::AlreadySettled)?;
         let settlement = IexHistCapacitySettlement {
             request_sha256: self.attempt.request_sha256,
             reservation_sha256: self.attempt.reservation_sha256,
