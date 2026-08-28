@@ -10,19 +10,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
-    CompanyIdentityObservation, DigestAlgorithm, EvidenceDigest, MetadataRevision,
-    ResearchObservation, SourceId, SourceIdentifier, Timestamp,
+    CompanyIdentityObservation, DigestAlgorithm, EvidenceDigest, FundEvidenceRecord,
+    FundFilingIdentity, FundSourceLineage, MetadataRevision, ResearchObservation, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{
     ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
     SealedResearchJournalStoreError, SealedResearchRawClaim, SealedResearchRecoveryAdmission,
 };
 use market_squawk_sources::{
-    ExtractionBatch, ExtractionContentIdentity, ExtractionError, ExtractionRevisionPlan,
+    CanonicalPartitionExpectation, ExtractionBatch, ExtractionContentIdentity, ExtractionError,
+    ExtractionRevisionPlan, LogicalItemRange, LogicalObjectRole, LogicalPartitionFamily,
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, MAX_PROVIDER_CAPTURE_PAGES, ObservedRevisionAuthority,
     ObservedRevisionError, OptionMarketBatchKind, ProviderCaptureError,
-    ProviderCaptureTerminalDisposition, ProviderNativeLineageImplementation,
-    SealedProviderCaptureBinding, SealedProviderOptionMarketBinding,
+    ProviderCaptureTerminalDisposition, ProviderLogicalTerminalReceipt,
+    ProviderNativeLineageImplementation, SealedProviderCaptureBinding,
+    SealedProviderLogicalPublicationBinding, SealedProviderOptionMarketBinding,
     SealedProviderPublicationBinding, SourceClass, SourceMetadata, SourceObjectCaptureIdentity,
 };
 use sha2::{Digest as _, Sha256};
@@ -51,20 +54,25 @@ use crate::query::QueryArtifactMemoryLease;
 use crate::{
     AnalyticalManifestCatalog, ArrowConversionError, ArtifactRecord, CatalogAuthority,
     CatalogError, ContractCompletion, DatasetArrowBatch, DatasetId, DatasetManifestRecord,
-    DatasetManifestRef, DatasetSchemaRef, GenerationKind, IngestIdentity, IngestReservation,
-    IngestRunState, ListingReferenceError, ListingReferencePublicationCapability,
-    ListingReferenceReadCapability, ManifestCatalogError, ManifestObject, ManifestPlan,
-    ManifestPlanError, ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore,
-    ParquetStoreError, PinnedDataset, PinnedQueryOutput, ProviderMarketEventArrowBatch,
-    ProviderOptionMarketArrowBatch, PublishedObject, QueryArtifactReservation,
-    QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, ResearchArrowBatch,
-    ResearchQueryEngine, RightsDecisionInput, Sha256Digest, SourceOperation,
+    DatasetManifestRef, DatasetSchemaRef, FundHoldingsArrowBatch, FundPointInTimeRequest,
+    FundPointInTimeSelection, GenerationKind, IngestIdentity, IngestReservation, IngestRunState,
+    ListingReferenceError, ListingReferencePublicationCapability, ListingReferenceReadCapability,
+    MAX_FUND_HOLDINGS_BATCH_RECORDS, MAX_FUND_HOLDINGS_RETAINED_BYTES, ManifestCatalogError,
+    ManifestObject, ManifestPlan, ManifestPlanError, ObjectStoreConfig, OrphanRecoveryReport,
+    ParquetObjectStore, ParquetStoreError, PinnedDataset, PinnedQueryOutput,
+    ProviderMarketEventArrowBatch, ProviderOptionMarketArrowBatch, PublishedObject,
+    QueryArtifactReservation, QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest,
+    ResearchArrowBatch, ResearchQueryEngine, RightsDecisionInput, Sha256Digest, SourceOperation,
 };
 
 const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 const REVISION_ASSIGNMENT_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_EVENT_PUBLICATION_READ_BYTES: usize = 128 * 1024 * 1024;
 const MAX_OPTION_PUBLICATION_READ_BYTES: usize = 192 * 1024 * 1024;
+const SEC_FUND_SOURCE_ID: &str = "sec-edgar";
+const SEC_FUND_CANONICAL_PARTITION_DOMAIN: &[u8] = b"market-squawk/sec-fund/canonical-partition/v1";
+const SEC_FUND_NATIVE_SCHEMA_DOMAIN: &[u8] = b"market-squawk/sec-fund/provider-native-envelope/v1";
+const SEC_FUND_ROW_MAP_SCHEMA_DOMAIN: &[u8] = b"market-squawk/sec-fund/canonical-row-map/v1";
 const PROVIDER_MACRO_PLAN_PUBLICATION_DOMAIN: &[u8] =
     b"market-squawk/provider-macro-plan-publication/v1";
 
@@ -1045,6 +1053,260 @@ fn provider_market_event_source_id(
             Ok(composite.response().capture_evidence().source_id())
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct SecFundLogicalPartitionCoordinate {
+    family: LogicalPartitionFamily,
+    partition_ordinal: u32,
+    item_range: LogicalItemRange,
+    schema_identity: EvidenceDigest,
+}
+
+fn validate_live_sec_fund_logical_publication(
+    binding: &SealedProviderLogicalPublicationBinding,
+    batch: &FundHoldingsArrowBatch,
+) -> Result<(), IngestError> {
+    let object_roles = binding
+        .objects()
+        .iter()
+        .map(|object| (object.role(), object.ordinal()))
+        .collect::<Vec<_>>();
+    let partitions = binding
+        .partitions()
+        .iter()
+        .map(|partition| SecFundLogicalPartitionCoordinate {
+            family: partition.family(),
+            partition_ordinal: partition.partition_ordinal(),
+            item_range: partition.item_range(),
+            schema_identity: partition.schema_identity(),
+        })
+        .collect::<Vec<_>>();
+    validate_sec_fund_logical_publication(
+        binding.terminal(),
+        binding.canonical_partitions(),
+        &object_roles,
+        &partitions,
+        batch,
+    )
+}
+
+fn validate_persisted_sec_fund_logical_publication(
+    binding: &crate::catalog::PersistedProviderLogicalPublicationBinding,
+    batch: &FundHoldingsArrowBatch,
+) -> Result<(), IngestError> {
+    let object_roles = binding
+        .objects()
+        .iter()
+        .map(|object| (object.role(), object.ordinal()))
+        .collect::<Vec<_>>();
+    let partitions = binding
+        .partitions()
+        .iter()
+        .map(|partition| SecFundLogicalPartitionCoordinate {
+            family: partition.family(),
+            partition_ordinal: partition.partition_ordinal(),
+            item_range: partition.item_range(),
+            schema_identity: partition.schema_identity(),
+        })
+        .collect::<Vec<_>>();
+    validate_sec_fund_logical_publication(
+        binding.terminal(),
+        binding.canonical_partitions(),
+        &object_roles,
+        &partitions,
+        batch,
+    )
+}
+
+fn validate_sec_fund_logical_publication(
+    terminal: &ProviderLogicalTerminalReceipt,
+    canonical: &[CanonicalPartitionExpectation],
+    object_roles: &[(LogicalObjectRole, u32)],
+    partitions: &[SecFundLogicalPartitionCoordinate],
+    batch: &FundHoldingsArrowBatch,
+) -> Result<(), IngestError> {
+    let records = batch.records();
+    let row_count =
+        u64::try_from(records.len()).map_err(|_| IngestError::ProviderLogicalFundRequired)?;
+    if terminal.source_id().as_str() != SEC_FUND_SOURCE_ID
+        || terminal.total_decoded_events() != 0
+        || terminal.total_canonical_rows() != row_count
+        || canonical.is_empty()
+        || object_roles
+            != [
+                (LogicalObjectRole::ProviderPayload, 0),
+                (LogicalObjectRole::ProviderComponent, 1),
+            ]
+        || partitions.len() != canonical.len().saturating_mul(2)
+    {
+        return Err(IngestError::ProviderLogicalFundRequired);
+    }
+
+    let registered = crate::DatasetSchemaRegistry::local()
+        .canonical_fund_holdings()
+        .map_err(ArrowConversionError::from)?;
+    if batch.schema_ref() != &registered {
+        return Err(IngestError::ProviderLogicalFundRequired);
+    }
+    let canonical_schema_identity =
+        EvidenceDigest::new(DigestAlgorithm::Sha256, registered.fingerprint());
+    let native_schema_identity = sec_fund_domain_digest(SEC_FUND_NATIVE_SCHEMA_DOMAIN);
+    let row_map_schema_identity = sec_fund_domain_digest(SEC_FUND_ROW_MAP_SCHEMA_DOMAIN);
+
+    let first_filing = records
+        .first()
+        .map(sec_fund_record_filing)
+        .ok_or(IngestError::ProviderLogicalFundRequired)?;
+    if first_filing.source_id().as_str() != SEC_FUND_SOURCE_ID
+        || records.iter().any(|record| {
+            let filing = sec_fund_record_filing(record);
+            let lineage = sec_fund_record_lineage(record);
+            filing != first_filing
+                || filing.source_id() != terminal.source_id()
+                || lineage.family() != filing.family()
+                || lineage.terminal_handoff_evidence()
+                    != terminal.provider_terminal_evidence_digest()
+        })
+    {
+        return Err(IngestError::ProviderLogicalFundRequired);
+    }
+
+    let mut next_row = 0_u64;
+    for (ordinal_index, expectation) in canonical.iter().enumerate() {
+        let ordinal =
+            u32::try_from(ordinal_index).map_err(|_| IngestError::ProviderLogicalFundRequired)?;
+        let range = expectation.row_range();
+        let start = usize::try_from(range.first_ordinal())
+            .map_err(|_| IngestError::ProviderLogicalFundRequired)?;
+        let count = usize::try_from(range.item_count().get())
+            .map_err(|_| IngestError::ProviderLogicalFundRequired)?;
+        let end = start
+            .checked_add(count)
+            .ok_or(IngestError::ProviderLogicalFundRequired)?;
+        let partition_records = records
+            .get(start..end)
+            .ok_or(IngestError::ProviderLogicalFundRequired)?;
+        let native = partitions
+            .get(ordinal_index)
+            .ok_or(IngestError::ProviderLogicalFundRequired)?;
+        let row_map = partitions
+            .get(
+                canonical
+                    .len()
+                    .checked_add(ordinal_index)
+                    .ok_or(IngestError::ProviderLogicalFundRequired)?,
+            )
+            .ok_or(IngestError::ProviderLogicalFundRequired)?;
+        if expectation.partition_ordinal() != ordinal
+            || range.first_ordinal() != next_row
+            || expectation.schema_identity() != canonical_schema_identity
+            || expectation.semantic_digest()
+                != sec_fund_canonical_partition_digest(range, partition_records)?
+            || expectation.aligned_native_partition() != ordinal
+            || expectation.aligned_row_map_partition() != ordinal
+            || native.family != LogicalPartitionFamily::ProviderNative
+            || native.partition_ordinal != ordinal
+            || native.item_range != range
+            || native.schema_identity != native_schema_identity
+            || row_map.family != LogicalPartitionFamily::CanonicalRowMap
+            || row_map.partition_ordinal != ordinal
+            || row_map.item_range != range
+            || row_map.schema_identity != row_map_schema_identity
+        {
+            return Err(IngestError::ProviderLogicalFundRequired);
+        }
+        next_row = range
+            .end_exclusive()
+            .map_err(|_| IngestError::ProviderLogicalFundRequired)?;
+    }
+    if next_row != row_count {
+        return Err(IngestError::ProviderLogicalFundRequired);
+    }
+    Ok(())
+}
+
+fn sec_fund_canonical_partition_digest(
+    range: LogicalItemRange,
+    records: &[FundEvidenceRecord],
+) -> Result<EvidenceDigest, IngestError> {
+    if usize::try_from(range.item_count().get()).ok() != Some(records.len()) {
+        return Err(IngestError::ProviderLogicalFundRequired);
+    }
+    let mut digest = Sha256::new();
+    digest.update(SEC_FUND_CANONICAL_PARTITION_DOMAIN);
+    digest.update(range.first_ordinal().to_be_bytes());
+    digest.update(range.item_count().get().to_be_bytes());
+    for (offset, record) in records.iter().enumerate() {
+        let ordinal = range
+            .first_ordinal()
+            .checked_add(
+                u64::try_from(offset).map_err(|_| IngestError::ProviderLogicalFundRequired)?,
+            )
+            .ok_or(IngestError::ProviderLogicalFundRequired)?;
+        let bytes = serde_json::to_vec(record)?;
+        digest.update(ordinal.to_be_bytes());
+        digest.update(
+            u64::try_from(bytes.len())
+                .map_err(|_| IngestError::ProviderLogicalFundRequired)?
+                .to_be_bytes(),
+        );
+        digest.update(Sha256::digest(bytes));
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn sec_fund_domain_digest(domain: &[u8]) -> EvidenceDigest {
+    EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(domain).into())
+}
+
+fn sec_fund_record_filing(record: &FundEvidenceRecord) -> &FundFilingIdentity {
+    match record {
+        FundEvidenceRecord::Report(value) => value.filing(),
+        FundEvidenceRecord::ShareClass(value) => value.filing(),
+        FundEvidenceRecord::PortfolioHolding(value) => value.filing(),
+    }
+}
+
+fn sec_fund_record_lineage(record: &FundEvidenceRecord) -> &FundSourceLineage {
+    match record {
+        FundEvidenceRecord::Report(value) => value.lineage(),
+        FundEvidenceRecord::ShareClass(value) => value.lineage(),
+        FundEvidenceRecord::PortfolioHolding(value) => value.lineage(),
+    }
+}
+
+fn verify_persisted_sec_fund_raw_objects(
+    binding: &crate::catalog::PersistedProviderLogicalPublicationBinding,
+    store: &market_squawk_platform::SealedResearchJournalStore,
+    cancellation: &CancellationToken,
+) -> Result<(), IngestError> {
+    let control = ProviderCaptureRecoveryControl { cancellation };
+    for claim in binding
+        .objects()
+        .iter()
+        .map(crate::catalog::PersistedProviderLogicalObjectClaim::claim)
+        .chain(
+            binding
+                .partitions()
+                .iter()
+                .map(crate::catalog::PersistedProviderLogicalPartitionClaim::claim),
+        )
+    {
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        let verified = store.open_verified_logical_object_claim(claim, &control)?;
+        if verified.content_digest() != claim.content_digest()
+            || verified.size_bytes() != claim.size_bytes()
+        {
+            return Err(IngestError::ProviderLogicalFundRequired);
+        }
+    }
+    Ok(())
 }
 
 /// Process-local authority that must remain live through the durable ingest commit boundary.
@@ -2371,6 +2633,99 @@ impl AnalyticalDataService {
             .map_err(IngestError::Arrow)
     }
 
+    /// Reopens one exact SEC logical publication and applies the fixed fund PIT selector.
+    ///
+    /// An exact manifest is mandatory. The selected provider-logical binding, every raw object,
+    /// the canonical Parquet object, and the caller's knowledge cutoff are all revalidated; this
+    /// operation never resolves or substitutes a latest generation.
+    pub async fn read_sec_fund_point_in_time(
+        &self,
+        request: &FundPointInTimeRequest,
+        binding_digest: EvidenceDigest,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        cancellation: CancellationToken,
+    ) -> Result<FundPointInTimeSelection, IngestError> {
+        let manifest = request
+            .exact_manifest()
+            .ok_or(IngestError::ProviderLogicalFundRequired)?;
+        if manifest.dataset_id() != request.dataset()
+            || manifest.schema().name() != market_squawk_domain::FUND_HOLDINGS_SCHEMA_NAME
+            || !self
+                .manifests
+                .provider_publication_bindings(manifest)?
+                .iter()
+                .any(|(digest, kind)| *digest == binding_digest && kind == "provider_logical")
+        {
+            return Err(IngestError::ProviderLogicalFundRequired);
+        }
+        let persisted = self
+            .lock_authority()?
+            .provider_logical_publication_binding(binding_digest)?
+            .ok_or(IngestError::ProviderLogicalFundRequired)?;
+        verify_persisted_sec_fund_raw_objects(&persisted, store, &cancellation)?;
+
+        let pinned = self.manifests.pinned(manifest)?;
+        let mut selected = None;
+        for (object_ordinal, object) in pinned.objects().iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return Err(IngestError::Cancelled);
+            }
+            let batches = self
+                .objects
+                .read_pinned_object_bounded_async(
+                    &pinned,
+                    object.artifact_id(),
+                    object_ordinal,
+                    MAX_FUND_HOLDINGS_BATCH_RECORDS,
+                    MAX_FUND_HOLDINGS_RETAINED_BYTES,
+                    &cancellation,
+                )
+                .await?;
+            let schema = batches
+                .first()
+                .map(RecordBatch::schema)
+                .ok_or(IngestError::ProviderLogicalFundRequired)?;
+            let batch = concat_batches(&schema, &batches).map_err(ArrowConversionError::Arrow)?;
+            let candidate = FundHoldingsArrowBatch::try_from_record_batch(
+                batch,
+                MAX_FUND_HOLDINGS_RETAINED_BYTES,
+            )?;
+            match validate_persisted_sec_fund_logical_publication(&persisted, &candidate) {
+                Ok(()) if selected.is_none() => selected = Some(candidate),
+                Ok(()) => return Err(IngestError::ProviderLogicalFundRequired),
+                Err(IngestError::ProviderLogicalFundRequired) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let selected = selected.ok_or(IngestError::ProviderLogicalFundRequired)?;
+        FundPointInTimeSelection::try_new(request, manifest.clone(), &selected)
+            .map_err(IngestError::Arrow)
+    }
+
+    /// Repeats one exact-manifest fund PIT read and rejects any receipt or outcome drift.
+    pub async fn verify_sec_fund_point_in_time_restart(
+        &self,
+        request: &FundPointInTimeRequest,
+        binding_digest: EvidenceDigest,
+        original: &FundPointInTimeSelection,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        cancellation: CancellationToken,
+    ) -> Result<FundPointInTimeSelection, IngestError> {
+        if request.exact_manifest() != Some(original.manifest()) {
+            return Err(IngestError::ReplayConflict);
+        }
+        let replay = self
+            .read_sec_fund_point_in_time(request, binding_digest, store, cancellation)
+            .await?;
+        if replay.manifest() != original.manifest()
+            || replay.selection_digest() != original.selection_digest()
+            || replay.outcome() != original.outcome()
+        {
+            return Err(IngestError::ReplayConflict);
+        }
+        Ok(replay)
+    }
+
     /// Persists query-result ownership and expiry before artifact publication begins.
     pub async fn reserve_query_artifact(
         &self,
@@ -3049,6 +3404,114 @@ impl AnalyticalDataService {
             .map_err(Into::into)
     }
 
+    /// Atomically publishes one exact SEC fund filing scope and its complete logical evidence.
+    ///
+    /// The reservation payload must be the logical binding digest. The returned digest and the
+    /// [`CommittedDataset`] manifest together are the exact publication receipt; neither a latest
+    /// generation nor a separately committed raw-evidence transaction is permitted.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the exact run, dataset, logical authority, records, cancellation, and precommit authority stay explicit"
+    )]
+    pub async fn ingest_sec_fund_logical_publication(
+        &self,
+        reservation: IngestReservation,
+        analytical_dataset: DatasetId,
+        binding: SealedProviderLogicalPublicationBinding,
+        records: Vec<FundEvidenceRecord>,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Result<(CommittedDataset, EvidenceDigest), IngestError> {
+        precommit_authority.validate_precommit()?;
+        let payload_digest = binding.binding_digest();
+        let source_id = binding.terminal().source_id().clone();
+        let dataset_name = SourceIdentifier::try_from(analytical_dataset.as_str())
+            .map_err(|_| IngestError::InvalidDataset)?;
+        let converted = FundHoldingsArrowBatch::try_from_records(dataset_name.clone(), records)?;
+        validate_live_sec_fund_logical_publication(&binding, &converted)?;
+        let schema = converted.schema_ref().clone();
+        self.manifests
+            .validate_append_schema(&analytical_dataset, &schema)?;
+
+        let _operation = self
+            .operation_gate
+            .acquire(&cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        {
+            let authority = self.lock_authority()?;
+            let run =
+                self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
+            match run.state() {
+                IngestRunState::Reserved => {}
+                IngestRunState::Succeeded => {
+                    let committed = self.reconcile_succeeded_provider_logical_fund_run(
+                        &authority,
+                        &reservation,
+                        &analytical_dataset,
+                        payload_digest,
+                    )?;
+                    return Ok((committed, payload_digest));
+                }
+                IngestRunState::Failed => return Err(IngestError::TerminalRun),
+            }
+        }
+
+        let publication = self.objects.begin_publication(&cancellation).await?;
+        let published = self
+            .objects
+            .publish_dataset_under_lease(converted.dataset_batch(), &cancellation, &publication)
+            .await?;
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        let object = ManifestObject::try_new(
+            published.content_hash(),
+            published.row_count(),
+            published.size_bytes(),
+            Sha256Digest::new(converted.lineage_digest().bytes()),
+        )?;
+        if object.row_count() != binding.terminal().total_canonical_rows() {
+            return Err(IngestError::ProviderLogicalFundRequired);
+        }
+
+        let authority = self.lock_authority()?;
+        let run = self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
+        if run.state() != IngestRunState::Reserved {
+            return Err(IngestError::TerminalRun);
+        }
+        let plan = self
+            .manifests
+            .preview_append(analytical_dataset, &schema, object)?;
+        let committed = self.commit_plan(
+            &authority,
+            &reservation,
+            &run,
+            dataset_name,
+            schema,
+            plan,
+            published,
+            GenerationKind::Ingest,
+            Some(precommit_authority.as_ref()),
+            None,
+            None,
+            PublicationSourceEvidence::ProviderLogical(&binding),
+        )?;
+        let persisted = authority
+            .provider_logical_publication_binding(payload_digest)?
+            .ok_or(IngestError::ProviderLogicalFundRequired)?;
+        validate_persisted_sec_fund_logical_publication(&persisted, &converted)?;
+        if !self
+            .manifests
+            .provider_publication_bindings(committed.manifest())?
+            .iter()
+            .any(|(digest, kind)| *digest == payload_digest && kind == "provider_logical")
+        {
+            return Err(IngestError::ProviderLogicalFundRequired);
+        }
+        Ok((committed, payload_digest))
+    }
+
     /// Atomically publishes typed canonical events, their sealed raw evidence, and one generation.
     pub async fn ingest_provider_market_events(
         &self,
@@ -3438,6 +3901,34 @@ impl AnalyticalDataService {
         Ok(CommittedDataset::new(existing))
     }
 
+    fn reconcile_succeeded_provider_logical_fund_run(
+        &self,
+        authority: &CatalogAuthority,
+        reservation: &IngestReservation,
+        dataset_id: &DatasetId,
+        binding_digest: EvidenceDigest,
+    ) -> Result<CommittedDataset, IngestError> {
+        let existing = self
+            .manifests
+            .for_run(reservation.run_id())?
+            .ok_or(IngestError::IncompleteSuccessfulRun)?;
+        let retained = authority
+            .provider_logical_publication_binding(binding_digest)?
+            .ok_or(IngestError::IncompleteSuccessfulRun)?;
+        let generation = self
+            .manifests
+            .provider_publication_bindings(existing.manifest())?;
+        if existing.manifest().dataset_id() != dataset_id
+            || retained.binding_digest() != binding_digest
+            || !generation
+                .iter()
+                .any(|(digest, kind)| *digest == binding_digest && kind == "provider_logical")
+        {
+            return Err(IngestError::ReplayConflict);
+        }
+        Ok(CommittedDataset::new(existing))
+    }
+
     fn reconcile_committed_run(
         &self,
         authority: &CatalogAuthority,
@@ -3599,6 +4090,7 @@ impl AnalyticalDataService {
             PublicationSourceEvidence::Provider(_)
                 | PublicationSourceEvidence::ProviderEvent(_)
                 | PublicationSourceEvidence::ProviderOptionMarket(_)
+                | PublicationSourceEvidence::ProviderLogical(_)
         ) {
             if kind != GenerationKind::Ingest {
                 return Err(IngestError::ProviderCaptureRequired);
@@ -3779,6 +4271,9 @@ pub enum IngestError {
     /// A complete ordered macro plan failed canonical/native/raw closure validation.
     #[error("provider macro publication plan is invalid")]
     InvalidProviderMacroPlan,
+    /// SEC fund canonical rows do not match their exact logical raw/native publication evidence.
+    #[error("SEC fund publication requires exact provider-logical evidence")]
+    ProviderLogicalFundRequired,
     /// Provider page/frame and sealed-segment receipts could not be bound exactly.
     #[error("provider capture receipt is invalid")]
     ProviderCapture(#[from] ProviderCaptureError),
