@@ -817,6 +817,7 @@ mod provider_rate;
 pub use provider_rate::{
     PreparedProviderRateRegistrationBatch, ProviderRateAuthority, ProviderRateCollisionIdentity,
     ProviderRateCollisionKind, ProviderRateDeclaration, ProviderRateDispatchDecision,
+    ProviderRateExtensionKey, ProviderRateExtensionRevision, ProviderRateExtensionState,
     ProviderRateGroupId, ProviderRatePermitId, ProviderRateRegistration,
     ProviderRateReservationDecision, ProviderRateReservationId, ProviderRateRunId,
     ProviderRateStore, ProviderRateStoreError,

@@ -1,5 +1,6 @@
 //! Product-wide durable provider request and connection admission.
 
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 #[cfg(debug_assertions)]
 use std::time::Duration;
@@ -329,6 +330,154 @@ pub struct ProviderRateRegistration {
     declaration_digest: EvidenceDigest,
 }
 
+/// Stable key for opaque provider-specific control state retained by the shared rate authority.
+///
+/// The key is derived from one exact generic provider-rate declaration. Account-qualified
+/// declarations use their trusted stable authorization subject; public declarations use the
+/// code-owned governed-provider subject. The extension and schema identities are code-owned and
+/// keep unrelated provider state from sharing one durable row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRateExtensionKey {
+    provider_subject: SourceIdentifier,
+    extension_id: SourceIdentifier,
+    schema_id: SourceIdentifier,
+    policy_digest: EvidenceDigest,
+    declaration_digest: EvidenceDigest,
+}
+
+impl ProviderRateExtensionKey {
+    /// Binds one provider-specific state schema to an exact validated generic declaration.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid declaration or an unrepresentable governed public-provider subject.
+    pub fn try_from_declaration(
+        declaration: &ProviderRateDeclaration,
+        extension_id: SourceIdentifier,
+        schema_id: SourceIdentifier,
+    ) -> Result<Self, BudgetPoolError> {
+        declaration.validate()?;
+        let provider_subject = declaration
+            .policy()
+            .scope()
+            .authorization_account()
+            .cloned()
+            .map_or_else(
+                || {
+                    ProviderRateDeclaration::governed_provider_subject(
+                        declaration.policy().scope().as_source_identifier(),
+                    )
+                },
+                Ok,
+            )?;
+        Ok(Self {
+            provider_subject,
+            extension_id,
+            schema_id,
+            policy_digest: declaration.policy_digest(),
+            declaration_digest: declaration.declaration_digest(),
+        })
+    }
+
+    /// Returns the stable provider/account subject retained in the durable key.
+    pub const fn provider_subject(&self) -> &SourceIdentifier {
+        &self.provider_subject
+    }
+
+    /// Returns the code-owned provider extension identity.
+    pub const fn extension_id(&self) -> &SourceIdentifier {
+        &self.extension_id
+    }
+
+    /// Returns the exact extension-state schema identity.
+    pub const fn schema_id(&self) -> &SourceIdentifier {
+        &self.schema_id
+    }
+
+    /// Returns the exact generic limit policy bound to this extension.
+    pub const fn policy_digest(&self) -> EvidenceDigest {
+        self.policy_digest
+    }
+
+    /// Returns the exact registered generic declaration bound to this extension.
+    pub const fn declaration_digest(&self) -> EvidenceDigest {
+        self.declaration_digest
+    }
+}
+
+/// Exact predecessor identity used for a provider-extension compare-and-exchange transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderRateExtensionRevision {
+    version: NonZeroU64,
+    digest: EvidenceDigest,
+}
+
+impl ProviderRateExtensionRevision {
+    /// Constructs one store-verified opaque-state revision.
+    pub const fn new(version: NonZeroU64, digest: EvidenceDigest) -> Self {
+        Self { version, digest }
+    }
+
+    /// Returns the strictly increasing row version.
+    pub const fn version(self) -> NonZeroU64 {
+        self.version
+    }
+
+    /// Returns the domain-separated digest of the exact opaque state bytes and durable key.
+    pub const fn digest(self) -> EvidenceDigest {
+        self.digest
+    }
+}
+
+/// Bounded opaque provider-extension state returned by the shared durable authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRateExtensionState {
+    key: ProviderRateExtensionKey,
+    revision: ProviderRateExtensionRevision,
+    bytes: Box<[u8]>,
+    updated_at: Timestamp,
+}
+
+impl ProviderRateExtensionState {
+    /// Maximum opaque payload retained in one provider-extension row.
+    pub const MAXIMUM_BYTES: usize = 1024 * 1024;
+
+    /// Constructs state after a store has verified its exact row and digest.
+    pub fn from_verified_store(
+        key: ProviderRateExtensionKey,
+        revision: ProviderRateExtensionRevision,
+        bytes: Box<[u8]>,
+        updated_at: Timestamp,
+    ) -> Self {
+        Self {
+            key,
+            revision,
+            bytes,
+            updated_at,
+        }
+    }
+
+    /// Returns the exact durable extension key.
+    pub const fn key(&self) -> &ProviderRateExtensionKey {
+        &self.key
+    }
+
+    /// Returns the compare-and-exchange predecessor identity.
+    pub const fn revision(&self) -> ProviderRateExtensionRevision {
+        self.revision
+    }
+
+    /// Returns the exact bounded opaque state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns when this state transition committed in the shared authority clock.
+    pub const fn updated_at(&self) -> Timestamp {
+        self.updated_at
+    }
+}
+
 impl ProviderRateRegistration {
     /// Constructs a verified registration returned by a store implementation.
     pub const fn new(
@@ -576,6 +725,31 @@ pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
         mode: AuthorizationMode,
         evidence: EvidenceDigest,
     ) -> Result<Option<SourceIdentifier>, ProviderRateStoreError>;
+
+    /// Loads one exact provider-specific extension state after validating its generic declaration.
+    fn load_extension(
+        &self,
+        _run_id: ProviderRateRunId,
+        _key: &ProviderRateExtensionKey,
+        _now: Timestamp,
+    ) -> Result<Option<ProviderRateExtensionState>, ProviderRateStoreError> {
+        Err(ProviderRateStoreError::Conflict)
+    }
+
+    /// Atomically creates or replaces one bounded opaque extension state.
+    ///
+    /// `None` is the only valid predecessor for initial creation. A replacement requires the
+    /// exact current version and digest. Stale, missing, or unexpected predecessors fail closed.
+    fn compare_exchange_extension(
+        &self,
+        _run_id: ProviderRateRunId,
+        _key: &ProviderRateExtensionKey,
+        _expected: Option<ProviderRateExtensionRevision>,
+        _replacement: &[u8],
+        _now: Timestamp,
+    ) -> Result<ProviderRateExtensionState, ProviderRateStoreError> {
+        Err(ProviderRateStoreError::Conflict)
+    }
 }
 
 /// Cloneable capability over one process run in the product-owned provider-rate store.
@@ -778,6 +952,53 @@ impl ProviderRateAuthority {
             store.bind_authorization_subject(run_id, mode, evidence, subject, now)
         })
         .map(|(_observation, ())| ())
+    }
+
+    /// Loads one provider-specific state row through the same serialized SQLite authority.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed for an unregistered or mismatched declaration, corrupt state, capacity, or
+    /// unavailable authority clock/storage.
+    pub fn load_extension(
+        &self,
+        key: &ProviderRateExtensionKey,
+    ) -> Result<Option<ProviderRateExtensionState>, ProviderRateStoreError> {
+        self.serialized_timed_store_operation(|store, run_id, now| {
+            store.load_extension(run_id, key, now)
+        })
+        .map(|(_observation, state)| state)
+    }
+
+    /// Returns the wall-clock coordinate used by serialized provider-extension transitions.
+    ///
+    /// This preserves the paired manual clock used by debug authority fixtures and avoids a
+    /// provider-specific second clock. The value is an observation, not a state mutation.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the shared operation gate or authority clock is unavailable.
+    pub fn extension_clock_timestamp(&self) -> Result<Timestamp, ProviderRateStoreError> {
+        self.clock_observation()
+            .map(|observation| observation.wall_clock)
+    }
+
+    /// Performs one serialized durable compare-and-exchange of bounded opaque provider state.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the exact predecessor no longer matches or any declaration, schema,
+    /// digest, size, clock, persistence, or integrity invariant fails.
+    pub fn compare_exchange_extension(
+        &self,
+        key: &ProviderRateExtensionKey,
+        expected: Option<ProviderRateExtensionRevision>,
+        replacement: &[u8],
+    ) -> Result<ProviderRateExtensionState, ProviderRateStoreError> {
+        self.serialized_timed_store_operation(|store, run_id, now| {
+            store.compare_exchange_extension(run_id, key, expected, replacement, now)
+        })
+        .map(|(_observation, state)| state)
     }
 
     pub(in crate::policy) fn register_binding(

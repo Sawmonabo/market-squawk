@@ -14,6 +14,7 @@ use market_squawk_sources::{
     AuthorizationMode, BudgetUnavailableReason, BudgetWindowSemantics,
     PreparedProviderRateRegistrationBatch, ProviderBudgetPolicy, ProviderRateCollisionKind,
     ProviderRateDeclaration, ProviderRateDispatchClaim, ProviderRateDispatchDecision,
+    ProviderRateExtensionKey, ProviderRateExtensionRevision, ProviderRateExtensionState,
     ProviderRateGroupId, ProviderRatePermitId, ProviderRateRegistration,
     ProviderRateReservationDecision, ProviderRateReservationId, ProviderRateResponseClass,
     ProviderRateResponseSettlement, ProviderRateResponseSettlementReceipt,
@@ -28,13 +29,16 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 const PROVIDER_RATE_APPLICATION_ID: i64 = 0x4d53_5152;
-const PROVIDER_RATE_SCHEMA_VERSION: i64 = 2;
+const PROVIDER_RATE_SCHEMA_VERSION: i64 = 3;
 const PROVIDER_RATE_STATE_SEMANTICS_VERSION: u16 = 2;
 const MAXIMUM_RETAINED_RUNS: i64 = 1_024;
 const MAXIMUM_RETAINED_REQUESTS: i64 = 65_536;
 const MAXIMUM_AUTHORIZATION_SUBJECTS: i64 = 4_096;
 const MAXIMUM_GROUPS: i64 = 4_096;
 const MAXIMUM_DECLARATIONS: i64 = 4_096;
+const MAXIMUM_PROVIDER_EXTENSIONS: i64 = 4_096;
+const MAXIMUM_PROVIDER_EXTENSION_STATE_BYTES: usize = ProviderRateExtensionState::MAXIMUM_BYTES;
+const MAXIMUM_PROVIDER_EXTENSION_TOTAL_BYTES: i64 = 32 * 1024 * 1024;
 const MAXIMUM_COLLISION_KEYS: usize = 64;
 const COLLISION_KEY_BYTES: usize = 33;
 const MAXIMUM_WEIGHTED_SLIDING_RELEASES: usize = 4_096;
@@ -42,7 +46,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(750);
 const OWNER_LOCK_FILE: &str = "provider-rate-authority.owner.lock";
 const PROVIDER_RATE_LOGICAL_CHECKPOINT_SCHEMA: &str =
     "market-squawk.provider-rate-logical-checkpoint";
-const PROVIDER_RATE_LOGICAL_CHECKPOINT_VERSION: u16 = 2;
+const PROVIDER_RATE_LOGICAL_CHECKPOINT_VERSION: u16 = 3;
 const MAXIMUM_LOGICAL_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 
 const SCHEMA: &str = r#"
@@ -75,6 +79,25 @@ CREATE TABLE provider_rate_declarations (
     created_at_ns INTEGER NOT NULL
 ) STRICT;
 
+CREATE TABLE provider_rate_extensions (
+    provider_subject TEXT NOT NULL
+        CHECK(length(CAST(provider_subject AS BLOB)) BETWEEN 1 AND 512),
+    extension_id TEXT NOT NULL
+        CHECK(length(CAST(extension_id AS BLOB)) BETWEEN 1 AND 512),
+    schema_id TEXT NOT NULL
+        CHECK(length(CAST(schema_id AS BLOB)) BETWEEN 1 AND 512),
+    declaration_digest BLOB NOT NULL
+        REFERENCES provider_rate_declarations(declaration_digest) ON DELETE RESTRICT
+        CHECK(length(declaration_digest) = 32),
+    policy_digest BLOB NOT NULL CHECK(length(policy_digest) = 32),
+    state_bytes BLOB NOT NULL CHECK(length(state_bytes) BETWEEN 1 AND 1048576),
+    state_digest BLOB NOT NULL CHECK(length(state_digest) = 32),
+    state_version INTEGER NOT NULL CHECK(state_version >= 1),
+    row_digest BLOB NOT NULL CHECK(length(row_digest) = 32),
+    updated_at_ns INTEGER NOT NULL,
+    PRIMARY KEY(provider_subject, extension_id, schema_id)
+) STRICT;
+
 CREATE TABLE provider_rate_requests (
     request_id BLOB PRIMARY KEY CHECK(length(request_id) = 16),
     run_id BLOB NOT NULL REFERENCES provider_rate_runs(run_id) ON DELETE CASCADE,
@@ -103,6 +126,8 @@ CREATE TABLE provider_authorization_subjects (
 
 CREATE INDEX provider_rate_declarations_group
     ON provider_rate_declarations(group_id);
+CREATE INDEX provider_rate_extensions_declaration
+    ON provider_rate_extensions(declaration_digest);
 CREATE INDEX provider_rate_requests_group
     ON provider_rate_requests(group_id);
 "#;
@@ -274,6 +299,7 @@ struct ProviderRateLogicalCheckpointEnvelope {
     capacities: ProviderRateCheckpointCapacities,
     groups: Vec<ProviderRateCheckpointGroup>,
     declarations: Vec<ProviderRateCheckpointDeclaration>,
+    extensions: Vec<ProviderRateCheckpointExtension>,
     authorization_subjects: Vec<ProviderRateCheckpointAuthorizationSubject>,
 }
 
@@ -282,6 +308,9 @@ struct ProviderRateLogicalCheckpointEnvelope {
 struct ProviderRateCheckpointCapacities {
     maximum_groups: i64,
     maximum_declarations: i64,
+    maximum_provider_extensions: i64,
+    maximum_provider_extension_state_bytes: usize,
+    maximum_provider_extension_total_bytes: i64,
     maximum_authorization_subjects: i64,
     maximum_collision_keys: usize,
     maximum_weighted_sliding_releases: usize,
@@ -308,6 +337,21 @@ struct ProviderRateCheckpointDeclaration {
     collision_keys: Vec<u8>,
     row_digest: [u8; 32],
     created_at_ns: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRateCheckpointExtension {
+    provider_subject: String,
+    extension_id: String,
+    schema_id: String,
+    declaration_digest: [u8; 32],
+    policy_digest: [u8; 32],
+    state_bytes: Vec<u8>,
+    state_digest: [u8; 32],
+    state_version: i64,
+    row_digest: [u8; 32],
+    updated_at_ns: i64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1078,6 +1122,391 @@ impl ProviderRateStore for SqliteProviderRateStore {
         })
         .transpose()
     }
+
+    fn load_extension(
+        &self,
+        run_id: ProviderRateRunId,
+        key: &ProviderRateExtensionKey,
+        now: Timestamp,
+    ) -> Result<Option<ProviderRateExtensionState>, ProviderRateStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        validate_run(&transaction, run_id, now)?;
+        validate_extension_key(&transaction, key)?;
+        validate_extension_capacity(&transaction)?;
+        let state = load_extension_row(&transaction, key)?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(state)
+    }
+
+    fn compare_exchange_extension(
+        &self,
+        run_id: ProviderRateRunId,
+        key: &ProviderRateExtensionKey,
+        expected: Option<ProviderRateExtensionRevision>,
+        replacement: &[u8],
+        now: Timestamp,
+    ) -> Result<ProviderRateExtensionState, ProviderRateStoreError> {
+        validate_extension_replacement(replacement)?;
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        validate_run(&transaction, run_id, now)?;
+        validate_extension_key(&transaction, key)?;
+        validate_extension_capacity(&transaction)?;
+        let current = load_extension_row(&transaction, key)?;
+        match (&current, expected) {
+            (None, None) | (Some(_), Some(_)) => {}
+            (None, Some(_)) | (Some(_), None) => return Err(ProviderRateStoreError::Conflict),
+        }
+        if let (Some(current), Some(expected)) = (&current, expected)
+            && current.revision() != expected
+        {
+            return Err(ProviderRateStoreError::Conflict);
+        }
+
+        let retained_total: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(SUM(length(state_bytes)), 0) FROM provider_rate_extensions",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sql)?;
+        if !(0..=MAXIMUM_PROVIDER_EXTENSION_TOTAL_BYTES).contains(&retained_total) {
+            return Err(ProviderRateStoreError::Capacity);
+        }
+        let replacement_bytes =
+            i64::try_from(replacement.len()).map_err(|_| ProviderRateStoreError::Capacity)?;
+        let current_bytes = current
+            .as_ref()
+            .map(|state| i64::try_from(state.bytes().len()))
+            .transpose()
+            .map_err(|_| ProviderRateStoreError::Capacity)?
+            .unwrap_or(0);
+        let next_total = retained_total
+            .checked_sub(current_bytes)
+            .and_then(|value| value.checked_add(replacement_bytes))
+            .ok_or(ProviderRateStoreError::Capacity)?;
+        if next_total > MAXIMUM_PROVIDER_EXTENSION_TOTAL_BYTES {
+            return Err(ProviderRateStoreError::Capacity);
+        }
+
+        let version = current.as_ref().map_or(Ok(1_i64), |state| {
+            i64::try_from(state.revision().version().get())
+                .map_err(|_| ProviderRateStoreError::Corrupt)?
+                .checked_add(1)
+                .ok_or(ProviderRateStoreError::Corrupt)
+        })?;
+        let state_digest = extension_state_digest(key, version, replacement)?;
+        let row_digest = extension_row_digest(key, version, state_digest, now.unix_nanos())?;
+        let declaration_digest = sha256_bytes(key.declaration_digest())?;
+        let policy_digest = sha256_bytes(key.policy_digest())?;
+        let changed = if let Some(current) = &current {
+            transaction
+                .execute(
+                    "UPDATE provider_rate_extensions
+                     SET state_bytes = ?1, state_digest = ?2, state_version = ?3,
+                         row_digest = ?4, updated_at_ns = ?5
+                     WHERE provider_subject = ?6 AND extension_id = ?7 AND schema_id = ?8
+                       AND declaration_digest = ?9 AND policy_digest = ?10
+                       AND state_version = ?11 AND state_digest = ?12",
+                    params![
+                        replacement,
+                        state_digest,
+                        version,
+                        row_digest,
+                        now.unix_nanos(),
+                        key.provider_subject().as_str(),
+                        key.extension_id().as_str(),
+                        key.schema_id().as_str(),
+                        declaration_digest,
+                        policy_digest,
+                        i64::try_from(current.revision().version().get())
+                            .map_err(|_| ProviderRateStoreError::Corrupt)?,
+                        sha256_bytes(current.revision().digest())?,
+                    ],
+                )
+                .map_err(map_sql)?
+        } else {
+            let count = bounded_table_count(
+                &transaction,
+                "provider_rate_extensions",
+                MAXIMUM_PROVIDER_EXTENSIONS,
+            )?;
+            if count == MAXIMUM_PROVIDER_EXTENSIONS {
+                return Err(ProviderRateStoreError::Capacity);
+            }
+            transaction
+                .execute(
+                    "INSERT INTO provider_rate_extensions(
+                        provider_subject, extension_id, schema_id, declaration_digest,
+                        policy_digest, state_bytes, state_digest, state_version, row_digest,
+                        updated_at_ns
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        key.provider_subject().as_str(),
+                        key.extension_id().as_str(),
+                        key.schema_id().as_str(),
+                        declaration_digest,
+                        policy_digest,
+                        replacement,
+                        state_digest,
+                        version,
+                        row_digest,
+                        now.unix_nanos(),
+                    ],
+                )
+                .map_err(map_sql)?
+        };
+        if changed != 1 {
+            return Err(ProviderRateStoreError::Conflict);
+        }
+        let state = extension_state_from_verified(
+            key.clone(),
+            version,
+            state_digest,
+            replacement.to_vec(),
+            now.unix_nanos(),
+        )?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(state)
+    }
+}
+
+fn validate_extension_replacement(replacement: &[u8]) -> Result<(), ProviderRateStoreError> {
+    if replacement.is_empty() || replacement.len() > MAXIMUM_PROVIDER_EXTENSION_STATE_BYTES {
+        return Err(ProviderRateStoreError::Capacity);
+    }
+    Ok(())
+}
+
+fn validate_extension_key(
+    connection: &Connection,
+    key: &ProviderRateExtensionKey,
+) -> Result<(), ProviderRateStoreError> {
+    let declaration_digest = sha256_bytes(key.declaration_digest())?;
+    let policy_digest = sha256_bytes(key.policy_digest())?;
+    let declaration = existing_declaration(connection, declaration_digest)?
+        .ok_or(ProviderRateStoreError::Conflict)?;
+    if declaration.policy_digest != policy_digest {
+        return Err(ProviderRateStoreError::Conflict);
+    }
+    let group = load_group_by_id(connection, declaration.group_id)?;
+    if group.policy_digest != policy_digest {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    let expected_subject = group
+        .policy
+        .scope()
+        .authorization_account()
+        .cloned()
+        .map_or_else(
+            || {
+                ProviderRateDeclaration::governed_provider_subject(
+                    group.policy.scope().as_source_identifier(),
+                )
+            },
+            Ok,
+        )
+        .map_err(|_| ProviderRateStoreError::Corrupt)?;
+    if &expected_subject != key.provider_subject() {
+        return Err(ProviderRateStoreError::Conflict);
+    }
+    Ok(())
+}
+
+fn validate_extension_capacity(connection: &Connection) -> Result<(), ProviderRateStoreError> {
+    bounded_table_count(
+        connection,
+        "provider_rate_extensions",
+        MAXIMUM_PROVIDER_EXTENSIONS,
+    )?;
+    let total: i64 = connection
+        .query_row(
+            "SELECT COALESCE(SUM(length(state_bytes)), 0) FROM provider_rate_extensions",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_sql)?;
+    if !(0..=MAXIMUM_PROVIDER_EXTENSION_TOTAL_BYTES).contains(&total) {
+        return Err(ProviderRateStoreError::Capacity);
+    }
+    Ok(())
+}
+
+type ProviderRateExtensionRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>, Vec<u8>, i64);
+
+fn load_extension_row(
+    connection: &Connection,
+    key: &ProviderRateExtensionKey,
+) -> Result<Option<ProviderRateExtensionState>, ProviderRateStoreError> {
+    let row: Option<ProviderRateExtensionRow> = connection
+        .query_row(
+            "SELECT declaration_digest, policy_digest, state_bytes, state_version,
+                    state_digest, row_digest, updated_at_ns
+             FROM provider_rate_extensions
+             WHERE provider_subject = ?1 AND extension_id = ?2 AND schema_id = ?3",
+            params![
+                key.provider_subject().as_str(),
+                key.extension_id().as_str(),
+                key.schema_id().as_str(),
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_sql)?;
+    row.map(
+        |(declaration_digest, policy_digest, state, version, digest, row_digest, updated_at_ns)| {
+            if fixed_bytes::<32>(declaration_digest)? != sha256_bytes(key.declaration_digest())?
+                || fixed_bytes::<32>(policy_digest)? != sha256_bytes(key.policy_digest())?
+            {
+                return Err(ProviderRateStoreError::Corrupt);
+            }
+            let digest = fixed_bytes(digest)?;
+            if extension_state_digest(key, version, &state)? != digest
+                || extension_row_digest(key, version, digest, updated_at_ns)?
+                    != fixed_bytes::<32>(row_digest)?
+            {
+                return Err(ProviderRateStoreError::Corrupt);
+            }
+            extension_state_from_verified(key.clone(), version, digest, state, updated_at_ns)
+        },
+    )
+    .transpose()
+}
+
+fn extension_state_from_verified(
+    key: ProviderRateExtensionKey,
+    version: i64,
+    digest: [u8; 32],
+    state: Vec<u8>,
+    updated_at_ns: i64,
+) -> Result<ProviderRateExtensionState, ProviderRateStoreError> {
+    validate_extension_replacement(&state)?;
+    let version = u64::try_from(version)
+        .ok()
+        .and_then(NonZeroU64::new)
+        .ok_or(ProviderRateStoreError::Corrupt)?;
+    Ok(ProviderRateExtensionState::from_verified_store(
+        key,
+        ProviderRateExtensionRevision::new(
+            version,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, digest),
+        ),
+        state.into_boxed_slice(),
+        Timestamp::from_unix_nanos(updated_at_ns),
+    ))
+}
+
+fn extension_state_digest(
+    key: &ProviderRateExtensionKey,
+    version: i64,
+    state: &[u8],
+) -> Result<[u8; 32], ProviderRateStoreError> {
+    extension_state_digest_fields(
+        key.provider_subject(),
+        key.extension_id(),
+        key.schema_id(),
+        sha256_bytes(key.declaration_digest())?,
+        sha256_bytes(key.policy_digest())?,
+        version,
+        state,
+    )
+}
+
+fn extension_state_digest_fields(
+    provider_subject: &market_squawk_domain::SourceIdentifier,
+    extension_id: &market_squawk_domain::SourceIdentifier,
+    schema_id: &market_squawk_domain::SourceIdentifier,
+    declaration_digest: [u8; 32],
+    policy_digest: [u8; 32],
+    version: i64,
+    state: &[u8],
+) -> Result<[u8; 32], ProviderRateStoreError> {
+    validate_extension_replacement(state)?;
+    if version < 1 || declaration_digest == [0; 32] || policy_digest == [0; 32] {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/provider-rate-extension-state/v1\0");
+    for field in [
+        provider_subject.as_str().as_bytes(),
+        extension_id.as_str().as_bytes(),
+        schema_id.as_str().as_bytes(),
+    ] {
+        digest.update(
+            u64::try_from(field.len())
+                .map_err(|_| ProviderRateStoreError::Capacity)?
+                .to_be_bytes(),
+        );
+        digest.update(field);
+    }
+    digest.update(declaration_digest);
+    digest.update(policy_digest);
+    digest.update(version.to_be_bytes());
+    digest.update(
+        u64::try_from(state.len())
+            .map_err(|_| ProviderRateStoreError::Capacity)?
+            .to_be_bytes(),
+    );
+    digest.update(state);
+    Ok(digest.finalize().into())
+}
+
+fn extension_row_digest(
+    key: &ProviderRateExtensionKey,
+    version: i64,
+    state_digest: [u8; 32],
+    updated_at_ns: i64,
+) -> Result<[u8; 32], ProviderRateStoreError> {
+    Ok(extension_row_digest_fields(
+        key.provider_subject(),
+        key.extension_id(),
+        key.schema_id(),
+        sha256_bytes(key.declaration_digest())?,
+        sha256_bytes(key.policy_digest())?,
+        version,
+        state_digest,
+        updated_at_ns,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extension_row_digest_fields(
+    provider_subject: &market_squawk_domain::SourceIdentifier,
+    extension_id: &market_squawk_domain::SourceIdentifier,
+    schema_id: &market_squawk_domain::SourceIdentifier,
+    declaration_digest: [u8; 32],
+    policy_digest: [u8; 32],
+    version: i64,
+    state_digest: [u8; 32],
+    updated_at_ns: i64,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/provider-rate-extension-row/v1\0");
+    for field in [
+        provider_subject.as_str().as_bytes(),
+        extension_id.as_str().as_bytes(),
+        schema_id.as_str().as_bytes(),
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    digest.update(declaration_digest);
+    digest.update(policy_digest);
+    digest.update(version.to_be_bytes());
+    digest.update(state_digest);
+    digest.update(updated_at_ns.to_be_bytes());
+    digest.finalize().into()
 }
 
 fn register_in_open_transaction(
@@ -2336,6 +2765,9 @@ fn checkpoint_from_connection(
         capacities: ProviderRateCheckpointCapacities {
             maximum_groups: MAXIMUM_GROUPS,
             maximum_declarations: MAXIMUM_DECLARATIONS,
+            maximum_provider_extensions: MAXIMUM_PROVIDER_EXTENSIONS,
+            maximum_provider_extension_state_bytes: MAXIMUM_PROVIDER_EXTENSION_STATE_BYTES,
+            maximum_provider_extension_total_bytes: MAXIMUM_PROVIDER_EXTENSION_TOTAL_BYTES,
             maximum_authorization_subjects: MAXIMUM_AUTHORIZATION_SUBJECTS,
             maximum_collision_keys: MAXIMUM_COLLISION_KEYS,
             maximum_weighted_sliding_releases: MAXIMUM_WEIGHTED_SLIDING_RELEASES,
@@ -2345,6 +2777,7 @@ fn checkpoint_from_connection(
             checkpoint_groups(connection)?
         },
         declarations: checkpoint_declarations(connection)?,
+        extensions: checkpoint_extensions(connection)?,
         authorization_subjects: checkpoint_authorization_subjects(connection)?,
     };
     checkpoint_from_envelope(envelope)
@@ -2360,7 +2793,7 @@ fn checkpoint_from_envelope(
     }
     let content_sha256 = Sha256::digest(&bytes).into();
     let mut authority = Sha256::new();
-    authority.update(b"market-squawk/provider-rate-logical-checkpoint-authority/v2\0");
+    authority.update(b"market-squawk/provider-rate-logical-checkpoint-authority/v3\0");
     authority.update(content_sha256);
     Ok(ProviderRateLogicalCheckpoint {
         bytes,
@@ -2512,6 +2945,50 @@ fn checkpoint_declarations(
     Ok(declarations)
 }
 
+fn checkpoint_extensions(
+    connection: &Connection,
+) -> Result<Vec<ProviderRateCheckpointExtension>, ProviderRateStoreError> {
+    validate_extension_capacity(connection)?;
+    let count = bounded_table_count(
+        connection,
+        "provider_rate_extensions",
+        MAXIMUM_PROVIDER_EXTENSIONS,
+    )?;
+    let capacity = usize::try_from(count).map_err(|_| ProviderRateStoreError::Capacity)?;
+    let mut extensions = Vec::new();
+    extensions
+        .try_reserve_exact(capacity)
+        .map_err(|_| ProviderRateStoreError::Capacity)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT provider_subject, extension_id, schema_id, declaration_digest,
+                    policy_digest, state_bytes, state_digest, state_version, row_digest,
+                    updated_at_ns
+             FROM provider_rate_extensions
+             ORDER BY provider_subject, extension_id, schema_id",
+        )
+        .map_err(map_sql)?;
+    let mut rows = statement.query([]).map_err(map_sql)?;
+    while let Some(row) = rows.next().map_err(map_sql)? {
+        extensions.push(ProviderRateCheckpointExtension {
+            provider_subject: row.get(0).map_err(map_sql)?,
+            extension_id: row.get(1).map_err(map_sql)?,
+            schema_id: row.get(2).map_err(map_sql)?,
+            declaration_digest: fixed_bytes(row.get(3).map_err(map_sql)?)?,
+            policy_digest: fixed_bytes(row.get(4).map_err(map_sql)?)?,
+            state_bytes: row.get(5).map_err(map_sql)?,
+            state_digest: fixed_bytes(row.get(6).map_err(map_sql)?)?,
+            state_version: row.get(7).map_err(map_sql)?,
+            row_digest: fixed_bytes(row.get(8).map_err(map_sql)?)?,
+            updated_at_ns: row.get(9).map_err(map_sql)?,
+        });
+    }
+    if extensions.len() != capacity {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    Ok(extensions)
+}
+
 fn checkpoint_authorization_subjects(
     connection: &Connection,
 ) -> Result<Vec<ProviderRateCheckpointAuthorizationSubject>, ProviderRateStoreError> {
@@ -2575,6 +3052,11 @@ fn validate_checkpoint_envelope(
         || checkpoint.sqlite_schema_sha256 != provider_rate_schema_sha256()?
         || checkpoint.capacities.maximum_groups != MAXIMUM_GROUPS
         || checkpoint.capacities.maximum_declarations != MAXIMUM_DECLARATIONS
+        || checkpoint.capacities.maximum_provider_extensions != MAXIMUM_PROVIDER_EXTENSIONS
+        || checkpoint.capacities.maximum_provider_extension_state_bytes
+            != MAXIMUM_PROVIDER_EXTENSION_STATE_BYTES
+        || checkpoint.capacities.maximum_provider_extension_total_bytes
+            != MAXIMUM_PROVIDER_EXTENSION_TOTAL_BYTES
         || checkpoint.capacities.maximum_authorization_subjects != MAXIMUM_AUTHORIZATION_SUBJECTS
         || checkpoint.capacities.maximum_collision_keys != MAXIMUM_COLLISION_KEYS
         || checkpoint.capacities.maximum_weighted_sliding_releases
@@ -2582,6 +3064,8 @@ fn validate_checkpoint_envelope(
         || i64::try_from(checkpoint.groups.len()).map_or(true, |count| count > MAXIMUM_GROUPS)
         || i64::try_from(checkpoint.declarations.len())
             .map_or(true, |count| count > MAXIMUM_DECLARATIONS)
+        || i64::try_from(checkpoint.extensions.len())
+            .map_or(true, |count| count > MAXIMUM_PROVIDER_EXTENSIONS)
         || i64::try_from(checkpoint.authorization_subjects.len())
             .map_or(true, |count| count > MAXIMUM_AUTHORIZATION_SUBJECTS)
     {
@@ -2637,7 +3121,23 @@ fn validate_checkpoint_envelope(
         {
             return Err(ProviderRateStoreError::Corrupt);
         }
-        if groups.insert(group.group_id, group.policy_digest).is_some() {
+        let provider_subject = policy
+            .scope()
+            .authorization_account()
+            .cloned()
+            .map_or_else(
+                || {
+                    ProviderRateDeclaration::governed_provider_subject(
+                        policy.scope().as_source_identifier(),
+                    )
+                },
+                Ok,
+            )
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        if groups
+            .insert(group.group_id, (group.policy_digest, provider_subject))
+            .is_some()
+        {
             return Err(ProviderRateStoreError::Corrupt);
         }
         previous_group = Some(group.group_id);
@@ -2645,6 +3145,7 @@ fn validate_checkpoint_envelope(
 
     let mut previous_declaration = None;
     let mut declarations_per_group = std::collections::BTreeMap::new();
+    let mut declarations = std::collections::BTreeMap::new();
     for declaration in &checkpoint.declarations {
         if declaration.declaration_digest == [0; 32]
             || declaration.group_id == [0; 16]
@@ -2652,7 +3153,10 @@ fn validate_checkpoint_envelope(
             || previous_declaration
                 .is_some_and(|previous| previous >= declaration.declaration_digest)
             || decode_collision_keys(&declaration.collision_keys).is_err()
-            || groups.get(&declaration.group_id) != Some(&declaration.policy_digest)
+            || groups
+                .get(&declaration.group_id)
+                .map(|(policy_digest, _subject)| policy_digest)
+                != Some(&declaration.policy_digest)
             || declaration_row_digest(
                 declaration.declaration_digest,
                 declaration.group_id,
@@ -2668,6 +3172,15 @@ fn validate_checkpoint_envelope(
         *declaration_count = declaration_count
             .checked_add(1)
             .ok_or(ProviderRateStoreError::Corrupt)?;
+        if declarations
+            .insert(
+                declaration.declaration_digest,
+                (declaration.group_id, declaration.policy_digest),
+            )
+            .is_some()
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
         previous_declaration = Some(declaration.declaration_digest);
     }
     if groups
@@ -2675,6 +3188,69 @@ fn validate_checkpoint_envelope(
         .any(|group_id| !declarations_per_group.contains_key(group_id))
     {
         return Err(ProviderRateStoreError::Corrupt);
+    }
+
+    let mut previous_extension = None;
+    let mut retained_extension_bytes = 0_i64;
+    for extension in &checkpoint.extensions {
+        let provider_subject =
+            market_squawk_domain::SourceIdentifier::try_from(extension.provider_subject.clone())
+                .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        let extension_id =
+            market_squawk_domain::SourceIdentifier::try_from(extension.extension_id.clone())
+                .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        let schema_id =
+            market_squawk_domain::SourceIdentifier::try_from(extension.schema_id.clone())
+                .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        let ordering_key = (
+            extension.provider_subject.as_str(),
+            extension.extension_id.as_str(),
+            extension.schema_id.as_str(),
+        );
+        let Some((group_id, policy_digest)) =
+            declarations.get(&extension.declaration_digest).copied()
+        else {
+            return Err(ProviderRateStoreError::Corrupt);
+        };
+        if previous_extension.is_some_and(|previous| previous >= ordering_key)
+            || extension.policy_digest != policy_digest
+            || groups
+                .get(&group_id)
+                .is_none_or(|(_policy, subject)| subject != &provider_subject)
+            || extension.state_version < 1
+            || validate_extension_replacement(&extension.state_bytes).is_err()
+            || extension_state_digest_fields(
+                &provider_subject,
+                &extension_id,
+                &schema_id,
+                extension.declaration_digest,
+                extension.policy_digest,
+                extension.state_version,
+                &extension.state_bytes,
+            )? != extension.state_digest
+            || extension_row_digest_fields(
+                &provider_subject,
+                &extension_id,
+                &schema_id,
+                extension.declaration_digest,
+                extension.policy_digest,
+                extension.state_version,
+                extension.state_digest,
+                extension.updated_at_ns,
+            ) != extension.row_digest
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        retained_extension_bytes = retained_extension_bytes
+            .checked_add(
+                i64::try_from(extension.state_bytes.len())
+                    .map_err(|_| ProviderRateStoreError::Capacity)?,
+            )
+            .ok_or(ProviderRateStoreError::Capacity)?;
+        if retained_extension_bytes > MAXIMUM_PROVIDER_EXTENSION_TOTAL_BYTES {
+            return Err(ProviderRateStoreError::Capacity);
+        }
+        previous_extension = Some(ordering_key);
     }
 
     let mut previous_subject = None;
@@ -2721,6 +3297,7 @@ fn restore_checkpoint(
         "provider_rate_runs",
         "provider_rate_groups",
         "provider_rate_declarations",
+        "provider_rate_extensions",
         "provider_rate_requests",
         "provider_authorization_subjects",
     ] {
@@ -2766,6 +3343,29 @@ fn restore_checkpoint(
                     declaration.collision_keys,
                     declaration.row_digest,
                     declaration.created_at_ns,
+                ],
+            )
+            .map_err(map_sql)?;
+    }
+    for extension in &checkpoint.envelope.extensions {
+        transaction
+            .execute(
+                "INSERT INTO provider_rate_extensions(
+                    provider_subject, extension_id, schema_id, declaration_digest,
+                    policy_digest, state_bytes, state_digest, state_version, row_digest,
+                    updated_at_ns
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    extension.provider_subject,
+                    extension.extension_id,
+                    extension.schema_id,
+                    extension.declaration_digest,
+                    extension.policy_digest,
+                    extension.state_bytes,
+                    extension.state_digest,
+                    extension.state_version,
+                    extension.row_digest,
+                    extension.updated_at_ns,
                 ],
             )
             .map_err(map_sql)?;
@@ -2820,7 +3420,7 @@ fn schema_sha256(connection: &Connection) -> Result<[u8; 32], ProviderRateStoreE
         .map_err(map_sql)?;
     let mut rows = statement.query([]).map_err(map_sql)?;
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/provider-rate-sqlite-schema/v2\0");
+    digest.update(b"market-squawk/provider-rate-sqlite-schema/v3\0");
     let mut count = 0_u64;
     while let Some(row) = rows.next().map_err(map_sql)? {
         for index in 0..4 {
@@ -3616,6 +4216,30 @@ mod tests {
             &EndpointPolicy::try_new(["https://provider-rate.test/"])?,
         )?;
         let registration = source.register(run_id, &declaration, now)?;
+        let extension_key = ProviderRateExtensionKey::try_from_declaration(
+            &declaration,
+            market_squawk_domain::SourceIdentifier::try_from("checkpoint-extension")?,
+            market_squawk_domain::SourceIdentifier::try_from("checkpoint-extension-v1")?,
+        )?;
+        let initial_extension =
+            source.compare_exchange_extension(run_id, &extension_key, None, b"initial", now)?;
+        let updated_extension = source.compare_exchange_extension(
+            run_id,
+            &extension_key,
+            Some(initial_extension.revision()),
+            b"updated",
+            now,
+        )?;
+        assert_eq!(
+            source.compare_exchange_extension(
+                run_id,
+                &extension_key,
+                Some(initial_extension.revision()),
+                b"stale",
+                now,
+            ),
+            Err(ProviderRateStoreError::Conflict)
+        );
         let reservation = match source.try_reserve(run_id, registration, now)? {
             ProviderRateReservationDecision::Ready(reservation) => reservation,
             decision => return Err(format!("unexpected reservation decision: {decision:?}").into()),
@@ -3651,6 +4275,10 @@ mod tests {
 
         let restored_run = restored.start_run(now)?;
         let restored_registration = restored.register(restored_run, &declaration, now)?;
+        let restored_extension = restored
+            .load_extension(restored_run, &extension_key, now)?
+            .ok_or("restored extension state")?;
+        assert_eq!(restored_extension, updated_extension);
         assert!(matches!(
             restored.try_reserve(restored_run, restored_registration, now)?,
             ProviderRateReservationDecision::WaitUntil(_)
