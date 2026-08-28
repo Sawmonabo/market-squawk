@@ -54,7 +54,17 @@ pub(crate) use forecast_evidence::AnalyticalForecastEvidenceReader;
 pub(crate) use ingest::{
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
-    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+    BLS_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BlsMacroApplicationClosure,
+    BlsMacroApplicationError, BlsMacroCapabilityState, BlsMacroPlanPublication,
+    BlsMacroUnavailableReason, BlsPreparedMacroPlan, BlsProviderPeriodLatestKnownDto,
+    BlsProviderPeriodLatestKnownRequest, BlsSealFirstExtractionLimits,
+    BlsWholePlanApplicationHandoff, CoinbaseMarketApplicationOutcome,
+    CryptoMarketEventPublicationReceipt, CryptoMarketEventRestartReceipt,
+    CryptoMarketEventRestartSelector, CryptoMarketPublicationClosure, CryptoMarketPublicationError,
+    CryptoMarketSealedReceiptEvidence, CryptoMarketSelectorAvailability,
+    CryptoMarketSelectorDependency, CryptoMarketSurface, KrakenMarketApplicationOutcome,
+    KrakenSealedRawCanonicalUnavailable, ResearchProviderRuntimeMutationAuthority,
+    ResearchProviderRuntimeReplacement,
 };
 pub use ingest::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
@@ -1424,6 +1434,7 @@ fn map_manifest_error(error: ManifestCatalogError) -> ServiceError {
         | ManifestCatalogError::CaptureInputLimitExceeded { .. }
         | ManifestCatalogError::MarketBarHistoryMismatch
         | ManifestCatalogError::MarketBarHistoryInputLimitExceeded { .. }
+        | ManifestCatalogError::ProviderMacroPlanMismatch
         | ManifestCatalogError::LockPoisoned
         | ManifestCatalogError::Plan(_)
         | ManifestCatalogError::Path(_)

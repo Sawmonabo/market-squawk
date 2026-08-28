@@ -50,6 +50,8 @@ const STANDARD_DISCOVERY_RECEIPT_RETENTION: Duration = Duration::from_secs(5 * 6
 const MAXIMUM_PREPUBLISHED_RESEARCH_SOURCES: usize = 64;
 
 mod alpaca_historical;
+mod bls;
+mod crypto_market;
 mod provider_runtime;
 mod schwab_market;
 mod selection;
@@ -59,6 +61,21 @@ pub(crate) use alpaca_historical::{
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
     AlpacaHistoricalSourceSlotError,
+};
+pub(crate) use bls::{
+    BLS_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BlsMacroApplicationClosure,
+    BlsMacroApplicationError, BlsMacroCapabilityState, BlsMacroPlanPublication,
+    BlsMacroUnavailableReason, BlsPreparedMacroPlan, BlsProviderPeriodLatestKnownDto,
+    BlsProviderPeriodLatestKnownRequest, BlsSealFirstExtractionLimits,
+    BlsWholePlanApplicationHandoff,
+};
+pub(crate) use crypto_market::{
+    CoinbaseMarketApplicationOutcome, CryptoMarketEventPublicationReceipt,
+    CryptoMarketEventRestartReceipt, CryptoMarketEventRestartSelector,
+    CryptoMarketPublicationClosure, CryptoMarketPublicationError,
+    CryptoMarketSealedReceiptEvidence, CryptoMarketSelectorAvailability,
+    CryptoMarketSelectorDependency, CryptoMarketSurface, KrakenMarketApplicationOutcome,
+    KrakenSealedRawCanonicalUnavailable,
 };
 pub use provider_runtime::ResearchProviderRuntimeGeneration;
 use provider_runtime::{ResearchProviderAdmission, ResearchProviderPublicationLease};

@@ -6,6 +6,7 @@ mod credential_bundle_delegation;
 mod portal;
 mod schwab_market_doctor;
 mod schwab_market_doctor_probe;
+mod schwab_market_doctor_runtime;
 mod schwab_oauth_installation;
 mod schwab_oauth_runtime;
 mod service;
@@ -37,6 +38,10 @@ pub use contracts::{
 pub use portal::{
     ProviderOnboardingPortal, ProviderPortalActivationAuthority, ProviderPortalActivationError,
     ProviderPortalConfig, ProviderPortalError,
+};
+pub(crate) use schwab_market_doctor_runtime::{
+    SchwabMarketDoctorRuntimeCoordinator, SchwabMarketDoctorRuntimeError,
+    SchwabMarketDoctorRuntimeTerminal,
 };
 pub(crate) use schwab_oauth_installation::{
     InstallationSchwabOAuthBrowser, InstallationSchwabOAuthIdentity,
