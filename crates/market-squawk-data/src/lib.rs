@@ -24,6 +24,7 @@ mod migrations;
 mod option_market;
 mod parquet_store;
 mod pit;
+mod provider_event_selection;
 mod provider_rate;
 mod publication_coordinator;
 mod python_dataset;
@@ -144,16 +145,20 @@ pub use dataset_builder::{
     MAX_FEATURE_DATASET_PRODUCTION_RECEIPT_BYTES, MAX_FEATURE_LABEL_EXPORT_BYTES,
     MissingValuePolicy,
 };
+pub use fund_holdings::{
+    FundHoldingsArrowBatch, FundLatestUnavailableReason, FundPointInTimeOutcome,
+    FundPointInTimeRequest, FundPointInTimeRevisionMode, FundPointInTimeSelection,
+    MAX_FUND_HOLDINGS_BATCH_RECORDS, MAX_FUND_HOLDINGS_RETAINED_BYTES,
+};
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
     IngestPrecommitAuthority, ListingReferenceAdmissionCapability,
     PendingProviderMacroPlanPublication, PinnedArtifactQueryRequest, ProviderMacroPlanChunkInput,
     ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
-    ProviderMacroPlanRestartSelector,
-    ProviderMacroPlanSemantics, ProviderMarketEventPublicationKind,
-    ProviderMarketEventPublicationSelector, ProviderOptionMarketPublicationSelector,
-    ProviderPublicationInput, QueryArtifactPublication, ResearchIngestService,
-    extraction_batch_digest, extraction_provider_payload_digest,
+    ProviderMacroPlanRestartSelector, ProviderMacroPlanSemantics,
+    ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
+    ProviderOptionMarketPublicationSelector, ProviderPublicationInput, QueryArtifactPublication,
+    ResearchIngestService, extraction_batch_digest, extraction_provider_payload_digest,
     provider_market_event_publication_digest, provider_option_market_publication_digest,
 };
 pub use manifest::{
@@ -170,11 +175,6 @@ pub use manifest::{
     ReleaseEvidenceStorageError, ReleaseEvidenceStorageResult, run_release_evidence_storage,
 };
 pub use market_event::ProviderMarketEventArrowBatch;
-pub use fund_holdings::{
-    FundHoldingsArrowBatch, FundLatestUnavailableReason, FundPointInTimeOutcome,
-    FundPointInTimeRequest, FundPointInTimeRevisionMode, FundPointInTimeSelection,
-    MAX_FUND_HOLDINGS_BATCH_RECORDS, MAX_FUND_HOLDINGS_RETAINED_BYTES,
-};
 pub use option_market::{
     OptionMarketPointInTimeRequest, OptionMarketPointInTimeSelection,
     ProviderOptionMarketArrowBatch,
@@ -191,6 +191,17 @@ pub use pit::{
     PointInTimeLimits, PointInTimePolicy, PointInTimeRecord, PointInTimeRequest,
     PointInTimeRevisionCounts, PointInTimeRevisionMode, PointInTimeRevisionState,
     PointInTimeSelection, PointInTimeService,
+};
+pub use provider_event_selection::{
+    MAX_PROVIDER_MARKET_EVENT_POINT_IN_TIME_CANDIDATES, ProviderMarketEventComponentKind,
+    ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventExactPublication,
+    ProviderMarketEventExclusionCounts, ProviderMarketEventPointInTimeRequest,
+    ProviderMarketEventPointInTimeSelection, ProviderMarketEventSelectedCandidate,
+    ProviderMarketEventSelectionCompleteness, ProviderMarketEventSelectionCoordinate,
+    ProviderMarketEventSelectionError, ProviderMarketEventSourceSelection,
+};
+pub(crate) use provider_event_selection::{
+    ProviderMarketEventCatalogCandidate, ProviderMarketEventCatalogPlan,
 };
 pub use provider_rate::SqliteProviderRateStore;
 pub use python_dataset::{
