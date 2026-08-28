@@ -4,6 +4,8 @@ mod account;
 mod alpaca;
 pub(crate) mod credentials;
 mod direct;
+mod fred;
+mod fred_read;
 mod kraken_l3;
 mod market_config;
 pub(crate) mod nasdaq_reference;
@@ -55,6 +57,11 @@ pub(crate) use account::ProviderAccountRuntimeCurrentness;
 pub use account::{ProviderAccountActivationError, ProviderAccountBinding, ProviderMarketAccount};
 pub use alpaca::{AlpacaBasicAccountActivation, AlpacaBasicActivationError};
 pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
+pub(crate) use fred::FredRestartActivation;
+pub(crate) use fred_read::{
+    FRED_ALFRED_READ_OPERATION, FredDesktopPointInTimeReadDto, FredPointInTimeReadCapability,
+    FredPointInTimeReadError,
+};
 pub use kraken_l3::{
     KrakenL3AccountActivation, KrakenL3ActivationError, KrakenL3WebSocketTokenMaterial,
 };
