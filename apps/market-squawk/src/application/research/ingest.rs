@@ -57,6 +57,7 @@ mod iex_hist;
 mod provider_runtime;
 mod schwab_market;
 mod selection;
+mod tiingo;
 mod yahoo_enrichment;
 
 pub(crate) use alpaca_historical::{
@@ -102,6 +103,11 @@ pub(crate) use provider_runtime::{
 use selection::{PreparedRetainedSelection, RetainedDiscoverySelections};
 pub use selection::{
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceObjectListing,
+};
+pub(crate) use tiingo::{
+    TIINGO_EOD_MARKET_BAR_POINT_IN_TIME_OPERATION, TIINGO_FUND_NAV_POINT_IN_TIME_OPERATION,
+    TiingoEodApplicationOutcome, TiingoEodRestartSelector, TiingoFundNavApplicationOutcome,
+    TiingoFundNavRestartSelector, TiingoLatestApplicationError, TiingoLatestApplicationState,
 };
 
 /// Fixed operation ceilings applied independently of transport result limits.
