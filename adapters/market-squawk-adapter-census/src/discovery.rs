@@ -385,8 +385,7 @@ impl CensusVariableMetadata {
                 | CensusPredicateType::Time
         ) || matches!(
             self.required,
-            CensusRequiredVariable::PredicateOnly
-                | CensusRequiredVariable::RequiredPredicateOnly
+            CensusRequiredVariable::PredicateOnly | CensusRequiredVariable::RequiredPredicateOnly
         )
     }
 }
@@ -450,15 +449,23 @@ impl CensusVariableCatalog {
             }
         }
         let mut attribute_owners = BTreeMap::<SourceIdentifier, Vec<SourceIdentifier>>::new();
+        let mut attribute_relationships = 0_usize;
         for metadata in variables.values() {
             for attribute in &metadata.attributes {
                 if !variables.contains_key(attribute) {
                     return Err(CensusAdapterError::MetadataMismatch);
                 }
-                attribute_owners
-                    .entry(attribute.clone())
-                    .or_default()
-                    .push(metadata.name.clone());
+                attribute_relationships = attribute_relationships
+                    .checked_add(1)
+                    .ok_or(CensusAdapterError::ResourceLimitExceeded)?;
+                if attribute_relationships > limits.max_cells() {
+                    return Err(CensusAdapterError::ResourceLimitExceeded);
+                }
+                let owners = attribute_owners.entry(attribute.clone()).or_default();
+                owners
+                    .try_reserve_exact(1)
+                    .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+                owners.push(metadata.name.clone());
             }
         }
         Ok(Self {
@@ -661,10 +668,9 @@ pub enum CensusGeographyAdmission {
         for_is_wildcard: bool,
         grammar_digest: [u8; 32],
     },
-    /// `ucgid` is admitted from exact variable metadata rather than `fips` geography entries.
-    Uniform {
-        grammar_digest: [u8; 32],
-    },
+    /// `ucgid` request grammar is bound to the exact geography discovery document. The complete
+    /// metadata-bundle validator separately requires the dataset's exact `ucgid` variable entry.
+    Uniform { grammar_digest: [u8; 32] },
 }
 
 impl CensusGeographyAdmission {
@@ -687,9 +693,19 @@ impl CensusGeographyAdmission {
                 },
             ) => {
                 let actual_for_wildcard = clause_is_wildcard(for_clause.codes())?;
+                let required_set = requires.iter().map(String::as_str).collect::<BTreeSet<_>>();
+                let wildcard_set = wildcard_parents
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>();
                 if for_clause.level() != for_level
                     || actual_for_wildcard != *for_is_wildcard
                     || *grammar_digest == [0; 32]
+                    || required_set.len() != requires.len()
+                    || wildcard_set.len() != wildcard_parents.len()
+                    || wildcard_set
+                        .iter()
+                        .any(|parent| !required_set.contains(parent))
                 {
                     return Err(CensusAdapterError::MetadataMismatch);
                 }
@@ -697,19 +713,24 @@ impl CensusGeographyAdmission {
                     .iter()
                     .map(String::as_str)
                     .collect::<BTreeSet<_>>();
+                if optional.len() != optional_with_wildcard_for.len()
+                    || optional.iter().any(|parent| !required_set.contains(parent))
+                {
+                    return Err(CensusAdapterError::MetadataMismatch);
+                }
                 let supplied = in_clauses
                     .iter()
                     .map(|clause| clause.level())
-                    .collect::<BTreeSet<_>>();
-                if supplied.len() != in_clauses.len()
-                    || in_clauses
-                        .iter()
-                        .any(|clause| !requires.iter().any(|required| required == clause.level()))
-                    || requires.iter().any(|required| {
-                        !supplied.contains(required.as_str())
-                            && !(*for_is_wildcard && optional.contains(required.as_str()))
+                    .collect::<Vec<_>>();
+                let expected = requires
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|required| {
+                        !(*for_is_wildcard && optional.contains(*required))
+                            || supplied.contains(required)
                     })
-                {
+                    .collect::<Vec<_>>();
+                if supplied != expected {
                     return Err(CensusAdapterError::MetadataMismatch);
                 }
                 for clause in in_clauses {
@@ -766,20 +787,40 @@ impl CensusGeographyCatalog {
             if !identities.insert((name.clone(), geo_level_display.clone())) {
                 return Err(CensusAdapterError::DuplicateIdentity);
             }
+            let requires = optional_string_array(entry, "requires", limits)?;
+            let wildcard = optional_string_array(entry, "wildcard", limits)?;
+            let optional_with_wildcard_for =
+                optional_string_array_or_scalar(entry, "optionalWithWCFor", limits)?;
+            let required_set = requires.iter().map(String::as_str).collect::<BTreeSet<_>>();
+            if wildcard
+                .iter()
+                .chain(&optional_with_wildcard_for)
+                .any(|parent| !required_set.contains(parent.as_str()))
+            {
+                return Err(CensusAdapterError::SchemaDrift);
+            }
             geographies.push(CensusGeographyMetadata {
                 name,
                 geo_level_display,
                 reference_date: optional_text(entry, "referenceDate", limits)?
                     .map(|value| parse_date(&value))
                     .transpose()?,
-                requires: optional_string_array(entry, "requires", limits)?,
-                wildcard: optional_string_array(entry, "wildcard", limits)?,
-                optional_with_wildcard_for: optional_string_array_or_scalar(
-                    entry,
-                    "optionalWithWCFor",
-                    limits,
-                )?,
+                requires,
+                wildcard,
+                optional_with_wildcard_for,
             });
+        }
+        let geography_names = geographies
+            .iter()
+            .map(|geography| geography.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if geographies.iter().any(|geography| {
+            geography
+                .requires
+                .iter()
+                .any(|parent| !geography_names.contains(parent.as_str()))
+        }) {
+            return Err(CensusAdapterError::MetadataMismatch);
         }
         geographies.sort_by(|left, right| {
             (&left.geo_level_display, &left.name).cmp(&(&right.geo_level_display, &right.name))
@@ -829,7 +870,8 @@ impl CensusGeographyCatalog {
                     return Err(CensusAdapterError::MetadataMismatch);
                 }
                 let for_is_wildcard = clause_is_wildcard(for_clause.codes())?;
-                let grammar_digest = geography_grammar_digest(entry, geography)?;
+                let grammar_digest =
+                    geography_grammar_digest(&self.dataset, &self.evidence, entry, geography)?;
                 CensusGeographyAdmission::Standard {
                     for_level: entry.name.clone(),
                     geo_level_display: entry.geo_level_display.clone(),
@@ -844,12 +886,12 @@ impl CensusGeographyCatalog {
                 }
             }
             CensusGeography::Uniform { .. } => {
-                let wire = serde_json::to_vec(geography)
-                    .map_err(|_| CensusAdapterError::SchemaDrift)?;
+                let wire =
+                    serde_json::to_vec(&(&self.dataset, self.evidence.payload_digest(), geography))
+                        .map_err(|_| CensusAdapterError::SchemaDrift)?;
                 let mut digest = sha2::Sha256::new();
                 use sha2::Digest as _;
-                digest.update(b"market-squawk/census-ucgid-admission/v1");
-                digest.update(self.evidence.payload_digest);
+                digest.update(b"market-squawk/census-ucgid-admission/v2");
                 digest.update(wire);
                 CensusGeographyAdmission::Uniform {
                     grammar_digest: digest.finalize().into(),
@@ -968,10 +1010,14 @@ fn required_string_array(
     if values.is_empty() || values.len() > limits.max_columns() {
         return Err(CensusAdapterError::ResourceLimitExceeded);
     }
-    values
-        .iter()
-        .map(|value| bounded_str(value, limits).map(str::to_owned))
-        .collect()
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(values.len())
+        .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+    for value in values {
+        output.push(bounded_str(value, limits)?.to_owned());
+    }
+    Ok(output)
 }
 
 fn optional_string_array(
@@ -986,10 +1032,19 @@ fn optional_string_array(
     if values.len() > limits.max_columns() {
         return Err(CensusAdapterError::ResourceLimitExceeded);
     }
-    values
-        .iter()
-        .map(|value| bounded_str(value, limits).map(str::to_owned))
-        .collect()
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(values.len())
+        .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+    let mut identities = BTreeSet::new();
+    for value in values {
+        let value = bounded_str(value, limits)?;
+        if value.is_empty() || !identities.insert(value) {
+            return Err(CensusAdapterError::SchemaDrift);
+        }
+        output.push(value.to_owned());
+    }
+    Ok(output)
 }
 
 fn optional_string_array_or_scalar(
@@ -1002,19 +1057,25 @@ fn optional_string_array_or_scalar(
     };
     match value {
         Value::String(value) => {
-            if value.len() > limits.max_string_bytes() || value.chars().any(char::is_control) {
+            if value.is_empty()
+                || value.len() > limits.max_string_bytes()
+                || value.chars().any(char::is_control)
+            {
                 return Err(CensusAdapterError::ResourceLimitExceeded);
             }
-            Ok(vec![value.clone()])
+            let mut output = Vec::new();
+            output
+                .try_reserve_exact(1)
+                .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+            output.push(value.clone());
+            Ok(output)
         }
         Value::Array(_) => optional_string_array(object, key, limits),
         _ => Err(CensusAdapterError::SchemaDrift),
     }
 }
 
-fn clause_is_wildcard(
-    codes: &[CensusGeographyCode],
-) -> Result<bool, CensusAdapterError> {
+fn clause_is_wildcard(codes: &[CensusGeographyCode]) -> Result<bool, CensusAdapterError> {
     let wildcard_count = codes
         .iter()
         .filter(|code| matches!(code, CensusGeographyCode::Wildcard))
@@ -1026,10 +1087,14 @@ fn clause_is_wildcard(
 }
 
 fn geography_grammar_digest(
+    dataset: &CensusDataset,
+    evidence: &CensusMetadataEvidence,
     entry: &CensusGeographyMetadata,
     geography: &CensusGeography,
 ) -> Result<[u8; 32], CensusAdapterError> {
     let wire = serde_json::to_vec(&(
+        dataset,
+        evidence.payload_digest(),
         entry.name(),
         entry.geo_level_display(),
         entry.reference_date(),
@@ -1041,7 +1106,7 @@ fn geography_grammar_digest(
     .map_err(|_| CensusAdapterError::SchemaDrift)?;
     let mut digest = sha2::Sha256::new();
     use sha2::Digest as _;
-    digest.update(b"market-squawk/census-geography-admission/v1");
+    digest.update(b"market-squawk/census-geography-admission/v2");
     digest.update(wire);
     Ok(digest.finalize().into())
 }
@@ -1063,9 +1128,7 @@ fn parse_required(
     let parsed = match value {
         Value::Bool(true) => CensusRequiredVariable::Required,
         Value::Bool(false) => CensusRequiredVariable::Optional,
-        Value::String(value) if value == "predicate-only" => {
-            CensusRequiredVariable::PredicateOnly
-        }
+        Value::String(value) if value == "predicate-only" => CensusRequiredVariable::PredicateOnly,
         Value::String(value) if value == "required, predicate-only" => {
             CensusRequiredVariable::RequiredPredicateOnly
         }
@@ -1078,9 +1141,7 @@ fn parse_required(
         _ => return Err(CensusAdapterError::SchemaDrift),
     };
     Ok(match (parsed, predicate_only) {
-        (CensusRequiredVariable::Required, true) => {
-            CensusRequiredVariable::RequiredPredicateOnly
-        }
+        (CensusRequiredVariable::Required, true) => CensusRequiredVariable::RequiredPredicateOnly,
         (CensusRequiredVariable::Optional | CensusRequiredVariable::Unspecified, true) => {
             CensusRequiredVariable::PredicateOnly
         }
@@ -1097,33 +1158,55 @@ fn parse_attributes(
     };
     let values = match value {
         Value::String(value) => {
-            if value.len() > limits.max_string_bytes() {
+            if value.len() > limits.max_string_bytes() || value.chars().any(char::is_control) {
                 return Err(CensusAdapterError::ResourceLimitExceeded);
             }
             if value.is_empty() {
                 Vec::new()
             } else {
-                value.split(',').map(str::trim).collect::<Vec<_>>()
+                let mut values = Vec::new();
+                for candidate in value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    if values.len() == limits.max_columns() {
+                        return Err(CensusAdapterError::ResourceLimitExceeded);
+                    }
+                    values
+                        .try_reserve_exact(1)
+                        .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+                    values.push(candidate);
+                }
+                values
             }
         }
         Value::Array(values) => {
             if values.len() > limits.max_columns() {
                 return Err(CensusAdapterError::ResourceLimitExceeded);
             }
-            values
-                .iter()
-                .map(|value| bounded_str(value, limits))
-                .collect::<Result<Vec<_>, _>>()?
+            let mut parsed = Vec::new();
+            parsed
+                .try_reserve_exact(values.len())
+                .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+            for value in values {
+                parsed.push(bounded_str(value, limits)?);
+            }
+            parsed
         }
         _ => return Err(CensusAdapterError::SchemaDrift),
     };
-    let attributes = values
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .map(identifier)
-        .collect::<Result<Vec<_>, _>>()?;
-    if attributes.iter().collect::<BTreeSet<_>>().len() != attributes.len() {
-        return Err(CensusAdapterError::DuplicateIdentity);
+    let mut attributes = Vec::new();
+    attributes
+        .try_reserve_exact(values.len())
+        .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+    let mut identities = BTreeSet::new();
+    for value in values.into_iter().filter(|value| !value.is_empty()) {
+        let attribute = identifier(value)?;
+        if !identities.insert(attribute.clone()) {
+            return Err(CensusAdapterError::DuplicateIdentity);
+        }
+        attributes.push(attribute);
     }
     Ok(attributes)
 }

@@ -15,6 +15,7 @@ const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " census-data-api-adapter"
 );
+const MAX_RETAINED_HEADER_BYTES: usize = 128;
 
 #[derive(Debug)]
 pub(super) struct CensusHttpRequest<'a> {
@@ -97,9 +98,8 @@ impl CensusTransport for ReqwestCensusTransport {
                     .validate_current()
                     .map_err(|_| CensusSourceError::Authority)?;
                 let started = Instant::now();
-                let mut request_builder = self
-                    .client
-                    .get(request.authorized.transport_url().clone());
+                let mut request_builder =
+                    self.client.get(request.authorized.transport_url().clone());
                 if let Some(key) = request.authorized.key_query_value() {
                     request_builder = request_builder.query(&[("key", key)]);
                 }
@@ -109,6 +109,9 @@ impl CensusTransport for ReqwestCensusTransport {
                     .send()
                     .await
                     .map_err(|_| CensusSourceError::Network)?;
+                in_flight
+                    .validate_current()
+                    .map_err(|_| CensusSourceError::Authority)?;
                 if response.content_length().is_some_and(|length| {
                     usize::try_from(length).map_or(true, |length| length > max_bytes)
                 }) {
@@ -116,33 +119,29 @@ impl CensusTransport for ReqwestCensusTransport {
                 }
                 let status = response.status().as_u16();
                 let key_error = response.headers().contains_key("x-datawebapi-keyerror");
-                let retry_after = response
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .map(|value| value.as_bytes().to_vec());
-                let content_encoding = response
-                    .headers()
-                    .get(reqwest::header::CONTENT_ENCODING)
-                    .map(|value| value.as_bytes().to_vec());
-                let content_type = response
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .map(|value| value.as_bytes().to_vec());
+                let retry_after = bounded_retry_after(response.headers());
+                let content_encoding =
+                    bounded_header(response.headers(), reqwest::header::CONTENT_ENCODING)?;
+                let content_type =
+                    bounded_header(response.headers(), reqwest::header::CONTENT_TYPE)?;
                 let rate_headers = CensusRateLimitHeaders {
                     limit: supported_rate_header(
                         response.headers(),
                         &["x-ratelimit-limit", "x-rate-limit-limit"],
-                    ),
+                    )?,
                     remaining: supported_rate_header(
                         response.headers(),
                         &["x-ratelimit-remaining", "x-rate-limit-remaining"],
-                    ),
+                    )?,
                     reset: supported_rate_header(
                         response.headers(),
                         &["x-ratelimit-reset", "x-rate-limit-reset"],
-                    ),
+                    )?,
                 };
                 let body = collect_bounded(response.bytes_stream(), in_flight, max_bytes).await?;
+                in_flight
+                    .validate_current()
+                    .map_err(|_| CensusSourceError::Authority)?;
                 let received_at = system_timestamp()?;
                 let latency = started.elapsed();
                 Ok(CensusHttpResponse {
@@ -168,14 +167,56 @@ impl CensusTransport for ReqwestCensusTransport {
     }
 }
 
+fn bounded_header(
+    headers: &reqwest::header::HeaderMap,
+    name: reqwest::header::HeaderName,
+) -> Result<Option<Vec<u8>>, CensusSourceError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(CensusSourceError::Protocol);
+    }
+    let value = value.as_bytes();
+    if value.len() > MAX_RETAINED_HEADER_BYTES {
+        return Err(CensusSourceError::Protocol);
+    }
+    Ok(Some(value.to_vec()))
+}
+
+fn bounded_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Vec<u8>> {
+    let mut values = headers.get_all(reqwest::header::RETRY_AFTER).iter();
+    let value = values.next()?.as_bytes();
+    if values.next().is_some() || value.len() > MAX_RETAINED_HEADER_BYTES || !value.is_ascii() {
+        return None;
+    }
+    Some(value.to_vec())
+}
+
 fn supported_rate_header(
     headers: &reqwest::header::HeaderMap,
     names: &[&str],
-) -> Option<Vec<u8>> {
-    names
-        .iter()
-        .find_map(|name| headers.get(*name))
-        .map(|value| value.as_bytes().to_vec())
+) -> Result<Option<Vec<u8>>, CensusSourceError> {
+    let mut retained: Option<Vec<u8>> = None;
+    for name in names {
+        for value in headers.get_all(*name).iter() {
+            let value = value.as_bytes();
+            if value.len() > MAX_RETAINED_HEADER_BYTES || !value.is_ascii() {
+                return Err(CensusSourceError::Protocol);
+            }
+            if retained
+                .as_deref()
+                .is_some_and(|retained| retained != value)
+            {
+                return Err(CensusSourceError::Protocol);
+            }
+            if retained.is_none() {
+                retained = Some(value.to_vec());
+            }
+        }
+    }
+    Ok(retained)
 }
 
 async fn collect_bounded<S, E>(
