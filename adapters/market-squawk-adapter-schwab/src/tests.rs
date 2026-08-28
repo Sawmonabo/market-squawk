@@ -4,6 +4,7 @@ use std::future::{Future, pending};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,21 +18,25 @@ use market_squawk_platform::{
     EncryptedFileSecretStore, SecretCancellation, SecretGeneration, SecretInteractionPolicy,
     SecretKey, SecretOperationControl, SecretStore, SecretValue,
 };
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     ACCESS_TOKEN_MAX_LIFETIME_SECONDS, AccessTokenAdmission, AccessTokenGeneration,
     CallbackOutcome, ChainRequest, ConnectionGeneration, ConnectionState, DesiredStateController,
-    HttpMethod, InboundStreamerFrame, MarketDataService, OAuthCallback, ParseBounds,
-    PriceHistoryFrequency, PriceHistoryFrequencyType, PriceHistoryRequest,
-    ProtectedSchwabOAuthAuthority, ProviderIdentifier, QuoteRequest, RawStreamerFrameKind,
-    ReadOnlyRoute, RefreshTokenGeneration, RequestAdmission, ResponseHeaderEvidence,
-    RestExecutionOutcome, RestTransportBounds, SchwabAccessTokenSource, SchwabAdapterError,
-    SchwabCanonicalError, SchwabCaptureCoordinates, SchwabHttpWire, SchwabHttpWireRequest,
-    SchwabHttpWireResponse, SchwabOAuthAuthorityConfiguration, SchwabOAuthInteraction,
-    SchwabOAuthSecretPolicy, SchwabOAuthWire, SchwabOAuthWireError, SchwabOAuthWireRequest,
-    SchwabOAuthWireResponse, SchwabOptionCandidateAbstention, SchwabOptionCandidateOutcome,
+    HttpMethod, InboundStreamerFrame, MarketDataService, OAuthCallback, OAuthLoopbackBounds,
+    OAuthLoopbackReceiver, OAuthLoopbackTlsAcceptError, OAuthLoopbackTlsAcceptFuture,
+    OAuthLoopbackTlsAcceptor, OAuthLoopbackTlsStream, ParseBounds, PriceHistoryFrequency,
+    PriceHistoryFrequencyType, PriceHistoryRequest, ProtectedSchwabOAuthAuthority,
+    ProviderIdentifier, QuoteRequest, RawStreamerFrameKind, ReadOnlyRoute, RefreshTokenGeneration,
+    RequestAdmission, ResponseHeaderEvidence, RestExecutionOutcome, RestTransportBounds,
+    SchwabAccessTokenSource, SchwabAdapterError, SchwabCanonicalError, SchwabCaptureCoordinates,
+    SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse,
+    SchwabOAuthAuthorityConfiguration, SchwabOAuthInteraction, SchwabOAuthSecretPolicy,
+    SchwabOAuthWire, SchwabOAuthWireError, SchwabOAuthWireRequest, SchwabOAuthWireResponse,
+    SchwabOptionCandidateAbstention, SchwabOptionCandidateOutcome,
     SchwabPriceHistoryCapabilityObservation, SchwabResolvedProviderIdentity, SchwabRestExecutor,
     SchwabRestPayload, SchwabStreamerConnection, SchwabStreamerConnector, SchwabStreamerExecutor,
     SchwabStreamerFieldDictionary, SchwabStreamerSemanticField, SchwabTransportError,
@@ -104,8 +109,27 @@ fn bounds() -> ParseBounds {
     )
 }
 
-#[test]
-fn oauth_lifecycle_and_read_only_route_allowlist_fail_closed() {
+#[derive(Debug)]
+struct BrowserProbeTlsAcceptor {
+    attempts: AtomicUsize,
+}
+
+impl OAuthLoopbackTlsAcceptor for BrowserProbeTlsAcceptor {
+    fn accept(&self, stream: TcpStream) -> OAuthLoopbackTlsAcceptFuture<'_> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if attempt == 0 {
+                Err(OAuthLoopbackTlsAcceptError)
+            } else {
+                let stream: Box<dyn OAuthLoopbackTlsStream> = Box::new(stream);
+                Ok(stream)
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn oauth_lifecycle_and_read_only_route_allowlist_fail_closed() {
     let callback = OAuthCallback::parse(
         "https://127.0.0.1:8182/?code=one-time&session=s1&state=correlation",
         "correlation",
@@ -207,6 +231,57 @@ fn oauth_lifecycle_and_read_only_route_allowlist_fail_closed() {
     .build(admission())
     .unwrap_or_else(|error| panic!("chain request: {error}"));
     assert_eq!(chain.route(), ReadOnlyRoute::Chains);
+
+    let tls = Arc::new(BrowserProbeTlsAcceptor {
+        attempts: AtomicUsize::new(0),
+    });
+    let receiver = OAuthLoopbackReceiver::bind(
+        tls.clone(),
+        OAuthLoopbackBounds::try_new(
+            Duration::from_secs(2),
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+            nonzero(2),
+            nonzero(4 * 1024),
+            nonzero(16),
+        )
+        .unwrap_or_else(|error| panic!("callback bounds: {error}")),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("callback listener: {error}"));
+    let receive = tokio::spawn(async move {
+        receiver
+            .receive("correlation", CancellationToken::new())
+            .await
+    });
+    let browser_probe = TcpStream::connect("127.0.0.1:8182")
+        .await
+        .unwrap_or_else(|error| panic!("browser TLS probe: {error}"));
+    drop(browser_probe);
+    let mut callback = TcpStream::connect("127.0.0.1:8182")
+        .await
+        .unwrap_or_else(|error| panic!("browser callback: {error}"));
+    callback
+        .write_all(
+            b"GET /?code=one-time-browser&state=correlation HTTP/1.1\r\nHost: 127.0.0.1:8182\r\n\r\n",
+        )
+        .await
+        .unwrap_or_else(|error| panic!("write browser callback: {error}"));
+    let mut acknowledgement = Vec::new();
+    callback
+        .read_to_end(&mut acknowledgement)
+        .await
+        .unwrap_or_else(|error| panic!("read browser acknowledgement: {error}"));
+    assert!(acknowledgement.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let outcome = receive
+        .await
+        .unwrap_or_else(|error| panic!("callback task: {error}"))
+        .unwrap_or_else(|error| panic!("callback receive: {error}"));
+    let CallbackOutcome::Authorized(callback) = outcome else {
+        panic!("browser callback was not authorized")
+    };
+    assert_eq!(callback.expose_code(), "one-time-browser");
+    assert_eq!(tls.attempts.load(Ordering::SeqCst), 2);
 }
 
 #[test]

@@ -1,8 +1,10 @@
-//! Code-owned, one-shot HTTPS loopback OAuth callback receiver.
+//! Code-owned HTTPS loopback OAuth callback receiver.
 //!
 //! This module owns the fixed listener, bounded HTTP request grammar, callback route, and shutdown
 //! lifecycle. TLS private-key/certificate custody remains an injected capability so key material
-//! never enters adapter configuration or logs. There is deliberately no plaintext acceptor.
+//! never enters adapter configuration or logs. There is deliberately no plaintext acceptor. One
+//! authorization flow may accept several bounded connections because browsers can open TLS probes
+//! or abandon a handshake before delivering the actual callback.
 
 use std::fmt;
 use std::future::Future;
@@ -15,6 +17,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{CallbackOutcome, OAuthCallback, RequestAdmission, SchwabAdapterError};
@@ -22,6 +25,7 @@ use crate::{CallbackOutcome, OAuthCallback, RequestAdmission, SchwabAdapterError
 const CALLBACK_ADDRESS: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8182));
 const AUTHORIZED_BODY: &[u8] = b"Authorization received. Return to Market Squawk.";
 const DENIED_BODY: &[u8] = b"Authorization was not completed. Return to Market Squawk.";
+const MAX_CONNECTION_ATTEMPTS: usize = 16;
 
 /// Finite local listener and request bounds. None is a provider capacity claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +33,7 @@ pub struct OAuthLoopbackBounds {
     accept_timeout: Duration,
     tls_handshake_timeout: Duration,
     io_timeout: Duration,
+    max_connection_attempts: NonZeroUsize,
     max_request_bytes: NonZeroUsize,
     max_header_count: NonZeroUsize,
 }
@@ -39,12 +44,14 @@ impl OAuthLoopbackBounds {
         accept_timeout: Duration,
         tls_handshake_timeout: Duration,
         io_timeout: Duration,
+        max_connection_attempts: NonZeroUsize,
         max_request_bytes: NonZeroUsize,
         max_header_count: NonZeroUsize,
     ) -> Result<Self, OAuthLoopbackError> {
         if accept_timeout.is_zero()
             || tls_handshake_timeout.is_zero()
             || io_timeout.is_zero()
+            || max_connection_attempts.get() > MAX_CONNECTION_ATTEMPTS
             || max_request_bytes.get() < 128
         {
             return Err(OAuthLoopbackError::InvalidConfiguration);
@@ -53,6 +60,7 @@ impl OAuthLoopbackBounds {
             accept_timeout,
             tls_handshake_timeout,
             io_timeout,
+            max_connection_attempts,
             max_request_bytes,
             max_header_count,
         })
@@ -90,7 +98,7 @@ pub trait OAuthLoopbackTlsAcceptor: fmt::Debug + Send + Sync {
 #[error("Schwab OAuth callback TLS handshake failed")]
 pub struct OAuthLoopbackTlsAcceptError;
 
-/// One fixed-address callback receiver. It accepts at most one TLS connection.
+/// One fixed-address callback receiver with a bounded retry budget for browser connections.
 pub struct OAuthLoopbackReceiver {
     listener: TcpListener,
     tls: Arc<dyn OAuthLoopbackTlsAcceptor>,
@@ -131,48 +139,79 @@ impl OAuthLoopbackReceiver {
         })
     }
 
-    /// Receives, validates, acknowledges, and consumes exactly one callback connection.
+    /// Receives and validates one callback across a bounded number of browser connections.
+    ///
+    /// A TLS failure, malformed request, wrong host, or invalid correlation state discards only
+    /// that connection. Cancellation, the overall deadline, or exhaustion of the explicit
+    /// connection budget terminates the flow.
     pub async fn receive(
         self,
         expected_state: &str,
         cancellation: CancellationToken,
     ) -> Result<CallbackOutcome, OAuthLoopbackError> {
-        let (socket, peer) = cancellable_timeout(
-            self.bounds.accept_timeout,
-            &cancellation,
-            self.listener.accept(),
-        )
-        .await?
-        .map_err(|_| OAuthLoopbackError::Transport)?;
-        if !peer.ip().is_loopback() {
-            return Err(OAuthLoopbackError::TrustBoundary);
+        let deadline = TokioInstant::now()
+            .checked_add(self.bounds.accept_timeout)
+            .ok_or(OAuthLoopbackError::InvalidConfiguration)?;
+        for _attempt in 0..self.bounds.max_connection_attempts.get() {
+            let accepted =
+                cancellable_deadline(deadline, &cancellation, self.listener.accept()).await?;
+            let (socket, peer) = match accepted {
+                Ok(accepted) => accepted,
+                Err(_error) => continue,
+            };
+            if !peer.ip().is_loopback() || socket.set_nodelay(true).is_err() {
+                continue;
+            }
+            let handshake_deadline =
+                operation_deadline(deadline, self.bounds.tls_handshake_timeout)?;
+            let mut stream = match cancellable_deadline(
+                handshake_deadline,
+                &cancellation,
+                self.tls.accept(socket),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(_error)) => continue,
+                Err(OAuthLoopbackError::Deadline) if TokioInstant::now() < deadline => continue,
+                Err(error) => return Err(error),
+            };
+            let request =
+                match read_request(&mut *stream, self.bounds, deadline, &cancellation).await {
+                    Ok(request) => request,
+                    Err(OAuthLoopbackError::Deadline) if TokioInstant::now() < deadline => continue,
+                    Err(OAuthLoopbackError::Cancelled) => {
+                        return Err(OAuthLoopbackError::Cancelled);
+                    }
+                    Err(_error) => continue,
+                };
+            let redirected_url = match callback_url(&request, self.bounds) {
+                Ok(url) => url,
+                Err(_error) => continue,
+            };
+            let admission = RequestAdmission::new(self.bounds.max_request_bytes, NonZeroUsize::MIN);
+            let outcome = match OAuthCallback::parse(&redirected_url, expected_state, admission) {
+                Ok(outcome) => outcome,
+                Err(_error) => continue,
+            };
+            let body = match &outcome {
+                CallbackOutcome::Authorized(_) => AUTHORIZED_BODY,
+                CallbackOutcome::Denied { .. } => DENIED_BODY,
+            };
+            // Browser acknowledgement is best effort after the complete callback has been
+            // validated. A browser closing the connection must not discard a valid one-time code.
+            let _acknowledgement =
+                write_response(&mut *stream, body, self.bounds, deadline, &cancellation).await;
+            return Ok(outcome);
         }
-        socket
-            .set_nodelay(true)
-            .map_err(|_| OAuthLoopbackError::Transport)?;
-        let mut stream = cancellable_timeout(
-            self.bounds.tls_handshake_timeout,
-            &cancellation,
-            self.tls.accept(socket),
-        )
-        .await?
-        .map_err(|_| OAuthLoopbackError::Tls)?;
-        let request = read_request(&mut *stream, self.bounds, &cancellation).await?;
-        let redirected_url = callback_url(&request, self.bounds)?;
-        let admission = RequestAdmission::new(self.bounds.max_request_bytes, NonZeroUsize::MIN);
-        let outcome = OAuthCallback::parse(&redirected_url, expected_state, admission)?;
-        let body = match &outcome {
-            CallbackOutcome::Authorized(_) => AUTHORIZED_BODY,
-            CallbackOutcome::Denied { .. } => DENIED_BODY,
-        };
-        write_response(&mut *stream, body, self.bounds.io_timeout, &cancellation).await?;
-        Ok(outcome)
+        Err(OAuthLoopbackError::ConnectionAttemptsExhausted)
     }
 }
 
 async fn read_request(
     stream: &mut dyn OAuthLoopbackTlsStream,
     bounds: OAuthLoopbackBounds,
+    deadline: TokioInstant,
     cancellation: &CancellationToken,
 ) -> Result<Vec<u8>, OAuthLoopbackError> {
     let mut request = Vec::new();
@@ -189,8 +228,8 @@ async fn read_request(
         }
         let remaining = bounds.max_request_bytes() - request.len();
         let read_limit = remaining.min(chunk.len());
-        let read = cancellable_timeout(
-            bounds.io_timeout,
+        let read = cancellable_deadline(
+            operation_deadline(deadline, bounds.io_timeout)?,
             cancellation,
             stream.read(&mut chunk[..read_limit]),
         )
@@ -272,31 +311,46 @@ fn callback_url(request: &[u8], bounds: OAuthLoopbackBounds) -> Result<String, O
 async fn write_response(
     stream: &mut dyn OAuthLoopbackTlsStream,
     body: &[u8],
-    timeout: Duration,
+    bounds: OAuthLoopbackBounds,
+    deadline: TokioInstant,
     cancellation: &CancellationToken,
 ) -> Result<(), OAuthLoopbackError> {
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    cancellable_timeout(timeout, cancellation, async {
-        stream.write_all(response.as_bytes()).await?;
-        stream.write_all(body).await?;
-        stream.flush().await
-    })
+    cancellable_deadline(
+        operation_deadline(deadline, bounds.io_timeout)?,
+        cancellation,
+        async {
+            stream.write_all(response.as_bytes()).await?;
+            stream.write_all(body).await?;
+            stream.flush().await
+        },
+    )
     .await?
     .map_err(|_| OAuthLoopbackError::Transport)
 }
 
-async fn cancellable_timeout<T>(
-    timeout: Duration,
+fn operation_deadline(
+    overall: TokioInstant,
+    allowance: Duration,
+) -> Result<TokioInstant, OAuthLoopbackError> {
+    TokioInstant::now()
+        .checked_add(allowance)
+        .map(|local| local.min(overall))
+        .ok_or(OAuthLoopbackError::InvalidConfiguration)
+}
+
+async fn cancellable_deadline<T>(
+    deadline: TokioInstant,
     cancellation: &CancellationToken,
     operation: impl Future<Output = T>,
 ) -> Result<T, OAuthLoopbackError> {
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(OAuthLoopbackError::Cancelled),
-        result = tokio::time::timeout(timeout, operation) => {
+        result = tokio::time::timeout_at(deadline, operation) => {
             result.map_err(|_| OAuthLoopbackError::Deadline)
         }
     }
@@ -323,6 +377,8 @@ pub enum OAuthLoopbackError {
     Deadline,
     #[error("Schwab OAuth callback operation was cancelled")]
     Cancelled,
+    #[error("Schwab OAuth callback connection-attempt budget was exhausted")]
+    ConnectionAttemptsExhausted,
     #[error(transparent)]
     Adapter(#[from] SchwabAdapterError),
 }
