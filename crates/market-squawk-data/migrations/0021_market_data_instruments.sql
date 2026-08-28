@@ -1336,6 +1336,162 @@ CREATE TABLE ingest_run_provider_publication_bindings (
     )
 ) STRICT, WITHOUT ROWID;
 
+-- Immutable row-level coordinates for bounded provider-neutral current-market selection. This
+-- table retains no provider preference: later application policy compares these exact candidates.
+CREATE TABLE provider_market_event_selection_index (
+    publication_digest BLOB NOT NULL CHECK (
+        length(publication_digest) = 32 AND publication_digest <> zeroblob(32)
+    ),
+    publication_kind TEXT NOT NULL CHECK (
+        publication_kind IN (
+            'response_market_event',
+            'event_microbatch',
+            'composite_response_event'
+        )
+    ),
+    publication_row_ordinal INTEGER NOT NULL CHECK (
+        publication_row_ordinal BETWEEN 0 AND 127
+    ),
+    component_kind TEXT NOT NULL CHECK (component_kind IN ('response', 'stream')),
+    component_binding_digest BLOB NOT NULL CHECK (
+        length(component_binding_digest) = 32
+        AND component_binding_digest <> zeroblob(32)
+    ),
+    component_row_ordinal INTEGER NOT NULL CHECK (
+        component_row_ordinal BETWEEN 0 AND 63
+    ),
+    canonical_event_digest BLOB NOT NULL CHECK (
+        length(canonical_event_digest) = 32
+        AND canonical_event_digest <> zeroblob(32)
+    ),
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    instrument_id BLOB NOT NULL CHECK (
+        length(instrument_id) = 16 AND instrument_id <> zeroblob(16)
+    ),
+    venue_id TEXT NOT NULL CHECK (
+        length(CAST(venue_id AS BLOB)) BETWEEN 1 AND 128
+    ),
+    event_kind TEXT NOT NULL CHECK (
+        event_kind IN (
+            'trade', 'quote', 'book_snapshot', 'book_delta',
+            'auction', 'trading_halt', 'instrument_status', 'corporate_action'
+        )
+    ),
+    source_timestamp_ns INTEGER,
+    received_at_ns INTEGER NOT NULL,
+    available_at_ns INTEGER NOT NULL,
+    ingested_at_ns INTEGER NOT NULL,
+    connection_generation_be BLOB NOT NULL CHECK (
+        length(connection_generation_be) = 8
+        AND connection_generation_be <> zeroblob(8)
+    ),
+    source_sequence_be BLOB CHECK (
+        source_sequence_be IS NULL OR length(source_sequence_be) = 8
+    ),
+    provider_event_id TEXT NOT NULL CHECK (
+        length(CAST(provider_event_id AS BLOB)) BETWEEN 1 AND 512
+    ),
+    coordinate_digest BLOB NOT NULL CHECK (
+        length(coordinate_digest) = 32 AND coordinate_digest <> zeroblob(32)
+    ),
+    PRIMARY KEY (publication_digest, publication_row_ordinal),
+    UNIQUE (
+        publication_digest,
+        component_kind,
+        component_row_ordinal
+    ),
+    UNIQUE (publication_digest, coordinate_digest),
+    FOREIGN KEY (publication_digest)
+        REFERENCES ingest_run_provider_publication_bindings(publication_digest),
+    CHECK (received_at_ns <= available_at_ns AND available_at_ns <= ingested_at_ns)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX provider_market_event_selection_source_time
+ON provider_market_event_selection_index(
+    instrument_id,
+    venue_id,
+    event_kind,
+    source_timestamp_ns DESC,
+    available_at_ns DESC,
+    ingested_at_ns DESC,
+    publication_digest,
+    publication_row_ordinal
+)
+WHERE source_timestamp_ns IS NOT NULL;
+
+CREATE INDEX provider_market_event_selection_received_time
+ON provider_market_event_selection_index(
+    instrument_id,
+    venue_id,
+    event_kind,
+    received_at_ns DESC,
+    available_at_ns DESC,
+    ingested_at_ns DESC,
+    publication_digest,
+    publication_row_ordinal
+);
+
+CREATE TRIGGER provider_market_event_selection_index_guarded_insert
+BEFORE INSERT ON provider_market_event_selection_index
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM ingest_run_provider_publication_bindings AS publication
+    WHERE publication.publication_digest = NEW.publication_digest
+      AND publication.publication_kind = NEW.publication_kind
+      AND publication.source_id = NEW.source_id
+      AND (
+          (
+              NEW.component_kind = 'response'
+              AND publication.response_binding_digest = NEW.component_binding_digest
+              AND EXISTS (
+                  SELECT 1
+                  FROM provider_response_market_event_binding_rows AS row
+                  WHERE row.response_event_binding_digest = NEW.component_binding_digest
+                    AND row.canonical_row_ordinal = NEW.component_row_ordinal
+                    AND row.canonical_event_digest = NEW.canonical_event_digest
+              )
+          )
+          OR (
+              NEW.component_kind = 'stream'
+              AND publication.event_binding_digest = NEW.component_binding_digest
+              AND EXISTS (
+                  SELECT 1
+                  FROM provider_event_binding_rows AS row
+                  WHERE row.event_binding_digest = NEW.component_binding_digest
+                    AND row.canonical_row_ordinal = NEW.component_row_ordinal
+                    AND row.canonical_event_digest = NEW.canonical_event_digest
+              )
+          )
+      )
+      AND (
+          (
+              publication.publication_kind IN (
+                  'response_market_event', 'event_microbatch'
+              )
+              AND NEW.publication_row_ordinal = NEW.component_row_ordinal
+          )
+          OR (
+              publication.publication_kind = 'composite_response_event'
+              AND NEW.component_kind = 'response'
+              AND NEW.publication_row_ordinal = NEW.component_row_ordinal
+          )
+          OR (
+              publication.publication_kind = 'composite_response_event'
+              AND NEW.component_kind = 'stream'
+              AND NEW.publication_row_ordinal = (
+                  SELECT composite.response_row_count + NEW.component_row_ordinal
+                  FROM provider_composite_response_event_bindings AS composite
+                  WHERE composite.composite_binding_digest = NEW.publication_digest
+                    AND composite.response_binding_digest = publication.response_binding_digest
+                    AND composite.event_binding_digest = publication.event_binding_digest
+              )
+          )
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider market-event selection coordinate is invalid');
+END;
+
 CREATE TRIGGER ingest_run_provider_publication_bindings_guarded_insert
 BEFORE INSERT ON ingest_run_provider_publication_bindings
 WHEN NOT EXISTS (
@@ -1777,6 +1933,16 @@ END;
 CREATE TRIGGER ingest_run_provider_publication_bindings_immutable_delete
 BEFORE DELETE ON ingest_run_provider_publication_bindings BEGIN
     SELECT RAISE(ABORT, 'ingest-run provider event publications are immutable');
+END;
+
+CREATE TRIGGER provider_market_event_selection_index_immutable_update
+BEFORE UPDATE ON provider_market_event_selection_index BEGIN
+    SELECT RAISE(ABORT, 'provider market-event selection coordinates are immutable');
+END;
+
+CREATE TRIGGER provider_market_event_selection_index_immutable_delete
+BEFORE DELETE ON provider_market_event_selection_index BEGIN
+    SELECT RAISE(ABORT, 'provider market-event selection coordinates are immutable');
 END;
 
 CREATE TRIGGER analytical_generation_provider_capture_bindings_immutable_update
