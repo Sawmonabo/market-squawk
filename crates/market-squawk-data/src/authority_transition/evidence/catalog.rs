@@ -20,6 +20,128 @@ const MAX_EVIDENCE_ARTIFACTS: usize = 100_000;
 const MAX_EVIDENCE_REFERENCES: usize = 400_000;
 const MAX_EVIDENCE_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 const MAX_EVIDENCE_OBJECT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const MAX_PROVIDER_RELATION_KEY_BYTES: usize = 128;
+
+/// Closed durable provider relations whose exact rows participate in catalog authority evidence.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ProviderCatalogRelation {
+    SealedRawObject,
+    LogicalPublicationBinding,
+    LogicalPublicationRequiredFamily,
+    LogicalPublicationObject,
+    LogicalPublicationPartition,
+    LogicalPublicationCanonicalExpectation,
+    OptionMarketBinding,
+    OptionMarketNativeLineage,
+    OptionMarketBindingRow,
+    MarketEventSelectionIndex,
+}
+
+impl ProviderCatalogRelation {
+    pub(super) const fn canonical_tag(self) -> u8 {
+        match self {
+            Self::SealedRawObject => 1,
+            Self::LogicalPublicationBinding => 2,
+            Self::LogicalPublicationRequiredFamily => 3,
+            Self::LogicalPublicationObject => 4,
+            Self::LogicalPublicationPartition => 5,
+            Self::LogicalPublicationCanonicalExpectation => 6,
+            Self::OptionMarketBinding => 7,
+            Self::OptionMarketNativeLineage => 8,
+            Self::OptionMarketBindingRow => 9,
+            Self::MarketEventSelectionIndex => 10,
+        }
+    }
+
+    pub(crate) const fn database_name(self) -> &'static str {
+        match self {
+            Self::SealedRawObject => "sealed_raw_objects",
+            Self::LogicalPublicationBinding => "provider_logical_publication_bindings",
+            Self::LogicalPublicationRequiredFamily => {
+                "provider_logical_publication_required_families"
+            }
+            Self::LogicalPublicationObject => "provider_logical_publication_objects",
+            Self::LogicalPublicationPartition => "provider_logical_publication_partitions",
+            Self::LogicalPublicationCanonicalExpectation => {
+                "provider_logical_publication_canonical_expectations"
+            }
+            Self::OptionMarketBinding => "provider_option_market_bindings",
+            Self::OptionMarketNativeLineage => "provider_option_market_binding_native_lineage",
+            Self::OptionMarketBindingRow => "provider_option_market_binding_rows",
+            Self::MarketEventSelectionIndex => "provider_market_event_selection_index",
+        }
+    }
+
+    fn from_database_name(value: &str) -> Option<Self> {
+        Some(match value {
+            "sealed_raw_objects" => Self::SealedRawObject,
+            "provider_logical_publication_bindings" => Self::LogicalPublicationBinding,
+            "provider_logical_publication_required_families" => {
+                Self::LogicalPublicationRequiredFamily
+            }
+            "provider_logical_publication_objects" => Self::LogicalPublicationObject,
+            "provider_logical_publication_partitions" => Self::LogicalPublicationPartition,
+            "provider_logical_publication_canonical_expectations" => {
+                Self::LogicalPublicationCanonicalExpectation
+            }
+            "provider_option_market_bindings" => Self::OptionMarketBinding,
+            "provider_option_market_binding_native_lineage" => Self::OptionMarketNativeLineage,
+            "provider_option_market_binding_rows" => Self::OptionMarketBindingRow,
+            "provider_market_event_selection_index" => Self::MarketEventSelectionIndex,
+            _ => return None,
+        })
+    }
+}
+
+/// One exact provider-catalog row reduced under a relation-specific, field-complete SHA-256 domain.
+///
+/// Large JSON and native sidecar values are hashed while each SQLite row is owned and are not
+/// retained in the snapshot. The canonical primary key remains explicit so duplicate rows and
+/// non-deterministic relation ordering fail closed independently of the row-content digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderCatalogRelationEvidenceRow {
+    relation: ProviderCatalogRelation,
+    primary_key: Box<[u8]>,
+    row_content_digest: Sha256Digest,
+    accounted_object_bytes: u64,
+}
+
+impl ProviderCatalogRelationEvidenceRow {
+    pub(crate) fn try_new(
+        relation: ProviderCatalogRelation,
+        primary_key: impl Into<Box<[u8]>>,
+        row_content_digest: Sha256Digest,
+        accounted_object_bytes: u64,
+    ) -> Result<Self, EvidenceError> {
+        let primary_key = primary_key.into();
+        if primary_key.is_empty()
+            || primary_key.len() > MAX_PROVIDER_RELATION_KEY_BYTES
+            || (relation == ProviderCatalogRelation::SealedRawObject)
+                != (accounted_object_bytes > 0)
+            || accounted_object_bytes > MAX_EVIDENCE_OBJECT_BYTES
+        {
+            return Err(EvidenceError::InvalidCatalogEvidence);
+        }
+        Ok(Self {
+            relation,
+            primary_key,
+            row_content_digest,
+            accounted_object_bytes,
+        })
+    }
+
+    pub(super) const fn relation(&self) -> ProviderCatalogRelation {
+        self.relation
+    }
+
+    pub(super) fn primary_key(&self) -> &[u8] {
+        &self.primary_key
+    }
+
+    pub(super) const fn row_content_digest(&self) -> Sha256Digest {
+        self.row_content_digest
+    }
+}
 
 /// Caller-selected resource bounds, capped by fixed process ceilings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -515,15 +637,67 @@ pub(crate) struct CatalogEvidenceSnapshot {
     manifests: Vec<ManifestEvidenceRow>,
     generations: Vec<GenerationEvidenceRow>,
     query_artifacts: Vec<QueryArtifactEvidenceRow>,
+    provider_relations: Vec<ProviderCatalogRelationEvidenceRow>,
 }
 
 impl CatalogEvidenceSnapshot {
+    #[cfg(test)]
     pub(crate) fn try_new(
         request: EvidenceSnapshotRequest,
         artifacts: Vec<ArtifactEvidenceRow>,
         manifests: Vec<ManifestEvidenceRow>,
         generations: Vec<GenerationEvidenceRow>,
         query_artifacts: Vec<QueryArtifactEvidenceRow>,
+    ) -> Result<Self, EvidenceError> {
+        Self::try_new_with_provider_relations(
+            request,
+            artifacts,
+            manifests,
+            generations,
+            query_artifacts,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn try_new_with_provider_relation_rows(
+        request: EvidenceSnapshotRequest,
+        artifacts: Vec<ArtifactEvidenceRow>,
+        manifests: Vec<ManifestEvidenceRow>,
+        generations: Vec<GenerationEvidenceRow>,
+        query_artifacts: Vec<QueryArtifactEvidenceRow>,
+        provider_relation_rows: Vec<(Box<str>, Box<[u8]>, Sha256Digest, u64)>,
+    ) -> Result<Self, EvidenceError> {
+        let provider_relations = provider_relation_rows
+            .into_iter()
+            .map(
+                |(relation, primary_key, row_content_digest, accounted_object_bytes)| {
+                    ProviderCatalogRelationEvidenceRow::try_new(
+                        ProviderCatalogRelation::from_database_name(&relation)
+                            .ok_or(EvidenceError::InvalidCatalogEvidence)?,
+                        primary_key,
+                        row_content_digest,
+                        accounted_object_bytes,
+                    )
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_new_with_provider_relations(
+            request,
+            artifacts,
+            manifests,
+            generations,
+            query_artifacts,
+            provider_relations,
+        )
+    }
+
+    fn try_new_with_provider_relations(
+        request: EvidenceSnapshotRequest,
+        artifacts: Vec<ArtifactEvidenceRow>,
+        manifests: Vec<ManifestEvidenceRow>,
+        generations: Vec<GenerationEvidenceRow>,
+        query_artifacts: Vec<QueryArtifactEvidenceRow>,
+        provider_relations: Vec<ProviderCatalogRelationEvidenceRow>,
     ) -> Result<Self, EvidenceError> {
         let limits = request.limits;
         let generation_objects = generations.iter().try_fold(0_usize, |count, generation| {
@@ -542,10 +716,16 @@ impl CatalogEvidenceSnapshot {
             .and_then(|count| count.checked_add(generation_objects))
             .and_then(|count| count.checked_add(generation_parents))
             .and_then(|count| count.checked_add(query_artifacts.len()))
+            .and_then(|count| count.checked_add(provider_relations.len()))
             .ok_or(EvidenceError::ResourceLimitExceeded)?;
+        let sealed_raw_objects = provider_relations
+            .iter()
+            .filter(|row| row.relation == ProviderCatalogRelation::SealedRawObject)
+            .count();
         let physical_artifacts = artifacts
             .len()
             .checked_add(query_artifacts.len())
+            .and_then(|count| count.checked_add(sealed_raw_objects))
             .ok_or(EvidenceError::ResourceLimitExceeded)?;
         if physical_artifacts > limits.max_artifacts || references > limits.max_references {
             return Err(EvidenceError::ResourceLimitExceeded);
@@ -556,6 +736,7 @@ impl CatalogEvidenceSnapshot {
             &manifests,
             &generations,
             &query_artifacts,
+            &provider_relations,
         )?;
         Ok(Self {
             request,
@@ -563,6 +744,7 @@ impl CatalogEvidenceSnapshot {
             manifests,
             generations,
             query_artifacts,
+            provider_relations,
         })
     }
 
@@ -584,6 +766,10 @@ impl CatalogEvidenceSnapshot {
 
     pub(crate) fn query_artifacts(&self) -> &[QueryArtifactEvidenceRow] {
         &self.query_artifacts
+    }
+
+    pub(crate) fn provider_relations(&self) -> &[ProviderCatalogRelationEvidenceRow] {
+        &self.provider_relations
     }
 
     pub(crate) fn physical_artifact_count(&self) -> usize {
@@ -612,6 +798,7 @@ fn validate_relational_evidence(
     manifests: &[ManifestEvidenceRow],
     generations: &[GenerationEvidenceRow],
     query_artifacts: &[QueryArtifactEvidenceRow],
+    provider_relations: &[ProviderCatalogRelationEvidenceRow],
 ) -> Result<(), EvidenceError> {
     let limits = request.limits;
     let mut artifacts_by_id = BTreeMap::new();
@@ -701,6 +888,20 @@ fn validate_relational_evidence(
         }
         total_bytes = total_bytes
             .checked_add(query.size_bytes)
+            .ok_or(EvidenceError::ResourceLimitExceeded)?;
+        if total_bytes > limits.max_total_bytes {
+            return Err(EvidenceError::ResourceLimitExceeded);
+        }
+    }
+    let mut provider_keys = BTreeSet::new();
+    for row in provider_relations {
+        if !provider_keys.insert((row.relation, row.primary_key.as_ref()))
+            || row.accounted_object_bytes > limits.max_object_bytes
+        {
+            return Err(EvidenceError::InvalidCatalogEvidence);
+        }
+        total_bytes = total_bytes
+            .checked_add(row.accounted_object_bytes)
             .ok_or(EvidenceError::ResourceLimitExceeded)?;
         if total_bytes > limits.max_total_bytes {
             return Err(EvidenceError::ResourceLimitExceeded);

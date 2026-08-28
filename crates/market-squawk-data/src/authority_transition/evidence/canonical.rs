@@ -10,7 +10,7 @@ pub(super) fn evidence_digest(
     snapshot: &CatalogEvidenceSnapshot,
 ) -> Result<CatalogContentEvidenceDigest, EvidenceError> {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/analytical-catalog-evidence/v3");
+    digest.update(b"market-squawk/analytical-catalog-evidence/v4");
     digest.update(snapshot.request().cutoff().unix_nanos().to_be_bytes());
 
     let mut artifacts: Vec<_> = snapshot.artifacts().iter().collect();
@@ -116,6 +116,24 @@ pub(super) fn evidence_digest(
         digest.update(query.size_bytes().to_be_bytes());
         digest.update(query.expires_at().unix_nanos().to_be_bytes());
     }
+
+    let mut provider_relations: Vec<_> = snapshot.provider_relations().iter().collect();
+    provider_relations.sort_unstable_by(|left, right| {
+        left.relation()
+            .cmp(&right.relation())
+            .then_with(|| left.primary_key().cmp(right.primary_key()))
+    });
+    section_count(
+        &mut digest,
+        b"provider-catalog-relations",
+        provider_relations.len(),
+    )?;
+    for row in provider_relations {
+        digest.update([row.relation().canonical_tag()]);
+        text(&mut digest, row.relation().database_name())?;
+        bytes(&mut digest, row.primary_key())?;
+        digest.update(row.row_content_digest().bytes());
+    }
     CatalogContentEvidenceDigest::try_new(digest.finalize().into())
         .ok_or(EvidenceError::InvalidCatalogEvidence)
 }
@@ -134,11 +152,15 @@ fn section_count(digest: &mut Sha256, domain: &[u8], count: usize) -> Result<(),
 }
 
 fn text(digest: &mut Sha256, value: &str) -> Result<(), EvidenceError> {
+    bytes(digest, value.as_bytes())
+}
+
+fn bytes(digest: &mut Sha256, value: &[u8]) -> Result<(), EvidenceError> {
     digest.update(
         u64::try_from(value.len())
             .map_err(|_| EvidenceError::ResourceLimitExceeded)?
             .to_be_bytes(),
     );
-    digest.update(value.as_bytes());
+    digest.update(value);
     Ok(())
 }

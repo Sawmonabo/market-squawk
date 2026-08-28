@@ -3,12 +3,15 @@
 use std::collections::BTreeMap;
 
 use market_squawk_domain::{SourceIdentifier, Timestamp};
+use market_squawk_platform::SealedResearchRawClaim;
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, Transaction};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use super::authority::read_authority_snapshot_without_endpoint;
 use super::backup::{VerifiedBackupCatalog, open_immutable_backup};
+use super::provider_capture::raw_claim_digest;
 use super::storage::{verify_integrity, verify_migration_identities};
 use super::types::MAX_SQLITE_RECORD_BYTES;
 use super::{Catalog, CatalogError};
@@ -88,12 +91,18 @@ fn evidence_snapshot(
         .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
     let query_artifacts =
         read_query_artifacts(transaction, request.cutoff(), remaining_references)?;
-    let evidence = CatalogEvidenceSnapshot::try_new(
+    remaining_references = remaining_references
+        .checked_sub(query_artifacts.len())
+        .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
+    validate_provider_relation_integrity(transaction)?;
+    let provider_relation_rows = read_provider_relation_rows(transaction, remaining_references)?;
+    let evidence = CatalogEvidenceSnapshot::try_new_with_provider_relation_rows(
         request,
         artifacts,
         manifests,
         generations,
         query_artifacts,
+        provider_relation_rows,
     )
     .map_err(map_evidence_error)?;
     Ok((authority, evidence))
@@ -435,6 +444,960 @@ fn read_query_artifacts(
         );
     }
     Ok(result)
+}
+
+type ProviderRelationEvidenceRow = (Box<str>, Box<[u8]>, Sha256Digest, u64);
+
+fn read_provider_relation_rows(
+    connection: &Connection,
+    maximum: usize,
+) -> Result<Vec<ProviderRelationEvidenceRow>, CatalogError> {
+    let mut result = Vec::new();
+    read_sealed_raw_object_evidence(connection, maximum, &mut result)?;
+    read_provider_logical_evidence(connection, maximum, &mut result)?;
+    read_provider_option_evidence(connection, maximum, &mut result)?;
+    read_market_event_selection_evidence(connection, maximum, &mut result)?;
+    Ok(result)
+}
+
+fn validate_provider_relation_integrity(connection: &Connection) -> Result<(), CatalogError> {
+    let invalid: i64 = connection.query_row(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM provider_capture_recovery_capacity AS capacity
+             WHERE capacity.singleton != 1
+                OR capacity.physical_claims != (SELECT COUNT(*) FROM sealed_raw_objects)
+                OR capacity.physical_bytes !=
+                   COALESCE((SELECT SUM(object.size_bytes) FROM sealed_raw_objects AS object), 0)
+             UNION ALL
+             SELECT 1
+             FROM provider_logical_publication_bindings AS binding
+             WHERE binding.required_family_count != (
+                       SELECT COUNT(*)
+                       FROM provider_logical_publication_required_families AS family
+                       WHERE family.binding_digest=binding.binding_digest)
+                OR binding.object_count != (
+                       SELECT COUNT(*)
+                       FROM provider_logical_publication_objects AS object
+                       WHERE object.binding_digest=binding.binding_digest)
+                OR binding.partition_count != (
+                       SELECT COUNT(*)
+                       FROM provider_logical_publication_partitions AS partition
+                       WHERE partition.binding_digest=binding.binding_digest)
+                OR binding.canonical_partition_count != (
+                       SELECT COUNT(*)
+                       FROM provider_logical_publication_canonical_expectations AS expected
+                       WHERE expected.binding_digest=binding.binding_digest)
+                OR (SELECT MIN(family.family_ordinal)
+                    FROM provider_logical_publication_required_families AS family
+                    WHERE family.binding_digest=binding.binding_digest) != 0
+                OR (SELECT MAX(family.family_ordinal)
+                    FROM provider_logical_publication_required_families AS family
+                    WHERE family.binding_digest=binding.binding_digest)
+                   != binding.required_family_count - 1
+                OR (SELECT MIN(object.object_ordinal)
+                    FROM provider_logical_publication_objects AS object
+                    WHERE object.binding_digest=binding.binding_digest) != 0
+                OR (SELECT MAX(object.object_ordinal)
+                    FROM provider_logical_publication_objects AS object
+                    WHERE object.binding_digest=binding.binding_digest)
+                   != binding.object_count - 1
+                OR (binding.canonical_partition_count > 0 AND (
+                       (SELECT MIN(expected.partition_ordinal)
+                        FROM provider_logical_publication_canonical_expectations AS expected
+                        WHERE expected.binding_digest=binding.binding_digest) != 0
+                    OR (SELECT MAX(expected.partition_ordinal)
+                        FROM provider_logical_publication_canonical_expectations AS expected
+                        WHERE expected.binding_digest=binding.binding_digest)
+                       != binding.canonical_partition_count - 1))
+             UNION ALL
+             SELECT 1
+             FROM provider_logical_publication_objects AS object
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM sealed_raw_objects AS claim
+                 WHERE claim.raw_claim_digest=object.raw_claim_digest
+                   AND claim.physical_receipt_digest=object.physical_receipt_digest
+                   AND claim.raw_claim_kind='logical_object')
+             UNION ALL
+             SELECT 1
+             FROM provider_logical_publication_partitions AS partition
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM provider_logical_publication_required_families AS family
+                 JOIN sealed_raw_objects AS claim
+                   ON claim.raw_claim_digest=partition.raw_claim_digest
+                  AND claim.physical_receipt_digest=partition.physical_receipt_digest
+                 WHERE family.binding_digest=partition.binding_digest
+                   AND family.family_ordinal=partition.partition_family_ordinal
+                   AND family.family=partition.partition_family
+                   AND claim.raw_claim_kind='logical_object')
+             UNION ALL
+             SELECT 1
+             FROM provider_logical_publication_canonical_expectations AS expected
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM provider_logical_publication_partitions AS native
+                 JOIN provider_logical_publication_partitions AS row_map
+                   ON row_map.binding_digest=native.binding_digest
+                 WHERE native.binding_digest=expected.binding_digest
+                   AND native.partition_family='provider_native'
+                   AND native.partition_ordinal=expected.aligned_native_partition
+                   AND row_map.partition_family='canonical_row_map'
+                   AND row_map.partition_ordinal=expected.aligned_row_map_partition
+                   AND native.first_item_ordinal=expected.first_row_ordinal
+                   AND native.item_count=expected.row_count
+                   AND row_map.first_item_ordinal=expected.first_row_ordinal
+                   AND row_map.item_count=expected.row_count)
+             UNION ALL
+             SELECT 1
+             FROM provider_option_market_bindings AS binding
+             WHERE NOT EXISTS (
+                       SELECT 1
+                       FROM provider_option_market_binding_native_lineage AS native
+                       WHERE native.option_binding_digest=binding.option_binding_digest
+                         AND native.row_count=binding.canonical_row_count)
+                OR binding.canonical_row_count != (
+                       SELECT COUNT(*)
+                       FROM provider_option_market_binding_rows AS row
+                       WHERE row.option_binding_digest=binding.option_binding_digest)
+                OR (binding.canonical_row_count > 0 AND (
+                       (SELECT MIN(row.canonical_row_ordinal)
+                        FROM provider_option_market_binding_rows AS row
+                        WHERE row.option_binding_digest=binding.option_binding_digest) != 0
+                    OR (SELECT MAX(row.canonical_row_ordinal)
+                        FROM provider_option_market_binding_rows AS row
+                        WHERE row.option_binding_digest=binding.option_binding_digest)
+                       != binding.canonical_row_count - 1))
+             UNION ALL
+             SELECT 1
+             FROM provider_market_event_selection_index AS selected
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM ingest_run_provider_publication_bindings AS publication
+                 WHERE publication.publication_digest=selected.publication_digest
+                   AND publication.publication_kind=selected.publication_kind
+                   AND publication.source_id=selected.source_id)
+             LIMIT 1
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid == 0 {
+        Ok(())
+    } else {
+        Err(CatalogError::CorruptCatalog)
+    }
+}
+
+fn read_sealed_raw_object_evidence(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "sealed_raw_objects";
+    let mut statement = connection.prepare(
+        "SELECT raw_claim_digest, raw_claim_kind, physical_receipt_digest,
+                relative_reference, content_digest, size_bytes, integrity_chunk_bytes,
+                unit_count, raw_claim_json, recorded_at_ns
+         FROM sealed_raw_objects ORDER BY raw_claim_digest LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let claim_digest = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let claim_kind: String = row.get(1)?;
+        let physical_receipt = parse_sha256(1, row.get::<_, Vec<u8>>(2)?)?;
+        let relative_reference: String = row.get(3)?;
+        let content_digest = parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?;
+        let size_bytes_raw: i64 = row.get(5)?;
+        let size_bytes = parse_positive_u64(size_bytes_raw)?;
+        let integrity_chunk_bytes_raw: Option<i64> = row.get(6)?;
+        let integrity_chunk_bytes = integrity_chunk_bytes_raw
+            .map(parse_positive_u64)
+            .transpose()?;
+        let unit_count_raw: i64 = row.get(7)?;
+        let unit_count = parse_positive_u64(unit_count_raw)?;
+        let claim_json: String = row.get(8)?;
+        let recorded_at_ns: i64 = row.get(9)?;
+        if relative_reference.is_empty()
+            || relative_reference.len() > 1_024
+            || claim_json.len() < 2
+            || claim_json.len() > 2_097_152
+            || raw_claim_digest(claim_json.as_bytes()).bytes() != claim_digest.bytes()
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let claim: SealedResearchRawClaim = serde_json::from_str(&claim_json)?;
+        if serde_json::to_string(&claim)? != claim_json {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let claim_matches = match &claim {
+            SealedResearchRawClaim::JournalSegment(claim) => {
+                claim_kind == "journal_segment"
+                    && integrity_chunk_bytes.is_none()
+                    && size_bytes <= 536_870_912
+                    && unit_count <= 64
+                    && claim.relative_reference() == relative_reference
+                    && claim.content_digest().bytes() == content_digest.bytes()
+                    && claim.size_bytes() == size_bytes
+                    && u64::try_from(claim.frames().len()).ok() == Some(unit_count)
+                    && claim.physical_receipt_digest().bytes() == physical_receipt.bytes()
+            }
+            SealedResearchRawClaim::LogicalObject(claim) => {
+                claim_kind == "logical_object"
+                    && integrity_chunk_bytes == Some(claim.integrity_chunk_bytes())
+                    && size_bytes <= 68_719_476_736
+                    && unit_count <= 4_096
+                    && claim.relative_reference() == relative_reference
+                    && claim.content_digest().bytes() == content_digest.bytes()
+                    && claim.size_bytes() == size_bytes
+                    && u64::try_from(claim.chunks().len()).ok() == Some(unit_count)
+                    && claim.physical_receipt_digest().bytes() == physical_receipt.bytes()
+            }
+        };
+        if !claim_matches {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(claim_digest);
+        digest.text(&claim_kind)?;
+        digest.digest(physical_receipt);
+        digest.text(&relative_reference)?;
+        digest.digest(content_digest);
+        digest.integer(size_bytes_raw);
+        digest.optional_integer(integrity_chunk_bytes_raw);
+        digest.integer(unit_count_raw);
+        digest.text(&claim_json)?;
+        digest.integer(recorded_at_ns);
+        result.push(provider_relation_row(
+            RELATION,
+            digest_primary_key(claim_digest),
+            digest.finish(),
+            size_bytes,
+        ));
+    }
+    Ok(())
+}
+
+fn read_provider_logical_evidence(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    read_provider_logical_bindings(connection, maximum, result)?;
+    read_provider_logical_families(connection, maximum, result)?;
+    read_provider_logical_objects(connection, maximum, result)?;
+    read_provider_logical_partitions(connection, maximum, result)?;
+    read_provider_logical_expectations(connection, maximum, result)
+}
+
+fn read_provider_logical_bindings(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_logical_publication_bindings";
+    let mut statement = connection.prepare(
+        "SELECT binding_digest, binding_format_version, source_id, terminal_receipt_digest,
+                terminal_json, required_family_count, object_count, partition_count,
+                canonical_partition_count, recorded_at_ns
+         FROM provider_logical_publication_bindings ORDER BY binding_digest LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let format: i64 = row.get(1)?;
+        let source: String = row.get(2)?;
+        SourceIdentifier::try_from(source.clone()).map_err(|_| CatalogError::CorruptCatalog)?;
+        let terminal_receipt = parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?;
+        let terminal_json: Vec<u8> = row.get(4)?;
+        validate_json(&terminal_json, 2_097_152)?;
+        let families: i64 = row.get(5)?;
+        let objects: i64 = row.get(6)?;
+        let partitions: i64 = row.get(7)?;
+        let canonical: i64 = row.get(8)?;
+        let recorded: i64 = row.get(9)?;
+        if format != 1
+            || !(1..=6).contains(&families)
+            || !(1..=64).contains(&objects)
+            || !(1..=4_096).contains(&partitions)
+            || !(0..=1_024).contains(&canonical)
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(binding);
+        digest.integer(format);
+        digest.text(&source)?;
+        digest.digest(terminal_receipt);
+        digest.bytes(&terminal_json)?;
+        digest.integer(families);
+        digest.integer(objects);
+        digest.integer(partitions);
+        digest.integer(canonical);
+        digest.integer(recorded);
+        result.push(provider_relation_row(
+            RELATION,
+            digest_primary_key(binding),
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+fn read_provider_logical_families(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_logical_publication_required_families";
+    let mut statement = connection.prepare(
+        "SELECT binding_digest, family_ordinal, family
+         FROM provider_logical_publication_required_families
+         ORDER BY binding_digest, family_ordinal LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let ordinal: i64 = row.get(1)?;
+        let family: String = row.get(2)?;
+        if !(0..=5).contains(&ordinal) || !logical_family(&family) {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(binding);
+        digest.integer(ordinal);
+        digest.text(&family)?;
+        result.push(provider_relation_row(
+            RELATION,
+            digest_ordinal_primary_key(binding, ordinal)?,
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+fn read_provider_logical_objects(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_logical_publication_objects";
+    let mut statement = connection.prepare(
+        "SELECT binding_digest, object_ordinal, object_role, semantic_identity,
+                raw_claim_digest, physical_receipt_digest
+         FROM provider_logical_publication_objects
+         ORDER BY binding_digest, object_ordinal LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let ordinal: i64 = row.get(1)?;
+        let role: String = row.get(2)?;
+        let semantic = parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?;
+        let raw_claim = parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?;
+        let physical = parse_sha256(1, row.get::<_, Vec<u8>>(5)?)?;
+        if !(0..=63).contains(&ordinal)
+            || !matches!(
+                role.as_str(),
+                "catalog" | "provider_payload" | "expanded_payload" | "provider_component"
+            )
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(binding);
+        digest.integer(ordinal);
+        digest.text(&role)?;
+        digest.digest(semantic);
+        digest.digest(raw_claim);
+        digest.digest(physical);
+        result.push(provider_relation_row(
+            RELATION,
+            digest_ordinal_primary_key(binding, ordinal)?,
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+fn read_provider_logical_partitions(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_logical_publication_partitions";
+    let mut statement = connection.prepare(
+        "SELECT binding_digest, partition_family_ordinal, partition_family,
+                partition_ordinal, first_item_ordinal, item_count, schema_identity,
+                semantic_digest, raw_claim_digest, physical_receipt_digest
+         FROM provider_logical_publication_partitions
+         ORDER BY binding_digest, partition_family_ordinal, partition_ordinal LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let family_ordinal: i64 = row.get(1)?;
+        let family: String = row.get(2)?;
+        let partition_ordinal: i64 = row.get(3)?;
+        let first_item: i64 = row.get(4)?;
+        let item_count: i64 = row.get(5)?;
+        let schema = parse_sha256(1, row.get::<_, Vec<u8>>(6)?)?;
+        let semantic = parse_sha256(1, row.get::<_, Vec<u8>>(7)?)?;
+        let raw_claim = parse_sha256(1, row.get::<_, Vec<u8>>(8)?)?;
+        let physical = parse_sha256(1, row.get::<_, Vec<u8>>(9)?)?;
+        if !(0..=5).contains(&family_ordinal)
+            || !logical_family(&family)
+            || !(0..=4_095).contains(&partition_ordinal)
+            || first_item < 0
+            || !(1..=4_294_967_295).contains(&item_count)
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(binding);
+        digest.integer(family_ordinal);
+        digest.text(&family)?;
+        digest.integer(partition_ordinal);
+        digest.integer(first_item);
+        digest.integer(item_count);
+        digest.digest(schema);
+        digest.digest(semantic);
+        digest.digest(raw_claim);
+        digest.digest(physical);
+        result.push(provider_relation_row(
+            RELATION,
+            digest_pair_ordinal_primary_key(binding, family_ordinal, partition_ordinal)?,
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+fn read_provider_logical_expectations(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_logical_publication_canonical_expectations";
+    let mut statement = connection.prepare(
+        "SELECT binding_digest, partition_ordinal, first_row_ordinal, row_count,
+                schema_identity, semantic_digest, aligned_native_partition,
+                aligned_row_map_partition
+         FROM provider_logical_publication_canonical_expectations
+         ORDER BY binding_digest, partition_ordinal LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let ordinal: i64 = row.get(1)?;
+        let first: i64 = row.get(2)?;
+        let count: i64 = row.get(3)?;
+        let schema = parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?;
+        let semantic = parse_sha256(1, row.get::<_, Vec<u8>>(5)?)?;
+        let native: i64 = row.get(6)?;
+        let row_map: i64 = row.get(7)?;
+        if !(0..=1_023).contains(&ordinal)
+            || first < 0
+            || !(1..=4_294_967_295).contains(&count)
+            || !(0..=4_095).contains(&native)
+            || !(0..=4_095).contains(&row_map)
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(binding);
+        digest.integer(ordinal);
+        digest.integer(first);
+        digest.integer(count);
+        digest.digest(schema);
+        digest.digest(semantic);
+        digest.integer(native);
+        digest.integer(row_map);
+        result.push(provider_relation_row(
+            RELATION,
+            digest_ordinal_primary_key(binding, ordinal)?,
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+fn read_provider_option_evidence(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    read_provider_option_bindings(connection, maximum, result)?;
+    read_provider_option_native_lineage(connection, maximum, result)?;
+    read_provider_option_rows(connection, maximum, result)
+}
+
+fn read_provider_option_bindings(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_option_market_bindings";
+    let mut statement = connection.prepare(
+        "SELECT option_binding_digest, binding_format_version, capture_observation_digest,
+                sealed_capture_receipt_digest, publication_kind,
+                canonical_schema_fingerprint, canonical_content_digest, canonical_row_count,
+                scope_json, scope_digest, completeness_json, completeness_digest,
+                filter_json, filter_digest, underlying_instrument_id, available_at_ns,
+                received_at_ns, ingested_at_ns, disposition, row_mapping_digest, recorded_at_ns
+         FROM provider_option_market_bindings ORDER BY option_binding_digest LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let format: i64 = row.get(1)?;
+        let capture = parse_sha256(1, row.get::<_, Vec<u8>>(2)?)?;
+        let sealed_receipt = parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?;
+        let kind: String = row.get(4)?;
+        let schema = parse_sha256(1, row.get::<_, Vec<u8>>(5)?)?;
+        let content = parse_sha256(1, row.get::<_, Vec<u8>>(6)?)?;
+        let row_count: i64 = row.get(7)?;
+        let scope: Vec<u8> = row.get(8)?;
+        let scope_digest = parse_sha256(1, row.get::<_, Vec<u8>>(9)?)?;
+        let completeness: Vec<u8> = row.get(10)?;
+        let completeness_digest = parse_sha256(1, row.get::<_, Vec<u8>>(11)?)?;
+        let filter: Vec<u8> = row.get(12)?;
+        let filter_digest = parse_sha256(1, row.get::<_, Vec<u8>>(13)?)?;
+        let underlying: Vec<u8> = row.get(14)?;
+        let available: i64 = row.get(15)?;
+        let received: i64 = row.get(16)?;
+        let ingested: i64 = row.get(17)?;
+        let disposition: String = row.get(18)?;
+        let row_mapping = parse_sha256(1, row.get::<_, Vec<u8>>(19)?)?;
+        let recorded: i64 = row.get(20)?;
+        validate_json(&scope, 67_108_864)?;
+        validate_json(&completeness, 1_048_576)?;
+        validate_json(&filter, 4_194_304)?;
+        let underlying = parse_uuid_blob(&underlying)?;
+        if format != 1
+            || !matches!(kind.as_str(), "option_snapshots" | "option_expirations")
+            || !(0..=100_000).contains(&row_count)
+            || available > ingested
+            || received > ingested
+            || !matches!(disposition.as_str(), "complete" | "unavailable")
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(binding);
+        digest.integer(format);
+        digest.digest(capture);
+        digest.digest(sealed_receipt);
+        digest.text(&kind)?;
+        digest.digest(schema);
+        digest.digest(content);
+        digest.integer(row_count);
+        digest.bytes(&scope)?;
+        digest.digest(scope_digest);
+        digest.bytes(&completeness)?;
+        digest.digest(completeness_digest);
+        digest.bytes(&filter)?;
+        digest.digest(filter_digest);
+        digest.bytes(underlying.as_bytes())?;
+        digest.integer(available);
+        digest.integer(received);
+        digest.integer(ingested);
+        digest.text(&disposition)?;
+        digest.digest(row_mapping);
+        digest.integer(recorded);
+        result.push(provider_relation_row(
+            RELATION,
+            digest_primary_key(binding),
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+fn read_provider_option_native_lineage(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_option_market_binding_native_lineage";
+    let mut statement = connection.prepare(
+        "SELECT option_binding_digest, schema_version, implementation, schema_fingerprint,
+                row_count, batch_digest, batch_sidecar_payload, batch_sidecar_digest
+         FROM provider_option_market_binding_native_lineage
+         ORDER BY option_binding_digest LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let schema_version: i64 = row.get(1)?;
+        let implementation: String = row.get(2)?;
+        let schema = parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?;
+        let row_count: i64 = row.get(4)?;
+        let batch = parse_sha256(1, row.get::<_, Vec<u8>>(5)?)?;
+        let sidecar: Vec<u8> = row.get(6)?;
+        let sidecar_digest = parse_sha256(1, row.get::<_, Vec<u8>>(7)?)?;
+        if schema_version <= 0
+            || implementation.is_empty()
+            || implementation.len() > 128
+            || !(0..=100_000).contains(&row_count)
+            || sidecar.is_empty()
+            || sidecar.len() > 4_194_304
+            || Sha256Digest::new(Sha256::digest(&sidecar).into()) != sidecar_digest
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(binding);
+        digest.integer(schema_version);
+        digest.text(&implementation)?;
+        digest.digest(schema);
+        digest.integer(row_count);
+        digest.digest(batch);
+        digest.bytes(&sidecar)?;
+        digest.digest(sidecar_digest);
+        result.push(provider_relation_row(
+            RELATION,
+            digest_primary_key(binding),
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+fn read_provider_option_rows(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_option_market_binding_rows";
+    let mut statement = connection.prepare(
+        "SELECT option_binding_digest, capture_observation_digest, canonical_row_ordinal,
+                canonical_row_digest, native_semantic_payload, native_semantic_digest,
+                capture_page_ordinal, physical_frame_ordinal, payload_digest,
+                received_at_ns, source_sequence
+         FROM provider_option_market_binding_rows
+         ORDER BY option_binding_digest, canonical_row_ordinal LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let capture = parse_sha256(1, row.get::<_, Vec<u8>>(1)?)?;
+        let ordinal: i64 = row.get(2)?;
+        let canonical = parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?;
+        let native_payload: Vec<u8> = row.get(4)?;
+        let native = parse_sha256(1, row.get::<_, Vec<u8>>(5)?)?;
+        let page: i64 = row.get(6)?;
+        let frame: i64 = row.get(7)?;
+        let payload = parse_sha256(1, row.get::<_, Vec<u8>>(8)?)?;
+        let received: i64 = row.get(9)?;
+        let source_sequence: Option<Vec<u8>> = row.get(10)?;
+        if !(0..=99_999).contains(&ordinal)
+            || native_payload.is_empty()
+            || native_payload.len() > 65_536
+            || Sha256Digest::new(Sha256::digest(&native_payload).into()) != native
+            || !(0..=63).contains(&page)
+            || !(0..=63).contains(&frame)
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        validate_optional_u64_blob(source_sequence.as_deref())?;
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(binding);
+        digest.digest(capture);
+        digest.integer(ordinal);
+        digest.digest(canonical);
+        digest.bytes(&native_payload)?;
+        digest.digest(native);
+        digest.integer(page);
+        digest.integer(frame);
+        digest.digest(payload);
+        digest.integer(received);
+        digest.optional_bytes(source_sequence.as_deref())?;
+        result.push(provider_relation_row(
+            RELATION,
+            digest_ordinal_primary_key(binding, ordinal)?,
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+fn read_market_event_selection_evidence(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_market_event_selection_index";
+    let mut statement = connection.prepare(
+        "SELECT publication_digest, publication_kind, publication_row_ordinal,
+                component_kind, component_binding_digest, component_row_ordinal,
+                canonical_event_digest, source_id, instrument_id, venue_id, event_kind,
+                source_timestamp_ns, received_at_ns, available_at_ns, ingested_at_ns,
+                connection_generation_be, source_sequence_be, provider_event_id,
+                coordinate_digest
+         FROM provider_market_event_selection_index
+         ORDER BY publication_digest, publication_row_ordinal LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let publication = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let publication_kind: String = row.get(1)?;
+        let publication_ordinal: i64 = row.get(2)?;
+        let component_kind: String = row.get(3)?;
+        let component = parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?;
+        let component_ordinal: i64 = row.get(5)?;
+        let canonical = parse_sha256(1, row.get::<_, Vec<u8>>(6)?)?;
+        let source: String = row.get(7)?;
+        SourceIdentifier::try_from(source.clone()).map_err(|_| CatalogError::CorruptCatalog)?;
+        let instrument_bytes: Vec<u8> = row.get(8)?;
+        let instrument = parse_uuid_blob(&instrument_bytes)?;
+        let venue: String = row.get(9)?;
+        let event_kind: String = row.get(10)?;
+        let source_timestamp: Option<i64> = row.get(11)?;
+        let received: i64 = row.get(12)?;
+        let available: i64 = row.get(13)?;
+        let ingested: i64 = row.get(14)?;
+        let connection_generation: Vec<u8> = row.get(15)?;
+        let source_sequence: Option<Vec<u8>> = row.get(16)?;
+        let provider_event_id: String = row.get(17)?;
+        let coordinate = parse_sha256(1, row.get::<_, Vec<u8>>(18)?)?;
+        validate_nonzero_u64_blob(&connection_generation)?;
+        validate_optional_u64_blob(source_sequence.as_deref())?;
+        let kind_matches = match publication_kind.as_str() {
+            "response_market_event" => component_kind == "response",
+            "event_microbatch" => component_kind == "stream",
+            "composite_response_event" => {
+                matches!(component_kind.as_str(), "response" | "stream")
+            }
+            _ => false,
+        };
+        if !kind_matches
+            || !(0..=127).contains(&publication_ordinal)
+            || !(0..=63).contains(&component_ordinal)
+            || (publication_kind != "composite_response_event"
+                && publication_ordinal != component_ordinal)
+            || venue.is_empty()
+            || venue.len() > 128
+            || !matches!(
+                event_kind.as_str(),
+                "trade"
+                    | "quote"
+                    | "book_snapshot"
+                    | "book_delta"
+                    | "auction"
+                    | "trading_halt"
+                    | "instrument_status"
+                    | "corporate_action"
+            )
+            || received > available
+            || available > ingested
+            || provider_event_id.is_empty()
+            || provider_event_id.len() > 512
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(publication);
+        digest.text(&publication_kind)?;
+        digest.integer(publication_ordinal);
+        digest.text(&component_kind)?;
+        digest.digest(component);
+        digest.integer(component_ordinal);
+        digest.digest(canonical);
+        digest.text(&source)?;
+        digest.bytes(instrument.as_bytes())?;
+        digest.text(&venue)?;
+        digest.text(&event_kind)?;
+        digest.optional_integer(source_timestamp);
+        digest.integer(received);
+        digest.integer(available);
+        digest.integer(ingested);
+        digest.bytes(&connection_generation)?;
+        digest.optional_bytes(source_sequence.as_deref())?;
+        digest.text(&provider_event_id)?;
+        digest.digest(coordinate);
+        result.push(provider_relation_row(
+            RELATION,
+            digest_ordinal_primary_key(publication, publication_ordinal)?,
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+struct ProviderRowDigest(Sha256);
+
+impl ProviderRowDigest {
+    fn new(relation: &str) -> Result<Self, CatalogError> {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/provider-catalog-relation-row/v1");
+        hash_length_prefixed(&mut digest, relation.as_bytes())?;
+        Ok(Self(digest))
+    }
+
+    fn integer(&mut self, value: i64) {
+        self.0.update([1]);
+        self.0.update(value.to_be_bytes());
+    }
+
+    fn optional_integer(&mut self, value: Option<i64>) {
+        match value {
+            Some(value) => {
+                self.0.update([2, 1]);
+                self.0.update(value.to_be_bytes());
+            }
+            None => self.0.update([2, 0]),
+        }
+    }
+
+    fn digest(&mut self, value: Sha256Digest) {
+        self.0.update([3]);
+        self.0.update(value.bytes());
+    }
+
+    fn text(&mut self, value: &str) -> Result<(), CatalogError> {
+        self.0.update([4]);
+        hash_length_prefixed(&mut self.0, value.as_bytes())
+    }
+
+    fn bytes(&mut self, value: &[u8]) -> Result<(), CatalogError> {
+        self.0.update([5]);
+        hash_length_prefixed(&mut self.0, value)
+    }
+
+    fn optional_bytes(&mut self, value: Option<&[u8]>) -> Result<(), CatalogError> {
+        match value {
+            Some(value) => {
+                self.0.update([6, 1]);
+                hash_length_prefixed(&mut self.0, value)
+            }
+            None => {
+                self.0.update([6, 0]);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self) -> Sha256Digest {
+        Sha256Digest::new(self.0.finalize().into())
+    }
+}
+
+fn provider_relation_row(
+    relation: &'static str,
+    primary_key: Box<[u8]>,
+    row_content_digest: Sha256Digest,
+    accounted_object_bytes: u64,
+) -> ProviderRelationEvidenceRow {
+    (
+        relation.into(),
+        primary_key,
+        row_content_digest,
+        accounted_object_bytes,
+    )
+}
+
+fn digest_primary_key(digest: Sha256Digest) -> Box<[u8]> {
+    Box::from(digest.bytes())
+}
+
+fn digest_ordinal_primary_key(
+    digest: Sha256Digest,
+    ordinal: i64,
+) -> Result<Box<[u8]>, CatalogError> {
+    let ordinal = u64::try_from(ordinal).map_err(|_| CatalogError::CorruptCatalog)?;
+    let mut key = [0_u8; 40];
+    key[..32].copy_from_slice(&digest.bytes());
+    key[32..].copy_from_slice(&ordinal.to_be_bytes());
+    Ok(Box::from(key))
+}
+
+fn digest_pair_ordinal_primary_key(
+    digest: Sha256Digest,
+    first: i64,
+    second: i64,
+) -> Result<Box<[u8]>, CatalogError> {
+    let first = u64::try_from(first).map_err(|_| CatalogError::CorruptCatalog)?;
+    let second = u64::try_from(second).map_err(|_| CatalogError::CorruptCatalog)?;
+    let mut key = [0_u8; 48];
+    key[..32].copy_from_slice(&digest.bytes());
+    key[32..40].copy_from_slice(&first.to_be_bytes());
+    key[40..].copy_from_slice(&second.to_be_bytes());
+    Ok(Box::from(key))
+}
+
+fn hash_length_prefixed(digest: &mut Sha256, value: &[u8]) -> Result<(), CatalogError> {
+    let length =
+        u64::try_from(value.len()).map_err(|_| CatalogError::AnalyticalEvidenceLimitExceeded)?;
+    digest.update(length.to_be_bytes());
+    digest.update(value);
+    Ok(())
+}
+
+fn validate_json(value: &[u8], maximum: usize) -> Result<(), CatalogError> {
+    if value.len() < 2 || value.len() > maximum {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(value);
+    let _: serde::de::IgnoredAny = serde::Deserialize::deserialize(&mut deserializer)?;
+    deserializer.end().map_err(Into::into)
+}
+
+fn parse_uuid_blob(value: &[u8]) -> Result<Uuid, CatalogError> {
+    let value = Uuid::from_slice(value).map_err(|_| CatalogError::CorruptCatalog)?;
+    if value.is_nil() {
+        Err(CatalogError::CorruptCatalog)
+    } else {
+        Ok(value)
+    }
+}
+
+fn validate_nonzero_u64_blob(value: &[u8]) -> Result<(), CatalogError> {
+    let value: [u8; 8] = value.try_into().map_err(|_| CatalogError::CorruptCatalog)?;
+    if u64::from_be_bytes(value) == 0 {
+        Err(CatalogError::CorruptCatalog)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_optional_u64_blob(value: Option<&[u8]>) -> Result<(), CatalogError> {
+    value.map_or(Ok(()), |value| {
+        <[u8; 8]>::try_from(value)
+            .map(|_| ())
+            .map_err(|_| CatalogError::CorruptCatalog)
+    })
+}
+
+fn logical_family(value: &str) -> bool {
+    matches!(
+        value,
+        "decoded_event"
+            | "provider_native"
+            | "canonical_row_map"
+            | "resolver_assertion"
+            | "resolver_outcome"
+            | "resolver_conflict"
+    )
 }
 
 fn require_capacity<T>(items: &[T], maximum: usize) -> Result<(), CatalogError> {
