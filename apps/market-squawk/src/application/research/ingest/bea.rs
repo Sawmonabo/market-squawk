@@ -1,15 +1,15 @@
 //! Application-owned BEA activation, atomic macro publication, and provider-period reads.
 //!
-//! BEA declares response-byte and provider/body-error budgets in addition to the shared request
-//! windows. The current shared provider-rate authority cannot settle those post-response
-//! dimensions. This boundary therefore refuses acquisition before network I/O unless an injected
-//! shared authority proves and performs both settlements. It never creates a second counter,
-//! credential path, raw store, or publication authority.
+//! BEA acquisition runs only through a registry-minted extraction authority. The adapter reserves
+//! the shared durable response-byte and provider-error claims before every send and consumes the
+//! exact in-flight permit when each response terminates. This boundary therefore never performs a
+//! second settlement or creates a local counter, credential path, raw store, or publication
+//! authority.
 
 use std::{sync::Arc, time::Instant};
 
 use market_squawk_adapter_bea::{
-    BeaDoctorAdmissionEvidence, BeaDoctorRun, BeaProviderQuotaDeclaration, BeaPublicationCandidate,
+    BeaDoctorAdmissionEvidence, BeaProviderQuotaDeclaration, BeaPublicationCandidate,
     BeaPublicationError, BeaRequiredSharedSettlement, BeaSource, BeaSourceError,
 };
 use market_squawk_data::{
@@ -21,7 +21,9 @@ use market_squawk_data::{
     ProviderMacroPlanRestartSelector, ProviderMacroPlanSemantics, QueryLimits,
 };
 use market_squawk_domain::{EvidenceDigest, ResearchPeriod, SourceId, SourceIdentifier, Timestamp};
-use market_squawk_sources::ProviderNativeLineageImplementation;
+use market_squawk_sources::{
+    ExtractionAuthority, ExtractionSourceError, ProviderNativeLineageImplementation,
+};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -32,42 +34,6 @@ pub(crate) const BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION: &str =
     "Macro.GetBeaProviderPeriodLatestKnown";
 
 const BEA_PROVIDER_SEMANTICS_SCHEMA: &str = "bea-regional-provider-semantics-v1";
-
-/// Shared durable settlement seam required before any BEA response-producing operation.
-///
-/// An implementation must be backed by the product-wide provider-rate authority. It must not be
-/// adapter-local or process-only. The preflight covers both successful and failed responses; the
-/// settlement method atomically charges the exact successful response evidence before it can
-/// authorize activation.
-pub(crate) trait BeaSharedQuotaSettlementAuthority: std::fmt::Debug + Send + Sync {
-    /// Proves that the exact BEA declaration and both post-response dimensions are durable.
-    fn validate_complete_declaration(
-        &self,
-        declaration: &BeaProviderQuotaDeclaration,
-    ) -> Result<(), BeaSharedQuotaSettlementFailure>;
-
-    /// Settles one successful bounded operation into the shared durable byte/error windows.
-    fn settle_success(
-        &self,
-        declaration: &BeaProviderQuotaDeclaration,
-        request_count: u32,
-        response_bytes: u64,
-    ) -> Result<EvidenceDigest, BeaSharedQuotaSettlementFailure>;
-}
-
-/// Closed shared-rate failure retained as an unavailable product state, not an adapter retry.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum BeaSharedQuotaSettlementFailure {
-    /// The shared authority does not durably settle every required BEA response dimension.
-    #[error("shared BEA response-byte and provider-error settlement is unavailable")]
-    Unsupported,
-    /// The shared authority is stale, unavailable, or could not durably commit settlement.
-    #[error("shared BEA quota settlement authority is unavailable")]
-    AuthorityUnavailable,
-    /// The operation evidence does not match the registered declaration or durable window.
-    #[error("shared BEA quota settlement evidence does not match")]
-    EvidenceMismatch,
-}
 
 /// Application-owned BEA physical sealing, publication, and typed-read coordinator.
 #[derive(Clone)]
@@ -90,80 +56,55 @@ impl BeaMacroApplicationClosure {
         Self { research }
     }
 
-    /// Reports setup or the exact shared-authority blocker without performing network I/O.
-    pub(crate) fn acquisition_state(
-        source: Option<&BeaSource>,
-        settlement: Option<&dyn BeaSharedQuotaSettlementAuthority>,
-    ) -> BeaMacroCapabilityState {
+    /// Reports protected setup or an invalid code-owned quota contract without network I/O.
+    pub(crate) fn acquisition_state(source: Option<&BeaSource>) -> BeaMacroCapabilityState {
         let Some(source) = source else {
             return BeaMacroCapabilityState::SetupRequired(BeaSetupRequiredDto {
                 kind: BeaSetupRequiredKind::ProtectedCredential,
             });
         };
-        let Some(settlement) = settlement else {
-            return BeaMacroCapabilityState::Unavailable(BeaUnavailableDto::shared_quota(
+        if !complete_shared_quota_declaration(source.quota_declaration()) {
+            return BeaMacroCapabilityState::Unavailable(BeaUnavailableDto::invalid_quota(
                 source.quota_declaration(),
-                BeaSharedQuotaSettlementFailure::Unsupported,
             ));
-        };
-        match settlement.validate_complete_declaration(source.quota_declaration()) {
-            Ok(()) => BeaMacroCapabilityState::SetupRequired(BeaSetupRequiredDto {
-                kind: BeaSetupRequiredKind::DoctorActivation,
-            }),
-            Err(reason) => BeaMacroCapabilityState::Unavailable(BeaUnavailableDto::shared_quota(
-                source.quota_declaration(),
-                reason,
-            )),
         }
+        BeaMacroCapabilityState::SetupRequired(BeaSetupRequiredDto {
+            kind: BeaSetupRequiredKind::DoctorActivation,
+        })
     }
 
-    /// Settles, physically seals, rejoins, and activates one successful protected doctor run.
+    /// Acquires, physically seals, rejoins, and activates one protected BEA doctor run.
     ///
-    /// The caller must route provider failures through the same shared settlement authority. A
-    /// missing or incomplete authority returns `Unavailable` before this method mutates source
-    /// activation. No credential material is retained in the result.
-    pub(crate) async fn settle_seal_and_activate_doctor(
+    /// The registry-minted extraction authority is the only request path. The BEA adapter uses it
+    /// to reserve the worst-case weighted claim before every transport send and consuming-settles
+    /// every complete response with exact bytes, error class, and Retry-After evidence. Transport
+    /// abandonment charges the reserved maximum through the common authority. No credential
+    /// material or independent quota state is retained in the result.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn acquire_seal_and_activate_doctor(
         &self,
         source: &BeaSource,
-        doctor: BeaDoctorRun,
-        settlement: Option<&dyn BeaSharedQuotaSettlementAuthority>,
+        authority: &ExtractionAuthority,
+        provider_dataset: &SourceIdentifier,
+        acquisition_deadline: Timestamp,
         seal_deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<BeaDoctorActivationState, BeaMacroApplicationError> {
         let quota = source.quota_declaration();
-        let Some(settlement) = settlement else {
+        if !complete_shared_quota_declaration(quota) {
             return Ok(BeaDoctorActivationState::Unavailable(
-                BeaUnavailableDto::shared_quota(
-                    quota,
-                    BeaSharedQuotaSettlementFailure::Unsupported,
-                ),
-            ));
-        };
-        if let Err(reason) = settlement.validate_complete_declaration(quota) {
-            return Ok(BeaDoctorActivationState::Unavailable(
-                BeaUnavailableDto::shared_quota(quota, reason),
+                BeaUnavailableDto::invalid_quota(quota),
             ));
         }
-        let settlement_digest = match settlement.settle_success(
-            quota,
-            doctor.receipt().request_count(),
-            doctor.receipt().total_response_bytes(),
-        ) {
-            Ok(digest) if digest.bytes() != [0; 32] => digest,
-            Ok(_) => {
-                return Ok(BeaDoctorActivationState::Unavailable(
-                    BeaUnavailableDto::shared_quota(
-                        quota,
-                        BeaSharedQuotaSettlementFailure::EvidenceMismatch,
-                    ),
-                ));
-            }
-            Err(reason) => {
-                return Ok(BeaDoctorActivationState::Unavailable(
-                    BeaUnavailableDto::shared_quota(quota, reason),
-                ));
-            }
-        };
+        let doctor = source
+            .doctor(
+                authority,
+                provider_dataset,
+                acquisition_deadline,
+                cancellation.clone(),
+            )
+            .await?;
+        let doctor_receipt_digest = doctor.receipt().receipt_digest();
 
         let (pending, seal_request) = doctor.into_sealing_parts()?;
         let sealed = self
@@ -171,39 +112,31 @@ impl BeaMacroApplicationClosure {
             .seal_provider_capture(seal_request, &cancellation, seal_deadline)
             .await?;
         let admission = Arc::new(pending.try_rejoin(source.source_binding(), sealed)?);
+        if admission.quota_declaration_digest() != quota.declaration_digest()
+            || admission.doctor_receipt_digest() != doctor_receipt_digest
+        {
+            return Err(BeaMacroApplicationError::DoctorAuthorityMismatch);
+        }
         source.activate_doctor(Arc::clone(&admission))?;
         Ok(BeaDoctorActivationState::Available(
-            BeaDoctorActivationDto {
-                admission,
-                quota_declaration_digest: quota.declaration_digest(),
-                settlement_digest,
-            },
+            BeaDoctorActivationDto { admission },
         ))
     }
 
     /// Publishes one already sealed BEA candidate through the shared atomic macro-plan authority.
     ///
-    /// The shared input currently rejects BEA native lineage and its metadata-first whole capture
-    /// shape. That exact rejection is retained as a typed unavailable state; no alternate store or
-    /// partial generation is created. Once the shared contract admits the handoff, this same path
-    /// performs Persist/precommit, atomic commit, and exact restart verification.
+    /// The shared contract admits only the exact BEA native lineage and metadata-first whole
+    /// capture shape. Invalid evidence fails closed; no alternate store or partial generation is
+    /// created.
     pub(crate) async fn publish_candidate(
         &self,
         candidate: BeaPublicationCandidate,
         persist_reservation: IngestReservation,
         application_precommit_authority: Arc<dyn IngestPrecommitAuthority>,
         cancellation: CancellationToken,
-    ) -> Result<BeaCandidatePublicationState, BeaMacroApplicationError> {
+    ) -> Result<BeaMacroPlanPublication, BeaMacroApplicationError> {
         application_precommit_authority.validate_precommit()?;
-        let publication_input = match try_into_provider_macro_plan_publication_input(candidate) {
-            Ok(input) => input,
-            Err(IngestError::InvalidProviderMacroPlan) => {
-                return Ok(BeaCandidatePublicationState::Unavailable(
-                    BeaUnavailableDto::shared_macro_publication(),
-                ));
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let publication_input = try_into_provider_macro_plan_publication_input(candidate)?;
         let pending = self
             .research
             .analytical()
@@ -223,9 +156,7 @@ impl BeaMacroApplicationClosure {
         if reopened.manifest() != receipt.manifest() {
             return Err(BeaMacroApplicationError::RestartVerificationMismatch);
         }
-        Ok(BeaCandidatePublicationState::Published(
-            BeaMacroPlanPublication { receipt, reopened },
-        ))
+        Ok(BeaMacroPlanPublication { receipt, reopened })
     }
 
     /// Reopens one exact generation and performs the fixed provider-period PIT read.
@@ -276,6 +207,16 @@ impl BeaMacroApplicationClosure {
             },
         ))
     }
+}
+
+fn complete_shared_quota_declaration(declaration: &BeaProviderQuotaDeclaration) -> bool {
+    let requirements = declaration.required_shared_settlements();
+    requirements.as_slice()
+        == [
+            BeaRequiredSharedSettlement::ResponseBytes,
+            BeaRequiredSharedSettlement::ProviderErrors,
+        ]
+        && declaration.shared_declaration().validate().is_ok()
 }
 
 /// Consumes one BEA canonical/native/raw handoff into the shared atomic macro-plan input.
@@ -330,7 +271,7 @@ fn try_into_provider_macro_plan_publication_input(
 pub(crate) enum BeaDoctorActivationState {
     /// The exact doctor admission is active without retaining its protected credential.
     Available(BeaDoctorActivationDto),
-    /// Shared durable quota authority could not authorize activation.
+    /// The code-owned shared weighted declaration is invalid.
     Unavailable(BeaUnavailableDto),
 }
 
@@ -338,8 +279,6 @@ pub(crate) enum BeaDoctorActivationState {
 #[derive(Debug)]
 pub(crate) struct BeaDoctorActivationDto {
     admission: Arc<BeaDoctorAdmissionEvidence>,
-    quota_declaration_digest: EvidenceDigest,
-    settlement_digest: EvidenceDigest,
 }
 
 impl BeaDoctorActivationDto {
@@ -349,23 +288,14 @@ impl BeaDoctorActivationDto {
     }
 
     /// Returns the complete request/byte/error policy identity that was settled.
-    pub(crate) const fn quota_declaration_digest(&self) -> EvidenceDigest {
-        self.quota_declaration_digest
+    pub(crate) fn quota_declaration_digest(&self) -> EvidenceDigest {
+        self.admission.quota_declaration_digest()
     }
 
-    /// Returns the shared durable settlement receipt without exposing a rate mutation API.
-    pub(crate) const fn settlement_digest(&self) -> EvidenceDigest {
-        self.settlement_digest
+    /// Returns the exact successful page/byte receipt bound to consuming shared settlements.
+    pub(crate) fn doctor_receipt_digest(&self) -> EvidenceDigest {
+        self.admission.doctor_receipt_digest()
     }
-}
-
-/// BEA candidate publication result; unavailable never represents an empty generation.
-#[derive(Debug)]
-pub(crate) enum BeaCandidatePublicationState {
-    /// One atomic immutable generation passed exact restart verification.
-    Published(BeaMacroPlanPublication),
-    /// The shared macro authority does not yet admit the exact BEA handoff.
-    Unavailable(BeaUnavailableDto),
 }
 
 /// Exact immutable BEA macro-plan generation proven readable after commit.
@@ -513,29 +443,10 @@ pub(crate) struct BeaUnavailableDto {
 }
 
 impl BeaUnavailableDto {
-    fn shared_quota(
-        declaration: &BeaProviderQuotaDeclaration,
-        failure: BeaSharedQuotaSettlementFailure,
-    ) -> Self {
-        let requirements = declaration.required_shared_settlements();
-        let complete_requirement = requirements
-            .contains(&BeaRequiredSharedSettlement::ResponseBytes)
-            && requirements.contains(&BeaRequiredSharedSettlement::ProviderErrors);
-        let reason = if complete_requirement {
-            BeaUnavailableReason::SharedQuotaSettlement(failure)
-        } else {
-            BeaUnavailableReason::InvalidQuotaDeclaration
-        };
+    fn invalid_quota(declaration: &BeaProviderQuotaDeclaration) -> Self {
         Self {
-            reason,
+            reason: BeaUnavailableReason::InvalidQuotaDeclaration,
             quota_declaration_digest: Some(declaration.declaration_digest()),
-        }
-    }
-
-    fn shared_macro_publication() -> Self {
-        Self {
-            reason: BeaUnavailableReason::SharedMacroPublicationContract,
-            quota_declaration_digest: None,
         }
     }
 
@@ -544,7 +455,7 @@ impl BeaUnavailableDto {
         self.reason
     }
 
-    /// Returns the BEA declaration identity when quota settlement caused unavailability.
+    /// Returns the BEA declaration identity when its shared weighted contract is invalid.
     pub(crate) const fn quota_declaration_digest(&self) -> Option<EvidenceDigest> {
         self.quota_declaration_digest
     }
@@ -553,12 +464,8 @@ impl BeaUnavailableDto {
 /// Closed reasons the fixed BEA operation cannot currently run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BeaUnavailableReason {
-    /// Shared durable response-byte/provider-error settlement is incomplete or unavailable.
-    SharedQuotaSettlement(BeaSharedQuotaSettlementFailure),
     /// The adapter declaration does not retain both mandatory BEA settlement dimensions.
     InvalidQuotaDeclaration,
-    /// Shared atomic macro publication does not yet admit BEA lineage/capture topology.
-    SharedMacroPublicationContract,
     /// No exact restart selector is available for the fixed read.
     ManifestRequired,
 }
@@ -610,6 +517,9 @@ pub(crate) enum BeaMacroApplicationError {
     /// The BEA canonical publication candidate is invalid.
     #[error("BEA canonical publication candidate is invalid")]
     Publication(#[from] BeaPublicationError),
+    /// Registry-authorized BEA acquisition or shared weighted response settlement failed.
+    #[error("BEA registry-authorized acquisition failed")]
+    Extraction(#[from] ExtractionSourceError),
     /// The application-owned research service rejected physical capture sealing.
     #[error("BEA application-owned physical capture sealing failed")]
     ResearchService(#[from] ResearchServiceError),
@@ -622,6 +532,9 @@ pub(crate) enum BeaMacroApplicationError {
     /// Exact publication evidence did not reopen the same immutable generation.
     #[error("BEA exact restart verification changed generation identity")]
     RestartVerificationMismatch,
+    /// Doctor sealing changed quota or successful-response receipt identity.
+    #[error("BEA doctor activation changed shared authority evidence")]
+    DoctorAuthorityMismatch,
     /// The typed read did not retain the exact source and immutable generation.
     #[error("BEA provider-period read returned invalid binding evidence")]
     InvalidReadResult,
