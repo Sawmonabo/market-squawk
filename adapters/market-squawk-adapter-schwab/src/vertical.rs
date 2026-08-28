@@ -12,14 +12,169 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ACCESS_TOKEN_MAX_LIFETIME_SECONDS, ExecutedRestResponse, ReadOnlyRoute,
-    SchwabOAuthAuthorityReceipt, SchwabRestPayload, SchwabUserPreferenceEvidence,
+    ACCESS_TOKEN_MAX_LIFETIME_SECONDS, ExecutedRestResponse, MarketDataService, ReadOnlyRoute,
+    SchwabOAuthAuthorityReceipt, SchwabRestPayload, SchwabSealedStreamerCapture,
+    SchwabUserPreferenceEvidence,
 };
 
-/// The sole family for which this adapter currently observes scoped capability evidence.
+/// One independently probed read-only Schwab market-data family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchwabObservedCapabilityFamily {
+    Quotes,
+    OptionChain,
+    ExpirationChain,
     DailyPriceHistory,
+    MarketHours,
+    Movers,
+    Instruments,
+    Streamer(MarketDataService),
+}
+
+/// Typed REST doctor input. The constructor proves route, decoded response family, accounting,
+/// raw-body identity, and at least one provider record before the input can be observed.
+#[derive(Clone, Copy, Debug)]
+pub struct SchwabRestFamilyDoctorInput<'a> {
+    family: SchwabObservedCapabilityFamily,
+    response: &'a ExecutedRestResponse,
+}
+
+impl<'a> SchwabRestFamilyDoctorInput<'a> {
+    pub fn try_new(
+        family: SchwabObservedCapabilityFamily,
+        response: &'a ExecutedRestResponse,
+    ) -> Result<Self, SchwabVerticalError> {
+        if !rest_family_matches(family, response) {
+            return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+        }
+        let receipt = response.capture().receipt();
+        let accounting = response.accounting();
+        if receipt.status() != 200
+            || receipt.body_sha256() != response.payload().raw_sha256()
+            || accounting.requested == 0
+            || accounting.returned == 0
+            || accounting.missing != 0
+            || accounting.unexpected != 0
+            || accounting.provider_records == 0
+        {
+            return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+        }
+        Ok(Self { family, response })
+    }
+
+    pub const fn family(self) -> SchwabObservedCapabilityFamily {
+        self.family
+    }
+
+    pub const fn response(self) -> &'a ExecutedRestResponse {
+        self.response
+    }
+}
+
+/// Typed Streamer doctor input bound to one selected service and one physically sealed capture.
+#[derive(Clone, Copy, Debug)]
+pub struct SchwabStreamerFamilyDoctorInput<'a> {
+    service: MarketDataService,
+    capture: &'a SchwabSealedStreamerCapture,
+    provider_records: u64,
+}
+
+impl<'a> SchwabStreamerFamilyDoctorInput<'a> {
+    pub fn try_new(
+        service: MarketDataService,
+        capture: &'a SchwabSealedStreamerCapture,
+    ) -> Result<Self, SchwabVerticalError> {
+        let mut provider_records = 0_u64;
+        for frame in capture.parsed_frames() {
+            for batch in &frame.value().data {
+                if batch.service == service {
+                    provider_records = provider_records
+                        .checked_add(
+                            u64::try_from(batch.content.len())
+                                .map_err(|_| SchwabVerticalError::Overflow)?,
+                        )
+                        .ok_or(SchwabVerticalError::Overflow)?;
+                }
+            }
+        }
+        if provider_records == 0 || capture.frames().is_empty() {
+            return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+        }
+        Ok(Self {
+            service,
+            capture,
+            provider_records,
+        })
+    }
+
+    pub const fn family(self) -> SchwabObservedCapabilityFamily {
+        SchwabObservedCapabilityFamily::Streamer(self.service)
+    }
+
+    pub const fn capture(self) -> &'a SchwabSealedStreamerCapture {
+        self.capture
+    }
+
+    pub const fn provider_records(self) -> u64 {
+        self.provider_records
+    }
+}
+
+/// Closed typed doctor input across every admitted read-only market-data family.
+#[derive(Clone, Copy, Debug)]
+pub enum SchwabFamilyDoctorInput<'a> {
+    Rest(SchwabRestFamilyDoctorInput<'a>),
+    Streamer(SchwabStreamerFamilyDoctorInput<'a>),
+}
+
+impl SchwabFamilyDoctorInput<'_> {
+    pub const fn family(self) -> SchwabObservedCapabilityFamily {
+        match self {
+            Self::Rest(input) => input.family(),
+            Self::Streamer(input) => input.family(),
+        }
+    }
+}
+
+fn rest_family_matches(
+    family: SchwabObservedCapabilityFamily,
+    response: &ExecutedRestResponse,
+) -> bool {
+    matches!(
+        (
+            family,
+            response.capture().receipt().route(),
+            response.payload()
+        ),
+        (
+            SchwabObservedCapabilityFamily::Quotes,
+            ReadOnlyRoute::Quotes | ReadOnlyRoute::SingleQuote,
+            SchwabRestPayload::Quotes(_)
+        ) | (
+            SchwabObservedCapabilityFamily::OptionChain,
+            ReadOnlyRoute::Chains,
+            SchwabRestPayload::OptionChain(_)
+        ) | (
+            SchwabObservedCapabilityFamily::ExpirationChain,
+            ReadOnlyRoute::ExpirationChain,
+            SchwabRestPayload::Expirations(_)
+        ) | (
+            SchwabObservedCapabilityFamily::DailyPriceHistory,
+            ReadOnlyRoute::PriceHistory,
+            SchwabRestPayload::PriceHistory(_)
+        ) | (
+            SchwabObservedCapabilityFamily::MarketHours,
+            ReadOnlyRoute::Markets | ReadOnlyRoute::SingleMarket,
+            SchwabRestPayload::MarketHours(_)
+        ) | (
+            SchwabObservedCapabilityFamily::Movers,
+            ReadOnlyRoute::Movers,
+            SchwabRestPayload::Movers(_)
+        ) | (
+            SchwabObservedCapabilityFamily::Instruments,
+            ReadOnlyRoute::Instruments | ReadOnlyRoute::InstrumentByCusip,
+            SchwabRestPayload::Instruments(_)
+        )
+    )
 }
 
 /// Currentness of one exact family observation.
@@ -303,6 +458,13 @@ fn validate_observed_clock(
 
 pub(crate) fn rest_receipt_digest(response: &ExecutedRestResponse) -> [u8; 32] {
     receipt_digest(response.capture().receipt(), response.accounting())
+}
+
+pub(crate) fn rest_receipt_digest_from_parts(
+    receipt: &crate::RawRestResponseReceipt,
+    accounting: crate::RestItemAccounting,
+) -> [u8; 32] {
+    receipt_digest(receipt, accounting)
 }
 
 pub(crate) fn user_preference_receipt_digest(response: &SchwabUserPreferenceEvidence) -> [u8; 32] {

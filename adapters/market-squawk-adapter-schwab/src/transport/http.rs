@@ -12,8 +12,9 @@ use futures_util::StreamExt as _;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
 use market_squawk_platform::RawCaptureRecord;
 use market_squawk_sources::{
-    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition,
+    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSealExpectation,
+    ProviderCaptureSealRequest, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    ProviderWholeCaptureToken, SealedProviderCaptureMaterial, SealedProviderCaptureSetReceipt,
 };
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
@@ -265,6 +266,18 @@ pub enum SchwabRestPayload {
     Instruments(ParsedNative<InstrumentResponse>),
 }
 
+/// Closed selected REST response family, preserving exact route evidence separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchwabRestFamily {
+    Quotes,
+    OptionChain,
+    ExpirationChain,
+    DailyPriceHistory,
+    MarketHours,
+    Movers,
+    Instruments,
+}
+
 impl SchwabRestPayload {
     /// Exact provider-native records returned by the response, separate from lookup completion.
     pub fn record_count(&self) -> usize {
@@ -279,7 +292,20 @@ impl SchwabRestPayload {
         }
     }
 
-    fn raw_sha256(&self) -> [u8; 32] {
+    /// Returns the closed response family without erasing the exact request route.
+    pub const fn family(&self) -> SchwabRestFamily {
+        match self {
+            Self::Quotes(_) => SchwabRestFamily::Quotes,
+            Self::OptionChain(_) => SchwabRestFamily::OptionChain,
+            Self::Expirations(_) => SchwabRestFamily::ExpirationChain,
+            Self::PriceHistory(_) => SchwabRestFamily::DailyPriceHistory,
+            Self::MarketHours(_) => SchwabRestFamily::MarketHours,
+            Self::Movers(_) => SchwabRestFamily::Movers,
+            Self::Instruments(_) => SchwabRestFamily::Instruments,
+        }
+    }
+
+    pub(crate) fn raw_sha256(&self) -> [u8; 32] {
         match self {
             Self::Quotes(value) => value.raw_sha256(),
             Self::OptionChain(value) => value.raw_sha256(),
@@ -396,14 +422,16 @@ impl ExecutedRestResponse {
             return Err(SchwabTransportError::CaptureMaterial);
         }
         let material = rest_capture_material(&receipt, body, &coordinates, event_id)?;
+        let (seal_expectation, seal_request) = material.into_whole_seal_parts();
         Ok(SchwabPendingRestCapture {
             rejoin: SchwabRestCaptureSealRejoin {
                 coordinates,
                 receipt,
                 payload,
                 accounting,
+                seal_expectation,
             },
-            material,
+            seal_request,
         })
     }
 }
@@ -413,7 +441,7 @@ impl ExecutedRestResponse {
 /// Splitting consumes this value once. Neither half can manufacture a second handoff.
 pub struct SchwabPendingRestCapture {
     rejoin: SchwabRestCaptureSealRejoin,
-    material: ProviderCaptureMaterial,
+    seal_request: ProviderCaptureSealRequest,
 }
 
 impl fmt::Debug for SchwabPendingRestCapture {
@@ -421,29 +449,29 @@ impl fmt::Debug for SchwabPendingRestCapture {
         formatter
             .debug_struct("SchwabPendingRestCapture")
             .field("rejoin", &self.rejoin)
-            .field("capture_receipt", self.material.receipt())
+            .field("seal_request", &"EXACT RAW BODY PENDING PHYSICAL SEAL")
             .finish()
     }
 }
 
 impl SchwabPendingRestCapture {
-    /// Splits exact source-neutral material from the opaque typed continuation exactly once.
-    pub fn into_sealing_parts(self) -> (SchwabRestCaptureSealRejoin, ProviderCaptureMaterial) {
-        (self.rejoin, self.material)
+    /// Splits the opaque typed continuation from the sole consuming physical-seal request.
+    pub fn into_sealing_parts(self) -> (SchwabRestCaptureSealRejoin, ProviderCaptureSealRequest) {
+        (self.rejoin, self.seal_request)
     }
 }
 
-/// Opaque typed continuation awaiting the common consuming material-seal witness.
+/// Opaque typed continuation awaiting its exact common consuming material-seal witness.
 ///
-/// This type intentionally exposes no receipt-equality rejoin. Once the common
-/// `ProviderCaptureSealExpectation` / consuming sealed-material contract is available, the
-/// adapter can add the only transition that consumes both values. Until then the typed payload
-/// remains inaccessible to downstream publication.
+/// Only adapter-owned family publication code can consume this continuation with the matching
+/// `SealedProviderCaptureMaterial`; public callers cannot substitute receipt equality for the
+/// process-local seal witness.
 pub struct SchwabRestCaptureSealRejoin {
     coordinates: SchwabCaptureCoordinates,
     receipt: RawRestResponseReceipt,
     payload: SchwabRestPayload,
     accounting: RestItemAccounting,
+    seal_expectation: ProviderCaptureSealExpectation,
 }
 
 impl fmt::Debug for SchwabRestCaptureSealRejoin {
@@ -461,31 +489,144 @@ impl fmt::Debug for SchwabRestCaptureSealRejoin {
             )
             .field("payload_family", &rest_payload_family(&self.payload))
             .field("accounting", &self.accounting)
-            .field("sealed_transition", &"AWAITING_COMMON_MATERIAL_BINDING")
+            .field("sealed_transition", &"AWAITING_COMMON_PHYSICAL_SEAL")
             .finish()
     }
 }
 
 impl SchwabRestCaptureSealRejoin {
-    #[cfg(test)]
-    pub(crate) const fn coordinates(&self) -> &SchwabCaptureCoordinates {
-        &self.coordinates
+    /// Rejoins the exact application-owned physical seal into an opaque sealed REST response.
+    ///
+    /// This is the common terminal boundary for every selected read-only REST family. It exposes
+    /// no raw-body clone, capture token, canonical publication authority, or account-shaped User
+    /// Preference response.
+    pub fn try_rejoin(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<SchwabSealedRestResponse, SchwabTransportError> {
+        self.try_rejoin_parts(sealed)
+            .map(|parts| SchwabSealedRestResponse { parts })
     }
 
-    #[cfg(test)]
-    pub(crate) const fn receipt(&self) -> &RawRestResponseReceipt {
-        &self.receipt
+    pub(crate) fn try_rejoin_whole(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<SchwabSealedRestResponseParts, SchwabTransportError> {
+        self.try_rejoin_parts(sealed)
     }
 
-    #[cfg(test)]
-    pub(crate) const fn payload(&self) -> &SchwabRestPayload {
-        &self.payload
+    fn try_rejoin_parts(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<SchwabSealedRestResponseParts, SchwabTransportError> {
+        let token = self
+            .seal_expectation
+            .try_rejoin(sealed)
+            .and_then(|capture| capture.try_into_whole())
+            .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+        if token.persisted_receipt().capture().source_id() != self.coordinates.source_id()
+            || token.persisted_receipt().capture().metadata_revision()
+                != self.coordinates.metadata_revision()
+            || token.persisted_receipt().capture().dataset() != self.coordinates.dataset()
+        {
+            return Err(SchwabTransportError::CaptureMaterial);
+        }
+        let capture = token.persisted_receipt().capture();
+        let [page] = capture.pages() else {
+            return Err(SchwabTransportError::CaptureMaterial);
+        };
+        let received_at = self
+            .receipt
+            .received_at_unix_millis()
+            .checked_mul(1_000_000)
+            .and_then(|value| i64::try_from(value).ok())
+            .map(Timestamp::from_unix_nanos)
+            .ok_or(SchwabTransportError::CaptureMaterial)?;
+        if capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+            || page.body_digest()
+                != EvidenceDigest::new(DigestAlgorithm::Sha256, self.receipt.body_sha256())
+            || page.body_bytes() != self.receipt.body_bytes()
+            || page.received_at() != received_at
+            || self.payload.raw_sha256() != self.receipt.body_sha256()
+            || u64::try_from(self.payload.record_count())
+                .map_err(|_| SchwabTransportError::Overflow)?
+                != self.accounting.provider_records
+        {
+            return Err(SchwabTransportError::CaptureMaterial);
+        }
+        Ok(SchwabSealedRestResponseParts {
+            coordinates: self.coordinates,
+            receipt: self.receipt,
+            payload: self.payload,
+            accounting: self.accounting,
+            token,
+        })
+    }
+}
+
+/// Opaque physically sealed selected REST response awaiting its truthful family-specific sink.
+///
+/// The wrapper is deliberately non-cloneable and non-serializable. It proves exact raw retention
+/// and typed provider parsing, but does not claim that every family already has a canonical domain
+/// schema or durable analytical publisher.
+pub struct SchwabSealedRestResponse {
+    parts: SchwabSealedRestResponseParts,
+}
+
+impl fmt::Debug for SchwabSealedRestResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabSealedRestResponse")
+            .field("family", &self.family())
+            .field("route", &self.route())
+            .field("receipt", &self.parts.receipt)
+            .field("accounting", &self.parts.accounting)
+            .field("raw_body", &"PHYSICALLY SEALED")
+            .finish()
+    }
+}
+
+impl SchwabSealedRestResponse {
+    /// Returns the typed provider response family.
+    pub const fn family(&self) -> SchwabRestFamily {
+        self.parts.payload.family()
     }
 
-    #[cfg(test)]
-    pub(crate) const fn accounting(&self) -> RestItemAccounting {
-        self.accounting
+    /// Returns the exact allowlisted request route, including grouped route aliases.
+    pub const fn route(&self) -> ReadOnlyRoute {
+        self.parts.receipt.route()
     }
+
+    /// Returns the exact bounded transport and raw-body receipt.
+    pub const fn receipt(&self) -> &RawRestResponseReceipt {
+        &self.parts.receipt
+    }
+
+    /// Returns request/response completion accounting without exposing canonical authority.
+    pub const fn accounting(&self) -> RestItemAccounting {
+        self.parts.accounting
+    }
+
+    /// Returns cloneable logical/physical response evidence without exposing publication authority.
+    pub fn persisted_receipt(&self) -> &SealedProviderCaptureSetReceipt {
+        self.parts.token.persisted_receipt()
+    }
+
+    pub(crate) const fn parts(&self) -> &SchwabSealedRestResponseParts {
+        &self.parts
+    }
+
+    pub(crate) fn into_parts(self) -> SchwabSealedRestResponseParts {
+        self.parts
+    }
+}
+
+pub(crate) struct SchwabSealedRestResponseParts {
+    pub(crate) coordinates: SchwabCaptureCoordinates,
+    pub(crate) receipt: RawRestResponseReceipt,
+    pub(crate) payload: SchwabRestPayload,
+    pub(crate) accounting: RestItemAccounting,
+    pub(crate) token: ProviderWholeCaptureToken,
 }
 
 fn payload_matches_capturable_route(route: ReadOnlyRoute, payload: &SchwabRestPayload) -> bool {

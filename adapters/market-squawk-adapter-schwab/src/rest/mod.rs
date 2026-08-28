@@ -23,3 +23,4 @@ pub use response::{
 };
 
 pub(crate) use native::{ParseContext, parse_json_payload};
+pub(crate) use response::ExpirationEntry;

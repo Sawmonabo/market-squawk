@@ -13,8 +13,12 @@ mod callback;
 mod canonical;
 mod error;
 mod oauth;
+mod option_publication;
+mod publication;
 mod rest;
+mod rest_quote_publication;
 mod streamer;
+mod streamer_publication;
 mod transport;
 mod vertical;
 
@@ -48,6 +52,18 @@ pub use oauth::{
     SchwabApplicationCredentialEnvelope, TokenDecision, TokenGrant, TokenLifecycle,
     TransientTokenResponse, parse_token_response,
 };
+pub use option_publication::{
+    SchwabRestOptionContractRequest, SchwabRestOptionDisposition,
+    SchwabRestOptionDispositionReason, SchwabRestOptionMarketDataEvidence,
+    SchwabRestOptionPublicationError, SchwabRestOptionPublicationOutcome,
+    SchwabRestOptionPublicationRequest, SchwabRestOptionUnderlyingRequest,
+    SchwabSealedRawRestOptionPublication, SchwabSealedRestOptionPublication,
+};
+pub use publication::{
+    SchwabDailyPriceHistoryPublicationRequest, SchwabPendingDailyPriceHistoryPublication,
+    SchwabPriceHistoryMarketDataEvidence, SchwabPriceHistoryPublicationError,
+    SchwabRestDelayEvidence, SchwabSealedDailyPriceHistoryPublication,
+};
 pub use rest::{
     ChainContractType, ChainRequest, ChainStrategy, ExpirationChainRequest, ExpirationMonth,
     ExpirationResponse, FundamentalField, HistoricalCandle, InstrumentProjection,
@@ -63,6 +79,13 @@ pub use rest::{
     parse_market_hours_response, parse_movers_response, parse_option_chain_response,
     parse_price_history_response, parse_quote_response,
 };
+pub use rest_quote_publication::{
+    SchwabRestQuoteDisposition, SchwabRestQuoteDispositionReason,
+    SchwabRestQuoteMarketDataEvidence, SchwabRestQuotePublicationError,
+    SchwabRestQuotePublicationOutcome, SchwabRestQuotePublicationRequest,
+    SchwabRestQuoteRecordRequest, SchwabSealedRawRestQuotePublication,
+    SchwabSealedRestQuotePublication,
+};
 pub use streamer::{
     ConnectionGeneration, ConnectionState, DesiredStateController, MarketDataService,
     StreamerAdmission, StreamerBootstrap, StreamerBootstrapResponse, StreamerCommand,
@@ -71,22 +94,33 @@ pub use streamer::{
     StreamerResponseCode, StreamerSubscription, TransientStreamerRequest, parse_streamer_frame,
     parse_user_preference,
 };
+pub use streamer_publication::{
+    SchwabSealedRawStreamerPublication, SchwabSealedStreamerQuotePublication,
+    SchwabStreamerDelayEvidence, SchwabStreamerPublicationError,
+    SchwabStreamerQuoteMarketDataEvidence, SchwabStreamerQuotePublicationOutcome,
+    SchwabStreamerQuotePublicationRequest, SchwabStreamerQuoteRecordRequest,
+    SchwabStreamerRecordDisposition, SchwabStreamerRecordDispositionReason,
+};
 pub use transport::{
     AccessTokenAdmission, AccessTokenGeneration, CapturedRestResponse, ExecutedRestResponse,
     InboundStreamerFrame, ProductionSchwabStreamerConnector, RawRestResponseReceipt,
     RawStreamerFrame, RawStreamerFrameKind, ReqwestSchwabHttpWire, ResponseHeaderEvidence,
     RestExecutionOutcome, RestItemAccounting, RestTransportBounds, SchwabAccessTokenSource,
     SchwabCaptureCoordinates, SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse,
-    SchwabPendingRestCapture, SchwabRestCaptureSealRejoin, SchwabRestExecutor, SchwabRestPayload,
-    SchwabStreamerConnection, SchwabStreamerConnector, SchwabStreamerExecutor,
+    SchwabPendingRestCapture, SchwabPendingStreamerCapture, SchwabRestCaptureSealRejoin,
+    SchwabRestExecutor, SchwabRestFamily, SchwabRestPayload, SchwabSealedRestResponse,
+    SchwabSealedStreamerCapture, SchwabStreamerConnection, SchwabStreamerConnectionControl,
+    SchwabStreamerConnectionControlSource, SchwabStreamerConnectionEvidence,
+    SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence,
     SchwabTransportError, SchwabTransportTelemetry, SchwabTransportTelemetrySnapshot,
     SchwabUserPreferenceEvidence, StreamerCaptureSink, StreamerCaptureSinkError,
     StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit, StreamerTransportBounds,
     TokenAuthorityError, TransientAccessToken,
 };
 pub use vertical::{
-    SchwabCapabilityCurrentness, SchwabObservedCapabilityFamily,
-    SchwabPriceHistoryCapabilityObservation, SchwabVerticalError,
+    SchwabCapabilityCurrentness, SchwabFamilyDoctorInput, SchwabObservedCapabilityFamily,
+    SchwabPriceHistoryCapabilityObservation, SchwabRestFamilyDoctorInput,
+    SchwabStreamerFamilyDoctorInput, SchwabVerticalError,
 };
 
 /// Exact Schwab OAuth authorization endpoint.
