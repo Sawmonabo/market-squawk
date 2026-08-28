@@ -56,6 +56,7 @@ mod crypto_market;
 mod iex_hist;
 mod provider_runtime;
 mod schwab_market;
+mod sec_fund;
 mod selection;
 mod tiingo;
 mod yahoo_enrichment;
@@ -94,6 +95,12 @@ pub(crate) use iex_hist::{
     IexHistPhysicalArtifact, IexHistPhysicalSealRequirement, IexHistPublicationAvailability,
     IexHistPublicationBlocker, IexHistPublicationBlockers, IexHistResearchJobLeaf,
     IexHistSelectionStatus,
+};
+pub(crate) use sec_fund::{
+    SEC_NCEN_FUND_POINT_IN_TIME_OPERATION, SEC_NPORT_FUND_POINT_IN_TIME_OPERATION,
+    SecFundApplicationBridge, SecFundApplicationError, SecFundPublicationReceipt,
+    SecNcenFundPublicationReceipt, SecNcenFundRestartSelector, SecNportFundPublicationReceipt,
+    SecNportFundRestartSelector,
 };
 pub use provider_runtime::ResearchProviderRuntimeGeneration;
 use provider_runtime::{ResearchProviderAdmission, ResearchProviderPublicationLease};
