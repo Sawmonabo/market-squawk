@@ -1109,7 +1109,7 @@ impl From<ExtractionAuthorityError> for NasdaqReferenceIngestError {
     }
 }
 
-fn parse_object_id(
+pub(crate) fn parse_object_id(
     object_id: &SourceIdentifier,
 ) -> Result<(NasdaqDirectoryKind, &str), ExtractionSourceError> {
     let mut fields = object_id.as_str().split(':');

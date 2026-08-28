@@ -7,6 +7,7 @@ mod archive;
 mod client;
 mod model;
 mod parser;
+mod publication;
 mod source;
 
 pub use archive::{
@@ -28,6 +29,10 @@ pub use model::{
     NasdaqProviderFields,
 };
 pub use parser::{MAX_DIRECTORY_RECORDS, MAX_SOURCE_BYTES, NasdaqParseError};
+pub use publication::{
+    NasdaqDirectoryPublicationError, NasdaqPendingDirectoryPublication,
+    NasdaqSealedDirectoryComponent, NasdaqSealedDirectoryPublication, NasdaqSealedListingRow,
+};
 pub use source::{
     NASDAQ_APPLICATION_BUDGET_WINDOW_NANOS, NASDAQ_APPLICATION_MAX_CONCURRENT_REQUESTS,
     NASDAQ_APPLICATION_MIN_BACKOFF_MAXIMUM_NANOS, NASDAQ_APPLICATION_REQUESTS_PER_MINUTE,
