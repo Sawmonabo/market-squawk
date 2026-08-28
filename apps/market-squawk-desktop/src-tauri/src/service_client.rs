@@ -17,6 +17,7 @@ use crate::{
 // Canonical string conversion happens after the shared bridge's size check, so retain its cap.
 const MAXIMUM_CANONICAL_JOB_RESULT_BYTES: usize = 1024 * 1024;
 const FEDERAL_RESERVE_BOARD_DDP_PROVIDER: &str = "federal-reserve-board.data-download-program";
+const FRED_ALFRED_LATEST_KNOWN_OPERATION: &str = "Macro.GetFredAlfredLatestKnown";
 const H15_RELEASE: &str = "h15";
 
 #[tauri::command]
@@ -37,6 +38,34 @@ pub(crate) async fn dashboard_query(
             arguments.insert("provider".to_owned(), json!(provider));
             arguments.insert("release".to_owned(), json!(release));
             ("Macro.GetDashboard", arguments)
+        }
+        DashboardQueryCommand::FredAlfredLatestKnownStatus => {
+            (FRED_ALFRED_LATEST_KNOWN_OPERATION, Map::new())
+        }
+        DashboardQueryCommand::FredAlfredLatestKnownRead {
+            generation,
+            knowledge_cutoff,
+            effective_date_cutoff,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert(
+                "generation".to_owned(),
+                json!({
+                    "manifestVersion": generation.manifest_version,
+                    "schema": {
+                        "name": generation.schema.name,
+                        "version": generation.schema.version,
+                        "fingerprint": generation.schema.fingerprint,
+                    },
+                    "contentHash": generation.content_hash,
+                }),
+            );
+            arguments.insert("knowledgeCutoff".to_owned(), json!(knowledge_cutoff));
+            arguments.insert(
+                "effectiveDateCutoff".to_owned(),
+                json!(effective_date_cutoff),
+            );
+            (FRED_ALFRED_LATEST_KNOWN_OPERATION, arguments)
         }
         DashboardQueryCommand::Lookup { text, categories } => {
             let mut arguments = Map::new();
