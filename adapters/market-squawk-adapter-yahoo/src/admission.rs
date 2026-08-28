@@ -45,7 +45,6 @@ pub enum AttemptKind {
     ConsentCopy,
     Primary,
     CookieStrategyFallback,
-    ExplicitTransientRetry,
     RepairSubrequest,
     HalfOpenProbe,
 }
@@ -55,11 +54,24 @@ pub enum AttemptKind {
 pub enum AttemptDisposition {
     Success,
     Partial,
-    Http429 { retry_after_ms: Option<u64> },
+    Http429 {
+        retry_after: Option<YahooRetryAfterDirective>,
+    },
     TransportFailure,
     SchemaFailure,
     Cancelled,
     DeadlineExceeded,
+}
+
+/// Exact server recovery instruction retained without converting absolute dates into delays.
+///
+/// Delta seconds are applied from completion of the corresponding HTTP attempt. An HTTP-date is
+/// already an absolute wall-clock deadline and is therefore never added to another timestamp.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "syntax", rename_all = "kebab-case")]
+pub enum YahooRetryAfterDirective {
+    DeltaSeconds { seconds: u64 },
+    HttpDate { retry_at_unix_ms: i64 },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -507,9 +519,9 @@ fn record_actual_attempt(
             false
         }
         AttemptDisposition::Partial => active.half_open_probe,
-        AttemptDisposition::Http429 { retry_after_ms } => {
+        AttemptDisposition::Http429 { retry_after } => {
             state.snapshot.http_429_total = checked_add(state.snapshot.http_429_total, 1)?;
-            open_circuit(state, completed_at_unix_ms, retry_after_ms);
+            open_circuit(state, completed_at_unix_ms, retry_after);
             false
         }
         AttemptDisposition::TransportFailure => {
@@ -570,7 +582,6 @@ const fn attempt_carries_observation_units(kind: AttemptKind) -> bool {
         kind,
         AttemptKind::Primary
             | AttemptKind::CookieStrategyFallback
-            | AttemptKind::ExplicitTransientRetry
             | AttemptKind::RepairSubrequest
             | AttemptKind::HalfOpenProbe
     )
@@ -585,10 +596,25 @@ fn increment_failure(state: &mut AdmissionState) -> Result<bool, AdmissionReject
     Ok(state.snapshot.consecutive_failures >= state.policy.repeated_failure_threshold)
 }
 
-fn open_circuit(state: &mut AdmissionState, now_unix_ms: i64, retry_after_ms: Option<u64>) {
-    let delay = retry_after_ms.unwrap_or(state.policy.circuit_cooldown_ms);
+fn open_circuit(
+    state: &mut AdmissionState,
+    now_unix_ms: i64,
+    retry_after: Option<YahooRetryAfterDirective>,
+) {
+    let provider_retry_at = match retry_after {
+        Some(YahooRetryAfterDirective::DeltaSeconds { seconds }) => seconds
+            .checked_mul(1_000)
+            .map(|delay_ms| add_millis(now_unix_ms, delay_ms)),
+        Some(YahooRetryAfterDirective::HttpDate { retry_at_unix_ms })
+            if retry_at_unix_ms > now_unix_ms =>
+        {
+            Some(retry_at_unix_ms)
+        }
+        Some(YahooRetryAfterDirective::HttpDate { .. }) | None => None,
+    };
     state.circuit = CircuitState::Open {
-        retry_at_unix_ms: add_millis(now_unix_ms, delay),
+        retry_at_unix_ms: provider_retry_at
+            .unwrap_or_else(|| add_millis(now_unix_ms, state.policy.circuit_cooldown_ms)),
     };
 }
 

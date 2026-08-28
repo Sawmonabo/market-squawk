@@ -14,7 +14,9 @@ use market_squawk_domain::{
 use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_sources::{
     ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    ProviderCaptureSealExpectation, ProviderCaptureSealRequest, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, ProviderWholeCaptureToken, SealedProviderCaptureMaterial,
+    SealedProviderCaptureSetReceipt,
 };
 use reqwest::cookie::Jar;
 use reqwest::header::{
@@ -42,9 +44,9 @@ use crate::{
     LookupKind, ParseContext, YAHOO_SOURCE_ID, YahooAdapterError, YahooAdmission, YahooAssetClass,
     YahooChart, YahooDurableStateStore, YahooEnrichment, YahooFundData, YahooHttpMethod,
     YahooHttpRequest, YahooLocale, YahooLookupHint, YahooOptionChain, YahooQuote, YahooReference,
-    YahooRequestFamily, YahooRequestPlan, YahooRequestPlanner, YahooReturnedDisposition,
-    YahooSymbol, YahooTarget, parse_chart_response, parse_fund_response, parse_lookup_response,
-    parse_option_response, parse_quote_response, parse_reference_response,
+    YahooRequestFamily, YahooRequestPlan, YahooRequestPlanner, YahooRetryAfterDirective,
+    YahooReturnedDisposition, YahooSymbol, YahooTarget, parse_chart_response, parse_fund_response,
+    parse_lookup_response, parse_option_response, parse_quote_response, parse_reference_response,
 };
 
 const FALLBACK_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
@@ -55,6 +57,7 @@ const CONSENT_BOOTSTRAP_URL: &str = "https://guce.yahoo.com/consent";
 const CONSENT_SUBMIT_URL: &str = "https://consent.yahoo.com/v2/collectConsent";
 const CONSENT_COPY_URL: &str = "https://guce.yahoo.com/copyConsent";
 const CSRF_CRUMB_URL: &str = "https://query2.finance.yahoo.com/v1/test/getcrumb";
+const MAX_RATE_LIMIT_TEXT_SCAN_BYTES: usize = 64 * 1024;
 
 /// Application safety configuration. No field is a Yahoo provider quota or capacity promise.
 #[derive(Clone, Copy, Debug)]
@@ -212,14 +215,16 @@ impl YahooHttpResult {
         let native_evidence =
             YahooNativePublicationEvidence::try_new(self.raw.as_ref(), self.parsed.as_ref())?;
         let material = self.raw.capture_material(&binding)?;
+        let (expectation, seal_request) = material.into_whole_seal_parts();
         Ok(YahooPendingPublication {
             rejoin: YahooPublicationSealRejoin {
                 raw: self.raw,
                 parsed: self.parsed,
                 binding,
                 native_evidence,
+                expectation,
             },
-            material,
+            seal_request,
         })
     }
 }
@@ -228,41 +233,23 @@ impl YahooHttpResult {
 #[derive(Debug)]
 pub struct YahooPendingPublication {
     rejoin: YahooPublicationSealRejoin,
-    material: ProviderCaptureMaterial,
+    seal_request: ProviderCaptureSealRequest,
 }
 
 impl YahooPendingPublication {
-    /// Splits the one-shot value into shared source-neutral material and an opaque typed rejoin.
-    pub fn into_sealing_parts(self) -> (YahooPublicationSealRejoin, ProviderCaptureMaterial) {
-        (self.rejoin, self.material)
+    /// Splits the one-shot value into the application-sealed request and its opaque typed rejoin.
+    pub fn into_sealing_parts(self) -> (YahooPublicationSealRejoin, ProviderCaptureSealRequest) {
+        (self.rejoin, self.seal_request)
     }
 }
 
-/// Opaque continuation held until the shared sealer returns a consuming material-bound seal.
-///
-/// There is intentionally no public post-seal transition accepting a cloneable logical or physical
-/// receipt. Integration waits for the common nonforgeable material-to-physical-seal witness. Once
-/// that source-neutral API is available at this lane's base, the serialized integration seam is:
-///
-/// ```text
-/// let (expectation, request) = material.into_whole_seal_parts();
-/// // The Yahoo pending continuation privately takes ownership of `expectation`.
-/// ResearchService::seal_provider_capture(
-///     request: ProviderCaptureSealRequest,
-///     cancellation: &CancellationToken,
-///     deadline: Instant,
-/// ) -> Result<SealedProviderCaptureMaterial, ResearchServiceError>
-///
-/// YahooPublicationSealRejoin::try_rejoin(
-///     self,
-///     sealed: SealedProviderCaptureMaterial,
-/// ) -> Result<YahooPublicationCandidate, YahooPublicationBridgeError>
-/// ```
+/// Opaque continuation held until the shared sealer returns the matching consuming seal.
 pub struct YahooPublicationSealRejoin {
     raw: Arc<YahooRawReceipt>,
     parsed: Arc<YahooParsedResponse>,
     binding: YahooPublicationBinding,
     native_evidence: YahooNativePublicationEvidence,
+    expectation: ProviderCaptureSealExpectation,
 }
 
 impl YahooPublicationSealRejoin {
@@ -276,6 +263,34 @@ impl YahooPublicationSealRejoin {
             self.raw.as_ref(),
             self.parsed.as_ref(),
         )
+    }
+
+    /// Rejoins only the physical result split from this exact network response.
+    ///
+    /// The returned family is typed but deliberately remains pre-canonical: reference and fund
+    /// responses are hints, while quote, chart, and option publication still require externally
+    /// resolved canonical identity and the corresponding closed shared native-lineage tag.
+    pub fn try_rejoin(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<YahooSealedPublication, YahooPublicationBridgeError> {
+        let token = self.expectation.try_rejoin(sealed)?.try_into_whole()?;
+        let family = match self.parsed.as_ref() {
+            YahooParsedResponse::Quote(_) => YahooSealedPublicationFamily::CurrentQuotes,
+            YahooParsedResponse::Chart(_) => YahooSealedPublicationFamily::HistoricalBars,
+            YahooParsedResponse::OptionChain(_) => YahooSealedPublicationFamily::Options,
+            YahooParsedResponse::Reference(_) => YahooSealedPublicationFamily::ReferenceHint,
+            YahooParsedResponse::Fund(_) => YahooSealedPublicationFamily::FundHint,
+            YahooParsedResponse::Lookup(_) => YahooSealedPublicationFamily::LookupHint,
+        };
+        Ok(YahooSealedPublication {
+            family,
+            token,
+            raw: self.raw,
+            parsed: self.parsed,
+            binding: self.binding,
+            native_evidence: self.native_evidence,
+        })
     }
 }
 
@@ -301,6 +316,88 @@ impl fmt::Debug for YahooPublicationSealRejoin {
             .field("metadata_revision", &self.binding.metadata_revision())
             .field("sealed_transition", &"AWAITING_COMMON_MATERIAL_BINDING")
             .finish()
+    }
+}
+
+/// Truthful post-seal route for the exact Yahoo response family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum YahooSealedPublicationFamily {
+    CurrentQuotes,
+    HistoricalBars,
+    Options,
+    ReferenceHint,
+    FundHint,
+    LookupHint,
+}
+
+/// Non-cloneable typed response plus the sole whole-capture authority for its physical raw seal.
+///
+/// This adapter-local boundary never manufactures canonical identity. The application must
+/// consume this value into the correct shared quote, history, or option mapper; hints remain raw.
+pub struct YahooSealedPublication {
+    family: YahooSealedPublicationFamily,
+    token: ProviderWholeCaptureToken,
+    raw: Arc<YahooRawReceipt>,
+    parsed: Arc<YahooParsedResponse>,
+    binding: YahooPublicationBinding,
+    native_evidence: YahooNativePublicationEvidence,
+}
+
+impl YahooSealedPublication {
+    pub const fn family(&self) -> YahooSealedPublicationFamily {
+        self.family
+    }
+
+    pub fn raw_receipt(&self) -> &YahooRawReceipt {
+        self.raw.as_ref()
+    }
+
+    pub fn parsed_response(&self) -> &YahooParsedResponse {
+        self.parsed.as_ref()
+    }
+
+    pub const fn publication_binding(&self) -> &YahooPublicationBinding {
+        &self.binding
+    }
+
+    pub fn sealed_capture_receipt(&self) -> &SealedProviderCaptureSetReceipt {
+        self.token.persisted_receipt()
+    }
+
+    pub fn pending_chart_history(&self) -> Option<YahooPendingChartHistory<'_>> {
+        self.native_evidence.pending_chart_history(
+            &self.binding,
+            self.raw.as_ref(),
+            self.parsed.as_ref(),
+        )
+    }
+
+    /// Consumes this adapter handoff for the family-specific canonical mapper.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        YahooSealedPublicationFamily,
+        ProviderWholeCaptureToken,
+        Arc<YahooRawReceipt>,
+        Arc<YahooParsedResponse>,
+        YahooPublicationBinding,
+    ) {
+        (self.family, self.token, self.raw, self.parsed, self.binding)
+    }
+}
+
+impl fmt::Debug for YahooSealedPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("YahooSealedPublication")
+            .field("family", &self.family)
+            .field(
+                "request_identity_sha256_hex",
+                &self.raw.request_identity_sha256_hex,
+            )
+            .field("source_id", &self.binding.source_id())
+            .field("metadata_revision", &self.binding.metadata_revision())
+            .finish_non_exhaustive()
     }
 }
 
@@ -425,6 +522,14 @@ pub enum YahooPublicationBridgeError {
     NonPublicationResult,
     #[error("the Yahoo application publication binding is invalid")]
     InvalidPublicationBinding,
+    #[error("Yahoo canonical publication request does not match its exact raw response")]
+    InvalidCanonicalRequest,
+    #[error("Yahoo canonical identity, economics, or clock authority is inconsistent")]
+    InvalidCanonicalAuthority,
+    #[error("Yahoo response has no canonical rows for the requested family")]
+    EmptyCanonicalOutput,
+    #[error("Yahoo canonical/native output is invalid or misaligned")]
+    InvalidCanonicalOutput,
     #[error("the Yahoo raw request, body, clocks, or schema receipt is inconsistent")]
     InvalidRawReceipt,
     #[error("Yahoo publication timestamp is outside the canonical range")]
@@ -556,7 +661,7 @@ struct ScriptedWireState {
 pub(crate) struct ScriptedHttpResponse {
     pub status: u16,
     pub content_type: &'static str,
-    pub retry_after_ms: Option<u64>,
+    pub retry_after: Option<YahooRetryAfterDirective>,
     pub body: Bytes,
 }
 
@@ -1158,7 +1263,7 @@ impl YahooHttpSession {
                         cancellation,
                     )
                     .await?;
-                if bootstrap.status == 429 {
+                if wire_indicates_rate_limit(&bootstrap) {
                     return Err(self.record_429(bootstrap, permit, attempts)?);
                 }
                 if !bootstrap.is_success() {
@@ -1263,7 +1368,7 @@ impl YahooHttpSession {
         permit: &mut AttemptPermit,
         attempts: &mut Vec<YahooHttpAttemptReceipt>,
     ) -> Result<(), YahooHttpFailureKind> {
-        if wire.status == 429 {
+        if wire_indicates_rate_limit(&wire) {
             return Err(self.record_429(wire, permit, attempts)?);
         }
         // The pinned cookie bootstrap and consent submit/copy paths validate the following crumb,
@@ -1277,7 +1382,7 @@ impl YahooHttpSession {
         permit: &mut AttemptPermit,
         attempts: &mut Vec<YahooHttpAttemptReceipt>,
     ) -> Result<Zeroizing<String>, YahooHttpFailureKind> {
-        if wire.status == 429 || bytes_contain(&wire.bytes, b"Too Many Requests") {
+        if wire_indicates_rate_limit(&wire) {
             return Err(self.record_429(wire, permit, attempts)?);
         }
         let crumb = std::str::from_utf8(&wire.bytes)
@@ -1350,7 +1455,7 @@ impl YahooHttpSession {
             )
             .await
             .map_err(DataFailure::Terminal)?;
-        if wire.status == 429 || bytes_contain(&wire.bytes, b"Too Many Requests") {
+        if wire_indicates_rate_limit(&wire) {
             return Err(DataFailure::Terminal(
                 self.record_429(wire, permit, attempts)
                     .unwrap_or(YahooHttpFailureKind::AdmissionUnavailable),
@@ -1449,6 +1554,37 @@ impl YahooHttpSession {
                 return Err(kind_error);
             }
         };
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after);
+        let final_url = response.url().clone();
+        if status == 429 {
+            let completed_at_unix_ms =
+                wall_time_ms().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+            let wire = WireResponse {
+                kind,
+                target,
+                status,
+                response_sha256_hex: None,
+                bytes: Bytes::new(),
+                content_type,
+                retry_after,
+                final_url,
+                started_at_unix_ms,
+                completed_at_unix_ms,
+                latency_ms: duration_ms(started.elapsed()),
+                observation_units,
+            };
+            return Err(self.record_429(wire, permit, attempts)?);
+        }
         if response
             .headers()
             .get(CONTENT_ENCODING)
@@ -1486,18 +1622,6 @@ impl YahooHttpSession {
             )?;
             return Err(YahooHttpFailureKind::ResponseTooLarge);
         }
-        let status = response.status().as_u16();
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let retry_after = response
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_retry_after_ms);
-        let final_url = response.url().clone();
         let mut stream = response.bytes_stream();
         let mut bytes = BytesMut::new();
         while let Some(chunk) = match deadline_wait(deadline, cancellation, stream.next()).await {
@@ -1559,7 +1683,7 @@ impl YahooHttpSession {
             response_sha256_hex: Some(sha256_hex(&bytes)),
             bytes,
             content_type,
-            retry_after_ms: retry_after,
+            retry_after,
             final_url,
             started_at_unix_ms,
             completed_at_unix_ms: wall_time_ms()
@@ -1593,7 +1717,7 @@ impl YahooHttpSession {
             .responses
             .pop_front()
             .ok_or(YahooHttpFailureKind::Network)?;
-        if response.body.len() > spec.maximum_bytes {
+        if response.status != 429 && response.body.len() > spec.maximum_bytes {
             return Err(YahooHttpFailureKind::ResponseTooLarge);
         }
         let bytes = response.body;
@@ -1604,7 +1728,7 @@ impl YahooHttpSession {
             response_sha256_hex: Some(sha256_hex(&bytes)),
             bytes,
             content_type: Some(response.content_type.to_owned()),
-            retry_after_ms: response.retry_after_ms,
+            retry_after: response.retry_after,
             final_url: spec.url,
             started_at_unix_ms,
             completed_at_unix_ms: wall_time_ms()
@@ -1671,7 +1795,7 @@ impl YahooHttpSession {
         permit: &mut AttemptPermit,
         attempts: &mut Vec<YahooHttpAttemptReceipt>,
     ) -> Result<YahooHttpFailureKind, YahooHttpFailureKind> {
-        let retry_after_ms = wire.retry_after_ms;
+        let retry_after = wire.retry_after;
         let completed_at = wire.completed_at_unix_ms;
         let units = wire.observation_units;
         self.record_wire(
@@ -1681,7 +1805,7 @@ impl YahooHttpSession {
             0,
             units,
             0,
-            AttemptDisposition::Http429 { retry_after_ms },
+            AttemptDisposition::Http429 { retry_after },
         )?;
         let retry_at_unix_ms = self
             .inner
@@ -2491,20 +2615,39 @@ fn sha256_finish(digest: Sha256) -> String {
     value
 }
 
-fn parse_retry_after_ms(value: &str) -> Option<u64> {
+fn parse_retry_after(value: &str) -> Option<YahooRetryAfterDirective> {
     if let Ok(seconds) = value.trim().parse::<u64>() {
-        return seconds.checked_mul(1_000);
+        seconds.checked_mul(1_000)?;
+        return Some(YahooRetryAfterDirective::DeltaSeconds { seconds });
     }
     let retry_at = httpdate::parse_http_date(value).ok()?;
-    let delay = retry_at.duration_since(SystemTime::now()).ok()?;
-    u64::try_from(delay.as_millis()).ok()
+    let retry_at_unix_ms =
+        i64::try_from(retry_at.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()?;
+    Some(YahooRetryAfterDirective::HttpDate { retry_at_unix_ms })
 }
 
-fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+fn bytes_contain_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+            .get(..haystack.len().min(MAX_RATE_LIMIT_TEXT_SCAN_BYTES))
+            .is_some_and(|bounded| {
+                bounded
+                    .windows(needle.len())
+                    .any(|window| window.eq_ignore_ascii_case(needle))
+            })
+}
+
+fn wire_indicates_rate_limit(wire: &WireResponse) -> bool {
+    wire.status == 429
+        || [
+            b"too many requests".as_slice(),
+            b"rate limit".as_slice(),
+            b"rate-limit".as_slice(),
+            b"rate_limit".as_slice(),
+            b"ratelimit".as_slice(),
+        ]
+        .iter()
+        .any(|needle| bytes_contain_ascii_case_insensitive(&wire.bytes, needle))
 }
 
 fn parse_consent_fields(
@@ -2651,7 +2794,7 @@ struct WireResponse {
     response_sha256_hex: Option<String>,
     bytes: Bytes,
     content_type: Option<String>,
-    retry_after_ms: Option<u64>,
+    retry_after: Option<YahooRetryAfterDirective>,
     final_url: Url,
     started_at_unix_ms: i64,
     completed_at_unix_ms: i64,

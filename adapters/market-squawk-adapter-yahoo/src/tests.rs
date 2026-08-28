@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use market_squawk_domain::{MetadataRevision, SourceId, SourceIdentifier};
+use market_squawk_platform::LocalPaths;
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -10,13 +11,14 @@ use uuid::Uuid;
 
 use crate::http::ScriptedHttpResponse;
 use crate::{
-    AdapterBounds, AdmissionDecision, AdmissionPolicy, AttemptKind, ChartInterval, ChartWindow,
-    ExplicitDemand, ExplicitDemandPurpose, ProviderField, YahooAdmission, YahooAssetClass,
-    YahooAttemptTarget, YahooChartActionScope, YahooChartAdjustmentMode, YahooChartEventKind,
-    YahooChartSessionScope, YahooDurableStateStore, YahooExecutionDisposition,
-    YahooExecutionLimits, YahooHttpFailureKind, YahooHttpSession, YahooHttpSessionConfig,
-    YahooLocale, YahooParsedResponse, YahooPublicationBinding, YahooPublicationBridgeError,
-    YahooRequestPlanner, YahooSymbol, YahooTarget,
+    AdapterBounds, AdmissionDecision, AdmissionPolicy, AttemptDisposition, AttemptKind,
+    AttemptOutcome, ChartInterval, ChartWindow, CircuitSnapshot, ExplicitDemand,
+    ExplicitDemandPurpose, ProviderField, YahooAdmission, YahooAssetClass, YahooAttemptTarget,
+    YahooChartActionScope, YahooChartAdjustmentMode, YahooChartEventKind, YahooChartSessionScope,
+    YahooDurableStateStore, YahooExecutionDisposition, YahooExecutionLimits, YahooHttpFailureKind,
+    YahooHttpSession, YahooHttpSessionConfig, YahooLocale, YahooParsedResponse,
+    YahooPublicationBinding, YahooPublicationBridgeError, YahooRequestPlanner,
+    YahooRetryAfterDirective, YahooSymbol, YahooTarget,
 };
 
 fn bounds(maximum_symbols: usize) -> AdapterBounds {
@@ -84,25 +86,25 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after_ms: None,
+                retry_after: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after_ms: None,
+                retry_after: None,
                 body: Bytes::from_static(b"local-crumb"),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "application/json",
-                retry_after_ms: None,
+                retry_after: None,
                 body: chart.clone(),
             },
             ScriptedHttpResponse {
                 status: 429,
                 content_type: "text/plain",
-                retry_after_ms: Some(2_000),
+                retry_after: Some(YahooRetryAfterDirective::DeltaSeconds { seconds: 2 }),
                 body: Bytes::from_static(b"Too Many Requests"),
             },
         ],
@@ -158,7 +160,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         Uuid::from_u128(2),
     )?;
     let pending = first.into_pending_publication(publication_binding.clone())?;
-    let (rejoin, material) = pending.into_sealing_parts();
+    let (rejoin, seal_request) = pending.into_sealing_parts();
     let native_history = rejoin
         .pending_chart_history()
         .ok_or("chart response must retain one native history candidate")?;
@@ -263,22 +265,30 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     );
     assert_eq!(splits[0].kind, YahooChartEventKind::Split);
     assert_eq!(capital_gains[0].kind, YahooChartEventKind::CapitalGain);
-    assert_eq!(material.records().len(), 1);
+    let seal_root = state_root.join("sealed-publication");
+    let seal_paths = LocalPaths::prepare(&seal_root)?;
+    let sealed =
+        rejoin.try_rejoin(seal_request.seal(&seal_paths.sealed_research_journal_store()?)?)?;
     assert_eq!(
-        material.records()[0].payload().len(),
-        usize::try_from(material.receipt().total_body_bytes())?
+        sealed.family(),
+        crate::YahooSealedPublicationFamily::HistoricalBars
     );
-    assert_eq!(material.records()[0].source_sequence(), Some(0));
+    let (_, token, sealed_raw, _, sealed_binding) = sealed.into_parts();
+    let receipt = token.persisted_receipt();
     assert_eq!(
-        material.receipt().dataset().as_str(),
+        sealed_raw.response_bytes.len(),
+        usize::try_from(receipt.capture().total_body_bytes())?
+    );
+    assert_eq!(
+        receipt.capture().dataset().as_str(),
         "yahoo-finance.experimental.chart-history"
     );
     assert_eq!(
-        material.receipt().pages()[0].body_bytes(),
-        material.receipt().total_body_bytes()
+        receipt.capture().pages()[0].body_bytes(),
+        receipt.capture().total_body_bytes()
     );
-    drop(rejoin);
-    drop(material);
+    assert_eq!(sealed_binding, publication_binding);
+    drop(token);
 
     let second = session
         .execute(plan.requests[1].clone(), limits, &cancellation)
@@ -348,6 +358,70 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     assert_eq!(snapshot.missing_units_total, 1);
     assert_eq!(snapshot.http_429_total, 1);
 
+    let absolute_retry = YahooAdmission::new(AdmissionPolicy::new(9_000, 3)?);
+    let absolute_permit = match absolute_retry.admit(
+        &plan.requests[0],
+        "absolute-retry-after",
+        AttemptKind::Primary,
+        10_000,
+    )? {
+        AdmissionDecision::Execute(permit) => permit,
+        _ => return Err("fresh absolute Retry-After admission must execute".into()),
+    };
+    absolute_permit.complete(
+        AttemptOutcome {
+            returned_units: 0,
+            missing_units: 1,
+            returned_records: 0,
+            response_bytes: 0,
+            latency_ms: 1,
+            disposition: AttemptDisposition::Http429 {
+                retry_after: Some(YahooRetryAfterDirective::HttpDate {
+                    retry_at_unix_ms: 50_000,
+                }),
+            },
+        },
+        20_000,
+    )?;
+    assert_eq!(
+        absolute_retry.snapshot()?.circuit,
+        CircuitSnapshot::Open {
+            retry_at_unix_ms: 50_000
+        }
+    );
+
+    let expired_retry = YahooAdmission::new(AdmissionPolicy::new(9_000, 3)?);
+    let expired_permit = match expired_retry.admit(
+        &plan.requests[0],
+        "expired-retry-after",
+        AttemptKind::Primary,
+        10_000,
+    )? {
+        AdmissionDecision::Execute(permit) => permit,
+        _ => return Err("fresh expired Retry-After admission must execute".into()),
+    };
+    expired_permit.complete(
+        AttemptOutcome {
+            returned_units: 0,
+            missing_units: 1,
+            returned_records: 0,
+            response_bytes: 0,
+            latency_ms: 1,
+            disposition: AttemptDisposition::Http429 {
+                retry_after: Some(YahooRetryAfterDirective::HttpDate {
+                    retry_at_unix_ms: 19_999,
+                }),
+            },
+        },
+        20_000,
+    )?;
+    assert_eq!(
+        expired_retry.snapshot()?.circuit,
+        CircuitSnapshot::Open {
+            retry_at_unix_ms: 29_000
+        }
+    );
+
     let attempt_bounded = YahooHttpSession::new_for_test_with_durable(
         YahooHttpSessionConfig {
             max_attempt_receipts: 2,
@@ -358,19 +432,19 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after_ms: None,
+                retry_after: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after_ms: None,
+                retry_after: None,
                 body: Bytes::from_static(b"bounded-crumb"),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "application/json",
-                retry_after_ms: None,
+                retry_after: None,
                 body: chart.clone(),
             },
         ],
@@ -404,19 +478,19 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after_ms: None,
+                retry_after: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after_ms: None,
+                retry_after: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/html",
-                retry_after_ms: None,
+                retry_after: None,
                 body: Bytes::from_static(
                     br#"<input name="csrfToken" value="csrf"><input name="sessionId" value="session">"#,
                 ),
@@ -424,25 +498,25 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after_ms: None,
+                retry_after: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after_ms: None,
+                retry_after: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after_ms: None,
+                retry_after: None,
                 body: Bytes::from_static(b"csrf-crumb"),
             },
             ScriptedHttpResponse {
                 status: 500,
                 content_type: "application/json",
-                retry_after_ms: None,
+                retry_after: None,
                 body: Bytes::from_static(b"{}"),
             },
         ],

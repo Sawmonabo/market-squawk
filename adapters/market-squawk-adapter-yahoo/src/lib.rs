@@ -13,11 +13,13 @@ mod http;
 mod model;
 mod native;
 mod parse;
+mod publication;
 mod request;
 
 pub use admission::{
     AdmissionDecision, AdmissionPolicy, AdmissionRejection, AdmissionSnapshot, AttemptDisposition,
     AttemptKind, AttemptOutcome, AttemptPermit, CircuitSnapshot, YahooAdmission,
+    YahooRetryAfterDirective,
 };
 pub use durable::{
     MAX_YAHOO_DURABLE_CACHE_BODY_BYTES, YahooDurableStateError, YahooDurableStateStore,
@@ -28,6 +30,7 @@ pub use http::{
     YahooHttpFailure, YahooHttpFailureKind, YahooHttpResult, YahooHttpSession,
     YahooHttpSessionConfig, YahooParsedResponse, YahooPendingPublication, YahooPublicationBinding,
     YahooPublicationBridgeError, YahooPublicationSealRejoin, YahooRawReceipt,
+    YahooSealedPublication, YahooSealedPublicationFamily,
 };
 pub use model::{
     EvidenceAuthority, ExplicitDemand, ExplicitDemandPurpose, ParseContext, ProviderField,
@@ -44,6 +47,13 @@ pub use native::{
 pub use parse::{
     parse_chart_response, parse_fund_response, parse_lookup_response, parse_option_response,
     parse_quote_response, parse_reference_response,
+};
+pub use publication::{
+    YahooCanonicalInstrumentAuthority, YahooHistoricalPublicationRequest, YahooOptionAbstention,
+    YahooOptionCanonicalRow, YahooOptionPublicationOutcome, YahooOptionPublicationRequest,
+    YahooQuoteAbstention, YahooQuoteCanonicalRow, YahooQuotePublicationOutcome,
+    YahooQuotePublicationRequest, YahooSealedHistoricalPublication, YahooSealedOptionPublication,
+    YahooSealedQuotePublication,
 };
 pub use request::{
     AdapterBounds, ChartInterval, ChartWindow, LookupKind, YahooHttpMethod, YahooHttpRequest,
