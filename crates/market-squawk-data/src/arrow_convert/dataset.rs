@@ -4,13 +4,14 @@ use arrow::array::{
     Array as _, Decimal128Array, FixedSizeBinaryArray, Float64Array, UInt8Array, UInt32Array,
 };
 use arrow::record_batch::RecordBatch;
-use market_squawk_domain::{Currency, InstrumentId, SourceIdentifier};
+use market_squawk_domain::{Currency, FUND_HOLDINGS_SCHEMA_NAME, InstrumentId, SourceIdentifier};
 use uuid::Uuid;
 
 use super::ArrowConversionError;
 use crate::schema::{
     BUILD_DIGEST_KEY, DATASET_KEY, DatasetSchemaRef, DatasetSchemaRegistry,
-    FEATURE_LABEL_SCHEMA_NAME, MARKET_EVENT_SCHEMA_NAME, OPTION_MARKET_SCHEMA_NAME,
+    FEATURE_LABEL_SCHEMA_NAME, FUND_HOLDINGS_LINEAGE_DIGEST_KEY,
+    FUND_HOLDINGS_PUBLICATION_DIGEST_KEY, MARKET_EVENT_SCHEMA_NAME, OPTION_MARKET_SCHEMA_NAME,
     POLICY_DIGEST_KEY, PROVIDER_PUBLICATION_DIGEST_KEY, PROVIDER_PUBLICATION_KIND_KEY,
     REQUEST_DIGEST_KEY, RESEARCH_SCHEMA_NAME, UNIVERSE_DIGEST_KEY, decode_hex,
     schema_ref_from_metadata,
@@ -92,6 +93,11 @@ fn validate_batch_metadata(
             DATASET_KEY,
             PROVIDER_PUBLICATION_DIGEST_KEY,
             PROVIDER_PUBLICATION_KIND_KEY,
+        ],
+        FUND_HOLDINGS_SCHEMA_NAME => &[
+            DATASET_KEY,
+            FUND_HOLDINGS_PUBLICATION_DIGEST_KEY,
+            FUND_HOLDINGS_LINEAGE_DIGEST_KEY,
         ],
         _ => return Err(ArrowConversionError::UnexpectedDatasetSchema),
     };

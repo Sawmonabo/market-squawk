@@ -14,7 +14,9 @@ use super::{
     PreparedProviderCaptureBinding, PreparedProviderOptionMarketBinding,
     PreparedProviderPublicationBinding, retain_prepared_provider_capture_binding,
     retain_prepared_provider_option_market_binding, retain_prepared_provider_publication_binding,
+    retain_sealed_provider_logical_publication_binding,
 };
+use market_squawk_sources::SealedProviderLogicalPublicationBinding;
 
 /// Closed raw-input state admitted by the sole artifact/manifest transaction.
 #[derive(Clone, Copy)]
@@ -29,6 +31,8 @@ pub(crate) enum PublicationSourceEvidence<'a> {
     ProviderEvent(&'a PreparedProviderPublicationBinding),
     /// The provider publication consumes one exact sealed option-market binding.
     ProviderOptionMarket(&'a PreparedProviderOptionMarketBinding),
+    /// The provider publication consumes one exact streamed logical-publication binding.
+    ProviderLogical(&'a SealedProviderLogicalPublicationBinding),
 }
 
 /// One atomically published artifact and its exact durable dataset manifest.
@@ -283,6 +287,14 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
         }
         PublicationSourceEvidence::ProviderOptionMarket(binding) => {
             retain_prepared_provider_option_market_binding(
+                transaction,
+                reservation.run_id,
+                binding,
+                catalog_now,
+            )?;
+        }
+        PublicationSourceEvidence::ProviderLogical(binding) => {
+            retain_sealed_provider_logical_publication_binding(
                 transaction,
                 reservation.run_id,
                 binding,

@@ -14,6 +14,7 @@ mod observed_revisions;
 mod onboarding;
 mod provider_capture;
 mod provider_event;
+mod provider_logical;
 mod provider_option;
 mod publication;
 mod query_artifacts;
@@ -112,6 +113,11 @@ pub use provider_event::{
 };
 pub(crate) use provider_event::{
     PreparedProviderPublicationBinding, retain_prepared_provider_publication_binding,
+};
+pub(crate) use provider_logical::retain_sealed_provider_logical_publication_binding;
+pub use provider_logical::{
+    PersistedProviderLogicalGenerationBinding, PersistedProviderLogicalObjectClaim,
+    PersistedProviderLogicalPartitionClaim, PersistedProviderLogicalPublicationBinding,
 };
 pub use provider_option::{
     PersistedProviderOptionMarketBindingEvidence, PersistedProviderOptionMarketBindingRow,

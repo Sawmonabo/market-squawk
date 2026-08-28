@@ -16,6 +16,7 @@ mod catalog;
 mod catalog_capabilities;
 mod corporate_actions;
 mod dataset_builder;
+mod fund_holdings;
 mod ingest;
 mod manifest;
 mod market_event;
@@ -169,6 +170,11 @@ pub use manifest::{
     ReleaseEvidenceStorageError, ReleaseEvidenceStorageResult, run_release_evidence_storage,
 };
 pub use market_event::ProviderMarketEventArrowBatch;
+pub use fund_holdings::{
+    FundHoldingsArrowBatch, FundLatestUnavailableReason, FundPointInTimeOutcome,
+    FundPointInTimeRequest, FundPointInTimeRevisionMode, FundPointInTimeSelection,
+    MAX_FUND_HOLDINGS_BATCH_RECORDS, MAX_FUND_HOLDINGS_RETAINED_BYTES,
+};
 pub use option_market::{
     OptionMarketPointInTimeRequest, OptionMarketPointInTimeSelection,
     ProviderOptionMarketArrowBatch,

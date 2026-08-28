@@ -5,7 +5,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use market_squawk_domain::{EvidenceDigest, ResearchObservation, SchemaVersion, SourceIdentifier};
+use market_squawk_domain::{
+    EvidenceDigest, FUND_HOLDINGS_SCHEMA_NAME, FUND_HOLDINGS_SCHEMA_VERSION, ResearchObservation,
+    SchemaVersion, SourceIdentifier,
+};
 use market_squawk_sources::CURRENT_RESEARCH_RECORD_SCHEMA;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -23,6 +26,10 @@ pub(crate) const POLICY_DIGEST_KEY: &str = "market_squawk.policy_sha256";
 pub(crate) const PROVIDER_PUBLICATION_DIGEST_KEY: &str =
     "market_squawk.provider_publication_sha256";
 pub(crate) const PROVIDER_PUBLICATION_KIND_KEY: &str = "market_squawk.provider_publication_kind";
+pub(crate) const FUND_HOLDINGS_PUBLICATION_DIGEST_KEY: &str =
+    "market_squawk.fund_holdings_publication_sha256";
+pub(crate) const FUND_HOLDINGS_LINEAGE_DIGEST_KEY: &str =
+    "market_squawk.fund_holdings_lineage_sha256";
 pub(crate) const RESEARCH_SCHEMA_NAME: &str = "market_squawk.research_observations";
 pub(crate) const FEATURE_LABEL_SCHEMA_NAME: &str = "market_squawk.feature_label_components";
 pub(crate) const MARKET_EVENT_SCHEMA_NAME: &str = "market_squawk.market_events";
@@ -274,6 +281,11 @@ impl DatasetSchemaRegistry {
         identity_for_schema(OPTION_MARKET_SCHEMA_NAME, option_market_schema_definition())
     }
 
+    /// Returns the exact canonical SEC fund filing/share-class/holding identity.
+    pub fn canonical_fund_holdings(self) -> Result<DatasetSchemaRef, DatasetSchemaError> {
+        identity_for_schema(FUND_HOLDINGS_SCHEMA_NAME, fund_holdings_schema_definition())
+    }
+
     /// Resolves an exact known identity to its canonical Arrow schema.
     ///
     /// Unknown names or versions and known names with altered fingerprints fail closed.
@@ -288,6 +300,9 @@ impl DatasetSchemaRegistry {
             }
             (OPTION_MARKET_SCHEMA_NAME, OPTION_MARKET_SCHEMA_VERSION) => {
                 option_market_schema_definition()
+            }
+            (FUND_HOLDINGS_SCHEMA_NAME, FUND_HOLDINGS_SCHEMA_VERSION) => {
+                fund_holdings_schema_definition()
             }
             _ => return Err(DatasetSchemaError::UnknownIdentity),
         };
@@ -406,6 +421,30 @@ pub(crate) fn option_market_schema(
     metadata.insert(
         PROVIDER_PUBLICATION_KIND_KEY.to_owned(),
         publication_kind.to_owned(),
+    );
+    Ok(Arc::new(Schema::new_with_metadata(
+        schema.fields().clone(),
+        metadata,
+    )))
+}
+
+pub(crate) fn fund_holdings_schema(
+    dataset: &SourceIdentifier,
+    publication_digest: EvidenceDigest,
+    lineage_digest: EvidenceDigest,
+) -> Result<SchemaRef, DatasetSchemaError> {
+    let registry = DatasetSchemaRegistry::local();
+    let schema_ref = registry.canonical_fund_holdings()?;
+    let schema = registry.resolve(&schema_ref)?;
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(DATASET_KEY.to_owned(), dataset.as_str().to_owned());
+    metadata.insert(
+        FUND_HOLDINGS_PUBLICATION_DIGEST_KEY.to_owned(),
+        encode_hex(publication_digest.bytes()),
+    );
+    metadata.insert(
+        FUND_HOLDINGS_LINEAGE_DIGEST_KEY.to_owned(),
+        encode_hex(lineage_digest.bytes()),
     );
     Ok(Arc::new(Schema::new_with_metadata(
         schema.fields().clone(),
@@ -693,6 +732,73 @@ fn option_market_schema_definition() -> Schema {
             (
                 "market_squawk.option_market_encoding".to_owned(),
                 "batch-header-plus-typed-json-rows-v1".to_owned(),
+            ),
+        ]),
+    )
+}
+
+fn fund_holdings_schema_definition() -> Schema {
+    let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()));
+    Schema::new_with_metadata(
+        vec![
+            Field::new("schema_version", DataType::UInt16, false),
+            Field::new("record_kind", DataType::Utf8, false),
+            Field::new("canonical_row_ordinal", DataType::UInt32, false),
+            Field::new("source_id", DataType::Utf8, false),
+            Field::new("source_family", DataType::Utf8, false),
+            Field::new("fund_instrument_id", DataType::FixedSizeBinary(16), false),
+            Field::new("provider_series_id", DataType::Utf8, false),
+            Field::new("accession", DataType::Utf8, false),
+            Field::new("form", DataType::Utf8, false),
+            Field::new("report_period_end", DataType::Date32, true),
+            Field::new("accepted_at", timestamp.clone(), true),
+            Field::new("available_at", timestamp.clone(), true),
+            Field::new("received_at", timestamp.clone(), false),
+            Field::new("ingested_at", timestamp, false),
+            Field::new("amendment_state", DataType::Utf8, false),
+            Field::new("revision_status", DataType::Utf8, false),
+            Field::new("release_coverage", DataType::Utf8, false),
+            Field::new("holding_id", DataType::Utf8, true),
+            Field::new("held_instrument_id", DataType::FixedSizeBinary(16), true),
+            Field::new(
+                "native_generation_sha256",
+                DataType::FixedSizeBinary(32),
+                false,
+            ),
+            Field::new(
+                "layout_evidence_sha256",
+                DataType::FixedSizeBinary(32),
+                false,
+            ),
+            Field::new(
+                "terminal_handoff_evidence_sha256",
+                DataType::FixedSizeBinary(32),
+                false,
+            ),
+            Field::new(
+                "source_lineage_sha256",
+                DataType::FixedSizeBinary(32),
+                false,
+            ),
+            Field::new("payload_sha256", DataType::FixedSizeBinary(32), false),
+            Field::new("payload_json", DataType::Binary, false),
+        ],
+        HashMap::from([
+            (
+                SCHEMA_NAME_KEY.to_owned(),
+                FUND_HOLDINGS_SCHEMA_NAME.to_owned(),
+            ),
+            (
+                SCHEMA_VERSION_KEY.to_owned(),
+                FUND_HOLDINGS_SCHEMA_VERSION.to_string(),
+            ),
+            (
+                "market_squawk.timestamp_timezone".to_owned(),
+                "UTC".to_owned(),
+            ),
+            (
+                "market_squawk.fund_holdings_encoding".to_owned(),
+                "typed-json-with-exact-lineage-v1".to_owned(),
             ),
         ]),
     )

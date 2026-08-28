@@ -968,6 +968,12 @@ pub enum CatalogError {
     /// A repeated typed event/composite admission differs from retained immutable evidence.
     #[error("provider event publication conflicts with retained immutable evidence")]
     ProviderEventConflict,
+    /// A sealed streamed logical publication does not match its source, run, or exact evidence.
+    #[error("provider logical publication does not match its source, run, or exact evidence")]
+    ProviderLogicalMismatch,
+    /// A repeated streamed logical publication differs from retained immutable evidence.
+    #[error("provider logical publication conflicts with retained immutable evidence")]
+    ProviderLogicalConflict,
     /// Retained physical provider evidence exhausted the fixed recovery-safe catalog ceiling.
     #[error(
         "provider capture exceeds the recovery-safe maximum of {max_claims} physical objects or {max_bytes} retained bytes"
