@@ -9,7 +9,7 @@ use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt as _;
@@ -29,8 +29,9 @@ use tokio::sync::Mutex;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{
-    ACCESS_TOKEN_MAX_LIFETIME_SECONDS, AccessTokenAdmission, AccessTokenGeneration, OAuthCallback,
-    OAuthTokenHttpRequest, ParseBounds, REFRESH_TOKEN_LIFETIME_SECONDS, RefreshTokenGeneration,
+    ACCESS_TOKEN_MAX_LIFETIME_SECONDS, AccessTokenAdmission, AccessTokenGeneration,
+    AuthorizationRequest, OAuthCallback, OAuthTokenHttpRequest, ParseBounds,
+    REFRESH_TOKEN_LIFETIME_SECONDS, RefreshTokenGeneration, RequestAdmission,
     SCHWAB_TOKEN_ENDPOINT, SchwabAccessTokenSource, SchwabAdapterError,
     SchwabApplicationCredentialEnvelope, TokenAuthorityError, TokenDecision, TokenGrant,
     TransientAccessToken, parse_token_response,
@@ -66,6 +67,56 @@ impl SchwabOAuthSecretPolicy {
 pub enum SchwabOAuthInteraction {
     Background,
     Foreground,
+}
+
+/// Exact one-use guard for replacing the protected Schwab application credential generation.
+///
+/// Replacement is intentionally distinct from token refresh. It consumes the prior authority,
+/// locally revokes every token minted under the prior application credential, and returns a new
+/// authority in `AwaitingAuthorization` state. The replacement secret is validated before the
+/// durable transition begins.
+pub struct SchwabApplicationCredentialReplacement {
+    expected: SecretRef,
+    replacement: SecretRef,
+}
+
+/// Exact credential generation retained by a recoverable replacement failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchwabApplicationCredentialReplacementBinding {
+    /// The returned authority remains bound to the credential that preceded this attempt.
+    Previous,
+    /// The durable transition began and the returned authority is bound to the replacement.
+    Replacement,
+    /// The durable store has not yet produced an unambiguous recoverable winner.
+    Indeterminate,
+}
+
+impl SchwabApplicationCredentialReplacement {
+    /// Binds a strictly newer credential generation to the exact current reference.
+    pub fn try_new(
+        expected: SecretRef,
+        replacement: SecretRef,
+    ) -> Result<Self, SchwabOAuthAuthorityError> {
+        if expected.backend() != replacement.backend()
+            || replacement.generation() <= expected.generation()
+        {
+            return Err(SchwabOAuthAuthorityError::InvalidConfiguration);
+        }
+        Ok(Self {
+            expected,
+            replacement,
+        })
+    }
+}
+
+impl fmt::Debug for SchwabApplicationCredentialReplacement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabApplicationCredentialReplacement")
+            .field("expected_generation", &self.expected.generation())
+            .field("replacement_generation", &self.replacement.generation())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SchwabOAuthInteraction {
@@ -464,6 +515,12 @@ enum DurablePhase {
         current: TokenMetadata,
         retired: Option<TokenMetadata>,
     },
+    ReplacingApplication {
+        application: SecretRef,
+        replacement: SecretRef,
+        tokens: Vec<TokenMetadata>,
+        last_generation: u64,
+    },
     Revoking {
         application: SecretRef,
         tokens: Vec<TokenMetadata>,
@@ -483,9 +540,17 @@ impl DurablePhase {
             | Self::Refreshing { application, .. }
             | Self::Rotating { application, .. }
             | Self::Active { application, .. }
+            | Self::ReplacingApplication { application, .. }
             | Self::Revoking { application, .. }
             | Self::Revoked { application, .. } => application,
         }
+    }
+}
+
+fn phase_matches_application_credential(state: &DurablePhase, configured: &SecretRef) -> bool {
+    match state {
+        DurablePhase::ReplacingApplication { replacement, .. } => replacement == configured,
+        _ => state.application() == configured,
     }
 }
 
@@ -554,13 +619,88 @@ pub struct ProtectedSchwabOAuthAuthority {
     state: Arc<LocalAuthorityStateStore>,
     secrets: Arc<dyn SecretStore>,
     wire: Arc<dyn SchwabOAuthWire>,
-    application_credential: SecretRef,
+    application_credential: StdMutex<SchwabApplicationCredentialAuthority>,
     token_key: market_squawk_platform::SecretKey,
     secret_policy: SchwabOAuthSecretPolicy,
     parse_bounds: ParseBounds,
     token_admission: AccessTokenAdmission,
     refresh_early_seconds: u64,
     gate: Mutex<()>,
+}
+
+enum SchwabApplicationCredentialAuthority {
+    Bound(SecretRef),
+    IndeterminateReplacement {
+        previous: SecretRef,
+        replacement: SecretRef,
+    },
+}
+
+/// Recoverable application-credential replacement failure.
+///
+/// The sole protected authority is always returned to the caller. `binding` identifies which
+/// exact credential generation the returned authority owns, or explicitly reports that the local
+/// two-copy store still requires reconciliation. No caller reopens the same authority root or
+/// guesses whether the durable replacement transition began.
+pub struct SchwabApplicationCredentialReplacementFailure {
+    authority: ProtectedSchwabOAuthAuthority,
+    binding: SchwabApplicationCredentialReplacementBinding,
+    error: SchwabOAuthAuthorityError,
+}
+
+impl SchwabApplicationCredentialReplacementFailure {
+    fn new(
+        authority: ProtectedSchwabOAuthAuthority,
+        binding: SchwabApplicationCredentialReplacementBinding,
+        error: SchwabOAuthAuthorityError,
+    ) -> Self {
+        Self {
+            authority,
+            binding,
+            error,
+        }
+    }
+
+    pub const fn binding(&self) -> SchwabApplicationCredentialReplacementBinding {
+        self.binding
+    }
+
+    pub const fn error(&self) -> &SchwabOAuthAuthorityError {
+        &self.error
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ProtectedSchwabOAuthAuthority,
+        SchwabApplicationCredentialReplacementBinding,
+        SchwabOAuthAuthorityError,
+    ) {
+        (self.authority, self.binding, self.error)
+    }
+}
+
+impl fmt::Debug for SchwabApplicationCredentialReplacementFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabApplicationCredentialReplacementFailure")
+            .field("authority", &"[PROTECTED OAUTH AUTHORITY]")
+            .field("binding", &self.binding)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl fmt::Display for SchwabApplicationCredentialReplacementFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for SchwabApplicationCredentialReplacementFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 impl fmt::Debug for ProtectedSchwabOAuthAuthority {
@@ -600,7 +740,9 @@ impl ProtectedSchwabOAuthAuthority {
             state: Arc::new(state),
             secrets,
             wire,
-            application_credential: application_credential.clone(),
+            application_credential: StdMutex::new(SchwabApplicationCredentialAuthority::Bound(
+                application_credential.clone(),
+            )),
             token_key: market_squawk_platform::SecretKey::try_new(
                 TOKEN_SECRET_SCOPE,
                 TOKEN_SECRET_NAME,
@@ -612,7 +754,7 @@ impl ProtectedSchwabOAuthAuthority {
             gate: Mutex::new(()),
         };
         let _guard = authority.gate.lock().await;
-        let initial = authority.load_state().await?;
+        let initial = authority.load_state_unbound().await?;
         match initial {
             None => {
                 authority
@@ -622,13 +764,42 @@ impl ProtectedSchwabOAuthAuthority {
                     })
                     .await?;
             }
-            Some(state) if state.application() == &application_credential => {
+            Some(state) => {
+                if !phase_matches_application_credential(&state, &application_credential) {
+                    return Err(SchwabOAuthAuthorityError::ApplicationCredentialMismatch);
+                }
                 authority.recover_state(state).await?;
             }
-            Some(_) => return Err(SchwabOAuthAuthorityError::ApplicationCredentialMismatch),
         }
         drop(_guard);
         Ok(authority)
+    }
+
+    /// Builds one state-bound browser authorization request without exposing application secrets.
+    ///
+    /// The exact protected application credential is read only for this foreground operation and
+    /// is parsed into a zeroizing envelope. Only the redacted authorization request leaves the
+    /// authority boundary; callers never receive the Schwab application key or secret.
+    pub async fn authorization_request(
+        &self,
+        state: &str,
+        admission: RequestAdmission,
+        interaction: SchwabOAuthInteraction,
+    ) -> Result<AuthorizationRequest, SchwabOAuthAuthorityError> {
+        let _guard = self.gate.lock().await;
+        let durable = self.reconcile_transient_state_locked().await?;
+        if !matches!(
+            durable,
+            DurablePhase::AwaitingAuthorization { .. } | DurablePhase::Revoked { .. }
+        ) {
+            return Err(SchwabOAuthAuthorityError::InvalidState);
+        }
+        let secret = self
+            .read_secret(self.bound_application_credential()?, interaction.policy())
+            .await?;
+        let credential = SchwabApplicationCredentialEnvelope::try_parse(secret.expose_secret())?;
+        AuthorizationRequest::try_new(credential.expose_app_key(), state, admission)
+            .map_err(Into::into)
     }
 
     /// Returns secret-free lifecycle state after exact durable-state validation.
@@ -645,11 +816,165 @@ impl ProtectedSchwabOAuthAuthority {
             )),
             DurablePhase::Refreshing { .. }
             | DurablePhase::Rotating { .. }
+            | DurablePhase::ReplacingApplication { .. }
             | DurablePhase::Revoking { .. }
             | DurablePhase::Revoked { .. } => {
                 Ok(SchwabOAuthAuthorityStatus::ReauthorizationRequired)
             }
         }
+    }
+
+    /// Consumes this authority and replaces its exact protected application credential.
+    ///
+    /// Existing OAuth tokens are deleted because they were minted for the prior application.
+    /// A successful returned authority requires fresh owner authorization. Every failure returns
+    /// the sole authority and identifies whether it remains bound to the previous credential or
+    /// has crossed the durable transition and is bound to the replacement. The latter authority
+    /// reconciles any remaining local token cleanup before becoming usable.
+    pub async fn replace_application_credential(
+        self,
+        replacement: SchwabApplicationCredentialReplacement,
+        interaction: SchwabOAuthInteraction,
+    ) -> Result<Self, SchwabApplicationCredentialReplacementFailure> {
+        let guard = self.gate.lock().await;
+        let state = match self.reconcile_transient_state_locked().await {
+            Ok(state) => state,
+            Err(error) => {
+                let binding = self.replacement_binding(&replacement);
+                drop(guard);
+                return Err(SchwabApplicationCredentialReplacementFailure::new(
+                    self, binding, error,
+                ));
+            }
+        };
+        if self.replacement_binding(&replacement)
+            != SchwabApplicationCredentialReplacementBinding::Previous
+        {
+            let binding = self.replacement_binding(&replacement);
+            drop(guard);
+            return Err(SchwabApplicationCredentialReplacementFailure::new(
+                self,
+                binding,
+                SchwabOAuthAuthorityError::ApplicationCredentialMismatch,
+            ));
+        }
+        let candidate_secret = match self
+            .read_secret(replacement.replacement.clone(), interaction.policy())
+            .await
+        {
+            Ok(secret) => secret,
+            Err(error) => {
+                drop(guard);
+                return Err(SchwabApplicationCredentialReplacementFailure::new(
+                    self,
+                    SchwabApplicationCredentialReplacementBinding::Previous,
+                    error,
+                ));
+            }
+        };
+        if let Err(error) =
+            SchwabApplicationCredentialEnvelope::try_parse(candidate_secret.expose_secret())
+        {
+            drop(guard);
+            return Err(SchwabApplicationCredentialReplacementFailure::new(
+                self,
+                SchwabApplicationCredentialReplacementBinding::Previous,
+                error.into(),
+            ));
+        }
+        let (tokens, last_generation) = match state {
+            DurablePhase::Active {
+                current, retired, ..
+            } => {
+                let last_generation = current.generation;
+                let mut tokens = vec![current];
+                if let Some(retired) = retired {
+                    tokens.push(retired);
+                }
+                (tokens, last_generation)
+            }
+            DurablePhase::AwaitingAuthorization {
+                last_generation, ..
+            }
+            | DurablePhase::Revoked {
+                last_generation, ..
+            } => (Vec::new(), last_generation),
+            DurablePhase::ExchangingAuthorization { .. }
+            | DurablePhase::Refreshing { .. }
+            | DurablePhase::Rotating { .. }
+            | DurablePhase::ReplacingApplication { .. }
+            | DurablePhase::Revoking { .. } => {
+                drop(guard);
+                return Err(SchwabApplicationCredentialReplacementFailure::new(
+                    self,
+                    SchwabApplicationCredentialReplacementBinding::Previous,
+                    SchwabOAuthAuthorityError::InvalidState,
+                ));
+            }
+        };
+        if let Err(error) = self
+            .store_state(DurablePhase::ReplacingApplication {
+                application: replacement.expected.clone(),
+                replacement: replacement.replacement.clone(),
+                tokens: tokens.clone(),
+                last_generation,
+            })
+            .await
+        {
+            self.mark_indeterminate_application_replacement(
+                replacement.expected.clone(),
+                replacement.replacement.clone(),
+            );
+            let binding = match self.load_state_unbound().await {
+                Ok(Some(state)) => self
+                    .resolve_application_credential(&state)
+                    .map(|credential| {
+                        if credential == replacement.replacement {
+                            SchwabApplicationCredentialReplacementBinding::Replacement
+                        } else if credential == replacement.expected {
+                            SchwabApplicationCredentialReplacementBinding::Previous
+                        } else {
+                            SchwabApplicationCredentialReplacementBinding::Indeterminate
+                        }
+                    })
+                    .unwrap_or(SchwabApplicationCredentialReplacementBinding::Indeterminate),
+                Ok(None) | Err(_) => SchwabApplicationCredentialReplacementBinding::Indeterminate,
+            };
+            drop(guard);
+            return Err(SchwabApplicationCredentialReplacementFailure::new(
+                self, binding, error,
+            ));
+        }
+        // No fallible or cancellable step may intervene between the durable transition commit and
+        // rebinding the in-memory authority. Every later failure can therefore return a sole
+        // authority that reconciles the replacement phase in place.
+        self.bind_application_credential(replacement.replacement.clone());
+        for token in tokens {
+            if let Err(error) = self.delete_token(token, interaction.policy()).await {
+                drop(guard);
+                return Err(SchwabApplicationCredentialReplacementFailure::new(
+                    self,
+                    SchwabApplicationCredentialReplacementBinding::Replacement,
+                    error,
+                ));
+            }
+        }
+        if let Err(error) = self
+            .store_state_unbound(DurablePhase::AwaitingAuthorization {
+                application: replacement.replacement,
+                last_generation,
+            })
+            .await
+        {
+            drop(guard);
+            return Err(SchwabApplicationCredentialReplacementFailure::new(
+                self,
+                SchwabApplicationCredentialReplacementBinding::Replacement,
+                error,
+            ));
+        }
+        drop(guard);
+        Ok(self)
     }
 
     /// Exchanges one validated callback and transactionally publishes the protected token pair.
@@ -803,6 +1128,7 @@ impl ProtectedSchwabOAuthAuthority {
             | DurablePhase::ExchangingAuthorization { .. }
             | DurablePhase::Refreshing { .. }
             | DurablePhase::Rotating { .. }
+            | DurablePhase::ReplacingApplication { .. }
             | DurablePhase::Revoking { .. } => {
                 return Err(SchwabOAuthAuthorityError::ReauthorizationRequired);
             }
@@ -874,7 +1200,11 @@ impl ProtectedSchwabOAuthAuthority {
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                self.force_reauthorization(application, prior).await?;
+                if terminal_credential_rejection(&error) {
+                    self.force_reauthorization(application, prior).await?;
+                } else {
+                    self.restore_active_prior(application, prior).await?;
+                }
                 return Err(error);
             }
         };
@@ -893,7 +1223,7 @@ impl ProtectedSchwabOAuthAuthority {
         ) {
             Ok(value) => value,
             Err(error) => {
-                self.force_reauthorization(application, prior).await?;
+                self.restore_active_prior(application, prior).await?;
                 return Err(error.into());
             }
         };
@@ -999,7 +1329,7 @@ impl ProtectedSchwabOAuthAuthority {
                 .await
             }
             DurablePhase::Refreshing { application, prior } => {
-                self.force_reauthorization(application, prior).await
+                self.restore_active_prior(application, prior).await
             }
             DurablePhase::Rotating {
                 application,
@@ -1029,7 +1359,7 @@ impl ProtectedSchwabOAuthAuthority {
                         .await
                     }
                     (RotationKind::Refresh, Some(prior)) => {
-                        self.force_reauthorization(application, prior).await
+                        self.restore_active_prior(application, prior).await
                     }
                     _ => Err(SchwabOAuthAuthorityError::InvalidState),
                 }
@@ -1063,6 +1393,22 @@ impl ProtectedSchwabOAuthAuthority {
                     }
                     Err(error) => Err(error),
                 }
+            }
+            DurablePhase::ReplacingApplication {
+                replacement,
+                tokens,
+                last_generation,
+                ..
+            } => {
+                for token in tokens {
+                    self.delete_token(token, SecretInteractionPolicy::Forbid)
+                        .await?;
+                }
+                self.store_state_unbound(DurablePhase::AwaitingAuthorization {
+                    application: replacement,
+                    last_generation,
+                })
+                .await
             }
             DurablePhase::Revoking {
                 application,
@@ -1102,6 +1448,20 @@ impl ProtectedSchwabOAuthAuthority {
         .await
     }
 
+    async fn restore_active_prior(
+        &self,
+        application: SecretRef,
+        prior: TokenMetadata,
+    ) -> Result<(), SchwabOAuthAuthorityError> {
+        prior.validate()?;
+        self.store_state(DurablePhase::Active {
+            application,
+            current: prior,
+            retired: None,
+        })
+        .await
+    }
+
     async fn required_state(&self) -> Result<DurablePhase, SchwabOAuthAuthorityError> {
         self.load_state()
             .await?
@@ -1118,6 +1478,7 @@ impl ProtectedSchwabOAuthAuthority {
             DurablePhase::ExchangingAuthorization { .. }
             | DurablePhase::Refreshing { .. }
             | DurablePhase::Rotating { .. }
+            | DurablePhase::ReplacingApplication { .. }
             | DurablePhase::Revoking { .. } => true,
         };
         if !requires_recovery {
@@ -1127,7 +1488,98 @@ impl ProtectedSchwabOAuthAuthority {
         self.required_state().await
     }
 
+    fn application_credential_guard(
+        &self,
+    ) -> std::sync::MutexGuard<'_, SchwabApplicationCredentialAuthority> {
+        match self.application_credential.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn bound_application_credential(&self) -> Result<SecretRef, SchwabOAuthAuthorityError> {
+        match &*self.application_credential_guard() {
+            SchwabApplicationCredentialAuthority::Bound(credential) => Ok(credential.clone()),
+            SchwabApplicationCredentialAuthority::IndeterminateReplacement { .. } => {
+                Err(LocalAuthorityStateStoreError::RecoveryRequired.into())
+            }
+        }
+    }
+
+    fn replacement_binding(
+        &self,
+        replacement: &SchwabApplicationCredentialReplacement,
+    ) -> SchwabApplicationCredentialReplacementBinding {
+        match &*self.application_credential_guard() {
+            SchwabApplicationCredentialAuthority::Bound(credential)
+                if credential == &replacement.expected =>
+            {
+                SchwabApplicationCredentialReplacementBinding::Previous
+            }
+            SchwabApplicationCredentialAuthority::Bound(credential)
+                if credential == &replacement.replacement =>
+            {
+                SchwabApplicationCredentialReplacementBinding::Replacement
+            }
+            SchwabApplicationCredentialAuthority::Bound(_)
+            | SchwabApplicationCredentialAuthority::IndeterminateReplacement { .. } => {
+                SchwabApplicationCredentialReplacementBinding::Indeterminate
+            }
+        }
+    }
+
+    fn bind_application_credential(&self, credential: SecretRef) {
+        *self.application_credential_guard() =
+            SchwabApplicationCredentialAuthority::Bound(credential);
+    }
+
+    fn mark_indeterminate_application_replacement(
+        &self,
+        previous: SecretRef,
+        replacement: SecretRef,
+    ) {
+        *self.application_credential_guard() =
+            SchwabApplicationCredentialAuthority::IndeterminateReplacement {
+                previous,
+                replacement,
+            };
+    }
+
+    fn resolve_application_credential(
+        &self,
+        state: &DurablePhase,
+    ) -> Result<SecretRef, SchwabOAuthAuthorityError> {
+        let mut authority = self.application_credential_guard();
+        let selected = match &*authority {
+            SchwabApplicationCredentialAuthority::Bound(credential) => credential.clone(),
+            SchwabApplicationCredentialAuthority::IndeterminateReplacement {
+                previous: _,
+                replacement,
+            } if phase_matches_application_credential(state, replacement) => replacement.clone(),
+            SchwabApplicationCredentialAuthority::IndeterminateReplacement {
+                previous,
+                replacement: _,
+            } if phase_matches_application_credential(state, previous) => previous.clone(),
+            SchwabApplicationCredentialAuthority::IndeterminateReplacement { .. } => {
+                return Err(SchwabOAuthAuthorityError::InvalidState);
+            }
+        };
+        *authority = SchwabApplicationCredentialAuthority::Bound(selected.clone());
+        Ok(selected)
+    }
+
     async fn load_state(&self) -> Result<Option<DurablePhase>, SchwabOAuthAuthorityError> {
+        let state = self.load_state_unbound().await?;
+        if let Some(state) = state.as_ref() {
+            let credential = self.resolve_application_credential(state)?;
+            if !phase_matches_application_credential(state, &credential) {
+                return Err(SchwabOAuthAuthorityError::ApplicationCredentialMismatch);
+            }
+        }
+        Ok(state)
+    }
+
+    async fn load_state_unbound(&self) -> Result<Option<DurablePhase>, SchwabOAuthAuthorityError> {
         let state = self.state.clone();
         let bytes = tokio::task::spawn_blocking(move || state.load())
             .await
@@ -1140,9 +1592,6 @@ impl ProtectedSchwabOAuthAuthority {
                     return Err(SchwabOAuthAuthorityError::InvalidState);
                 }
                 validate_phase(&envelope.state)?;
-                if envelope.state.application() != &self.application_credential {
-                    return Err(SchwabOAuthAuthorityError::ApplicationCredentialMismatch);
-                }
                 Ok(envelope.state)
             })
             .transpose()
@@ -1150,9 +1599,17 @@ impl ProtectedSchwabOAuthAuthority {
 
     async fn store_state(&self, state: DurablePhase) -> Result<(), SchwabOAuthAuthorityError> {
         validate_phase(&state)?;
-        if state.application() != &self.application_credential {
+        if state.application() != &self.bound_application_credential()? {
             return Err(SchwabOAuthAuthorityError::ApplicationCredentialMismatch);
         }
+        self.store_state_unbound(state).await
+    }
+
+    async fn store_state_unbound(
+        &self,
+        state: DurablePhase,
+    ) -> Result<(), SchwabOAuthAuthorityError> {
+        validate_phase(&state)?;
         let bytes = serde_json::to_vec(&DurableEnvelope {
             version: AUTHORITY_STATE_VERSION,
             state,
@@ -1390,6 +1847,10 @@ fn token_is_absent(error: &SchwabOAuthAuthorityError) -> bool {
     )
 }
 
+fn terminal_credential_rejection(error: &SchwabOAuthAuthorityError) -> bool {
+    matches!(error, SchwabOAuthAuthorityError::ReauthorizationRequired)
+}
+
 fn token_metadata(plan: SecretMutationPlan, lifecycle: crate::TokenLifecycle) -> TokenMetadata {
     let refresh = lifecycle.refresh_generation();
     let reference = plan.target().clone();
@@ -1452,6 +1913,35 @@ fn validate_phase(state: &DurablePhase) -> Result<(), SchwabOAuthAuthorityError>
                 {
                     return Err(SchwabOAuthAuthorityError::InvalidState);
                 }
+            }
+            Ok(())
+        }
+        DurablePhase::ReplacingApplication {
+            application,
+            replacement,
+            tokens,
+            last_generation,
+        } => {
+            if application == replacement
+                || application.backend() != replacement.backend()
+                || replacement.generation() <= application.generation()
+                || tokens.len() > 2
+                || tokens
+                    .windows(2)
+                    .any(|pair| pair[0].reference == pair[1].reference)
+            {
+                return Err(SchwabOAuthAuthorityError::InvalidState);
+            }
+            for token in tokens {
+                token.validate()?;
+            }
+            if tokens
+                .iter()
+                .map(|token| token.generation)
+                .max()
+                .is_some_and(|generation| generation != *last_generation)
+            {
+                return Err(SchwabOAuthAuthorityError::InvalidState);
             }
             Ok(())
         }

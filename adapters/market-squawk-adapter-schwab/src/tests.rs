@@ -32,10 +32,11 @@ use crate::{
     PriceHistoryFrequencyType, PriceHistoryRequest, ProtectedSchwabOAuthAuthority,
     ProviderIdentifier, QuoteRequest, RawStreamerFrameKind, ReadOnlyRoute, RefreshTokenGeneration,
     RequestAdmission, ResponseHeaderEvidence, RestExecutionOutcome, RestTransportBounds,
-    SchwabAccessTokenSource, SchwabAdapterError, SchwabCanonicalError, SchwabCaptureCoordinates,
-    SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse,
-    SchwabOAuthAuthorityConfiguration, SchwabOAuthInteraction, SchwabOAuthSecretPolicy,
-    SchwabOAuthWire, SchwabOAuthWireError, SchwabOAuthWireRequest, SchwabOAuthWireResponse,
+    SchwabAccessTokenSource, SchwabAdapterError, SchwabApplicationCredentialReplacement,
+    SchwabCanonicalError, SchwabCaptureCoordinates, SchwabHttpWire, SchwabHttpWireRequest,
+    SchwabHttpWireResponse, SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError,
+    SchwabOAuthAuthorityStatus, SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire,
+    SchwabOAuthWireError, SchwabOAuthWireRequest, SchwabOAuthWireResponse,
     SchwabOptionCandidateAbstention, SchwabOptionCandidateOutcome,
     SchwabPriceHistoryCapabilityObservation, SchwabResolvedProviderIdentity, SchwabRestExecutor,
     SchwabRestPayload, SchwabStreamerConnection, SchwabStreamerConnector, SchwabStreamerExecutor,
@@ -479,6 +480,7 @@ async fn rest_price_history_moves_once_into_pending_capture_and_excludes_user_pr
         )
         .unwrap_or_else(|error| panic!("OAuth secret store: {error}")),
     );
+    let secret_authority: Arc<dyn SecretStore> = secrets.clone();
     let secret_control = SecretOperationControl::try_new(
         "schwab-test-application",
         Instant::now() + Duration::from_secs(60),
@@ -504,9 +506,9 @@ async fn rest_price_history_moves_once_into_pending_capture_and_excludes_user_pr
         .unwrap_or_else(|error| panic!("application credential: {error}"));
     let token_admission = AccessTokenAdmission::new(nonzero(4 * 1024), Duration::from_secs(1));
     let oauth_configuration = SchwabOAuthAuthorityConfiguration::try_new(
-        secrets,
+        Arc::clone(&secret_authority),
         Arc::new(ShortLivedOAuthWire),
-        application_credential,
+        application_credential.clone(),
         SchwabOAuthSecretPolicy::try_new(Duration::from_secs(30), 0)
             .unwrap_or_else(|error| panic!("OAuth secret policy: {error}")),
         bounds(),
@@ -719,6 +721,97 @@ async fn rest_price_history_moves_once_into_pending_capture_and_excludes_user_pr
         Some("NP")
     );
     assert!(!format!("{preference:?}").contains("must-not-enter-raw-capture"));
+
+    let replacement_credential = secrets
+        .create(
+            &application_key,
+            SecretGeneration::new(2)
+                .unwrap_or_else(|error| panic!("replacement application generation: {error}")),
+            SecretValue::new(
+                r#"{"version":1,"app_key":"replacement-app-key","app_secret":"replacement-app-secret"}"#
+                    .to_owned(),
+            )
+            .unwrap_or_else(|error| panic!("replacement application secret: {error}")),
+            &secret_control,
+        )
+        .unwrap_or_else(|error| panic!("replacement application credential: {error}"));
+    let replacement = SchwabApplicationCredentialReplacement::try_new(
+        application_credential,
+        replacement_credential.clone(),
+    )
+    .unwrap_or_else(|error| panic!("guarded application replacement: {error}"));
+    let replaced_authority = oauth_authority
+        .replace_application_credential(replacement, SchwabOAuthInteraction::Background)
+        .await
+        .unwrap_or_else(|error| panic!("application credential replacement: {error}"));
+
+    let invalid_replacement_credential = secrets
+        .create(
+            &application_key,
+            SecretGeneration::new(3)
+                .unwrap_or_else(|error| panic!("invalid replacement generation: {error}")),
+            SecretValue::new("invalid-replacement-envelope".to_owned())
+                .unwrap_or_else(|error| panic!("invalid replacement secret: {error}")),
+            &secret_control,
+        )
+        .unwrap_or_else(|error| panic!("invalid replacement credential: {error}"));
+    let invalid_replacement = SchwabApplicationCredentialReplacement::try_new(
+        replacement_credential.clone(),
+        invalid_replacement_credential,
+    )
+    .unwrap_or_else(|error| panic!("invalid guarded replacement: {error}"));
+    let failure = match replaced_authority
+        .replace_application_credential(invalid_replacement, SchwabOAuthInteraction::Background)
+        .await
+    {
+        Ok(_unexpected_authority) => panic!("invalid replacement envelope must fail closed"),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        failure.binding(),
+        crate::SchwabApplicationCredentialReplacementBinding::Previous
+    );
+    assert!(matches!(
+        failure.error(),
+        SchwabOAuthAuthorityError::Adapter(SchwabAdapterError::InvalidInput)
+    ));
+    let (replaced_authority, retained_binding, _replacement_error) = failure.into_parts();
+    assert_eq!(
+        retained_binding,
+        crate::SchwabApplicationCredentialReplacementBinding::Previous
+    );
+    assert!(matches!(
+        replaced_authority
+            .status()
+            .await
+            .unwrap_or_else(|error| panic!("replacement authority status: {error}")),
+        SchwabOAuthAuthorityStatus::AwaitingAuthorization
+    ));
+    drop(replaced_authority);
+
+    let restarted = ProtectedSchwabOAuthAuthority::try_open(
+        temporary.path().join("oauth-authority"),
+        SchwabOAuthAuthorityConfiguration::try_new(
+            secret_authority,
+            Arc::new(ShortLivedOAuthWire),
+            replacement_credential,
+            SchwabOAuthSecretPolicy::try_new(Duration::from_secs(30), 0)
+                .unwrap_or_else(|error| panic!("restart OAuth secret policy: {error}")),
+            bounds(),
+            token_admission,
+            5,
+        )
+        .unwrap_or_else(|error| panic!("restart OAuth configuration: {error}")),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("restart OAuth authority: {error}"));
+    assert!(matches!(
+        restarted
+            .status()
+            .await
+            .unwrap_or_else(|error| panic!("restarted replacement authority status: {error}")),
+        SchwabOAuthAuthorityStatus::AwaitingAuthorization
+    ));
 }
 
 #[tokio::test]

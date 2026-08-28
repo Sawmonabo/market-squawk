@@ -19,10 +19,11 @@ mod transport;
 mod vertical;
 
 pub use authority::{
-    ProtectedSchwabOAuthAuthority, ReqwestSchwabOAuthWire, SchwabOAuthAuthorityConfiguration,
-    SchwabOAuthAuthorityError, SchwabOAuthAuthorityReceipt, SchwabOAuthAuthorityStatus,
-    SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire, SchwabOAuthWireBounds,
-    SchwabOAuthWireError, SchwabOAuthWireRequest, SchwabOAuthWireResponse,
+    ProtectedSchwabOAuthAuthority, ReqwestSchwabOAuthWire, SchwabApplicationCredentialReplacement,
+    SchwabApplicationCredentialReplacementBinding, SchwabApplicationCredentialReplacementFailure,
+    SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError, SchwabOAuthAuthorityReceipt,
+    SchwabOAuthAuthorityStatus, SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire,
+    SchwabOAuthWireBounds, SchwabOAuthWireError, SchwabOAuthWireRequest, SchwabOAuthWireResponse,
 };
 pub use bounds::{
     AdaptiveAssessment, CapacityCounters, CapacityObservation, CapacityUnit, ParseBounds,
