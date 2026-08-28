@@ -20,18 +20,18 @@ mod nav;
 mod quota;
 mod request;
 
+pub use authority::{
+    TiingoCompletedResponseDisposition, TiingoHistoryCheckpointReceipt,
+    TiingoProviderAdmissionDecision, TiingoProviderAdmissionRequest, TiingoProviderAuthority,
+    TiingoProviderAuthorityError, TiingoProviderAuthorityInstallation,
+    TiingoProviderAuthorityRequirements, TiingoProviderPermit, TiingoRateLimitDisposition,
+    TiingoResponseSettlement,
+};
 pub use canonical::{
     TiingoCompletedFundNavHistoryCandidate, TiingoFundNavCanonicalCandidate,
     TiingoFundNavContractEvidence, TiingoFundNavHistoryFinancialCoverage, TiingoFundNavMapError,
     TiingoFundNavMappingInput, TiingoPendingFundNavHistoryPublication,
     TiingoPendingLatestFundNavPublication, map_fund_nav_candidate,
-};
-pub use authority::{
-    TiingoCompletedResponseDisposition, TiingoProviderAdmissionDecision,
-    TiingoHistoryCheckpointReceipt, TiingoProviderAdmissionRequest, TiingoProviderAuthority,
-    TiingoProviderAuthorityError, TiingoProviderAuthorityInstallation,
-    TiingoProviderAuthorityRequirements, TiingoProviderPermit, TiingoRateLimitDisposition,
-    TiingoResponseSettlement,
 };
 pub use credentials::{TiingoApiToken, TiingoRequestBuilder};
 pub use decoder::{TiingoDecoder, TiingoSchemaCircuitState};
@@ -39,26 +39,25 @@ pub use eod::{
     TiingoCompletedEodHistoryCandidate, TiingoEodBarCandidate, TiingoEodBarTimeAuthority,
     TiingoEodBarTimeRequest, TiingoEodContractEvidence, TiingoEodExpectedSessionAuthority,
     TiingoEodExpectedSessionEvidence, TiingoEodExpectedSessionRequest,
-    TiingoEodExpectedSessionValidationReceipt,
-    TiingoEodFinancialCoverageDisposition, TiingoEodInstrumentAuthority,
-    TiingoEodInstrumentKind, TiingoEodMapError, TiingoEodMappingInput,
-    TiingoEodPageCandidate, TiingoEodPagePublicationRoute, TiingoEodProviderActionEvidence,
-    TiingoEodSurface, TiingoEodSurfaceGap, TiingoEodSurfaceGapReason,
-    TiingoPendingEodHistoryPublication, TiingoPendingLatestEodPublication,
-    map_eod_page_candidate,
+    TiingoEodExpectedSessionValidationReceipt, TiingoEodFinancialCoverageDisposition,
+    TiingoEodInstrumentAuthority, TiingoEodInstrumentKind, TiingoEodMapError,
+    TiingoEodMappingInput, TiingoEodPageCandidate, TiingoEodPagePublicationRoute,
+    TiingoEodProviderActionEvidence, TiingoEodSurface, TiingoEodSurfaceGap,
+    TiingoEodSurfaceGapReason, TiingoPendingEodHistoryPublication,
+    TiingoPendingLatestEodPublication, map_eod_page_candidate,
 };
 pub use error::{
     TiingoAdapterError, TiingoProviderFailure, TiingoSchemaChange, TiingoSchemaChangeReason,
 };
+pub use history::{
+    TiingoCompletedHistoryCapture, TiingoHistoryEvidenceError, TiingoHistoryTerminalDisposition,
+    TiingoSealedHistoryPage,
+};
 pub use http::{
     TiingoCaptureMaterialError, TiingoCapturedPage, TiingoDecodeFailure,
-    TiingoHttpResponseMaterial, TiingoHttpSource, TiingoHttpSourceError,
-    TiingoProviderHttpFailure, TiingoRawMaterial, TiingoTransportFailure,
-    TiingoTransportFailureKind, tiingo_provider_rate_declaration,
-};
-pub use history::{
-    TiingoCompletedHistoryCapture, TiingoHistoryEvidenceError,
-    TiingoHistoryTerminalDisposition, TiingoSealedHistoryPage,
+    TiingoHttpResponseMaterial, TiingoHttpSource, TiingoHttpSourceError, TiingoProviderHttpFailure,
+    TiingoRawMaterial, TiingoTransportFailure, TiingoTransportFailureKind,
+    tiingo_provider_rate_declaration,
 };
 pub use model::{
     TiingoApplicationPage, TiingoCoverage, TiingoEodReceipt, TiingoEodRow, TiingoMetadata,

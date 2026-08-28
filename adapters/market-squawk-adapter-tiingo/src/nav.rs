@@ -445,7 +445,10 @@ pub fn missing_nav_candidate(
 ) -> Result<TiingoNavObservationCandidate, TiingoAdapterError> {
     let evidence = response.evidence();
     let disposition = response.disposition();
-    let supported = matches!(metadata.metadata().coverage(), TiingoCoverage::Supported { .. });
+    let supported = matches!(
+        metadata.metadata().coverage(),
+        TiingoCoverage::Supported { .. }
+    );
     let date_is_covered = metadata.metadata().coverage().contains(nav_date);
     let state_matches_metadata = match state {
         TiingoNavValueState::Unsupported => !supported,
@@ -470,9 +473,7 @@ pub fn missing_nav_candidate(
             ..
         } if *start_date == nav_date && *end_date == nav_date
     );
-    if !response.rows().is_empty()
-        || disposition.returned_rows() != 0
-        || !exact_single_date_absence
+    if !response.rows().is_empty() || disposition.returned_rows() != 0 || !exact_single_date_absence
     {
         return Err(TiingoAdapterError::InvalidResponseSelection);
     }
@@ -701,10 +702,7 @@ fn nav_provenance_identity(
     );
     append_field(&mut hasher, &response.body_digest().bytes());
     append_field(&mut hasher, &metadata.body_digest().bytes());
-    append_field(
-        &mut hasher,
-        &metadata.request().request_identity().bytes(),
-    );
+    append_field(&mut hasher, &metadata.request().request_identity().bytes());
     append_field(
         &mut hasher,
         &metadata.received_at().unix_nanos().to_be_bytes(),

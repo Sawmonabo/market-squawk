@@ -97,12 +97,7 @@ impl TiingoSchemaChange {
         if response_digest.bytes() == [0; 32] {
             return Err(TiingoAdapterError::InvalidSchemaCircuitEvidence);
         }
-        Ok(Self::new(
-            endpoint,
-            reason,
-            response_digest,
-            observed_at,
-        ))
+        Ok(Self::new(endpoint, reason, response_digest, observed_at))
     }
 
     /// Returns the response family whose native contract changed.

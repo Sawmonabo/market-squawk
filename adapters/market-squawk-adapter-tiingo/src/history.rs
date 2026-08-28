@@ -8,9 +8,7 @@
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
-use market_squawk_sources::{
-    ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt,
-};
+use market_squawk_sources::{ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -238,8 +236,8 @@ impl TiingoCompletedHistoryCapture {
         if total_response_bytes > plan.maximum_response_bytes() {
             return Err(TiingoHistoryEvidenceError::IncompletePlan);
         }
-        let page_count = u32::try_from(pages.len())
-            .map_err(|_| TiingoHistoryEvidenceError::Allocation)?;
+        let page_count =
+            u32::try_from(pages.len()).map_err(|_| TiingoHistoryEvidenceError::Allocation)?;
         checkpoint
             .validate_for(
                 &plan,
@@ -369,8 +367,14 @@ fn history_page_identity(
     ] {
         append_field(&mut hasher, &value.to_be_bytes());
     }
-    append_field(&mut hasher, &evidence.received_at().unix_nanos().to_be_bytes());
-    append_field(&mut hasher, &evidence.decoded_at().unix_nanos().to_be_bytes());
+    append_field(
+        &mut hasher,
+        &evidence.received_at().unix_nanos().to_be_bytes(),
+    );
+    append_field(
+        &mut hasher,
+        &evidence.decoded_at().unix_nanos().to_be_bytes(),
+    );
     for digest in row_digests {
         append_field(&mut hasher, &digest.bytes());
     }
@@ -391,15 +395,10 @@ fn complete_history_identity(
         b"market-squawk/tiingo/sealed-history-completion/v1",
     );
     append_field(&mut hasher, &plan.request_set_identity().bytes());
+    append_field(&mut hasher, &plan.maximum_response_bytes().to_be_bytes());
     append_field(
         &mut hasher,
-        &plan.maximum_response_bytes().to_be_bytes(),
-    );
-    append_field(
-        &mut hasher,
-        &u64::try_from(pages.len())
-            .unwrap_or(u64::MAX)
-            .to_be_bytes(),
+        &u64::try_from(pages.len()).unwrap_or(u64::MAX).to_be_bytes(),
     );
     for page in pages {
         append_field(&mut hasher, &page.page_identity().bytes());

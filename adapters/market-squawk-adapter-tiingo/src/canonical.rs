@@ -437,8 +437,8 @@ fn validate_completed_nav_history(
     completed: &TiingoCompletedHistoryCapture,
     observations: &[TiingoFundNavCanonicalCandidate],
 ) -> Result<(), TiingoFundNavMapError> {
-    let expected_row_count = usize::try_from(completed.total_rows())
-        .map_err(|_| TiingoFundNavMapError::Allocation)?;
+    let expected_row_count =
+        usize::try_from(completed.total_rows()).map_err(|_| TiingoFundNavMapError::Allocation)?;
     let maximum_observations = expected_row_count
         .checked_add(completed.pages().len())
         .ok_or(TiingoFundNavMapError::Allocation)?;
@@ -492,8 +492,7 @@ fn validate_completed_nav_history(
             || observation.lineage().page_identity() != Some(page_identity)
             || observation.lineage().checkpoint_identity() != completed.completion_identity()
             || observation.lineage().completeness() != FundNavCompleteness::Complete
-            || observation.provider_instrument_id().as_str()
-                != completed.plan().ticker().as_str()
+            || observation.provider_instrument_id().as_str() != completed.plan().ticker().as_str()
             || observation.provenance().source_id() != completed.source_id()
         {
             return Err(TiingoFundNavMapError::IncompleteHistoryMapping);
@@ -502,7 +501,10 @@ fn validate_completed_nav_history(
             .provenance()
             .instrument_id()
             .ok_or(TiingoFundNavMapError::IncompleteHistoryMapping)?;
-        if resolved_instrument.replace(instrument_id).is_some_and(|prior| prior != instrument_id) {
+        if resolved_instrument
+            .replace(instrument_id)
+            .is_some_and(|prior| prior != instrument_id)
+        {
             return Err(TiingoFundNavMapError::IncompleteHistoryMapping);
         }
         let page = completed
@@ -534,8 +536,7 @@ fn validate_completed_nav_history(
                     && matches!(
                         observation.value(),
                         FundNavValue::Missing(
-                            FundNavMissingState::Unsupported
-                                | FundNavMissingState::SourceMissing
+                            FundNavMissingState::Unsupported | FundNavMissingState::SourceMissing
                         )
                     ) =>
             {
@@ -728,8 +729,7 @@ pub fn map_fund_nav_candidate(
         provider_row_index: input.candidate.provider_row_index(),
         provider_row_digest: input.candidate.provider_row_digest(),
         history_page_identity: history_binding.map(|binding| binding.page_identity),
-        history_completion_identity: history_binding
-            .map(|binding| binding.completion_identity),
+        history_completion_identity: history_binding.map(|binding| binding.completion_identity),
         handoff_identity,
     })
 }
@@ -743,8 +743,7 @@ struct TiingoNavHistoryBinding {
 fn validate_contract_binding(
     input: &TiingoFundNavMappingInput<'_>,
 ) -> Result<(), TiingoFundNavMapError> {
-    if input.candidate.context().native_schema_revision()
-        != input.contract.native_schema_revision()
+    if input.candidate.context().native_schema_revision() != input.contract.native_schema_revision()
         || input.candidate.context().entitlement_generation()
             != input.contract.entitlement_generation_identity()
     {
@@ -761,9 +760,12 @@ fn validate_history_binding(
         input.candidate.pagination(),
         input.completed_history,
     ) {
-        (TiingoEndpointFamily::LatestDailyPrices, TiingoPaginationEvidence::NotApplicable, None)
-            if input.candidate.provider_row_index().is_some()
-                && input.candidate.provider_row_digest().is_some() =>
+        (
+            TiingoEndpointFamily::LatestDailyPrices,
+            TiingoPaginationEvidence::NotApplicable,
+            None,
+        ) if input.candidate.provider_row_index().is_some()
+            && input.candidate.provider_row_digest().is_some() =>
         {
             Ok(None)
         }
@@ -773,10 +775,8 @@ fn validate_history_binding(
             Some(completed),
         ) => {
             if completed.source_id() != input.contract.source_id()
-                || completed.source_contract_revision()
-                    != input.contract.source_contract_revision()
-                || completed.native_contract_revision()
-                    != input.contract.native_schema_revision()
+                || completed.source_contract_revision() != input.contract.source_contract_revision()
+                || completed.native_contract_revision() != input.contract.native_schema_revision()
                 || completed.entitlement_generation()
                     != input.contract.entitlement_generation_identity()
                 || completed.plan().ticker() != input.candidate.context().ticker()
@@ -803,8 +803,7 @@ fn validate_history_binding(
                 || input.candidate.nav_date() > *end_date
                 || page.response_body_digest() != input.candidate.raw_object_digest()
                 || page.response_status() != input.candidate.response_status()
-                || page.response_bytes()
-                    != input.candidate.request_disposition().response_bytes()
+                || page.response_bytes() != input.candidate.request_disposition().response_bytes()
                 || page.received_at() != input.candidate.clocks().received_at()
                 || page.decoded_at() != input.candidate.clocks().decoded_at()
                 || page.sealed_capture_receipt() != input.sealed_capture.receipt_digest()
@@ -855,7 +854,10 @@ fn nav_handoff_identity(
     history_binding: Option<TiingoNavHistoryBinding>,
 ) -> EvidenceDigest {
     let mut hasher = Sha256::new();
-    append_field(&mut hasher, b"market-squawk/tiingo/nav-canonical-candidate/v3");
+    append_field(
+        &mut hasher,
+        b"market-squawk/tiingo/nav-canonical-candidate/v3",
+    );
     for digest in [
         input.candidate.family_identity(),
         input.candidate.payload_identity(),
@@ -875,10 +877,7 @@ fn nav_handoff_identity(
     if let Some(history_binding) = history_binding {
         append_field(&mut hasher, b"completed-history");
         append_field(&mut hasher, &history_binding.page_identity.bytes());
-        append_field(
-            &mut hasher,
-            &history_binding.completion_identity.bytes(),
-        );
+        append_field(&mut hasher, &history_binding.completion_identity.bytes());
     } else {
         append_field(&mut hasher, b"latest-response");
     }
@@ -892,10 +891,7 @@ fn nav_handoff_identity(
         }
         _ => append_field(&mut hasher, b"no-provider-row"),
     }
-    append_field(
-        &mut hasher,
-        input.contract.source_id().as_str().as_bytes(),
-    );
+    append_field(&mut hasher, input.contract.source_id().as_str().as_bytes());
     append_field(
         &mut hasher,
         input
@@ -948,7 +944,9 @@ fn validate_capture(input: &TiingoFundNavMappingInput<'_>) -> Result<(), TiingoF
     let expected_dataset = match input.candidate.response_endpoint() {
         crate::TiingoEndpointFamily::LatestDailyPrices => "tiingo-daily-latest",
         crate::TiingoEndpointFamily::HistoricalDailyPrices => "tiingo-daily-history-window",
-        crate::TiingoEndpointFamily::Metadata => return Err(TiingoFundNavMapError::CaptureMismatch),
+        crate::TiingoEndpointFamily::Metadata => {
+            return Err(TiingoFundNavMapError::CaptureMismatch);
+        }
     };
     if capture.pages().len() != 1
         || capture.source_id() != input.contract.source_id()
@@ -967,8 +965,7 @@ fn validate_capture(input: &TiingoFundNavMappingInput<'_>) -> Result<(), TiingoF
         || metadata_capture.source_id() != input.contract.source_id()
         || metadata_capture.metadata_revision() != input.contract.source_contract_revision()
         || metadata_capture.dataset().as_str() != "tiingo-daily-metadata"
-        || metadata_capture.terminal()
-            != ProviderCaptureTerminalDisposition::StandaloneResponse
+        || metadata_capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
         || metadata_capture.request_set_identity() != input.candidate.metadata_request_identity()
         || metadata_capture.total_body_bytes() != input.candidate.metadata_response_bytes()
         || metadata_page.request_identity() != input.candidate.metadata_request_identity()
@@ -984,9 +981,7 @@ fn validate_capture(input: &TiingoFundNavMappingInput<'_>) -> Result<(), TiingoF
 
 fn validate_chronology(input: &TiingoFundNavMappingInput<'_>) -> Result<(), TiingoFundNavMapError> {
     let clocks = input.candidate.clocks();
-    if clocks.received_at() > clocks.decoded_at()
-        || clocks.decoded_at() > input.ingested_at
-    {
+    if clocks.received_at() > clocks.decoded_at() || clocks.decoded_at() > input.ingested_at {
         return Err(TiingoFundNavMapError::InvalidChronology);
     }
     Ok(())

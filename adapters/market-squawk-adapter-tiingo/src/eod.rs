@@ -216,13 +216,13 @@ impl TiingoEodContractEvidence {
         adjusted_surface_evidence: ExactPayloadEvidence,
     ) -> Result<Self, TiingoEodMapError> {
         if [
-                source_contract_evidence.content_digest(),
-                native_schema_evidence.content_digest(),
-                entitlement_evidence,
-                adjusted_surface_evidence.content_digest(),
-            ]
-            .into_iter()
-            .any(|digest| digest.bytes() == [0; 32])
+            source_contract_evidence.content_digest(),
+            native_schema_evidence.content_digest(),
+            entitlement_evidence,
+            adjusted_surface_evidence.content_digest(),
+        ]
+        .into_iter()
+        .any(|digest| digest.bytes() == [0; 32])
         {
             return Err(TiingoEodMapError::InvalidContractEvidence);
         }
@@ -1469,9 +1469,7 @@ impl TiingoPendingEodHistoryPublication {
     }
 
     /// Returns the terminal currentness receipt retained for common publication.
-    pub const fn expected_session_validation(
-        &self,
-    ) -> &TiingoEodExpectedSessionValidationReceipt {
+    pub const fn expected_session_validation(&self) -> &TiingoEodExpectedSessionValidationReceipt {
         &self.expected_session_validation
     }
 
@@ -2125,8 +2123,8 @@ fn validate_response(input: &TiingoEodMappingInput<'_>) -> Result<(), TiingoEodM
     let disposition = input.response.disposition();
     let metadata_evidence = input.metadata.evidence();
     let metadata_disposition = input.metadata.disposition();
-    let row_count = u32::try_from(input.response.rows().len())
-        .map_err(|_| TiingoEodMapError::Allocation)?;
+    let row_count =
+        u32::try_from(input.response.rows().len()).map_err(|_| TiingoEodMapError::Allocation)?;
     let pagination_matches = match (evidence.request().scope(), input.response.pagination()) {
         (TiingoRequestScope::Latest, TiingoPaginationEvidence::NotApplicable) => true,
         (
