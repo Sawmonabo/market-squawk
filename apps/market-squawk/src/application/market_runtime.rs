@@ -6,6 +6,7 @@ mod display;
 mod generation;
 mod group;
 mod kraken;
+mod schwab;
 
 pub(crate) use alpaca_historical::{
     AlpacaHistoricalCompositeCalendarAuthority, AlpacaHistoricalLookupError,
@@ -19,6 +20,12 @@ pub(crate) use display::{MarketDisplaySnapshotBatch, MarketDisplaySnapshotLease}
 pub(crate) use generation::{MarketRuntimeGroupGeneration, MarketSourceRuntimeGeneration};
 pub(crate) use group::MarketProviderGroupLifecycleEvidence;
 pub(crate) use kraken::MarketKrakenPriceProjectionLease;
+pub(crate) use schwab::{
+    SchwabRestQuoteBatch, SchwabRestQuoteBatchOutcome, SchwabRestQuoteEventSink,
+    SchwabRestQuoteInstrumentBinding, SchwabRestQuotePollOutcome, SchwabRestQuoteProducer,
+    SchwabRestQuotePublicationReceipt, SchwabRestQuoteRuntimeBounds, SchwabRestQuoteRuntimeError,
+    SchwabRestQuoteSinkError, SchwabRestQuoteSourceEvidence,
+};
 
 use std::{
     fmt,
