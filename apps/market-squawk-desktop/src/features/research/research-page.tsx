@@ -23,6 +23,8 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
+  FRED_ALFRED_OPERATION,
+  FredAlfredLatestKnown,
   H15Dashboard,
   H15_SURFACE_ID,
   parseMacroDashboard,
@@ -110,6 +112,9 @@ function ResearchWorkspace({
     bootstrap.operations.map((operation) => operation.name),
   )
   const macroDashboardAvailable = operations.has("Macro.GetDashboard")
+  const fredAlfredLatestKnownAvailable = operations.has(
+    FRED_ALFRED_OPERATION,
+  )
   const sourceStatusAvailable = operations.has("Source.GetStatus")
   const h15Key = productKeys.operation(
     bootstrap.runtime,
@@ -280,6 +285,12 @@ function ResearchWorkspace({
                     }
             }
           />
+        </div>
+      ) : null}
+
+      {fredAlfredLatestKnownAvailable ? (
+        <div className="mt-4">
+          <FredAlfredLatestKnown bootstrap={bootstrap} transport={transport} />
         </div>
       ) : null}
 

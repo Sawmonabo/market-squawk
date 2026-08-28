@@ -1046,6 +1046,196 @@ const refreshedH15DashboardResult: ApplicationResult = {
   metadata: h15DashboardResult.metadata,
 }
 
+const fredAlfredGeneration = {
+  manifestVersion: "7",
+  schema: {
+    name: "market-squawk-research-v3",
+    version: 3,
+    fingerprint: "c".repeat(64),
+  },
+  contentHash: "d".repeat(64),
+}
+
+const fredAlfredProviderBinding = {
+  surfaceId: "fred-alfred.api-v1-v2",
+  providerDatasetId:
+    "fred:series-observations:UNRATE:1776-07-04:9999-12-31",
+  analyticalDatasetId: "fred.unrate.latest-known",
+}
+
+function fredAlfredStatus(
+  state: "setup_required" | "unavailable" | "ready",
+): ApplicationResult {
+  if (state === "setup_required") {
+    return {
+      data: {
+        schemaIdentity: "market-squawk-fred-alfred-operation/v1",
+        operation: "Macro.GetFredAlfredLatestKnown",
+        state,
+        reason: "desired_activation_absent",
+      },
+      metadata: {
+        completeness: "complete",
+        returnedItems: 0,
+        availableItems: 0,
+        sourceCoverage: {
+          operation: "Macro.GetFredAlfredLatestKnown",
+          surfaceId: "fred-alfred.api-v1-v2",
+          state,
+          configured: false,
+        },
+        dataQuality: {
+          classification: "unavailable",
+          reason: "desired_activation_absent",
+          manifestPinned: false,
+          executionEligible: false,
+        },
+      },
+    }
+  }
+
+  if (state === "unavailable") {
+    return {
+      data: {
+        schemaIdentity: "market-squawk-fred-alfred-operation/v1",
+        operation: "Macro.GetFredAlfredLatestKnown",
+        state,
+        reason: "exact_provider_dataset_absent",
+      },
+      metadata: {
+        completeness: "complete",
+        returnedItems: 0,
+        availableItems: 0,
+        sourceCoverage: {
+          operation: "Macro.GetFredAlfredLatestKnown",
+          surfaceId: "fred-alfred.api-v1-v2",
+          state,
+          configured: true,
+          datasetState: "unbound",
+        },
+        dataQuality: {
+          classification: "unavailable",
+          reason: "exact_provider_dataset_absent",
+          manifestPinned: false,
+          executionEligible: false,
+        },
+      },
+    }
+  }
+
+  return {
+    data: {
+      schemaIdentity: "market-squawk-fred-alfred-operation/v1",
+      operation: "Macro.GetFredAlfredLatestKnown",
+      state,
+      binding: fredAlfredProviderBinding,
+      generation: fredAlfredGeneration,
+    },
+    metadata: {
+      completeness: "complete",
+      returnedItems: 0,
+      availableItems: 0,
+      sourceCoverage: {
+        operation: "Macro.GetFredAlfredLatestKnown",
+        state,
+        binding: fredAlfredProviderBinding,
+        generation: fredAlfredGeneration,
+      },
+      dataQuality: {
+        classification: "manifest_bound_not_read",
+        manifestPinned: true,
+        executionEligible: false,
+        executionEligibility: "research_only_execution_ineligible",
+      },
+    },
+  }
+}
+
+function fredAlfredReadResult(
+  request: {
+    knowledgeCutoff: string
+    effectiveDateCutoff: string
+  },
+  changedGeneration: "outer" | "inner" | null,
+): ApplicationResult {
+  const changed = {
+    ...fredAlfredGeneration,
+    contentHash: "e".repeat(64),
+  }
+  const outerGeneration =
+    changedGeneration === "outer" ? changed : fredAlfredGeneration
+  const innerGeneration =
+    changedGeneration === "inner" ? changed : fredAlfredGeneration
+  const selection = {
+    policy: "latest_known_by_series_as_of_cutoff_v1",
+    knowledgeCutoff: request.knowledgeCutoff,
+    effectiveDateCutoff: request.effectiveDateCutoff,
+    evaluatedAt: request.knowledgeCutoff,
+    selectionDigest: "4".repeat(64),
+    complete: true,
+  }
+  const binding = {
+    provider: {
+      ...fredAlfredProviderBinding,
+      sourceId: "fred-fred-alfred.api-v1-v2",
+      seriesId: "UNRATE",
+    },
+    manifest: {
+      datasetId: fredAlfredProviderBinding.analyticalDatasetId,
+      ...innerGeneration,
+    },
+    objectGraphDigest: "5".repeat(64),
+    queryIdentity: "6".repeat(64),
+    resultDigest: "7".repeat(64),
+  }
+  return {
+    data: {
+      schemaIdentity: "market-squawk-fred-alfred-operation/v1",
+      operation: "Macro.GetFredAlfredLatestKnown",
+      state: "ready",
+      generation: outerGeneration,
+      result: {
+        schemaIdentity: "market-squawk-fred-alfred-point-in-time/v1",
+        binding,
+        selection,
+        observation: {
+          seriesId: "UNRATE",
+          unitId: "fred-unit:v1:percent",
+          effectiveDate: "2026-08-20",
+          publishedVintage: "2026-08-21",
+          supersededAfter: null,
+          availableAt: "2026-08-21T12:00:00Z",
+          receivedAt: "2026-08-21T12:00:00Z",
+          ingestedAt: "2026-08-21T12:01:00Z",
+          revision: 2,
+          value: { state: "observed", decimal: "4.875" },
+          sourceIdentifier: "fred:UNRATE:2026-08-20:2026-08-21",
+          rawPageDigest: "8".repeat(64),
+          quality: "official_delayed",
+        },
+      },
+    },
+    metadata: {
+      completeness: "complete",
+      returnedItems: 1,
+      availableItems: 1,
+      sourceCoverage: {
+        operation: "Macro.GetFredAlfredLatestKnown",
+        binding,
+        selection,
+      },
+      dataQuality: {
+        classification: "official_delayed_point_in_time",
+        recordLevelProvenance: true,
+        manifestPinned: true,
+        selectionComplete: true,
+        executionEligible: false,
+        executionEligibility: "research_only_execution_ineligible",
+      },
+    },
+  }
+}
+
 const inactiveH15SourceStatus: ApplicationResult = {
   data: [
     {
@@ -2627,6 +2817,9 @@ describe("Market Squawk desktop boundary", () => {
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
     let alpacaStage: AlpacaSourceStage = "unconfigured"
+    let fredStatusState: "setup_required" | "unavailable" | "ready" =
+      "setup_required"
+    let fredReadAttempt = 0
     let corruptSecondaryEvidence = false
     const credentialProviders = [
       "schwab",
@@ -2701,6 +2894,11 @@ describe("Market Squawk desktop boundary", () => {
           "Return bounded macroeconomic revision history.",
         ),
         macroDashboardRead(),
+        localRead(
+          "Macro.GetFredAlfredLatestKnown",
+          "macro",
+          "Return FRED/ALFRED availability or one exact manifest-pinned latest-known observation.",
+        ),
         sourceStatusRead(),
         {
           name: "Source.ImportCredentialBundle",
@@ -2769,6 +2967,19 @@ describe("Market Squawk desktop boundary", () => {
           return admittedServiceGeneration === 2
             ? refreshedH15DashboardResult
             : h15DashboardResult
+        }
+        if (request.query === "fredAlfredLatestKnownStatus") {
+          return fredAlfredStatus(fredStatusState)
+        }
+        if (request.query === "fredAlfredLatestKnownRead") {
+          const changedGeneration =
+            fredReadAttempt === 0
+              ? "outer"
+              : fredReadAttempt === 1
+                ? "inner"
+                : null
+          fredReadAttempt += 1
+          return fredAlfredReadResult(request, changedGeneration)
         }
         if (request.query === "sourceStatus") {
           return request.sourceIds?.includes("alpaca.basic-market-data") === true
@@ -2920,6 +3131,116 @@ describe("Market Squawk desktop boundary", () => {
 
     const heading = await screen.findByRole("heading", { name: "Research" })
     expect(heading.tagName).toBe("H1")
+    expect(
+      await screen.findByText("Connect FRED/ALFRED research"),
+    ).toBeTruthy()
+    expect(
+      issuedQueries.filter(
+        (request) => request.query === "fredAlfredLatestKnownStatus",
+      ),
+    ).toEqual([{ query: "fredAlfredLatestKnownStatus" }])
+    expect(readCount("fredAlfredLatestKnownRead")).toBe(0)
+
+    fredStatusState = "unavailable"
+    await notifyAuthorityChanged(
+      "1",
+      "research",
+      "Macro.GetFredAlfredLatestKnown",
+    )
+    expect(
+      await screen.findByText("FRED/ALFRED dataset is not bound"),
+    ).toBeTruthy()
+    expect(readCount("fredAlfredLatestKnownRead")).toBe(0)
+
+    fredStatusState = "ready"
+    fireEvent.click(
+      screen.getByRole("button", { name: "Check publication again" }),
+    )
+    const fredHeading = await screen.findByRole("heading", {
+      name: "Latest known observation at your cutoffs",
+    })
+    const fredSection = fredHeading.closest("section")
+    expect(fredSection).toBeInstanceOf(HTMLElement)
+    if (!(fredSection instanceof HTMLElement)) {
+      throw new Error("The FRED/ALFRED point-in-time research section is absent")
+    }
+    expect(within(fredSection).getByText("v7")).toBeTruthy()
+    expect(within(fredSection).getByText("c".repeat(64))).toBeTruthy()
+    expect(within(fredSection).getByText("d".repeat(64))).toBeTruthy()
+
+    const knowledgeCutoff = within(fredSection).getByLabelText("Knowledge cutoff")
+    const effectiveDateCutoff = within(fredSection).getByLabelText(
+      "Effective-date cutoff",
+    )
+    fireEvent.change(knowledgeCutoff, {
+      target: { value: "2026-08-28T14:30:00Z" },
+    })
+    fireEvent.change(effectiveDateCutoff, {
+      target: { value: "2026-08-22" },
+    })
+    fireEvent.click(
+      within(fredSection).getByRole("button", {
+        name: "Read point-in-time value",
+      }),
+    )
+    expect(
+      await within(fredSection).findByText(
+        "The exact point-in-time read was rejected",
+      ),
+    ).toBeTruthy()
+    expect(readCount("fredAlfredLatestKnownRead")).toBe(1)
+
+    fireEvent.change(knowledgeCutoff, {
+      target: { value: "2026-08-29T14:30:00Z" },
+    })
+    fireEvent.click(
+      within(fredSection).getByRole("button", {
+        name: "Read point-in-time value",
+      }),
+    )
+    await waitFor(() => expect(readCount("fredAlfredLatestKnownRead")).toBe(2))
+    expect(
+      within(fredSection).getByText("The exact point-in-time read was rejected"),
+    ).toBeTruthy()
+
+    fireEvent.change(knowledgeCutoff, {
+      target: { value: "2026-08-30T14:30:00Z" },
+    })
+    fireEvent.click(
+      within(fredSection).getByRole("button", {
+        name: "Read point-in-time value",
+      }),
+    )
+    expect(await within(fredSection).findByText("4.875")).toBeTruthy()
+    expect(within(fredSection).getByText("2026-08-21")).toBeTruthy()
+    expect(
+      within(fredSection).getAllByText("Official delayed · research only")
+        .length,
+    ).toBeGreaterThan(0)
+    expect(
+      issuedQueries.filter(
+        (request) => request.query === "fredAlfredLatestKnownRead",
+      ),
+    ).toEqual([
+      {
+        query: "fredAlfredLatestKnownRead",
+        generation: fredAlfredGeneration,
+        knowledgeCutoff: "2026-08-28T14:30:00Z",
+        effectiveDateCutoff: "2026-08-22",
+      },
+      {
+        query: "fredAlfredLatestKnownRead",
+        generation: fredAlfredGeneration,
+        knowledgeCutoff: "2026-08-29T14:30:00Z",
+        effectiveDateCutoff: "2026-08-22",
+      },
+      {
+        query: "fredAlfredLatestKnownRead",
+        generation: fredAlfredGeneration,
+        knowledgeCutoff: "2026-08-30T14:30:00Z",
+        effectiveDateCutoff: "2026-08-22",
+      },
+    ])
     const workspaceHome = screen.getByRole("link", {
       name: "Market Squawk workspace",
     })
@@ -3023,15 +3344,17 @@ describe("Market Squawk desktop boundary", () => {
         "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY20_N.B",
       ),
     ).toBeTruthy()
-    expect(
-      issuedQueries.filter((request) => request.query === "macroDashboard"),
-    ).toEqual([
-      {
+    const initialMacroDashboardQueries = issuedQueries.filter(
+      (request) => request.query === "macroDashboard",
+    )
+    expect(initialMacroDashboardQueries.length).toBeGreaterThan(0)
+    for (const request of initialMacroDashboardQueries) {
+      expect(request).toEqual({
         query: "macroDashboard",
         provider: "federal-reserve-board.data-download-program",
         release: "h15",
-      },
-    ])
+      })
+    }
     expect(
       issuedQueries.filter((request) => request.query === "sourceStatus"),
     ).toEqual([
