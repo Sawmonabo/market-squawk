@@ -8,7 +8,6 @@ import {
   SlidersHorizontal,
 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -283,7 +282,8 @@ export function TargetBuilder({
             <AlertCircle aria-hidden="true" />
             <AlertTitle>Target inputs could not be loaded</AlertTitle>
             <AlertDescription>
-              {messageFrom(inventory.error)}
+              Market Squawk could not retrieve the information needed to prepare this target.
+              Retry, and check Logs if the problem continues.
               <Button
                 type="button"
                 variant="outline"
@@ -319,7 +319,10 @@ export function TargetBuilder({
               <Alert variant="destructive">
                 <AlertCircle aria-hidden="true" />
                 <AlertTitle>The target revision was not committed</AlertTitle>
-                <AlertDescription>{messageFrom(commit.error)}</AlertDescription>
+                <AlertDescription>
+                  Market Squawk could not save this target revision. Try again, and check Logs if
+                  the problem continues.
+                </AlertDescription>
               </Alert>
             )}
             <PreparedTargetPreview
@@ -478,7 +481,9 @@ export function TargetBuilder({
               <Alert variant="destructive">
                 <AlertCircle aria-hidden="true" />
                 <AlertTitle>The target preview was not prepared</AlertTitle>
-                <AlertDescription>{messageFrom(prepare.error)}</AlertDescription>
+                <AlertDescription>
+                  Review the target inputs and try again. Detailed errors are available in Logs.
+                </AlertDescription>
               </Alert>
             )}
             {commitReceipt && <TargetCommitReceipt {...commitReceipt} />}

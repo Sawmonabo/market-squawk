@@ -7,7 +7,6 @@ import {
   RefreshCw,
 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -311,7 +310,8 @@ export function ScreenBuilder({
             <AlertCircle aria-hidden="true" />
             <AlertTitle>Screen data could not be loaded</AlertTitle>
             <AlertDescription>
-              {messageFrom(evidence.error)}
+              Prepared research data could not be retrieved. Retry, and check Logs if the problem
+              continues.
               <Button
                 type="button"
                 variant="outline"
@@ -594,14 +594,20 @@ export function ScreenBuilder({
               <Alert variant="destructive">
                 <AlertCircle aria-hidden="true" />
                 <AlertTitle>The screen was not saved</AlertTitle>
-                <AlertDescription>{messageFrom(save.error)}</AlertDescription>
+                <AlertDescription>
+                  Market Squawk could not save this screen. Review the inputs and try again. Check
+                  Logs if the problem continues.
+                </AlertDescription>
               </Alert>
             )}
             {run.isError && (
               <Alert variant="destructive">
                 <AlertCircle aria-hidden="true" />
                 <AlertTitle>The screen run was not started</AlertTitle>
-                <AlertDescription>{messageFrom(run.error)}</AlertDescription>
+                <AlertDescription>
+                  Market Squawk could not start this screen run. Try again, and check Logs if the
+                  problem continues.
+                </AlertDescription>
               </Alert>
             )}
             {receipt && <Receipt receipt={receipt} />}

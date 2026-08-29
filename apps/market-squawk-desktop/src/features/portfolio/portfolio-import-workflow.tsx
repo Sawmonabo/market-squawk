@@ -8,7 +8,6 @@ import {
   Trash2,
 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
@@ -124,8 +123,8 @@ export function PortfolioImportWorkflow({
             }
           }),
       )
-    } catch (cause) {
-      setError(messageFrom(cause))
+    } catch {
+      setError("The file could not be prepared for review. Check the account ID and try again.")
     } finally {
       setActivity(null)
     }
@@ -153,8 +152,8 @@ export function PortfolioImportWorkflow({
       setInterpretations([])
       setConfirmationOpen(false)
       await onCommitted()
-    } catch (cause) {
-      setError(messageFrom(cause))
+    } catch {
+      setError("Your portfolio details could not be saved right now. Try again.")
       setConfirmationOpen(false)
     } finally {
       setActivity(null)
@@ -173,8 +172,8 @@ export function PortfolioImportWorkflow({
       setPreview(null)
       setInterpretations([])
       setConfirmationOpen(false)
-    } catch (cause) {
-      setError(messageFrom(cause))
+    } catch {
+      setError("The import preview could not be discarded right now. Try again.")
     } finally {
       setActivity(null)
     }

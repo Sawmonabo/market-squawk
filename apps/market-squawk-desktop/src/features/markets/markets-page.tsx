@@ -11,7 +11,7 @@ import {
 } from "lucide-react"
 import { useSearchParams } from "react-router-dom"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -1197,8 +1197,11 @@ function levelSummary(value: BookLevel | null) {
 function parseRead<T>(read: () => T): { value: T | null; error: string | null } {
   try {
     return { value: read(), error: null }
-  } catch (error) {
-    return { value: null, error: messageFrom(error) }
+  } catch {
+    return {
+      value: null,
+      error: "This market information is unavailable. Try refreshing the page.",
+    }
   }
 }
 

@@ -2,7 +2,6 @@ import * as React from "react"
 import { useQuery } from "@tanstack/react-query"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
-import { messageFrom } from "@/app/product-context"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
@@ -65,7 +64,11 @@ export function useLookup(
     return { status: "loading", data: null, message: null }
   }
   if (query.isError) {
-    return { status: "unavailable", data: null, message: messageFrom(query.error) }
+    return {
+      status: "unavailable",
+      data: null,
+      message: "Search is unavailable right now.",
+    }
   }
   const parsed = lookupResultSchema.safeParse(query.data.data)
   if (!parsed.success) {

@@ -8,7 +8,6 @@ import {
   ShieldAlert,
 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -111,7 +110,7 @@ export function TargetGovernanceWorkspace({
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Target discovery could not be loaded</AlertTitle>
           <AlertDescription>
-            {messageFrom(targetIndex.error)}
+            Saved targets could not be retrieved. Retry, and check Logs if the problem continues.
             <Button
               type="button"
               variant="outline"
@@ -160,7 +159,8 @@ export function TargetGovernanceWorkspace({
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Target history could not be loaded</AlertTitle>
           <AlertDescription>
-            {messageFrom(targets.error)}
+            The selected target's history could not be retrieved. Retry, and check Logs if the
+            problem continues.
             <Button
               type="button"
               variant="outline"

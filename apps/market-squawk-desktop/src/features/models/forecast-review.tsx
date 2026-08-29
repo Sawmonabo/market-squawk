@@ -1,7 +1,6 @@
 import { useQuery } from "@tanstack/react-query"
 import { AlertTriangle, CalendarClock, ChartNoAxesCombined, ShieldCheck } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import {
   MarketPriceChart,
@@ -107,7 +106,7 @@ export function ForecastReview({
       ) : loading ? (
         <Unavailable text="Loading forecasts…" />
       ) : error ? (
-        <Unavailable text={error} />
+        <Unavailable text="Forecasts cannot be shown right now. Try refreshing the page." />
       ) : forecasts.length === 0 ? (
         <Unavailable text="No forecast is ready for this model yet." />
       ) : (
@@ -140,11 +139,11 @@ export function ForecastReview({
             detail={detail.data ?? null}
             detailAvailable={detailAvailable}
             detailLoading={detail.isPending && selected !== null}
-            detailError={detail.isError ? messageFrom(detail.error) : null}
+            detailError={detail.isError ? "Forecast details are unavailable right now." : null}
             outcomes={outcomes.data?.outcomes ?? []}
             outcomesAvailable={outcomesAvailable}
             outcomesLoading={outcomes.isPending && selected !== null}
-            outcomesError={outcomes.isError ? messageFrom(outcomes.error) : null}
+            outcomesError={outcomes.isError ? "Forecast outcomes are unavailable right now." : null}
             outcomesTruncated={outcomes.data?.truncated ?? false}
           />
         </>
@@ -199,7 +198,7 @@ function ForecastDetail({
     return <Unavailable text="Forecast details and uncertainty ranges are unavailable." />
   }
   if (detailLoading) return <Unavailable text="Loading exact forecast payload…" />
-  if (detailError) return <Unavailable text={detailError} />
+  if (detailError) return <Unavailable text="Forecast details are unavailable right now." />
   if (!detail) return <Unavailable text="No complete forecast payload was returned." />
 
   const outcomeByTarget = new Map(
@@ -283,7 +282,7 @@ function ForecastDetail({
         </table>
       </div>
 
-      {outcomesError ? <Unavailable text={`Outcomes could not be loaded: ${outcomesError}`} /> : null}
+      {outcomesError ? <Unavailable text="Forecast outcomes are unavailable right now." /> : null}
       {!outcomesAvailable ? (
         <Unavailable text="Actual outcomes and forecast errors are unavailable." />
       ) : null}

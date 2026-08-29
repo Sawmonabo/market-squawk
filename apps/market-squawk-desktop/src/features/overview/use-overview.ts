@@ -2,7 +2,6 @@ import { useQuery } from "@tanstack/react-query"
 import type { z } from "zod"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
-import { messageFrom } from "@/app/product-context"
 import { parseInvestmentAnalysisPage } from "@/features/opportunities/contracts"
 import type { ApplicationResult } from "@/lib/schemas"
 import type { DashboardQuery, ProductTransport } from "@/lib/transport"
@@ -120,12 +119,20 @@ function useParsedProductQuery<Result>(
     return { status: "loading", data: null, message: null }
   }
   if (query.isError) {
-    return { status: "unavailable", data: null, message: messageFrom(query.error) }
+    return {
+      status: "unavailable",
+      data: null,
+      message: "This information is unavailable right now.",
+    }
   }
   try {
     return { status: "ready", data: parse(query.data), message: null }
-  } catch (error) {
-    return { status: "unavailable", data: null, message: messageFrom(error) }
+  } catch {
+    return {
+      status: "unavailable",
+      data: null,
+      message: "This information is unavailable right now.",
+    }
   }
 }
 

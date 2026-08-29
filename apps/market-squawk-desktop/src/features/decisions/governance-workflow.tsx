@@ -2,7 +2,6 @@ import * as React from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { CheckCircle2, KeyRound, RefreshCw, ShieldCheck, TriangleAlert } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -254,7 +253,12 @@ export function TargetGovernanceWorkflow({
         </div>
       )}
 
-      {previewAction.isError && <GovernanceError error={previewAction.error} />}
+      {previewAction.isError && (
+        <GovernanceError
+          title="Governance preview could not be prepared"
+          detail="Review the proposed action and try again. Check Logs if the problem continues."
+        />
+      )}
 
       {preview && !receipt && (
         <div className="mt-4 grid gap-4">
@@ -267,7 +271,10 @@ export function TargetGovernanceWorkflow({
           {principals.isPending ? (
             <p className="text-xs text-muted-foreground">Loading eligible principals…</p>
           ) : principals.isError ? (
-            <GovernanceError error={principals.error} />
+            <GovernanceError
+              title="Eligible reviewers could not be loaded"
+              detail="Market Squawk could not retrieve the eligible reviewers. Check Logs for details."
+            />
           ) : authorizations.length < preview.distinctPrincipalCount ? (
             <div className="grid gap-3 rounded-lg border border-border bg-background/50 p-3">
               <p className="text-xs leading-5 text-muted-foreground">
@@ -314,7 +321,12 @@ export function TargetGovernanceWorkflow({
                 <KeyRound />
                 Authenticate selected principal
               </Button>
-              {authenticate.isError && <GovernanceError error={authenticate.error} />}
+              {authenticate.isError && (
+                <GovernanceError
+                  title="Reviewer could not be verified"
+                  detail="Check the selected reviewer and credential, then try again. Detailed errors are available in Logs."
+                />
+              )}
             </div>
           ) : null}
 
@@ -353,7 +365,12 @@ export function TargetGovernanceWorkflow({
               Record governance decision
             </Button>
           )}
-          {commit.isError && <GovernanceError error={commit.error} />}
+          {commit.isError && (
+            <GovernanceError
+              title="Governance decision was not recorded"
+              detail="Market Squawk could not save this decision. Try again, and check Logs if the problem continues."
+            />
+          )}
         </div>
       )}
 
@@ -399,12 +416,12 @@ function PreviewCard({ preview }: { preview: GovernancePreviewView }) {
   )
 }
 
-function GovernanceError({ error }: { error: unknown }) {
+function GovernanceError({ title, detail }: { title: string; detail: string }) {
   return (
     <Alert variant="destructive" className="mt-3">
       <TriangleAlert aria-hidden="true" />
-      <AlertTitle>Governance action could not continue</AlertTitle>
-      <AlertDescription>{messageFrom(error)}</AlertDescription>
+      <AlertTitle>{title}</AlertTitle>
+      <AlertDescription>{detail}</AlertDescription>
     </Alert>
   )
 }

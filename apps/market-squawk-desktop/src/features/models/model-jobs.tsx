@@ -31,7 +31,7 @@ export function ModelJobActivity({
       ) : loading ? (
         <Message text="Loading model jobs…" />
       ) : error ? (
-        <Message text={error} />
+        <Message text="Model activity is unavailable right now. Try refreshing the page." />
       ) : jobs.length === 0 ? (
         <Message text="No durable model or training job has been retained." />
       ) : (

@@ -2,7 +2,6 @@ import * as React from "react"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
 import { FileCheck2, FlaskConical, Play, ShieldAlert } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import {
@@ -116,8 +115,8 @@ export function ModelWorkflows({
         if (kind === "configuration") setConfiguration(ticket)
         else setAuthority(ticket)
       }
-    } catch (error) {
-      setStageError(messageFrom(error))
+    } catch {
+      setStageError("The selected file could not be prepared. Check the file and try again.")
     } finally {
       setStaging(null)
     }
@@ -252,7 +251,9 @@ export function ModelWorkflows({
               Training queued as job <span className="font-mono">{trainingJob}</span>.
             </p>
           ) : null}
-          {stageError ? <WorkflowError text={stageError} /> : null}
+          {stageError ? (
+            <WorkflowError text="The selected file could not be prepared. Check the file and try again." />
+          ) : null}
         </div>
       </div>
 
@@ -284,7 +285,9 @@ export function ModelWorkflows({
               <TicketFact label="Model definition" ticket={pending.authority} />
             </dl>
           ) : null}
-          {mutation.isError ? <WorkflowError text={messageFrom(mutation.error)} /> : null}
+          {mutation.isError ? (
+            <WorkflowError text="The requested model action could not be completed. Review the inputs and try again." />
+          ) : null}
           <DialogFooter>
             <Button variant="outline" disabled={mutation.isPending} onClick={() => setPending(null)}>
               Cancel

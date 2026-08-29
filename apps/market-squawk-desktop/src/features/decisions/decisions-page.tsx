@@ -2,7 +2,7 @@ import { useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { AlertCircle, RefreshCw } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -29,7 +29,10 @@ export function DecisionsPage() {
         <Alert variant="destructive">
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Opportunities are unavailable</AlertTitle>
-          <AlertDescription>{product.error}</AlertDescription>
+          <AlertDescription>
+            Market Squawk could not open this workspace. Try again, and check Logs if the problem
+            continues.
+          </AlertDescription>
         </Alert>
         <Button type="button" className="mt-4" onClick={product.refresh}>
           Try again
@@ -144,7 +147,8 @@ function ReadyDecisions({
               <AlertCircle aria-hidden="true" />
               <AlertTitle>Saved screens could not be loaded</AlertTitle>
               <AlertDescription>
-                {messageFrom(screens.error)}
+                Market Squawk could not retrieve your saved screens. Retry, and check Logs if the
+                problem continues.
                 <Button
                   type="button"
                   variant="outline"

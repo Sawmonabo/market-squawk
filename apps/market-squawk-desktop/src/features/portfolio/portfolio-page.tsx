@@ -6,7 +6,7 @@ import {
   RefreshCw,
 } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -49,7 +49,10 @@ export function PortfolioPage() {
         <Alert variant="destructive">
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Portfolio workspace unavailable</AlertTitle>
-          <AlertDescription>{product.error}</AlertDescription>
+          <AlertDescription>
+            Portfolio details cannot be loaded right now. Try again, or review Logs &amp;
+            Diagnostics if the problem continues.
+          </AlertDescription>
         </Alert>
         <Button className="mt-4" onClick={product.refresh}>
           Try again
@@ -143,7 +146,7 @@ function PortfolioWorkspace({
       ) : accounts.query.isError ? (
         <PortfolioError
           title="Accounts could not be read"
-          message={messageFrom(accounts.query.error)}
+          message="Your accounts could not be loaded right now. Try again."
           retry={() => void accounts.query.refetch()}
         />
       ) : rows.length === 0 ? (
@@ -230,12 +233,12 @@ function DetailWorkspace({
   const missing = Object.entries(details.operationAvailable)
     .filter(([, available]) => !available)
     .map(([operation]) => detailName(operation))
-  const errors = [
+  const hasDetailError = [
     details.holdings.error,
     details.performance.error,
     details.exposure.error,
     details.risk.error,
-  ].filter((error): error is Error => error instanceof Error)
+  ].some(Boolean)
 
   return (
     <div className="mt-5 space-y-4">
@@ -249,11 +252,14 @@ function DetailWorkspace({
           </AlertDescription>
         </Alert>
       ) : null}
-      {errors.length ? (
+      {hasDetailError ? (
         <Alert variant="destructive">
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Some portfolio sections could not be refreshed</AlertTitle>
-          <AlertDescription>{errors.map(messageFrom).join(" · ")}</AlertDescription>
+          <AlertDescription>
+            Some information could not be loaded right now. Try refreshing; detailed diagnostics
+            are available in Logs &amp; Diagnostics.
+          </AlertDescription>
         </Alert>
       ) : null}
 

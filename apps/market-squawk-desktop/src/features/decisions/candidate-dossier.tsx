@@ -13,7 +13,6 @@ import {
   Search,
 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -199,7 +198,7 @@ export function CandidateDossierWorkspace({
           ) : runs.isError ? (
             <RecordError
               title="Saved-screen runs could not be loaded"
-              error={runs.error}
+              detail="Saved-screen runs could not be retrieved. Retry, and check Logs if the problem continues."
               retry={() => void runs.refetch()}
             />
           ) : runEntries.length === 0 ? (
@@ -245,7 +244,7 @@ export function CandidateDossierWorkspace({
           ) : candidates.isError ? (
             <RecordError
               title="Candidates could not be loaded"
-              error={candidates.error}
+              detail="Candidates from this screen run could not be retrieved. Retry, and check Logs if the problem continues."
               retry={() => void candidates.refetch()}
             />
           ) : candidates.data.length === 0 ? (
@@ -287,7 +286,7 @@ export function CandidateDossierWorkspace({
                 ) : dossierPreparation.isError ? (
                   <RecordError
                     title="Dossier evidence could not be loaded"
-                    error={dossierPreparation.error}
+                    detail="The information needed to prepare this dossier could not be retrieved. Retry, and check Logs if the problem continues."
                     retry={() => void dossierPreparation.refetch()}
                   />
                 ) : (
@@ -338,7 +337,10 @@ export function CandidateDossierWorkspace({
                   <Alert variant="destructive" className="mt-3">
                     <AlertCircle aria-hidden="true" />
                     <AlertTitle>Dossier preparation failed</AlertTitle>
-                    <AlertDescription>{messageFrom(prepareDossier.error)}</AlertDescription>
+                    <AlertDescription>
+                      Market Squawk could not prepare this dossier. Try again, and check Logs if the
+                      problem continues.
+                    </AlertDescription>
                   </Alert>
                 )}
                 {prepareDossier.data && (
@@ -371,7 +373,10 @@ export function CandidateDossierWorkspace({
                   <Alert variant="destructive" className="mt-3">
                     <AlertCircle aria-hidden="true" />
                     <AlertTitle>Dossier was not retained</AlertTitle>
-                    <AlertDescription>{messageFrom(createDossier.error)}</AlertDescription>
+                    <AlertDescription>
+                      Market Squawk could not save this dossier. Try again, and check Logs if the
+                      problem continues.
+                    </AlertDescription>
                   </Alert>
                 )}
                 {createDossier.isSuccess && (
@@ -390,7 +395,7 @@ export function CandidateDossierWorkspace({
               ) : dossiers.isError ? (
                 <RecordError
                   title="Candidate dossiers could not be loaded"
-                  error={dossiers.error}
+                  detail="Saved dossiers for this candidate could not be retrieved. Retry, and check Logs if the problem continues."
                   retry={() => void dossiers.refetch()}
                 />
               ) : dossierEntries.length === 0 ? (
@@ -785,11 +790,11 @@ function PanelLoading() {
 
 function RecordError({
   title,
-  error,
+  detail,
   retry,
 }: {
   title: string
-  error: unknown
+  detail: string
   retry: () => void
 }) {
   return (
@@ -797,7 +802,7 @@ function RecordError({
       <AlertCircle aria-hidden="true" />
       <AlertTitle>{title}</AlertTitle>
       <AlertDescription>
-        {messageFrom(error)}
+        {detail}
         <Button type="button" variant="outline" size="sm" className="mt-2" onClick={retry}>
           Retry
         </Button>

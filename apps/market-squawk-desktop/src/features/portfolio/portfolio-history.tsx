@@ -2,7 +2,6 @@ import * as React from "react"
 import type { ColumnDef } from "@tanstack/react-table"
 import { AlertCircle, Clock3, GitCompareArrows, History } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { DataTable } from "@/components/tables/data-table"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -51,11 +50,11 @@ export function PortfolioHistory({
     }
   }, [baselineId, baselines])
 
-  const errors = [
+  const hasHistoryError = [
     history.transactions.error,
     history.revisions.error,
     history.attribution.error,
-  ].filter((error): error is Error => error instanceof Error)
+  ].some(Boolean)
 
   return (
     <section className="rounded-xl border border-border bg-card/35 p-5">
@@ -70,11 +69,14 @@ export function PortfolioHistory({
         </p>
       </header>
 
-      {errors.length ? (
+      {hasHistoryError ? (
         <Alert variant="destructive" className="mt-4">
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Some history could not be read</AlertTitle>
-          <AlertDescription>{errors.map(messageFrom).join(" · ")}</AlertDescription>
+          <AlertDescription>
+            Some account history is unavailable right now. Try refreshing; detailed diagnostics are
+            available in Logs &amp; Diagnostics.
+          </AlertDescription>
         </Alert>
       ) : null}
 

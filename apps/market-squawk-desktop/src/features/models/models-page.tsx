@@ -37,7 +37,7 @@ export function ModelsPage() {
       <ModelsFrame>
         <UnavailableEvidence
           title="Model workspace unavailable"
-          detail={product.error}
+          detail="Models and forecasts cannot be shown right now. Try again when the workspace is available."
         />
       </ModelsFrame>
     )

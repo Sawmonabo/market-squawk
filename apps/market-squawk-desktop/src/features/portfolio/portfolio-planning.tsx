@@ -2,7 +2,6 @@ import * as React from "react"
 import { useMutation } from "@tanstack/react-query"
 import { AlertCircle, ArrowRightLeft, ShieldCheck, Target } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -211,7 +210,9 @@ function CandidatePlanner({
             {mutation.isPending ? "Calculating…" : "Compare impact"}
           </Button>
           {validation ? <PlanningError text={validation} /> : null}
-          {mutation.isError ? <PlanningError text={messageFrom(mutation.error)} /> : null}
+          {mutation.isError ? (
+            <PlanningError text="The position comparison could not be calculated right now. Try again." />
+          ) : null}
           {mutation.data ? <CandidateResult result={mutation.data} /> : null}
         </>
       )}
@@ -450,7 +451,9 @@ function RebalancePlanner({
             {mutation.isPending ? "Calculating…" : "Create proposal"}
           </Button>
           {validation ? <PlanningError text={validation} /> : null}
-          {mutation.isError ? <PlanningError text={messageFrom(mutation.error)} /> : null}
+          {mutation.isError ? (
+            <PlanningError text="The rebalance plan could not be calculated right now. Try again." />
+          ) : null}
           {mutation.data ? <RebalanceResult result={mutation.data} /> : null}
         </>
       )}

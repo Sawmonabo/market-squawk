@@ -317,7 +317,8 @@ function SelectedPortfolioSummary({
     <div className="mt-4">
       {failures.length > 0 ? (
         <p className="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[11px] leading-5 text-destructive">
-          {failures.map((failure) => failure.message).join(" · ")}
+          Some portfolio details could not be loaded. Try refreshing this page. If the problem
+          continues, review Logs &amp; Diagnostics.
         </p>
       ) : null}
 

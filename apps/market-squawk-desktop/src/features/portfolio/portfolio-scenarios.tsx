@@ -2,7 +2,6 @@ import * as React from "react"
 import { useMutation } from "@tanstack/react-query"
 import { AlertCircle, FlaskConical, Layers3 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -193,7 +192,9 @@ export function PortfolioScenarios({
             </Button>
           </div>
           {validation ? <InlineError text={validation} /> : null}
-          {mutation.isError ? <InlineError text={messageFrom(mutation.error)} /> : null}
+          {mutation.isError ? (
+            <InlineError text="The stress test could not be calculated right now. Try again." />
+          ) : null}
           {results.length ? <ScenarioResults results={results} /> : null}
         </>
       )}

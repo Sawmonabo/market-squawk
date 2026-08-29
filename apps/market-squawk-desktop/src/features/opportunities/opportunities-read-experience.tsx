@@ -8,7 +8,7 @@ import {
   Search,
 } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -176,7 +176,8 @@ export function OpportunitiesReadExperience({
           : trackRecord.isError
             ? {
                 state: "error",
-                detail: messageFrom(trackRecord.error),
+                detail:
+                  "Recommendation history could not be retrieved. Retry, and check Logs if the problem continues.",
                 onRetry: () => void trackRecord.refetch(),
               }
             : trackRecord.data
@@ -219,7 +220,7 @@ export function OpportunitiesReadExperience({
             {controller.data
               ? `${controller.data.activeProfile.displayName} is active, but the required analysis inputs are not ready. This control starts no work.`
               : controller.isError
-                ? `Analysis readiness could not be checked: ${messageFrom(controller.error)} This control starts no work.`
+                ? "Analysis readiness could not be checked. See Logs for details. This control starts no work."
                 : "Checking whether the analysis workflow is ready. This control starts no work."}
           </p>
         </div>
@@ -268,7 +269,7 @@ export function OpportunitiesReadExperience({
             <HistoryLoading />
           ) : analyses.isError && history.length === 0 ? (
             <HistoryError
-              detail={messageFrom(analyses.error)}
+              detail="Saved analyses could not be retrieved. Retry, and check Logs if the problem continues."
               onRetry={() => void analyses.refetch()}
             />
           ) : repeatedIdentity ? (
@@ -301,10 +302,7 @@ export function OpportunitiesReadExperience({
 
               {analyses.isError ? (
                 <HistoryError
-                  detail={
-                    `More saved analyses could not be loaded: ` +
-                    messageFrom(analyses.error)
-                  }
+                  detail="More saved analyses could not be retrieved. Retry, and check Logs if the problem continues."
                   onRetry={() => void analyses.refetch()}
                 />
               ) : null}
@@ -342,7 +340,8 @@ export function OpportunitiesReadExperience({
               <CircleAlert aria-hidden="true" />
               <AlertTitle>The Investment Brief could not be loaded</AlertTitle>
               <AlertDescription>
-                {messageFrom(selected.error)}
+                The selected analysis could not be retrieved. Retry, and check Logs if the problem
+                continues.
                 <Button
                   type="button"
                   variant="outline"
