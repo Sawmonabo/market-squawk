@@ -22,19 +22,6 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
-import {
-  FRED_ALFRED_OPERATION,
-  FredAlfredLatestKnown,
-  H15Dashboard,
-  H15_SURFACE_ID,
-  parseMacroDashboard,
-  type MacroDashboardSourceReadiness,
-} from "@/features/macro"
-import {
-  parseSourceStatusResult,
-  sourceEvidence,
-  type SourceEvidence,
-} from "@/features/sources/source-evidence"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { JobControlRequest, ProductTransport } from "@/lib/transport"
 
@@ -61,8 +48,10 @@ export function ResearchPage() {
       <ResearchFrame>
         <Alert variant="destructive">
           <AlertCircle aria-hidden="true" />
-          <AlertTitle>Research workspace unavailable</AlertTitle>
-          <AlertDescription>{product.error}</AlertDescription>
+          <AlertTitle>Research is unavailable right now</AlertTitle>
+          <AlertDescription>
+            Your other workspace areas are still available. Try opening Research again.
+          </AlertDescription>
         </Alert>
         <Button className="mt-4" onClick={product.refresh}>
           Try again
@@ -108,29 +97,6 @@ function ResearchWorkspace({
     ...productKeys.domain(bootstrap.runtime, "job"),
     "research-activity",
   ] as const
-  const operations = new Set(
-    bootstrap.operations.map((operation) => operation.name),
-  )
-  const macroDashboardAvailable = operations.has("Macro.GetDashboard")
-  const fredAlfredLatestKnownAvailable = operations.has(
-    FRED_ALFRED_OPERATION,
-  )
-  const sourceStatusAvailable = operations.has("Source.GetStatus")
-  const h15Key = productKeys.operation(
-    bootstrap.runtime,
-    "research",
-    "Macro.GetDashboard",
-    {
-      provider: H15_SURFACE_ID,
-      release: "h15",
-    },
-  )
-  const h15SourceKey = productKeys.operation(
-    bootstrap.runtime,
-    "source",
-    "Source.GetStatus",
-    { sourceIds: [H15_SURFACE_ID] },
-  )
   const datasets = useInfiniteQuery({
     queryKey: datasetKey,
     initialPageParam: undefined as string | undefined,
@@ -149,30 +115,6 @@ function ResearchWorkspace({
     queryFn: async () =>
       parseResearchJobs(await transport.query({ query: "jobs", limit: 25 })),
     refetchInterval: 5_000,
-  })
-  const h15 = useQuery({
-    queryKey: h15Key,
-    enabled: macroDashboardAvailable,
-    queryFn: async () =>
-      parseMacroDashboard(
-        await transport.query({
-          query: "macroDashboard",
-          provider: H15_SURFACE_ID,
-          release: "h15",
-        }),
-      ),
-  })
-  const h15Source = useQuery({
-    queryKey: h15SourceKey,
-    enabled: macroDashboardAvailable && sourceStatusAvailable,
-    queryFn: async () =>
-      parseSourceStatusResult(
-        await transport.query({
-          query: "sourceStatus",
-          sourceIds: [H15_SURFACE_ID],
-        }),
-        [H15_SURFACE_ID],
-      ),
   })
   const jobMutation = useMutation({
     mutationFn: ({ request }: { request: ResearchJobMutationRequest }) =>
@@ -211,39 +153,20 @@ function ResearchWorkspace({
       job.state,
     ),
   ).length
-  const h15SourceReadiness = macroSourceReadiness(
-    sourceStatusAvailable,
-    h15Source.isPending,
-    h15Source.isError,
-    h15Source.data
-      ? sourceEvidence(
-          bootstrap.providerProfiles,
-          bootstrap.providerSessions,
-          h15Source.data,
-          undefined,
-          undefined,
-        ).find((source) => source.id === H15_SURFACE_ID)
-      : undefined,
-  )
-  const refreshing =
-    datasets.isFetching ||
-    jobs.isFetching ||
-    (macroDashboardAvailable && h15.isFetching) ||
-    (macroDashboardAvailable && sourceStatusAvailable && h15Source.isFetching)
+  const refreshing = datasets.isFetching || jobs.isFetching
 
   return (
     <ResearchFrame>
       <header className="flex flex-col gap-4 border-b border-border pb-6 md:flex-row md:items-end md:justify-between">
         <div>
-          <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">
-            Point-in-time research library
+          <p className="text-[10px] uppercase tracking-[0.18em] text-primary">
+            Research and data
           </p>
-          <h1 className="mt-2 text-3xl font-semibold tracking-tight">
-            Research
-          </h1>
+          <h1 className="mt-2 text-3xl font-semibold tracking-tight">Research</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Inspect immutable analytical datasets, their exact lineage, and
-            durable research work without changing the underlying evidence.
+            Prepare point-in-time evidence, inspect immutable datasets and lineage, and follow
+            durable research work. Market Squawk keeps source acquisition separate from the
+            shared data used by models, forecasts, valuation, and backtests.
           </p>
         </div>
         <Button
@@ -251,10 +174,6 @@ function ResearchWorkspace({
           onClick={() => {
             void datasets.refetch()
             void jobs.refetch()
-            if (macroDashboardAvailable) void h15.refetch()
-            if (macroDashboardAvailable && sourceStatusAvailable) {
-              void h15Source.refetch()
-            }
           }}
           disabled={refreshing}
         >
@@ -265,34 +184,6 @@ function ResearchWorkspace({
           Refresh
         </Button>
       </header>
-
-      {macroDashboardAvailable ? (
-        <div className="mt-6">
-          <H15Dashboard
-            state={
-              h15.isPending
-                ? { status: "loading" }
-                : h15.isError
-                  ? {
-                      status: "error",
-                      message: messageFrom(h15.error),
-                      onRetry: () => void h15.refetch(),
-                    }
-                  : {
-                      status: "ready",
-                      dashboard: h15.data,
-                      sourceReadiness: h15SourceReadiness,
-                    }
-            }
-          />
-        </div>
-      ) : null}
-
-      {fredAlfredLatestKnownAvailable ? (
-        <div className="mt-4">
-          <FredAlfredLatestKnown bootstrap={bootstrap} transport={transport} />
-        </div>
-      ) : null}
 
       <ResearchIngestion
         bootstrap={bootstrap}
@@ -316,10 +207,7 @@ function ResearchWorkspace({
       {datasets.isPending ? (
         <ResearchContentLoading />
       ) : datasets.isError ? (
-        <DatasetError
-          message={messageFrom(datasets.error)}
-          retry={() => void datasets.refetch()}
-        />
+        <DatasetError retry={() => void datasets.refetch()} />
       ) : allDatasets.length === 0 ? (
         <>
           <EmptyResearch />
@@ -327,15 +215,11 @@ function ResearchWorkspace({
             <ResearchActivity
               jobs={jobs.data ?? []}
               loading={jobs.isPending}
-              error={jobs.isError ? messageFrom(jobs.error) : null}
+              failed={jobs.isError}
               pendingJobId={
-                jobMutation.isPending
-                  ? jobMutation.variables.request.jobId
-                  : null
+                jobMutation.isPending ? jobMutation.variables.request.jobId : null
               }
-              mutationError={
-                jobMutation.isError ? messageFrom(jobMutation.error) : null
-              }
+              mutationFailed={jobMutation.isError}
               act={(job, action) =>
                 jobMutation.mutate({
                   request: {
@@ -401,7 +285,7 @@ function ResearchWorkspace({
                     id="research-dataset-filter"
                     value={filter}
                     onChange={(event) => setFilter(event.target.value)}
-                    placeholder="Name, source, schema, or generation"
+                    placeholder="Name, evidence source, schema, or generation"
                     className="pl-9"
                   />
                 </div>
@@ -411,16 +295,13 @@ function ResearchWorkspace({
                   <ul className="space-y-1" aria-label="Research datasets">
                     {visibleDatasets.map((dataset) => {
                       const active =
-                        selected?.manifest.datasetId ===
-                        dataset.manifest.datasetId
+                        selected?.manifest.datasetId === dataset.manifest.datasetId
                       return (
                         <li key={dataset.manifest.datasetId}>
                           <button
                             type="button"
                             aria-pressed={active}
-                            onClick={() =>
-                              setSelectedId(dataset.manifest.datasetId)
-                            }
+                            onClick={() => setSelectedId(dataset.manifest.datasetId)}
                             className={`w-full rounded-lg border px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
                               active
                                 ? "border-primary/45 bg-primary/10"
@@ -443,8 +324,8 @@ function ResearchWorkspace({
                   </ul>
                 ) : (
                   <p className="p-5 text-sm leading-6 text-muted-foreground">
-                    No loaded dataset matches “{filter}”. Try a dataset name,
-                    source, schema, or generation type.
+                    No loaded dataset matches “{filter}”. Try another name, evidence source,
+                    schema, or generation type.
                   </p>
                 )}
               </div>
@@ -473,15 +354,11 @@ function ResearchWorkspace({
               <ResearchActivity
                 jobs={jobs.data ?? []}
                 loading={jobs.isPending}
-                error={jobs.isError ? messageFrom(jobs.error) : null}
+                failed={jobs.isError}
                 pendingJobId={
-                  jobMutation.isPending
-                    ? jobMutation.variables.request.jobId
-                    : null
+                  jobMutation.isPending ? jobMutation.variables.request.jobId : null
                 }
-                mutationError={
-                  jobMutation.isError ? messageFrom(jobMutation.error) : null
-                }
+                mutationFailed={jobMutation.isError}
                 act={(job, action) =>
                   jobMutation.mutate({
                     request: {
@@ -504,16 +381,16 @@ function ResearchWorkspace({
 function ResearchActivity({
   jobs,
   loading,
-  error,
+  failed,
   pendingJobId,
-  mutationError,
+  mutationFailed,
   act,
 }: {
   jobs: ResearchJob[]
   loading: boolean
-  error: string | null
+  failed: boolean
   pendingJobId: string | null
-  mutationError: string | null
+  mutationFailed: boolean
   act: (job: ResearchJob, action: "cancel" | "retry") => void
 }) {
   return (
@@ -529,8 +406,10 @@ function ResearchActivity({
       </div>
       {loading ? (
         <Skeleton className="mt-4 h-20 rounded-lg" />
-      ) : error ? (
-        <p className="mt-4 text-xs leading-5 text-destructive">{error}</p>
+      ) : failed ? (
+        <p className="mt-4 text-xs leading-5 text-destructive">
+          Current research activity could not be loaded.
+        </p>
       ) : jobs.length ? (
         <ul className="mt-4 space-y-2">
           {jobs.slice(0, 5).map((job) => (
@@ -539,12 +418,7 @@ function ResearchActivity({
               className="rounded-lg border border-border bg-background/40 p-3"
             >
               <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="truncate text-xs font-medium">{jobLabel(job.kind)}</p>
-                  <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-                    {job.jobId.slice(0, 12)} · generation {job.generation}
-                  </p>
-                </div>
+                <p className="truncate text-xs font-medium">{jobLabel(job.kind)}</p>
                 <EvidenceBadge>{humanize(job.state)}</EvidenceBadge>
               </div>
               {job.totalUnits !== null && job.completedUnits !== null ? (
@@ -559,7 +433,6 @@ function ResearchActivity({
                   </div>
                   <p className="mt-1 text-[10px] text-muted-foreground">
                     {formatCount(job.completedUnits)} of {formatCount(job.totalUnits)}
-                    {job.phase ? ` · ${humanize(job.phase)}` : ""}
                   </p>
                 </div>
               ) : null}
@@ -573,11 +446,13 @@ function ResearchActivity({
         </ul>
       ) : (
         <p className="mt-4 text-xs leading-5 text-muted-foreground">
-          No research ingestion, dataset build, or export job is currently retained.
+          No research ingestion, dataset preparation, or export is currently running.
         </p>
       )}
-      {mutationError ? (
-        <p className="mt-3 text-xs leading-5 text-destructive">{mutationError}</p>
+      {mutationFailed ? (
+        <p className="mt-3 text-xs leading-5 text-destructive">
+          That activity could not be changed. Refresh and try again.
+        </p>
       ) : null}
     </section>
   )
@@ -601,11 +476,15 @@ function JobAction({
         disabled={pending}
         onClick={() => act(job, "retry")}
       >
-        Retry from retained input
+        Retry
       </Button>
     )
   }
-  if (["queued", "preparing", "running", "awaiting_confirmation", "recovering"].includes(job.state)) {
+  if (
+    ["queued", "preparing", "running", "awaiting_confirmation", "recovering"].includes(
+      job.state,
+    )
+  ) {
     return (
       <Button
         className="mt-3"
@@ -614,7 +493,7 @@ function JobAction({
         disabled={pending}
         onClick={() => act(job, "cancel")}
       >
-        Cancel job
+        Cancel
       </Button>
     )
   }
@@ -627,11 +506,11 @@ function EmptyResearch() {
       <Database className="mx-auto size-7 text-primary" aria-hidden="true" />
       <h2 className="mt-4 text-lg font-semibold">No analytical datasets yet</h2>
       <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-muted-foreground">
-        Connect and verify a research source first. Market Squawk will show a
-        dataset here only after its immutable generation is durably published.
+        Connect and verify the information sources you need. A dataset appears here only after a
+        complete immutable generation is available for research.
       </p>
       <Button asChild className="mt-5">
-        <Link to="/connections/sources">Review research sources</Link>
+        <Link to="/connections/sources">Manage connections</Link>
       </Button>
     </section>
   )
@@ -641,22 +520,23 @@ function UnavailableResearch() {
   return (
     <Alert>
       <AlertCircle aria-hidden="true" />
-      <AlertTitle>Research service is not ready</AlertTitle>
+      <AlertTitle>Research is not ready</AlertTitle>
       <AlertDescription>
-        Restore the installed Research service from Home before opening
-        local analytical datasets.
+        Finish local setup from Home before preparing or inspecting research data.
       </AlertDescription>
     </Alert>
   )
 }
 
-function DatasetError({ message, retry }: { message: string; retry: () => void }) {
+function DatasetError({ retry }: { retry: () => void }) {
   return (
     <div className="mt-6">
       <Alert variant="destructive">
         <AlertCircle aria-hidden="true" />
-        <AlertTitle>Datasets could not be loaded</AlertTitle>
-        <AlertDescription>{message}</AlertDescription>
+        <AlertTitle>Research datasets could not be loaded</AlertTitle>
+        <AlertDescription>
+          No partial result is shown. Refresh the current research library to try again.
+        </AlertDescription>
       </Alert>
       <Button className="mt-4" variant="outline" onClick={retry}>
         Try again
@@ -743,108 +623,13 @@ function humanize(value: string) {
 }
 
 function jobLabel(kind: string) {
-  if (kind === "research.ingest-source.v1") return "Ingest research source"
+  if (kind === "research.ingest-source.v1") return "Load research information"
   if (kind === "research.phase-one-derived-generation-job.v1") {
-    return "Build phase-one derived generation"
+    return "Prepare derived research data"
   }
   if (kind === "analysis.phase-one-feature-derived-generation-job.v1") {
-    return "Build phase-one feature generation"
+    return "Prepare model features"
   }
   if (kind === "research.dataset-export.v1") return "Export research history"
   return humanize(kind.replace(/^research\./, "").replace(/\.v\d+$/, ""))
-}
-
-function messageFrom(error: unknown) {
-  return error instanceof Error
-    ? error.message
-    : "Market Squawk could not complete this local research request."
-}
-
-function macroSourceReadiness(
-  available: boolean,
-  pending: boolean,
-  failed: boolean,
-  source: SourceEvidence | undefined,
-): MacroDashboardSourceReadiness | null {
-  if (!available) return null
-  if (pending) {
-    return {
-      state: "unknown",
-      label: "Checking",
-      detail:
-        "Current provider acquisition readiness is being checked separately from stored data.",
-      lifecycleObservedAt: null,
-      runtimeObservedAt: null,
-    }
-  }
-  if (failed) {
-    return {
-      state: "unavailable",
-      label: "Readiness unavailable",
-      detail:
-        "Current provider acquisition readiness could not be read; the stored publication remains queryable.",
-      lifecycleObservedAt: null,
-      runtimeObservedAt: null,
-    }
-  }
-  if (!source?.operationalState) {
-    return {
-      state: "unknown",
-      label: "Not reported",
-      detail:
-        "The source status response did not contain a safely recognized acquisition state.",
-      lifecycleObservedAt: source?.lifecycle?.observedAt ?? null,
-      runtimeObservedAt: source?.runtimeObservedAt ?? null,
-    }
-  }
-
-  switch (source.operationalState) {
-    case "active":
-      return {
-        state: "active",
-        label: "Active",
-        detail:
-          "Provider acquisition is active; stored publication readiness remains independently evidenced.",
-        lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
-        runtimeObservedAt: source.runtimeObservedAt,
-      }
-    case "stopped":
-    case "removed":
-      return {
-        state: "inactive",
-        label: "Inactive",
-        detail:
-          "Provider acquisition is inactive; the retained publication is still stored and queryable.",
-        lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
-        runtimeObservedAt: source.runtimeObservedAt,
-      }
-    case "blocked":
-      return {
-        state: "blocked",
-        label: "Blocked",
-        detail:
-          "Provider acquisition requires attention; the retained publication is still stored and queryable.",
-        lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
-        runtimeObservedAt: source.runtimeObservedAt,
-      }
-    case "unavailable":
-    case "failed":
-      return {
-        state: "unavailable",
-        label: "Unavailable",
-        detail:
-          "Provider acquisition is unavailable; the retained publication is still stored and queryable.",
-        lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
-        runtimeObservedAt: source.runtimeObservedAt,
-      }
-    default:
-      return {
-        state: "unknown",
-        label: humanize(source.operationalState),
-        detail:
-          "Provider acquisition is changing or unrecognized; stored publication readiness remains independent.",
-        lifecycleObservedAt: source.lifecycle?.observedAt ?? null,
-        runtimeObservedAt: source.runtimeObservedAt,
-      }
-  }
 }
