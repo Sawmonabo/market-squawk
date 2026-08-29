@@ -73,27 +73,27 @@ export function AssumptionsEditor({
   onChange: (assumptions: TargetAssumptionDraft[]) => void
 }) {
   const evidenceChoices = [
-    { value: "dossier", label: "Complete retained dossier" },
+    { value: "dossier", label: "Complete candidate dossier" },
     ...dossier.references.map((reference, index) => ({
       value: `dossier_reference:${index}`,
       label: `Dossier reference ${index + 1}: ${humanize(reference.section)}`,
     })),
-    ...(forecastSelected ? [{ value: "forecast", label: "Selected forecast evidence" }] : []),
+    ...(forecastSelected ? [{ value: "forecast", label: "Selected forecast analysis" }] : []),
     ...(preparation.fairValueAvailable && fairValueSelected
-      ? [{ value: "fair_value", label: "Selected fair-value evidence" }]
+      ? [{ value: "fair_value", label: "Selected fair-value analysis" }]
       : []),
     ...(preparation.portfolioAvailable && portfolioSelected
-      ? [{ value: "portfolio", label: "Selected portfolio evidence" }]
+      ? [{ value: "portfolio", label: "Selected portfolio analysis" }]
       : []),
-    { value: "reference_mark", label: "Selected observed reference mark" },
+    { value: "reference_mark", label: "Selected observed price" },
   ]
   return (
     <fieldset>
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <legend className="text-sm font-semibold">Evidence-bound assumptions</legend>
+          <legend className="text-sm font-semibold">Assumptions and support</legend>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            State each assumption and select the exact retained evidence that supports it.
+            State each assumption and choose the analysis or observation that supports it.
           </p>
         </div>
         <Button
@@ -128,7 +128,7 @@ export function AssumptionsEditor({
                 }
               />
             </Field>
-            <Field label="Supporting evidence" htmlFor={`target-assumption-evidence-${index}`}>
+            <Field label="Supporting analysis" htmlFor={`target-assumption-evidence-${index}`}>
               <select
                 id={`target-assumption-evidence-${index}`}
                 className={SELECT_CLASS}

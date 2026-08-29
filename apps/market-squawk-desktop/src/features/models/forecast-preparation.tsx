@@ -10,7 +10,6 @@ import {
   ShieldCheck,
 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -150,9 +149,8 @@ export function ForecastPreparation({
           </p>
           <h2 className="mt-2 text-xl font-semibold">Prepare a statistical forecast</h2>
           <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-            Choose only admitted models and compatible research evidence. The installed service
-            derives the observed series and exact feature matrix, then retains one immutable
-            request behind an expiring one-use receipt.
+            Choose a reviewed model, investment, time horizon, and historical cutoff. Check the
+            limitations and uncertainty before starting.
           </p>
         </div>
         <BrainCircuit className="size-5 text-primary" aria-hidden="true" />
@@ -163,22 +161,20 @@ export function ForecastPreparation({
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Guided forecast preparation is unavailable</AlertTitle>
           <AlertDescription>
-            This service generation must expose the preparation catalog, evidence preview, and
-            receipt-bound durable start operations together. A raw forecast request is never used
-            as a fallback.
+            Forecast preparation is not available in this workspace.
           </AlertDescription>
         </Alert>
       ) : optionsQuery.isPending ? (
         <Status text="Loading admitted models and compatible evidence…" />
       ) : optionsQuery.isError ? (
-        <Status text={messageFrom(optionsQuery.error)} tone="error" />
+        <Status text="Forecast choices are unavailable right now." tone="error" />
       ) : optionsQuery.data.models.length === 0 ? (
         <Alert className="mt-4">
           <Database aria-hidden="true" />
           <AlertTitle>No forecast-ready evidence is available</AlertTitle>
           <AlertDescription>
-            An admitted forecast model must have an exact compatible point-in-time feature
-            dataset and qualified instrument history before it appears here.
+            A reviewed model needs enough compatible historical information before it can produce
+            a forecast.
           </AlertDescription>
         </Alert>
       ) : draft && context ? (
@@ -197,9 +193,7 @@ export function ForecastPreparation({
           />
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-background/25 p-3">
             <p className="max-w-3xl text-[11px] leading-5 text-muted-foreground">
-              No price history, feature values, dataset paths, SQL, source identity, or evidence
-              digest is entered here. Preparation is read from the authoritative dataset at its
-              recorded availability cutoff.
+              Review the model, investment, horizon, and historical cutoff before continuing.
             </p>
             <Button
               disabled={!ready || previewMutation.isPending}
@@ -208,15 +202,15 @@ export function ForecastPreparation({
               }}
             >
               <ShieldCheck aria-hidden="true" />
-              {previewMutation.isPending ? "Preparing evidence…" : "Review forecast evidence"}
+              {previewMutation.isPending ? "Preparing…" : "Review forecast"}
             </Button>
           </div>
           {previewMutation.isError ? (
-            <Status text={messageFrom(previewMutation.error)} tone="error" />
+            <Status text="This forecast could not be prepared. Review the choices and try again." tone="error" />
           ) : null}
           {queuedJobId ? (
             <Status
-              text={`Forecast queued as durable job ${queuedJobId}. Progress appears below.`}
+              text={`Forecast queued as job ${queuedJobId}. Progress appears below.`}
               tone="success"
             />
           ) : null}
@@ -234,12 +228,12 @@ export function ForecastPreparation({
             <DialogTitle>Start this exact forecast?</DialogTitle>
             <DialogDescription>
               Review the model purpose, evidence cutoff, limitations, and fallback before the
-              one-use receipt is consumed to queue durable work.
+              forecast begins.
             </DialogDescription>
           </DialogHeader>
           {preview ? <ForecastPreviewEvidence prepared={preview} /> : null}
           {startMutation.isError ? (
-            <Status text={messageFrom(startMutation.error)} tone="error" />
+            <Status text="The forecast could not be started. Review it and try again." tone="error" />
           ) : null}
           <DialogFooter>
             <Button
@@ -256,7 +250,7 @@ export function ForecastPreparation({
               }}
             >
               <Play aria-hidden="true" />
-              {startMutation.isPending ? "Starting durable job…" : "Confirm and start forecast"}
+              {startMutation.isPending ? "Starting…" : "Confirm and start forecast"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -313,7 +307,7 @@ function PreparationFields({
           ))}
         </select>
       </Field>
-      <Field label="Point-in-time dataset" htmlFor="forecast-dataset">
+      <Field label="Historical information" htmlFor="forecast-dataset">
         <select
           id="forecast-dataset"
           className={CONTROL_CLASS}
@@ -328,7 +322,7 @@ function PreparationFields({
         >
           {context.model.datasets.map((dataset) => (
             <option key={datasetKey(dataset)} value={datasetKey(dataset)}>
-              {dataset.label} · generation {dataset.manifest.manifestVersion}
+              {dataset.label}
             </option>
           ))}
         </select>
@@ -455,7 +449,7 @@ function ForecastPreviewEvidence({ prepared }: { prepared: ForecastPreparationPr
         <p className="mt-2 text-sm leading-6">{preview.model.intendedUse}</p>
         <p className="mt-2 text-xs leading-5 text-muted-foreground">
           If inference cannot produce a valid result: {preview.model.fallbackReason}. Modeled output
-          grants no order or execution authority.
+          cannot place a trade.
         </p>
       </div>
       <dl className="grid gap-3 sm:grid-cols-2">
@@ -479,18 +473,14 @@ function ForecastPreviewEvidence({ prepared }: { prepared: ForecastPreparationPr
         )}
       </div>
       <div className="grid gap-2 text-[10px] text-muted-foreground sm:grid-cols-2">
-        <EvidenceIdentity label="Evidence" value={preview.evidenceSha256} />
-        <EvidenceIdentity label="Exact request" value={preview.requestSha256} />
-        <EvidenceIdentity label="Model generation" value={preview.runtimeGenerationSha256} />
         <div className="rounded-lg border border-border p-2.5">
-          <p className="uppercase tracking-wider">Receipt expires</p>
+          <p className="uppercase tracking-wider">Review expires</p>
           <p className="mt-1 text-foreground">{formatTimestamp(receipt.expiresAtUnixNanos)}</p>
         </div>
       </div>
       <p className="flex gap-2 text-xs leading-5 text-muted-foreground">
         <CalendarClock className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-        Confirmation consumes this receipt once. The service rechecks the workspace, admitted
-        model, dataset generation, and evidence digest before the durable job can be queued.
+        If this review expires, prepare it again before starting the forecast.
       </p>
     </div>
   )
@@ -648,15 +638,6 @@ function Field({
       <span>{label}</span>
       {children}
     </label>
-  )
-}
-
-function EvidenceIdentity({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-lg border border-border p-2.5">
-      <p className="uppercase tracking-wider">{label}</p>
-      <p className="mt-1 font-mono text-foreground">{short(value)}</p>
-    </div>
   )
 }
 

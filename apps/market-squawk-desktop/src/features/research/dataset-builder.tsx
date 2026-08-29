@@ -10,7 +10,6 @@ import {
   Split,
 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -22,8 +21,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { friendlyResearchCollectionName } from "@/lib/formatters"
 import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
-import { humanize } from "@/lib/formatters"
 import { formatTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -64,7 +63,7 @@ export function DatasetBuilder({
     React.useState<DatasetPreparationSelection | null>(null)
   const [preview, setPreview] =
     React.useState<DatasetPreparationPreview | null>(null)
-  const [queuedJobId, setQueuedJobId] = React.useState<string | null>(null)
+  const [started, setStarted] = React.useState(false)
   const optionsQuery = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
@@ -109,8 +108,8 @@ export function DatasetBuilder({
         ),
       )
     },
-    onSuccess: async (receipt) => {
-      setQueuedJobId(receipt.jobId)
+    onSuccess: async () => {
+      setStarted(true)
       setPreview(null)
       await onStarted()
     },
@@ -148,13 +147,12 @@ export function DatasetBuilder({
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
-            Point-in-time dataset builder
+            Prepare research
           </p>
-          <h2 className="mt-2 text-xl font-semibold">Prepare research or model data</h2>
+          <h2 className="mt-2 text-xl font-semibold">Prepare information for analysis</h2>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Choose from evidence the installed service can build safely now. Market Squawk fixes
-            the observation cutoff, chronological split, source rights, and immutable parent
-            generation before any durable work starts.
+            Choose the information and how you plan to use it. Market Squawk keeps dates in order
+            and separates training, review, and testing periods before work begins.
           </p>
         </div>
         <Layers3 className="size-5 text-primary" aria-hidden="true" />
@@ -163,25 +161,23 @@ export function DatasetBuilder({
       {!operationsAvailable || guidedTransport === null ? (
         <Alert className="mt-4">
           <AlertCircle aria-hidden="true" />
-          <AlertTitle>Guided dataset preparation is unavailable</AlertTitle>
+          <AlertTitle>Research preparation is unavailable</AlertTitle>
           <AlertDescription>
-            This service generation must expose the bounded choices, evidence preview, and
-            receipt-bound start operations together. The dashboard will not fall back to raw
-            registrations.
+            This installation cannot safely prepare research yet. Other Research tools remain
+            available.
           </AlertDescription>
         </Alert>
       ) : optionsQuery.isPending ? (
-        <Status text="Reading current buildable evidence…" />
+        <Status text="Finding information that is ready to use…" />
       ) : optionsQuery.isError ? (
-        <Status text={messageFrom(optionsQuery.error)} tone="error" />
+        <Status text="Available research choices could not be loaded. Try again." tone="error" />
       ) : optionsQuery.data.datasets.length === 0 ? (
         <Alert className="mt-4">
           <Database aria-hidden="true" />
-          <AlertTitle>No build-ready point-in-time series</AlertTitle>
+          <AlertTitle>No information is ready to prepare</AlertTitle>
           <AlertDescription>
-            Publish research observations and universe membership first. A choice appears only
-            when the service can derive a complete feature, label, chronological split, and
-            current source-rights fence.
+            Add research history first. A choice appears here when Market Squawk has enough dated
+            information to prepare it safely.
           </AlertDescription>
         </Alert>
       ) : selection && selectedDataset ? (
@@ -194,30 +190,30 @@ export function DatasetBuilder({
             onChange={(next) => {
               setSelection(next)
               setPreview(null)
-              setQueuedJobId(null)
+              setStarted(false)
               previewMutation.reset()
               startMutation.reset()
             }}
           />
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-background/25 p-3">
             <p className="max-w-3xl text-[11px] leading-5 text-muted-foreground">
-              You choose only a dataset and purpose. Values, labels, time cutoffs, source
-              evidence, output authority, and the build registration remain service-owned.
+              Market Squawk checks the available dates and keeps training, review, and testing
+              periods separate.
             </p>
             <Button
               disabled={previewMutation.isPending}
               onClick={() => previewMutation.mutate(selection)}
             >
               <ShieldCheck aria-hidden="true" />
-              {previewMutation.isPending ? "Preparing evidence…" : "Review build evidence"}
+              {previewMutation.isPending ? "Preparing review…" : "Review preparation"}
             </Button>
           </div>
           {previewMutation.isError ? (
-            <Status text={messageFrom(previewMutation.error)} tone="error" />
+            <Status text="This preparation could not be reviewed. Check your choices and try again." tone="error" />
           ) : null}
-          {queuedJobId ? (
+          {started ? (
             <Status
-              text={`Feature dataset queued as durable job ${queuedJobId}. Progress appears in Research activity.`}
+              text="Preparation started. You can follow it in Background activity."
               tone="success"
             />
           ) : null}
@@ -232,15 +228,19 @@ export function DatasetBuilder({
       >
         <DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-3xl">
           <DialogHeader>
-            <DialogTitle>Build this exact point-in-time dataset?</DialogTitle>
+            <DialogTitle>Prepare this information?</DialogTitle>
             <DialogDescription>
-              Review the source generation, time range, split, and every service-provided evidence
-              statement before consuming the one-use receipt.
+              Review the date range and how the examples will be divided before you continue.
             </DialogDescription>
           </DialogHeader>
-          {preview ? <DatasetPreparationReview preview={preview} /> : null}
+          {preview && selectedDataset ? (
+            <DatasetPreparationReview
+              preview={preview}
+              collectionName={friendlyCollectionName(selectedDataset)}
+            />
+          ) : null}
           {startMutation.isError ? (
-            <Status text={messageFrom(startMutation.error)} tone="error" />
+            <Status text="Preparation could not be started. Review your choices and try again." tone="error" />
           ) : null}
           <DialogFooter>
             <Button
@@ -257,7 +257,7 @@ export function DatasetBuilder({
               }}
             >
               <Play aria-hidden="true" />
-              {startMutation.isPending ? "Starting durable build…" : "Start dataset build"}
+              {startMutation.isPending ? "Starting…" : "Start preparation"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -282,7 +282,7 @@ function DatasetPreparationFields({
   return (
     <div className="grid gap-4 md:grid-cols-2">
       <label className="text-xs font-medium">
-        Available point-in-time series
+        Available research collections
         <select
           className={CONTROL_CLASS}
           value={selection.dataset}
@@ -302,7 +302,7 @@ function DatasetPreparationFields({
         >
           {options.datasets.map((dataset) => (
             <option key={dataset.id} value={dataset.id}>
-              {dataset.label} · generation {dataset.immutableGeneration}
+              {friendlyCollectionName(dataset)} · {dataset.examples.toLocaleString()} examples
             </option>
           ))}
         </select>
@@ -336,7 +336,7 @@ function DatasetPreparationFields({
           ))}
         </select>
         <span className="mt-2 block text-[11px] font-normal leading-5 text-muted-foreground">
-          Only purposes allowed by the current source evidence are shown.
+          Only purposes supported by the available data are shown.
         </span>
       </label>
     </div>
@@ -345,22 +345,27 @@ function DatasetPreparationFields({
 
 function DatasetPreparationReview({
   preview,
+  collectionName,
 }: {
   preview: DatasetPreparationPreview
+  collectionName: string
 }) {
   return (
     <div className="space-y-4 py-2">
       <div className="grid gap-3 sm:grid-cols-2">
-        <ReviewFact icon={Database} label="Dataset" value={preview.dataset} />
-        <ReviewFact icon={Layers3} label="Immutable source" value={preview.source} />
+        <ReviewFact icon={Database} label="Collection" value={collectionName} />
         <ReviewFact
           icon={ShieldCheck}
-          label="Approved purpose"
-          value={humanize(preview.intendedUse)}
+          label="Planned use"
+          value={
+            preview.intendedUse === "train"
+              ? "Train or evaluate a model"
+              : "Analyze locally"
+          }
         />
         <ReviewFact
           icon={CalendarClock}
-          label="Receipt valid until"
+          label="Review available until"
           value={formatTimestamp(preview.receipt.expiresAt)}
         />
       </div>
@@ -377,29 +382,29 @@ function DatasetPreparationReview({
           <ReviewMetric label="Testing" value={preview.testExamples} />
         </dl>
         <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
-          Observations available from {formatTimestamp(preview.observedFrom)} through{" "}
-          {formatTimestamp(preview.observedThrough)} for instrument {preview.instrumentId}.
+          Information covers {formatTimestamp(preview.observedFrom)} through{" "}
+          {formatTimestamp(preview.observedThrough)}.
         </p>
       </section>
 
       <section className="rounded-lg border border-border bg-background/35 p-4">
         <div className="flex items-center gap-2">
           <ShieldCheck className="size-4 text-primary" aria-hidden="true" />
-          <h3 className="text-sm font-semibold">Evidence checked by the service</h3>
+          <h3 className="text-sm font-semibold">Checks completed</h3>
         </div>
-        <ul className="mt-3 space-y-2">
-          {preview.evidence.map((statement) => (
-            <li
-              key={statement}
-              className="rounded-md border border-border/70 bg-card/35 p-3 text-xs leading-5"
-            >
-              {statement}
-            </li>
-          ))}
+        <ul className="mt-3 grid gap-2 sm:grid-cols-3">
+          <li className="rounded-md border border-border/70 bg-card/35 p-3 text-xs leading-5">
+            Dates are in order
+          </li>
+          <li className="rounded-md border border-border/70 bg-card/35 p-3 text-xs leading-5">
+            Periods do not overlap
+          </li>
+          <li className="rounded-md border border-border/70 bg-card/35 p-3 text-xs leading-5">
+            Information is currently available
+          </li>
         </ul>
         <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
-          The exact build specification is sealed by the installed service and checked again when
-          this receipt is consumed.
+          These checks are repeated when preparation starts.
         </p>
       </section>
     </div>
@@ -490,4 +495,8 @@ function defaultSelection(
     dataset: dataset.id,
     intendedUse,
   }
+}
+
+function friendlyCollectionName(dataset: DatasetPreparationOption) {
+  return friendlyResearchCollectionName(`${dataset.id} ${dataset.label}`)
 }

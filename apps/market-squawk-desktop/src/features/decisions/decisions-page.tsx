@@ -106,7 +106,7 @@ function ReadyDecisions({
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
               <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
-                Evidence-bound research judgment
+                Guided research judgment
               </p>
               <h2 className="mt-1 text-lg font-semibold">Manual screens and targets</h2>
             </div>
@@ -131,10 +131,10 @@ function ReadyDecisions({
           {!manualAnalysisAvailable ? (
             <Alert className="mt-6">
               <AlertCircle aria-hidden="true" />
-              <AlertTitle>Manual decision records are not exposed</AlertTitle>
+              <AlertTitle>Manual analysis is unavailable</AlertTitle>
               <AlertDescription>
-                This installed service does not advertise the closed saved-screen read contract.
-                Update or repair the installation before using the advanced manual workspace.
+                This installation cannot open saved screens yet. Update or repair Market Squawk
+                before using the advanced manual workspace.
               </AlertDescription>
             </Alert>
           ) : screens.isPending ? (

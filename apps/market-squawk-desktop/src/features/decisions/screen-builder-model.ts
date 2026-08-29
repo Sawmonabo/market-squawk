@@ -1,4 +1,4 @@
-import { humanize } from "@/lib/formatters"
+import { friendlyResearchCollectionName, humanize } from "@/lib/formatters"
 import { dataQualities, type DataQuality } from "@/lib/quality"
 
 import {
@@ -72,6 +72,10 @@ export function bindingFor(contract: FeatureContractView) {
 
 export function datasetKeyFor(dataset: FeatureDatasetView): string {
   return `${dataset.manifest.dataset}:${dataset.manifest.contentHash}`
+}
+
+export function featureDatasetLabel(dataset: FeatureDatasetView): string {
+  return friendlyResearchCollectionName(dataset.manifest.schema.name)
 }
 
 export function screenKey(screen: SavedScreenView): string {

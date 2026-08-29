@@ -38,23 +38,10 @@ export const decisionOverviewSchema = z.object({
   ),
 })
 
-export const sourceHealthSchema = z
-  .array(
-    z
-      .object({
-        surfaceId: z.string(),
-        onboardingState: z.string().nullable(),
-        runtimeHealth: z.record(z.string(), z.unknown()),
-      })
-      .loose(),
-  )
-  .nullable()
-
 export const marketSnapshotSchema = z
   .array(
     z
       .object({
-        sourceId: z.string(),
         venueId: z.string(),
         instrumentId: z.string(),
         phase: z.string(),
@@ -89,4 +76,3 @@ export type DecisionOverview = z.infer<typeof decisionOverviewSchema>
 export type MarketSnapshot = z.infer<typeof marketSnapshotSchema>
 export type OverviewJob = z.infer<typeof overviewJobSchema>
 export type PaperStatus = z.infer<typeof paperStatusSchema>
-export type SourceHealth = z.infer<typeof sourceHealthSchema>

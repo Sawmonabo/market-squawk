@@ -22,12 +22,12 @@ export function ModelJobActivity({
         <div>
           <h2 className="text-sm font-semibold">Durable model activity</h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            Recent training, evaluation, and forecast jobs from the installed job authority.
+            Recent training, evaluation, and forecast activity.
           </p>
         </div>
       </div>
       {!available ? (
-        <Message text="Job.List is not registered by this service generation." />
+        <Message text="Model activity is unavailable in this workspace." />
       ) : loading ? (
         <Message text="Loading model jobs…" />
       ) : error ? (
@@ -54,7 +54,7 @@ export function ModelJobActivity({
                     <div className="min-w-0">
                       <p className="truncate text-xs font-medium">{humanize(job.kind)}</p>
                       <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-                        {job.jobId} · generation {job.generation}
+                        Job {job.jobId}
                       </p>
                     </div>
                   </div>
@@ -87,7 +87,7 @@ export function ModelJobActivity({
       )}
       <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
         Cancellation, retry, and exact confirmation remain centralized in Operations, where the
-        latest generation and sequence are revalidated before mutation.
+        the latest job state is checked before the change is applied.
       </p>
     </section>
   )

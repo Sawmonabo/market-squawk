@@ -15,24 +15,30 @@ export const lookupCategories = [
 
 export type LookupCategory = (typeof lookupCategories)[number]
 
+export const productLookupCategories = [
+  "company",
+  "dataset",
+  "instrument",
+  "model",
+  "portfolio",
+  "screen",
+  "target",
+] as const satisfies readonly LookupCategory[]
+
+export type ProductLookupCategory = (typeof productLookupCategories)[number]
+
 export const instrumentLookupDetailSchema = z.object({
   displayName: z.string(),
   companyName: z.string().nullable(),
   assetClass: z.string(),
   tradingStatus: z.string(),
   quoteCurrency: z.string(),
-  definitionRevision: z.number(),
-  definitionObservedAt: z.unknown(),
-  venueMappings: z.array(z.record(z.string(), z.unknown())),
   matchReasons: z.array(
     z.object({
-      kind: z.string(),
       label: z.string(),
       value: z.string(),
       venueId: z.string().optional(),
-      sourceId: z.string().optional(),
       current: z.boolean(),
-      evidence: z.record(z.string(), z.unknown()),
     }),
   ).max(8),
   matchReasonsTruncated: z.boolean(),
@@ -45,9 +51,6 @@ const lookupDestinationSchema = z.discriminatedUnion("kind", [
   }),
   z.object({
     kind: z.literal("research_company"),
-    sourceId: z.string(),
-    providerCompanyId: z.string(),
-    surface: z.string(),
   }),
 ])
 

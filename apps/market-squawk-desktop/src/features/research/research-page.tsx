@@ -9,7 +9,6 @@ import {
   Activity,
   AlertCircle,
   Database,
-  HardDrive,
   RefreshCw,
   Rows3,
   Search,
@@ -22,12 +21,12 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
+import { friendlyResearchCollectionName } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { JobControlRequest, ProductTransport } from "@/lib/transport"
 
 import { DatasetBuilder } from "./dataset-builder"
 import { DatasetEvidence } from "./dataset-evidence"
-import { ResearchIngestion } from "./research-ingestion"
 import {
   parseResearchDatasetPage,
   parseResearchJobs,
@@ -126,12 +125,9 @@ function ResearchWorkspace({
   const normalizedFilter = filter.trim().toLocaleLowerCase()
   const visibleDatasets = normalizedFilter
     ? allDatasets.filter((dataset) =>
-        [
-          dataset.manifest.datasetId,
-          dataset.sourceId,
-          dataset.manifest.schema.name,
-          dataset.generationKind,
-        ].some((value) => value.toLocaleLowerCase().includes(normalizedFilter)),
+        friendlyResearchCollectionName(dataset.manifest.schema.name)
+          .toLocaleLowerCase()
+          .includes(normalizedFilter),
       )
     : allDatasets
   const selected =
@@ -142,10 +138,6 @@ function ResearchWorkspace({
     null
   const totalRows = allDatasets.reduce(
     (total, dataset) => total + dataset.rowCount,
-    0,
-  )
-  const totalBytes = allDatasets.reduce(
-    (total, dataset) => total + dataset.totalBytes,
     0,
   )
   const activeJobs = (jobs.data ?? []).filter((job) =>
@@ -164,9 +156,9 @@ function ResearchWorkspace({
           </p>
           <h1 className="mt-2 text-3xl font-semibold tracking-tight">Research</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Prepare point-in-time evidence, inspect immutable datasets and lineage, and follow
-            durable research work. Market Squawk keeps source acquisition separate from the
-            shared data used by models, forecasts, valuation, and backtests.
+            Prepare dated information, review its history and limitations, and use it in analysis
+            or model work. Connections manages where information comes from; Operations &amp; Jobs
+            shows technical activity.
           </p>
         </div>
         <Button
@@ -184,14 +176,6 @@ function ResearchWorkspace({
           Refresh
         </Button>
       </header>
-
-      <ResearchIngestion
-        bootstrap={bootstrap}
-        transport={transport}
-        onStarted={() => {
-          void queryClient.invalidateQueries({ queryKey: jobKey })
-        }}
-      />
 
       <DatasetBuilder
         bootstrap={bootstrap}
@@ -237,26 +221,21 @@ function ResearchWorkspace({
         <>
           <section
             aria-label="Loaded research facts"
-            className="mt-5 grid overflow-hidden rounded-xl border border-border bg-card/50 sm:grid-cols-2 xl:grid-cols-4"
+            className="mt-5 grid overflow-hidden rounded-xl border border-border bg-card/50 sm:grid-cols-3"
           >
             <ResearchFact
               icon={Database}
-              label="Loaded generations"
+              label="Available collections"
               value={formatCount(allDatasets.length)}
             />
             <ResearchFact
               icon={Rows3}
-              label="Rows represented"
+              label="Research observations"
               value={formatCount(totalRows)}
             />
             <ResearchFact
-              icon={HardDrive}
-              label="Immutable storage"
-              value={formatBytes(totalBytes)}
-            />
-            <ResearchFact
               icon={Activity}
-              label="Active research jobs"
+              label="Work in progress"
               value={
                 jobs.isError
                   ? "Unavailable"
@@ -274,7 +253,7 @@ function ResearchWorkspace({
                   htmlFor="research-dataset-filter"
                   className="text-xs font-semibold"
                 >
-                  Find a dataset
+                  Find a collection
                 </label>
                 <div className="relative mt-2">
                   <Search
@@ -285,14 +264,14 @@ function ResearchWorkspace({
                     id="research-dataset-filter"
                     value={filter}
                     onChange={(event) => setFilter(event.target.value)}
-                    placeholder="Name, evidence source, schema, or generation"
+                    placeholder="Name of the information"
                     className="pl-9"
                   />
                 </div>
               </div>
               <div className="max-h-[620px] overflow-y-auto p-2">
                 {visibleDatasets.length ? (
-                  <ul className="space-y-1" aria-label="Research datasets">
+                  <ul className="space-y-1" aria-label="Research collections">
                     {visibleDatasets.map((dataset) => {
                       const active =
                         selected?.manifest.datasetId === dataset.manifest.datasetId
@@ -309,13 +288,10 @@ function ResearchWorkspace({
                             }`}
                           >
                             <span className="block truncate text-sm font-medium">
-                              {dataset.manifest.datasetId}
+                              {friendlyResearchCollectionName(dataset.manifest.schema.name)}
                             </span>
-                            <span className="mt-1 flex items-center justify-between gap-3 text-[11px] text-muted-foreground">
-                              <span className="truncate">{dataset.sourceId}</span>
-                              <span className="shrink-0 font-mono">
-                                v{dataset.manifest.manifestVersion}
-                              </span>
+                            <span className="mt-1 block truncate text-[11px] text-muted-foreground">
+                              {formatCount(dataset.rowCount)} observations
                             </span>
                           </button>
                         </li>
@@ -324,8 +300,7 @@ function ResearchWorkspace({
                   </ul>
                 ) : (
                   <p className="p-5 text-sm leading-6 text-muted-foreground">
-                    No loaded dataset matches “{filter}”. Try another name, evidence source,
-                    schema, or generation type.
+                    No collection matches “{filter}”. Try another description.
                   </p>
                 )}
               </div>
@@ -337,7 +312,7 @@ function ResearchWorkspace({
                     onClick={() => void datasets.fetchNextPage()}
                     disabled={datasets.isFetchingNextPage}
                   >
-                    {datasets.isFetchingNextPage ? "Loading…" : "Load more datasets"}
+                    {datasets.isFetchingNextPage ? "Loading…" : "Load more collections"}
                   </Button>
                 </div>
               ) : null}
@@ -395,14 +370,19 @@ function ResearchActivity({
 }) {
   return (
     <section className="rounded-xl border border-border bg-card/35 p-5">
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
         <Activity className="size-4 text-primary" aria-hidden="true" />
         <div>
-          <h2 className="text-sm font-semibold">Research activity</h2>
+          <h2 className="text-sm font-semibold">Background activity</h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            Durable work continues if this window closes.
+            Longer tasks continue if this window closes.
           </p>
         </div>
+        </div>
+        <Button asChild size="xs" variant="outline">
+          <Link to="/system/operations-jobs">See all activity</Link>
+        </Button>
       </div>
       {loading ? (
         <Skeleton className="mt-4 h-20 rounded-lg" />
@@ -419,7 +399,7 @@ function ResearchActivity({
             >
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <p className="truncate text-xs font-medium">{jobLabel(job.kind)}</p>
-                <EvidenceBadge>{humanize(job.state)}</EvidenceBadge>
+                <EvidenceBadge>{activityStateLabel(job.state)}</EvidenceBadge>
               </div>
               {job.totalUnits !== null && job.completedUnits !== null ? (
                 <div className="mt-3">
@@ -446,7 +426,7 @@ function ResearchActivity({
         </ul>
       ) : (
         <p className="mt-4 text-xs leading-5 text-muted-foreground">
-          No research ingestion, dataset preparation, or export is currently running.
+          Nothing is running right now.
         </p>
       )}
       {mutationFailed ? (
@@ -504,10 +484,10 @@ function EmptyResearch() {
   return (
     <section className="mt-6 rounded-xl border border-dashed border-border bg-card/30 p-8 text-center">
       <Database className="mx-auto size-7 text-primary" aria-hidden="true" />
-      <h2 className="mt-4 text-lg font-semibold">No analytical datasets yet</h2>
+      <h2 className="mt-4 text-lg font-semibold">No research collections yet</h2>
       <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-muted-foreground">
-        Connect and verify the information sources you need. A dataset appears here only after a
-        complete immutable generation is available for research.
+        Add the information you want from Connections. Completed research will appear here when it
+        is ready to use.
       </p>
       <Button asChild className="mt-5">
         <Link to="/connections/sources">Manage connections</Link>
@@ -533,9 +513,9 @@ function DatasetError({ retry }: { retry: () => void }) {
     <div className="mt-6">
       <Alert variant="destructive">
         <AlertCircle aria-hidden="true" />
-        <AlertTitle>Research datasets could not be loaded</AlertTitle>
+        <AlertTitle>Research information could not be loaded</AlertTitle>
         <AlertDescription>
-          No partial result is shown. Refresh the current research library to try again.
+          Refresh the research library to try again.
         </AlertDescription>
       </Alert>
       <Button className="mt-4" variant="outline" onClick={retry}>
@@ -590,7 +570,7 @@ function ResearchLoading() {
 
 function ResearchContentLoading() {
   return (
-    <div className="mt-6 space-y-4" aria-label="Loading research datasets">
+    <div className="mt-6 space-y-4" aria-label="Loading research information">
       <Skeleton className="h-20 rounded-xl" />
       <div className="grid gap-4 xl:grid-cols-[minmax(280px,0.78fr)_minmax(0,1.42fr)]">
         <Skeleton className="h-[560px] rounded-xl" />
@@ -604,24 +584,6 @@ function formatCount(value: number) {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value)
 }
 
-function formatBytes(value: number) {
-  if (value < 1_024) return `${value} B`
-  const units = ["KiB", "MiB", "GiB", "TiB"]
-  let amount = value
-  let unit = -1
-  do {
-    amount /= 1_024
-    unit += 1
-  } while (amount >= 1_024 && unit < units.length - 1)
-  return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${units[unit]}`
-}
-
-function humanize(value: string) {
-  return value
-    .replaceAll("_", " ")
-    .replace(/\b\w/g, (character) => character.toUpperCase())
-}
-
 function jobLabel(kind: string) {
   if (kind === "research.ingest-source.v1") return "Load research information"
   if (kind === "research.phase-one-derived-generation-job.v1") {
@@ -631,5 +593,16 @@ function jobLabel(kind: string) {
     return "Prepare model features"
   }
   if (kind === "research.dataset-export.v1") return "Export research history"
-  return humanize(kind.replace(/^research\./, "").replace(/\.v\d+$/, ""))
+  return "Research activity"
+}
+
+function activityStateLabel(state: string) {
+  if (["queued", "preparing", "recovering"].includes(state)) return "Getting ready"
+  if (state === "running") return "In progress"
+  if (state === "awaiting_confirmation") return "Needs review"
+  if (state === "cancelling") return "Stopping"
+  if (state === "completed") return "Complete"
+  if (["failed", "interrupted"].includes(state)) return "Needs attention"
+  if (state === "cancelled") return "Stopped"
+  return "Status unavailable"
 }

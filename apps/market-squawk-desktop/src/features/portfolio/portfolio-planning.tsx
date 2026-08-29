@@ -6,7 +6,7 @@ import { messageFrom } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { formatMoney } from "@/lib/formatters"
+import { formatMoney, humanize } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -50,8 +50,7 @@ export function PortfolioPlanning({
         </p>
         <h2 className="mt-2 text-lg font-semibold">Portfolio planning</h2>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          Compare an exact position quantity or create a bounded rebalance proposal. The service
-          selects the configured account and current evidence; these tools cannot submit orders.
+          Compare a position quantity or create a rebalance plan. These tools cannot submit orders.
         </p>
       </header>
       <div className="mt-5 grid gap-4 xl:grid-cols-2">
@@ -152,11 +151,11 @@ function CandidatePlanner({
         <h3 className="text-sm font-semibold">Compare a position quantity</h3>
       </div>
       <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
-        Choose a holding or enter an instrument ID for a new position. Market marks, terms, account,
-        and portfolio revision are resolved by the service from current evidence.
+        Choose a holding or enter an asset ID for a new position. Current price, terms, and account
+        details are used for the comparison.
       </p>
       {!available ? (
-        <Unavailable text="Candidate-impact analysis is not registered." />
+        <Unavailable text="Position impact analysis is unavailable right now." />
       ) : (
         <>
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
@@ -191,7 +190,7 @@ function CandidatePlanner({
               <span className="text-[10px] text-muted-foreground">
                 {selected
                   ? `Current ${selected.quantity} · lot ${selected.lot_size}`
-                  : "Exact lot alignment is checked by the service."}
+                  : "Lot-size alignment is checked before the comparison."}
               </span>
             </label>
             <label htmlFor="portfolio-candidate-shock" className="grid gap-1.5 text-xs">
@@ -223,15 +222,14 @@ function CandidatePlanner({
 function CandidateResult({ result }: { result: PortfolioCandidateImpact }) {
   const unavailable = [
     ["Portfolio-wide current marks", result.availability.portfolioWideSelectedMarks],
-    ["Selected-source liquidity", result.availability.liquidity],
+    ["Liquidity information", result.availability.liquidity],
     ["Settlement-backed sizing", result.availability.settlementBackedSizing],
     ["Factor classification", result.availability.factorClassification],
   ] as const
   return (
     <div className="mt-4 rounded-lg border border-border bg-card/30 p-4" aria-live="polite">
       <dl className="grid gap-3 sm:grid-cols-2">
-        <Fact label="Server-selected account" value={shortIdentity(result.accountId, "Account")} />
-        <Fact label="Portfolio revision" value={result.revisionId} />
+        <Fact label="Selected account" value={shortIdentity(result.accountId, "Account")} />
         <Fact label="Current value" value={formatMoney(result.currentMarketValue)} />
         <Fact label="Proposed value" value={formatMoney(result.proposedMarketValue)} />
         <Fact label="Capital change" value={formatMoney(result.capitalChange)} />
@@ -245,7 +243,7 @@ function CandidateResult({ result }: { result: PortfolioCandidateImpact }) {
         <Fact label="Concentration change" value={formatPercent(result.concentration.change)} />
         <Fact label="Marginal stress impact" value={formatMoney(result.scenario.marginalImpact)} />
         <Fact label="Selected mark" value={formatMoney(result.markEvidence.unitMark)} />
-        <Fact label="Mark source" value={result.markEvidence.sourceId} />
+        <Fact label="Mark quality" value={humanize(result.markEvidence.quality)} />
         <Fact label="Lot size" value={result.instrumentTerms.lotSize} />
         <Fact label="Contract multiplier" value={result.instrumentTerms.contractMultiplier} />
       </dl>
@@ -384,7 +382,7 @@ function RebalancePlanner({
         exactly 100%; short positions are disabled in this guided workflow.
       </p>
       {!available ? (
-        <Unavailable text="Rebalance proposals are not registered." />
+        <Unavailable text="Rebalance planning is unavailable right now." />
       ) : holdings.length === 0 ? (
         <Unavailable text="A rebalance proposal requires at least one holding." />
       ) : (

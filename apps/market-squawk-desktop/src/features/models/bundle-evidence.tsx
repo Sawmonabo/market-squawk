@@ -1,4 +1,4 @@
-import { Box, Database, Fingerprint, ShieldCheck } from "lucide-react"
+import { Box, Database, ShieldCheck } from "lucide-react"
 
 import { humanize } from "@/lib/formatters"
 import type { LosslessInteger } from "@/lib/lossless-integer"
@@ -23,7 +23,7 @@ export function BundleEvidence({
     return (
       <EvidencePanel
         title="No admitted bundle selected"
-        detail="Select an admitted generation to inspect the immutable identities returned by the installed model registry."
+        detail="Select a model to review its intended use, validation, limitations, and readiness."
       />
     )
   }
@@ -33,7 +33,7 @@ export function BundleEvidence({
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-wider text-primary">
-            Immutable bundle generation
+            Research model
           </p>
           <h2 className="mt-2 text-xl font-semibold">
             {bundle.bundleId} <span className="text-muted-foreground">v{bundle.bundleVersion}</span>
@@ -52,34 +52,30 @@ export function BundleEvidence({
         <MiniFact icon={Box} label="Format" value={`${humanize(bundle.format)} v${bundle.formatVersion}`} />
         <MiniFact
           icon={Database}
-          label="Training dataset"
-          value={`${bundle.trainingDataset.dataset} · manifest ${bundle.trainingDataset.manifestVersion}`}
+          label="Training evidence"
+          value="Available"
         />
-        <MiniFact icon={Fingerprint} label="Metadata" value={short(bundle.metadataHash)} mono />
-        <MiniFact icon={Fingerprint} label="Artifact" value={short(bundle.artifactHash)} mono />
+        <MiniFact icon={ShieldCheck} label="Failure response" value="No action" />
       </div>
 
       <dl className="mt-5 grid gap-x-6 gap-y-3 border-t border-border pt-4 sm:grid-cols-2">
-        <Fact label="Dataset schema" value={`${bundle.trainingDataset.schema.name} v${bundle.trainingDataset.schema.version}`} />
-        <Fact label="Dataset content" value={short(bundle.trainingDataset.contentHash)} mono />
-        <Fact label="Schema fingerprint" value={short(bundle.trainingDataset.schema.fingerprint)} mono />
+        <Fact label="Training period available" value="Yes" />
         <Fact label="Inference failure" value="No action" />
       </dl>
 
       {!metadataAvailable ? (
-        <EvidenceNotice text="Model.GetMetadata is not registered by this service generation. Validation, feature, and intended-use evidence is unavailable." />
+        <EvidenceNotice text="Validation, inputs, and intended-use information are unavailable." />
       ) : loading ? (
         <EvidenceNotice text="Loading complete admitted metadata…" />
       ) : error ? (
-        <EvidenceNotice text={`Complete metadata could not be loaded: ${error}`} />
+        <EvidenceNotice text="Model details could not be loaded right now." />
       ) : metadata ? (
         <MetadataEvidence metadata={metadata} />
       ) : (
         <EvidenceNotice text="No complete metadata was returned for this admitted model." />
       )}
       <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
-        Fail-closed policy: {bundle.fallbackBehavior.reason}. A failed or unavailable inference
-        produces {humanize(bundle.fallbackBehavior.decision)}.
+        If the model cannot produce a valid result, it suggests no action.
       </p>
     </section>
   )
@@ -107,9 +103,7 @@ function MetadataEvidence({ metadata }: { metadata: ModelMetadata }) {
           label="Universe / label"
           value={`${metadata.universeId} · ${metadata.label.name} v${metadata.label.version} (${humanize(metadata.label.kind)})`}
         />
-        <Fact label="Training code" value={metadata.trainingCodeRevision} mono />
-        <Fact label="Training run" value={short(metadata.trainingRunHash)} mono />
-        <Fact label="Environment" value={short(metadata.trainingEnvironmentHash)} mono />
+        <Fact label="Validation status" value="Available" />
       </dl>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         {metadata.validationMetrics.map((metric) => (
@@ -138,9 +132,6 @@ function MetadataEvidence({ metadata }: { metadata: ModelMetadata }) {
                   ? `Standardized · mean ${feature.normalizer.mean} · scale ${feature.normalizer.scale}`
                   : "Identity normalization"}
               </p>
-              <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-                semantic {short(feature.semanticDigest)}
-              </p>
             </li>
           ))}
         </ul>
@@ -157,37 +148,32 @@ function MetadataEvidence({ metadata }: { metadata: ModelMetadata }) {
           </ul>
         )}
       </div>
-      <AdmissionAndRuntimeEvidence metadata={metadata} />
+      <ModelReadiness metadata={metadata} />
       <TrainingAndCohortEvidence metadata={metadata} />
     </div>
   )
 }
 
-function AdmissionAndRuntimeEvidence({ metadata }: { metadata: ModelMetadata }) {
+function ModelReadiness({ metadata }: { metadata: ModelMetadata }) {
   return (
     <div className="grid gap-3 lg:grid-cols-2">
       <div className="rounded-lg border border-emerald-400/25 bg-emerald-400/5 p-3">
-        <p className="text-xs font-medium text-emerald-200">Admission and rejection boundary</p>
+        <p className="text-xs font-medium text-emerald-200">Research readiness</p>
         <dl className="mt-3 grid gap-3 sm:grid-cols-2">
           <Fact label="Status" value={humanize(metadata.admissionEvidence.status)} />
-          <Fact label="Authority" value={humanize(metadata.admissionEvidence.authority)} />
-          <Fact label="Metadata proof" value={short(metadata.admissionEvidence.metadataHash)} mono />
-          <Fact label="Training proof" value={short(metadata.admissionEvidence.trainingRunHash)} mono />
+          <Fact label="Use" value="Investment research only" />
         </dl>
         <p className="mt-3 text-xs leading-5 text-muted-foreground">
           {metadata.admissionEvidence.rejectionPolicy}
         </p>
       </div>
       <div className="rounded-lg border border-sky-400/25 bg-sky-400/5 p-3">
-        <p className="text-xs font-medium text-sky-200">Runtime health</p>
+        <p className="text-xs font-medium text-sky-200">Current availability</p>
         <dl className="mt-3 grid gap-3 sm:grid-cols-2">
           <Fact label="Status" value={humanize(metadata.runtimeHealth.status)} />
-          <Fact label="Probe" value={humanize(metadata.runtimeHealth.probe)} />
-          <Fact label="Backend generations" value={metadata.runtimeHealth.backendGenerations.toLocaleString()} />
-          <Fact label="Registry generations" value={metadata.runtimeHealth.registryGenerations.toLocaleString()} />
         </dl>
         <p className="mt-3 text-xs leading-5 text-muted-foreground">
-          Failure behavior: {metadata.runtimeHealth.failureBehavior}.
+          If unavailable or unhealthy, the model suggests no action.
         </p>
       </div>
     </div>
@@ -201,9 +187,7 @@ function TrainingAndCohortEvidence({ metadata }: { metadata: ModelMetadata }) {
       <p className="text-xs font-medium text-violet-200">Training and cohort evidence</p>
       <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Fact label="Train / validation / test" value={`${evidence.splits.train.toLocaleString()} / ${evidence.splits.validation.toLocaleString()} / ${evidence.splits.test.toLocaleString()}`} mono />
-        <Fact label="Split identity" value={short(evidence.splits.splitHash)} mono />
         <Fact label="Seed / missing policy" value={`${evidence.seed.toLocaleString()} · ${humanize(evidence.missingPolicy)}`} />
-        <Fact label="Trial identity" value={short(evidence.trialHash)} mono />
       </dl>
       {evidence.forecastSchedule ? (
         <p className="mt-3 text-xs leading-5 text-muted-foreground">

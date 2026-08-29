@@ -44,8 +44,8 @@ export function MarketsPage() {
     return (
       <PageFrame>
         <EmptyState
-          title="Market service is unavailable"
-          detail={product.error}
+          title="Markets are unavailable"
+          detail="Try again or review Logs & Diagnostics for details."
         />
       </PageFrame>
     )
@@ -127,8 +127,6 @@ function ReadyMarketsPage({
           row.displayName,
           row.assetClass,
           row.quoteCurrency,
-          row.selectedSource?.providerId,
-          row.selectedSource?.providerSymbol,
         ]
           .filter((value): value is string => Boolean(value))
           .some((value) => value.toLocaleLowerCase().includes(normalizedSearch)),
@@ -229,12 +227,8 @@ function ReadyMarketsPage({
     quotes.isFetching ||
     books.isFetching ||
     comparisons.isFetching
-  const feedError =
-    feedRead.error ?? (feed.isError ? messageFrom(feed.error) : null)
-  const universeError =
-    universeRead.error ?? (universe.isError ? messageFrom(universe.error) : null)
-  const feedFailed = feedError !== null
-  const universeFailed = universeError !== null
+  const feedFailed = feedRead.error !== null || feed.isError
+  const universeFailed = universeRead.error !== null || universe.isError
   const live = rows.filter((row) => row.availability === "Live").length
   const verified = rows.filter((row) => row.confidence === "Verified").length
 
@@ -274,13 +268,13 @@ function ReadyMarketsPage({
     >
       {!feedAvailable && !universeAvailable ? (
         <EmptyState
-          title="Unified Markets is not available in this service build"
-          detail="Update the installed Market Squawk service, then reopen the app."
+          title="Markets are not available in this build"
+          detail="Update Market Squawk, then reopen the app."
         />
       ) : feedFailed && universeFailed ? (
         <EmptyState
           title="Market data is temporarily unavailable"
-          detail={feedError ?? universeError ?? "Market data could not be read."}
+          detail="Try again or review Logs & Diagnostics for details."
         />
       ) : rows.length === 0 &&
         referenceRows.length === 0 &&
@@ -289,12 +283,12 @@ function ReadyMarketsPage({
       ) : rows.length === 0 && referenceRows.length === 0 && feedFailed ? (
         <EmptyState
           title="Live market observations are unavailable"
-          detail={feedError ?? "Live market observations could not be read."}
+          detail="Check your connections, then try again."
         />
       ) : rows.length === 0 && referenceRows.length === 0 && universeFailed ? (
         <EmptyState
           title="U.S. listing search is unavailable"
-          detail={universeError ?? "U.S. listing search could not be read."}
+          detail="Try again or review Logs & Diagnostics for details."
         />
       ) : rows.length === 0 && referenceRows.length === 0 ? (
         <EmptyState
@@ -305,12 +299,12 @@ function ReadyMarketsPage({
         <>
           {feedFailed ? (
             <Notice
-              text={`Live observations are unavailable. Official listing search remains usable. ${feedError}`}
+              text="Live prices are unavailable. Official listing search remains usable."
             />
           ) : null}
           {universeFailed ? (
             <Notice
-              text={`U.S. listing search is unavailable. Active live markets remain usable. ${universeError}`}
+              text="U.S. listing search is unavailable. Current markets remain usable."
             />
           ) : null}
           <div className="grid gap-3 sm:grid-cols-3">
@@ -337,8 +331,8 @@ function ReadyMarketsPage({
               />
             </div>
             <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
-              Market Squawk chooses the best available source for each instrument and keeps any
-              delay, coverage limit, or confidence downgrade visible.
+              Market Squawk shows the best available current information and clearly labels delays,
+              coverage limits, and confidence.
             </p>
           </section>
           {visibleRows.length === 0 && referenceRows.length === 0 ? (
@@ -369,7 +363,7 @@ function ReadyMarketsPage({
           {selectedInstrument ? (
             <details className="mt-5 rounded-xl border border-border bg-card/30 p-4">
               <summary className="cursor-pointer text-sm font-semibold">
-                Show detailed trades, quotes, order book, and source comparison
+                Show detailed trades, quotes, order book, and data agreement
               </summary>
               <InstrumentWorkspace
                 instrumentId={selectedInstrument}
@@ -391,7 +385,6 @@ function ReadyMarketsPage({
               text="That reference listing is no longer present in the current search result."
             />
           ) : null}
-          <UnifiedResultBoundary feed={resultState(feed.data)} />
         </>
       )}
     </PageFrame>
@@ -449,7 +442,7 @@ function ReferenceMarketCard({ row, selected, onSelect }: {
       </div>
       <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-border/70 pt-4">
         <Fact label="Identity" value="Official listing" />
-        <Fact label="Price coverage" value="Provider credentials required" />
+        <Fact label="Price coverage" value="Live data connection required" />
         <Fact label="Round lot" value={`${row.roundLotSize.toLocaleString()} shares`} />
         <Fact label="Updated" value={dateTime(row.availableAt)} />
       </dl>
@@ -473,13 +466,11 @@ function ReferenceWorkspace({ row }: { row: ReferenceMarketRow }) {
             {row.symbol} · {row.name}
           </h2>
           <p className="mt-2 max-w-2xl text-xs leading-5 text-muted-foreground">
-            Market Squawk found this U.S. listing without inventing a price. The supported no-cost
-            U.S. IEX option still requires an Alpaca Paper account and API credentials. When an
-            admitted runtime is available, this workspace can show its current source-bound market
-            observation.
+            Market Squawk found this U.S. listing without inventing a price. Connect an eligible
+            live market-data account in Connections to add a current observation.
           </p>
         </div>
-        <EvidenceBadge label="Provider account required for prices" tone="neutral" />
+        <EvidenceBadge label="Live data connection required" tone="neutral" />
       </div>
       <dl className="mt-5 grid gap-4 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
         <Fact label="Listing venue" value={row.venueId} />
@@ -487,15 +478,10 @@ function ReferenceWorkspace({ row }: { row: ReferenceMarketRow }) {
         <Fact label="Reference quality" value="Official delayed" />
         <Fact label="Observed" value={dateTime(row.availableAt)} />
       </dl>
-      <details className="mt-5 rounded-lg border border-border bg-background/30 p-3">
-        <summary className="cursor-pointer text-xs font-semibold">Data confidence</summary>
-        <dl className="mt-3 grid gap-3 sm:grid-cols-2">
-          <Fact label="Provider" value={row.providerId} />
-          <Fact label="Source" value={row.sourceId} />
-          <Fact label="Source effective time" value={dateTime(row.effectiveAt)} />
-          <Fact label="Payload SHA-256" value={row.sourcePayloadSha256} />
-        </dl>
-      </details>
+      <p className="mt-5 text-xs leading-5 text-muted-foreground">
+        Listing details were effective {dateTime(row.effectiveAt)}. Technical provenance is
+        available in Logs &amp; Diagnostics.
+      </p>
     </section>
   )
 }
@@ -539,13 +525,13 @@ function runtimeDisplayMarkSummary(
 ): string {
   if (!mark) {
     return row.selectedSource
-      ? "The selected runtime source has no fresh completed trade or bid-and-ask midpoint."
+      ? "No fresh completed trade or bid-and-ask midpoint is available."
       : marketObservationUnavailableName(row.marketObservation.reason)
   }
   const validThrough = mark.sourceValidUntil
-    ? ` · source valid through ${dateTime(mark.sourceValidUntil)}`
-    : " · no precise source deadline reported"
-  return `${markBasisName(mark.basis)} · runtime display only${validThrough}`
+    ? ` · current through ${dateTime(mark.sourceValidUntil)}`
+    : " · no precise freshness deadline reported"
+  return `${markBasisName(mark.basis)}${validThrough}`
 }
 
 function MarketCard({ row, selected, onSelect }: {
@@ -574,7 +560,7 @@ function MarketCard({ row, selected, onSelect }: {
           </p>
           <h2 className="mt-2 truncate text-xl font-semibold">{row.symbol}</h2>
           <p className="mt-1 truncate text-[11px] text-muted-foreground">
-            {row.displayName ?? source?.providerId ?? "No source available"}
+            {row.displayName ?? "Current market"}
           </p>
         </div>
         <EvidenceBadge
@@ -622,12 +608,9 @@ function MarketCard({ row, selected, onSelect }: {
       (source.integrity.generationCurrent === false || !source.integrity.snapshotInitialized) ? (
         <div className="mt-4 flex gap-2 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-xs text-amber-200">
           <CircleAlert className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-          <span>Source synchronization is incomplete. This observation is not treated as current.</span>
+          <span>Market data is still updating and is not treated as current yet.</span>
         </div>
       ) : null}
-      <p className="mt-4 truncate font-mono text-[9px] text-muted-foreground">
-        {row.instrumentId}
-      </p>
     </button>
   )
 }
@@ -671,7 +654,7 @@ function InstrumentWorkspace({
             Instrument-scoped reads
           </p>
           <h2 id="instrument-workspace-title" className="mt-1 text-lg font-semibold">
-            Trades, quotes, book, and cross-source comparison
+            Trades, quotes, book, and data agreement
           </h2>
         </div>
       </div>
@@ -690,7 +673,7 @@ function InstrumentWorkspace({
               {tradeRows.map((trade) => (
                 <li key={trade.key} className="grid gap-2 py-3 first:pt-0 last:pb-0 sm:grid-cols-[1fr_auto]">
                   <div>
-                    <p className="text-xs font-medium">{trade.sourceId} · {trade.venueId}</p>
+                    <p className="text-xs font-medium">Trade observation · {trade.venueId}</p>
                     <p className="mt-1 font-mono text-[10px] text-muted-foreground">{trade.stableTradeId}</p>
                   </div>
                   <div className="text-left sm:text-right">
@@ -722,7 +705,7 @@ function InstrumentWorkspace({
               {quoteRows.map((quote) => (
                 <li key={quote.key} className="rounded-lg border border-border bg-background/35 p-3">
                   <div className="flex items-center justify-between gap-3">
-                    <p className="text-xs font-medium">{quote.sourceId} · {quote.venueId}</p>
+                    <p className="text-xs font-medium">Quote observation · {quote.venueId}</p>
                     <span className="text-[10px] text-muted-foreground">{qualityName(quote.currentQuality)}</span>
                   </div>
                   <div className="mt-3 grid grid-cols-2 gap-2">
@@ -751,7 +734,7 @@ function InstrumentWorkspace({
               {bookRows.map((book) => (
                 <div key={book.key} className="rounded-lg border border-border bg-background/35 p-3">
                   <div className="flex items-center justify-between gap-3">
-                    <p className="text-xs font-medium">{book.sourceId} · {book.venueId}</p>
+                    <p className="text-xs font-medium">Order book · {book.venueId}</p>
                     <span className="text-[10px] text-muted-foreground">{qualityName(book.currentQuality)}</span>
                   </div>
                   <div className="mt-3 grid grid-cols-2 gap-3 text-[10px]">
@@ -766,7 +749,7 @@ function InstrumentWorkspace({
         </InstrumentPanel>
 
         <InstrumentPanel
-          title="Cross-source comparison"
+          title="Independent data agreement"
           available={comparisons.available}
           query={comparisons.query}
           parseError={comparisonRead.error}
@@ -777,13 +760,15 @@ function InstrumentWorkspace({
               <p className="text-xs font-medium">
                 {comparison.comparable
                   ? `${comparison.observationCount} current observations can be compared.`
-                  : "Only one current observation is available; a cross-source comparison is not possible."}
+                  : "Only one current observation is available, so independent agreement cannot be measured."}
               </p>
               <ul className="mt-3 divide-y divide-border">
-                {comparison.observations.map((observation) => (
+                {comparison.observations.map((observation, index) => (
                   <li key={observation.key} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
                     <div>
-                      <p className="text-xs font-medium">{observation.sourceId} · {observation.venueId}</p>
+                      <p className="text-xs font-medium">
+                        Observation {index + 1} · {observation.venueId}
+                      </p>
                       <p className="mt-1 text-[10px] text-muted-foreground">{qualityName(observation.currentQuality)} · {dateTime(observation.asOf)}</p>
                     </div>
                     <p className="font-mono text-[10px] text-muted-foreground">
@@ -811,18 +796,16 @@ function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-            Selected market evidence
+            Current market data
           </p>
           <h3 className="mt-1 text-sm font-semibold">
-            {source
-              ? `${humanize(source.providerId)} · ${source.providerSymbol ?? row.symbol}`
-              : `${row.symbol} · no eligible source`}
+            {source ? row.symbol : `${row.symbol} · current data unavailable`}
           </h3>
           <p className="mt-1 max-w-2xl text-[11px] leading-5 text-muted-foreground">
             {source
               ? mark
-                ? "This current display price comes from the exact selected runtime source. This live-feed response does not establish durable point-in-time evidence for investment analysis."
-                : "The runtime source remains selected, but it has no fresh completed trade or bid-and-ask midpoint to display."
+                ? "This is the best current market observation available. Historical analysis data is not ready yet."
+                : "Current market data is available, but it has no fresh completed trade or bid-and-ask midpoint to display."
               : marketObservationUnavailableName(observation.reason)}
           </p>
           <p className="mt-2 text-[10px] font-medium text-amber-200">
@@ -834,10 +817,6 @@ function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
             label={mark ? "Current display price" : "Display price unavailable"}
             tone={mark ? "good" : "bad"}
           />
-          <EvidenceBadge
-            label="Runtime display only"
-            tone="neutral"
-          />
         </div>
       </div>
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -847,7 +826,7 @@ function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
         />
         <Fact label="Price basis" value={mark ? markBasisName(mark.basis) : "Not available"} />
         <Fact
-          label="Source valid through"
+          label="Price current through"
           value={
             mark
               ? mark.sourceValidUntil
@@ -856,19 +835,16 @@ function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
               : "Not available"
           }
         />
-        <Fact label="Selected at" value={dateTime(receipt.selectedAt)} />
+        <Fact label="Updated" value={dateTime(receipt.selectedAt)} />
       </dl>
       <details className="mt-4 rounded-lg border border-border bg-background/30 p-3">
         <summary className="cursor-pointer text-xs font-semibold">
-          Source, quality, and evidence details
+          Data confidence
         </summary>
         <dl className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <Fact label="Provider" value={source?.providerId ?? "Not selected"} />
-          <Fact label="Source" value={source?.sourceId ?? "Not selected"} />
           <Fact label="Venue" value={source?.venueId ?? "Not reported"} />
-          <Fact label="Provider channel" value={source?.providerChannel ?? "Not selected"} />
           <Fact label="Timing" value={source ? humanize(source.timing) : "Not available"} />
-          <Fact label="Source health" value={source ? humanize(source.health) : "Not available"} />
+          <Fact label="Data health" value={source ? humanize(source.health) : "Not available"} />
           <Fact
             label="Quality"
             value={source ? humanize(source.quality) : "Not available"}
@@ -892,30 +868,9 @@ function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
             value={source ? humanize(source.integrity.state) : "Not available"}
           />
           <Fact
-            label="Connection generation"
-            value={source?.integrity.connectionGeneration ?? "Not available"}
+            label="Independent observations"
+            value={receipt.eligibleCount.toLocaleString()}
           />
-          <Fact
-            label="Eligible sources"
-            value={`${receipt.eligibleCount.toLocaleString()} eligible · ${receipt.rejectedCount.toLocaleString()} rejected`}
-          />
-          <Fact
-            label="Selection result"
-            value={receipt.selectionClass ? humanize(receipt.selectionClass) : "No source selected"}
-          />
-          <Fact
-            label="Selection downgrades"
-            value={marketDowngradeSummary(receipt.downgradeDimensions)}
-          />
-          <Fact
-            label="Selection receipt"
-            value={digestName(receipt.selectionDigest)}
-          />
-          <Fact
-            label="Selection policy"
-            value={`Revision ${receipt.policyRevision.toLocaleString()} · up to ${receipt.policyCandidateLimit.toLocaleString()} sources`}
-          />
-          <Fact label="Policy digest" value={digestName(receipt.policyDigest)} />
           <Fact label="Analytical use" value={analyticalReadinessName(row.analyticalReadiness)} />
         </dl>
       </details>
@@ -939,8 +894,8 @@ function IndividualOrderBook({
           </p>
           <h3 className="mt-1 text-sm font-semibold">Orders behind the visible market</h3>
           <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            Each row is a distinct provider order. Market Squawk keeps these separate even when
-            several orders share the same price.
+            Each row is a distinct live order. Market Squawk keeps them separate when several
+            orders share the same price.
           </p>
         </div>
         <EvidenceBadge
@@ -954,7 +909,7 @@ function IndividualOrderBook({
       </div>
       <p className="mt-3 text-[10px] leading-5 text-muted-foreground">
         Showing {book.returnedOrderCount.toLocaleString()} of {book.totalOrderCount.toLocaleString()}
-        {book.sampleTruncated ? " distinct orders in a bounded identity-stable sample." : " distinct orders."}
+        {book.sampleTruncated ? " distinct orders; more are available." : " distinct orders."}
         {book.lastMarketAt ? ` Last market update ${dateTime(book.lastMarketAt)}.` : ""}
         {` Available to this installation ${dateTime(book.availableAt)}.`}
       </p>
@@ -978,23 +933,16 @@ function IndividualOrderSide({
         <ol className="mt-2 divide-y divide-border font-mono text-[10px]">
           {orders.slice(0, 10).map((order) => (
             <li key={order.orderId} className="grid grid-cols-[1fr_auto] gap-3 py-2 first:pt-0 last:pb-0">
-              <div>
-                <p>{order.price}</p>
-                <p className="mt-0.5 text-muted-foreground">{shortOrderId(order.orderId)}</p>
-              </div>
+              <p>{order.price}</p>
               <p className="text-right">{order.quantity}</p>
             </li>
           ))}
         </ol>
       ) : (
-        <p className="mt-2 text-[10px] text-muted-foreground">No orders in this bounded sample</p>
+        <p className="mt-2 text-[10px] text-muted-foreground">No current orders available</p>
       )}
     </div>
   )
-}
-
-function shortOrderId(orderId: string) {
-  return orderId.length <= 18 ? orderId : `${orderId.slice(0, 8)}…${orderId.slice(-6)}`
 }
 
 function InstrumentPanel({
@@ -1026,13 +974,13 @@ function InstrumentPanel({
         ) : null}
       </div>
       {!available ? (
-        <NoInstrumentData text="This installed service does not expose this bounded market read." />
+        <NoInstrumentData text="This market detail is unavailable in the current build." />
       ) : query.isPending ? (
         <Skeleton className="h-28 rounded-lg" />
       ) : query.isError ? (
-        <NoInstrumentData text={messageFrom(query.error)} />
+        <NoInstrumentData text="This market detail is unavailable right now." />
       ) : boundaryError ? (
-        <NoInstrumentData text={boundaryError} />
+        <NoInstrumentData text="This market detail could not be loaded safely." />
       ) : query.data.metadata.returnedItems === 0 || !children ? (
         <NoInstrumentData text={empty} />
       ) : (
@@ -1110,27 +1058,18 @@ function Summary({
   )
 }
 
-function UnifiedResultBoundary({ feed }: { feed: ReturnType<typeof resultState> }) {
-  return (
-    <p className="mt-4 text-[10px] leading-relaxed text-muted-foreground">
-      Unified market result: {boundary(feed)}. Each displayed price uses the exact canonical
-      instrument scale, while source, coverage, freshness, and confidence remain attached.
-    </p>
-  )
-}
-
 function PageFrame({ children, action }: { children: React.ReactNode; action?: React.ReactNode }) {
   return (
     <div className="mx-auto w-full max-w-[1180px] p-5 lg:p-7">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-            Market Squawk · Current runtime
+            Market Squawk · Live market view
           </p>
           <h1 className="mt-2 text-3xl font-semibold tracking-tight">Markets</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Current market state with its source, venue, time, freshness, quality, and integrity
-            evidence kept visible.
+            Current market prices, trading activity, depth, freshness, and plain-language data
+            confidence.
           </p>
         </div>
         {action}
@@ -1218,43 +1157,16 @@ function marketObservationUnavailableName(
 ): string {
   switch (value) {
     case "no_eligible_source":
-      return "No source met the current data requirements."
+      return "No current observation met the data requirements."
     case "durable_pit_evidence_not_established":
-      return "The live source is usable for current display, but this live-feed response does not establish durable point-in-time evidence for investment analysis."
+      return "Current market data is available, but historical analysis data is not ready yet."
   }
 }
 
 function analyticalReadinessName(
   _readiness: UnifiedMarketRow["analyticalReadiness"],
 ) {
-  return "Live runtime display · this feed is not PIT evidence"
-}
-
-function marketDowngradeSummary(
-  values: UnifiedMarketRow["selectionReceipt"]["downgradeDimensions"],
-): string {
-  if (values.length === 0) return "None"
-  return values
-    .map((value) => {
-      switch (value.dimension) {
-        case "timing":
-          return `Timing: ${humanize(value.required)} to ${humanize(value.selected)}`
-        case "depth":
-          return `Depth: ${humanize(value.minimum)} to ${value.selected ? humanize(value.selected) : "no market book"}`
-        case "quality":
-          return `Quality: ${humanize(value.minimum)} to ${humanize(value.selected)}`
-        case "coverage":
-          return `Coverage: ${humanize(value.required)} to ${humanize(value.selected)}`
-        case "freshness":
-          return "Freshness: older than requested"
-      }
-    })
-    .join(" · ")
-}
-
-function digestName(value: { algorithm: "sha256" | "blake3"; bytes: string }): string {
-  const algorithm = value.algorithm === "sha256" ? "SHA-256" : "BLAKE3"
-  return `${algorithm} · ${value.bytes}`
+  return "Current price only · unavailable for historical analysis"
 }
 
 function qualityName(value: string | null) {
@@ -1269,12 +1181,6 @@ function dateTime(value: string | null) {
   if (!value) return "Not reported"
   const parsed = new Date(value)
   return Number.isNaN(parsed.getTime()) ? "Not reported" : parsed.toLocaleString()
-}
-
-function boundary(value: ReturnType<typeof resultState>) {
-  return value
-    ? `${humanize(value.completeness)}, ${value.returned} of ${value.available} rows`
-    : "unavailable"
 }
 
 function requiredInstrument(value: string | null) {

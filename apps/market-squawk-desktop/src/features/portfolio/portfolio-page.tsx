@@ -18,7 +18,7 @@ import { PortfolioHistory } from "./portfolio-history"
 import { PortfolioPlanning } from "./portfolio-planning"
 import { PortfolioScenarios } from "./portfolio-scenarios"
 import type { PortfolioAccount } from "./portfolio-contracts"
-import { shortIdentity } from "./portfolio-format"
+import { formatTimestamp, shortIdentity } from "./portfolio-format"
 import { PortfolioImportWorkflow } from "./portfolio-import-workflow"
 import {
   AllocationPanel,
@@ -26,7 +26,7 @@ import {
   FinancialPositionCoverage,
   PerformancePanel,
   PortfolioSummary,
-  ProvenancePanel,
+  DataQualityPanel,
   RecommendationSetupPanel,
   ReconciliationPanel,
   RiskPanel,
@@ -134,7 +134,7 @@ function PortfolioWorkspace({
             className={accounts.query.isFetching || details.isFetching ? "animate-spin" : ""}
             aria-hidden="true"
           />
-          Refresh evidence
+          Refresh
         </Button>
       </header>
 
@@ -191,15 +191,15 @@ function PortfolioWorkspace({
 
       <details className="group mt-5 rounded-xl border border-border bg-card/30 p-4">
         <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary">
-          <span>Import or update account evidence</span>
+          <span>Import or update account details</span>
           <ChevronDown
             className="size-4 text-muted-foreground transition-transform group-open:rotate-180"
             aria-hidden="true"
           />
         </summary>
         <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
-          This advanced local workflow imports an immutable account revision. It does not connect
-          a bank, classify an account, or select an account for recommendations.
+          Import an account file to review its holdings, cash, transactions, and reconciliation
+          results. It does not connect a bank or choose an account for recommendations.
         </p>
         <PortfolioImportWorkflow
           bootstrap={bootstrap}
@@ -242,10 +242,10 @@ function DetailWorkspace({
       {missing.length ? (
         <Alert>
           <AlertCircle aria-hidden="true" />
-          <AlertTitle>Some portfolio evidence is unavailable</AlertTitle>
+          <AlertTitle>Some portfolio details are unavailable</AlertTitle>
           <AlertDescription>
-            The installed service does not expose {missing.join(", ")}. The available sections
-            below remain usable.
+            {missing.join(", ")} are not available right now. The available sections below remain
+            usable.
           </AlertDescription>
         </Alert>
       ) : null}
@@ -279,12 +279,12 @@ function DetailWorkspace({
       <section className="rounded-xl border border-border bg-card/35 p-5">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
-            Exact source records
+            Your account details
           </p>
           <h2 className="mt-2 text-lg font-semibold">Holdings</h2>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            Market value, quantity, cost-basis state, and the retained source reference for every
-            asset in this revision.
+            Market value, quantity, cost-basis status, and the latest available details for every
+            asset in this account.
           </p>
         </div>
         <div className="mt-5">
@@ -317,15 +317,15 @@ function DetailWorkspace({
 
       <details className="group rounded-xl border border-border bg-card/20 p-4">
         <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary">
-          <span>Advanced history, stress tests, planning, and evidence</span>
+          <span>History, stress tests, and planning</span>
           <ChevronDown
             className="size-4 text-muted-foreground transition-transform group-open:rotate-180"
             aria-hidden="true"
           />
         </summary>
         <p className="mt-2 text-xs leading-5 text-muted-foreground">
-          Open this workspace to compare immutable revisions, run deterministic scenarios, draft
-          analysis-only changes, and inspect provenance. None of these controls can place an order.
+          Compare earlier account snapshots, run stress tests, and explore changes before making a
+          decision. None of these controls can place an order.
         </p>
         <div className="mt-4 space-y-4">
           <PortfolioHistory account={account} bootstrap={bootstrap} transport={transport} />
@@ -347,9 +347,9 @@ function DetailWorkspace({
 
           <div className="grid gap-4 xl:grid-cols-2">
             {details.holdings.data ? (
-              <ProvenancePanel account={account} holdingsResult={details.holdings.data} />
+              <DataQualityPanel account={account} holdingsResult={details.holdings.data} />
             ) : (
-              <InlineUnavailable text="Mark provenance is unavailable without holding evidence." />
+              <InlineUnavailable text="Market-price details are unavailable without holdings." />
             )}
             <ReconciliationPanel
               account={account}
@@ -434,9 +434,6 @@ function AccountDirectory({
                   <p className="text-sm font-semibold">
                     {shortIdentity(account.accountId, "Account")}
                   </p>
-                  <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">
-                    {account.accountId}
-                  </p>
                 </div>
                 <span className="rounded-md border border-border px-2 py-1 font-mono text-[10px]">
                   {account.currency.toUpperCase()}
@@ -444,7 +441,10 @@ function AccountDirectory({
               </div>
               <dl className="mt-4 grid grid-cols-2 gap-3 text-xs">
                 <AccountFact label="Account type" value="Not supplied" />
-                <AccountFact label="Source" value={account.currentRevision.sourceId} />
+                <AccountFact
+                  label="Updated"
+                  value={formatTimestamp(account.currentRevision.effectiveAtUnixNanos)}
+                />
                 <AccountFact label="Assets" value={account.holdingCount.toLocaleString()} />
                 <AccountFact
                   label="Transactions"
@@ -475,7 +475,7 @@ function SelectAccountPrompt() {
   return (
     <section className="mt-5 rounded-xl border border-dashed border-border bg-card/20 p-7 text-center">
       <BriefcaseBusiness className="mx-auto size-6 text-muted-foreground" aria-hidden="true" />
-      <h2 className="mt-4 text-lg font-semibold">Select an account to view its evidence</h2>
+      <h2 className="mt-4 text-lg font-semibold">Select an account to view its details</h2>
       <p className="mx-auto mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
         Market Squawk will load holdings, account cash, performance, exposure, and risk only after
         you make an explicit selection. Accounts in different currencies are never silently
@@ -495,7 +495,7 @@ function PortfolioFrame({ children }: { children: React.ReactNode }) {
 
 function PortfolioLoading() {
   return (
-    <div className="mt-6 space-y-4" aria-label="Loading portfolio evidence">
+    <div className="mt-6 space-y-4" aria-label="Loading portfolio details">
       <Skeleton className="h-32 rounded-xl" />
       <div className="grid gap-4 xl:grid-cols-2">
         <Skeleton className="h-96 rounded-xl" />
@@ -532,12 +532,12 @@ function EmptyPortfolio() {
   return (
     <section className="mt-6 rounded-xl border border-border bg-card/45 p-7">
       <BriefcaseBusiness className="size-6 text-muted-foreground" aria-hidden="true" />
-      <h2 className="mt-4 text-lg font-semibold">No account evidence has been imported</h2>
+      <h2 className="mt-4 text-lg font-semibold">No account has been imported</h2>
       <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
         Open{" "}
-        <span className="font-medium text-foreground">Import or update account evidence</span>
-        {" "}below to select a portfolio extraction batch, review its normalized records and
-        reconciliation evidence, and commit an immutable revision.
+        <span className="font-medium text-foreground">Import or update account details</span>
+        {" "}below to select an account file, review the imported transactions, and confirm any
+        reconciliation differences.
       </p>
     </section>
   )
@@ -547,10 +547,10 @@ function UnavailablePortfolio() {
   return (
     <section className="rounded-xl border border-border bg-card/45 p-7">
       <BriefcaseBusiness className="size-6 text-muted-foreground" aria-hidden="true" />
-      <h1 className="mt-4 text-xl font-semibold">Portfolio service unavailable</h1>
+      <h1 className="mt-4 text-xl font-semibold">Portfolio unavailable</h1>
       <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-        The installed application does not currently expose a bounded portfolio-account query.
-        No account or balance is inferred from files, paper execution, or another workspace.
+        Portfolio details cannot be loaded right now. No account or balance is inferred from files,
+        paper activity, or another workspace.
       </p>
     </section>
   )

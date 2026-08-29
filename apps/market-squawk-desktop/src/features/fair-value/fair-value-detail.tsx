@@ -49,7 +49,7 @@ export function FairValueDetail({
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="min-w-0">
             <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-              Measurement · {shortIdentity(measurement.measurementId)}
+              Fair-value measurement
             </p>
             <h2 className="mt-2 break-words text-xl font-semibold">
               {measurement.instrumentId}
@@ -62,7 +62,7 @@ export function FairValueDetail({
         </div>
         <p className="mt-4 max-w-3xl text-xs leading-5 text-muted-foreground">
           Prepared by {measurement.preparedBy} using {humanize(measurement.method)}. The amount,
-          method, input evidence, classification, and approval history remain separate facts.
+          method, supporting inputs, classification, and approval history are reviewed separately.
         </p>
       </header>
 
@@ -137,7 +137,7 @@ function SemanticSeparation({
         icon={ShieldCheck}
         eyebrow="Data-quality class"
         value={qualities?.length ? qualities.map(humanize).join(", ") : "Not loaded"}
-        detail="Source and evidence usability. It does not assign hierarchy."
+        detail="How usable the supporting information is. It does not assign hierarchy."
         tone={qualities?.includes("direct_verified") ? "good" : "warning"}
       />
     </section>
@@ -191,7 +191,6 @@ function MeasurementPanel({ measurement }: { measurement: FairValueMeasurement }
         <Fact label="Prepared by" value={measurement.preparedBy} />
         <Fact label="Account" value={measurement.accountId} />
       </dl>
-      <Digest label="Measurement evidence" value={measurement.evidenceHash} />
     </Panel>
   )
 }
@@ -201,7 +200,7 @@ function ClassificationPanel({ measurement }: { measurement: FairValueMeasuremen
   if (!classification) {
     return (
       <Panel title="Classification" icon={Landmark}>
-        <MissingDetail text="The measurement summary is available, but its classification, ruleset, basis, and explanation were not included in this view." />
+        <MissingDetail text="The measurement summary is available, but its classification, basis, and explanation are not available in this view." />
       </Panel>
     )
   }
@@ -234,8 +233,6 @@ function ClassificationPanel({ measurement }: { measurement: FairValueMeasuremen
           </AlertDescription>
         </Alert>
       ) : null}
-      <Digest label="Ruleset" value={classification.rulesetHash} />
-      <Digest label="Decision" value={classification.decisionId} />
     </Panel>
   )
 }
@@ -250,7 +247,7 @@ function LevelOneReview({
   if (!classificationLoaded || reasons === undefined) {
     return (
       <Panel title="Level 1 qualification review" icon={BookOpenCheck}>
-        <MissingDetail text="Ruleset reasons were not returned. No Level 1 eligibility or disqualification is inferred from the measurement method, amount, or a connected market alone." />
+        <MissingDetail text="Classification reasons are not available. No Level 1 eligibility or disqualification is inferred from the measurement method, amount, or market availability alone." />
       </Panel>
     )
   }
@@ -261,10 +258,9 @@ function LevelOneReview({
         <div className="flex gap-3 rounded-lg border border-emerald-400/20 bg-emerald-400/5 p-4">
           <BadgeCheck className="mt-0.5 size-4 shrink-0 text-emerald-300" aria-hidden="true" />
           <div>
-            <p className="text-xs font-semibold">No ruleset disqualification was returned</p>
+            <p className="text-xs font-semibold">No Level 1 disqualifying condition was found</p>
             <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-              This statement applies only to the retained classification and its exact ruleset and
-              evidence hashes.
+              This result applies to the current saved classification and supporting information.
             </p>
           </div>
         </div>
@@ -279,7 +275,7 @@ function LevelOneReview({
               <span>
                 <span className="block text-xs font-medium">{humanize(reason.code)}</span>
                 <span className="mt-1 block font-mono text-[9px] text-muted-foreground">
-                  {reason.inputId ? `Input ${shortIdentity(reason.inputId)}` : "Measurement-wide"}
+                  {reason.inputId ? "Valuation input" : "Measurement-wide"}
                 </span>
               </span>
             </li>
@@ -300,9 +296,9 @@ function EvidencePanel({
   return (
     <Panel title="Valuation inputs and evidence" icon={Database}>
       {inputs === undefined ? (
-        <MissingDetail text={`The measurement declares ${expectedCount.toLocaleString()} input${expectedCount === 1 ? "" : "s"}, but their source, time, observability, quality, and verification evidence were not included in this view.`} />
+        <MissingDetail text={`The measurement uses ${expectedCount.toLocaleString()} input${expectedCount === 1 ? "" : "s"}, but their timing, observability, quality, and verification details are not available in this view.`} />
       ) : inputs.length === 0 ? (
-        <MissingDetail text="No input evidence was returned for this retained measurement." />
+        <MissingDetail text="Supporting input details are not available for this measurement." />
       ) : (
         <div className="space-y-3">
           {inputs.map((input) => (
@@ -322,10 +318,10 @@ function EvidenceInput({ input }: { input: FairValueInput }) {
         <span className="flex flex-wrap items-start justify-between gap-3">
           <span>
             <span className="block text-xs font-semibold">
-              {humanize(input.evidence.origin.kind)} · {input.evidence.sourceId}
+              {humanize(input.evidence.origin.kind)} input
             </span>
-            <span className="mt-1 block font-mono text-[9px] text-muted-foreground">
-              {shortIdentity(input.inputId)} · {humanize(input.significance)}
+            <span className="mt-1 block text-[9px] text-muted-foreground">
+              {humanize(input.significance)}
             </span>
           </span>
           <span
@@ -350,13 +346,13 @@ function EvidenceInput({ input }: { input: FairValueInput }) {
           value={input.marketDepth ? humanize(input.marketDepth) : "Not reported"}
         />
         <Fact label="Input amount" value={formatMoney(input.amount)} />
-        <Fact label="Evidence verification" value={humanize(input.evidence.verification)} />
+        <Fact label="Verification status" value={humanize(input.evidence.verification)} />
         <Fact
-          label="Available at"
+          label="Available since"
           value={input.evidence.availableAt ? dateTime(input.evidence.availableAt) : "Not reported"}
         />
         <Fact
-          label="Source time"
+          label="Observation time"
           value={input.evidence.sourceTimestamp ? dateTime(input.evidence.sourceTimestamp) : "Not reported"}
         />
         <Fact
@@ -367,9 +363,8 @@ function EvidenceInput({ input }: { input: FairValueInput }) {
               : "Not reported"
           }
         />
-        <Fact label="Ingested at" value={dateTime(input.evidence.ingestedAt)} />
+        <Fact label="Recorded at" value={dateTime(input.evidence.ingestedAt)} />
       </dl>
-      <Digest label="Input evidence" value={input.evidence.evidenceHash} />
     </details>
   )
 }
@@ -384,7 +379,7 @@ function MarketAccessPanel({
   return (
     <Panel title="Market access" icon={ShieldCheck}>
       {!loaded ? (
-        <MissingDetail text="Market-access evidence was not returned. Accessibility is a reporting-entity assessment, not a conclusion derived from source connectivity." />
+        <MissingDetail text="Market-access details are not available. Accessibility requires a reporting-entity assessment and is not inferred from data availability alone." />
       ) : assessments.length === 0 ? (
         <MissingDetail text="No approved market-access assessment is attached to the returned valuation inputs." />
       ) : (
@@ -427,7 +422,7 @@ function GovernancePanel({
         <div className="mb-3 rounded-lg border border-primary/25 bg-primary/5 p-3">
           <p className="text-xs font-semibold">Governed override applied</p>
           <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
-            The classification binds both the base decision and override identity.
+            The classification includes a separately reviewed override.
           </p>
         </div>
       ) : null}
@@ -439,7 +434,7 @@ function GovernancePanel({
       {approvals === undefined ? (
         <MissingDetail text="Approval status, override details, and revocation evidence were not included in this view." />
       ) : approvals.length === 0 ? (
-        <MissingDetail text="No approval has been retained for this measurement at the requested cutoff." />
+        <MissingDetail text="No approval is active for this measurement at the requested date and time." />
       ) : (
         <div className="space-y-3">
           {approvals.map((approval) => (
@@ -463,11 +458,6 @@ function ApprovalCard({ approval }: { approval: FairValueApproval }) {
       <p className="mt-2 font-mono text-[9px] text-muted-foreground">
         Approved {dateTime(approval.approvedAt)} · expires {dateTime(approval.expiresAt)}
       </p>
-      {approval.overrideId ? (
-        <p className="mt-2 text-[10px] text-muted-foreground">
-          Override {shortIdentity(approval.overrideId)}
-        </p>
-      ) : null}
       {approval.revocation ? (
         <div className="mt-3 border-t border-border pt-3">
           <p className="text-[10px] font-semibold text-amber-200">Revoked</p>
@@ -491,9 +481,9 @@ function AuditPanel({
   return (
     <Panel title="Audit trail" icon={ScrollText}>
       {events === undefined ? (
-        <MissingDetail text="The bounded audit history was not included in this view." />
+        <MissingDetail text="Review history is not available in this view." />
       ) : events.length === 0 ? (
-        <MissingDetail text="No matching fair-value audit events were returned." />
+        <MissingDetail text="No matching fair-value review events were found." />
       ) : (
         <ol className="space-y-2">
           {events.map((event) => (
@@ -515,12 +505,7 @@ function AuditPanel({
       )}
       <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
         <p className="text-[10px] leading-4 text-muted-foreground">
-          {events?.length.toLocaleString() ?? 0} related events found in{" "}
-          {boundary.loadedEventCount.toLocaleString()} loaded system events
-          {boundary.totalEventCount !== undefined
-            ? ` of ${boundary.totalEventCount.toLocaleString()} retained`
-            : ""}
-          .
+          Showing {events?.length.toLocaleString() ?? 0} related review events.
         </p>
         {boundary.hasMore ? (
           <button
@@ -535,8 +520,7 @@ function AuditPanel({
       </div>
       {boundary.capped ? (
         <p className="mt-2 text-[10px] leading-4 text-amber-200">
-          This view reached its 1,000-event safety limit. Use the bounded CLI or MCP audit query for
-          older pages.
+          Additional older review history is available in Logs.
         </p>
       ) : null}
     </Panel>
@@ -581,15 +565,6 @@ function Fact({ label, value }: { label: string; value: string }) {
   )
 }
 
-function Digest({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="mt-4 border-t border-border pt-3">
-      <p className="text-[9px] uppercase tracking-wider text-muted-foreground">{label} identity</p>
-      <p className="mt-1 break-all font-mono text-[9px] leading-4 text-foreground/65">{value}</p>
-    </div>
-  )
-}
-
 function HierarchyBadge({ hierarchy }: { hierarchy: FairValueHierarchy | null }) {
   return (
     <span className="rounded-full border border-primary/35 bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary">
@@ -615,10 +590,6 @@ function mergeMarketAccess(
 
 function unique<T>(values: T[] | undefined) {
   return values ? [...new Set(values)] : undefined
-}
-
-function shortIdentity(value: string) {
-  return value.length > 16 ? `${value.slice(0, 8)}…${value.slice(-8)}` : value
 }
 
 function dateTime(value: string) {

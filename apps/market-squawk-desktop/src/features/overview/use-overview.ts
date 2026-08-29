@@ -8,10 +8,8 @@ import type { ApplicationResult } from "@/lib/schemas"
 import type { DashboardQuery, ProductTransport } from "@/lib/transport"
 
 import {
-  decisionOverviewSchema,
   jobListSchema,
   marketSnapshotSchema,
-  sourceHealthSchema,
 } from "./schemas"
 
 export type ReadState<T> =
@@ -19,8 +17,6 @@ export type ReadState<T> =
   | { status: "ready"; data: T; message: null }
   | { status: "unavailable"; data: null; message: string }
 
-const OVERVIEW_INPUT = { query: "overview" } as const
-const SOURCE_INPUT = { query: "sourceHealth" } as const
 const MARKET_INPUT = { query: "marketSnapshot" } as const
 const JOB_INPUT = { query: "jobs", limit: 24 } as const
 const ANALYSIS_INPUT = {
@@ -32,14 +28,6 @@ export function useOverviewQueries(
   transport: ProductTransport,
   scope: ProductScope,
 ) {
-  const overview = useProductQuery(
-    transport,
-    scope,
-    "analysis",
-    "decision-overview",
-    OVERVIEW_INPUT,
-    decisionOverviewSchema,
-  )
   const analyses = useParsedProductQuery(
     transport,
     scope,
@@ -49,10 +37,9 @@ export function useOverviewQueries(
     (result) =>
       parseInvestmentAnalysisPage(result, { limit: ANALYSIS_INPUT.limit }),
   )
-  const sources = useSourceHealthQuery(transport, scope)
   const markets = useMarketSnapshotQuery(transport, scope)
   const jobs = useJobListQuery(transport, scope)
-  return { overview, analyses, sources, markets, jobs }
+  return { analyses, markets, jobs }
 }
 
 export function useOperationalQueries(
@@ -60,24 +47,9 @@ export function useOperationalQueries(
   scope: ProductScope,
 ) {
   return {
-    sources: useSourceHealthQuery(transport, scope),
     markets: useMarketSnapshotQuery(transport, scope),
     jobs: useJobListQuery(transport, scope),
   }
-}
-
-function useSourceHealthQuery(
-  transport: ProductTransport,
-  scope: ProductScope,
-) {
-  return useProductQuery(
-    transport,
-    scope,
-    "source",
-    "health",
-    SOURCE_INPUT,
-    sourceHealthSchema,
-  )
 }
 
 function useMarketSnapshotQuery(
@@ -123,7 +95,7 @@ function useProductQuery<Schema extends z.ZodType>(
       const parsed = parseApplicationData(result, schema)
       if (!parsed.success) {
         throw new Error(
-          "The installed service returned data this screen cannot safely interpret.",
+          "This information is unavailable right now.",
         )
       }
       return parsed.data

@@ -16,7 +16,6 @@ type Evidence = InvestmentAnalysis["evidence"]
 type Money = NonNullable<Evidence["market"]>["price"]
 type PriceRange = NonNullable<Evidence["priceForecast"]>["ranges"]["base"]
 type EvidenceWindow = NonNullable<Evidence["market"]>["window"]
-type ContentIdentity = EvidenceWindow["contentIdentity"]
 
 export type TrackRecordPresentation =
   | { state: "loading" }
@@ -49,14 +48,14 @@ export function InvestmentBrief({
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
-            Exact retained analysis
+            Saved investment analysis
           </p>
           <h2 id="investment-brief-title" className="mt-1 text-xl font-semibold">
             Investment Brief
           </h2>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            This brief restates the stored policy, evidence, and outcome. It does not add a
-            ranking, forecast a return, or turn the analysis into an order.
+            This brief explains the saved assumptions, supporting information, and outcome. It
+            does not add a ranking, invent a return forecast, or turn the analysis into an order.
           </p>
         </div>
         <div className="flex flex-col items-end gap-3">
@@ -72,7 +71,7 @@ export function InvestmentBrief({
               className={refreshing ? "animate-spin" : undefined}
               aria-hidden="true"
             />
-            Refresh current evidence
+            Refresh brief
           </Button>
         </div>
       </div>
@@ -81,9 +80,8 @@ export function InvestmentBrief({
         <CircleAlert aria-hidden="true" />
         <AlertTitle>Research only — execution ineligible</AlertTitle>
         <AlertDescription>
-          The installed service marks this analysis as {enumLabel(analysis.executionEligibility)}.
-          Projection and sizing evidence below creates no target, order, reservation, fill, or
-          settlement authority.
+          This analysis is {enumLabel(analysis.executionEligibility)} for execution. The projections
+          and sizing ranges below cannot create a target or place an order.
         </AlertDescription>
       </Alert>
 
@@ -92,7 +90,7 @@ export function InvestmentBrief({
         <p className="mt-1 text-sm leading-6 text-muted-foreground">{outcome.detail}</p>
         {analysis.result.kind === "no_action" ? (
           <p className="mt-3 text-xs leading-5 text-muted-foreground">
-            Policy invalidator: {invalidatorLabel(analysis.result.invalidators[0]!)}
+            Why no action: {invalidatorLabel(analysis.result.invalidators[0]!)}
           </p>
         ) : null}
       </div>
@@ -101,14 +99,14 @@ export function InvestmentBrief({
         <Fact label="Instrument record" value={analysis.evidence.instrumentId} mono />
         <Fact label="Account" value={analysis.evidence.accountId} mono />
         <Fact label="Reporting currency" value={analysis.evidence.currency} />
-        <Fact label="Evidence as of" value={formatUnixNanos(analysis.evidence.asOf)} />
+        <Fact label="Information current through" value={formatUnixNanos(analysis.evidence.asOf)} />
         <Fact label="Analysis horizon" value={formatUnixNanos(analysis.result.horizonAt)} />
         <Fact label="Brief expires" value={formatUnixNanos(analysis.result.expiresAt)} />
         <Fact
-          label="Evidence reliability"
+          label="Information reliability"
           value={
             reliability
-              ? `${reliability.valuePpm.toLocaleString("en-US")} ppm`
+              ? formatPpm(reliability.valuePpm)
               : "Not produced for an unavailable analysis"
           }
         />
@@ -123,13 +121,12 @@ export function InvestmentBrief({
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Analysis unavailable</AlertTitle>
           <AlertDescription>
-            The retained reason and any partial or mismatched evidence are shown below. Missing
-            evidence is not filled in by the desktop.
+            The saved reason and any partial or mismatched information are shown below. Market
+            Squawk does not fill in missing information.
           </AlertDescription>
         </Alert>
       ) : null}
 
-      <PublicationDetails analysis={analysis} />
       <ProjectionDetails analysis={analysis} />
       <SizingDetails analysis={analysis} />
       <RealizedOutcomeDetails analysis={analysis} />
@@ -137,7 +134,6 @@ export function InvestmentBrief({
       <PolicyDetails policy={analysis.policy} />
       {reliability ? <ReliabilityDetails reliability={reliability} /> : null}
       <EvidenceDetails evidence={analysis.evidence} />
-      <IdentityDetails analysis={analysis} />
     </section>
   )
 }
@@ -159,10 +155,10 @@ function GeneratedDetails({
 
   return (
     <>
-      <Disclosure title="Price cases and all seven retained ranges">
+      <Disclosure title="Price cases and action ranges">
         <p className="text-xs leading-5 text-muted-foreground">
-          These are exact backend-supplied prices. The desktop does not calculate gains, losses,
-          or percentages from them.
+          These are the prices saved with the analysis. They are research ranges, not promised
+          gains or losses.
         </p>
         <dl className="mt-4 grid gap-4 sm:grid-cols-3">
           <Fact label="Downside case" value={money(result.priceLadder.cases.downside)} />
@@ -206,76 +202,14 @@ function GeneratedDetails({
   )
 }
 
-function PublicationDetails({ analysis }: { analysis: InvestmentAnalysis }) {
-  const publication = analysis.publication
-  return (
-    <Disclosure title="Publication and analytical binding">
-      {!publication ? (
-        <p className="text-xs leading-5 text-muted-foreground">
-          Not published. No analytical-profile/workflow publication or profile-bound track record
-          is claimed for this retained analysis.
-        </p>
-      ) : (
-        <>
-          <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            <Fact label="Publication identity" value={publication.publicationId} mono />
-            <Fact label="Published" value={formatUnixNanos(publication.publishedAt)} />
-            <Fact
-              label="Execution eligibility"
-              value={enumLabel(publication.executionEligibility)}
-            />
-            <Fact
-              label="Analytical profile"
-              value={publication.analyticalProfile.profileId}
-              mono
-            />
-            <Fact
-              label="Profile revision"
-              value={publication.analyticalProfile.revision.toLocaleString("en-US")}
-            />
-            <IdentityFact
-              label="Analytical profile content"
-              identity={publication.analyticalProfile.contentDigest}
-            />
-            <Fact label="Publishing workflow" value={publication.workflow.workflowId} mono />
-            <Fact
-              label="Workflow revision"
-              value={publication.workflow.revision.toLocaleString("en-US")}
-            />
-            <IdentityFact
-              label="Workflow content"
-              identity={publication.workflow.contentDigest}
-            />
-            <Fact label="Proposal account" value={publication.accountSetup.accountId} mono />
-            <Fact
-              label="Account/profile separation"
-              value="Confirmed — the brokerage account is not the analytical profile"
-            />
-            <Fact
-              label="Outcome projection digest"
-              value={publication.outcomeProjectionDigest ?? "Not published"}
-              mono={publication.outcomeProjectionDigest !== null}
-            />
-            <Fact
-              label="Sizing projection digest"
-              value={publication.sizingProjectionDigest ?? "Not published"}
-              mono={publication.sizingProjectionDigest !== null}
-            />
-          </dl>
-        </>
-      )}
-    </Disclosure>
-  )
-}
-
 function ProjectionDetails({ analysis }: { analysis: InvestmentAnalysis }) {
   const projection = analysis.projection
   if (!projection) {
     return (
       <Disclosure title="Gross outcome projection">
         <p className="text-xs leading-5 text-muted-foreground">
-          No exact generated-proposal outcome projection is published for this analysis. The
-          desktop does not infer one from the price ladder.
+          No gross outcome projection was saved for this analysis. Market Squawk does not infer
+          one from the price ranges.
         </p>
       </Disclosure>
     )
@@ -288,17 +222,12 @@ function ProjectionDetails({ analysis }: { analysis: InvestmentAnalysis }) {
   return (
     <Disclosure title="Gross outcome projection">
       <p className="text-xs leading-5 text-muted-foreground">
-        Exact server-owned gross mark-relative evidence. The numerator and denominator are shown
-        without client-side division. Net P/L, benchmark-relative return, and after-tax P/L remain
-        explicitly unavailable.
+        Gross price-change inputs relative to the observed starting price. Fees, taxes, benchmark
+        performance, and actual trading results are not included.
       </p>
       <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-        <Fact label="Projection identity" value={projection.resultDigest} mono />
-        <Fact label="Proposal identity" value={projection.proposalId} mono />
-        <Fact label="Derivation digest" value={projection.derivationDigest} mono />
-        <Fact label="Authority" value={enumLabel(projection.authority)} />
         <Fact label="Execution eligible" value="No" />
-        <Fact label="Retained mark" value={money(projection.mark)} />
+        <Fact label="Starting price" value={money(projection.mark)} />
         <Fact label="Horizon" value={formatUnixNanos(projection.horizonAt)} />
         <Fact label="Net P/L" value={unavailableLabel(projection.netPnl.reason)} />
         <Fact
@@ -317,11 +246,11 @@ function ProjectionDetails({ analysis }: { analysis: InvestmentAnalysis }) {
             <dl className="mt-3 grid gap-3">
               <Fact label="Price range" value={priceRange(value.priceRange)} />
               <Fact
-                label="Gross return lower expression"
+                label="Lower price change ÷ starting price"
                 value={`${money(value.grossReturnFromMark.lowerNumerator)} ÷ ${money(value.grossReturnFromMark.denominator)}`}
               />
               <Fact
-                label="Gross return upper expression"
+                label="Upper price change ÷ starting price"
                 value={`${money(value.grossReturnFromMark.upperNumerator)} ÷ ${money(value.grossReturnFromMark.denominator)}`}
               />
             </dl>
@@ -338,20 +267,16 @@ function SizingDetails({ analysis }: { analysis: InvestmentAnalysis }) {
     <Disclosure title="Sizing feasibility — no selected target">
       {!sizing ? (
         <p className="text-xs leading-5 text-muted-foreground">
-          No exact sizing-feasibility sidecar is published. The desktop will not derive a quantity
-          from price, cash, risk, or portfolio evidence.
+          No sizing range was saved. Market Squawk will not invent a quantity from price, cash,
+          risk, or portfolio information.
         </p>
       ) : (
         <>
           <p className="text-xs leading-5 text-muted-foreground">
-            The server evaluated feasible lot intervals only. It selected no target lots and
-            produced no order quantity.
+            These ranges show what may fit the recorded limits. No target quantity was selected
+            and no order was created.
           </p>
           <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            <Fact label="Sizing identity" value={sizing.resultDigest} mono />
-            <Fact label="Proposal identity" value={sizing.proposalId} mono />
-            <Fact label="Derivation digest" value={sizing.derivationDigest} mono />
-            <Fact label="Authority" value={enumLabel(sizing.authority)} />
             <Fact label="Execution eligible" value="No" />
             <Fact label="Evaluated" value={formatUnixNanos(sizing.evaluatedAt)} />
             <Fact
@@ -381,16 +306,14 @@ function RealizedOutcomeDetails({ analysis }: { analysis: InvestmentAnalysis }) 
     <Disclosure title="Current realized-outcome status">
       {!outcome ? (
         <p className="text-xs leading-5 text-muted-foreground">
-          No current outcome-status revision is published. Absence is not treated as a completed or
-          profitable result.
+          No current result is available. Missing results are not counted as completed or
+          profitable.
         </p>
       ) : (
         <>
           <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
             <Fact label="Status" value={enumLabel(outcome.kind)} />
-            <Fact label="Outcome series" value={outcome.seriesId} mono />
             <Fact label="Revision" value={outcome.revision.toLocaleString("en-US")} />
-            <Fact label="Status digest" value={outcome.statusDigest} mono />
             <Fact label="Evaluated" value={formatUnixNanos(outcome.evaluatedAt)} />
             <Fact label="Execution eligible" value="No" />
             {outcome.kind === "pending" || outcome.kind === "unavailable" ? (
@@ -410,18 +333,6 @@ function RealizedOutcomeDetails({ analysis }: { analysis: InvestmentAnalysis }) 
                 <Fact label="Gross price-return decimal" value={outcome.grossPriceReturn} mono />
                 <Fact label="Observed" value={formatUnixNanos(outcome.observedAt)} />
                 <Fact label="Available" value={formatUnixNanos(outcome.availableAt)} />
-                <IdentityFact
-                  label="Endpoint selection receipt"
-                  identity={outcome.selectionReceiptIdentity}
-                />
-                <IdentityFact
-                  label="Selected endpoint observation"
-                  identity={outcome.selectedObservationIdentity}
-                />
-                <IdentityFact
-                  label="Corporate-action evidence"
-                  identity={outcome.corporateActionEvidenceIdentity}
-                />
                 <Fact label="Net return" value={unavailableLabel(outcome.netReturn.reason)} />
                 <Fact
                   label="Benchmark return"
@@ -450,7 +361,7 @@ function TrackRecordDetails({
   presentation: TrackRecordPresentation
 }) {
   return (
-    <Disclosure title="Profile-bound recommendation track record">
+    <Disclosure title="Recommendation history">
       {presentation.state === "loading" ? (
         <div className="grid gap-3 sm:grid-cols-2" aria-label="Loading recommendation track record">
           <Skeleton className="h-24 w-full" />
@@ -461,7 +372,7 @@ function TrackRecordDetails({
       ) : presentation.state === "error" ? (
         <Alert variant="destructive">
           <CircleAlert aria-hidden="true" />
-          <AlertTitle>The exact track record could not be loaded</AlertTitle>
+          <AlertTitle>Recommendation history could not be loaded</AlertTitle>
           <AlertDescription>
             {presentation.detail}
             <Button
@@ -471,7 +382,7 @@ function TrackRecordDetails({
               className="mt-2"
               onClick={presentation.onRetry}
             >
-              Retry exact track record
+              Retry recommendation history
             </Button>
           </AlertDescription>
         </Alert>
@@ -486,23 +397,14 @@ function TrackRecordReady({ value }: { value: RecommendationTrackRecord }) {
   return (
     <>
       <p className="text-xs leading-5 text-muted-foreground">
-        Current-status outcomes for the exact published analytical profile and recommendation
-        horizon. Cohorts remain separate; the service owns sample gates, coverage, and mean-return
-        arithmetic. Forecast calibration and execution performance are not included.
+        Current results for recommendations made with the same analysis settings and horizon.
+        Groups remain separate, and results appear only when sample size and coverage are adequate.
+        Forecast calibration and actual trading performance are not included.
       </p>
       <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-        <Fact label="Analytical profile" value={value.analyticalProfile.profileId} mono />
         <Fact
-          label="Profile revision"
-          value={value.analyticalProfile.revision.toLocaleString("en-US")}
-        />
-        <IdentityFact
-          label="Profile content"
-          identity={value.analyticalProfile.contentDigest}
-        />
-        <Fact
-          label="Exact horizon (nanoseconds)"
-          value={formatLosslessInteger(value.horizonNanos)}
+          label="Horizon"
+          value={formatDuration(value.horizonNanos)}
         />
         <Fact label="Evaluated" value={formatUnixNanos(value.evaluatedAt)} />
         <Fact
@@ -515,7 +417,7 @@ function TrackRecordReady({ value }: { value: RecommendationTrackRecord }) {
         />
         <Fact
           label="Minimum coverage"
-          value={`${value.minimumCoveragePpm.toLocaleString("en-US")} ppm`}
+          value={formatPpm(value.minimumCoveragePpm)}
         />
         <Fact label="Forecast calibration included" value="No" />
         <Fact label="Execution performance included" value="No" />
@@ -525,13 +427,13 @@ function TrackRecordReady({ value }: { value: RecommendationTrackRecord }) {
           <thead className="text-muted-foreground">
             <tr className="border-b border-border">
               <th className="px-2 py-2 font-medium">Cohort</th>
-              <th className="px-2 py-2 font-medium">Published</th>
+              <th className="px-2 py-2 font-medium">Total</th>
               <th className="px-2 py-2 font-medium">Due</th>
               <th className="px-2 py-2 font-medium">Completed</th>
               <th className="px-2 py-2 font-medium">Pending</th>
               <th className="px-2 py-2 font-medium">Unavailable</th>
               <th className="px-2 py-2 font-medium">Coverage</th>
-              <th className="px-2 py-2 font-medium">Server performance</th>
+              <th className="px-2 py-2 font-medium">Historical result</th>
             </tr>
           </thead>
           <tbody>
@@ -543,7 +445,7 @@ function TrackRecordReady({ value }: { value: RecommendationTrackRecord }) {
                 <td className="px-2 py-3">{group.completedCount.toLocaleString("en-US")}</td>
                 <td className="px-2 py-3">{group.pendingCount.toLocaleString("en-US")}</td>
                 <td className="px-2 py-3">{group.unavailableCount.toLocaleString("en-US")}</td>
-                <td className="px-2 py-3">{group.coveragePpm.toLocaleString("en-US")} ppm</td>
+                <td className="px-2 py-3">{formatPpm(group.coveragePpm)}</td>
                 <td className="px-2 py-3">{trackPerformanceLabel(group.performance)}</td>
               </tr>
             ))}
@@ -556,23 +458,7 @@ function TrackRecordReady({ value }: { value: RecommendationTrackRecord }) {
 
 function PolicyDetails({ policy }: { policy: InvestmentAnalysis["policy"] }) {
   return (
-    <Disclosure title="Policy, assumptions, and limits">
-      <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-        <Fact label="Policy version" value={policy.version.toLocaleString("en-US")} />
-        <Fact
-          label="Action-zone version"
-          value={policy.actionZoneSemanticsVersion.toLocaleString("en-US")}
-        />
-        <Fact
-          label="Policy horizon (nanoseconds)"
-          value={formatLosslessInteger(policy.horizonNanos)}
-        />
-        <Fact
-          label="Brief lifetime (nanoseconds)"
-          value={formatLosslessInteger(policy.proposalLifetimeNanos)}
-        />
-        <Fact label="Policy digest" value={policy.digest} mono />
-      </dl>
+    <Disclosure title="Assumptions and limits">
       <PolicyList title="Assumptions" values={policy.assumptions} />
       <PolicyList
         title="Invalidation conditions"
@@ -592,16 +478,16 @@ function ReliabilityDetails({
   >["evidenceReliability"]
 }) {
   return (
-    <Disclosure title="Evidence reliability components">
+    <Disclosure title="Supporting-information reliability">
       <p className="text-xs leading-5 text-muted-foreground">
-        This is policy-weighted evidence reliability in parts per million. It is not a
-        probability of profit or a predicted return.
+        This measures how complete and dependable the supporting information was under the saved
+        rules. It is not a probability of profit or a predicted return.
       </p>
       <dl className="mt-4 grid gap-4 sm:grid-cols-2">
         <Fact label="Meaning" value={enumLabel(reliability.meaning)} />
         <Fact
           label="Aggregate reliability"
-          value={`${reliability.valuePpm.toLocaleString("en-US")} ppm`}
+          value={formatPpm(reliability.valuePpm)}
         />
       </dl>
       <div className="mt-4 overflow-x-auto">
@@ -610,7 +496,7 @@ function ReliabilityDetails({
             <tr className="border-b border-border">
               <th className="px-2 py-2 font-medium">Component</th>
               <th className="px-2 py-2 font-medium">Reliability</th>
-              <th className="px-2 py-2 font-medium">Policy weight</th>
+              <th className="px-2 py-2 font-medium">Weight</th>
             </tr>
           </thead>
           <tbody>
@@ -618,10 +504,10 @@ function ReliabilityDetails({
               <tr key={component.kind} className="border-b border-border/70 last:border-0">
                 <td className="px-2 py-3">{enumLabel(component.kind)}</td>
                 <td className="px-2 py-3 font-mono">
-                  {component.valuePpm.toLocaleString("en-US")} ppm
+                  {formatPpm(component.valuePpm)}
                 </td>
                 <td className="px-2 py-3 font-mono">
-                  {component.weightPpm.toLocaleString("en-US")} ppm
+                  {formatPpm(component.weightPpm)}
                 </td>
               </tr>
             ))}
@@ -634,10 +520,10 @@ function ReliabilityDetails({
 
 function EvidenceDetails({ evidence }: { evidence: Evidence }) {
   return (
-    <Disclosure title="Retained evidence">
+    <Disclosure title="Supporting information">
       <p className="text-xs leading-5 text-muted-foreground">
-        Each section shows only evidence retained by the service. An unavailable analysis may
-        intentionally retain absent or mismatched fields to explain why it could not proceed.
+        Each section shows the information saved with this analysis. Missing or mismatched inputs
+        remain visible when they explain why an analysis could not proceed.
       </p>
       <div className="mt-4 space-y-3">
         <EvidenceSection title="Market reference" present={evidence.market !== null}>
@@ -686,11 +572,6 @@ function MarketEvidence({
         <Fact label="Quality" value={enumLabel(evidence.quality)} />
         <Fact label="Price kind" value={enumLabel(evidence.priceKind)} />
         <Fact label="Adjustment basis" value={enumLabel(evidence.adjustmentBasis)} />
-        <IdentityFact label="Selection receipt" identity={evidence.selectionReceiptIdentity} />
-        <IdentityFact
-          label="Selected observation"
-          identity={evidence.selectedObservationIdentity}
-        />
       </dl>
       <EvidenceWindowFacts window={evidence.window} />
     </>
@@ -722,10 +603,6 @@ function ForecastEvidence({
               label="Expected terminal statistic"
               value={enumLabel(expected.statistic)}
             />
-            <IdentityFact
-              label="Expected terminal statistic binding"
-              identity={expected.statisticIdentity}
-            />
           </>
         ) : (
           <Fact
@@ -733,7 +610,6 @@ function ForecastEvidence({
             value="Unavailable — no admitted conditional mean"
           />
         )}
-        <Fact label="Vintage identity" value={evidence.vintageId} mono />
         <Fact label="Downside case" value={money(evidence.cases.downside)} />
         <Fact label="Base case" value={money(evidence.cases.base)} />
         <Fact label="Upside case" value={money(evidence.cases.upside)} />
@@ -742,24 +618,21 @@ function ForecastEvidence({
         <Fact label="Upside range" value={priceRange(evidence.ranges.upside)} />
         <Fact
           label="Nominal coverage"
-          value={`${evidence.calibration.nominalCoveragePpm.toLocaleString("en-US")} ppm`}
+          value={formatPpm(evidence.calibration.nominalCoveragePpm)}
         />
         <Fact
           label="Realized coverage"
-          value={`${evidence.calibration.realizedCoveragePpm.toLocaleString("en-US")} ppm`}
+          value={formatPpm(evidence.calibration.realizedCoveragePpm)}
         />
         <Fact
           label="Completed outcomes"
           value={evidence.calibration.completedOutcomes.toLocaleString("en-US")}
         />
-        <IdentityFact label="Output binding" identity={evidence.outputBindingIdentity} />
-        <IdentityFact label="Calibration" identity={evidence.calibrationIdentity} />
-        <IdentityFact label="Outcome set" identity={evidence.outcomeSetIdentity} />
       </dl>
       <p className="mt-4 text-xs leading-5 text-muted-foreground">
         {expected
-          ? "This admitted conditional mean authorizes exact backend expected-return calculations. It is not a probability, a guaranteed profit, or a net-profit estimate."
-          : "Expected return is unavailable: calibration coverage intervals do not establish an admitted conditional mean."}
+          ? "This conditional mean can support expected-return analysis. It is not a probability, a guaranteed profit, or a net-profit estimate."
+          : "Expected return is unavailable because the forecast does not include a sufficiently supported conditional mean."}
       </p>
       <EvidenceWindowFacts window={evidence.window} />
     </>
@@ -781,17 +654,6 @@ function ValuationEvidence({
         />
         <Fact label="Valuation basis" value={enumLabel(evidence.basis)} />
         <Fact label="Horizon" value={formatUnixNanos(evidence.horizonAt)} />
-        <Fact label="Measurement identity" value={evidence.measurementId} mono />
-        <Fact
-          label="Classification decision"
-          value={evidence.classificationDecisionId}
-          mono
-        />
-        <Fact
-          label="Selection receipt hash"
-          value={evidence.selectionReceiptHash}
-          mono
-        />
       </dl>
       <EvidenceWindowFacts window={evidence.window} />
     </>
@@ -809,45 +671,39 @@ function BacktestEvidence({
         <Fact label="Instrument record" value={evidence.instrumentId} mono />
         <Fact label="Currency" value={evidence.currency} />
         <Fact
-          label="Outcome horizon (nanoseconds)"
-          value={formatLosslessInteger(evidence.outcomeHorizonNanos)}
+          label="Outcome horizon"
+          value={formatDuration(evidence.outcomeHorizonNanos)}
         />
         <Fact
-          label="Supplied net return (basis points)"
-          value={formatLosslessInteger(evidence.netReturnBasisPoints)}
+          label="Net return"
+          value={formatBasisPoints(evidence.netReturnBasisPoints)}
         />
         <Fact
-          label="Supplied maximum drawdown (basis points)"
-          value={formatLosslessInteger(evidence.maxDrawdownBasisPoints)}
+          label="Maximum drawdown"
+          value={formatBasisPoints(evidence.maxDrawdownBasisPoints)}
         />
         <Fact
-          label="Fee assumption (basis points)"
-          value={formatLosslessInteger(evidence.feeBasisPoints)}
+          label="Fee assumption"
+          value={formatBasisPoints(evidence.feeBasisPoints)}
         />
         <Fact
-          label="Slippage assumption (basis points)"
-          value={formatLosslessInteger(evidence.slippageBasisPoints)}
+          label="Slippage assumption"
+          value={formatBasisPoints(evidence.slippageBasisPoints)}
         />
         <Fact
-          label="Maximum random slippage (basis points)"
-          value={formatLosslessInteger(evidence.maximumRandomSlippageBasisPoints)}
+          label="Maximum random slippage"
+          value={formatBasisPoints(evidence.maximumRandomSlippageBasisPoints)}
         />
         <Fact label="Observations" value={evidence.observations.toLocaleString("en-US")} />
         <Fact label="Trials" value={evidence.trials.toLocaleString("en-US")} />
         <Fact
           label="Stability"
-          value={`${evidence.stabilityPpm.toLocaleString("en-US")} ppm`}
+          value={formatPpm(evidence.stabilityPpm)}
         />
         <Fact
           label="Simulation cutoff"
           value={formatUnixNanos(evidence.simulationCutoffAt)}
         />
-        <IdentityFact label="Dataset" identity={evidence.datasetIdentity} />
-        <IdentityFact label="Command" identity={evidence.commandIdentity} />
-        <IdentityFact label="Terminal result" identity={evidence.terminalIdentity} />
-        <IdentityFact label="Report" identity={evidence.reportIdentity} />
-        <IdentityFact label="Cohort" identity={evidence.cohortIdentity} />
-        <IdentityFact label="Cost model" identity={evidence.costModelIdentity} />
       </dl>
       <EvidenceWindowFacts window={evidence.window} />
     </>
@@ -865,15 +721,14 @@ function LiquidityEvidence({
         <Fact label="Instrument record" value={evidence.instrumentId} mono />
         <Fact label="Currency" value={evidence.currency} />
         <Fact
-          label="Quoted spread (basis points)"
-          value={formatLosslessInteger(evidence.quotedSpreadBasisPoints)}
+          label="Quoted spread"
+          value={formatBasisPoints(evidence.quotedSpreadBasisPoints)}
         />
         <Fact
           label="Capacity"
-          value={`${evidence.capacityPpm.toLocaleString("en-US")} ppm`}
+          value={formatPpm(evidence.capacityPpm)}
         />
         <Fact label="Quality" value={enumLabel(evidence.quality)} />
-        <IdentityFact label="Assessment" identity={evidence.assessmentIdentity} />
       </dl>
       <EvidenceWindowFacts window={evidence.window} />
     </>
@@ -887,9 +742,9 @@ function PortfolioRiskEvidence({
 }) {
   const position =
     evidence.positionState.kind === "no_position"
-      ? "No retained position"
+      ? "No saved position"
       : [
-          "Position retained",
+          "Position available",
           evidence.positionState.addAllowed ? "add allowed" : "add not allowed",
           evidence.positionState.trimAllowed ? "trim allowed" : "trim not allowed",
           evidence.positionState.exitAllowed ? "exit allowed" : "exit not allowed",
@@ -901,13 +756,11 @@ function PortfolioRiskEvidence({
         <Fact label="Instrument record" value={evidence.instrumentId} mono />
         <Fact label="Account" value={evidence.accountId} mono />
         <Fact label="Currency" value={evidence.currency} />
-        <Fact label="Portfolio revision" value={evidence.portfolioRevision} mono />
         <Fact label="Position state" value={position} />
         <Fact
           label="Risk capacity"
-          value={`${evidence.riskCapacityPpm.toLocaleString("en-US")} ppm`}
+          value={formatPpm(evidence.riskCapacityPpm)}
         />
-        <IdentityFact label="Risk report" identity={evidence.riskReportIdentity} />
       </dl>
       <EvidenceWindowFacts window={evidence.window} />
     </>
@@ -920,30 +773,7 @@ function EvidenceWindowFacts({ window }: { window: EvidenceWindow }) {
       <Fact label="Observed" value={formatUnixNanos(window.observedAt)} />
       <Fact label="Available" value={formatUnixNanos(window.availableAt)} />
       <Fact label="Expires" value={formatUnixNanos(window.expiresAt)} />
-      <IdentityFact label="Content" identity={window.contentIdentity} />
     </dl>
-  )
-}
-
-function IdentityDetails({ analysis }: { analysis: InvestmentAnalysis }) {
-  return (
-    <Disclosure title="Exact analysis identities">
-      <dl className="grid gap-4 sm:grid-cols-2">
-        <Fact label="Analysis identity" value={analysis.analysisId} mono />
-        <Fact label="Policy digest" value={analysis.policy.digest} mono />
-        <Fact label="Evidence digest" value={analysis.evidenceDigest} mono />
-        {analysis.result.kind !== "unavailable" ? (
-          <>
-            <Fact label="Proposal identity" value={analysis.result.proposalId} mono />
-            <Fact
-              label="Derivation digest"
-              value={analysis.result.derivationDigest}
-              mono
-            />
-          </>
-        ) : null}
-      </dl>
-    </Disclosure>
   )
 }
 
@@ -959,13 +789,13 @@ function EvidenceSection({
   return (
     <details className="rounded-lg border border-border bg-background/30 p-3">
       <summary className="cursor-pointer text-xs font-semibold">
-        {title} · {present ? "Retained" : "Not retained"}
+        {title} · {present ? "Available" : "Not available"}
       </summary>
       {present ? (
         <div className="mt-4">{children}</div>
       ) : (
         <p className="mt-3 text-xs text-muted-foreground">
-          No {title.toLocaleLowerCase()} evidence is present in this analysis.
+          No {title.toLocaleLowerCase()} information is present in this analysis.
         </p>
       )}
     </details>
@@ -997,16 +827,6 @@ function PolicyList({ title, values }: { title: string; values: readonly string[
         ))}
       </ul>
     </div>
-  )
-}
-
-function IdentityFact({ label, identity }: { label: string; identity: ContentIdentity }) {
-  return (
-    <Fact
-      label={`${label} identity`}
-      value={`${identity.algorithm}: ${identity.digest}`}
-      mono
-    />
   )
 }
 
@@ -1062,13 +882,13 @@ function outcomeSummary(result: InvestmentAnalysisResult): {
         label: "Generated",
         title: `${actionLabel(result.action)} analysis generated`,
         detail:
-          "The service retained a research action, price ladder, action boundaries, and " +
-          "evidence reliability under the recorded policy.",
+          "The analysis includes a research action, price ranges, action boundaries, and a " +
+          "reliability assessment under the saved rules.",
       }
     case "no_action":
       return {
         label: "No action",
-        title: "The policy produced no action",
+        title: "The saved rules produced no action",
         detail: noActionReasonLabel(result.reason),
       }
     case "unavailable":
@@ -1110,15 +930,15 @@ function noActionReasonLabel(
 ): string {
   return {
     conflicting_forecast_and_valuation:
-      "The retained forecast and valuation did not support one policy-consistent action.",
-    backtest_below_policy: "The retained backtest evidence did not meet policy.",
-    liquidity_below_policy: "The retained liquidity evidence did not meet policy.",
+      "The forecast and valuation did not support one consistent action.",
+    backtest_below_policy: "The backtest did not meet the saved requirements.",
+    liquidity_below_policy: "Liquidity did not meet the saved requirements.",
     portfolio_risk_below_policy:
-      "The retained account-specific portfolio risk evidence did not meet policy.",
+      "Account-specific portfolio risk did not meet the saved requirements.",
     evidence_reliability_below_policy:
-      "The policy-weighted evidence reliability did not meet policy.",
+      "Supporting-information reliability did not meet the saved requirements.",
     position_state_not_actionable:
-      "The retained position state did not admit an action under policy.",
+      "The saved position did not allow an action under the saved rules.",
     generated_price_order_collapsed:
       "The generated price ordering could not preserve the required action zones.",
   }[value]
@@ -1129,10 +949,10 @@ function invalidatorLabel(
 ): string {
   return {
     forecast_valuation_conflict: "Forecast and valuation conflict",
-    backtest_policy_breach: "Backtest policy breach",
-    liquidity_policy_breach: "Liquidity policy breach",
-    portfolio_risk_policy_breach: "Portfolio-risk policy breach",
-    evidence_reliability_policy_breach: "Evidence-reliability policy breach",
+    backtest_policy_breach: "Backtest requirements not met",
+    liquidity_policy_breach: "Liquidity requirements not met",
+    portfolio_risk_policy_breach: "Portfolio-risk requirements not met",
+    evidence_reliability_policy_breach: "Information reliability requirements not met",
     position_state_incompatible: "Position state incompatible",
     generated_price_order_collapsed: "Generated price order collapsed",
   }[value]
@@ -1143,34 +963,28 @@ function unavailableReasonLabel(
 ): string {
   switch (reason.kind) {
     case "missing_evidence":
-      return `${evidenceKindLabel(reason.evidence)} evidence is missing.`
+      return `${evidenceKindLabel(reason.evidence)} information is missing.`
     case "instrument_mismatch":
-      return (
-        `${evidenceKindLabel(reason.evidence)} evidence names instrument ` +
-        `${reason.actual}, not expected instrument ${reason.expected}.`
-      )
+      return `${evidenceKindLabel(reason.evidence)} information belongs to a different investment.`
     case "currency_mismatch":
       return (
-        `${evidenceKindLabel(reason.evidence)} evidence uses ${reason.actual}, ` +
+        `${evidenceKindLabel(reason.evidence)} information uses ${reason.actual}, ` +
         `not expected currency ${reason.expected}.`
       )
     case "account_mismatch":
-      return (
-        `Portfolio evidence names account ${reason.actual}, ` +
-        `not expected account ${reason.expected}.`
-      )
+      return "Portfolio information belongs to a different account."
     case "not_available_at_cutoff":
       return (
-        `${evidenceKindLabel(reason.evidence)} evidence was not available ` +
+        `${evidenceKindLabel(reason.evidence)} information was not available ` +
         "at the analysis cutoff."
       )
     case "expired_evidence":
-      return `${evidenceKindLabel(reason.evidence)} evidence had expired.`
+      return `${evidenceKindLabel(reason.evidence)} information had expired.`
     case "stale_evidence":
-      return `${evidenceKindLabel(reason.evidence)} evidence was too old for policy.`
+      return `${evidenceKindLabel(reason.evidence)} information was too old for the saved rules.`
     case "rejected_quality":
       return (
-        `${evidenceKindLabel(reason.evidence)} evidence had rejected quality: ` +
+        `${evidenceKindLabel(reason.evidence)} information had unacceptable quality: ` +
         `${enumLabel(reason.quality)}.`
       )
     case "forecast_horizon_mismatch":
@@ -1185,29 +999,28 @@ function unavailableReasonLabel(
       )
     case "backtest_horizon_mismatch":
       return (
-        `The backtest horizon was ${formatLosslessInteger(reason.actualNanos)} ` +
-        `nanoseconds; policy expected ${formatLosslessInteger(reason.expectedNanos)}.`
+        `The backtest horizon was ${formatDuration(reason.actualNanos)}; ` +
+        `the saved rules expected ${formatDuration(reason.expectedNanos)}.`
       )
     case "insufficient_forecast_outcomes":
       return (
         `The forecast retained ${reason.actual.toLocaleString("en-US")} completed ` +
-        `outcomes; policy required ${reason.required.toLocaleString("en-US")}.`
+        `outcomes; the saved rules required ${reason.required.toLocaleString("en-US")}.`
       )
     case "unsupported_forecast_coverage":
       return (
-        `Forecast coverage was ${reason.actualPpm.toLocaleString("en-US")} ppm; ` +
-        `policy admitted ${reason.minimumPpm.toLocaleString("en-US")}–` +
-        `${reason.maximumPpm.toLocaleString("en-US")} ppm.`
+        `Forecast coverage was ${formatPpm(reason.actualPpm)}; ` +
+        `the saved range was ${formatPpm(reason.minimumPpm)}–${formatPpm(reason.maximumPpm)}.`
       )
     case "insufficient_backtest_observations":
       return (
         `The backtest retained ${reason.actual.toLocaleString("en-US")} ` +
-        `observations; policy required ${reason.required.toLocaleString("en-US")}.`
+        `observations; the saved rules required ${reason.required.toLocaleString("en-US")}.`
       )
     case "insufficient_backtest_trials":
       return (
-        `The backtest retained ${reason.actual.toLocaleString("en-US")} trials; ` +
-        `policy required ${reason.required.toLocaleString("en-US")}.`
+        `The backtest included ${reason.actual.toLocaleString("en-US")} trials; ` +
+        `the saved rules required ${reason.required.toLocaleString("en-US")}.`
       )
     case "reserved_portfolio_revision":
       return "The portfolio revision was reserved and could not authorize analysis."
@@ -1260,7 +1073,43 @@ function trackPerformanceLabel(
     case "insufficient_completed_samples":
       return `Unavailable — ${performance.actual} completed; ${performance.required} required`
     case "insufficient_coverage":
-      return `Unavailable — ${performance.actualPpm.toLocaleString("en-US")} ppm coverage; ${performance.requiredPpm.toLocaleString("en-US")} ppm required`
+      return `Unavailable — ${formatPpm(performance.actualPpm)} coverage; ${formatPpm(performance.requiredPpm)} required`
+  }
+}
+
+function formatDuration(value: string): string {
+  try {
+    const totalSeconds = BigInt(value) / 1_000_000_000n
+    const days = totalSeconds / 86_400n
+    const hours = (totalSeconds % 86_400n) / 3_600n
+    const minutes = (totalSeconds % 3_600n) / 60n
+    const parts = [
+      days > 0n ? `${days.toLocaleString("en-US")} day${days === 1n ? "" : "s"}` : null,
+      hours > 0n ? `${hours} hour${hours === 1n ? "" : "s"}` : null,
+      minutes > 0n ? `${minutes} minute${minutes === 1n ? "" : "s"}` : null,
+    ].filter((part): part is string => part !== null)
+    return parts.length > 0 ? parts.slice(0, 2).join(" ") : "Less than one minute"
+  } catch {
+    return "Unavailable"
+  }
+}
+
+function formatPpm(value: number): string {
+  return `${(value / 10_000).toLocaleString("en-US", {
+    maximumFractionDigits: 2,
+  })}%`
+}
+
+function formatBasisPoints(value: string): string {
+  try {
+    const basisPoints = BigInt(value)
+    const sign = basisPoints < 0n ? "−" : ""
+    const absolute = basisPoints < 0n ? -basisPoints : basisPoints
+    const whole = absolute / 100n
+    const fraction = (absolute % 100n).toString().padStart(2, "0").replace(/0+$/, "")
+    return `${sign}${whole.toLocaleString("en-US")}${fraction ? `.${fraction}` : ""}%`
+  } catch {
+    return "Unavailable"
   }
 }
 
@@ -1296,7 +1145,7 @@ export function BriefLoading() {
     <div className="rounded-xl border border-border bg-card/40 p-6" aria-live="polite">
       <div className="flex items-center gap-3 text-sm text-muted-foreground">
         <FileText className="size-4" aria-hidden="true" />
-        Loading the exact retained Investment Brief…
+        Loading the selected Investment Brief…
       </div>
     </div>
   )

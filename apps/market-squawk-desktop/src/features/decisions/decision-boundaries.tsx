@@ -10,13 +10,13 @@ export function DecisionBoundaries() {
     >
       <BoundaryCard
         icon={DatabaseZap}
-        title="Evidence stays identified"
-        detail="Observed marks and source identities remain distinct from forecasts, fair-value analyses, and portfolio revisions."
+        title="Facts stay separate from estimates"
+        detail="Observed prices remain distinct from forecasts, fair-value estimates, and portfolio judgments."
       />
       <BoundaryCard
         icon={ShieldCheck}
         title="Targets are governed judgment"
-        detail="Cases and entry, trim, and exit ranges are versioned research judgments with review and invalidation evidence."
+        detail="Cases and entry, trim, and exit ranges are reviewable research judgments with clear invalidation conditions."
       />
       <BoundaryCard
         icon={Ban}
@@ -24,17 +24,9 @@ export function DecisionBoundaries() {
         detail="A target never submits an order, bypasses portfolio risk, promotes a model output, or authorizes execution."
       />
       <h2 id="decision-boundaries-heading" className="sr-only">
-        Decision evidence boundaries
+        Decision safeguards
       </h2>
     </section>
-  )
-}
-
-export function EvidenceIdentity({ value }: { value: string }) {
-  return (
-    <span className="block truncate font-mono text-[10px] text-muted-foreground" title={value}>
-      {value}
-    </span>
   )
 }
 

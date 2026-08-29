@@ -10,7 +10,6 @@ import {
   Trash2,
 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
@@ -29,7 +28,6 @@ import {
   parseResearchFileDiscard,
   parseResearchFilePreview,
   type ResearchFilePreview,
-  type ResearchJobReceipt,
 } from "./research-contracts"
 
 type ResearchFileFormat = ResearchFilePreview["format"]
@@ -129,7 +127,7 @@ export function ResearchFileImport({
   const [universe, setUniverse] = React.useState("")
   const [activity, setActivity] = React.useState<ImportActivity>(null)
   const [error, setError] = React.useState<string | null>(null)
-  const [receipt, setReceipt] = React.useState<ResearchJobReceipt | null>(null)
+  const [importStarted, setImportStarted] = React.useState(false)
   const [confirmationOpen, setConfirmationOpen] = React.useState(false)
 
   const clearMapping = React.useCallback(() => {
@@ -146,7 +144,7 @@ export function ResearchFileImport({
   const beginPreview = async () => {
     if (!format) return
     setError(null)
-    setReceipt(null)
+    setImportStarted(false)
     setActivity("preview")
     try {
       const value = await invoke<unknown>("preview_research_file_import", {
@@ -162,8 +160,8 @@ export function ResearchFileImport({
       }
       setPreview(next)
       clearMapping()
-    } catch (cause) {
-      setError(messageFrom(cause))
+    } catch {
+      setError("The file could not be checked. Try again or choose another file.")
     } finally {
       setActivity(null)
     }
@@ -182,8 +180,8 @@ export function ResearchFileImport({
       setPreview(null)
       clearMapping()
       setConfirmationOpen(false)
-    } catch (cause) {
-      setError(messageFrom(cause))
+    } catch {
+      setError("The file preview could not be closed. Try again.")
     } finally {
       setActivity(null)
     }
@@ -213,14 +211,14 @@ export function ResearchFileImport({
         mapping: mappingResult.mapping,
         confirmed: true,
       })
-      const started = parseResearchFileCommit(value)
-      setReceipt(started)
+      parseResearchFileCommit(value)
+      setImportStarted(true)
       setPreview(null)
       clearMapping()
       setConfirmationOpen(false)
       await onStarted()
-    } catch (cause) {
-      setError(messageFrom(cause))
+    } catch {
+      setError("The file could not be imported. Review your choices and try again.")
       setConfirmationOpen(false)
     } finally {
       setActivity(null)
@@ -271,7 +269,7 @@ export function ResearchFileImport({
   }> = [
     {
       key: "publishedField",
-      label: "Publication time column",
+      label: "First-public time column",
       columns: rowFieldColumns,
     },
     {
@@ -310,8 +308,8 @@ export function ResearchFileImport({
             <h2 className="mt-2 text-lg font-semibold">Import a research file</h2>
             <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
               Choose a file, check a small preview, and tell Market Squawk what each useful
-              column means. The selected file remains on this device; its path and access ticket
-              are never shown in the dashboard.
+              column means. The selected file remains on this device, and only the columns you
+              choose become research information.
             </p>
           </div>
           <ol className="flex shrink-0 items-center gap-2 text-[10px] text-muted-foreground">
@@ -330,8 +328,7 @@ export function ResearchFileImport({
             <AlertCircle aria-hidden="true" />
             <AlertTitle>File import is unavailable</AlertTitle>
             <AlertDescription>
-              The installed service is missing {missingOperations.join(", ")}. No file will be
-              selected until the complete local import chain is available.
+              This installation cannot safely import files yet. No file has been selected.
             </AlertDescription>
           </Alert>
         ) : !isTauri() ? (
@@ -339,8 +336,8 @@ export function ResearchFileImport({
             <AlertCircle aria-hidden="true" />
             <AlertTitle>Open the installed desktop application</AlertTitle>
             <AlertDescription>
-              Protected file selection is available in the Market Squawk desktop application,
-              not a standalone browser tab.
+              Choose files from the installed Market Squawk desktop application. File selection
+              is not available in a standalone browser tab.
             </AlertDescription>
           </Alert>
         ) : null}
@@ -405,8 +402,8 @@ export function ResearchFileImport({
 
             {identityColumns.length === 0 ? (
               <CorrectionAlert>
-                Every row needs one always-present ID column. Add a unique ID column without
-                blank values, then choose the corrected file again.
+                Every row needs one value that identifies it. Add a unique column without blank
+                values, then choose the corrected file again.
               </CorrectionAlert>
             ) : null}
             {numericColumns.length === 0 ? (
@@ -424,7 +421,7 @@ export function ResearchFileImport({
                     These names make the imported history searchable and identify every row.
                   </p>
                 </div>
-                <Field label="Dataset name" help="Use letters, numbers, dots, dashes, underscores, colons, or slashes.">
+                <Field label="Collection name" help="Use letters, numbers, dots, dashes, underscores, colons, or slashes.">
                   <Input
                     value={dataset}
                     onChange={(event) => setDataset(event.target.value)}
@@ -435,13 +432,13 @@ export function ResearchFileImport({
                   />
                 </Field>
                 <Field
-                  label="Unique row ID column"
-                  help="Choose one always-present column that is different for every row, such as a provider record ID or an existing combined date-and-symbol ID."
+                  label="Column that identifies each row"
+                  help="Choose one always-present column that is different for every row, such as a record number or an existing combined date-and-symbol value."
                 >
                   <ColumnSelect
                     value={identityField}
                     columns={identityColumns.map((column) => column.name)}
-                    emptyLabel="Choose the unique ID column"
+                    emptyLabel="Choose the unique column"
                     onChange={setIdentityField}
                   />
                 </Field>
@@ -451,7 +448,7 @@ export function ResearchFileImport({
                 <h3 className="text-sm font-semibold">Choose the values to analyze</h3>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
                   Select one or more always-present numeric columns. Market Squawk verifies the
-                  exact decimal scale across the full file before ingestion.
+                  number format across the full file before importing it.
                 </p>
                 <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
                   {numericColumns.map((column) => {
@@ -545,7 +542,7 @@ export function ResearchFileImport({
                     onChange={(event) => setEffectiveAt(event.target.value)}
                   />
                 </Field>
-                <Field label="Per-row data time (optional)" help="Every value must be an RFC 3339 timestamp.">
+                <Field label="Per-row data time (optional)" help="Each entry must include a date, time, and time zone, such as 2026-08-29T14:30:00Z.">
                   <ColumnSelect
                     value={rowMappings.effectiveField}
                     columns={rowFieldColumns.map((column) => column.name)}
@@ -555,7 +552,7 @@ export function ResearchFileImport({
                     }
                   />
                 </Field>
-                <Field label="Fallback publication time (optional, UTC)" help="When the information first became public.">
+                <Field label="Fallback first-public time (optional, UTC)" help="When the information first became public.">
                   <Input
                     type="datetime-local"
                     value={publishedAt}
@@ -569,8 +566,8 @@ export function ResearchFileImport({
                   Advanced time, revision, and investment links
                 </summary>
                 <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                  Use these only when the file explicitly contains the corresponding evidence.
-                  Leaving them blank does not invent a value.
+                  Use these only when the file explicitly contains the corresponding information.
+                  Leave them blank when it does not.
                 </p>
                 <div className="mt-4 grid gap-4 sm:grid-cols-2">
                   {advancedRowFields.map((field) => (
@@ -587,10 +584,10 @@ export function ResearchFileImport({
                       }
                     />
                   ))}
-                  <Field label="Internal investment UUID (optional)" help="Link only when you know the exact Market Squawk instrument ID.">
+                  <Field label="Investment link (optional)" help="Use the reference copied from an investment page.">
                     <Input value={instrumentId} onChange={(event) => setInstrumentId(event.target.value)} maxLength={36} autoComplete="off" spellCheck={false} />
                   </Field>
-                  <Field label="Historical universe (optional)" help="Requires an internal investment UUID.">
+                  <Field label="Investment group on that date (optional)" help="Available after linking an investment.">
                     <Input value={universe} onChange={(event) => setUniverse(event.target.value)} maxLength={256} placeholder="my_watchlist" autoComplete="off" spellCheck={false} />
                   </Field>
                 </div>
@@ -606,9 +603,9 @@ export function ResearchFileImport({
                 <ShieldCheck aria-hidden="true" />
                 <AlertTitle>Ready for final review</AlertTitle>
                 <AlertDescription>
-                  The exact file preview, {valueMappings.length.toLocaleString()} selected value
-                  {valueMappings.length === 1 ? "" : "s"}, timing choices, and optional investment
-                  link are ready to be bound to one durable ingestion job.
+                  The file preview, {valueMappings.length.toLocaleString()} selected value
+                  {valueMappings.length === 1 ? "" : "s"}, dates, and optional investment link are
+                  ready to import.
                 </AlertDescription>
               </Alert>
             )}
@@ -616,7 +613,7 @@ export function ResearchFileImport({
             <div className="flex flex-wrap justify-end gap-2 border-t border-border pt-4">
               <Button variant="outline" onClick={() => void discard()} disabled={activity !== null}>
                 <Trash2 aria-hidden="true" />
-                {activity === "discard" ? "Discarding…" : "Discard preview"}
+                {activity === "discard" ? "Closing…" : "Choose a different file"}
               </Button>
               <Button
                 onClick={() => setConfirmationOpen(true)}
@@ -637,12 +634,13 @@ export function ResearchFileImport({
           </Alert>
         ) : null}
 
-        {receipt ? (
+        {importStarted ? (
           <Alert className="mt-4">
             <CheckCircle2 aria-hidden="true" />
             <AlertTitle>Your research import is running</AlertTitle>
             <AlertDescription>
-              Durable job {receipt.jobId} is queued at generation {receipt.generation}, sequence {receipt.sequence}. You may leave this page; live progress and recovery actions appear in Research activity below and Operations.
+              You may leave this page. Follow progress and recovery actions in Background activity
+              or Operations &amp; Jobs.
             </AlertDescription>
           </Alert>
         ) : null}
@@ -656,18 +654,17 @@ export function ResearchFileImport({
       >
         <DialogContent showCloseButton={activity !== "commit"}>
           <DialogHeader>
-            <DialogTitle>Import this exact research file?</DialogTitle>
+            <DialogTitle>Import this research file?</DialogTitle>
             <DialogDescription>
-              Market Squawk will bind this mapping to the reviewed local bytes, retain the
-              point-in-time evidence, and start a durable ingestion job. It cannot substitute a
-              different file or mapping.
+              Market Squawk will use the choices shown below and add the file to your research
+              library. Review them before continuing.
             </DialogDescription>
           </DialogHeader>
           {preview && mappingResult.mapping ? (
             <div className="space-y-2 rounded-lg border border-border bg-card/40 p-3 text-xs leading-5">
-              <Summary label="Dataset" value={mappingResult.mapping.dataset} />
+              <Summary label="Collection" value={mappingResult.mapping.dataset} />
               <Summary label="Rows" value={preview.rowCount.toLocaleString()} />
-              <Summary label="Unique ID" value={mappingResult.mapping.identityField} />
+              <Summary label="Row identifier column" value={mappingResult.mapping.identityField} />
               <Summary
                 label="Values"
                 value={mappingResult.mapping.fields
@@ -677,7 +674,7 @@ export function ResearchFileImport({
               <Summary label="Fallback data time" value={mappingResult.mapping.effectiveAt} />
               <Summary
                 label="Investment link"
-                value={mappingResult.mapping.instrumentId ?? "Not linked"}
+                value={mappingResult.mapping.instrumentId ? "Linked" : "Not linked"}
               />
             </div>
           ) : null}
@@ -691,7 +688,7 @@ export function ResearchFileImport({
               ) : (
                 <ShieldCheck aria-hidden="true" />
               )}
-              {activity === "commit" ? "Starting durable import…" : "Confirm and import"}
+              {activity === "commit" ? "Importing…" : "Confirm and import"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -712,7 +709,7 @@ function PreviewTable({ preview }: { preview: ResearchFilePreview }) {
           </p>
         </div>
         <span className="rounded-md border border-border px-2 py-1 font-mono text-[10px] text-muted-foreground">
-          Local bytes verified
+          Ready to review
         </span>
       </div>
       <div className="mt-3 max-h-80 overflow-auto rounded-lg border border-border bg-background/30">
@@ -834,11 +831,11 @@ function buildMapping(input: {
   universe: string
 }): { mapping: GuidedMapping | null; error: string | null } {
   const dataset = input.dataset.trim()
-  if (!validIdentifier(dataset, 256)) return invalid("Enter a valid searchable dataset name.")
+  if (!validIdentifier(dataset, 256)) return invalid("Enter a valid searchable collection name.")
   const columns = new Map(input.preview.columns.map((column) => [column.name, column]))
   const identity = columns.get(input.identityField)
   if (!identity || identity.nullable || ["unsupported", "null"].includes(identity.kind)) {
-    return invalid("Choose an always-present unique row ID column.")
+    return invalid("Choose an always-present column that identifies each row.")
   }
   if (input.valueMappings.length === 0) return invalid("Choose at least one numeric value column.")
   if (input.valueMappings.length > 64) return invalid("Choose no more than 64 numeric value columns.")
@@ -862,15 +859,15 @@ function buildMapping(input: {
   const effective = utcTimestamp(input.effectiveAt)
   if (!effective) return invalid("Choose the fallback data time in UTC.")
   const published = input.publishedAt ? utcTimestamp(input.publishedAt) : null
-  if (input.publishedAt && !published) return invalid("Choose a valid fallback publication time in UTC.")
-  for (const [label, field] of Object.entries(input.rowMappings)) {
-    if (field && !columns.has(field)) return invalid(`The selected ${label} column is not in this preview.`)
+  if (input.publishedAt && !published) return invalid("Choose a valid fallback first-public time in UTC.")
+  for (const field of Object.values(input.rowMappings)) {
+    if (field && !columns.has(field)) return invalid("A selected date or revision column is no longer in this file preview.")
   }
   const instrument = input.instrumentId.trim().toLowerCase()
-  if (instrument && (!uuidPattern.test(instrument) || instrument === nilUuid)) return invalid("Enter a non-empty Market Squawk instrument UUID or leave it blank.")
+  if (instrument && (!uuidPattern.test(instrument) || instrument === nilUuid)) return invalid("Enter a valid investment reference or leave it blank.")
   const universe = input.universe.trim()
-  if (universe && !instrument) return invalid("Link an internal investment before naming its historical universe.")
-  if (universe && !validIdentifier(universe, 256)) return invalid("Enter a valid historical-universe name.")
+  if (universe && !instrument) return invalid("Link an investment before naming its dated group.")
+  if (universe && !validIdentifier(universe, 256)) return invalid("Enter a valid dated investment-group name.")
   const optionalRows = Object.fromEntries(
     Object.entries(input.rowMappings).filter(([, value]) => value !== ""),
   ) as Partial<RowMappings>

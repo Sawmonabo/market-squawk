@@ -99,7 +99,7 @@ export function OpportunitiesReadExperience({
     queryFn: async () => {
       const analysisId = selectedAnalysisId
       if (analysisId === null) {
-        throw new Error("Select one retained analysis before opening its brief.")
+        throw new Error("Select a saved analysis before opening its brief.")
       }
       return parseInvestmentAnalysis(
         await transport.query({
@@ -140,9 +140,7 @@ export function OpportunitiesReadExperience({
     queryFn: async () => {
       const request = trackRecordRequest
       if (!request) {
-        throw new Error(
-          "The selected analysis does not expose a callable track-record binding.",
-        )
+        throw new Error("A comparable track record is not available for this analysis.")
       }
       return parseRecommendationTrackRecord(
         await transport.query({
@@ -164,7 +162,7 @@ export function OpportunitiesReadExperience({
       ? {
           state: "unavailable",
           detail:
-            "This installed service generation does not advertise the exact recommendation track-record read.",
+            "Recommendation history is not available in this installation.",
         }
       : trackRecordRequestAvailability?.kind === "unavailable"
         ? {
@@ -195,12 +193,12 @@ export function OpportunitiesReadExperience({
       >
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">
-            Retained, evidence-bound investment analysis
+            Saved investment analysis
           </p>
           <h1 className="mt-2 text-3xl font-semibold tracking-tight">Opportunities</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Review investment analyses already retained by Market Squawk. History stays in its
-            durable append order; this page does not rank instruments or claim that a new search
+            Review investment analyses already saved by Market Squawk. History is shown in the
+            order it was created; this page does not rank investments or claim that a new search
             has run.
           </p>
         </div>
@@ -219,10 +217,10 @@ export function OpportunitiesReadExperience({
             className="mt-2 text-xs leading-5 text-muted-foreground"
           >
             {controller.data
-              ? `${controller.data.activeProfile.displayName} is active, but ${controller.data.workflowReadiness.blockers[0]?.detail ?? "the required analysis capabilities are unavailable"} This control starts no work.`
+              ? `${controller.data.activeProfile.displayName} is active, but the required analysis inputs are not ready. This control starts no work.`
               : controller.isError
-                ? `The durable Desktop analytical profile could not be read: ${messageFrom(controller.error)} This control starts no work.`
-                : "Checking the durable analytical profile and workflow blockers. This control starts no work."}
+                ? `Analysis readiness could not be checked: ${messageFrom(controller.error)} This control starts no work.`
+                : "Checking whether the analysis workflow is ready. This control starts no work."}
           </p>
         </div>
       </header>
@@ -232,9 +230,8 @@ export function OpportunitiesReadExperience({
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Investment-analysis history is unavailable</AlertTitle>
           <AlertDescription>
-            This installed service generation does not advertise both exact investment-analysis
-            read operations. Update or repair the installation; the desktop will not substitute a
-            different decision record or infer a latest result.
+            This installation cannot open saved investment analyses. Update or repair Market
+            Squawk before using this page.
           </AlertDescription>
         </Alert>
       ) : (
@@ -244,12 +241,12 @@ export function OpportunitiesReadExperience({
               <div className="flex items-center gap-2">
                 <History className="size-4 text-primary" aria-hidden="true" />
                 <h2 id="opportunity-history-title" className="text-lg font-semibold">
-                  Retained analysis history
+                  Saved analysis history
                 </h2>
               </div>
               <p className="mt-1 max-w-2xl text-xs leading-5 text-muted-foreground">
-                Generated, no-action, and unavailable outcomes are all kept. Their storage order
-                is not a quality score or recommendation ranking.
+                Generated, no-action, and unavailable outcomes are all kept. Their order is not a
+                quality score or recommendation ranking.
               </p>
             </div>
             <Button
@@ -279,8 +276,8 @@ export function OpportunitiesReadExperience({
               <CircleAlert aria-hidden="true" />
               <AlertTitle>Analysis history could not be reconciled</AlertTitle>
               <AlertDescription>
-                The exact append-order pages repeated a stable analysis identity. The desktop
-                will not hide or reorder the conflict.
+                The saved history contains conflicting duplicate entries. Market Squawk will not
+                hide or reorder them.
               </AlertDescription>
             </Alert>
           ) : history.length === 0 ? (
@@ -288,8 +285,8 @@ export function OpportunitiesReadExperience({
           ) : (
             <>
               <p className="mt-5 text-xs text-muted-foreground">
-                {history.length.toLocaleString("en-US")} retained analysis
-                {history.length === 1 ? "" : "es"} loaded in append order.
+                {history.length.toLocaleString("en-US")} saved analysis
+                {history.length === 1 ? "" : "es"} loaded in creation order.
               </p>
               <div className="mt-3 grid gap-3 xl:grid-cols-2">
                 {history.map((analysis) => (
@@ -305,7 +302,7 @@ export function OpportunitiesReadExperience({
               {analyses.isError ? (
                 <HistoryError
                   detail={
-                    `An exact retained page could not be loaded: ` +
+                    `More saved analyses could not be loaded: ` +
                     messageFrom(analyses.error)
                   }
                   onRetry={() => void analyses.refetch()}
@@ -325,7 +322,7 @@ export function OpportunitiesReadExperience({
                     ) : (
                       <ChevronRight aria-hidden="true" />
                     )}
-                    Load the next retained page
+                    Load more analyses
                   </Button>
                 </div>
               ) : null}
@@ -353,7 +350,7 @@ export function OpportunitiesReadExperience({
                   className="mt-2"
                   onClick={() => void selected.refetch()}
                 >
-                  Retry exact analysis
+                  Retry analysis
                 </Button>
               </AlertDescription>
             </Alert>
@@ -379,11 +376,11 @@ function trackRecordUnavailableDetail(
 ): string {
   switch (reason) {
     case "analysis_not_published":
-      return "This retained analysis has not been published under an exact analytical profile, so no profile-bound track record can be requested."
+      return "A comparable recommendation history is not available for this analysis yet."
     case "profile_digest_algorithm_unsupported":
-      return "The publication uses a profile digest algorithm that the current track-record operation cannot accept."
+      return "This analysis cannot be compared with the current recommendation history."
     case "profile_identifier_unsupported":
-      return "The publication's analytical-profile binding is not accepted by the current track-record request contract."
+      return "This analysis cannot be compared with the current recommendation history."
   }
 }
 
@@ -418,7 +415,7 @@ function AnalysisHistoryCard({
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="font-mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground">
-            Analysis {analysis.analysisId.slice(0, 12)}…
+            Investment analysis
           </p>
           <p className="mt-2 break-all text-sm font-semibold">{analysis.instrumentId}</p>
           <p className="mt-1 text-xs text-muted-foreground">
@@ -435,12 +432,12 @@ function AnalysisHistoryCard({
       </div>
       <p className="mt-4 text-xs font-medium">{locatorOutcomeLabel(analysis.outcome)}</p>
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-3 sm:grid-cols-3">
-        <CardFact label="Evidence as of" value={formatUnixNanos(analysis.asOf)} />
+        <CardFact label="Information current through" value={formatUnixNanos(analysis.asOf)} />
         <CardFact label="Horizon" value={formatUnixNanos(analysis.horizonAt)} />
         <CardFact label="Expires" value={formatUnixNanos(analysis.expiresAt)} />
       </dl>
       <div className="mt-4 flex items-center justify-end gap-1 text-xs font-medium text-primary">
-        Open exact brief
+        Open brief
         <ChevronRight className="size-3" aria-hidden="true" />
       </div>
     </button>
@@ -459,7 +456,7 @@ function CardFact({ label, value }: { label: string; value: string }) {
 function EmptyHistory() {
   return (
     <div className="mt-5 rounded-xl border border-dashed border-border bg-card/30 p-6">
-      <p className="text-sm font-semibold">No retained investment analyses</p>
+      <p className="text-sm font-semibold">No saved investment analyses</p>
       <p className="mt-2 max-w-2xl text-xs leading-5 text-muted-foreground">
         No Generated, No action, or Unavailable result has been stored. This does not mean a
         search ran and found nothing; the guided finding workflow is not available from this page.
@@ -471,10 +468,10 @@ function EmptyHistory() {
 function SelectBriefPrompt() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-card/30 p-6">
-      <p className="text-sm font-semibold">Select one retained analysis</p>
+      <p className="text-sm font-semibold">Select a saved analysis</p>
       <p className="mt-2 max-w-2xl text-xs leading-5 text-muted-foreground">
-        Choose a history item to request that exact analysis identity and open its Investment
-        Brief. The desktop will not substitute the newest record.
+        Choose a history item to open its Investment Brief. Market Squawk will keep your selection
+        instead of silently switching to a newer analysis.
       </p>
     </div>
   )
@@ -482,7 +479,7 @@ function SelectBriefPrompt() {
 
 function HistoryLoading() {
   return (
-    <div className="mt-5 grid gap-3 xl:grid-cols-2" aria-label="Loading retained analyses">
+    <div className="mt-5 grid gap-3 xl:grid-cols-2" aria-label="Loading saved analyses">
       <Skeleton className="h-52 w-full" />
       <Skeleton className="h-52 w-full" />
     </div>
@@ -493,7 +490,7 @@ function HistoryError({ detail, onRetry }: { detail: string; onRetry: () => void
   return (
     <Alert variant="destructive" className="mt-5">
       <CircleAlert aria-hidden="true" />
-      <AlertTitle>Retained analysis history could not be loaded</AlertTitle>
+      <AlertTitle>Saved analysis history could not be loaded</AlertTitle>
       <AlertDescription>
         {detail}
         <Button type="button" variant="outline" size="sm" className="mt-2" onClick={onRetry}>

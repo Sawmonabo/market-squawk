@@ -16,7 +16,7 @@ import {
   ScrollText,
 } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -67,8 +67,10 @@ export function FairValuePage() {
       <FairValueFrame>
         <Alert variant="destructive">
           <CircleAlert aria-hidden="true" />
-          <AlertTitle>Fair-value service unavailable</AlertTitle>
-          <AlertDescription>{product.error}</AlertDescription>
+          <AlertTitle>Fair Value is unavailable</AlertTitle>
+          <AlertDescription>
+            The workspace could not start. Try again, or open Logs if the problem continues.
+          </AlertDescription>
         </Alert>
         <Button className="mt-4" onClick={product.refresh}>
           Try again
@@ -85,7 +87,7 @@ export function FairValuePage() {
       <FairValueFrame>
         <EmptyState
           title="Fair-value workspace is not available"
-          detail="The installed service did not advertise the bounded measurement index. Restore or update the Fair Value component before relying on classifications."
+          detail="This installation cannot open saved fair-value measurements. Update or restore the Fair Value component before relying on classifications."
         />
       </FairValueFrame>
     )
@@ -165,12 +167,14 @@ function FairValueWorkspace({
         <Alert variant="destructive">
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Measurements could not be loaded</AlertTitle>
-          <AlertDescription>{messageFrom(measurements.error)}</AlertDescription>
+          <AlertDescription>
+            Saved measurements are temporarily unavailable. Try again, or open Logs for details.
+          </AlertDescription>
         </Alert>
       ) : rows.length === 0 ? (
         <EmptyState
           title="No fair-value measurements yet"
-          detail="Create a measurement through a typed Fair Value workflow. Measurements appear here only after the service has retained their exact method, amount, inputs, and evidence identity."
+          detail="Create a measurement from a current portfolio holding. Saved measurements will appear here with their method, amount, supporting inputs, and classification."
         />
       ) : (
         <>
@@ -182,7 +186,7 @@ function FairValueWorkspace({
               icon={Landmark}
               label="Measurements"
               value={String(rows.length)}
-              detail="Immutable retained records"
+              detail="Saved valuations"
             />
             <SummaryFact
               icon={Layers3}
@@ -207,11 +211,11 @@ function FairValueWorkspace({
           {measurements.data.availableItems > measurements.data.returnedItems ? (
             <Alert className="mt-4">
               <CircleAlert aria-hidden="true" />
-              <AlertTitle>Bounded measurement result</AlertTitle>
+              <AlertTitle>Some measurements are not shown</AlertTitle>
               <AlertDescription>
                 Showing {measurements.data.returnedItems.toLocaleString()} of{" "}
-                {measurements.data.availableItems.toLocaleString()} retained measurements. Do not
-                treat this dashboard window as the complete population.
+                {measurements.data.availableItems.toLocaleString()} saved measurements. Load or
+                filter additional records before treating this view as complete.
               </AlertDescription>
             </Alert>
           ) : null}
@@ -233,10 +237,8 @@ function FairValueWorkspace({
           </div>
 
           <p className="mt-4 text-[10px] leading-5 text-muted-foreground">
-            Result boundary: {humanize(measurements.data.completeness)} · returned{" "}
-            {measurements.data.returnedItems.toLocaleString()} · available{" "}
-            {measurements.data.availableItems.toLocaleString()}. Fair-value classification is
-            analytical evidence and never grants execution-quality status.
+            Fair-value classification explains the valuation inputs and judgment. It does not make
+            the result a live quote or authorize a trade.
           </p>
         </>
       )}
@@ -399,7 +401,7 @@ function SelectedFairValue({
       setConfirmClassification(false)
       setAnnouncement(
         result.replay
-          ? "The current rules classification was already retained."
+          ? "The current rules classification was already saved."
           : "The measurement was evaluated with the current rules.",
       )
       await queryClient.invalidateQueries({
@@ -430,7 +432,7 @@ function SelectedFairValue({
       ),
     onSuccess: () => {
       setGovernanceAuthorizations([])
-      setAnnouncement("The service created a canonical governance preview. Authenticate every required principal before committing it.")
+      setAnnouncement("The governance review is ready. Authenticate every required reviewer before recording it.")
     },
   })
   const governanceAuthenticate = useMutation({
@@ -464,7 +466,7 @@ function SelectedFairValue({
         ),
         authorization,
       ])
-      setAnnouncement("The service accepted this principal's one-use authorization for the exact preview.")
+      setAnnouncement("The reviewer was authenticated for this proposal.")
     },
   })
   const governanceCommit = useMutation({
@@ -485,12 +487,10 @@ function SelectedFairValue({
         preview.previewId,
       )
     },
-    onSuccess: async (commit) => {
+    onSuccess: async () => {
       setGovernanceAuthorizations([])
       governancePreview.reset()
-      setAnnouncement(
-        `The service committed the governed action and retained receipt ${commit.receiptId}.`,
-      )
+      setAnnouncement("The governed action was recorded.")
       await queryClient.invalidateQueries({
         queryKey: productKeys.domain(bootstrap.runtime, "FairValue"),
       })
@@ -550,14 +550,9 @@ function SelectedFairValue({
     (operations.has("FairValue.ListAuditEvents") && audit.isPending) ||
     (operations.has("FairValue.GetMarketAccess") &&
       marketAccess.some((query) => query.isPending))
-  const errors = [
-    ...queries.flatMap((query) =>
-      query.isError ? [messageFrom(query.error)] : [],
-    ),
-    ...marketAccess.flatMap((query) =>
-      query.isError ? [messageFrom(query.error)] : [],
-    ),
-  ]
+  const hasDetailErrors =
+    queries.some((query) => query.isError) ||
+    marketAccess.some((query) => query.isError)
   const boundedDetails = [explanation.data, evidence.data, approvals.data].filter(
     (result) =>
       result !== undefined && result.availableItems > result.returnedItems,
@@ -574,38 +569,38 @@ function SelectedFairValue({
       {loading ? (
         <Alert>
           <RefreshCw className="animate-spin" aria-hidden="true" />
-          <AlertTitle>Loading retained evidence</AlertTitle>
+          <AlertTitle>Loading valuation review</AlertTitle>
           <AlertDescription>
-            The service is resolving this measurement&apos;s classification, evidence, approvals,
-            market access, and bounded audit history.
+            Loading classification, supporting inputs, approvals, market access, and review history.
           </AlertDescription>
         </Alert>
       ) : null}
-      {errors.length > 0 ? (
+      {hasDetailErrors ? (
         <Alert variant="destructive">
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Some fair-value details could not be loaded</AlertTitle>
-          <AlertDescription>{[...new Set(errors)].join(" ")}</AlertDescription>
+          <AlertDescription>
+            Refresh this measurement. If the problem continues, open Logs for diagnostic details.
+          </AlertDescription>
         </Alert>
       ) : null}
       {unavailableOperations.length > 0 ? (
         <Alert>
           <CircleAlert aria-hidden="true" />
-          <AlertTitle>Installed Fair Value detail is incomplete</AlertTitle>
+          <AlertTitle>Some review details are unavailable</AlertTitle>
           <AlertDescription>
-            The service did not advertise {unavailableOperations.map(operationLabel).join(", ")}.
-            Restore or update the installed component before relying on this record as a complete
-            review.
+            This installation cannot open every part of the valuation review. Update or restore
+            the Fair Value component before treating this record as complete.
           </AlertDescription>
         </Alert>
       ) : null}
       {boundedDetails.length > 0 ? (
         <Alert>
           <CircleAlert aria-hidden="true" />
-          <AlertTitle>Bounded detail result</AlertTitle>
+          <AlertTitle>Some review details are not shown</AlertTitle>
           <AlertDescription>
-            One or more evidence, explanation, or approval sections were truncated by the service.
-            The displayed classification remains tied to its exact evidence and ruleset identities.
+            Some supporting inputs, explanations, or approvals are outside the current view. Treat
+            this screen as partial until the remaining details are available.
           </AlertDescription>
         </Alert>
       ) : null}
@@ -627,7 +622,9 @@ function SelectedFairValue({
         <Alert variant="destructive">
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Classification was not accepted</AlertTitle>
-          <AlertDescription>{messageFrom(classify.error)}</AlertDescription>
+          <AlertDescription>
+            Review the measurement and try again. If the problem continues, open Logs for details.
+          </AlertDescription>
         </Alert>
       ) : null}
       <FairValueDetail
@@ -659,13 +656,13 @@ function SelectedFairValue({
               governanceAuthenticate.isPending ||
               governanceCommit.isPending,
             error: governanceAuthenticate.isError
-              ? "Authentication was not accepted. Reauthenticate an eligible principal for this exact preview."
+              ? "Authentication was not accepted. Reauthenticate an eligible reviewer for this proposal."
               : governanceCommit.isError
-                ? messageFrom(governanceCommit.error)
+                ? "The action could not be recorded. Try again, or open Logs for details."
                 : governancePreview.isError
-                  ? messageFrom(governancePreview.error)
+                  ? "The proposal could not be prepared. Review it and try again, or open Logs for details."
                   : governancePrincipals.isError
-                    ? messageFrom(governancePrincipals.error)
+                    ? "Eligible reviewers could not be loaded. Refresh, or open Logs for details."
                     : null,
           }}
           onPreview={(proposal) => governancePreview.mutate(proposal)}
@@ -679,9 +676,8 @@ function SelectedFairValue({
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Guided governance is unavailable</AlertTitle>
           <AlertDescription>
-            This installed service does not advertise the principal, preview, authentication, and
-            commit operations required to record a governed action. Do not substitute actor names,
-            raw requests, or browser confirmation for those service-held controls.
+            This installation cannot complete the governed review workflow. Update or restore Fair
+            Value before recording an approval or override.
           </AlertDescription>
         </Alert>
       )}
@@ -690,8 +686,8 @@ function SelectedFairValue({
           <DialogHeader>
             <DialogTitle>Evaluate this measurement?</DialogTitle>
             <DialogDescription>
-              Market Squawk will apply the installed ruleset to the retained measurement and its
-              exact evidence hash. Existing decisions remain immutable and auditable.
+              Market Squawk will apply the current valuation policy to the saved measurement and
+              its supporting inputs. Earlier decisions remain available in review history.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -706,10 +702,6 @@ function SelectedFairValue({
       </Dialog>
     </div>
   )
-}
-
-function operationLabel(operation: string) {
-  return operation.replace("FairValue.", "").replace(/([a-z])([A-Z])/g, "$1 $2")
 }
 
 function relatedAuditEvents(
@@ -771,7 +763,7 @@ function MeasurementIndex({
           Measurement register
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
-          Newest retained records from the bounded service view.
+          Newest saved valuations.
         </p>
       </div>
       <ul className="max-h-[720px] space-y-1 overflow-y-auto p-2">

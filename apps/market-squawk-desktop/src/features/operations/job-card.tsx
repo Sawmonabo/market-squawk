@@ -37,13 +37,16 @@ export function JobCard({
   scope,
   mutationPending,
   onAction,
+  presentation = "operations",
 }: {
   job: JobView
   transport: ProductTransport
   scope: ProductScope
   mutationPending: boolean
   onAction: (action: PendingJobAction) => void
+  presentation?: "operations" | "product"
 }) {
+  const productPresentation = presentation === "product"
   const currentSequence = BigInt(job.sequence)
   const afterSequence = (
     currentSequence > 0n ? currentSequence - 1n : 0n
@@ -80,15 +83,18 @@ export function JobCard({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <StateBadge state={job.state} />
-            <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-              Generation {job.generation} · Sequence {job.sequence}
-            </span>
+            {!productPresentation ? (
+              <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+                Generation {job.generation} · Sequence {job.sequence}
+              </span>
+            ) : null}
           </div>
           <h3 className="mt-2 truncate text-sm font-semibold" title={job.kind}>
             {humanize(job.kind)}
           </h3>
-          <p className="mt-1 font-mono text-[11px] text-muted-foreground">
-            Job {shortId(job.jobId)} · Updated {formatJobTime(job.updatedAt)}
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {!productPresentation ? `Job ${shortId(job.jobId)} · ` : ""}
+            Updated {formatJobTime(job.updatedAt)}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -133,11 +139,11 @@ export function JobCard({
         </div>
       </div>
 
-      <JobProgress job={job} />
+      <JobProgress job={job} productPresentation={productPresentation} />
 
       {job.cancellationRequested && (
         <p className="mt-3 text-xs text-amber-300">
-          Cancellation is durably requested; cleanup has not completed yet.
+          Cancellation is in progress.
         </p>
       )}
       {job.failure && (
@@ -146,19 +152,21 @@ export function JobCard({
             {humanize(job.failure.class)}
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            {humanize(job.failure.diagnostic)}.{" "}
-            {job.failure.retryable
-              ? "A fenced retry is available."
-              : "The service did not admit a retry."}
+            {productPresentation
+              ? job.failure.retryable
+                ? "You can retry this backtest."
+                : "Review Logs & Diagnostics for details."
+              : `${humanize(job.failure.diagnostic)}. ${job.failure.retryable ? "A fenced retry is available." : "The service did not admit a retry."}`}
           </p>
         </div>
       )}
       {job.recovery && (
         <div className="mt-3 rounded-lg border border-amber-400/30 bg-amber-400/5 p-3">
-          <p className="text-xs font-medium text-amber-300">Recovery evidence</p>
+          <p className="text-xs font-medium text-amber-300">Recovery status</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            {humanize(job.recovery)}. No recovery action is shown unless the
-            current state admits an exact typed mutation.
+            {productPresentation
+              ? "This backtest is recovering. Available actions will appear when it is ready."
+              : `${humanize(job.recovery)}. No recovery action is shown unless the current state admits an exact typed mutation.`}
           </p>
         </div>
       )}
@@ -166,12 +174,11 @@ export function JobCard({
         <div className="mt-3 rounded-lg border border-emerald-400/25 bg-emerald-400/5 p-3">
           <p className="text-xs font-medium text-emerald-300">Result published</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            {humanize(job.result.authority)} owns {humanize(job.result.identity)}
-            {job.result.artifacts.length > 0
-              ? ` with ${job.result.artifacts.length} controlled artifact${job.result.artifacts.length === 1 ? "" : "s"}.`
-              : "."}
+            {productPresentation
+              ? "This backtest completed. Select it to inspect the result."
+              : `${humanize(job.result.authority)} owns ${humanize(job.result.identity)}${job.result.artifacts.length > 0 ? ` with ${job.result.artifacts.length} controlled artifact${job.result.artifacts.length === 1 ? "" : "s"}.` : "."}`}
           </p>
-          {job.result.artifacts.length > 0 && (
+          {!productPresentation && job.result.artifacts.length > 0 && (
             <div className="mt-3 grid gap-3">
               {job.result.artifacts.map((artifact) => (
                 <JobArtifactPreview
@@ -187,8 +194,9 @@ export function JobCard({
       )}
       {confirmationQuery.isError && job.state === "awaiting_confirmation" && (
         <p className="mt-3 text-xs text-destructive">
-          Confirmation is disabled because the exact current evidence could not
-          be retrieved: {messageFrom(confirmationQuery.error)}
+          {productPresentation
+            ? "Confirmation is unavailable. Try again or review Logs & Diagnostics."
+            : `Confirmation is disabled because the exact current evidence could not be retrieved: ${messageFrom(confirmationQuery.error)}`}
         </p>
       )}
       {confirmationQuery.isSuccess &&
@@ -350,11 +358,19 @@ function decodeUtf8(chunksBase64: string[]): string {
   }
 }
 
-function JobProgress({ job }: { job: JobView }) {
+function JobProgress({
+  job,
+  productPresentation,
+}: {
+  job: JobView
+  productPresentation: boolean
+}) {
   if (!job.phase) {
     return (
       <p className="mt-4 text-xs text-muted-foreground">
-        No progress evidence has been published for this generation.
+        {productPresentation
+          ? "Progress details are not available yet."
+          : "No progress evidence has been published for this generation."}
       </p>
     )
   }
@@ -384,7 +400,9 @@ function JobProgress({ job }: { job: JobView }) {
         />
       ) : (
         <p className="mt-1 text-[11px] text-muted-foreground">
-          The runner supplied a phase without a measurable nonzero total.
+          {productPresentation
+            ? "A completion percentage is not available for this step."
+            : "The runner supplied a phase without a measurable nonzero total."}
         </p>
       )}
     </div>

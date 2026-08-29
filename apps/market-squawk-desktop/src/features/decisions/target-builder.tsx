@@ -87,7 +87,7 @@ export function TargetBuilder({
         result.dossierId !== dossier.id ||
         result.instrumentId !== dossier.instrumentId
       ) {
-        throw new Error("The installed service returned target evidence for a different dossier.")
+        throw new Error("The target preparation details did not match the selected dossier.")
       }
       return result
     },
@@ -259,8 +259,8 @@ export function TargetBuilder({
               Turn retained research into a reviewable price judgment
             </h2>
             <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-              Select server-owned evidence, enter your assumptions and ordered ranges, review the
-              complete prepared result, then explicitly confirm one immutable revision.
+              Choose the supporting analysis, enter your assumptions and ordered ranges, review the
+              complete result, then explicitly confirm the revision.
             </p>
           </div>
           <StateLabel value={dossier ? "dossier selected" : "waiting for dossier"} />
@@ -271,8 +271,7 @@ export function TargetBuilder({
             className="m-5 rounded-xl border border-dashed border-border p-6 text-sm leading-6 text-muted-foreground"
           >
             Select <strong className="text-foreground">Use for investment target</strong> on a
-            retained dossier above. Target IDs, evidence identities, authorship, rulesets, and
-            business timestamps are supplied only by the installed service.
+            saved dossier above to begin a reviewable price judgment.
           </div>
         ) : inventory.isPending ? (
           <div className="grid gap-3 p-5" aria-label="Loading target evidence inventory">
@@ -282,7 +281,7 @@ export function TargetBuilder({
         ) : inventory.isError ? (
           <Alert variant="destructive" className="m-5">
             <AlertCircle aria-hidden="true" />
-            <AlertTitle>Target evidence could not be loaded</AlertTitle>
+            <AlertTitle>Target inputs could not be loaded</AlertTitle>
             <AlertDescription>
               {messageFrom(inventory.error)}
               <Button
@@ -301,9 +300,8 @@ export function TargetBuilder({
             <AlertCircle aria-hidden="true" />
             <AlertTitle>No current reference mark is available</AlertTitle>
             <AlertDescription>
-              The installed service has no admitted, current price evidence for{" "}
-              {dossier.instrumentId}. Refresh the portfolio or market evidence before preparing a
-              target.
+              No current, eligible price is available for {dossier.instrumentId}. Refresh market
+              or portfolio information before preparing a target.
             </AlertDescription>
           </Alert>
         ) : inventory.data.forecastOptions.length === 0 && !inventory.data.fairValueAvailable ? (
@@ -311,7 +309,7 @@ export function TargetBuilder({
             <AlertCircle aria-hidden="true" />
             <AlertTitle>No supported analytical method is available</AlertTitle>
             <AlertDescription>
-              This dossier contains neither retained forecast evidence nor a fair-value decision.
+              This dossier contains neither a forecast nor a fair-value analysis.
               Assemble a complete dossier before preparing an investment target.
             </AlertDescription>
           </Alert>
@@ -342,7 +340,7 @@ export function TargetBuilder({
               <Field
                 label="Target history action"
                 htmlFor="target-operation"
-                help="Create a new series or derive the next revision of a retained series for this instrument."
+                help="Create a new target or revise a previous target for this investment."
               >
                 <select
                   id="target-operation"
@@ -353,7 +351,7 @@ export function TargetBuilder({
                   <option value="create">Create a new target series</option>
                   {targets.map((target) => (
                     <option key={target.id} value={target.id}>
-                      Reevaluate {target.id} · revision {target.revision} · {humanize(target.status)}
+                      Reevaluate revision {target.revision} · {humanize(target.status)}
                     </option>
                   ))}
                 </select>
@@ -361,7 +359,7 @@ export function TargetBuilder({
               <Field
                 label="Decision posture"
                 htmlFor="target-intent"
-                help="The service checks this choice against the mark and ranges."
+                help="This choice must agree with the observed price and your ranges."
               >
                 <select
                   id="target-intent"
@@ -377,7 +375,7 @@ export function TargetBuilder({
               <Field
                 label="Research horizon"
                 htmlFor="target-horizon"
-                help="The service owns the exact horizon, review, and expiry timestamps."
+                help="This choice sets the review period and target expiration."
               >
                 <select
                   id="target-horizon"
@@ -411,7 +409,7 @@ export function TargetBuilder({
               <Field
                 label="Analytical method"
                 htmlFor="target-method"
-                help="The service admits only methods supported by selected forecast or fair-value evidence."
+                help="Only methods supported by the selected forecast or fair-value analysis are available."
               >
                 <select
                   id="target-method"
@@ -429,8 +427,7 @@ export function TargetBuilder({
                   <p className="text-xs font-semibold">Selected reference mark</p>
                   <p className="mt-2 text-lg font-semibold tabular-nums">{formatMoney(selectedMark.price)}</p>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    {selectedMark.source} · {humanize(selectedMark.quality)} ·{" "}
-                    {formatTimestamp(selectedMark.observedAt)}
+                    {humanize(selectedMark.quality)} · observed {formatTimestamp(selectedMark.observedAt)}
                   </p>
                 </div>
               )}
@@ -488,8 +485,8 @@ export function TargetBuilder({
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
               <div className="flex max-w-2xl items-start gap-2 text-xs leading-5 text-muted-foreground">
                 <ShieldCheck className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden="true" />
-                Preparing performs server-side validation and returns a short-lived human preview.
-                It does not commit a target or create an order.
+                Market Squawk checks the complete judgment and returns a short-lived preview. This
+                step does not save a target or create an order.
               </div>
               <Button type="submit" disabled={!validation.valid || prepare.isPending}>
                 {prepare.isPending ? (
@@ -522,7 +519,7 @@ function DossierSummary({ dossier }: { dossier: DecisionDossierView }) {
           {dossier.references.length} evidence references
         </p>
       </div>
-      <StateLabel value={dossier.id} />
+      <StateLabel value="selected" />
     </div>
   )
 }
@@ -550,10 +547,9 @@ function EvidenceSelector({
 }) {
   return (
     <fieldset className="rounded-xl border border-border bg-background/45 p-4">
-      <legend className="px-1 text-sm font-semibold">Server-owned supporting evidence</legend>
+      <legend className="px-1 text-sm font-semibold">Supporting analysis</legend>
       <p className="mt-1 text-xs leading-5 text-muted-foreground">
-        Choose only from evidence retained for this exact dossier. Opaque selectors and identities
-        are never typed or supplied by the operator.
+        Choose from the observations and analyses already available for this dossier.
       </p>
       <div className="mt-3 grid gap-4 lg:grid-cols-2">
         <Field label="Observed reference mark" htmlFor="target-reference-mark">
@@ -565,34 +561,34 @@ function EvidenceSelector({
           >
             {preparation.referenceMarks.map((mark) => (
               <option key={mark.selector} value={mark.selector}>
-                {formatMoney(mark.price)} · {mark.source} · {humanize(mark.quality)}
+                {formatMoney(mark.price)} · {humanize(mark.quality)}
               </option>
             ))}
           </select>
         </Field>
-        <Field label="Forecast evidence" htmlFor="target-forecast">
+        <Field label="Forecast analysis" htmlFor="target-forecast">
           <select
             id="target-forecast"
             className={SELECT_CLASS}
             value={forecastIndex}
             onChange={(event) => onForecastIndex(event.target.value)}
           >
-            <option value="none">Do not bind forecast evidence</option>
+            <option value="none">Do not include a forecast</option>
             {preparation.forecastOptions.map((option) => (
               <option key={option.index} value={String(option.index)}>
-                Retained dossier forecast reference {option.index + 1}
+                Forecast {option.index + 1}
               </option>
             ))}
           </select>
         </Field>
         <EvidenceToggle
-          label="Bind fair-value evidence"
+          label="Include fair-value analysis"
           available={preparation.fairValueAvailable}
           checked={useFairValue}
           onChange={onUseFairValue}
         />
         <EvidenceToggle
-          label="Bind portfolio evidence"
+          label="Include portfolio analysis"
           available={preparation.portfolioAvailable}
           checked={usePortfolio}
           onChange={onUsePortfolio}

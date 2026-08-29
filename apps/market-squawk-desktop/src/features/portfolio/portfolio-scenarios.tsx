@@ -130,9 +130,9 @@ export function PortfolioScenarios({
       </header>
 
       {!canRunOne && !canRunBatch ? (
-        <Unavailable text="Portfolio scenario analysis is not registered." />
+        <Unavailable text="Portfolio stress analysis is unavailable right now." />
       ) : holdings.length === 0 ? (
-        <Unavailable text="Scenario analysis requires at least one source-backed holding." />
+        <Unavailable text="Stress analysis requires at least one holding with a current price." />
       ) : (
         <>
           <div className="mt-5 grid gap-3 md:grid-cols-3">

@@ -2,8 +2,8 @@ import { Filter, ListOrdered } from "lucide-react"
 
 import { humanize } from "@/lib/formatters"
 
-import { digestHex, type SavedScreenView } from "./contracts"
-import { EvidenceIdentity, StateLabel } from "./decision-boundaries"
+import type { SavedScreenView } from "./contracts"
+import { StateLabel } from "./decision-boundaries"
 
 export function SavedScreens({ screens }: { screens: SavedScreenView[] }) {
   return (
@@ -11,13 +11,13 @@ export function SavedScreens({ screens }: { screens: SavedScreenView[] }) {
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
-            Durable screen authority
+            Reusable research screens
           </p>
           <h2 id="saved-screens-heading" className="mt-1 text-lg font-semibold">
             Saved screens
           </h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Point-in-time definitions loaded from the installed decision repository.
+            Saved definitions use only information available by each chosen research cutoff.
           </p>
         </div>
         <StateLabel value={`${screens.length} loaded`} />
@@ -72,7 +72,6 @@ export function SavedScreens({ screens }: { screens: SavedScreenView[] }) {
                       <span className="text-muted-foreground">
                         {humanize(predicate.operator)} {predicate.threshold} · nulls {predicate.nullPolicy}
                       </span>
-                      <EvidenceIdentity value={digestHex(predicate.binding.semanticDigest)} />
                     </li>
                   ))}
                 </ul>
@@ -84,20 +83,6 @@ export function SavedScreens({ screens }: { screens: SavedScreenView[] }) {
                 <p className="sm:col-span-2">
                   Admitted quality: {screen.constraints.admittedDataQualities.map(humanize).join(", ")}
                 </p>
-              </div>
-              <div className="mt-3 grid gap-2 border-t border-border pt-3">
-                <div>
-                  <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                    Ranking semantic identity
-                  </span>
-                  <EvidenceIdentity value={digestHex(screen.ranking.binding.semanticDigest)} />
-                </div>
-                <div>
-                  <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                    Universe identity
-                  </span>
-                  <EvidenceIdentity value={digestHex(screen.universeIdentity)} />
-                </div>
               </div>
             </article>
           ))}

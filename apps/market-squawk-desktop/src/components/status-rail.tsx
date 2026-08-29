@@ -111,11 +111,6 @@ function ReadyStatusRail({
   return (
     <>
       <StatusFact
-        label="Sources"
-        value={status.sources.status === "ready" ? String(status.sources.data?.length ?? 0) : statusLabel(status.sources.status)}
-        ready={status.sources.status === "ready"}
-      />
-      <StatusFact
         label="Markets"
         value={status.markets.status === "ready" ? String(status.markets.data?.length ?? 0) : statusLabel(status.markets.status)}
         ready={status.markets.status === "ready" && (status.markets.data?.length ?? 0) > 0}

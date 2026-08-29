@@ -8,6 +8,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { humanize } from "@/lib/formatters"
+import { formatTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
@@ -19,7 +20,7 @@ import {
   type GovernancePreviewView,
   type GovernanceReceiptView,
 } from "./contracts"
-import { EvidenceIdentity, StateLabel } from "./decision-boundaries"
+import { StateLabel } from "./decision-boundaries"
 
 type ReviewDisposition = "activate" | "reject" | "needs_changes"
 type InvalidationKind =
@@ -167,8 +168,8 @@ export function TargetGovernanceWorkflow({
           </p>
           <h4 className="mt-1 text-sm font-semibold">Review or invalidate this revision</h4>
           <p className="mt-1 max-w-2xl text-xs leading-5 text-muted-foreground">
-            The service canonicalizes this proposal before authentication. It derives the actor,
-            time, and immutable content identity; this screen never asks for or sends them.
+            Review the proposed action before authorization. Market Squawk records who approved it
+            and when.
           </p>
         </div>
         <StateLabel value={`revision ${targetRevision}`} />
@@ -194,7 +195,7 @@ export function TargetGovernanceWorkflow({
                 checked={action === "invalidation"}
                 onChange={() => setAction("invalidation")}
               />{" "}
-              Record invalidating evidence
+              Mark this judgment as no longer valid
             </label>
           </fieldset>
 
@@ -213,7 +214,7 @@ export function TargetGovernanceWorkflow({
             </label>
           ) : (
             <label className="text-xs font-medium">
-              Invalidation source
+              Reason for invalidation
               <select
                 className="mt-2 h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                 value={invalidationKind}
@@ -224,7 +225,7 @@ export function TargetGovernanceWorkflow({
                 <option value="assumption">Assumption breach</option>
                 <option value="corporate_action">Corporate action</option>
                 <option value="model">Model or forecast change</option>
-                <option value="data">Point-in-time data change</option>
+                <option value="data">New information became available</option>
                 <option value="reference_mark">Reference mark change</option>
               </select>
             </label>
@@ -238,7 +239,7 @@ export function TargetGovernanceWorkflow({
               className="mt-2"
               maxLength={4096}
               autoComplete="off"
-              placeholder="State the evidence-backed reason for this action"
+              placeholder="State the reason for this action"
             />
           </label>
           <Button
@@ -260,7 +261,7 @@ export function TargetGovernanceWorkflow({
           <div className="flex flex-wrap items-start justify-between gap-3">
             <PreviewCard preview={preview} />
             <Button type="button" variant="outline" size="sm" onClick={resetWorkflow}>
-              Discard expired or unwanted preview
+              Discard preview
             </Button>
           </div>
           {principals.isPending ? (
@@ -272,8 +273,7 @@ export function TargetGovernanceWorkflow({
               <p className="text-xs leading-5 text-muted-foreground">
                 Authenticate {preview.distinctPrincipalCount - authorizations.length} more distinct
                 principal{preview.distinctPrincipalCount - authorizations.length === 1 ? "" : "s"}.
-                Credentials are sent only to the native authentication bridge and are cleared after
-                each attempt.
+                Credentials are used only to verify this action and are cleared after each attempt.
               </p>
               <label className="text-xs font-medium">
                 Eligible principal
@@ -326,7 +326,10 @@ export function TargetGovernanceWorkflow({
                   className="flex items-center gap-2 rounded-lg border border-border bg-background/50 px-3 py-2 text-xs"
                 >
                   <CheckCircle2 className="size-4 text-primary" aria-hidden="true" />
-                  {authorization.principalId} authenticated for this exact preview
+                  {principals.data?.find(
+                    (principal) => principal.principalId === authorization.principalId,
+                  )?.displayName ?? "Authorized reviewer"}{" "}
+                  approved this action
                 </li>
               ))}
             </ul>
@@ -347,7 +350,7 @@ export function TargetGovernanceWorkflow({
               }
             >
               {commit.isPending ? <RefreshCw className="animate-spin" /> : <ShieldCheck />}
-              Commit immutable governance evidence
+              Record governance decision
             </Button>
           )}
           {commit.isError && <GovernanceError error={commit.error} />}
@@ -358,14 +361,12 @@ export function TargetGovernanceWorkflow({
         <div className="mt-4 rounded-lg border border-primary/30 bg-background/60 p-3">
           <div className="flex items-center gap-2 text-xs font-medium">
             <CheckCircle2 className="size-4 text-primary" aria-hidden="true" />
-            Immutable governance receipt committed
+            Governance decision recorded
           </div>
-          <EvidenceIdentity value={receipt.receiptId} />
-          <EvidenceIdentity value={receipt.digest} />
           <p className="mt-2 text-xs text-muted-foreground">
-            {receipt.authorizedPrincipals.length} authenticated principal
+            {receipt.authorizedPrincipals.length} authorized reviewer
             {receipt.authorizedPrincipals.length === 1 ? "" : "s"} recorded. The resulting target
-            remains research-only and does not authorize execution.
+            remains research-only and cannot place an order.
           </p>
           <Button type="button" variant="outline" size="sm" className="mt-3" onClick={resetWorkflow}>
             Start another governed action
@@ -381,10 +382,9 @@ function PreviewCard({ preview }: { preview: GovernancePreviewView }) {
     <div className="rounded-lg border border-border bg-background/50 p-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="text-xs font-medium">Canonical governed action</p>
-          <EvidenceIdentity value={preview.digest} />
+          <p className="text-xs font-medium">Governance action ready for review</p>
         </div>
-        <StateLabel value={`expires ${preview.expiresAt}`} />
+        <StateLabel value={`expires ${formatTimestamp(preview.expiresAt)}`} />
       </div>
       <p className="mt-3 text-xs text-muted-foreground">
         Requires {preview.distinctPrincipalCount} distinct principal

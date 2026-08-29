@@ -8,7 +8,7 @@ import {
   ShieldAlert,
 } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -162,15 +162,14 @@ function ModelsWorkspace({
       <header className="flex flex-col gap-4 border-b border-border pb-6 md:flex-row md:items-end md:justify-between">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">
-            Admitted evidence · research authority only
+            Investment research · no automatic trading
           </p>
           <h1 className="mt-2 text-3xl font-semibold tracking-tight">
             Models & forecasts
           </h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Review immutable model generations, durable forecast vintages, and
-            background work. Modeled values remain separate from observed market
-            evidence, investment targets, and deterministic scenarios.
+            Review model quality, forecasts, uncertainty, and background work. Modeled values
+            are estimates, not guaranteed outcomes or automatic investment actions.
           </p>
         </div>
         <Button
@@ -225,20 +224,19 @@ function ModelsWorkspace({
       <div className="mt-5 grid gap-4 xl:grid-cols-[minmax(260px,0.72fr)_minmax(0,1.5fr)]">
         <section className="overflow-hidden rounded-xl border border-border bg-card/35">
           <div className="border-b border-border p-4">
-            <h2 className="text-sm font-semibold">Admitted generations</h2>
+            <h2 className="text-sm font-semibold">Available models</h2>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              Every row is one immutable bundle version returned by the installed
-              registry.
+              Select a model to review its purpose, validation, limitations, and forecasts.
             </p>
           </div>
           {!bundleAvailable ? (
-            <InlineUnavailable text="Model.ListBundles is not registered by this service generation." />
+            <InlineUnavailable text="Models are unavailable in this workspace." />
           ) : bundles.isPending ? (
             <ListLoading />
           ) : bundles.isError ? (
-            <InlineUnavailable text={messageFrom(bundles.error)} />
+            <InlineUnavailable text="Models are unavailable right now." />
           ) : bundleRows.length === 0 ? (
-            <InlineUnavailable text="No model bundle has passed Rust admission. Failed or rejected candidates are intentionally absent." />
+            <InlineUnavailable text="No model is ready for investment research yet." />
           ) : (
             <ul className="max-h-[570px] space-y-1 overflow-y-auto p-2">
               {bundleRows.map((bundle) => {
@@ -285,7 +283,7 @@ function ModelsWorkspace({
             metadata={metadata.data ?? null}
             metadataAvailable={metadataAvailable}
             loading={metadata.isPending && selectedBundle !== null}
-            error={metadata.isError ? messageFrom(metadata.error) : null}
+            error={metadata.isError ? "Model details are unavailable right now." : null}
           />
           <ModelWorkflows
             bootstrap={bootstrap}
@@ -318,7 +316,7 @@ function ModelsWorkspace({
             selected={selectedForecast}
             available={forecastsAvailable}
             loading={forecasts.isPending}
-            error={forecasts.isError ? messageFrom(forecasts.error) : null}
+            error={forecasts.isError ? "Forecasts are unavailable right now." : null}
             completeness={forecasts.data?.completeness ?? null}
             select={setSelectedVintageId}
           />
@@ -326,7 +324,7 @@ function ModelsWorkspace({
             jobs={modelJobs}
             available={jobsAvailable}
             loading={jobs.isPending}
-            error={jobs.isError ? messageFrom(jobs.error) : null}
+            error={jobs.isError ? "Model activity is unavailable right now." : null}
           />
         </div>
       </div>

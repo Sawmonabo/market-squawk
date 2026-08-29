@@ -61,15 +61,15 @@ export function PortfolioEvidenceSummary({
       />
       <EvidenceFact
         icon={Layers3}
-        label="Portfolio revision"
-        value={shortIdentity(account.currentRevision.revisionId)}
-        detail={bounded ? "Selected from a bounded holdings view" : "Complete holdings view"}
+        label="Portfolio state"
+        value="Current saved position"
+        detail={bounded ? "Additional holdings are not shown" : "All current holdings are included"}
       />
       <EvidenceFact
         icon={ShieldCheck}
-        label="Source quality"
+        label="Data quality"
         value={humanize(holding.markEvidence.quality)}
-        detail={`${humanize(holding.markEvidence.freshness.status)} · not execution authority`}
+        detail={`${humanize(holding.markEvidence.freshness.status)} · not a live trading quote`}
       />
       <EvidenceFact
         icon={BadgeCheck}
@@ -79,7 +79,7 @@ export function PortfolioEvidenceSummary({
             ? "No reported breaks"
             : `${account.reconciliationDiscrepancies} breaks`
         }
-        detail={`Source ${shortIdentity(account.currentRevision.sourceId)}`}
+        detail="Compared with the imported account totals"
       />
     </div>
   )
@@ -90,24 +90,13 @@ export function MeasurementSuccess({ result }: { result: PortfolioMeasurementRes
   return (
     <Alert className="mt-4 border-emerald-400/25 bg-emerald-400/5">
       <BadgeCheck className="text-emerald-300" aria-hidden="true" />
-      <AlertTitle>Immutable measurement retained</AlertTitle>
+      <AlertTitle>Measurement saved</AlertTitle>
       <AlertDescription>
         <span className="block">
           Classification: <strong>{humanize(result.classification.hierarchy)}</strong> ·{" "}
           {ready ? "ready for governed review" : "more evidence or review is required"}.
         </span>
-        <span className="mt-1 block font-mono text-[10px]">
-          Measurement {shortIdentity(result.measurement.measurementId)} · decision{" "}
-          {shortIdentity(result.classification.decisionId)}
-        </span>
-        <span className="mt-1 block text-[10px]">
-          {result.measurementReplay ? "Existing measurement replayed" : "New measurement created"}
-          {" · "}
-          {result.classificationReplay
-            ? "existing classification replayed"
-            : "classification evaluated now"}
-          .
-        </span>
+        <span className="mt-1 block text-[10px]">Open the measurement below to review its inputs and classification.</span>
       </AlertDescription>
     </Alert>
   )

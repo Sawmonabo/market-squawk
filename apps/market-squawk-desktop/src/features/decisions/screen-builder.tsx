@@ -34,6 +34,7 @@ import {
   datasetKeyFor,
   DEFAULT_QUALITIES,
   emptyPredicate,
+  featureDatasetLabel,
   featureLabel,
   isDataQuality,
   screenKey,
@@ -251,7 +252,7 @@ export function ScreenBuilder({
     if (!ranking) return
     const normalizedPredicates = predicates.map((predicate) => {
       const contract = contractByKey.get(predicate.featureKey)
-      if (!contract) throw new Error("A selected feature contract is unavailable.")
+      if (!contract) throw new Error("A selected feature is unavailable.")
       return {
         binding: bindingFor(contract),
         operator: predicate.operator,
@@ -293,22 +294,22 @@ export function ScreenBuilder({
               Find investments using evidence you choose
             </h2>
             <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-              Choose a prepared research dataset, add clear rules, and save an immutable revision.
-              This defines research criteria only; it cannot place an order.
+              Choose prepared research data, add clear rules, and save the screen. This defines
+              research criteria only; it cannot place an order.
             </p>
           </div>
           <StateLabel value={selectedScreen ? `editing revision ${selectedScreen.revision}` : "new screen"} />
         </header>
 
         {evidence.isPending ? (
-          <div className="grid gap-3 p-5" aria-label="Loading point-in-time screen evidence">
+          <div className="grid gap-3 p-5" aria-label="Loading research data for the screen">
             <Skeleton className="h-20 w-full" />
             <Skeleton className="h-40 w-full" />
           </div>
         ) : evidence.isError ? (
           <Alert variant="destructive" className="m-5">
             <AlertCircle aria-hidden="true" />
-            <AlertTitle>Screen evidence could not be loaded</AlertTitle>
+            <AlertTitle>Screen data could not be loaded</AlertTitle>
             <AlertDescription>
               {messageFrom(evidence.error)}
               <Button
@@ -325,10 +326,10 @@ export function ScreenBuilder({
         ) : contracts.length === 0 || datasets.length === 0 ? (
           <Alert className="m-5">
             <AlertCircle aria-hidden="true" />
-            <AlertTitle>Prepare research evidence first</AlertTitle>
+            <AlertTitle>Prepare research data first</AlertTitle>
             <AlertDescription>
-              A saved screen needs both a point-in-time statistical feature and an immutable
-              feature dataset. Build a feature dataset in Research, then return here.
+              A saved screen needs a historical statistical feature and a prepared dataset. Build
+              the dataset in Research, then return here.
             </AlertDescription>
           </Alert>
         ) : (
@@ -374,7 +375,7 @@ export function ScreenBuilder({
               <Field
                 label="Prepared research dataset"
                 htmlFor="screen-dataset"
-                help="The dataset supplies the exact historical universe used by this screen."
+                help="The dataset supplies the historical investment universe used by this screen."
               >
                 <select
                   id="screen-dataset"
@@ -388,7 +389,7 @@ export function ScreenBuilder({
                   <option value="">Select a point-in-time dataset</option>
                   {datasets.map((dataset) => (
                     <option key={datasetKeyFor(dataset)} value={datasetKeyFor(dataset)}>
-                      {dataset.manifest.dataset} · manifest {dataset.manifest.manifestVersion}
+                      {featureDatasetLabel(dataset)}
                     </option>
                   ))}
                 </select>
@@ -412,7 +413,7 @@ export function ScreenBuilder({
                 <DatasetEvidence dataset={selectedDataset} />
               ) : (
                 <p className="self-center text-xs leading-5 text-muted-foreground">
-                  Select a dataset to inspect its immutable manifest and universe evidence.
+                  Select a dataset to review its coverage and prepared sample counts.
                 </p>
               )}
             </div>
@@ -422,7 +423,7 @@ export function ScreenBuilder({
                 <div>
                   <legend className="text-sm font-semibold">Screen rules</legend>
                   <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                    Each rule compares one code-owned point-in-time feature with a finite threshold.
+                    Each rule compares a feature available at the research cutoff with a threshold.
                   </p>
                 </div>
                 <Button
@@ -545,10 +546,10 @@ export function ScreenBuilder({
                 />
               </Field>
               <fieldset className="lg:col-span-2">
-                <legend className="text-sm font-medium">Allowed evidence quality</legend>
+                <legend className="text-sm font-medium">Allowed data quality</legend>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  These choices govern research inclusion only. They never promote modeled,
-                  estimated, stale, or quarantined data into execution-quality evidence.
+                  These choices affect research inclusion only. Estimated or older information
+                  remains clearly labeled and is never treated as current observed data.
                 </p>
                 <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                   {dataQualities.map((quality) => (
@@ -572,7 +573,7 @@ export function ScreenBuilder({
                         <span className="font-medium">{qualityLabel(quality)}</span>
                         {(quality === "stale" || quality === "quarantined") && (
                           <span className="mt-1 block text-muted-foreground">
-                            Include only for explicit review of degraded evidence.
+                            Include only when you explicitly want to review lower-quality data.
                           </span>
                         )}
                       </span>
@@ -609,16 +610,16 @@ export function ScreenBuilder({
                 <ListFilter aria-hidden="true" />
                 <AlertTitle>Screen queued</AlertTitle>
                 <AlertDescription>
-                  Job {run.data.jobId} is retained as generation {run.data.generation}. Its ranked
-                  candidates will appear in the candidate funnel when the durable run completes.
+                  The screen is running. Ranked candidates will appear in the candidate funnel when
+                  it completes.
                 </AlertDescription>
               </Alert>
             )}
 
             <div className="grid gap-4 border-t border-border pt-4 lg:grid-cols-[minmax(0,1fr)_minmax(280px,0.55fr)] lg:items-end">
               <p className="max-w-2xl text-xs leading-5 text-muted-foreground">
-                Saving records one immutable definition revision. Running the screen is a separate
-                point-in-time research job that binds its exact dataset and cutoff.
+                Saving records this screen revision. Running it separately uses only information
+                available by the selected research cutoff.
               </p>
               <Field
                 label="Research cutoff"

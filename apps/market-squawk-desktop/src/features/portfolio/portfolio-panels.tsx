@@ -47,7 +47,7 @@ export function PortfolioSummary({
         icon={WalletCards}
         label="Account value"
         value={performance ? compactMoney(performance.currentValue) : "Unavailable"}
-        help="Source-reported cash plus source-backed asset values for this account only."
+        help="Reported cash plus current asset values for this account only."
       />
       <SummaryFact
         icon={BadgeDollarSign}
@@ -57,7 +57,7 @@ export function PortfolioSummary({
             ? compactMoney(performance.accountingEvidence.cash.amount)
             : "Unavailable"
         }
-        help="The exact source-reported cash snapshot; not an inferred checking or savings balance."
+        help="The reported account cash balance; not an inferred checking or savings balance."
       />
       <SummaryFact
         icon={Activity}
@@ -66,14 +66,14 @@ export function PortfolioSummary({
         help={
           performance?.historyStatus
             ? evidenceLabel(performance.historyStatus)
-            : "Time-weighted return for the available comparable revision history."
+            : "Time-weighted return for the available account history."
         }
       />
       <SummaryFact
         icon={Layers3}
         label="Assets"
         value={(holdings?.length ?? account.holdingCount).toLocaleString()}
-        help={`${account.transactionCount.toLocaleString()} source transactions; no stock-only assumption.`}
+        help={`${account.transactionCount.toLocaleString()} recorded transactions across supported asset types.`}
       />
       <SummaryFact
         icon={
@@ -111,7 +111,7 @@ export function FinancialPositionCoverage({
       <PanelHeading
         eyebrow="What this workspace can represent"
         title="Financial-position coverage"
-        detail="Available means the installed service exposes a typed source-backed read. Setup required and Unavailable are evidence gaps—not zero balances."
+        detail="Available means the account contains enough information for this view. Setup required and Unavailable never mean a zero balance."
       />
       <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
         <CoverageItem
@@ -120,7 +120,7 @@ export function FinancialPositionCoverage({
           detail={
             accounts.length > 0
               ? `${accounts.length.toLocaleString()} account record${accounts.length === 1 ? "" : "s"} returned. Their account classifications were not supplied.`
-              : "Import an exact account revision before Portfolio can show account evidence."
+              : "Import an account file before Portfolio can show account details."
           }
         />
         <CoverageItem
@@ -128,8 +128,8 @@ export function FinancialPositionCoverage({
           state={holdingsAvailable ? "available" : "unavailable"}
           detail={
             holdingsAvailable
-              ? "Generic asset IDs, quantities, marks, and cost-basis states are available after account selection."
-              : "The installed service does not expose the typed holdings operation."
+              ? "Asset details, quantities, prices, and cost-basis status are available after account selection."
+              : "Holding details are unavailable right now."
           }
         />
         <CoverageItem
@@ -137,8 +137,8 @@ export function FinancialPositionCoverage({
           state={performanceAvailable ? "available" : "unavailable"}
           detail={
             performanceAvailable
-              ? "Source-reported cash appears with the selected account's accounting evidence. It is not inferred from holdings."
-              : "The installed service does not expose the typed performance/accounting response required for cash."
+              ? "Reported cash appears with the selected account. It is not inferred from holdings."
+              : "No reported cash balance is available for this account."
           }
         />
         <CoverageItem
@@ -146,24 +146,24 @@ export function FinancialPositionCoverage({
           state={transactionsAvailable ? "available" : "unavailable"}
           detail={
             transactionsAvailable
-              ? "Source classifications are retained. Generic income does not establish dividend, interest, or withholding detail."
-              : "The installed service does not expose typed account transactions."
+              ? "Transactions are available, although some income categories may need clarification."
+              : "Transaction details are unavailable right now."
           }
         />
         <CoverageItem
           label="Bank, checking, and savings synchronization"
           state="setup"
-          detail="The current Portfolio contract has no live bank connection, account subtype, or synchronized bank-balance authority."
+          detail="Bank connections and synchronized balances are not available yet."
         />
         <CoverageItem
           label="Liabilities and net worth"
           state="unavailable"
-          detail="No liability or cross-account net-worth contract is exposed. Accounts and currencies are never silently combined."
+          detail="Liabilities and a combined net-worth view are not available. Accounts and currencies are never silently combined."
         />
         <CoverageItem
           label="Recommendation account and profile"
           state="setup"
-          detail="Durable recommendation-account selection and its plain-language allocation profile are not wired to Desktop yet."
+          detail="Choose a recommendation account and allocation profile in a future update."
         />
       </div>
     </section>
@@ -193,14 +193,12 @@ export function RecommendationSetupPanel({
             {selectedAccount
               ? `${shortIdentity(selectedAccount.accountId, "Account")} is selected only for inspection on this page. `
               : "No account is selected for inspection. "}
-            The current Desktop contract cannot read or commit the separate durable account and
-            allocation profile used for personalized Add, Hold, Trim, or Sell recommendations.
+            Personalized Add, Hold, Trim, or Sell recommendations are not available for this
+            account yet.
             Market Squawk will not reuse the first account or this page selection as that authority.
           </p>
           <p className="mt-3 text-xs leading-5 text-muted-foreground">
-            Position-specific recommendations are Unavailable until that setup authority and its
-            typed Desktop workflow are wired. Existing holdings, cash, performance, and risk
-            evidence below remain independently usable.
+            Holdings, cash, performance, and risk details below remain available independently.
           </p>
         </div>
       </div>
@@ -245,7 +243,7 @@ export function PerformancePanel({
       <PanelHeading
         eyebrow="How it has changed"
         title="Performance"
-        detail="Returns are calculated only from revisions that were available at the selected point in time."
+        detail="Returns use the available account history and do not fill in missing periods."
       />
       <dl className="mt-5 grid gap-4 sm:grid-cols-2">
         {values.map(([label, value]) => (
@@ -271,7 +269,7 @@ export function ExposurePanel({ exposure }: { exposure: PortfolioExposure }) {
       <PanelHeading
         eyebrow="Where risk is concentrated"
         title="Exposure"
-        detail="Exact holdings and currency totals from the selected immutable revision."
+        detail="Holdings and currency totals from the selected account snapshot."
       />
       <div className="mt-5 grid gap-5 lg:grid-cols-2">
         <ExposureList
@@ -349,7 +347,7 @@ export function RiskPanel({ risk }: { risk: PortfolioRisk }) {
   )
 }
 
-export function ProvenancePanel({
+export function DataQualityPanel({
   account,
   holdingsResult,
 }: {
@@ -361,18 +359,17 @@ export function ProvenancePanel({
     <section className="rounded-xl border border-border bg-card/35 p-5">
       <PanelHeading
         eyebrow="Why these numbers can be trusted"
-        title="Value provenance"
-        detail="Every imported value stays tied to its portfolio source, immutable revision, and availability time."
+        title="Data confidence"
+        detail="Review when the account was updated, its coverage, and whether its values are suitable for analysis."
       />
       <dl className="mt-5 grid gap-4 sm:grid-cols-2">
         <Fact label="Reporting currency" value={account.currency.toUpperCase()} />
-        <Fact label="Source" value={account.currentRevision.sourceId} />
         <Fact
-          label="Portfolio effective time"
+          label="Account updated"
           value={formatTimestamp(account.currentRevision.effectiveAtUnixNanos)}
         />
         <Fact
-          label="Available to analysis"
+          label="Analysis updated"
           value={formatTimestamp(account.currentRevision.availableAtUnixNanos)}
         />
         <Fact
@@ -380,46 +377,35 @@ export function ProvenancePanel({
           value={evidenceLabel(quality?.class)}
         />
         <Fact
-          label="Execution eligible"
+          label="Suitable for analysis"
           value={quality?.executionEligible === true ? "Yes" : "No"}
         />
+        <Fact
+          label="Coverage"
+          value={`${holdingsResult.evidence.returnedItems} of ${holdingsResult.evidence.availableItems} holdings`}
+        />
       </dl>
-      <div className="mt-5 rounded-lg border border-border bg-background/35 p-4 text-xs text-muted-foreground">
-        <p className="font-medium text-foreground">Immutable evidence</p>
-        <p className="mt-2 break-all font-mono">Revision {account.currentRevision.revisionId}</p>
-        <p className="mt-1 break-all font-mono">Artifact {account.currentRevision.artifactSha256}</p>
-        <p className="mt-2">
-          Coverage: {account.currentRevision.sourceCoverage.join(", ") || "Not reported"}. Result:
-          {" "}{humanize(holdingsResult.evidence.completeness)} ({holdingsResult.evidence.returnedItems}
-          {" "}of {holdingsResult.evidence.availableItems}).
-        </p>
-      </div>
       <div className="mt-4 rounded-lg border border-border bg-background/35 p-4">
         <p className="text-sm font-medium text-foreground">Import progress</p>
         <ol className="mt-3 space-y-2 text-xs leading-5 text-muted-foreground">
           <li>
-            1. Source file archived and normalized into immutable revision {" "}
-            <span className="font-mono text-[10px] text-foreground">
-              {shortIdentity(account.currentRevision.revisionId, "Revision")}
-            </span>
-            .
+            1. The account file was imported successfully.
           </li>
           <li>
             2. {account.holdingCount.toLocaleString()} holdings and {" "}
-            {account.transactionCount.toLocaleString()} source transactions are available to
+            {account.transactionCount.toLocaleString()} transactions are available to
             review.
           </li>
           <li>
             3. {account.reconciliationDiscrepancies === 0
               ? "Review the reconciliation explanation before relying on the totals."
-              : "Review each reconciliation difference below, then import a corrected later source revision if needed."}
+                : "Review each reconciliation difference below, then import a corrected file if needed."}
           </li>
         </ol>
       </div>
       <EvidenceNote icon={CircleAlert}>
-        Each holding row shows its exact imported mark source and observation time. This portfolio
-        source has not supplied a venue, market-freshness policy, or alternate mark authority, so
-        Market Squawk does not promote the values to live, delayed, stale, or modeled marks.
+        Imported account values may differ from current market prices. Check each holding's update
+        time and data quality before acting on it.
       </EvidenceNote>
     </section>
   )
@@ -456,7 +442,7 @@ export function ReconciliationPanel({
             <CircleAlert className="size-4 text-amber-300" aria-hidden="true" />
           )}
           {missingDetails
-            ? "Detailed reconciliation evidence is unavailable"
+            ? "Detailed reconciliation information is unavailable"
             : hasNoFindings
             ? "No supplied-versus-calculated discrepancy was retained"
             : `${account.reconciliationDiscrepancies} supplied total${
@@ -465,19 +451,18 @@ export function ReconciliationPanel({
         </div>
         {missingDetails ? (
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            The service has not returned the source-total comparison rows for this revision. Do
-            not treat the discrepancy count as a reconciliation result.
+            Detailed comparison information is unavailable for this account snapshot. Do not treat
+            the discrepancy count as a completed reconciliation.
           </p>
         ) : !hasNoFindings ? (
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            Each mismatch below keeps the source value, independently calculated value, tolerance,
-            and raw source reference together. Correct the source export or import a later
-            revision; the dashboard never overwrites either side.
+            Each mismatch compares the supplied value with the independently calculated value and
+            tolerance. Correct the export and import it again if needed.
           </p>
         ) : (
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            This says only that no retained comparison exceeded its declared tolerance. It does not
-            establish that the source supplied every possible total.
+            This means no recorded comparison exceeded its tolerance. It does not confirm that every
+            possible total was included.
           </p>
         )}
       </div>
@@ -491,9 +476,6 @@ export function ReconciliationPanel({
                 <Fact label="Calculated" value={formatMoney(detail.calculated)} />
                 <Fact label="Tolerance" value={formatMoney(detail.tolerance.amount)} />
               </dl>
-              <p className="mt-2 break-all font-mono text-[10px] text-muted-foreground">
-                Source {detail.sourceReference}
-              </p>
             </div>
           ))}
         </div>
@@ -508,25 +490,25 @@ function AccountingPanel({
   accounting: NonNullable<PortfolioPerformance["accountingEvidence"]>
 }) {
   const entries: [string, string][] = [
-    ["Source-reported cash", formatMoney(accounting.cash.amount)],
-    ["Source-reported market value", formatMoney(accounting.reportedMarketValue)],
+    ["Reported cash", formatMoney(accounting.cash.amount)],
+    ["Reported market value", formatMoney(accounting.reportedMarketValue)],
     ["Unrealized gain", accountingValue(accounting.unrealizedGain)],
     ["Realized gain", accountingValue(accounting.realizedGain)],
-    ["Source-classified income", accountingValue(accounting.income)],
-    ["Source-classified fees", accountingValue(accounting.fees)],
+    ["Reported income", accountingValue(accounting.income)],
+    ["Reported fees", accountingValue(accounting.fees)],
   ]
   return (
     <section className="mt-5 rounded-lg border border-border bg-background/35 p-4">
-      <p className="font-medium text-sm">Accounting evidence</p>
+      <p className="font-medium text-sm">Account summary</p>
       <p className="mt-1 text-xs leading-5 text-muted-foreground">
-        Exact source values and calculated values remain separate. A gain is shown only after the
-        import has enough basis and trade-lifecycle evidence to support it.
+        Reported values and calculated values remain separate. A gain appears only when the account
+        includes enough cost-basis and transaction history.
       </p>
       <dl className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         {entries.map(([label, value]) => <Fact key={label} label={label} value={value} />)}
       </dl>
       <p className="mt-3 text-[11px] text-muted-foreground">
-        Cash observed {formatTimestamp(accounting.cash.observedAtUnixNanos)} · source {accounting.cash.sourceReference}
+        Cash updated {formatTimestamp(accounting.cash.observedAtUnixNanos)}
       </p>
     </section>
   )

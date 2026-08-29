@@ -27,8 +27,6 @@ import {
   type PortfolioImportCommit,
   type PortfolioImportPreview,
 } from "./portfolio-contracts"
-import { shortIdentity } from "./portfolio-format"
-
 const accountUuidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const nilUuid = "00000000-0000-0000-0000-000000000000"
@@ -86,7 +84,7 @@ export function PortfolioImportWorkflow({
     const requestedAccount = accountId.trim().toLowerCase()
     if (!isAccountUuid(requestedAccount)) {
       setError(
-        "Enter a non-nil account UUID that exactly matches the account UUID in the selected extraction batch.",
+        "Enter a valid account ID that matches the account selected for this import.",
       )
       return
     }
@@ -102,7 +100,7 @@ export function PortfolioImportWorkflow({
       const next = parsePortfolioImportPreview(value)
       if (next.preview.accountId !== requestedAccount) {
         throw new Error(
-          "The installed service returned a preview for a different portfolio account.",
+          "The preview does not match the selected portfolio account.",
         )
       }
       setPreview(next)
@@ -120,7 +118,7 @@ export function PortfolioImportWorkflow({
               recordId: transaction.recordId,
               interpretation: exactlyOneInterpretation ? onlyInterpretation : "",
               rationale: exactlyOneInterpretation
-                ? "Confirmed the only service-enumerated interpretation after reviewing this source record."
+                ? "Confirmed the only available interpretation after reviewing this transaction."
                 : "",
               selectedLotIndexes: [],
             }
@@ -147,7 +145,7 @@ export function PortfolioImportWorkflow({
       const committed = parsePortfolioImportCommit(value)
       if (committed.previewId !== preview.previewId) {
         throw new Error(
-          "The installed service committed a receipt for a different portfolio preview.",
+          "The import confirmation did not match the portfolio file being reviewed.",
         )
       }
       setReceipt(committed)
@@ -205,11 +203,10 @@ export function PortfolioImportWorkflow({
               Protected local import
             </p>
           </div>
-          <h2 className="mt-2 text-lg font-semibold">Import portfolio evidence</h2>
+          <h2 className="mt-2 text-lg font-semibold">Import portfolio details</h2>
           <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-            Market Squawk opens the file natively, stages a bounded no-follow copy, and sends only
-            its opaque ticket to the installed service. Review the service-owned preview and exact
-            mappings before anything is approved or committed.
+            Choose a portfolio file, review the imported details, and confirm any transaction
+            interpretations before saving it to this account.
           </p>
         </div>
         {!preview ? (
@@ -233,8 +230,7 @@ export function PortfolioImportWorkflow({
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Protected import is unavailable</AlertTitle>
           <AlertDescription>
-            The installed service is missing {missingOperations.join(", ")}. No local file can be
-            selected through an incomplete authority chain.
+            Import is unavailable right now. No changes have been made to this account.
           </AlertDescription>
         </Alert>
       ) : !isTauri() ? (
@@ -247,7 +243,7 @@ export function PortfolioImportWorkflow({
         </Alert>
       ) : (
         <label className="mt-4 grid max-w-xl gap-1.5 text-xs">
-          <span className="font-semibold">Destination account UUID</span>
+          <span className="font-semibold">Account ID</span>
           <input
             value={accountId}
             onChange={(event) => setAccountId(event.target.value)}
@@ -263,8 +259,8 @@ export function PortfolioImportWorkflow({
             id="portfolio-import-account-help"
             className={accountId !== "" && !accountIdValid ? "text-destructive" : "text-muted-foreground"}
           >
-            Enter a non-nil UUID. It must exactly match the account UUID retained in the selected
-            portfolio extraction batch.
+            Choose an account above whenever possible. If needed, enter the account ID for this
+            import.
           </span>
         </label>
       )}
@@ -280,9 +276,9 @@ export function PortfolioImportWorkflow({
       {receipt ? (
         <Alert className="mt-4">
           <CheckCircle2 aria-hidden="true" />
-          <AlertTitle>Portfolio revision committed</AlertTitle>
+          <AlertTitle>Portfolio details saved</AlertTitle>
           <AlertDescription>
-            The installed authority committed preview {shortIdentity(receipt.previewId, "Preview")} under approval {shortIdentity(receipt.approvalId, "Approval")}. Account evidence is refreshing.
+            Your portfolio details were saved. The account is refreshing now.
           </AlertDescription>
         </Alert>
       ) : null}
@@ -292,7 +288,7 @@ export function PortfolioImportWorkflow({
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <ImportFact label="Account" value={preview.preview.accountId} />
             <ImportFact
-              label="Source records"
+              label="Imported records"
               value={preview.preview.rawRecords.length.toLocaleString()}
             />
             <ImportFact
@@ -304,19 +300,12 @@ export function PortfolioImportWorkflow({
               value={preview.preview.reconciliationDiscrepancies.length.toLocaleString()}
             />
           </div>
-          <div className="rounded-lg border border-border bg-background/25 p-3">
-            <p className="text-[11px] font-semibold">Exact preview digest</p>
-            <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
-              {preview.digest}
-            </p>
-          </div>
-
           {preview.preview.reconciliationDiscrepancies.length > 0 ? (
             <Alert>
               <AlertCircle aria-hidden="true" />
               <AlertTitle>Reconciliation breaks remain visible</AlertTitle>
               <AlertDescription>
-                The preview contains {preview.preview.reconciliationDiscrepancies.length.toLocaleString()} supplied-total discrepancies. A committed revision will not be presented as reconciled while these breaks remain.
+                The preview contains {preview.preview.reconciliationDiscrepancies.length.toLocaleString()} differences in reported totals. It will not be shown as reconciled until they are resolved.
               </AlertDescription>
             </Alert>
           ) : null}
@@ -326,18 +315,15 @@ export function PortfolioImportWorkflow({
               <AlertCircle aria-hidden="true" />
               <AlertTitle>Corporate-action resolution is required</AlertTitle>
               <AlertDescription>
-                This preview requires a server-held corporate-action plan. The installed service
-                has not made that plan available, so this preview cannot be approved or committed.
+                This import needs a corporate-action plan before it can be saved.
               </AlertDescription>
             </Alert>
           ) : null}
 
           <div>
-            <h3 className="text-sm font-semibold">Normalized source preview and mappings</h3>
+            <h3 className="text-sm font-semibold">Review transactions</h3>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              Trade and income records require an explicit service-enumerated interpretation.
-              Specific-lot choices are indexes into the server-held eligible-lot list; no lot ID is
-              accepted from the browser.
+              Some trade and income records need your interpretation before they can be saved.
             </p>
           </div>
           <div className="max-h-[32rem] space-y-3 overflow-y-auto pr-1">
@@ -355,13 +341,7 @@ export function PortfolioImportWorkflow({
                       <p className="text-sm font-semibold">
                         {transaction.classification.replaceAll("_", " ")} · {transaction.amount.value} {transaction.amount.currency}
                       </p>
-                      <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">
-                        {transaction.recordId}
-                      </p>
                     </div>
-                    <span className="rounded-md border border-border px-2 py-1 font-mono text-[10px] text-muted-foreground">
-                      {transaction.sourceRevision}
-                    </span>
                   </div>
                   {interpretation ? (
                     <div className="mt-4 grid gap-3">
@@ -412,14 +392,13 @@ export function PortfolioImportWorkflow({
                                       }))
                                     }
                                   />
-                                  <span className="break-all font-mono">{lotId}</span>
+                                  <span>Lot {index + 1}</span>
                                 </label>
                               ))}
                             </div>
                           ) : (
                             <p className="text-xs text-destructive">
-                              The service did not enumerate an eligible opening lot for this
-                              interpretation.
+                              No eligible opening lot is available for this interpretation.
                             </p>
                           )}
                         </fieldset>
@@ -436,7 +415,7 @@ export function PortfolioImportWorkflow({
                           }
                           maxLength={4096}
                           rows={2}
-                          placeholder="Why does this interpretation match the retained source record?"
+                          placeholder="Why does this interpretation match this transaction?"
                           className="resize-y rounded-md border border-input bg-background px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
                         />
                       </label>
@@ -479,16 +458,15 @@ export function PortfolioImportWorkflow({
       >
         <DialogContent showCloseButton={activity !== "commit"}>
           <DialogHeader>
-            <DialogTitle>Approve and commit this exact portfolio preview?</DialogTitle>
+            <DialogTitle>Save these portfolio details?</DialogTitle>
             <DialogDescription>
-              The installed service will first bind these interpretations to preview {preview ? shortIdentity(preview.previewId, "Preview") : ""}, then commit only the resulting durable approval. It cannot substitute another file, account, mapping, or lot.
+              Confirm that the selected account, file, and transaction interpretations are correct.
             </DialogDescription>
           </DialogHeader>
           {preview ? (
             <div className="rounded-lg border border-border bg-card/40 p-3 text-xs leading-5">
-              <p><span className="font-semibold">Account:</span> {preview.preview.accountId}</p>
               <p><span className="font-semibold">Transactions:</span> {preview.preview.transactions.length.toLocaleString()}</p>
-              <p><span className="font-semibold">Governed mappings:</span> {interpretations.length.toLocaleString()}</p>
+              <p><span className="font-semibold">Interpretations:</span> {interpretations.length.toLocaleString()}</p>
               <p><span className="font-semibold">Reconciliation breaks:</span> {preview.preview.reconciliationDiscrepancies.length.toLocaleString()}</p>
             </div>
           ) : null}
@@ -504,7 +482,7 @@ export function PortfolioImportWorkflow({
               disabled={!ready || corporateActionBlocked || activity === "commit"}
               onClick={() => void commit()}
             >
-              {activity === "commit" ? "Approving and committing…" : "Approve exact preview and commit"}
+              {activity === "commit" ? "Saving…" : "Save portfolio details"}
             </Button>
           </DialogFooter>
         </DialogContent>

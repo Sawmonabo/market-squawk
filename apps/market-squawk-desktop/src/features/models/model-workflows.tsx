@@ -142,8 +142,8 @@ export function ModelWorkflows({
         </p>
         <h2 className="mt-2 text-xl font-semibold">Evaluate or train</h2>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          Closed feature fields and staged files replace raw command payloads. Every mutation
-          requires a final local confirmation and grants no execution authority.
+          Test a model with your assumptions or start training after reviewing the inputs. Neither
+          action can place a trade.
         </p>
       </div>
 
@@ -151,10 +151,10 @@ export function ModelWorkflows({
         <div className="rounded-lg border border-border bg-background/25 p-4">
           <div className="flex items-center gap-2">
             <FlaskConical className="size-4 text-primary" aria-hidden="true" />
-            <h3 className="text-sm font-semibold">Evaluate admitted generation</h3>
+            <h3 className="text-sm font-semibold">Test the selected model</h3>
           </div>
           {!canEvaluate ? (
-            <WorkflowUnavailable text="Model.Evaluate is not registered." />
+            <WorkflowUnavailable text="Model testing is unavailable." />
           ) : !metadata ? (
             <WorkflowUnavailable text="Select a model with complete metadata before evaluating it." />
           ) : (
@@ -211,12 +211,12 @@ export function ModelWorkflows({
             <h3 className="text-sm font-semibold">Start governed training</h3>
           </div>
           {!canTrain ? (
-            <WorkflowUnavailable text="Model.StartTraining is not registered." />
+            <WorkflowUnavailable text="Model training is unavailable." />
           ) : (
             <>
               <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                Choose the closed training configuration and model-authority files. The desktop
-                stages bounded copies and passes only one-use ticket identities.
+                Choose the training settings and approved model definition, then review before
+                starting.
               </p>
               <div className="mt-4 grid gap-2 sm:grid-cols-2">
                 <StageButton
@@ -226,7 +226,7 @@ export function ModelWorkflows({
                   onClick={() => void stage("configuration")}
                 />
                 <StageButton
-                  label="Model authority"
+                  label="Model definition"
                   ticket={authority}
                   loading={staging === "model_authority"}
                   onClick={() => void stage("model_authority")}
@@ -249,7 +249,7 @@ export function ModelWorkflows({
           )}
           {trainingJob ? (
             <p className="mt-3 text-xs text-emerald-300">
-              Training queued as durable job <span className="font-mono">{trainingJob}</span>.
+              Training queued as job <span className="font-mono">{trainingJob}</span>.
             </p>
           ) : null}
           {stageError ? <WorkflowError text={stageError} /> : null}
@@ -264,8 +264,8 @@ export function ModelWorkflows({
             </DialogTitle>
             <DialogDescription>
               {pending?.kind === "evaluate"
-                ? "The installed service will evaluate the selected immutable generation and retain bounded process-local evidence. The result has no execution authority."
-                : "The installed service will consume the two staged tickets and queue durable training. Candidate output is not admitted merely because the job starts."}
+                ? "The selected model will be tested with these values. The result is research only and cannot place a trade."
+                : "Training will start with the selected files. A started job does not mean the resulting model is suitable for investment use."}
             </DialogDescription>
           </DialogHeader>
           {pending?.kind === "evaluate" && metadata ? (
@@ -281,7 +281,7 @@ export function ModelWorkflows({
           {pending?.kind === "train" ? (
             <dl className="grid gap-2 rounded-lg border border-border p-3 text-xs">
               <TicketFact label="Configuration" ticket={pending.configuration} />
-              <TicketFact label="Authority" ticket={pending.authority} />
+              <TicketFact label="Model definition" ticket={pending.authority} />
             </dl>
           ) : null}
           {mutation.isError ? <WorkflowError text={messageFrom(mutation.error)} /> : null}
@@ -306,8 +306,8 @@ function EvaluationEvidence({ result }: { result: EvaluationResult }) {
         {result.decision.replaceAll("_", " ")} · score {result.score.toLocaleString(undefined, { maximumFractionDigits: 6 })} · confidence {result.confidence.toLocaleString(undefined, { maximumFractionDigits: 6 })}
       </p>
       <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-        Evidence sequence {result.evaluationEvidence.sequence}; bounded process-local retention.
-        Execution authority: none. Inference failure: no action.
+        Confidence reflects this model output, not certainty of profit. If the model cannot produce
+        a valid result, no action is suggested.
       </p>
     </div>
   )

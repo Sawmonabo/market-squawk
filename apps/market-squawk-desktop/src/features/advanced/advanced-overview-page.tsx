@@ -9,7 +9,7 @@ import {
 } from "lucide-react"
 import { Link } from "react-router-dom"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import type { ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -22,31 +22,31 @@ const workspaces = [
   {
     label: "Research & Data",
     path: "/advanced/research-data",
-    detail: "Inspect sources, point-in-time datasets, lineage, rights, and feature preparation.",
+    detail: "Review the information used in analysis, including coverage, timing, and limitations.",
     icon: FlaskConical,
   },
   {
     label: "Models & Forecasts",
     path: "/advanced/models-forecasts",
-    detail: "Review model evidence, forecast preparation, outcomes, drift, and calibration.",
+    detail: "Review forecast performance, uncertainty, drift, and calibration.",
     icon: Bot,
   },
   {
     label: "Backtests",
     path: "/advanced/backtests",
-    detail: "Configure and inspect point-in-time backtests, costs, artifacts, and diagnostics.",
+    detail: "Run historical simulations and review assumptions, costs, results, and limitations.",
     icon: FileClock,
   },
   {
     label: "Valuation & Targets",
     path: "/advanced/valuation-targets",
-    detail: "Review valuation evidence, governance, and explicitly custom research targets.",
+    detail: "Review valuation assumptions, estimated ranges, and custom research targets.",
     icon: Landmark,
   },
   {
     label: "Risk & Recommendation Policy",
     path: "/advanced/risk-recommendation-policy",
-    detail: "Inspect detailed risk evidence and, when available, recommendation policy controls.",
+    detail: "Review risk limits, recommendation rules, confidence, and reasons to abstain.",
     icon: ShieldCheck,
   },
 ]
@@ -62,7 +62,9 @@ export function AdvancedOverviewPage() {
         <Alert variant="destructive">
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Advanced analysis is unavailable</AlertTitle>
-          <AlertDescription>{product.error}</AlertDescription>
+          <AlertDescription>
+            Try again. If the problem continues, review the app setup before using these tools.
+          </AlertDescription>
         </Alert>
       </main>
     )
@@ -92,8 +94,9 @@ function ReadyAdvancedOverview({
         </p>
         <h1 className="mt-2 text-3xl font-semibold tracking-tight">Research & analysis</h1>
         <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-          Inspect and customize the analytical evidence behind Market Squawk. Ordinary investment
-          workflows will use governed defaults after the canonical backend path is composed.
+          Review and adjust the assumptions behind Market Squawk&apos;s analysis. Everyday investment
+          workflows use recommended settings, while this area explains confidence, limitations,
+          and available controls.
         </p>
       </header>
 
@@ -136,8 +139,10 @@ function AnalyticalProfileStatus({
     return (
       <Alert variant="destructive" className="mt-6">
         <CircleAlert aria-hidden="true" />
-        <AlertTitle>The Desktop analytical profile could not be opened</AlertTitle>
-        <AlertDescription>{messageFrom(query.error)}</AlertDescription>
+        <AlertTitle>Analysis settings could not be opened</AlertTitle>
+        <AlertDescription>
+          Try again. If the problem continues, review the app setup before changing these settings.
+        </AlertDescription>
       </Alert>
     )
   }
@@ -159,42 +164,52 @@ function AnalyticalProfileStatus({
           </h2>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
             {active.kind === "default"
-              ? "The immutable built-in profile is active. Custom copies can be compared, validated, activated, and restored without changing historical results."
-              : "A validated custom profile is active. Historical results keep the exact profile revision and digest used when they were created."}
+              ? "Market Squawk's recommended analysis settings are active. You can compare and validate custom settings without changing earlier results."
+              : "Your validated custom analysis settings are active. Earlier results continue to reflect the settings used when they were created."}
           </p>
         </div>
         <span className="rounded-full border border-border bg-background/40 px-2.5 py-1 text-[10px] uppercase tracking-wider text-muted-foreground">
           {active.kind === "default" ? "Default" : "Custom"}
         </span>
       </div>
-      <dl className="mt-4 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
-        <ProfileFact label="Profile version" value={`V${active.version}`} />
-        <ProfileFact label="Profile revision" value={active.profileRevision} />
-        <ProfileFact label="Activation revision" value={active.activationRevision} />
+      <dl className="mt-4 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-3">
+        <ProfileFact
+          label="Settings"
+          value={active.kind === "default" ? "Recommended" : "Custom"}
+        />
+        <ProfileFact label="Status" value="Active" />
         <ProfileFact label="Activated" value={formatUnixNanos(active.activatedAt)} />
       </dl>
-      <p className="mt-4 break-all font-mono text-[9px] text-muted-foreground">
-        Configuration SHA-256 {active.configDigest}
-      </p>
 
       <div className="mt-5 flex gap-3 rounded-lg border border-amber-400/25 bg-amber-400/5 p-4">
         <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-300" aria-hidden="true" />
         <div>
-          <h3 className="text-sm font-semibold">Find and Analyze remain blocked</h3>
+          <h3 className="text-sm font-semibold">Find and Analyze are not ready yet</h3>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            The profile and restart journal are durable, but a profile is not financial evidence.
-            Market Squawk will not start an analysis until the canonical data and pure backend
-            capabilities listed below are composed and restart-proven.
+            Market Squawk will wait until the required investment information and analysis tools
+            are ready. This prevents incomplete information from being presented as investment
+            guidance.
           </p>
           <ul className="mt-3 space-y-2 text-xs leading-5 text-muted-foreground">
             {status.workflowReadiness.blockers.map((blocker) => (
-              <li key={blocker.code}>• {blocker.detail}</li>
+              <li key={blocker.code}>• {readinessMessage(blocker.code)}</li>
             ))}
           </ul>
         </div>
       </div>
     </section>
   )
+}
+
+function readinessMessage(code: string) {
+  switch (code) {
+    case "canonical_data_and_backend_composition_required":
+      return "The investment information needed for a complete analysis is still being prepared."
+    case "desktop_start_resume_not_registered":
+      return "Starting or resuming an analysis is not available in the app yet."
+    default:
+      return "A required analysis capability is not ready yet."
+  }
 }
 
 function ProfileFact({ label, value }: { label: string; value: string }) {

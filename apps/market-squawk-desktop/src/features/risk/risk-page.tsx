@@ -10,7 +10,7 @@ import {
   ShieldCheck,
 } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { RiskChart, type RiskChartValue } from "@/components/charts/risk-chart"
 import { Button } from "@/components/ui/button"
@@ -41,7 +41,10 @@ export function RiskPage() {
   if (product.status === "error") {
     return (
       <PageFrame>
-        <EmptyState title="Risk evidence is unavailable" detail={product.error} />
+        <EmptyState
+          title="Risk analysis is unavailable"
+          detail="Try again. If the problem continues, review the app setup before relying on these estimates."
+        />
       </PageFrame>
     )
   }
@@ -102,11 +105,14 @@ function ReadyRiskPage({
       {accounts.isLoading ? (
         <RiskGridLoading />
       ) : accounts.isError ? (
-        <EmptyState title="Portfolio risk could not be read" detail={messageFrom(accounts.error)} />
+        <EmptyState
+          title="Portfolio risk could not be opened"
+          detail="Try refreshing the account list. If the problem continues, review the portfolio setup."
+        />
       ) : availableAccounts.length === 0 ? (
         <EmptyState
           title="No portfolio risk is available"
-          detail="Import and publish a portfolio account before requesting account-scoped risk evidence."
+          detail="Import a portfolio account to review its risk."
         />
       ) : (
         <>
@@ -129,7 +135,8 @@ function ReadyRiskPage({
               </select>
             </div>
             <p className="max-w-xl text-xs leading-5 text-muted-foreground">
-              This view is bound to the account&apos;s current immutable portfolio revision. It does not treat historical portfolio risk as an execution approval.
+              This view reflects the account&apos;s latest available holdings. Historical risk
+              estimates do not approve or place trades.
             </p>
           </div>
           {accountId ? (
@@ -141,7 +148,8 @@ function ReadyRiskPage({
             />
           ) : null}
           <p className="mt-4 text-[10px] leading-relaxed text-muted-foreground">
-            Account listing: {countBoundary(accounts.data)}. Central pre-trade risk decisions and limits are not inferred from this portfolio analytics report.
+            Showing {countBoundary(accounts.data)}. Portfolio analytics describe risk; they do not
+            approve trades or change trading limits.
           </p>
         </>
       )}
@@ -165,20 +173,34 @@ function CentralExecutionRisk({
       <div className="flex gap-3">
         <ShieldAlert className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden="true" />
         <div className="min-w-0">
-          <h2 className="text-sm font-semibold">Central paper-execution risk</h2>
+          <h2 className="text-sm font-semibold">Paper trading safeguards</h2>
           {error ? (
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">Execution-risk evidence could not be read: {messageFrom(error)}</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              Paper trading safeguards could not be opened. Try again before relying on paper
+              trading results.
+            </p>
           ) : status?.state !== "running" ? (
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">No active paper-risk evidence. Starting a paper runtime never bypasses central risk.</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              Paper trading is not running, so no current risk decisions are available. Risk
+              checks cannot be bypassed.
+            </p>
           ) : (
             <>
               <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                Every returned paper order reached the adapter only after central assessment. This immutable read image is published by the existing durable audit owner; it cannot amend a decision, consume an audit record, or change limits.
+                Every paper order shown here was checked before it could proceed. This view is
+                read-only: it cannot change a decision or alter risk limits.
               </p>
               <dl className="mt-3 grid gap-3 sm:grid-cols-3">
-                <Fact label="Orders with execution bound" value={activeBounds.toLocaleString()} />
-                <Fact label="Adapter rejected orders" value={rejected.toLocaleString()} />
-                <Fact label="Breach / reconciliation state" value={status.reconciliationRequired || !status.financialReconciliationCurrent ? "Action required" : "Current"} />
+                <Fact label="Orders with price protection" value={activeBounds.toLocaleString()} />
+                <Fact label="Rejected orders" value={rejected.toLocaleString()} />
+                <Fact
+                  label="Account checks"
+                  value={
+                    status.reconciliationRequired || !status.financialReconciliationCurrent
+                      ? "Action required"
+                      : "Current"
+                  }
+                />
               </dl>
               <RiskLimitEvidence limits={status.riskLimits} />
               <RiskDecisionEvidence decisions={status.riskDecisions} />
@@ -191,48 +213,88 @@ function CentralExecutionRisk({
 }
 
 function RiskLimitEvidence({ limits }: { limits: PaperRiskLimits | undefined }) {
-  if (!limits) return <p className="mt-3 text-xs text-muted-foreground">Active central-risk limits were not returned.</p>
+  if (!limits) {
+    return (
+      <p className="mt-3 text-xs text-muted-foreground">
+        Risk limits are not available right now.
+      </p>
+    )
+  }
   return (
     <div className="mt-4 rounded-lg border border-border/70 bg-background/35 p-3">
-      <h3 className="text-xs font-semibold">Active immutable limits</h3>
+      <h3 className="text-xs font-semibold">Active risk limits</h3>
       <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Fact label="Order notional" value={formatMoney(limits.maximumOrderNotional)} />
-        <Fact label="Gross exposure" value={formatMoney(limits.maximumGrossExposure)} />
+        <Fact label="Maximum order value" value={formatMoney(limits.maximumOrderNotional)} />
+        <Fact label="Maximum total exposure" value={formatMoney(limits.maximumGrossExposure)} />
         <Fact label="Position limit" value={`${limits.maximumPositionLots.toLocaleString()} lots`} />
-        <Fact label="Leverage limit" value={`${limits.maximumLeverageBasisPoints.toLocaleString()} bp`} />
-        <Fact label="Slippage limit" value={`${limits.maximumSlippageBasisPoints.toLocaleString()} bp`} />
-        <Fact label="Price deviation" value={`${limits.maximumPriceDeviationBasisPoints.toLocaleString()} bp`} />
-        <Fact label="Loss / drawdown" value={`${formatMoney(limits.maximumLoss)} / ${formatMoney(limits.maximumDrawdown)}`} />
-        <Fact label="Rate limit" value={`${limits.maximumOrdersPerWindow} orders / ${durationFromNanos(limits.orderRateWindowNanos)}`} />
+        <Fact label="Leverage limit" value={formatBasisPoints(limits.maximumLeverageBasisPoints)} />
+        <Fact label="Slippage limit" value={formatBasisPoints(limits.maximumSlippageBasisPoints)} />
+        <Fact
+          label="Price deviation"
+          value={formatBasisPoints(limits.maximumPriceDeviationBasisPoints)}
+        />
+        <Fact
+          label="Loss / drawdown"
+          value={`${formatMoney(limits.maximumLoss)} / ${formatMoney(limits.maximumDrawdown)}`}
+        />
+        <Fact
+          label="Order pace"
+          value={`${limits.maximumOrdersPerWindow} orders / ${durationFromNanos(limits.orderRateWindowNanos)}`}
+        />
       </dl>
       <p className="mt-3 text-[10px] text-muted-foreground">
-        Eligible instruments: {limits.eligibleInstruments.returnedItems} of {limits.eligibleInstruments.availableItems}; shorting {limits.allowShort ? "allowed" : "disabled"}; kill switch {limits.killSwitch ? "engaged" : "clear"}.
+        Allowed investments: {limits.eligibleInstruments.returnedItems} of{" "}
+        {limits.eligibleInstruments.availableItems}; shorting{" "}
+        {limits.allowShort ? "allowed" : "disabled"}; emergency stop{" "}
+        {limits.killSwitch ? "engaged" : "clear"}.
       </p>
     </div>
   )
 }
 
 function RiskDecisionEvidence({ decisions }: { decisions: PaperRiskDecisions | undefined }) {
-  if (!decisions) return <p className="mt-3 text-xs text-muted-foreground">No retained durable execution decisions were returned.</p>
+  if (!decisions) {
+    return (
+      <p className="mt-3 text-xs text-muted-foreground">
+        No recent paper-trading decisions are available.
+      </p>
+    )
+  }
   return (
     <div className="mt-4 rounded-lg border border-border/70 bg-background/35 p-3">
-      <h3 className="text-xs font-semibold">Durable decision evidence</h3>
+      <h3 className="text-xs font-semibold">Recent risk decisions</h3>
       <p className="mt-1 text-[10px] text-muted-foreground">
-        {decisions.returnedItems} of {decisions.availableItems} retained decisions returned; {decisions.totalPublished} published. Sequence {decisions.oldestSequence ?? "—"} to {decisions.latestSequence ?? "—"}; {decisions.cursorExpired ? "requested cursor expired" : decisions.nextCursor ? `next cursor ${decisions.nextCursor}` : "page complete"}.
+        Showing {decisions.returnedItems} of {decisions.availableItems} recent decisions.
       </p>
       {decisions.records.length === 0 ? null : (
         <div className="mt-3 space-y-2">
           {decisions.records.map((decision) => (
-            <article key={decision.sequence} className="rounded-md border border-border/70 p-3 text-xs">
+            <article
+              key={decision.sequence}
+              className="rounded-md border border-border/70 p-3 text-xs"
+            >
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="font-mono">#{decision.sequence} · {humanize(decision.kind)}</p>
-                <span className={decision.reasons.length > 0 ? "rounded-md border border-rose-400/20 bg-rose-400/10 px-2 py-1 text-[10px] text-rose-200" : "rounded-md border border-border px-2 py-1 text-[10px] text-muted-foreground"}>
-                  {decision.reasons.length > 0 ? `${decision.reasons.length} reason${decision.reasons.length === 1 ? "" : "s"}` : "No rejection reason"}
+                <p>{humanize(decision.kind)}</p>
+                <span
+                  className={
+                    decision.reasons.length > 0
+                      ? "rounded-md border border-rose-400/20 bg-rose-400/10 px-2 py-1 text-[10px] text-rose-200"
+                      : "rounded-md border border-border px-2 py-1 text-[10px] text-muted-foreground"
+                  }
+                >
+                  {decision.reasons.length > 0
+                    ? `${decision.reasons.length} reason${decision.reasons.length === 1 ? "" : "s"}`
+                    : "No rejection reason"}
                 </span>
               </div>
-              <p className="mt-2 text-muted-foreground">Order {shortDigest(decision.orderId)} · account {shortDigest(decision.accountId)} · observed {timeValue(decision.observedAt)}</p>
-              <p className="mt-1 font-mono text-[10px] text-muted-foreground">Intent {shortDigest(decision.intentDigestSha256)} · policy {shortDigest(decision.riskPolicyDigestSha256)} v{decision.riskPolicyRulesetVersion}</p>
-              {decision.reasons.length > 0 ? <p className="mt-2 text-rose-200">Reasons: {decision.reasons.map(reasonText).join(" · ")}</p> : null}
+              <p className="mt-2 text-muted-foreground">
+                Checked {timeValue(decision.observedAt)}
+              </p>
+              {decision.reasons.length > 0 ? (
+                <p className="mt-2 text-rose-200">
+                  Reasons: {decision.reasons.map(reasonText).join(" · ")}
+                </p>
+              ) : null}
             </article>
           ))}
         </div>
@@ -276,7 +338,10 @@ function AccountRisk({
   if (risk.isError) {
     return (
       <div className="mt-4">
-        <EmptyState title="This account&apos;s risk could not be read" detail={messageFrom(risk.error)} />
+        <EmptyState
+          title="This account&apos;s risk could not be opened"
+          detail="Try again. If the problem continues, refresh the portfolio before relying on these estimates."
+        />
       </div>
     )
   }
@@ -304,7 +369,7 @@ function AccountRisk({
           icon={ShieldCheck}
         />
         <Summary
-          label="Reconciliation breaks"
+          label="Account data issues"
           value={account.reconciliationDiscrepancies.toLocaleString()}
           icon={ShieldAlert}
           bad={account.reconciliationDiscrepancies > 0}
@@ -333,7 +398,10 @@ function RiskMeasures({ report }: { report: PortfolioRiskReport }) {
   ].filter((value): value is RiskChartValue => value !== null)
 
   return (
-    <Panel title="Measured risk" subtitle="Historical return risk from the selected immutable revision.">
+    <Panel
+      title="Measured risk"
+      subtitle="Estimated from the account&apos;s available return history."
+    >
       {values.length > 0 ? (
         <RiskChart values={values} />
       ) : (
@@ -341,7 +409,7 @@ function RiskMeasures({ report }: { report: PortfolioRiskReport }) {
           detail={
             report.historyStatus
               ? `Risk measures are unavailable: ${humanize(report.historyStatus)}.`
-              : "The service did not return historical risk measures for this revision."
+              : "Historical risk measures are not available for this account."
           }
         />
       )}
@@ -357,9 +425,9 @@ function ScenarioPanel({
   account: PortfolioAccountRiskSummary
 }) {
   return (
-    <Panel title="Standard stress" subtitle="A deterministic scenario, kept separate from forecasts.">
+    <Panel title="Standard stress" subtitle="A fixed scenario, kept separate from forecasts.">
       <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-        {humanize(report.scenario.id)}
+        {scenarioName(report.scenario.id)}
       </p>
       <p className="mt-3 font-mono text-2xl font-semibold">
         {report.scenario.impact
@@ -370,8 +438,11 @@ function ScenarioPanel({
       </p>
       <dl className="mt-5 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-2 xl:grid-cols-1">
         <Fact label="Account currency" value={account.currency} />
-        <Fact label="Policy" value={humanize(report.policy)} />
-        <Fact label="Revision" value={shortDigest(report.revisionId)} />
+        <Fact label="Confidence" value={formatPercent(report.confidence)} />
+        <Fact
+          label="Observations"
+          value={report.observations?.toLocaleString() ?? "Not available"}
+        />
         <Fact
           label="Tracking error"
           value={report.trackingErrorStatus ? humanize(report.trackingErrorStatus) : "Not reported"}
@@ -396,9 +467,12 @@ function EvidencePanel({
       <div className="flex gap-3">
         <CircleAlert className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden="true" />
         <div>
-          <h2 className="text-sm font-semibold">Evidence boundary</h2>
+          <h2 className="text-sm font-semibold">Confidence and limitations</h2>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            {result.completeness}; {result.returnedItems} of {result.availableItems} result items. Effective {timeFromNanos(report.effectiveAtUnixNanos)}; available {timeFromNanos(report.availableAtUnixNanos)}.
+            Coverage: {humanize(result.completeness)}. Showing {result.returnedItems} of{" "}
+            {result.availableItems} available measures. Risk period ends{" "}
+            {timeFromNanos(report.effectiveAtUnixNanos)}; updated{" "}
+            {timeFromNanos(report.availableAtUnixNanos)}.
           </p>
           {limitations.length > 0 ? (
             <p className="mt-2 text-xs text-amber-200">Limitations: {limitations.join(" · ")}</p>
@@ -457,7 +531,8 @@ function PageFrame({ children, action }: { children: React.ReactNode; action?: R
           </p>
           <h1 className="mt-2 text-3xl font-semibold tracking-tight">Risk</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Revision-bound historical risk and deterministic stress evidence, without converting analytics into execution authority.
+            Review historical risk, stress scenarios, confidence, and limitations. These estimates
+            inform decisions but never approve or place a trade.
           </p>
         </div>
         {action}
@@ -530,16 +605,22 @@ function countBoundary(
   value: { completeness: string; returnedItems: number; availableItems: number } | undefined,
 ) {
   return value
-    ? `${value.completeness}, ${value.returnedItems} of ${value.availableItems} returned`
-    : "unavailable"
-}
-
-function shortDigest(value: string) {
-  return value.length > 18 ? `${value.slice(0, 10)}…${value.slice(-6)}` : value
+    ? `${value.returnedItems} of ${value.availableItems} accounts (${humanize(value.completeness)} coverage)`
+    : "no account coverage"
 }
 
 function durationFromNanos(value: number) {
   return value >= 1_000_000_000 ? `${value / 1_000_000_000}s` : `${value / 1_000_000}ms`
+}
+
+function formatBasisPoints(value: number) {
+  return formatPercent(value / 10_000)
+}
+
+function scenarioName(value: string) {
+  return value === "parallel_market_minus_10_percent"
+    ? "Market prices fall 10%"
+    : "Standard market stress"
 }
 
 function timeValue(value: string | number) {

@@ -94,7 +94,7 @@ The boundaries are:
 | Provider-native | **ADD** | Each endpoint, file, or stream protocol receives a closed, versioned source-owned decoder type. Unknown fields may be retained in the raw object and diagnostics, but not exposed as an open canonical map. |
 | Canonical | **PRESENT / EXTEND / ADD** | Existing domain observations are reused. Structurally different families receive separate closed domain and Arrow schemas below. |
 | Derived | **PRESENT / EXTEND** | Features, labels, forecasts, outcomes, valuations, screens, dossiers, portfolio analytics, and advisories bind immutable canonical generations and their policies. They never overwrite source observations. |
-| Application read | **PRESENT / EXTEND / ADD** | An application service selects exact evidence and returns a bounded typed projection plus a selection/evidence receipt. |
+| Application read | **PRESENT / EXTEND / ADD** | An application service selects exact evidence and returns a bounded typed canonical product projection. Exact selection/evidence receipts remain internal or are exposed only through Settings/Connections and Logs/Diagnostics; ordinary product DTOs never expose provider identities or provider-runtime plumbing. |
 
 The current `payload_json` binary field in `market_squawk.research_observations` serializes the
 closed `ResearchObservation` enum. It is not permission to introduce arbitrary provider JSON or a

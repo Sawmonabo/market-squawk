@@ -65,9 +65,8 @@ export function PortfolioHistory({
         </p>
         <h2 className="mt-2 text-lg font-semibold">History and attribution</h2>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          Review retained source transactions and compare the current immutable revision with an
-          earlier one. Attribution uses source mark changes and does not adjust for cash flows or
-          corporate actions.
+          Review recorded transactions and compare the current account snapshot with an earlier one.
+          Changes in cash flows and corporate actions are shown separately from investment returns.
         </p>
       </header>
 
@@ -81,7 +80,6 @@ export function PortfolioHistory({
 
       <div className="mt-5 grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
         <RevisionComparison
-          currentId={account.currentRevision.revisionId}
           baselines={baselines}
           selectedId={baselineId}
           select={setBaselineId}
@@ -108,7 +106,6 @@ export function PortfolioHistory({
 }
 
 function RevisionComparison({
-  currentId,
   baselines,
   selectedId,
   select,
@@ -120,7 +117,6 @@ function RevisionComparison({
   attributionLoading,
   attributionAvailable,
 }: {
-  currentId: string
   baselines: PortfolioAccount["currentRevision"][]
   selectedId: string | null
   select: (revisionId: string) => void
@@ -136,18 +132,18 @@ function RevisionComparison({
     <div className="rounded-lg border border-border bg-background/25 p-4">
       <div className="flex items-center gap-2">
         <GitCompareArrows className="size-4 text-primary" aria-hidden="true" />
-        <h3 className="text-sm font-semibold">Compare revisions</h3>
+        <h3 className="text-sm font-semibold">Compare account snapshots</h3>
       </div>
       {!available ? (
-        <Unavailable text="Portfolio revision history is not registered." />
+        <Unavailable text="Portfolio history is unavailable right now." />
       ) : loading ? (
         <Skeleton className="mt-4 h-40 rounded-lg" />
       ) : baselines.length === 0 ? (
-        <Unavailable text="At least two available revisions are required for attribution." />
+        <Unavailable text="At least two account snapshots are needed to show changes over time." />
       ) : (
         <>
           <label className="mt-4 grid gap-1.5 text-xs">
-            <span className="font-medium">Earlier revision</span>
+            <span className="font-medium">Earlier snapshot</span>
             <select
               value={selectedId ?? ""}
               onChange={(event) => select(event.target.value)}
@@ -168,14 +164,11 @@ function RevisionComparison({
               onClick={loadMore}
               disabled={loadingMore}
             >
-              {loadingMore ? "Loading…" : "Load earlier revisions"}
+              {loadingMore ? "Loading…" : "Load earlier snapshots"}
             </Button>
           ) : null}
-          <p className="mt-3 break-all text-[10px] text-muted-foreground">
-            Current revision: <span className="font-mono">{currentId}</span>
-          </p>
           {!attributionAvailable ? (
-            <Unavailable text="Portfolio attribution is not registered." />
+            <Unavailable text="Changes over time are unavailable right now." />
           ) : attributionLoading ? (
             <Skeleton className="mt-4 h-28 rounded-lg" />
           ) : attribution ? (
@@ -191,7 +184,7 @@ function AttributionResult({ result }: { result: PortfolioAttribution }) {
   return (
     <div className="mt-4 rounded-lg border border-border bg-card/30 p-4">
       <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-        Total source-mark change
+            Change in market value
       </p>
       <p className="mt-1 font-mono text-lg font-semibold tabular-nums">
         {formatMoney(result.total)}
@@ -249,15 +242,6 @@ function TransactionHistory({
           <span className="font-mono tabular-nums">{formatMoney(row.original.amount)}</span>
         ),
       },
-      {
-        accessorKey: "source_reference",
-        header: "Source reference",
-        cell: ({ row }) => (
-          <span className="block max-w-44 truncate font-mono text-xs">
-            {row.original.source_reference}
-          </span>
-        ),
-      },
     ],
     [],
   )
@@ -265,10 +249,10 @@ function TransactionHistory({
     <div className="min-w-0 rounded-lg border border-border bg-background/25 p-4">
       <div className="flex items-center gap-2">
         <History className="size-4 text-primary" aria-hidden="true" />
-        <h3 className="text-sm font-semibold">Source transactions</h3>
+        <h3 className="text-sm font-semibold">Transactions</h3>
       </div>
       {!available ? (
-        <Unavailable text="Portfolio transaction history is not registered." />
+        <Unavailable text="Transaction history is unavailable right now." />
       ) : loading ? (
         <Skeleton className="mt-4 h-72 rounded-lg" />
       ) : (
@@ -276,10 +260,10 @@ function TransactionHistory({
           <DataTable
             columns={columns}
             data={rows}
-            emptyMessage="No transactions were retained in this revision."
+            emptyMessage="No transactions are available in this account snapshot."
             getRowId={(row) => row.broker_transaction_id}
             pageSize={8}
-            ariaLabel="Portfolio source transactions"
+            ariaLabel="Portfolio transactions"
           />
         </div>
       )}

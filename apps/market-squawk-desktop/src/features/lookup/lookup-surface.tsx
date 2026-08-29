@@ -7,7 +7,6 @@ import {
   Database,
   Gauge,
   Search,
-  ServerCog,
   Settings2,
 } from "lucide-react"
 import { useNavigate } from "react-router-dom"
@@ -20,21 +19,17 @@ import { cn } from "@/lib/utils"
 
 import {
   instrumentLookupDetailSchema,
-  lookupCategories,
-  type LookupCategory,
-  type LookupMatch,
+  productLookupCategories,
+  type ProductLookupCategory,
 } from "./schemas"
-import { useLookup } from "./use-lookup"
+import { useLookup, type ProductLookupMatch } from "./use-lookup"
 
-const categoryLabels: Record<LookupCategory, string> = {
+const categoryLabels: Record<ProductLookupCategory, string> = {
   company: "Companies",
-  command: "Actions",
   dataset: "Research data",
   instrument: "Instruments",
-  job: "Running work",
   model: "Models",
   portfolio: "Portfolio",
-  provider: "Connections & sources",
   screen: "Saved screens",
   target: "Investment targets",
 }
@@ -50,10 +45,10 @@ export function LookupSurface({
 }) {
   const navigate = useNavigate()
   const [text, setText] = React.useState("")
-  const [categories, setCategories] = React.useState<LookupCategory[]>([])
+  const [categories, setCategories] = React.useState<ProductLookupCategory[]>([])
   const state = useLookup(transport, scope, text, categories)
 
-  const toggle = (category: LookupCategory) => {
+  const toggle = (category: ProductLookupCategory) => {
     setCategories((current) =>
       current.includes(category)
         ? current.filter((value) => value !== category)
@@ -73,14 +68,14 @@ export function LookupSurface({
           value={text}
           maxLength={256}
           onChange={(event) => setText(event.target.value)}
-          placeholder="Search a ticker, market, identifier, source, or research item…"
+          placeholder="Search a ticker, company, investment, or research item…"
           aria-label="Search your Market Squawk workspace"
           className="h-11 pl-10"
         />
       </div>
 
       <div className="flex flex-wrap gap-2" aria-label="Limit search categories">
-        {lookupCategories.map((category) => {
+        {productLookupCategories.map((category) => {
           const selected = categories.includes(category)
           return (
             <button
@@ -117,7 +112,7 @@ function LookupResults({
 }: {
   state: ReturnType<typeof useLookup>
   query: string
-  onOpen: (match: LookupMatch) => void
+  onOpen: (match: ProductLookupMatch) => void
 }) {
   if (state.status === "idle") {
     return (
@@ -125,8 +120,8 @@ function LookupResults({
         <Gauge className="mx-auto size-5 text-primary" aria-hidden="true" />
         <p className="mt-3 text-sm font-medium">Find something in your workspace</p>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          Enter at least two characters, such as a ticker, market, FIGI, dataset, or saved screen.
-          Every instrument result explains why it matched.
+          Enter at least two characters, such as a ticker, company, investment, research collection,
+          or saved screen.
         </p>
       </div>
     )
@@ -144,7 +139,9 @@ function LookupResults({
     return (
       <div role="alert" className="rounded-xl border border-destructive/40 bg-destructive/5 p-4">
         <p className="text-sm font-medium text-destructive">Search is unavailable</p>
-        <p className="mt-1 text-xs leading-5 text-muted-foreground">{state.message}</p>
+        <p className="mt-1 text-xs leading-5 text-muted-foreground">
+          Try again. If the problem continues, review Logs &amp; Diagnostics.
+        </p>
       </div>
     )
   }
@@ -159,8 +156,7 @@ function LookupResults({
       <div className="rounded-xl border border-border bg-card/25 p-5">
         <p className="text-sm font-medium">No matches for “{query}”</p>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          Try a ticker, venue, external identifier, source, dataset, screen, job, or action name.
-          Categories without a safe local index are listed below.
+          Try a ticker, company, investment name, research collection, model, or saved screen.
         </p>
         <UnavailableCategories categories={unavailable} />
       </div>
@@ -217,19 +213,19 @@ function LookupResults({
 function UnavailableCategories({
   categories,
 }: {
-  categories: Array<{ category: LookupCategory; reason?: string }>
+  categories: Array<{ category: ProductLookupCategory; reason?: string }>
 }) {
   if (categories.length === 0) return null
   return (
     <details className="mt-4 rounded-lg border border-border bg-background/40 px-3 py-2">
       <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground">
-        Not searchable yet ({categories.length})
+        Some results are unavailable ({categories.length})
       </summary>
       <ul className="mt-2 space-y-2 text-[11px] leading-4 text-muted-foreground">
         {categories.map((category) => (
           <li key={category.category}>
             <strong className="text-foreground/75">{categoryLabels[category.category]}:</strong>{" "}
-            {category.reason ?? "No bounded index is available."}
+            Search is not available for this category right now.
           </li>
         ))}
       </ul>
@@ -237,12 +233,10 @@ function UnavailableCategories({
   )
 }
 
-function LookupIcon({ category }: { category: LookupCategory }) {
+function LookupIcon({ category }: { category: ProductLookupCategory }) {
   const Icon =
     category === "company"
       ? Building2
-      : category === "provider"
-      ? ServerCog
       : category === "dataset"
         ? Database
         : category === "instrument"
@@ -257,31 +251,18 @@ function LookupIcon({ category }: { category: LookupCategory }) {
   )
 }
 
-function friendlyLabel(match: LookupMatch) {
+function friendlyLabel(match: ProductLookupMatch) {
   if (match.category === "instrument") {
     const parsed = instrumentLookupDetailSchema.safeParse(match.detail)
     if (parsed.success) return parsed.data.companyName ?? parsed.data.displayName
   }
-  if (match.category === "provider" && typeof match.detail.display_name === "string") {
-    return match.detail.display_name
-  }
   return match.label
 }
 
-function detailFor(match: LookupMatch) {
+function detailFor(match: ProductLookupMatch) {
   const detail = match.detail
   if (match.category === "company") {
-    const associations = Array.isArray(detail.providerReportedSecurityAssociations)
-      ? detail.providerReportedSecurityAssociations
-      : []
-    const first = associations[0]
-    const ticker =
-      typeof first === "object" && first !== null && "ticker" in first && isText(first.ticker)
-        ? first.ticker
-        : null
-    return [ticker, detail.sicDescription, detail.providerCompanyId]
-      .filter(isText)
-      .join(" · ") || match.id
+    return isText(detail.sicDescription) ? detail.sicDescription : "Company"
   }
   if (match.category === "instrument") {
     const parsed = instrumentLookupDetailSchema.safeParse(detail)
@@ -289,67 +270,37 @@ function detailFor(match: LookupMatch) {
       const reason = parsed.data.matchReasons[0]
       const matched = reason
         ? `${reason.label}: ${reason.value}${reason.venueId ? ` · ${reason.venueId}` : ""}`
-        : match.id
-      return `${matched} · ${parsed.data.assetClass.replaceAll("_", " ")} · ${parsed.data.quoteCurrency}`
+        : parsed.data.displayName
+      return `${matched} · ${friendlyAssetClass(parsed.data.assetClass)} · ${parsed.data.quoteCurrency}`
     }
-  }
-  if (match.category === "provider") {
-    return [detail.coverage, detail.quality_ceiling].filter(isText).join(" · ") || match.id
   }
   if (match.category === "dataset") {
     const rows = typeof detail.rowCount === "number" ? `${detail.rowCount.toLocaleString()} rows` : null
-    return [detail.sourceId, rows].filter(isText).join(" · ") || match.id
+    return rows ?? "Research collection"
   }
   if (match.category === "screen") {
     return typeof detail.revision === "number" ? `Revision ${detail.revision}` : match.id
   }
-  if (match.category === "job") {
-    return [detail.kind, detail.state].filter(isText).join(" · ") || match.id
-  }
-  if (match.category === "command" && typeof detail.domain === "string") {
-    return `${detail.domain} action · ${match.id}`
-  }
-  return match.id
+  return categoryLabels[match.category]
 }
 
-export function lookupRoute(match: LookupMatch) {
+export function lookupRoute(match: ProductLookupMatch) {
   if (match.destination?.kind === "market_instrument") {
     return `/markets?instrumentId=${encodeURIComponent(match.destination.instrumentId)}`
   }
   if (match.destination?.kind === "research_company") {
-    return `/advanced/research-data?companyId=${encodeURIComponent(match.destination.providerCompanyId)}`
+    return "/advanced/research-data"
   }
-  if (match.category === "provider") return "/connections/sources"
   if (match.category === "dataset") return "/advanced/research-data"
   if (match.category === "screen") return "/opportunities"
   if (match.category === "model") return "/advanced/models-forecasts"
   if (match.category === "portfolio") return "/portfolio"
   if (match.category === "target") return "/advanced/valuation-targets"
-  if (match.category === "job") return "/system/operations-jobs"
-  if (match.category === "command" && typeof match.detail.domain === "string") {
-    const domain = match.detail.domain.toLowerCase()
-    const paths: Record<string, string> = {
-      analysis: "/advanced/backtests",
-      bot: "/advanced/risk-recommendation-policy",
-      decision: "/opportunities",
-      execution: "/paper-execution",
-      fairvalue: "/advanced/valuation-targets",
-      fundamental: "/advanced/research-data",
-      job: "/system/operations-jobs",
-      macro: "/advanced/research-data",
-      market: "/markets",
-      model: "/advanced/models-forecasts",
-      portfolio: "/portfolio",
-      research: "/advanced/research-data",
-      source: "/connections/sources",
-    }
-    return paths[domain] ?? "/home"
-  }
   return "/home"
 }
 
-function groupMatches(matches: LookupMatch[]) {
-  const grouped = new Map<LookupCategory, LookupMatch[]>()
+function groupMatches(matches: ProductLookupMatch[]) {
+  const grouped = new Map<ProductLookupCategory, ProductLookupMatch[]>()
   for (const match of matches) {
     const group = grouped.get(match.category)
     if (group) group.push(match)
@@ -360,4 +311,9 @@ function groupMatches(matches: LookupMatch[]) {
 
 function isText(value: unknown): value is string {
   return typeof value === "string" && value.length > 0
+}
+
+function friendlyAssetClass(value: string) {
+  const label = value.replaceAll("_", " ")
+  return label.charAt(0).toUpperCase() + label.slice(1)
 }

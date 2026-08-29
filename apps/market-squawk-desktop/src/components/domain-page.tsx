@@ -53,46 +53,21 @@ export function DomainPage({
           icon={DatabaseZap}
           label="Available views"
           value={reads}
-          detail="Bounded reads admitted by the installed service."
+          detail="Information available in this workspace."
         />
         <CapabilityFact
           icon={ShieldCheck}
           label="Protected actions"
           value={protectedChanges}
-          detail="Changes remain behind confirmation and owning risk authority."
+          detail="Changes require review and confirmation."
         />
         <CapabilityFact
           icon={DatabaseZap}
-          label="Service generation"
-          value={product.bootstrap.runtime.serviceGeneration}
-          detail="Cached data is isolated to this exact running service."
+          label="Available tools"
+          value={operations.length}
+          detail="Features available in this area."
         />
       </div>
-      <details className="mt-5 rounded-xl border border-border bg-card/35 p-5">
-        <summary className="cursor-pointer text-sm font-semibold">
-          Technical capability details
-        </summary>
-        <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-          This diagnostic list describes the installed contract. Product pages
-          use purpose-built views and controls; they do not expose a raw command
-          or JSON editor.
-        </p>
-        <ul className="mt-4 grid gap-3 md:grid-cols-2">
-          {operations.map((operation) => (
-            <li
-              key={operation.name}
-              className="rounded-lg border border-border bg-background/50 p-3"
-            >
-              <p className="font-mono text-[11px] text-foreground/85">
-                {operation.name}
-              </p>
-              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                {operation.description}
-              </p>
-            </li>
-          ))}
-        </ul>
-      </details>
     </PageFrame>
   )
 }

@@ -30,6 +30,7 @@ import {
   parseResearchManifest,
   type ResearchDataset,
 } from "@/features/research/research-contracts"
+import { ResearchIngestion } from "@/features/research/research-ingestion"
 
 import {
   type DoctorRateEvidence,
@@ -220,6 +221,20 @@ function ReadySourcesPage({
         onAttempted={() => {
           void refreshAuthority()
           refresh()
+        }}
+      />
+      <ResearchIngestion
+        bootstrap={bootstrap}
+        transport={transport}
+        onStarted={() => {
+          void Promise.all([
+            queryClient.invalidateQueries({
+              queryKey: productKeys.domain(bootstrap.runtime, "job"),
+            }),
+            queryClient.invalidateQueries({
+              queryKey: productKeys.domain(bootstrap.runtime, "research"),
+            }),
+          ])
         }}
       />
       {failedReads === totalReads ? (

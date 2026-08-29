@@ -375,8 +375,7 @@ export function ProductProvider({
       availability: "unavailable",
       bootstrap: null,
       serviceBootstrap: null,
-      error:
-        "The Desktop could not establish an authenticated event connection for the current service generation.",
+      error: "Market Squawk could not finish opening this workspace. Try again.",
     }
   } else if (generationHandoffPending) {
     state = {
@@ -392,8 +391,7 @@ export function ProductProvider({
       availability: "degraded",
       bootstrap: null,
       serviceBootstrap: bootstrap.data,
-      error:
-        "Secure local storage needs the foreground recovery action shown above. Navigation and stored workspace routes remain available.",
+      error: "This workspace needs attention before it can open. Complete the recovery action shown above.",
     }
   } else if (bootstrap.data) {
     state = {
@@ -409,7 +407,7 @@ export function ProductProvider({
       availability: "unavailable",
       bootstrap: null,
       serviceBootstrap: null,
-      error: messageFrom(bootstrap.error),
+      error: "Market Squawk could not open this workspace. Try again or review Logs & Diagnostics.",
     }
   } else {
     state = {

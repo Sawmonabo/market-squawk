@@ -4,7 +4,6 @@ import {
   AlertCircle,
   Clock3,
   Download,
-  GitBranch,
   LoaderCircle,
 } from "lucide-react"
 
@@ -12,6 +11,7 @@ import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
+import { friendlyResearchCollectionName } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -90,12 +90,13 @@ export function DatasetEvidence({
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              Selected immutable generation
+              Selected collection
             </p>
-            <h2 className="mt-2 break-words text-xl font-semibold">{datasetId}</h2>
+            <h2 className="mt-2 break-words text-xl font-semibold">
+              {friendlyResearchCollectionName(exact.manifest.schema.name)}
+            </h2>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <EvidenceBadge>{humanize(exact.generationKind)}</EvidenceBadge>
             {canExport ? (
               <Button
                 size="sm"
@@ -108,88 +109,48 @@ export function DatasetEvidence({
                 ) : (
                   <Download aria-hidden="true" />
                 )}
-                Export dataset
+                Export history
               </Button>
             ) : null}
           </div>
         </div>
         <p className="mt-3 text-sm text-muted-foreground">
-          Source authority: <span className="text-foreground">{exact.sourceId}</span>
+          Dated research information available for repeatable analysis.
         </p>
         {exportJob.data ? (
           <p className="mt-3 text-xs text-[var(--success)]" role="status">
-            Controlled export queued as job {exportJob.data.jobId.slice(0, 12)}.
+            Export started. Follow its progress in Operations &amp; Jobs.
           </p>
         ) : null}
         {exportJob.isError ? (
           <p className="mt-3 text-xs text-destructive" role="alert">
-            {messageFrom(exportJob.error)}
+            The export could not be started. Try again.
           </p>
         ) : null}
       </div>
 
       {manifest.isError ? (
         <InlineError
-          title="Manifest verification failed"
-          error={manifest.error}
+          title="This collection could not be checked"
           retry={() => void manifest.refetch()}
         />
       ) : null}
-      <div className="grid gap-px bg-border sm:grid-cols-2 lg:grid-cols-4">
-        <EvidenceMetric label="Manifest" value={`v${exact.manifest.manifestVersion}`} />
-        <EvidenceMetric
-          label="Schema"
-          value={`${exact.manifest.schema.name} v${exact.manifest.schema.version}`}
-        />
-        <EvidenceMetric label="Rows" value={formatCount(exact.rowCount)} />
-        <EvidenceMetric label="Objects" value={formatCount(exact.objectCount)} />
+      <div className="grid gap-px bg-border sm:grid-cols-2">
+        <EvidenceMetric label="Observations" value={formatCount(exact.rowCount)} />
+        <EvidenceMetric label="Availability" value="Ready to review" />
       </div>
 
-      <div className="grid gap-5 p-5 lg:grid-cols-2">
-        <EvidenceBlock
-          icon={GitBranch}
-          title="Lineage"
-          description="Exact generation ancestry and content identity."
-        >
-          <Digest label="Lineage digest" value={exact.lineageDigest} />
-          <Digest label="Content hash" value={exact.manifest.contentHash} />
-          {exact.parents.length ? (
-            <ul className="mt-3 space-y-2">
-              {exact.parents.map((parent) => (
-                <li
-                  key={`${parent.relation}-${parent.manifest.datasetId}-${parent.manifest.manifestVersion}`}
-                  className="rounded-md border border-border bg-background/45 p-3"
-                >
-                  <p className="text-xs font-medium">
-                    {parent.manifest.datasetId} · v{parent.manifest.manifestVersion}
-                  </p>
-                  <p className="mt-1 text-[10px] uppercase tracking-wider text-muted-foreground">
-                    {humanize(parent.relation)}
-                  </p>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="mt-3 text-xs text-muted-foreground">
-              This generation has no retained parent edge.
-            </p>
-          )}
-          {exact.generationKind === "derived" ? (
-            <DerivedGenerationEvidence generation={exact} />
-          ) : null}
-        </EvidenceBlock>
-
+      <div className="p-5">
         <EvidenceBlock
           icon={Clock3}
-          title="Point-in-time & revisions"
-          description="Real observation timing and revision evidence from this manifest-pinned dataset."
+          title="History and revisions"
+          description="When the information applied, when it became public, and whether it later changed."
         >
           <HistoryEvidence
             query={{
               data: history.data,
               isPending: history.isPending,
               isError: history.isError,
-              error: history.error,
               retry: () => void history.refetch(),
             }}
           />
@@ -212,24 +173,19 @@ function HistoryEvidence({
     data: ResearchObservationResult | undefined
     isPending: boolean
     isError: boolean
-    error: unknown
     retry: () => void
   }
 }) {
   if (query.isPending) return <Skeleton className="h-48 rounded-lg" />
   if (query.isError) {
     return (
-      <InlineError
-        title="History could not be loaded"
-        error={query.error}
-        retry={query.retry}
-      />
+      <InlineError title="History could not be loaded" retry={query.retry} />
     )
   }
   if (!query.data || query.data.kind === "empty") {
     return (
       <p className="rounded-md border border-border bg-background/40 p-3 text-xs leading-5 text-muted-foreground">
-        This immutable generation contains no matching history observations.
+        This collection contains no matching history.
       </p>
     )
   }
@@ -237,13 +193,12 @@ function HistoryEvidence({
     return (
       <div className="rounded-md border border-border bg-background/40 p-3">
         <p className="text-xs font-medium">
-          {formatCount(query.data.artifact.rowCount)} rows retained as a controlled artifact
+          {formatCount(query.data.artifact.rowCount)} observations are available
         </p>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          The result exceeded the safe inline preview. Its Parquet identity is retained without
-          inventing row-level timing values.
+          This is more information than the page can show at once. Export the history to review
+          the full collection.
         </p>
-        <Digest label="Artifact SHA-256" value={query.data.artifact.sha256} />
       </div>
     )
   }
@@ -254,7 +209,7 @@ function HistoryEvidence({
       </p>
       <ul className="max-h-80 space-y-2 overflow-y-auto pr-1">
         {query.data.rows.slice(0, 8).map((row, index) => (
-          <ObservationEvidence key={observationKey(row, index)} row={row} />
+          <ObservationEvidence key={index} row={row} />
         ))}
       </ul>
       {query.data.rows.length > 8 ? (
@@ -267,30 +222,24 @@ function HistoryEvidence({
 }
 
 function ObservationEvidence({ row }: { row: Record<string, unknown> }) {
-  const source = textValue(row.source_identifier) ?? textValue(row.source_id) ?? "Observation"
   const revision = numberValue(row.revision)
-  const kind = textValue(row.observation_kind)
   const quality = textValue(row.quality)
   return (
     <li className="rounded-md border border-border bg-background/45 p-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
-          <p className="text-xs font-medium">{source}</p>
-          <p className="mt-1 text-[10px] text-muted-foreground">
-            {kind ? humanize(kind) : "Research observation"}
-          </p>
+          <p className="text-xs font-medium">Observation</p>
         </div>
         <EvidenceBadge>Revision {revision ?? "unavailable"}</EvidenceBadge>
       </div>
       <dl className="mt-3 grid gap-2 text-[10px] sm:grid-cols-2">
         <TimeFact label="Effective" value={row.effective_at ?? row.effective_date} />
-        <TimeFact label="Published" value={row.published_at ?? row.published_date} />
+        <TimeFact label="First public" value={row.published_at ?? row.published_date} />
         <TimeFact label="Available" value={row.available_at} />
-        <TimeFact label="Ingested" value={row.ingested_at} />
         <TimeFact label="Superseded" value={row.superseded_at ?? row.superseded_date} />
         <div>
           <dt className="text-muted-foreground">Quality</dt>
-          <dd className="mt-0.5 text-foreground">{quality ? humanize(quality) : "Unclassified"}</dd>
+          <dd className="mt-0.5 text-foreground">{qualityLabel(quality)}</dd>
         </div>
       </dl>
     </li>
@@ -312,21 +261,20 @@ function AlternativeEvidence({
   if (error) {
     return (
       <InlineError
-        title="Alternative-data check failed"
-        error={error}
+        title="Additional information could not be loaded"
         retry={retry}
       />
     )
   }
   const value = !result || result.kind === "empty"
-    ? "No alternative-data rows in this generation"
+    ? "No additional information in this collection"
     : result.kind === "artifact"
-      ? `${formatCount(result.artifact.rowCount)} alternative-data rows in a controlled artifact`
-      : `${formatCount(result.returnedItems)} alternative-data rows available`
+      ? `${formatCount(result.artifact.rowCount)} additional observations available`
+      : `${formatCount(result.returnedItems)} additional observations available`
   return (
     <div className="rounded-md border border-border bg-background/40 p-3">
       <p className="text-[9px] uppercase tracking-wider text-muted-foreground">
-        Alternative data
+        Additional information
       </p>
       <p className="mt-1 text-xs text-foreground">{value}</p>
     </div>
@@ -344,11 +292,9 @@ function TimeFact({ label, value }: { label: string; value: unknown }) {
 
 function InlineError({
   title,
-  error,
   retry,
 }: {
   title: string
-  error: unknown
   retry: () => void
 }) {
   return (
@@ -356,7 +302,7 @@ function InlineError({
       <AlertCircle aria-hidden="true" />
       <AlertTitle>{title}</AlertTitle>
       <AlertDescription>
-        <p>{messageFrom(error)}</p>
+        <p>Refresh this collection to try again.</p>
         <Button size="xs" variant="outline" onClick={retry}>
           Try again
         </Button>
@@ -371,7 +317,7 @@ function EvidenceBlock({
   description,
   children,
 }: {
-  icon: typeof GitBranch
+  icon: typeof Clock3
   title: string
   description: string
   children: React.ReactNode
@@ -399,65 +345,12 @@ function EvidenceMetric({ label, value }: { label: string; value: string }) {
   )
 }
 
-function Digest({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="mt-3">
-      <p className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</p>
-      <p className="mt-1 break-all font-mono text-[10px] leading-4 text-foreground/80">
-        {value}
-      </p>
-    </div>
-  )
-}
-
-function DerivedGenerationEvidence({
-  generation,
-}: {
-  generation: Extract<ResearchDataset, { generationKind: "derived" }>
-}) {
-  return (
-    <div className="mt-3 rounded-md border border-border bg-background/45 p-3">
-      <p className="text-[10px] font-medium uppercase tracking-wider text-foreground">
-        {humanize(generation.publicationStage)}
-      </p>
-      <p className="mt-1 text-xs text-muted-foreground">
-        This immutable phase-one generation is retained for inspection. Product admission is not
-        established by this research-generation response; use the receipt-admitted feature-dataset
-        surface for product status.
-      </p>
-      <p className="mt-2 text-[10px] uppercase tracking-wider text-muted-foreground">
-        Product admission evidence · {humanize(generation.productAdmission)}
-      </p>
-      <Digest label="Build specification" value={generation.buildSpecDigest} />
-      {generation.phaseOneDescriptorSha256 ? (
-        <Digest
-          label="Phase-one descriptor"
-          value={generation.phaseOneDescriptorSha256}
-        />
-      ) : (
-        <p className="mt-3 text-xs text-muted-foreground">
-          No phase-one descriptor is present on this generation response.
-        </p>
-      )}
-    </div>
-  )
-}
-
 function EvidenceBadge({ children }: { children: React.ReactNode }) {
   return (
     <span className="rounded-full border border-primary/30 bg-primary/10 px-2.5 py-1 text-[10px] font-medium text-primary">
       {children}
     </span>
   )
-}
-
-function observationKey(row: Record<string, unknown>, index: number) {
-  return [
-    textValue(row.source_id),
-    textValue(row.source_identifier),
-    numberValue(row.revision),
-    index,
-  ].join(":")
 }
 
 function textValue(value: unknown) {
@@ -478,14 +371,20 @@ function formatCount(value: number) {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value)
 }
 
-function humanize(value: string) {
-  return value
-    .replaceAll("_", " ")
-    .replace(/\b\w/g, (character) => character.toUpperCase())
-}
-
-function messageFrom(error: unknown) {
-  return error instanceof Error
-    ? error.message
-    : "Market Squawk could not complete this local research request."
+function qualityLabel(value: string | null) {
+  if (!value) return "Not rated"
+  const quality = value.toLocaleLowerCase()
+  if (["estimated", "preliminary", "provisional"].some((part) => quality.includes(part))) {
+    return "Preliminary"
+  }
+  if (["revised", "superseded"].some((part) => quality.includes(part))) {
+    return "Revised"
+  }
+  if (["missing", "incomplete", "degraded", "suspect", "invalid"].some((part) => quality.includes(part))) {
+    return "Needs review"
+  }
+  if (["verified", "final", "complete", "valid", "good"].some((part) => quality.includes(part))) {
+    return "Checked"
+  }
+  return "Not rated"
 }

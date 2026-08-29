@@ -87,12 +87,12 @@ export function ForecastReview({
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-wider text-primary">
-            Immutable vintage review
+            Forecast review
           </p>
           <h2 className="mt-2 text-xl font-semibold">Forecast evidence</h2>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            Statistical forecasts, realized outcomes, targets, and deterministic scenarios retain
-            separate semantics.
+            Compare each forecast with what actually happened, then review its target, range, and
+            assumptions.
           </p>
         </div>
         {completeness ? (
@@ -103,13 +103,13 @@ export function ForecastReview({
       </div>
 
       {!available ? (
-        <Unavailable text="Model.ListForecasts is not registered by this service generation." />
+        <Unavailable text="Forecasts are unavailable in this workspace." />
       ) : loading ? (
-        <Unavailable text="Loading durable forecast vintages…" />
+        <Unavailable text="Loading forecasts…" />
       ) : error ? (
         <Unavailable text={error} />
       ) : forecasts.length === 0 ? (
-        <Unavailable text="No immutable forecast vintage exists for this admitted bundle." />
+        <Unavailable text="No forecast is ready for this model yet." />
       ) : (
         <>
           <div className="mt-4 flex gap-2 overflow-x-auto pb-1" aria-label="Forecast vintage selection">
@@ -165,12 +165,8 @@ function SummaryEvidence({ summary }: { summary: ForecastSummary }) {
         label="Calibrated intervals"
         value={summary.hasCalibratedIntervals ? "Present in vintage" : "Unavailable"}
       />
-      <Fact label="Request" value={short(summary.requestHash)} mono />
-      <Fact
-        label="Controlled artifact"
-        value={`${summary.controlledArtifact.byteCount.toLocaleString()} bytes · ${short(summary.controlledArtifact.sha256)}`}
-        mono
-      />
+      <Fact label="Use" value="Investment research only" />
+      <Fact label="If unavailable" value="No action suggested" />
     </dl>
   )
 }
@@ -200,7 +196,7 @@ function ForecastDetail({
 }) {
   if (!summary) return null
   if (!detailAvailable) {
-    return <Unavailable text="Model.GetForecast is not registered, so points and interval bounds cannot be reviewed." />
+    return <Unavailable text="Forecast details and uncertainty ranges are unavailable." />
   }
   if (detailLoading) return <Unavailable text="Loading exact forecast payload…" />
   if (detailError) return <Unavailable text={detailError} />
@@ -221,7 +217,7 @@ function ForecastDetail({
         forecast={chartPoints}
         cutoffUnixNanos={detail.observedThroughUnixNanos}
         unit={`mantissa × 10^-${detail.points[0]?.decimalScale ?? "?"}`}
-        unavailableReason="This immutable vintage has no qualified observed history, so the chart cannot truthfully render a pre-forecast series."
+        unavailableReason="This forecast has no usable observed history, so the chart cannot show a reliable historical comparison."
       />
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -249,7 +245,7 @@ function ForecastDetail({
       <div className="overflow-x-auto rounded-lg border border-border">
         <table className="w-full min-w-[720px] text-left text-xs">
           <caption className="border-b border-border px-3 py-2 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
-            Exact decimal payload · statistical forecast only
+            Statistical forecast · estimates only
           </caption>
           <thead className="bg-background/35 text-[10px] uppercase tracking-wider text-muted-foreground">
             <tr>
@@ -289,7 +285,7 @@ function ForecastDetail({
 
       {outcomesError ? <Unavailable text={`Outcomes could not be loaded: ${outcomesError}`} /> : null}
       {!outcomesAvailable ? (
-        <Unavailable text="Model.GetForecastOutcomes is not registered; actuals and errors are unavailable." />
+        <Unavailable text="Actual outcomes and forecast errors are unavailable." />
       ) : null}
       {detail.limitations.length > 0 ? (
         <div className="rounded-lg border border-amber-400/25 bg-amber-400/5 p-3">
@@ -306,9 +302,8 @@ function ForecastDetail({
         </div>
       ) : null}
       <p className="text-[11px] leading-5 text-muted-foreground">
-        The solid series is immutable source/PIT-qualified observed history through the vertical
-        forecast boundary. The dashed future path is modeled evidence only. No target or
-        deterministic scenario query was requested in this Models view.
+        The solid line is observed history. The dashed line is an estimate with uncertainty and
+        should be weighed alongside valuation, risk, and other research before acting.
       </p>
     </div>
   )
@@ -342,17 +337,14 @@ function CalibrationEvidence({ vintage }: { vintage: ForecastVintage }) {
   const calibration = vintage.calibration
   if (!calibration) {
     return (
-      <Unavailable text="This vintage has no admitted calibration evidence. The chart and table omit uncertainty bands." />
+      <Unavailable text="This forecast has no usable calibration history, so uncertainty ranges are unavailable." />
     )
   }
   return (
     <div className="rounded-lg border border-blue-400/25 bg-blue-400/5 p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
+      <div>
         <p className="text-xs font-medium text-blue-200">
           {humanize(calibration.method)} calibration · {calibration.observations.toLocaleString()} observations
-        </p>
-        <p className="font-mono text-[10px] text-muted-foreground">
-          policy {short(calibration.policyHash)}
         </p>
       </div>
       <div className="mt-3 grid gap-2 sm:grid-cols-3">

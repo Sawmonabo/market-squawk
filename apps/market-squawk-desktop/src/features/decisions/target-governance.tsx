@@ -18,14 +18,13 @@ import { formatTimestamp, timestampFromUnixNanos } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
-  digestHex,
   parseDecisionTargetIndexPage,
   parseDecisionTargets,
   type DecisionDossierView,
   type TargetIndexView,
   type TargetStateView,
 } from "./contracts"
-import { EvidenceIdentity, StateLabel } from "./decision-boundaries"
+import { StateLabel } from "./decision-boundaries"
 import { TargetGovernanceWorkflow } from "./governance-workflow"
 import { TargetBuilder } from "./target-builder"
 
@@ -77,14 +76,14 @@ export function TargetGovernanceWorkspace({
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
-            Append-only target authority
+            Reviewable target history
           </p>
           <h2 id="target-governance-heading" className="mt-1 text-lg font-semibold">
             Target ranges, review, and invalidation
           </h2>
           <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Discover bounded target-series heads, then inspect immutable history, evidence, review,
-            and invalidation state for the selected research judgment.
+            Review each target's price ranges, supporting analysis, review dates, and invalidation
+            state.
           </p>
         </div>
         <div className="max-w-sm rounded-xl border border-primary/25 bg-primary/5 p-3 text-xs leading-5 text-muted-foreground">
@@ -126,7 +125,7 @@ export function TargetGovernanceWorkspace({
         </Alert>
       ) : targetEntries.length === 0 ? (
         <div className="mt-4 rounded-xl border border-dashed border-border p-6 text-sm text-muted-foreground">
-          No target series are retained in this workspace.
+          No investment targets are saved in this workspace.
         </div>
       ) : (
         <div className="mt-4 grid gap-2 lg:grid-cols-2">
@@ -175,7 +174,7 @@ export function TargetGovernanceWorkspace({
         </Alert>
       ) : revisions.length === 0 ? (
         <div className="mt-4 rounded-xl border border-dashed border-border p-6 text-sm text-muted-foreground">
-          No target revisions exist for this identity.
+          No revisions exist for this target.
         </div>
       ) : (
         <div className="mt-4 grid gap-4">
@@ -226,13 +225,12 @@ function TargetRevisionCard({
           <p className="mt-1 text-xs text-muted-foreground">
             Author {target.author} · ruleset {target.rulesetVersion}
           </p>
-          <EvidenceIdentity value={target.id} />
         </div>
         <div className="flex flex-wrap justify-end gap-2">
           <StateLabel value={state.status} />
           {expired && <StateLabel value="expired by recorded timestamp" />}
           {reviewOverdue && <StateLabel value="review overdue" />}
-          {stale && <StateLabel value="stale evidence" />}
+          {stale && <StateLabel value="new review needed" />}
         </div>
       </header>
 
@@ -281,7 +279,7 @@ function TargetIndexCard({
             {entry.instrumentId}
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            {entry.id} · revision {entry.revision}
+            Revision {entry.revision}
           </p>
         </div>
         <StateLabel value={entry.status} />
@@ -303,9 +301,6 @@ function ObservedReference({ state }: { state: TargetStateView }) {
         <p className="text-xs text-muted-foreground">
           Observed {formatTimestamp(target.referenceObservedAt)} · {humanize(target.markQuality)}
         </p>
-      </div>
-      <div className="mt-3">
-        <EvidenceIdentity value={digestHex(target.referenceIdentity)} />
       </div>
     </section>
   )
@@ -343,23 +338,15 @@ function ThesisEvidence({ state }: { state: TargetStateView }) {
     <section className="rounded-xl border border-border bg-background/45 p-4">
       <h4 className="text-sm font-semibold">Thesis and supporting analysis</h4>
       <p className="mt-2 text-sm leading-6">{target.thesis}</p>
-      <dl className="mt-4 grid gap-3 sm:grid-cols-2">
-        <EvidenceFact label="Target content" value={digestHex(target.targetIdentity)} />
-        <EvidenceFact label="Dossier" value={target.dossierId} />
-        <EvidenceFact label="Portfolio revision" value={digestHex(target.portfolioRevision)} />
-        <EvidenceFact label="Forecast evidence" value={digestHex(target.forecast)} />
-        <EvidenceFact label="Fair-value decision" value={target.fairValue ?? "Not bound"} />
-      </dl>
       {target.assumptions.length > 0 && (
         <div className="mt-4">
           <h5 className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-            Evidence-bound assumptions
+            Assumptions
           </h5>
           <ul className="mt-2 grid gap-2">
             {target.assumptions.map((assumption, index) => (
-              <li key={`${digestHex(assumption.evidenceIdentity)}:${index}`} className="rounded-lg border border-border/60 p-3 text-xs">
+              <li key={index} className="rounded-lg border border-border/60 p-3 text-xs">
                 <p>{assumption.text}</p>
-                <EvidenceIdentity value={digestHex(assumption.evidenceIdentity)} />
               </li>
             ))}
           </ul>
@@ -375,7 +362,7 @@ function GovernanceTimeline({ state }: { state: TargetStateView }) {
     <section className="rounded-xl border border-border bg-background/45 p-4">
       <div className="flex items-center gap-2">
         <CalendarClock className="size-4 text-primary" aria-hidden="true" />
-        <h4 className="text-sm font-semibold">Version and review evidence</h4>
+        <h4 className="text-sm font-semibold">Version and review history</h4>
       </div>
       <dl className="mt-3 grid gap-3 text-xs sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
         <TimelineFact label="Created" value={formatTimestamp(target.createdAt)} />
@@ -395,7 +382,7 @@ function GovernanceTimeline({ state }: { state: TargetStateView }) {
 
       <div className="mt-4 border-t border-border pt-3">
         <h5 className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-          Latest immutable review
+          Latest review
         </h5>
         {latestReview ? (
           <div className="mt-2 text-xs leading-5">
@@ -403,18 +390,16 @@ function GovernanceTimeline({ state }: { state: TargetStateView }) {
               <span>{latestReview.reviewer} · {formatTimestamp(latestReview.reviewedAt)}</span>
               <StateLabel value={latestReview.disposition} />
             </div>
-            <EvidenceIdentity value={latestReview.id} />
-            <EvidenceIdentity value={digestHex(latestReview.contentIdentity)} />
           </div>
         ) : (
-          <p className="mt-2 text-xs text-muted-foreground">No review evidence has been appended.</p>
+          <p className="mt-2 text-xs text-muted-foreground">No review has been recorded.</p>
         )}
       </div>
 
       {latestInvalidation && (
         <div className="mt-4 border-t border-border pt-3">
           <h5 className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-            Latest immutable invalidation
+            Latest invalidation
           </h5>
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs">
             <span>
@@ -422,8 +407,6 @@ function GovernanceTimeline({ state }: { state: TargetStateView }) {
             </span>
             <StateLabel value={latestInvalidation.kind} />
           </div>
-          <EvidenceIdentity value={latestInvalidation.id} />
-          <EvidenceIdentity value={digestHex(latestInvalidation.contentIdentity)} />
         </div>
       )}
     </section>
@@ -455,8 +438,7 @@ function ExecutionBoundary() {
       <AlertTitle>Research only</AlertTitle>
       <AlertDescription>
         Review state does not confer execution authority. No order controls are available here.
-        Every new review or invalidation uses the service-owned authenticated governance flow and
-        retains immutable audit evidence.
+        Every review or invalidation requires authorization and is recorded in the target history.
       </AlertDescription>
     </Alert>
   )
@@ -494,15 +476,6 @@ function PriceFact({ label, value }: { label: string; value: string }) {
   )
 }
 
-function EvidenceFact({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="min-w-0">
-      <dt className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{label}</dt>
-      <dd><EvidenceIdentity value={value} /></dd>
-    </div>
-  )
-}
-
 function TimelineFact({ label, value }: { label: string; value: string }) {
   return (
     <div>
@@ -515,7 +488,7 @@ function TimelineFact({ label, value }: { label: string; value: string }) {
 function TargetPrompt() {
   return (
     <div className="mt-4 rounded-xl border border-dashed border-border p-6 text-sm leading-6 text-muted-foreground">
-      Select a discovered target series to load its versioned judgment, evidence, review state,
+      Select a target to load its price judgment, supporting analysis, review state,
       expiration timestamps, and latest invalidation record.
     </div>
   )

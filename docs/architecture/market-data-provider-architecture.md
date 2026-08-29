@@ -388,6 +388,16 @@ The sources are complementary layers. No single provider is expected to supply t
 and the frontend never calls a provider directly. Desktop, CLI, and MCP consume only fixed typed
 application operations over admitted canonical data.
 
+Provider identity and provider-runtime plumbing stop at the application boundary for ordinary
+product reads. Home, Markets, Opportunities, Portfolio, Paper Execution, Research, Models,
+Forecasts, Backtests, Valuation, and Risk receive canonical domain results and plain-language data
+confidence only. They do not receive or render provider names, provider/source IDs, provider
+operation names, credential/session identities, quota or circuit state, retry timestamps, raw
+manifest coordinates, or provider-specific controls. Connections & Sources owns setup, credentials,
+entitlements, and provider health; Logs & Diagnostics owns exact technical provenance and runtime
+evidence. The application still retains complete source-qualified evidence internally for
+point-in-time selection, audit, and reproducibility.
+
 The exact cross-provider envelope, family schemas, clocks, precision, revision, Arrow/Parquet,
 manifest, PIT-selection, feature/model binding, and typed-read requirements are maintained in the
 [canonical schema and evidence contract](../reference/market-data-canonical-schemas.md). This page

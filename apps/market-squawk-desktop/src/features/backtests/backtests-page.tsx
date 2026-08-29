@@ -18,7 +18,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -73,8 +73,8 @@ export function BacktestsPage() {
           <AlertTitle>Backtests are unavailable</AlertTitle>
           <AlertDescription>
             {product.status === "error"
-              ? product.error
-              : "Connecting to the installed Market Squawk service."}
+              ? "Market Squawk could not open Backtests. Check Settings, then try again."
+              : "Getting Backtests ready."}
           </AlertDescription>
         </Alert>
       </BacktestsFrame>
@@ -146,7 +146,7 @@ function BacktestsWorkspace({
     }),
     enabled: resultIdentity !== null && operations.has("Analysis.GetBacktests"),
     queryFn: async () => {
-      if (!resultIdentity) throw new Error("No governed result identity is available.")
+      if (!resultIdentity) throw new Error("No compatible result is available.")
       return parseBacktestRecord(
         await transport.query({ query: "backtest", runId: resultIdentity }),
       )
@@ -162,7 +162,7 @@ function BacktestsWorkspace({
     }),
     enabled: false,
     queryFn: async () => {
-      if (!reportArtifact) throw new Error("No compatible governed report is available.")
+      if (!reportArtifact) throw new Error("No compatible report is available.")
       return transport.query({
         query: "analysisArtifact",
         artifactId: reportArtifact.artifactId,
@@ -188,9 +188,9 @@ function BacktestsWorkspace({
         <div>
           <div className="flex items-end justify-between gap-3">
             <div>
-              <h2 className="text-lg font-semibold">Durable backtest activity</h2>
+              <h2 className="text-lg font-semibold">Backtest activity</h2>
               <p className="mt-1 text-sm text-muted-foreground">
-                Reconnect to admitted runs and act only on their current job evidence.
+                Revisit recent runs, review their current status, or continue an available action.
               </p>
             </div>
             <Button
@@ -210,19 +210,19 @@ function BacktestsWorkspace({
           {!operations.has("Job.List") ? (
             <UnavailableCard
               title="Backtest jobs unavailable"
-              detail="The installed service did not advertise the closed Job.List operation."
+              detail="Backtest history is not available in this installation. Check for an update, then try again."
             />
           ) : jobsQuery.isPending ? (
-            <LoadingCard label="Loading durable backtest jobs…" />
+            <LoadingCard label="Loading backtests…" />
           ) : jobsQuery.isError ? (
             <UnavailableCard
               title="Backtest jobs could not be loaded"
-              detail={messageFrom(jobsQuery.error)}
+              detail="Refresh the list. If the problem continues, reopen Market Squawk and try again."
             />
           ) : jobs.length === 0 ? (
             <UnavailableCard
-              title="No governed backtests yet"
-              detail="A run will appear here only after the service admits its immutable point-in-time inputs and durable job."
+              title="No backtests yet"
+              detail="Configure a backtest above. It will appear here after its point-in-time data and assumptions pass review."
             />
           ) : (
             <div className="mt-4 grid gap-3">
@@ -239,6 +239,7 @@ function BacktestsWorkspace({
                     job={job}
                     transport={transport}
                     scope={scope}
+                    presentation="product"
                     mutationPending={mutation.isPending}
                     onAction={(action) => {
                       mutation.reset()
@@ -267,14 +268,18 @@ function BacktestsWorkspace({
           job={selectedJob}
           record={resultQuery.data ?? null}
           loading={resultQuery.isPending && resultQuery.fetchStatus !== "idle"}
-          error={resultQuery.isError ? messageFrom(resultQuery.error) : null}
+          error={
+            resultQuery.isError
+              ? "Refresh the result. If it is still unavailable, review the run status and try again."
+              : null
+          }
           canRead={operations.has("Analysis.GetBacktests")}
           onReadReport={reportArtifact ? () => void reportQuery.refetch() : null}
           reportState={
             reportQuery.isFetching
               ? "loading"
               : reportQuery.isError
-                ? messageFrom(reportQuery.error)
+                ? "failed"
                 : reportQuery.data
                   ? "retrieved"
                   : null
@@ -288,13 +293,19 @@ function BacktestsWorkspace({
         <Alert variant="destructive" className="mt-5">
           <AlertCircle aria-hidden="true" />
           <AlertTitle>The backtest job did not change</AlertTitle>
-          <AlertDescription>{messageFrom(mutation.error)}</AlertDescription>
+          <AlertDescription>
+            Refresh its status, review the available action, and try again.
+          </AlertDescription>
         </Alert>
       )}
       <ActionDialog
         action={pendingAction}
         pending={mutation.isPending}
-        error={mutation.isError ? messageFrom(mutation.error) : null}
+        error={
+          mutation.isError
+            ? "The backtest may have changed since you reviewed it. Refresh its status and try again."
+            : null
+        }
         onOpenChange={(open) => {
           if (!open && !mutation.isPending) setPendingAction(null)
         }}
@@ -411,12 +422,12 @@ function BuilderAvailability({
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
-            Governed experiment builder
+            Experiment builder
           </p>
           <h2 className="mt-2 text-xl font-semibold">Test an idea against history</h2>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            A run must bind one admitted universe, point-in-time dataset, strategy or model,
-            evaluation period, cost policy, cohort plan, and deterministic seed before it can start.
+            Choose a research universe, point-in-time dataset, strategy or model, evaluation
+            period, trading-cost policy, comparison plan, and repeatable seed.
           </p>
         </div>
         <Button
@@ -436,35 +447,36 @@ function BuilderAvailability({
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Guided preparation is unavailable</AlertTitle>
           <AlertDescription>
-            The installed service did not advertise the closed preparation, preview, and
-            receipt-bound start operations required by this release.
+            This installation cannot prepare a guided backtest. Check for an update, or use the
+            advanced file option if an administrator prepared one for you.
           </AlertDescription>
         </Alert>
       ) : optionsQuery.isError ? (
         <Alert variant="destructive" className="mt-4">
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Backtest choices could not be loaded</AlertTitle>
-          <AlertDescription>{messageFrom(optionsQuery.error)}</AlertDescription>
+          <AlertDescription>
+            Refresh the page. If the problem continues, reopen Market Squawk and try again.
+          </AlertDescription>
         </Alert>
       ) : optionsQuery.data?.datasets.length === 0 ? (
         <Alert className="mt-4">
           <Database aria-hidden="true" />
           <AlertTitle>No point-in-time feature dataset is ready</AlertTitle>
           <AlertDescription>
-            Build or publish a governed feature dataset first. The builder will expose it only
-            after its universe, instruments, source coverage, and immutable period are admitted.
+            Build a feature dataset first, including its research universe, instruments,
+            historical coverage, and evaluation period. Then return here to configure a backtest.
           </AlertDescription>
         </Alert>
       ) : null}
 
       <details className="mt-5 rounded-xl border border-border/70 bg-background/35 p-4">
         <summary className="cursor-pointer text-sm font-medium">
-          Advanced: import an administrator-prepared registration
+          Advanced: use an administrator-prepared backtest file
         </summary>
         <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
-          This protected file workflow is for auditing, recovery, and administrator-authored
-          experiments. The guided builder above is the normal path and never asks for SQL,
-          registration JSON, manifest hashes, or evidence identifiers.
+          Use this for a backtest that an administrator prepared or restored for you. The guided
+          builder above is the normal path and is easier to review before starting.
         </p>
         <Button
           className="mt-3"
@@ -483,8 +495,10 @@ function BuilderAvailability({
       {advancedMutation.isError ? (
         <Alert variant="destructive" className="mt-4">
           <AlertCircle aria-hidden="true" />
-          <AlertTitle>The advanced registration was not started</AlertTitle>
-          <AlertDescription>{messageFrom(advancedMutation.error)}</AlertDescription>
+          <AlertTitle>The prepared backtest was not started</AlertTitle>
+          <AlertDescription>
+            Check the selected file, then try again or use the guided builder.
+          </AlertDescription>
         </Alert>
       ) : null}
 
@@ -500,12 +514,12 @@ function BuilderAvailability({
         <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle>
-              {preview ? "Review the governed backtest" : "Configure a governed backtest"}
+              {preview ? "Review this backtest" : "Configure a backtest"}
             </DialogTitle>
             <DialogDescription>
               {preview
-                ? "This preview is bound to the current workspace, client, dataset generation, and exact code-owned registration. Starting consumes it once."
-                : "Choose plain-language research inputs. Market Squawk constructs and validates the point-in-time query and all governed registration evidence inside the service."}
+                ? "Confirm the data, period, strategy, costs, comparison plan, and uncertainty checks before starting."
+                : "Choose the research inputs below. Market Squawk will check that the data and assumptions are suitable for a point-in-time backtest."}
             </DialogDescription>
           </DialogHeader>
           {optionsQuery.data && selection ? (
@@ -523,18 +537,19 @@ function BuilderAvailability({
               />
             )
           ) : (
-            <LoadingCard label="Loading bounded preparation choices…" />
+            <LoadingCard label="Loading backtest choices…" />
           )}
           {previewMutation.isError || startMutation.isError ? (
             <Alert variant="destructive">
               <AlertCircle aria-hidden="true" />
               <AlertTitle>
                 {startMutation.isError
-                  ? "The governed backtest was not started"
-                  : "The governed preview could not be prepared"}
+                  ? "The backtest was not started"
+                  : "The review could not be prepared"}
               </AlertTitle>
               <AlertDescription>
-                {messageFrom(startMutation.error ?? previewMutation.error)}
+                Review your choices and try again. If the problem continues, refresh the available
+                choices before starting.
               </AlertDescription>
             </Alert>
           ) : null}
@@ -564,7 +579,7 @@ function BuilderAvailability({
                 disabled={startMutation.isPending}
                 onClick={() => startMutation.mutate(preview.receipt)}
               >
-                {startMutation.isPending ? "Starting governed job…" : "Start this backtest"}
+                {startMutation.isPending ? "Starting backtest…" : "Start this backtest"}
               </Button>
             ) : (
               <Button
@@ -573,7 +588,7 @@ function BuilderAvailability({
                   if (selection) previewMutation.mutate(selection)
                 }}
               >
-                {previewMutation.isPending ? "Preparing exact preview…" : "Review assumptions"}
+                {previewMutation.isPending ? "Preparing review…" : "Review assumptions"}
               </Button>
             )}
           </DialogFooter>
@@ -588,13 +603,12 @@ function BuilderAvailability({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Use the advanced registration path?</DialogTitle>
+            <DialogTitle>Use a prepared backtest file?</DialogTitle>
             <DialogDescription>
-              Market Squawk will open the protected native file picker. Select a canonical JSON
-              registration that binds the admitted universe, point-in-time dataset, strategy or
-              model, evaluation period, execution costs, cohort plan, and deterministic seed.
-              This is not the normal guided workflow. Exact integer evidence is parsed and
-              validated entirely in Rust.
+              Choose a file prepared by an administrator. It should describe the research
+              universe, point-in-time dataset, strategy or model, evaluation period, trading
+              costs, comparison plan, and repeatable seed. Use the guided builder when you want to
+              review and choose these inputs yourself.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -693,7 +707,7 @@ function BacktestPreparationFields({
       value: selection.dataset,
       options: options.datasets.map((option) => ({
         id: option.id,
-        label: `${option.label} · generation ${option.immutableGeneration} · ${option.instrumentCount.toLocaleString()} instruments`,
+        label: `${option.label} · ${option.instrumentCount.toLocaleString()} instruments`,
       })),
       onValue: (value: string) => {
         const nextDataset =
@@ -745,7 +759,7 @@ function BacktestPreparationFields({
     },
     {
       id: "backtest-comparison",
-      label: "Comparison and robustness evidence",
+      label: "Comparison and robustness checks",
       value: selection.comparison,
       options: options.comparisons,
       onValue: (value: string) => onChange({ ...selection, comparison: value }),
@@ -780,10 +794,11 @@ function BacktestPreparationFields({
       ))}
       <div className="sm:col-span-2 rounded-xl border border-border/70 bg-muted/20 p-4">
         <p className="text-xs font-medium uppercase tracking-wider text-primary">
-          Fixed safety and resource policy
+          Run safeguards
         </p>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          {options.defaultLimitPolicy}
+          Market Squawk checks data volume, evaluation size, and run limits before starting so a
+          backtest can stop safely when a limit is reached.
         </p>
       </div>
     </div>
@@ -816,12 +831,24 @@ function BacktestPreviewReview({
           </div>
         ))}
       </div>
-      <ReviewList title="Point-in-time evidence" items={preview.evidence} />
-      <ReviewList title="Execution and interpretation assumptions" items={preview.assumptions} />
+      <ReviewList
+        title="Point-in-time checks"
+        items={[
+          "Uses only information available at each simulated decision time.",
+          "Keeps historical membership and revisions aligned with each decision date.",
+        ]}
+      />
+      <ReviewList
+        title="Trading and interpretation assumptions"
+        items={[
+          "Applies the selected fees, spread, slippage, latency, fill, and liquidity rules throughout the run.",
+          "Uses the selected period and comparison plan when evaluating the strategy.",
+          "Treats historical performance as an uncertain estimate, not a forecast of future returns.",
+        ]}
+      />
       <p className="text-xs text-muted-foreground">
-        This review expires {new Date(preview.expiresAt).toLocaleString()}. Starting it consumes
-        the receipt once and revalidates the active workspace generation and exact dataset
-        catalog.
+        This review expires {new Date(preview.expiresAt).toLocaleString()}. If it expires or your
+        choices change, review the assumptions again before starting.
       </p>
     </div>
   )
@@ -863,33 +890,33 @@ function BacktestEvidence({
   return (
     <section className="rounded-2xl border border-border bg-card/35 p-5" aria-labelledby="backtest-evidence-heading">
       <h2 id="backtest-evidence-heading" className="text-lg font-semibold">
-        Result and evidence
+        Backtest result
       </h2>
       <p className="mt-1 text-sm text-muted-foreground">
-        Historical performance is shown only with its exact data, assumptions, and experiment evidence.
+        Read historical performance together with its data, trading assumptions, and uncertainty checks.
       </p>
       {!job ? (
         <UnavailableCard
           title="No run selected"
-          detail="Select a durable backtest job to inspect its current result evidence."
+          detail="Select a backtest to review its latest status and result."
         />
       ) : job.state !== "completed" ? (
         <UnavailableCard
-          title="No terminal result"
-          detail="This generation has not published a completed governed backtest record. Its progress and failure evidence remain on the job card."
+          title="Result not ready"
+          detail="This backtest has not finished. Review its progress above, or return after it completes."
         />
       ) : job.result?.authority !== BACKTEST_RESULT_AUTHORITY ? (
         <UnavailableCard
-          title="Unsupported result authority"
-          detail="The completed job did not publish the governed backtest result authority expected by this release."
+          title="Result format unavailable"
+          detail="This result was created by an incompatible version. Update Market Squawk, then rerun the backtest."
         />
       ) : !canRead ? (
         <UnavailableCard
           title="Result read unavailable"
-          detail="The installed service did not advertise the closed Analysis.GetBacktests operation."
+          detail="This installation cannot open backtest results. Check for an update, then try again."
         />
       ) : loading ? (
-        <LoadingCard label="Loading the governed terminal record…" />
+        <LoadingCard label="Loading the backtest result…" />
       ) : error ? (
         <UnavailableCard title="Result details unavailable" detail={error} />
       ) : record ? (
@@ -901,7 +928,7 @@ function BacktestEvidence({
       ) : (
         <UnavailableCard
           title="Result details unavailable"
-          detail="The job published an identity, but no governed record was returned."
+          detail="Refresh the result. If it remains unavailable, rerun the backtest."
         />
       )}
     </section>
@@ -933,23 +960,23 @@ function BacktestRecordView({
         <EvidenceFact
           icon={Database}
           label="Point-in-time dataset"
-          value={shortDigest(record.datasetIdentity)}
-          detail={`Object graph ${shortDigest(record.objectGraphDigest)}`}
+          value="Included"
+          detail="Uses history as it was known at each decision time, including membership and revisions."
         />
         <EvidenceFact
           icon={CircleDollarSign}
           label="Execution assumptions"
-          value={shortDigest(record.executionAssumptionDigest)}
-          detail="Fees, spread, slippage, latency, fills, and liquidity are bound by this evidence—not inferred by the UI."
+          value="Declared"
+          detail="Fees, spread, slippage, latency, fills, and liquidity follow the assumptions reviewed for this run."
         />
         <EvidenceFact
           icon={GitCompareArrows}
-          label="Cohort authority"
-          value={shortDigest(record.cohortAuthorityDigest)}
+          label="Strategy comparison"
+          value={record.cohortUniverseDigest ? "Comparable set included" : "Not available"}
           detail={
             record.cohortUniverseDigest
-              ? `Universe ${shortDigest(record.cohortUniverseDigest)}`
-              : "This record does not contain comparable-cohort evidence."
+              ? "Candidate strategies were evaluated using the same comparison set."
+              : "This result does not include a comparable strategy set."
           }
         />
         <EvidenceFact
@@ -963,9 +990,9 @@ function BacktestRecordView({
       {record.status.state === "failed" ? (
         <Alert variant="destructive">
           <AlertCircle aria-hidden="true" />
-          <AlertTitle>Governed run failed</AlertTitle>
+          <AlertTitle>Backtest failed</AlertTitle>
           <AlertDescription>
-            No performance, fills, or overfitting claim is available from this terminal record.
+            No performance, fill, or overfitting result is available. Review the run status before retrying.
           </AlertDescription>
         </Alert>
       ) : (
@@ -1010,7 +1037,7 @@ function CompletedResult({
       </div>
       {metrics.length > 0 ? (
         <div className="rounded-xl border border-border bg-background/25 p-4">
-          <h3 className="text-sm font-medium">Published metrics</h3>
+          <h3 className="text-sm font-medium">Performance metrics</h3>
           <dl className="mt-3 grid gap-x-5 gap-y-3 sm:grid-cols-2">
             {metrics.map((metric) => (
               <div key={metric.name} className="flex items-baseline justify-between gap-4 border-b border-border/60 pb-2">
@@ -1023,37 +1050,37 @@ function CompletedResult({
       ) : (
         <UnavailableCard
           title="Performance metrics unavailable"
-          detail="The completed record did not publish bounded summary metrics."
+          detail="This completed backtest did not include summary metrics. Review the detailed report or rerun it."
         />
       )}
       <div className="grid gap-3 sm:grid-cols-2">
         <DiagnosticFact
           label="Probability of backtest overfitting"
           value={pbo}
-          unavailable="No completed controlled cohort evaluation qualifies this terminal, so PBO is not available."
+          unavailable="This result does not include a completed comparable-strategy evaluation, so PBO is not available."
         />
         <DiagnosticFact
           label="Deflated performance probability"
           value={deflated}
-          unavailable="No completed controlled cohort evaluation qualifies this terminal, so no multiple-testing-adjusted probability is available."
+          unavailable="This result does not include a completed comparable-strategy evaluation, so no multiple-testing-adjusted probability is available."
         />
       </div>
       <ExecutionAssumptions assumptions={status.executionAssumptions} />
       <div className="rounded-xl border border-border bg-background/25 p-4 text-xs leading-relaxed text-muted-foreground">
         <p>
-          Accounting reconciliation: <span className="font-medium text-foreground">independent</span>.
-          The governed report is {status.artifact.byteCount.toLocaleString()} bytes.
+          Accounting is reconciled <span className="font-medium text-foreground">independently</span>
+          from the performance summary.
         </p>
         <div className="mt-3 flex flex-wrap items-center gap-3">
           <Button size="sm" variant="outline" disabled={reportState === "loading"} onClick={onReadReport ?? undefined}>
-            {reportState === "loading" ? "Retrieving report…" : "Retrieve controlled report"}
+            {reportState === "loading" ? "Opening report…" : "Open detailed report"}
           </Button>
           <span>
             {reportState === "retrieved"
-              ? "The first bounded report segment was verified and retrieved."
-              : typeof reportState === "string"
-                ? `Report retrieval failed: ${reportState}`
-                : `ID ${shortDigest(status.artifact.artifactId)} · SHA-256 ${shortDigest(status.artifact.sha256)}`}
+              ? "The report preview is ready."
+              : reportState === "failed"
+                ? "The report could not be opened. Try again."
+                : "Open the report for detailed calculations, assumptions, and checks."}
           </span>
         </div>
       </div>
@@ -1071,16 +1098,17 @@ function ExecutionAssumptions({
     ["Spread", "Observed point-in-time half spread"],
     ["Adverse slippage", `${assumptions.slippageBasisPoints} bp + up to ${assumptions.maximumRandomSlippageBasisPoints} bp seeded`],
     ["Latency", `${assumptions.latencyNanos} ns minimum event-time delay`],
-    ["Participation", `${(assumptions.maximumParticipationBasisPoints / 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}% of evidenced depth`],
+    ["Participation", `${(assumptions.maximumParticipationBasisPoints / 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}% of available market depth`],
     ["Liquidity priority", humanize(assumptions.liquidityPriority)],
     ["Partial fills", assumptions.partialFillsAllowed ? "Permitted when depth is insufficient" : "Rejected when depth is insufficient"],
-    ["Fee rounding", `Scale ${assumptions.feeDecimalScale}; nearest-even`],
+    ["Fee rounding", "Nearest even"],
   ] as const
   return (
     <div className="rounded-xl border border-border bg-background/25 p-4">
-      <h3 className="text-sm font-medium">Bound execution assumptions</h3>
+      <h3 className="text-sm font-medium">Trading assumptions</h3>
       <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-        Policy v{assumptions.policyVersion}. These values are immutable run evidence; the UI does not infer costs or liquidity.
+        These values were fixed when the backtest started, so the same cost and liquidity rules
+        apply throughout.
       </p>
       <dl className="mt-3 grid gap-x-5 gap-y-3 sm:grid-cols-2">
         {facts.map(([label, value]) => (
@@ -1104,17 +1132,17 @@ function SemanticsGuide() {
     {
       icon: CircleDollarSign,
       title: "Costs stay visible",
-      detail: "Fees, spread, slippage, latency, partial fills, and liquidity belong to the immutable assumption evidence.",
+      detail: "Fees, spread, slippage, latency, partial fills, and liquidity should remain visible in the assumptions.",
     },
     {
       icon: GitCompareArrows,
-      title: "Compare one admitted cohort",
-      detail: "Variant comparison is meaningful only when candidate membership and selection authority are fixed before evaluation.",
+      title: "Compare a fixed peer set",
+      detail: "Strategy comparisons are meaningful only when candidate membership and the selection rule are fixed before evaluation.",
     },
     {
       icon: ShieldCheck,
-      title: "Overfitting is evidence",
-      detail: "PBO and deflated-performance diagnostics qualify a result; they never promise future returns.",
+      title: "Check for overfitting",
+      detail: "PBO and deflated-performance diagnostics add context to a result; they never promise future returns.",
     },
   ] as const
   return (
@@ -1196,14 +1224,13 @@ function ActionDialog({ action, pending, error, onOpenChange, onConfirm }: { act
         <DialogHeader>
           <DialogTitle>{actionTitle(action.kind)}</DialogTitle>
           <DialogDescription>
-            This request is fenced to generation {action.job.generation}, sequence {action.job.sequence}. The service rejects it if the job changed.
+            This action applies only if the backtest is still in the state you reviewed. If it has
+            changed, refresh its status and try again.
           </DialogDescription>
         </DialogHeader>
         {action.kind === "confirm" && (
           <dl className="rounded-lg border border-border bg-card/40 p-4 text-xs">
-            <dt className="text-muted-foreground">Exact confirmation evidence</dt>
-            <dd className="mt-1 break-all font-mono text-[10px]">sha256:{digestHex(action.confirmation.digest)}</dd>
-            <dt className="mt-3 text-muted-foreground">Expires</dt>
+            <dt className="text-muted-foreground">Review expires</dt>
             <dd className="mt-1">{formatTimestamp(BigInt(action.confirmation.expiresAt))}</dd>
           </dl>
         )}
@@ -1235,7 +1262,8 @@ function BacktestsFrame({ children }: { children: React.ReactNode }) {
         <div>
           <h1 className="text-3xl font-semibold tracking-tight">Backtests</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Test admitted investment rules against point-in-time history, declared trading costs, and explicit experiment governance. Historical results are evidence—not a forecast or guarantee.
+            Test investment rules against point-in-time history and declared trading costs. Treat
+            historical performance as an uncertain estimate—not a forecast or guarantee.
           </p>
         </div>
       </div>
@@ -1255,10 +1283,6 @@ function jobKey(job: JobView | null): string {
   return job ? `${job.jobId}:${job.generation}` : ""
 }
 
-function shortDigest(value: string): string {
-  return `${value.slice(0, 10)}…${value.slice(-8)}`
-}
-
 function formatMetric(value: number): string {
   return Math.abs(value) >= 1_000 ? value.toLocaleString() : value.toLocaleString(undefined, { maximumFractionDigits: 6 })
 }
@@ -1274,5 +1298,5 @@ function actionTitle(kind: PendingJobAction["kind"]): string {
 }
 
 function actionButtonLabel(kind: PendingJobAction["kind"]): string {
-  return kind === "cancel" ? "Request cancellation" : kind === "retry" ? "Start retry" : "Confirm exact request"
+  return kind === "cancel" ? "Request cancellation" : kind === "retry" ? "Start retry" : "Confirm and start"
 }

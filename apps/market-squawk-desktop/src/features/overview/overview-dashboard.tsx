@@ -36,7 +36,7 @@ import { formatMoney, humanize } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
-import type { MarketSnapshot, OverviewJob, SourceHealth } from "./schemas"
+import type { MarketSnapshot, OverviewJob } from "./schemas"
 import { type ReadState, useOverviewQueries } from "./use-overview"
 
 type OverviewQueries = ReturnType<typeof useOverviewQueries>
@@ -64,28 +64,17 @@ export function OverviewDashboard({
     <div className="space-y-4">
       <section
         aria-label="Home summary"
-        className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4"
+        className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3"
       >
-        <StatusCard
-          icon={ServerCog}
-          label="Data sources"
-          value={countValue(queries.sources, "source records")}
-          state={queries.sources.status}
-          detail={
-            queries.sources.status === "ready"
-              ? sourceReadinessDetail(queries.sources.data)
-              : queries.sources.message
-          }
-        />
         <StatusCard
           icon={Activity}
           label="Live markets"
-          value={countValue(queries.markets, "streams")}
+          value={countValue(queries.markets, "markets")}
           state={queries.markets.status}
           detail={
             queries.markets.status === "ready"
               ? freshMarketDetail(queries.markets.data)
-              : queries.markets.message
+              : "Current market information is unavailable."
           }
         />
         <StatusCard
@@ -100,9 +89,9 @@ export function OverviewDashboard({
           detail={
             queries.jobs.status === "ready"
               ? queries.jobs.data.next
-                ? "Count from the first bounded job page; more jobs are retained."
-                : "Current analytical, research, forecasting, and decision jobs."
-              : queries.jobs.message
+                ? "More active work may be available in Operations & Jobs."
+                : "Current research, forecasting, and decision work."
+              : "Analysis status is unavailable."
           }
         />
         <StatusCard
@@ -112,8 +101,8 @@ export function OverviewDashboard({
           state={queries.analyses.status}
           detail={
             queries.analyses.status === "ready"
-              ? "Durable analyses, not an opportunity ranking."
-              : queries.analyses.message
+              ? "Saved analyses ready for review."
+              : "Saved analyses are unavailable."
           }
         />
       </section>
@@ -132,8 +121,7 @@ export function OverviewDashboard({
         <RunningAnalysisPanel jobs={queries.jobs} analysisJobs={analysisJobs} />
         <SetupGuidance
           accounts={accounts}
-          overview={queries.overview}
-          sources={queries.sources}
+          markets={queries.markets}
           analyses={queries.analyses}
         />
       </section>
@@ -144,17 +132,13 @@ export function OverviewDashboard({
             Current context
           </p>
           <h2 id="home-evidence-title" className="mt-1 text-base font-semibold">
-            Market and source evidence
+            Market context
           </h2>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            These are compact service summaries. Markets and Connections &amp; Sources retain the
-            complete workspaces.
+            A compact view of current market availability. Open Markets for the full workspace.
           </p>
         </div>
-        <div className="grid gap-4 lg:grid-cols-2">
-          <LiveMarketPanel markets={queries.markets} />
-          <SourceHealthPanel sources={queries.sources} />
-        </div>
+        <LiveMarketPanel markets={queries.markets} />
       </section>
     </div>
   )
@@ -189,7 +173,7 @@ function PortfolioSummary({
     return (
       <PortfolioUnavailable
         title="Portfolio summary is unavailable"
-        detail="This installed service does not expose the account index. Home will not invent an account, value, currency, or cash balance."
+        detail="Portfolio accounts are unavailable right now."
       />
     )
   }
@@ -201,9 +185,7 @@ function PortfolioSummary({
       <PortfolioUnavailable
         title="Portfolio accounts could not be read"
         detail={
-          accounts.query.error instanceof Error
-            ? accounts.query.error.message
-            : "The installed service rejected the account query."
+          "Portfolio accounts could not be loaded. Try again or review Logs & Diagnostics."
         }
       />
     )
@@ -212,7 +194,7 @@ function PortfolioSummary({
     return (
       <PortfolioUnavailable
         title="No portfolio account is loaded"
-        detail="Import a supported account before Home can show an account-bound value. Market Squawk will not combine currencies or substitute the paper account."
+        detail="Add an account to see its value, cash, performance, exposure, and risk."
       />
     )
   }
@@ -235,11 +217,10 @@ function PortfolioSummary({
               Financial position
             </p>
             <h2 id="portfolio-summary-title" className="mt-1 text-base font-semibold">
-              One account, one currency, one revision
+              Your account at a glance
             </h2>
             <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-              Choose an account explicitly for this Home summary. This temporary display choice
-              does not set the durable recommendation account.
+              Choose an account to review its current financial position.
             </p>
           </div>
         </div>
@@ -265,8 +246,7 @@ function PortfolioSummary({
       </label>
       {accounts.query.hasNextPage ? (
         <p className="mt-2 text-[10px] leading-4 text-muted-foreground">
-          This bounded Home read contains only the returned account page. Open Portfolio to inspect
-          the complete account index.
+          Open Portfolio to review more accounts.
         </p>
       ) : null}
 
@@ -274,8 +254,7 @@ function PortfolioSummary({
         <div className="mt-4 rounded-lg border border-dashed border-border p-5">
           <p className="text-xs font-medium">Choose before values are read</p>
           <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            Home never falls back to the first account. No portfolio details are requested until
-            you make an explicit display choice.
+            Choose an account to view its summary.
           </p>
         </div>
       ) : (
@@ -316,8 +295,7 @@ function SelectedPortfolioSummary({
         <CircleAlert aria-hidden="true" />
         <AlertTitle>Portfolio changed while Home was reading it</AlertTitle>
         <AlertDescription>
-          At least one result belongs to a different account or revision. Home is withholding all
-          mixed-revision values. Refresh or reopen the account in Portfolio.
+          The account changed while this page was loading. Refresh to view one consistent update.
         </AlertDescription>
       </Alert>
     )
@@ -355,7 +333,7 @@ function SelectedPortfolioSummary({
           detail={
             performance?.timeWeightedReturn === undefined
               ? "No comparable performance result was returned."
-              : "The service returns an available-history time-weighted return, but no bounded recent-period start for Home to label as recent."
+              : "A comparable recent period is not available for this account."
           }
         />
         <TruthFact
@@ -364,7 +342,7 @@ function SelectedPortfolioSummary({
           detail={
             reportedCash
               ? `The account reports ${formatMoney(reportedCash)}, but settlement availability and reservations are not included.`
-              : "No source-reported cash evidence was returned; settlement availability is also absent."
+              : "No cash balance is available for this account."
           }
         />
         <TruthFact
@@ -373,7 +351,7 @@ function SelectedPortfolioSummary({
           detail={
             risk
               ? "The current risk read supplies historical measures, not alert severity, active limit breaches, or an all-clear state."
-              : "No typed alert or active-limit state was returned."
+              : "No current risk-alert status is available."
           }
         />
       </div>
@@ -383,12 +361,11 @@ function SelectedPortfolioSummary({
           Additional account evidence
         </summary>
         <p className="mt-2 text-[10px] leading-4 text-muted-foreground">
-          These values retain their backend labels. They do not fill the missing recent-period,
-          settlement-availability, or alert-classification contracts above.
+          Additional values currently available for this account.
         </p>
         <dl className="mt-3 grid gap-3 text-[10px] sm:grid-cols-2 xl:grid-cols-4">
           <EvidenceFact
-            label="Source-reported cash"
+            label="Reported cash"
             value={reportedCash ? formatMoney(reportedCash) : "Not returned"}
           />
           <EvidenceFact
@@ -412,21 +389,8 @@ function SelectedPortfolioSummary({
             value={account.holdingCount.toLocaleString()}
           />
           <EvidenceFact
-            label="Revision effective at"
+            label="Last updated"
             value={formatTimestamp(account.currentRevision.effectiveAtUnixNanos)}
-          />
-          <EvidenceFact
-            label="Available to analysis"
-            value={formatTimestamp(account.currentRevision.availableAtUnixNanos)}
-          />
-          <EvidenceFact
-            label="Revision"
-            value={account.currentRevision.revisionId}
-            mono
-          />
-          <EvidenceFact
-            label="Portfolio source"
-            value={account.currentRevision.sourceId}
           />
         </dl>
       </details>
@@ -464,14 +428,16 @@ function RecommendationSummary({
       ) : analyses.status === "unavailable" ? (
         <Alert className="mt-5">
           <CircleAlert aria-hidden="true" />
-          <AlertTitle>Retained analyses are unavailable</AlertTitle>
-          <AlertDescription>{analyses.message}</AlertDescription>
+          <AlertTitle>Saved analyses are unavailable</AlertTitle>
+          <AlertDescription>
+            Try again or review Logs &amp; Diagnostics for details.
+          </AlertDescription>
         </Alert>
       ) : analyses.data.availableCount === 0 ? (
         <div className="mt-5 rounded-lg border border-dashed border-border p-5">
-          <p className="text-xs font-medium">No persisted investment analysis exists yet</p>
+          <p className="text-xs font-medium">No saved investment analysis yet</p>
           <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            Home will not fill this space with saved screens, manual targets, or market movers.
+            Run an analysis to see recommendations and supporting evidence here.
           </p>
         </div>
       ) : (
@@ -502,27 +468,26 @@ function RecommendationFacts({ page }: { page: InvestmentAnalysisPage }) {
       <QueueItem
         label="Retained analyses"
         value={page.availableCount.toLocaleString()}
-        detail={`${generatedInPage.length.toLocaleString()} generated and ${heldActionsInPage.length.toLocaleString()} non-Buy action records appear in this ${page.completeness} append-order page.`}
+        detail={`${generatedInPage.length.toLocaleString()} completed analyses and ${heldActionsInPage.length.toLocaleString()} non-Buy actions are ready to review.`}
       />
       <QueueItem
         label="Strongest current opportunities"
         value="Not available"
-        detail="The typed read has no ranking receipt, score, or server-selected strongest set. Home will not promote the first appended record."
+        detail="No ranked opportunity set is available yet."
       />
       <QueueItem
         label="Current held-position actions"
         value="Not available"
-        detail="Retained Add, Hold, Trim, or Sell records do not include a current supersession and invalidation status for Home."
+        detail="No current position guidance is available yet."
       />
       <QueueItem
         label="Changed, expired, or invalidated"
         value="Not available"
-        detail="The list supplies valid-through timestamps but no authoritative current-status, change, supersession, or invalidation feed. Home does not compare them with the browser clock."
+        detail="No current changes or expired recommendations are available yet."
       />
       {page.completeness === "truncated" ? (
         <p className="rounded-lg border border-border bg-background/35 p-3 text-[10px] leading-4 text-muted-foreground">
-          This Home read is intentionally bounded. More retained append-order analyses exist; the
-          page is not a complete ranking.
+          More saved analyses are available in Opportunities.
         </p>
       ) : null}
     </div>
@@ -559,19 +524,17 @@ function RunningAnalysisPanel({
         <Alert className="mt-5">
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Job status is unavailable</AlertTitle>
-          <AlertDescription>{jobs.message}</AlertDescription>
+          <AlertDescription>
+            Try again or review Logs &amp; Diagnostics for details.
+          </AlertDescription>
         </Alert>
       ) : analysisJobs.length === 0 ? (
         <div className="mt-5 rounded-lg border border-dashed border-border p-5">
           <p className="text-xs font-medium">
-            {jobs.data.next
-              ? "No running analysis appeared in the first job page"
-              : "No analysis is running"}
+            No analysis is running
           </p>
           <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            {jobs.data.next
-              ? "More jobs are retained, so this bounded page cannot establish a complete zero."
-              : "The complete returned job page has no active research, model, analysis, or decision job."}
+            Start an analysis when you are ready to research an investment.
           </p>
         </div>
       ) : (
@@ -606,13 +569,11 @@ function RunningAnalysisPanel({
 
 function SetupGuidance({
   accounts,
-  overview,
-  sources,
+  markets,
   analyses,
 }: {
   accounts: PortfolioAccountsRead
-  overview: OverviewQueries["overview"]
-  sources: OverviewQueries["sources"]
+  markets: OverviewQueries["markets"]
   analyses: OverviewQueries["analyses"]
 }) {
   const accountCount =
@@ -620,13 +581,6 @@ function SetupGuidance({
       (count, page) => count + page.value.length,
       0,
     ) ?? 0
-  const activeSources =
-    sources.status === "ready" && sources.data
-      ? sources.data.filter(
-          (source) => source.runtimeHealth.state === "active",
-        ).length
-      : 0
-
   return (
     <section
       className="rounded-xl border border-border bg-card/45 p-5"
@@ -648,7 +602,7 @@ function SetupGuidance({
         <GuidanceItem
           icon={Sparkles}
           title="Automatic opportunity search is not available yet"
-          detail="This Desktop build has no typed Find opportunities workflow command. The disabled Home control starts nothing and creates no analysis."
+          detail="Opportunity search is still being completed. You can review saved analyses now."
           path="/opportunities"
           linkLabel="Review retained analyses"
         />
@@ -656,7 +610,7 @@ function SetupGuidance({
           <GuidanceItem
             icon={BriefcaseBusiness}
             title="Checking portfolio accounts"
-            detail="Home is waiting for the bounded account read and does not infer that an account is missing while it is still loading."
+            detail="Checking your connected accounts."
             path="/portfolio"
             linkLabel="Open Portfolio"
           />
@@ -664,52 +618,38 @@ function SetupGuidance({
           <GuidanceItem
             icon={BriefcaseBusiness}
             title="Add a portfolio account"
-            detail="Recommendations need an explicit account and currency. Home never selects the first account or substitutes simulated paper balances."
+            detail="Add an account and choose its currency before requesting portfolio-aware recommendations."
             path="/portfolio"
             linkLabel="Open Portfolio"
           />
         ) : (
           <GuidanceItem
             icon={BriefcaseBusiness}
-            title="Recommendation-account selection is not readable here yet"
-            detail="Accounts are present, but the current Desktop transport does not expose the durable recommendation account and profile. Home will not infer either one."
+            title="Review your recommendation account"
+            detail="Confirm which account and investment preferences recommendations should use."
             path="/portfolio"
             linkLabel="Open Portfolio setup"
           />
         )}
-        {sources.status === "unavailable" ||
-        (sources.status === "ready" && activeSources === 0) ? (
+        {markets.status === "unavailable" ||
+        (markets.status === "ready" && (markets.data?.length ?? 0) === 0) ? (
           <GuidanceItem
             icon={ServerCog}
-            title="Connect or start a data source"
+            title="Market data needs attention"
             detail={
-              sources.status === "unavailable"
-                ? "Home cannot read provider health, so it cannot claim the data foundation is ready."
-                : "No returned source reports an active runtime. Market and research coverage must remain explicit."
+              markets.status === "unavailable"
+                ? "Current market information is unavailable. Review your connections to restore coverage."
+                : "No current market information is available. Connect a data service to continue."
             }
             path="/connections/sources"
             linkLabel="Open Connections & Sources"
-          />
-        ) : null}
-        {overview.status === "unavailable" ||
-        (overview.status === "ready" && overview.data.datasets.count === 0) ? (
-          <GuidanceItem
-            icon={Database}
-            title="Research data needs attention"
-            detail={
-              overview.status === "unavailable"
-                ? "The research-readiness summary is unavailable. Home does not infer a usable dataset."
-                : "The service returned no admitted research dataset in this bounded summary."
-            }
-            path="/advanced/research-data"
-            linkLabel="Open Research & Data"
           />
         ) : null}
         {analyses.status === "unavailable" ? (
           <GuidanceItem
             icon={ShieldAlert}
             title="Investment-analysis history needs repair"
-            detail="The typed persisted-analysis read is unavailable. Home will not replace it with manual targets or saved screens."
+            detail="Saved analyses are unavailable. Try again or review Logs & Diagnostics."
             path="/opportunities"
             linkLabel="Open Opportunities"
           />
@@ -789,13 +729,12 @@ function LiveMarketPanel({
       title="Live market truth"
       icon={Activity}
       state={markets.status}
-      message={markets.message}
     >
       {markets.status === "ready" && markets.data && markets.data.length > 0 ? (
         <ul className="divide-y divide-border">
-          {markets.data.slice(0, 5).map((stream) => (
+          {markets.data.slice(0, 5).map((stream, index) => (
             <li
-              key={`${stream.sourceId}:${stream.instrumentId}`}
+              key={`${stream.instrumentId}:${stream.venueId}:${index}`}
               className="flex items-center gap-3 py-3 first:pt-0 last:pb-0"
             >
               <span
@@ -807,7 +746,7 @@ function LiveMarketPanel({
                   {stream.instrumentId}
                 </span>
                 <span className="mt-0.5 block truncate font-mono text-[9px] text-muted-foreground">
-                  {stream.sourceId} · {stream.venueId}
+                  {stream.venueId}
                 </span>
               </span>
               <span className="text-right text-[10px] text-muted-foreground">
@@ -824,68 +763,15 @@ function LiveMarketPanel({
   )
 }
 
-function SourceHealthPanel({
-  sources,
-}: {
-  sources: OverviewQueries["sources"]
-}) {
-  return (
-    <EvidencePanel
-      title="Source health"
-      icon={ServerCog}
-      state={sources.status}
-      message={sources.message}
-    >
-      {sources.status === "ready" && sources.data && sources.data.length > 0 ? (
-        <ul className="divide-y divide-border">
-          {sources.data.slice(0, 5).map((source) => {
-            const runtimeState =
-              firstText(source.runtimeHealth, ["state", "phase", "status"]) ??
-              "not_active"
-            return (
-              <li
-                key={source.surfaceId}
-                className="flex items-center gap-3 py-3 first:pt-0 last:pb-0"
-              >
-                <span className="rounded-md border border-border bg-background/60 p-2">
-                  <ServerCog
-                    className="size-3.5 text-primary"
-                    aria-hidden="true"
-                  />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-xs font-medium">
-                    {source.surfaceId}
-                  </span>
-                  <span className="mt-0.5 block text-[10px] text-muted-foreground">
-                    {source.onboardingState
-                      ? humanize(source.onboardingState)
-                      : "Not configured"}
-                  </span>
-                </span>
-                <span className="text-[10px] text-muted-foreground">
-                  {humanize(runtimeState)}
-                </span>
-              </li>
-            )
-          })}
-        </ul>
-      ) : null}
-    </EvidencePanel>
-  )
-}
-
 function EvidencePanel({
   title,
   icon: Icon,
   state,
-  message,
   children,
 }: {
   title: string
   icon: typeof Activity
   state: ReadState<unknown>["status"]
-  message: string | null
   children: React.ReactNode
 }) {
   return (
@@ -899,7 +785,7 @@ function EvidencePanel({
         <div className="rounded-lg border border-border bg-background/35 p-4">
           <p className="text-xs font-medium">Not available right now</p>
           <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            {message}
+            Try again or review Logs &amp; Diagnostics for details.
           </p>
         </div>
       ) : null}
@@ -1017,7 +903,7 @@ function factFromPerformance(
   if (performance) {
     return {
       value: formatMoney(performance.currentValue),
-      detail: "Backend-calculated value for the selected immutable account revision.",
+      detail: "Current value for the selected account.",
     }
   }
   if (loading) {
@@ -1067,28 +953,12 @@ function analysisCount(state: ReadState<InvestmentAnalysisPage>) {
     : "Unavailable"
 }
 
-function sourceReadinessDetail(sources: SourceHealth) {
-  if (!sources || sources.length === 0) return "No source records were returned."
-  const active = sources.filter(
-    (source) => source.runtimeHealth.state === "active",
-  ).length
-  return `${active} of ${sources.length} returned sources report an active runtime.`
-}
-
 function freshMarketDetail(markets: MarketSnapshot) {
   if (!markets || markets.length === 0) {
     return "No active qualified live streams."
   }
   const fresh = markets.filter((stream) => stream.freshAtReference).length
-  return `${fresh} of ${markets.length} streams are fresh at the service reference time.`
-}
-
-function firstText(values: Record<string, unknown>, keys: string[]) {
-  for (const key of keys) {
-    const value = values[key]
-    if (typeof value === "string" && value.length > 0) return value
-  }
-  return null
+  return `${fresh} of ${markets.length} markets are current.`
 }
 
 function isAnalysisJob(kind: string) {

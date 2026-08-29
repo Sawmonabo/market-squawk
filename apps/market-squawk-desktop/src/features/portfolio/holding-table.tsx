@@ -16,7 +16,6 @@ export function HoldingTable({ holdings }: { holdings: PortfolioHolding[] }) {
     ? holdings.filter((holding) =>
         [
           holding.instrument_id,
-          holding.source_reference,
           holding.market_value.currency,
           holding.basis.status,
         ].some((value) => value.toLocaleLowerCase().includes(normalized)),
@@ -33,7 +32,7 @@ export function HoldingTable({ holdings }: { holdings: PortfolioHolding[] }) {
         <Input
           value={filter}
           onChange={(event) => setFilter(event.target.value)}
-          placeholder="Find an asset, source, or currency"
+          placeholder="Find an asset or currency"
           aria-label="Filter portfolio holdings"
           className="pl-9"
         />
@@ -45,7 +44,7 @@ export function HoldingTable({ holdings }: { holdings: PortfolioHolding[] }) {
         getRowId={(holding) => holding.instrument_id}
         emptyMessage={
           holdings.length === 0
-            ? "This account has no holdings in the selected revision."
+            ? "This account has no holdings in the selected snapshot."
             : "No holding matches this filter."
         }
       />
@@ -69,7 +68,7 @@ const holdingColumns: ColumnDef<PortfolioHolding, unknown>[] = [
   {
     id: "markEvidence",
     accessorFn: (holding) => holding.markEvidence.observedAtUnixNanos,
-    header: "Mark evidence",
+    header: "Price status",
     cell: ({ row }) => <MarkEvidence holding={row.original} />,
   },
   {
@@ -101,18 +100,6 @@ const holdingColumns: ColumnDef<PortfolioHolding, unknown>[] = [
     header: "Cost basis",
     cell: ({ row }) => <BasisValue holding={row.original} />,
   },
-  {
-    accessorKey: "source_reference",
-    header: "Source reference",
-    cell: ({ row }) => (
-      <div className="max-w-48">
-        <p className="truncate text-xs">{row.original.source_reference}</p>
-        <p className="mt-1 text-[10px] text-muted-foreground">
-          Source as of {formatTimestamp(row.original.as_of)}
-        </p>
-      </div>
-    ),
-  },
 ]
 
 function MarkEvidence({ holding }: { holding: PortfolioHolding }) {
@@ -121,7 +108,7 @@ function MarkEvidence({ holding }: { holding: PortfolioHolding }) {
     <div className="max-w-56 text-xs">
       <p>{humanize(mark.state)}</p>
       <p className="mt-1 text-[10px] text-muted-foreground">
-        Observed {formatTimestamp(mark.observedAtUnixNanos)} · {mark.sourceReference}
+        Updated {formatTimestamp(mark.observedAtUnixNanos)}
       </p>
       <p className="mt-1 text-[10px] text-amber-300">
         {humanize(mark.freshness.status)} · {humanize(mark.fallback.status)}
@@ -148,7 +135,7 @@ function BasisValue({ holding }: { holding: PortfolioHolding }) {
         <div>
           <p className="text-amber-300">Needs review</p>
           <p className="mt-1 text-[10px] text-muted-foreground">
-            {holding.basis.candidates.length} source candidates
+            {holding.basis.candidates.length} possible matches
           </p>
         </div>
       )

@@ -8,9 +8,9 @@ import { Label } from "@/components/ui/label"
 import { humanize } from "@/lib/formatters"
 
 import type { FeatureContractView, FeatureDatasetView } from "./contracts"
-import { EvidenceIdentity } from "./decision-boundaries"
 import {
   contractKey,
+  featureDatasetLabel,
   featureLabel,
   SELECT_CLASS,
   type ComparisonOperator,
@@ -121,14 +121,12 @@ export function DatasetEvidence({ dataset }: { dataset: FeatureDatasetView }) {
     <div className="rounded-lg border border-border bg-card/55 p-3">
       <div className="flex items-center gap-2">
         <Filter className="size-4 text-primary" aria-hidden="true" />
-        <p className="text-xs font-semibold">Immutable evidence selected</p>
+        <p className="text-xs font-semibold">Research data selected</p>
       </div>
       <dl className="mt-3 grid gap-2 text-xs">
         <div>
-          <dt className="text-muted-foreground">Dataset manifest</dt>
-          <dd className="font-medium">
-            {dataset.manifest.dataset} · revision {dataset.manifest.manifestVersion}
-          </dd>
+          <dt className="text-muted-foreground">Dataset</dt>
+          <dd className="font-medium">{featureDatasetLabel(dataset)}</dd>
         </div>
         <div>
           <dt className="text-muted-foreground">Prepared examples</dt>
@@ -137,14 +135,6 @@ export function DatasetEvidence({ dataset }: { dataset: FeatureDatasetView }) {
             {dataset.splitCounts.validation.toLocaleString()} validation ·{" "}
             {dataset.splitCounts.test.toLocaleString()} test
           </dd>
-        </div>
-        <div>
-          <dt className="text-muted-foreground">Universe identity</dt>
-          <dd><EvidenceIdentity value={dataset.universeDigest} /></dd>
-        </div>
-        <div>
-          <dt className="text-muted-foreground">Manifest content</dt>
-          <dd><EvidenceIdentity value={dataset.manifest.contentHash} /></dd>
         </div>
       </dl>
     </div>
@@ -158,16 +148,11 @@ export function Receipt({ receipt }: { receipt: SavedScreenReceipt }) {
       <AlertTitle>
         {receipt.outcome === "appended"
           ? "Saved-screen revision committed"
-          : "This exact revision was already committed"}
+          : "This revision was already saved"}
       </AlertTitle>
       <AlertDescription>
         <span className="block">
-          {receipt.screenId} revision {receipt.revision} is durable and the saved-screen list has
-          been refreshed.
-        </span>
-        <span className="mt-2 block text-xs">
-          Universe evidence: {receipt.dataset.universeDigest.slice(0, 16)}… · dataset{" "}
-          {receipt.dataset.manifest.dataset} manifest {receipt.dataset.manifest.manifestVersion}
+          Your saved screen is ready to use. The saved-screen list has been refreshed.
         </span>
       </AlertDescription>
     </Alert>

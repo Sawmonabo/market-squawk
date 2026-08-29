@@ -7,7 +7,6 @@ import {
   RefreshCw,
 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -285,22 +284,20 @@ export function PortfolioMeasurementWorkflow({
             significance,
           },
         )
-      } catch (error) {
+      } catch {
         throw new RetainedMeasurementVerificationError(
-          `Measurement ${shortIdentity(result.measurement.measurementId)} was retained, but its ` +
-            `evidence could not be verified in this read. Refresh measurements and inspect it ` +
-            `before retrying. ${messageFrom(error)}`,
+          "The measurement was saved, but its supporting inputs could not be confirmed for display. Refresh before relying on it; diagnostic details are available in Logs.",
         )
       }
       return result
     },
     onSuccess: async (result) => {
       setAnnouncement(
-        `Measurement retained and classified ${humanize(result.classification.hierarchy)}.`,
+        `Measurement saved and classified ${humanize(result.classification.hierarchy)}.`,
       )
       await onCreated(result.measurement.measurementId)
     },
-    onError: (error) => setAnnouncement(messageFrom(error)),
+    onError: (error) => setAnnouncement(measurementErrorMessage(error)),
   })
 
   if (!available) {
@@ -309,8 +306,8 @@ export function PortfolioMeasurementWorkflow({
         <CircleAlert aria-hidden="true" />
         <AlertTitle>Portfolio-backed measurements are unavailable</AlertTitle>
         <AlertDescription>
-          The installed service is missing {missingOperations.join(", ")}. Existing retained
-          measurements remain readable, but this guided workflow cannot safely create one.
+          This installation cannot create a portfolio-backed measurement right now. Existing saved
+          measurements remain readable; update or restore Fair Value before creating another.
         </AlertDescription>
       </Alert>
     )
@@ -331,8 +328,8 @@ export function PortfolioMeasurementWorkflow({
           </h2>
           <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
             Choose what you own, state the valuation amount and technique, and let Market Squawk
-            retain the exact portfolio revision as evidence. Classification is analytical; it does
-            not make the value a live quote or authorize a trade.
+            use the current portfolio position as supporting information. The resulting valuation
+            is separate from live quotes and does not authorize a trade.
           </p>
         </div>
         <Button
@@ -364,10 +361,10 @@ export function PortfolioMeasurementWorkflow({
       </div>
 
       {duplicateAccount || duplicatePrincipal ? (
-        <WorkflowError message="The account or principal list returned duplicate identities. Refresh before creating a measurement." />
+        <WorkflowError message="The account or reviewer list contains duplicate entries. Refresh before creating a measurement." />
       ) : accounts.isError || holdings.isError || principals.isError ? (
         <WorkflowError
-          message={messageFrom(accounts.error ?? holdings.error ?? principals.error)}
+          message="Portfolio or reviewer details could not be loaded. Refresh, or open Logs for diagnostic details."
         />
       ) : accounts.isSuccess && accountSelections.length === 0 ? (
         <WorkflowNotice
@@ -377,7 +374,7 @@ export function PortfolioMeasurementWorkflow({
       ) : principals.isSuccess && principalSelections.length === 0 ? (
         <WorkflowNotice
           title="Set up a governance principal"
-          message="A named local governance principal is required to prepare an immutable fair-value measurement. Complete governance setup, then refresh this workflow."
+          message="An authorized reviewer is required to prepare a fair-value measurement. Complete governance setup, then refresh this workflow."
         />
       ) : selectedAccount && holdings.isSuccess && holdings.data.holdings.length === 0 ? (
         <WorkflowNotice
@@ -399,7 +396,7 @@ export function PortfolioMeasurementWorkflow({
             <MeasurementField
               label="1. Portfolio account"
               htmlFor="fair-value-portfolio-account"
-              detail="The service will pin this account's current immutable revision."
+              detail="Uses the latest saved account position when you submit."
             >
               <select
                 id="fair-value-portfolio-account"
@@ -438,7 +435,7 @@ export function PortfolioMeasurementWorkflow({
             <MeasurementField
               label="2. Holding"
               htmlFor="fair-value-portfolio-holding"
-              detail="The selected holding supplies the retained portfolio evidence, not execution-quality data."
+              detail="The holding supports the valuation; it is not treated as a live trading quote."
             >
               <select
                 id="fair-value-portfolio-holding"
@@ -478,7 +475,7 @@ export function PortfolioMeasurementWorkflow({
             <MeasurementField
               label="3. Valuation amount"
               htmlFor="fair-value-amount"
-              detail="Exact decimal amount; commas and currency symbols are not accepted."
+              detail="Enter the amount without commas or a currency symbol."
               error={amountIssue}
             >
               <Input
@@ -535,7 +532,7 @@ export function PortfolioMeasurementWorkflow({
             <MeasurementField
               label="Declared scale"
               htmlFor="fair-value-scale"
-              detail="Number of decimal places retained without rounding, from 0 through 28."
+              detail="Number of decimal places, from 0 through 28."
               error={amountIssue?.startsWith("Scale") ? amountIssue : null}
             >
               <Input
@@ -608,7 +605,7 @@ export function PortfolioMeasurementWorkflow({
           <MeasurementField
             label="5. Prepared by"
             htmlFor="fair-value-principal"
-            detail="Choose an admitted local governance principal. Market Squawk records this identity with the immutable measurement."
+            detail="Choose an authorized reviewer to record with this measurement."
           >
             <select
               id="fair-value-principal"
@@ -652,11 +649,10 @@ export function PortfolioMeasurementWorkflow({
             ) : (
               <FileCheck2 aria-hidden="true" />
             )}
-            {measure.isPending ? "Verifying and measuring…" : "Create immutable measurement"}
+            {measure.isPending ? "Verifying and measuring…" : "Create measurement"}
           </Button>
           <p className="text-[10px] leading-4 text-muted-foreground">
-            Market Squawk re-checks the portfolio revision and principal before submission, then
-            verifies the retained evidence after classification.
+            Market Squawk confirms the selected holding and reviewer before saving the measurement.
           </p>
         </div>
       </form>
@@ -668,7 +664,7 @@ export function PortfolioMeasurementWorkflow({
               ? "Measurement outcome needs verification"
               : undefined
           }
-          message={messageFrom(measure.error)}
+          message={measurementErrorMessage(measure.error)}
         />
       ) : null}
       {measure.data ? <MeasurementSuccess result={measure.data} /> : null}
@@ -681,6 +677,12 @@ export function PortfolioMeasurementWorkflow({
 
 function decimalPlaces(value: string) {
   return value.split(".")[1]?.length ?? 0
+}
+
+function measurementErrorMessage(error: unknown) {
+  return error instanceof RetainedMeasurementVerificationError
+    ? error.message
+    : "The measurement could not be created. Review the fields and try again, or open Logs for diagnostic details."
 }
 
 function hasDuplicate(values: string[]) {

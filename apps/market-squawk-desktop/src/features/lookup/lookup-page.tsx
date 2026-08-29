@@ -24,8 +24,10 @@ export function LookupPage() {
       <LookupFrame>
         <Alert variant="destructive">
           <CircleAlert aria-hidden="true" />
-          <AlertTitle>Lookup workspace unavailable</AlertTitle>
-          <AlertDescription>{product.error}</AlertDescription>
+          <AlertTitle>Search is unavailable</AlertTitle>
+          <AlertDescription>
+            Try again. If the problem continues, review Logs &amp; Diagnostics.
+          </AlertDescription>
         </Alert>
         <Button className="mt-4" onClick={product.refresh}>
           Try again
@@ -41,13 +43,9 @@ export function LookupPage() {
   return (
     <LookupFrame>
       <header className="border-b border-border pb-6">
-        <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">
-          Local workspace index
-        </p>
         <h1 className="mt-2 text-3xl font-semibold tracking-tight">Search</h1>
         <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-          Find instruments, local sources, research datasets, screens, jobs, and safe application
-          actions. Results come from bounded local indexes in the installed service.
+          Find investments, companies, research collections, models, portfolios, and saved screens.
         </p>
       </header>
 
@@ -64,8 +62,7 @@ export function LookupPage() {
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Search is unavailable</AlertTitle>
           <AlertDescription>
-            The installed service does not advertise the bounded Analysis.Lookup operation. Restore
-            or update the local service before relying on workspace search.
+            Search is not available in this build. You can continue using the main navigation.
           </AlertDescription>
         </Alert>
       )}

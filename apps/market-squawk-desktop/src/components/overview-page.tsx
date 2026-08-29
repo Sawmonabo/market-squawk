@@ -1,4 +1,4 @@
-import { ShieldCheck, Sparkles } from "lucide-react"
+import { Sparkles } from "lucide-react"
 import { Link } from "react-router-dom"
 
 import { useProduct } from "@/app/product-context"
@@ -6,8 +6,6 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { SquawkSignal } from "@/components/squawk-signal"
-import { SetupOverview } from "@/components/setup/setup-overview"
-import { VerificationPanel } from "@/components/setup/verification-panel"
 import { OverviewDashboard } from "@/features/overview/overview-dashboard"
 
 export function OverviewPage() {
@@ -21,9 +19,8 @@ export function OverviewPage() {
         <Alert>
           <AlertTitle>Secure setup is waiting for you</AlertTitle>
           <AlertDescription>
-            {product.error} Complete the single recovery action in the shared
-            banner, or keep browsing the workspace navigation while secure
-            storage remains locked.
+            Complete the recovery action in the shared banner to unlock secure
+            storage. More detail is available in Logs &amp; Diagnostics.
           </AlertDescription>
         </Alert>
       </div>
@@ -34,7 +31,9 @@ export function OverviewPage() {
       <div className="mx-auto max-w-3xl p-8">
         <Alert variant="destructive">
           <AlertTitle>Local application unavailable</AlertTitle>
-          <AlertDescription>{product.error}</AlertDescription>
+          <AlertDescription>
+            Try again or review Logs &amp; Diagnostics for details.
+          </AlertDescription>
         </Alert>
         <Button className="mt-4" onClick={product.refresh}>
           Try again
@@ -76,10 +75,8 @@ export function OverviewPage() {
             role="status"
             className="mt-3 max-w-3xl text-[11px] leading-5 text-muted-foreground"
           >
-            Market Squawk Default V1 is retained locally, but the required
-            canonical data and pure backend analysis capabilities are not yet
-            composed into a restart-proven workflow. This disabled control
-            starts no scan and creates no recommendation.
+            Opportunity search is not available in this build yet. You can
+            still review your existing analyses.
           </p>
         </div>
         <SquawkSignal status={bootstrap.storage.label} />
@@ -91,85 +88,17 @@ export function OverviewPage() {
         bootstrap={bootstrap}
       />
 
-      <details className="rounded-xl border border-border bg-card/35">
-        <summary className="cursor-pointer px-5 py-4 text-sm font-semibold">
-          Guided setup and installation evidence
-        </summary>
-        <div className="space-y-4 border-t border-border p-4">
-          <section
-            aria-label="Application facts"
-            className="grid overflow-hidden rounded-xl border border-border bg-card/55 sm:grid-cols-2 lg:grid-cols-4"
-          >
-            <Fact
-              label="Workspace"
-              value={bootstrap.storage.label}
-              ready={bootstrap.storage.state === "ready"}
-            />
-            <Fact
-              label="Release"
-              value={`v${bootstrap.applicationVersion} · ${bootstrap.installation.label}`}
-              ready={bootstrap.installation.state === "ready"}
-            />
-            <Fact
-              label="Model runtime"
-              value={bootstrap.modelRuntime.label}
-              ready={bootstrap.modelRuntime.state === "ready"}
-            />
-            <Fact
-              label="Local AI service"
-              value={bootstrap.mcp.label}
-              ready={bootstrap.mcp.state === "ready"}
-            />
-          </section>
-          <div className="grid gap-4 lg:grid-cols-[1fr_340px]">
-            <SetupOverview
-              bootstrap={bootstrap}
-              transport={product.transport}
-              onRefresh={product.refresh}
-            />
-            <VerificationPanel bootstrap={bootstrap} />
-          </div>
-        </div>
-      </details>
+      <section className="rounded-xl border border-border bg-card/35 p-5">
+        <h2 className="text-sm font-semibold">Setup and connections</h2>
+        <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
+          Manage data connections, credentials, and connection health in their dedicated settings
+          workspace. Home shows only the resulting investment and readiness summaries.
+        </p>
+        <Button asChild className="mt-4" variant="outline">
+          <Link to="/connections/sources">Manage connections</Link>
+        </Button>
+      </section>
 
-      <aside className="flex items-start gap-3 rounded-lg border border-border bg-card/20 px-4 py-3 text-[11px] leading-relaxed text-muted-foreground">
-        <ShieldCheck
-          className="mt-0.5 size-4 shrink-0 text-foreground/70"
-          aria-hidden="true"
-        />
-        <span>
-          Safe to close. Accepted provider work is checkpointed by the Rust
-          authorities and resumes without exposing credentials or fabricating
-          readiness.
-        </span>
-      </aside>
-    </div>
-  )
-}
-
-function Fact({
-  label,
-  value,
-  ready = false,
-}: {
-  label: string
-  value: string
-  ready?: boolean
-}) {
-  return (
-    <div className="min-h-16 border-b border-border px-4 py-3 last:border-b-0 sm:odd:border-r lg:border-b-0 lg:border-r lg:last:border-r-0">
-      <p className="font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
-        {label}
-      </p>
-      <p className="mt-2 flex items-center gap-2 text-xs font-medium">
-        {ready ? (
-          <span
-            className="size-1.5 rounded-full bg-[var(--success)]"
-            aria-hidden="true"
-          />
-        ) : null}
-        {value}
-      </p>
     </div>
   )
 }

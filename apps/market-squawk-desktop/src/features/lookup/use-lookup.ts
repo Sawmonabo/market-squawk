@@ -7,14 +7,32 @@ import type { ProductTransport } from "@/lib/transport"
 
 import {
   lookupResultSchema,
+  productLookupCategories,
   type LookupCategory,
+  type LookupMatch,
   type LookupResult,
+  type ProductLookupCategory,
 } from "./schemas"
+
+const productCategorySet = new Set<LookupCategory>(productLookupCategories)
+
+export type ProductLookupMatch = Omit<LookupMatch, "category"> & {
+  category: ProductLookupCategory
+}
+
+type ProductLookupResult = Omit<LookupResult, "matches" | "categories"> & {
+  matches: ProductLookupMatch[]
+  categories: Array<{
+    category: ProductLookupCategory
+    state: "available" | "unavailable"
+    reason?: string
+  }>
+}
 
 export type LookupState =
   | { status: "idle"; data: null; message: null }
   | { status: "loading"; data: null; message: null }
-  | { status: "ready"; data: LookupResult; message: null }
+  | { status: "ready"; data: ProductLookupResult; message: null }
   | { status: "unavailable"; data: null; message: string }
 
 export function useLookup(
@@ -29,7 +47,7 @@ export function useLookup(
     () => ({
       query: "lookup" as const,
       text: deferred,
-      categories: categories.length === 0 ? undefined : categories,
+      categories: categories.length === 0 ? [...productLookupCategories] : categories,
     }),
     [categories, deferred],
   )
@@ -50,11 +68,31 @@ export function useLookup(
     return { status: "unavailable", data: null, message: messageFrom(query.error) }
   }
   const parsed = lookupResultSchema.safeParse(query.data.data)
-  return parsed.success
-    ? { status: "ready", data: parsed.data, message: null }
-    : {
+  if (!parsed.success) {
+    return {
         status: "unavailable",
         data: null,
-        message: "The installed service returned results this screen cannot safely interpret.",
+        message: "Search results are unavailable right now.",
       }
+  }
+
+  return {
+    status: "ready",
+    data: {
+      ...parsed.data,
+      matches: parsed.data.matches.filter(isProductLookupMatch),
+      categories: parsed.data.categories.filter(isProductLookupCategoryState),
+    },
+    message: null,
+  }
+}
+
+function isProductLookupMatch(match: LookupMatch): match is ProductLookupMatch {
+  return productCategorySet.has(match.category)
+}
+
+function isProductLookupCategoryState(
+  category: LookupResult["categories"][number],
+): category is ProductLookupResult["categories"][number] {
+  return productCategorySet.has(category.category)
 }

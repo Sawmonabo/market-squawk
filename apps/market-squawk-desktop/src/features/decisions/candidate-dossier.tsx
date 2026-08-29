@@ -23,7 +23,6 @@ import { formatTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
-  digestHex,
   parseDossierCreateOutcome,
   parseDossierPreparationInventory,
   parseDossierPreparationPreview,
@@ -36,7 +35,7 @@ import {
   type DossierPreparationPreview,
   type ScreenRunIndexView,
 } from "./contracts"
-import { EvidenceIdentity, StateLabel } from "./decision-boundaries"
+import { StateLabel } from "./decision-boundaries"
 
 const DISCOVERY_LIMIT = 100
 
@@ -182,14 +181,14 @@ export function CandidateDossierWorkspace({
     <section aria-labelledby="candidate-funnel-heading" className="mt-8">
       <div>
         <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
-          Screen-to-decision evidence
+          Screen-to-decision research
         </p>
         <h2 id="candidate-funnel-heading" className="mt-1 text-lg font-semibold">
           Candidate funnel and dossier
         </h2>
         <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-          Start with an immutable point-in-time screen run, review its bounded ranked candidates,
-          then open only dossiers the decision authority retained for the selected candidate.
+          Start with a saved screen run at a chosen cutoff, review its ranked candidates, then open
+          the supporting analysis saved for the selected candidate.
         </p>
       </div>
 
@@ -204,7 +203,7 @@ export function CandidateDossierWorkspace({
               retry={() => void runs.refetch()}
             />
           ) : runEntries.length === 0 ? (
-            <PromptState text="No immutable saved-screen runs are retained in this workspace." />
+            <PromptState text="No saved-screen runs are available in this workspace." />
           ) : (
             <div className="mt-4 grid gap-2">
               {runEntries.map((run) => (
@@ -250,7 +249,7 @@ export function CandidateDossierWorkspace({
               retry={() => void candidates.refetch()}
             />
           ) : candidates.data.length === 0 ? (
-            <PromptState text="This durable screen run contains no selected candidates." />
+            <PromptState text="This screen run contains no selected candidates." />
           ) : (
             <div className="mt-4 grid gap-3">
               {candidates.data.map((candidate) => (
@@ -273,16 +272,15 @@ export function CandidateDossierWorkspace({
 
         <RecordPanel title="Dossiers for the selected candidate" icon={BookOpenCheck}>
           {!candidateId ? (
-            <PromptState text="Select a candidate to discover its authoritative decision dossiers." />
+            <PromptState text="Select a candidate to review its saved investment analysis." />
           ) : (
             <div className="mt-4 grid gap-4">
               <div className="rounded-xl border border-primary/25 bg-primary/5 p-4">
-                <h3 className="text-sm font-semibold">Build an evidence-bound dossier</h3>
+                <h3 className="text-sm font-semibold">Build a candidate dossier</h3>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  Market Squawk assembles the selected candidate, exact dataset, historical
-                  universe, compatible forecast and fair-value evidence, and available portfolio
-                  impact. Review the preview before retaining it for targets and later paper
-                  decisions.
+                  Market Squawk combines the selected candidate with its historical universe,
+                  compatible forecast and fair-value analysis, and available portfolio impact.
+                  Review the result before saving it for targets and later paper decisions.
                 </p>
                 {dossierPreparation.isPending ? (
                   <Skeleton className="mt-3 h-9 w-40" />
@@ -345,15 +343,13 @@ export function CandidateDossierWorkspace({
                 )}
                 {prepareDossier.data && (
                   <div className="mt-3 rounded-lg border border-border bg-background/60 p-3">
-                    <p className="text-xs font-medium">
-                      Preview {prepareDossier.data.dossierId}
+                    <p className="text-xs font-medium">Dossier preview ready</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Included analysis: {prepareDossier.data.evidence.map(humanize).join(", ")}
                     </p>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      Evidence: {prepareDossier.data.evidence.join(", ")}
-                    </p>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      Forecast: {prepareDossier.data.forecastSelector ?? "Not included"} · fair
-                      value: {prepareDossier.data.fairValueSelector ?? "Not included"}
+                      Forecast: {prepareDossier.data.forecastSelector ? "Included" : "Not included"}
+                      {" · "}fair value: {prepareDossier.data.fairValueSelector ? "Included" : "Not included"}
                     </p>
                     <Button
                       type="button"
@@ -383,7 +379,7 @@ export function CandidateDossierWorkspace({
                     <BookOpenCheck aria-hidden="true" />
                     <AlertTitle>Dossier retained</AlertTitle>
                     <AlertDescription>
-                      The immutable dossier is now available for target preparation.
+                      The dossier is now available for target preparation.
                     </AlertDescription>
                   </Alert>
                 )}
@@ -575,10 +571,6 @@ function ScreenRunCard({
         </div>
         <StateLabel value={selected ? "selected" : "open"} />
       </div>
-      <div className="mt-3 grid gap-2 sm:grid-cols-2">
-        <EvidenceBlock label="Dataset identity" digest={run.datasetIdentity} />
-        <EvidenceBlock label="Universe identity" digest={run.universeIdentity} />
-      </div>
     </button>
   )
 }
@@ -609,7 +601,6 @@ function CandidateCard({
           <p className="mt-1 text-xs text-muted-foreground">
             Score {candidate.score} · selected {formatTimestamp(candidate.selectedAt)}
           </p>
-          <EvidenceIdentity value={candidate.id} />
         </div>
         <StateLabel value={candidate.dataQuality} />
       </div>
@@ -619,7 +610,6 @@ function CandidateCard({
           label="Saved screen"
           value={`${candidate.screenId} · revision ${candidate.screenRevision}`}
         />
-        <CandidateFact label="Screen run" value={candidate.screenRunId} />
         <CandidateFact label="Coverage" value={`${candidate.coverage}`} />
         <CandidateFact label="Liquidity" value={`${candidate.liquidity}`} />
       </dl>
@@ -642,7 +632,6 @@ function CandidateCard({
                   observed {contribution.observed ?? "missing"} · contribution {contribution.contribution}
                 </span>
               </div>
-              <EvidenceIdentity value={digestHex(contribution.binding.semanticDigest)} />
             </li>
           ))}
         </ul>
@@ -656,10 +645,6 @@ function CandidateCard({
         </div>
       )}
 
-      <div className="mt-4 grid gap-3 border-t border-border pt-3">
-        <EvidenceBlock label="Candidate evidence" digest={candidate.evidenceIdentity} />
-        <EvidenceBlock label="Portfolio impact revision" digest={candidate.portfolioRevision} />
-      </div>
       <Button type="button" variant="outline" size="sm" className="mt-4" onClick={onSelect}>
         <BookOpenCheck aria-hidden="true" />
         {selected ? "Showing dossiers" : "Discover dossiers"}
@@ -696,21 +681,21 @@ function DossierCard({
       </div>
 
       <dl className="mt-4 grid gap-3 text-xs sm:grid-cols-2">
-        <DossierFact label="Dossier" value={dossier.id} />
-        <DossierFact label="Candidate" value={dossier.candidateId} />
-        <DossierFact label="Model bundle" value={dossier.evidence.modelBundle ?? "Not bound"} />
         <DossierFact
-          label="Fair-value decision"
-          value={dossier.evidence.fairValueDecision ?? "Not bound"}
+          label="Forecast analysis"
+          value={dossier.evidence.modelBundle ? "Included" : "Not included"}
+        />
+        <DossierFact
+          label="Fair-value analysis"
+          value={dossier.evidence.fairValueDecision ? "Included" : "Not included"}
         />
       </dl>
 
       <div className="mt-4 rounded-lg border border-border/70 p-3">
         <div className="flex items-center gap-2 text-xs font-medium">
           <BriefcaseBusiness className="size-3.5 text-primary" aria-hidden="true" />
-          Portfolio impact evidence
+          Portfolio impact included
         </div>
-        <EvidenceIdentity value={digestHex(dossier.evidence.portfolioRevision)} />
       </div>
 
       <div className="mt-4">
@@ -727,19 +712,12 @@ function DossierCard({
                 className="rounded-lg border border-border/60 px-3 py-2"
               >
                 <span className="text-xs font-medium">{humanize(reference.section)}</span>
-                <EvidenceIdentity value={digestHex(reference.contentIdentity)} />
               </li>
             ))}
           </ul>
         )}
       </div>
 
-      <div className="mt-4 border-t border-border pt-3">
-        <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-          Dossier content identity
-        </span>
-        <EvidenceIdentity value={digestHex(dossier.evidence.contentIdentity)} />
-      </div>
       <Button type="button" className="mt-4" variant="outline" size="sm" onClick={onSelect}>
         <BookOpenCheck aria-hidden="true" />
         {selected ? "Selected for investment target" : "Use for investment target"}
@@ -783,22 +761,7 @@ function DossierFact({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
       <dt className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{label}</dt>
-      <dd className="mt-1 truncate font-mono text-[10px]" title={value}>{value}</dd>
-    </div>
-  )
-}
-
-function EvidenceBlock({
-  label,
-  digest,
-}: {
-  label: string
-  digest: readonly number[] | null
-}) {
-  return (
-    <div>
-      <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{label}</span>
-      <EvidenceIdentity value={digestHex(digest)} />
+      <dd className="mt-1 truncate text-xs font-medium" title={value}>{value}</dd>
     </div>
   )
 }

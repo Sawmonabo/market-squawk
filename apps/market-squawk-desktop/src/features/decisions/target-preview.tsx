@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button"
 import { formatMoney, humanize } from "@/lib/formatters"
 import { formatTimestamp } from "@/lib/time"
 
-import { EvidenceIdentity, StateLabel } from "./decision-boundaries"
+import { StateLabel } from "./decision-boundaries"
 import { evidenceKey, TARGET_PRICE_FIELDS } from "./target-builder-model"
 import type {
   PreparedTargetView,
@@ -37,19 +37,17 @@ export function PreparedTargetPreview({
             Review the complete prepared target
           </h3>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            Nothing is committed until you confirm this exact server-owned preview.
+            Nothing is saved until you confirm this complete preview.
           </p>
         </div>
-        <StateLabel value={expired ? "receipt expired" : `revision ${preview.revision} prepared`} />
+        <StateLabel value={expired ? "confirmation expired" : `revision ${preview.revision} prepared`} />
       </header>
 
       <div className="grid gap-5 p-4 xl:grid-cols-2">
-        <PreviewSection title="Identity and authority">
+        <PreviewSection title="Target summary">
           <PreviewGrid>
-            <Fact label="Target series" value={preview.targetId} evidence />
             <Fact label="Revision" value={String(preview.revision)} />
             <Fact label="Instrument" value={preview.instrumentId} />
-            <Fact label="Retained dossier" value={preview.dossierId} evidence />
             <Fact label="Author" value={preview.author} />
             <Fact label="Ruleset" value={`Version ${preview.rulesetVersion}`} />
             <Fact label="Intent" value={humanize(preview.intent)} />
@@ -57,26 +55,24 @@ export function PreparedTargetPreview({
           </PreviewGrid>
         </PreviewSection>
 
-        <PreviewSection title="Server-owned timing">
+        <PreviewSection title="Timing">
           <PreviewGrid>
             <Fact label="Prepared" value={formatTimestamp(preview.createdAt)} />
             <Fact label="Review due" value={formatTimestamp(preview.reviewDueAt)} />
             <Fact label="Target horizon" value={formatTimestamp(preview.horizonAt)} />
             <Fact label="Target expires" value={formatTimestamp(preview.expiresAt)} />
             <Fact label="Confirmation expires" value={formatTimestamp(preview.receiptExpiresAt)} />
-            <Fact label="Admission receipt" value={preview.receiptId} evidence />
           </PreviewGrid>
         </PreviewSection>
 
         <PreviewSection title="Observed reference mark">
           <p className="text-lg font-semibold tabular-nums">{formatMoney(preview.referenceMark)}</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            {preview.referenceMarkSource} · {humanize(preview.referenceMarkQuality)} · observed{" "}
-            {formatTimestamp(preview.referenceMarkObservedAt)}
+            {humanize(preview.referenceMarkQuality)} · observed {formatTimestamp(preview.referenceMarkObservedAt)}
           </p>
         </PreviewSection>
 
-        <PreviewSection title="Selected evidence">
+        <PreviewSection title="Included analysis">
           <PreviewGrid>
             <Fact label="Forecast" value={preview.forecastSelected ? "Selected" : "Not selected"} />
             <Fact label="Fair value" value={preview.fairValueSelected ? "Selected" : "Not selected"} />
@@ -101,7 +97,7 @@ export function PreparedTargetPreview({
           <p className="text-sm leading-6">{preview.thesis}</p>
         </PreviewSection>
 
-        <PreviewSection title="Evidence-bound assumptions">
+        <PreviewSection title="Assumptions and support">
           <PreviewList
             values={preview.assumptions.map(
               (assumption) =>
@@ -121,8 +117,8 @@ export function PreparedTargetPreview({
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <Clock3 className="size-4" aria-hidden="true" />
           {expired
-            ? "This receipt can no longer be committed. Prepare a fresh preview."
-            : "Confirmation consumes this one-use receipt and appends immutable history."}
+            ? "This confirmation window has closed. Prepare a fresh preview."
+            : "Confirming saves this revision to the target's review history."}
         </div>
         <div className="flex gap-2">
           <Button type="button" variant="outline" onClick={onDiscard}>Edit draft</Button>
@@ -138,7 +134,6 @@ export function PreparedTargetPreview({
 
 export function TargetCommitReceipt({
   outcome,
-  targetId,
   revision,
 }: {
   outcome: TargetCommitOutcome
@@ -151,11 +146,10 @@ export function TargetCommitReceipt({
       <AlertTitle>
         {outcome === "appended"
           ? "Target revision committed"
-          : "This exact target revision was already committed"}
+          : "This target revision was already saved"}
       </AlertTitle>
       <AlertDescription>
-        <span className="block">Target {targetId} revision {revision} is retained in immutable history.</span>
-        <EvidenceIdentity value={targetId} />
+        <span className="block">Target revision {revision} is saved in its review history.</span>
       </AlertDescription>
     </Alert>
   )
@@ -182,13 +176,11 @@ function PreviewGrid({ children }: { children: React.ReactNode }) {
   return <dl className="grid gap-3 sm:grid-cols-2">{children}</dl>
 }
 
-function Fact({ label, value, evidence = false }: { label: string; value: string; evidence?: boolean }) {
+function Fact({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
       <dt className="text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{label}</dt>
-      <dd className="mt-1 text-xs font-medium">
-        {evidence ? <EvidenceIdentity value={value} /> : value}
-      </dd>
+      <dd className="mt-1 text-xs font-medium">{value}</dd>
     </div>
   )
 }

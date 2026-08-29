@@ -141,20 +141,16 @@ export function FairValueGovernanceWorkflow({
             Guided governance
           </p>
           <h3 id="fair-value-governance-heading" className="mt-1 text-base font-semibold">
-            Review, authorize, and record an immutable decision
+            Review, authorize, and record a decision
           </h3>
           <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-            The service binds this workflow to the retained measurement, evidence, ruleset, and
-            authenticated principal. This workspace never accepts actor names or self-asserted
-            approval authority.
+            Market Squawk ties this review to the saved measurement, its classification, and an
+            authenticated reviewer. Approval authority cannot be self-declared.
           </p>
         </div>
         <div className="rounded-lg border border-primary/20 bg-background/45 px-3 py-2 text-[10px] leading-4 text-muted-foreground">
-          <p>Measurement {shortIdentity(measurement.measurementId)}</p>
-          <p>Evidence {shortIdentity(measurement.evidenceHash)}</p>
-          <p>
-            Ruleset {classification ? `${classification.rulesetVersion} · ${shortIdentity(classification.rulesetHash)}` : "load classification first"}
-          </p>
+          <p>{classification ? humanize(classification.hierarchy) : "Classification needed"}</p>
+          <p>{measurement.inputCount.toLocaleString()} supporting input{measurement.inputCount === 1 ? "" : "s"}</p>
         </div>
       </div>
 
@@ -163,15 +159,15 @@ export function FairValueGovernanceWorkflow({
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Classification evidence is required</AlertTitle>
           <AlertDescription>
-            Load or evaluate the retained measurement before proposing an approval or override.
-            Governance cannot infer a decision from a method, connected source, or market-depth label.
+            Load or evaluate the saved measurement before proposing an approval or override.
+            Governance cannot infer a decision from a valuation method or market-depth label alone.
           </AlertDescription>
         </Alert>
       ) : null}
 
       <form className="mt-4 grid gap-4" onSubmit={submitProposal}>
         <fieldset disabled={state.busy}>
-          <legend className="text-xs font-medium">1. Prepare a bounded proposal</legend>
+          <legend className="text-xs font-medium">1. Prepare a proposal</legend>
           <div className="mt-2 grid gap-3 lg:grid-cols-2">
             <Field label="Governance action" htmlFor="fair-value-governance-action">
               <select
@@ -180,7 +176,7 @@ export function FairValueGovernanceWorkflow({
                 onChange={(event) => setKind(event.target.value as ProposalKind)}
                 className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
-                <option value="approve">Approve retained classification</option>
+                <option value="approve">Approve current classification</option>
                 <option value="override">Propose Level 2 / Level 3 override</option>
                 <option value="revoke">Revoke approval</option>
                 <option value="market_access">Assess market access</option>
@@ -245,7 +241,7 @@ export function FairValueGovernanceWorkflow({
             }
           >
             <FilePreviewIcon kind={kind} />
-            Create service preview
+            Review proposed action
           </Button>
         </div>
       </form>
@@ -299,8 +295,7 @@ export function FairValueGovernanceWorkflow({
                 disabled={state.busy || !selectedPrincipal}
               />
               <FieldMessage>
-                The credential is sent once to the local service, then cleared from this form. It is
-                not part of the preview, audit record, or desktop result.
+                The credential is used once for this authorization and then cleared from the form.
               </FieldMessage>
             </Field>
             <div>
@@ -318,7 +313,7 @@ export function FairValueGovernanceWorkflow({
           <div className="mt-4 flex flex-wrap gap-2">
             <Button type="button" disabled={state.busy || !canCommit} onClick={onCommit}>
               <BadgeCheck aria-hidden="true" />
-              Commit service-held action
+              Record action
             </Button>
             {needsMoreAuthorizations ? (
               <p className="self-center text-[10px] text-muted-foreground">
@@ -356,12 +351,11 @@ function ClassificationProposalFields({
 }) {
   return (
     <div className="mt-3 grid gap-3 lg:grid-cols-2">
-      <Field label="Exact retained decision" htmlFor="fair-value-governance-decision">
+      <Field label="Current classification" htmlFor="fair-value-governance-decision">
         <Input
           id="fair-value-governance-decision"
           readOnly
-          value={classification?.decisionId ?? "Classification not loaded"}
-          className="font-mono text-[10px]"
+          value={classification ? humanize(classification.hierarchy) : "Classification not loaded"}
         />
       </Field>
       <Field label="Approval / override expiry" htmlFor="fair-value-governance-expiry">
@@ -420,7 +414,7 @@ function RevocationFields({
 }) {
   return (
     <div className="mt-3 grid gap-3 lg:grid-cols-2">
-      <Field label="Exact approval to revoke" htmlFor="fair-value-governance-approval">
+      <Field label="Approval to revoke" htmlFor="fair-value-governance-approval">
         <select
           id="fair-value-governance-approval"
           value={approvalId}
@@ -428,10 +422,10 @@ function RevocationFields({
           required
           className="h-9 w-full rounded-md border border-input bg-background px-3 font-mono text-[10px] outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-          <option value="">Select a retained approval</option>
+          <option value="">Select an approval</option>
           {approvals.map((approval) => (
             <option key={approval.approvalId} value={approval.approvalId}>
-              {shortIdentity(approval.approvalId)} · {humanize(approval.status)}
+              {approval.approvedBy} · {humanize(approval.status)} · {formatDate(approval.approvedAt)}
             </option>
           ))}
         </select>
@@ -477,7 +471,7 @@ function MarketAccessFields({
 }) {
   return (
     <div className="mt-3 grid gap-3 lg:grid-cols-2">
-      <Field label="Retained live-market evidence" htmlFor="fair-value-governance-market-input">
+      <Field label="Market input" htmlFor="fair-value-governance-market-input">
         <select
           id="fair-value-governance-market-input"
           value={selectedInputId}
@@ -485,16 +479,15 @@ function MarketAccessFields({
           required
           className="h-9 w-full rounded-md border border-input bg-background px-3 font-mono text-[10px] outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-          <option value="">Select a retained live-market input</option>
+          <option value="">Select a current market input</option>
           {inputs.map((input) => (
             <option key={input.inputId} value={input.inputId}>
-              {input.evidence.origin.venueId} · {shortIdentity(input.inputId)} · {shortIdentity(input.evidence.evidenceHash)}
+              {input.evidence.origin.venueId} · {humanize(input.significance)}
             </option>
           ))}
         </select>
         <FieldMessage>
-          Venue and instrument are selected from retained evidence; source connectivity is not an
-          access conclusion.
+          Market accessibility is a business assessment and is not inferred from data availability.
         </FieldMessage>
       </Field>
       <Field label="Accessibility conclusion" htmlFor="fair-value-governance-access">
@@ -545,14 +538,12 @@ function PreviewReview({ preview }: { preview: GovernanceActionPreview }) {
     <div className="rounded-lg border border-primary/25 bg-background/45 p-3">
       <div className="flex items-center gap-2">
         <Landmark className="size-4 text-primary" aria-hidden="true" />
-        <h4 className="text-sm font-semibold">2. Review server-canonical action</h4>
+        <h4 className="text-sm font-semibold">2. Review proposed action</h4>
       </div>
       <dl className="mt-3 grid gap-3 text-xs md:grid-cols-2">
-        <Fact label="Preview identity" value={preview.previewId} mono />
-        <Fact label="Canonical digest" value={preview.digest} mono />
         <Fact label="Required roles" value={preview.requiredRoles.map(humanize).join(", ")} />
-        <Fact label="Distinct principals" value={String(preview.distinctPrincipalCount)} />
-        <Fact label="Preview expires" value={formatDate(preview.expiresAt)} />
+        <Fact label="Reviewers required" value={String(preview.distinctPrincipalCount)} />
+        <Fact label="Review expires" value={formatDate(preview.expiresAt)} />
       </dl>
       <ul className="mt-3 space-y-1 border-t border-border pt-3 text-[11px] text-muted-foreground">
         {preview.effects.map((effect) => (
@@ -582,14 +573,14 @@ function AuthorizationProgress({
         <p className="text-xs font-semibold">One-use authorization progress</p>
       </div>
       <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
-        {distinct.size} of {preview.distinctPrincipalCount} distinct required principal
-        {preview.distinctPrincipalCount === 1 ? "" : "s"} have reauthenticated this exact preview.
+        {distinct.size} of {preview.distinctPrincipalCount} required reviewer
+        {preview.distinctPrincipalCount === 1 ? "" : "s"} have reauthenticated this proposal.
       </p>
       {distinct.size > 0 ? (
-        <ul className="mt-2 space-y-1 font-mono text-[9px] text-muted-foreground">
-          {[...distinct.values()].map((authorization) => (
+        <ul className="mt-2 space-y-1 text-[9px] text-muted-foreground">
+          {[...distinct.values()].map((authorization, index) => (
             <li key={authorization.principalId}>
-              {shortIdentity(authorization.principalId)} · authorization accepted · expires {formatDate(authorization.expiresAt)}
+              Reviewer {index + 1} authorized · expires {formatDate(authorization.expiresAt)}
             </li>
           ))}
         </ul>
@@ -601,12 +592,12 @@ function AuthorizationProgress({
 function ProposalBoundary({ kind }: { kind: ProposalKind }) {
   const text =
     kind === "approve"
-      ? "Approves one exact retained classification; it never changes evidence or rules."
+      ? "Approves the current saved classification without changing its supporting information."
       : kind === "override"
         ? "Creates a separate expiring Level 2 or Level 3 judgment; it cannot promote to Level 1."
         : kind === "revoke"
-          ? "Appends a revocation record and leaves the original approval immutable."
-          : "Records reporting-entity access for retained market evidence; it does not claim feed or execution quality."
+          ? "Records a revocation while preserving the original approval history."
+          : "Records reporting-entity market access; it does not claim trading-data or execution quality."
   return <p className="rounded-md border border-border bg-background/35 p-3 text-[10px] leading-4 text-muted-foreground">{text}</p>
 }
 
@@ -634,16 +625,14 @@ function FieldMessage({ children }: { children: React.ReactNode }) {
 function Fact({
   label,
   value,
-  mono = false,
 }: {
   label: string
   value: string
-  mono?: boolean
 }) {
   return (
     <div>
       <dt className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</dt>
-      <dd className={`mt-1 break-all ${mono ? "font-mono text-[9px]" : "text-xs"}`}>{value}</dd>
+      <dd className="mt-1 break-words text-xs">{value}</dd>
     </div>
   )
 }
@@ -769,10 +758,6 @@ function validDateTime(value: string) {
 function toIso(value: string) {
   const parsed = new Date(value)
   return Number.isFinite(parsed.valueOf()) ? parsed.toISOString() : null
-}
-
-function shortIdentity(value: string) {
-  return value.length > 16 ? `${value.slice(0, 8)}…${value.slice(-8)}` : value
 }
 
 function formatDate(value: string) {
