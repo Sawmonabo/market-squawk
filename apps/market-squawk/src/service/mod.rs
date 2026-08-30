@@ -250,16 +250,36 @@ impl InstalledServiceConnector {
     /// Consumes one explicit encrypted-fallback unlock over the owner-authenticated channel.
     pub async fn bootstrap_unlock(
         &self,
+        captured_status: InstalledServiceBootstrapStatus,
         unlock: SecretValue,
     ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
-        bootstrap::unlock(&self.paths, unlock).await
+        bootstrap::unlock(&self.paths, captured_status, unlock).await
     }
 
-    /// Retries unchanged preparation after a foreground platform-keyring interaction.
-    pub async fn bootstrap_retry_after_foreground_keyring(
+    /// Supplies the exact protected runtime credential from this foreground native owner.
+    pub async fn bootstrap_foreground_keyring(
         &self,
+        captured_status: InstalledServiceBootstrapStatus,
     ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
-        bootstrap::retry_after_foreground_keyring(&self.paths).await
+        if captured_status.state() != InstalledServiceBootstrapState::Required
+            || captured_status.requirement()
+                != Some(BootstrapRequirement::ForegroundKeyringCredential)
+            || captured_status.generation() == 0
+        {
+            return Err(InstalledServiceError::BootstrapRejected);
+        }
+        let installation_id = runtime::installation_id(&self.paths)?
+            .ok_or(InstalledServiceError::InvalidRuntimeState)?;
+        if captured_status.installation_id() != installation_id {
+            return Err(InstalledServiceError::BootstrapRejected);
+        }
+        let secret_store = runtime_secret_store(&self.paths)?;
+        let foreground = runtime::prepare_foreground_runtime_credential(
+            &self.paths,
+            secret_store.as_ref(),
+            installation_id,
+        )?;
+        bootstrap::provide_foreground_credential(&self.paths, captured_status, foreground).await
     }
 
     /// Applies one explicit native Schwab callback-trust action to this installation.
@@ -530,14 +550,12 @@ impl InstalledService {
         let cleanup_paths = installation_paths.clone();
         let cleanup_store = Arc::clone(&secret_store);
         let result = async move {
-            let mut interaction = SecretInteractionPolicy::Forbid;
             let mut runtime = loop {
                 match PreparedRuntime::prepare(
                     &installation_paths,
                     Arc::clone(&secret_store),
                     selection.identity(),
                     installation_id,
-                    interaction,
                 )
                 .await
                 {
@@ -547,26 +565,45 @@ impl InstalledService {
                             &installation_paths,
                             secret_store.as_ref(),
                             &error,
-                            interaction,
                         )?
                         else {
                             return Err(error);
+                        };
+                        let admission = match requirement {
+                            BootstrapRequirement::EncryptedFallbackLocked => {
+                                bootstrap::BootstrapAdmission::EncryptedFallbackUnlock
+                            }
+                            BootstrapRequirement::ForegroundKeyringCredential => {
+                                let [expected_reference] = runtime::credential_references(
+                                    &installation_paths,
+                                )?
+                                .try_into()
+                                .map_err(|_| InstalledServiceError::InvalidRuntimeState)?;
+                                bootstrap::BootstrapAdmission::ForegroundKeyringCredential {
+                                    expected_reference,
+                                }
+                            }
                         };
                         let action = bootstrap::wait_for_action(
                             &installation_paths,
                             Arc::clone(&secret_store),
                             installation_id,
-                            requirement,
+                            admission,
                         )
                         .await?;
-                        interaction = match action {
-                            bootstrap::BootstrapAction::Retry => {
-                                SecretInteractionPolicy::AllowPlatformPrompt
+                        match action {
+                            bootstrap::BootstrapAction::ForegroundCredential(foreground) => {
+                                break PreparedRuntime::prepare_with_foreground_credential(
+                                    &installation_paths,
+                                    Arc::clone(&secret_store),
+                                    selection.identity(),
+                                    installation_id,
+                                    foreground,
+                                )
+                                .await?;
                             }
-                            bootstrap::BootstrapAction::UnlockAccepted => {
-                                SecretInteractionPolicy::Forbid
-                            }
-                        };
+                            bootstrap::BootstrapAction::UnlockAccepted => {}
+                        }
                     }
                 }
             };
@@ -1460,15 +1497,13 @@ fn recoverable_bootstrap_requirement(
     paths: &LocalPaths,
     secret_store: &dyn SecretStore,
     error: &InstalledServiceError,
-    interaction: SecretInteractionPolicy,
 ) -> Result<Option<BootstrapRequirement>, InstalledServiceError> {
     if matches!(
         error,
         InstalledServiceError::SecretInteractionRequired
             | InstalledServiceError::Credential(CredentialError::SecretInteractionRequired)
     ) {
-        return Ok(matches!(interaction, SecretInteractionPolicy::Forbid)
-            .then_some(BootstrapRequirement::ForegroundKeyringRetry));
+        return Ok(Some(BootstrapRequirement::ForegroundKeyringCredential));
     }
     let credential_condition = matches!(
         error,
@@ -1479,8 +1514,7 @@ fn recoverable_bootstrap_requirement(
         return Ok(None);
     }
     if !runtime::encrypted_fallback_eligible(paths)? {
-        return Ok(matches!(interaction, SecretInteractionPolicy::Forbid)
-            .then_some(BootstrapRequirement::ForegroundKeyringRetry));
+        return Ok(Some(BootstrapRequirement::ForegroundKeyringCredential));
     }
     match secret_store
         .encrypted_file_fallback_status()

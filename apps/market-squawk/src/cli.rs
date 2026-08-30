@@ -943,11 +943,11 @@ pub enum ServiceCommand {
     /// Complete the short-lived owner-authenticated credential bootstrap.
     Bootstrap {
         /// Read one bounded unlock from standard input instead of a no-echo terminal prompt.
-        #[arg(long, conflicts_with = "retry_after_foreground_keyring")]
+        #[arg(long, conflicts_with = "complete_foreground_keyring")]
         stdin: bool,
-        /// Retry after foreground code completed the platform keyring interaction.
+        /// Complete the protected-keyring handoff from this foreground process.
         #[arg(long)]
-        retry_after_foreground_keyring: bool,
+        complete_foreground_keyring: bool,
     },
 }
 

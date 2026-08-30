@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tokio::net::TcpListener;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use super::{
     InstalledServiceError,
@@ -90,6 +91,61 @@ enum DurableRuntimeDocument {
     Active {
         state: DurableRuntimeState,
     },
+}
+
+/// Exact protected runtime credential transferred once by the foreground owner.
+///
+/// The credential is bound to both the installation and the durable secret reference. It is
+/// deliberately neither cloneable nor serializable; bootstrap IPC is the only cross-process
+/// boundary and consumes it into the prepared runtime.
+pub(super) struct ForegroundRuntimeCredential {
+    installation_id: InstallationId,
+    reference: SecretRef,
+    credential: SecretValue,
+}
+
+impl ForegroundRuntimeCredential {
+    pub(super) fn try_new(
+        installation_id: InstallationId,
+        reference: SecretRef,
+        credential: SecretValue,
+    ) -> Result<Self, InstalledServiceError> {
+        if reference.generation().get() != 1 {
+            return Err(InstalledServiceError::InvalidRuntimeState);
+        }
+        Ok(Self {
+            installation_id,
+            reference,
+            credential,
+        })
+    }
+
+    pub(super) const fn installation_id(&self) -> InstallationId {
+        self.installation_id
+    }
+
+    pub(super) const fn reference(&self) -> &SecretRef {
+        &self.reference
+    }
+
+    pub(super) const fn credential(&self) -> &SecretValue {
+        &self.credential
+    }
+
+    pub(super) fn into_parts(self) -> (InstallationId, SecretRef, SecretValue) {
+        (self.installation_id, self.reference, self.credential)
+    }
+}
+
+impl std::fmt::Debug for ForegroundRuntimeCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ForegroundRuntimeCredential")
+            .field("installation_id", &self.installation_id)
+            .field("reference", &self.reference)
+            .field("credential", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -163,7 +219,6 @@ impl PreparedRuntime {
         secret_store: Arc<dyn SecretStore>,
         selected: WorkspaceRuntimeIdentity,
         installation_id: InstallationId,
-        interaction: SecretInteractionPolicy,
     ) -> Result<Self, InstalledServiceError> {
         let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
         let identity_store =
@@ -172,8 +227,50 @@ impl PreparedRuntime {
             &identity_store,
             secret_store.as_ref(),
             installation_id,
-            interaction,
+            SecretInteractionPolicy::Forbid,
         )?;
+        drop(identity_store);
+        Self::compose(paths, secret_store, selected, durable, signing_key).await
+    }
+
+    pub(super) async fn prepare_with_foreground_credential(
+        paths: &LocalPaths,
+        secret_store: Arc<dyn SecretStore>,
+        selected: WorkspaceRuntimeIdentity,
+        installation_id: InstallationId,
+        foreground: ForegroundRuntimeCredential,
+    ) -> Result<Self, InstalledServiceError> {
+        let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
+        let identity_store =
+            LocalAuthorityStateStore::try_open(service_root.join(IDENTITY_DIRECTORY))?;
+        let encoded = identity_store
+            .load()?
+            .ok_or(InstalledServiceError::InvalidRuntimeState)?;
+        let durable = match decode_runtime_document(&encoded)? {
+            DurableRuntimeDocument::Active { state } => state.validate()?,
+            DurableRuntimeDocument::Initializing { .. } => {
+                return Err(InstalledServiceError::InvalidRuntimeState);
+            }
+        };
+        let (foreground_installation_id, reference, signing_key) = foreground.into_parts();
+        if foreground_installation_id != installation_id
+            || durable.installation_id != installation_id
+            || durable.rendezvous_signing_secret != reference
+        {
+            return Err(InstalledServiceError::InvalidRuntimeState);
+        }
+        drop(identity_store);
+        Self::compose(paths, secret_store, selected, durable, signing_key).await
+    }
+
+    async fn compose(
+        paths: &LocalPaths,
+        secret_store: Arc<dyn SecretStore>,
+        selected: WorkspaceRuntimeIdentity,
+        durable: DurableRuntimeState,
+        signing_key: SecretValue,
+    ) -> Result<Self, InstalledServiceError> {
+        let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
         let runtime = selected
             .to_runtime(durable.installation_id)
             .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?;
@@ -225,7 +322,6 @@ impl PreparedRuntime {
                 .registration(NamedClient::Cli)
                 .ok_or(InstalledServiceError::InvalidRuntimeState)?,
         )?;
-        drop(identity_store);
         let verifier = SystemProcessIdentityVerifier;
         let process = verifier.current()?;
         let published_at = wall_now()?;
@@ -237,10 +333,9 @@ impl PreparedRuntime {
             process,
             published_at,
         )?;
-        let rendezvous = RendezvousAuthority::try_open(
-            service_root.join(RENDEZVOUS_DIRECTORY),
-            duplicate_secret(&signing_key)?,
-        )?;
+        let rendezvous =
+            RendezvousAuthority::try_open(service_root.join(RENDEZVOUS_DIRECTORY), signing_key)?;
+        let _authenticated_prior = rendezvous.encoded_current()?;
         Ok(Self {
             state,
             secret_store,
@@ -345,6 +440,27 @@ impl PreparedRuntime {
     pub(super) const fn record(&self) -> &RendezvousRecord {
         &self.record
     }
+}
+
+pub(super) fn prepare_foreground_runtime_credential(
+    paths: &LocalPaths,
+    secret_store: &dyn SecretStore,
+    installation_id: InstallationId,
+) -> Result<ForegroundRuntimeCredential, InstalledServiceError> {
+    let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
+    let identity_store = LocalAuthorityStateStore::try_open(service_root.join(IDENTITY_DIRECTORY))?;
+    let (durable, credential) = prepare_runtime_authority(
+        &identity_store,
+        secret_store,
+        installation_id,
+        SecretInteractionPolicy::AllowPlatformPrompt,
+    )?;
+    drop(identity_store);
+    ForegroundRuntimeCredential::try_new(
+        durable.installation_id,
+        durable.rendezvous_signing_secret,
+        credential,
+    )
 }
 
 pub(super) fn acquire_instance(
@@ -586,17 +702,18 @@ fn store_runtime_document(
 }
 
 fn random_secret() -> Result<SecretValue, InstalledServiceError> {
-    let mut bytes = [0_u8; SIGNING_SECRET_BYTES];
-    fill_random(&mut bytes).map_err(|_error| InstalledServiceError::EntropyUnavailable)?;
+    let mut bytes = Zeroizing::new([0_u8; SIGNING_SECRET_BYTES]);
+    fill_random(&mut *bytes).map_err(|_error| InstalledServiceError::EntropyUnavailable)?;
     if bytes.iter().all(|byte| *byte == 0) {
         return Err(InstalledServiceError::EntropyUnavailable);
     }
     let mut encoded = String::with_capacity(SIGNING_SECRET_BYTES * 2);
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
+    for byte in bytes.iter().copied() {
         encoded.push(char::from(HEX[usize::from(byte >> 4)]));
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
+    drop(bytes);
     SecretValue::new(encoded).map_err(|_error| InstalledServiceError::EntropyUnavailable)
 }
 

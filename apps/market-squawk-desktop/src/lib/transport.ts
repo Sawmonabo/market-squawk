@@ -244,7 +244,7 @@ export type InstallationControlRequest =
 
 export type DesktopServiceBootstrapRequest =
   | { action: "unlock_encrypted_fallback"; unlock: string }
-  | { action: "retry_after_foreground_keyring" }
+  | { action: "complete_foreground_keyring" }
 
 export type ProviderOnboardingRequest =
   | { action: "bootstrap" }

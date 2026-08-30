@@ -124,31 +124,47 @@ impl DesktopBootstrapState {
     async fn status(&self) -> Result<DesktopServiceBootstrapStatus, DesktopCommandError> {
         let pending = self.pending.lock().await;
         let pending = pending.as_ref().ok_or_else(DesktopCommandError::internal)?;
-        Ok(pending_bootstrap_status(pending))
+        pending_bootstrap_status(pending)
     }
 
-    async fn pending_status(&self) -> Option<DesktopServiceBootstrapStatus> {
+    async fn pending_status(
+        &self,
+    ) -> Result<Option<DesktopServiceBootstrapStatus>, DesktopCommandError> {
         self.pending
             .lock()
             .await
             .as_ref()
             .map(pending_bootstrap_status)
+            .transpose()
     }
 }
 
-fn pending_bootstrap_status(pending: &PendingDesktopBootstrap) -> DesktopServiceBootstrapStatus {
+fn pending_bootstrap_status(
+    pending: &PendingDesktopBootstrap,
+) -> Result<DesktopServiceBootstrapStatus, DesktopCommandError> {
     let service = match pending {
         PendingDesktopBootstrap::Initial { service, .. }
         | PendingDesktopBootstrap::Reconnect { service, .. } => service,
     };
-    DesktopServiceBootstrapStatus::required(match service.requirement() {
-        BootstrapRequirement::EncryptedFallbackLocked => {
-            DesktopServiceBootstrapRequirement::EncryptedFallbackLocked
-        }
-        BootstrapRequirement::ForegroundKeyringRetry => {
-            DesktopServiceBootstrapRequirement::ForegroundKeyringRetry
-        }
-    })
+    desktop_bootstrap_status(service)
+}
+
+fn desktop_bootstrap_status(
+    service: &DesktopServiceBootstrap,
+) -> Result<DesktopServiceBootstrapStatus, DesktopCommandError> {
+    Ok(DesktopServiceBootstrapStatus::required(
+        match service
+            .requirement()
+            .ok_or_else(DesktopCommandError::internal)?
+        {
+            BootstrapRequirement::EncryptedFallbackLocked => {
+                DesktopServiceBootstrapRequirement::EncryptedFallbackLocked
+            }
+            BootstrapRequirement::ForegroundKeyringCredential => {
+                DesktopServiceBootstrapRequirement::ForegroundKeyringCredential
+            }
+        },
+    ))
 }
 
 fn manage_ready_desktop(
@@ -1198,7 +1214,7 @@ pub(crate) async fn desktop_bootstrap(
     bootstrap_state: State<'_, DesktopBootstrapState>,
 ) -> Result<DesktopStartup, DesktopCommandError> {
     let _reconnect_guard = bootstrap_state.reconnect_gate.lock().await;
-    if let Some(status) = bootstrap_state.pending_status().await {
+    if let Some(status) = bootstrap_state.pending_status().await? {
         return Ok(DesktopStartup::BootstrapRequired(status));
     }
     if let Some(state) = app.try_state::<DesktopState>() {
@@ -1224,7 +1240,7 @@ pub(crate) async fn desktop_service_bootstrap(
     if window.label() != "main" {
         return Err(DesktopCommandError::new(
             "service_bootstrap_unavailable",
-            "The local service bootstrap action is not available for this window.",
+            "Secure startup is available only from the main Market Squawk window.",
         ));
     }
     let action = match request {
@@ -1232,12 +1248,12 @@ pub(crate) async fn desktop_service_bootstrap(
             DesktopBootstrapAction::Unlock(SecretValue::new(unlock).map_err(|_error| {
                 DesktopCommandError::new(
                     "service_bootstrap_rejected",
-                    "The local service rejected the bounded bootstrap action.",
+                    "Market Squawk could not use that secure-startup request.",
                 )
             })?)
         }
-        DesktopServiceBootstrapCommand::RetryAfterForegroundKeyring => {
-            DesktopBootstrapAction::RetryAfterForegroundKeyring
+        DesktopServiceBootstrapCommand::CompleteForegroundKeyring => {
+            DesktopBootstrapAction::CompleteForegroundKeyring
         }
     };
     let _reconnect_guard = bootstrap_state.reconnect_gate.lock().await;
@@ -1245,7 +1261,7 @@ pub(crate) async fn desktop_service_bootstrap(
     let pending = pending_guard.as_ref().ok_or_else(|| {
         DesktopCommandError::new(
             "service_bootstrap_unavailable",
-            "The local service bootstrap action is no longer available.",
+            "Secure startup is no longer waiting for this action.",
         )
     })?;
     let service = match pending {
@@ -1257,7 +1273,7 @@ pub(crate) async fn desktop_service_bootstrap(
         .map_err(|_error| {
             DesktopCommandError::new(
                 "service_bootstrap_failed",
-                "The local service could not complete credential bootstrap and reconnect.",
+                "Market Squawk could not complete secure startup. Try again.",
             )
         })?;
     match pending_guard
@@ -1349,14 +1365,7 @@ pub(crate) async fn desktop_service_reconnect(
             Ok(DesktopStartup::Ready(Box::new(bootstrap)))
         }
         DesktopServiceStartup::BootstrapRequired(service) => {
-            let status = DesktopServiceBootstrapStatus::required(match service.requirement() {
-                BootstrapRequirement::EncryptedFallbackLocked => {
-                    DesktopServiceBootstrapRequirement::EncryptedFallbackLocked
-                }
-                BootstrapRequirement::ForegroundKeyringRetry => {
-                    DesktopServiceBootstrapRequirement::ForegroundKeyringRetry
-                }
-            });
+            let status = desktop_bootstrap_status(&service)?;
             *bootstrap_state.pending.lock().await = Some(PendingDesktopBootstrap::Reconnect {
                 service,
                 expected_runtime,

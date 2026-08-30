@@ -13,8 +13,8 @@ use market_squawk::{
     SchwabOAuthInstallationCapabilityError, SchwabOAuthInstallationTrustAction,
     SchwabOAuthInstallationTrustState,
     service::{
-        BootstrapRequirement, InstalledServiceBootstrapState, InstalledServiceConnector,
-        InstalledServiceError,
+        BootstrapRequirement, InstalledServiceBootstrapState, InstalledServiceBootstrapStatus,
+        InstalledServiceConnector, InstalledServiceError,
     },
     verified_installed_service_program,
 };
@@ -49,12 +49,12 @@ pub(crate) enum DesktopServiceStartup {
 
 pub(crate) struct DesktopServiceBootstrap {
     authority: Arc<DesktopServiceAuthority>,
-    requirement: BootstrapRequirement,
+    status: InstalledServiceBootstrapStatus,
 }
 
 impl DesktopServiceBootstrap {
-    pub(crate) const fn requirement(&self) -> BootstrapRequirement {
-        self.requirement
+    pub(crate) const fn requirement(&self) -> Option<BootstrapRequirement> {
+        self.status.requirement()
     }
 }
 
@@ -96,7 +96,7 @@ struct DesktopServiceLaunch {
 
 pub(crate) enum DesktopBootstrapAction {
     Unlock(SecretValue),
-    RetryAfterForegroundKeyring,
+    CompleteForegroundKeyring,
 }
 
 #[derive(Debug, Error)]
@@ -267,16 +267,23 @@ pub(crate) async fn complete_bootstrap(
     bootstrap: &DesktopServiceBootstrap,
     action: DesktopBootstrapAction,
 ) -> Result<DesktopServiceConnection, DesktopServiceError> {
-    let action = admit_bootstrap_action(bootstrap.requirement, action)?;
+    let requirement = bootstrap
+        .requirement()
+        .ok_or(DesktopServiceError::InvalidBootstrap)?;
+    let action = admit_bootstrap_action(requirement, action)?;
     let status = match action {
         DesktopBootstrapAction::Unlock(unlock) => {
-            bootstrap.authority.connector.bootstrap_unlock(unlock).await
-        }
-        DesktopBootstrapAction::RetryAfterForegroundKeyring => {
             bootstrap
                 .authority
                 .connector
-                .bootstrap_retry_after_foreground_keyring()
+                .bootstrap_unlock(bootstrap.status, unlock)
+                .await
+        }
+        DesktopBootstrapAction::CompleteForegroundKeyring => {
+            bootstrap
+                .authority
+                .connector
+                .bootstrap_foreground_keyring(bootstrap.status)
                 .await
         }
     }
@@ -298,8 +305,8 @@ fn admit_bootstrap_action(
             BootstrapRequirement::EncryptedFallbackLocked,
             DesktopBootstrapAction::Unlock(_)
         ) | (
-            BootstrapRequirement::ForegroundKeyringRetry,
-            DesktopBootstrapAction::RetryAfterForegroundKeyring
+            BootstrapRequirement::ForegroundKeyringCredential,
+            DesktopBootstrapAction::CompleteForegroundKeyring
         )
     ) {
         Ok(action)
@@ -318,9 +325,7 @@ async fn bootstrap_required(
         {
             Ok(Some(DesktopServiceBootstrap {
                 authority: Arc::clone(authority),
-                requirement: status
-                    .requirement()
-                    .ok_or(DesktopServiceError::InvalidBootstrap)?,
+                status,
             }))
         }
         Ok(status)
@@ -446,14 +451,14 @@ mod tests {
         assert!(
             admit_bootstrap_action(
                 BootstrapRequirement::EncryptedFallbackLocked,
-                DesktopBootstrapAction::RetryAfterForegroundKeyring,
+                DesktopBootstrapAction::CompleteForegroundKeyring,
             )
             .is_err()
         );
         let unlock = SecretValue::new("process-local-test-unlock".to_owned())?;
         assert!(
             admit_bootstrap_action(
-                BootstrapRequirement::ForegroundKeyringRetry,
+                BootstrapRequirement::ForegroundKeyringCredential,
                 DesktopBootstrapAction::Unlock(unlock),
             )
             .is_err()

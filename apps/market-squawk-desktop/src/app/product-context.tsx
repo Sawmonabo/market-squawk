@@ -245,7 +245,7 @@ export function ProductProvider({
                   action: "unlock_encrypted_fallback",
                   unlock: unlock ?? "",
                 }
-              : { action: "retry_after_foreground_keyring" },
+              : { action: "complete_foreground_keyring" },
           )
           await bootstrap.refetch()
         } catch (error) {

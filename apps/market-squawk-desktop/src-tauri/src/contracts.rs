@@ -271,7 +271,7 @@ pub(crate) struct DesktopBootstrap {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DesktopServiceBootstrapRequirement {
     EncryptedFallbackLocked,
-    ForegroundKeyringRetry,
+    ForegroundKeyringCredential,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -303,11 +303,23 @@ pub(crate) enum DesktopStartup {
     BootstrapRequired(DesktopServiceBootstrapStatus),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "action")]
 pub(crate) enum DesktopServiceBootstrapCommand {
     UnlockEncryptedFallback { unlock: String },
-    RetryAfterForegroundKeyring,
+    CompleteForegroundKeyring,
+}
+
+impl fmt::Debug for DesktopServiceBootstrapCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnlockEncryptedFallback { unlock: _ } => formatter
+                .debug_struct("UnlockEncryptedFallback")
+                .field("unlock", &"[REDACTED]")
+                .finish(),
+            Self::CompleteForegroundKeyring => formatter.write_str("CompleteForegroundKeyring"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]

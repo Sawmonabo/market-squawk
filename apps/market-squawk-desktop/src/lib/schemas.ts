@@ -423,7 +423,7 @@ export const desktopServiceBootstrapSchema = z.object({
   status: z.literal("bootstrap_required"),
   requirement: z.enum([
     "encrypted_fallback_locked",
-    "foreground_keyring_retry",
+    "foreground_keyring_credential",
   ]),
 })
 

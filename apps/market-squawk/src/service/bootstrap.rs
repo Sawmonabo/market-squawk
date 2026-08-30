@@ -13,21 +13,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::{BufMut as _, Bytes};
-use futures_util::{SinkExt as _, StreamExt as _};
 use getrandom::fill as fill_random;
 use market_squawk_platform::{
     EncryptedFileFallbackStatus, EncryptedFileUnlockCapability, LocalPaths, SecretCancellation,
-    SecretInteractionPolicy, SecretOperationControl, SecretStore, SecretValue,
+    SecretInteractionPolicy, SecretOperationControl, SecretRef, SecretStore, SecretValue,
 };
 use market_squawk_runtime::InstallationId;
 use serde::Serialize;
-use tokio::io::AsyncWriteExt as _;
-use tokio_util::codec::LengthDelimitedCodec;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use uuid::Uuid;
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
-use super::InstalledServiceError;
+use super::{InstalledServiceError, runtime::ForegroundRuntimeCredential};
 
 #[cfg(unix)]
 use self::unix as platform;
@@ -42,20 +39,22 @@ const PREFACE: &[u8; 8] = b"MSQB\0\x01\0\0";
 const PROTOCOL_VERSION: u16 = 1;
 const MAXIMUM_FRAME_BYTES: usize = 64 * 1024;
 const MAXIMUM_UNLOCK_BYTES: usize = 4 * 1024;
+const MAXIMUM_CREDENTIAL_BYTES: usize = 4 * 1024;
+const MAXIMUM_REFERENCE_BYTES: usize = 1024;
 const MAXIMUM_CONNECTIONS: usize = 16;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const TOTAL_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const TRAILING_DATA_TIMEOUT: Duration = Duration::from_millis(100);
 const SECRET_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Non-secret credential condition that permits a bounded foreground retry.
+/// Non-secret credential condition that permits one bounded foreground action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BootstrapRequirement {
     /// The configured encrypted fallback needs explicit user-held unlock material.
     EncryptedFallbackLocked,
-    /// The foreground process completed a platform keyring interaction and may request retry.
-    ForegroundKeyringRetry,
+    /// The foreground process must supply the exact protected runtime credential.
+    ForegroundKeyringCredential,
 }
 
 /// Closed bootstrap-channel lifecycle state.
@@ -104,10 +103,39 @@ impl InstalledServiceBootstrapStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(super) enum BootstrapAction {
-    Retry,
+    ForegroundCredential(ForegroundRuntimeCredential),
     UnlockAccepted,
+}
+
+#[derive(Debug)]
+pub(super) enum BootstrapAdmission {
+    EncryptedFallbackUnlock,
+    ForegroundKeyringCredential { expected_reference: SecretRef },
+}
+
+impl BootstrapAdmission {
+    const fn requirement(&self) -> BootstrapRequirement {
+        match self {
+            Self::EncryptedFallbackUnlock => BootstrapRequirement::EncryptedFallbackLocked,
+            Self::ForegroundKeyringCredential { .. } => {
+                BootstrapRequirement::ForegroundKeyringCredential
+            }
+        }
+    }
+
+    fn admits_foreground_reference(&self, reference: &SecretRef) -> bool {
+        matches!(
+            self,
+            Self::ForegroundKeyringCredential { expected_reference }
+                if expected_reference == reference
+        )
+    }
+
+    const fn admits_fallback_unlock(&self) -> bool {
+        matches!(self, Self::EncryptedFallbackUnlock)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,11 +145,30 @@ struct BootstrapMetadata {
     requirement: BootstrapRequirement,
 }
 
-#[derive(Debug)]
 enum BootstrapCommand {
     Status,
-    RetryAfterForegroundKeyring,
+    ProvideForegroundCredential {
+        reference: SecretRef,
+        credential: SecretValue,
+    },
     UnlockEncryptedFallback(SecretValue),
+}
+
+impl std::fmt::Debug for BootstrapCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Status => formatter.write_str("Status"),
+            Self::ProvideForegroundCredential { reference, .. } => formatter
+                .debug_struct("ProvideForegroundCredential")
+                .field("reference", reference)
+                .field("credential", &"[REDACTED]")
+                .finish(),
+            Self::UnlockEncryptedFallback(_) => formatter
+                .debug_tuple("UnlockEncryptedFallback")
+                .field(&"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -141,14 +188,14 @@ pub(super) async fn wait_for_action(
     paths: &LocalPaths,
     secret_store: Arc<dyn SecretStore>,
     installation_id: InstallationId,
-    requirement: BootstrapRequirement,
+    admission: BootstrapAdmission,
 ) -> Result<BootstrapAction, InstalledServiceError> {
     let root = bootstrap_root(paths)?;
     let generation = random_generation()?;
     let metadata = BootstrapMetadata {
         installation_id,
         generation,
-        requirement,
+        requirement: admission.requirement(),
     };
     let listener = platform::Listener::bind(&root)?;
     publish_metadata(&root, metadata)?;
@@ -166,7 +213,7 @@ pub(super) async fn wait_for_action(
             .map_err(|_elapsed| InstalledServiceError::BootstrapDeadline)??;
         match tokio::time::timeout(
             CONNECTION_TIMEOUT,
-            serve_connection(stream, metadata, Arc::clone(&secret_store)),
+            serve_connection(stream, metadata, &admission, Arc::clone(&secret_store)),
         )
         .await
         {
@@ -180,78 +227,129 @@ pub(super) async fn wait_for_action(
 pub(super) async fn status(
     paths: &LocalPaths,
 ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
-    request(paths, BootstrapCommand::Status).await
+    let root = bootstrap_root(paths)?;
+    let metadata = load_metadata(&root)?;
+    request_exact_at_root(&root, metadata, BootstrapCommand::Status).await
 }
 
 pub(super) async fn unlock(
     paths: &LocalPaths,
+    captured_status: InstalledServiceBootstrapStatus,
     unlock: SecretValue,
 ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
-    request(paths, BootstrapCommand::UnlockEncryptedFallback(unlock)).await
+    let metadata = required_metadata(
+        captured_status,
+        BootstrapRequirement::EncryptedFallbackLocked,
+    )?;
+    request_exact(
+        paths,
+        metadata,
+        BootstrapCommand::UnlockEncryptedFallback(unlock),
+    )
+    .await
 }
 
-pub(super) async fn retry_after_foreground_keyring(
+pub(super) async fn provide_foreground_credential(
     paths: &LocalPaths,
+    captured_status: InstalledServiceBootstrapStatus,
+    foreground: ForegroundRuntimeCredential,
 ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
-    request(paths, BootstrapCommand::RetryAfterForegroundKeyring).await
+    let metadata = required_metadata(
+        captured_status,
+        BootstrapRequirement::ForegroundKeyringCredential,
+    )?;
+    let (installation_id, reference, credential) = foreground.into_parts();
+    if installation_id != metadata.installation_id {
+        return Err(InstalledServiceError::BootstrapRejected);
+    }
+    request_exact(
+        paths,
+        metadata,
+        BootstrapCommand::ProvideForegroundCredential {
+            reference,
+            credential,
+        },
+    )
+    .await
 }
 
-async fn request(
+async fn request_exact(
     paths: &LocalPaths,
+    metadata: BootstrapMetadata,
     command: BootstrapCommand,
 ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
     let root = bootstrap_root(paths)?;
-    let metadata = load_metadata(&root)?;
-    let mut stream = platform::connect(&root).await?;
-    stream.write_all(PREFACE).await?;
-    let mut framed = codec().new_framed(stream);
-    let frame = encode_request(metadata, command)?;
-    framed
-        .send(Bytes::from(frame))
-        .await
-        .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?;
-    framed
-        .get_mut()
-        .shutdown()
-        .await
-        .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?;
-    let response = tokio::time::timeout(CONNECTION_TIMEOUT, framed.next())
-        .await
-        .map_err(|_elapsed| InstalledServiceError::BootstrapDeadline)?
-        .ok_or(InstalledServiceError::BootstrapUnavailable)?
-        .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?;
-    decode_response(&response, metadata)
+    request_exact_at_root(&root, metadata, command).await
+}
+
+async fn request_exact_at_root(
+    root: &Path,
+    metadata: BootstrapMetadata,
+    command: BootstrapCommand,
+) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
+    let deadline = Instant::now()
+        .checked_add(CONNECTION_TIMEOUT)
+        .ok_or(InstalledServiceError::BootstrapUnavailable)?;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(InstalledServiceError::BootstrapDeadline)?;
+    tokio::time::timeout(remaining, async move {
+        let mut stream = platform::connect(root).await?;
+        stream.write_all(PREFACE).await?;
+        let frame = encode_request(metadata, command)?;
+        write_frame(&mut stream, &frame).await?;
+        drop(frame);
+        stream
+            .shutdown()
+            .await
+            .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?;
+        let response = read_frame(&mut stream)
+            .await
+            .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?;
+        let status = decode_response(&response, metadata)?;
+        require_no_trailing_data(&mut stream).await?;
+        Ok(status)
+    })
+    .await
+    .map_err(|_elapsed| InstalledServiceError::BootstrapDeadline)?
 }
 
 async fn serve_connection(
     mut stream: platform::Stream,
     metadata: BootstrapMetadata,
+    admission: &BootstrapAdmission,
     secret_store: Arc<dyn SecretStore>,
 ) -> Result<Option<BootstrapAction>, InstalledServiceError> {
     platform::authenticate_preface(&mut stream).await?;
-    let mut framed = codec().new_framed(stream);
-    let mut frame = framed
-        .next()
-        .await
-        .ok_or(InstalledServiceError::BootstrapProtocol)?
-        .map_err(|_error| InstalledServiceError::BootstrapProtocol)?;
+    let frame = read_frame(&mut stream).await?;
     let request = decode_request(&frame, metadata)?;
-    frame.as_mut().zeroize();
-    // A quiet window is sufficient: this handler executes exactly one decoded action and closes,
-    // so incomplete or delayed trailing bytes are discarded and can never become a second action.
-    match tokio::time::timeout(TRAILING_DATA_TIMEOUT, framed.next()).await {
-        Ok(None) | Err(_) => {}
-        Ok(Some(_)) => return Err(InstalledServiceError::BootstrapProtocol),
-    }
+    drop(frame);
+    require_no_trailing_data(&mut stream).await?;
     if Instant::now() >= request.deadline {
         return Err(InstalledServiceError::BootstrapDeadline);
     }
     let (code, action) = match request.command {
         BootstrapCommand::Status => (ResponseCode::Required, None),
-        BootstrapCommand::RetryAfterForegroundKeyring => {
-            (ResponseCode::Retrying, Some(BootstrapAction::Retry))
+        BootstrapCommand::ProvideForegroundCredential {
+            reference,
+            credential,
+        } if metadata.requirement == BootstrapRequirement::ForegroundKeyringCredential
+            && admission.admits_foreground_reference(&reference) =>
+        {
+            let foreground = ForegroundRuntimeCredential::try_new(
+                metadata.installation_id,
+                reference,
+                credential,
+            )?;
+            (
+                ResponseCode::Retrying,
+                Some(BootstrapAction::ForegroundCredential(foreground)),
+            )
         }
-        BootstrapCommand::UnlockEncryptedFallback(unlock) => {
+        BootstrapCommand::UnlockEncryptedFallback(unlock)
+            if metadata.requirement == BootstrapRequirement::EncryptedFallbackLocked
+                && admission.admits_fallback_unlock() =>
+        {
             let control = bootstrap_secret_control()?;
             let status = secret_store
                 .unlock_encrypted_file_fallback(
@@ -268,58 +366,159 @@ async fn serve_connection(
                 )
             }
         }
+        BootstrapCommand::ProvideForegroundCredential { .. }
+        | BootstrapCommand::UnlockEncryptedFallback(_) => (ResponseCode::Rejected, None),
     };
-    framed
-        .send(Bytes::from(encode_response(metadata, code)))
-        .await
-        .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?;
-    framed
-        .close()
-        .await
-        .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?;
+    let response = encode_response(metadata, code);
+    write_frame(&mut stream, &response).await?;
+    // Returning immediately after the acknowledged frame keeps credential handoff and connection
+    // close in the same poll; there is no cancellation point where the client can observe
+    // acceptance after the server has dropped the accepted credential.
     Ok(action)
 }
 
-fn codec() -> tokio_util::codec::length_delimited::Builder {
-    let mut builder = LengthDelimitedCodec::builder();
-    builder
-        .big_endian()
-        .length_field_length(4)
-        .max_frame_length(MAXIMUM_FRAME_BYTES);
-    builder
+fn required_metadata(
+    status: InstalledServiceBootstrapStatus,
+    requirement: BootstrapRequirement,
+) -> Result<BootstrapMetadata, InstalledServiceError> {
+    if status.state != InstalledServiceBootstrapState::Required
+        || status.requirement != Some(requirement)
+        || status.generation == 0
+    {
+        return Err(InstalledServiceError::BootstrapRejected);
+    }
+    Ok(BootstrapMetadata {
+        installation_id: status.installation_id,
+        generation: status.generation,
+        requirement,
+    })
+}
+
+async fn write_frame(
+    stream: &mut platform::Stream,
+    frame: &[u8],
+) -> Result<(), InstalledServiceError> {
+    if frame.is_empty() || frame.len() > MAXIMUM_FRAME_BYTES {
+        return Err(InstalledServiceError::BootstrapProtocol);
+    }
+    let length = u32::try_from(frame.len())
+        .map_err(|_error| InstalledServiceError::BootstrapProtocol)?
+        .to_be_bytes();
+    stream
+        .write_all(&length)
+        .await
+        .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?;
+    stream
+        .write_all(frame)
+        .await
+        .map_err(|_error| InstalledServiceError::BootstrapUnavailable)
+}
+
+async fn read_frame(
+    stream: &mut platform::Stream,
+) -> Result<Zeroizing<Vec<u8>>, InstalledServiceError> {
+    let mut length = [0_u8; 4];
+    stream
+        .read_exact(&mut length)
+        .await
+        .map_err(|_error| InstalledServiceError::BootstrapProtocol)?;
+    let length = usize::try_from(u32::from_be_bytes(length))
+        .map_err(|_error| InstalledServiceError::BootstrapProtocol)?;
+    if length == 0 || length > MAXIMUM_FRAME_BYTES {
+        return Err(InstalledServiceError::BootstrapProtocol);
+    }
+    let mut frame = zeroizing_buffer(length)?;
+    frame.resize(length, 0);
+    stream
+        .read_exact(&mut frame)
+        .await
+        .map_err(|_error| InstalledServiceError::BootstrapProtocol)?;
+    Ok(frame)
+}
+
+async fn require_no_trailing_data(
+    stream: &mut platform::Stream,
+) -> Result<(), InstalledServiceError> {
+    let mut trailing = [0_u8; 1];
+    let outcome = tokio::time::timeout(TRAILING_DATA_TIMEOUT, stream.read(&mut trailing)).await;
+    let result = match outcome {
+        Ok(Ok(0)) => Ok(()),
+        Ok(Ok(_)) | Ok(Err(_)) => Err(InstalledServiceError::BootstrapProtocol),
+        Err(_) => Err(InstalledServiceError::BootstrapDeadline),
+    };
+    trailing.zeroize();
+    result
 }
 
 fn encode_request(
     metadata: BootstrapMetadata,
     command: BootstrapCommand,
-) -> Result<Vec<u8>, InstalledServiceError> {
-    let (command_code, mut payload) = match command {
-        BootstrapCommand::Status => (1_u8, Vec::new()),
-        BootstrapCommand::RetryAfterForegroundKeyring => (2, Vec::new()),
+) -> Result<Zeroizing<Vec<u8>>, InstalledServiceError> {
+    let (command_code, payload) = match command {
+        BootstrapCommand::Status => (1_u8, Zeroizing::new(Vec::new())),
+        BootstrapCommand::ProvideForegroundCredential {
+            reference,
+            credential,
+        } => {
+            let reference = serde_json::to_vec(&reference)
+                .map_err(|_error| InstalledServiceError::BootstrapProtocol)?;
+            let credential_bytes = credential.expose_secret().as_bytes();
+            if reference.is_empty()
+                || reference.len() > MAXIMUM_REFERENCE_BYTES
+                || credential_bytes.is_empty()
+                || credential_bytes.len() > MAXIMUM_CREDENTIAL_BYTES
+            {
+                return Err(InstalledServiceError::BootstrapProtocol);
+            }
+            let payload_length = 4_usize
+                .checked_add(reference.len())
+                .and_then(|length| length.checked_add(credential_bytes.len()))
+                .ok_or(InstalledServiceError::BootstrapProtocol)?;
+            let mut payload = zeroizing_buffer(payload_length)?;
+            payload.extend_from_slice(
+                &u16::try_from(reference.len())
+                    .map_err(|_error| InstalledServiceError::BootstrapProtocol)?
+                    .to_be_bytes(),
+            );
+            payload.extend_from_slice(
+                &u16::try_from(credential_bytes.len())
+                    .map_err(|_error| InstalledServiceError::BootstrapProtocol)?
+                    .to_be_bytes(),
+            );
+            payload.extend_from_slice(&reference);
+            payload.extend_from_slice(credential_bytes);
+            drop(credential);
+            (2, payload)
+        }
         BootstrapCommand::UnlockEncryptedFallback(unlock) => {
-            let payload = unlock.expose_secret().as_bytes().to_vec();
+            let unlock_bytes = unlock.expose_secret().as_bytes();
+            if unlock_bytes.is_empty() || unlock_bytes.len() > MAXIMUM_UNLOCK_BYTES {
+                return Err(InstalledServiceError::BootstrapProtocol);
+            }
+            let mut payload = zeroizing_buffer(unlock_bytes.len())?;
+            payload.extend_from_slice(unlock_bytes);
             drop(unlock);
             (3, payload)
         }
     };
-    if payload.len() > MAXIMUM_UNLOCK_BYTES {
-        payload.zeroize();
-        return Err(InstalledServiceError::BootstrapProtocol);
-    }
     let payload_len =
         u16::try_from(payload.len()).map_err(|_error| InstalledServiceError::BootstrapProtocol)?;
-    let mut encoded = Vec::with_capacity(33 + payload.len());
-    encoded.put_u16(PROTOCOL_VERSION);
+    let frame_length = 33_usize
+        .checked_add(payload.len())
+        .filter(|length| *length <= MAXIMUM_FRAME_BYTES)
+        .ok_or(InstalledServiceError::BootstrapProtocol)?;
+    let mut encoded = zeroizing_buffer(frame_length)?;
+    encoded.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
     encoded.extend_from_slice(metadata.installation_id.as_uuid().as_bytes());
-    encoded.put_u64(metadata.generation);
-    encoded.put_u8(command_code);
-    encoded.put_u32(
-        u32::try_from(CONNECTION_TIMEOUT.as_millis())
-            .map_err(|_error| InstalledServiceError::BootstrapProtocol)?,
+    encoded.extend_from_slice(&metadata.generation.to_be_bytes());
+    encoded.push(command_code);
+    encoded.extend_from_slice(
+        &u32::try_from(CONNECTION_TIMEOUT.as_millis())
+            .map_err(|_error| InstalledServiceError::BootstrapProtocol)?
+            .to_be_bytes(),
     );
-    encoded.put_u16(payload_len);
+    encoded.extend_from_slice(&payload_len.to_be_bytes());
     encoded.extend_from_slice(&payload);
-    payload.zeroize();
     Ok(encoded)
 }
 
@@ -361,25 +560,78 @@ fn decode_request(
         .ok_or(InstalledServiceError::BootstrapProtocol)?;
     let command = match command {
         1 if payload_len == 0 => BootstrapCommand::Status,
-        2 if payload_len == 0 => BootstrapCommand::RetryAfterForegroundKeyring,
+        2 => decode_foreground_credential(&encoded[33..])?,
         3 if payload_len <= MAXIMUM_UNLOCK_BYTES => BootstrapCommand::UnlockEncryptedFallback(
-            SecretValue::from_utf8_bytes(encoded[33..].to_vec())
-                .map_err(|_error| InstalledServiceError::BootstrapRejected)?,
+            decode_secret(&encoded[33..], MAXIMUM_UNLOCK_BYTES)?,
         ),
         _ => return Err(InstalledServiceError::BootstrapProtocol),
     };
     Ok(BootstrapRequest { deadline, command })
 }
 
+fn decode_foreground_credential(payload: &[u8]) -> Result<BootstrapCommand, InstalledServiceError> {
+    if payload.len() < 4 {
+        return Err(InstalledServiceError::BootstrapProtocol);
+    }
+    let reference_len = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+    let credential_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
+    if reference_len == 0
+        || reference_len > MAXIMUM_REFERENCE_BYTES
+        || credential_len == 0
+        || credential_len > MAXIMUM_CREDENTIAL_BYTES
+        || 4_usize
+            .checked_add(reference_len)
+            .and_then(|length| length.checked_add(credential_len))
+            != Some(payload.len())
+    {
+        return Err(InstalledServiceError::BootstrapProtocol);
+    }
+    let reference_end = 4 + reference_len;
+    let encoded_reference = &payload[4..reference_end];
+    let reference: SecretRef = serde_json::from_slice(encoded_reference)
+        .map_err(|_error| InstalledServiceError::BootstrapRejected)?;
+    let canonical_reference = serde_json::to_vec(&reference)
+        .map_err(|_error| InstalledServiceError::BootstrapProtocol)?;
+    if canonical_reference != encoded_reference {
+        return Err(InstalledServiceError::BootstrapProtocol);
+    }
+    let credential = decode_secret(&payload[reference_end..], MAXIMUM_CREDENTIAL_BYTES)?;
+    Ok(BootstrapCommand::ProvideForegroundCredential {
+        reference,
+        credential,
+    })
+}
+
+fn decode_secret(
+    encoded: &[u8],
+    maximum_bytes: usize,
+) -> Result<SecretValue, InstalledServiceError> {
+    if encoded.is_empty() || encoded.len() > maximum_bytes {
+        return Err(InstalledServiceError::BootstrapRejected);
+    }
+    let mut secret = zeroizing_buffer(encoded.len())?;
+    secret.extend_from_slice(encoded);
+    SecretValue::from_utf8_bytes(std::mem::take(&mut *secret))
+        .map_err(|_error| InstalledServiceError::BootstrapRejected)
+}
+
+fn zeroizing_buffer(capacity: usize) -> Result<Zeroizing<Vec<u8>>, InstalledServiceError> {
+    let mut buffer = Zeroizing::new(Vec::new());
+    buffer
+        .try_reserve_exact(capacity)
+        .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?;
+    Ok(buffer)
+}
+
 fn encode_response(metadata: BootstrapMetadata, code: ResponseCode) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(28);
-    encoded.put_u16(PROTOCOL_VERSION);
+    encoded.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
     encoded.extend_from_slice(metadata.installation_id.as_uuid().as_bytes());
-    encoded.put_u64(metadata.generation);
-    encoded.put_u8(code as u8);
-    encoded.put_u8(match metadata.requirement {
+    encoded.extend_from_slice(&metadata.generation.to_be_bytes());
+    encoded.push(code as u8);
+    encoded.push(match metadata.requirement {
         BootstrapRequirement::EncryptedFallbackLocked => 1,
-        BootstrapRequirement::ForegroundKeyringRetry => 2,
+        BootstrapRequirement::ForegroundKeyringCredential => 2,
     });
     encoded
 }
@@ -406,9 +658,12 @@ fn decode_response(
     };
     let requirement = match encoded[27] {
         1 => BootstrapRequirement::EncryptedFallbackLocked,
-        2 => BootstrapRequirement::ForegroundKeyringRetry,
+        2 => BootstrapRequirement::ForegroundKeyringCredential,
         _ => return Err(InstalledServiceError::BootstrapProtocol),
     };
+    if requirement != metadata.requirement {
+        return Err(InstalledServiceError::BootstrapProtocol);
+    }
     Ok(InstalledServiceBootstrapStatus {
         state,
         requirement: (state == InstalledServiceBootstrapState::Required).then_some(requirement),
@@ -466,7 +721,7 @@ fn encode_metadata(metadata: BootstrapMetadata) -> [u8; 29] {
     encoded[20..28].copy_from_slice(&metadata.generation.to_be_bytes());
     encoded[28] = match metadata.requirement {
         BootstrapRequirement::EncryptedFallbackLocked => 1,
-        BootstrapRequirement::ForegroundKeyringRetry => 2,
+        BootstrapRequirement::ForegroundKeyringCredential => 2,
     };
     encoded
 }
@@ -489,7 +744,7 @@ fn decode_metadata(encoded: &[u8; 29]) -> Result<BootstrapMetadata, InstalledSer
     }
     let requirement = match encoded[28] {
         1 => BootstrapRequirement::EncryptedFallbackLocked,
-        2 => BootstrapRequirement::ForegroundKeyringRetry,
+        2 => BootstrapRequirement::ForegroundKeyringCredential,
         _ => return Err(InstalledServiceError::BootstrapProtocol),
     };
     Ok(BootstrapMetadata {

@@ -409,20 +409,20 @@ async fn run_service_command(
         }
         ServiceCommand::Bootstrap {
             stdin,
-            retry_after_foreground_keyring,
+            complete_foreground_keyring,
         } => {
             let connector = installed_service_connector(config, installation_data_root)?;
-            let status = if retry_after_foreground_keyring {
-                connector.bootstrap_retry_after_foreground_keyring().await?
+            let captured_status = connector.bootstrap_status().await?;
+            let status = if complete_foreground_keyring {
+                connector
+                    .bootstrap_foreground_keyring(captured_status)
+                    .await?
             } else {
                 connector
-                    .bootstrap_unlock(read_bootstrap_unlock(stdin)?)
+                    .bootstrap_unlock(captured_status, read_bootstrap_unlock(stdin)?)
                     .await?
             };
-            (
-                "installed service bootstrap was accepted",
-                serde_json::to_value(status)?,
-            )
+            ("secure startup was accepted", serde_json::to_value(status)?)
         }
     };
     emit_result(output, summary, &value)
